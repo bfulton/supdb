@@ -1,11 +1,15 @@
 # The index decision, in theoretical context
 
-`indexlab` measured nine index layouts. This is what the theory says about the
-result — including the places the theory predicts something the measurement
-does not show, which are the interesting places.
+`indexlab` measures twelve index layouts. This is what the theory says about
+the result — including the places the theory predicts something the
+measurement does not show, which are the interesting places.
 
-All figures are 10M sixteen-byte decimal keys, `--profile full`, from
-`results/f9-index-layout.full.json`.
+All figures are 10M sixteen-byte decimal keys, `--profile full`. The summary
+table below comes from `results/f9-index-layout.full.json`, which **predates
+the two fixed-extent paged arms** and so lists ten; those two are measured
+pairwise against their originals in `results/f10-pair-*.full.json` and are
+reported in "Varint decoding" below. Regenerating the f9 record at `full` so
+the summary table covers all twelve is outstanding work.
 
 | layout | hit | miss | scan | B/key | MiB @ 10M |
 |---|---|---|---|---|---|
@@ -187,6 +191,45 @@ space optimisation that must not sit on a latency-critical path.** Sixteen
 fixed bytes cost about 7 B/key more than varints and bought back 180 ns per
 lookup. The same encoding choice is still on the hot path in `hash+paged` and
 `mph+paged`, which is the obvious next thing to fix.
+
+**DONE — and the generalisation held, at about half the strength predicted.**
+`hash+pagedfixed` and `mph+pagedfixed` apply the same change to the paged
+blob. They are arms rather than replacements, and `indexlab pair` measures
+each against its varint original **interleaved in one process**, because the
+probe's cross-layout comparisons come from sequential `Trial` blocks and that
+is not a basis for a claim about a change. At 10M keys, `--profile full`,
+decimal16:
+
+| pair | hit | scan | B/key | verdict |
+|---|---|---|---|---|
+| `hash+paged` → `hash+pagedfixed` | 694 → 508 ns (**1.37×**) | 5.10 → 3.22 ns/e (**1.59×**) | 42.9 → 49.8 | p=0.0022 / 0.0122 |
+| `mph+paged` → `mph+pagedfixed` | 788 → 662 ns (**1.19×**) | 5.36 → 3.32 ns/e (**1.61×**) | 20.5 → 27.4 | p=0.0022 / 0.0122 |
+
+Predicted ~350 ns and ~450 ns; measured 508 and 662. The prediction assumed
+the varint was the same share of the path it was in `hash+flat`, where it
+*was* the path. A paged hit also pays a page-directory lookup, a slot-directory
+read and a prefix comparison, and an MPH hit pays several level bit-array
+probes and a rank before it reaches the record at all — which is exactly why
+the MPH arm gains least. The denominator matters, and reasoning about the
+numerator alone overstated both.
+
+Absent-key lookups are **unchanged** in both pairs (p=0.25, p=0.70), which is
+the result that makes the rest credible: a miss fails at the key comparison and
+never reaches the extent, so an encoding change behind that comparison must not
+move it. That is recorded as finding P3 in each pair rather than left as an
+observation, so a future run that *does* move it fails the build.
+
+The scan column is the more consequential half. F9.5 fails because no composite
+scans as fast as the heap index; at 3.22 against heap-hash's 2.71 ns/entry the
+gap is 1.19× rather than 1.88×. Still failing, and F9.5 stays `fails` in
+`claims.json` — but it now fails by a margin that a page-layout change could
+plausibly close, rather than by one that says the approach is wrong.
+
+The space cost is the thing to watch, and it is not symmetric: +16% for the
+hash arm, +34% for the MPH arm, because the MPH arm has less other space to
+absorb the same twelve bytes. Both are pinned as `max` metrics in
+`claims.json` so speed cannot be bought with space again without a person
+deciding to.
 
 **TESTED — and the prediction was too strong.** The argument was that an L2
 TLB of ~1536 entries covers 6 MiB at 4 KiB pages while these structures are

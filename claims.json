@@ -272,6 +272,54 @@
       "because": "A minimal perfect hash reaches 22.2 B/key -- 4.5x smaller than today -- but at 801 ns against 369, so it does not deliver hash-class speed. BBHash probes several level bit-arrays plus a rank index, which is more cache misses than one hash probe rather than fewer. It is another point on the frontier, not a way past it. Pinned to full: these thresholds are calibrated at 10M keys, and at ci scale (100k) every structure fits in cache and the ordering differs. Pinned to x86_64: the thresholds are calibrated for 64-byte cache lines and 4 KiB pages, and Apple Silicon has 128-byte lines and 16 KiB pages.",
       "profile": "full",
       "arch": "x86_64"
+    },
+    {
+      "experiment": "f10-pair-hash-paged-vs-hash-pagedfixed",
+      "id": "P1",
+      "expect": "holds",
+      "because": "Fixed-width extents remove four varint decodes from the paged hit path, worth 1.37x (694 -> 508 ns) at 10M keys. This is the same defect hash+flatfixed found in hash+flat, applied to the layout the frontier actually points at. Pinned to full: the paged layouts only separate at 10M keys; at ci scale everything fits in cache and a 100k-key extent varint-encodes to a single byte, so the arm being tested barely differs from the other. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
+      "profile": "full",
+      "arch": "x86_64"
+    },
+    {
+      "experiment": "f10-pair-hash-paged-vs-hash-pagedfixed",
+      "id": "P2",
+      "expect": "holds",
+      "because": "The same change is worth 1.59x on ordered scans (5.10 -> 3.22 ns/entry), which matters more than the hit figure: F9.5 fails because no composite scans as fast as the heap index, and this closes most of that gap. Pinned to full: the paged layouts only separate at 10M keys; at ci scale everything fits in cache and a 100k-key extent varint-encodes to a single byte, so the arm being tested barely differs from the other. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
+      "profile": "full",
+      "arch": "x86_64"
+    },
+    {
+      "experiment": "f10-pair-hash-paged-vs-hash-pagedfixed",
+      "id": "P3",
+      "expect": "holds",
+      "because": "A miss fails at the key comparison and never reaches the extent, so an encoding change behind that comparison must not move it. This is a harness check, not a performance claim -- if it ever stops holding, distrust P1 rather than celebrating it. Pinned to full: the paged layouts only separate at 10M keys; at ci scale everything fits in cache and a 100k-key extent varint-encodes to a single byte, so the arm being tested barely differs from the other. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
+      "profile": "full",
+      "arch": "x86_64"
+    },
+    {
+      "experiment": "f10-pair-mph-paged-vs-mph-pagedfixed",
+      "id": "P1",
+      "expect": "holds",
+      "because": "The same change on the MPH arm is worth 1.19x (788 -> 662 ns). Much less than the hash arm, because a BBHash lookup probes several level bit-arrays before it reaches the record, so the varint is a smaller share of a longer path. Pinned to full: the paged layouts only separate at 10M keys; at ci scale everything fits in cache and a 100k-key extent varint-encodes to a single byte, so the arm being tested barely differs from the other. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
+      "profile": "full",
+      "arch": "x86_64"
+    },
+    {
+      "experiment": "f10-pair-mph-paged-vs-mph-pagedfixed",
+      "id": "P2",
+      "expect": "holds",
+      "because": "1.61x on ordered scans (5.36 -> 3.32 ns/entry), essentially the same as the hash arm, because the scan path is the blob and is shared. Pinned to full: the paged layouts only separate at 10M keys; at ci scale everything fits in cache and a 100k-key extent varint-encodes to a single byte, so the arm being tested barely differs from the other. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
+      "profile": "full",
+      "arch": "x86_64"
+    },
+    {
+      "experiment": "f10-pair-mph-paged-vs-mph-pagedfixed",
+      "id": "P3",
+      "expect": "holds",
+      "because": "The mechanism check, as above. The MPH arm makes it sharper: its misses are dominated by the MPH probe itself, so a moved miss figure here would be unambiguous evidence of a harness fault. Pinned to full: the paged layouts only separate at 10M keys; at ci scale everything fits in cache and a 100k-key extent varint-encodes to a single byte, so the arm being tested barely differs from the other. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
+      "profile": "full",
+      "arch": "x86_64"
     }
   ],
   "metrics": [
@@ -327,6 +375,20 @@
       "path": "series.scaling.0.ops_per_s",
       "min": 500000,
       "because": "Single-threaded append throughput at full scale, the axis the design is built to win."
+    },
+    {
+      "experiment": "f10-pair-hash-paged-vs-hash-pagedfixed",
+      "path": "series.arms.1.logical_bytes_per_key",
+      "max": 52.0,
+      "because": "The price of P1 and P2. hash+pagedfixed spends 49.8 B/key against hash+paged's 42.9 -- 16% more -- and the whole argument for the paged layout is that it is small. A ceiling here means a future change cannot buy speed with space without someone deciding to. Pinned to full: the paged layouts only separate at 10M keys; at ci scale everything fits in cache and a 100k-key extent varint-encodes to a single byte, so the arm being tested barely differs from the other. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
+      "profile": "full"
+    },
+    {
+      "experiment": "f10-pair-mph-paged-vs-mph-pagedfixed",
+      "path": "series.arms.1.logical_bytes_per_key",
+      "max": 29.0,
+      "because": "mph+pagedfixed spends 27.4 B/key against mph+paged's 20.5 -- 34% more, a far worse trade than the hash arm's 16%, because the MPH arm has less other space to hide the extra twelve bytes in. Pinned to full: the paged layouts only separate at 10M keys; at ci scale everything fits in cache and a 100k-key extent varint-encodes to a single byte, so the arm being tested barely differs from the other. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
+      "profile": "full"
     }
   ]
 }
