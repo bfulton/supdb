@@ -78,7 +78,9 @@ assumption about constant factors, and that is not the sort of thing to settle
 by reasoning.
 
 It has already overturned two recommendations, including mine. See
-`results/f9-index-layout.full.json`.
+`results/f9-index-layout.full.json` for the measurements and
+`docs/index-theory.md` for where they sit against the known bounds — including
+the two places the theory predicts something the measurement does not show.
 
 ## Profiles
 
