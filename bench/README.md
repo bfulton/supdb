@@ -62,6 +62,24 @@ cargo run --release --bin correctness -- all --profile dev
 almost always lands in a value payload, where a flipped byte is structurally
 harmless and silently served — which is itself a finding, but a different one.
 
+## Index layout laboratory — `indexlab`
+
+Not a benchmark of the engine: a benchmark of a *proposed replacement* for its
+weakest part, run before anyone writes code against it.
+
+```
+cargo run --release --bin indexlab -- --profile full
+```
+
+Six layouts × three key shapes × three scales, with correctness assertions
+before any timing and resident size measured in a child process. It exists
+because the architecture argument for replacing the reader index turned on an
+assumption about constant factors, and that is not the sort of thing to settle
+by reasoning.
+
+It has already overturned two recommendations, including mine. See
+`results/f9-index-layout.full.json`.
+
 ## Profiles
 
 `--profile ci` runs in seconds and is **never citable**; it proves the

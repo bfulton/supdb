@@ -60,3 +60,7 @@ path = "src/bin/figures.rs"
 [[bin]]
 name = "correctness"
 path = "src/bin/correctness.rs"
+
+[[bin]]
+name = "indexlab"
+path = "src/bin/indexlab.rs"

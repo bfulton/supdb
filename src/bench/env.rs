@@ -170,6 +170,21 @@ pub fn peak_rss_bytes() -> u64 {
         .unwrap_or(0)
 }
 
+/// Current resident set size in bytes.
+///
+/// Distinct from `peak_rss_bytes`, which reports VmHWM -- a high-water mark.
+/// For measuring what a structure costs, the peak is the wrong statistic: if
+/// building the inputs spiked resident memory above what the structure itself
+/// occupies, the delta between two peak readings is zero. That produced
+/// "2.1 bytes per key" for a structure that plainly costs seventeen.
+pub fn rss_bytes() -> u64 {
+    first_line_after("/proc/self/status", "VmRSS")
+        .and_then(|v| v.split_whitespace().next().map(|s| s.to_string()))
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|kb| kb * 1024)
+        .unwrap_or(0)
+}
+
 /// Bytes this process has actually caused to be sent to storage.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IoCounters {
