@@ -35,7 +35,7 @@
 
 use std::path::PathBuf;
 use std::time::Instant;
-use supdb::bench::{compare, env, Finding, Profile, Record, Rng, Trial, J};
+use supdb::bench::{compare, env, Finding, Profile, Record, Rng, Trial, Verdict, J};
 use supdb::jobj;
 
 // ------------------------------------------------------------------ types --
@@ -2403,18 +2403,53 @@ fn pair_mode(args: &Args) -> std::io::Result<()> {
         .param("keys", J::u(keys.len() as u64))
         .param("shape", J::s(shape.as_str()))
         .param("lookups", J::u(lookups));
-    rec.compare(
-        "b_hit_vs_a_hit",
-        compare(&s[0], &s[2], supdb::bench::MIN_EFFECT),
-    );
-    rec.compare(
-        "b_miss_vs_a_miss",
-        compare(&s[1], &s[3], supdb::bench::MIN_EFFECT),
-    );
-    rec.compare(
-        "b_scan_vs_a_scan",
-        compare(&scan[0], &scan[1], supdb::bench::MIN_EFFECT),
-    );
+    let hit_cmp = compare(&s[0], &s[2], supdb::bench::MIN_EFFECT);
+    let miss_cmp = compare(&s[1], &s[3], supdb::bench::MIN_EFFECT);
+    let scan_cmp = compare(&scan[0], &scan[1], supdb::bench::MIN_EFFECT);
+    let (hit_v, hit_r) = (hit_cmp.verdict, hit_cmp.ratio);
+    let (miss_v, miss_r) = (miss_cmp.verdict, miss_cmp.ratio);
+    let (scan_v, scan_r) = (scan_cmp.verdict, scan_cmp.ratio);
+    rec.compare("b_hit_vs_a_hit", hit_cmp);
+    rec.compare("b_miss_vs_a_miss", miss_cmp);
+    rec.compare("b_scan_vs_a_scan", scan_cmp);
+
+    // Three statements rather than three numbers, so `verify` has something to
+    // hold the next run against.
+    rec.finding(Finding::new(
+        "P1",
+        "the b arm's point lookup is faster by a margin that clears the gate",
+        hit_v == Verdict::Greater,
+        format!(
+            "{a_name} {:.0} ns -> {b_name} {:.0} ns ({hit_r:.3}x), verdict {hit_v:?}",
+            s[0].median(),
+            s[2].median()
+        ),
+    ));
+    rec.finding(Finding::new(
+        "P2",
+        "the b arm's ordered scan is faster by a margin that clears the gate",
+        scan_v == Verdict::Greater,
+        format!(
+            "{a_name} {:.2} ns/entry -> {b_name} {:.2} ns/entry ({scan_r:.3}x), verdict {scan_v:?}",
+            scan[0].median(),
+            scan[1].median()
+        ),
+    ));
+    // The mechanism check, and the one most likely to catch a harness error.
+    // A miss fails at the key comparison and never reaches the extent, so an
+    // encoding change sitting behind that comparison must not move it. If this
+    // ever reports a difference, the benchmark is measuring something other
+    // than what it says it is.
+    rec.finding(Finding::new(
+        "P3",
+        "the b arm's absent-key lookup is unchanged, the encoding sitting past the key comparison",
+        miss_v == Verdict::NoDifference,
+        format!(
+            "{a_name} {:.0} ns vs {b_name} {:.0} ns ({miss_r:.3}x), verdict {miss_v:?}",
+            s[1].median(),
+            s[3].median()
+        ),
+    ));
     rec.series(
         "arms",
         J::arr(vec![
