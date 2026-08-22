@@ -82,6 +82,25 @@ It has already overturned two recommendations, including mine. See
 `docs/index-theory.md` for where they sit against the known bounds — including
 the two places the theory predicts something the measurement does not show.
 
+## Profiling
+
+`docs/profiling.md` covers what each tool answers, what this machine can and
+cannot do, and what a full rig needs.
+
+The short version: hardware counters are unavailable here — Firecracker does
+not virtualise the PMU, so `perf` reports every hardware event as
+`<not supported>` regardless of privileges. Two software methods stand in, and
+they answer different questions:
+
+```sh
+./target/release/indexlab trace --keys 10000000   # distinct lines/pages a lookup demands
+bench/profile.sh                                  # simulated misses, deterministic
+```
+
+Cachegrind is worse than a PMU for fidelity and better for regression
+detection: it is deterministic, so cache behaviour can be gated in CI where
+wall-clock numbers are too noisy to be.
+
 ## Profiles
 
 `--profile ci` runs in seconds and is **never citable**; it proves the

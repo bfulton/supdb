@@ -1798,6 +1798,9 @@ fn main() -> std::io::Result<()> {
     if argv.get(1).map(|s| s.as_str()) == Some("trace") {
         return trace_mode(&args);
     }
+    if argv.get(1).map(|s| s.as_str()) == Some("probe") {
+        return probe_mode(&args);
+    }
     let profile = Profile::parse(args.get("--profile").unwrap_or("dev")).unwrap_or(Profile::Dev);
     let out = PathBuf::from(args.get("--out").unwrap_or("results"));
     let scales: Vec<usize> = match profile {
@@ -2179,5 +2182,31 @@ fn trace_mode(args: &Args) -> std::io::Result<()> {
          # A page count above one means the lookup is exposed to TLB reach: an L2 TLB of\n\
          # ~1536 entries covers 6 MiB with 4 KiB pages, and these structures are hundreds."
     );
+    Ok(())
+}
+
+/// Build one layout, perform a fixed number of lookups, exit.
+///
+/// Exists so an external simulator can measure a single layout in isolation.
+/// Cachegrind reports misses for the whole process, so the process has to do
+/// one thing. The build phase is unavoidably included; `--lookups 0` measures
+/// the build alone, and subtracting gives the lookup cost.
+fn probe_mode(args: &Args) -> std::io::Result<()> {
+    let which = args.get("--layout").expect("--layout");
+    let n = args.num("--keys", 1_000_000);
+    let lookups = args.num("--lookups", 50_000);
+    let shape = Shape::parse(args.get("--shape").unwrap_or("decimal16")).expect("shape");
+    let keys = make_keys(shape, n);
+    let exts = make_exts(keys.len());
+    let l = build_layout(which, &keys, &exts);
+    let mut rng = Rng::new(0x9803);
+    let mut found = 0u64;
+    for _ in 0..lookups {
+        let k = &keys[(rng.next() as usize) % keys.len()];
+        if std::hint::black_box(l.lookup(k)).is_some() {
+            found += 1;
+        }
+    }
+    eprintln!("# {which} {n} keys {lookups} lookups, {found} found");
     Ok(())
 }

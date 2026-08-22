@@ -50,6 +50,11 @@ pub struct Env {
     pub rustc: String,
     pub git_sha: String,
     pub profile: String,
+    /// Whether hardware performance counters can be read at all. False inside
+    /// a Firecracker guest, which exposes no PMU.
+    pub pmu_available: bool,
+    pub smt_on: bool,
+    pub aslr_disabled: bool,
 }
 
 impl Env {
@@ -90,6 +95,16 @@ impl Env {
             governor: read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
                 .map(|s| s.trim().into())
                 .unwrap_or_else(|| "unknown".into()),
+            // A PMU that exists reports a nonzero count for a trivial program;
+            // one that does not reports "<not supported>".
+            pmu_available: read("/proc/sys/kernel/perf_event_paranoid").is_some()
+                && std::path::Path::new("/sys/bus/event_source/devices/cpu").exists(),
+            smt_on: read("/sys/devices/system/cpu/smt/active")
+                .map(|s| s.trim() == "1")
+                .unwrap_or(false),
+            aslr_disabled: read("/proc/sys/kernel/randomize_va_space")
+                .map(|s| s.trim() == "0")
+                .unwrap_or(false),
             rustc: option_env!("SUPDB_RUSTC").unwrap_or("unknown").to_string(),
             git_sha: option_env!("SUPDB_GIT_SHA")
                 .unwrap_or("unknown")
@@ -141,6 +156,9 @@ impl Env {
             "rustc" => J::s(&self.rustc),
             "git_sha" => J::s(&self.git_sha),
             "profile" => J::s(&self.profile),
+            "pmu_available" => J::Bool(self.pmu_available),
+            "smt_on" => J::Bool(self.smt_on),
+            "aslr_disabled" => J::Bool(self.aslr_disabled),
             "warnings" => J::arr(self.warnings().iter().map(J::s).collect()),
         }
     }
