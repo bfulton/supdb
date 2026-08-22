@@ -145,13 +145,48 @@ Not provable, and not provable in principle:
 
 Two gaps, both worth naming rather than papering over.
 
-**The cache-miss model does not explain the lookup ordering.** Counting
-dependent misses: `heap-hash` costs three (hash probe → entry → key deref),
-`hash+flat` costs two (probe → record). The model says `hash+flat` should win.
-It loses, 475 ns to 369. No confident explanation is available without hardware
-counters, which this environment does not provide. `perf stat -e
-cache-misses,dTLB-load-misses` on both layouts is the experiment that would
-settle it, and until it is run this is an unexplained result, not a subtle one.
+**RESOLVED — and the model was right.** This section previously recorded an
+unexplained result: `heap-hash` costs three dependent misses, `hash+flat` two,
+and yet `hash+flat` lost 475 ns to 369.
+
+Hardware counters were unavailable — this is a Firecracker guest, and `perf`
+reports every PMU event as `<not supported>` — so the model's *inputs* were
+instrumented instead. `indexlab trace` records the byte ranges each lookup
+reads and counts distinct 64-byte lines and 4 KiB pages:
+
+| layout | reads | distinct lines | distinct pages |
+|---|---|---|---|
+| heap-hash | 3.20 | 3.53 | 3.01 |
+| hash+flat | 2.20 | **2.67** | **2.01** |
+| hash+paged | 5.20 | 5.69 | 3.30 |
+
+So the model's input was correct: `hash+flat` really does touch fewer lines and
+fewer pages. Subtracting the miss path, which is identical for both (240 ns
+against 253), sharpened it further — `heap-hash`'s *two* extra memory accesses
+cost 126 ns while `hash+flat`'s *single* access cost 241 ns. One access costing
+twice what two cost is not a memory effect.
+
+The remaining candidate on that path was varint decoding: four varints, a
+serial branchy loop with data-dependent exits. `hash+flatfixed` tests exactly
+that and nothing else, storing the extent as four fixed u32s:
+
+| layout @ 10M | hit | miss | scan | B/key |
+|---|---|---|---|---|
+| heap-hash | 366 ns | 240 ns | 2.69 ns/e | 98.8 |
+| hash+flat (varint) | 494 ns | 253 ns | 7.33 ns/e | 54.2 |
+| **hash+flatfixed** | **314 ns** | 248 ns | 2.95 ns/e | 61.1 |
+
+Varint decoding was the entire anomaly, and it was an artifact of how the
+records were encoded rather than anything about the layout. With it removed the
+mmap-able layout is **faster than the current heap index on the dominant
+operation**, level on misses and scans, at 1.6× less memory — and it is
+shareable and opens in O(1), which the heap index can never be.
+
+The lesson generalises past this benchmark: **variable-length encoding is a
+space optimisation that must not sit on a latency-critical path.** Sixteen
+fixed bytes cost about 7 B/key more than varints and bought back 180 ns per
+lookup. The same encoding choice is still on the hot path in `hash+paged` and
+`mph+paged`, which is the obvious next thing to fix.
 
 **Every layout is far beyond TLB reach, and none of them was measured with
 huge pages.** A typical L2 TLB of ~1536 entries covers 6 MiB with 4 KiB pages.

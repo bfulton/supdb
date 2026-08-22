@@ -146,6 +146,35 @@ fn prefix8(key: &[u8]) -> u64 {
     u64::from_be_bytes(b)
 }
 
+/// Records the byte ranges a lookup actually reads, so the number of distinct
+/// cache lines and pages it touches can be counted directly.
+///
+/// This exists because the machine has no usable PMU: it is a Firecracker
+/// guest, and `perf` reports every hardware counter as `<not supported>`. The
+/// cache-miss model can still be tested, but its *inputs* have to be measured
+/// rather than its outputs -- count the distinct lines a lookup touches, and
+/// compare that against the latency it costs.
+#[derive(Default)]
+struct Trace {
+    lines: std::collections::HashSet<usize>,
+    pages: std::collections::HashSet<usize>,
+    reads: usize,
+}
+
+impl Trace {
+    #[inline]
+    fn touch(&mut self, addr: usize, len: usize) {
+        self.reads += 1;
+        let mut a = addr & !63;
+        let end = addr + len.max(1);
+        while a < end {
+            self.lines.insert(a >> 6);
+            self.pages.insert(a >> 12);
+            a += 64;
+        }
+    }
+}
+
 trait Layout {
     /// Reported alongside every measurement, so a row can never be attributed
     /// to the wrong structure.
@@ -166,6 +195,12 @@ trait Layout {
     /// field measures something the engine never does, and flatters exactly
     /// the layout that keys behind a pointer.
     fn scan_from(&self, start: usize, n: usize) -> u64;
+    /// Mirror of `lookup` that records what it reads. Implemented only for the
+    /// layouts under investigation; the default reports nothing so the others
+    /// are visibly absent rather than silently zero.
+    fn trace_lookup(&self, _key: &[u8], _t: &mut Trace) -> bool {
+        false
+    }
 }
 
 // ------------------------------------------------------------- heap-hash --
@@ -242,6 +277,32 @@ impl Layout for HeapHash {
                 let e = &self.entries[i as usize];
                 if e.0.as_slice() == key {
                     return Some(e.1);
+                }
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+    fn trace_lookup(&self, key: &[u8], t: &mut Trace) -> bool {
+        let h = key_hash(key);
+        let tag = ((h >> 56) as u8) | 1;
+        let mut slot = (h as usize) & self.mask;
+        let hbase = self.hash.as_ptr() as usize;
+        let ebase = self.entries.as_ptr() as usize;
+        let esz = std::mem::size_of::<(Vec<u8>, Ext4)>();
+        loop {
+            t.touch(hbase + slot * 8, 8);
+            let (tg, i) = self.hash[slot];
+            if i == u32::MAX {
+                return true;
+            }
+            if tg == tag {
+                // The entry record, then the key it points at: two separate
+                // regions, which is the whole point of the comparison.
+                t.touch(ebase + i as usize * esz, esz);
+                let e = &self.entries[i as usize];
+                t.touch(e.0.as_ptr() as usize, e.0.len());
+                if e.0.as_slice() == key {
+                    return true;
                 }
             }
             slot = (slot + 1) & self.mask;
@@ -737,6 +798,30 @@ impl Layout for HashFlat {
             slot = (slot + 1) & self.mask;
         }
     }
+    fn trace_lookup(&self, key: &[u8], t: &mut Trace) -> bool {
+        let h = key_hash(key);
+        let tag = ((h >> 56) as u8) | 1;
+        let mut slot = (h as usize) & self.mask;
+        let hbase = self.hash.as_ptr() as usize;
+        let bbase = self.blob.as_ptr() as usize;
+        loop {
+            t.touch(hbase + slot * 8, 8);
+            let (tg, off) = self.hash[slot];
+            if off == u32::MAX {
+                return true;
+            }
+            if tg == tag {
+                let p = off as usize;
+                let kl = u16::from_le_bytes(self.blob[p..p + 2].try_into().unwrap()) as usize;
+                // One contiguous record: length, key, extent varints.
+                t.touch(bbase + p, 2 + kl + 24);
+                if self.blob[p + 2..p + 2 + kl] == *key {
+                    return true;
+                }
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
     fn scan_from(&self, start: usize, n: usize) -> u64 {
         let r = start / RESTART_EVERY;
         let Some(off) = self.restarts.get(r) else {
@@ -761,6 +846,157 @@ impl Layout for HashFlat {
             idx += 1;
         }
         acc
+    }
+}
+
+// ------------------------------- hash over flat records, fixed-width extents --
+
+/// `hash+flat` with the extent stored as four little-endian u32s instead of
+/// four varints.
+///
+/// One variable, to test one hypothesis. `hash+flat` touches fewer cache lines
+/// and fewer pages than the current heap layout (2.67 and 2.01 against 3.53 and
+/// 3.01, measured) and is nonetheless 29% slower. Subtracting the miss path,
+/// which is identical for both, heap-hash's two extra memory accesses cost
+/// 123ns while hash+flat's single access costs 224ns -- so the extra time is
+/// not being spent waiting for memory. Varint decoding is a serial, branchy
+/// loop of eight or so iterations with data-dependent exits, and it is the only
+/// other thing on that path. Sixteen fixed bytes instead removes it.
+struct HashFlatFixed {
+    blob: Vec<u8>,
+    hash: Vec<(u8, u32)>,
+    mask: usize,
+    restarts: Vec<u32>,
+}
+
+impl HashFlatFixed {
+    fn build(keys: &[Vec<u8>], exts: &[Ext4]) -> HashFlatFixed {
+        let mut blob = Vec::with_capacity(keys.len() * 34);
+        let mut offs = Vec::with_capacity(keys.len());
+        let mut restarts = Vec::with_capacity(keys.len() / RESTART_EVERY + 1);
+        for (i, k) in keys.iter().enumerate() {
+            if i % RESTART_EVERY == 0 {
+                restarts.push(blob.len() as u32);
+            }
+            offs.push(blob.len() as u32);
+            blob.extend_from_slice(&(k.len() as u16).to_le_bytes());
+            blob.extend_from_slice(k);
+            let e = exts[i];
+            for v in [e.block, e.off, e.len, e.last] {
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        blob.shrink_to_fit();
+        restarts.shrink_to_fit();
+        let mut cap = 1usize;
+        while cap < keys.len() * 2 {
+            cap <<= 1;
+        }
+        cap = cap.max(16);
+        let mask = cap - 1;
+        let mut hash = vec![(0u8, u32::MAX); cap];
+        for (i, k) in keys.iter().enumerate() {
+            let h = key_hash(k);
+            let mut slot = (h as usize) & mask;
+            while hash[slot].1 != u32::MAX {
+                slot = (slot + 1) & mask;
+            }
+            hash[slot] = (((h >> 56) as u8) | 1, offs[i]);
+        }
+        HashFlatFixed {
+            blob,
+            hash,
+            mask,
+            restarts,
+        }
+    }
+}
+
+impl Layout for HashFlatFixed {
+    fn name(&self) -> &'static str {
+        "hash+flatfixed"
+    }
+    fn logical_bytes(&self) -> usize {
+        self.blob.capacity()
+            + self.hash.capacity() * std::mem::size_of::<(u8, u32)>()
+            + self.restarts.capacity() * 4
+    }
+    fn lookup(&self, key: &[u8]) -> Option<Ext4> {
+        let h = key_hash(key);
+        let tag = ((h >> 56) as u8) | 1;
+        let mut slot = (h as usize) & self.mask;
+        loop {
+            let (t, off) = self.hash[slot];
+            if off == u32::MAX {
+                return None;
+            }
+            if t == tag {
+                let mut p = off as usize;
+                let kl = u16::from_le_bytes(self.blob[p..p + 2].try_into().unwrap()) as usize;
+                p += 2;
+                if self.blob[p..p + kl] == *key {
+                    p += kl;
+                    let mut v = [0u32; 4];
+                    for slot in v.iter_mut() {
+                        *slot = u32::from_le_bytes(self.blob[p..p + 4].try_into().unwrap());
+                        p += 4;
+                    }
+                    return Some(Ext4 {
+                        block: v[0],
+                        off: v[1],
+                        len: v[2],
+                        last: v[3],
+                    });
+                }
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+    fn scan_from(&self, start: usize, n: usize) -> u64 {
+        let r = start / RESTART_EVERY;
+        let Some(off) = self.restarts.get(r) else {
+            return 0;
+        };
+        let mut p = *off as usize;
+        let mut acc = 0u64;
+        let mut seen = 0usize;
+        let mut idx = r * RESTART_EVERY;
+        while p < self.blob.len() && seen < n {
+            let kl = u16::from_le_bytes(self.blob[p..p + 2].try_into().unwrap()) as usize;
+            let kb = if kl > 0 { self.blob[p + 2] as u64 } else { 0 };
+            p += 2 + kl;
+            let b = u32::from_le_bytes(self.blob[p..p + 4].try_into().unwrap()) as u64;
+            p += 16;
+            if idx >= start {
+                acc = acc.wrapping_add(b).wrapping_add(kb);
+                seen += 1;
+            }
+            idx += 1;
+        }
+        acc
+    }
+    fn trace_lookup(&self, key: &[u8], t: &mut Trace) -> bool {
+        let h = key_hash(key);
+        let tag = ((h >> 56) as u8) | 1;
+        let mut slot = (h as usize) & self.mask;
+        let hbase = self.hash.as_ptr() as usize;
+        let bbase = self.blob.as_ptr() as usize;
+        loop {
+            t.touch(hbase + slot * 8, 8);
+            let (tg, off) = self.hash[slot];
+            if off == u32::MAX {
+                return true;
+            }
+            if tg == tag {
+                let p = off as usize;
+                let kl = u16::from_le_bytes(self.blob[p..p + 2].try_into().unwrap()) as usize;
+                t.touch(bbase + p, 2 + kl + 16);
+                if self.blob[p + 2..p + 2 + kl] == *key {
+                    return true;
+                }
+            }
+            slot = (slot + 1) & self.mask;
+        }
     }
 }
 
@@ -949,6 +1185,37 @@ impl Layout for HashPaged {
                 if let Some((base, prefix, at)) = self.blob.locate(rank as usize) {
                     if let Some(e) = self.blob.matches(base, prefix, at, key) {
                         return Some(e);
+                    }
+                }
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+    fn trace_lookup(&self, key: &[u8], t: &mut Trace) -> bool {
+        let h = key_hash(key);
+        let tag = ((h >> 56) as u8) | 1;
+        let mut slot = (h as usize) & self.mask;
+        let hbase = self.hash.as_ptr() as usize;
+        let pbase = self.blob.pages.as_ptr() as usize;
+        let dbase = self.blob.page_dir.as_ptr() as usize;
+        loop {
+            t.touch(hbase + slot * 8, 8);
+            let (tg, rank) = self.hash[slot];
+            if rank == u32::MAX {
+                return true;
+            }
+            if tg == tag {
+                let page = rank as usize / PER_PAGE;
+                t.touch(dbase + page * 4, 4);
+                if let Some((base, prefix, at)) = self.blob.locate(rank as usize) {
+                    // Page header and shared prefix, the slot directory entry,
+                    // then the record itself.
+                    t.touch(pbase + base, 4 + prefix);
+                    let slot_in = rank as usize % PER_PAGE;
+                    t.touch(pbase + base + 4 + prefix + 2 * slot_in, 2);
+                    t.touch(pbase + at, 2 + 32);
+                    if self.blob.matches(base, prefix, at, key).is_some() {
+                        return true;
                     }
                 }
             }
@@ -1501,6 +1768,7 @@ fn build_layout(which: &str, keys: &[Vec<u8>], exts: &[Ext4]) -> Box<dyn Layout>
         "packed+radix" => Box::new(Packed::build(keys, exts, 18)),
         "hash+packed" => Box::new(HashPacked::build(keys, exts)),
         "hash+flat" => Box::new(HashFlat::build(keys, exts)),
+        "hash+flatfixed" => Box::new(HashFlatFixed::build(keys, exts)),
         "hash+paged" => Box::new(HashPaged::build(keys, exts)),
         "mph+paged" => Box::new(MphPaged::build(keys, exts, false)),
         "mph+bloom+paged" => Box::new(MphPaged::build(keys, exts, true)),
@@ -1508,13 +1776,14 @@ fn build_layout(which: &str, keys: &[Vec<u8>], exts: &[Ext4]) -> Box<dyn Layout>
     }
 }
 
-const LAYOUTS: [&str; 9] = [
+const LAYOUTS: [&str; 10] = [
     "heap-hash",
     "btree",
     "packed",
     "packed+radix",
     "hash+packed",
     "hash+flat",
+    "hash+flatfixed",
     "hash+paged",
     "mph+paged",
     "mph+bloom+paged",
@@ -1525,6 +1794,9 @@ fn main() -> std::io::Result<()> {
     let args = Args(argv.clone());
     if argv.get(1).map(|s| s.as_str()) == Some("child") {
         return child(&args);
+    }
+    if argv.get(1).map(|s| s.as_str()) == Some("trace") {
+        return trace_mode(&args);
     }
     let profile = Profile::parse(args.get("--profile").unwrap_or("dev")).unwrap_or(Profile::Dev);
     let out = PathBuf::from(args.get("--out").unwrap_or("results"));
@@ -1849,6 +2121,63 @@ fn child(args: &Args) -> std::io::Result<()> {
     println!(
         "rss_bytes={} before={before} after={after}",
         after.saturating_sub(before)
+    );
+    Ok(())
+}
+
+/// Count the distinct cache lines and pages a lookup actually touches.
+///
+/// The machine is a Firecracker guest with no PMU -- `perf` reports every
+/// hardware counter as `<not supported>` -- so the cache-miss model cannot be
+/// checked against measured misses. It can still be checked against its
+/// inputs: instrument the lookups, count distinct 64-byte lines and 4 KiB
+/// pages, and see whether the layout that touches fewer is the one that runs
+/// faster. When it is not, the model is missing a term.
+fn trace_mode(args: &Args) -> std::io::Result<()> {
+    let n = args.num("--keys", 10_000_000);
+    let samples = args.num("--samples", 20_000);
+    let shape = Shape::parse(args.get("--shape").unwrap_or("decimal16")).expect("shape");
+    let keys = make_keys(shape, n);
+    let exts = make_exts(keys.len());
+    let traced = ["heap-hash", "hash+flat", "hash+flatfixed", "hash+paged"];
+
+    println!(
+        "# {} x {} keys, {} sampled lookups\n{:<13} {:>8} {:>9} {:>9} {:>9}",
+        shape.as_str(),
+        keys.len(),
+        samples,
+        "layout",
+        "reads",
+        "lines",
+        "pages",
+        "bytes/key"
+    );
+    for which in traced {
+        let l = build_layout(which, &keys, &exts);
+        let mut rng = Rng::new(0x71ACE);
+        let (mut lines, mut pages, mut reads) = (0usize, 0usize, 0usize);
+        for _ in 0..samples {
+            let k = &keys[(rng.next() as usize) % keys.len()];
+            let mut t = Trace::default();
+            assert!(l.trace_lookup(k, &mut t), "{which} has no tracer");
+            lines += t.lines.len();
+            pages += t.pages.len();
+            reads += t.reads;
+        }
+        let s = samples as f64;
+        println!(
+            "{:<13} {:>8.2} {:>9.2} {:>9.2} {:>9.1}",
+            which,
+            reads as f64 / s,
+            lines as f64 / s,
+            pages as f64 / s,
+            l.logical_bytes() as f64 / keys.len() as f64
+        );
+    }
+    println!(
+        "\n# lines and pages are distinct 64-byte lines and 4 KiB pages touched per lookup.\n\
+         # A page count above one means the lookup is exposed to TLB reach: an L2 TLB of\n\
+         # ~1536 entries covers 6 MiB with 4 KiB pages, and these structures are hundreds."
     );
     Ok(())
 }
