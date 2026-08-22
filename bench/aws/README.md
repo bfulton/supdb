@@ -114,3 +114,36 @@ constants have to be derived at runtime rather than compiled in.
   value tool available: it would have identified the varint decode as core-bound
   in one command, rather than the three rounds of hypothesis-and-control it
   actually took.
+
+## A least-privilege identity
+
+`iam/bench-policy.json` is the smallest policy that runs everything here, and
+`iam/setup.sh` applies it and then removes whatever else is attached.
+
+Run it yourself with admin credentials; it does not need an agent. The order is
+deliberate — the scoped policy is created **and verified with the IAM policy
+simulator** before anything is detached, so a mistake is caught while you still
+have the privileges to fix it. If the simulation disagrees with intent, the
+script stops and leaves admin in place.
+
+```sh
+bench/aws/iam/setup.sh supdb-bench-user
+```
+
+What the policy allows: EC2 `Describe*`, `RunInstances` restricted to an
+explicit instance-type list *and* requiring the `supdb-bench` tag,
+`CreateTags` only as part of a launch, and `TerminateInstances` only on
+instances already carrying that tag.
+
+What it denies outright, regardless of anything else attached: all of `iam:*`
+and `sts:AssumeRole`, so the credential cannot grant itself more; security
+group and key pair creation, so it cannot open network access to what it
+launches; and everything outside that EC2 subset via a `NotAction` deny, so a
+future service cannot be reached by default.
+
+Recovery, if the reduced policy turns out to be wrong:
+
+```sh
+aws iam attach-user-policy --user-name supdb-bench-user \
+  --policy-arn arn:aws:iam::aws:policy/AdministratorAccess
+```
