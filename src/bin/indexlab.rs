@@ -1216,7 +1216,11 @@ impl HashPaged {
             blob,
             hash,
             mask,
-            named: if fixed { "hash+pagedfixed" } else { "hash+paged" },
+            named: if fixed {
+                "hash+pagedfixed"
+            } else {
+                "hash+paged"
+            },
         }
     }
 }
@@ -1881,6 +1885,9 @@ fn main() -> std::io::Result<()> {
     if argv.get(1).map(|s| s.as_str()) == Some("machine") {
         return machine_mode();
     }
+    if argv.get(1).map(|s| s.as_str()) == Some("pair") {
+        return pair_mode(&args);
+    }
     let profile = Profile::parse(args.get("--profile").unwrap_or("dev")).unwrap_or(Profile::Dev);
     let out = PathBuf::from(args.get("--out").unwrap_or("results"));
     let scales: Vec<usize> = match profile {
@@ -2300,6 +2307,161 @@ fn probe_mode(args: &Args) -> std::io::Result<()> {
 /// best. If the derivation lands close to the optimum on every machine shape,
 /// the unified approach holds and no per-architecture tuning table is needed.
 /// If it does not, the gap says how much complexity is actually being bought.
+/// Compare two layouts interleaved in one process.
+///
+/// The probe measures each layout under its own `Trial`, one after another.
+/// That is enough for a table and not enough for a claim: CLAUDE.md requires
+/// two arms of a change to be run interleaved, as `f8-checksums` does for
+/// `Options::checksums`, precisely because sequential blocks let the machine
+/// drift between them. The drift within one process over a few seconds is far
+/// smaller than the drift between runs that once moved three unchanged
+/// comparators by +20% to +43% -- but "far smaller" is not "measured", and a
+/// difference is not a difference here until it clears `stats::compare`.
+///
+/// So this mode builds both layouts up front and round-robins the
+/// configurations through a single `Trial`, which is the only shape that
+/// licenses a comparison between them.
+fn pair_mode(args: &Args) -> std::io::Result<()> {
+    let profile = Profile::parse(args.get("--profile").unwrap_or("dev")).unwrap_or(Profile::Dev);
+    let out = PathBuf::from(args.get("--out").unwrap_or("results"));
+    let a_name = args.get("--a").expect("--a <layout>");
+    let b_name = args.get("--b").expect("--b <layout>");
+    let n = args.num("--keys", profile.pick(100_000, 1_000_000, 10_000_000));
+    let lookups = args.num("--lookups", profile.pick(200_000, 500_000, 2_000_000)) as u64;
+    let shape = Shape::parse(args.get("--shape").unwrap_or("decimal16")).expect("shape");
+
+    let keys = make_keys(shape, n);
+    let exts = make_exts(keys.len());
+    let arms = [
+        build_layout(a_name, &keys, &exts),
+        build_layout(b_name, &keys, &exts),
+    ];
+
+    // Correctness first. An arm that is fast and wrong is not an arm.
+    for (which, l) in [a_name, b_name].iter().zip(arms.iter()) {
+        for i in (0..keys.len()).step_by((keys.len() / 997).max(1)) {
+            assert_eq!(l.lookup(&keys[i]), Some(exts[i]), "{which}: wrong value");
+        }
+    }
+
+    // Four configurations round-robined: {a,b} x {hit,miss}. The Trial
+    // interleaves them, so a thermal or frequency excursion lands on both arms
+    // rather than on whichever happened to run during it.
+    let trial = Trial::new(profile.reps());
+    let s = trial.run(4, |ci, _| {
+        let l = &arms[ci / 2];
+        let miss = ci % 2 == 1;
+        let mut r = Rng::new(0xF9);
+        let t = Instant::now();
+        let mut found = 0u64;
+        for _ in 0..lookups {
+            let i = (r.next() as usize) % keys.len();
+            let hit = if miss {
+                let mut k = keys[i].clone();
+                *k.last_mut().unwrap() = b'~';
+                l.lookup(&k)
+            } else {
+                l.lookup(&keys[i])
+            };
+            if std::hint::black_box(hit).is_some() {
+                found += 1;
+            }
+        }
+        std::hint::black_box(found);
+        t.elapsed().as_secs_f64() * 1e9 / lookups as f64
+    });
+
+    let scan_len = 1000usize.min(keys.len());
+    let scan = Trial::new(profile.reps().min(5)).run(2, |ci, _| {
+        let l = &arms[ci];
+        let mut r = Rng::new(0x5CA5);
+        let rounds = 200usize;
+        let t = Instant::now();
+        let mut acc = 0u64;
+        for _ in 0..rounds {
+            let from = (r.next() as usize) % (keys.len() - scan_len).max(1);
+            acc = acc.wrapping_add(l.scan_from(from, scan_len));
+        }
+        std::hint::black_box(acc);
+        t.elapsed().as_secs_f64() * 1e9 / (rounds * scan_len) as f64
+    });
+
+    let a_bytes = arms[0].logical_bytes() as f64 / keys.len() as f64;
+    let b_bytes = arms[1].logical_bytes() as f64 / keys.len() as f64;
+
+    let mut rec = Record::new("f10-layout-pair", profile);
+    rec.param("a", J::s(a_name))
+        .param("b", J::s(b_name))
+        .param("keys", J::u(keys.len() as u64))
+        .param("shape", J::s(shape.as_str()))
+        .param("lookups", J::u(lookups));
+    rec.compare(
+        "b_hit_vs_a_hit",
+        compare(&s[0], &s[2], supdb::bench::MIN_EFFECT),
+    );
+    rec.compare(
+        "b_miss_vs_a_miss",
+        compare(&s[1], &s[3], supdb::bench::MIN_EFFECT),
+    );
+    rec.compare(
+        "b_scan_vs_a_scan",
+        compare(&scan[0], &scan[1], supdb::bench::MIN_EFFECT),
+    );
+    rec.series(
+        "arms",
+        J::arr(vec![
+            jobj! {
+                "layout" => J::s(a_name),
+                "hit_ns" => J::fp(s[0].median(), 2),
+                "miss_ns" => J::fp(s[1].median(), 2),
+                "scan_ns_per_entry" => J::fp(scan[0].median(), 3),
+                "logical_bytes_per_key" => J::fp(a_bytes, 2),
+                "hit_samples" => s[0].to_json(),
+            },
+            jobj! {
+                "layout" => J::s(b_name),
+                "hit_ns" => J::fp(s[2].median(), 2),
+                "miss_ns" => J::fp(s[3].median(), 2),
+                "scan_ns_per_entry" => J::fp(scan[1].median(), 3),
+                "logical_bytes_per_key" => J::fp(b_bytes, 2),
+                "hit_samples" => s[2].to_json(),
+            },
+        ]),
+    );
+
+    println!(
+        "# {} vs {} -- {} x {} keys [{}]",
+        a_name,
+        b_name,
+        shape.as_str(),
+        keys.len(),
+        profile.as_str()
+    );
+    for (name, hit, miss, sc, by) in [
+        (
+            a_name,
+            s[0].median(),
+            s[1].median(),
+            scan[0].median(),
+            a_bytes,
+        ),
+        (
+            b_name,
+            s[2].median(),
+            s[3].median(),
+            scan[1].median(),
+            b_bytes,
+        ),
+    ] {
+        println!(
+            "  {name:<16} hit {hit:>7.1} ns  miss {miss:>7.1} ns  scan {sc:>6.2} ns/e  {by:>6.1} B/key"
+        );
+    }
+    rec.print_summary();
+    rec.write(&out)?;
+    Ok(())
+}
+
 /// Print what the machine reports about itself and exit.
 ///
 /// The sweep derives its candidate from `cache_line`, so a machine whose line
