@@ -188,18 +188,39 @@ fixed bytes cost about 7 B/key more than varints and bought back 180 ns per
 lookup. The same encoding choice is still on the hot path in `hash+paged` and
 `mph+paged`, which is the obvious next thing to fix.
 
-**Every layout is far beyond TLB reach, and none of them was measured with
-huge pages.** A typical L2 TLB of ~1536 entries covers 6 MiB with 4 KiB pages.
-The structures here are 134–942 MiB, so every random access risks a page-table
-walk on top of the data miss. With 2 MiB pages the same TLB covers ~3 GiB —
-enough for all of them.
+**TESTED — and the prediction was too strong.** The argument was that an L2
+TLB of ~1536 entries covers 6 MiB at 4 KiB pages while these structures are
+134–942 MiB, so every random access risks a page-table walk; 2 MiB pages raise
+reach to ~3 GiB. That predicted a "substantial, possibly ordering-changing"
+win.
 
-That predicts a substantial, possibly ordering-changing win for every
-mmap-backed layout from `MADV_HUGEPAGE`, and it is a deployment knob rather
-than a structural change. The engine currently calls `madvise` nowhere at all,
-which the architecture review already flagged for a different reason. This is
-the highest-leverage untested hypothesis the theory hands us, and it is cheap
-to test.
+Measured by running the whole sweep twice with the system THP setting toggled
+(verified in effect: `AnonHugePages` went from 0 to 956 MiB), at 10M keys:
+
+| layout | hit, 4 KiB | hit, 2 MiB | delta |
+|---|---|---|---|
+| heap-hash | 366.2 ns | 354.1 ns | −3.3% |
+| hash+flat | 493.6 ns | 442.8 ns | −10.3% |
+| hash+flatfixed | 314.0 ns | 299.1 ns | −4.7% |
+| hash+paged | 682.2 ns | 647.8 ns | −5.0% |
+| mph+bloom+paged | 890.8 ns | 859.7 ns | −3.5% |
+| packed | 1078.1 ns | 1075.6 ns | −0.2% |
+| btree | 1367.6 ns | 1394.4 ns | +2.0% |
+
+Consistent single-digit gains for most layouts, nothing above 10%, and **the
+ordering is unchanged**. The hypothesis is not supported at the strength it was
+stated.
+
+Two caveats keep this from being a firm negative. The arms are separate runs —
+THP is a global kernel setting and cannot be interleaved within one process —
+so by this project's own rule the comparison cannot clear the significance
+gate, and drift of a few percent between runs is plausible. And the deltas
+being small is itself consistent with the tracer: at 2–3 distinct pages per
+lookup, the page-walk caches likely absorb most of the cost, so there was less
+TLB pressure to relieve than the reach calculation implied.
+
+The practical reading: huge pages are worth having and cost nothing to enable,
+but they are a few percent, not a redesign.
 
 ## References
 
