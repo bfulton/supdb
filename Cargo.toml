@@ -1,0 +1,43 @@
+[package]
+name = "supdb"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+memmap2 = "0.9"
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = true
+
+[[bin]]
+name = "supbench"
+path = "src/bin/supbench.rs"
+
+[[bin]]
+name = "recover"
+path = "src/bin/recover.rs"
+
+[[bin]]
+name = "mvcc"
+path = "src/bin/mvcc.rs"
+
+[[bin]]
+name = "kvbench"
+path = "src/bin/kvbench.rs"
+
+[[bin]]
+name = "concur"
+path = "src/bin/concur.rs"
+
+[[bin]]
+name = "soak"
+path = "src/bin/soak.rs"
+
+[[bin]]
+name = "tablebench"
+path = "src/bin/tablebench.rs"
