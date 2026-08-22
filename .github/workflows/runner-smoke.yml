@@ -1,0 +1,28 @@
+name: runner-smoke
+
+# The smallest job that can distinguish "these runners claim work" from
+# "something about the sweep job stops them claiming it".
+#
+# The sweep sat queued for eleven minutes with a healthy localmost heartbeat.
+# That job also carries a `needs:`, a concurrency group, a 180-minute timeout
+# and a checkout, any of which could hold a job in `queued` for reasons that
+# have nothing to do with the runner. This one carries none of them: one
+# label, one echo. If this is claimed, the fault is in the sweep job. If it is
+# not, the fault is in the runner or its registration.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 5
+    steps:
+      - name: Say where we are
+        run: |
+          echo "runner:   ${RUNNER_NAME:-?}"
+          echo "arch:     $(uname -m)"
+          echo "line:     $(sysctl -n hw.cachelinesize)"
+          echo "page:     $(getconf PAGE_SIZE)"
+          echo "cpus:     $(sysctl -n hw.ncpu)"
+          echo "loadavg:  $(sysctl -n vm.loadavg)"
