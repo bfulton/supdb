@@ -40,6 +40,10 @@ on:
       shape:
         description: 'Key shape (decimal16, randomhex, clustered)'
         default: 'decimal16'
+      force:
+        description: 'Dispatch to the self-hosted runner even if the heartbeat looks stale'
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -94,7 +98,9 @@ jobs:
     # repository variable every 60 seconds while the self-hosted runner is up.
     # Dispatching the sweep at a self-hosted label with nothing listening
     # queues the job until it expires; checking first turns that into an
-    # honest skip.
+    # honest skip. `force` bypasses this for a repository that publishes
+    # runners without publishing a heartbeat -- the gate exists to avoid a
+    # job that hangs, not to be the authority on whether the Mac is up.
     runs-on: ubuntu-latest
     outputs:
       fresh: ${{ steps.hb.outputs.fresh }}
@@ -124,7 +130,7 @@ jobs:
     # push to a laptop someone is using is not a measurement, it is a
     # background process competing with one.
     needs: [detect, runner-available]
-    if: github.event_name == 'workflow_dispatch' && needs.runner-available.outputs.fresh == 'true'
+    if: github.event_name == 'workflow_dispatch' && (needs.runner-available.outputs.fresh == 'true' || inputs.force)
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 180
     # Never two timing benchmarks at once. Four cores measuring each other is
