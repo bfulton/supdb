@@ -143,6 +143,48 @@
       "id": "F7.3",
       "expect": "holds",
       "because": "Eight concurrent readers must still hold a 10M-key store on a 16GB machine. It holds with thin margin -- the ceiling is about 16M keys each -- so this is the guard that would catch the per-key cost growing."
+    },
+    {
+      "experiment": "c1-decoders",
+      "id": "C1.1",
+      "expect": "fails",
+      "because": "Damage aimed at the key index takes the process down rather than returning an error: 'index out of bounds: the len is 13220 but the index is 13220'. get_uvarint reads without a bounds check and emit slices on a length it just read. In an embedded library a panic is the host application dying. Uniform random damage does not find this -- it almost always lands in a value payload -- so the experiment aims at the index section deliberately."
+    },
+    {
+      "experiment": "c1-decoders",
+      "id": "C1.2",
+      "expect": "fails",
+      "because": "About 74% of damaged files read through to the end without complaint, and values came back with the wrong length. Nothing outside the 120-byte superblock carries a checksum, so there is nothing for the engine to notice. This is the single clearest argument for per-block checksums."
+    },
+    {
+      "experiment": "c2-oracle",
+      "id": "C2.1",
+      "expect": "holds",
+      "because": "The store must agree with a BTreeMap model across appends, replaces, deletes and checkpoints. This is the core data-model contract and must never regress."
+    },
+    {
+      "experiment": "c3-crash",
+      "id": "C3.1",
+      "expect": "holds",
+      "because": "A store killed after at least one checkpoint must open. It does, across every trial -- the alternating superblock slots work. This is a genuine strength of the design."
+    },
+    {
+      "experiment": "c3-crash",
+      "id": "C3.2",
+      "expect": "holds",
+      "because": "Recovery must invent nothing: every value read back after a crash was actually written."
+    },
+    {
+      "experiment": "c3-crash",
+      "id": "C3.3",
+      "expect": "holds",
+      "because": "Recovery must lose only a suffix. About 95% of keys survive a mid-run crash."
+    },
+    {
+      "experiment": "c3-crash",
+      "id": "C3.4",
+      "expect": "fails",
+      "because": "A store killed before its first checkpoint does not open at all -- there is no superblock to find. Everything written lives in per-shard memory buffers and buffer_bytes defaults to 512MB, so the window in which a crash loses everything is not small."
     }
   ],
   "metrics": [

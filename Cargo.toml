@@ -56,3 +56,7 @@ path = "src/bin/verify.rs"
 [[bin]]
 name = "figures"
 path = "src/bin/figures.rs"
+
+[[bin]]
+name = "correctness"
+path = "src/bin/correctness.rs"

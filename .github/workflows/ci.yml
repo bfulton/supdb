@@ -54,6 +54,9 @@ jobs:
           ./target/release/external kv   --profile ci --out results-ci
           ./target/release/external ycsb --profile ci --keys 10000 --ops 10000 --out results-ci
 
+      - name: Correctness suite
+        run: ./target/release/correctness all --profile ci --out results-ci
+
       - name: Verify claims against the measurements
         run: ./target/release/verify --profile ci --results results-ci
 

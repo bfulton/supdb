@@ -42,6 +42,25 @@ transactions, checksums, reopen-for-write, read-your-writes, ordered scan.
 Supdb provides one of six; the others provide five or six. A throughput number
 that does not say so is comparing promises as much as implementations.
 
+## Correctness — `correctness`
+
+A fast wrong answer is not a result, so these produce `Finding`s in the same
+format and are governed by the same claims file.
+
+```
+cargo run --release --bin correctness -- all --profile dev
+```
+
+| id | asks |
+|----|------|
+| `c1-decoders` | does a damaged file produce an error, or take the host process down? |
+| `c2-oracle`   | does the store agree with a `BTreeMap` model over random operation sequences? |
+| `c3-crash`    | what survives a writer killed at an arbitrary point? |
+
+`c1` aims damage at the key index deliberately. Uniform random corruption
+almost always lands in a value payload, where a flipped byte is structurally
+harmless and silently served — which is itself a finding, but a different one.
+
 ## Profiles
 
 `--profile ci` runs in seconds and is **never citable**; it proves the
@@ -83,4 +102,8 @@ Named so their absence cannot be mistaken for a passing result:
 - RocksDB and Pebble as comparators (both need a non-Rust toolchain in CI).
 - `db_bench --benchmarks=mixgraph`, the FAST'20 realistic workload.
 - Real production traces (Twitter OSDI'20).
-- Crash injection (ALICE/CrashMonkey), fuzzing, `loom` on the reader protocol.
+- `loom` on the reader-table claim protocol, and `miri` over the five `unsafe`
+  blocks.
+- Exhaustive crash-point enumeration in the ALICE sense. `c3-crash` samples
+  crash points at random rather than enumerating the write sequence.
+- Damage aimed at the block chunk directories, as `c1` aims at the key index.

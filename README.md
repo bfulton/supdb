@@ -12,6 +12,7 @@ document and asking what measurement would prove it wrong.
 src/               engine  (~1,400 lines, two dependencies: memmap2, lz4_flex)
 src/bench/         the measurement substrate  -- repetition, significance, latency, I/O accounting
 src/bin/internal   the falsification suite    -- Supdb against itself, as it scales
+src/bin/correctness  the correctness suite    -- damaged files, a model oracle, crash injection
 bench/external/    the comparison suite       -- Supdb inside other projects' evaluations
 results/           committed measurements     -- the source of truth for figures and claims
 figures/           publication-quality SVG    -- generated from results/, never by hand
@@ -25,6 +26,7 @@ docs/              the architecture review that produced all of the above
 cargo build --release --workspace
 cargo run --release --bin internal -- all --profile dev      # falsification suite
 cargo run --release --bin external -- all --profile dev      # against redb, LMDB, sled
+cargo run --release --bin correctness -- all --profile dev   # damage, oracle, crashes
 cargo run --release --bin verify                             # claims vs measurements
 cargo run --release --bin figures                            # results/ -> figures/*.svg
 ```
@@ -43,6 +45,12 @@ Device-level write amplification is **0.96×** — genuinely below one, because
 compression more than pays for the append-only overhead. That is a real result
 and it is the design's strongest number.
 
+Crash recovery works: across every trial that crashed *after* a checkpoint, the
+store opened, ~95% of keys survived, and recovery invented nothing — no value
+came back that had not been written. The alternating superblock slots do their
+job. And the store agrees with a `BTreeMap` model over randomized sequences of
+appends, replaces and deletes across every checkpoint.
+
 **What does not.**
 
 | finding | measured |
@@ -57,6 +65,9 @@ and it is the design's strongest number.
 | Supdb sustains a mixed read/write workload | YCSB-A runs **13.5× slower** than read-only YCSB-C |
 | reads survive the dataset outgrowing memory | **916× degradation** — 338,681 reads/s resident vs 370 at 23 GB against 15.7 GB of RAM; p99 9.5 ms |
 | the reader index is affordable | **131 bytes per key**, resident, per process, shared with nobody — to index a 100-byte value |
+| damaged data is detected | **74%** of corrupted files read through without complaint, returning wrong-length values; nothing outside the superblock is checksummed |
+| a damaged file errors rather than panics | damage aimed at the key index panics the host process — `get_uvarint` has no bounds check |
+| a store killed before its first checkpoint is readable | it is not; nothing reaches disk until a checkpoint, and `buffer_bytes` defaults to 512 MB |
 
 The out-of-core result is the largest single number in the suite, and it is
 the only one measured at `--profile full`, so it is the only citable one.
