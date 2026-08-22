@@ -110,6 +110,34 @@ both arms behind a runtime flag and interleave them in one process, as
 toggles a global kernel setting — say so, and treat the result as indicative
 rather than as clearing the significance gate.
 
+## Winning on more than one architecture
+
+The measurements in this repository are x86-64 with 64-byte cache lines and
+4 KiB pages. Two things follow.
+
+**Claims are pinned by architecture as well as by profile.** A layout threshold
+calibrated for 64-byte lines is not a claim about a machine with 128-byte
+lines, and `verify` now skips rather than fails such a claim, the same way it
+handles a profile it cannot evaluate.
+
+**"ARM" is not one target.** Graviton is 64 B / 4 KiB, the same geometry as
+x86. Apple Silicon is 128 B / 16 KiB. For every question this project has
+asked, those are different machines: distinct-lines-per-lookup roughly halves
+on Apple Silicon, and TLB reach is four times better before huge pages are
+considered.
+
+A prediction worth recording before it is tested, since predicting first is the
+only way a measurement can surprise you: **on 128-byte lines the compact
+layouts should gain relative to the heap layout.** `heap-hash` chases three
+pointers into unrelated regions and a wider line fetches more bytes it does not
+use; `hash+flatfixed`'s 34-byte record straddles a line far less often, and
+`packed`'s 16-record restart group falls from four lines to two. If that is
+wrong, the cache-line story is not the mechanism and something else is.
+
+`bench/aws/` runs the whole suite on a bare-metal instance of either
+architecture, applying the hygiene above, and brings the results back. See
+`bench/aws/README.md` for instance choices.
+
 ## Running what is available
 
 ```sh

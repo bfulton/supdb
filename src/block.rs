@@ -97,11 +97,45 @@ unsafe fn crc32c_hw(data: &[u8]) -> u32 {
     c ^ 0xFFFF_FFFF
 }
 
+/// ARMv8 CRC extension. Graviton and Apple Silicon both have it; it is
+/// optional in the base ISA, so it is still feature-detected.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+unsafe fn crc32c_hw(data: &[u8]) -> u32 {
+    use core::arch::aarch64::{__crc32cb, __crc32cd};
+    let mut c = 0xFFFF_FFFFu32;
+    let mut chunks = data.chunks_exact(8);
+    for w in &mut chunks {
+        c = __crc32cd(c, u64::from_le_bytes(w.try_into().unwrap()));
+    }
+    for b in chunks.remainder() {
+        c = __crc32cb(c, *b);
+    }
+    c ^ 0xFFFF_FFFF
+}
+
 /// Resolved once, not per call: 0 unknown, 1 hardware, 2 scalar.
 static CRC_IMPL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 pub fn crc32(data: &[u8]) -> u32 {
+    #[allow(unused_imports)]
     use std::sync::atomic::Ordering;
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut which = CRC_IMPL.load(Ordering::Relaxed);
+        if which == 0 {
+            which = if std::arch::is_aarch64_feature_detected!("crc") {
+                1
+            } else {
+                2
+            };
+            CRC_IMPL.store(which, Ordering::Relaxed);
+        }
+        if which == 1 {
+            // SAFETY: only reached once the CPU has advertised the CRC extension.
+            return unsafe { crc32c_hw(data) };
+        }
+    }
     #[cfg(target_arch = "x86_64")]
     {
         let mut which = CRC_IMPL.load(Ordering::Relaxed);
@@ -578,9 +612,14 @@ mod checksum_tests {
     /// Two implementations of one function silently diverging is exactly the
     /// hazard this arrangement creates, so it is tested directly.
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn hardware_and_scalar_crc_agree() {
+        #[cfg(target_arch = "x86_64")]
         if !std::arch::is_x86_feature_detected!("sse4.2") {
+            return;
+        }
+        #[cfg(target_arch = "aarch64")]
+        if !std::arch::is_aarch64_feature_detected!("crc") {
             return;
         }
         let mut seed = 0x1234_5678_9ABC_DEF0u64;

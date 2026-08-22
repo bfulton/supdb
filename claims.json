@@ -229,43 +229,49 @@
       "experiment": "f9-index-layout",
       "id": "F9.1",
       "expect": "holds",
-      "because": "An mmap-able layout at least 1.5x smaller than the current index must exist, or the whole argument for replacing it collapses. hash+flat is 1.8x smaller and mph+paged 4.5x. Pinned to full: these thresholds are calibrated at 10M keys, and at ci scale (100k) every structure fits in cache and the ordering differs.",
-      "profile": "full"
+      "because": "An mmap-able layout at least 1.5x smaller than the current index must exist, or the whole argument for replacing it collapses. hash+flat is 1.8x smaller and mph+paged 4.5x. Pinned to full: these thresholds are calibrated at 10M keys, and at ci scale (100k) every structure fits in cache and the ordering differs. Pinned to x86_64: the thresholds are calibrated for 64-byte cache lines and 4 KiB pages, and Apple Silicon has 128-byte lines and 16 KiB pages.",
+      "profile": "full",
+      "arch": "x86_64"
     },
     {
       "experiment": "f9-index-layout",
       "id": "F9.2",
       "expect": "holds",
-      "because": "hash+flat looks up within 1.5x of the current heap hash (1.29x at 10M, p=0.0022). The index is about a fifth of a point read, so that is roughly +5% end to end -- the price of an O(1) open and cross-process sharing. Pinned to full: these thresholds are calibrated at 10M keys, and at ci scale (100k) every structure fits in cache and the ordering differs.",
-      "profile": "full"
+      "because": "hash+flat looks up within 1.5x of the current heap hash (1.29x at 10M, p=0.0022). The index is about a fifth of a point read, so that is roughly +5% end to end -- the price of an O(1) open and cross-process sharing. Pinned to full: these thresholds are calibrated at 10M keys, and at ci scale (100k) every structure fits in cache and the ordering differs. Pinned to x86_64: the thresholds are calibrated for 64-byte cache lines and 4 KiB pages, and Apple Silicon has 128-byte lines and 16 KiB pages.",
+      "profile": "full",
+      "arch": "x86_64"
     },
     {
       "experiment": "f9-index-layout",
       "id": "F9.3",
       "expect": "fails",
-      "because": "A bulk-loaded B+tree is not on the frontier: a plain packed array is both faster and smaller. Loaded here at 100% fill, which flatters it. This is the measured answer to whether copying LMDB's index is worth doing. Pinned to full: these thresholds are calibrated at 10M keys, and at ci scale (100k) every structure fits in cache and the ordering differs.",
-      "profile": "full"
+      "because": "A bulk-loaded B+tree is not on the frontier: a plain packed array is both faster and smaller. Loaded here at 100% fill, which flatters it. This is the measured answer to whether copying LMDB's index is worth doing. Pinned to full: these thresholds are calibrated at 10M keys, and at ci scale (100k) every structure fits in cache and the ordering differs. Pinned to x86_64: the thresholds are calibrated for 64-byte cache lines and 4 KiB pages, and Apple Silicon has 128-byte lines and 16 KiB pages.",
+      "profile": "full",
+      "arch": "x86_64"
     },
     {
       "experiment": "f9-index-layout",
       "id": "F9.5",
       "expect": "fails",
-      "because": "No composite scans as fast as the current heap layout, whose entries are one contiguous Vec. Its advantage is partly allocation locality in a freshly built index and would be expected to erode in a long-lived process, which is not measured. Pinned to full: these thresholds are calibrated at 10M keys, and at ci scale (100k) every structure fits in cache and the ordering differs.",
-      "profile": "full"
+      "because": "No composite scans as fast as the current heap layout, whose entries are one contiguous Vec. Its advantage is partly allocation locality in a freshly built index and would be expected to erode in a long-lived process, which is not measured. Pinned to full: these thresholds are calibrated at 10M keys, and at ci scale (100k) every structure fits in cache and the ordering differs. Pinned to x86_64: the thresholds are calibrated for 64-byte cache lines and 4 KiB pages, and Apple Silicon has 128-byte lines and 16 KiB pages.",
+      "profile": "full",
+      "arch": "x86_64"
     },
     {
       "experiment": "f9-index-layout",
       "id": "F9.6",
       "expect": "holds",
-      "because": "A blocked Bloom filter at least halves absent-key lookups (667 -> 239 ns) for about 2.7 B/key. This is the one dedicated structure that wins a category outright, and it exists specifically because a minimal perfect hash has no cheap way to fail. Pinned to full: these thresholds are calibrated at 10M keys, and at ci scale (100k) every structure fits in cache and the ordering differs.",
-      "profile": "full"
+      "because": "A blocked Bloom filter at least halves absent-key lookups (667 -> 239 ns) for about 2.7 B/key. This is the one dedicated structure that wins a category outright, and it exists specifically because a minimal perfect hash has no cheap way to fail. Pinned to full: these thresholds are calibrated at 10M keys, and at ci scale (100k) every structure fits in cache and the ordering differs. Pinned to x86_64: the thresholds are calibrated for 64-byte cache lines and 4 KiB pages, and Apple Silicon has 128-byte lines and 16 KiB pages.",
+      "profile": "full",
+      "arch": "x86_64"
     },
     {
       "experiment": "f9-index-layout",
       "id": "F9.7",
       "expect": "fails",
-      "because": "A minimal perfect hash reaches 22.2 B/key -- 4.5x smaller than today -- but at 801 ns against 369, so it does not deliver hash-class speed. BBHash probes several level bit-arrays plus a rank index, which is more cache misses than one hash probe rather than fewer. It is another point on the frontier, not a way past it. Pinned to full: these thresholds are calibrated at 10M keys, and at ci scale (100k) every structure fits in cache and the ordering differs.",
-      "profile": "full"
+      "because": "A minimal perfect hash reaches 22.2 B/key -- 4.5x smaller than today -- but at 801 ns against 369, so it does not deliver hash-class speed. BBHash probes several level bit-arrays plus a rank index, which is more cache misses than one hash probe rather than fewer. It is another point on the frontier, not a way past it. Pinned to full: these thresholds are calibrated at 10M keys, and at ci scale (100k) every structure fits in cache and the ordering differs. Pinned to x86_64: the thresholds are calibrated for 64-byte cache lines and 4 KiB pages, and Apple Silicon has 128-byte lines and 16 KiB pages.",
+      "profile": "full",
+      "arch": "x86_64"
     }
   ],
   "metrics": [

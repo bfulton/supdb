@@ -125,6 +125,16 @@ fn check_findings(claims: &J, results: &Path, profile: &str, out: &mut Outcome) 
             out.skipped.push(label);
             continue;
         };
+        // Architecture pins for the same reason profile pins exist. Cache line
+        // size and page size differ across targets -- Graviton is 64B/4KiB like
+        // x86, Apple Silicon is 128B/16KiB -- so a layout threshold calibrated
+        // on one is not a claim about the other, and checking it there would
+        // fail for a reason that says nothing about the engine.
+        if let Some(want_arch) = c.path("arch").and_then(|v| v.as_str()) {
+            if doc.path("env.arch").and_then(|v| v.as_str()) != Some(want_arch) {
+                continue;
+            }
+        }
         out.checked += 1;
 
         let found = doc
@@ -188,6 +198,11 @@ fn check_metrics(claims: &J, results: &Path, profile: &str, out: &mut Outcome) {
             out.skipped.push(label);
             continue;
         };
+        if let Some(want_arch) = c.path("arch").and_then(|v| v.as_str()) {
+            if doc.path("env.arch").and_then(|v| v.as_str()) != Some(want_arch) {
+                continue;
+            }
+        }
         out.checked += 1;
 
         let Some(v) = doc.num(path) else {

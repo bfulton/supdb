@@ -95,7 +95,14 @@ fn prefetch(p: *const Slot) {
     unsafe {
         core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0);
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    // ARM has its own prefetch hint; without this the hot path silently loses
+    // it on every non-x86 target, which is exactly the kind of quiet
+    // architectural regression "win everywhere" has to rule out.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let _ = p;
 }
 

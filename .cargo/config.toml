@@ -1,0 +1,7 @@
+# Cross-compiling to aarch64 so the ARM paths are built and tested before any
+# ARM hardware is involved. qemu-user runs the result: timings under emulation
+# are meaningless, but correctness is real -- and ARM's weak memory model
+# exercises orderings that x86's TSO hides for free.
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+runner = "qemu-aarch64-static -L /usr/aarch64-linux-gnu"
