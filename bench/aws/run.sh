@@ -34,15 +34,36 @@ echo "AMI $AMI ($ARCH)"
 
 # Spot is roughly 70% cheaper and a benchmark run is interruptible: if it dies,
 # rerun it. Set ON_DEMAND=1 for a long interactive session instead.
+# MaxPrice is set explicitly so a spot price spike cannot quietly cost
+# on-demand rates.
 MARKET=()
-[ -z "${ON_DEMAND:-}" ] && MARKET=(--instance-market-options 'MarketType=spot')
+if [ -z "${ON_DEMAND:-}" ]; then
+  MARKET=(--instance-market-options \
+    "MarketType=spot,SpotOptions={MaxPrice=${MAX_PRICE:-1.00},SpotInstanceType=one-time}")
+fi
 
+# The bootstrap runs from user-data rather than being pushed over ssh, so the
+# watchdog is armed at boot even if ssh never connects. Combined with
+# instance-initiated-shutdown-behavior=terminate, the instance ends itself:
+# nothing about the teardown depends on this script, this shell, or this
+# machine still being alive.
+USERDATA=$(mktemp)
+{
+  echo '#!/bin/bash'
+  echo "exec > /var/log/supdb-bootstrap.log 2>&1"
+  cat "$(dirname "$0")/bootstrap.sh"
+} > "$USERDATA"
+
+MAX_MINUTES="${MAX_MINUTES:-240}"
 ID=$(aws ec2 run-instances --region "$REGION" --image-id "$AMI" \
   --instance-type "$TYPE" --key-name "$KEY" --security-group-ids "$SG" \
   ${SUBNET:+--subnet-id "$SUBNET"} "${MARKET[@]}" \
-  --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=200,VolumeType=gp3,Iops=6000}' \
-  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=supdb-bench}]" \
+  --instance-initiated-shutdown-behavior terminate \
+  --user-data "file://$USERDATA" \
+  --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=200,VolumeType=gp3,Iops=6000,DeleteOnTermination=true}' \
+  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=supdb-bench},{Key=supdb-bench,Value=true},{Key=MaxMinutes,Value=$MAX_MINUTES}]" \
   --query 'Instances[0].InstanceId' --output text)
+rm -f "$USERDATA"
 echo "instance $ID"
 cleanup() {
   if [ -z "${KEEP:-}" ]; then
@@ -62,16 +83,14 @@ echo "ip $IP"
 SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i $KEYFILE ubuntu@$IP"
 for _ in $(seq 60); do $SSH true 2>/dev/null && break; sleep 5; done
 
-scp -o StrictHostKeyChecking=no -i "$KEYFILE" \
-  "$(dirname "$0")/bootstrap.sh" "ubuntu@$IP:/tmp/bootstrap.sh"
-# The suites take well over an hour at --profile full; run detached so a
-# dropped connection does not kill the run.
-$SSH "sudo nohup bash /tmp/bootstrap.sh '$REF' '$REPO' > /tmp/bootstrap.log 2>&1 &"
+echo "bootstrap is running from user-data; watchdog armed for ${MAX_MINUTES} min"
+echo "if this script dies, the instance still terminates on its own"
+echo "orphan check any time:  bench/aws/reap.sh --list"
 
 echo "running; polling for completion"
 while ! $SSH "test -f ~/DONE" 2>/dev/null; do
   sleep 60
-  $SSH "tail -1 /tmp/bootstrap.log" 2>/dev/null || true
+  $SSH "sudo tail -1 /var/log/supdb-bootstrap.log" 2>/dev/null || true
 done
 
 OUT="results/aws-$TYPE-$(date -u +%Y%m%dT%H%M%SZ)"

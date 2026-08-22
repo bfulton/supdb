@@ -8,6 +8,20 @@
 set -eux
 REF="${1:-main}"
 REPO="${2:-https://github.com/bfulton/supdb}"
+MAX_MINUTES="${3:-240}"
+
+# ---------------------------------------------------------------- watchdog --
+# Armed before anything else, and deliberately not conditional on the run
+# succeeding, on ssh working, or on any process elsewhere staying alive.
+#
+# The first version of the runner relied on a shell `trap` in the launching
+# process to terminate the instance. That is not a guarantee: if the launching
+# machine dies -- and the machine this was written on restarts on its own -- the
+# trap never fires and the instance bills until somebody notices. This, plus
+# --instance-initiated-shutdown-behavior terminate on the launch, means the
+# instance ends itself no matter what happens anywhere else.
+shutdown -h "+${MAX_MINUTES}" "supdb-bench watchdog: hard cap ${MAX_MINUTES} min" || true
+echo "watchdog armed: terminating in ${MAX_MINUTES} minutes regardless of progress"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -68,3 +82,9 @@ fi
 tar czf ~/results.tgz -C ~ out
 touch ~/DONE
 "
+
+# Give the collector a window to fetch results, then end the instance. If
+# nobody is listening, it still ends.
+GRACE="${GRACE_MINUTES:-20}"
+echo "run complete; shutting down in ${GRACE} minutes"
+shutdown -h "+${GRACE}" "supdb-bench: run complete" || true

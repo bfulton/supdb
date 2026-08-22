@@ -15,6 +15,65 @@ It launches a spot instance, applies the measurement hygiene from
 copies the results into `results/aws-<type>-<timestamp>/`, and terminates.
 `KEEP=1` leaves it up; `ON_DEMAND=1` skips spot.
 
+## Cost, and not being surprised by it
+
+Three independent stops, because one is not enough and the weakest of them was
+the original design:
+
+1. **A watchdog on the instance.** `bootstrap.sh` runs `shutdown -h +240` as its
+   very first action, before it installs anything, and the instance launches
+   with `--instance-initiated-shutdown-behavior terminate`. The instance ends
+   itself after four hours no matter what — whether the run finished, whether
+   ssh ever connected, whether the launching machine still exists. Override with
+   `MAX_MINUTES=90`.
+2. **A spot ceiling.** `MAX_PRICE` (default `1.00`) caps the hourly rate, so a
+   spot price spike cannot quietly bill at on-demand rates.
+3. **A reaper.** `bench/aws/reap.sh --list` sweeps every region for anything
+   tagged `supdb-bench`; without `--list` it terminates them. It should always
+   find nothing.
+
+**What was wrong before:** teardown was a shell `trap` in the launching process.
+That is not a guarantee. If the launching machine dies mid-run the trap never
+fires and the instance bills until somebody notices — and the machine this was
+developed on restarts on its own. The bootstrap now runs from user-data so the
+watchdog is armed at boot rather than pushed over ssh, and nothing about
+termination depends on the launcher surviving.
+
+## Account-level caps, which are worth more than any script
+
+A script you trust is worse than a limit that cannot be exceeded.
+
+- **Service Quotas** are the only true hard stop. Set *Running On-Demand
+  Standard instances* to a low vCPU count (say 200, enough for one `.metal`) and
+  you cannot launch a second one by accident, script bug or otherwise.
+- **AWS Budgets alert; Budget Actions stop.** A plain budget only emails you. A
+  *Budget Action* can attach a deny policy at a threshold. Only the second is a
+  cap.
+- **A scoped IAM user** for this work: allow `ec2:RunInstances` only in one
+  region, only with `ec2:InstanceType` in an explicit list, and require the
+  `supdb-bench` tag. Then the credential cannot launch anything expensive even
+  if the script is wrong.
+- **A separate sub-account** under Organizations with its own small budget, if
+  you want the blast radius bounded by construction.
+
+## The cheap ladder — and most of it is free
+
+`.metal` buys exactly one thing: hardware performance counters. Everything else
+runs anywhere, and the single most important open question cannot be answered on
+AWS at all.
+
+| what you want | where | cost |
+|---|---|---|
+| ARM correctness, weak memory ordering | GitHub Actions `ubuntu-24.04-arm` (already in CI) | free |
+| ARM build + logic | local cross-compile + qemu (already wired) | free |
+| simulated cache misses | cachegrind, any machine | free |
+| **128-byte lines / 16 KiB pages** | **your Mac — no AWS instance has this** | free |
+| ARM server timings | `c7g.large` ≈ $0.07/hr, `c7g.xlarge` ≈ $0.15/hr | cents |
+| real PMU counters, `toplev`, `perf c2c` | `c7g.metal` / `c6i.metal`, spot | ~$0.60–1.80/hr |
+
+A full sweep is about an hour. On spot that is roughly a dollar or two per
+architecture, once.
+
 ## Which instance
 
 **Only `.metal` sizes expose the PMU.** Virtualised Nitro instances report
