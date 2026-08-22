@@ -153,7 +153,7 @@ jobs:
     # background process competing with one.
     needs: detect
     if: github.event_name == 'workflow_dispatch'
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: [self-hosted, macOS]
     timeout-minutes: 180
     # Never two timing benchmarks at once. Four cores measuring each other is
     # not a measurement, and this is the one runner in the fleet that is also

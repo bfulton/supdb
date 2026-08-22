@@ -14,13 +14,14 @@ on:
   workflow_dispatch:
 
 jobs:
-  # Two jobs differing only in how specific the label set is. Inspection says
-  # the runners carry self-hosted, macOS, ARM64 and localmost-proxy, so the
-  # three-label form should match -- but inspection is not a test, and if the
-  # bare form is claimed while the specific one is not, the fault is label
-  # matching rather than the runner.
+  # Two jobs differing only in how specific the label set is. The ARM64 chip
+  # shown against a runner in the repository settings is GitHub displaying the
+  # detected architecture, not necessarily a label the runner was registered
+  # with -- these carry self-hosted and macOS only. If the bare form is
+  # claimed while the specific one is not, the fault is label matching rather
+  # than the runner.
   smoke-labelled:
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: [self-hosted, macOS]
     timeout-minutes: 5
     steps:
       - name: Say where we are
