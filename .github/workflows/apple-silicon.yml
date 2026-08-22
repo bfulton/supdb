@@ -45,6 +45,10 @@ on:
         description: 'Cancel the run if no self-hosted runner claims the sweep within this many minutes'
         default: '10'
 
+permissions:
+  actions: read
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -93,6 +97,12 @@ jobs:
       - name: Machine unit tests
         run: cargo test --release --lib machine
 
+  check:
+    # localmost's own runner-selection workflow. It reads the
+    # LOCALMOST_HEARTBEAT repository variable and resolves to `self-hosted`
+    # when the Mac is live, `macos-latest` otherwise.
+    uses: bfulton/localmost/.github/workflows/check.yaml@main
+
   pickup-watchdog:
     # Bounds how long the sweep may sit unclaimed.
     #
@@ -108,8 +118,8 @@ jobs:
     # the window, cancel the run and say so. A job that hangs for a day
     # looks identical to a job that is about to start, and neither is a
     # measurement.
-    needs: detect
-    if: github.event_name == 'workflow_dispatch'
+    needs: [detect, check]
+    if: github.event_name == 'workflow_dispatch' && needs.check.outputs.runner == 'self-hosted'
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -151,9 +161,14 @@ jobs:
     # The measurement. Manual only: a timing benchmark that fires on every
     # push to a laptop someone is using is not a measurement, it is a
     # background process competing with one.
-    needs: detect
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: [self-hosted, macOS]
+    needs: [detect, check]
+    # Note what this does NOT do: fall back to macos-latest. localmost's
+    # documented pattern resolves runs-on to a hosted runner when the Mac is
+    # unavailable, which is right for a build and wrong for a timing
+    # benchmark -- a shared virtualised runner would return a number that
+    # looks like a measurement and is not. So the fallback becomes a skip.
+    if: github.event_name == 'workflow_dispatch' && needs.check.outputs.runner == 'self-hosted'
+    runs-on: ${{ needs.check.outputs.runner }}
     timeout-minutes: 180
     # Never two timing benchmarks at once. Four cores measuring each other is
     # not a measurement, and this is the one runner in the fleet that is also
