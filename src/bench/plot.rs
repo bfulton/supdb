@@ -50,7 +50,12 @@ pub struct Series {
 
 impl Series {
     pub fn new(name: &str, points: Vec<(f64, f64)>) -> Series {
-        Series { name: name.to_string(), points, band: Vec::new(), reference: false }
+        Series {
+            name: name.to_string(),
+            points,
+            band: Vec::new(),
+            reference: false,
+        }
     }
     pub fn with_band(mut self, band: Vec<(f64, f64, f64)>) -> Series {
         self.band = band;
@@ -109,6 +114,7 @@ impl Chart {
         self.y_scale = Scale::Log;
         self
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn add(mut self, s: Series) -> Chart {
         self.series.push(s);
         self
@@ -173,7 +179,11 @@ impl Chart {
         // labels, axis title, legend and however many lines the caption wraps
         // to each get their own band. Fixing it as a constant is what made the
         // legend sit on top of the caption and the caption fall off the canvas.
-        let cap_lines = if self.caption.is_empty() { 0 } else { wrap(&self.caption, 96).len() };
+        let cap_lines = if self.caption.is_empty() {
+            0
+        } else {
+            wrap(&self.caption, 96).len()
+        };
         let legend_h = if self.series.len() >= 2 { 22.0 } else { 0.0 };
         let (ml, mr, mt) = (78.0, 132.0, 62.0);
         let mb = 30.0 + 22.0 + legend_h + cap_lines as f64 * 14.0 + 14.0;
@@ -185,16 +195,20 @@ impl Chart {
         let sx = |v: f64| -> f64 {
             let t = match self.x_scale {
                 Scale::Linear => (v - x0) / (x1 - x0),
-                Scale::Log => (v.max(1e-12).ln() - x0.max(1e-12).ln())
-                    / (x1.max(1e-12).ln() - x0.max(1e-12).ln()),
+                Scale::Log => {
+                    (v.max(1e-12).ln() - x0.max(1e-12).ln())
+                        / (x1.max(1e-12).ln() - x0.max(1e-12).ln())
+                }
             };
             ml + t * pw
         };
         let sy = |v: f64| -> f64 {
             let t = match self.y_scale {
                 Scale::Linear => (v - y0) / (y1 - y0),
-                Scale::Log => (v.max(1e-12).ln() - y0.max(1e-12).ln())
-                    / (y1.max(1e-12).ln() - y0.max(1e-12).ln()),
+                Scale::Log => {
+                    (v.max(1e-12).ln() - y0.max(1e-12).ln())
+                        / (y1.max(1e-12).ln() - y0.max(1e-12).ln())
+                }
             };
             mt + ph - t * ph
         };
@@ -245,9 +259,17 @@ impl Chart {
             r#"<rect width="{}" height="{}" fill="var(--bg)"/>"#,
             self.width, height
         );
-        let _ = write!(s, r#"<text x="{ml}" y="26" class="ttl">{}</text>"#, esc(&self.title));
+        let _ = write!(
+            s,
+            r#"<text x="{ml}" y="26" class="ttl">{}</text>"#,
+            esc(&self.title)
+        );
         if !self.subtitle.is_empty() {
-            let _ = write!(s, r#"<text x="{ml}" y="43" class="sub">{}</text>"#, esc(&self.subtitle));
+            let _ = write!(
+                s,
+                r#"<text x="{ml}" y="43" class="sub">{}</text>"#,
+                esc(&self.subtitle)
+            );
         }
 
         // Grid and ticks.
@@ -369,7 +391,10 @@ impl Chart {
                     }
                 }
                 let d = path_of(&ser.points, &sx, &sy);
-                let _ = write!(s, r#"<path d="{d}" fill="none" stroke="{col}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>"#);
+                let _ = write!(
+                    s,
+                    r#"<path d="{d}" fill="none" stroke="{col}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>"#
+                );
                 // A 2px surface ring keeps overlapping markers separable.
                 for (x, y) in &ser.points {
                     let _ = write!(
@@ -383,7 +408,11 @@ impl Chart {
             // Direct label at the right end, positioned after every series
             // is placed so overlapping ends can be pushed apart.
             let (lx, ly) = *ser.points.last().unwrap();
-            let fill = if ser.reference { "var(--fg3)".to_string() } else { col.clone() };
+            let fill = if ser.reference {
+                "var(--fg3)".to_string()
+            } else {
+                col.clone()
+            };
             labels.push((sx(lx) + 9.0, sy(ly) + 3.8, fill, ser.name.clone()));
         }
 
@@ -424,7 +453,11 @@ impl Chart {
                 } else {
                     format!("var(--s{})", (i % SERIES_LIGHT.len()) + 1)
                 };
-                let dash = if ser.reference { r#" stroke-dasharray="5 4""# } else { "" };
+                let dash = if ser.reference {
+                    r#" stroke-dasharray="5 4""#
+                } else {
+                    ""
+                };
                 let _ = write!(
                     s,
                     r#"<line x1="{x:.1}" y1="{y:.1}" x2="{:.1}" y2="{y:.1}" stroke="{col}" stroke-width="2"{dash}/>"#,
@@ -456,14 +489,16 @@ impl Chart {
     }
 }
 
-fn path_of(
-    pts: &[(f64, f64)],
-    sx: &dyn Fn(f64) -> f64,
-    sy: &dyn Fn(f64) -> f64,
-) -> String {
+fn path_of(pts: &[(f64, f64)], sx: &dyn Fn(f64) -> f64, sy: &dyn Fn(f64) -> f64) -> String {
     let mut d = String::new();
     for (n, (x, y)) in pts.iter().enumerate() {
-        let _ = write!(d, "{}{:.1} {:.1}", if n == 0 { "M" } else { "L" }, sx(*x), sy(*y));
+        let _ = write!(
+            d,
+            "{}{:.1} {:.1}",
+            if n == 0 { "M" } else { "L" },
+            sx(*x),
+            sy(*y)
+        );
     }
     d
 }
@@ -526,7 +561,11 @@ fn fmt_num(v: f64) -> String {
     } else if a >= 1.0 || a == 0.0 {
         // Only drop the decimals when there are none to drop, or a fractional
         // tick prints as a duplicate of its neighbour.
-        if (v - v.round()).abs() < 1e-9 { format!("{:.0}", v.round()) } else { format!("{v:.1}") }
+        if (v - v.round()).abs() < 1e-9 {
+            format!("{:.0}", v.round())
+        } else {
+            format!("{v:.1}")
+        }
     } else if a >= 0.01 {
         format!("{v:.2}")
     } else {
@@ -553,7 +592,9 @@ fn wrap(s: &str, width: usize) -> Vec<String> {
 }
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[cfg(test)]
@@ -576,7 +617,10 @@ mod tests {
         // not a fetch, so it is excluded from this check.
         let body = s.replace("http://www.w3.org/2000/svg", "");
         for forbidden in ["http://", "https://", "xlink", "<image", "@import", "url("] {
-            assert!(!body.contains(forbidden), "figure must not reference {forbidden}");
+            assert!(
+                !body.contains(forbidden),
+                "figure must not reference {forbidden}"
+            );
         }
     }
 
@@ -585,7 +629,10 @@ mod tests {
         let s = demo().to_svg();
         assert!(s.contains("prefers-color-scheme:dark"));
         assert!(s.contains("[data-theme=\"dark\"]"));
-        assert!(s.contains("fill=\"var(--bg)\""), "must paint its own ground");
+        assert!(
+            s.contains("fill=\"var(--bg)\""),
+            "must paint its own ground"
+        );
     }
 
     /// Identity must never rest on colour alone.
@@ -677,5 +724,307 @@ mod axis_tests {
         assert_eq!(fmt_num(2.0), "2");
         assert_eq!(fmt_num(2.5), "2.5");
         assert_eq!(fmt_num(0.0), "0");
+    }
+}
+
+// ------------------------------------------------------------------- bars --
+
+/// A grouped bar chart, for comparing engines across named workloads.
+///
+/// A line implies continuity between its points. YCSB's workloads are
+/// categories, not a sequence, so drawing them as a line would assert a
+/// relationship that does not exist -- one of the commoner ways a correct
+/// measurement becomes a misleading figure.
+pub struct Bars {
+    pub title: String,
+    pub subtitle: String,
+    pub y_label: String,
+    /// Category names along the x axis.
+    pub groups: Vec<String>,
+    /// (series name, one value per group).
+    pub series: Vec<(String, Vec<f64>)>,
+    pub caption: String,
+    pub width: f64,
+    pub log_y: bool,
+}
+
+impl Bars {
+    pub fn new(title: &str, y_label: &str) -> Bars {
+        Bars {
+            title: title.to_string(),
+            subtitle: String::new(),
+            y_label: y_label.to_string(),
+            groups: Vec::new(),
+            series: Vec::new(),
+            caption: String::new(),
+            width: 820.0,
+            log_y: false,
+        }
+    }
+    pub fn subtitle(mut self, s: &str) -> Bars {
+        self.subtitle = s.to_string();
+        self
+    }
+    pub fn caption(mut self, s: &str) -> Bars {
+        self.caption = s.to_string();
+        self
+    }
+    pub fn log_y(mut self) -> Bars {
+        self.log_y = true;
+        self
+    }
+    pub fn groups(mut self, g: Vec<String>) -> Bars {
+        self.groups = g;
+        self
+    }
+    pub fn add(mut self, name: &str, values: Vec<f64>) -> Bars {
+        self.series.push((name.to_string(), values));
+        self
+    }
+
+    pub fn to_svg(&self) -> String {
+        let cap_lines = if self.caption.is_empty() {
+            0
+        } else {
+            wrap(&self.caption, 104).len()
+        };
+        let (ml, mr, mt) = (78.0, 26.0, 62.0);
+        let mb = 44.0 + 22.0 + cap_lines as f64 * 14.0 + 14.0;
+        let ph = 300.0;
+        let height = mt + ph + mb;
+        let pw = self.width - ml - mr;
+
+        let maxv = self
+            .series
+            .iter()
+            .flat_map(|(_, v)| v.iter())
+            .cloned()
+            .fold(0.0f64, f64::max)
+            .max(1.0);
+        let minv = self
+            .series
+            .iter()
+            .flat_map(|(_, v)| v.iter())
+            .cloned()
+            .filter(|v| *v > 0.0)
+            .fold(f64::INFINITY, f64::min);
+        let (y0, y1) = if self.log_y {
+            (minv.min(maxv) / 2.0, maxv * 1.4)
+        } else {
+            (0.0, maxv * 1.08)
+        };
+        let sy = |v: f64| -> f64 {
+            let t = if self.log_y {
+                (v.max(y0).ln() - y0.ln()) / (y1.ln() - y0.ln())
+            } else {
+                (v - y0) / (y1 - y0)
+            };
+            mt + ph - t * ph
+        };
+
+        let mut s = String::new();
+        let _ = write!(
+            s,
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {height}" width="{w}" height="{height}" font-family="'IBM Plex Sans',-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" role="img" aria-label="{t}">"#,
+            w = self.width,
+            t = esc(&self.title)
+        );
+        s.push_str("<style>");
+        s.push_str(":root{--fg:#151a24;--fg2:#525d74;--fg3:#7d879c;--grid:#e2e6ee;--axis:#aeb6c6;--bg:#ffffff;");
+        for (i, c) in SERIES_LIGHT.iter().enumerate() {
+            let _ = write!(s, "--s{}:{};", i + 1, c);
+        }
+        s.push('}');
+        for scope in [
+            "@media(prefers-color-scheme:dark){:root:not([data-theme=\"light\"])",
+            ":root[data-theme=\"dark\"]",
+        ] {
+            let _ = write!(s, "{scope}{{--fg:#e3e8f2;--fg2:#9aa5bc;--fg3:#6e7a92;--grid:#242c3a;--axis:#3a4557;--bg:#0d1017;");
+            for (i, c) in SERIES_DARK.iter().enumerate() {
+                let _ = write!(s, "--s{}:{};", i + 1, c);
+            }
+            s.push('}');
+            if scope.starts_with('@') {
+                s.push('}');
+            }
+        }
+        s.push_str(
+            ".ttl{font-size:15px;font-weight:600;fill:var(--fg)}\
+             .sub{font-size:11.5px;fill:var(--fg2)}\
+             .ax{font-size:11px;fill:var(--fg2);font-variant-numeric:tabular-nums}\
+             .axt{font-size:11.5px;font-weight:500;fill:var(--fg2)}\
+             .cap{font-size:10.5px;fill:var(--fg3)}\
+             .lg{font-size:11px;fill:var(--fg2)}\
+             .gl{font-size:10.5px;fill:var(--fg2)}",
+        );
+        s.push_str("</style>");
+        let _ = write!(
+            s,
+            r#"<rect width="{}" height="{height}" fill="var(--bg)"/>"#,
+            self.width
+        );
+        let _ = write!(
+            s,
+            r#"<text x="{ml}" y="26" class="ttl">{}</text>"#,
+            esc(&self.title)
+        );
+        if !self.subtitle.is_empty() {
+            let _ = write!(
+                s,
+                r#"<text x="{ml}" y="43" class="sub">{}</text>"#,
+                esc(&self.subtitle)
+            );
+        }
+
+        for t in ticks(
+            y0.max(if self.log_y { y0 } else { 0.0 }),
+            y1,
+            if self.log_y {
+                Scale::Log
+            } else {
+                Scale::Linear
+            },
+            5,
+        ) {
+            let y = sy(t);
+            let _ = write!(
+                s,
+                r#"<line x1="{ml}" y1="{y:.1}" x2="{:.1}" y2="{y:.1}" stroke="var(--grid)" stroke-width="1"/>"#,
+                ml + pw
+            );
+            let _ = write!(
+                s,
+                r#"<text x="{:.1}" y="{:.1}" class="ax" text-anchor="end">{}</text>"#,
+                ml - 9.0,
+                y + 3.8,
+                fmt_num(t)
+            );
+        }
+        let _ = write!(
+            s,
+            r#"<line x1="{ml}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="var(--axis)" stroke-width="1"/>"#,
+            mt + ph,
+            ml + pw,
+            mt + ph
+        );
+        let _ = write!(
+            s,
+            r#"<text transform="translate(18,{:.1}) rotate(-90)" class="axt" text-anchor="middle">{}{}</text>"#,
+            mt + ph / 2.0,
+            esc(&self.y_label),
+            if self.log_y { " (log)" } else { "" }
+        );
+
+        let ng = self.groups.len().max(1) as f64;
+        let ns = self.series.len().max(1) as f64;
+        let gw = pw / ng;
+        // A 2px surface gap between adjacent bars keeps them separable.
+        let bw = ((gw - 16.0) / ns - 2.0).max(2.0);
+        for (gi, g) in self.groups.iter().enumerate() {
+            let gx = ml + gi as f64 * gw;
+            for (si, (_, vals)) in self.series.iter().enumerate() {
+                let Some(v) = vals.get(gi) else { continue };
+                if !v.is_finite() || *v <= 0.0 {
+                    continue;
+                }
+                let x = gx + 8.0 + si as f64 * (bw + 2.0);
+                let y = sy(*v);
+                let h = (mt + ph - y).max(1.0);
+                let col = format!("var(--s{})", (si % SERIES_LIGHT.len()) + 1);
+                // Rounded data-end anchored to the baseline.
+                let _ = write!(
+                    s,
+                    r#"<path d="M{x:.1} {:.1} L{x:.1} {:.1} Q{x:.1} {y:.1} {:.1} {y:.1} Q{:.1} {y:.1} {:.1} {:.1} L{:.1} {:.1} Z" fill="{col}"/>"#,
+                    mt + ph,
+                    y + 4.0_f64.min(h),
+                    x + 4.0_f64.min(bw / 2.0),
+                    x + bw - 4.0_f64.min(bw / 2.0),
+                    x + bw,
+                    y + 4.0_f64.min(h),
+                    x + bw,
+                    mt + ph
+                );
+            }
+            let _ = write!(
+                s,
+                r#"<text x="{:.1}" y="{:.1}" class="gl" text-anchor="middle">{}</text>"#,
+                gx + gw / 2.0,
+                mt + ph + 18.0,
+                esc(g)
+            );
+        }
+
+        let mut x = ml;
+        let ly = mt + ph + 42.0;
+        for (si, (name, _)) in self.series.iter().enumerate() {
+            let col = format!("var(--s{})", (si % SERIES_LIGHT.len()) + 1);
+            let _ = write!(
+                s,
+                r#"<rect x="{x:.1}" y="{:.1}" width="11" height="11" rx="2" fill="{col}"/>"#,
+                ly - 9.0
+            );
+            let _ = write!(
+                s,
+                r#"<text x="{:.1}" y="{ly:.1}" class="lg">{}</text>"#,
+                x + 17.0,
+                esc(name)
+            );
+            x += 30.0 + 6.6 * name.chars().count() as f64;
+        }
+        for (i, line) in wrap(&self.caption, 104).iter().enumerate() {
+            let _ = write!(
+                s,
+                r#"<text x="{ml}" y="{:.1}" class="cap">{}</text>"#,
+                mt + ph + 62.0 + i as f64 * 14.0,
+                esc(line)
+            );
+        }
+        s.push_str("</svg>");
+        s
+    }
+}
+
+#[cfg(test)]
+mod bar_tests {
+    use super::*;
+
+    fn b() -> Bars {
+        Bars::new("T", "ops/s")
+            .groups(vec!["A".into(), "B".into()])
+            .add("supdb", vec![10.0, 20.0])
+            .add("lmdb", vec![30.0, 5.0])
+    }
+
+    #[test]
+    fn bars_render_and_are_self_contained() {
+        let s = b().to_svg();
+        assert!(s.starts_with("<svg") && s.ends_with("</svg>"));
+        let body = s.replace("http://www.w3.org/2000/svg", "");
+        assert!(!body.contains("http"));
+    }
+
+    #[test]
+    fn every_group_and_series_is_labelled() {
+        let s = b().to_svg();
+        for t in [">A</text>", ">B</text>", ">supdb</text>", ">lmdb</text>"] {
+            assert!(s.contains(t), "missing {t}");
+        }
+    }
+
+    #[test]
+    fn both_themes_defined_and_ground_painted() {
+        let s = b().to_svg();
+        assert!(s.contains("prefers-color-scheme:dark"));
+        assert!(s.contains("[data-theme=\"dark\"]"));
+        assert!(s.contains("fill=\"var(--bg)\""));
+    }
+
+    #[test]
+    fn zero_and_missing_values_do_not_panic() {
+        let s = Bars::new("T", "y")
+            .groups(vec!["A".into(), "B".into(), "C".into()])
+            .add("x", vec![0.0, 5.0])
+            .to_svg();
+        assert!(s.contains("</svg>"));
     }
 }

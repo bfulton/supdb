@@ -6,13 +6,17 @@
 //! published chart follows from the data without trusting this program.
 
 use std::path::{Path, PathBuf};
-use supdb::bench::plot::{Chart, Series};
+use supdb::bench::plot::{Bars, Chart, Series};
 use supdb::bench::{jparse, J};
 
 fn main() -> std::io::Result<()> {
     let argv: Vec<String> = std::env::args().collect();
     let arg = |n: &str, d: &str| -> String {
-        argv.iter().position(|a| a == n).and_then(|i| argv.get(i + 1)).cloned().unwrap_or_else(|| d.into())
+        argv.iter()
+            .position(|a| a == n)
+            .and_then(|i| argv.get(i + 1))
+            .cloned()
+            .unwrap_or_else(|| d.into())
     };
     let results = PathBuf::from(arg("--results", "results"));
     let outdir = PathBuf::from(arg("--out", "figures"));
@@ -29,27 +33,67 @@ fn main() -> std::io::Result<()> {
     };
 
     if let Some(d) = load(&results, "f2-open", &profile) {
-        emit("f2-open-cost", "Reader open cost against key count", fig_open_cost(&d))?;
-        emit("f2-amortization", "Cost per read against reads per process", fig_amortization(&d))?;
+        emit(
+            "f2-open-cost",
+            "Reader open cost against key count",
+            fig_open_cost(&d),
+        )?;
+        emit(
+            "f2-amortization",
+            "Cost per read against reads per process",
+            fig_amortization(&d),
+        )?;
     }
     if let Some(d) = load(&results, "f6-threads", &profile) {
-        emit("f6-thread-scaling", "Write throughput against writer threads", fig_threads(&d))?;
+        emit(
+            "f6-thread-scaling",
+            "Write throughput against writer threads",
+            fig_threads(&d),
+        )?;
     }
     if let Some(d) = load(&results, "f4-durability", &profile) {
-        emit("f4-durability", "Throughput against the data-loss window", fig_durability(&d))?;
+        emit(
+            "f4-durability",
+            "Throughput against the data-loss window",
+            fig_durability(&d),
+        )?;
     }
     if let Some(d) = load(&results, "f5-latency", &profile) {
-        emit("f5-latency-cdf", "Append latency distribution", fig_latency(&d))?;
+        emit(
+            "f5-latency-cdf",
+            "Append latency distribution",
+            fig_latency(&d),
+        )?;
+    }
+    if let Some(d) = load(&results, "ext-ycsb", &profile) {
+        emit(
+            "ext-ycsb",
+            "YCSB core workloads across the field",
+            fig_ycsb(&d),
+        )?;
+    }
+    if let Some(d) = load(&results, "ext-kv", &profile) {
+        emit(
+            "ext-kv",
+            "Load, read and scan across the field",
+            fig_extkv(&d),
+        )?;
     }
     if let Some(d) = load(&results, "f1-outofcore", &profile) {
-        emit("f1-outofcore", "Read latency, warm against cold", fig_outofcore(&d))?;
+        emit(
+            "f1-outofcore",
+            "Read latency, warm against cold",
+            fig_outofcore(&d),
+        )?;
     }
 
     let idx = outdir.join("index.html");
     std::fs::write(&idx, index_html(&made, &profile))?;
     println!("# wrote {}", idx.display());
     if made.is_empty() {
-        println!("# no results at profile '{profile}'; run `internal all --profile {profile}` first");
+        println!(
+            "# no results at profile '{profile}'; run `internal all --profile {profile}` first"
+        );
     }
     Ok(())
 }
@@ -78,25 +122,33 @@ fn fig_open_cost(d: &J) -> String {
         .unwrap_or(&[])
         .iter()
         .filter_map(|p| {
-            Some((p.num("keys")?, p.num("open_samples.ci95_lo")?, p.num("open_samples.ci95_hi")?))
+            Some((
+                p.num("keys")?,
+                p.num("open_samples.ci95_lo")?,
+                p.num("open_samples.ci95_hi")?,
+            ))
         })
         .collect();
     let linear: Vec<(f64, f64)> = match (pts.first(), pts.last()) {
         (Some((x0, y0)), Some((x1, _))) => vec![(*x0, *y0), (*x1, y0 * (x1 / x0))],
         _ => vec![],
     };
-    Chart::new("Reader open cost scales with key count", "keys in the store", "open (ms)")
-        .subtitle("Reader::build materialises the whole key index per process")
-        .log_x()
-        .log_y()
-        .add(Series::new("measured", pts).with_band(band))
-        .add(Series::new("linear", linear).as_reference())
-        .caption(
-            "Median of interleaved repetitions; band is the 95% bootstrap interval of the median. \
+    Chart::new(
+        "Reader open cost scales with key count",
+        "keys in the store",
+        "open (ms)",
+    )
+    .subtitle("Reader::build materialises the whole key index per process")
+    .log_x()
+    .log_y()
+    .add(Series::new("measured", pts).with_band(band))
+    .add(Series::new("linear", linear).as_reference())
+    .caption(
+        "Median of interleaved repetitions; band is the 95% bootstrap interval of the median. \
              A shared mmap-able index would be a flat line. Every read benchmark in the design \
              document calls Reader::open before starting its timer, so this cost appears nowhere.",
-        )
-        .to_svg()
+    )
+    .to_svg()
 }
 
 /// Figure 2. The amortization curve, one series per store size.
@@ -126,8 +178,12 @@ fn fig_amortization(d: &J) -> String {
     if let Some(p) = d.path("series.scaling").and_then(|s| s.items().last()) {
         if let (Some(sr), Some(first), Some(last)) = (
             p.num("steady_read_us"),
-            p.path("process_curve").and_then(|c| c.at(0)).and_then(|q| q.num("reads")),
-            p.path("process_curve").and_then(|c| c.items().last()).and_then(|q| q.num("reads")),
+            p.path("process_curve")
+                .and_then(|c| c.at(0))
+                .and_then(|q| q.num("reads")),
+            p.path("process_curve")
+                .and_then(|c| c.items().last())
+                .and_then(|q| q.num("reads")),
         ) {
             c = c.add(Series::new("steady state", vec![(first, sr), (last, sr)]).as_reference());
         }
@@ -143,31 +199,46 @@ fn fig_amortization(d: &J) -> String {
 /// Figure 3. Thread scaling against ideal.
 fn fig_threads(d: &J) -> String {
     let rows = d.path("series.scaling").map(|s| s.items()).unwrap_or(&[]);
-    let pts: Vec<(f64, f64)> =
-        rows.iter().filter_map(|p| Some((p.num("threads")?, p.num("ops_per_s")?))).collect();
+    let pts: Vec<(f64, f64)> = rows
+        .iter()
+        .filter_map(|p| Some((p.num("threads")?, p.num("ops_per_s")?)))
+        .collect();
     let band: Vec<(f64, f64, f64)> = rows
         .iter()
-        .filter_map(|p| Some((p.num("threads")?, p.num("samples.ci95_lo")?, p.num("samples.ci95_hi")?)))
+        .filter_map(|p| {
+            Some((
+                p.num("threads")?,
+                p.num("samples.ci95_lo")?,
+                p.num("samples.ci95_hi")?,
+            ))
+        })
         .collect();
     let ideal: Vec<(f64, f64)> = match pts.first() {
         Some((_, y0)) => pts.iter().map(|(x, _)| (*x, y0 * x)).collect(),
         None => vec![],
     };
-    Chart::new("Write throughput does not scale with writer threads", "writer threads", "appends/s")
-        .subtitle("the appender mutex is taken inside seal_shard's per-extent loop")
-        .add(Series::new("measured", pts).with_band(band))
-        .add(Series::new("linear", ideal).as_reference())
-        .caption(
-            "Median of interleaved repetitions; band is the 95% bootstrap interval. Every \
+    Chart::new(
+        "Write throughput does not scale with writer threads",
+        "writer threads",
+        "appends/s",
+    )
+    .subtitle("the appender mutex is taken inside seal_shard's per-extent loop")
+    .add(Series::new("measured", pts).with_band(band))
+    .add(Series::new("linear", ideal).as_reference())
+    .caption(
+        "Median of interleaved repetitions; band is the 95% bootstrap interval. Every \
              db_bench comparison in the design document is single-threaded, which is the \
              configuration in which this does not appear.",
-        )
-        .to_svg()
+    )
+    .to_svg()
 }
 
 /// Figure 4. The durability curve.
 fn fig_durability(d: &J) -> String {
-    let rows = d.path("series.durability_curve").map(|s| s.items()).unwrap_or(&[]);
+    let rows = d
+        .path("series.durability_curve")
+        .map(|s| s.items())
+        .unwrap_or(&[]);
     let pts: Vec<(f64, f64)> = rows
         .iter()
         .filter_map(|p| Some((p.num("ops_at_risk")?.max(1.0), p.num("ops_per_s")?)))
@@ -175,7 +246,11 @@ fn fig_durability(d: &J) -> String {
     let band: Vec<(f64, f64, f64)> = rows
         .iter()
         .filter_map(|p| {
-            Some((p.num("ops_at_risk")?.max(1.0), p.num("samples.ci95_lo")?, p.num("samples.ci95_hi")?))
+            Some((
+                p.num("ops_at_risk")?.max(1.0),
+                p.num("samples.ci95_lo")?,
+                p.num("samples.ci95_hi")?,
+            ))
         })
         .collect();
     Chart::new(
@@ -215,18 +290,22 @@ fn fig_latency(d: &J) -> String {
         (Some((x0, _)), Some((x1, _))) if mean > 0.0 => vec![(*x0, mean), (*x1, mean)],
         _ => vec![],
     };
-    Chart::new("The mean is not a summary of append cost", "1 / (1 - percentile)", "append latency (ms)")
-        .subtitle("x = 10 is p90, 100 is p99, 1000 is p99.9")
-        .log_x()
-        .log_y()
-        .add(Series::new("append", pts))
-        .add(Series::new("mean", meanline).as_reference())
-        .caption(
-            "Latency measured per call. The distance between the curve and the dashed mean is \
+    Chart::new(
+        "The mean is not a summary of append cost",
+        "1 / (1 - percentile)",
+        "append latency (ms)",
+    )
+    .subtitle("x = 10 is p90, 100 is p99, 1000 is p99.9")
+    .log_x()
+    .log_y()
+    .add(Series::new("append", pts))
+    .add(Series::new("mean", meanline).as_reference())
+    .caption(
+        "Latency measured per call. The distance between the curve and the dashed mean is \
              the cost inline merging and whole-index checkpoints impose on an unlucky caller, \
              and is invisible in every number the design document publishes.",
-        )
-        .to_svg()
+    )
+    .to_svg()
 }
 
 /// Figure 6. Warm against cold, as distributions rather than two numbers.
@@ -259,8 +338,13 @@ fn fig_outofcore(d: &J) -> String {
     if !b.is_empty() {
         c = c.add(Series::new("cache squeezed", b));
     }
-    let honest = d.num("series.cache_control.drop_caches_succeeded").unwrap_or(0.0) > 0.0
-        || d.path("series.cache_control.drop_caches_succeeded").and_then(|v| v.as_bool()).unwrap_or(false);
+    let honest = d
+        .num("series.cache_control.drop_caches_succeeded")
+        .unwrap_or(0.0)
+        > 0.0
+        || d.path("series.cache_control.drop_caches_succeeded")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
     c.caption(if honest {
         "Page cache dropped between phases. The gap is what the engine pays when it has to \
          reach storage, which no published number measures."
@@ -268,6 +352,92 @@ fn fig_outofcore(d: &J) -> String {
         "WARNING: drop_caches did not succeed on this run, so the 'cold' series was served from \
          page cache and is not a cold measurement. Recorded rather than hidden."
     })
+    .to_svg()
+}
+
+/// External figure: YCSB throughput, one bar per engine within each workload.
+fn fig_ycsb(d: &J) -> String {
+    let rows = d.path("series.workloads").map(|s| s.items()).unwrap_or(&[]);
+    let mut groups: Vec<String> = Vec::new();
+    let mut engines: Vec<String> = Vec::new();
+    for r in rows {
+        if let Some(w) = r.path("workload").and_then(|v| v.as_str()) {
+            // Keep the YCSB letter; the descriptive tail does not fit an axis.
+            let short = w.split('-').next().unwrap_or(w).to_string();
+            if !groups.contains(&short) {
+                groups.push(short);
+            }
+        }
+        if let Some(e) = r.path("engine").and_then(|v| v.as_str()) {
+            if !engines.contains(&e.to_string()) {
+                engines.push(e.to_string());
+            }
+        }
+    }
+    let mut b = Bars::new(
+        "YCSB core workloads: Supdb against the field",
+        "throughput (ops/s)",
+    )
+    .subtitle("A 50/50 update-heavy, B 95/5, C read-only, D read-latest, E short scans, F read-modify-write")
+    .log_y()
+    .groups(groups.clone());
+    for e in &engines {
+        let vals: Vec<f64> = groups
+            .iter()
+            .map(|g| {
+                rows.iter()
+                    .find(|r| {
+                        r.path("engine").and_then(|v| v.as_str()) == Some(e.as_str())
+                            && r.path("workload")
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|w| w.starts_with(g.as_str()))
+                    })
+                    .and_then(|r| r.num("ops_per_s"))
+                    .unwrap_or(0.0)
+            })
+            .collect();
+        b = b.add(e, vals);
+    }
+    b.caption(
+        "Log scale. Every engine runs the same workload definitions, key distribution and batch \
+         size. Supdb provides one of six guarantees the others provide five or six of -- durable \
+         commit, transactions, checksums, reopen-for-write, read-your-writes, ordered scan -- so \
+         this compares promises as well as implementations.",
+    )
+    .to_svg()
+}
+
+/// External figure: the redb benchmark shape across the field.
+fn fig_extkv(d: &J) -> String {
+    let rows = d.path("series.engines").map(|s| s.items()).unwrap_or(&[]);
+    let groups: Vec<String> = vec![
+        "bulk load".into(),
+        "random read".into(),
+        "range scan".into(),
+    ];
+    let mut b = Bars::new(
+        "Load, read and scan: Supdb against the field",
+        "operations/s",
+    )
+    .subtitle("workload shape follows redb's own benchmark; all engines native, no JNI")
+    .log_y()
+    .groups(groups);
+    for r in rows {
+        let name = r.path("engine").and_then(|v| v.as_str()).unwrap_or("?");
+        b = b.add(
+            name,
+            vec![
+                r.num("load_ops_per_s").unwrap_or(0.0),
+                r.num("read_ops_per_s").unwrap_or(0.0),
+                r.num("scan_entries_per_s").unwrap_or(0.0),
+            ],
+        );
+    }
+    b.caption(
+        "Log scale. The design document reports Supdb ahead of LMDB on warm reads, measured \
+         through a Java harness with an adapter it separately found to allocate per value and \
+         open a transaction per lookup. Measured natively, the ordering reverses.",
+    )
     .to_svg()
 }
 

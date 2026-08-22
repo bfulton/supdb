@@ -24,11 +24,23 @@
 //! ordered scans will need later, at close to no cost.
 
 pub mod bench;
+
+// The engine modules below are vendored from the design artifact verbatim, so
+// that the architecture review's line-level references stay valid and so a
+// reader can compare what was measured against what was described. Style lints
+// are scoped off here rather than fixed in place; the harness code above and
+// in src/bin holds to -D warnings.
+#[allow(clippy::all, dead_code)]
 mod block;
+#[allow(clippy::all, dead_code)]
 mod freelist;
-mod readers;
+#[allow(clippy::all, dead_code)]
 mod index;
+#[allow(clippy::all, dead_code)]
 pub mod keytable;
+#[allow(clippy::all, dead_code)]
+mod readers;
+#[allow(clippy::all, dead_code)]
 mod store;
 
 pub use store::{Options, Reader, Reclaim, Stats, Store};

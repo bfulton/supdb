@@ -25,7 +25,11 @@ struct Outcome {
 fn main() -> std::io::Result<()> {
     let argv: Vec<String> = std::env::args().collect();
     let arg = |n: &str, d: &str| -> String {
-        argv.iter().position(|a| a == n).and_then(|i| argv.get(i + 1)).cloned().unwrap_or_else(|| d.into())
+        argv.iter()
+            .position(|a| a == n)
+            .and_then(|i| argv.get(i + 1))
+            .cloned()
+            .unwrap_or_else(|| d.into())
     };
     let claims_path = PathBuf::from(arg("--claims", "claims.json"));
     let results = PathBuf::from(arg("--results", "results"));
@@ -34,34 +38,53 @@ fn main() -> std::io::Result<()> {
     let strict = argv.iter().any(|a| a == "--strict");
 
     let text = std::fs::read_to_string(&claims_path).map_err(|e| {
-        std::io::Error::new(e.kind(), format!("cannot read {}: {e}", claims_path.display()))
+        std::io::Error::new(
+            e.kind(),
+            format!("cannot read {}: {e}", claims_path.display()),
+        )
     })?;
     let claims = jparse::parse(&text)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
-    let mut out = Outcome { failures: Vec::new(), checked: 0, skipped: Vec::new() };
+    let mut out = Outcome {
+        failures: Vec::new(),
+        checked: 0,
+        skipped: Vec::new(),
+    };
 
-    println!("verifying claims in {} against {}/*.{}.json\n", claims_path.display(), results.display(), profile);
+    println!(
+        "verifying claims in {} against {}/*.{}.json\n",
+        claims_path.display(),
+        results.display(),
+        profile
+    );
 
     check_findings(&claims, &results, &profile, &mut out);
     check_metrics(&claims, &results, &profile, &mut out);
 
     println!("\n{} claim(s) checked", out.checked);
     if !out.skipped.is_empty() {
-        println!("{} skipped (no result file at this profile):", out.skipped.len());
+        println!(
+            "{} skipped (no result file at this profile):",
+            out.skipped.len()
+        );
         for s in &out.skipped {
             println!("  - {s}");
         }
         if strict {
             println!("\n--strict: a skipped claim is a failure");
-            out.failures.extend(out.skipped.iter().map(|s| format!("skipped: {s}")));
+            out.failures
+                .extend(out.skipped.iter().map(|s| format!("skipped: {s}")));
         }
     }
     if out.failures.is_empty() {
         println!("\nOK: every claim matches the recorded results.");
         Ok(())
     } else {
-        println!("\n{} CLAIM(S) DO NOT MATCH THE RESULTS:", out.failures.len());
+        println!(
+            "\n{} CLAIM(S) DO NOT MATCH THE RESULTS:",
+            out.failures.len()
+        );
         for f in &out.failures {
             println!("  x {f}");
         }
@@ -80,7 +103,9 @@ fn load(results: &Path, experiment: &str, profile: &str) -> Option<J> {
 }
 
 fn check_findings(claims: &J, results: &Path, profile: &str, out: &mut Outcome) {
-    let Some(list) = claims.path("findings") else { return };
+    let Some(list) = claims.path("findings") else {
+        return;
+    };
     for c in list.items() {
         let exp = c.path("experiment").and_then(|v| v.as_str()).unwrap_or("");
         let id = c.path("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -101,7 +126,9 @@ fn check_findings(claims: &J, results: &Path, profile: &str, out: &mut Outcome) 
             .find(|f| f.path("id").and_then(|v| v.as_str()) == Some(id));
 
         let Some(f) = found else {
-            out.failures.push(format!("{label}: claimed but the experiment recorded no such finding"));
+            out.failures.push(format!(
+                "{label}: claimed but the experiment recorded no such finding"
+            ));
             continue;
         };
         let got = f.path("status").and_then(|v| v.as_str()).unwrap_or("");
@@ -117,7 +144,11 @@ fn check_findings(claims: &J, results: &Path, profile: &str, out: &mut Outcome) 
             continue;
         }
         if got == want {
-            let mark = if got == "fails" { "known-failing" } else { "ok" };
+            let mark = if got == "fails" {
+                "known-failing"
+            } else {
+                "ok"
+            };
             println!("  [{mark}] {label}: {}", short(detail));
         } else {
             out.failures.push(format!(
@@ -128,7 +159,9 @@ fn check_findings(claims: &J, results: &Path, profile: &str, out: &mut Outcome) 
 }
 
 fn check_metrics(claims: &J, results: &Path, profile: &str, out: &mut Outcome) {
-    let Some(list) = claims.path("metrics") else { return };
+    let Some(list) = claims.path("metrics") else {
+        return;
+    };
     for c in list.items() {
         let exp = c.path("experiment").and_then(|v| v.as_str()).unwrap_or("");
         let path = c.path("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -141,18 +174,21 @@ fn check_metrics(claims: &J, results: &Path, profile: &str, out: &mut Outcome) {
         out.checked += 1;
 
         let Some(v) = doc.num(path) else {
-            out.failures.push(format!("{label}: path not present in the result"));
+            out.failures
+                .push(format!("{label}: path not present in the result"));
             continue;
         };
         if let Some(min) = c.num("min") {
             if v < min {
-                out.failures.push(format!("{label}: {v:.3} is below the floor {min:.3}"));
+                out.failures
+                    .push(format!("{label}: {v:.3} is below the floor {min:.3}"));
                 continue;
             }
         }
         if let Some(max) = c.num("max") {
             if v > max {
-                out.failures.push(format!("{label}: {v:.3} is above the ceiling {max:.3}"));
+                out.failures
+                    .push(format!("{label}: {v:.3} is above the ceiling {max:.3}"));
                 continue;
             }
         }

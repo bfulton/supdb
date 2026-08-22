@@ -49,8 +49,8 @@ pub fn acquire(t: &[AtomicU64], generation: u64) -> Option<usize> {
         let gen = &t[i * WORDS];
         let beat = &t[i * WORDS + 1];
         let hb = beat.load(Ordering::Acquire);
-        let free = gen.load(Ordering::Acquire) == 0
-            || (hb != 0 && now.saturating_sub(hb) > STALE_MILLIS);
+        let free =
+            gen.load(Ordering::Acquire) == 0 || (hb != 0 && now.saturating_sub(hb) > STALE_MILLIS);
         if !free {
             continue;
         }

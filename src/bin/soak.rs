@@ -32,7 +32,10 @@ fn key(k: u64) -> Vec<u8> {
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let get = |n: &str, d: usize| -> usize {
-        args.iter().position(|a| a == n).map(|i| args[i + 1].parse().unwrap()).unwrap_or(d)
+        args.iter()
+            .position(|a| a == n)
+            .map(|i| args[i + 1].parse().unwrap())
+            .unwrap_or(d)
     };
     let secs = get("--seconds", 180) as u64;
     let keys = get("--keys", 200_000) as u64;
@@ -48,7 +51,11 @@ fn main() -> std::io::Result<()> {
         &path,
         Options {
             buffer_bytes: 64 << 20,
-            reclaim: if snapshots { Reclaim::Never } else { Reclaim::AfterReads },
+            reclaim: if snapshots {
+                Reclaim::Never
+            } else {
+                Reclaim::AfterReads
+            },
             ..Default::default()
         },
     )?;
@@ -61,16 +68,18 @@ fn main() -> std::io::Result<()> {
     let mut last_report = Instant::now();
     let mut last_ops = 0u64;
 
-    println!("{:>6} {:>12} {:>10} {:>10} {:>10} {:>9} {:>9} {:>8}",
-             "sec", "ops", "ops/s", "file MB", "live MB", "free MB", "reused", "merges");
+    println!(
+        "{:>6} {:>12} {:>10} {:>10} {:>10} {:>9} {:>9} {:>8}",
+        "sec", "ops", "ops/s", "file MB", "live MB", "free MB", "reused", "merges"
+    );
     while Instant::now() < deadline {
         for _ in 0..200_000 {
             let k = rng.next() % keys;
             val[..8].copy_from_slice(&rng.next().to_be_bytes());
             match rng.next() % 100 {
-                0..=79 => store.append(&key(k), &val)?,   // fragments keys, drives merges
-                80..=94 => store.put(&key(k), &val)?,     // supersedes
-                _ => store.delete(&key(k))?,              // tombstones
+                0..=79 => store.append(&key(k), &val)?, // fragments keys, drives merges
+                80..=94 => store.put(&key(k), &val)?,   // supersedes
+                _ => store.delete(&key(k))?,            // tombstones
             }
             ops += 1;
         }
@@ -84,9 +93,17 @@ fn main() -> std::io::Result<()> {
             }
             let live_mb = live as f64 * (keys as f64 / (keys as f64 / 211.0)) / 1048576.0 / 211.0;
             let dt = last_report.elapsed().as_secs_f64();
-            println!("{:>6.0} {:>12} {:>10.0} {:>10.1} {:>10.1} {:>9} {:>9} {:>8}",
-                     t0.elapsed().as_secs_f64(), ops, (ops - last_ops) as f64 / dt,
-                     file, live_mb, "-", "-", "-");
+            println!(
+                "{:>6.0} {:>12} {:>10.0} {:>10.1} {:>10.1} {:>9} {:>9} {:>8}",
+                t0.elapsed().as_secs_f64(),
+                ops,
+                (ops - last_ops) as f64 / dt,
+                file,
+                live_mb,
+                "-",
+                "-",
+                "-"
+            );
             last_report = Instant::now();
             last_ops = ops;
         }
@@ -94,10 +111,17 @@ fn main() -> std::io::Result<()> {
 
     let stats = store.close()?;
     let file = std::fs::metadata(&path)?.len() as f64 / 1048576.0;
-    println!("\nfinal: {ops} ops in {:.0}s, file {file:.1} MB", t0.elapsed().as_secs_f64());
-    println!("  merges {} | slots reused {} ({:.1} MB) | free left {:.1} MB",
-             stats.merges, stats.reused, stats.reused_bytes as f64 / 1048576.0,
-             stats.free_bytes as f64 / 1048576.0);
+    println!(
+        "\nfinal: {ops} ops in {:.0}s, file {file:.1} MB",
+        t0.elapsed().as_secs_f64()
+    );
+    println!(
+        "  merges {} | slots reused {} ({:.1} MB) | free left {:.1} MB",
+        stats.merges,
+        stats.reused,
+        stats.reused_bytes as f64 / 1048576.0,
+        stats.free_bytes as f64 / 1048576.0
+    );
 
     // everything still readable and self-consistent?
     let r = Reader::open(&path)?;
@@ -105,11 +129,20 @@ fn main() -> std::io::Result<()> {
     for k in 0..keys {
         let mut n = 0;
         match r.read_all(&key(k), |_| n += 1) {
-            Ok(_) => { if n > 0 { present += 1 } }
+            Ok(_) => {
+                if n > 0 {
+                    present += 1
+                }
+            }
             Err(_) => errs += 1,
         }
     }
-    println!("  keys indexed {} | with values {} | read errors {}", r.keys(), present, errs);
+    println!(
+        "  keys indexed {} | with values {} | read errors {}",
+        r.keys(),
+        present,
+        errs
+    );
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }

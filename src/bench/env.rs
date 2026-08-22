@@ -26,7 +26,13 @@ fn first_line_after(path: &str, prefix: &str) -> Option<String> {
     read(path)?
         .lines()
         .find(|l| l.starts_with(prefix))
-        .map(|l| l[prefix.len()..].trim().trim_start_matches(':').trim().to_string())
+        .map(|l| {
+            l[prefix.len()..]
+                .trim()
+                .trim_start_matches(':')
+                .trim()
+                .to_string()
+        })
 }
 
 /// Everything about the machine that could plausibly move a number.
@@ -55,7 +61,11 @@ impl Env {
             .and_then(|l| l.split(':').nth(1))
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|| "unknown".into());
-        let cpus = cpuinfo.lines().filter(|l| l.starts_with("processor")).count().max(1);
+        let cpus = cpuinfo
+            .lines()
+            .filter(|l| l.starts_with("processor"))
+            .count()
+            .max(1);
 
         let kb = |k: &str| -> u64 {
             first_line_after("/proc/meminfo", k)
@@ -65,7 +75,9 @@ impl Env {
         };
 
         Env {
-            kernel: read("/proc/sys/kernel/osrelease").map(|s| s.trim().into()).unwrap_or_default(),
+            kernel: read("/proc/sys/kernel/osrelease")
+                .map(|s| s.trim().into())
+                .unwrap_or_default(),
             arch: std::env::consts::ARCH.to_string(),
             cpu_model,
             cpus,
@@ -79,8 +91,14 @@ impl Env {
                 .map(|s| s.trim().into())
                 .unwrap_or_else(|| "unknown".into()),
             rustc: option_env!("SUPDB_RUSTC").unwrap_or("unknown").to_string(),
-            git_sha: option_env!("SUPDB_GIT_SHA").unwrap_or("unknown").to_string(),
-            profile: if cfg!(debug_assertions) { "debug".into() } else { "release".into() },
+            git_sha: option_env!("SUPDB_GIT_SHA")
+                .unwrap_or("unknown")
+                .to_string(),
+            profile: if cfg!(debug_assertions) {
+                "debug".into()
+            } else {
+                "release".into()
+            },
         }
     }
 
@@ -90,13 +108,18 @@ impl Env {
     pub fn warnings(&self) -> Vec<String> {
         let mut w = Vec::new();
         if self.governor != "performance" && self.governor != "unknown" {
-            w.push(format!("cpu governor is '{}', not 'performance'", self.governor));
+            w.push(format!(
+                "cpu governor is '{}', not 'performance'",
+                self.governor
+            ));
         }
         if self.thp.contains("[always]") {
             w.push("transparent hugepages are 'always'; page-fault costs will vary".into());
         }
         if self.swap_total_kb > 0 {
-            w.push("swap is enabled; an out-of-core result may measure swap, not the engine".into());
+            w.push(
+                "swap is enabled; an out-of-core result may measure swap, not the engine".into(),
+            );
         }
         if cfg!(debug_assertions) {
             w.push("built without --release; timings are meaningless".into());
@@ -165,7 +188,9 @@ impl IoCounters {
         if let Some(s) = read("/proc/self/io") {
             for line in s.lines() {
                 let mut it = line.split(':');
-                let (Some(k), Some(v)) = (it.next(), it.next()) else { continue };
+                let (Some(k), Some(v)) = (it.next(), it.next()) else {
+                    continue;
+                };
                 let v: u64 = v.trim().parse().unwrap_or(0);
                 match k {
                     "write_bytes" => c.write_bytes = v,
@@ -216,7 +241,10 @@ pub fn write_amp_json(io: &IoCounters, logical_bytes: u64, file_bytes: u64) -> J
 /// measurement that cannot prove it was cold is not a cold measurement.
 pub fn drop_caches() -> bool {
     use std::io::Write;
-    let synced = std::process::Command::new("sync").status().map(|s| s.success()).unwrap_or(false);
+    let synced = std::process::Command::new("sync")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
     if !synced {
         return false;
     }
@@ -249,7 +277,11 @@ mod tests {
 
     #[test]
     fn write_amp_reports_both_quantities() {
-        let io = IoCounters { write_bytes: 300, read_bytes: 0, wchar: 250 };
+        let io = IoCounters {
+            write_bytes: 300,
+            read_bytes: 0,
+            wchar: 250,
+        };
         let j = write_amp_json(&io, 100, 150).render();
         assert!(j.contains("\"write_amp_device\":3.000"), "{j}");
         assert!(j.contains("\"space_amp_file\":1.500"), "{j}");

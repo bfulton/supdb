@@ -47,7 +47,12 @@ struct Slot {
 
 impl Slot {
     const fn empty() -> Slot {
-        Slot { entry: EMPTY, len: 0, key: [0; INLINE], fp: 0 }
+        Slot {
+            entry: EMPTY,
+            len: 0,
+            key: [0; INLINE],
+            fp: 0,
+        }
     }
 
     #[inline]
@@ -169,7 +174,12 @@ impl<P> KeyTable<P> {
         while self.slots[i].entry != EMPTY {
             i = (i + 1) & self.mask;
         }
-        let mut slot = Slot { entry: idx, len: key.len() as u32, key: [0; INLINE], fp };
+        let mut slot = Slot {
+            entry: idx,
+            len: key.len() as u32,
+            key: [0; INLINE],
+            fp,
+        };
         if key.len() <= INLINE {
             slot.key[..key.len()].copy_from_slice(key);
         } else {
@@ -204,7 +214,10 @@ impl<P> KeyTable<P> {
     /// keeps a tombstone -- so indices stay valid for the table's lifetime.
     pub fn iter(&self) -> impl Iterator<Item = (&[u8], &Entry<P>)> {
         self.entries.iter().map(move |e| {
-            (&self.arena[e.key_off as usize..(e.key_off + e.key_len) as usize], e)
+            (
+                &self.arena[e.key_off as usize..(e.key_off + e.key_len) as usize],
+                e,
+            )
         })
     }
 

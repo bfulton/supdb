@@ -46,7 +46,11 @@ fn class_of(len: u32) -> usize {
     let base = 1u64 << (CLASS_MIN_SHIFT as usize + oct);
     // which eighth of this octave does it fall into
     let step = base / SUB as u64;
-    let sub = if step == 0 { 0 } else { (((l - 1) - base) / step) as usize + 1 };
+    let sub = if step == 0 {
+        0
+    } else {
+        (((l - 1) - base) / step) as usize + 1
+    };
     let sub = sub.min(SUB - 1);
     (oct * SUB + sub).min(CLASSES - 1)
 }

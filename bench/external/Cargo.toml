@@ -1,0 +1,25 @@
+[package]
+name = "supdb-external"
+version = "0.0.1"
+edition = "2021"
+
+# Comparator engines live here, not in the engine crate.
+#
+# Supdb itself holds to two dependencies, and that is a real property worth
+# preserving -- a reviewer can read the whole thing. The external harness is
+# where the field lives, so pulling in redb, LMDB and sled costs the engine
+# nothing.
+#
+# All three are in-process Rust. The design document's cross-language
+# comparison went through a Java harness and carried a JNI caveat it
+# quantified at <=11% of the append gap; measuring through native bindings
+# removes the asterisk rather than bounding it.
+[dependencies]
+supdb = { path = "../.." }
+redb = "2"
+heed = "0.20"
+sled = "0.34"
+
+[[bin]]
+name = "external"
+path = "src/main.rs"

@@ -13,7 +13,6 @@
     "expected a real result but got 'not_exercised' also fails: an untested hazard",
     "must never read as a green build."
   ],
-
   "findings": [
     {
       "experiment": "f5-latency",
@@ -62,9 +61,38 @@
       "id": "F3.1",
       "expect": "holds",
       "because": "Every reader process must see a complete, self-consistent checkpoint state. This is the core safety property of the append-only design and must never regress."
+    },
+    {
+      "experiment": "ext-kv",
+      "id": "EXT.1",
+      "expect": "holds",
+      "because": "Supdb loads faster than LMDB, the architecture it is modelled on. This is the design's real and defensible win and must not regress."
+    },
+    {
+      "experiment": "ext-kv",
+      "id": "EXT.4",
+      "expect": "fails",
+      "because": "Measured through native bindings LMDB reads about 2.4x faster than Supdb. The design document reports the opposite ordering, but measured LMDB through a Java harness with an adapter it separately found to allocate per value and open a transaction per lookup. Removing the language boundary reverses the result."
+    },
+    {
+      "experiment": "ext-kv",
+      "id": "EXT.5",
+      "expect": "fails",
+      "because": "LMDB scans roughly 4.7x faster than Supdb natively."
+    },
+    {
+      "experiment": "ext-kv",
+      "id": "EXT.6",
+      "expect": "holds",
+      "because": "Supdb stores the same data in less space than LMDB. Compactness is a genuine strength of the design."
+    },
+    {
+      "experiment": "ext-ycsb",
+      "id": "EXT.3",
+      "expect": "fails",
+      "because": "On YCSB-A (50/50 read/write) Supdb runs 13.5x slower than on read-only YCSB-C. Store exposes no read method, so a read following a write needs a checkpoint plus a fresh Reader, both O(key count). No benchmark in the design document mixes reads and writes, which is why this never appeared."
     }
   ],
-
   "metrics": [
     {
       "experiment": "f5-latency",
@@ -89,6 +117,12 @@
       "path": "series.readers.torn_or_inconsistent",
       "max": 0,
       "because": "Zero torn or inconsistent states."
+    },
+    {
+      "experiment": "ext-kv",
+      "path": "series.engines.0.read_hit_rate",
+      "min": 0.99,
+      "because": "The comparison is only meaningful if Supdb actually returns the data. A collapse here would mean the reads being timed are misses."
     }
   ]
 }

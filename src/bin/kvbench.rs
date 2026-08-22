@@ -70,7 +70,10 @@ fn emit(bench: &str, ops: u64, secs: f64, extra: &str) {
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let get = |n: &str, d: usize| -> usize {
-        args.iter().position(|a| a == n).map(|i| args[i + 1].parse().unwrap()).unwrap_or(d)
+        args.iter()
+            .position(|a| a == n)
+            .map(|i| args[i + 1].parse().unwrap())
+            .unwrap_or(d)
     };
     let num = get("--num", 1_000_000) as u64;
     let value_size = get("--value-size", 100);
@@ -137,7 +140,16 @@ fn main() -> std::io::Result<()> {
                 let stats = store.close()?;
                 let secs = t.elapsed().as_secs_f64();
                 let sz = std::fs::metadata(&file)?.len();
-                emit(b, num, secs, &format!(",\"file_mb\":{:.1},\"keys\":{}", sz as f64 / 1048576.0, stats.keys));
+                emit(
+                    b,
+                    num,
+                    secs,
+                    &format!(
+                        ",\"file_mb\":{:.1},\"keys\":{}",
+                        sz as f64 / 1048576.0,
+                        stats.keys
+                    ),
+                );
             }
             // Absent keys drawn from inside the populated range, so a miss is
             // indistinguishable from a hit until the index says otherwise.
@@ -154,11 +166,20 @@ fn main() -> std::io::Result<()> {
                     let k = r.next() % num;
                     let mut found = false;
                     reader.read_all(&db_key(k), |_| found = true)?;
-                    if found { hit += 1 } else { miss += 1 }
+                    if found {
+                        hit += 1
+                    } else {
+                        miss += 1
+                    }
                     done += 1;
                 }
                 let secs = t.elapsed().as_secs_f64();
-                emit(b, reads, secs, &format!(",\"hit\":{},\"miss\":{}", hit, miss));
+                emit(
+                    b,
+                    reads,
+                    secs,
+                    &format!(",\"hit\":{},\"miss\":{}", hit, miss),
+                );
             }
             "readrandom" | "readmissing" => {
                 let reader = Reader::open(&file)?;
@@ -167,11 +188,17 @@ fn main() -> std::io::Result<()> {
                 let mut kb = [0u8; 16];
                 let t = Instant::now();
                 for _ in 0..reads {
-                    let k = if b == "readmissing" { num + r.next() % num } else { r.next() % num };
+                    let k = if b == "readmissing" {
+                        num + r.next() % num
+                    } else {
+                        r.next() % num
+                    };
                     db_key_into(k, &mut kb);
                     let mut hit = false;
                     reader.read_all(&kb, |_| hit = true)?;
-                    if hit { found += 1 }
+                    if hit {
+                        found += 1
+                    }
                 }
                 let secs = t.elapsed().as_secs_f64();
                 emit(b, reads, secs, &format!(",\"found\":{}", found));

@@ -51,7 +51,10 @@ impl<'a> Parser<'a> {
             self.i += 1;
             Ok(())
         } else {
-            Err(ParseError(format!("expected '{}' at byte {}", c as char, self.i)))
+            Err(ParseError(format!(
+                "expected '{}' at byte {}",
+                c as char, self.i
+            )))
         }
     }
 
@@ -74,13 +77,25 @@ impl<'a> Parser<'a> {
             b'[' => self.array(),
             b'"' => Ok(J::S(self.string()?)),
             b't' => {
-                if self.lit("true") { Ok(J::Bool(true)) } else { Err(self.bad()) }
+                if self.lit("true") {
+                    Ok(J::Bool(true))
+                } else {
+                    Err(self.bad())
+                }
             }
             b'f' => {
-                if self.lit("false") { Ok(J::Bool(false)) } else { Err(self.bad()) }
+                if self.lit("false") {
+                    Ok(J::Bool(false))
+                } else {
+                    Err(self.bad())
+                }
             }
             b'n' => {
-                if self.lit("null") { Ok(J::Null) } else { Err(self.bad()) }
+                if self.lit("null") {
+                    Ok(J::Null)
+                } else {
+                    Err(self.bad())
+                }
             }
             _ => self.number(),
         }
@@ -146,7 +161,10 @@ impl<'a> Parser<'a> {
                 }
                 b'\\' => {
                     self.i += 1;
-                    let c = *self.b.get(self.i).ok_or_else(|| ParseError("escape at eof".into()))?;
+                    let c = *self
+                        .b
+                        .get(self.i)
+                        .ok_or_else(|| ParseError("escape at eof".into()))?;
                     self.i += 1;
                     match c {
                         b'"' => out.push('"'),
@@ -191,7 +209,10 @@ impl<'a> Parser<'a> {
             self.i += 1;
         }
         while self.i < self.b.len()
-            && matches!(self.b[self.i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'-' | b'+')
+            && matches!(
+                self.b[self.i],
+                b'0'..=b'9' | b'.' | b'e' | b'E' | b'-' | b'+'
+            )
         {
             self.i += 1;
         }
@@ -206,7 +227,9 @@ impl<'a> Parser<'a> {
                 return Ok(J::I(v));
             }
         }
-        txt.parse::<f64>().map(|v| J::F(v, 6)).map_err(|_| ParseError(format!("bad number {txt}")))
+        txt.parse::<f64>()
+            .map(|v| J::F(v, 6))
+            .map_err(|_| ParseError(format!("bad number {txt}")))
     }
 }
 

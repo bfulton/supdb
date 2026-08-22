@@ -35,7 +35,11 @@ fn main() -> std::io::Result<()> {
     println!("reclaim policy: {reclaim:?}");
     let store = Store::create(
         &path,
-        Options { buffer_bytes: 1 << 20, reclaim, ..Default::default() },
+        Options {
+            buffer_bytes: 1 << 20,
+            reclaim,
+            ..Default::default()
+        },
     )?;
     store.checkpoint()?;
 
@@ -49,15 +53,25 @@ fn main() -> std::io::Result<()> {
 
     std::thread::scope(|scope| -> std::io::Result<()> {
         for _ in 0..readers {
-            let (path, done, opens, torn, backwards, errors, open_err, first_err) =
-                (path.clone(), done.clone(), opens.clone(), torn.clone(),
-                 backwards.clone(), errors.clone(), open_err.clone(), first_err.clone());
+            let (path, done, opens, torn, backwards, errors, open_err, first_err) = (
+                path.clone(),
+                done.clone(),
+                opens.clone(),
+                torn.clone(),
+                backwards.clone(),
+                errors.clone(),
+                open_err.clone(),
+                first_err.clone(),
+            );
             scope.spawn(move || {
                 let mut high = 0u64;
                 while !done.load(Ordering::Relaxed) {
                     let r = match Reader::open(&path) {
                         Ok(r) => r,
-                        Err(_) => { open_err.fetch_add(1, Ordering::Relaxed); continue }
+                        Err(_) => {
+                            open_err.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                     };
                     opens.fetch_add(1, Ordering::Relaxed);
                     let (gen, _) = r.version();
@@ -80,7 +94,9 @@ fn main() -> std::io::Result<()> {
                             Err(e) => {
                                 errors.fetch_add(1, Ordering::Relaxed);
                                 let mut g = first_err.lock().unwrap();
-                                if g.is_empty() { *g = e.to_string(); }
+                                if g.is_empty() {
+                                    *g = e.to_string();
+                                }
                             }
                         }
                     }

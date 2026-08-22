@@ -9,12 +9,22 @@ fn main() -> std::io::Result<()> {
     for k in 0..3000usize {
         let mut key = vec![b'k'; 10];
         let mut v = k;
-        for i in (1..10).rev() { key[i] = b'0' + (v % 10) as u8; v /= 10; }
+        for i in (1..10).rev() {
+            key[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
         let mut n = 0usize;
         r.read_all(&key, |_| n += 1)?;
         total += n as u64;
-        min = min.min(n); max = max.max(n);
+        min = min.min(n);
+        max = max.max(n);
     }
-    println!("recovered {} keys | values per key: min {} max {} | total {}", r.keys(), min, max, total);
+    println!(
+        "recovered {} keys | values per key: min {} max {} | total {}",
+        r.keys(),
+        min,
+        max,
+        total
+    );
     Ok(())
 }

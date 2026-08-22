@@ -28,8 +28,8 @@ pub mod stats;
 pub mod workload;
 
 pub use env::{peak_rss_bytes, Env, IoCounters};
-pub use jparse::parse as parse_json;
 pub use hist::Hist;
+pub use jparse::parse as parse_json;
 pub use json::J;
 pub use stats::{compare, Comparison, Samples, Trial, Verdict, DEFAULT_REPS, MIN_EFFECT};
 pub use workload::{db_key_into, KeyDist, KeyGen, Payload, Rng};
@@ -137,6 +137,8 @@ impl Status {
             Status::NotExercised => "not_exercised",
         }
     }
+    // Fallible-with-None, not FromStr's Result; the caller wants Option here.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Status> {
         match s {
             "holds" => Some(Status::Holds),
@@ -243,7 +245,10 @@ impl Record {
     }
 
     pub fn unexercised(&self) -> Vec<&Finding> {
-        self.findings.iter().filter(|f| f.status == Status::NotExercised).collect()
+        self.findings
+            .iter()
+            .filter(|f| f.status == Status::NotExercised)
+            .collect()
     }
 
     pub fn to_json(&self) -> J {
@@ -265,7 +270,11 @@ impl Record {
     /// Write to `results/<experiment>.<profile>.json` and echo a human summary.
     pub fn write(&self, dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
-        let path = dir.join(format!("{}.{}.json", self.experiment, self.profile.as_str()));
+        let path = dir.join(format!(
+            "{}.{}.json",
+            self.experiment,
+            self.profile.as_str()
+        ));
         let mut f = std::fs::File::create(&path)?;
         writeln!(f, "{}", self.to_json().render())?;
         eprintln!("# wrote {}", path.display());
@@ -296,7 +305,10 @@ impl Record {
             println!("  note: {n}");
         }
         if !self.profile.is_citable() {
-            println!("  (profile '{}' is not citable evidence)", self.profile.as_str());
+            println!(
+                "  (profile '{}' is not citable evidence)",
+                self.profile.as_str()
+            );
         }
     }
 }

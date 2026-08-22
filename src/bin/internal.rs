@@ -34,16 +34,17 @@ struct Args(Vec<String>);
 
 impl Args {
     fn get(&self, name: &str) -> Option<&str> {
-        self.0.iter().position(|a| a == name).and_then(|i| self.0.get(i + 1)).map(|s| s.as_str())
+        self.0
+            .iter()
+            .position(|a| a == name)
+            .and_then(|i| self.0.get(i + 1))
+            .map(|s| s.as_str())
     }
     fn num(&self, name: &str, d: usize) -> usize {
         self.get(name).and_then(|v| v.parse().ok()).unwrap_or(d)
     }
     fn f64(&self, name: &str, d: f64) -> f64 {
         self.get(name).and_then(|v| v.parse().ok()).unwrap_or(d)
-    }
-    fn has(&self, name: &str) -> bool {
-        self.0.iter().any(|a| a == name)
     }
 }
 
@@ -98,13 +99,18 @@ fn main() -> std::io::Result<()> {
 
     match cmd.as_str() {
         // Child modes, used by experiments that must measure a fresh process.
-        "f2-child" => return f2_child(&args),
-        "f3-reader" => return f3_reader(&args),
+        "f2-child" => f2_child(&args),
+        "f3-reader" => f3_reader(&args),
         "all" => {
             let mut failed = Vec::new();
-            for e in
-                ["f5-latency", "f6-threads", "f2-open", "f4-durability", "f3-multiproc", "f1-outofcore"]
-            {
+            for e in [
+                "f5-latency",
+                "f6-threads",
+                "f2-open",
+                "f4-durability",
+                "f3-multiproc",
+                "f1-outofcore",
+            ] {
                 if !run(e)? {
                     failed.push(e);
                 }
@@ -202,15 +208,21 @@ fn f5_latency(args: &Args, profile: Profile) -> std::io::Result<Record> {
     rec.series("append_latency", append.to_json())
         .series("append_cdf", append.cdf_json())
         .series("checkpoint_latency", ckpt.to_json())
-        .series("throughput", jobj! {
-            "ops" => J::u(total_ops),
-            "seconds" => J::fp(secs, 4),
-            "ops_per_s" => J::fp(total_ops as f64 / secs, 1),
-            "close_ms" => J::fp(close_ms, 2),
-            "merges" => J::u(stats.merges),
-        })
+        .series(
+            "throughput",
+            jobj! {
+                "ops" => J::u(total_ops),
+                "seconds" => J::fp(secs, 4),
+                "ops_per_s" => J::fp(total_ops as f64 / secs, 1),
+                "close_ms" => J::fp(close_ms, 2),
+                "merges" => J::u(stats.merges),
+            },
+        )
         .series("io", env::write_amp_json(&io, logical, file_len(&file)))
-        .series("memory", jobj! { "peak_rss_mb" => J::fp(env::peak_rss_bytes() as f64 / 1048576.0, 1) });
+        .series(
+            "memory",
+            jobj! { "peak_rss_mb" => J::fp(env::peak_rss_bytes() as f64 / 1048576.0, 1) },
+        );
 
     // The finding. A mean is a faithful summary only when the tail is close to
     // it; the threshold is generous on purpose, so failing it is unambiguous.
@@ -239,7 +251,7 @@ fn f5_latency(args: &Args, profile: Profile) -> std::io::Result<Record> {
         format!("worst append {max_ms:.2}ms"),
     ));
 
-    if ckpt.len() > 0 {
+    if !ckpt.is_empty() {
         let cmax = ckpt.max() as f64 / 1e6;
         rec.finding(Finding::new(
             "F5.3",
@@ -268,12 +280,19 @@ fn f6_threads(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let value_size = args.num("--value-size", 100);
     let buffer_mb = args.num("--buffer-mb", 128);
     let max_threads = args.num("--max-threads", profile.pick(4, 8, 16));
-    let counts: Vec<usize> = [1usize, 2, 4, 8, 16].iter().copied().filter(|t| *t <= max_threads).collect();
+    let counts: Vec<usize> = [1usize, 2, 4, 8, 16]
+        .iter()
+        .copied()
+        .filter(|t| *t <= max_threads)
+        .collect();
 
     let mut rec = Record::new("f6-threads", profile);
     rec.param("ops_per_thread", J::u(per_thread))
         .param("value_size", J::u(value_size as u64))
-        .param("thread_counts", J::arr(counts.iter().map(|c| J::u(*c as u64)).collect()))
+        .param(
+            "thread_counts",
+            J::arr(counts.iter().map(|c| J::u(*c as u64)).collect()),
+        )
         .param("buffer_mb", J::u(buffer_mb as u64));
 
     let dir = scratch("f6");
@@ -324,7 +343,10 @@ fn f6_threads(args: &Args, profile: Profile) -> std::io::Result<Record> {
     rec.series("scaling", J::arr(points));
 
     for (i, t) in counts.iter().enumerate().skip(1) {
-        rec.compare(&format!("threads_{t}_vs_1"), compare(&samples[i], &samples[0], supdb::bench::MIN_EFFECT));
+        rec.compare(
+            &format!("threads_{t}_vs_1"),
+            compare(&samples[i], &samples[0], supdb::bench::MIN_EFFECT),
+        );
     }
 
     // Half of linear at four threads is a low bar deliberately: the claim
@@ -381,8 +403,11 @@ fn f2_open(args: &Args, profile: Profile) -> std::io::Result<Record> {
     };
 
     let mut rec = Record::new("f2-open", profile);
-    rec.param("key_counts", J::arr(scale.iter().map(|k| J::u(*k)).collect()))
-        .param("value_size", J::u(value_size as u64));
+    rec.param(
+        "key_counts",
+        J::arr(scale.iter().map(|k| J::u(*k)).collect()),
+    )
+    .param("value_size", J::u(value_size as u64));
 
     let dir = scratch("f2");
     let payload = Payload::new(value_size, 0.5, 0xF2);
@@ -426,9 +451,11 @@ fn f2_open(args: &Args, profile: Profile) -> std::io::Result<Record> {
             let t = Instant::now();
             for _ in 0..n {
                 db_key_into(g.next(), &mut kb);
-                reader.read_all(&kb, |v| {
-                    std::hint::black_box(v);
-                }).expect("read");
+                reader
+                    .read_all(&kb, |v| {
+                        std::hint::black_box(v);
+                    })
+                    .expect("read");
             }
             t.elapsed().as_secs_f64() * 1e6 / n as f64
         });
@@ -559,7 +586,14 @@ fn f3_multiproc(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let payload = Payload::new(value_size, 0.5, 0xF3);
     let exe = std::env::current_exe().expect("current exe");
 
-    let store = Store::create(&file, Options { buffer_bytes: 1 << 20, reclaim: Reclaim::AfterReads, ..Default::default() })?;
+    let store = Store::create(
+        &file,
+        Options {
+            buffer_bytes: 1 << 20,
+            reclaim: Reclaim::AfterReads,
+            ..Default::default()
+        },
+    )?;
     {
         let mut vrng = Rng::new(1);
         let mut kb = [0u8; 16];
@@ -616,13 +650,14 @@ fn f3_multiproc(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let mut unregistered = 0u64;
     let mut late_errors = 0u64;
     let mut reports = Vec::new();
-    for mut c in children {
+    for c in children {
         let out = c.wait_with_output()?;
         let text = String::from_utf8_lossy(&out.stdout).to_string();
         let field = |k: &str| -> u64 {
-            text.split(&format!("{k}=")).nth(1).and_then(|s| {
-                s.split_whitespace().next().and_then(|v| v.parse().ok())
-            }).unwrap_or(0)
+            text.split(&format!("{k}="))
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse().ok()))
+                .unwrap_or(0)
         };
         if out.status.success() {
             ok += 1;
@@ -635,21 +670,27 @@ fn f3_multiproc(args: &Args, profile: Profile) -> std::io::Result<Record> {
     }
     let stats = store.close()?;
 
-    rec.series("writer", jobj! {
-        "seconds" => J::fp(writer_secs, 2),
-        "merges" => J::u(stats.merges),
-        "reused_slots" => J::u(stats.reused),
-        "reused_mb" => J::fp(stats.reused_bytes as f64 / 1048576.0, 1),
-        "file_mb" => J::fp(file_len(&file) as f64 / 1048576.0, 1),
-    })
-    .series("readers", jobj! {
-        "spawned" => J::u(readers as u64),
-        "exited_ok" => J::u(ok as u64),
-        "read_errors" => J::u(read_errors),
-        "torn_or_inconsistent" => J::u(torn),
-        "failed_to_register" => J::u(unregistered),
-        "errors_after_stale_window" => J::u(late_errors),
-    })
+    rec.series(
+        "writer",
+        jobj! {
+            "seconds" => J::fp(writer_secs, 2),
+            "merges" => J::u(stats.merges),
+            "reused_slots" => J::u(stats.reused),
+            "reused_mb" => J::fp(stats.reused_bytes as f64 / 1048576.0, 1),
+            "file_mb" => J::fp(file_len(&file) as f64 / 1048576.0, 1),
+        },
+    )
+    .series(
+        "readers",
+        jobj! {
+            "spawned" => J::u(readers as u64),
+            "exited_ok" => J::u(ok as u64),
+            "read_errors" => J::u(read_errors),
+            "torn_or_inconsistent" => J::u(torn),
+            "failed_to_register" => J::u(unregistered),
+            "errors_after_stale_window" => J::u(late_errors),
+        },
+    )
     .series("reader_reports", J::arr(reports));
 
     rec.finding(Finding::new(
@@ -792,7 +833,10 @@ fn f4_durability(args: &Args, profile: Profile) -> std::io::Result<Record> {
     rec.param("ops", J::u(ops))
         .param("keys", J::u(keys))
         .param("value_size", J::u(value_size as u64))
-        .param("checkpoint_intervals", J::arr(intervals.iter().map(|i| J::u(*i)).collect()))
+        .param(
+            "checkpoint_intervals",
+            J::arr(intervals.iter().map(|i| J::u(*i)).collect()),
+        )
         .note("interval 0 means no checkpoint until close: the whole run is at risk");
 
     let dir = scratch("f4");
@@ -836,7 +880,14 @@ fn f4_durability(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let durable = samples[0].median();
     let loose = samples.last().unwrap().median();
-    rec.compare("frequent_vs_never", compare(&samples[0], samples.last().unwrap(), supdb::bench::MIN_EFFECT));
+    rec.compare(
+        "frequent_vs_never",
+        compare(
+            &samples[0],
+            samples.last().unwrap(),
+            supdb::bench::MIN_EFFECT,
+        ),
+    );
     rec.finding(Finding::new(
         "F4.1",
         "throughput at a 1,000-op durability window is within 2x of no durability at all",
@@ -890,7 +941,10 @@ fn f1_outofcore(args: &Args, profile: Profile) -> std::io::Result<Record> {
         .param("key_distribution", J::s(dist.as_str()))
         .param("mem_total_mb", J::fp(mem as f64 / 1048576.0, 0))
         .param("ballast_gb", J::fp(ballast_gb, 2))
-        .param("dataset_over_ram", J::fp(data_mb as f64 * 1048576.0 / mem.max(1) as f64, 3));
+        .param(
+            "dataset_over_ram",
+            J::fp(data_mb as f64 * 1048576.0 / mem.max(1) as f64, 3),
+        );
 
     let dir = scratch("f1");
     let file = dir.join("s.dat");
@@ -955,8 +1009,10 @@ fn f1_outofcore(args: &Args, profile: Profile) -> std::io::Result<Record> {
                            else { "drop_caches unavailable (needs root); the 'cold' figure is NOT cold" }),
         });
     if let Some((r, locked)) = &squeezed {
-        rec.series("ballasted", ratio_json(&r.0, r.1))
-            .series("ballast", jobj! { "gb" => J::fp(ballast_gb, 2), "mlock_succeeded" => J::Bool(*locked) });
+        rec.series("ballasted", ratio_json(&r.0, r.1)).series(
+            "ballast",
+            jobj! { "gb" => J::fp(ballast_gb, 2), "mlock_succeeded" => J::Bool(*locked) },
+        );
     }
 
     let warm_rps = reads as f64 / warm.1;
@@ -965,8 +1021,12 @@ fn f1_outofcore(args: &Args, profile: Profile) -> std::io::Result<Record> {
         "F1.1",
         "a cold measurement can prove it was cold",
         dropped,
-        if dropped { "page cache dropped between phases".into() }
-        else { "drop_caches failed; every 'cold' number in this run is warm and must not be cited".to_string() },
+        if dropped {
+            "page cache dropped between phases".into()
+        } else {
+            "drop_caches failed; every 'cold' number in this run is warm and must not be cited"
+                .to_string()
+        },
     ));
     if dropped {
         rec.finding(Finding::new(

@@ -40,7 +40,13 @@ impl Default for Hist {
 
 impl Hist {
     pub fn new() -> Hist {
-        Hist { counts: vec![0; 64 * SUB], total: 0, max: 0, min: u64::MAX, sum: 0 }
+        Hist {
+            counts: vec![0; 64 * SUB],
+            total: 0,
+            max: 0,
+            min: u64::MAX,
+            sum: 0,
+        }
     }
 
     #[inline]
@@ -241,7 +247,10 @@ mod tests {
             "p99.9 should stay on the fast bucket, got {}",
             h.percentile(99.9)
         );
-        assert!(h.percentile(99.99) > 100_000_000, "p99.99 must expose the stall");
+        assert!(
+            h.percentile(99.99) > 100_000_000,
+            "p99.99 must expose the stall"
+        );
         assert!(h.max() >= 500_000_000);
     }
 
@@ -292,8 +301,14 @@ mod boundary_tests {
         for _ in 0..100 {
             h.record(500_000_000);
         }
-        assert!(h.percentile(99.9) < 2_000, "p99.9 must stay on the fast bucket");
-        assert!(h.percentile(99.99) > 100_000_000, "p99.99 must reach the stalls");
+        assert!(
+            h.percentile(99.9) < 2_000,
+            "p99.9 must stay on the fast bucket"
+        );
+        assert!(
+            h.percentile(99.99) > 100_000_000,
+            "p99.99 must reach the stalls"
+        );
         assert_eq!(h.percentile(100.0), h.max());
     }
 

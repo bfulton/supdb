@@ -270,7 +270,14 @@ pub fn compare(a: &Samples, b: &Samples, min_effect: f64) -> Comparison {
     } else {
         Verdict::Less
     };
-    Comparison { verdict, ratio, p_value: p, min_effect, a: a.clone(), b: b.clone() }
+    Comparison {
+        verdict,
+        ratio,
+        p_value: p,
+        min_effect,
+        a: a.clone(),
+        b: b.clone(),
+    }
 }
 
 /// Two-sided Mann-Whitney U, normal approximation with tie correction.
@@ -284,8 +291,11 @@ pub fn mann_whitney_p(a: &[f64], b: &[f64]) -> f64 {
         return 1.0;
     }
     // Rank the pooled sample, averaging ranks across ties.
-    let mut pooled: Vec<(f64, bool)> =
-        a.iter().map(|v| (*v, true)).chain(b.iter().map(|v| (*v, false))).collect();
+    let mut pooled: Vec<(f64, bool)> = a
+        .iter()
+        .map(|v| (*v, true))
+        .chain(b.iter().map(|v| (*v, false)))
+        .collect();
     pooled.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let n = pooled.len();
@@ -308,7 +318,12 @@ pub fn mann_whitney_p(a: &[f64], b: &[f64]) -> f64 {
         i = j + 1;
     }
 
-    let r1: f64 = ranks.iter().zip(&pooled).filter(|(_, p)| p.1).map(|(r, _)| *r).sum();
+    let r1: f64 = ranks
+        .iter()
+        .zip(&pooled)
+        .filter(|(_, p)| p.1)
+        .map(|(r, _)| *r)
+        .sum();
     let n1f = n1 as f64;
     let n2f = n2 as f64;
     let u1 = r1 - n1f * (n1f + 1.0) / 2.0;
@@ -376,8 +391,8 @@ impl Trial {
             }
         }
         for rep in 0..self.reps {
-            for c in 0..configs {
-                out[c].push(f(c, self.warmup + rep));
+            for (c, samples) in out.iter_mut().enumerate() {
+                samples.push(f(c, self.warmup + rep));
             }
         }
         out
@@ -415,7 +430,13 @@ mod tests {
             426_374.0, 470_000.0, 389_000.0, 501_000.0, 412_000.0, 455_000.0, 433_000.0,
         ]);
         let c = compare(&a, &b, MIN_EFFECT);
-        assert_eq!(c.verdict, Verdict::NoDifference, "p={} ratio={}", c.p_value, c.ratio);
+        assert_eq!(
+            c.verdict,
+            Verdict::NoDifference,
+            "p={} ratio={}",
+            c.p_value,
+            c.ratio
+        );
     }
 
     /// A real, clean separation must still be reported, or the gate is useless.
@@ -448,7 +469,10 @@ mod tests {
     #[test]
     fn mann_whitney_matches_known_case() {
         // Fully separated samples of 7 give the smallest attainable U.
-        let p = mann_whitney_p(&[1., 2., 3., 4., 5., 6., 7.], &[8., 9., 10., 11., 12., 13., 14.]);
+        let p = mann_whitney_p(
+            &[1., 2., 3., 4., 5., 6., 7.],
+            &[8., 9., 10., 11., 12., 13., 14.],
+        );
         assert!(p < 0.01, "p={p}");
     }
 
@@ -466,6 +490,10 @@ mod tests {
             order.borrow_mut().push(c);
             1.0
         });
-        assert_eq!(*order.borrow(), vec![0, 1, 0, 1, 0, 1], "must be round-robin, not blocked");
+        assert_eq!(
+            *order.borrow(),
+            vec![0, 1, 0, 1, 0, 1],
+            "must be round-robin, not blocked"
+        );
     }
 }

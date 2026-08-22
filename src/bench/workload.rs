@@ -29,8 +29,15 @@ pub struct Rng(pub u64);
 
 impl Rng {
     pub fn new(seed: u64) -> Rng {
-        Rng(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
+        Rng(if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        })
     }
+    // Deliberately not `Iterator`: this is an infinite generator on the hot
+    // path and the trait's Option wrapper is measurable there.
+    #[allow(clippy::should_implement_trait)]
     #[inline]
     pub fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
@@ -92,7 +99,6 @@ pub struct KeyGen {
     rng: Rng,
     seq: u64,
     zeta_n: f64,
-    zeta_theta: f64,
     alpha: f64,
     eta: f64,
     theta: f64,
@@ -102,16 +108,31 @@ impl KeyGen {
     pub fn new(dist: KeyDist, n: u64, seed: u64) -> KeyGen {
         let theta = 0.99f64;
         let n = n.max(1);
-        let (zeta_n, zeta_theta) = if dist == KeyDist::Zipfian {
-            (zeta(n, theta), zeta(2, theta))
+        let zeta_n = if dist == KeyDist::Zipfian {
+            zeta(n, theta)
         } else {
-            (0.0, 0.0)
+            0.0
+        };
+        let zeta_theta = if dist == KeyDist::Zipfian {
+            zeta(2, theta)
+        } else {
+            0.0
         };
         let alpha = 1.0 / (1.0 - theta);
         let eta = (1.0 - (2.0 / n as f64).powf(1.0 - theta)) / (1.0 - zeta_theta / zeta_n);
-        KeyGen { dist, n, rng: Rng::new(seed), seq: 0, zeta_n, zeta_theta, alpha, eta, theta }
+        KeyGen {
+            dist,
+            n,
+            rng: Rng::new(seed),
+            seq: 0,
+            zeta_n,
+            alpha,
+            eta,
+            theta,
+        }
     }
 
+    #[allow(clippy::should_implement_trait)]
     #[inline]
     pub fn next(&mut self) -> u64 {
         match self.dist {
@@ -192,7 +213,11 @@ impl Payload {
                 pool.push((rng.next() & 0xff) as u8);
             }
         }
-        Payload { pool, value_size, compressibility }
+        Payload {
+            pool,
+            value_size,
+            compressibility,
+        }
     }
 
     /// A value-sized slice at a pseudo-random offset. No allocation, no copy.
@@ -240,7 +265,11 @@ mod tests {
         for _ in 0..500 {
             prefixes.insert(p.get(&mut rng)[..50].to_vec());
         }
-        assert!(prefixes.len() > 400, "only {} distinct 50-byte prefixes", prefixes.len());
+        assert!(
+            prefixes.len() > 400,
+            "only {} distinct 50-byte prefixes",
+            prefixes.len()
+        );
     }
 
     #[test]
@@ -285,6 +314,9 @@ mod tests {
     #[test]
     fn sequential_covers_the_space_in_order() {
         let mut g = KeyGen::new(KeyDist::Sequential, 5, 0);
-        assert_eq!((0..7).map(|_| g.next()).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 0, 1]);
+        assert_eq!(
+            (0..7).map(|_| g.next()).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 0, 1]
+        );
     }
 }

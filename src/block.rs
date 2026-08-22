@@ -45,7 +45,10 @@ pub struct BlockBuilder {
 
 impl BlockBuilder {
     pub fn new(cap: usize) -> Self {
-        BlockBuilder { buf: Vec::with_capacity(cap), cap }
+        BlockBuilder {
+            buf: Vec::with_capacity(cap),
+            cap,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -134,7 +137,11 @@ impl BlockCache {
 
 pub fn compress(src: &[u8]) -> Option<Vec<u8>> {
     let out = lz4_flex::compress(src);
-    if out.len() < src.len() { Some(out) } else { None }
+    if out.len() < src.len() {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 pub fn decompress(src: &[u8], uncompressed: usize) -> std::io::Result<Vec<u8>> {
@@ -266,7 +273,13 @@ pub fn read_chunks_into(
     Ok(())
 }
 
-pub fn read_chunked_range(blk: &[u8], uncompressed: usize, a: usize, b: usize, dst: &mut [u8]) -> std::io::Result<()> {
+pub fn read_chunked_range(
+    blk: &[u8],
+    uncompressed: usize,
+    a: usize,
+    b: usize,
+    dst: &mut [u8],
+) -> std::io::Result<()> {
     // These bytes may not be a chunk directory at all -- under Retain::Reclaim
     // the space a superseded value occupied can have been written over. Decode
     // defensively and report it, rather than trusting a length read out of

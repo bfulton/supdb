@@ -1,3 +1,5 @@
+// Vendored from the design artifact verbatim; see src/lib.rs.
+#![allow(clippy::all, dead_code)]
 //! Mirrors the Java harness: same key shape, same event payload drawn from a
 //! pool of distinct records, same permuted append order, same phases. The
 //! point is that a Supdb number can be laid beside an Uppend/RocksDB/LMDB one
@@ -23,7 +25,9 @@ fn key_bytes(k: usize) -> Vec<u8> {
 /// varying content -- a value that is a real record rather than a run of one
 /// byte, because a degenerate payload flatters block compressors by 6x.
 fn build_pool(value_size: usize) -> Vec<Vec<u8>> {
-    let events = ["click", "view", "purchase", "scroll", "hover", "submit", "login"];
+    let events = [
+        "click", "view", "purchase", "scroll", "hover", "submit", "login",
+    ];
     let plats = ["ios", "android", "web", "tv"];
     (0..POOL)
         .map(|i| {
@@ -68,7 +72,10 @@ fn permutation(n: usize) -> Vec<usize> {
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let get = |name: &str, dflt: usize| -> usize {
-        args.iter().position(|a| a == name).map(|i| args[i + 1].parse().unwrap()).unwrap_or(dflt)
+        args.iter()
+            .position(|a| a == name)
+            .map(|i| args[i + 1].parse().unwrap())
+            .unwrap_or(dflt)
     };
     let keys = get("--keys", 20_000);
     let values = get("--values", 500);
@@ -97,7 +104,12 @@ fn main() -> std::io::Result<()> {
 
     std::fs::create_dir_all(&dir)?;
     let file = dir.join("supdb.dat");
-    let name = format!("supdb-b{}k-c{}{}", block_size / 1024, chunk, if compress { "-lz4" } else { "" });
+    let name = format!(
+        "supdb-b{}k-c{}{}",
+        block_size / 1024,
+        chunk,
+        if compress { "-lz4" } else { "" }
+    );
 
     let keyv: Vec<Vec<u8>> = (0..keys).map(key_bytes).collect();
 
@@ -127,7 +139,9 @@ fn main() -> std::io::Result<()> {
                 for n in 0..keys {
                     let k = perm[(n + offset) % keys];
                     let src = &pool[((round as u64).wrapping_mul(2654435761)
-                        ^ (k as u64).wrapping_mul(40503)) as usize & (POOL - 1)];
+                        ^ (k as u64).wrapping_mul(40503))
+                        as usize
+                        & (POOL - 1)];
                     val.copy_from_slice(src);
                     let seq = ((round as u64) << 32) | k as u64;
                     val[..8].copy_from_slice(&seq.to_be_bytes());
@@ -190,7 +204,7 @@ fn main() -> std::io::Result<()> {
         // repair fragmentation before sealing the file, and charge for it
         let tc = Instant::now();
         store.flush()?;
-        let merged = if no_compact { 0 } else { 0 };  // merging now happens inline
+        let merged = if no_compact { 0 } else { 0 }; // merging now happens inline
         let compact_s = tc.elapsed().as_secs_f64();
 
         let tf = Instant::now();

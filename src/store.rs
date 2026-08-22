@@ -1,14 +1,14 @@
 use crate::block::{self, BlockBuilder, BlockCache, BlockLoc};
 use crate::freelist::{capacity_for, FreeList};
-use crate::readers;
 use crate::index::{get_uvarint, put_uvarint, Ext, Extents};
 use crate::keytable::KeyTable;
+use crate::readers;
 
 use memmap2::{Mmap, MmapMut};
+use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{Result, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 
 const MAGIC: u64 = 0x5355_5044_4200_0001;
@@ -58,10 +58,21 @@ struct Super {
 
 impl Super {
     fn fields(&self) -> [u64; 13] {
-        [self.generation, self.history_from, self.timestamp, self.key_off,
-         self.key_stored, self.key_uncompressed, self.blk_off, self.blk_stored,
-         self.blk_uncompressed, self.reuse_off, self.reuse_stored,
-         self.reuse_uncompressed, self.high_water]
+        [
+            self.generation,
+            self.history_from,
+            self.timestamp,
+            self.key_off,
+            self.key_stored,
+            self.key_uncompressed,
+            self.blk_off,
+            self.blk_stored,
+            self.blk_uncompressed,
+            self.reuse_off,
+            self.reuse_stored,
+            self.reuse_uncompressed,
+            self.high_water,
+        ]
     }
 
     /// FNV-1a over the fields and the magic. Enough to reject a torn or never
@@ -98,10 +109,19 @@ impl Super {
             return None;
         }
         let s = Super {
-            generation: f[0], history_from: f[1], timestamp: f[2], key_off: f[3],
-            key_stored: f[4], key_uncompressed: f[5], blk_off: f[6],
-            blk_stored: f[7], blk_uncompressed: f[8], reuse_off: f[9],
-            reuse_stored: f[10], reuse_uncompressed: f[11], high_water: f[12],
+            generation: f[0],
+            history_from: f[1],
+            timestamp: f[2],
+            key_off: f[3],
+            key_stored: f[4],
+            key_uncompressed: f[5],
+            blk_off: f[6],
+            blk_stored: f[7],
+            blk_uncompressed: f[8],
+            reuse_off: f[9],
+            reuse_stored: f[10],
+            reuse_uncompressed: f[11],
+            high_water: f[12],
         };
         if u64::from_le_bytes(buf[112..120].try_into().unwrap()) != s.checksum() {
             return None;
@@ -285,7 +305,13 @@ impl Appender {
             raw
         } else if loc.chunked {
             let mut out = vec![0u8; loc.uncompressed as usize];
-            block::read_chunked_range(&raw, loc.uncompressed as usize, 0, loc.uncompressed as usize, &mut out)?;
+            block::read_chunked_range(
+                &raw,
+                loc.uncompressed as usize,
+                0,
+                loc.uncompressed as usize,
+                &mut out,
+            )?;
             out
         } else {
             block::decompress(&raw, loc.uncompressed as usize)?
@@ -327,7 +353,14 @@ impl Appender {
         }
     }
 
-    fn write_block(&mut self, payload: &[u8], compress: bool, solo: bool, chunk: usize, policy: Reclaim) -> Result<u32> {
+    fn write_block(
+        &mut self,
+        payload: &[u8],
+        compress: bool,
+        solo: bool,
+        chunk: usize,
+        policy: Reclaim,
+    ) -> Result<u32> {
         // Every compressed block is chunked, packed ones included. A packed
         // block holds many keys' short runs, so reading one key out of a
         // 64 KiB block compressed as a unit meant decompressing 64 KiB to
@@ -337,7 +370,11 @@ impl Appender {
         let chunked = compress && payload.len() > chunk;
         let stored: Option<Vec<u8>> = if chunked {
             let c = block::write_chunked_sz(payload, chunk);
-            if c.len() < payload.len() { Some(c) } else { None }
+            if c.len() < payload.len() {
+                Some(c)
+            } else {
+                None
+            }
         } else if compress {
             block::compress(payload)
         } else {
@@ -526,11 +563,22 @@ impl Store {
                 // means a read of this key decompresses only this key
                 let id = {
                     let mut ap = self.appender.lock().unwrap();
-                    ap.write_block(&p.buf, self.opts.compress, true, self.opts.solo_chunk_size, self.opts.reclaim)?
+                    ap.write_block(
+                        &p.buf,
+                        self.opts.compress,
+                        true,
+                        self.opts.solo_chunk_size,
+                        self.opts.reclaim,
+                    )?
                 };
                 let len = p.buf.len() as u32;
                 self.appender.lock().unwrap().retain(id);
-                let ext = Ext { block: id, off: 0, len, last: p.last };
+                let ext = Ext {
+                    block: id,
+                    off: 0,
+                    len,
+                    last: p.last,
+                };
                 {
                     let entry = sh.keys.entry_at(idx);
                     if p.replaces {
@@ -546,7 +594,8 @@ impl Store {
                 self.flush_builder(sh)?;
             }
             let off = sh.builder.push(&p.buf);
-            sh.members.push((idx, off, p.buf.len() as u32, p.last, p.replaces));
+            sh.members
+                .push((idx, off, p.buf.len() as u32, p.last, p.replaces));
         }
         Ok(())
     }
@@ -560,7 +609,13 @@ impl Store {
         let payload = sh.builder.take();
         let id = {
             let mut ap = self.appender.lock().unwrap();
-            ap.write_block(&payload, self.opts.compress, false, self.opts.chunk_size, self.opts.reclaim)?
+            ap.write_block(
+                &payload,
+                self.opts.compress,
+                false,
+                self.opts.chunk_size,
+                self.opts.reclaim,
+            )?
         };
         {
             let mut ap = self.appender.lock().unwrap();
@@ -572,7 +627,12 @@ impl Store {
             .members
             .drain(..)
             .map(|(idx, off, len, last, replaces)| {
-                let ext = Ext { block: id, off, len, last };
+                let ext = Ext {
+                    block: id,
+                    off,
+                    len,
+                    last,
+                };
                 let entry = sh.keys.entry_at(idx);
                 if replaces {
                     entry.extents = Extents::One(ext);
@@ -607,7 +667,7 @@ impl Store {
         // and a probe on the hot path, and the index is already in hand at
         // seal time, where the new extent has to be recorded anyway. Putting a
         // value therefore touches one map, not two.
-let (before, after) = {
+        let (before, after) = {
             let e = sh.keys.get_or_insert(key);
             let p = e.pending.get_or_insert_with(Pending::default);
             let before = p.buf.len();
@@ -666,7 +726,9 @@ let (before, after) = {
         let mut moved = 0usize;
         while moved < max_moves {
             let holes = ap.free.coalesced();
-            let Some(&(hole_off, hole_len)) = holes.first() else { break };
+            let Some(&(hole_off, hole_len)) = holes.first() else {
+                break;
+            };
             // the highest-offset live block that fits in this hole
             let mut best: Option<(usize, u64)> = None;
             for (i, b) in ap.blocks.iter().enumerate() {
@@ -731,7 +793,13 @@ let (before, after) = {
             buf.extend_from_slice(&bytes);
         }
         let len = buf.len() as u32;
-        let id = ap.write_block(&buf, self.opts.compress, true, self.opts.solo_chunk_size, self.opts.reclaim)?;
+        let id = ap.write_block(
+            &buf,
+            self.opts.compress,
+            true,
+            self.opts.solo_chunk_size,
+            self.opts.reclaim,
+        )?;
         ap.retain(id);
         // Only when reclaiming. Merging relocates a key's values; the originals
         // are unreachable from the current index either way, but an older
@@ -744,7 +812,12 @@ let (before, after) = {
             }
         }
         drop(ap);
-        sh.keys.entry_at(idx).extents = Extents::One(Ext { block: id, off: 0, len, last });
+        sh.keys.entry_at(idx).extents = Extents::One(Ext {
+            block: id,
+            off: 0,
+            len,
+            last,
+        });
         sh.merges += 1;
         Ok(())
     }
@@ -779,7 +852,10 @@ let (before, after) = {
         // slower than the last.
         // keep only what a reader could still be checking against; below the
         // reuse floor the record can never change an answer
-        let horizon = ap.reuse_floor(self.opts.reclaim).min(ap.generation).saturating_sub(1);
+        let horizon = ap
+            .reuse_floor(self.opts.reclaim)
+            .min(ap.generation)
+            .saturating_sub(1);
         ap.reuse_log.retain(|(_, _, gen)| *gen >= horizon);
         let reuse = encode_reuse_log(&ap.reuse_log);
         let reuse_loc = write_section(&mut ap, &reuse)?;
@@ -794,11 +870,14 @@ let (before, after) = {
             generation: gen,
             history_from: 0,
             timestamp: now.max(ap.timestamp),
-            key_off: key_loc.off, key_stored: key_loc.stored as u64,
+            key_off: key_loc.off,
+            key_stored: key_loc.stored as u64,
             key_uncompressed: key_loc.uncompressed as u64,
-            blk_off: blk_loc.off, blk_stored: blk_loc.stored as u64,
+            blk_off: blk_loc.off,
+            blk_stored: blk_loc.stored as u64,
             blk_uncompressed: blk_loc.uncompressed as u64,
-            reuse_off: reuse_loc.off, reuse_stored: reuse_loc.stored as u64,
+            reuse_off: reuse_loc.off,
+            reuse_stored: reuse_loc.stored as u64,
             reuse_uncompressed: reuse_loc.uncompressed as u64,
             high_water: ap.off,
         };
@@ -1130,7 +1209,13 @@ impl Reader {
         let a = Super::decode(&mmap[0..120]);
         let b = Super::decode(&mmap[SLOT as usize..SLOT as usize + 120]);
         let sb = match (a, b) {
-            (Some(x), Some(y)) => if x.generation >= y.generation { x } else { y },
+            (Some(x), Some(y)) => {
+                if x.generation >= y.generation {
+                    x
+                } else {
+                    y
+                }
+            }
             (Some(x), None) => x,
             (None, Some(y)) => y,
             (None, None) => return Ok(()),
@@ -1138,7 +1223,12 @@ impl Reader {
         if sb.reuse_off == 0 {
             return Ok(());
         }
-        let raw = read_section(&mmap, sb.reuse_off, sb.reuse_stored as usize, sb.reuse_uncompressed as usize)?;
+        let raw = read_section(
+            &mmap,
+            sb.reuse_off,
+            sb.reuse_stored as usize,
+            sb.reuse_uncompressed as usize,
+        )?;
         let mut v: Vec<(u64, u64)> = decode_reuse_log(&raw)
             .into_iter()
             // a slot reused during generation N was overwritten after
@@ -1255,8 +1345,18 @@ impl Reader {
     }
 
     fn open_mapped(mmap: Mmap, sb: Super) -> Result<Reader> {
-        let key_idx = read_section(&mmap, sb.key_off, sb.key_stored as usize, sb.key_uncompressed as usize)?;
-        let blk_idx = read_section(&mmap, sb.blk_off, sb.blk_stored as usize, sb.blk_uncompressed as usize)?;
+        let key_idx = read_section(
+            &mmap,
+            sb.key_off,
+            sb.key_stored as usize,
+            sb.key_uncompressed as usize,
+        )?;
+        let blk_idx = read_section(
+            &mmap,
+            sb.blk_off,
+            sb.blk_stored as usize,
+            sb.blk_uncompressed as usize,
+        )?;
         Self::build(mmap, key_idx, blk_idx, sb.timestamp, sb.history_from)
     }
 
@@ -1264,7 +1364,11 @@ impl Reader {
     /// space behind it. Best effort: if the table is full or unwritable the
     /// reader still works, and falls back on the grace window for safety.
     fn claim(path: &Path, generation: u64) -> Option<(usize, MmapMut)> {
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(path).ok()?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .ok()?;
         let table = unsafe { MmapMut::map_mut(&file) }.ok()?;
         if table.len() < readers::TABLE_OFF + readers::TABLE_BYTES {
             return None;
@@ -1277,24 +1381,51 @@ impl Reader {
     }
 
     /// Load a specific index section, for reading as of an older generation.
-    fn open_at(path: &Path, off: u64, stored: usize, uncompressed: usize, ts: u64) -> Result<Reader> {
+    fn open_at(
+        path: &Path,
+        off: u64,
+        stored: usize,
+        uncompressed: usize,
+        ts: u64,
+    ) -> Result<Reader> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         let a = Super::decode(&mmap[0..120]);
         let b = Super::decode(&mmap[SLOT as usize..SLOT as usize + 120]);
         let sb = match (a, b) {
-            (Some(x), Some(y)) => if x.generation >= y.generation { x } else { y },
+            (Some(x), Some(y)) => {
+                if x.generation >= y.generation {
+                    x
+                } else {
+                    y
+                }
+            }
             (Some(x), None) => x,
             (None, Some(y)) => y,
-            (None, None) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "no checkpoint")),
+            (None, None) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "no checkpoint",
+                ))
+            }
         };
         let key_idx = read_section(&mmap, off, stored, uncompressed)?;
-        let blk_idx = read_section(&mmap, sb.blk_off, sb.blk_stored as usize, sb.blk_uncompressed as usize)?;
+        let blk_idx = read_section(
+            &mmap,
+            sb.blk_off,
+            sb.blk_stored as usize,
+            sb.blk_uncompressed as usize,
+        )?;
         Self::build(mmap, key_idx, blk_idx, ts, sb.history_from)
     }
 
-    fn build(mmap: Mmap, key_idx: Vec<u8>, blk_idx: Vec<u8>, ts: u64, history_from: u64) -> Result<Reader> {
-
+    fn build(
+        mmap: Mmap,
+        key_idx: Vec<u8>,
+        blk_idx: Vec<u8>,
+        ts: u64,
+        history_from: u64,
+    ) -> Result<Reader> {
         let mut p = 0usize;
         let nblocks = get_uvarint(&blk_idx, &mut p) as usize;
         let mut blocks = Vec::with_capacity(nblocks);
@@ -1340,7 +1471,12 @@ impl Reader {
                 let o = get_uvarint(&key_idx, &mut p) as u32;
                 let l = get_uvarint(&key_idx, &mut p) as u32;
                 let last = get_uvarint(&key_idx, &mut p) as u32;
-                exts.push(Ext { block, off: o, len: l, last });
+                exts.push(Ext {
+                    block,
+                    off: o,
+                    len: l,
+                    last,
+                });
             }
             entries.push((key, exts));
         }
@@ -1368,7 +1504,21 @@ impl Reader {
         }
 
         let cache = BlockCache::new(4096);
-        Ok(Reader { mmap, entries, hash, hash_mask: mask, blocks, cache, slot: None, table: None, generation: _gen_read, timestamp: ts, history_from, overwritten: Vec::new(), prev })
+        Ok(Reader {
+            mmap,
+            entries,
+            hash,
+            hash_mask: mask,
+            blocks,
+            cache,
+            slot: None,
+            table: None,
+            generation: _gen_read,
+            timestamp: ts,
+            history_from,
+            overwritten: Vec::new(),
+            prev,
+        })
     }
 
     fn block(&self, id: u32) -> Result<BlockRef<'_>> {
@@ -1389,7 +1539,9 @@ impl Reader {
     /// Visit every value of a key in append order. Values are handed out as
     /// slices of the block, so a read allocates nothing per value.
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
-        let Some(exts) = self.lookup(key) else { return Ok(0) };
+        let Some(exts) = self.lookup(key) else {
+            return Ok(0);
+        };
         let mut total = 0u64;
         for e in exts.as_slice() {
             self.check_extent(*e)?;
@@ -1401,7 +1553,10 @@ impl Reader {
                     format!(
                         "block {} spans {}..{} but the mapping is {} bytes: the file grew after \
                          it was mapped",
-                        e.block, loc.off, end, self.mmap.len()
+                        e.block,
+                        loc.off,
+                        end,
+                        self.mmap.len()
                     ),
                 ));
             }
@@ -1410,8 +1565,15 @@ impl Reader {
                 total += emit(&raw[e.off as usize..(e.off + e.len) as usize], &mut f);
             } else if loc.chunked || loc.solo {
                 if std::env::var_os("SUPDB_DEBUG").is_some() && loc.stored as usize > raw.len() {
-                    eprintln!("# block {} off={} stored={} chunked={} solo={} mmap={}",
-                        e.block, loc.off, loc.stored, loc.chunked, loc.solo, self.mmap.len());
+                    eprintln!(
+                        "# block {} off={} stored={} chunked={} solo={} mmap={}",
+                        e.block,
+                        loc.off,
+                        loc.stored,
+                        loc.chunked,
+                        loc.solo,
+                        self.mmap.len()
+                    );
                 }
                 // one key's run: decompress into scratch, retain nothing
                 total += SCRATCH.with(|s| -> Result<u64> {
@@ -1443,7 +1605,10 @@ impl Reader {
                 })?;
             } else {
                 let b = self.block(e.block)?;
-                total += emit(&b.as_slice()[e.off as usize..(e.off + e.len) as usize], &mut f);
+                total += emit(
+                    &b.as_slice()[e.off as usize..(e.off + e.len) as usize],
+                    &mut f,
+                );
             }
         }
         Ok(total)
@@ -1485,13 +1650,17 @@ impl Reader {
     }
 
     pub fn read_first(&self, key: &[u8]) -> Result<i32> {
-        let Some(exts) = self.lookup(key) else { return Ok(-1) };
+        let Some(exts) = self.lookup(key) else {
+            return Ok(-1);
+        };
         let Some(e) = exts.first() else { return Ok(-1) };
         self.record_len_at(e, 0)
     }
 
     pub fn read_last(&self, key: &[u8]) -> Result<i32> {
-        let Some(exts) = self.lookup(key) else { return Ok(-1) };
+        let Some(exts) = self.lookup(key) else {
+            return Ok(-1);
+        };
         let Some(e) = exts.last() else { return Ok(-1) };
         self.record_len_at(e, e.last)
     }
@@ -1521,7 +1690,10 @@ impl Reader {
 
     /// Position of the first key at or after `key`.
     pub fn seek(&self, key: &[u8]) -> usize {
-        match self.entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+        match self
+            .entries
+            .binary_search_by(|(k, _)| k.as_slice().cmp(key))
+        {
             Ok(i) | Err(i) => i,
         }
     }
@@ -1537,7 +1709,12 @@ impl Reader {
     ///
     /// A scan also needs no lookup: the entry is already in hand, so neither
     /// the hash nor the key copy that read_all performs is required.
-    pub fn scan<F: FnMut(&[u8], &[u8])>(&self, from: Option<&[u8]>, limit: usize, mut f: F) -> Result<u64> {
+    pub fn scan<F: FnMut(&[u8], &[u8])>(
+        &self,
+        from: Option<&[u8]>,
+        limit: usize,
+        mut f: F,
+    ) -> Result<u64> {
         let start = from.map(|k| self.seek(k)).unwrap_or(0);
         let end = (start + limit).min(self.entries.len());
         let mut n = 0u64;
@@ -1590,7 +1767,6 @@ impl Reader {
         }
         Ok(n)
     }
-
 }
 
 fn read_section(mmap: &Mmap, off: u64, stored: usize, uncompressed: usize) -> Result<Vec<u8>> {
@@ -1601,7 +1777,10 @@ fn read_section(mmap: &Mmap, off: u64, stored: usize, uncompressed: usize) -> Re
     if end > mmap.len() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
-            format!("section at {off}..{end} lies past the {} byte mapping", mmap.len()),
+            format!(
+                "section at {off}..{end} lies past the {} byte mapping",
+                mmap.len()
+            ),
         ));
     }
     let raw = &mmap[off as usize..end];

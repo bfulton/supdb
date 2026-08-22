@@ -1,0 +1,86 @@
+name: ci
+
+# The point of this workflow is not that the code compiles. It is that the
+# claims the repository makes about the engine still match what the engine
+# measurably does. `verify` fails in both directions: a known limitation that
+# quietly gets fixed is as much a reason to stop as one that gets worse,
+# because either the engine changed or the experiment stopped testing anything.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --workspace
+      - name: Unit tests
+        run: cargo test --release --workspace
+      - name: Clippy
+        run: cargo clippy --release --workspace -- -D warnings
+      - name: Format
+        run: cargo fmt --all -- --check
+
+  falsify:
+    # The falsification suite and the claim gate. Runs at the `ci` profile,
+    # which is deliberately too small to be evidence about performance -- it
+    # exists to prove the experiments still run and the findings still say what
+    # claims.json says they say.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --workspace
+
+      - name: Internal falsification suite
+        run: ./target/release/internal all --profile ci --out results-ci
+
+      - name: External comparison suite
+        run: |
+          ./target/release/external kv   --profile ci --out results-ci
+          ./target/release/external ycsb --profile ci --keys 10000 --ops 10000 --out results-ci
+
+      - name: Verify claims against the measurements
+        run: ./target/release/verify --profile ci --results results-ci
+
+      - name: Regenerate figures
+        run: ./target/release/figures --profile ci --results results-ci --out figures-ci
+
+      - name: Publish results and figures
+        uses: actions/upload-artifact@v4
+        with:
+          name: measurements
+          path: |
+            results-ci/
+            figures-ci/
+
+  committed-results-are-current:
+    # Guards against results/ drifting away from the code that produced it.
+    # A committed result whose schema no longer parses, or whose findings no
+    # longer match claims.json, is a stale proof.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --workspace
+      - name: Verify the committed results
+        run: ./target/release/verify --profile ci
+      - name: Figures regenerate cleanly from committed results
+        run: |
+          ./target/release/figures --profile ci --out /tmp/figcheck
+          test -s /tmp/figcheck/index.html
