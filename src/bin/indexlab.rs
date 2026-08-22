@@ -2389,7 +2389,15 @@ fn pair_mode(args: &Args) -> std::io::Result<()> {
     let a_bytes = arms[0].logical_bytes() as f64 / keys.len() as f64;
     let b_bytes = arms[1].logical_bytes() as f64 / keys.len() as f64;
 
-    let mut rec = Record::new("f10-layout-pair", profile);
+    // Named for the arms, not for the mode: two pairs written to the same
+    // directory would otherwise collide on one filename, and results/ is the
+    // source of truth rather than a scratch area.
+    let slug = format!(
+        "f10-pair-{}-vs-{}",
+        a_name.replace('+', "-"),
+        b_name.replace('+', "-")
+    );
+    let mut rec = Record::new(&slug, profile);
     rec.param("a", J::s(a_name))
         .param("b", J::s(b_name))
         .param("keys", J::u(keys.len() as u64))
