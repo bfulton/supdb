@@ -1,0 +1,94 @@
+{
+  "_comment": [
+    "Every statement this project makes about itself, with the state the recorded",
+    "measurements are expected to be in. `verify` checks this file against results/.",
+    "",
+    "expect: 'holds'  - the statement is true and must stay true.",
+    "        'fails'  - a known, accepted limitation. It is written down so that it",
+    "                   cannot be quietly forgotten, and so that fixing it is a",
+    "                   deliberate act that updates this file.",
+    "        'not_exercised' - the profile cannot reach the condition.",
+    "",
+    "A finding that flips in EITHER direction fails verification. A claim that",
+    "expected a real result but got 'not_exercised' also fails: an untested hazard",
+    "must never read as a green build."
+  ],
+
+  "findings": [
+    {
+      "experiment": "f5-latency",
+      "id": "F5.1",
+      "expect": "fails",
+      "because": "Append latency is long-tailed: inline merge_key holds both the shard lock and the appender lock while it decompresses, concatenates, recompresses and rewrites a key's whole run. The design document reports only throughput means, which cannot show this."
+    },
+    {
+      "experiment": "f5-latency",
+      "id": "F5.2",
+      "expect": "holds",
+      "because": "No single append should stall for more than 50ms. This currently holds at ci profile and is the guard that would catch inline merging getting worse."
+    },
+    {
+      "experiment": "f6-threads",
+      "id": "F6.1",
+      "expect": "fails",
+      "because": "Write throughput does not scale with writer threads. seal_shard takes the single appender mutex inside its per-extent loop and flush_builder takes it twice consecutively, so the write path convoys. Measured at 19% efficiency and negative absolute scaling at 4 threads. Every db_bench comparison in the design document is single-threaded, which is the configuration that hides this."
+    },
+    {
+      "experiment": "f2-open",
+      "id": "F2.1",
+      "expect": "fails",
+      "because": "Reader::build materialises the entire key index on the heap -- one Vec<u8> per key plus a 2N-slot hash table -- so open is linear in key count and paid per process, shared with nobody. This is Bitcask's design, not the LMDB many-reader-process model the architecture claims."
+    },
+    {
+      "experiment": "f2-open",
+      "id": "F2.2",
+      "expect": "fails",
+      "because": "Open cost is measured super-linear (20x the keys costs 30x the open), so it is not merely un-amortised, it degrades. Fixing this means a mmap-able, binary-searchable index shared through the page cache."
+    },
+    {
+      "experiment": "f4-durability",
+      "id": "F4.1",
+      "expect": "fails",
+      "because": "A 1,000-op durability window costs 25x throughput, because checkpoint() rewrites the whole key index rather than what changed."
+    },
+    {
+      "experiment": "f4-durability",
+      "id": "F4.2",
+      "expect": "fails",
+      "because": "There is no usable point on the durability curve: either lose everything buffered since the last checkpoint (512MB by default), or pay an O(nkeys) index rewrite per commit. An incremental checkpoint is the single largest piece of remaining work."
+    },
+    {
+      "experiment": "f3-multiproc",
+      "id": "F3.1",
+      "expect": "holds",
+      "because": "Every reader process must see a complete, self-consistent checkpoint state. This is the core safety property of the append-only design and must never regress."
+    }
+  ],
+
+  "metrics": [
+    {
+      "experiment": "f5-latency",
+      "path": "series.throughput.ops_per_s",
+      "min": 100000,
+      "because": "A floor, not a target. The per-call timer is inside the loop here, so this is well below headline throughput; it exists to catch a collapse."
+    },
+    {
+      "experiment": "f6-threads",
+      "path": "series.scaling.0.ops_per_s",
+      "min": 200000,
+      "because": "Single-threaded append throughput. The axis the design is built to win, so a regression here is the most serious kind."
+    },
+    {
+      "experiment": "f3-multiproc",
+      "path": "series.readers.read_errors",
+      "max": 0,
+      "because": "Zero read errors across reader processes. Any nonzero value means a reader observed space the writer reused underneath it."
+    },
+    {
+      "experiment": "f3-multiproc",
+      "path": "series.readers.torn_or_inconsistent",
+      "max": 0,
+      "because": "Zero torn or inconsistent states."
+    }
+  ]
+}

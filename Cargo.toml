@@ -41,3 +41,15 @@ path = "src/bin/soak.rs"
 [[bin]]
 name = "tablebench"
 path = "src/bin/tablebench.rs"
+
+[[bin]]
+name = "internal"
+path = "src/bin/internal.rs"
+
+[[bin]]
+name = "verify"
+path = "src/bin/verify.rs"
+
+[[bin]]
+name = "figures"
+path = "src/bin/figures.rs"

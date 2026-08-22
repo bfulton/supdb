@@ -5,9 +5,8 @@ use crate::index::{get_uvarint, put_uvarint, Ext, Extents};
 use crate::keytable::KeyTable;
 
 use memmap2::{Mmap, MmapMut};
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Result, Seek, SeekFrom, Write};
+use std::io::{Result, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};

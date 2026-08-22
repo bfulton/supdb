@@ -21,13 +21,18 @@
 
 pub mod env;
 pub mod hist;
+pub mod jparse;
 pub mod json;
+pub mod plot;
 pub mod stats;
+pub mod workload;
 
 pub use env::{peak_rss_bytes, Env, IoCounters};
+pub use jparse::parse as parse_json;
 pub use hist::Hist;
 pub use json::J;
 pub use stats::{compare, Comparison, Samples, Trial, Verdict, DEFAULT_REPS, MIN_EFFECT};
+pub use workload::{db_key_into, KeyDist, KeyGen, Payload, Rng};
 
 use crate::jobj;
 use std::io::Write;
@@ -107,12 +112,47 @@ pub struct Record {
     pub notes: Vec<String>,
 }
 
+/// The outcome of a checked statement.
+///
+/// Three states, not two. A finding whose preconditions were never met must
+/// not report the same thing as one that was tested and passed: at the `ci`
+/// profile the multi-process experiment runs 8 readers for 2 seconds, which
+/// exercises neither the 64-slot reader table nor the 30-second stale window,
+/// and reporting that as "holds" would turn an untested condition into a green
+/// build. That is the precise failure mode a benchmark suite exists to
+/// prevent, so it is represented in the type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Holds,
+    Fails,
+    /// The conditions required to test this were not met by this run.
+    NotExercised,
+}
+
+impl Status {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Status::Holds => "holds",
+            Status::Fails => "fails",
+            Status::NotExercised => "not_exercised",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Status> {
+        match s {
+            "holds" => Some(Status::Holds),
+            "fails" => Some(Status::Fails),
+            "not_exercised" => Some(Status::NotExercised),
+            _ => None,
+        }
+    }
+}
+
 /// A checked statement about the engine.
 #[derive(Clone, Debug)]
 pub struct Finding {
     pub id: String,
     pub statement: String,
-    pub holds: bool,
+    pub status: Status,
     pub detail: String,
 }
 
@@ -121,16 +161,36 @@ impl Finding {
         Finding {
             id: id.to_string(),
             statement: statement.to_string(),
-            holds,
+            status: if holds { Status::Holds } else { Status::Fails },
             detail: detail.into(),
         }
+    }
+
+    /// Record that this run could not test the statement, and why.
+    pub fn not_exercised(id: &str, statement: &str, why: impl Into<String>) -> Finding {
+        Finding {
+            id: id.to_string(),
+            statement: statement.to_string(),
+            status: Status::NotExercised,
+            detail: why.into(),
+        }
+    }
+
+    /// `holds` only when the statement was actually tested and passed.
+    pub fn holds(&self) -> bool {
+        self.status == Status::Holds
+    }
+
+    pub fn failed(&self) -> bool {
+        self.status == Status::Fails
     }
 
     pub fn to_json(&self) -> J {
         jobj! {
             "id" => J::s(&self.id),
             "statement" => J::s(&self.statement),
-            "holds" => J::Bool(self.holds),
+            "status" => J::s(self.status.as_str()),
+            "holds" => J::Bool(self.status == Status::Holds),
             "detail" => J::s(&self.detail),
         }
     }
@@ -175,9 +235,15 @@ impl Record {
         self
     }
 
-    /// True when every finding in this record holds.
+    /// True when no finding in this record failed. A finding that was not
+    /// exercised does not fail the record, but it is reported loudly and
+    /// `verify` treats it as a regression when a claim expected it to run.
     pub fn all_findings_hold(&self) -> bool {
-        self.findings.iter().all(|f| f.holds)
+        self.findings.iter().all(|f| !f.failed())
+    }
+
+    pub fn unexercised(&self) -> Vec<&Finding> {
+        self.findings.iter().filter(|f| f.status == Status::NotExercised).collect()
     }
 
     pub fn to_json(&self) -> J {
@@ -216,7 +282,12 @@ impl Record {
             println!("  {}", c.summary(name, "baseline"));
         }
         for f in &self.findings {
-            println!("  [{}] {}: {}", if f.holds { "HOLDS" } else { "FAILS" }, f.id, f.statement);
+            let tag = match f.status {
+                Status::Holds => "HOLDS",
+                Status::Fails => "FAILS",
+                Status::NotExercised => "NOT EXERCISED",
+            };
+            println!("  [{tag}] {}: {}", f.id, f.statement);
             if !f.detail.is_empty() {
                 println!("        {}", f.detail);
             }

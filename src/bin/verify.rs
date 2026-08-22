@@ -1,0 +1,170 @@
+//! Check committed results against committed claims.
+//!
+//! This is the mechanism that keeps the rigorous edge from regressing. Every
+//! statement the project makes about itself is written down in `claims.json`
+//! with the state it is expected to be in, and this program checks the
+//! recorded measurements against it. CI runs it, so a change that alters the
+//! engine's behaviour cannot land while the documentation still says otherwise.
+//!
+//! It is deliberately symmetric. A finding that was expected to fail and now
+//! passes is reported just as loudly as the reverse -- because either the
+//! engine improved and the claim is stale, or the experiment stopped testing
+//! anything. Both need a human. A "not exercised" finding where the claim
+//! expected a real result is also a failure: an untested hazard must never
+//! read as a green build.
+
+use std::path::{Path, PathBuf};
+use supdb::bench::{jparse, Status, J};
+
+struct Outcome {
+    failures: Vec<String>,
+    checked: usize,
+    skipped: Vec<String>,
+}
+
+fn main() -> std::io::Result<()> {
+    let argv: Vec<String> = std::env::args().collect();
+    let arg = |n: &str, d: &str| -> String {
+        argv.iter().position(|a| a == n).and_then(|i| argv.get(i + 1)).cloned().unwrap_or_else(|| d.into())
+    };
+    let claims_path = PathBuf::from(arg("--claims", "claims.json"));
+    let results = PathBuf::from(arg("--results", "results"));
+    // Which profile's results to check. CI checks `ci`; a release checks `full`.
+    let profile = arg("--profile", "ci");
+    let strict = argv.iter().any(|a| a == "--strict");
+
+    let text = std::fs::read_to_string(&claims_path).map_err(|e| {
+        std::io::Error::new(e.kind(), format!("cannot read {}: {e}", claims_path.display()))
+    })?;
+    let claims = jparse::parse(&text)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+    let mut out = Outcome { failures: Vec::new(), checked: 0, skipped: Vec::new() };
+
+    println!("verifying claims in {} against {}/*.{}.json\n", claims_path.display(), results.display(), profile);
+
+    check_findings(&claims, &results, &profile, &mut out);
+    check_metrics(&claims, &results, &profile, &mut out);
+
+    println!("\n{} claim(s) checked", out.checked);
+    if !out.skipped.is_empty() {
+        println!("{} skipped (no result file at this profile):", out.skipped.len());
+        for s in &out.skipped {
+            println!("  - {s}");
+        }
+        if strict {
+            println!("\n--strict: a skipped claim is a failure");
+            out.failures.extend(out.skipped.iter().map(|s| format!("skipped: {s}")));
+        }
+    }
+    if out.failures.is_empty() {
+        println!("\nOK: every claim matches the recorded results.");
+        Ok(())
+    } else {
+        println!("\n{} CLAIM(S) DO NOT MATCH THE RESULTS:", out.failures.len());
+        for f in &out.failures {
+            println!("  x {f}");
+        }
+        println!(
+            "\nEither the engine changed and the claim is stale, or the experiment stopped\n\
+             testing what it says it tests. Both need a decision, not a re-run."
+        );
+        std::process::exit(1);
+    }
+}
+
+fn load(results: &Path, experiment: &str, profile: &str) -> Option<J> {
+    let p = results.join(format!("{experiment}.{profile}.json"));
+    let text = std::fs::read_to_string(p).ok()?;
+    jparse::parse(&text).ok()
+}
+
+fn check_findings(claims: &J, results: &Path, profile: &str, out: &mut Outcome) {
+    let Some(list) = claims.path("findings") else { return };
+    for c in list.items() {
+        let exp = c.path("experiment").and_then(|v| v.as_str()).unwrap_or("");
+        let id = c.path("id").and_then(|v| v.as_str()).unwrap_or("");
+        let want = c.path("expect").and_then(|v| v.as_str()).unwrap_or("holds");
+        let label = format!("{exp}/{id}");
+
+        let Some(doc) = load(results, exp, profile) else {
+            out.skipped.push(label);
+            continue;
+        };
+        out.checked += 1;
+
+        let found = doc
+            .path("findings")
+            .map(|f| f.items())
+            .unwrap_or(&[])
+            .iter()
+            .find(|f| f.path("id").and_then(|v| v.as_str()) == Some(id));
+
+        let Some(f) = found else {
+            out.failures.push(format!("{label}: claimed but the experiment recorded no such finding"));
+            continue;
+        };
+        let got = f.path("status").and_then(|v| v.as_str()).unwrap_or("");
+        let detail = f.path("detail").and_then(|v| v.as_str()).unwrap_or("");
+
+        let want_status = Status::from_str(want);
+        let got_status = Status::from_str(got);
+
+        if got_status == Some(Status::NotExercised) && want_status != Some(Status::NotExercised) {
+            out.failures.push(format!(
+                "{label}: claim expects '{want}' but the run did not exercise it -- {detail}"
+            ));
+            continue;
+        }
+        if got == want {
+            let mark = if got == "fails" { "known-failing" } else { "ok" };
+            println!("  [{mark}] {label}: {}", short(detail));
+        } else {
+            out.failures.push(format!(
+                "{label}: expected '{want}', recorded '{got}' -- {detail}"
+            ));
+        }
+    }
+}
+
+fn check_metrics(claims: &J, results: &Path, profile: &str, out: &mut Outcome) {
+    let Some(list) = claims.path("metrics") else { return };
+    for c in list.items() {
+        let exp = c.path("experiment").and_then(|v| v.as_str()).unwrap_or("");
+        let path = c.path("path").and_then(|v| v.as_str()).unwrap_or("");
+        let label = format!("{exp}:{path}");
+
+        let Some(doc) = load(results, exp, profile) else {
+            out.skipped.push(label);
+            continue;
+        };
+        out.checked += 1;
+
+        let Some(v) = doc.num(path) else {
+            out.failures.push(format!("{label}: path not present in the result"));
+            continue;
+        };
+        if let Some(min) = c.num("min") {
+            if v < min {
+                out.failures.push(format!("{label}: {v:.3} is below the floor {min:.3}"));
+                continue;
+            }
+        }
+        if let Some(max) = c.num("max") {
+            if v > max {
+                out.failures.push(format!("{label}: {v:.3} is above the ceiling {max:.3}"));
+                continue;
+            }
+        }
+        println!("  [ok] {label} = {v:.3}");
+    }
+}
+
+fn short(s: &str) -> String {
+    let one: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one.chars().count() > 110 {
+        format!("{}...", one.chars().take(107).collect::<String>())
+    } else {
+        one
+    }
+}
