@@ -155,6 +155,17 @@ trait Layout {
     /// see the allocator's overhead and that overhead is most of the story.
     fn logical_bytes(&self) -> usize;
     fn lookup(&self, key: &[u8]) -> Option<Ext4>;
+    /// Visit `n` records in key order from sorted position `start`, returning
+    /// an accumulator so the work cannot be optimised away. Ordered scan is a
+    /// category in its own right and a layout that wins point lookups by
+    /// giving up order has not won anything.
+    ///
+    /// Every implementation must touch the key as well as the extent. The
+    /// engine's `scan` hands `(key, value)` to a visitor, so it dereferences
+    /// the key on every entry; a scan benchmark that reads only an inline
+    /// field measures something the engine never does, and flatters exactly
+    /// the layout that keys behind a pointer.
+    fn scan_from(&self, start: usize, n: usize) -> u64;
 }
 
 // ------------------------------------------------------------- heap-hash --
@@ -235,6 +246,15 @@ impl Layout for HeapHash {
             }
             slot = (slot + 1) & self.mask;
         }
+    }
+    fn scan_from(&self, start: usize, n: usize) -> u64 {
+        let end = (start + n).min(self.entries.len());
+        let mut acc = 0u64;
+        for (k, e) in &self.entries[start.min(end)..end] {
+            // The pointer chase the engine's scan actually pays.
+            acc = acc.wrapping_add(e.block as u64).wrapping_add(k[0] as u64);
+        }
+        acc
     }
 }
 
@@ -513,6 +533,32 @@ impl Layout for Packed {
         }
         None
     }
+    fn scan_from(&self, start: usize, n: usize) -> u64 {
+        let r = start / RESTART_EVERY;
+        let Some((_, off)) = self.restarts.get(r) else {
+            return 0;
+        };
+        let mut p = *off as usize;
+        let mut acc = 0u64;
+        let mut seen = 0usize;
+        let mut idx = r * RESTART_EVERY;
+        while p < self.blob.len() && seen < n {
+            let _shared = get_uv(&self.blob, &mut p) as usize;
+            let suffix = get_uv(&self.blob, &mut p) as usize;
+            let kb = if suffix > 0 { self.blob[p] as u64 } else { 0 };
+            p += suffix;
+            let b = get_uv(&self.blob, &mut p).wrapping_add(kb);
+            let _ = get_uv(&self.blob, &mut p);
+            let _ = get_uv(&self.blob, &mut p);
+            let _ = get_uv(&self.blob, &mut p);
+            if idx >= start {
+                acc = acc.wrapping_add(b);
+                seen += 1;
+            }
+            idx += 1;
+        }
+        acc
+    }
 }
 
 // ---------------------------------------------------- hash over a packed blob --
@@ -583,6 +629,9 @@ impl Layout for HashPacked {
             }
             slot = (slot + 1) & self.mask;
         }
+    }
+    fn scan_from(&self, start: usize, n: usize) -> u64 {
+        self.packed.scan_from(start, n)
     }
 }
 
@@ -688,6 +737,200 @@ impl Layout for HashFlat {
             slot = (slot + 1) & self.mask;
         }
     }
+    fn scan_from(&self, start: usize, n: usize) -> u64 {
+        let r = start / RESTART_EVERY;
+        let Some(off) = self.restarts.get(r) else {
+            return 0;
+        };
+        let mut p = *off as usize;
+        let mut acc = 0u64;
+        let mut seen = 0usize;
+        let mut idx = r * RESTART_EVERY;
+        while p < self.blob.len() && seen < n {
+            let kl = u16::from_le_bytes(self.blob[p..p + 2].try_into().unwrap()) as usize;
+            let kb = if kl > 0 { self.blob[p + 2] as u64 } else { 0 };
+            p += 2 + kl;
+            let b = get_uv(&self.blob, &mut p).wrapping_add(kb);
+            let _ = get_uv(&self.blob, &mut p);
+            let _ = get_uv(&self.blob, &mut p);
+            let _ = get_uv(&self.blob, &mut p);
+            if idx >= start {
+                acc = acc.wrapping_add(b);
+                seen += 1;
+            }
+            idx += 1;
+        }
+        acc
+    }
+}
+
+// ------------------------------------------------- paged, prefix per page --
+
+/// Records grouped into fixed-count pages, each page storing its keys' common
+/// prefix once and a slot directory for O(1) access to any record in it.
+///
+/// This is the composite the frontier argues for. `packed` is small because it
+/// prefix-compresses each key against its predecessor, but that makes a record
+/// undecodable without replaying the ones before it -- which is why
+/// `hash+packed` misses fast and hits slowly. Sharing the prefix at *page*
+/// granularity instead keeps most of the space saving while leaving every
+/// record independently decodable, so one structure can serve a point lookup
+/// and an ordered scan without either paying for the other.
+///
+/// The hash stores a rank, not a byte offset, so the page directory can move
+/// pages without touching it.
+const PER_PAGE: usize = 128;
+
+struct HashPaged {
+    pages: Vec<u8>,
+    /// Byte offset of each page. Pages are packed end to end, so nothing is
+    /// wasted on alignment.
+    page_dir: Vec<u32>,
+    hash: Vec<(u8, u32)>,
+    mask: usize,
+    len: usize,
+}
+
+impl HashPaged {
+    fn build(keys: &[Vec<u8>], exts: &[Ext4]) -> HashPaged {
+        let mut pages: Vec<u8> = Vec::with_capacity(keys.len() * 16);
+        let mut page_dir = Vec::with_capacity(keys.len() / PER_PAGE + 1);
+        for chunk_start in (0..keys.len()).step_by(PER_PAGE) {
+            let end = (chunk_start + PER_PAGE).min(keys.len());
+            let group = &keys[chunk_start..end];
+            let base = pages.len();
+            page_dir.push(base as u32);
+            let prefix = match (group.first(), group.last()) {
+                (Some(a), Some(b)) => a.iter().zip(b).take_while(|(x, y)| x == y).count(),
+                _ => 0,
+            };
+            let count = group.len();
+            pages.extend_from_slice(&(prefix as u16).to_le_bytes());
+            pages.extend_from_slice(&(count as u16).to_le_bytes());
+            pages.extend_from_slice(&group[0][..prefix]);
+            let slot_base = pages.len();
+            pages.resize(slot_base + 2 * count, 0);
+            for (j, k) in group.iter().enumerate() {
+                let off = (pages.len() - base) as u16;
+                pages[slot_base + 2 * j..slot_base + 2 * j + 2].copy_from_slice(&off.to_le_bytes());
+                let suffix = &k[prefix..];
+                pages.extend_from_slice(&(suffix.len() as u16).to_le_bytes());
+                pages.extend_from_slice(suffix);
+                let e = exts[chunk_start + j];
+                put_uv(&mut pages, e.block as u64);
+                put_uv(&mut pages, e.off as u64);
+                put_uv(&mut pages, e.len as u64);
+                put_uv(&mut pages, e.last as u64);
+            }
+        }
+        pages.shrink_to_fit();
+        page_dir.shrink_to_fit();
+
+        let mut cap = 1usize;
+        while cap < keys.len() * 2 {
+            cap <<= 1;
+        }
+        cap = cap.max(16);
+        let mask = cap - 1;
+        let mut hash = vec![(0u8, u32::MAX); cap];
+        for (i, k) in keys.iter().enumerate() {
+            let h = key_hash(k);
+            let mut slot = (h as usize) & mask;
+            while hash[slot].1 != u32::MAX {
+                slot = (slot + 1) & mask;
+            }
+            hash[slot] = (((h >> 56) as u8) | 1, i as u32);
+        }
+        HashPaged {
+            pages,
+            page_dir,
+            hash,
+            mask,
+            len: keys.len(),
+        }
+    }
+
+    /// (key prefix, slot offset within the page) for a record by rank.
+    #[inline]
+    fn locate(&self, rank: usize) -> Option<(usize, usize, usize)> {
+        let page = rank / PER_PAGE;
+        let slot = rank % PER_PAGE;
+        let base = *self.page_dir.get(page)? as usize;
+        let prefix = u16::from_le_bytes(self.pages[base..base + 2].try_into().unwrap()) as usize;
+        let count = u16::from_le_bytes(self.pages[base + 2..base + 4].try_into().unwrap()) as usize;
+        if slot >= count {
+            return None;
+        }
+        let slot_base = base + 4 + prefix;
+        let off = u16::from_le_bytes(
+            self.pages[slot_base + 2 * slot..slot_base + 2 * slot + 2]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        Some((base, prefix, base + off))
+    }
+}
+
+impl Layout for HashPaged {
+    fn name(&self) -> &'static str {
+        "hash+paged"
+    }
+    fn logical_bytes(&self) -> usize {
+        self.pages.capacity()
+            + self.page_dir.capacity() * 4
+            + self.hash.capacity() * std::mem::size_of::<(u8, u32)>()
+    }
+    fn lookup(&self, key: &[u8]) -> Option<Ext4> {
+        let h = key_hash(key);
+        let tag = ((h >> 56) as u8) | 1;
+        let mut slot = (h as usize) & self.mask;
+        loop {
+            let (t, rank) = self.hash[slot];
+            if rank == u32::MAX {
+                return None;
+            }
+            if t == tag {
+                if let Some((base, prefix, at)) = self.locate(rank as usize) {
+                    let sl =
+                        u16::from_le_bytes(self.pages[at..at + 2].try_into().unwrap()) as usize;
+                    let mut p = at + 2;
+                    // Compare against prefix then suffix without rebuilding
+                    // the key: the prefix is shared by the whole page.
+                    if key.len() == prefix + sl
+                        && key[..prefix] == self.pages[base + 4..base + 4 + prefix]
+                        && key[prefix..] == self.pages[p..p + sl]
+                    {
+                        p += sl;
+                        return Some(Ext4 {
+                            block: get_uv(&self.pages, &mut p) as u32,
+                            off: get_uv(&self.pages, &mut p) as u32,
+                            len: get_uv(&self.pages, &mut p) as u32,
+                            last: get_uv(&self.pages, &mut p) as u32,
+                        });
+                    }
+                }
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+    fn scan_from(&self, start: usize, n: usize) -> u64 {
+        let mut acc = 0u64;
+        let mut rank = start;
+        let end = (start + n).min(self.len);
+        while rank < end {
+            let Some((_, _, at)) = self.locate(rank) else {
+                break;
+            };
+            let sl = u16::from_le_bytes(self.pages[at..at + 2].try_into().unwrap()) as usize;
+            let kb = if sl > 0 { self.pages[at + 2] as u64 } else { 0 };
+            let mut p = at + 2 + sl;
+            acc = acc
+                .wrapping_add(get_uv(&self.pages, &mut p))
+                .wrapping_add(kb);
+            rank += 1;
+        }
+        acc
+    }
 }
 
 // ----------------------------------------------------------------- btree --
@@ -706,6 +949,9 @@ struct BTree {
     /// Levels from root to leaf; reported so a page-size change that alters
     /// the tree's shape is visible rather than inferred from timings.
     height: usize,
+    /// Leaves are emitted before branches, so an ordered scan is a walk of
+    /// [0, leaf_end) rather than a traversal.
+    leaf_end: usize,
 }
 
 impl BTree {
@@ -761,6 +1007,7 @@ impl BTree {
             leaf_seps.push((first, base as u32));
         }
 
+        let leaf_end = pages.len();
         let mut level = leaf_seps;
         let mut height = 1usize;
         let mut root = level[0].1 as usize;
@@ -800,6 +1047,7 @@ impl BTree {
             page_size,
             root,
             height,
+            leaf_end,
         }
     }
 
@@ -882,6 +1130,38 @@ impl Layout for BTree {
             }
         }
     }
+    /// NOTE: this walks leaves from the beginning rather than descending to
+    /// `start`, so its cost includes an O(start) prefix walk. That is a
+    /// property of this harness, not of B+trees -- a real implementation seeks
+    /// to the leaf first. The figure is reported for completeness and must not
+    /// be read as a B+tree scan rate. The tree is dominated on the other two
+    /// axes regardless, which is why this was not worth fixing.
+    fn scan_from(&self, start: usize, n: usize) -> u64 {
+        let mut acc = 0u64;
+        let (mut seen, mut idx) = (0usize, 0usize);
+        let mut base = 0usize;
+        while base < self.leaf_end && seen < n {
+            let count =
+                u16::from_le_bytes(self.pages[base + 1..base + 3].try_into().unwrap()) as usize;
+            for i in 0..count {
+                if seen >= n {
+                    break;
+                }
+                if idx >= start {
+                    let e = self.slot(base, count, i);
+                    let kl = u16::from_le_bytes(self.pages[e..e + 2].try_into().unwrap()) as usize;
+                    let p = e + 2 + kl;
+                    acc = acc.wrapping_add(u32::from_le_bytes(
+                        self.pages[p..p + 4].try_into().unwrap(),
+                    ) as u64);
+                    seen += 1;
+                }
+                idx += 1;
+            }
+            base += self.page_size;
+        }
+        acc
+    }
 }
 
 // ------------------------------------------------------------------ main --
@@ -908,17 +1188,19 @@ fn build_layout(which: &str, keys: &[Vec<u8>], exts: &[Ext4]) -> Box<dyn Layout>
         "packed+radix" => Box::new(Packed::build(keys, exts, 18)),
         "hash+packed" => Box::new(HashPacked::build(keys, exts)),
         "hash+flat" => Box::new(HashFlat::build(keys, exts)),
+        "hash+paged" => Box::new(HashPaged::build(keys, exts)),
         other => panic!("unknown layout {other}"),
     }
 }
 
-const LAYOUTS: [&str; 6] = [
+const LAYOUTS: [&str; 7] = [
     "heap-hash",
     "btree",
     "packed",
     "packed+radix",
     "hash+packed",
     "hash+flat",
+    "hash+paged",
 ];
 
 fn main() -> std::io::Result<()> {
@@ -1027,6 +1309,24 @@ fn main() -> std::io::Result<()> {
                     t.elapsed().as_secs_f64() * 1e9 / lookups as f64
                 });
 
+                // Ordered scan: the other category. A layout that wins point
+                // lookups by abandoning order has not won anything, and the
+                // engine's `scan` is a first-class API.
+                let scan_len = 1000usize.min(keys.len());
+                let scan = Trial::new(profile.reps().min(5)).run(1, |_, _| {
+                    let mut r = Rng::new(0x5CA5);
+                    let rounds = 200usize;
+                    let t = Instant::now();
+                    let mut acc = 0u64;
+                    for _ in 0..rounds {
+                        let from = (r.next() as usize) % (keys.len() - scan_len).max(1);
+                        acc = acc.wrapping_add(l.scan_from(from, scan_len));
+                    }
+                    std::hint::black_box(acc);
+                    t.elapsed().as_secs_f64() * 1e9 / (rounds * scan_len) as f64
+                });
+                let scan_ns = scan[0].median();
+
                 // Resident size, measured in a child so the allocator's
                 // overhead is counted rather than estimated.
                 let o = std::process::Command::new(&exe)
@@ -1057,12 +1357,12 @@ fn main() -> std::io::Result<()> {
                     packed_samples.insert((shape.as_str(), n), s[0].clone());
                 }
                 println!(
-                    "  {:<13} {:>10} keys  hit {:>7.1} ns  miss {:>7.1} ns  {:>6.1} B/key logical  {:>6.1} B/key resident",
+                    "  {:<13} {:>10} keys  hit {:>7.1} ns  miss {:>7.1} ns  scan {:>6.2} ns/e  {:>6.1} B/key",
                     which,
                     keys.len(),
                     hit_ns,
                     miss_ns,
-                    logical as f64 / keys.len() as f64,
+                    scan_ns,
                     rss / keys.len() as f64
                 );
                 rows.push(jobj! {
@@ -1073,6 +1373,7 @@ fn main() -> std::io::Result<()> {
                     "miss_ns" => J::fp(miss_ns, 2),
                     "logical_bytes_per_key" => J::fp(logical as f64 / keys.len() as f64, 2),
                     "resident_bytes_per_key" => J::fp(rss / keys.len() as f64, 2),
+                    "scan_ns_per_entry" => J::fp(scan_ns, 3),
                     "build_ms" => J::fp(build_ms, 2),
                     "btree_height" => J::u(height),
                     "hit_samples" => s[0].to_json(),
@@ -1145,6 +1446,20 @@ fn main() -> std::io::Result<()> {
             format!("B+tree {bl:.0} ns / {bb:.0} B/key against a plain packed array at {pl:.0} ns / {pb:.0} B/key: the array is {} on both axes, so the tree is dominated. Loaded at 100% fill, which flatters it -- a mutated tree sits nearer 65-70%", if dominated { "better" } else { "not better" }),
         ));
     }
+    if let (Some(hs), Some(ps)) = (
+        get("decimal16", "heap-hash", "scan_ns_per_entry"),
+        get("decimal16", "hash+paged", "scan_ns_per_entry"),
+    ) {
+        rec.finding(Finding::new(
+            "F9.5",
+            "the composite layout scans in order at least as fast as the current index",
+            ps <= hs,
+            format!(
+                "hash+paged {ps:.2} ns/entry against heap-hash {hs:.2} ns/entry ({:.2}x)",
+                ps / hs.max(1e-9)
+            ),
+        ));
+    }
     if let (Some(smooth), Some(rough)) = (
         get("decimal16", "packed+radix", "hit_ns"),
         get("clustered", "packed+radix", "hit_ns"),
@@ -1156,6 +1471,11 @@ fn main() -> std::io::Result<()> {
             format!("clustered {rough:.0} ns against smooth {smooth:.0} ns ({:.2}x). Indexing by key value rather than by comparison is only as good as its assumption about the distribution, and the radix layer collapsed entirely on decimal keys until the shared prefix was stripped", rough / smooth.max(1e-9)),
         ));
     }
+    rec.note(
+        "The B+tree's scan figure includes an O(start) prefix walk because this harness does not \
+         seek to the starting leaf. It is a harness artifact, not a property of B+trees, and is \
+         reported only so the column is not silently blank",
+    );
     rec.note(
         "This measures a proposed replacement, not the shipped engine. Layouts are built in \
          memory rather than mapped from a file, so the figures are an upper bound on what an \
