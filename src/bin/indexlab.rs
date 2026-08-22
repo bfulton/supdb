@@ -1028,6 +1028,16 @@ struct PagedBlob {
     /// compiled in, so the same binary is sized correctly on a machine with
     /// 128-byte lines as on one with 64.
     per_page: usize,
+    /// Extents written as four fixed 32-bit words rather than four varints.
+    ///
+    /// `hash+flatfixed` established that varint decoding, not cache misses,
+    /// was the whole of the gap between the heap index and the mmap-able one:
+    /// cachegrind put `hash+flat` and `hash+flatfixed` within 1.5% of each
+    /// other on misses while they were 180ns apart. The paged layouts decode
+    /// four varints per hit on exactly the same path, so both arms are kept
+    /// here and measured interleaved -- the space this costs is the thing
+    /// being traded, and a claim about it has to come from one process.
+    fixed: bool,
     pages: Vec<u8>,
     /// Byte offset of each page. Pages are packed end to end, so nothing is
     /// wasted on alignment.
@@ -1039,14 +1049,19 @@ struct HashPaged {
     blob: PagedBlob,
     hash: Vec<(u8, u32)>,
     mask: usize,
+    named: &'static str,
 }
 
 impl PagedBlob {
     fn build(keys: &[Vec<u8>], exts: &[Ext4]) -> PagedBlob {
-        Self::build_with(keys, exts, per_page_setting())
+        Self::build_with(keys, exts, per_page_setting(), false)
     }
 
-    fn build_with(keys: &[Vec<u8>], exts: &[Ext4], per_page: usize) -> PagedBlob {
+    fn build_fixed(keys: &[Vec<u8>], exts: &[Ext4]) -> PagedBlob {
+        Self::build_with(keys, exts, per_page_setting(), true)
+    }
+
+    fn build_with(keys: &[Vec<u8>], exts: &[Ext4], per_page: usize, fixed: bool) -> PagedBlob {
         let mut pages: Vec<u8> = Vec::with_capacity(keys.len() * 16);
         let mut page_dir = Vec::with_capacity(keys.len() / PER_PAGE + 1);
         for chunk_start in (0..keys.len()).step_by(per_page) {
@@ -1071,10 +1086,16 @@ impl PagedBlob {
                 pages.extend_from_slice(&(suffix.len() as u16).to_le_bytes());
                 pages.extend_from_slice(suffix);
                 let e = exts[chunk_start + j];
-                put_uv(&mut pages, e.block as u64);
-                put_uv(&mut pages, e.off as u64);
-                put_uv(&mut pages, e.len as u64);
-                put_uv(&mut pages, e.last as u64);
+                if fixed {
+                    for v in [e.block, e.off, e.len, e.last] {
+                        pages.extend_from_slice(&v.to_le_bytes());
+                    }
+                } else {
+                    put_uv(&mut pages, e.block as u64);
+                    put_uv(&mut pages, e.off as u64);
+                    put_uv(&mut pages, e.len as u64);
+                    put_uv(&mut pages, e.last as u64);
+                }
             }
         }
         pages.shrink_to_fit();
@@ -1082,6 +1103,7 @@ impl PagedBlob {
 
         PagedBlob {
             per_page,
+            fixed,
             pages,
             page_dir,
             len: keys.len(),
@@ -1124,6 +1146,19 @@ impl PagedBlob {
             return None;
         }
         p += sl;
+        if self.fixed {
+            let mut v = [0u32; 4];
+            for w in v.iter_mut() {
+                *w = u32::from_le_bytes(self.pages[p..p + 4].try_into().unwrap());
+                p += 4;
+            }
+            return Some(Ext4 {
+                block: v[0],
+                off: v[1],
+                len: v[2],
+                last: v[3],
+            });
+        }
         Some(Ext4 {
             block: get_uv(&self.pages, &mut p) as u32,
             off: get_uv(&self.pages, &mut p) as u32,
@@ -1143,9 +1178,12 @@ impl PagedBlob {
             let sl = u16::from_le_bytes(self.pages[at..at + 2].try_into().unwrap()) as usize;
             let kb = if sl > 0 { self.pages[at + 2] as u64 } else { 0 };
             let mut p = at + 2 + sl;
-            acc = acc
-                .wrapping_add(get_uv(&self.pages, &mut p))
-                .wrapping_add(kb);
+            let first = if self.fixed {
+                u32::from_le_bytes(self.pages[p..p + 4].try_into().unwrap()) as u64
+            } else {
+                get_uv(&self.pages, &mut p)
+            };
+            acc = acc.wrapping_add(first).wrapping_add(kb);
             rank += 1;
         }
         acc
@@ -1153,8 +1191,12 @@ impl PagedBlob {
 }
 
 impl HashPaged {
-    fn build(keys: &[Vec<u8>], exts: &[Ext4]) -> HashPaged {
-        let blob = PagedBlob::build(keys, exts);
+    fn build(keys: &[Vec<u8>], exts: &[Ext4], fixed: bool) -> HashPaged {
+        let blob = if fixed {
+            PagedBlob::build_fixed(keys, exts)
+        } else {
+            PagedBlob::build(keys, exts)
+        };
         let mut cap = 1usize;
         while cap < keys.len() * 2 {
             cap <<= 1;
@@ -1170,13 +1212,18 @@ impl HashPaged {
             }
             hash[slot] = (((h >> 56) as u8) | 1, i as u32);
         }
-        HashPaged { blob, hash, mask }
+        HashPaged {
+            blob,
+            hash,
+            mask,
+            named: if fixed { "hash+pagedfixed" } else { "hash+paged" },
+        }
     }
 }
 
 impl Layout for HashPaged {
     fn name(&self) -> &'static str {
-        "hash+paged"
+        self.named
     }
     fn logical_bytes(&self) -> usize {
         self.blob.bytes() + self.hash.capacity() * std::mem::size_of::<(u8, u32)>()
@@ -1467,8 +1514,12 @@ struct MphPaged {
 }
 
 impl MphPaged {
-    fn build(keys: &[Vec<u8>], exts: &[Ext4], with_bloom: bool) -> MphPaged {
-        let blob = PagedBlob::build(keys, exts);
+    fn build(keys: &[Vec<u8>], exts: &[Ext4], with_bloom: bool, fixed: bool) -> MphPaged {
+        let blob = if fixed {
+            PagedBlob::build_fixed(keys, exts)
+        } else {
+            PagedBlob::build(keys, exts)
+        };
         let mph = Mphf::build(keys);
         let mut rank_of_slot = vec![u32::MAX; mph.n];
         for (rank, k) in keys.iter().enumerate() {
@@ -1484,10 +1535,11 @@ impl MphPaged {
             } else {
                 None
             },
-            named: if with_bloom {
-                "mph+bloom+paged"
-            } else {
-                "mph+paged"
+            named: match (with_bloom, fixed) {
+                (true, false) => "mph+bloom+paged",
+                (true, true) => "mph+bloom+pagedfixed",
+                (false, false) => "mph+paged",
+                (false, true) => "mph+pagedfixed",
             },
         }
     }
@@ -1787,14 +1839,16 @@ fn build_layout(which: &str, keys: &[Vec<u8>], exts: &[Ext4]) -> Box<dyn Layout>
         "hash+packed" => Box::new(HashPacked::build(keys, exts)),
         "hash+flat" => Box::new(HashFlat::build(keys, exts)),
         "hash+flatfixed" => Box::new(HashFlatFixed::build(keys, exts)),
-        "hash+paged" => Box::new(HashPaged::build(keys, exts)),
-        "mph+paged" => Box::new(MphPaged::build(keys, exts, false)),
-        "mph+bloom+paged" => Box::new(MphPaged::build(keys, exts, true)),
+        "hash+paged" => Box::new(HashPaged::build(keys, exts, false)),
+        "hash+pagedfixed" => Box::new(HashPaged::build(keys, exts, true)),
+        "mph+paged" => Box::new(MphPaged::build(keys, exts, false, false)),
+        "mph+pagedfixed" => Box::new(MphPaged::build(keys, exts, false, true)),
+        "mph+bloom+paged" => Box::new(MphPaged::build(keys, exts, true, false)),
         other => panic!("unknown layout {other}"),
     }
 }
 
-const LAYOUTS: [&str; 10] = [
+const LAYOUTS: [&str; 12] = [
     "heap-hash",
     "btree",
     "packed",
@@ -1803,7 +1857,9 @@ const LAYOUTS: [&str; 10] = [
     "hash+flat",
     "hash+flatfixed",
     "hash+paged",
+    "hash+pagedfixed",
     "mph+paged",
+    "mph+pagedfixed",
     "mph+bloom+paged",
 ];
 
