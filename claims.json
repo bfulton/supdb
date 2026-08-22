@@ -91,6 +91,58 @@
       "id": "EXT.3",
       "expect": "fails",
       "because": "On YCSB-A (50/50 read/write) Supdb runs 13.5x slower than on read-only YCSB-C. Store exposes no read method, so a read following a write needs a checkpoint plus a fresh Reader, both O(key count). No benchmark in the design document mixes reads and writes, which is why this never appeared."
+    },
+    {
+      "experiment": "f1-outofcore",
+      "id": "F1.1",
+      "expect": "holds",
+      "because": "A cold measurement must be able to prove it was cold. The design document confesses that its earlier cold-read numbers were served from pages the JVM had pinned across drop_caches, invalidating all of them."
+    },
+    {
+      "experiment": "f1-outofcore",
+      "id": "F1.2",
+      "profile": "ci",
+      "expect": "not_exercised",
+      "because": "The ci profile builds 64MB on a 16GB machine, so the dataset never leaves the page cache. Recorded as not-exercised rather than passing, because an untested hazard must not read as a green build."
+    },
+    {
+      "experiment": "f1-outofcore",
+      "id": "F1.2",
+      "profile": "full",
+      "expect": "fails",
+      "because": "Measured at 23.0GB against 15.7GB of RAM: 338,681 reads/s resident against 370 out-of-core, a 916x degradation. The engine reads through a read-only mmap with no madvise anywhere, so it has no readahead control, no asynchronous I/O and no influence over eviction -- the failure modes Crotty et al. (CIDR'22) enumerate."
+    },
+    {
+      "experiment": "f1-outofcore",
+      "id": "F1.4",
+      "profile": "full",
+      "expect": "fails",
+      "because": "Out-of-core read latency is bimodal: p50 0.155ms but p99 9.5ms and max 81ms. Every cache miss is a synchronous page fault the engine cannot see coming or overlap."
+    },
+    {
+      "experiment": "f1-outofcore",
+      "id": "F1.3",
+      "profile": "full",
+      "expect": "holds",
+      "because": "The precondition: the stored file must exceed the memory available to cache it. 23.0GB against 15.7GB, ratio 1.47."
+    },
+    {
+      "experiment": "f7-index",
+      "id": "F7.1",
+      "expect": "fails",
+      "because": "Reader memory is linear in key count. Reader::build allocates one Vec<u8> per key plus a 2N-slot hash table, all on the heap, all before the first read."
+    },
+    {
+      "experiment": "f7-index",
+      "id": "F7.2",
+      "expect": "fails",
+      "because": "About 131 bytes of resident index per key, to index a 100-byte value -- and paid again by every reader process, shared with nobody. In RUM terms this is the memory the design spends to buy read performance; the objection is that it was unmeasured and that the stated architecture is many reader processes sharing one mapping."
+    },
+    {
+      "experiment": "f7-index",
+      "id": "F7.3",
+      "expect": "holds",
+      "because": "Eight concurrent readers must still hold a 10M-key store on a 16GB machine. It holds with thin margin -- the ceiling is about 16M keys each -- so this is the guard that would catch the per-key cost growing."
     }
   ],
   "metrics": [

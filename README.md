@@ -39,6 +39,9 @@ numbers, not headline ones.
 file — 1.55× smaller than LMDB on the same data. Every reader process sees a
 complete, self-consistent state under a live writer. Chunk-granular
 decompression inside a packed block is a genuinely good idea and it works.
+Device-level write amplification is **0.96×** — genuinely below one, because
+compression more than pays for the append-only overhead. That is a real result
+and it is the design's strongest number.
 
 **What does not.**
 
@@ -52,9 +55,18 @@ decompression inside a packed block is a genuinely good idea and it works.
 | many reader processes are safe | 80 readers past the 64-slot table, held 35 s past the 30 s stale window: **2 read errors** |
 | Supdb reads faster than LMDB | measured natively, LMDB is **2.4× faster** on reads and 4.7× on scans |
 | Supdb sustains a mixed read/write workload | YCSB-A runs **13.5× slower** than read-only YCSB-C |
+| reads survive the dataset outgrowing memory | **916× degradation** — 338,681 reads/s resident vs 370 at 23 GB against 15.7 GB of RAM; p99 9.5 ms |
+| the reader index is affordable | **131 bytes per key**, resident, per process, shared with nobody — to index a 100-byte value |
 
-The last two matter most, because they contradict the design document rather
-than merely extending it. The LMDB comparison reverses once the Java harness is
+The out-of-core result is the largest single number in the suite, and it is
+the only one measured at `--profile full`, so it is the only citable one.
+Reading through a mmap with no `madvise` anywhere means no readahead control,
+no asynchronous I/O and no influence over eviction — the failure modes Crotty
+et al. (CIDR'22) enumerate — and none of them are visible until the working
+set stops fitting.
+
+The LMDB and YCSB results matter for a different reason: they contradict the
+design document rather than merely extending it. The LMDB comparison reverses once the Java harness is
 removed. The mixed-workload result is structural: `Store` exposes no read
 method, so a read after a write needs a checkpoint and a fresh `Reader`, both
 `O(key count)` — and no benchmark in the original suite mixes reads with

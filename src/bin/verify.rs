@@ -110,6 +110,15 @@ fn check_findings(claims: &J, results: &Path, profile: &str, out: &mut Outcome) 
         let exp = c.path("experiment").and_then(|v| v.as_str()).unwrap_or("");
         let id = c.path("id").and_then(|v| v.as_str()).unwrap_or("");
         let want = c.path("expect").and_then(|v| v.as_str()).unwrap_or("holds");
+        // A claim may pin itself to one profile. An out-of-core finding cannot
+        // hold at `ci`, where the dataset is 64MB on a 16GB machine, and a
+        // claim that ignored that would either fail every CI run or have to be
+        // written so loosely it checked nothing.
+        if let Some(want_profile) = c.path("profile").and_then(|v| v.as_str()) {
+            if want_profile != profile {
+                continue;
+            }
+        }
         let label = format!("{exp}/{id}");
 
         let Some(doc) = load(results, exp, profile) else {

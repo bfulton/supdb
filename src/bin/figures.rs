@@ -82,8 +82,15 @@ fn main() -> std::io::Result<()> {
     if let Some(d) = load(&results, "f1-outofcore", &profile) {
         emit(
             "f1-outofcore",
-            "Read latency, warm against cold",
+            "Read latency once the dataset outgrows memory",
             fig_outofcore(&d),
+        )?;
+    }
+    if let Some(d) = load(&results, "f7-index", &profile) {
+        emit(
+            "f7-index",
+            "Reader index memory against key count",
+            fig_index(&d),
         )?;
     }
 
@@ -325,15 +332,15 @@ fn fig_outofcore(d: &J) -> String {
             .collect()
     };
     let mut c = Chart::new(
-        "Read latency once the page cache is gone",
+        "Read latency once the dataset outgrows memory",
         "1 / (1 - percentile)",
         "read latency (ms)",
     )
     .subtitle("mmap with no madvise: no readahead control, no async I/O, no eviction policy")
     .log_x()
     .log_y()
-    .add(Series::new("warm", curve("warm")))
-    .add(Series::new("cold", curve("cold")));
+    .add(Series::new("resident", curve("resident")))
+    .add(Series::new("out of core", curve("cold")));
     let b = curve("ballasted");
     if !b.is_empty() {
         c = c.add(Series::new("cache squeezed", b));
@@ -437,6 +444,41 @@ fn fig_extkv(d: &J) -> String {
         "Log scale. The design document reports Supdb ahead of LMDB on warm reads, measured \
          through a Java harness with an adapter it separately found to allocate per value and \
          open a transaction per lookup. Measured natively, the ordering reverses.",
+    )
+    .to_svg()
+}
+
+/// Reader index memory against key count, with the shared-index alternative.
+fn fig_index(d: &J) -> String {
+    let rows = d.path("series.scaling").map(|s| s.items()).unwrap_or(&[]);
+    let one: Vec<(f64, f64)> = rows
+        .iter()
+        .filter_map(|p| Some((p.num("keys")?, p.num("index_rss_mb")?)))
+        .collect();
+    let eight: Vec<(f64, f64)> = one.iter().map(|(k, m)| (*k, m * 8.0)).collect();
+    let ram = d.num("extrapolation.machine_ram_gb").unwrap_or(0.0) * 1024.0;
+    let ramline: Vec<(f64, f64)> = match (one.first(), one.last()) {
+        (Some((x0, _)), Some((x1, _))) if ram > 0.0 => vec![(*x0, ram), (*x1, ram)],
+        _ => vec![],
+    };
+    Chart::new(
+        "The index is resident, per process, and shared with nobody",
+        "keys in the store",
+        "reader index memory (MB)",
+    )
+    .subtitle(
+        "Reader::build allocates one Vec per key plus a 2N-slot hash table, before the first read",
+    )
+    .log_x()
+    .log_y()
+    .add(Series::new("one reader", one))
+    .add(Series::new("eight readers", eight))
+    .add(Series::new("machine RAM", ramline).as_reference())
+    .caption(
+        "An index read through a shared mapping would cost this once for the machine, not once \
+         per process. In RUM terms (Athanassoulis et al., EDBT'16) this is the memory spent to \
+         buy read performance -- a legitimate trade, but the term that decides how many reader \
+         processes fit, and many reader processes is the premise.",
     )
     .to_svg()
 }

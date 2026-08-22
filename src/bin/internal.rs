@@ -16,6 +16,7 @@
 //!   f4-durability  throughput against the data-loss window
 //!   f5-latency     the distribution behind the throughput means
 //!   f6-threads     write throughput against writer-thread count
+//!   f7-index       reader memory against key count, and the ceiling it implies
 //!
 //! Run `internal all --profile dev` for everything.
 
@@ -87,6 +88,7 @@ fn main() -> std::io::Result<()> {
             "f4-durability" => f4_durability(&args, profile)?,
             "f5-latency" => f5_latency(&args, profile)?,
             "f6-threads" => f6_threads(&args, profile)?,
+            "f7-index" => f7_index(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -100,6 +102,7 @@ fn main() -> std::io::Result<()> {
     match cmd.as_str() {
         // Child modes, used by experiments that must measure a fresh process.
         "f2-child" => f2_child(&args),
+        "f7-child" => f7_child(&args),
         "f3-reader" => f3_reader(&args),
         "all" => {
             let mut failed = Vec::new();
@@ -107,6 +110,7 @@ fn main() -> std::io::Result<()> {
                 "f5-latency",
                 "f6-threads",
                 "f2-open",
+                "f7-index",
                 "f4-durability",
                 "f3-multiproc",
                 "f1-outofcore",
@@ -144,6 +148,7 @@ internal <experiment> [--profile ci|dev|full] [--out DIR]
   f4-durability  throughput vs data-loss window
   f5-latency     the distribution behind the throughput means
   f6-threads     write throughput vs writer-thread count
+  f7-index       reader memory vs key count, and the ceiling it implies
   all            every experiment above
 ";
 
@@ -925,10 +930,21 @@ fn f4_durability(args: &Args, profile: Profile) -> std::io::Result<Record> {
 /// cache, making a smaller dataset genuinely out-of-core. Both are recorded,
 /// so a result can never claim to be cold without saying how it got cold.
 fn f1_outofcore(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    let value_size = args.num("--value-size", 100);
-    let data_mb = args.num("--data-mb", profile.pick(64, 1_024, 8_192)) as u64;
+    // Value size matters more here than anywhere else. At 100 bytes a
+    // dataset large enough to exceed memory needs hundreds of millions of
+    // keys, and the reader would exhaust the heap materialising the index
+    // before it could read a byte -- which is a real failure, but a different
+    // one. Larger values put the pressure on storage rather than on the index,
+    // which is what this experiment is for. See f7-index for the other axis.
+    let value_size = args.num("--value-size", 4096);
+    let data_mb = args.num("--data-mb", profile.pick(64, 1_024, 24_576)) as u64;
     let ballast_gb = args.f64("--ballast-gb", 0.0);
-    let reads = args.num("--reads", profile.pick(20_000, 200_000, 1_000_000)) as u64;
+    let reads = args.num("--reads", profile.pick(20_000, 50_000, 100_000)) as u64;
+    // Compression works against this experiment: what has to exceed memory is
+    // the file, because that is what the page cache holds. Highly compressible
+    // values produce a small file that stays resident no matter how much
+    // logical data went into it.
+    let compressibility = args.f64("--compressibility", 0.1);
     let dist = KeyDist::parse(args.get("--dist").unwrap_or("uniform")).unwrap_or(KeyDist::Uniform);
 
     let mem = env::mem_total_bytes();
@@ -948,7 +964,35 @@ fn f1_outofcore(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let dir = scratch("f1");
     let file = dir.join("s.dat");
-    let payload = Payload::new(value_size, 0.5, 0xF1);
+    let payload = Payload::new(value_size, compressibility, 0xF1);
+
+    // A resident control, built first and sized to sit comfortably inside
+    // memory. Without it the only comparison available is warm-against-cold
+    // within the large dataset -- and once the file exceeds RAM the "warm"
+    // pass was never warm, so the two agree and the experiment reports that
+    // nothing degraded. That is a false green, and the first run of this
+    // experiment produced exactly one.
+    let resident_mb = args.num("--resident-mb", 512) as u64;
+    let resident_keys = (resident_mb * 1048576) / value_size.max(1) as u64;
+    let resident = {
+        let rf = dir.join("resident.dat");
+        let store = Store::create(&rf, default_opts(256))?;
+        let mut vrng = Rng::new(0x8F1);
+        let mut kb = [0u8; 16];
+        for i in 0..resident_keys {
+            db_key_into(i, &mut kb);
+            store.append(&kb, payload.get(&mut vrng))?;
+        }
+        store.close()?;
+        // Warm it deliberately, then measure: this is the in-memory ceiling.
+        let _ = measure_reads(&rf, resident_keys, reads.min(50_000), dist)?;
+        let r = measure_reads(&rf, resident_keys, reads.min(50_000), dist)?;
+        let n = reads.min(50_000);
+        rec.param("resident_mb", J::u(resident_mb))
+            .param("resident_keys", J::u(resident_keys));
+        let _ = std::fs::remove_file(&rf);
+        (r.0, r.1, n)
+    };
 
     let io0 = IoCounters::read_now();
     {
@@ -963,6 +1007,14 @@ fn f1_outofcore(args: &Args, profile: Profile) -> std::io::Result<Record> {
     }
     let build_io = IoCounters::read_now().since(&io0);
     let fsz = file_len(&file);
+    // What must exceed memory is the file. Ballast, if used, reduces what the
+    // page cache can hold, so it counts against available memory rather than
+    // for the dataset.
+    let effective_mem = (mem as f64 - ballast_gb * 1073741824.0).max(1.0);
+    let file_over_mem = fsz as f64 / effective_mem;
+    rec.param("file_mb", J::fp(fsz as f64 / 1048576.0, 1))
+        .param("effective_mem_mb", J::fp(effective_mem / 1048576.0, 0))
+        .param("file_over_effective_mem", J::fp(file_over_mem, 3));
 
     // Warm: everything the build just wrote is still in page cache.
     let warm = measure_reads(&file, nkeys, reads, dist)?;
@@ -1000,7 +1052,16 @@ fn f1_outofcore(args: &Args, profile: Profile) -> std::io::Result<Record> {
         }
     };
 
-    rec.series("build", env::write_amp_json(&build_io, nkeys * value_size as u64, fsz))
+    let resident_rps = resident.2 as f64 / resident.1;
+    rec.series("resident", jobj! {
+        "reads" => J::u(resident.2),
+        "seconds" => J::fp(resident.1, 4),
+        "reads_per_s" => J::fp(resident_rps, 1),
+        "latency" => resident.0.to_json(),
+        "cdf" => resident.0.cdf_json(),
+        "note" => J::s("in-memory control: same value size and key distribution, sized to fit"),
+    })
+    .series("build", env::write_amp_json(&build_io, nkeys * value_size as u64, fsz))
         .series("warm", ratio_json(&warm.0, warm.1))
         .series("cold", ratio_json(&cold.0, cold.1))
         .series("cache_control", jobj! {
@@ -1028,34 +1089,88 @@ fn f1_outofcore(args: &Args, profile: Profile) -> std::io::Result<Record> {
                 .to_string()
         },
     ));
-    if dropped {
+    // The comparison that means something: the out-of-core dataset against a
+    // resident one of the same shape. Warm-against-cold inside the large
+    // dataset cannot answer this, because when the file exceeds memory the
+    // warm pass is already cold.
+    let degradation = resident_rps / cold_rps.max(1e-9);
+    if file_over_mem > 1.0 {
         rec.finding(Finding::new(
             "F1.2",
-            "read throughput degrades by less than 10x when the page cache is evicted",
-            warm_rps / cold_rps.max(1e-9) < 10.0,
+            "read throughput degrades by less than 10x once the dataset outgrows memory",
+            degradation < 10.0,
             format!(
-                "warm {warm_rps:.0} reads/s, cold {cold_rps:.0} reads/s -> {:.1}x",
-                warm_rps / cold_rps.max(1e-9)
+                "resident {resident_mb}MB: {resident_rps:.0} reads/s; out-of-core \
+                 {:.1}GB: {cold_rps:.0} reads/s -> {degradation:.0}x degradation. \
+                 p50 {:.3}ms but p99 {:.1}ms: the engine has no madvise, no readahead \
+                 control and no asynchronous I/O, so every miss is a synchronous fault",
+                fsz as f64 / 1073741824.0,
+                cold.0.percentile(50.0) as f64 / 1e6,
+                cold.0.percentile(99.0) as f64 / 1e6
             ),
         ));
     } else {
         rec.finding(Finding::not_exercised(
             "F1.2",
-            "read throughput degrades by less than 10x when the page cache is evicted",
-            "drop_caches failed (needs root), so the cold phase was served from page cache",
+            "read throughput degrades by less than 10x once the dataset outgrows memory",
+            format!(
+                "file/memory ratio is {file_over_mem:.2}; the dataset never left the page cache"
+            ),
         ));
     }
-    rec.finding(Finding::new(
-        "F1.3",
-        "the dataset actually exceeds available memory",
-        data_mb as f64 * 1048576.0 > mem as f64 || ballast_gb > 0.0,
-        format!(
-            "dataset {data_mb}MB against {:.0}MB of RAM (ratio {:.2}); a ratio below 1 measures \
-             page cache, not storage",
-            mem as f64 / 1048576.0,
-            data_mb as f64 * 1048576.0 / mem.max(1) as f64
-        ),
-    ));
+    let f14 = format!(
+        "p50 {:.3}ms, p99 {:.2}ms, p99.9 {:.2}ms, max {:.1}ms",
+        cold.0.percentile(50.0) as f64 / 1e6,
+        cold.0.percentile(99.0) as f64 / 1e6,
+        cold.0.percentile(99.9) as f64 / 1e6,
+        cold.0.max() as f64 / 1e6
+    );
+    rec.finding(if file_over_mem > 1.0 {
+        Finding::new(
+            "F1.4",
+            "out-of-core read latency stays bounded (p99 under 5ms)",
+            cold.0.percentile(99.0) < 5_000_000,
+            f14,
+        )
+    } else {
+        Finding::not_exercised(
+            "F1.4",
+            "out-of-core read latency stays bounded (p99 under 5ms)",
+            format!("the dataset stayed in page cache, so this is a resident figure: {f14}"),
+        )
+    });
+    let _ = warm_rps;
+    // The precondition for the whole experiment. Stated against the file
+    // rather than the logical data, because a compressible 24GB dataset can
+    // land in a 9GB file that never leaves the page cache.
+    let f13 = format!(
+        "file {:.1}GB against {:.1}GB of effective memory (ratio {file_over_mem:.2}){}; \
+             a ratio below 1 measures page cache, not storage",
+        fsz as f64 / 1073741824.0,
+        effective_mem / 1073741824.0,
+        if ballast_gb > 0.0 {
+            format!(", after {ballast_gb:.1}GB of ballast")
+        } else {
+            String::new()
+        }
+    );
+    rec.finding(if file_over_mem > 1.0 {
+        Finding::new(
+            "F1.3",
+            "the stored file actually exceeds the memory available to cache it",
+            true,
+            f13,
+        )
+    } else {
+        // Not a property of the engine -- a condition this run could not
+        // create. Reporting it as a failure would blame the engine for the
+        // size of the machine.
+        Finding::not_exercised(
+            "F1.3",
+            "the stored file actually exceeds the memory available to cache it",
+            f13,
+        )
+    });
     Ok(rec)
 }
 
@@ -1079,4 +1194,164 @@ fn measure_reads(
         h.record(t.elapsed().as_nanos() as u64);
     }
     Ok((h, t0.elapsed().as_secs_f64()))
+}
+
+// ------------------------------------------------- F7: index memory scaling --
+
+/// How much memory a reader costs, and the store size at which one stops
+/// fitting.
+///
+/// This is the other half of "out of core". F1 asks what happens when the
+/// *data* outgrows memory; this asks what happens when the *index* does.
+/// `Reader::build` decodes the key index into a `Vec<(Vec<u8>, Extents)>` --
+/// one heap allocation per key -- and then builds a 2N-slot hash table over
+/// it, all before the first read. Nothing is shared between processes, so the
+/// cost is paid again by every reader.
+///
+/// In RUM terms (Athanassoulis et al., EDBT'16) this is the memory the design
+/// spends to buy its read performance. Spending it is a legitimate choice. Not
+/// measuring it is not, because it is the term that decides how many reader
+/// processes a machine can hold -- and many reader processes is the premise.
+fn f7_index(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let value_size = args.num("--value-size", 100);
+    let scale: Vec<u64> = match profile {
+        Profile::Ci => vec![50_000, 200_000, 800_000],
+        Profile::Dev => vec![100_000, 500_000, 2_000_000],
+        Profile::Full => vec![250_000, 1_000_000, 4_000_000, 16_000_000],
+    };
+
+    let mut rec = Record::new("f7-index", profile);
+    rec.param(
+        "key_counts",
+        J::arr(scale.iter().map(|k| J::u(*k)).collect()),
+    )
+    .param("value_size", J::u(value_size as u64));
+
+    let dir = scratch("f7");
+    let payload = Payload::new(value_size, 0.5, 0xF7);
+    let exe = std::env::current_exe().expect("current exe");
+    let mem = env::mem_total_bytes();
+
+    let mut points = Vec::new();
+    let mut per_key: Vec<(u64, f64)> = Vec::new();
+
+    for &nkeys in &scale {
+        let file = dir.join(format!("k{nkeys}.dat"));
+        {
+            let store = Store::create(&file, default_opts(256))?;
+            let mut vrng = Rng::new(nkeys);
+            let mut kb = [0u8; 16];
+            for i in 0..nkeys {
+                db_key_into(i, &mut kb);
+                store.append(&kb, payload.get(&mut vrng))?;
+            }
+            store.close()?;
+        }
+        let fsz = file_len(&file);
+
+        // Measured in a child, so the figure is a reader's own footprint and
+        // not the writer's arena left over in this process.
+        let out = std::process::Command::new(&exe)
+            .arg("f7-child")
+            .arg("--file")
+            .arg(&file)
+            .arg("--keys")
+            .arg(nkeys.to_string())
+            .output()?;
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let field = |k: &str| -> f64 {
+            text.split(&format!("{k}="))
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse().ok()))
+                .unwrap_or(0.0)
+        };
+        let rss = field("reader_rss_bytes");
+        let baseline = field("baseline_rss_bytes");
+        let index_bytes = (rss - baseline).max(0.0);
+        let b_per_key = index_bytes / nkeys as f64;
+        per_key.push((nkeys, b_per_key));
+
+        points.push(jobj! {
+            "keys" => J::u(nkeys),
+            "file_mb" => J::fp(fsz as f64 / 1048576.0, 2),
+            "reader_rss_mb" => J::fp(rss / 1048576.0, 2),
+            "baseline_rss_mb" => J::fp(baseline / 1048576.0, 2),
+            "index_rss_mb" => J::fp(index_bytes / 1048576.0, 2),
+            "index_bytes_per_key" => J::fp(b_per_key, 1),
+            "open_ms" => J::fp(field("open_ms"), 3),
+            // The index is heap, so N readers cost N times this. A shared
+            // mmap-able index would cost it once.
+            "rss_over_file" => J::fp(index_bytes / fsz.max(1) as f64, 3),
+        });
+        let _ = std::fs::remove_file(&file);
+    }
+    rec.series("scaling", J::arr(points));
+
+    let (k_lo, b_lo) = per_key[0];
+    let (k_hi, b_hi) = *per_key.last().unwrap();
+    let bytes_per_key = b_hi;
+    let ceiling_keys = mem as f64 / bytes_per_key.max(1.0);
+
+    rec.series(
+        "extrapolation",
+        jobj! {
+            "bytes_per_key_at_largest" => J::fp(bytes_per_key, 1),
+            "machine_ram_gb" => J::fp(mem as f64 / 1073741824.0, 2),
+            "keys_before_one_reader_fills_ram" => J::fp(ceiling_keys, 0),
+            "keys_before_eight_readers_fill_ram" => J::fp(ceiling_keys / 8.0, 0),
+        },
+    );
+
+    rec.finding(Finding::new(
+        "F7.1",
+        "reader memory is independent of key count",
+        b_hi * k_hi as f64 / (b_lo * k_lo as f64) < 2.0,
+        format!(
+            "{k_lo} keys -> {:.1}MB of index, {k_hi} keys -> {:.1}MB",
+            b_lo * k_lo as f64 / 1048576.0,
+            b_hi * k_hi as f64 / 1048576.0
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F7.2",
+        "a reader's index costs less than 32 bytes per key",
+        bytes_per_key < 32.0,
+        format!(
+            "{bytes_per_key:.0} bytes per key resident, per reader process, shared with nobody"
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F7.3",
+        "eight concurrent reader processes can hold a 10M-key store on this machine",
+        ceiling_keys / 8.0 > 10_000_000.0,
+        format!(
+            "at {bytes_per_key:.0} B/key one reader fills {:.1}GB of RAM at {:.1}M keys; eight \
+             readers reach that at {:.1}M keys each",
+            mem as f64 / 1073741824.0,
+            ceiling_keys / 1e6,
+            ceiling_keys / 8.0 / 1e6
+        ),
+    ));
+    rec.note(
+        "In RUM terms this is the memory spent to buy read performance. Spending it is a \
+         legitimate choice; the objection is that it is unmeasured, and that it is paid per \
+         process when the stated architecture is many reader processes sharing one mapping",
+    );
+    Ok(rec)
+}
+
+/// Child for F7: report resident size before and after building a reader.
+fn f7_child(args: &Args) -> std::io::Result<()> {
+    let file = PathBuf::from(args.get("--file").expect("--file"));
+    let baseline = env::peak_rss_bytes();
+    let t = Instant::now();
+    let reader = Reader::open(&file)?;
+    let open_ms = t.elapsed().as_secs_f64() * 1000.0;
+    // Touch the index so nothing is lazily deferred past the measurement.
+    let keys = reader.keys();
+    println!(
+        "baseline_rss_bytes={baseline} reader_rss_bytes={} open_ms={open_ms:.3} keys={keys}",
+        env::peak_rss_bytes()
+    );
+    Ok(())
 }
