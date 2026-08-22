@@ -28,6 +28,33 @@
 use super::J;
 use crate::jobj;
 
+/// Read one integer from `sysctl`, for platforms without `/sys`.
+///
+/// Shelling out rather than calling `sysctlbyname` through FFI: this cannot be
+/// compiled or tested from the Linux machine it was written on, and a wrong
+/// FFI signature fails in ways a wrong command does not.
+#[cfg(target_os = "macos")]
+fn sysctl_num(name: &str) -> Option<usize> {
+    let out = std::process::Command::new("sysctl")
+        .arg("-n")
+        .arg(name)
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sysctl_num(_name: &str) -> Option<usize> {
+    None
+}
+
+/// Override detection. The escape hatch for a platform whose values are not
+/// read correctly -- which is better than deriving a tuning constant from a
+/// default that happens to be wrong.
+fn env_num(name: &str) -> Option<usize> {
+    std::env::var(name).ok()?.parse().ok()
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Machine {
     /// Bytes per cache line. 64 on x86-64 and Graviton, 128 on Apple Silicon.
@@ -37,6 +64,10 @@ pub struct Machine {
     pub l1d: usize,
     pub l2: usize,
     pub l3: usize,
+    /// False when the cache line size was defaulted rather than read. A
+    /// derived constant built on a guessed line size is not a measurement, and
+    /// on Apple Silicon the guess is wrong by a factor of two.
+    pub cache_line_detected: bool,
 }
 
 fn sysfs_num(path: &str) -> Option<usize> {
@@ -52,17 +83,33 @@ fn sysfs_num(path: &str) -> Option<usize> {
 
 impl Machine {
     pub fn detect() -> Machine {
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }.max(4096);
+        let page_size = env_num("SUPDB_PAGE_SIZE")
+            .or_else(|| Some(unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }))
+            .unwrap_or(4096)
+            .max(4096);
+        // Linux exposes this under /sys; macOS under sysctl. Neither is
+        // present on the other, and defaulting silently is how Apple Silicon
+        // gets tuned as though it had 64-byte lines.
+        let line = env_num("SUPDB_CACHE_LINE")
+            .or_else(|| sysfs_num("/sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size"))
+            .or_else(|| sysctl_num("hw.cachelinesize"));
         let mut m = Machine {
-            // Fall back to 64 rather than 0: a wrong-but-plausible line size
-            // degrades a derived constant, an absent one divides by zero.
-            cache_line: sysfs_num("/sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size")
-                .unwrap_or(64),
+            cache_line: line.unwrap_or(64),
+            cache_line_detected: line.is_some(),
             page_size,
             l1d: 0,
             l2: 0,
             l3: 0,
         };
+        // Apple Silicon reports per-performance-level caches; the P-core
+        // figures are the relevant ones for a latency-sensitive path.
+        m.l1d = sysctl_num("hw.perflevel0.l1dcachesize")
+            .or_else(|| sysctl_num("hw.l1dcachesize"))
+            .unwrap_or(0);
+        m.l2 = sysctl_num("hw.perflevel0.l2cachesize")
+            .or_else(|| sysctl_num("hw.l2cachesize"))
+            .unwrap_or(0);
+        m.l3 = sysctl_num("hw.l3cachesize").unwrap_or(0);
         for i in 0..8 {
             let base = format!("/sys/devices/system/cpu/cpu0/cache/index{i}");
             let Some(size) = sysfs_num(&format!("{base}/size")) else {
@@ -121,6 +168,7 @@ impl Machine {
             "l3" => J::u(self.l3 as u64),
             "derived_records_per_page" => J::u(self.records_per_page() as u64),
             "derived_restart_group" => J::u(self.restart_group() as u64),
+            "cache_line_detected" => J::Bool(self.cache_line_detected),
         }
     }
 }
@@ -150,6 +198,7 @@ mod tests {
                     l1d: 32 << 10,
                     l2: 1 << 20,
                     l3: 8 << 20,
+                    cache_line_detected: true,
                 };
                 let rpp = m.records_per_page();
                 let rg = m.restart_group();
@@ -170,6 +219,7 @@ mod tests {
             l1d: 48 << 10,
             l2: 1 << 20,
             l3: 32 << 20,
+            cache_line_detected: true,
         };
         let m1 = Machine {
             cache_line: 128,
@@ -177,6 +227,7 @@ mod tests {
             l1d: 128 << 10,
             l2: 4 << 20,
             l3: 8 << 20,
+            cache_line_detected: true,
         };
         assert!(m1.records_per_page() > x86.records_per_page());
         assert!(m1.restart_group() > x86.restart_group());

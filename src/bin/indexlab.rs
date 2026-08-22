@@ -2247,6 +2247,13 @@ fn sweep_mode(args: &Args) -> std::io::Result<()> {
     let shape = Shape::parse(args.get("--shape").unwrap_or("decimal16")).expect("shape");
     let machine = supdb::bench::Machine::detect();
     let derived = machine.records_per_page();
+    if !machine.cache_line_detected {
+        eprintln!(
+            "!! cache line size could not be read on this platform; assuming 64 bytes.\n\
+             !! Apple Silicon is 128 -- the derived constant will be wrong by a factor of two.\n\
+             !! Re-run with SUPDB_CACHE_LINE=128 (check: sysctl -n hw.cachelinesize)."
+        );
+    }
     let candidates: Vec<usize> = vec![8, 16, 32, 64, 128, 256];
 
     let keys = make_keys(shape, n);
