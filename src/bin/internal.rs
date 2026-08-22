@@ -89,6 +89,7 @@ fn main() -> std::io::Result<()> {
             "f5-latency" => f5_latency(&args, profile)?,
             "f6-threads" => f6_threads(&args, profile)?,
             "f7-index" => f7_index(&args, profile)?,
+            "f8-checksums" => f8_checksums(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -149,6 +150,7 @@ internal <experiment> [--profile ci|dev|full] [--out DIR]
   f5-latency     the distribution behind the throughput means
   f6-threads     write throughput vs writer-thread count
   f7-index       reader memory vs key count, and the ceiling it implies
+  f8-checksums   what block checksums cost, measured interleaved
   all            every experiment above
 ";
 
@@ -1354,4 +1356,164 @@ fn f7_child(args: &Args) -> std::io::Result<()> {
         env::peak_rss_bytes()
     );
     Ok(())
+}
+
+// ------------------------------------------------- F8: the cost of checksums --
+
+/// What integrity checking costs, measured the only way that means anything.
+///
+/// The tempting comparison -- run the suite before the change, run it after,
+/// subtract -- is worthless across separate runs. When it was tried here the
+/// unchanged comparators in the external suite moved by +20% to +43% between
+/// the two runs, so the "improvement" attributed to the change was mostly the
+/// machine being in a different mood. Both arms therefore run in one process,
+/// interleaved round-robin, with nothing else between them.
+///
+/// The safety this buys is not optional in any real deployment: without it a
+/// bit flip, a torn write or a reused slot returns silently wrong data,
+/// because LZ4 decodes many corrupted inputs into plausible bytes. The
+/// question is only what it costs.
+fn f8_checksums(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
+    let depth = args.num("--depth", 4) as u64;
+    let value_size = args.num("--value-size", 100);
+    let reads = args.num("--reads", profile.pick(50_000, 200_000, 500_000)) as u64;
+
+    let mut rec = Record::new("f8-checksums", profile);
+    rec.param("keys", J::u(keys))
+        .param("values_per_key", J::u(depth))
+        .param("value_size", J::u(value_size as u64))
+        .param("reads", J::u(reads))
+        .note("both arms interleaved in one process; the only difference is Options::checksums");
+
+    let dir = scratch("f8");
+    let payload = Payload::new(value_size, 0.5, 0xF8);
+    let on = [true, false];
+
+    // Write throughput.
+    let trial = Trial::new(profile.reps());
+    let write = trial.run(2, |ci, rep| {
+        let file = dir.join(format!("w{ci}-{rep}.dat"));
+        let store = Store::create(
+            &file,
+            Options {
+                checksums: on[ci],
+                ..default_opts(128)
+            },
+        )
+        .expect("create");
+        let mut vrng = Rng::new(0xF8 + rep as u64);
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        for i in 0..(keys * depth) {
+            db_key_into(i % keys, &mut kb);
+            store.append(&kb, payload.get(&mut vrng)).expect("append");
+        }
+        store.flush().expect("flush");
+        let secs = t.elapsed().as_secs_f64();
+        let _ = store.close();
+        let _ = std::fs::remove_file(&file);
+        (keys * depth) as f64 / secs
+    });
+
+    // Read throughput, and the stored size, on a store built once per arm.
+    let mut read_samples = Vec::new();
+    let mut sizes = Vec::new();
+    for (ci, want) in on.iter().enumerate() {
+        let file = dir.join(format!("r{ci}.dat"));
+        {
+            let store = Store::create(
+                &file,
+                Options {
+                    checksums: *want,
+                    ..default_opts(128)
+                },
+            )
+            .expect("create");
+            let mut vrng = Rng::new(0xF8);
+            let mut kb = [0u8; 16];
+            for i in 0..(keys * depth) {
+                db_key_into(i % keys, &mut kb);
+                store.append(&kb, payload.get(&mut vrng)).expect("append");
+            }
+            store.close().expect("close");
+        }
+        sizes.push(file_len(&file));
+        read_samples.push(file);
+    }
+    let read = Trial::new(profile.reps()).run(2, |ci, _| {
+        // The flag is global, so it is set for the arm being measured.
+        let reader = Reader::open(&read_samples[ci]).expect("open");
+        let mut g = KeyGen::new(KeyDist::Uniform, keys, 0xF8);
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        for _ in 0..reads {
+            db_key_into(g.next(), &mut kb);
+            reader
+                .read_all(&kb, |v| {
+                    std::hint::black_box(v);
+                })
+                .expect("read");
+        }
+        reads as f64 / t.elapsed().as_secs_f64()
+    });
+    for f in &read_samples {
+        let _ = std::fs::remove_file(f);
+    }
+
+    let wc = compare(&write[0], &write[1], supdb::bench::MIN_EFFECT);
+    let rc = compare(&read[0], &read[1], supdb::bench::MIN_EFFECT);
+    rec.compare("write_on_vs_off", wc.clone());
+    rec.compare("read_on_vs_off", rc.clone());
+    rec.series(
+        "write",
+        jobj! {
+            "checksums_on_ops_per_s" => J::fp(write[0].median(), 1),
+            "checksums_off_ops_per_s" => J::fp(write[1].median(), 1),
+            "cost_pct" => J::fp((1.0 - write[0].median() / write[1].median()) * 100.0, 2),
+            "on" => write[0].to_json(),
+            "off" => write[1].to_json(),
+        },
+    )
+    .series(
+        "read",
+        jobj! {
+            "checksums_on_ops_per_s" => J::fp(read[0].median(), 1),
+            "checksums_off_ops_per_s" => J::fp(read[1].median(), 1),
+            "cost_pct" => J::fp((1.0 - read[0].median() / read[1].median()) * 100.0, 2),
+            "on" => read[0].to_json(),
+            "off" => read[1].to_json(),
+        },
+    )
+    .series(
+        "space",
+        jobj! {
+            "checksums_on_bytes" => J::u(sizes[0]),
+            "checksums_off_bytes" => J::u(sizes[1]),
+            "cost_pct" => J::fp((sizes[0] as f64 / sizes[1] as f64 - 1.0) * 100.0, 3),
+        },
+    );
+
+    let wcost = (1.0 - write[0].median() / write[1].median()) * 100.0;
+    let rcost = (1.0 - read[0].median() / read[1].median()) * 100.0;
+    let scost = (sizes[0] as f64 / sizes[1] as f64 - 1.0) * 100.0;
+    rec.finding(Finding::new(
+        "F8.1",
+        "block checksums cost less than 10% of write throughput",
+        wcost < 10.0,
+        format!("write {wcost:+.1}% ({})", wc.summary("on", "off")),
+    ));
+    rec.finding(Finding::new(
+        "F8.2",
+        "block checksums cost less than 10% of read throughput",
+        rcost < 10.0,
+        format!("read {rcost:+.1}% ({})", rc.summary("on", "off")),
+    ));
+    rec.finding(Finding::new(
+        "F8.3",
+        "block checksums cost less than 1% of stored size",
+        scost < 1.0,
+        format!("{scost:+.3}% on disk: four bytes per chunk plus one per block"),
+    ));
+    Ok(rec)
 }

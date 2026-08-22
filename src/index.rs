@@ -74,10 +74,22 @@ pub fn put_uvarint(out: &mut Vec<u8>, mut v: u64) {
     out.push(v as u8);
 }
 
+/// Read a varint, stopping at the end of the buffer rather than past it.
+///
+/// This used to index `buf[*pos]` unconditionally and shift without bound. On
+/// a damaged or reused index section both are reachable: the corruption
+/// experiment drove it straight into "index out of bounds: the len is 13220
+/// but the index is 13220", which in an embedded library is the host
+/// application aborting.
+///
+/// Truncated input now yields whatever was decoded so far, and `*pos` stops at
+/// the end. That alone is not sufficient -- a caller that then slices by the
+/// decoded length can still run off the end -- so every caller validates the
+/// length it gets back against the bytes actually remaining.
 pub fn get_uvarint(buf: &[u8], pos: &mut usize) -> u64 {
     let mut v = 0u64;
-    let mut shift = 0;
-    loop {
+    let mut shift = 0u32;
+    while *pos < buf.len() {
         let b = buf[*pos];
         *pos += 1;
         v |= ((b & 0x7f) as u64) << shift;
@@ -85,7 +97,13 @@ pub fn get_uvarint(buf: &[u8], pos: &mut usize) -> u64 {
             return v;
         }
         shift += 7;
+        // A 64-bit value needs at most ten 7-bit groups; beyond that the
+        // input is not a varint this encoder produced.
+        if shift >= 64 {
+            break;
+        }
     }
+    v
 }
 
 // FxHash was tried for the store's internal maps and made the write path ten

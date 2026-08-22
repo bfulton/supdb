@@ -65,11 +65,10 @@ appends, replaces and deletes across every checkpoint.
 | Supdb sustains a mixed read/write workload | YCSB-A runs **13.5× slower** than read-only YCSB-C |
 | reads survive the dataset outgrowing memory | **916× degradation** — 338,681 reads/s resident vs 370 at 23 GB against 15.7 GB of RAM; p99 9.5 ms |
 | the reader index is affordable | **131 bytes per key**, resident, per process, shared with nobody — to index a 100-byte value |
-| damaged data is detected | **74%** of corrupted files read through without complaint, returning wrong-length values; nothing outside the superblock is checksummed |
-| a damaged file errors rather than panics | damage aimed at the key index panics the host process — `get_uvarint` has no bounds check |
 | a store killed before its first checkpoint is readable | it is not; nothing reaches disk until a checkpoint, and `buffer_bytes` defaults to 512 MB |
-| the store agrees with a `BTreeMap` model | **no** — a deleted key comes back (see below) |
-| the write path completes under every reclaim policy | **no** — under `AfterReads` the writer fails to decode a block it wrote |
+| the store agrees with a `BTreeMap` model | **yes**, since the fixes — 60k comparisons across all reclaim policies |
+| a damaged file errors rather than panics | **yes**, since the fixes — 0 panics in 3,317 damage trials |
+| a read returns written bytes or an error | **yes**, since checksums — 0 corrupt reads |
 
 The out-of-core result is the largest single number in the suite, and it is
 the only one measured at `--profile full`, so it is the only citable one.
@@ -85,28 +84,72 @@ method, so a read after a write needs a checkpoint and a fresh `Reader`, both
 `O(key count)` — and no benchmark in the original suite mixes reads with
 writes.
 
-## Two data-correctness bugs
+## Three defects, found and fixed
 
-Found by the differential oracle, both reduced and both recorded in
-`claims.json` so they cannot be forgotten.
+All three were found by the suites here and none is reachable by any benchmark
+in the original design, because none of those compares the store against an
+independent model or feeds it damaged bytes.
 
-**A deleted key comes back.** `append` calls `seal_shard` inline once a shard's
-buffer fills, which stages the extent in the block builder and records it in
-`Shard::members` — but the block has no id yet, so the key's `extents` are not
-updated until `flush_builder` runs. `delete` clears `entry.extents` and knows
-nothing about the staged member, so `flush_builder` later pushes it back and
-the key returns with every value it had. Reduced to a 30-line deterministic
-test in `tests/known_bugs.rs`. The fix has to make a staged member cancellable.
+**A deleted key came back.** `append` calls `seal_shard` inline once a shard's
+buffer fills, staging the extent in the block builder — but the block has no id
+yet, so `entry.extents` is not updated until `flush_builder` runs. `delete`
+cleared `entry.extents` and knew nothing about the staged member, so
+`flush_builder` pushed it back and the key returned with every value it had.
+*Fixed*: `delete` and `put` drop matching entries from `Shard::members`.
 
-**A freed slot is handed out while still referenced.** Under
-`Reclaim::AfterReads` the writer's own merge path fails to decode a block it
-wrote. Instrumentation showed three block ids describing the identical byte
-range `[300643..319075)`, one of them still holding 71 live references. This is
-distinct from the first bug — that one occurs under `Never` too, this one does
-not.
+**A freed slot was handed out while still referenced.** Two causes.
+`Appender::release` used a saturating guard — decrement if positive, then free
+if zero — which did not prevent a double release, it *guaranteed* one: a second
+call on an already-freed block skipped the decrement and fell straight into the
+free-list push. And `seal_shard` released a replaced key's superseded blocks
+without clearing `entry.extents`, so the index kept naming blocks whose
+refcount had reached zero. Instrumentation showed three block ids describing
+the identical range `[300643..319075)`, one still holding 71 live references.
+*Fixed*: an unbalanced release is refused and asserts in debug builds; the
+index reference is dropped in the same breath as the release.
 
-Neither is reachable by any benchmark in the original suite, because none of
-them compares the store against an independent model.
+**Damaged bytes were served as data, or killed the process.** `get_uvarint`
+read past the end of its buffer and shifted without bound; `emit` sliced on a
+length it had just read; extent block ids indexed `self.blocks` unchecked.
+*Fixed*: every length is validated against the bytes remaining, block ids are
+validated once at index-build time, and the file now carries checksums —
+CRC-32C per chunk in the chunk directory so a point read verifies only what it
+decodes, plus a whole-block CRC for blocks stored verbatim.
+
+Reproducers live in `tests/known_bugs.rs` and stay there after the fix: a test
+written from the failure is worth more than one written from the patch.
+
+## What the fixes cost
+
+Checksums are not free in principle, so the cost is measured — **interleaved in
+one process**, both arms round-robin, because the obvious approach of running
+the suite before and after and subtracting does not work. When that was tried
+here, the three *unchanged* comparators in the external suite moved by +20% to
++43% between the two runs. Most of the apparent improvement was the machine.
+
+| axis | cost | significant? |
+|---|---|---|
+| write throughput | **+8.5%** | yes (p = 0.0022) |
+| read throughput | −0.9% | no (p = 0.37) — free |
+| stored size | +0.166% | yes — and drift-immune |
+
+Reads are free because verification happens at chunk granularity: a point read
+hashes only the chunk it decodes, which is the reason the chunking exists.
+Writes pay 8.5% because every block is hashed once on the way out. That is a
+real cost on the axis the design is built to win, and it is the price of not
+returning silently wrong data — a trade worth making, but worth stating.
+
+Note the `dev` profile put the write cost at +3.0% and called it insignificant
+(p = 0.21). It was underpowered, not free; only the `full` profile has variance
+tight enough (rel IQR 2.3%) to resolve the effect. That is why `full` is the
+only profile this project treats as citable.
+
+A first attempt used a byte-at-a-time CRC-32 (IEEE) table and cost **13–35% of
+write throughput**, which is not a reasonable price on the axis this design is
+built to win. Replacing it with hardware CRC-32C on x86-64 — with a portable
+slice-by-8 fallback, and a test asserting the two agree — brought it into the
+noise. `results/baseline/` keeps the pre-fix measurements so this is checkable
+rather than asserted.
 
 ## The rules
 

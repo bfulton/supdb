@@ -1,16 +1,16 @@
 //! Reduced reproducers for bugs the suites found.
 //!
-//! Each is a real defect in the engine, found by a randomized or adversarial
+//! Each was a real defect in the engine, found by a randomized or adversarial
 //! experiment and then reduced to the smallest deterministic form that still
-//! shows it. They are `#[ignore]`d so `cargo test` stays green on a
-//! known-broken engine; run them with:
+//! showed it. A reproducer stays here after its bug is fixed: it is the
+//! regression test, and it is worth more than a test written from the fix,
+//! because it is written from the failure.
 //!
-//! ```text
-//! cargo test --release --test known_bugs -- --ignored
-//! ```
-//!
-//! When one is fixed, remove its `#[ignore]` and flip the corresponding entry
-//! in `claims.json` from `fails` to `holds`, in the same commit.
+//! A reproducer for a bug that is still open carries `#[ignore]` with the
+//! reason, so `cargo test` stays green on a known-broken engine while
+//! `cargo test --test known_bugs -- --ignored` still shows it. When a bug is
+//! fixed, remove the `#[ignore]` and flip its `claims.json` entry from `fails`
+//! to `holds` in the same commit.
 
 use supdb::{Options, Reader, Reclaim, Store};
 
@@ -32,8 +32,8 @@ use supdb::{Options, Reader, Reclaim, Store};
 /// The fix has to make a staged member cancellable: either `delete` and `put`
 /// drop matching entries from `Shard::members`, or each entry carries a
 /// version that `flush_builder` re-checks before pushing.
+/// FIXED: `delete` and `put` now drop matching entries from `Shard::members`.
 #[test]
-#[ignore = "known bug: delete does not cancel an extent already staged in the block builder"]
 fn delete_is_not_undone_by_a_staged_extent() {
     let dir = std::env::temp_dir().join("supdb-test-delete-resurrection");
     let _ = std::fs::remove_dir_all(&dir);

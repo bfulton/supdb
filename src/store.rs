@@ -221,6 +221,15 @@ pub struct Options {
     /// alone and a read touches nothing but that key's bytes.
     pub solo_threshold: usize,
     pub chunk_size: usize,
+    /// Compute and verify block checksums.
+    ///
+    /// On by default: without it a bit flip, a torn write or a reused slot
+    /// returns silently wrong data, because LZ4 decodes many corrupted inputs
+    /// into plausible bytes. The knob exists so the cost can be measured
+    /// honestly -- both arms in one process, interleaved -- rather than by
+    /// comparing two runs taken hours apart, which measures the machine as
+    /// much as the code.
+    pub checksums: bool,
     /// Chunk size for solo blocks. A deep key's whole run is decompressed on a
     /// full read regardless of chunking, so warm reads there are flat across
     /// this value while compression is not: the larger window is close to free
@@ -240,6 +249,7 @@ impl Default for Options {
             chunk_size: 1024,
             solo_chunk_size: block::CHUNK,
             merge_threshold: 4,
+            checksums: true,
             reclaim: Reclaim::AfterReads,
         }
     }
@@ -280,14 +290,30 @@ impl Appender {
         self.live[id as usize] += 1;
     }
 
-    /// Drop one reference; punch the block out when the last one goes.
+    /// Drop one reference; hand the block's space back when the last one goes.
+    ///
+    /// The saturating guard this used to carry -- decrement only if positive,
+    /// then free if the count is zero -- did not prevent a double release, it
+    /// guaranteed one. A second call on an already-freed block skipped the
+    /// decrement and then fell straight into the free-list push, offering the
+    /// same slot twice. `take_below` duly handed it out twice, and the
+    /// differential oracle caught the result: three block ids describing the
+    /// identical byte range, one of them still holding 71 live references,
+    /// and the writer's own merge path unable to decode a block it had
+    /// written.
+    ///
+    /// Now an unbalanced release is refused rather than absorbed, and asserts
+    /// in debug builds so the caller that over-released is the thing that
+    /// fails, not a decode three thousand operations later.
     fn release(&mut self, id: u32) -> Result<()> {
-        let n = &mut self.live[id as usize];
-        if *n > 0 {
-            *n -= 1;
+        let i = id as usize;
+        if self.live[i] == 0 {
+            debug_assert!(false, "release of block {id} with no live references");
+            return Ok(());
         }
-        if self.live[id as usize] == 0 {
-            let loc = self.blocks[id as usize];
+        self.live[i] -= 1;
+        if self.live[i] == 0 {
+            let loc = self.blocks[i];
             self.free.release(loc.off, loc.cap, self.generation);
         }
         Ok(())
@@ -410,6 +436,11 @@ impl Appender {
             cap,
             chunked,
             solo,
+            crc: if block::checksums_on() {
+                block::crc32(bytes)
+            } else {
+                0
+            },
         };
         self.file.write_all_at(bytes, off)?;
         self.blocks.push(loc);
@@ -459,6 +490,7 @@ impl Store {
             .write(true)
             .truncate(true)
             .open(path)?;
+        block::CHECKSUMS.store(opts.checksums, std::sync::atomic::Ordering::Relaxed);
         let shards = (0..opts.shards)
             .map(|_| {
                 Mutex::new(Shard {
@@ -545,17 +577,33 @@ impl Store {
             // Whatever this extent replaces stops being referenced now. For a
             // replacement the superseded extents are whatever the index still
             // holds for the key, resolved here rather than on the hot path.
-            if self.opts.reclaim.releases() {
-                let superseded: Vec<Ext> = if p.replaces {
-                    sh.keys.entry_at(idx).extents.as_slice().to_vec()
-                } else {
-                    p.supersedes.clone()
-                };
-                if !superseded.is_empty() {
-                    let mut ap = self.appender.lock().unwrap();
-                    for e in &superseded {
-                        ap.release(e.block)?;
-                    }
+            //
+            // The index reference has to be dropped in the same breath as the
+            // release. This previously released the blocks and left
+            // `entry.extents` pointing at them until `flush_builder` got round
+            // to overwriting it -- a window in which the entry named blocks
+            // whose refcount had already reached zero and whose space was back
+            // in the free list. A subsequent non-replacing append would then
+            // `push` onto that stale list rather than replacing it, and the
+            // writer's own merge path would try to decode a block that had
+            // since been handed to somebody else. The differential oracle
+            // found it as three block ids describing one byte range.
+            //
+            // Clearing is unconditional: `replaces` means the previous values
+            // are gone whether or not this store is reclaiming their space.
+            let superseded: Vec<Ext> = if p.replaces {
+                let e = sh.keys.entry_at(idx);
+                let old = e.extents.as_slice().to_vec();
+                e.extents = Extents::None;
+                old
+            } else {
+                // Never populated: an append supersedes nothing.
+                p.supersedes.clone()
+            };
+            if self.opts.reclaim.releases() && !superseded.is_empty() {
+                let mut ap = self.appender.lock().unwrap();
+                for e in &superseded {
+                    ap.release(e.block)?;
                 }
             }
             if p.buf.len() >= self.opts.solo_threshold {
@@ -679,6 +727,13 @@ impl Store {
             (before, p.buf.len())
         };
         sh.pending_bytes = sh.pending_bytes + after - before;
+        // Same hazard as `delete`: a replacement supersedes every earlier
+        // value, including one already staged in the block builder by an
+        // inline seal. Left in place, `flush_builder` would push the
+        // superseded extent onto the entry after this replacement lands.
+        if let Some(idx) = sh.keys.index_of(key) {
+            sh.members.retain(|m| m.0 != idx);
+        }
         Ok(())
     }
 
@@ -699,6 +754,20 @@ impl Store {
             (freed, old)
         };
         sh.pending_bytes -= freed;
+        // Clearing `extents` is not enough on its own. An earlier `append` may
+        // have filled the shard buffer and triggered an inline `seal_shard`,
+        // which stages the extent in the block builder and records it in
+        // `members` -- but the block has no id yet, so nothing has been
+        // written to `extents` for `delete` to clear. When `flush_builder`
+        // later assigns the id it pushes the staged extent onto the entry and
+        // the deleted key comes back with every value it had.
+        //
+        // The staged bytes stay in the block; they are simply no longer
+        // referenced. `flush_builder` retains the block once per surviving
+        // member, so the refcount stays correct.
+        if let Some(idx) = sh.keys.index_of(key) {
+            sh.members.retain(|m| m.0 != idx);
+        }
         if self.opts.reclaim.releases() {
             let mut ap = self.appender.lock().unwrap();
             for x in &old {
@@ -1021,6 +1090,7 @@ fn encode_block_index(blocks: &[BlockLoc]) -> Vec<u8> {
         put_uvarint(&mut out, b.stored as u64);
         put_uvarint(&mut out, b.uncompressed as u64);
         put_uvarint(&mut out, b.cap as u64);
+        put_uvarint(&mut out, b.crc as u64);
         out.push((b.solo as u8) | ((b.chunked as u8) << 1));
     }
     out
@@ -1037,6 +1107,11 @@ fn write_section(ap: &mut Appender, payload: &[u8]) -> Result<BlockLoc> {
         cap: bytes.len() as u32,
         chunked: false,
         solo: false,
+        crc: if block::checksums_on() {
+            block::crc32(bytes)
+        } else {
+            0
+        },
     };
     ap.file.write_all_at(bytes, ap.off)?;
     ap.off += bytes.len() as u64;
@@ -1063,17 +1138,41 @@ thread_local! {
     static SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::new());
 }
 
+/// The error a decoder returns when the bytes it was given are not the bytes
+/// that were written.
+fn corrupt(what: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "record framing is not valid ({what}); the stored bytes differ from what was \
+             written, and nothing outside the superblock is checksummed so this is the first \
+             point at which that can be noticed"
+        ),
+    )
+}
+
 /// Hand each record in an extent to the visitor; returns bytes emitted.
-fn emit<F: FnMut(&[u8])>(extent: &[u8], f: &mut F) -> u64 {
+///
+/// Every record length is checked against the bytes actually remaining. This
+/// used to slice `extent[p..p + n]` on a length read straight out of the
+/// buffer, so a damaged extent panicked the calling process instead of
+/// returning an error.
+fn emit<F: FnMut(&[u8])>(extent: &[u8], f: &mut F) -> Result<u64> {
     let mut p = 0usize;
     let mut total = 0u64;
     while p < extent.len() {
         let n = get_uvarint(extent, &mut p) as usize;
-        f(&extent[p..p + n]);
+        let end = p
+            .checked_add(n)
+            .ok_or_else(|| corrupt("record length overflows"))?;
+        if end > extent.len() {
+            return Err(corrupt("record runs past the end of its extent"));
+        }
+        f(&extent[p..end]);
         total += n as u64;
-        p += n;
+        p = end;
     }
-    total
+    Ok(total)
 }
 
 pub struct Reader {
@@ -1428,12 +1527,19 @@ impl Reader {
     ) -> Result<Reader> {
         let mut p = 0usize;
         let nblocks = get_uvarint(&blk_idx, &mut p) as usize;
-        let mut blocks = Vec::with_capacity(nblocks);
+        if nblocks > blk_idx.len() {
+            return Err(corrupt("block count exceeds the size of the block index"));
+        }
+        let mut blocks = Vec::with_capacity(nblocks.min(1 << 20));
         for _ in 0..nblocks {
             let off = get_uvarint(&blk_idx, &mut p);
             let stored = get_uvarint(&blk_idx, &mut p) as u32;
             let uncompressed = get_uvarint(&blk_idx, &mut p) as u32;
             let cap = get_uvarint(&blk_idx, &mut p) as u32;
+            let crc = get_uvarint(&blk_idx, &mut p) as u32;
+            if p >= blk_idx.len() {
+                return Err(corrupt("block index is truncated"));
+            }
             let flags = blk_idx[p];
             p += 1;
             blocks.push(BlockLoc {
@@ -1443,6 +1549,7 @@ impl Reader {
                 cap,
                 solo: flags & 1 != 0,
                 chunked: flags & 2 != 0,
+                crc,
             });
         }
 
@@ -1459,18 +1566,44 @@ impl Reader {
             None
         };
         let nkeys = get_uvarint(&key_idx, &mut p) as usize;
-        let mut entries: Vec<(Vec<u8>, Extents)> = Vec::with_capacity(nkeys);
+        // Every length below is read out of the file, so every one of them is
+        // checked against the bytes actually present. Unchecked, a damaged
+        // index section panics the calling process -- which for a library
+        // embedded in somebody else's address space means their application
+        // aborts. `with_capacity` is bounded for the same reason: a corrupt
+        // key count would otherwise try to reserve gigabytes before the first
+        // length is even looked at.
+        if nkeys > key_idx.len() {
+            return Err(corrupt("key count exceeds the size of the index"));
+        }
+        let mut entries: Vec<(Vec<u8>, Extents)> = Vec::with_capacity(nkeys.min(1 << 20));
         for _ in 0..nkeys {
             let klen = get_uvarint(&key_idx, &mut p) as usize;
-            let key = key_idx[p..p + klen].to_vec();
-            p += klen;
+            let kend = p
+                .checked_add(klen)
+                .ok_or_else(|| corrupt("key length overflows"))?;
+            if kend > key_idx.len() {
+                return Err(corrupt("key runs past the end of the index"));
+            }
+            let key = key_idx[p..kend].to_vec();
+            p = kend;
             let n = get_uvarint(&key_idx, &mut p) as usize;
+            if n > key_idx.len() {
+                return Err(corrupt("extent count exceeds the size of the index"));
+            }
             let mut exts = Extents::None;
             for _ in 0..n {
                 let block = get_uvarint(&key_idx, &mut p) as u32;
                 let o = get_uvarint(&key_idx, &mut p) as u32;
                 let l = get_uvarint(&key_idx, &mut p) as u32;
                 let last = get_uvarint(&key_idx, &mut p) as u32;
+                // Validate the block id once, here, rather than at each of the
+                // four read paths that index `self.blocks` with it. A damaged
+                // index otherwise names a block that does not exist and every
+                // one of those paths panics the calling process.
+                if block as usize >= blocks.len() {
+                    return Err(corrupt("extent names a block that does not exist"));
+                }
                 exts.push(Ext {
                     block,
                     off: o,
@@ -1525,11 +1658,18 @@ impl Reader {
         let loc = self.blocks[id as usize];
         let raw = &self.mmap[loc.off as usize..loc.off as usize + loc.stored as usize];
         if loc.is_plain() {
+            if block::checksums_on() && block::crc32(raw) != loc.crc {
+                return Err(corrupt("block checksum mismatch"));
+            }
             // never compressed, so hand out the mapping itself
             return Ok(BlockRef::Mapped(raw));
         }
         if let Some(hit) = self.cache.get(id) {
             return Ok(BlockRef::Owned(hit));
+        }
+        // Compressed as a single stream, so no per-chunk checksum applies.
+        if block::checksums_on() && block::crc32(raw) != loc.crc {
+            return Err(corrupt("block checksum mismatch"));
         }
         let out = Arc::new(block::decompress(raw, loc.uncompressed as usize)?);
         self.cache.put(id, Arc::clone(&out));
@@ -1562,7 +1702,16 @@ impl Reader {
             }
             let raw = &self.mmap[loc.off as usize..end];
             if loc.is_plain() {
-                total += emit(&raw[e.off as usize..(e.off + e.len) as usize], &mut f);
+                // Stored verbatim, so there is no chunk directory to carry a
+                // checksum; the block index carries one instead.
+                if block::checksums_on() && block::crc32(raw) != loc.crc {
+                    return Err(corrupt("block checksum mismatch"));
+                }
+                let (a, b) = (e.off as usize, (e.off + e.len) as usize);
+                if b > raw.len() {
+                    return Err(corrupt("extent runs past its block"));
+                }
+                total += emit(&raw[a..b], &mut f)?;
             } else if loc.chunked || loc.solo {
                 if std::env::var_os("SUPDB_DEBUG").is_some() && loc.stored as usize > raw.len() {
                     eprintln!(
@@ -1585,6 +1734,8 @@ impl Reader {
                     let (a, b) = (e.off as usize, (e.off + e.len) as usize);
                     let r = if loc.chunked {
                         block::read_chunked_range(raw, un, a, b, &mut buf[..un])
+                    } else if block::checksums_on() && block::crc32(raw) != loc.crc {
+                        Err(corrupt("block checksum mismatch"))
                     } else {
                         block::decompress_into(raw, &mut buf, un)
                     };
@@ -1601,14 +1752,19 @@ impl Reader {
                         }
                         return Err(err);
                     }
-                    Ok(emit(&buf[a..b], &mut f))
+                    if b > un {
+                        return Err(corrupt("extent runs past its block"));
+                    }
+                    emit(&buf[a..b], &mut f)
                 })?;
             } else {
                 let b = self.block(e.block)?;
-                total += emit(
-                    &b.as_slice()[e.off as usize..(e.off + e.len) as usize],
-                    &mut f,
-                );
+                let sl = b.as_slice();
+                let (a, z) = (e.off as usize, (e.off + e.len) as usize);
+                if z > sl.len() {
+                    return Err(corrupt("extent runs past its block"));
+                }
+                total += emit(&sl[a..z], &mut f)?;
             }
         }
         Ok(total)
@@ -1623,6 +1779,9 @@ impl Reader {
         let loc = self.blocks[e.block as usize];
         let raw = &self.mmap[loc.off as usize..loc.off as usize + loc.stored as usize];
         if loc.is_plain() {
+            if block::checksums_on() && block::crc32(raw) != loc.crc {
+                return Err(corrupt("block checksum mismatch"));
+            }
             let mut p = (e.off + at) as usize;
             return Ok(get_uvarint(raw, &mut p) as i32);
         }
@@ -1638,6 +1797,9 @@ impl Reader {
                     // only the chunks holding this one record
                     block::read_chunked_range(raw, un, at, (at + 16).min(un), &mut buf[..un])?;
                 } else {
+                    if block::checksums_on() && block::crc32(raw) != loc.crc {
+                        return Err(corrupt("block checksum mismatch"));
+                    }
                     block::decompress_into(raw, &mut buf, un)?;
                 }
                 let mut p = at;
@@ -1667,6 +1829,36 @@ impl Reader {
 
     pub fn keys(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Byte ranges holding live block payload, as (offset, stored length).
+    ///
+    /// Diagnostic. A corruption experiment that picks byte offsets uniformly
+    /// mostly lands in size-class padding or in an index section, so a "how
+    /// much damage goes unnoticed" figure taken that way says more about the
+    /// file's layout than about the engine's integrity checking. This lets a
+    /// caller aim at bytes that actually carry data. An fsck-style tool would
+    /// want the same thing.
+    pub fn block_extents(&self) -> Vec<(u64, u64)> {
+        // Only blocks some key still points at. A superseded block whose space
+        // has not yet been reused is still in the file and still in the block
+        // table, but nothing reads it -- damage there is undetectable and
+        // correctly so, and counting it as undetected corruption would
+        // overstate the gap a second time.
+        let mut referenced = vec![false; self.blocks.len()];
+        for (_, exts) in &self.entries {
+            for e in exts.as_slice() {
+                if let Some(slot) = referenced.get_mut(e.block as usize) {
+                    *slot = true;
+                }
+            }
+        }
+        self.blocks
+            .iter()
+            .zip(referenced)
+            .filter(|(_, live)| *live)
+            .map(|(b, _)| (b.off, b.stored as u64))
+            .collect()
     }
 
     fn lookup(&self, key: &[u8]) -> Option<&Extents> {
@@ -1729,6 +1921,9 @@ impl Reader {
                 let loc = self.blocks[e.block as usize];
                 let raw = &self.mmap[loc.off as usize..loc.off as usize + loc.stored as usize];
                 let extent: &[u8] = if loc.is_plain() {
+                    if block::checksums_on() && block::crc32(raw) != loc.crc {
+                        return Err(corrupt("block checksum mismatch"));
+                    }
                     &raw[e.off as usize..(e.off + e.len) as usize]
                 } else {
                     let un = loc.uncompressed as usize;
@@ -1739,6 +1934,9 @@ impl Reader {
                         have.clear();
                         have.resize(un / 64 + 2, 0);
                         if !loc.chunked {
+                            if block::checksums_on() && block::crc32(raw) != loc.crc {
+                                return Err(corrupt("block checksum mismatch"));
+                            }
                             block::decompress_into(raw, &mut buf, un)?;
                         }
                         cached = e.block;
@@ -1759,9 +1957,15 @@ impl Reader {
                 let mut p = 0usize;
                 while p < extent.len() {
                     let len = get_uvarint(extent, &mut p) as usize;
-                    f(key, &extent[p..p + len]);
+                    let end = p
+                        .checked_add(len)
+                        .ok_or_else(|| corrupt("record length overflows"))?;
+                    if end > extent.len() {
+                        return Err(corrupt("record runs past the end of its extent"));
+                    }
+                    f(key, &extent[p..end]);
                     n += 1;
-                    p += len;
+                    p = end;
                 }
             }
         }

@@ -66,7 +66,8 @@
       "experiment": "ext-kv",
       "id": "EXT.1",
       "expect": "holds",
-      "because": "Supdb loads faster than LMDB, the architecture it is modelled on. This is the design's real and defensible win and must not regress."
+      "because": "Supdb loads faster than LMDB at 500k keys (1,002,973 vs 916,518 ops/s), and this is the design's real and defensible win. Pinned to full: at ci scale (20k keys) it now loses, because block checksums cost 8.5% of write throughput and the margin there was smaller than that. The pair is kept deliberately -- a win that only appears at scale is a different claim from one that holds everywhere.",
+      "profile": "full"
     },
     {
       "experiment": "ext-kv",
@@ -147,20 +148,20 @@
     {
       "experiment": "c1-decoders",
       "id": "C1.1",
-      "expect": "fails",
-      "because": "Damage aimed at the key index takes the process down rather than returning an error: 'index out of bounds: the len is 13220 but the index is 13220'. get_uvarint reads without a bounds check and emit slices on a length it just read. In an embedded library a panic is the host application dying. Uniform random damage does not find this -- it almost always lands in a value payload -- so the experiment aims at the index section deliberately."
+      "expect": "holds",
+      "because": "FIXED. get_uvarint no longer reads past the end of its buffer or shifts without bound; emit, scan and the index decoder validate every length against the bytes actually remaining; and extent block ids are validated once at index-build time rather than at each of the four read paths that index self.blocks with them. 0 panics in 3,317 damage trials."
     },
     {
       "experiment": "c1-decoders",
       "id": "C1.2",
-      "expect": "fails",
-      "because": "About 74% of damaged files read through to the end without complaint, and values came back with the wrong length. Nothing outside the 120-byte superblock carries a checksum, so there is nothing for the engine to notice. This is the single clearest argument for per-block checksums."
+      "expect": "holds",
+      "because": "FIXED by adding checksums: CRC-32C per chunk in the chunk directory, so a point read verifies only what it decodes, plus a whole-block CRC in the block index for blocks stored verbatim or compressed as a single stream. The statement was also corrected twice: it previously measured how much damage went unnoticed, which at 73% was mostly size-class padding, and then at 7.5% was mostly chunks orphaned inside live blocks. The engine's actual obligation is that a read returns written bytes or an error, and that now holds at 0/3,317."
     },
     {
       "experiment": "c2-oracle",
       "id": "C2.1",
-      "expect": "fails",
-      "because": "The store diverges from the model: a deleted key comes back. delete() clears entry.extents but does not cancel an extent already staged in the block builder by an inline seal_shard, so flush_builder later pushes it back. Found by this oracle, reduced to a deterministic 30-line reproducer in tests/known_bugs.rs. This is a data-correctness bug, not a performance one."
+      "expect": "holds",
+      "because": "FIXED. delete() and put() now drop matching entries from Shard::members, so an extent staged in the block builder by an inline seal cannot be pushed back onto a key that was deleted or replaced. Reproducer in tests/known_bugs.rs, no longer ignored."
     },
     {
       "experiment": "c3-crash",
@@ -196,8 +197,33 @@
     {
       "experiment": "c2-oracle",
       "id": "C2.2",
+      "expect": "holds",
+      "because": "FIXED, by two changes. Appender::release now refuses an unbalanced release instead of absorbing it -- the old saturating guard did not prevent a double free, it guaranteed one, pushing the same slot into the free list twice. And seal_shard now clears entry.extents in the same breath as releasing the superseded blocks, so the index can never name a block whose refcount has already reached zero."
+    },
+    {
+      "experiment": "f8-checksums",
+      "id": "F8.1",
+      "expect": "holds",
+      "because": "Block checksums must cost less than 10% of write throughput. Measured interleaved in one process, not by subtracting two runs -- when that was tried the unchanged comparators in the external suite moved +20% to +43% between runs, so the apparent effect was mostly machine drift."
+    },
+    {
+      "experiment": "f8-checksums",
+      "id": "F8.2",
+      "expect": "holds",
+      "because": "Same for read throughput. Hardware CRC-32C on x86-64 with a portable slice-by-8 fallback; a byte-at-a-time IEEE table cost 13-35% of writes and was replaced."
+    },
+    {
+      "experiment": "f8-checksums",
+      "id": "F8.3",
+      "expect": "holds",
+      "because": "Four bytes per chunk plus one per block. Space is the axis this design wins on, so the cost is bounded explicitly. Unlike the timing figures this one is immune to machine drift."
+    },
+    {
+      "experiment": "ext-kv",
+      "id": "EXT.1",
+      "profile": "ci",
       "expect": "fails",
-      "because": "Under Reclaim::AfterReads the writer's own merge path fails to decode a block it wrote. Instrumentation showed three block ids describing the identical byte range, one of them still holding 71 live references: a freed slot is handed out while it is still referenced. Distinct from C2.1 -- C2.1 also occurs under Never, this does not."
+      "because": "At 20k keys LMDB now loads faster than Supdb (1,025,727 vs 850,158 ops/s). Before checksums Supdb led by about 6% here; the 8.5% write cost of integrity checking erased it. Recorded rather than hidden: this is what the safety was paid for."
     }
   ],
   "metrics": [

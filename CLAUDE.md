@@ -62,10 +62,30 @@ is not a measurement.
 | `figures/` | generated from `results/`, never drawn by hand |
 | `docs/architecture-review.md` | why every experiment here exists |
 
-The engine modules carry scoped `#[allow(clippy::all, dead_code)]`. That is
-deliberate: they are kept byte-for-byte as delivered so the architecture
-review's line-level references stay valid. **Do not reformat them.** Everything
-in `src/bench/`, `src/bin/` and `bench/external/` holds to `-D warnings`.
+The engine modules carry scoped `#[allow(clippy::all, dead_code)]`. They were
+vendored byte-for-byte from the design artifact and have since been changed
+only to fix specific defects, each described in `claims.json`. **Do not
+reformat them** — the architecture review cites line numbers in commit
+`101a4e7`, and `results/baseline/` holds the measurements taken against that
+revision. Everything in `src/bench/`, `src/bin/` and `bench/external/` holds to
+`-D warnings`.
+
+## Measuring a change to the engine
+
+**Never compare two separate runs.** It was tried here and it does not work:
+between a pre-fix and a post-fix run of the same suite, the three *unchanged*
+comparators in the external benchmark moved by +20% to +43%. Almost all of the
+apparent improvement was the machine.
+
+To measure the cost of a change, put both arms behind a runtime flag and run
+them **interleaved in one process**, as `f8-checksums` does for
+`Options::checksums`. Space is the exception — file size is immune to drift and
+can be compared across runs.
+
+And use `--profile full`. The same checksum cost measured at `dev` came out
+"+3.0%, not significant"; at `full`, with the variance tight enough to resolve
+it, it is +8.5% and unambiguous. An underpowered measurement is not a free
+lunch, it is a measurement that could not see.
 
 ## Known-failing on purpose
 
@@ -74,10 +94,14 @@ described in `claims.json`:
 
 - `Store::create` truncates and there is no `Store::open` — a store cannot be
   reopened for writing.
-- No checksums outside the 120-byte superblock.
-- `get_uvarint` has no bounds check; damage aimed at the key index panics.
 - Reader open is super-linear in key count; the index is heap-resident per
-  process.
+  process, at ~131 bytes per key.
+- Write throughput barely scales with writer threads.
+- No usable point on the durability curve; `checkpoint` is O(key count).
 
 If you fix one, the corresponding claim must change from `fails` to `holds` in
 the same commit, and the review in `docs/` should be updated to say so.
+
+Fixed so far, with reproducers kept in `tests/known_bugs.rs`: delete
+resurrection, the double-free that handed one slot to three blocks, decoder
+panics on damaged input, and silently-served corruption (now checksummed).

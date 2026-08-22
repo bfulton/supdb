@@ -141,6 +141,16 @@ impl<P> KeyTable<P> {
         }
     }
 
+    /// The stable index of a key, if it is present.
+    ///
+    /// Needed because an extent can be staged in the block builder before its
+    /// block has an id, and `delete`/`put` must be able to find and cancel
+    /// that staged entry. Members are recorded by index, so the index is the
+    /// handle a cancellation needs.
+    pub fn index_of(&self, key: &[u8]) -> Option<u32> {
+        self.find(key, hash(key))
+    }
+
     pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut Entry<P>> {
         let idx = self.find(key, hash(key))?;
         Some(&mut self.entries[idx as usize])

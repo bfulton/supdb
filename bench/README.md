@@ -21,6 +21,7 @@ cargo run --release --bin internal -- all --profile dev
 | `f4-durability` | what does a bounded data-loss window cost in throughput? |
 | `f5-latency`    | what is the distribution behind the throughput means? |
 | `f6-threads`    | does write throughput scale with writer threads? |
+| `f7-index`      | how much memory does a reader's index cost, and where is the ceiling? |
 
 ## External — `external`
 

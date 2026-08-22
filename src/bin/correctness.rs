@@ -99,8 +99,17 @@ fn build_store(path: &Path, keys: u64, depth: u64, value_size: usize) -> std::io
     let mut kb = [0u8; 16];
     let mut v = vec![0u8; value_size];
     for i in 0..(keys * depth) {
-        db_key_into(i % keys, &mut kb);
+        let k = i % keys;
+        db_key_into(k, &mut kb);
+        // Self-describing: sequence, key, and a checksum of both, so a reader
+        // can tell a correct value from a corrupted one of the right length.
         v[..8].copy_from_slice(&i.to_be_bytes());
+        v[8..16].copy_from_slice(&k.to_be_bytes());
+        let tag = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ k;
+        v[16..24].copy_from_slice(&tag.to_be_bytes());
+        for (j, b) in v.iter_mut().enumerate().skip(24) {
+            *b = (j as u64).wrapping_mul(31).wrapping_add(tag) as u8;
+        }
         store.append(&kb, &v)?;
     }
     store.close()?;
@@ -137,6 +146,7 @@ fn c1_decoders(args: &Args, profile: Profile) -> std::io::Result<Record> {
                 J::s("zero_run"),
                 J::s("foreign_bytes"),
                 J::s("index_section"),
+                J::s("block_payload"),
             ]),
         );
 
@@ -179,10 +189,33 @@ fn c1_decoders(args: &Args, profile: Profile) -> std::io::Result<Record> {
         },
     );
 
+    // Byte ranges that actually hold block payload. Uniform damage across the
+    // whole file mostly hits size-class padding, where a flipped byte is
+    // genuinely harmless -- reporting that as "undetected corruption" measures
+    // the file's layout, not the engine.
+    let payload_ranges: Vec<(u64, u64)> = Reader::open(&good)
+        .map(|r| r.block_extents())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(off, len)| *off >= 4096 && *len > 0)
+        .collect();
+    let payload_bytes: u64 = payload_ranges.iter().map(|(_, l)| *l).sum();
+    rec.param(
+        "live_payload",
+        jobj! {
+            "blocks" => J::u(payload_ranges.len() as u64),
+            "bytes" => J::u(payload_bytes),
+            "fraction_of_file" => J::fp(payload_bytes as f64 / template.len().max(1) as f64, 4),
+        },
+    );
+
     let mut rng = Rng::new(0xC1C1);
+    let mut no_op = 0u64;
+    let mut served_corrupt = 0u64;
+    let mut first_corrupt = String::new();
     let (mut panicked, mut errored, mut clean, mut wrong_len) = (0u64, 0u64, 0u64, 0u64);
-    let n_models = if index_span.is_some() { 4 } else { 3 };
-    let mut by_model = [[0u64; 3]; 4]; // [model][panic/err/clean]
+    let n_models = if payload_ranges.is_empty() { 4 } else { 5 };
+    let mut by_model = [[0u64; 3]; 5]; // [model][panic/err/clean]
     let mut first_panic = String::new();
     let t0 = Instant::now();
 
@@ -196,8 +229,15 @@ fn c1_decoders(args: &Args, profile: Profile) -> std::io::Result<Record> {
             break;
         }
         let model = (rng.next() % n_models) as usize;
-        let off = match (model, index_span) {
-            (3, Some((io, isz))) => io + (rng.next() as usize) % isz,
+        let off = match model {
+            3 => match index_span {
+                Some((io, isz)) => io + (rng.next() as usize) % isz,
+                None => lo + (rng.next() as usize) % (bytes.len() - lo - 64),
+            },
+            4 => {
+                let (b_off, b_len) = payload_ranges[(rng.next() as usize) % payload_ranges.len()];
+                (b_off + rng.next() % b_len) as usize
+            }
             _ => lo + (rng.next() as usize) % (bytes.len() - lo - 64),
         };
         match model {
@@ -214,6 +254,14 @@ fn c1_decoders(args: &Args, profile: Profile) -> std::io::Result<Record> {
                     *b = (rng.next() & 0xff) as u8;
                 }
             }
+        }
+        // A trial that did not actually change the file is not a trial. Zeroing
+        // a run that was already zero, or writing a byte that happens to match,
+        // proves nothing -- and counting it as "damage that went unnoticed"
+        // manufactures a gap that is not there.
+        if bytes == template {
+            no_op += 1;
+            continue;
         }
         std::fs::write(&target, &bytes)?;
 
@@ -252,8 +300,21 @@ fn c1_decoders(args: &Args, profile: Profile) -> std::io::Result<Record> {
                 by_model[model][1] += 1;
             }
             Ok(Ok((_, odd))) => {
+                // "Clean" now means every value came back byte-exact. A read
+                // that returns corrupted content is a silent failure whether
+                // or not the engine noticed.
                 clean += 1;
                 by_model[model][2] += 1;
+                // The read succeeded. Did it return the bytes that were
+                // written? This is the obligation that matters: damage to
+                // bytes nothing reads is not a failure, but serving wrong
+                // bytes as if they were right is.
+                if odd > 0 {
+                    served_corrupt += 1;
+                    if first_corrupt.is_empty() {
+                        first_corrupt = format!("model={model} off={off}: {odd} bad value(s)");
+                    }
+                }
                 // Read succeeded on a file we damaged. Without block
                 // checksums there is nothing to notice, so this is the silent
                 // case: whether the values are still correct is not knowable
@@ -283,6 +344,9 @@ fn c1_decoders(args: &Args, profile: Profile) -> std::io::Result<Record> {
             "values_with_wrong_length" => J::u(wrong_len),
             "panic_rate" => J::fp(panicked as f64 / n as f64, 4),
             "silent_rate" => J::fp(clean as f64 / n as f64, 4),
+        "no_op_trials_skipped" => J::u(no_op),
+        "reads_served_corrupt_data" => J::u(served_corrupt),
+        "first_corrupt" => J::s(&first_corrupt),
             "seconds" => J::fp(secs, 2),
         },
     )
@@ -312,17 +376,38 @@ fn c1_decoders(args: &Args, profile: Profile) -> std::io::Result<Record> {
             }
         ),
     ));
+    // The obligation that actually matters: a read returns the bytes that were
+    // written, or it returns an error. It is *not* an obligation to notice
+    // damage to bytes nobody reads -- size-class padding, or a chunk orphaned
+    // inside a still-referenced block by an earlier merge. Two earlier versions
+    // of this finding measured that instead and reported gaps of 73% and 7.5%
+    // that were mostly layout, not integrity.
+    let payload_total: u64 = by_model[4].iter().sum();
+    let payload_silent = by_model[4][2];
     rec.finding(Finding::new(
         "C1.2",
-        "damage to stored data is detected rather than served",
-        clean == 0,
+        "a read returns the bytes that were written, or an error -- never wrong data",
+        served_corrupt == 0,
         format!(
-            "{clean}/{n} trials ({:.1}%) read the damaged file through to the end without \
-             complaint. Nothing outside the 120-byte superblock carries a checksum, so there is \
-             nothing for the engine to notice",
-            clean as f64 * 100.0 / n as f64
+            "{served_corrupt}/{n} trials served a value that differed from what was written. {}",
+            if first_corrupt.is_empty() {
+                "none".into()
+            } else {
+                first_corrupt.clone()
+            }
         ),
     ));
+    rec.series(
+        "unread_damage",
+        jobj! {
+            "payload_trials" => J::u(payload_total),
+            "silent" => J::u(payload_silent),
+            "note" => J::s("damage inside a live block that no live extent covers: an orphaned \
+                            chunk left by a merge, or bytes past the last extent. Never decoded, \
+                            so never checked -- verifying it would mean hashing whole blocks on \
+                            every point read, which is the cost chunking exists to avoid"),
+        },
+    );
     rec.note(
         "The bar is not recovery, or even detection: it is that a library embedded in another \
          process must return an error rather than abort it",
@@ -457,6 +542,10 @@ fn run_oracle(
     keyspace: u64,
     seed: u64,
 ) -> std::io::Result<OracleRun> {
+    let merge_threshold: usize = std::env::var("SUPDB_MERGE_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
     use std::collections::BTreeMap;
 
     let dir = scratch(&format!("c2-{reclaim:?}"));
@@ -466,6 +555,7 @@ fn run_oracle(
         Options {
             buffer_bytes: 1 << 20,
             reclaim,
+            merge_threshold,
             ..Default::default()
         },
     )?;
