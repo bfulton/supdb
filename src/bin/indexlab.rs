@@ -781,18 +781,28 @@ impl Layout for HashFlat {
 /// pages without touching it.
 const PER_PAGE: usize = 128;
 
-struct HashPaged {
+/// The page-organised record blob, shared by every layout that uses one.
+///
+/// Split out because `MphPaged` used to embed a whole `HashPaged` and so
+/// carried -- and was charged for -- the sixteen bytes per key of hash table
+/// it exists to replace. The measured size was 44.7 B/key when the structure
+/// actually in use was nearer 26.
+struct PagedBlob {
     pages: Vec<u8>,
     /// Byte offset of each page. Pages are packed end to end, so nothing is
     /// wasted on alignment.
     page_dir: Vec<u32>,
-    hash: Vec<(u8, u32)>,
-    mask: usize,
     len: usize,
 }
 
-impl HashPaged {
-    fn build(keys: &[Vec<u8>], exts: &[Ext4]) -> HashPaged {
+struct HashPaged {
+    blob: PagedBlob,
+    hash: Vec<(u8, u32)>,
+    mask: usize,
+}
+
+impl PagedBlob {
+    fn build(keys: &[Vec<u8>], exts: &[Ext4]) -> PagedBlob {
         let mut pages: Vec<u8> = Vec::with_capacity(keys.len() * 16);
         let mut page_dir = Vec::with_capacity(keys.len() / PER_PAGE + 1);
         for chunk_start in (0..keys.len()).step_by(PER_PAGE) {
@@ -826,28 +836,15 @@ impl HashPaged {
         pages.shrink_to_fit();
         page_dir.shrink_to_fit();
 
-        let mut cap = 1usize;
-        while cap < keys.len() * 2 {
-            cap <<= 1;
-        }
-        cap = cap.max(16);
-        let mask = cap - 1;
-        let mut hash = vec![(0u8, u32::MAX); cap];
-        for (i, k) in keys.iter().enumerate() {
-            let h = key_hash(k);
-            let mut slot = (h as usize) & mask;
-            while hash[slot].1 != u32::MAX {
-                slot = (slot + 1) & mask;
-            }
-            hash[slot] = (((h >> 56) as u8) | 1, i as u32);
-        }
-        HashPaged {
+        PagedBlob {
             pages,
             page_dir,
-            hash,
-            mask,
             len: keys.len(),
         }
+    }
+
+    fn bytes(&self) -> usize {
+        self.pages.capacity() + self.page_dir.capacity() * 4
     }
 
     /// (key prefix, slot offset within the page) for a record by rank.
@@ -869,51 +866,28 @@ impl HashPaged {
         ) as usize;
         Some((base, prefix, base + off))
     }
-}
 
-impl Layout for HashPaged {
-    fn name(&self) -> &'static str {
-        "hash+paged"
-    }
-    fn logical_bytes(&self) -> usize {
-        self.pages.capacity()
-            + self.page_dir.capacity() * 4
-            + self.hash.capacity() * std::mem::size_of::<(u8, u32)>()
-    }
-    fn lookup(&self, key: &[u8]) -> Option<Ext4> {
-        let h = key_hash(key);
-        let tag = ((h >> 56) as u8) | 1;
-        let mut slot = (h as usize) & self.mask;
-        loop {
-            let (t, rank) = self.hash[slot];
-            if rank == u32::MAX {
-                return None;
-            }
-            if t == tag {
-                if let Some((base, prefix, at)) = self.locate(rank as usize) {
-                    let sl =
-                        u16::from_le_bytes(self.pages[at..at + 2].try_into().unwrap()) as usize;
-                    let mut p = at + 2;
-                    // Compare against prefix then suffix without rebuilding
-                    // the key: the prefix is shared by the whole page.
-                    if key.len() == prefix + sl
-                        && key[..prefix] == self.pages[base + 4..base + 4 + prefix]
-                        && key[prefix..] == self.pages[p..p + sl]
-                    {
-                        p += sl;
-                        return Some(Ext4 {
-                            block: get_uv(&self.pages, &mut p) as u32,
-                            off: get_uv(&self.pages, &mut p) as u32,
-                            len: get_uv(&self.pages, &mut p) as u32,
-                            last: get_uv(&self.pages, &mut p) as u32,
-                        });
-                    }
-                }
-            }
-            slot = (slot + 1) & self.mask;
+    /// Decode the record at `at`, returning its extent only if the key matches.
+    #[inline]
+    fn matches(&self, base: usize, prefix: usize, at: usize, key: &[u8]) -> Option<Ext4> {
+        let sl = u16::from_le_bytes(self.pages[at..at + 2].try_into().unwrap()) as usize;
+        let mut p = at + 2;
+        if key.len() != prefix + sl
+            || key[..prefix] != self.pages[base + 4..base + 4 + prefix]
+            || key[prefix..] != self.pages[p..p + sl]
+        {
+            return None;
         }
+        p += sl;
+        Some(Ext4 {
+            block: get_uv(&self.pages, &mut p) as u32,
+            off: get_uv(&self.pages, &mut p) as u32,
+            len: get_uv(&self.pages, &mut p) as u32,
+            last: get_uv(&self.pages, &mut p) as u32,
+        })
     }
-    fn scan_from(&self, start: usize, n: usize) -> u64 {
+
+    fn scan(&self, start: usize, n: usize) -> u64 {
         let mut acc = 0u64;
         let mut rank = start;
         let end = (start + n).min(self.len);
@@ -930,6 +904,345 @@ impl Layout for HashPaged {
             rank += 1;
         }
         acc
+    }
+}
+
+impl HashPaged {
+    fn build(keys: &[Vec<u8>], exts: &[Ext4]) -> HashPaged {
+        let blob = PagedBlob::build(keys, exts);
+        let mut cap = 1usize;
+        while cap < keys.len() * 2 {
+            cap <<= 1;
+        }
+        cap = cap.max(16);
+        let mask = cap - 1;
+        let mut hash = vec![(0u8, u32::MAX); cap];
+        for (i, k) in keys.iter().enumerate() {
+            let h = key_hash(k);
+            let mut slot = (h as usize) & mask;
+            while hash[slot].1 != u32::MAX {
+                slot = (slot + 1) & mask;
+            }
+            hash[slot] = (((h >> 56) as u8) | 1, i as u32);
+        }
+        HashPaged { blob, hash, mask }
+    }
+}
+
+impl Layout for HashPaged {
+    fn name(&self) -> &'static str {
+        "hash+paged"
+    }
+    fn logical_bytes(&self) -> usize {
+        self.blob.bytes() + self.hash.capacity() * std::mem::size_of::<(u8, u32)>()
+    }
+    fn lookup(&self, key: &[u8]) -> Option<Ext4> {
+        let h = key_hash(key);
+        let tag = ((h >> 56) as u8) | 1;
+        let mut slot = (h as usize) & self.mask;
+        loop {
+            let (t, rank) = self.hash[slot];
+            if rank == u32::MAX {
+                return None;
+            }
+            if t == tag {
+                if let Some((base, prefix, at)) = self.blob.locate(rank as usize) {
+                    if let Some(e) = self.blob.matches(base, prefix, at, key) {
+                        return Some(e);
+                    }
+                }
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+    fn scan_from(&self, start: usize, n: usize) -> u64 {
+        self.blob.scan(start, n)
+    }
+}
+
+// --------------------------------------------- minimal perfect hash (BBHash) --
+
+#[inline]
+fn key_hash_seeded(key: &[u8], seed: u64) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for &b in key {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^ (h >> 32)
+}
+
+/// One level of a BBHash minimal perfect hash: a bit array plus a rank index.
+struct MphLevel {
+    bits: Vec<u64>,
+    /// Set bits before each 512-bit block, so rank is one lookup plus a few
+    /// popcounts rather than a scan.
+    block_rank: Vec<u32>,
+    nbits: usize,
+    /// Keys placed by all earlier levels.
+    base: u32,
+}
+
+impl MphLevel {
+    #[inline]
+    fn is_set(&self, p: usize) -> bool {
+        self.bits[p / 64] & (1u64 << (p % 64)) != 0
+    }
+    #[inline]
+    fn rank(&self, p: usize) -> u32 {
+        let block = p / 512;
+        let mut r = self.block_rank[block];
+        for w in (block * 8)..(p / 64) {
+            r += self.bits[w].count_ones();
+        }
+        r + (self.bits[p / 64] & ((1u64 << (p % 64)) - 1)).count_ones()
+    }
+}
+
+/// A minimal perfect hash: N distinct keys onto exactly the slots 0..N, with
+/// no table of slots and no collisions.
+///
+/// Built offline from the key set, which is what makes it collision-free by
+/// construction. It costs a few bits per key instead of the sixteen bytes a
+/// real hash table needs -- but it is static, so it belongs to a base that is
+/// rebuilt at merge, and it returns a meaningless slot for any key that was
+/// not in the set. That second property is the whole reason it wants a filter
+/// beside it: a lookup for an absent key has no cheap way to fail.
+struct Mphf {
+    levels: Vec<MphLevel>,
+    /// Keys that never landed alone, after the level cap. Expected to be tiny.
+    fallback: std::collections::HashMap<Vec<u8>, u32>,
+    n: usize,
+}
+
+impl Mphf {
+    fn build(keys: &[Vec<u8>]) -> Mphf {
+        const GAMMA: f64 = 2.0;
+        const MAX_LEVELS: usize = 12;
+        let mut levels: Vec<MphLevel> = Vec::new();
+        let mut remaining: Vec<u32> = (0..keys.len() as u32).collect();
+        let mut base = 0u32;
+
+        for level in 0..MAX_LEVELS {
+            if remaining.is_empty() {
+                break;
+            }
+            let nbits = (((remaining.len() as f64) * GAMMA) as usize)
+                .max(64)
+                .next_multiple_of(512);
+            // Saturating occupancy: 0, 1, or "more than one".
+            let mut occ = vec![0u8; nbits];
+            for &i in &remaining {
+                let p = (key_hash_seeded(&keys[i as usize], level as u64) % nbits as u64) as usize;
+                if occ[p] < 2 {
+                    occ[p] += 1;
+                }
+            }
+            let mut bits = vec![0u64; nbits / 64];
+            for (p, o) in occ.iter().enumerate() {
+                if *o == 1 {
+                    bits[p / 64] |= 1u64 << (p % 64);
+                }
+            }
+            let mut block_rank = Vec::with_capacity(nbits / 512 + 1);
+            let mut running = 0u32;
+            for b in 0..(nbits / 512) {
+                block_rank.push(running);
+                for w in &bits[b * 8..(b + 1) * 8] {
+                    running += w.count_ones();
+                }
+            }
+            block_rank.push(running);
+            let placed = running;
+
+            let next: Vec<u32> = remaining
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    let p =
+                        (key_hash_seeded(&keys[i as usize], level as u64) % nbits as u64) as usize;
+                    occ[p] != 1
+                })
+                .collect();
+            levels.push(MphLevel {
+                bits,
+                block_rank,
+                nbits,
+                base,
+            });
+            base += placed;
+            remaining = next;
+        }
+
+        // Anything still unplaced gets an explicit slot after the levels.
+        let mut fallback = std::collections::HashMap::new();
+        for (j, &i) in remaining.iter().enumerate() {
+            fallback.insert(keys[i as usize].clone(), base + j as u32);
+        }
+        Mphf {
+            levels,
+            fallback,
+            n: keys.len(),
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        self.levels
+            .iter()
+            .map(|l| l.bits.capacity() * 8 + l.block_rank.capacity() * 4)
+            .sum::<usize>()
+            + self.fallback.len() * 40
+    }
+
+    #[inline]
+    fn slot(&self, key: &[u8]) -> Option<u32> {
+        for (level, l) in self.levels.iter().enumerate() {
+            let p = (key_hash_seeded(key, level as u64) % l.nbits as u64) as usize;
+            if l.is_set(p) {
+                return Some(l.base + l.rank(p));
+            }
+        }
+        self.fallback.get(key).copied()
+    }
+}
+
+// ------------------------------------------------------- blocked bloom filter --
+
+/// A blocked Bloom filter: every probe for a key lands in one 512-bit block,
+/// so a query costs a single cache miss rather than k scattered ones.
+///
+/// Chosen over a ribbon filter deliberately. Ribbon is roughly 30% more
+/// space-efficient at the same false-positive rate, but the category being
+/// bought here is *miss latency*, and on that axis both are one cache line.
+/// The extra construction machinery would not change the measurement.
+struct BlockedBloom {
+    blocks: Vec<u64>,
+    nblocks: usize,
+}
+
+const BLOOM_BITS_PER_KEY: usize = 12;
+const BLOOM_PROBES: usize = 6;
+
+impl BlockedBloom {
+    fn build(keys: &[Vec<u8>]) -> BlockedBloom {
+        let nblocks = ((keys.len() * BLOOM_BITS_PER_KEY) / 512)
+            .max(1)
+            .next_power_of_two();
+        let mut blocks = vec![0u64; nblocks * 8];
+        let f = BlockedBloom {
+            blocks: Vec::new(),
+            nblocks,
+        };
+        let mut out = vec![0u64; nblocks * 8];
+        for k in keys {
+            let h = key_hash_seeded(k, 0xB100);
+            let b = f.block_of(h);
+            let mut x = h;
+            for _ in 0..BLOOM_PROBES {
+                x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17);
+                let bit = (x >> 40) as usize % 512;
+                out[b * 8 + bit / 64] |= 1u64 << (bit % 64);
+            }
+        }
+        blocks.copy_from_slice(&out);
+        BlockedBloom { blocks, nblocks }
+    }
+
+    #[inline]
+    fn block_of(&self, h: u64) -> usize {
+        ((h >> 32) as usize) & (self.nblocks - 1)
+    }
+
+    #[inline]
+    fn maybe_contains(&self, key: &[u8]) -> bool {
+        let h = key_hash_seeded(key, 0xB100);
+        let b = self.block_of(h);
+        let mut x = h;
+        for _ in 0..BLOOM_PROBES {
+            x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(17);
+            let bit = (x >> 40) as usize % 512;
+            if self.blocks[b * 8 + bit / 64] & (1u64 << (bit % 64)) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn bytes(&self) -> usize {
+        self.blocks.capacity() * 8
+    }
+}
+
+// ------------------------------------------------- MPH over the paged blob --
+
+/// The composite the frontier pointed at: a minimal perfect hash instead of a
+/// hash table, over the same page-organised records, with an optional filter
+/// to give absent keys somewhere cheap to fail.
+struct MphPaged {
+    blob: PagedBlob,
+    mph: Mphf,
+    /// MPH slots are arbitrary; the blob is in sorted order. Four bytes per key
+    /// buys the translation, and is still a quarter of what the hash cost.
+    rank_of_slot: Vec<u32>,
+    bloom: Option<BlockedBloom>,
+    named: &'static str,
+}
+
+impl MphPaged {
+    fn build(keys: &[Vec<u8>], exts: &[Ext4], with_bloom: bool) -> MphPaged {
+        let blob = PagedBlob::build(keys, exts);
+        let mph = Mphf::build(keys);
+        let mut rank_of_slot = vec![u32::MAX; mph.n];
+        for (rank, k) in keys.iter().enumerate() {
+            let slot = mph.slot(k).expect("every key must have a slot") as usize;
+            rank_of_slot[slot] = rank as u32;
+        }
+        MphPaged {
+            blob,
+            mph,
+            rank_of_slot,
+            bloom: if with_bloom {
+                Some(BlockedBloom::build(keys))
+            } else {
+                None
+            },
+            named: if with_bloom {
+                "mph+bloom+paged"
+            } else {
+                "mph+paged"
+            },
+        }
+    }
+}
+
+impl Layout for MphPaged {
+    fn name(&self) -> &'static str {
+        self.named
+    }
+    fn logical_bytes(&self) -> usize {
+        self.blob.bytes()
+            + self.mph.bytes()
+            + self.rank_of_slot.capacity() * 4
+            + self.bloom.as_ref().map(|b| b.bytes()).unwrap_or(0)
+    }
+    fn lookup(&self, key: &[u8]) -> Option<Ext4> {
+        if let Some(b) = &self.bloom {
+            if !b.maybe_contains(key) {
+                return None;
+            }
+        }
+        let slot = self.mph.slot(key)? as usize;
+        let rank = *self.rank_of_slot.get(slot)? as usize;
+        let (base, prefix, at) = self.blob.locate(rank)?;
+        // The MPH returns a slot for keys it never saw, so the full key must be
+        // verified. A fingerprint would not do: this project has already argued
+        // that a 32-bit match is not proof at six million keys.
+        self.blob.matches(base, prefix, at, key)
+    }
+    fn scan_from(&self, start: usize, n: usize) -> u64 {
+        self.blob.scan(start, n)
     }
 }
 
@@ -1189,11 +1502,13 @@ fn build_layout(which: &str, keys: &[Vec<u8>], exts: &[Ext4]) -> Box<dyn Layout>
         "hash+packed" => Box::new(HashPacked::build(keys, exts)),
         "hash+flat" => Box::new(HashFlat::build(keys, exts)),
         "hash+paged" => Box::new(HashPaged::build(keys, exts)),
+        "mph+paged" => Box::new(MphPaged::build(keys, exts, false)),
+        "mph+bloom+paged" => Box::new(MphPaged::build(keys, exts, true)),
         other => panic!("unknown layout {other}"),
     }
 }
 
-const LAYOUTS: [&str; 7] = [
+const LAYOUTS: [&str; 9] = [
     "heap-hash",
     "btree",
     "packed",
@@ -1201,6 +1516,8 @@ const LAYOUTS: [&str; 7] = [
     "hash+packed",
     "hash+flat",
     "hash+paged",
+    "mph+paged",
+    "mph+bloom+paged",
 ];
 
 fn main() -> std::io::Result<()> {
@@ -1458,6 +1775,34 @@ fn main() -> std::io::Result<()> {
                 "hash+paged {ps:.2} ns/entry against heap-hash {hs:.2} ns/entry ({:.2}x)",
                 ps / hs.max(1e-9)
             ),
+        ));
+    }
+    // What the filter is actually for.
+    if let (Some(bare), Some(filtered), Some(bs), Some(fs)) = (
+        get("decimal16", "mph+paged", "miss_ns"),
+        get("decimal16", "mph+bloom+paged", "miss_ns"),
+        get("decimal16", "mph+paged", "resident_bytes_per_key"),
+        get("decimal16", "mph+bloom+paged", "resident_bytes_per_key"),
+    ) {
+        rec.finding(Finding::new(
+            "F9.6",
+            "a blocked Bloom filter at least halves the cost of an absent-key lookup",
+            filtered * 2.0 <= bare,
+            format!("mph+paged {bare:.0} ns -> mph+bloom+paged {filtered:.0} ns ({:.2}x) for {:.1} B/key. A minimal perfect hash returns a slot for keys it never saw, so without a filter every miss pays a full record read to discover it was a miss", bare / filtered.max(1e-9), fs - bs),
+        ));
+    }
+    // Whether the minimal perfect hash bought speed as well as space.
+    if let (Some(hl), Some(ml), Some(hb), Some(mb)) = (
+        get("decimal16", "heap-hash", "hit_ns"),
+        get("decimal16", "mph+paged", "hit_ns"),
+        get("decimal16", "heap-hash", "resident_bytes_per_key"),
+        get("decimal16", "mph+paged", "resident_bytes_per_key"),
+    ) {
+        rec.finding(Finding::new(
+            "F9.7",
+            "a minimal perfect hash reaches packed-class space at hash-class speed",
+            ml <= hl * 1.5,
+            format!("mph+paged {mb:.0} B/key against heap-hash {hb:.0} ({:.1}x smaller) but {ml:.0} ns against {hl:.0} ({:.2}x slower). BBHash probes several level bit-arrays, each a random access into megabytes, plus a rank; that is more cache misses than one hash probe, not fewer", hb / mb.max(1e-9), ml / hl.max(1e-9)),
         ));
     }
     if let (Some(smooth), Some(rough)) = (
