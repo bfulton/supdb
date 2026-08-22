@@ -4,22 +4,32 @@
 the result — including the places the theory predicts something the
 measurement does not show, which are the interesting places.
 
-All figures are 10M sixteen-byte decimal keys, `--profile full`. The summary
-table below comes from `results/f9-index-layout.full.json`, which **predates
-the two fixed-extent paged arms** and so lists ten; those two are measured
-pairwise against their originals in `results/f10-pair-*.full.json` and are
-reported in "Varint decoding" below. Regenerating the f9 record at `full` so
-the summary table covers all twelve is outstanding work.
+All figures are 10M sixteen-byte decimal keys, `--profile full`, from
+`results/f9-index-layout.full.json`. The two fixed-extent paged arms are also
+measured pairwise against their varint originals, interleaved in one process,
+in `results/f10-pair-*.full.json`; the probe's own cross-layout figures come
+from sequential `Trial` blocks and are a table rather than a claim.
 
 | layout | hit | miss | scan | B/key | MiB @ 10M |
 |---|---|---|---|---|---|
-| heap-hash (today) | 369 ns | 246 ns | 2.78 ns/e | 98.8 | 942 |
-| hash+flat | 475 ns | 251 ns | 6.80 ns/e | 54.2 | 517 |
-| hash+paged | 686 ns | 259 ns | 4.92 ns/e | 43.2 | 412 |
-| mph+paged | 801 ns | 667 ns | 4.29 ns/e | 22.2 | 212 |
-| mph+bloom+paged | 861 ns | **239 ns** | 4.85 ns/e | 24.9 | 237 |
-| packed | 1088 ns | 1121 ns | 8.36 ns/e | **14.1** | 134 |
-| btree | 1417 ns | 1476 ns | — | 36.8 | 351 |
+| heap-hash (today) | 370 ns | 243 ns | **2.52 ns/e** | 98.8 | 942 |
+| **hash+flatfixed** | **307 ns** | 244 ns | 2.94 ns/e | 61.1 | 583 |
+| hash+flat | 462 ns | 239 ns | 7.19 ns/e | 54.2 | 517 |
+| hash+pagedfixed | 481 ns | 255 ns | 3.52 ns/e | 49.8 | 475 |
+| hash+paged | 673 ns | 249 ns | 5.98 ns/e | 42.9 | 409 |
+| mph+pagedfixed | 676 ns | 656 ns | 3.51 ns/e | 28.8 | 275 |
+| mph+paged | 767 ns | 623 ns | 5.74 ns/e | 21.8 | 208 |
+| mph+bloom+paged | 855 ns | **245 ns** | 5.66 ns/e | 24.6 | 235 |
+| hash+packed | 1102 ns | 251 ns | 8.33 ns/e | 41.0 | 391 |
+| packed | 1113 ns | 1111 ns | 7.25 ns/e | **14.1** | 134 |
+| packed+radix | 1104 ns | 1092 ns | 7.59 ns/e | 14.2 | 135 |
+| btree | 1390 ns | 1419 ns | — | 36.8 | 351 |
+
+Read the pairs together rather than the column: `hash+pagedfixed` and
+`mph+pagedfixed` each buy roughly 1.2–1.4× on hits and 1.6× on scans from
+their varint originals, for 16% and 34% more space respectively. Only
+`hash+flatfixed` is faster than the heap index outright, and it is the largest
+of the mmap-able layouts.
 
 ## 1. Which cost model applies
 
