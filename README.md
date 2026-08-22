@@ -68,6 +68,8 @@ appends, replaces and deletes across every checkpoint.
 | damaged data is detected | **74%** of corrupted files read through without complaint, returning wrong-length values; nothing outside the superblock is checksummed |
 | a damaged file errors rather than panics | damage aimed at the key index panics the host process — `get_uvarint` has no bounds check |
 | a store killed before its first checkpoint is readable | it is not; nothing reaches disk until a checkpoint, and `buffer_bytes` defaults to 512 MB |
+| the store agrees with a `BTreeMap` model | **no** — a deleted key comes back (see below) |
+| the write path completes under every reclaim policy | **no** — under `AfterReads` the writer fails to decode a block it wrote |
 
 The out-of-core result is the largest single number in the suite, and it is
 the only one measured at `--profile full`, so it is the only citable one.
@@ -82,6 +84,29 @@ removed. The mixed-workload result is structural: `Store` exposes no read
 method, so a read after a write needs a checkpoint and a fresh `Reader`, both
 `O(key count)` — and no benchmark in the original suite mixes reads with
 writes.
+
+## Two data-correctness bugs
+
+Found by the differential oracle, both reduced and both recorded in
+`claims.json` so they cannot be forgotten.
+
+**A deleted key comes back.** `append` calls `seal_shard` inline once a shard's
+buffer fills, which stages the extent in the block builder and records it in
+`Shard::members` — but the block has no id yet, so the key's `extents` are not
+updated until `flush_builder` runs. `delete` clears `entry.extents` and knows
+nothing about the staged member, so `flush_builder` later pushes it back and
+the key returns with every value it had. Reduced to a 30-line deterministic
+test in `tests/known_bugs.rs`. The fix has to make a staged member cancellable.
+
+**A freed slot is handed out while still referenced.** Under
+`Reclaim::AfterReads` the writer's own merge path fails to decode a block it
+wrote. Instrumentation showed three block ids describing the identical byte
+range `[300643..319075)`, one of them still holding 71 live references. This is
+distinct from the first bug — that one occurs under `Never` too, this one does
+not.
+
+Neither is reachable by any benchmark in the original suite, because none of
+them compares the store against an independent model.
 
 ## The rules
 

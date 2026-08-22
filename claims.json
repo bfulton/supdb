@@ -159,8 +159,8 @@
     {
       "experiment": "c2-oracle",
       "id": "C2.1",
-      "expect": "holds",
-      "because": "The store must agree with a BTreeMap model across appends, replaces, deletes and checkpoints. This is the core data-model contract and must never regress."
+      "expect": "fails",
+      "because": "The store diverges from the model: a deleted key comes back. delete() clears entry.extents but does not cancel an extent already staged in the block builder by an inline seal_shard, so flush_builder later pushes it back. Found by this oracle, reduced to a deterministic 30-line reproducer in tests/known_bugs.rs. This is a data-correctness bug, not a performance one."
     },
     {
       "experiment": "c3-crash",
@@ -185,6 +185,19 @@
       "id": "C3.4",
       "expect": "fails",
       "because": "A store killed before its first checkpoint does not open at all -- there is no superblock to find. Everything written lives in per-shard memory buffers and buffer_bytes defaults to 512MB, so the window in which a crash loses everything is not small."
+    },
+    {
+      "experiment": "ext-kv",
+      "id": "EXT.2",
+      "profile": "full",
+      "expect": "fails",
+      "because": "At 500k keys redb reads faster than Supdb (433,957/s against 372,887/s). The ci-scale ordering reverses, so the read advantage is a small-store effect, not a property of the design."
+    },
+    {
+      "experiment": "c2-oracle",
+      "id": "C2.2",
+      "expect": "fails",
+      "because": "Under Reclaim::AfterReads the writer's own merge path fails to decode a block it wrote. Instrumentation showed three block ids describing the identical byte range, one of them still holding 71 live references: a freed slot is handed out while it is still referenced. Distinct from C2.1 -- C2.1 also occurs under Never, this does not."
     }
   ],
   "metrics": [
@@ -192,13 +205,15 @@
       "experiment": "f5-latency",
       "path": "series.throughput.ops_per_s",
       "min": 100000,
-      "because": "A floor, not a target. The per-call timer is inside the loop here, so this is well below headline throughput; it exists to catch a collapse."
+      "because": "Pinned to ci. At full scale this figure collapses to about 12,500 ops/s because a single checkpoint took 66 seconds; the floor here exists to catch a collapse in the append path itself, not in checkpointing.",
+      "profile": "ci"
     },
     {
       "experiment": "f6-threads",
       "path": "series.scaling.0.ops_per_s",
       "min": 200000,
-      "because": "Single-threaded append throughput. The axis the design is built to win, so a regression here is the most serious kind."
+      "because": "Single-threaded append throughput. The axis the design is built to win, so a regression here is the most serious kind.",
+      "profile": "ci"
     },
     {
       "experiment": "f3-multiproc",
@@ -217,6 +232,27 @@
       "path": "series.engines.0.read_hit_rate",
       "min": 0.99,
       "because": "The comparison is only meaningful if Supdb actually returns the data. A collapse here would mean the reads being timed are misses."
+    },
+    {
+      "experiment": "f5-latency",
+      "profile": "full",
+      "path": "series.throughput.ops_per_s",
+      "min": 5000,
+      "because": "At full scale end-to-end throughput is about 12,500 ops/s -- two orders of magnitude below the append rate -- because checkpoint() rewrites the whole key index and one took 66 seconds. The floor is set low deliberately: it guards against total collapse while recording that the figure is already dominated by checkpointing."
+    },
+    {
+      "experiment": "f5-latency",
+      "profile": "full",
+      "path": "series.checkpoint_latency.max_ms",
+      "max": 120000,
+      "because": "The worst observed checkpoint is 66.6 seconds at 500k keys. This ceiling is a tripwire, not a target: any growth past two minutes means the O(nkeys) checkpoint has become unusable at this scale."
+    },
+    {
+      "experiment": "f6-threads",
+      "profile": "full",
+      "path": "series.scaling.0.ops_per_s",
+      "min": 500000,
+      "because": "Single-threaded append throughput at full scale, the axis the design is built to win."
     }
   ]
 }

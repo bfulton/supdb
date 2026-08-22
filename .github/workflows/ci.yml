@@ -7,8 +7,10 @@ name: ci
 # because either the engine changed or the experiment stopped testing anything.
 
 on:
+  # Pull requests and main only. Every branch commit would run three benchmark
+  # suites, and most branch commits are work in progress.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 

@@ -339,10 +339,13 @@ fn c1_decoders(args: &Args, profile: Profile) -> std::io::Result<Record> {
 /// compared against it. A hundred lines that the design document's six
 /// hand-written harnesses do not contain.
 fn c2_oracle(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    use std::collections::BTreeMap;
-
-    let rounds = args.num("--rounds", profile.pick(40, 200, 1_000));
-    let ops_per_round = args.num("--ops", profile.pick(500, 2_000, 10_000));
+    // The ci defaults are sized to actually reproduce, not merely to run.
+    // At 500 operations per round a shard's pending buffer never fills, so
+    // seal_shard is not triggered inline and the staged-extent bug cannot
+    // occur -- the suite reported "no divergence" for a defect it had already
+    // proven. Both known bugs surface at 60x2000 in under half a second.
+    let rounds = args.num("--rounds", profile.pick(60, 200, 1_000));
+    let ops_per_round = args.num("--ops", profile.pick(2_000, 2_000, 10_000));
     let keyspace = args.num("--keyspace", 300) as u64;
     let seed = args.num("--seed", 0xC2C2) as u64;
 
@@ -352,68 +355,188 @@ fn c2_oracle(args: &Args, profile: Profile) -> std::io::Result<Record> {
         .param("keyspace", J::u(keyspace))
         .param("seed", J::u(seed));
 
-    let dir = scratch("c2");
+    // Every reclaim policy, because the two defects this found are
+    // policy-dependent and running one policy hides the other: under
+    // AfterReads the write path dies before the comparison can run, and under
+    // Never it survives and diverges.
+    let policies: Vec<(&str, Reclaim)> = vec![
+        ("AfterReads", Reclaim::AfterReads),
+        ("Never", Reclaim::Never),
+        ("OnClose", Reclaim::OnClose),
+    ];
+
+    let mut rows = Vec::new();
+    let mut any_write_error = false;
+    let mut any_divergence = false;
+    let mut worst = String::new();
+
+    for (name, reclaim) in &policies {
+        let r = run_oracle(*reclaim, rounds, ops_per_round, keyspace, seed)?;
+        if r.write_error.is_some() {
+            any_write_error = true;
+        }
+        if r.mismatches > 0 {
+            any_divergence = true;
+            if worst.is_empty() {
+                worst = format!("{name}: {}", r.first);
+            }
+        }
+        println!(
+            "  {name:11} {:>7} comparisons  {:>6} mismatches  {:>4} read errors  write path: {}",
+            r.checked,
+            r.mismatches,
+            r.read_errors,
+            r.write_error.clone().unwrap_or_else(|| "ok".into())
+        );
+        rows.push(jobj! {
+            "reclaim" => J::s(*name),
+            "keys_compared" => J::u(r.checked),
+            "mismatches" => J::u(r.mismatches),
+            "read_errors" => J::u(r.read_errors),
+            "rounds_completed" => J::u(r.rounds_done),
+            "write_error" => match &r.write_error {
+                Some(e) => J::s(e.as_str()),
+                None => J::Null,
+            },
+            "first_divergence" => J::s(&r.first),
+        });
+    }
+    rec.series("by_reclaim_policy", J::arr(rows));
+
+    rec.finding(Finding::new(
+        "C2.1",
+        "the store agrees with a BTreeMap model across appends, replaces and deletes",
+        !any_divergence,
+        if worst.is_empty() {
+            "no divergence under any reclaim policy".to_string()
+        } else {
+            format!(
+                "{worst}. delete() clears entry.extents but does not cancel an extent already \
+                 staged in the block builder, so flush_builder pushes it back and the deleted \
+                 key returns. Reduced in tests/known_bugs.rs"
+            )
+        },
+    ));
+    rec.finding(Finding::new(
+        "C2.2",
+        "the write path completes without error under every reclaim policy",
+        !any_write_error,
+        if any_write_error {
+            "under AfterReads the writer's own merge path fails to decode a block it wrote: a \
+             freed slot is handed out while a block still holds live references to it, so three \
+             block ids end up describing the same byte range"
+                .to_string()
+        } else {
+            "no write-path errors".to_string()
+        },
+    ));
+    rec.note(format!(
+        "deterministic: rerun with --seed {seed} to reproduce exactly"
+    ));
+    Ok(rec)
+}
+
+struct OracleRun {
+    checked: u64,
+    mismatches: u64,
+    read_errors: u64,
+    rounds_done: u64,
+    write_error: Option<String>,
+    first: String,
+}
+
+/// One pass of the oracle under one reclaim policy.
+///
+/// A write-path error stops the run and is reported rather than propagated:
+/// the point is to characterise the failure, not to abort the experiment that
+/// found it.
+fn run_oracle(
+    reclaim: Reclaim,
+    rounds: usize,
+    ops_per_round: usize,
+    keyspace: u64,
+    seed: u64,
+) -> std::io::Result<OracleRun> {
+    use std::collections::BTreeMap;
+
+    let dir = scratch(&format!("c2-{reclaim:?}"));
     let file = dir.join("s.dat");
     let store = Store::create(
         &file,
         Options {
             buffer_bytes: 1 << 20,
-            reclaim: Reclaim::AfterReads,
+            reclaim,
             ..Default::default()
         },
     )?;
 
     let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
     let mut rng = Rng::new(seed);
-    let (mut mismatches, mut checked, mut read_errors) = (0u64, 0u64, 0u64);
-    let mut first: String = String::new();
-    let mut counts = jobj! {};
-    let (mut n_app, mut n_put, mut n_del) = (0u64, 0u64, 0u64);
+    let mut out = OracleRun {
+        checked: 0,
+        mismatches: 0,
+        read_errors: 0,
+        rounds_done: 0,
+        write_error: None,
+        first: String::new(),
+    };
 
-    for round in 0..rounds {
+    'rounds: for round in 0..rounds {
         for _ in 0..ops_per_round {
             let k = rng.next() % keyspace;
             let mut kb = [0u8; 16];
             db_key_into(k, &mut kb);
             let key = kb.to_vec();
-            // A value that identifies exactly which operation produced it, so
-            // a mismatch names its own cause.
             let tag = rng.next();
             let mut val = vec![0u8; 24];
             val[..8].copy_from_slice(&tag.to_be_bytes());
             val[8..16].copy_from_slice(&k.to_be_bytes());
             val[16..24].copy_from_slice(&(round as u64).to_be_bytes());
 
-            match rng.next() % 100 {
+            let r = match rng.next() % 100 {
                 0..=69 => {
-                    store.append(&key, &val)?;
-                    model.entry(key).or_default().push(val);
-                    n_app += 1;
+                    let r = store.append(&key, &val);
+                    if r.is_ok() {
+                        model.entry(key).or_default().push(val);
+                    }
+                    r
                 }
                 70..=89 => {
-                    store.put(&key, &val)?;
-                    model.insert(key, vec![val]);
-                    n_put += 1;
+                    let r = store.put(&key, &val);
+                    if r.is_ok() {
+                        model.insert(key, vec![val]);
+                    }
+                    r
                 }
                 _ => {
-                    store.delete(&key)?;
-                    model.insert(key, Vec::new());
-                    n_del += 1;
+                    let r = store.delete(&key);
+                    if r.is_ok() {
+                        model.insert(key, Vec::new());
+                    }
+                    r
                 }
+            };
+            if let Err(e) = r {
+                out.write_error = Some(format!("round {round}: {e}"));
+                break 'rounds;
             }
         }
-        store.checkpoint()?;
+        if let Err(e) = store.checkpoint() {
+            out.write_error = Some(format!("round {round} checkpoint: {e}"));
+            break 'rounds;
+        }
+        out.rounds_done += 1;
 
         let reader = Reader::open(&file)?;
         for (key, want) in &model {
-            checked += 1;
+            out.checked += 1;
             let mut got: Vec<Vec<u8>> = Vec::new();
             match reader.read_all(key, |v| got.push(v.to_vec())) {
                 Ok(_) => {
                     if &got != want {
-                        mismatches += 1;
-                        if first.is_empty() {
-                            first = format!(
+                        out.mismatches += 1;
+                        if out.first.is_empty() {
+                            out.first = format!(
                                 "round {round}, key {}: model has {} value(s), store returned {}",
                                 String::from_utf8_lossy(key),
                                 want.len(),
@@ -423,50 +546,17 @@ fn c2_oracle(args: &Args, profile: Profile) -> std::io::Result<Record> {
                     }
                 }
                 Err(e) => {
-                    read_errors += 1;
-                    if first.is_empty() {
-                        first = format!("round {round}: read error {e}");
+                    out.read_errors += 1;
+                    if out.first.is_empty() {
+                        out.first = format!("round {round}: read error {e}");
                     }
                 }
             }
         }
     }
-    let stats = store.close()?;
-    counts = jobj! {
-        "appends" => J::u(n_app),
-        "puts" => J::u(n_put),
-        "deletes" => J::u(n_del),
-        "keys_compared" => J::u(checked),
-        "merges" => J::u(stats.merges),
-        "slots_reused" => J::u(stats.reused),
-    };
-    rec.series("operations", counts).series(
-        "divergence",
-        jobj! {
-            "mismatches" => J::u(mismatches),
-            "read_errors" => J::u(read_errors),
-            "first" => J::s(&first),
-        },
-    );
-
-    rec.finding(Finding::new(
-        "C2.1",
-        "the store agrees with a BTreeMap model across appends, replaces and deletes",
-        mismatches == 0 && read_errors == 0,
-        format!(
-            "{checked} key comparisons over {rounds} checkpoints: {mismatches} mismatches, \
-             {read_errors} read errors. {}",
-            if first.is_empty() {
-                "no divergence".into()
-            } else {
-                first.clone()
-            }
-        ),
-    ));
-    rec.note(format!(
-        "deterministic: rerun with --seed {seed} to reproduce exactly"
-    ));
-    Ok(rec)
+    let _ = store.close();
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(out)
 }
 
 // ------------------------------------------------------------- C3: crashes --

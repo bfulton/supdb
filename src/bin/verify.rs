@@ -174,6 +174,14 @@ fn check_metrics(claims: &J, results: &Path, profile: &str, out: &mut Outcome) {
     for c in list.items() {
         let exp = c.path("experiment").and_then(|v| v.as_str()).unwrap_or("");
         let path = c.path("path").and_then(|v| v.as_str()).unwrap_or("");
+        // Metrics pin to a profile for the same reason findings do: a
+        // throughput floor calibrated at ci scale is meaningless at full,
+        // where a single 66-second checkpoint dominates the run.
+        if let Some(want_profile) = c.path("profile").and_then(|v| v.as_str()) {
+            if want_profile != profile {
+                continue;
+            }
+        }
         let label = format!("{exp}:{path}");
 
         let Some(doc) = load(results, exp, profile) else {
