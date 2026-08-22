@@ -18,8 +18,9 @@ name: apple-silicon
 #     virtualised runner cannot answer it, and so this job runs only on a
 #     self-hosted Apple Silicon runner -- for instance one published by
 #     localmost (https://github.com/bfulton/localmost). When no such runner
-#     is up, the job is skipped rather than run somewhere it would produce a
-#     number that looks like a measurement and is not.
+#     claims it, the run is cancelled rather than redirected to a hosted
+#     runner, which would produce a number that looks like a measurement and
+#     is not.
 
 on:
   push:
@@ -40,10 +41,9 @@ on:
       shape:
         description: 'Key shape (decimal16, randomhex, clustered)'
         default: 'decimal16'
-      force:
-        description: 'Dispatch to the self-hosted runner even if the heartbeat looks stale'
-        type: boolean
-        default: false
+      pickup_timeout_minutes:
+        description: 'Cancel the run if no self-hosted runner claims the sweep within this many minutes'
+        default: '10'
 
 env:
   CARGO_TERM_COLOR: always
@@ -93,44 +93,66 @@ jobs:
       - name: Machine unit tests
         run: cargo test --release --lib machine
 
-  runner-available:
-    # localmost writes an ISO-8601 timestamp into the LOCALMOST_HEARTBEAT
-    # repository variable every 60 seconds while the self-hosted runner is up.
-    # Dispatching the sweep at a self-hosted label with nothing listening
-    # queues the job until it expires; checking first turns that into an
-    # honest skip. `force` bypasses this for a repository that publishes
-    # runners without publishing a heartbeat -- the gate exists to avoid a
-    # job that hangs, not to be the authority on whether the Mac is up.
+  pickup-watchdog:
+    # Bounds how long the sweep may sit unclaimed.
+    #
+    # The first version of this gate read a LOCALMOST_HEARTBEAT repository
+    # variable and skipped the sweep when it was stale. It was the wrong
+    # instrument twice over: this repository does not publish that variable,
+    # so the gate blocked the only job it existed to enable, and a heartbeat
+    # is a claim about the Mac rather than an observation of the queue. A
+    # runner can be online, heartbeating, and still never claim the job --
+    # busy, wrong labels, proxy asleep.
+    #
+    # So observe the queue instead. If nothing has claimed the sweep within
+    # the window, cancel the run and say so. A job that hangs for a day
+    # looks identical to a job that is about to start, and neither is a
+    # measurement.
+    needs: detect
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    outputs:
-      fresh: ${{ steps.hb.outputs.fresh }}
+    permissions:
+      actions: write
     steps:
-      - id: hb
+      - name: Wait for a self-hosted runner to claim the sweep
         env:
-          HEARTBEAT: ${{ vars.LOCALMOST_HEARTBEAT }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          WINDOW: ${{ inputs.pickup_timeout_minutes || '10' }}
         run: |
           set -uo pipefail
-          if [ -z "${HEARTBEAT:-}" ]; then
-            echo "no LOCALMOST_HEARTBEAT variable set"
-            echo "fresh=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          beat=$(date -u -d "$HEARTBEAT" +%s 2>/dev/null || echo 0)
-          age=$(( $(date -u +%s) - beat ))
-          echo "heartbeat=$HEARTBEAT age=${age}s"
-          if [ "$beat" -gt 0 ] && [ "$age" -lt 300 ]; then
-            echo "fresh=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "self-hosted runner looks absent or stale; skipping the sweep"
-            echo "fresh=false" >> "$GITHUB_OUTPUT"
-          fi
+          deadline=$(( WINDOW * 2 ))   # polls, at 30s each
+          for i in $(seq 1 "$deadline"); do
+            status=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
+              --jq '.jobs[] | select(.name=="sweep") | .status' 2>/dev/null || echo "")
+            case "$status" in
+              in_progress|completed)
+                echo "sweep claimed after $(( i * 30 ))s"
+                exit 0
+                ;;
+              "")
+                # The job has not been created yet, or the API hiccupped.
+                echo "waiting: sweep job not visible yet"
+                ;;
+              *)
+                echo "waiting: sweep is $status ($(( i * 30 ))s)"
+                ;;
+            esac
+            sleep 30
+          done
+          echo "::error::No self-hosted runner claimed the sweep within ${WINDOW}m."
+          echo "::error::Check that localmost is running and the runners show Idle,"
+          echo "::error::not Offline, under Settings > Actions > Runners."
+          gh api -X POST "repos/$REPO/actions/runs/$RUN_ID/cancel" >/dev/null || true
+          exit 1
 
   sweep:
     # The measurement. Manual only: a timing benchmark that fires on every
     # push to a laptop someone is using is not a measurement, it is a
     # background process competing with one.
-    needs: [detect, runner-available]
-    if: github.event_name == 'workflow_dispatch' && (needs.runner-available.outputs.fresh == 'true' || inputs.force)
+    needs: detect
+    if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 180
     # Never two timing benchmarks at once. Four cores measuring each other is
