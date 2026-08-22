@@ -14,7 +14,12 @@ on:
   workflow_dispatch:
 
 jobs:
-  smoke:
+  # Two jobs differing only in how specific the label set is. Inspection says
+  # the runners carry self-hosted, macOS, ARM64 and localmost-proxy, so the
+  # three-label form should match -- but inspection is not a test, and if the
+  # bare form is claimed while the specific one is not, the fault is label
+  # matching rather than the runner.
+  smoke-labelled:
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 5
     steps:
@@ -26,3 +31,12 @@ jobs:
           echo "page:     $(getconf PAGE_SIZE)"
           echo "cpus:     $(sysctl -n hw.ncpu)"
           echo "loadavg:  $(sysctl -n vm.loadavg)"
+
+  smoke-bare:
+    runs-on: self-hosted
+    timeout-minutes: 5
+    steps:
+      - name: Say where we are
+        run: |
+          echo "runner:   ${RUNNER_NAME:-?}"
+          echo "arch:     $(uname -m)"
