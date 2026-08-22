@@ -1,0 +1,179 @@
+name: apple-silicon
+
+# Two questions that cannot be answered from the x86 Linux runners in ci.yml,
+# kept in separate jobs because only one of them needs real hardware.
+#
+#  1. Does `Machine::detect` read the right numbers on macOS? That is a
+#     parsing question, not a timing question, so a GitHub-hosted -- and
+#     therefore virtualised -- Apple Silicon runner answers it perfectly well.
+#     It is also the question that was silently wrong until 38868d2: the
+#     detector read a /sys path that does not exist on macOS and defaulted to
+#     a 64-byte line on a machine whose lines are 128.
+#
+#  2. Is the derived records-per-page still near-optimal at a 128-byte cache
+#     line and a 16 KiB page? On x86-64 the spread across a 32x parameter
+#     range is 7.7%, which is the evidence for a single unified derivation
+#     instead of a per-architecture tuning table. That evidence is currently
+#     one architecture wide. Answering it is a timing question, a shared
+#     virtualised runner cannot answer it, and so this job runs only on a
+#     self-hosted Apple Silicon runner -- for instance one published by
+#     localmost (https://github.com/bfulton/localmost). When no such runner
+#     is up, the job is skipped rather than run somewhere it would produce a
+#     number that looks like a measurement and is not.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'src/bench/machine.rs'
+      - 'src/bin/indexlab.rs'
+      - '.github/workflows/apple-silicon.yml'
+  workflow_dispatch:
+    inputs:
+      keys:
+        description: 'Keys per sweep point'
+        default: '10000000'
+      lookups:
+        description: 'Lookups per configuration'
+        default: '2000000'
+      shape:
+        description: 'Key shape (decimal16, randomhex, clustered)'
+        default: 'decimal16'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  detect:
+    # Cheap, and it runs on every change to the detector. `indexlab machine`
+    # exits non-zero when the line size was defaulted rather than read, so a
+    # platform the detector does not understand fails here instead of quietly
+    # producing tuning constants derived from a guess.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --bin indexlab
+
+      - name: What the machine reports about itself
+        run: ./target/release/indexlab machine
+
+      - name: Cross-check the detector against sysctl
+        run: |
+          set -euo pipefail
+          json=$(./target/release/indexlab machine)
+          line=$(printf '%s' "$json" | jq -r '.cache_line')
+          page=$(printf '%s' "$json" | jq -r '.page_size')
+          sys_line=$(sysctl -n hw.cachelinesize)
+          sys_page=$(getconf PAGE_SIZE)
+          echo "detector: line=$line page=$page"
+          echo "sysctl:   line=$sys_line page=$sys_page"
+          test "$line" = "$sys_line"
+          test "$page" = "$sys_page"
+
+      - name: Apple Silicon is 128-byte lines and 16 KiB pages
+        # Guarded on arch rather than assumed: macos-latest is Apple Silicon
+        # today and was Intel not long ago, and the point of the check is the
+        # shape of the machine, not the label on the runner.
+        if: runner.arch == 'ARM64'
+        run: |
+          set -euo pipefail
+          json=$(./target/release/indexlab machine)
+          test "$(printf '%s' "$json" | jq -r '.cache_line')" = "128"
+          test "$(printf '%s' "$json" | jq -r '.page_size')" = "16384"
+          test "$(printf '%s' "$json" | jq -r '.cache_line_detected')" = "true"
+
+      - name: Machine unit tests
+        run: cargo test --release --lib machine
+
+  runner-available:
+    # localmost writes an ISO-8601 timestamp into the LOCALMOST_HEARTBEAT
+    # repository variable every 60 seconds while the self-hosted runner is up.
+    # Dispatching the sweep at a self-hosted label with nothing listening
+    # queues the job until it expires; checking first turns that into an
+    # honest skip.
+    runs-on: ubuntu-latest
+    outputs:
+      fresh: ${{ steps.hb.outputs.fresh }}
+    steps:
+      - id: hb
+        env:
+          HEARTBEAT: ${{ vars.LOCALMOST_HEARTBEAT }}
+        run: |
+          set -uo pipefail
+          if [ -z "${HEARTBEAT:-}" ]; then
+            echo "no LOCALMOST_HEARTBEAT variable set"
+            echo "fresh=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          beat=$(date -u -d "$HEARTBEAT" +%s 2>/dev/null || echo 0)
+          age=$(( $(date -u +%s) - beat ))
+          echo "heartbeat=$HEARTBEAT age=${age}s"
+          if [ "$beat" -gt 0 ] && [ "$age" -lt 300 ]; then
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "self-hosted runner looks absent or stale; skipping the sweep"
+            echo "fresh=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  sweep:
+    # The measurement. Manual only: a timing benchmark that fires on every
+    # push to a laptop someone is using is not a measurement, it is a
+    # background process competing with one.
+    needs: [detect, runner-available]
+    if: github.event_name == 'workflow_dispatch' && needs.runner-available.outputs.fresh == 'true'
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 180
+    # Never two timing benchmarks at once. Four cores measuring each other is
+    # not a measurement, and this is the one runner in the fleet that is also
+    # somebody's desktop.
+    concurrency:
+      group: timing-benchmark
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --bin indexlab
+
+      - name: Record the machine and what else it was doing
+        # localmost publishes four runner slots on one Mac, and the Mac is
+        # also somebody's desktop. The concurrency group above keeps this
+        # workflow from racing itself, but nothing stops a person opening a
+        # compiler. Load average before and after is the cheapest evidence of
+        # whether the run deserves to be believed, and it travels with the
+        # numbers rather than being reconstructed afterwards.
+        run: |
+          ./target/release/indexlab machine | tee sweep-apple-silicon.txt
+          echo "# loadavg before: $(sysctl -n vm.loadavg)" | tee -a sweep-apple-silicon.txt
+
+      - name: Sweep records-per-page
+        run: |
+          ./target/release/indexlab sweep \
+            --keys    '${{ inputs.keys }}' \
+            --lookups '${{ inputs.lookups }}' \
+            --shape   '${{ inputs.shape }}' \
+            | tee -a sweep-apple-silicon.txt
+          echo "# loadavg after: $(sysctl -n vm.loadavg)" | tee -a sweep-apple-silicon.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweep-apple-silicon
+          path: sweep-apple-silicon.txt
+
+      - name: Summary
+        run: |
+          {
+            echo '## records-per-page sweep, Apple Silicon'
+            echo
+            echo 'Not yet evidence. `results/` is the source of truth and this'
+            echo 'artifact is not in it; a person has to read the run, decide'
+            echo 'the machine was quiet enough to believe, and commit it.'
+            echo
+            echo '```'
+            cat sweep-apple-silicon.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

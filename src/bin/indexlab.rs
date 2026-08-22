@@ -1822,6 +1822,9 @@ fn main() -> std::io::Result<()> {
     if argv.get(1).map(|s| s.as_str()) == Some("sweep") {
         return sweep_mode(&args);
     }
+    if argv.get(1).map(|s| s.as_str()) == Some("machine") {
+        return machine_mode();
+    }
     let profile = Profile::parse(args.get("--profile").unwrap_or("dev")).unwrap_or(Profile::Dev);
     let out = PathBuf::from(args.get("--out").unwrap_or("results"));
     let scales: Vec<usize> = match profile {
@@ -2241,6 +2244,27 @@ fn probe_mode(args: &Args) -> std::io::Result<()> {
 /// best. If the derivation lands close to the optimum on every machine shape,
 /// the unified approach holds and no per-architecture tuning table is needed.
 /// If it does not, the gap says how much complexity is actually being bought.
+/// Print what the machine reports about itself and exit.
+///
+/// The sweep derives its candidate from `cache_line`, so a machine whose line
+/// size was defaulted rather than read produces a derived constant that looks
+/// like every other one in the record. This mode is the cheap check -- seconds
+/// rather than a full sweep -- that detection worked before a measurement is
+/// taken against it. Exits non-zero when the line size was not detected, so
+/// CI on a new platform fails loudly instead of measuring a guess.
+fn machine_mode() -> std::io::Result<()> {
+    let m = supdb::bench::Machine::detect();
+    println!("{}", m.to_json().render());
+    if !m.cache_line_detected {
+        eprintln!(
+            "!! cache line size was not detected on this platform; 64 assumed.\n\
+             !! Set SUPDB_CACHE_LINE, or teach Machine::detect how to read it here."
+        );
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 fn sweep_mode(args: &Args) -> std::io::Result<()> {
     let n = args.num("--keys", 2_000_000);
     let lookups = args.num("--lookups", 200_000) as u64;
