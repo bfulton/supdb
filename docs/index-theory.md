@@ -222,6 +222,63 @@ TLB pressure to relieve than the reach calculation implied.
 The practical reading: huge pages are worth having and cost nothing to enable,
 but they are a few percent, not a redesign.
 
+## Is one implementation enough for every machine?
+
+The tuning constants are the only part of the design that is plausibly
+machine-dependent. The structural findings are not: flat records beat
+pointer-chasing because they cost one fewer dependent load and no per-key
+allocation, and fixed-width beats varint on a hot path because a branchy serial
+decode is compute rather than memory. Neither mechanism refers to a cache line,
+and the varint one should if anything be *stronger* on a machine with a weaker
+branch predictor.
+
+That leaves the granularity constants — records per page, restart group size,
+compression chunk size — which are sized against a cache line or a memory page,
+and those differ by 2× and 4× between x86-64, Graviton and Apple Silicon.
+`Machine::detect` reads them at runtime and derives the constants, so one
+binary adapts rather than being tuned for whichever machine it was benchmarked
+on.
+
+`indexlab sweep` tests whether the derivation is good enough. On x86-64
+(64-byte lines, 4 KiB pages, derived value 32) at 2M keys, interleaved with the
+significance gate:
+
+| records/page | hit | scan | B/key | rel IQR |
+|---|---|---|---|---|
+| 8 | 553.4 ns | 6.22 ns/e | 33.9 | 3.6% |
+| 16 | 559.4 ns | 5.82 ns/e | 33.0 | 4.6% |
+| **32 (derived)** | 550.7 ns | 5.84 ns/e | 32.5 | 4.5% |
+| 64 | 540.7 ns | 5.97 ns/e | 32.5 | 4.9% |
+| 128 | 528.8 ns | 6.12 ns/e | 32.8 | 3.2% |
+| 256 | 518.9 ns | 5.70 ns/e | 32.8 | 4.8% |
+
+The derivation is 6% off the best setting, and the gate calls that a real
+difference (p = 0.0215). So the mechanism behind it — "size the slot directory
+to one cache line" — is not the right formula; larger pages keep winning, which
+points at page-directory size and prefix amortisation rather than slot
+locality.
+
+**But the more useful number is the spread: 7.7% across a 32× range of the
+parameter.** The constant barely matters. That is the strongest available
+evidence for one unified implementation: if a 32× error in the tuning costs
+under 8%, then a mediocre derivation is fine and no per-architecture table is
+being bought. The question is whether that insensitivity survives a machine
+with 128-byte lines, where the same parameter spans a different number of
+lines.
+
+The formula is deliberately *not* being refit to this one result. Fitting a
+derivation to a single machine is how a constant becomes machine-specific
+while looking principled. It should be fit once there are at least two cache
+geometries to fit against.
+
+Two caveats on the sweep. Interleaving means all six layouts are resident and
+accessed round-robin, so every measurement runs against a cache the others have
+polluted; absolute latencies here are higher than the single-layout figures
+elsewhere in this document and are not comparable to them. And the earlier,
+blocked version of this sweep gave an unstable answer — two runs disagreed
+about which setting was best — which is what interleaving fixed and why the
+project's own rule exists.
+
 ## References
 
 - Aggarwal & Vitter, *The Input/Output Complexity of Sorting and Related

@@ -159,6 +159,7 @@ impl Env {
             "pmu_available" => J::Bool(self.pmu_available),
             "smt_on" => J::Bool(self.smt_on),
             "aslr_disabled" => J::Bool(self.aslr_disabled),
+            "machine" => super::machine::Machine::detect().to_json(),
             "warnings" => J::arr(self.warnings().iter().map(J::s).collect()),
         }
     }

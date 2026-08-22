@@ -1024,6 +1024,10 @@ const PER_PAGE: usize = 128;
 /// it exists to replace. The measured size was 44.7 B/key when the structure
 /// actually in use was nearer 26.
 struct PagedBlob {
+    /// Records per page. Derived from the detected cache line rather than
+    /// compiled in, so the same binary is sized correctly on a machine with
+    /// 128-byte lines as on one with 64.
+    per_page: usize,
     pages: Vec<u8>,
     /// Byte offset of each page. Pages are packed end to end, so nothing is
     /// wasted on alignment.
@@ -1039,10 +1043,14 @@ struct HashPaged {
 
 impl PagedBlob {
     fn build(keys: &[Vec<u8>], exts: &[Ext4]) -> PagedBlob {
+        Self::build_with(keys, exts, per_page_setting())
+    }
+
+    fn build_with(keys: &[Vec<u8>], exts: &[Ext4], per_page: usize) -> PagedBlob {
         let mut pages: Vec<u8> = Vec::with_capacity(keys.len() * 16);
         let mut page_dir = Vec::with_capacity(keys.len() / PER_PAGE + 1);
-        for chunk_start in (0..keys.len()).step_by(PER_PAGE) {
-            let end = (chunk_start + PER_PAGE).min(keys.len());
+        for chunk_start in (0..keys.len()).step_by(per_page) {
+            let end = (chunk_start + per_page).min(keys.len());
             let group = &keys[chunk_start..end];
             let base = pages.len();
             page_dir.push(base as u32);
@@ -1073,6 +1081,7 @@ impl PagedBlob {
         page_dir.shrink_to_fit();
 
         PagedBlob {
+            per_page,
             pages,
             page_dir,
             len: keys.len(),
@@ -1086,8 +1095,8 @@ impl PagedBlob {
     /// (key prefix, slot offset within the page) for a record by rank.
     #[inline]
     fn locate(&self, rank: usize) -> Option<(usize, usize, usize)> {
-        let page = rank / PER_PAGE;
-        let slot = rank % PER_PAGE;
+        let page = rank / self.per_page;
+        let slot = rank % self.per_page;
         let base = *self.page_dir.get(page)? as usize;
         let prefix = u16::from_le_bytes(self.pages[base..base + 2].try_into().unwrap()) as usize;
         let count = u16::from_le_bytes(self.pages[base + 2..base + 4].try_into().unwrap()) as usize;
@@ -1205,13 +1214,13 @@ impl Layout for HashPaged {
                 return true;
             }
             if tg == tag {
-                let page = rank as usize / PER_PAGE;
+                let page = rank as usize / self.blob.per_page;
                 t.touch(dbase + page * 4, 4);
                 if let Some((base, prefix, at)) = self.blob.locate(rank as usize) {
                     // Page header and shared prefix, the slot directory entry,
                     // then the record itself.
                     t.touch(pbase + base, 4 + prefix);
-                    let slot_in = rank as usize % PER_PAGE;
+                    let slot_in = rank as usize % self.blob.per_page;
                     t.touch(pbase + base + 4 + prefix + 2 * slot_in, 2);
                     t.touch(pbase + at, 2 + 32);
                     if self.blob.matches(base, prefix, at, key).is_some() {
@@ -1760,6 +1769,15 @@ impl Args {
     }
 }
 
+/// Records per page: derived from the machine unless overridden, which is how
+/// the sweep searches the parameter the derivation is meant to predict.
+fn per_page_setting() -> usize {
+    std::env::var("SUPDB_PER_PAGE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| supdb::bench::Machine::detect().records_per_page())
+}
+
 fn build_layout(which: &str, keys: &[Vec<u8>], exts: &[Ext4]) -> Box<dyn Layout> {
     match which {
         "heap-hash" => Box::new(HeapHash::build(keys, exts)),
@@ -1800,6 +1818,9 @@ fn main() -> std::io::Result<()> {
     }
     if argv.get(1).map(|s| s.as_str()) == Some("probe") {
         return probe_mode(&args);
+    }
+    if argv.get(1).map(|s| s.as_str()) == Some("sweep") {
+        return sweep_mode(&args);
     }
     let profile = Profile::parse(args.get("--profile").unwrap_or("dev")).unwrap_or(Profile::Dev);
     let out = PathBuf::from(args.get("--out").unwrap_or("results"));
@@ -2208,5 +2229,136 @@ fn probe_mode(args: &Args) -> std::io::Result<()> {
         }
     }
     eprintln!("# {which} {n} keys {lookups} lookups, {found} found");
+    Ok(())
+}
+
+/// Search the records-per-page parameter, and check the derived value against
+/// the empirical optimum.
+///
+/// This is the test of whether one implementation can be near-optimal
+/// everywhere. `Machine::records_per_page` derives the constant from the cache
+/// line size with a mechanism behind it; the sweep finds what is actually
+/// best. If the derivation lands close to the optimum on every machine shape,
+/// the unified approach holds and no per-architecture tuning table is needed.
+/// If it does not, the gap says how much complexity is actually being bought.
+fn sweep_mode(args: &Args) -> std::io::Result<()> {
+    let n = args.num("--keys", 2_000_000);
+    let lookups = args.num("--lookups", 200_000) as u64;
+    let shape = Shape::parse(args.get("--shape").unwrap_or("decimal16")).expect("shape");
+    let machine = supdb::bench::Machine::detect();
+    let derived = machine.records_per_page();
+    let candidates: Vec<usize> = vec![8, 16, 32, 64, 128, 256];
+
+    let keys = make_keys(shape, n);
+    let exts = make_exts(keys.len());
+    println!(
+        "# {} x {} keys, cache line {} B, page {} B -> derived records/page = {}",
+        shape.as_str(),
+        keys.len(),
+        machine.cache_line,
+        machine.page_size,
+        derived
+    );
+    println!(
+        "{:>12} {:>10} {:>10} {:>12}",
+        "records/page", "hit ns", "scan ns/e", "B/key"
+    );
+
+    // Build every candidate first, then measure them round-robin. Measuring all
+    // repetitions of one setting before moving to the next is blocked
+    // execution, and it gave an unstable answer here: two runs of the earlier
+    // version of this sweep disagreed about which setting was best, because
+    // whatever drifts over a run was being attributed to the setting.
+    let built: Vec<Box<dyn Layout>> = candidates
+        .iter()
+        .map(|&pp| {
+            std::env::set_var("SUPDB_PER_PAGE", pp.to_string());
+            let l = build_layout("hash+paged", &keys, &exts);
+            // A sweep that silently breaks lookups finds a very fast wrong answer.
+            for i in (0..keys.len()).step_by((keys.len() / 401).max(1)) {
+                assert_eq!(
+                    l.lookup(&keys[i]),
+                    Some(exts[i]),
+                    "per_page {pp} broke lookups"
+                );
+            }
+            l
+        })
+        .collect();
+    std::env::remove_var("SUPDB_PER_PAGE");
+
+    let samples = Trial::new(7).run(candidates.len(), |ci, _| {
+        let l = &built[ci];
+        let mut r = Rng::new(0x5EE9);
+        let t = Instant::now();
+        for _ in 0..lookups {
+            let k = &keys[(r.next() as usize) % keys.len()];
+            std::hint::black_box(l.lookup(k));
+        }
+        t.elapsed().as_secs_f64() * 1e9 / lookups as f64
+    });
+
+    let di = candidates.iter().position(|&p| p == derived).unwrap_or(0);
+    let mut best = di;
+    for (i, s) in samples.iter().enumerate() {
+        if s.median() < samples[best].median() {
+            best = i;
+        }
+    }
+    for (i, pp) in candidates.iter().enumerate() {
+        let scan = {
+            let t = Instant::now();
+            let mut acc = 0u64;
+            let mut r = Rng::new(0x5CA5);
+            for _ in 0..200 {
+                let from = (r.next() as usize) % (keys.len() - 1000);
+                acc = acc.wrapping_add(built[i].scan_from(from, 1000));
+            }
+            std::hint::black_box(acc);
+            t.elapsed().as_secs_f64() * 1e9 / 200_000.0
+        };
+        let mark = if *pp == derived { "  <- derived" } else { "" };
+        println!(
+            "{:>12} {:>10.1} {:>10.2} {:>12.1} {:>7.1}%{}",
+            pp,
+            samples[i].median(),
+            scan,
+            built[i].logical_bytes() as f64 / keys.len() as f64,
+            samples[i].rel_iqr() * 100.0,
+            mark
+        );
+    }
+
+    // The gate, not a bare ratio: if the best setting is not significantly
+    // different from the derived one, the derivation is fine and the spread is
+    // noise.
+    let c = compare(&samples[best], &samples[di], supdb::bench::MIN_EFFECT);
+    println!(
+        "\n# derived {} at {:.1} ns; best measured {} at {:.1} ns",
+        derived,
+        samples[di].median(),
+        candidates[best],
+        samples[best].median()
+    );
+    println!(
+        "# {}",
+        c.summary(
+            &format!("per_page={}", candidates[best]),
+            &format!("derived={derived}")
+        )
+    );
+    if c.verdict == supdb::bench::Verdict::NoDifference {
+        println!("# The derivation is not distinguishable from the best setting on this machine.");
+    } else {
+        println!(
+            "# The derivation is {:.0}% off the best setting here and needs revisiting.",
+            (samples[di].median() / samples[best].median() - 1.0) * 100.0
+        );
+    }
+    println!(
+        "# The unified approach holds on this machine if that penalty is small. Run the same\n\
+         # sweep on a machine with a different cache line to find out whether one derivation\n\
+         # covers both, or whether a per-shape table is actually being bought."
+    );
     Ok(())
 }

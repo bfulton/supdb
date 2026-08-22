@@ -23,6 +23,7 @@ pub mod env;
 pub mod hist;
 pub mod jparse;
 pub mod json;
+pub mod machine;
 pub mod plot;
 pub mod stats;
 pub mod workload;
@@ -31,6 +32,7 @@ pub use env::{peak_rss_bytes, Env, IoCounters};
 pub use hist::Hist;
 pub use jparse::parse as parse_json;
 pub use json::J;
+pub use machine::Machine;
 pub use stats::{compare, Comparison, Samples, Trial, Verdict, DEFAULT_REPS, MIN_EFFECT};
 pub use workload::{db_key_into, KeyDist, KeyGen, Payload, Rng};
 
