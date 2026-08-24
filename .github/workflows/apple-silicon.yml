@@ -179,6 +179,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # localmost publishes four runner slots and each has its own workspace,
+      # so a job lands on a cold target/ about three times in four. A cold
+      # release build is minutes of the job's budget spent before the
+      # measurement starts, which is how the first sweep spent its entire
+      # allowance compiling. The shared cache is keyed on the lockfile, not on
+      # the slot, so all four warm each other.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: apple-silicon-sweep
       - name: Build
         run: cargo build --release --bin indexlab
 
