@@ -33,11 +33,17 @@ on:
   workflow_dispatch:
     inputs:
       keys:
+        # Lower than the 10M the x86 baseline uses, because the whole sweep
+        # must fit inside localmost's 600-second job limit. The sweep compares
+        # candidate records/page values against each other on one machine, so
+        # a smaller scale still answers its question -- but it is not
+        # comparable to the x86 figures unless x86 is re-run at the same
+        # scale, which is what `bench/sweep-compare.sh` does.
         description: 'Keys per sweep point'
-        default: '10000000'
+        default: '2000000'
       lookups:
         description: 'Lookups per configuration'
-        default: '2000000'
+        default: '400000'
       shape:
         description: 'Key shape (decimal16, randomhex, clustered)'
         default: 'decimal16'
@@ -169,7 +175,13 @@ jobs:
     # looks like a measurement and is not. So the fallback becomes a skip.
     if: github.event_name == 'workflow_dispatch' && needs.check.outputs.runner == 'self-hosted'
     runs-on: ${{ needs.check.outputs.runner }}
-    timeout-minutes: 180
+    # Nine, not 180. localmost kills a job at exactly 600 seconds -- measured
+    # twice, 12:40:06->12:50:06 and 12:56:12->13:06:12 -- and an externally
+    # killed job uploads no logs at all, so both runs came back as a 404 with
+    # nothing to read. Ending just inside that window means GitHub stops the
+    # job itself and the partial output survives. A truncated measurement you
+    # can read beats a complete one you cannot.
+    timeout-minutes: 9
     # Never two timing benchmarks at once. Four cores measuring each other is
     # not a measurement, and this is the one runner in the fleet that is also
     # somebody's desktop.
