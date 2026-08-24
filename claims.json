@@ -36,13 +36,17 @@
       "experiment": "f2-open",
       "id": "F2.1",
       "expect": "fails",
-      "because": "Reader::build materialises the entire key index on the heap -- one Vec<u8> per key plus a 2N-slot hash table -- so open is linear in key count and paid per process, shared with nobody. This is Bitcask's design, not the LMDB many-reader-process model the architecture claims."
+      "because": "Open is no longer proportional to key count but is not independent of it either: 0.0ms at 100k keys against 0.6ms at 10M, so 100x the keys cost 20x the open. What remains is the block table, which is still decoded per entry. The key index, which used to dominate this, no longer contributes. Pinned to full: at ci scale the key counts are too small for an open to resolve at all -- F2.1 holds there and fails here, which is a property of the clock rather than of the engine. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
+      "profile": "full",
+      "arch": "x86_64"
     },
     {
       "experiment": "f2-open",
       "id": "F2.2",
-      "expect": "fails",
-      "because": "Open cost is measured super-linear (20x the keys costs 30x the open), so it is not merely un-amortised, it degrades. Fixing this means a mmap-able, binary-searchable index shared through the page cache."
+      "expect": "holds",
+      "because": "FIXED by the mapped key index. Open grew 196x for 100x the keys while the reader decoded the index into Vec<(Vec<u8>, Extents)> and hashed it; it now grows 20x, because opening validates a header and stops. At 10M keys that is 0.6ms against 2406ms. F2.1 still fails -- 20x is sub-linear, not independent -- since the index is still read from a file whose size grows with the key count. Pinned to full: at ci scale the key counts are too small for an open to resolve at all -- F2.1 holds there and fails here, which is a property of the clock rather than of the engine. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
+      "profile": "full",
+      "arch": "x86_64"
     },
     {
       "experiment": "f4-durability",
@@ -131,19 +135,19 @@
       "experiment": "f7-index",
       "id": "F7.1",
       "expect": "fails",
-      "because": "Reader memory is linear in key count. Reader::build allocates one Vec<u8> per key plus a 2N-slot hash table, all on the heap, all before the first read."
+      "because": "Index size still grows with key count -- 13.5MB at 250k keys, 866MB at 16M -- which no layout change fixes: an index of N keys holds N records. What changed is the constant, 57 B/key against 131, and that the bytes are shared between readers instead of duplicated."
     },
     {
       "experiment": "f7-index",
       "id": "F7.2",
       "expect": "fails",
-      "because": "About 131 bytes of resident index per key, to index a 100-byte value -- and paid again by every reader process, shared with nobody. In RUM terms this is the memory the design spends to buy read performance; the objection is that it was unmeasured and that the stated architecture is many reader processes sharing one mapping."
+      "because": "A reader's index is 57 bytes per key, against the 131 it cost when decoded onto the heap, and it now lives in a file-backed section that every reader process shares rather than a private copy each. Still above the 32-byte bar this claim sets, so it stays failing -- but the per-process multiplier, which was the substance of the objection, is gone. Measured as the size of the structure rather than the reader's resident set: a mapped index is demand-faulted, so resident size after open measures how little has been read, and resident size after a read pass measures data blocks both arms share."
     },
     {
       "experiment": "f7-index",
       "id": "F7.3",
       "expect": "holds",
-      "because": "Eight concurrent readers must still hold a 10M-key store on a 16GB machine. It holds with thin margin -- the ceiling is about 16M keys each -- so this is the guard that would catch the per-key cost growing."
+      "because": "At 57 B/key one reader fills this machine's 15.7GB at 297M keys and eight readers reach it at 37.1M keys each, against 16.1M each before the index was made shareable. The headroom is understated, since the eight now share one file-backed copy rather than holding eight."
     },
     {
       "experiment": "c1-decoders",
@@ -318,6 +322,46 @@
       "id": "P3",
       "expect": "holds",
       "because": "The mechanism check, as above. The MPH arm makes it sharper: its misses are dominated by the MPH probe itself, so a moved miss figure here would be unambiguous evidence of a harness fault. Pinned to full: the paged layouts only separate at 10M keys; at ci scale everything fits in cache and a 100k-key extent varint-encodes to a single byte, so the arm being tested barely differs from the other. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
+      "profile": "full",
+      "arch": "x86_64"
+    },
+    {
+      "experiment": "f11-flatindex",
+      "id": "F11.1",
+      "expect": "holds",
+      "because": "The whole point of the format. 5M keys open in 0.29ms against 738ms, 2537x, because a mapped index validates a header instead of decoding every key and hashing the result. This is what moved F2.2 from failing to holding. Pinned to full: the arms only separate at scale -- at 50k keys the open difference is 61x rather than 2537x and the read difference is inside noise. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
+      "profile": "full",
+      "arch": "x86_64"
+    },
+    {
+      "experiment": "f11-flatindex",
+      "id": "F11.2",
+      "expect": "holds",
+      "because": "67 bytes per key of mapped section against 186 resident for the decoded index. Measured against the section rather than the resident set, because a mapped index is demand-faulted and resident size measures what has been touched rather than what is needed -- three successive versions of this measurement got it wrong before that was understood. Pinned to full: the arms only separate at scale -- at 50k keys the open difference is 61x rather than 2537x and the read difference is inside noise. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
+      "profile": "full",
+      "arch": "x86_64"
+    },
+    {
+      "experiment": "f11-flatindex",
+      "id": "F11.3",
+      "expect": "holds",
+      "because": "Point reads are 1893ns against 2334ns, 1.25x, so the space is not being spent to stand still. Much smaller than the 6.9x the ci profile reported, which was a small-store artifact. Pinned to full: the arms only separate at scale -- at 50k keys the open difference is 61x rather than 2537x and the read difference is inside noise. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
+      "profile": "full",
+      "arch": "x86_64"
+    },
+    {
+      "experiment": "f11-flatindex",
+      "id": "F11.4",
+      "expect": "fails",
+      "because": "The price, and it is accepted deliberately: 394MB becomes 683MB at 5M keys, +73.5%, because a section read in place cannot be compressed. Space is the axis this engine has to spare and open latency is the one it does not. Measured on the minimal file -- one checkpoint -- because the churned file also contains holes left by reclaimed sections, which is a different quantity and was what made the first run of this report +217%. Pinned to full: the arms only separate at scale -- at 50k keys the open difference is 61x rather than 2537x and the read difference is inside noise. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
+      "profile": "full",
+      "arch": "x86_64"
+    },
+    {
+      "experiment": "f11-flatindex",
+      "id": "F11.5",
+      "expect": "holds",
+      "because": "Zero bytes per key of permanent growth per checkpoint, on both arms. It was 9.2 and 66.9 respectively, forever: every checkpoint appended keys, blocks and reuse-log sections and released none of them. A pre-existing leak that the flat format made expensive enough to notice, and the reason this format was not turned on by default until it was fixed. Pinned to full: the arms only separate at scale -- at 50k keys the open difference is 61x rather than 2537x and the read difference is inside noise. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
       "profile": "full",
       "arch": "x86_64"
     }
