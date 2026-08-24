@@ -14,10 +14,10 @@
 //!   * **No allocation per value on the read path** where the API allows it.
 //!     That handicap was worth 2.3x on LMDB when it was removed.
 //!   * **What each engine promises is recorded**, not assumed. Supdb has no
-//!     write-ahead log, no transactions, no checksums, and cannot reopen a
-//!     store for writing. Comparing its throughput against engines that
-//!     provide all four without saying so is the comparison the review
-//!     objected to.
+//!     write-ahead log, no transactions, and cannot reopen a store for
+//!     writing; it does checksum, since the CRC-32C work. Comparing its
+//!     throughput against engines that provide the rest without saying so is
+//!     the comparison the review objected to.
 
 use std::path::{Path, PathBuf};
 use supdb::bench::J;
@@ -163,7 +163,13 @@ impl Engine for Supdb {
         Features {
             durable_commit: false,
             transactions: false,
-            checksums: false,
+            // True since the CRC-32C work: `Options::checksums` defaults on,
+            // this adapter takes that default, and f8-checksums measures what
+            // it costs (+8.5% write, no measurable read cost, +0.166% on
+            // disk). The table said false long after that stopped being so,
+            // which understated the engine by a feature point in the one
+            // comparison that is meant to price its missing features.
+            checksums: true,
             reopen_for_write: false,
             // Only after a checkpoint and a reader rebuild, both O(keys).
             read_your_writes: false,

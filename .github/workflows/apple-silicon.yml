@@ -38,7 +38,8 @@ on:
         # candidate records/page values against each other on one machine, so
         # a smaller scale still answers its question -- but it is not
         # comparable to the x86 figures unless x86 is re-run at the same
-        # scale, which is what `bench/sweep-compare.sh` does.
+        # scale. That control was run and is recorded in
+        # docs/index-theory.md under "The 2M x86 baseline".
         description: 'Keys per sweep point'
         default: '2000000'
       lookups:
