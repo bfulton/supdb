@@ -324,6 +324,34 @@ derivation to a single machine is how a constant becomes machine-specific
 while looking principled. It should be fit once there are at least two cache
 geometries to fit against.
 
+### The 2M x86 baseline, held for the Apple Silicon comparison
+
+The Apple Silicon sweep cannot run at 10M keys: localmost caps a job at 600
+seconds, measured twice to the second, and a 10M sweep does not fit. It will
+run at 2M instead — which answers the sweep's own question, since that is a
+comparison among candidates on one machine, but says nothing across
+architectures unless x86 is measured at the same scale. So it was, on the same
+idle Linux box as everything else here:
+
+| records/page | hit | scan | B/key | rel IQR |
+|---|---|---|---|---|
+| 8 | 580.8 ns | 7.57 ns/e | 33.9 | 5.9% |
+| 16 | 568.3 ns | 6.06 ns/e | 33.0 | 7.8% |
+| **32 (derived)** | 572.2 ns | 5.83 ns/e | 32.5 | 4.9% |
+| 64 | 569.0 ns | 6.86 ns/e | 32.5 | 5.2% |
+| 128 | 571.6 ns | 6.52 ns/e | 32.8 | 5.7% |
+| 256 | 579.4 ns | 6.69 ns/e | 32.8 | 5.4% |
+
+`per_page=16 vs derived=32: NO DIFFERENCE (ratio 0.993, p=1.0000)`.
+
+At 2M the derivation is not merely close to the best setting, it is
+indistinguishable from it, and the spread across the whole 32× range is
+**2.2%** rather than 7.7%. That is a stronger result than the 10M one and it
+should be read with suspicion for exactly that reason: at 2M these structures
+are 30–70 MiB and sit far closer to last-level cache than the 10M versions do,
+so the parameter has less opportunity to matter. It is the right control for
+the Apple Silicon run and the wrong number to quote as the headline.
+
 Two caveats on the sweep. Interleaving means all six layouts are resident and
 accessed round-robin, so every measurement runs against a cache the others have
 polluted; absolute latencies here are higher than the single-layout figures
