@@ -36,6 +36,8 @@ mod block;
 mod freelist;
 #[allow(clippy::all, dead_code)]
 mod index;
+// Not vendored -- written here, so it holds to -D warnings like the harness.
+mod flatindex;
 #[allow(clippy::all, dead_code)]
 pub mod keytable;
 #[allow(clippy::all, dead_code)]

@@ -1,4 +1,5 @@
 use crate::block::{self, BlockBuilder, BlockCache, BlockLoc};
+use crate::flatindex::{self, FlatIndex};
 use crate::freelist::{capacity_for, FreeList};
 use crate::index::{get_uvarint, put_uvarint, Ext, Extents};
 use crate::keytable::KeyTable;
@@ -230,6 +231,15 @@ pub struct Options {
     /// comparing two runs taken hours apart, which measures the machine as
     /// much as the code.
     pub checksums: bool,
+    /// Write the key index in a shape a reader can use where it lies, instead
+    /// of one it has to decode into the heap first.
+    ///
+    /// Buys the two things the heap index cannot give: an open that does not
+    /// grow with the key count, and an index shared between reader processes
+    /// rather than duplicated in each. Costs file size, because a section read
+    /// in place cannot be compressed. Both arms exist so the trade is measured
+    /// rather than argued -- see `f11-flatindex`.
+    pub flat_index: bool,
     /// Chunk size for solo blocks. A deep key's whole run is decompressed on a
     /// full read regardless of chunking, so warm reads there are flat across
     /// this value while compression is not: the larger window is close to free
@@ -250,6 +260,13 @@ impl Default for Options {
             solo_chunk_size: block::CHUNK,
             merge_threshold: 4,
             checksums: true,
+            // Off until the space cost is bounded. The read and open wins are
+            // large and measured, but f11 shows a checkpoint appends a whole
+            // index section that nothing ever reclaims -- 61 bytes per key
+            // against the varint format's 8.8 -- so turning this on by default
+            // would trade a bounded cost for an unbounded one. Flip it once
+            // index sections are reclaimable.
+            flat_index: false,
             reclaim: Reclaim::AfterReads,
         }
     }
@@ -906,14 +923,43 @@ impl Store {
             all.extend(sh.keys.iter().map(|(k, e)| (k.to_vec(), e.extents.clone())));
         }
         all.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        let key_idx = {
+        // `flat` stays true only if the flat encoder actually produced a
+        // section. It declines on inputs it cannot address -- a key over 64KiB,
+        // or a record region past 4GiB -- and falling back to the varint
+        // encoder is correct there rather than an error.
+        let (key_idx, flat) = {
             let ap = self.appender.lock().unwrap();
             let prev = ap.last_index.map(|loc| (loc, ap.generation, ap.timestamp));
-            encode_key_index(&all, ap.generation + 1, prev)
+            let gen = ap.generation + 1;
+            let encoded = if self.opts.flat_index {
+                let p = prev.map(|(loc, pgen, pts)| {
+                    (
+                        pgen,
+                        pts,
+                        loc.off,
+                        loc.stored as u64,
+                        loc.uncompressed as u64,
+                    )
+                });
+                flatindex::encode(&all, gen, p, key_hash)
+            } else {
+                None
+            };
+            match encoded {
+                Some(v) => (v, true),
+                None => (encode_key_index(&all, gen, prev), false),
+            }
         };
         let mut ap = self.appender.lock().unwrap();
         let blk_idx = encode_block_index(&ap.blocks);
-        let key_loc = write_section(&mut ap, &key_idx)?;
+        // Uncompressed, deliberately: a section that is decompressed on open
+        // is a section copied into every reader's heap, which is the cost this
+        // format exists to remove.
+        let key_loc = if flat {
+            write_section_raw(&mut ap, &key_idx)?
+        } else {
+            write_section(&mut ap, &key_idx)?
+        };
         let blk_loc = write_section(&mut ap, &blk_idx)?;
         // Drop entries older than any reader could still be relying on. A
         // reader outside the grace window is already unsafe and is told so, so
@@ -1096,6 +1142,31 @@ fn encode_block_index(blocks: &[BlockLoc]) -> Vec<u8> {
     out
 }
 
+/// Write a section verbatim, so a reader can use it in the mapping.
+///
+/// `stored == uncompressed` is what marks a section as readable in place, and
+/// `read_section` already treats those as equal rather than decompressing, so
+/// nothing else has to learn about this.
+fn write_section_raw(ap: &mut Appender, payload: &[u8]) -> Result<BlockLoc> {
+    use std::os::unix::fs::FileExt;
+    let loc = BlockLoc {
+        off: ap.off,
+        stored: payload.len() as u32,
+        uncompressed: payload.len() as u32,
+        cap: payload.len() as u32,
+        chunked: false,
+        solo: false,
+        crc: if block::checksums_on() {
+            block::crc32(payload)
+        } else {
+            0
+        },
+    };
+    ap.file.write_all_at(payload, ap.off)?;
+    ap.off += payload.len() as u64;
+    Ok(loc)
+}
+
 fn write_section(ap: &mut Appender, payload: &[u8]) -> Result<BlockLoc> {
     let stored = block::compress(payload);
     let bytes: &[u8] = stored.as_deref().unwrap_or(payload);
@@ -1177,23 +1248,9 @@ fn emit<F: FnMut(&[u8])>(extent: &[u8], f: &mut F) -> Result<u64> {
 
 pub struct Reader {
     mmap: Mmap,
-    /// Keys in sorted order, which is how they were written.
-    ///
-    /// A seal batch is sorted before it is packed, so the index comes off disk
-    /// already ordered and an ordered scan is a walk rather than a sort. Point
-    /// lookups binary-search this instead of consulting a separate hash table,
-    /// which halves what an open has to build and keeps one structure
-    /// authoritative.
-    entries: Vec<(Vec<u8>, Extents)>,
-    /// Open-addressed hash of key -> position in `entries`, plus a byte of the
-    /// hash to reject most misses without touching the key.
-    ///
-    /// Binary search over a million sorted keys costs twenty comparisons, each
-    /// chasing a pointer into a separate allocation; it measured 2.2x slower
-    /// on shallow-key point reads than a hash. Keeping both costs eight bytes
-    /// per key and keeps ordered scans and O(1) lookups in the same reader.
-    hash: Vec<(u8, u32)>,
-    hash_mask: usize,
+    /// Where this reader's keys live: decoded onto the heap, or left in the
+    /// mapping and addressed where they lie.
+    idx: Idx,
     blocks: Vec<BlockLoc>,
     cache: BlockCache,
     /// Slot held in the reader table, released when this reader is dropped.
@@ -1210,6 +1267,95 @@ pub struct Reader {
     /// (generation, timestamp, offset, stored, uncompressed) of the previous
     /// checkpoint's index.
     prev: Option<(u64, u64, u64, u64, u64)>,
+}
+
+/// The two index arms.
+///
+/// `Heap` is the shipped one: every key copied into its own `Vec`, every
+/// extent decoded, then a hash built over the result. `Flat` is the same
+/// information addressed where the mapping already holds it.
+///
+/// Both answer the same four questions, and every caller in `Reader` goes
+/// through them, so the arms cannot drift apart in behaviour -- only in cost.
+enum Idx {
+    Heap {
+        entries: Vec<(Vec<u8>, Extents)>,
+        hash: Vec<(u8, u32)>,
+        mask: usize,
+    },
+    Flat {
+        meta: FlatIndex,
+        /// Byte range of the section inside the mapping.
+        off: usize,
+        len: usize,
+    },
+}
+
+impl Idx {
+    fn len(&self) -> usize {
+        match self {
+            Idx::Heap { entries, .. } => entries.len(),
+            Idx::Flat { meta, .. } => meta.len(),
+        }
+    }
+
+    #[inline]
+    fn section<'a>(&self, mmap: &'a Mmap) -> &'a [u8] {
+        match self {
+            Idx::Flat { off, len, .. } => &mmap[*off..*off + *len],
+            Idx::Heap { .. } => &[],
+        }
+    }
+
+    #[inline]
+    fn lookup<'a>(&'a self, mmap: &'a Mmap, key: &[u8]) -> Option<&'a [Ext]> {
+        match self {
+            Idx::Heap {
+                entries,
+                hash,
+                mask,
+            } => {
+                let h = key_hash(key);
+                let tag = ((h >> 56) as u8) | 1;
+                let mut slot = (h as usize) & mask;
+                loop {
+                    let (t, i) = hash[slot];
+                    if i == u32::MAX {
+                        return None;
+                    }
+                    if t == tag {
+                        let e = &entries[i as usize];
+                        if e.0.as_slice() == key {
+                            return Some(e.1.as_slice());
+                        }
+                    }
+                    slot = (slot + 1) & mask;
+                }
+            }
+            Idx::Flat { meta, .. } => meta.lookup(self.section(mmap), key, key_hash),
+        }
+    }
+
+    fn seek(&self, mmap: &Mmap, key: &[u8]) -> usize {
+        match self {
+            Idx::Heap { entries, .. } => {
+                match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+                    Ok(i) | Err(i) => i,
+                }
+            }
+            Idx::Flat { meta, .. } => meta.seek(self.section(mmap), key),
+        }
+    }
+
+    #[inline]
+    fn at<'a>(&'a self, mmap: &'a Mmap, rank: usize) -> Option<(&'a [u8], &'a [Ext])> {
+        match self {
+            Idx::Heap { entries, .. } => {
+                entries.get(rank).map(|(k, e)| (k.as_slice(), e.as_slice()))
+            }
+            Idx::Flat { meta, .. } => meta.at(self.section(mmap), rank),
+        }
+    }
 }
 
 impl Drop for Reader {
@@ -1444,17 +1590,37 @@ impl Reader {
     }
 
     fn open_mapped(mmap: Mmap, sb: Super) -> Result<Reader> {
-        let key_idx = read_section(
-            &mmap,
-            sb.key_off,
-            sb.key_stored as usize,
-            sb.key_uncompressed as usize,
-        )?;
         let blk_idx = read_section(
             &mmap,
             sb.blk_off,
             sb.blk_stored as usize,
             sb.blk_uncompressed as usize,
+        )?;
+        // A flat section is stored verbatim, so it is only a candidate when
+        // nothing was compressed away, and only if the header validates.
+        // Anything else is the varint format and gets decoded as before.
+        if sb.key_stored == sb.key_uncompressed {
+            let off = sb.key_off as usize;
+            let len = sb.key_stored as usize;
+            if let Some(sec) = mmap.get(off..off.saturating_add(len)) {
+                if let Some(meta) = FlatIndex::parse(sec) {
+                    return Self::build_flat(
+                        mmap,
+                        meta,
+                        off,
+                        len,
+                        blk_idx,
+                        sb.timestamp,
+                        sb.history_from,
+                    );
+                }
+            }
+        }
+        let key_idx = read_section(
+            &mmap,
+            sb.key_off,
+            sb.key_stored as usize,
+            sb.key_uncompressed as usize,
         )?;
         Self::build(mmap, key_idx, blk_idx, sb.timestamp, sb.history_from)
     }
@@ -1518,25 +1684,21 @@ impl Reader {
         Self::build(mmap, key_idx, blk_idx, ts, sb.history_from)
     }
 
-    fn build(
-        mmap: Mmap,
-        key_idx: Vec<u8>,
-        blk_idx: Vec<u8>,
-        ts: u64,
-        history_from: u64,
-    ) -> Result<Reader> {
+    /// Decode the block table. Shared by both index arms: the block index is
+    /// small and is not what either arm is arguing about.
+    fn decode_blocks(blk_idx: &[u8]) -> Result<Vec<BlockLoc>> {
         let mut p = 0usize;
-        let nblocks = get_uvarint(&blk_idx, &mut p) as usize;
+        let nblocks = get_uvarint(blk_idx, &mut p) as usize;
         if nblocks > blk_idx.len() {
             return Err(corrupt("block count exceeds the size of the block index"));
         }
         let mut blocks = Vec::with_capacity(nblocks.min(1 << 20));
         for _ in 0..nblocks {
-            let off = get_uvarint(&blk_idx, &mut p);
-            let stored = get_uvarint(&blk_idx, &mut p) as u32;
-            let uncompressed = get_uvarint(&blk_idx, &mut p) as u32;
-            let cap = get_uvarint(&blk_idx, &mut p) as u32;
-            let crc = get_uvarint(&blk_idx, &mut p) as u32;
+            let off = get_uvarint(blk_idx, &mut p);
+            let stored = get_uvarint(blk_idx, &mut p) as u32;
+            let uncompressed = get_uvarint(blk_idx, &mut p) as u32;
+            let cap = get_uvarint(blk_idx, &mut p) as u32;
+            let crc = get_uvarint(blk_idx, &mut p) as u32;
             if p >= blk_idx.len() {
                 return Err(corrupt("block index is truncated"));
             }
@@ -1552,6 +1714,52 @@ impl Reader {
                 crc,
             });
         }
+        Ok(blocks)
+    }
+
+    /// Open against a section used where it lies.
+    ///
+    /// Note what is absent: no loop over keys, no allocation per key, no hash
+    /// built. That is the entire difference, and it is the whole of F2.1 and
+    /// most of F7.2. Extents are validated against the block table lazily, at
+    /// the point a lookup returns one, rather than eagerly here -- validating
+    /// eagerly would reintroduce exactly the per-key pass being removed.
+    #[allow(clippy::too_many_arguments)]
+    fn build_flat(
+        mmap: Mmap,
+        meta: FlatIndex,
+        off: usize,
+        len: usize,
+        blk_idx: Vec<u8>,
+        ts: u64,
+        history_from: u64,
+    ) -> Result<Reader> {
+        let blocks = Self::decode_blocks(&blk_idx)?;
+        let generation = meta.generation;
+        let prev = meta.prev;
+        Ok(Reader {
+            mmap,
+            idx: Idx::Flat { meta, off, len },
+            blocks,
+            cache: BlockCache::new(4096),
+            slot: None,
+            table: None,
+            generation,
+            timestamp: ts,
+            history_from,
+            overwritten: Vec::new(),
+            prev,
+        })
+    }
+
+    fn build(
+        mmap: Mmap,
+        key_idx: Vec<u8>,
+        blk_idx: Vec<u8>,
+        ts: u64,
+        history_from: u64,
+    ) -> Result<Reader> {
+        let blocks = Self::decode_blocks(&blk_idx)?;
 
         let mut p = 0usize;
         let _gen_read = get_uvarint(&key_idx, &mut p);
@@ -1639,9 +1847,11 @@ impl Reader {
         let cache = BlockCache::new(4096);
         Ok(Reader {
             mmap,
-            entries,
-            hash,
-            hash_mask: mask,
+            idx: Idx::Heap {
+                entries,
+                hash,
+                mask,
+            },
             blocks,
             cache,
             slot: None,
@@ -1683,7 +1893,7 @@ impl Reader {
             return Ok(0);
         };
         let mut total = 0u64;
-        for e in exts.as_slice() {
+        for e in exts {
             self.check_extent(*e)?;
             let loc = self.blocks[e.block as usize];
             let end = loc.off as usize + loc.stored as usize;
@@ -1816,7 +2026,7 @@ impl Reader {
             return Ok(-1);
         };
         let Some(e) = exts.first() else { return Ok(-1) };
-        self.record_len_at(e, 0)
+        self.record_len_at(*e, 0)
     }
 
     pub fn read_last(&self, key: &[u8]) -> Result<i32> {
@@ -1824,11 +2034,11 @@ impl Reader {
             return Ok(-1);
         };
         let Some(e) = exts.last() else { return Ok(-1) };
-        self.record_len_at(e, e.last)
+        self.record_len_at(*e, e.last)
     }
 
     pub fn keys(&self) -> usize {
-        self.entries.len()
+        self.idx.len()
     }
 
     /// Byte ranges holding live block payload, as (offset, stored length).
@@ -1846,8 +2056,11 @@ impl Reader {
         // correctly so, and counting it as undetected corruption would
         // overstate the gap a second time.
         let mut referenced = vec![false; self.blocks.len()];
-        for (_, exts) in &self.entries {
-            for e in exts.as_slice() {
+        for r in 0..self.idx.len() {
+            let Some((_, exts)) = self.idx.at(&self.mmap, r) else {
+                continue;
+            };
+            for e in exts {
                 if let Some(slot) = referenced.get_mut(e.block as usize) {
                     *slot = true;
                 }
@@ -1861,33 +2074,14 @@ impl Reader {
             .collect()
     }
 
-    fn lookup(&self, key: &[u8]) -> Option<&Extents> {
-        let h = key_hash(key);
-        let tag = ((h >> 56) as u8) | 1;
-        let mut slot = (h as usize) & self.hash_mask;
-        loop {
-            let (t, i) = self.hash[slot];
-            if i == u32::MAX {
-                return None;
-            }
-            if t == tag {
-                let e = &self.entries[i as usize];
-                if e.0.as_slice() == key {
-                    return Some(&e.1);
-                }
-            }
-            slot = (slot + 1) & self.hash_mask;
-        }
+    #[inline]
+    fn lookup(&self, key: &[u8]) -> Option<&[Ext]> {
+        self.idx.lookup(&self.mmap, key)
     }
 
     /// Position of the first key at or after `key`.
     pub fn seek(&self, key: &[u8]) -> usize {
-        match self
-            .entries
-            .binary_search_by(|(k, _)| k.as_slice().cmp(key))
-        {
-            Ok(i) | Err(i) => i,
-        }
+        self.idx.seek(&self.mmap, key)
     }
 
     /// Visit keys in order from `from`, handing each key's values to the
@@ -1908,7 +2102,7 @@ impl Reader {
         mut f: F,
     ) -> Result<u64> {
         let start = from.map(|k| self.seek(k)).unwrap_or(0);
-        let end = (start + limit).min(self.entries.len());
+        let end = (start + limit).min(self.idx.len());
         let mut n = 0u64;
         let mut cached: u32 = u32::MAX;
         let mut buf: Vec<u8> = Vec::new();
@@ -1916,8 +2110,10 @@ impl Reader {
         let mut have: Vec<u64> = Vec::new();
 
         for i in start..end {
-            let (key, exts) = &self.entries[i];
-            for e in exts.as_slice() {
+            let Some((key, exts)) = self.idx.at(&self.mmap, i) else {
+                continue;
+            };
+            for e in exts {
                 let loc = self.blocks[e.block as usize];
                 let raw = &self.mmap[loc.off as usize..loc.off as usize + loc.stored as usize];
                 let extent: &[u8] = if loc.is_plain() {

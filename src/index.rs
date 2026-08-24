@@ -12,7 +12,12 @@
 //! spilled vector.
 
 /// One contiguous run of a key's values inside a block.
+///
+/// `repr(C)` so a mapped index can hand back `&[Ext]` borrowed straight out of
+/// the file rather than decoding one. Four `u32`s in declaration order, four
+/// byte alignment; `flatindex` lays its records out to match.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
 pub struct Ext {
     pub block: u32,
     pub off: u32,

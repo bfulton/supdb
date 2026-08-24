@@ -90,6 +90,7 @@ fn main() -> std::io::Result<()> {
             "f6-threads" => f6_threads(&args, profile)?,
             "f7-index" => f7_index(&args, profile)?,
             "f8-checksums" => f8_checksums(&args, profile)?,
+            "f11-flatindex" => f11_flatindex(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -104,6 +105,7 @@ fn main() -> std::io::Result<()> {
         // Child modes, used by experiments that must measure a fresh process.
         "f2-child" => f2_child(&args),
         "f7-child" => f7_child(&args),
+        "f11-child" => f11_child(&args),
         "f3-reader" => f3_reader(&args),
         "all" => {
             let mut failed = Vec::new();
@@ -112,6 +114,7 @@ fn main() -> std::io::Result<()> {
                 "f6-threads",
                 "f2-open",
                 "f7-index",
+                "f11-flatindex",
                 "f4-durability",
                 "f3-multiproc",
                 "f1-outofcore",
@@ -1354,6 +1357,299 @@ fn f7_child(args: &Args) -> std::io::Result<()> {
     println!(
         "baseline_rss_bytes={baseline} reader_rss_bytes={} open_ms={open_ms:.3} keys={keys}",
         env::peak_rss_bytes()
+    );
+    Ok(())
+}
+
+// ------------------------------------------- F11: the cost of a mapped index --
+
+/// What an index read where it lies buys, and what it costs.
+///
+/// F2.1 and F7.2 both fail for one reason: the reader decodes the key index
+/// into `Vec<(Vec<u8>, Extents)>` and hashes it. That is 131 bytes per key in
+/// every reader process and an open that grows with the key count -- 6.4ms at
+/// 100k keys, 1446ms at 10M. `Options::flat_index` writes a shape a lookup can
+/// use directly instead, so the open validates a header and stops.
+///
+/// The trade is file size: a section used in place cannot be compressed. That
+/// matters more than it sounds, because compactness is one of only two axes
+/// Supdb currently wins on, so the space cost is measured here rather than
+/// waved at.
+///
+/// Both arms run in one process, interleaved, as f8-checksums does. Space is
+/// the exception the project's own rule allows: file size is immune to drift
+/// and is compared directly.
+fn f11_flatindex(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let nkeys = args.num("--keys", profile.pick(50_000, 500_000, 5_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let lookups = args.num("--lookups", profile.pick(20_000, 100_000, 500_000)) as u64;
+
+    let mut rec = Record::new("f11-flatindex", profile);
+    rec.param("keys", J::u(nkeys))
+        .param("value_size", J::u(value_size as u64))
+        .param("lookups", J::u(lookups));
+
+    let dir = scratch("f11");
+    let payload = Payload::new(value_size, 0.5, 0xF1);
+    let exe = std::env::current_exe().expect("current exe");
+
+    // One store per arm, identical data.
+    let mut files = Vec::new();
+    let mut per_ckpt: Vec<f64> = Vec::new();
+    for flat in [false, true] {
+        let file = dir.join(if flat { "flat.dat" } else { "heap.dat" });
+        let store = Store::create(
+            &file,
+            Options {
+                buffer_bytes: 256 << 20,
+                reclaim: Reclaim::AfterReads,
+                flat_index: flat,
+                ..Default::default()
+            },
+        )?;
+        let mut vrng = Rng::new(nkeys);
+        let mut kb = [0u8; 16];
+        for i in 0..nkeys {
+            db_key_into(i, &mut kb);
+            store.append(&kb, payload.get(&mut vrng))?;
+        }
+        // What a checkpoint costs in space, which is the part the headline
+        // file size hides: every checkpoint appends a whole index section and
+        // nothing reclaims the last one. The heap arm leaks too -- this is a
+        // pre-existing defect, not one the flat format introduces -- but the
+        // flat section is several times larger, so the leak is several times
+        // more expensive and grows without bound in checkpoint count.
+        let before = file_len(&file);
+        store.checkpoint()?;
+        let after_one = file_len(&file);
+        store.checkpoint()?;
+        let after_two = file_len(&file);
+        per_ckpt.push((after_two - after_one) as f64);
+        let _ = before;
+        store.close()?;
+        files.push(file);
+    }
+
+    // Open cost, the two arms round-robined so a frequency excursion lands on
+    // both. Each iteration opens a fresh reader and drops it.
+    let opens = Trial::new(profile.reps()).run(2, |ci, _| {
+        let t = Instant::now();
+        let r = Reader::open(&files[ci]).expect("open");
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        std::hint::black_box(r.keys());
+        ms
+    });
+
+    // Before timing anything: the two arms must return the same data. An arm
+    // that silently finds nothing is very fast indeed, and a read benchmark
+    // that does not check would report that as a win. This has already caught
+    // three false greens elsewhere in this suite.
+    {
+        let a = Reader::open(&files[0])?;
+        let b = Reader::open(&files[1])?;
+        assert_eq!(a.keys(), b.keys(), "arms disagree on key count");
+        let mut kb = [0u8; 16];
+        let mut rng = Rng::new(0xC0DE);
+        for _ in 0..1000.min(nkeys) {
+            db_key_into(rng.next() % nkeys, &mut kb);
+            let mut ha = Vec::new();
+            let mut hb = Vec::new();
+            a.read_all(&kb, |v| ha.push(v.to_vec()))?;
+            b.read_all(&kb, |v| hb.push(v.to_vec()))?;
+            assert_eq!(ha, hb, "arms disagree on the values of a key");
+            assert!(!ha.is_empty(), "neither arm found a key that was written");
+        }
+        // Ordered scans too: `seek` and `at` are separate code in each arm.
+        let mut sa = Vec::new();
+        let mut sb = Vec::new();
+        a.scan(None, 500, |k, v| sa.push((k.to_vec(), v.to_vec())))?;
+        b.scan(None, 500, |k, v| sb.push((k.to_vec(), v.to_vec())))?;
+        assert_eq!(sa, sb, "arms disagree on an ordered scan");
+    }
+
+    // Steady-state point reads, same interleaving, readers built once so the
+    // open cost is not folded into the read figure.
+    let readers: Vec<Reader> = files
+        .iter()
+        .map(|f| Reader::open(f).expect("open"))
+        .collect();
+    let hits_seen = std::sync::atomic::AtomicU64::new(0);
+    let reads = Trial::new(profile.reps()).run(2, |ci, _| {
+        let r = &readers[ci];
+        let mut rng = Rng::new(0xF11);
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        let mut hits = 0u64;
+        for _ in 0..lookups {
+            db_key_into(rng.next() % nkeys, &mut kb);
+            hits += r
+                .read_all(&kb, |v| {
+                    std::hint::black_box(v);
+                })
+                .expect("read");
+        }
+        hits_seen.fetch_max(hits, std::sync::atomic::Ordering::Relaxed);
+        std::hint::black_box(hits);
+        t.elapsed().as_secs_f64() * 1e9 / lookups as f64
+    });
+    drop(readers);
+
+    // Resident cost, in a child so the allocator's overhead is counted rather
+    // than estimated, and *after* a random lookup pass: a mapped index is
+    // faulted in on demand, so measuring straight after open would credit the
+    // flat arm for laziness rather than for sharing.
+    let mut rss = Vec::new();
+    for f in &files {
+        let o = std::process::Command::new(&exe)
+            .args([
+                "f11-child",
+                "--file",
+                f.to_str().unwrap(),
+                "--keys",
+                &nkeys.to_string(),
+                "--lookups",
+                &lookups.min(200_000).to_string(),
+            ])
+            .output()?;
+        let txt = String::from_utf8_lossy(&o.stdout).to_string();
+        let pick = |k: &str| -> f64 {
+            txt.split(k)
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0)
+        };
+        rss.push((pick("index_rss_bytes="), pick("open_ms=")));
+    }
+
+    let heap_bytes = file_len(&files[0]) as f64;
+    let flat_bytes = file_len(&files[1]) as f64;
+    let heap_open = opens[0].median();
+    let flat_open = opens[1].median();
+    let heap_read = reads[0].median();
+    let flat_read = reads[1].median();
+    let heap_rss_key = rss[0].0 / nkeys as f64;
+    let flat_rss_key = rss[1].0 / nkeys as f64;
+
+    rec.series(
+        "arms",
+        J::arr(vec![
+            jobj! {
+                "arm" => J::s("heap"),
+                "open_ms" => J::fp(heap_open, 3),
+                "read_ns" => J::fp(heap_read, 1),
+                "index_bytes_per_key" => J::fp(heap_rss_key, 2),
+                "file_bytes" => J::u(heap_bytes as u64),
+                "child_open_ms" => J::fp(rss[0].1, 3),
+                "checkpoint_bytes_per_key" => J::fp(per_ckpt[0] / nkeys as f64, 2),
+            },
+            jobj! {
+                "arm" => J::s("flat"),
+                "open_ms" => J::fp(flat_open, 3),
+                "read_ns" => J::fp(flat_read, 1),
+                "index_bytes_per_key" => J::fp(flat_rss_key, 2),
+                "file_bytes" => J::u(flat_bytes as u64),
+                "child_open_ms" => J::fp(rss[1].1, 3),
+                "checkpoint_bytes_per_key" => J::fp(per_ckpt[1] / nkeys as f64, 2),
+            },
+        ]),
+    );
+    rec.param(
+        "values_per_lookup",
+        J::fp(
+            hits_seen.load(std::sync::atomic::Ordering::Relaxed) as f64 / lookups as f64,
+            3,
+        ),
+    );
+    rec.compare(
+        "flat_open_vs_heap_open",
+        compare(&opens[0], &opens[1], supdb::bench::MIN_EFFECT),
+    );
+    rec.compare(
+        "flat_read_vs_heap_read",
+        compare(&reads[0], &reads[1], supdb::bench::MIN_EFFECT),
+    );
+
+    rec.finding(Finding::new(
+        "F11.1",
+        "a mapped index opens at least 10x faster than a decoded one",
+        flat_open * 10.0 <= heap_open,
+        format!(
+            "{nkeys} keys: heap {heap_open:.2}ms -> flat {flat_open:.3}ms ({:.0}x)",
+            heap_open / flat_open.max(1e-9)
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F11.2",
+        "a mapped index costs less than half the resident bytes per key",
+        flat_rss_key * 2.0 <= heap_rss_key,
+        format!(
+            "heap {heap_rss_key:.0} B/key against flat {flat_rss_key:.0} B/key, and the flat \
+             arm's pages are file-backed, so N readers share one copy where the heap arm \
+             pays N times"
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F11.3",
+        "point reads do not get slower",
+        flat_read <= heap_read * 1.05,
+        format!("heap {heap_read:.0} ns -> flat {flat_read:.0} ns"),
+    ));
+    rec.finding(Finding::new(
+        "F11.5",
+        "a checkpoint does not cost more than 16 bytes per key of permanent file growth",
+        per_ckpt[1] / nkeys as f64 <= 16.0,
+        format!(
+            "heap {:.1} B/key per checkpoint, flat {:.1} B/key ({:.1}x). Every checkpoint \
+             appends a whole index section and nothing reclaims the previous one, so this is \
+             not a one-off cost -- it is the file growing without bound in checkpoint count. \
+             The leak predates the flat format; the flat format makes it several times dearer",
+            per_ckpt[0] / nkeys as f64,
+            per_ckpt[1] / nkeys as f64,
+            per_ckpt[1] / per_ckpt[0].max(1.0)
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F11.4",
+        "the file grows by less than 10% in exchange",
+        flat_bytes <= heap_bytes * 1.10,
+        format!(
+            "heap {:.1} MB -> flat {:.1} MB ({:+.1}%). An index read in place cannot be \
+             compressed, and compactness is one of the two axes this engine wins on",
+            heap_bytes / 1e6,
+            flat_bytes / 1e6,
+            (flat_bytes / heap_bytes - 1.0) * 100.0
+        ),
+    ));
+    Ok(rec)
+}
+
+/// Open, then fault the index in the way a real reader would, then report.
+fn f11_child(args: &Args) -> std::io::Result<()> {
+    let file = PathBuf::from(args.get("--file").expect("--file"));
+    let nkeys = args.num("--keys", 1) as u64;
+    let lookups = args.num("--lookups", 1) as u64;
+    let baseline = env::rss_bytes();
+    let t = Instant::now();
+    let reader = Reader::open(&file)?;
+    let open_ms = t.elapsed().as_secs_f64() * 1000.0;
+    // Touch a realistic working set. A mapped index is demand-faulted, so
+    // resident size straight after open measures how little has been read
+    // rather than how little is needed.
+    let mut rng = Rng::new(0xC11D);
+    let mut kb = [0u8; 16];
+    let mut hits = 0u64;
+    for _ in 0..lookups {
+        db_key_into(rng.next() % nkeys.max(1), &mut kb);
+        hits += reader.read_all(&kb, |v| {
+            std::hint::black_box(v);
+        })?;
+    }
+    std::hint::black_box(hits);
+    println!(
+        "baseline_rss_bytes={baseline} index_rss_bytes={} open_ms={open_ms:.3} keys={}",
+        env::rss_bytes().saturating_sub(baseline),
+        reader.keys()
     );
     Ok(())
 }
