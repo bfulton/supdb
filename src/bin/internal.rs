@@ -1348,11 +1348,30 @@ fn f7_index(args: &Args, profile: Profile) -> std::io::Result<Record> {
 /// Child for F7: report resident size before and after building a reader.
 fn f7_child(args: &Args) -> std::io::Result<()> {
     let file = PathBuf::from(args.get("--file").expect("--file"));
+    let nkeys = args.num("--keys", 1) as u64;
     let baseline = env::peak_rss_bytes();
     let t = Instant::now();
     let reader = Reader::open(&file)?;
     let open_ms = t.elapsed().as_secs_f64() * 1000.0;
-    // Touch the index so nothing is lazily deferred past the measurement.
+    // Fault in a real working set before measuring.
+    //
+    // `keys()` alone was enough while the index was decoded on open, because
+    // then the whole thing was already resident by the time it returned. A
+    // mapped index is demand-faulted, so the same measurement reports nearly
+    // zero -- which is how little has been read, not how little is needed, and
+    // reporting that as "0 bytes per key" would be a false green of exactly
+    // the kind this suite exists to refuse.
+    let lookups = (nkeys / 4).clamp(1, 200_000);
+    let mut rng = Rng::new(0xF7C);
+    let mut kb = [0u8; 16];
+    let mut hits = 0u64;
+    for _ in 0..lookups {
+        db_key_into(rng.next() % nkeys.max(1), &mut kb);
+        hits += reader.read_all(&kb, |v| {
+            std::hint::black_box(v);
+        })?;
+    }
+    std::hint::black_box(hits);
     let keys = reader.keys();
     // Report which index arm answered, so a run that silently fell back to the
     // decoded one is visible in the record rather than inferred from the
