@@ -1239,6 +1239,7 @@ fn f7_index(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let mut points = Vec::new();
     let mut per_key: Vec<(u64, f64)> = Vec::new();
+    let mut last_shared = false;
 
     for &nkeys in &scale {
         let file = dir.join(format!("k{nkeys}.dat"));
@@ -1272,7 +1273,18 @@ fn f7_index(args: &Args, profile: Profile) -> std::io::Result<Record> {
         };
         let rss = field("reader_rss_bytes");
         let baseline = field("baseline_rss_bytes");
-        let index_bytes = (rss - baseline).max(0.0);
+        let section = field("index_bytes");
+        // A mapped index reports its section; a decoded one has no section and
+        // its cost is what it added to the process on open. Both are the size
+        // of the structure a reader needs -- the difference is that only one
+        // of them is paid again by the next reader.
+        let index_bytes = if section > 0.0 {
+            section
+        } else {
+            (rss - baseline).max(0.0)
+        };
+        let shared = section > 0.0;
+        last_shared = shared;
         let b_per_key = index_bytes / nkeys as f64;
         per_key.push((nkeys, b_per_key));
 
@@ -1283,9 +1295,10 @@ fn f7_index(args: &Args, profile: Profile) -> std::io::Result<Record> {
             "baseline_rss_mb" => J::fp(baseline / 1048576.0, 2),
             "index_rss_mb" => J::fp(index_bytes / 1048576.0, 2),
             "index_bytes_per_key" => J::fp(b_per_key, 1),
+            "shared_between_readers" => J::Bool(shared),
             "open_ms" => J::fp(field("open_ms"), 3),
-            // The index is heap, so N readers cost N times this. A shared
-            // mmap-able index would cost it once.
+            // A decoded index is heap, so N readers cost N times this; a
+            // mapped one is file-backed and costs it once.
             "rss_over_file" => J::fp(index_bytes / fsz.max(1) as f64, 3),
         });
         let _ = std::fs::remove_file(&file);
@@ -1322,7 +1335,12 @@ fn f7_index(args: &Args, profile: Profile) -> std::io::Result<Record> {
         "a reader's index costs less than 32 bytes per key",
         bytes_per_key < 32.0,
         format!(
-            "{bytes_per_key:.0} bytes per key resident, per reader process, shared with nobody"
+            "{bytes_per_key:.0} bytes per key{}",
+            if last_shared {
+                ", in a file-backed section every reader process shares"
+            } else {
+                " resident, per reader process, shared with nobody"
+            }
         ),
     ));
     rec.finding(Finding::new(
@@ -1353,35 +1371,35 @@ fn f7_child(args: &Args) -> std::io::Result<()> {
     let t = Instant::now();
     let reader = Reader::open(&file)?;
     let open_ms = t.elapsed().as_secs_f64() * 1000.0;
-    // Fault in a real working set before measuring.
+    // Resident size straight after open, before anything else is touched.
     //
-    // `keys()` alone was enough while the index was decoded on open, because
-    // then the whole thing was already resident by the time it returned. A
-    // mapped index is demand-faulted, so the same measurement reports nearly
-    // zero -- which is how little has been read, not how little is needed, and
-    // reporting that as "0 bytes per key" would be a false green of exactly
-    // the kind this suite exists to refuse.
-    let lookups = (nkeys / 4).clamp(1, 200_000);
-    let mut rng = Rng::new(0xF7C);
-    let mut kb = [0u8; 16];
-    let mut hits = 0u64;
-    for _ in 0..lookups {
-        db_key_into(rng.next() % nkeys.max(1), &mut kb);
-        hits += reader.read_all(&kb, |v| {
-            std::hint::black_box(v);
-        })?;
-    }
-    std::hint::black_box(hits);
+    // For a decoded index that is the whole structure: it was built during
+    // `open`, so it is all resident by the time this line runs. Getting to
+    // this measurement took three wrong ones and they are worth recording,
+    // because each looked reasonable:
+    //
+    //   * `keys()` then read RSS. Correct for the decoded arm, and reports
+    //     nearly zero for a mapped one -- how little has been read, not how
+    //     little is needed.
+    //   * A random `read_all` pass first. That faults in data blocks as well,
+    //     which both arms share, so it drowned the index difference: 122 B/key
+    //     against the decoded arm's 131, for a structure half the size.
+    //   * Which leaves measuring the structure rather than the process. A
+    //     mapped index reports its section exactly; a decoded one has no
+    //     section and its resident-after-open figure is the right answer.
+    let rss_after_open = env::peak_rss_bytes();
     let keys = reader.keys();
     // Report which index arm answered, so a run that silently fell back to the
     // decoded one is visible in the record rather than inferred from the
     // numbers looking unchanged.
+    // `reader_rss_bytes` stays the decoded arm's answer; `index_bytes` is the
+    // mapped arm's, and is zero when there is no section to point at.
     println!(
-        "baseline_rss_bytes={baseline} reader_rss_bytes={} open_ms={open_ms:.3} keys={keys} \
-         index_bytes={}",
-        env::peak_rss_bytes(),
+        "baseline_rss_bytes={baseline} reader_rss_bytes={rss_after_open} open_ms={open_ms:.3} \
+         keys={keys} index_bytes={}",
         reader.index_bytes()
     );
+    let _ = nkeys;
     Ok(())
 }
 
