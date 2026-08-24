@@ -94,8 +94,10 @@ described in `claims.json`:
 
 - `Store::create` truncates and there is no `Store::open` — a store cannot be
   reopened for writing.
-- Reader open is super-linear in key count; the index is heap-resident per
-  process, at ~131 bytes per key.
+- Reader open grows with key count, though no longer in proportion to it: 20x
+  for 100x the keys, and what remains is the block table rather than the key
+  index. The index is 57 bytes per key in a mapped section readers share; it
+  was 131 bytes per key, heap-resident and duplicated per process.
 - Write throughput barely scales with writer threads.
 - No usable point on the durability curve; `checkpoint` is O(key count).
 
@@ -104,4 +106,10 @@ the same commit, and the review in `docs/` should be updated to say so.
 
 Fixed so far, with reproducers kept in `tests/known_bugs.rs`: delete
 resurrection, the double-free that handed one slot to three blocks, decoder
-panics on damaged input, and silently-served corruption (now checksummed).
+panics on damaged input, silently-served corruption (now checksummed), and a
+checkpoint that appended three index sections and released none of them.
+
+F2.2 is the first of the four above to move from `fails` to `holds`: reader
+open is sub-linear in key count since the key index became a mapped section
+(`src/flatindex.rs`, `Options::flat_index`). The other three still fail, and
+so does F2.1 — sub-linear is not independent.

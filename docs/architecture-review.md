@@ -361,6 +361,41 @@ open is `O(1)` and the index is shared across processes by the page cache. This 
 subsumes the acknowledged "checkpoint writes the whole key index" gap, since a shared,
 persistent index format is a prerequisite for making it incremental.
 
+**DONE — and the simplest of those options won.** `indexlab` measured ten candidate
+layouts before anything was built, and the prefix-compressed and learned-index families
+both lost to the plainest one: an open-addressed hash of (tag, record offset) over a flat
+blob of fixed-width records. `src/flatindex.rs` is that, and `Options::flat_index` is on by
+default. At 5M keys, `--profile full`:
+
+| | decoded | mapped |
+|---|---|---|
+| open | 738 ms | **0.29 ms** (2537×, p=0.0022) |
+| point read | 2334 ns | 1893 ns (1.25×, p=0.0022) |
+| index | 186 B/key resident, per process | **57 B/key, file-backed and shared** |
+| file | 394 MB | 683 MB (+73.5%) |
+
+**F2.2 moved from `fails` to `holds`** — reader open is sub-linear in key count. F2.1 still
+fails: 20× for 100× the keys is sub-linear, not independent, and what remains is the *block*
+table, still decoded per entry. F7.1 and F7.2 also still fail, because an index of N keys
+holds N records and 57 B/key is above that claim's 32-byte bar — but the per-process
+multiplier this section objects to is gone. Ten reader processes now share one copy.
+
+The price is +73.5% on disk, paid deliberately: a section read in place cannot be
+compressed. Space is the axis this engine has to spare.
+
+Two things found on the way are worth more than the speedup:
+
+- **A pre-existing leak.** Every checkpoint appended three index sections and released
+  none of them — 9.2 B/key per checkpoint, forever, in the shipped engine. It hid under a
+  compressed index for the project's whole life; the flat format made it seven times
+  dearer and therefore visible. Sections are now reclaimed and both arms measure zero
+  permanent growth per checkpoint. This is the space half of the "checkpoint writes the
+  whole key index" gap named above; the time half is still open.
+- **`history_from` was a lie.** It is the field that says how far back time travel is
+  intact once space is reclaimed, and it was hardcoded to zero — claiming unlimited
+  history while, by its own documentation, reclaimed blocks could already have been
+  overwritten. It now reports the truth.
+
 ### 2.8 The block cache is configured, documented as central, and effectively unused — **medium**
 
 - `Options::cache_blocks` is declared and defaulted to 4096 and **never read**. `Reader::build`
