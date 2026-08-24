@@ -289,10 +289,12 @@ impl FlatIndex {
         let key = recs.get(off + 4..off + 4 + klen)?;
         let e_at = off.checked_add(align_up(4 + klen, REC_ALIGN))?;
         let bytes = recs.get(e_at..e_at.checked_add(n.checked_mul(16)?)?)?;
-        // Records are laid out 4-aligned and `Ext` is four u32s, so this
-        // borrow is aligned by construction. Checked anyway: the offset came
-        // out of a file, and an unaligned read here is undefined behaviour
-        // rather than a wrong answer.
+        // Records are laid out 4-aligned within the section and the section is
+        // written at an 8-aligned file offset, so this borrow is aligned by
+        // construction. Checked anyway, and the check has already earned its
+        // keep: before `write_section_raw` aligned the section, records were
+        // aligned relative to the section and not absolutely, and this is what
+        // turned undefined behaviour into a miss.
         if !(bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<Ext>()) {
             return None;
         }

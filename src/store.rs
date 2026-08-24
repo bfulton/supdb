@@ -1149,6 +1149,18 @@ fn encode_block_index(blocks: &[BlockLoc]) -> Vec<u8> {
 /// nothing else has to learn about this.
 fn write_section_raw(ap: &mut Appender, payload: &[u8]) -> Result<BlockLoc> {
     use std::os::unix::fs::FileExt;
+    // Align the section in the *file*, not just within itself.
+    //
+    // A mapped index hands back `&[Ext]` borrowed from the mapping, which
+    // requires those extents to be aligned at their absolute address. Laying
+    // records out 4-aligned relative to the section start is not enough: the
+    // section begins wherever the appender happened to be, so the same layout
+    // was aligned or not depending on how many bytes preceded it. That
+    // presented as every lookup and every scan returning nothing while
+    // `keys()` stayed correct -- the header parsed, the records did not --
+    // and it tracked checkpoint count rather than key count, which is what
+    // made it look like a scale bug.
+    ap.off = (ap.off + 7) & !7;
     let loc = BlockLoc {
         off: ap.off,
         stored: payload.len() as u32,
