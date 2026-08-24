@@ -1419,13 +1419,15 @@ fn f11_flatindex(args: &Args, profile: Profile) -> std::io::Result<Record> {
         // pre-existing defect, not one the flat format introduces -- but the
         // flat section is several times larger, so the leak is several times
         // more expensive and grows without bound in checkpoint count.
+        // Steady state, not warm-up: the free list needs a few checkpoints
+        // before superseded sections come back round, so the first deltas
+        // overstate what a long-running store pays.
+        for _ in 0..5 {
+            store.checkpoint()?;
+        }
         let before = file_len(&file);
         store.checkpoint()?;
-        let after_one = file_len(&file);
-        store.checkpoint()?;
-        let after_two = file_len(&file);
-        per_ckpt.push((after_two - after_one) as f64);
-        let _ = before;
+        per_ckpt.push((file_len(&file) - before) as f64);
         store.close()?;
         files.push(file);
     }

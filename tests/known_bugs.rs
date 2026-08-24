@@ -159,3 +159,55 @@ fn a_mapped_index_agrees_with_the_decoded_one_at_every_alignment() {
         }
     }
 }
+
+/// Every checkpoint appended three index sections and freed none of them.
+///
+/// The keys, blocks and reuse-log sections were written at the append cursor
+/// and never handed back, so a store that checkpointed often grew without
+/// bound in *checkpoint count* rather than in data. It went unnoticed because
+/// the varint key section is small and compresses well; the flat index made
+/// the same leak seven times more expensive and thereby visible.
+///
+/// The fix reuses freed section space and releases superseded sections once no
+/// reader can still reach them, which is the same reuse floor blocks already
+/// use. Growth must therefore stop, not merely slow.
+#[test]
+fn repeated_checkpoints_stop_growing_the_file() {
+    for flat in [false, true] {
+        let dir = std::env::temp_dir().join(format!("supdb-kb-ckptleak-{flat}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s.dat");
+        let store = supdb::Store::create(
+            &file,
+            supdb::Options {
+                buffer_bytes: 128 << 20,
+                reclaim: supdb::Reclaim::AfterReads,
+                flat_index: flat,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for i in 0..20_000u64 {
+            store
+                .append(format!("k{i:012}").as_bytes(), &[7u8; 64])
+                .unwrap();
+        }
+        let mut sizes = Vec::new();
+        for _ in 0..8 {
+            store.checkpoint().unwrap();
+            sizes.push(std::fs::metadata(&file).unwrap().len());
+        }
+        // The first few may still grow while the free list warms; the tail
+        // must be flat. A leak shows up as a constant positive step forever.
+        let tail: Vec<i64> = sizes[4..]
+            .windows(2)
+            .map(|w| w[1] as i64 - w[0] as i64)
+            .collect();
+        assert!(
+            tail.iter().all(|d| *d == 0),
+            "flat={flat}: file still grows per checkpoint: {tail:?} (sizes {sizes:?})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

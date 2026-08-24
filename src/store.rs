@@ -300,6 +300,18 @@ struct Appender {
     timestamp: u64,
     reuse_log: Vec<(u64, u32, u64)>,
     last_index: Option<BlockLoc>,
+    /// The index sections of recent checkpoints, newest last, so superseded
+    /// ones can be handed back instead of accumulating.
+    ///
+    /// Every checkpoint writes three sections -- keys, blocks, reuse log --
+    /// and nothing ever released them, so a store that checkpoints often grew
+    /// without bound in checkpoint count rather than in data. That was
+    /// tolerable while the key section was compressed varints; it stopped
+    /// being tolerable at the flat format's seven times the size.
+    index_history: Vec<(u64, BlockLoc, BlockLoc, BlockLoc)>,
+    /// Oldest generation whose index sections are still intact. Reported in
+    /// the superblock, and what `open_as_of` refuses to read past.
+    history_from: u64,
 }
 
 impl Appender {
@@ -536,6 +548,8 @@ impl Store {
                 timestamp: 0,
                 reuse_log: Vec::new(),
                 last_index: None,
+                index_history: Vec::new(),
+                history_from: 0,
             }),
             opts,
             path: path.to_path_buf(),
@@ -956,11 +970,11 @@ impl Store {
         // is a section copied into every reader's heap, which is the cost this
         // format exists to remove.
         let key_loc = if flat {
-            write_section_raw(&mut ap, &key_idx)?
+            write_section_raw(&mut ap, &key_idx, self.opts.reclaim)?
         } else {
-            write_section(&mut ap, &key_idx)?
+            write_section(&mut ap, &key_idx, self.opts.reclaim)?
         };
-        let blk_loc = write_section(&mut ap, &blk_idx)?;
+        let blk_loc = write_section(&mut ap, &blk_idx, self.opts.reclaim)?;
         // Drop entries older than any reader could still be relying on. A
         // reader outside the grace window is already unsafe and is told so, so
         // keeping the record forever only made every checkpoint bigger and
@@ -973,7 +987,7 @@ impl Store {
             .saturating_sub(1);
         ap.reuse_log.retain(|(_, _, gen)| *gen >= horizon);
         let reuse = encode_reuse_log(&ap.reuse_log);
-        let reuse_loc = write_section(&mut ap, &reuse)?;
+        let reuse_loc = write_section(&mut ap, &reuse, self.opts.reclaim)?;
         ap.file.sync_data()?;
 
         let gen = ap.generation + 1;
@@ -981,9 +995,27 @@ impl Store {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        // Hand back the sections of checkpoints no reader can still be using.
+        //
+        // The newest is always kept, and so is anything at or above the reuse
+        // floor -- which under Reclaim::Never and Reclaim::OnClose is zero, so
+        // this does nothing and history stays complete. Where it does release,
+        // `history_from` records how far back the chain is still intact, which
+        // is what `open_as_of` already refuses to read past.
+        ap.index_history.push((gen, key_loc, blk_loc, reuse_loc));
+        let floor = ap.reuse_floor(self.opts.reclaim);
+        while ap.index_history.len() > 1 && ap.index_history[0].0 < floor {
+            let (g, k, b, r) = ap.index_history.remove(0);
+            for loc in [k, b, r] {
+                ap.free.release(loc.off, loc.cap, gen);
+            }
+            ap.history_from = ap.history_from.max(g + 1);
+        }
+        let history_from = ap.history_from;
+
         let sb = Super {
             generation: gen,
-            history_from: 0,
+            history_from,
             timestamp: now.max(ap.timestamp),
             key_off: key_loc.off,
             key_stored: key_loc.stored as u64,
@@ -1147,9 +1179,51 @@ fn encode_block_index(blocks: &[BlockLoc]) -> Vec<u8> {
 /// `stored == uncompressed` is what marks a section as readable in place, and
 /// `read_section` already treats those as equal rather than decompressing, so
 /// nothing else has to learn about this.
-fn write_section_raw(ap: &mut Appender, payload: &[u8]) -> Result<BlockLoc> {
+/// Place a section, reusing freed space when a big enough hole exists.
+///
+/// Mirrors how blocks are allocated, including the reuse-log entry: releasing
+/// a section only makes its space available, and an older index that pointed
+/// there stays correct until something is actually written over it. Recording
+/// the range and the generation is what lets a later read of an older state
+/// fail only if it really touches those bytes.
+///
+/// `align` is 8 for a section meant to be read in place. A hole that would not
+/// land aligned is left alone rather than fudged: the alternative is carving
+/// the slot up and handing a different range back to the free list than the
+/// one taken from it.
+fn place_section(ap: &mut Appender, len: u32, policy: Reclaim, align: u64) -> (u64, u32) {
+    let floor = ap.reuse_floor(policy);
+    if let Some((off, cap)) = ap.free.take_below(len, floor) {
+        if align <= 1 || off % align == 0 {
+            ap.reuse_log.push((off, cap, ap.generation));
+            return (off, cap);
+        }
+        // Put it straight back: this section cannot use it.
+        ap.free.release(off, cap, ap.generation);
+    }
+    if align > 1 {
+        ap.off = (ap.off + align - 1) & !(align - 1);
+    }
+    // Rounded to a size class, like blocks, so a section that grows by a byte
+    // between checkpoints still fits the hole the last one left. Exact fits
+    // were tried and reclaim collapsed: the varint key section changes size
+    // slightly every checkpoint and never fitted its predecessor's hole.
+    //
+    // Rounding means `ap.off` runs past the last byte written, and `ap.off` is
+    // the superblock's high water mark, so the file has to actually be that
+    // long -- otherwise a reader sees a superblock describing more file than
+    // exists and retries until it gives up with "the writer kept moving ahead
+    // of the mapping".
+    let cap = capacity_for(len);
+    let off = ap.off;
+    ap.off += cap as u64;
+    let _ = ap.file.set_len(ap.off);
+    (off, cap)
+}
+
+fn write_section_raw(ap: &mut Appender, payload: &[u8], policy: Reclaim) -> Result<BlockLoc> {
     use std::os::unix::fs::FileExt;
-    // Align the section in the *file*, not just within itself.
+    // Aligned in the *file*, not just within itself.
     //
     // A mapped index hands back `&[Ext]` borrowed from the mapping, which
     // requires those extents to be aligned at their absolute address. Laying
@@ -1160,12 +1234,12 @@ fn write_section_raw(ap: &mut Appender, payload: &[u8]) -> Result<BlockLoc> {
     // `keys()` stayed correct -- the header parsed, the records did not --
     // and it tracked checkpoint count rather than key count, which is what
     // made it look like a scale bug.
-    ap.off = (ap.off + 7) & !7;
+    let (off, cap) = place_section(ap, payload.len() as u32, policy, 8);
     let loc = BlockLoc {
-        off: ap.off,
+        off,
         stored: payload.len() as u32,
         uncompressed: payload.len() as u32,
-        cap: payload.len() as u32,
+        cap,
         chunked: false,
         solo: false,
         crc: if block::checksums_on() {
@@ -1174,20 +1248,20 @@ fn write_section_raw(ap: &mut Appender, payload: &[u8]) -> Result<BlockLoc> {
             0
         },
     };
-    ap.file.write_all_at(payload, ap.off)?;
-    ap.off += payload.len() as u64;
+    ap.file.write_all_at(payload, off)?;
     Ok(loc)
 }
 
-fn write_section(ap: &mut Appender, payload: &[u8]) -> Result<BlockLoc> {
+fn write_section(ap: &mut Appender, payload: &[u8], policy: Reclaim) -> Result<BlockLoc> {
     let stored = block::compress(payload);
     let bytes: &[u8] = stored.as_deref().unwrap_or(payload);
     use std::os::unix::fs::FileExt;
+    let (off, cap) = place_section(ap, bytes.len() as u32, policy, 1);
     let loc = BlockLoc {
-        off: ap.off,
+        off,
         stored: bytes.len() as u32,
         uncompressed: payload.len() as u32,
-        cap: bytes.len() as u32,
+        cap,
         chunked: false,
         solo: false,
         crc: if block::checksums_on() {
@@ -1196,8 +1270,7 @@ fn write_section(ap: &mut Appender, payload: &[u8]) -> Result<BlockLoc> {
             0
         },
     };
-    ap.file.write_all_at(bytes, ap.off)?;
-    ap.off += bytes.len() as u64;
+    ap.file.write_all_at(bytes, off)?;
     Ok(loc)
 }
 
