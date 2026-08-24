@@ -2126,6 +2126,20 @@ impl Reader {
         self.idx.len()
     }
 
+    /// Bytes the key index occupies, as stored.
+    ///
+    /// Diagnostic, and the honest way to price the index arms against each
+    /// other: resident-set size after a read pass includes block and cache
+    /// pages common to both arms, which dilutes the difference being measured.
+    /// Zero for a decoded index, whose cost is in the heap rather than in a
+    /// section -- ask `keys()` and the format for that.
+    pub fn index_bytes(&self) -> usize {
+        match &self.idx {
+            Idx::Flat { len, .. } => *len,
+            Idx::Heap { .. } => 0,
+        }
+    }
+
     /// Byte ranges holding live block payload, as (offset, stored length).
     ///
     /// Diagnostic. A corruption experiment that picks byte offsets uniformly
