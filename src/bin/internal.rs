@@ -1354,9 +1354,14 @@ fn f7_child(args: &Args) -> std::io::Result<()> {
     let open_ms = t.elapsed().as_secs_f64() * 1000.0;
     // Touch the index so nothing is lazily deferred past the measurement.
     let keys = reader.keys();
+    // Report which index arm answered, so a run that silently fell back to the
+    // decoded one is visible in the record rather than inferred from the
+    // numbers looking unchanged.
     println!(
-        "baseline_rss_bytes={baseline} reader_rss_bytes={} open_ms={open_ms:.3} keys={keys}",
-        env::peak_rss_bytes()
+        "baseline_rss_bytes={baseline} reader_rss_bytes={} open_ms={open_ms:.3} keys={keys} \
+         index_bytes={}",
+        env::peak_rss_bytes(),
+        reader.index_bytes()
     );
     Ok(())
 }

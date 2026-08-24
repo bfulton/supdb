@@ -260,13 +260,22 @@ impl Default for Options {
             solo_chunk_size: block::CHUNK,
             merge_threshold: 4,
             checksums: true,
-            // Off until the space cost is bounded. The read and open wins are
-            // large and measured, but f11 shows a checkpoint appends a whole
-            // index section that nothing ever reclaims -- 61 bytes per key
-            // against the varint format's 8.8 -- so turning this on by default
-            // would trade a bounded cost for an unbounded one. Flip it once
-            // index sections are reclaimable.
-            flat_index: false,
+            // On, now that the space cost is bounded.
+            //
+            // It was off while a checkpoint appended a whole index section
+            // that nothing reclaimed -- 61 bytes per key against the varint
+            // format's 8.8, forever -- because that trades a bounded cost for
+            // an unbounded one. Sections are now released once no reader can
+            // reach them, and f11 measures the steady-state growth at 0 B/key
+            // per checkpoint on both arms, so the precondition is met.
+            //
+            // What is left is a one-off: at 5M keys the file goes from 394 MB
+            // to 683 MB, +73.5%, because a section read in place cannot be
+            // compressed. That buys an open of 0.29ms against 738ms (2537x),
+            // reads at 1.25x, and an index of 67 B/key that is file-backed and
+            // shared between reader processes rather than 186 B/key duplicated
+            // in each. Space is the axis this engine has to spare.
+            flat_index: true,
             reclaim: Reclaim::AfterReads,
         }
     }
