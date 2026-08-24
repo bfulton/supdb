@@ -1345,6 +1345,23 @@ pub struct Reader {
     /// Where this reader's keys live: decoded onto the heap, or left in the
     /// mapping and addressed where they lie.
     idx: Idx,
+    /// One bit per block: whether this reader has already verified its
+    /// checksum.
+    ///
+    /// An uncompressed block is read straight out of the mapping, and the
+    /// checksum covers the whole block, so verifying on every read costs
+    /// O(block size) per value returned -- 64 KiB of CRC to hand back 100
+    /// bytes. It measured 7985 ns per entry on an ordered scan against 26 with
+    /// checking off: a 307x penalty, and the reason compression looked like it
+    /// made reads *faster*. The compressed path never showed it because
+    /// chunking makes it verify a kilobyte at a time.
+    ///
+    /// A block a reader can see cannot be rewritten underneath it -- that is
+    /// what the generation claim buys -- so once verified it stays verified
+    /// for this reader's lifetime. Atomic because a `Reader` is shared by
+    /// reference; the race is benign, two threads may verify the same block
+    /// once each.
+    verified: Vec<std::sync::atomic::AtomicU64>,
     blocks: Vec<BlockLoc>,
     cache: BlockCache,
     /// Slot held in the reader table, released when this reader is dropped.
@@ -1831,9 +1848,13 @@ impl Reader {
         let blocks = Self::decode_blocks(&blk_idx)?;
         let generation = meta.generation;
         let prev = meta.prev;
+        let verified = (0..blocks.len().div_ceil(64))
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
         Ok(Reader {
             mmap,
             idx: Idx::Flat { meta, off, len },
+            verified,
             blocks,
             cache: BlockCache::new(4096),
             slot: None,
@@ -1939,6 +1960,9 @@ impl Reader {
         }
 
         let cache = BlockCache::new(4096);
+        let verified = (0..blocks.len().div_ceil(64))
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
         Ok(Reader {
             mmap,
             idx: Idx::Heap {
@@ -1946,6 +1970,7 @@ impl Reader {
                 hash,
                 mask,
             },
+            verified,
             blocks,
             cache,
             slot: None,
@@ -1958,13 +1983,37 @@ impl Reader {
         })
     }
 
+    /// Verify an uncompressed block's checksum, at most once per reader.
+    #[inline]
+    fn verify_plain(&self, id: u32, raw: &[u8], want: u32) -> Result<()> {
+        if !block::checksums_on() {
+            return Ok(());
+        }
+        use std::sync::atomic::Ordering;
+        let (w, bit) = (id as usize / 64, 1u64 << (id as usize % 64));
+        let Some(cell) = self.verified.get(w) else {
+            // No room to remember: check every time rather than skip.
+            return if block::crc32(raw) == want {
+                Ok(())
+            } else {
+                Err(corrupt("block checksum mismatch"))
+            };
+        };
+        if cell.load(Ordering::Relaxed) & bit != 0 {
+            return Ok(());
+        }
+        if block::crc32(raw) != want {
+            return Err(corrupt("block checksum mismatch"));
+        }
+        cell.fetch_or(bit, Ordering::Relaxed);
+        Ok(())
+    }
+
     fn block(&self, id: u32) -> Result<BlockRef<'_>> {
         let loc = self.blocks[id as usize];
         let raw = &self.mmap[loc.off as usize..loc.off as usize + loc.stored as usize];
         if loc.is_plain() {
-            if block::checksums_on() && block::crc32(raw) != loc.crc {
-                return Err(corrupt("block checksum mismatch"));
-            }
+            self.verify_plain(id, raw, loc.crc)?;
             // never compressed, so hand out the mapping itself
             return Ok(BlockRef::Mapped(raw));
         }
@@ -1972,9 +2021,7 @@ impl Reader {
             return Ok(BlockRef::Owned(hit));
         }
         // Compressed as a single stream, so no per-chunk checksum applies.
-        if block::checksums_on() && block::crc32(raw) != loc.crc {
-            return Err(corrupt("block checksum mismatch"));
-        }
+        self.verify_plain(id, raw, loc.crc)?;
         let out = Arc::new(block::decompress(raw, loc.uncompressed as usize)?);
         self.cache.put(id, Arc::clone(&out));
         Ok(BlockRef::Owned(out))
@@ -2008,9 +2055,7 @@ impl Reader {
             if loc.is_plain() {
                 // Stored verbatim, so there is no chunk directory to carry a
                 // checksum; the block index carries one instead.
-                if block::checksums_on() && block::crc32(raw) != loc.crc {
-                    return Err(corrupt("block checksum mismatch"));
-                }
+                self.verify_plain(e.block, raw, loc.crc)?;
                 let (a, b) = (e.off as usize, (e.off + e.len) as usize);
                 if b > raw.len() {
                     return Err(corrupt("extent runs past its block"));
@@ -2038,10 +2083,9 @@ impl Reader {
                     let (a, b) = (e.off as usize, (e.off + e.len) as usize);
                     let r = if loc.chunked {
                         block::read_chunked_range(raw, un, a, b, &mut buf[..un])
-                    } else if block::checksums_on() && block::crc32(raw) != loc.crc {
-                        Err(corrupt("block checksum mismatch"))
                     } else {
-                        block::decompress_into(raw, &mut buf, un)
+                        self.verify_plain(e.block, raw, loc.crc)
+                            .and_then(|_| block::decompress_into(raw, &mut buf, un))
                     };
                     if let Err(err) = r {
                         if std::env::var_os("SUPDB_DEBUG").is_some() {
@@ -2083,9 +2127,7 @@ impl Reader {
         let loc = self.blocks[e.block as usize];
         let raw = &self.mmap[loc.off as usize..loc.off as usize + loc.stored as usize];
         if loc.is_plain() {
-            if block::checksums_on() && block::crc32(raw) != loc.crc {
-                return Err(corrupt("block checksum mismatch"));
-            }
+            self.verify_plain(e.block, raw, loc.crc)?;
             let mut p = (e.off + at) as usize;
             return Ok(get_uvarint(raw, &mut p) as i32);
         }
@@ -2101,9 +2143,7 @@ impl Reader {
                     // only the chunks holding this one record
                     block::read_chunked_range(raw, un, at, (at + 16).min(un), &mut buf[..un])?;
                 } else {
-                    if block::checksums_on() && block::crc32(raw) != loc.crc {
-                        return Err(corrupt("block checksum mismatch"));
-                    }
+                    self.verify_plain(e.block, raw, loc.crc)?;
                     block::decompress_into(raw, &mut buf, un)?;
                 }
                 let mut p = at;
@@ -2225,9 +2265,7 @@ impl Reader {
                 let loc = self.blocks[e.block as usize];
                 let raw = &self.mmap[loc.off as usize..loc.off as usize + loc.stored as usize];
                 let extent: &[u8] = if loc.is_plain() {
-                    if block::checksums_on() && block::crc32(raw) != loc.crc {
-                        return Err(corrupt("block checksum mismatch"));
-                    }
+                    self.verify_plain(e.block, raw, loc.crc)?;
                     &raw[e.off as usize..(e.off + e.len) as usize]
                 } else {
                     let un = loc.uncompressed as usize;
@@ -2238,9 +2276,7 @@ impl Reader {
                         have.clear();
                         have.resize(un / 64 + 2, 0);
                         if !loc.chunked {
-                            if block::checksums_on() && block::crc32(raw) != loc.crc {
-                                return Err(corrupt("block checksum mismatch"));
-                            }
+                            self.verify_plain(e.block, raw, loc.crc)?;
                             block::decompress_into(raw, &mut buf, un)?;
                         }
                         cached = e.block;

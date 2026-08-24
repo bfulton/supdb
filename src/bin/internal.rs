@@ -91,6 +91,7 @@ fn main() -> std::io::Result<()> {
             "f7-index" => f7_index(&args, profile)?,
             "f8-checksums" => f8_checksums(&args, profile)?,
             "f11-flatindex" => f11_flatindex(&args, profile)?,
+            "f12-compress" => f12_compress(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -115,6 +116,7 @@ fn main() -> std::io::Result<()> {
                 "f2-open",
                 "f7-index",
                 "f11-flatindex",
+                "f12-compress",
                 "f4-durability",
                 "f3-multiproc",
                 "f1-outofcore",
@@ -1401,6 +1403,215 @@ fn f7_child(args: &Args) -> std::io::Result<()> {
     );
     let _ = nkeys;
     Ok(())
+}
+
+// ------------------------------------------------ F12: the cost of compression --
+
+/// What block compression costs on the read path, and what it saves on disk.
+///
+/// This is the other half of the trade the mapped index started. LMDB reads
+/// about 2.9x faster than Supdb natively and does not compress at all, so the
+/// obvious question is how much of that gap is decompression rather than
+/// structure. It has never been measured: `Options::compress` has existed and
+/// defaulted on since the beginning, and nothing priced it.
+///
+/// Same shape as f8-checksums, for the same reason -- both arms in one
+/// process, interleaved, because separate runs of this suite have moved
+/// unchanged comparators by +20% to +43%. Scans get their own arm: a scan
+/// walks whole blocks in order, so if decompression matters anywhere it
+/// matters most there.
+fn f12_compress(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
+    let depth = args.num("--depth", 4) as u64;
+    let value_size = args.num("--value-size", 100);
+    let reads = args.num("--reads", profile.pick(50_000, 200_000, 500_000)) as u64;
+
+    let mut rec = Record::new("f12-compress", profile);
+    rec.param("keys", J::u(keys))
+        .param("values_per_key", J::u(depth))
+        .param("value_size", J::u(value_size as u64))
+        .param("reads", J::u(reads))
+        .note("both arms interleaved in one process; the only difference is Options::compress");
+
+    let dir = scratch("f12");
+    // Half-compressible payload, which is what the rest of the suite uses. A
+    // payload of zeroes would make compression look free and one of random
+    // bytes would make it look pointless; neither is a workload.
+    let payload = Payload::new(value_size, 0.5, 0x12);
+    let on = [true, false];
+
+    // Write throughput. Compression is on the seal path, so this is where its
+    // CPU cost lands for a writer.
+    let write = Trial::new(profile.reps()).run(2, |ci, rep| {
+        let file = dir.join(format!("w{ci}-{rep}.dat"));
+        let store = Store::create(
+            &file,
+            Options {
+                compress: on[ci],
+                ..default_opts(128)
+            },
+        )
+        .expect("create");
+        let mut vrng = Rng::new(0x12 + rep as u64);
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        for i in 0..(keys * depth) {
+            db_key_into(i % keys, &mut kb);
+            store.append(&kb, payload.get(&mut vrng)).expect("append");
+        }
+        store.flush().expect("flush");
+        let secs = t.elapsed().as_secs_f64();
+        let _ = store.close();
+        let _ = std::fs::remove_file(&file);
+        (keys * depth) as f64 / secs
+    });
+
+    let mut files = Vec::new();
+    let mut sizes = Vec::new();
+    for want in on.iter() {
+        let file = dir.join(format!("r{want}.dat"));
+        {
+            let store = Store::create(
+                &file,
+                Options {
+                    compress: *want,
+                    ..default_opts(128)
+                },
+            )
+            .expect("create");
+            let mut vrng = Rng::new(0x12);
+            let mut kb = [0u8; 16];
+            for i in 0..(keys * depth) {
+                db_key_into(i % keys, &mut kb);
+                store.append(&kb, payload.get(&mut vrng)).expect("append");
+            }
+            store.close().expect("close");
+        }
+        sizes.push(file_len(&file));
+        files.push(file);
+    }
+
+    // The arms must return the same data. An arm that reads nothing is fast.
+    {
+        let a = Reader::open(&files[0])?;
+        let b = Reader::open(&files[1])?;
+        assert_eq!(a.keys(), b.keys(), "arms disagree on key count");
+        let mut kb = [0u8; 16];
+        for i in 0..500.min(keys) {
+            db_key_into(i, &mut kb);
+            let (mut va, mut vb) = (Vec::new(), Vec::new());
+            a.read_all(&kb, |v| va.push(v.to_vec()))?;
+            b.read_all(&kb, |v| vb.push(v.to_vec()))?;
+            assert_eq!(va, vb, "arms disagree on the values of a key");
+            assert!(!va.is_empty(), "neither arm found a key that was written");
+        }
+    }
+
+    let readers: Vec<Reader> = files.iter().map(|f| Reader::open(f).expect("open")).collect();
+    let read = Trial::new(profile.reps()).run(2, |ci, _| {
+        let reader = &readers[ci];
+        let mut g = KeyGen::new(KeyDist::Uniform, keys, 0x12);
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        for _ in 0..reads {
+            db_key_into(g.next(), &mut kb);
+            reader
+                .read_all(&kb, |v| {
+                    std::hint::black_box(v);
+                })
+                .expect("read");
+        }
+        reads as f64 / t.elapsed().as_secs_f64()
+    });
+
+    let scan_len = 20_000usize.min(keys as usize);
+    let scan = Trial::new(profile.reps().min(5)).run(2, |ci, _| {
+        let reader = &readers[ci];
+        let t = Instant::now();
+        let mut n = 0u64;
+        n += reader
+            .scan(None, scan_len, |_, v| {
+                std::hint::black_box(v);
+            })
+            .expect("scan");
+        std::hint::black_box(n);
+        n as f64 / t.elapsed().as_secs_f64()
+    });
+    drop(readers);
+    for f in &files {
+        let _ = std::fs::remove_file(f);
+    }
+
+    let wc = compare(&write[1], &write[0], supdb::bench::MIN_EFFECT);
+    let rc = compare(&read[1], &read[0], supdb::bench::MIN_EFFECT);
+    let sc = compare(&scan[1], &scan[0], supdb::bench::MIN_EFFECT);
+    rec.compare("write_off_vs_on", wc.clone());
+    rec.compare("read_off_vs_on", rc.clone());
+    rec.compare("scan_off_vs_on", sc.clone());
+
+    let gain = |a: f64, b: f64| (a / b - 1.0) * 100.0;
+    let wgain = gain(write[1].median(), write[0].median());
+    let rgain = gain(read[1].median(), read[0].median());
+    let sgain = gain(scan[1].median(), scan[0].median());
+    let scost = sizes[1] as f64 / sizes[0] as f64;
+
+    rec.series(
+        "arms",
+        jobj! {
+            "write_on_ops_per_s" => J::fp(write[0].median(), 1),
+            "write_off_ops_per_s" => J::fp(write[1].median(), 1),
+            "read_on_ops_per_s" => J::fp(read[0].median(), 1),
+            "read_off_ops_per_s" => J::fp(read[1].median(), 1),
+            "scan_on_entries_per_s" => J::fp(scan[0].median(), 1),
+            "scan_off_entries_per_s" => J::fp(scan[1].median(), 1),
+            "bytes_on" => J::u(sizes[0]),
+            "bytes_off" => J::u(sizes[1]),
+            "size_multiple_off_over_on" => J::fp(scost, 3),
+        },
+    );
+
+    rec.finding(Finding::new(
+        "F12.1",
+        "turning compression off buys at least 10% on point reads",
+        rgain >= 10.0,
+        format!(
+            "reads {rgain:+.1}% with compression off ({})",
+            rc.summary("off", "on")
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F12.2",
+        "turning compression off buys at least 10% on ordered scans",
+        sgain >= 10.0,
+        format!(
+            "scans {sgain:+.1}% with compression off ({}). A scan walks whole blocks in order, \
+             so this is where decompression should cost most",
+            sc.summary("off", "on")
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F12.3",
+        "the space given up is less than 2x",
+        scost < 2.0,
+        format!(
+            "{:.1} MB compressed against {:.1} MB not ({scost:.2}x). Space is the axis this \
+             engine wins on, so this is what any read gain above is bought with",
+            sizes[0] as f64 / 1e6,
+            sizes[1] as f64 / 1e6
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F12.4",
+        "compression is not costing write throughput too",
+        wgain < 10.0,
+        format!(
+            "writes {wgain:+.1}% with compression off ({}). Ingest is the axis the design is \
+             built to win, so a compressor that costs the write path as well as the read path \
+             would be paying twice for one saving",
+            wc.summary("off", "on")
+        ),
+    ));
+    Ok(rec)
 }
 
 // ------------------------------------------- F11: the cost of a mapped index --

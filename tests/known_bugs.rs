@@ -211,3 +211,68 @@ fn repeated_checkpoints_stop_growing_the_file() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// An uncompressed block re-verified its whole checksum on every read.
+///
+/// The checksum covers the entire block, so a plain block read straight out of
+/// the mapping paid O(block size) of CRC to hand back one value -- 64 KiB of
+/// work for 100 bytes of data. An ordered scan measured 7985 ns per entry
+/// against 26 with checking off: 307x.
+///
+/// It hid because the default configuration compresses, and a compressed block
+/// is chunked, so that path verifies a kilobyte at a time. The visible effect
+/// was that turning compression *off* appeared to make reads 87% slower, which
+/// reads as "compression is free" rather than "the other path is broken".
+///
+/// A block a reader can see cannot be rewritten underneath it, so verifying
+/// once per reader is sound. This asserts the cost is bounded rather than
+/// asserting a wall-clock number: what must never come back is the shape,
+/// where scan cost tracks block size instead of value size.
+#[test]
+fn an_uncompressed_block_is_not_rechecksummed_per_read() {
+    use std::time::Instant;
+    let scan_ns = |compress: bool, checksums: bool| -> f64 {
+        let dir = std::env::temp_dir().join(format!("supdb-kb-crc-{compress}-{checksums}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s.dat");
+        let store = supdb::Store::create(
+            &file,
+            supdb::Options {
+                buffer_bytes: 128 << 20,
+                reclaim: supdb::Reclaim::AfterReads,
+                compress,
+                checksums,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for i in 0..60_000u64 {
+            store
+                .append(format!("k{i:012}").as_bytes(), &[7u8; 100])
+                .unwrap();
+        }
+        store.close().unwrap();
+        let r = supdb::Reader::open(&file).unwrap();
+        let t = Instant::now();
+        let n = r
+            .scan(None, 20_000, |_, v| {
+                std::hint::black_box(v);
+            })
+            .unwrap();
+        let ns = t.elapsed().as_secs_f64() * 1e9 / n as f64;
+        drop(r);
+        let _ = std::fs::remove_dir_all(&dir);
+        ns
+    };
+    let with = scan_ns(false, true);
+    let without = scan_ns(false, false);
+    // Generous: the defect was 307x. Anything near that is the bug returning,
+    // and a loose bound survives a noisy machine where a tight one would not.
+    assert!(
+        with < without * 20.0,
+        "checksums cost {:.0}x on an uncompressed scan ({with:.0} ns/entry against \
+         {without:.0}); the per-read whole-block CRC is back",
+        with / without.max(1e-9)
+    );
+}
