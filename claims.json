@@ -393,7 +393,7 @@
       "experiment": "f12-compress",
       "id": "F12.4",
       "expect": "fails",
-      "because": "Compression costs the write path too: 3.8x. Ingest is the axis the design is built to win, so paying on writes *and* reads *and* scans for 4% of disk is not a trade, and this claim is expected to fail until the default changes. Pinned to full: at ci scale the store fits in cache and the space saving looks four times larger than it is. Pinned to x86_64.",
+      "because": "Compression costs the write path too: 3.8x. It is off by default as of this measurement, so this claim now records what the option costs anyone who turns it back on rather than what the engine does. It stays expected-to-fail because the statement is about the compressor, not the default: paying on writes as well as reads and scans, for four percent of disk, is not a trade. Pinned to full: at ci scale the store fits in cache and the space saving looks four times larger than it is. Pinned to x86_64.",
       "profile": "full",
       "arch": "x86_64"
     }

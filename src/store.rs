@@ -252,7 +252,17 @@ impl Default for Options {
         Options {
             block_size: 64 * 1024,
             buffer_bytes: 512 * 1024 * 1024,
-            compress: true,
+            // Off. f12 measures what it costs at 5M keys, both arms
+            // interleaved: reads 3.6x, scans 30.1x, writes 3.8x -- to save
+            // 1.04x on disk. The payload there is half-random by
+            // construction, so a more compressible workload would save more
+            // space; the time costs do not depend on how well the data
+            // compresses, because decompression is per byte either way.
+            //
+            // Still available for a deployment that is disk-bound rather than
+            // latency-bound, which is why this is an option and not a
+            // deletion.
+            compress: false,
             shards: 64,
             cache_blocks: 4096,
             solo_threshold: 16 * 1024,
@@ -1614,11 +1624,48 @@ impl Reader {
         self.overwritten[..i].iter().any(|(o, l)| o + l > off)
     }
 
+    /// Resolve an extent's block, checking the id against the block table.
+    ///
+    /// The decoded index validated every block id while it was decoding, so
+    /// every read path could index `self.blocks` directly and did. A mapped
+    /// index does no such pass -- that pass is exactly the O(key count) open
+    /// being removed -- so the check has to happen here instead, and it did
+    /// not: `scan` indexed the block table with a number straight out of a
+    /// damaged file. The corruption suite found it at 4% of trials, as a
+    /// panic in the calling process rather than an error return, which for an
+    /// embedded library means somebody else's application aborting.
+    #[inline]
+    fn loc_of(&self, block: u32) -> Result<BlockLoc> {
+        self.blocks
+            .get(block as usize)
+            .copied()
+            .ok_or_else(|| corrupt("extent names a block that does not exist"))
+    }
+
+    /// The stored bytes of a block, checked against the mapping.
+    #[inline]
+    fn raw_of(&self, loc: BlockLoc) -> Result<&[u8]> {
+        let end = (loc.off as usize).checked_add(loc.stored as usize);
+        match end {
+            Some(end) => self.mmap.get(loc.off as usize..end).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "block spans {}..{end} but the mapping is {} bytes",
+                        loc.off,
+                        self.mmap.len()
+                    ),
+                )
+            }),
+            None => Err(corrupt("block offset overflows")),
+        }
+    }
+
     fn check_extent(&self, e: Ext) -> Result<()> {
+        let loc = self.loc_of(e.block)?;
         if self.overwritten.is_empty() {
             return Ok(());
         }
-        let loc = self.blocks[e.block as usize];
         if self.is_overwritten(loc.off, loc.stored as u64) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -2012,8 +2059,8 @@ impl Reader {
     }
 
     fn block(&self, id: u32) -> Result<BlockRef<'_>> {
-        let loc = self.blocks[id as usize];
-        let raw = &self.mmap[loc.off as usize..loc.off as usize + loc.stored as usize];
+        let loc = self.loc_of(id)?;
+        let raw = self.raw_of(loc)?;
         if loc.is_plain() {
             self.verify_plain(id, raw, loc.crc)?;
             // never compressed, so hand out the mapping itself
@@ -2038,7 +2085,7 @@ impl Reader {
         let mut total = 0u64;
         for e in exts {
             self.check_extent(*e)?;
-            let loc = self.blocks[e.block as usize];
+            let loc = self.loc_of(e.block)?;
             let end = loc.off as usize + loc.stored as usize;
             if end > self.mmap.len() {
                 return Err(std::io::Error::new(
@@ -2126,8 +2173,8 @@ impl Reader {
     /// one record; scratch keeps it from allocating as well.
     fn record_len_at(&self, e: Ext, at: u32) -> Result<i32> {
         self.check_extent(e)?;
-        let loc = self.blocks[e.block as usize];
-        let raw = &self.mmap[loc.off as usize..loc.off as usize + loc.stored as usize];
+        let loc = self.loc_of(e.block)?;
+        let raw = self.raw_of(loc)?;
         if loc.is_plain() {
             self.verify_plain(e.block, raw, loc.crc)?;
             let mut p = (e.off + at) as usize;
@@ -2264,8 +2311,9 @@ impl Reader {
                 continue;
             };
             for e in exts {
-                let loc = self.blocks[e.block as usize];
-                let raw = &self.mmap[loc.off as usize..loc.off as usize + loc.stored as usize];
+                self.check_extent(*e)?;
+                let loc = self.loc_of(e.block)?;
+                let raw = self.raw_of(loc)?;
                 let extent: &[u8] = if loc.is_plain() {
                     self.verify_plain(e.block, raw, loc.crc)?;
                     &raw[e.off as usize..(e.off + e.len) as usize]
