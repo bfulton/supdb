@@ -351,7 +351,32 @@ struct Appender {
     /// without bound in checkpoint count rather than in data. That was
     /// tolerable while the key section was compressed varints; it stopped
     /// being tolerable at the flat format's seven times the size.
-    index_history: Vec<(u64, BlockLoc, BlockLoc, BlockLoc)>,
+    /// Newest last. The key section is optional: an in-place checkpoint
+    /// republishes the *same* key section, which must not be released while
+    /// it is still the live one. Recording it again -- or worse, recording
+    /// some other section in its place -- hands a live index to the free list,
+    /// and the next section written lands on top of it. That presents as
+    /// "extent names a block that does not exist" from a reader, which is a
+    /// trampled index rather than a bad extent.
+    index_history: Vec<(u64, Option<BlockLoc>, BlockLoc, BlockLoc)>,
+    /// The published key index, mapped writable, so a checkpoint that only
+    /// changes existing keys can publish each one with a single aligned store
+    /// instead of rewriting the section.
+    ///
+    /// `pwrite` would not do: POSIX says nothing about a write racing a
+    /// reader's mapping of the same bytes, and the whole guarantee here is
+    /// that a reader sees the old slot or the new one and never half of
+    /// either. An aligned 8-byte store to a shared mapping is that guarantee.
+    live_index: Option<(MmapMut, FlatIndex, u64, u64)>,
+    /// File offset of the key section currently being updated in place.
+    ///
+    /// It was written by an ordinary full checkpoint, so it sits in
+    /// `index_history` marked releasable like any other -- and once the reuse
+    /// floor passed that generation it *was* released, while still live, and
+    /// the next section written landed on top of it. Six in-place checkpoints
+    /// were enough. Cleared when a full checkpoint supersedes it, which is the
+    /// only moment it stops being live.
+    live_key_off: Option<u64>,
     /// Oldest generation whose index sections are still intact. Reported in
     /// the superblock, and what `open_as_of` refuses to read past.
     history_from: u64,
@@ -593,6 +618,8 @@ impl Store {
                 last_index: None,
                 index_history: Vec::new(),
                 history_from: 0,
+                live_index: None,
+                live_key_off: None,
             }),
             opts,
             path: path.to_path_buf(),
@@ -980,11 +1007,28 @@ impl Store {
             all.extend(sh.keys.iter().map(|(k, e)| (k.to_vec(), e.extents.clone())));
         }
         all.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        // The fast path: every key already in the published index, and enough
+        // slack to hold the records that changed. Then a checkpoint is a few
+        // record writes and one aligned store each, and nothing is rewritten.
+        //
+        // This is what makes checkpoint cost track the change rather than the
+        // key count. YCSB's run phase never inserts, so it is entirely this
+        // path; a bulk load is entirely the slow one.
+        // Returns true when the key index was published in place. The block
+        // table and the superblock are still written below: new values live in
+        // new blocks, and a reader that cannot see those blocks gets extents
+        // naming blocks that do not exist. The block table is a few hundred
+        // entries where the key index is millions, so this is still O(changed)
+        // in the part that matters.
+        let in_place = self.checkpoint_in_place(&all)?;
         // `flat` stays true only if the flat encoder actually produced a
         // section. It declines on inputs it cannot address -- a key over 64KiB,
         // or a record region past 4GiB -- and falling back to the varint
         // encoder is correct there rather than an error.
-        let (key_idx, flat) = {
+        let (key_idx, flat) = if in_place {
+            (Vec::new(), true)
+        } else {
             let ap = self.appender.lock().unwrap();
             let prev = ap.last_index.map(|loc| (loc, ap.generation, ap.timestamp));
             let gen = ap.generation + 1;
@@ -1012,10 +1056,11 @@ impl Store {
         // Uncompressed, deliberately: a section that is decompressed on open
         // is a section copied into every reader's heap, which is the cost this
         // format exists to remove.
-        let key_loc = if flat {
-            write_section_raw(&mut ap, &key_idx, self.opts.reclaim)?
-        } else {
-            write_section(&mut ap, &key_idx, self.opts.reclaim)?
+        // An in-place checkpoint leaves the key section exactly where it was.
+        let key_loc = match (in_place, ap.last_index) {
+            (true, Some(loc)) => loc,
+            _ if flat => write_section_raw(&mut ap, &key_idx, self.opts.reclaim)?,
+            _ => write_section(&mut ap, &key_idx, self.opts.reclaim)?,
         };
         let blk_loc = write_section(&mut ap, &blk_idx, self.opts.reclaim)?;
         // Drop entries older than any reader could still be relying on. A
@@ -1052,11 +1097,25 @@ impl Store {
         // this does nothing and history stays complete. Where it does release,
         // `history_from` records how far back the chain is still intact, which
         // is what `open_as_of` already refuses to read past.
-        ap.index_history.push((gen, key_loc, blk_loc, reuse_loc));
+        // The key section is only added to the history when it is a new one;
+        // an in-place checkpoint reuses the section already recorded, and
+        // releasing it would hand a live index to the free list.
+        ap.index_history.push((
+            gen,
+            if in_place { None } else { Some(key_loc) },
+            blk_loc,
+            reuse_loc,
+        ));
         let floor = ap.reuse_floor(self.opts.reclaim);
         while ap.index_history.len() > 1 && ap.index_history[0].0 < floor {
             let (g, k, b, r) = ap.index_history.remove(0);
-            for loc in [k, b, r] {
+            let live = ap.live_key_off;
+            for loc in k.into_iter().chain([b, r]) {
+                if Some(loc.off) == live {
+                    // Still the index readers are using. It becomes
+                    // releasable when a full checkpoint replaces it.
+                    continue;
+                }
                 ap.free.release(loc.off, loc.cap, gen);
             }
             ap.history_from = ap.history_from.max(g + 1);
@@ -1078,15 +1137,171 @@ impl Store {
             reuse_uncompressed: reuse_loc.uncompressed as u64,
             high_water: ap.off,
         };
+        // The superblock's high water mark is the append cursor, and the
+        // cursor runs ahead of the bytes actually written: a block advances it
+        // by its size class while writing only its length, and a section
+        // placed in a reclaimed hole does not advance it at all. A reader
+        // whose mapping is shorter than the mark refuses to use that
+        // superblock, and until now quietly fell back to the older slot --
+        // which is how a mutated index came to be paired with a stale block
+        // table.
+        // Extend only. `set_len` shrinks as readily as it grows, and the
+        // cursor can legitimately sit behind the end of the file -- a section
+        // written into a reclaimed hole near the end does not move it -- so an
+        // unconditional call truncates live data.
+        if ap.file.metadata().map(|m| m.len()).unwrap_or(0) < ap.off {
+            let _ = ap.file.set_len(ap.off);
+        }
+
         let at = if gen % 2 == 0 { 0 } else { SLOT };
         ap.file.write_all_at(&sb.encode(), at)?;
+        // An in-place checkpoint mutates the key section rather than writing a
+        // new one, and the two superblock slots exist on the assumption that
+        // sections are immutable: the older slot names the *same* key section,
+        // which now holds records referring to blocks its own older block
+        // table does not list. A reader that falls back to it -- which
+        // Reader::open does whenever the newest slot's high water mark is past
+        // the end of its mapping -- gets a new index against an old block
+        // table, and reports an extent naming a block that does not exist.
+        //
+        // So the older slot is overwritten too. A crash between the two writes
+        // leaves the newer generation in one slot and the older in the other,
+        // which is the situation the alternation was already designed for.
+        if in_place {
+            let other = if at == 0 { SLOT } else { 0 };
+            ap.file.write_all_at(&sb.encode(), other)?;
+        }
         if self.opts.sync_on_checkpoint {
             ap.file.sync_data()?;
         }
         ap.generation = gen;
         ap.timestamp = sb.timestamp;
         ap.last_index = Some(key_loc);
+
+        // Adopt the section just written, so the next checkpoint can update it
+        // in place instead of rewriting it. Best effort: if it will not map or
+        // will not parse, the next checkpoint simply takes the slow path.
+        if in_place {
+            return Ok(gen);
+        }
+        // The section this replaces is no longer live and may be reclaimed.
+        let superseded = ap.live_key_off.take();
+        if let Some(off) = superseded {
+            if off != key_loc.off {
+                if let Some(old) = ap
+                    .index_history
+                    .iter()
+                    .find_map(|(_, k, _, _)| k.filter(|l| l.off == off))
+                {
+                    ap.free.release(old.off, old.cap, gen);
+                }
+            }
+        }
+        ap.live_index = None;
+        if flat {
+            if let Ok(map) = unsafe { MmapMut::map_mut(&ap.file) } {
+                let (o, l) = (key_loc.off as usize, key_loc.stored as usize);
+                let adopted = map
+                    .get(o..o.saturating_add(l))
+                    .and_then(FlatIndex::parse)
+                    .map(|meta| (map, meta, key_loc.off, key_loc.stored as u64));
+                if adopted.is_some() {
+                    ap.live_key_off = Some(key_loc.off);
+                }
+                ap.live_index = adopted;
+            }
+        }
         Ok(gen)
+    }
+
+    /// Publish only what changed, or decline.
+    ///
+    /// Declines -- returning Ok(None) so the caller does a full checkpoint --
+    /// when there is no published index yet, when a key is new, or when the
+    /// slack cannot hold the updated records. Declining is always safe; the
+    /// full path reclaims every superseded record as it rebuilds.
+    ///
+    /// Note what a reader observes: records are written before the slot that
+    /// points at them, and each slot is published by one aligned 8-byte store,
+    /// so a reader sees a key's old extents or its new ones. It does *not*
+    /// see a snapshot frozen at open -- a reader open across an incremental
+    /// checkpoint will observe the new values. For a store whose extents only
+    /// ever grow that is more data, not wrong data, and it is the trade that
+    /// buys an O(changed) checkpoint.
+    fn checkpoint_in_place(&self, all: &[(Vec<u8>, Extents)]) -> Result<bool> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let mut ap = self.appender.lock().unwrap();
+        let Some((map, meta, sec_off, sec_len)) = ap.live_index.as_mut() else {
+            return Ok(false);
+        };
+        if all.len() != meta.len() {
+            // A key was added or removed: the hash and the sorted directory
+            // both have to change, which is the rewrite this path avoids.
+            return Ok(false);
+        }
+        let (off, len) = (*sec_off as usize, *sec_len as usize);
+        let Some(sec) = map.get(off..off + len) else {
+            return Ok(false);
+        };
+
+        // Work out the edits first, so nothing is written until every one of
+        // them is known to fit.
+        let mut edits: Vec<(usize, u64, usize, Vec<u8>)> = Vec::new();
+        let mut probe =
+            FlatIndex::parse(sec).ok_or_else(|| corrupt("live index no longer parses"))?;
+        probe.set_bump(meta.bump());
+        for (k, exts) in all {
+            let slice = exts.as_slice();
+            let Some(slot_at) = meta.slot_of(sec, k, key_hash) else {
+                return Ok(false);
+            };
+            match meta.lookup(sec, k, key_hash) {
+                Some(cur) if cur == slice => continue,
+                _ => {}
+            }
+            let Some(bytes) = FlatIndex::encode_record(k, slice) else {
+                return Ok(false);
+            };
+            let Some((at, rel)) = probe.reserve(bytes.len()) else {
+                return Ok(false);
+            };
+            edits.push((
+                off + at,
+                FlatIndex::slot_value(k, rel, key_hash),
+                off + slot_at,
+                bytes,
+            ));
+        }
+        if edits.is_empty() {
+            return Ok(true);
+        }
+
+        // Records first. Nothing points at them yet, so a crash here leaks
+        // slack and loses nothing.
+        for (at, _, _, bytes) in &edits {
+            map[*at..*at + bytes.len()].copy_from_slice(bytes);
+        }
+        // Then the slots, one aligned store each. This is the publish.
+        for (_, value, slot_at, _) in &edits {
+            debug_assert_eq!(
+                slot_at % 8,
+                0,
+                "a slot must be 8-byte aligned to publish atomically"
+            );
+            let cell = unsafe { &*(map.as_ptr().add(*slot_at) as *const AtomicU64) };
+            cell.store(*value, Ordering::Release);
+        }
+        // Finally the bump cursor, so a later open knows where the slack
+        // starts. After the records, never before.
+        let bump = probe.bump();
+        let cur = unsafe { &*(map.as_ptr().add(off + FlatIndex::BUMP_AT) as *const AtomicU64) };
+        cur.store(bump as u64, Ordering::Release);
+        meta.set_bump(bump);
+
+        if self.opts.sync_on_checkpoint {
+            map.flush()?;
+        }
+        Ok(true)
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -1269,7 +1484,9 @@ fn place_section(ap: &mut Appender, len: u32, policy: Reclaim, align: u64) -> (u
     let cap = capacity_for(len);
     let off = ap.off;
     ap.off += cap as u64;
-    let _ = ap.file.set_len(ap.off);
+    if ap.file.metadata().map(|m| m.len()).unwrap_or(0) < ap.off {
+        let _ = ap.file.set_len(ap.off);
+    }
     (off, cap)
 }
 
@@ -1667,10 +1884,12 @@ impl Reader {
     /// embedded library means somebody else's application aborting.
     #[inline]
     fn loc_of(&self, block: u32) -> Result<BlockLoc> {
-        self.blocks
-            .get(block as usize)
-            .copied()
-            .ok_or_else(|| corrupt("extent names a block that does not exist"))
+        self.blocks.get(block as usize).copied().ok_or_else(|| {
+            corrupt(&format!(
+                "extent names block {block} but the table has {}",
+                self.blocks.len()
+            ))
+        })
     }
 
     /// The stored bytes of a block, checked against the mapping.

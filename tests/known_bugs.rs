@@ -308,7 +308,8 @@ fn a_held_reader_does_not_stop_reclaim() {
         )
         .unwrap();
         for i in 0..100_000u64 {
-            s.append(format!("k{i:012}").as_bytes(), &[7u8; 100]).unwrap();
+            s.append(format!("k{i:012}").as_bytes(), &[7u8; 100])
+                .unwrap();
         }
         let mut held = None;
         let mut sizes = Vec::new();

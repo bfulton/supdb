@@ -45,6 +45,20 @@ const SLOT: usize = 8;
 /// Records are 4-aligned so an extent array can be borrowed as `&[Ext]`.
 const REC_ALIGN: usize = 4;
 
+/// Spare room left at the end of the record region, as a fraction of it.
+///
+/// This is what makes a checkpoint incremental. Growing a key's extent list
+/// makes its record longer, so it cannot be edited where it lies -- but a new
+/// copy can be written into the slack and published by storing its offset into
+/// the key's existing hash slot, which is one aligned 8-byte write. No section
+/// is rewritten, no superblock flips, and a reader either sees the old record
+/// or the new one.
+///
+/// When the slack runs out the writer falls back to a full rewrite, which
+/// reclaims every superseded record at the same time.
+const SLACK_NUM: usize = 1;
+const SLACK_DEN: usize = 2;
+
 /// Offsets are 32-bit, so the record region is bounded. At the ~40 bytes per
 /// key this format uses that is about 100M keys, past which the caller falls
 /// back to the heap index rather than silently truncating.
@@ -69,6 +83,8 @@ fn rd_u64(b: &[u8], at: usize) -> Option<u64> {
 pub struct Plan {
     pub hash_cap: usize,
     pub recs_len: usize,
+    /// Record bytes reserved, including slack for in-place updates.
+    pub recs_cap: usize,
     /// Record offset of each key, in sorted order.
     pub rec_offs: Vec<u32>,
     pub total: usize,
@@ -107,10 +123,18 @@ pub fn plan(all: &[(Vec<u8>, crate::index::Extents)]) -> Option<Plan> {
     if at > MAX_RECS {
         return None;
     }
-    let total = HEADER + cap * SLOT + all.len() * 4 + at;
+    // Half again, so a store whose keys gain extents can publish updates
+    // without rewriting anything.
+    let slack = at * SLACK_NUM / SLACK_DEN;
+    let recs_cap = at.checked_add(slack)?;
+    if recs_cap > MAX_RECS {
+        return None;
+    }
+    let total = HEADER + cap * SLOT + all.len() * 4 + recs_cap;
     Some(Plan {
         hash_cap: cap,
         recs_len: at,
+        recs_cap,
         rec_offs,
         total,
     })
@@ -149,6 +173,9 @@ pub fn encode(
         hash_off as u64,
         dir_off as u64,
         recs_off as u64,
+        p.recs_len as u64,
+        p.recs_cap as u64,
+        // Bump cursor: where the next in-place update writes its record.
         p.recs_len as u64,
     ]
     .iter()
@@ -212,6 +239,11 @@ pub struct FlatIndex {
     hash_cap: usize,
     mask: usize,
     nkeys: usize,
+    /// Absolute offset of the record region within the section, and how much
+    /// of it is reserved. `bump` is where the next in-place update lands.
+    recs_off: usize,
+    recs_cap: usize,
+    bump: usize,
     pub generation: u64,
     pub prev: Option<(u64, u64, u64, u64, u64)>,
 }
@@ -244,6 +276,8 @@ impl FlatIndex {
         let dir_off = rd_u64(sec, 80)? as usize;
         let recs_off = rd_u64(sec, 88)? as usize;
         let recs_len = rd_u64(sec, 96)? as usize;
+        let recs_cap = rd_u64(sec, 104)?.max(recs_len as u64) as usize;
+        let bump = rd_u64(sec, 112)?.clamp(recs_len as u64, recs_cap as u64) as usize;
 
         if hash_cap == 0 || !hash_cap.is_power_of_two() {
             return None;
@@ -251,7 +285,7 @@ impl FlatIndex {
         // Each region must lie inside the section and after the one before it.
         let hash_end = hash_off.checked_add(hash_cap.checked_mul(SLOT)?)?;
         let dir_end = dir_off.checked_add(nkeys.checked_mul(4)?)?;
-        let recs_end = recs_off.checked_add(recs_len)?;
+        let recs_end = recs_off.checked_add(recs_cap)?;
         if hash_off < HEADER
             || hash_end > dir_off
             || dir_end > recs_off
@@ -267,6 +301,9 @@ impl FlatIndex {
             hash_cap,
             mask: hash_cap - 1,
             nkeys,
+            recs_off,
+            recs_cap,
+            bump,
             generation,
             prev: if prev_off > 0 {
                 Some((prev_gen, prev_ts, prev_off, prev_stored, prev_unc))
@@ -342,6 +379,94 @@ impl FlatIndex {
         let dir = sec.get(self.dir.0..self.dir.1)?;
         let off = rd_u32(dir, rank * 4)? as usize;
         self.record(sec, off)
+    }
+
+    /// Where in the section a key's hash slot lives, if the key is present.
+    ///
+    /// The one thing an incremental update needs: the address of the word to
+    /// store into. Returns the slot's byte offset within the section.
+    pub fn slot_of(&self, sec: &[u8], key: &[u8], hash_of: fn(&[u8]) -> u64) -> Option<usize> {
+        let hash = sec.get(self.hash.0..self.hash.1)?;
+        let h = hash_of(key);
+        let tag = ((h >> 56) | 1) & 0xff;
+        let mut s = (h as usize) & self.mask;
+        for _ in 0..self.hash_cap {
+            let at = s * SLOT;
+            let packed = rd_u64(hash, at)?;
+            if packed == 0 {
+                return None;
+            }
+            if packed >> 56 == tag {
+                let off = (packed & 0x00ff_ffff_ffff_ffff) as usize;
+                if let Some((k, _)) = self.record(sec, off) {
+                    if k == key {
+                        return Some(self.hash.0 + at);
+                    }
+                }
+            }
+            s = (s + 1) & self.mask;
+        }
+        None
+    }
+
+    pub fn bump(&self) -> usize {
+        self.bump
+    }
+
+    pub fn set_bump(&mut self, at: usize) {
+        self.bump = at.clamp(0, self.recs_cap);
+    }
+
+    /// Serialize one record, for writing into the slack.
+    ///
+    /// Returned separately from the store that publishes it, because the two
+    /// have to happen in that order and nothing else may see the record in
+    /// between: the bytes go down first, the slot that points at them second.
+    pub fn encode_record(key: &[u8], exts: &[Ext]) -> Option<Vec<u8>> {
+        if key.len() > u16::MAX as usize || exts.len() > u16::MAX as usize {
+            return None;
+        }
+        let mut out = vec![0u8; record_len(key.len(), exts.len())];
+        out[0..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+        out[2..4].copy_from_slice(&(exts.len() as u16).to_le_bytes());
+        out[4..4 + key.len()].copy_from_slice(key);
+        let mut at = align_up(4 + key.len(), REC_ALIGN);
+        for e in exts {
+            out[at..at + 4].copy_from_slice(&e.block.to_le_bytes());
+            out[at + 4..at + 8].copy_from_slice(&e.off.to_le_bytes());
+            out[at + 8..at + 12].copy_from_slice(&e.len.to_le_bytes());
+            out[at + 12..at + 16].copy_from_slice(&e.last.to_le_bytes());
+            at += 16;
+        }
+        Some(out)
+    }
+
+    /// Reserve room for a record in the slack. Returns its section offset and
+    /// its offset relative to the record region, or None if the slack is out.
+    ///
+    /// Bumping the cursor is the writer's business -- there is one writer, so
+    /// no contention -- but the *published* cursor in the header must only
+    /// move after the records below it are written, or a crash mid-checkpoint
+    /// leaves the header claiming bytes that were never filled in.
+    pub fn reserve(&mut self, len: usize) -> Option<(usize, u32)> {
+        let end = self.bump.checked_add(align_up(len, REC_ALIGN))?;
+        if end > self.recs_cap {
+            return None;
+        }
+        let rel = self.bump as u32;
+        let at = self.recs_off + self.bump;
+        self.bump = end;
+        Some((at, rel))
+    }
+
+    /// The header word holding the bump cursor, so the writer can publish it.
+    pub const BUMP_AT: usize = 112;
+
+    /// What a slot must contain to point at `rel` for `key`.
+    pub fn slot_value(key: &[u8], rel: u32, hash_of: fn(&[u8]) -> u64) -> u64 {
+        let h = hash_of(key);
+        let tag = ((h >> 56) | 1) & 0xff;
+        (tag << 56) | rel as u64
     }
 
     /// Position of the first key at or after `key`.

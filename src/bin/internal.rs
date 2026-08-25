@@ -922,8 +922,7 @@ fn f4_durability(args: &Args, profile: Profile) -> std::io::Result<Record> {
                 .enumerate()
                 .filter(|(i, iv)| {
                     let at_risk = if **iv == 0 { ops } else { **iv };
-                    samples[*i].median() > 100_000.0
-                        && at_risk * value_size as u64 <= 10 * 1048576
+                    samples[*i].median() > 100_000.0 && at_risk * value_size as u64 <= 10 * 1048576
                 })
                 .map(|(i, iv)| (iv, samples[i].median()))
                 .next();
@@ -1528,7 +1527,10 @@ fn f12_compress(args: &Args, profile: Profile) -> std::io::Result<Record> {
         }
     }
 
-    let readers: Vec<Reader> = files.iter().map(|f| Reader::open(f).expect("open")).collect();
+    let readers: Vec<Reader> = files
+        .iter()
+        .map(|f| Reader::open(f).expect("open"))
+        .collect();
     let read = Trial::new(profile.reps()).run(2, |ci, _| {
         let reader = &readers[ci];
         let mut g = KeyGen::new(KeyDist::Uniform, keys, 0x12);
