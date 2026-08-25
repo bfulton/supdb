@@ -240,6 +240,25 @@ pub struct Options {
     /// in place cannot be compressed. Both arms exist so the trade is measured
     /// rather than argued -- see `f11-flatindex`.
     pub flat_index: bool,
+    /// fsync on checkpoint.
+    ///
+    /// Publishing does not need it. Readers map the same file, so a write is
+    /// visible to them as soon as it is in the page cache, and a process crash
+    /// leaves the file intact either way. What fsync buys is *ordering* across
+    /// a power loss: it stops the superblock landing before the sections it
+    /// points at.
+    ///
+    /// Recovery can catch that instead of preventing it. Every section is
+    /// CRC'd, the superblock alternates between two slots, and `Reader::open`
+    /// already takes the newest one that validates and falls back to the older
+    /// otherwise. A superblock pointing at bytes that never landed fails its
+    /// checksum and the previous checkpoint is used.
+    ///
+    /// The cost of turning this off is losing checkpoints on power loss, not
+    /// corruption. LMDB's MDB_NOSYNC and RocksDB without WAL sync make the
+    /// same trade. Left on by default because it is the safe direction and
+    /// f13 measures what it costs.
+    pub sync_on_checkpoint: bool,
     /// Chunk size for solo blocks. A deep key's whole run is decompressed on a
     /// full read regardless of chunking, so warm reads there are flat across
     /// this value while compression is not: the larger window is close to free
@@ -286,6 +305,9 @@ impl Default for Options {
             // shared between reader processes rather than 186 B/key duplicated
             // in each. Space is the axis this engine has to spare.
             flat_index: std::env::var("SUPDB_FLAT_INDEX")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            sync_on_checkpoint: std::env::var("SUPDB_SYNC")
                 .map(|v| v != "0")
                 .unwrap_or(true),
             reclaim: Reclaim::AfterReads,
@@ -1009,7 +1031,14 @@ impl Store {
         ap.reuse_log.retain(|(_, _, gen)| *gen >= horizon);
         let reuse = encode_reuse_log(&ap.reuse_log);
         let reuse_loc = write_section(&mut ap, &reuse, self.opts.reclaim)?;
-        ap.file.sync_data()?;
+        // Before the superblock, so a power loss cannot leave one pointing at
+        // sections that never landed. Skipped when the caller has accepted
+        // losing checkpoints on power loss; the CRCs and the alternating
+        // superblock slots turn that into "fall back to the previous
+        // checkpoint" rather than into corruption.
+        if self.opts.sync_on_checkpoint {
+            ap.file.sync_data()?;
+        }
 
         let gen = ap.generation + 1;
         let now = std::time::SystemTime::now()
@@ -1051,7 +1080,9 @@ impl Store {
         };
         let at = if gen % 2 == 0 { 0 } else { SLOT };
         ap.file.write_all_at(&sb.encode(), at)?;
-        ap.file.sync_data()?;
+        if self.opts.sync_on_checkpoint {
+            ap.file.sync_data()?;
+        }
         ap.generation = gen;
         ap.timestamp = sb.timestamp;
         ap.last_index = Some(key_loc);
