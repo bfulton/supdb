@@ -276,3 +276,68 @@ fn an_uncompressed_block_is_not_rechecksummed_per_read() {
         with / without.max(1e-9)
     );
 }
+
+/// A checkpoint-heavy workload must reach a steady file size, not grow forever.
+///
+/// `repeated_checkpoints_stop_growing_the_file` holds no reader open, which
+/// lets the reuse floor advance freely. A real client does the opposite: the
+/// external YCSB adapter checkpoints and then keeps its `Reader` alive, which
+/// pins the floor. This is that shape.
+///
+/// It also records the price of the mapped index in the one place it is
+/// highest. The steady state is roughly six times the file, because every
+/// checkpoint writes a whole uncompressed index and only the sections below
+/// the floor come back. f11 measures +73% on a minimal file; this is what the
+/// same trade costs when checkpoints are frequent, and it is why a YCSB run
+/// grew a 22 GB store and filled the disk.
+#[test]
+fn a_held_reader_does_not_stop_reclaim() {
+    let plateau = |flat: bool| -> u64 {
+        let dir = std::env::temp_dir().join(format!("supdb-kb-held-{flat}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s.dat");
+        let s = supdb::Store::create(
+            &file,
+            supdb::Options {
+                buffer_bytes: 64 << 20,
+                reclaim: supdb::Reclaim::AfterReads,
+                flat_index: flat,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for i in 0..100_000u64 {
+            s.append(format!("k{i:012}").as_bytes(), &[7u8; 100]).unwrap();
+        }
+        let mut held = None;
+        let mut sizes = Vec::new();
+        for _ in 0..8 {
+            s.checkpoint().unwrap();
+            held = Some(supdb::Reader::open(&file).unwrap());
+            sizes.push(std::fs::metadata(&file).unwrap().len());
+        }
+        drop(held);
+        let tail: Vec<i64> = sizes[5..]
+            .windows(2)
+            .map(|w| w[1] as i64 - w[0] as i64)
+            .collect();
+        assert!(
+            tail.iter().all(|d| *d == 0),
+            "flat={flat}: still growing with a reader held open: {tail:?}"
+        );
+        let last = *sizes.last().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        last
+    };
+    let off = plateau(false);
+    let on = plateau(true);
+    // The mapped index is dearer here than anywhere else. Bounded, and the
+    // bound is what matters -- but it is a bound worth knowing about.
+    assert!(
+        on < off * 12,
+        "the mapped index costs {:.1}x the file under frequent checkpoints ({on} vs {off}); \
+         it was about 6x when this was written",
+        on as f64 / off as f64
+    );
+}
