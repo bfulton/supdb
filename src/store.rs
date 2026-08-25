@@ -275,7 +275,9 @@ impl Default for Options {
             // reads at 1.25x, and an index of 67 B/key that is file-backed and
             // shared between reader processes rather than 186 B/key duplicated
             // in each. Space is the axis this engine has to spare.
-            flat_index: true,
+            flat_index: std::env::var("SUPDB_FLAT_INDEX")
+                .map(|v| v != "0")
+                .unwrap_or(true),
             reclaim: Reclaim::AfterReads,
         }
     }
