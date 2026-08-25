@@ -342,3 +342,87 @@ fn a_held_reader_does_not_stop_reclaim() {
         on as f64 / off as f64
     );
 }
+
+/// A checkpoint must cost what changed, not what is stored.
+///
+/// checkpoint() rewrote the whole key index every time, so publishing a
+/// hundred updates against a two-million-key store cost the same as
+/// publishing the store. That is the floor under every read-your-writes
+/// workload: the external YCSB adapter checkpoints after each write batch,
+/// which is why its mixed workloads run at a hundredth of LMDB's rate while
+/// its read-only workload is competitive.
+///
+/// Two changes were needed and neither sufficed alone. The key index is
+/// published in place -- new records into reserved slack, one aligned store
+/// per slot -- so nothing is rewritten. And fsync is separated from
+/// publishing, because it dominated whatever was left: 38ms against 0.32ms at
+/// two million keys.
+///
+/// Asserts the shape rather than a wall-clock number: cost must not scale
+/// with the key count. A twenty-fold increase in keys may not cost anything
+/// like twenty times more.
+#[test]
+fn a_checkpoint_costs_what_changed_not_what_is_stored() {
+    use std::time::Instant;
+    let cost = |keys: u64| -> f64 {
+        let dir = std::env::temp_dir().join(format!("supdb-kb-inc-{keys}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s.dat");
+        let s = supdb::Store::create(
+            &file,
+            supdb::Options {
+                buffer_bytes: 512 << 20,
+                reclaim: supdb::Reclaim::AfterReads,
+                sync_on_checkpoint: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for i in 0..keys {
+            s.append(format!("k{i:012}").as_bytes(), &[7u8; 100])
+                .unwrap();
+        }
+        s.checkpoint().unwrap();
+        let mut best = f64::MAX;
+        for r in 0..6u64 {
+            for i in 0..100u64 {
+                s.append(
+                    format!("k{:012}", (i * 7 + r) % keys).as_bytes(),
+                    &[9u8; 100],
+                )
+                .unwrap();
+            }
+            let t = Instant::now();
+            s.checkpoint().unwrap();
+            best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        // The values must survive all of it.
+        let rd = supdb::Reader::open(&file).unwrap();
+        assert_eq!(rd.keys(), keys as usize);
+        let mut bytes = 0u64;
+        for i in 0..keys.min(2000) {
+            bytes += rd.read_all(format!("k{i:012}").as_bytes(), |_| {}).unwrap();
+        }
+        assert!(
+            bytes >= keys.min(2000) * 100,
+            "keys={keys}: lost values, {bytes} bytes for {} keys",
+            keys.min(2000)
+        );
+        drop(rd);
+        let _ = std::fs::remove_dir_all(&dir);
+        best
+    };
+    let small = cost(100_000);
+    let large = cost(2_000_000);
+    // 20x the keys. A full rewrite showed roughly 20x the cost; publishing
+    // only what changed showed about 4x, most of which is the block table.
+    // 8x is loose enough for a noisy machine and tight enough to catch a
+    // return to rewriting.
+    assert!(
+        large < small * 8.0,
+        "checkpoint cost is tracking the key count again: {small:.2}ms at 100k against \
+         {large:.2}ms at 2M ({:.1}x for 20x the keys)",
+        large / small.max(1e-9)
+    );
+}

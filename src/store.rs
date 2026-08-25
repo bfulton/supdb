@@ -569,6 +569,13 @@ struct Shard {
     builder: BlockBuilder,
     /// Extents already placed in the current block, awaiting its id.
     members: Vec<(u32, u32, u32, u32, bool)>,
+    /// Keys whose extents changed since the last checkpoint, by table index.
+    ///
+    /// Without this a checkpoint has to ask every shard for every key just to
+    /// find the handful that moved, which is O(key count) before the work
+    /// starts -- and that was the whole cost the in-place path exists to
+    /// avoid. Cleared when a checkpoint publishes them.
+    dirty: Vec<u32>,
 }
 
 pub struct Store {
@@ -596,6 +603,7 @@ impl Store {
                     pending_bytes: 0,
                     builder: BlockBuilder::new(opts.block_size),
                     members: Vec::new(),
+                    dirty: Vec::new(),
                 })
             })
             .collect();
@@ -736,6 +744,7 @@ impl Store {
                         entry.extents.push(ext);
                     }
                 }
+                sh.dirty.push(idx);
                 self.merge_key(sh, idx)?;
                 continue;
             }
@@ -791,6 +800,7 @@ impl Store {
                 idx
             })
             .collect();
+        sh.dirty.extend_from_slice(&touched);
         for idx in touched {
             self.merge_key(sh, idx)?;
         }
@@ -982,6 +992,7 @@ impl Store {
             }
         }
         drop(ap);
+        sh.dirty.push(idx);
         sh.keys.entry_at(idx).extents = Extents::One(Ext {
             block: id,
             off: 0,
@@ -1001,12 +1012,34 @@ impl Store {
     pub fn checkpoint(&self) -> Result<u64> {
         use std::os::unix::fs::FileExt;
         self.flush()?;
-        let mut all: Vec<(Vec<u8>, Extents)> = Vec::new();
+        // Gather only what moved. Asking every shard for every key just to
+        // find the handful that changed is O(key count) before any work
+        // starts, and that was the whole cost the in-place path exists to
+        // avoid -- it made an incremental checkpoint of 100 updates cost the
+        // same 24ms as a full one.
+        let mut changed: Vec<(Vec<u8>, Extents)> = Vec::new();
+        let mut nkeys = 0usize;
         for sh in &self.shards {
-            let sh = sh.lock().unwrap();
-            all.extend(sh.keys.iter().map(|(k, e)| (k.to_vec(), e.extents.clone())));
+            let mut sh = sh.lock().unwrap();
+            nkeys += sh.keys.len();
+            for idx in std::mem::take(&mut sh.dirty) {
+                let key = sh.keys.key_at(idx).to_vec();
+                let exts = sh.keys.entry_at(idx).extents.clone();
+                changed.push((key, exts));
+            }
         }
-        all.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let in_place = self.checkpoint_in_place(&changed, nkeys)?;
+
+        // Only the rewrite needs every key, and only then is the sort worth
+        // paying for.
+        let mut all: Vec<(Vec<u8>, Extents)> = Vec::new();
+        if !in_place {
+            for sh in &self.shards {
+                let sh = sh.lock().unwrap();
+                all.extend(sh.keys.iter().map(|(k, e)| (k.to_vec(), e.extents.clone())));
+            }
+            all.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        }
 
         // The fast path: every key already in the published index, and enough
         // slack to hold the records that changed. Then a checkpoint is a few
@@ -1014,14 +1047,6 @@ impl Store {
         //
         // This is what makes checkpoint cost track the change rather than the
         // key count. YCSB's run phase never inserts, so it is entirely this
-        // path; a bulk load is entirely the slow one.
-        // Returns true when the key index was published in place. The block
-        // table and the superblock are still written below: new values live in
-        // new blocks, and a reader that cannot see those blocks gets extents
-        // naming blocks that do not exist. The block table is a few hundred
-        // entries where the key index is millions, so this is still O(changed)
-        // in the part that matters.
-        let in_place = self.checkpoint_in_place(&all)?;
         // `flat` stays true only if the flat encoder actually produced a
         // section. It declines on inputs it cannot address -- a key over 64KiB,
         // or a record region past 4GiB -- and falling back to the varint
@@ -1228,13 +1253,13 @@ impl Store {
     /// checkpoint will observe the new values. For a store whose extents only
     /// ever grow that is more data, not wrong data, and it is the trade that
     /// buys an O(changed) checkpoint.
-    fn checkpoint_in_place(&self, all: &[(Vec<u8>, Extents)]) -> Result<bool> {
+    fn checkpoint_in_place(&self, changed: &[(Vec<u8>, Extents)], nkeys: usize) -> Result<bool> {
         use std::sync::atomic::{AtomicU64, Ordering};
         let mut ap = self.appender.lock().unwrap();
         let Some((map, meta, sec_off, sec_len)) = ap.live_index.as_mut() else {
             return Ok(false);
         };
-        if all.len() != meta.len() {
+        if nkeys != meta.len() {
             // A key was added or removed: the hash and the sorted directory
             // both have to change, which is the rewrite this path avoids.
             return Ok(false);
@@ -1250,7 +1275,7 @@ impl Store {
         let mut probe =
             FlatIndex::parse(sec).ok_or_else(|| corrupt("live index no longer parses"))?;
         probe.set_bump(meta.bump());
-        for (k, exts) in all {
+        for (k, exts) in changed {
             let slice = exts.as_slice();
             let Some(slot_at) = meta.slot_of(sec, k, key_hash) else {
                 return Ok(false);
@@ -1298,9 +1323,13 @@ impl Store {
         cur.store(bump as u64, Ordering::Release);
         meta.set_bump(bump);
 
-        if self.opts.sync_on_checkpoint {
-            map.flush()?;
-        }
+        // Deliberately no msync here. `MmapMut::flush` syncs the whole
+        // mapping, which is the whole file, so an incremental checkpoint of a
+        // hundred records paid for flushing every page of a multi-gigabyte
+        // store -- the cost grew with the store rather than with the change,
+        // which is the thing this path exists to stop. The `sync_data` at the
+        // end of the checkpoint already forces pages dirtied through the
+        // mapping, so durability is unchanged.
         Ok(true)
     }
 
