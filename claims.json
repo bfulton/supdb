@@ -364,6 +364,38 @@
       "because": "Zero bytes per key of permanent growth per checkpoint, on both arms. It was 9.2 and 66.9 respectively, forever: every checkpoint appended keys, blocks and reuse-log sections and released none of them. A pre-existing leak that the flat format made expensive enough to notice, and the reason this format was not turned on by default until it was fixed. Pinned to full: the arms only separate at scale -- at 50k keys the open difference is 61x rather than 2537x and the read difference is inside noise. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
       "profile": "full",
       "arch": "x86_64"
+    },
+    {
+      "experiment": "f12-compress",
+      "id": "F12.1",
+      "expect": "holds",
+      "because": "Turning block compression off makes point reads 3.6x faster. The question was whether decompression explains any of LMDB's 2.9x read lead; it explains more than all of it. Pinned to full: at ci scale the store fits in cache and the space saving looks four times larger than it is. Pinned to x86_64.",
+      "profile": "full",
+      "arch": "x86_64"
+    },
+    {
+      "experiment": "f12-compress",
+      "id": "F12.2",
+      "expect": "holds",
+      "because": "And ordered scans 30x faster. A scan walks whole blocks in order, so it pays decompression on every one; this is the largest single effect measured anywhere in this suite. Pinned to full: at ci scale the store fits in cache and the space saving looks four times larger than it is. Pinned to x86_64.",
+      "profile": "full",
+      "arch": "x86_64"
+    },
+    {
+      "experiment": "f12-compress",
+      "id": "F12.3",
+      "expect": "holds",
+      "because": "The space given up is 1.04x -- 3017 MB against 3142 MB. Compression is buying almost nothing here because the payload is half-random by construction; a more compressible payload would save more, but the read and scan costs above do not depend on how well the data compresses. Pinned to full: at ci scale the store fits in cache and the space saving looks four times larger than it is. Pinned to x86_64.",
+      "profile": "full",
+      "arch": "x86_64"
+    },
+    {
+      "experiment": "f12-compress",
+      "id": "F12.4",
+      "expect": "fails",
+      "because": "Compression costs the write path too: 3.8x. Ingest is the axis the design is built to win, so paying on writes *and* reads *and* scans for 4% of disk is not a trade, and this claim is expected to fail until the default changes. Pinned to full: at ci scale the store fits in cache and the space saving looks four times larger than it is. Pinned to x86_64.",
+      "profile": "full",
+      "arch": "x86_64"
     }
   ],
   "metrics": [
