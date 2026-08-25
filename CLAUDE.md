@@ -99,7 +99,10 @@ described in `claims.json`:
   index. The index is 57 bytes per key in a mapped section readers share; it
   was 131 bytes per key, heap-resident and duplicated per process.
 - Write throughput barely scales with writer threads.
-- No usable point on the durability curve; `checkpoint` is O(key count).
+- `checkpoint` is O(key count): it rewrites the whole key index rather than
+  what changed. The durability *curve* now has a usable point on it -- a
+  20,000-op window sustains ~199k ops/s with about 2MB at risk -- but that came
+  from making writes faster, not from fixing the floor.
 
 If you fix one, the corresponding claim must change from `fails` to `holds` in
 the same commit, and the review in `docs/` should be updated to say so.
@@ -109,7 +112,15 @@ resurrection, the double-free that handed one slot to three blocks, decoder
 panics on damaged input, silently-served corruption (now checksummed), and a
 checkpoint that appended three index sections and released none of them.
 
-F2.2 is the first of the four above to move from `fails` to `holds`: reader
-open is sub-linear in key count since the key index became a mapped section
-(`src/flatindex.rs`, `Options::flat_index`). The other three still fail, and
-so does F2.1 — sub-linear is not independent.
+Two of the four above have moved from `fails` to `holds`. F2.2: reader open is
+sub-linear in key count since the key index became a mapped section
+(`src/flatindex.rs`, `Options::flat_index`). F4.2: a usable durability point
+exists since block compression was turned off by default (`f12-compress`
+prices that at 3.6x on reads, 30x on scans, 3.8x on writes, for 1.04x the
+disk). F2.1 still fails — sub-linear is not independent — and so does F4.1, at
+38x.
+
+The compression change also took the size axis away: `EXT.6` moved from `holds`
+to `fails`, since Supdb now stores 4.7MB where LMDB stores 2.6. That was traded
+knowingly, and `EXT.5` is what it bought — Supdb now scans 1.29x faster than
+LMDB, having been 4.7x slower.

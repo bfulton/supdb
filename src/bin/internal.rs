@@ -916,8 +916,29 @@ fn f4_durability(args: &Args, profile: Profile) -> std::io::Result<Record> {
             let at_risk = if *iv == 0 { ops } else { *iv };
             samples[i].median() > 100_000.0 && at_risk * value_size as u64 <= 10 * 1048576
         }),
-        "checkpoint() rewrites the entire key index, so the floor on the durability interval \
-         grows with key count rather than with what changed",
+        {
+            let best = intervals
+                .iter()
+                .enumerate()
+                .filter(|(i, iv)| {
+                    let at_risk = if **iv == 0 { ops } else { **iv };
+                    samples[*i].median() > 100_000.0
+                        && at_risk * value_size as u64 <= 10 * 1048576
+                })
+                .map(|(i, iv)| (iv, samples[i].median()))
+                .next();
+            match best {
+                Some((iv, ops_s)) => format!(
+                    "a {iv}-op window sustains {ops_s:.0} ops/s. checkpoint() still rewrites the \
+                     entire key index, so the floor grows with key count rather than with what \
+                     changed -- but with block compression off the write path is fast enough \
+                     that a usable point exists anyway"
+                ),
+                None => "checkpoint() rewrites the entire key index, so the floor on the \
+                         durability interval grows with key count rather than with what changed"
+                    .to_string(),
+            }
+        },
     ));
     Ok(rec)
 }

@@ -57,8 +57,8 @@
     {
       "experiment": "f4-durability",
       "id": "F4.2",
-      "expect": "fails",
-      "because": "There is no usable point on the durability curve: either lose everything buffered since the last checkpoint (512MB by default), or pay an O(nkeys) index rewrite per commit. An incremental checkpoint is the single largest piece of remaining work."
+      "expect": "holds",
+      "because": "FIXED by turning block compression off. A 20,000-op window sustains 199,308 ops/s with about 2MB at risk -- the first usable point this curve has had. checkpoint() still rewrites the whole key index, so the floor grows with key count rather than with what changed, and F4.1 still fails at 38x; what changed is that the write path is now fast enough that the floor sits somewhere usable. Measured at ci, which is not citable for the throughput figure itself -- the claim is that a point exists, and its existence is not a ci artifact."
     },
     {
       "experiment": "f3-multiproc",
@@ -82,14 +82,14 @@
     {
       "experiment": "ext-kv",
       "id": "EXT.5",
-      "expect": "fails",
-      "because": "LMDB scans roughly 4.7x faster than Supdb natively."
+      "expect": "holds",
+      "because": "FIXED by turning block compression off. Supdb scans 58.9M entries/s against LMDB's 45.7M, 1.29x. It was 4.7x slower. A scan walks whole blocks in order and so paid decompression on every one; f12 measures that cost at 30x in isolation. This is the first axis Supdb takes from LMDB outright."
     },
     {
       "experiment": "ext-kv",
       "id": "EXT.6",
-      "expect": "holds",
-      "because": "Supdb stores the same data in less space than LMDB. Compactness is a genuine strength of the design."
+      "expect": "fails",
+      "because": "BROKEN by the same change, and deliberately. Supdb stores 4.7MB against LMDB's 2.6MB where it used to be smaller. Uncompressed data plus an uncompressed mapped index cost the space axis outright. That was one of only two axes Supdb led on, and it was traded knowingly for 3.6x on reads, 30x on scans and 3.8x on writes -- see f12. Turning Options::compress back on restores it."
     },
     {
       "experiment": "ext-ycsb",
