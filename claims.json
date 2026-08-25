@@ -69,8 +69,8 @@
     {
       "experiment": "ext-kv",
       "id": "EXT.1",
-      "expect": "holds",
-      "because": "Supdb loads faster than LMDB at 500k keys (1,002,973 vs 916,518 ops/s), and this is the design's real and defensible win. Pinned to full: at ci scale (20k keys) it now loses, because block checksums cost 8.5% of write throughput and the margin there was smaller than that. The pair is kept deliberately -- a win that only appears at scale is a different claim from one that holds everywhere.",
+      "expect": "fails",
+      "because": "BROKEN by turning block compression off, and this one was the design's headline. Supdb loads 209,474 ops/s against LMDB's 411,853, having led at 1.09x. Uncompressed data is about five times more bytes on disk, and a full load is bound by writing them. f12 measured writes as 3.8x *faster* with compression off; that was at a scale where the write buffer absorbed most of it, so it saw the CPU saving and not the I/O cost. The generalisation was mine and it was wrong. Pinned to full: these orderings move with scale -- EXT.5 holds at ci and fails here, which is what comes of reading a ci number as evidence.",
       "profile": "full"
     },
     {
@@ -82,8 +82,9 @@
     {
       "experiment": "ext-kv",
       "id": "EXT.5",
-      "expect": "holds",
-      "because": "FIXED by turning block compression off. Supdb scans 58.9M entries/s against LMDB's 45.7M, 1.29x. It was 4.7x slower. A scan walks whole blocks in order and so paid decompression on every one; f12 measures that cost at 30x in isolation. This is the first axis Supdb takes from LMDB outright."
+      "expect": "fails",
+      "because": "Supdb scans 22.6M entries/s against LMDB's 24.8M, 0.91x. It was 4.7x slower before block compression was turned off, so this is close to parity now rather than a loss of kind -- but it is still a loss, and I recorded this claim as holding on the strength of a ci run where it reached 1.29x. Pinned to full: these orderings move with scale -- EXT.5 holds at ci and fails here, which is what comes of reading a ci number as evidence.",
+      "profile": "full"
     },
     {
       "experiment": "ext-kv",
@@ -195,8 +196,8 @@
       "experiment": "ext-kv",
       "id": "EXT.2",
       "profile": "full",
-      "expect": "fails",
-      "because": "At 500k keys redb reads faster than Supdb (433,957/s against 372,887/s). The ci-scale ordering reverses, so the read advantage is a small-store effect, not a property of the design."
+      "expect": "holds",
+      "because": "Supdb reads 430,928/s against redb's 239,681, 1.80x. It lost this at 372,887 against 433,957 before the mapped index and uncompressed blocks. LMDB still reads 1.81x faster than Supdb, so this is second place, not first. Pinned to full: these orderings move with scale -- EXT.5 holds at ci and fails here, which is what comes of reading a ci number as evidence."
     },
     {
       "experiment": "c2-oracle",
