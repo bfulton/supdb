@@ -228,9 +228,22 @@ fn repeated_checkpoints_stop_growing_the_file() {
 /// once per reader is sound. This asserts the cost is bounded rather than
 /// asserting a wall-clock number: what must never come back is the shape,
 /// where scan cost tracks block size instead of value size.
+/// Serialises tests that depend on `Options::checksums`.
+///
+/// That option is process-global, not per-store: `Store::create` writes a
+/// static atomic that every reader in the process then consults. Two stores
+/// with different settings cannot coexist, and a test that creates one flips
+/// the flag under any other test running concurrently. This is a real
+/// limitation of the engine rather than of the tests -- an embedded library
+/// whose configuration is process-wide is surprising -- and it is recorded in
+/// docs/architecture-review.md. The lock is what keeps the suite honest until
+/// the option becomes per-store.
+static CHECKSUM_FLAG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn an_uncompressed_block_is_not_rechecksummed_per_read() {
     use std::time::Instant;
+    let _guard = CHECKSUM_FLAG.lock().unwrap_or_else(|e| e.into_inner());
     let scan_ns = |compress: bool, checksums: bool| -> f64 {
         let dir = std::env::temp_dir().join(format!("supdb-kb-crc-{compress}-{checksums}"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -374,7 +387,7 @@ fn a_checkpoint_costs_what_changed_not_what_is_stored() {
             supdb::Options {
                 buffer_bytes: 512 << 20,
                 reclaim: supdb::Reclaim::AfterReads,
-                sync_on_checkpoint: false,
+                sync: supdb::Sync::Never,
                 ..Default::default()
             },
         )
@@ -491,4 +504,99 @@ fn a_superseded_index_section_is_released_exactly_once() {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// `close` is durable whatever the sync policy says.
+///
+/// `Sync::Never` means "durable when I say so", and closing the store is
+/// saying so. A clean shutdown that leaves acknowledged writes on the wrong
+/// side of a power cut is not a policy, it is a bug -- and it is the obvious
+/// way to get this wrong, because the policy is consulted in one place and
+/// close goes through the same path.
+#[test]
+fn close_is_durable_under_every_sync_policy() {
+    for (name, policy) in [
+        ("Always", supdb::Sync::Always),
+        ("Never", supdb::Sync::Never),
+        ("EveryN", supdb::Sync::EveryN(1000)),
+        (
+            "Interval",
+            supdb::Sync::Interval(std::time::Duration::from_secs(3600)),
+        ),
+    ] {
+        let dir = std::env::temp_dir().join(format!("supdb-kb-sync-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s.dat");
+        let store = supdb::Store::create(
+            &file,
+            supdb::Options {
+                buffer_bytes: 8 << 20,
+                sync: policy,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for i in 0..5_000u64 {
+            store
+                .append(format!("k{i:08}").as_bytes(), &[3u8; 40])
+                .unwrap();
+        }
+        // Publish without persisting, then close. Everything must survive.
+        store.publish().unwrap();
+        store.close().unwrap();
+
+        let r = supdb::Reader::open(&file).unwrap();
+        assert_eq!(r.keys(), 5_000, "{name}: keys lost across close");
+        for i in (0..5_000u64).step_by(97) {
+            let mut n = 0usize;
+            r.read_all(format!("k{i:08}").as_bytes(), |v| n += v.len())
+                .unwrap();
+            assert_eq!(n, 40, "{name}: key {i} lost across close");
+        }
+        drop(r);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// `publish` makes writes visible without flushing; `sync` is what flushes.
+///
+/// The two are separate calls precisely because they are separate things, and
+/// the failure this guards is a `publish` that quietly syncs anyway -- which
+/// would be correct but would cost 31x and look like nothing was wrong.
+#[test]
+fn publish_makes_writes_visible_to_a_new_reader() {
+    let dir = std::env::temp_dir().join("supdb-kb-publish");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("s.dat");
+    let store = supdb::Store::create(
+        &file,
+        supdb::Options {
+            buffer_bytes: 8 << 20,
+            sync: supdb::Sync::Never,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for round in 0..5u64 {
+        for i in 0..500u64 {
+            store
+                .append(format!("k{i:08}").as_bytes(), &[round as u8; 16])
+                .unwrap();
+        }
+        store.publish().unwrap();
+        let r = supdb::Reader::open(&file).unwrap();
+        let mut n = 0usize;
+        r.read_all(b"k00000007", |v| n += v.len()).unwrap();
+        assert_eq!(
+            n,
+            16 * (round as usize + 1),
+            "round {round}: publish did not make the writes visible"
+        );
+    }
+    // sync after the fact is a no-op for visibility and must not error.
+    store.sync().unwrap();
+    store.sync().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }

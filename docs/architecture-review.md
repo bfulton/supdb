@@ -438,11 +438,49 @@ checkpoint is used. The cost is losing recent checkpoints on power loss, not
 corruption — the trade LMDB's `MDB_NOSYNC` and RocksDB without WAL sync both
 make.
 
-`Options::sync_on_checkpoint` exists and defaults on. What it does not yet have
-is the other half: holding one generation back from reclamation so the
-fallback state is guaranteed intact, and an explicit `sync()` for callers who
-want a durability point on demand. Those are what would make defaulting it off
-defensible rather than merely fast.
+**DONE, as an API rather than a default.** The surprise was never the fsync, it
+was that `checkpoint()` means two things at once -- make visible, and make
+durable -- so a caller who wanted the first paid for the second. Splitting them
+gives the fast path without changing what anyone already relies on:
+
+| call | visible to new readers | on the device |
+|---|---|---|
+| `publish()` | yes | no |
+| `checkpoint()` | yes | per `Options::sync` |
+| `sync()` | — | yes, and a no-op when nothing is pending |
+| `close()` | yes | **always**, whatever the policy |
+
+`Options::sync` is `Always` (unchanged behaviour, and the unsurprising
+default), `EveryN(n)`, `Interval(d)`, or `Never`. Every one of them is safe
+against a *process* crash — readers map the same file, so visibility never
+needed a flush. They differ only in how much recent work a *power* cut takes.
+
+`close()` flushing regardless is the part worth stating plainly: `Sync::Never`
+means "durable when I say so", and closing is saying so. A clean shutdown that
+strands acknowledged writes would be a bug wearing a policy's clothes, and
+`tests/known_bugs.rs` asserts it across all four settings.
+
+What is still missing for the *default* to move is the recovery half: holding
+one generation back from reclamation so the crash-fallback state is guaranteed
+intact. Until that exists, a caller choosing `Never` is choosing to lose recent
+checkpoints, which is the honest trade; a caller choosing nothing keeps today's
+durability.
+
+### 2.7c `Options::checksums` is process-global, not per-store — **medium**
+
+`Store::create` writes the setting into a static atomic that every reader in
+the process consults. Two stores in one process cannot disagree about it, and
+the last one created silently reconfigures the others.
+
+For a library embedded in somebody else's address space that is surprising in
+the way that matters: a caller who opens a verified store and an unverified
+scratch store gets whichever they happened to create second, with no error and
+no way to notice. It surfaced here as a test that passed alone and failed in
+parallel, which is the benign version of the same fault.
+
+The fix is to carry it on the `BlockLoc`/`Reader` rather than in a static; the
+cost is threading it through the read paths that currently ask a global. Until
+then `tests/known_bugs.rs` serialises the tests that depend on it.
 
 ### 2.8 The block cache is configured, documented as central, and effectively unused — **medium**
 

@@ -1468,7 +1468,7 @@ fn f13_sync(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let store = Store::create(
             &file,
             Options {
-                sync_on_checkpoint: on[ci],
+                sync: if on[ci] { supdb::Sync::Always } else { supdb::Sync::Never },
                 ..default_opts(256)
             },
         )

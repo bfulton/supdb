@@ -131,6 +131,41 @@ impl Super {
     }
 }
 
+/// When a checkpoint reaches the device.
+///
+/// Publishing and persisting are different things, and conflating them is
+/// where the cost hides. A reader maps the same file, so a write is visible to
+/// it as soon as it is in the page cache, and a process crash leaves the file
+/// intact regardless. fsync buys ordering against *power loss*: it stops the
+/// superblock landing before the sections it points at.
+///
+/// Every option here is safe against a process crash. They differ only in how
+/// much recent work a power cut may take with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sync {
+    /// fsync every checkpoint. Durable at the cost of two device flushes per
+    /// publish, which on the read-your-writes shape is 31x -- 415 ops/s
+    /// against 12,985 (`f13-sync`). The default, because a store that loses
+    /// acknowledged writes on power loss should be something a caller asked
+    /// for rather than something they got.
+    Always,
+    /// fsync at most once every `n` checkpoints.
+    ///
+    /// The window is bounded in *checkpoints*, not in time or bytes, because
+    /// that is the unit the caller controls: publish ten times between syncs
+    /// and at most ten publishes are at risk.
+    EveryN(u32),
+    /// fsync at most once every interval.
+    ///
+    /// The bound a caller usually means by "I can lose a second". Note that it
+    /// bounds the gap *between syncs*, not the age of the newest unsynced
+    /// write, so the exposure is up to one interval plus one checkpoint.
+    Interval(std::time::Duration),
+    /// Never automatically. `Store::sync` and `Store::close` still flush, so
+    /// this is "durable when I say so", not "never durable".
+    Never,
+}
+
 /// When space belonging to a superseded value may be handed out again.
 ///
 /// Releasing a block only makes its space available; reuse is what actually
@@ -258,7 +293,12 @@ pub struct Options {
     /// corruption. LMDB's MDB_NOSYNC and RocksDB without WAL sync make the
     /// same trade. Left on by default because it is the safe direction and
     /// f13 measures what it costs.
-    pub sync_on_checkpoint: bool,
+    /// When a checkpoint reaches the device. See `Sync`.
+    ///
+    /// `Sync::Always` by default. `Store::publish` is the per-call escape
+    /// hatch when a caller wants visibility without durability for one
+    /// checkpoint, and `Store::sync` takes a durability point on demand.
+    pub sync: Sync,
     /// Chunk size for solo blocks. A deep key's whole run is decompressed on a
     /// full read regardless of chunking, so warm reads there are flat across
     /// this value while compression is not: the larger window is close to free
@@ -316,9 +356,14 @@ impl Default for Options {
             flat_index: std::env::var("SUPDB_FLAT_INDEX")
                 .map(|v| v != "0")
                 .unwrap_or(true),
-            sync_on_checkpoint: std::env::var("SUPDB_SYNC")
-                .map(|v| v != "0")
-                .unwrap_or(true),
+            sync: match std::env::var("SUPDB_SYNC").ok().as_deref() {
+                Some("0") => Sync::Never,
+                Some(v) => v
+                    .parse::<u32>()
+                    .map(Sync::EveryN)
+                    .unwrap_or(Sync::Always),
+                None => Sync::Always,
+            },
             reclaim: Reclaim::AfterReads,
         }
     }
@@ -380,6 +425,13 @@ struct Appender {
     /// is what makes "released exactly once" a property of the structure
     /// rather than of two call sites agreeing.
     index_history: Vec<(u64, Option<BlockLoc>, Option<BlockLoc>, Option<BlockLoc>)>,
+    /// Checkpoints published since the last flush to the device, and when that
+    /// flush happened. What `Sync::EveryN` and `Sync::Interval` count.
+    since_sync: u32,
+    last_sync: std::time::Instant,
+    /// Set by a checkpoint that did not sync, cleared by one that did. Lets
+    /// `close` tell "nothing to flush" from "work is at risk".
+    unsynced: bool,
     /// The published key index, mapped writable, so a checkpoint that only
     /// changes existing keys can publish each one with a single aligned store
     /// instead of rewriting the section.
@@ -646,6 +698,9 @@ impl Store {
                 reuse_log: Vec::new(),
                 last_index: None,
                 index_history: Vec::new(),
+                since_sync: 0,
+                last_sync: std::time::Instant::now(),
+                unsynced: false,
                 history_from: 0,
                 live_index: None,
                 live_key_off: None,
@@ -1030,7 +1085,47 @@ impl Store {
     /// a checkpoint that reached the slot but not the data would describe
     /// blocks that do not exist. Blocks written after the last checkpoint are
     /// simply unreachable after a crash -- leaked space, not corruption.
+    /// Publish and persist: make everything written so far visible to new
+    /// readers, and flush it to the device according to `Options::sync`.
     pub fn checkpoint(&self) -> Result<u64> {
+        self.checkpoint_inner(self.opts.sync)
+    }
+
+    /// Publish without persisting: make writes visible to new readers, and let
+    /// `Options::sync` decide nothing -- this call never flushes.
+    ///
+    /// The distinction is the point. Readers map the same file, so visibility
+    /// costs nothing beyond the page cache, and a process crash cannot lose
+    /// what this published. Only a power cut can, and only back to the last
+    /// flush. On the read-your-writes shape that is worth 31x (`f13-sync`),
+    /// which is the whole of the gap between Supdb and LMDB on the mixed YCSB
+    /// workloads.
+    ///
+    /// Pair it with `sync` at whatever boundary the caller actually cares
+    /// about -- a batch, a second, a user-visible acknowledgement.
+    pub fn publish(&self) -> Result<u64> {
+        self.checkpoint_inner(Sync::Never)
+    }
+
+    /// Flush everything published so far to the device.
+    ///
+    /// Cheap and a no-op when nothing has been published since the last flush,
+    /// so calling it on a timer or per batch costs nothing when idle.
+    pub fn sync(&self) -> Result<()> {
+        let mut ap = self.appender.lock().unwrap();
+        if !ap.unsynced {
+            return Ok(());
+        }
+        ap.file.sync_data()?;
+        ap.since_sync = 0;
+        ap.last_sync = std::time::Instant::now();
+        ap.unsynced = false;
+        Ok(())
+    }
+
+    /// The one implementation. `policy` is the caller's, not necessarily the
+    /// store's: `publish` passes `Never` for a single call.
+    fn checkpoint_inner(&self, policy: Sync) -> Result<u64> {
         use std::os::unix::fs::FileExt;
         self.flush()?;
         // Gather only what moved. Asking every shard for every key just to
@@ -1139,7 +1234,18 @@ impl Store {
         // losing checkpoints on power loss; the CRCs and the alternating
         // superblock slots turn that into "fall back to the previous
         // checkpoint" rather than into corruption.
-        if self.opts.sync_on_checkpoint {
+        //
+        // Decided once and used for both flushes: syncing before the
+        // superblock but not after would leave a superblock that can land
+        // ahead of the sections it points at, which is the ordering the sync
+        // exists to provide. Either both or neither.
+        let do_sync = match policy {
+            Sync::Always => true,
+            Sync::Never => false,
+            Sync::EveryN(n) => ap.since_sync + 1 >= n.max(1),
+            Sync::Interval(d) => ap.last_sync.elapsed() >= d,
+        };
+        if do_sync {
             ap.file.sync_data()?;
         }
 
@@ -1249,8 +1355,14 @@ impl Store {
             let other = if at == 0 { SLOT } else { 0 };
             ap.file.write_all_at(&sb.encode(), other)?;
         }
-        if self.opts.sync_on_checkpoint {
+        if do_sync {
             ap.file.sync_data()?;
+            ap.since_sync = 0;
+            ap.last_sync = std::time::Instant::now();
+            ap.unsynced = false;
+        } else {
+            ap.since_sync = ap.since_sync.saturating_add(1);
+            ap.unsynced = true;
         }
         ap.generation = gen;
         ap.timestamp = sb.timestamp;
@@ -1415,8 +1527,12 @@ impl Store {
             }
             n
         };
-        // checkpoint first so the store is recoverable even if trimming fails
-        self.checkpoint()?;
+        // checkpoint first so the store is recoverable even if trimming fails.
+        // Always durable, whatever the policy: a clean shutdown that leaves
+        // acknowledged writes on the wrong side of a power cut is not a
+        // policy, it is a bug. Sync::Never means "durable when I say so", and
+        // closing is saying so.
+        self.checkpoint_inner(Sync::Always)?;
         {
             let mut ap = self.appender.lock().unwrap();
             let free = ap.free.coalesced();
@@ -1434,7 +1550,7 @@ impl Store {
             }
         }
         // trimming moved the high-water mark, so record the final state
-        self.checkpoint()?;
+        self.checkpoint_inner(Sync::Always)?;
         let ap = self.appender.lock().unwrap();
         let merges: u64 = self.shards.iter().map(|s| s.lock().unwrap().merges).sum();
         Ok(Stats {

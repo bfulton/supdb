@@ -45,4 +45,4 @@ mod readers;
 #[allow(clippy::all, dead_code)]
 mod store;
 
-pub use store::{Options, Reader, Reclaim, Stats, Store};
+pub use store::{Options, Reader, Reclaim, Stats, Store, Sync};
