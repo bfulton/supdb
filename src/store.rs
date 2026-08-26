@@ -1098,7 +1098,15 @@ impl Store {
             }
         };
         let mut ap = self.appender.lock().unwrap();
-        let blk_idx = encode_block_index(&ap.blocks);
+        // Flat and uncompressed, for the same reason as the key index: it is
+        // read on every open, and decoding it measured 34% of all
+        // instructions in a checkpoint-heavy workload.
+        let blk_flat = self.opts.flat_index;
+        let blk_idx = if blk_flat {
+            flatindex::encode_blocks(&ap.blocks)
+        } else {
+            encode_block_index(&ap.blocks)
+        };
         // Uncompressed, deliberately: a section that is decompressed on open
         // is a section copied into every reader's heap, which is the cost this
         // format exists to remove.
@@ -1108,7 +1116,11 @@ impl Store {
             _ if flat => write_section_raw(&mut ap, &key_idx, self.opts.reclaim)?,
             _ => write_section(&mut ap, &key_idx, self.opts.reclaim)?,
         };
-        let blk_loc = write_section(&mut ap, &blk_idx, self.opts.reclaim)?;
+        let blk_loc = if blk_flat {
+            write_section_raw(&mut ap, &blk_idx, self.opts.reclaim)?
+        } else {
+            write_section(&mut ap, &blk_idx, self.opts.reclaim)?
+        };
         // Drop entries older than any reader could still be relying on. A
         // reader outside the grace window is already unsafe and is told so, so
         // keeping the record forever only made every checkpoint bigger and
@@ -1701,7 +1713,9 @@ pub struct Reader {
     /// reference; the race is benign, two threads may verify the same block
     /// once each.
     verified: Vec<std::sync::atomic::AtomicU64>,
-    blocks: Vec<BlockLoc>,
+    /// Where this reader's block table lives: decoded onto the heap, or left
+    /// in the mapping like the key index.
+    blocks_src: BlocksSrc,
     cache: BlockCache,
     /// Slot held in the reader table, released when this reader is dropped.
     slot: Option<usize>,
@@ -1717,6 +1731,22 @@ pub struct Reader {
     /// (generation, timestamp, offset, stored, uncompressed) of the previous
     /// checkpoint's index.
     prev: Option<(u64, u64, u64, u64, u64)>,
+}
+
+/// The two block-table arms.
+///
+/// `Owned` is the varint format decoded into a `Vec` at open -- five varints
+/// and a flag byte per block, which callgrind measured at 34% of all
+/// instructions in a checkpoint-heavy workload, because block count grows with
+/// overwrite churn and every open pays it again. `Mapped` reads an entry where
+/// it lies.
+enum BlocksSrc {
+    Owned(Vec<BlockLoc>),
+    Mapped {
+        meta: flatindex::MappedBlocks,
+        off: usize,
+        len: usize,
+    },
 }
 
 /// The two index arms.
@@ -1963,12 +1993,27 @@ impl Reader {
     /// embedded library means somebody else's application aborting.
     #[inline]
     fn loc_of(&self, block: u32) -> Result<BlockLoc> {
-        self.blocks.get(block as usize).copied().ok_or_else(|| {
+        let got = match &self.blocks_src {
+            BlocksSrc::Owned(v) => v.get(block as usize).copied(),
+            BlocksSrc::Mapped { meta, off, len } => self
+                .mmap
+                .get(*off..off.saturating_add(*len))
+                .and_then(|sec| meta.get(sec, block as usize)),
+        };
+        got.ok_or_else(|| {
             corrupt(&format!(
                 "extent names block {block} but the table has {}",
-                self.blocks.len()
+                self.nblocks()
             ))
         })
+    }
+
+    #[inline]
+    fn nblocks(&self) -> usize {
+        match &self.blocks_src {
+            BlocksSrc::Owned(v) => v.len(),
+            BlocksSrc::Mapped { meta, .. } => meta.len(),
+        }
     }
 
     /// The stored bytes of a block, checked against the mapping.
@@ -2079,12 +2124,27 @@ impl Reader {
     }
 
     fn open_mapped(mmap: Mmap, sb: Super) -> Result<Reader> {
-        let blk_idx = read_section(
-            &mmap,
-            sb.blk_off,
-            sb.blk_stored as usize,
-            sb.blk_uncompressed as usize,
-        )?;
+        // Same treatment as the key index: used where it lies when it is the
+        // flat format, decoded otherwise.
+        let blocks_src = {
+            let off = sb.blk_off as usize;
+            let len = sb.blk_stored as usize;
+            let mapped = if sb.blk_stored == sb.blk_uncompressed {
+                mmap.get(off..off.saturating_add(len))
+                    .and_then(flatindex::MappedBlocks::parse)
+            } else {
+                None
+            };
+            match mapped {
+                Some(meta) => BlocksSrc::Mapped { meta, off, len },
+                None => BlocksSrc::Owned(Self::decode_blocks(&read_section(
+                    &mmap,
+                    sb.blk_off,
+                    sb.blk_stored as usize,
+                    sb.blk_uncompressed as usize,
+                )?)?),
+            }
+        };
         // A flat section is stored verbatim, so it is only a candidate when
         // nothing was compressed away, and only if the header validates.
         // Anything else is the varint format and gets decoded as before.
@@ -2098,7 +2158,7 @@ impl Reader {
                         meta,
                         off,
                         len,
-                        blk_idx,
+                        blocks_src,
                         sb.timestamp,
                         sb.history_from,
                     );
@@ -2111,7 +2171,7 @@ impl Reader {
             sb.key_stored as usize,
             sb.key_uncompressed as usize,
         )?;
-        Self::build(mmap, key_idx, blk_idx, sb.timestamp, sb.history_from)
+        Self::build(mmap, key_idx, blocks_src, sb.timestamp, sb.history_from)
     }
 
     /// Publish the generation being read so the writer will not hand out the
@@ -2170,7 +2230,20 @@ impl Reader {
             sb.blk_stored as usize,
             sb.blk_uncompressed as usize,
         )?;
-        Self::build(mmap, key_idx, blk_idx, ts, sb.history_from)
+        let blocks_src = match flatindex::MappedBlocks::parse(&blk_idx) {
+            // This path owns its section rather than borrowing the mapping, so
+            // the flat form is converted. Time travel, not the hot path.
+            Some(m) => BlocksSrc::Owned(
+                (0..m.len())
+                    .map(|i| {
+                        m.get(&blk_idx, i)
+                            .ok_or_else(|| corrupt("block table truncated"))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            None => BlocksSrc::Owned(Self::decode_blocks(&blk_idx)?),
+        };
+        Self::build(mmap, key_idx, blocks_src, ts, sb.history_from)
     }
 
     /// Decode the block table. Shared by both index arms: the block index is
@@ -2219,21 +2292,24 @@ impl Reader {
         meta: FlatIndex,
         off: usize,
         len: usize,
-        blk_idx: Vec<u8>,
+        blocks_src: BlocksSrc,
         ts: u64,
         history_from: u64,
     ) -> Result<Reader> {
-        let blocks = Self::decode_blocks(&blk_idx)?;
+        let nblocks = match &blocks_src {
+            BlocksSrc::Owned(v) => v.len(),
+            BlocksSrc::Mapped { meta, .. } => meta.len(),
+        };
         let generation = meta.generation;
         let prev = meta.prev;
-        let verified = (0..blocks.len().div_ceil(64))
+        let verified = (0..nblocks.div_ceil(64))
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect();
         Ok(Reader {
             mmap,
             idx: Idx::Flat { meta, off, len },
             verified,
-            blocks,
+            blocks_src,
             cache: BlockCache::new(4096),
             slot: None,
             table: None,
@@ -2248,11 +2324,14 @@ impl Reader {
     fn build(
         mmap: Mmap,
         key_idx: Vec<u8>,
-        blk_idx: Vec<u8>,
+        blocks_src: BlocksSrc,
         ts: u64,
         history_from: u64,
     ) -> Result<Reader> {
-        let blocks = Self::decode_blocks(&blk_idx)?;
+        let nblocks = match &blocks_src {
+            BlocksSrc::Owned(v) => v.len(),
+            BlocksSrc::Mapped { meta, .. } => meta.len(),
+        };
 
         let mut p = 0usize;
         let _gen_read = get_uvarint(&key_idx, &mut p);
@@ -2302,7 +2381,7 @@ impl Reader {
                 // four read paths that index `self.blocks` with it. A damaged
                 // index otherwise names a block that does not exist and every
                 // one of those paths panics the calling process.
-                if block as usize >= blocks.len() {
+                if block as usize >= nblocks {
                     return Err(corrupt("extent names a block that does not exist"));
                 }
                 exts.push(Ext {
@@ -2338,7 +2417,7 @@ impl Reader {
         }
 
         let cache = BlockCache::new(4096);
-        let verified = (0..blocks.len().div_ceil(64))
+        let verified = (0..nblocks.div_ceil(64))
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect();
         Ok(Reader {
@@ -2349,7 +2428,7 @@ impl Reader {
                 mask,
             },
             verified,
-            blocks,
+            blocks_src,
             cache,
             slot: None,
             table: None,
@@ -2473,7 +2552,7 @@ impl Reader {
                                  ext=({}..{}) mmap={} nblocks={} head={:?}",
                                 self.generation, e.block, loc.off, loc.stored, loc.uncompressed, loc.cap,
                                 loc.chunked, loc.solo, a, b, self.mmap.len(),
-                                self.blocks.len(), head
+                                self.nblocks(), head
                             );
                         }
                         return Err(err);
@@ -2581,7 +2660,7 @@ impl Reader {
         // table, but nothing reads it -- damage there is undetectable and
         // correctly so, and counting it as undetected corruption would
         // overstate the gap a second time.
-        let mut referenced = vec![false; self.blocks.len()];
+        let mut referenced = vec![false; self.nblocks()];
         for r in 0..self.idx.len() {
             let Some((_, exts)) = self.idx.at(&self.mmap, r) else {
                 continue;
@@ -2592,11 +2671,12 @@ impl Reader {
                 }
             }
         }
-        self.blocks
-            .iter()
-            .zip(referenced)
+        referenced
+            .into_iter()
+            .enumerate()
             .filter(|(_, live)| *live)
-            .map(|(b, _)| (b.off, b.stored as u64))
+            .filter_map(|(i, _)| self.loc_of(i as u32).ok())
+            .map(|b| (b.off, b.stored as u64))
             .collect()
     }
 

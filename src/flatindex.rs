@@ -630,3 +630,207 @@ mod tests {
         assert_eq!(ix.prev, Some((8, 1234, 4096, 100, 200)));
     }
 }
+
+// ------------------------------------------------------------ block table --
+
+/// "SBLK", little-endian.
+const BLK_MAGIC: u32 = 0x4B4C_4253;
+/// Header, padded so the first entry lands 8-aligned.
+const BLK_HEADER: usize = 16;
+
+/// A block table entry as it sits in the file.
+///
+/// Deliberately *not* `BlockLoc`. `BlockLoc` carries two `bool`s, and a `bool`
+/// has exactly two valid bit patterns -- borrowing an array of them out of a
+/// file that a corruption experiment deliberately damages would be undefined
+/// behaviour, not a wrong answer. Every field here is an integer, so every bit
+/// pattern is valid and a damaged entry yields nonsense the existing bounds
+/// checks reject rather than something the compiler may assume cannot happen.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct BlockRec {
+    off: u64,
+    stored: u32,
+    uncompressed: u32,
+    cap: u32,
+    crc: u32,
+    /// bit 0 solo, bit 1 chunked.
+    flags: u8,
+    _pad: [u8; 7],
+}
+
+const BLK_ENTRY: usize = std::mem::size_of::<BlockRec>();
+
+impl BlockRec {
+    #[inline]
+    fn to_loc(self) -> crate::block::BlockLoc {
+        crate::block::BlockLoc {
+            off: self.off,
+            stored: self.stored,
+            uncompressed: self.uncompressed,
+            cap: self.cap,
+            crc: self.crc,
+            solo: self.flags & 1 != 0,
+            chunked: self.flags & 2 != 0,
+        }
+    }
+    #[inline]
+    fn of(b: &crate::block::BlockLoc) -> BlockRec {
+        BlockRec {
+            off: b.off,
+            stored: b.stored,
+            uncompressed: b.uncompressed,
+            cap: b.cap,
+            crc: b.crc,
+            flags: (b.solo as u8) | ((b.chunked as u8) << 1),
+            _pad: [0; 7],
+        }
+    }
+}
+
+/// Serialize the block table as a flat array.
+///
+/// The varint encoding it replaces was five varints and a flag byte per block,
+/// decoded into a `Vec` on every reader open. Callgrind measured that decode at
+/// 34% of all instructions in a checkpoint-heavy workload: it is O(block
+/// count), block count grows with overwrite churn, and every open paid it
+/// again. Same treatment the key index already gets, for the same reason.
+pub fn encode_blocks(blocks: &[crate::block::BlockLoc]) -> Vec<u8> {
+    let mut out = vec![0u8; BLK_HEADER + blocks.len() * BLK_ENTRY];
+    out[0..4].copy_from_slice(&BLK_MAGIC.to_le_bytes());
+    out[4..8].copy_from_slice(&(BLK_ENTRY as u32).to_le_bytes());
+    out[8..16].copy_from_slice(&(blocks.len() as u64).to_le_bytes());
+    for (i, b) in blocks.iter().enumerate() {
+        let r = BlockRec::of(b);
+        // SAFETY: BlockRec is repr(C), Copy and all-integer, so its bytes are
+        // its representation and its padding is explicit.
+        let src =
+            unsafe { std::slice::from_raw_parts(&r as *const BlockRec as *const u8, BLK_ENTRY) };
+        let at = BLK_HEADER + i * BLK_ENTRY;
+        out[at..at + BLK_ENTRY].copy_from_slice(src);
+    }
+    out
+}
+
+/// A validated view of a mapped block table: where the entries are, and
+/// nothing copied out of them.
+///
+/// Offsets rather than a borrow, so `Reader` -- which owns the mapping -- does
+/// not become self-referential. Same shape as `FlatIndex`.
+#[derive(Clone, Copy)]
+pub struct MappedBlocks {
+    off: usize,
+    n: usize,
+}
+
+impl MappedBlocks {
+    /// `None` for the varint format, for an entry size this build disagrees
+    /// with, and for bytes the mapping did not land aligned -- each a reason to
+    /// fall back to the decoder rather than to fail.
+    pub fn parse(sec: &[u8]) -> Option<MappedBlocks> {
+        if rd_u32(sec, 0)? != BLK_MAGIC || rd_u32(sec, 4)? as usize != BLK_ENTRY {
+            return None;
+        }
+        let n = rd_u64(sec, 8)? as usize;
+        let bytes = sec.get(BLK_HEADER..BLK_HEADER.checked_add(n.checked_mul(BLK_ENTRY)?)?)?;
+        if !(bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<BlockRec>()) {
+            return None;
+        }
+        Some(MappedBlocks { off: BLK_HEADER, n })
+    }
+
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    /// The entry at `i`, read out of `sec`.
+    ///
+    /// Bounds are re-checked against the slice rather than trusted from
+    /// `parse`: the section comes from a mapping a corruption experiment
+    /// damages, and a shorter slice must be rejected rather than indexed.
+    #[inline]
+    pub fn get(&self, sec: &[u8], i: usize) -> Option<crate::block::BlockLoc> {
+        if i >= self.n {
+            return None;
+        }
+        let at = self.off.checked_add(i.checked_mul(BLK_ENTRY)?)?;
+        let bytes = sec.get(at..at.checked_add(BLK_ENTRY)?)?;
+        if !(bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<BlockRec>()) {
+            return None;
+        }
+        // SAFETY: length and alignment checked here; BlockRec is repr(C), Copy
+        // and all-integer, so every bit pattern of these bytes is a valid value.
+        let r = unsafe { *(bytes.as_ptr() as *const BlockRec) };
+        Some(r.to_loc())
+    }
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+    use crate::block::BlockLoc;
+
+    fn corpus(n: usize) -> Vec<BlockLoc> {
+        (0..n)
+            .map(|i| BlockLoc {
+                off: (i as u64) * 4096 + 7,
+                stored: i as u32 * 3,
+                uncompressed: i as u32 * 5,
+                cap: i as u32 * 7,
+                crc: i as u32 * 11,
+                solo: i % 3 == 0,
+                chunked: i % 5 == 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_block_round_trips() {
+        let blocks = corpus(5000);
+        let sec = encode_blocks(&blocks);
+        let m = MappedBlocks::parse(&sec).expect("parse");
+        assert_eq!(m.len(), blocks.len());
+        for (i, b) in blocks.iter().enumerate() {
+            let g = m.get(&sec, i).expect("present");
+            assert_eq!(
+                (g.off, g.stored, g.uncompressed, g.cap, g.crc, g.solo, g.chunked),
+                (b.off, b.stored, b.uncompressed, b.cap, b.crc, b.solo, b.chunked),
+                "block {i}"
+            );
+        }
+        assert!(m.get(&sec, blocks.len()).is_none());
+    }
+
+    /// Why `BlockRec` exists rather than mapping `BlockLoc` directly: a damaged
+    /// flag byte must produce a wrong answer, never a `bool` holding a value
+    /// the compiler is entitled to assume impossible.
+    #[test]
+    fn damage_never_produces_an_invalid_bool() {
+        let blocks = corpus(200);
+        let sec = encode_blocks(&blocks);
+        for i in 0..sec.len() {
+            let mut d = sec.clone();
+            d[i] ^= 0xff;
+            if let Some(m) = MappedBlocks::parse(&d) {
+                for j in 0..m.len().min(200) {
+                    if let Some(b) = m.get(&d, j) {
+                        std::hint::black_box((b.solo, b.chunked, b.off));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn truncation_is_rejected_not_misread() {
+        let blocks = corpus(100);
+        let sec = encode_blocks(&blocks);
+        for cut in 0..sec.len() {
+            if let Some(m) = MappedBlocks::parse(&sec[..cut]) {
+                for j in 0..m.len() {
+                    let _ = m.get(&sec[..cut], j);
+                }
+            }
+        }
+    }
+}
