@@ -304,9 +304,23 @@ impl Default for Options {
             // reads at 1.25x, and an index of 67 B/key that is file-backed and
             // shared between reader processes rather than 186 B/key duplicated
             // in each. Space is the axis this engine has to spare.
+            // OFF, pending a correctness fix. c2-oracle diverges from its
+            // model under Reclaim::AfterReads with this on: 187 mismatches and
+            // 2,896 read errors at ci scale, against zero with it off. It is
+            // not the in-place checkpoint -- disabling that leaves the
+            // divergence unchanged -- so it is the mapped section interacting
+            // with section reclamation. The varint index is about 9 bytes per
+            // key and the mapped one 57, so the space it releases is large
+            // enough for data blocks to take, which is why a latent hazard
+            // only bites at this size.
+            //
+            // Everything the format buys is real and measured -- 2537x on
+            // open, YCSB-C at parity with LMDB -- and none of it is worth
+            // serving wrong data by default. `SUPDB_FLAT_INDEX=1` still
+            // enables it for measurement.
             flat_index: std::env::var("SUPDB_FLAT_INDEX")
                 .map(|v| v != "0")
-                .unwrap_or(true),
+                .unwrap_or(false),
             sync_on_checkpoint: std::env::var("SUPDB_SYNC")
                 .map(|v| v != "0")
                 .unwrap_or(true),
