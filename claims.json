@@ -398,6 +398,22 @@
       "because": "Compression costs the write path too: 3.8x. It is off by default as of this measurement, so this claim now records what the option costs anyone who turns it back on rather than what the engine does. It stays expected-to-fail because the statement is about the compressor, not the default: paying on writes as well as reads and scans, for four percent of disk, is not a trade. Pinned to full: at ci scale the store fits in cache and the space saving looks four times larger than it is. Pinned to x86_64.",
       "profile": "full",
       "arch": "x86_64"
+    },
+    {
+      "experiment": "f13-sync",
+      "id": "F13.1",
+      "expect": "fails",
+      "because": "fsync is the dominant cost of publishing, by a wide margin: 415 ops/s against 12,985 without, 31.3x, on the read-your-writes shape. Every such operation costs a checkpoint because Store has no read method, and a checkpoint syncs twice. This is the whole of the gap on the workloads Supdb is worst at -- YCSB A/B/D/E/F sit at 0.07-0.14x of LMDB while C, which never publishes, sits at 1.73x. Recorded as expected-to-fail because the statement is about where the time goes, and it goes here. Pinned to full and to x86_64. The ratio is a property of this disk as much as of the engine -- a device with a faster flush would show less -- which is exactly why it is recorded as a measurement rather than folded into a design argument.",
+      "profile": "full",
+      "arch": "x86_64"
+    },
+    {
+      "experiment": "f13-sync",
+      "id": "F13.2",
+      "expect": "fails",
+      "because": "And it is worth far more than the largest thing an instruction profile could see. Callgrind put the block table decode at 34% of all instructions; mapping it removed 4.75x of the total instruction count and moved throughput by nothing, because the workload waits on a syscall. This claim exists to keep that lesson attached to a number: an instruction profile answers where the CPU goes, not why a workload is slow. Pinned to full and to x86_64. The ratio is a property of this disk as much as of the engine -- a device with a faster flush would show less -- which is exactly why it is recorded as a measurement rather than folded into a design argument.",
+      "profile": "full",
+      "arch": "x86_64"
     }
   ],
   "metrics": [

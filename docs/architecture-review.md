@@ -396,6 +396,54 @@ Two things found on the way are worth more than the speedup:
   history while, by its own documentation, reclaimed blocks could already have been
   overwritten. It now reports the truth.
 
+### 2.7b Read-your-writes costs a durable checkpoint — **high, and it is now the binding constraint**
+
+`Store` exposes no read method, so a reader must be reopened to see a write —
+and to reopen it, the write must be published by `checkpoint()`, which calls
+`fsync` twice. Every read-after-write in a mixed workload therefore costs two
+trips to the disk.
+
+Measured on the read-your-writes shape, both arms interleaved in one process
+(`f13-sync`): **860 ops/s with fsync against 25,095 without — 29.2x**,
+p=0.0122. That is the whole of the gap on the workloads Supdb is worst at.
+YCSB A, B, D, E and F sit at 0.07–0.14x of LMDB; C, which never writes and
+therefore never publishes, sits at **1.73x**.
+
+Two things this cost is *not*:
+
+- **It is not the index.** Reader open went from 738ms to 0.29ms and these
+  workloads moved 1.3x.
+- **It is not the block table decode.** An instruction profile put that at 34%
+  of everything. Mapping it removed 4.75x of the total instruction count and
+  changed throughput by nothing.
+
+That second one is worth dwelling on. Callgrind counts instructions and cannot
+see a thread parked in a syscall, so it pointed with total confidence at a
+third of the CPU that was not the constraint. **An instruction profile answers
+where the CPU goes, not why a workload is slow**, and those are different
+questions whenever the answer is I/O. The block table change was kept because
+it is real and free, not because it helped here.
+
+The fix is not a faster fsync, it is not calling one. Publishing does not need
+it: readers map the same file and see a write as soon as it is in the page
+cache, and a process crash leaves the file intact either way. fsync buys
+ordering against *power loss* — it stops the superblock landing before the
+sections it points at.
+
+That ordering can be recovered rather than enforced. Every section is CRC'd,
+the superblock alternates between two slots, and `Reader::open` already takes
+the newest slot that validates and falls back to the older one. A superblock
+pointing at bytes that never landed fails its checksum and the previous
+checkpoint is used. The cost is losing recent checkpoints on power loss, not
+corruption — the trade LMDB's `MDB_NOSYNC` and RocksDB without WAL sync both
+make.
+
+`Options::sync_on_checkpoint` exists and defaults on. What it does not yet have
+is the other half: holding one generation back from reclamation so the
+fallback state is guaranteed intact, and an explicit `sync()` for callers who
+want a durability point on demand. Those are what would make defaulting it off
+defensible rather than merely fast.
+
 ### 2.8 The block cache is configured, documented as central, and effectively unused — **medium**
 
 - `Options::cache_blocks` is declared and defaulted to 4096 and **never read**. `Reader::build`

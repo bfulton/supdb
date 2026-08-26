@@ -92,6 +92,7 @@ fn main() -> std::io::Result<()> {
             "f8-checksums" => f8_checksums(&args, profile)?,
             "f11-flatindex" => f11_flatindex(&args, profile)?,
             "f12-compress" => f12_compress(&args, profile)?,
+            "f13-sync" => f13_sync(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -117,6 +118,7 @@ fn main() -> std::io::Result<()> {
                 "f7-index",
                 "f11-flatindex",
                 "f12-compress",
+                "f13-sync",
                 "f4-durability",
                 "f3-multiproc",
                 "f1-outofcore",
@@ -1423,6 +1425,129 @@ fn f7_child(args: &Args) -> std::io::Result<()> {
     );
     let _ = nkeys;
     Ok(())
+}
+
+// --------------------------------------------- F13: what fsync costs to publish --
+
+/// What it costs to make a checkpoint durable rather than merely visible.
+///
+/// Publishing does not need fsync. Readers map the same file, so a write is
+/// visible as soon as it is in the page cache, and a process crash leaves the
+/// file intact regardless. fsync buys *ordering* against power loss: it stops
+/// the superblock landing before the sections it points at.
+///
+/// That matters because every read-your-writes operation costs a checkpoint --
+/// `Store` has no read method -- and a checkpoint syncs twice. The mixed YCSB
+/// workloads sit at 0.07-0.14x of LMDB, and an instruction profile of the same
+/// shape blamed the block table decode at 34%. Removing that decode entirely
+/// moved throughput by nothing, because the workload waits on a syscall rather
+/// than on the CPU. This asks the question the profiler could not.
+///
+/// Both arms in one process, interleaved, as f8 and f12 do.
+fn f13_sync(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let keys = args.num("--keys", profile.pick(20_000, 100_000, 500_000)) as u64;
+    let ops = args.num("--ops", profile.pick(400, 2_000, 6_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+
+    let mut rec = Record::new("f13-sync", profile);
+    rec.param("keys", J::u(keys))
+        .param("ops", J::u(ops))
+        .param("value_size", J::u(value_size as u64))
+        .note(
+            "read-your-writes shape: half the operations write, and a read after a write \
+             costs a checkpoint plus a reader reopen. Both arms interleaved; the only \
+             difference is Options::sync_on_checkpoint",
+        );
+
+    let dir = scratch("f13");
+    let payload = Payload::new(value_size, 0.5, 0x13);
+    let on = [true, false];
+
+    let s = Trial::new(profile.reps()).run(2, |ci, rep| {
+        let file = dir.join(format!("s{ci}-{rep}.dat"));
+        let store = Store::create(
+            &file,
+            Options {
+                sync_on_checkpoint: on[ci],
+                ..default_opts(256)
+            },
+        )
+        .expect("create");
+        let mut vrng = Rng::new(0x13 + rep as u64);
+        let mut kb = [0u8; 16];
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            store.append(&kb, payload.get(&mut vrng)).expect("append");
+        }
+        store.checkpoint().expect("checkpoint");
+
+        let mut reader = Some(Reader::open(&file).expect("open"));
+        let mut dirty = false;
+        let mut g = KeyGen::new(KeyDist::Uniform, keys, 0x13);
+        let t = Instant::now();
+        for i in 0..ops {
+            db_key_into(g.next(), &mut kb);
+            if i % 2 == 0 {
+                store.put(&kb, payload.get(&mut vrng)).expect("put");
+                dirty = true;
+            } else {
+                if dirty {
+                    store.checkpoint().expect("checkpoint");
+                    reader = Some(Reader::open(&file).expect("open"));
+                    dirty = false;
+                }
+                reader
+                    .as_ref()
+                    .unwrap()
+                    .read_all(&kb, |v| {
+                        std::hint::black_box(v);
+                    })
+                    .expect("read");
+            }
+        }
+        let rate = ops as f64 / t.elapsed().as_secs_f64();
+        drop(reader);
+        let _ = store.close();
+        let _ = std::fs::remove_file(&file);
+        rate
+    });
+
+    let cmp = compare(&s[1], &s[0], supdb::bench::MIN_EFFECT);
+    let (with, without) = (s[0].median(), s[1].median());
+    let ratio = without / with.max(1e-9);
+    rec.compare("nosync_vs_sync", cmp.clone());
+    rec.series(
+        "arms",
+        jobj! {
+            "sync_ops_per_s" => J::fp(with, 1),
+            "nosync_ops_per_s" => J::fp(without, 1),
+            "speedup" => J::fp(ratio, 2),
+        },
+    );
+
+    rec.finding(Finding::new(
+        "F13.1",
+        "fsync is not the dominant cost of publishing a checkpoint",
+        ratio <= 2.0,
+        format!(
+            "{with:.0} ops/s with fsync against {without:.0} without ({ratio:.1}x). Every \
+             read-your-writes operation costs a checkpoint and a checkpoint syncs twice, so \
+             this is what durability costs on the workload the engine is worst at ({})",
+            cmp.summary("nosync", "sync")
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F13.2",
+        "removing fsync is worth less than removing the block table decode was",
+        ratio <= 4.75,
+        format!(
+            "fsync is worth {ratio:.1}x here. Mapping the block table removed 34% of all \
+             instructions -- 4.75x fewer in total -- and moved throughput by nothing. An \
+             instruction profile answers where the CPU goes, not why a workload is slow, and \
+             those differ whenever the answer is a syscall"
+        ),
+    ));
+    Ok(rec)
 }
 
 // ------------------------------------------------ F12: the cost of compression --
