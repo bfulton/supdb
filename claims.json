@@ -77,7 +77,8 @@
       "experiment": "ext-kv",
       "id": "EXT.4",
       "expect": "fails",
-      "because": "Measured through native bindings LMDB reads about 2.4x faster than Supdb. The design document reports the opposite ordering, but measured LMDB through a Java harness with an adapter it separately found to allocate per value and open a transaction per lookup. Removing the language boundary reverses the result."
+      "because": "Measured through native bindings LMDB reads about 1.8x faster than Supdb at full scale. The design document reports the opposite ordering, but measured LMDB through a Java harness with an adapter it separately found to allocate per value and open a transaction per lookup. Pinned to full: at ci scale the store fits in cache and Supdb reads 1.75x *faster*, which is a property of the working set rather than of either engine -- the same reversal that had EXT.5 recorded wrongly for an hour.",
+      "profile": "full"
     },
     {
       "experiment": "ext-kv",

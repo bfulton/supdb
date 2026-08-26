@@ -426,3 +426,69 @@ fn a_checkpoint_costs_what_changed_not_what_is_stored() {
         large / small.max(1e-9)
     );
 }
+
+/// Two mechanisms both released a superseded key index section.
+///
+/// A full checkpoint recorded its key section in `index_history`. When a later
+/// checkpoint replaced it, one path released it directly; the pruning loop
+/// released it again once `live_key_off` had moved on. The free list then held
+/// one range twice and handed it to two different blocks -- and in the
+/// reproducing run a data block landed exactly on the live key index.
+///
+/// It only bit with the mapped index because that section is about 57 bytes
+/// per key against the varint format's 9, so the space it frees is large
+/// enough for a data block to want. The defect was in the release bookkeeping,
+/// not in the format.
+///
+/// c2-oracle is the general version of this; this is the reduction, and it
+/// asserts the property that actually matters: a range handed out by the free
+/// list is never a range something else is still using.
+#[test]
+fn a_superseded_index_section_is_released_exactly_once() {
+    for flat in [false, true] {
+        let dir = std::env::temp_dir().join(format!("supdb-kb-dbl-{flat}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s.dat");
+        let store = supdb::Store::create(
+            &file,
+            supdb::Options {
+                buffer_bytes: 4 << 20,
+                // The only policy that hands freed space back out, and the
+                // default. Never and OnClose never reproduced this.
+                reclaim: supdb::Reclaim::AfterReads,
+                flat_index: flat,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut model: std::collections::BTreeMap<String, Vec<Vec<u8>>> =
+            std::collections::BTreeMap::new();
+        // Enough rounds for the reuse floor to pass a section that is still
+        // live: the original failure needed nine.
+        for round in 0..14u64 {
+            for i in 0..800u64 {
+                let k = format!("k{:06}", i % 200);
+                let v = vec![(round as u8).wrapping_mul(7).wrapping_add(i as u8); 48];
+                if i % 5 == 0 {
+                    store.put(k.as_bytes(), &v).unwrap();
+                    model.insert(k, vec![v]);
+                } else {
+                    store.append(k.as_bytes(), &v).unwrap();
+                    model.entry(k).or_default().push(v);
+                }
+            }
+            store.checkpoint().unwrap();
+            let r = supdb::Reader::open(&file).unwrap();
+            for (k, want) in &model {
+                let mut got: Vec<Vec<u8>> = Vec::new();
+                r.read_all(k.as_bytes(), |v| got.push(v.to_vec()))
+                    .unwrap_or_else(|e| {
+                        panic!("flat={flat} round {round} key {k}: {e}")
+                    });
+                assert_eq!(&got, want, "flat={flat} round {round} key {k}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

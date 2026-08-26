@@ -304,23 +304,18 @@ impl Default for Options {
             // reads at 1.25x, and an index of 67 B/key that is file-backed and
             // shared between reader processes rather than 186 B/key duplicated
             // in each. Space is the axis this engine has to spare.
-            // OFF, pending a correctness fix. c2-oracle diverges from its
-            // model under Reclaim::AfterReads with this on: 187 mismatches and
-            // 2,896 read errors at ci scale, against zero with it off. It is
-            // not the in-place checkpoint -- disabling that leaves the
-            // divergence unchanged -- so it is the mapped section interacting
-            // with section reclamation. The varint index is about 9 bytes per
-            // key and the mapped one 57, so the space it releases is large
-            // enough for data blocks to take, which is why a latent hazard
-            // only bites at this size.
-            //
-            // Everything the format buys is real and measured -- 2537x on
-            // open, YCSB-C at parity with LMDB -- and none of it is worth
-            // serving wrong data by default. `SUPDB_FLAT_INDEX=1` still
-            // enables it for measurement.
+            // On. It was defaulted off for one commit after c2-oracle found
+            // it serving wrong data under Reclaim::AfterReads -- 187
+            // mismatches and 2,896 read errors. The cause was a double
+            // release: two mechanisms both freed a superseded key section, so
+            // the free list held one range twice and handed it to two blocks.
+            // A data block landed exactly on the live index. Fixed by making
+            // "released exactly once" a property of `index_history` rather
+            // than of two call sites agreeing; the oracle is clean on all
+            // three reclaim policies.
             flat_index: std::env::var("SUPDB_FLAT_INDEX")
                 .map(|v| v != "0")
-                .unwrap_or(false),
+                .unwrap_or(true),
             sync_on_checkpoint: std::env::var("SUPDB_SYNC")
                 .map(|v| v != "0")
                 .unwrap_or(true),
@@ -372,7 +367,19 @@ struct Appender {
     /// and the next section written lands on top of it. That presents as
     /// "extent names a block that does not exist" from a reader, which is a
     /// trampled index rather than a bad extent.
-    index_history: Vec<(u64, Option<BlockLoc>, BlockLoc, BlockLoc)>,
+    /// Each section is `Some` until it has been released, and the entry is
+    /// dropped only once all three are `None`.
+    ///
+    /// It used to hold them unconditionally and `remove(0)` the whole entry
+    /// while skipping the key section if it was still live -- which forgot
+    /// that section, so a second mechanism existed to catch the leak, and the
+    /// two of them released the same range twice. The free list then held one
+    /// range twice and handed it to two different blocks: c2-oracle saw 187
+    /// mismatches and 2,896 read errors, and a data block landed exactly on
+    /// the live key index at 209408..238080. Marking each section as it goes
+    /// is what makes "released exactly once" a property of the structure
+    /// rather than of two call sites agreeing.
+    index_history: Vec<(u64, Option<BlockLoc>, Option<BlockLoc>, Option<BlockLoc>)>,
     /// The published key index, mapped writable, so a checkpoint that only
     /// changes existing keys can publish each one with a single aligned store
     /// instead of rewriting the section.
@@ -1142,22 +1149,42 @@ impl Store {
         ap.index_history.push((
             gen,
             if in_place { None } else { Some(key_loc) },
-            blk_loc,
-            reuse_loc,
+            Some(blk_loc),
+            Some(reuse_loc),
         ));
         let floor = ap.reuse_floor(self.opts.reclaim);
-        while ap.index_history.len() > 1 && ap.index_history[0].0 < floor {
-            let (g, k, b, r) = ap.index_history.remove(0);
+        let mut i = 0;
+        while i < ap.index_history.len() && ap.index_history.len() > 1 {
+            if ap.index_history[i].0 >= floor {
+                break;
+            }
             let live = ap.live_key_off;
-            for loc in k.into_iter().chain([b, r]) {
-                if Some(loc.off) == live {
-                    // Still the index readers are using. It becomes
-                    // releasable when a full checkpoint replaces it.
-                    continue;
+            let g = ap.index_history[i].0;
+            // Take each section out of the entry as it is released, so nothing
+            // can release it a second time. A key section that is still live
+            // stays recorded rather than being forgotten here.
+            let mut freed = Vec::new();
+            {
+                let e = &mut ap.index_history[i];
+                if e.1.map(|l| l.off) != live {
+                    freed.extend(e.1.take());
                 }
+                freed.extend(e.2.take());
+                freed.extend(e.3.take());
+            }
+            for loc in freed {
                 ap.free.release(loc.off, loc.cap, gen);
             }
             ap.history_from = ap.history_from.max(g + 1);
+            let empty = {
+                let e = &ap.index_history[i];
+                e.1.is_none() && e.2.is_none() && e.3.is_none()
+            };
+            if empty {
+                ap.index_history.remove(i);
+            } else {
+                i += 1;
+            }
         }
         let history_from = ap.history_from;
 
@@ -1227,12 +1254,21 @@ impl Store {
         let superseded = ap.live_key_off.take();
         if let Some(off) = superseded {
             if off != key_loc.off {
-                if let Some(old) = ap
+                // Take it out of the history as it is released. Leaving it
+                // there let the pruning loop release the same range a second
+                // time once `live_key_off` had moved on.
+                if let Some(pos) = ap
                     .index_history
                     .iter()
-                    .find_map(|(_, k, _, _)| k.filter(|l| l.off == off))
+                    .position(|(_, k, _, _)| k.map(|l| l.off) == Some(off))
                 {
-                    ap.free.release(old.off, old.cap, gen);
+                    if let Some(loc) = ap.index_history[pos].1.take() {
+                        ap.free.release(loc.off, loc.cap, gen);
+                    }
+                    let e = &ap.index_history[pos];
+                    if e.1.is_none() && e.2.is_none() && e.3.is_none() {
+                        ap.index_history.remove(pos);
+                    }
                 }
             }
         }
