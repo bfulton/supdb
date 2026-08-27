@@ -35,6 +35,7 @@ use supdb::{Options, Reader, Reclaim, Store};
 /// FIXED: `delete` and `put` now drop matching entries from `Shard::members`.
 #[test]
 fn delete_is_not_undone_by_a_staged_extent() {
+    let _flag = CHECKSUM_FLAG.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join("supdb-test-delete-resurrection");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -94,6 +95,7 @@ fn delete_is_not_undone_by_a_staged_extent() {
 /// belief about what `read_all` returns, which is bytes rather than values.
 #[test]
 fn a_mapped_index_agrees_with_the_decoded_one_at_every_alignment() {
+    let _flag = CHECKSUM_FLAG.lock().unwrap_or_else(|e| e.into_inner());
     fn harvest(file: &std::path::Path, n: u64) -> (usize, Vec<Vec<u8>>, Vec<Vec<u8>>) {
         let r = supdb::Reader::open(file).unwrap();
         let mut values = Vec::new();
@@ -173,6 +175,7 @@ fn a_mapped_index_agrees_with_the_decoded_one_at_every_alignment() {
 /// use. Growth must therefore stop, not merely slow.
 #[test]
 fn repeated_checkpoints_stop_growing_the_file() {
+    let _flag = CHECKSUM_FLAG.lock().unwrap_or_else(|e| e.into_inner());
     for flat in [false, true] {
         let dir = std::env::temp_dir().join(format!("supdb-kb-ckptleak-{flat}"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -242,8 +245,8 @@ static CHECKSUM_FLAG: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn an_uncompressed_block_is_not_rechecksummed_per_read() {
+    let _flag = CHECKSUM_FLAG.lock().unwrap_or_else(|e| e.into_inner());
     use std::time::Instant;
-    let _guard = CHECKSUM_FLAG.lock().unwrap_or_else(|e| e.into_inner());
     let scan_ns = |compress: bool, checksums: bool| -> f64 {
         let dir = std::env::temp_dir().join(format!("supdb-kb-crc-{compress}-{checksums}"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -305,6 +308,7 @@ fn an_uncompressed_block_is_not_rechecksummed_per_read() {
 /// grew a 22 GB store and filled the disk.
 #[test]
 fn a_held_reader_does_not_stop_reclaim() {
+    let _flag = CHECKSUM_FLAG.lock().unwrap_or_else(|e| e.into_inner());
     let plateau = |flat: bool| -> u64 {
         let dir = std::env::temp_dir().join(format!("supdb-kb-held-{flat}"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -376,6 +380,7 @@ fn a_held_reader_does_not_stop_reclaim() {
 /// like twenty times more.
 #[test]
 fn a_checkpoint_costs_what_changed_not_what_is_stored() {
+    let _flag = CHECKSUM_FLAG.lock().unwrap_or_else(|e| e.into_inner());
     use std::time::Instant;
     let cost = |keys: u64| -> f64 {
         let dir = std::env::temp_dir().join(format!("supdb-kb-inc-{keys}"));
@@ -458,6 +463,7 @@ fn a_checkpoint_costs_what_changed_not_what_is_stored() {
 /// list is never a range something else is still using.
 #[test]
 fn a_superseded_index_section_is_released_exactly_once() {
+    let _flag = CHECKSUM_FLAG.lock().unwrap_or_else(|e| e.into_inner());
     for flat in [false, true] {
         let dir = std::env::temp_dir().join(format!("supdb-kb-dbl-{flat}"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -515,6 +521,7 @@ fn a_superseded_index_section_is_released_exactly_once() {
 /// close goes through the same path.
 #[test]
 fn close_is_durable_under_every_sync_policy() {
+    let _flag = CHECKSUM_FLAG.lock().unwrap_or_else(|e| e.into_inner());
     for (name, policy) in [
         ("Always", supdb::Sync::Always),
         ("Never", supdb::Sync::Never),
@@ -566,6 +573,7 @@ fn close_is_durable_under_every_sync_policy() {
 /// would be correct but would cost 31x and look like nothing was wrong.
 #[test]
 fn publish_makes_writes_visible_to_a_new_reader() {
+    let _flag = CHECKSUM_FLAG.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join("supdb-kb-publish");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -599,4 +607,101 @@ fn publish_makes_writes_visible_to_a_new_reader() {
     store.sync().unwrap();
     store.sync().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The writer can read its own writes without publishing them.
+///
+/// `Store` had no read method, so seeing your own write meant `checkpoint()`
+/// plus a fresh `Reader`. LMDB needs neither, which is the whole of EXT.3 and
+/// the reason the mixed YCSB workloads sit two orders of magnitude behind
+/// while read-only sits ahead.
+///
+/// The hazard is ordering. A key's values live in up to three places at once
+/// -- sealed extents, bytes staged in the block builder, and bytes still
+/// pending against the key -- and a `put` marks its pending value as replacing
+/// without clearing what it supersedes until the seal happens. Reading those
+/// in the wrong order resurrects deleted values, which this repository has
+/// already done once.
+///
+/// So this compares against a model at every step, with a small buffer so
+/// seals and builder flushes happen mid-run rather than never.
+#[test]
+fn a_writer_reads_its_own_writes() {
+    let _flag = CHECKSUM_FLAG.lock().unwrap_or_else(|e| e.into_inner());
+    for reclaim in [
+        supdb::Reclaim::AfterReads,
+        supdb::Reclaim::Never,
+        supdb::Reclaim::OnClose,
+    ] {
+        let dir = std::env::temp_dir().join(format!("supdb-kb-ryow-{reclaim:?}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s.dat");
+        let store = supdb::Store::create(
+            &file,
+            supdb::Options {
+                // Small, so sealing and flushing happen during the run and the
+                // three-places-at-once case is actually exercised.
+                buffer_bytes: 64 << 10,
+                reclaim,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut model: std::collections::BTreeMap<String, Vec<Vec<u8>>> =
+            std::collections::BTreeMap::new();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for step in 0..12_000u64 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = format!("k{:05}", x % 400);
+            let v = vec![(step % 251) as u8; 20 + (step % 40) as usize];
+            match x % 8 {
+                0 => {
+                    store.put(k.as_bytes(), &v).unwrap();
+                    model.insert(k.clone(), vec![v]);
+                }
+                1 => {
+                    store.delete(k.as_bytes()).unwrap();
+                    model.remove(&k);
+                }
+                _ => {
+                    store.append(k.as_bytes(), &v).unwrap();
+                    model.entry(k.clone()).or_default().push(v);
+                }
+            }
+            // Check the key just touched every time, and sweep the whole model
+            // periodically -- the cheap check catches ordering, the sweep
+            // catches a key that some other key's seal disturbed.
+            let mut got: Vec<Vec<u8>> = Vec::new();
+            store
+                .read_all(k.as_bytes(), |b| got.push(b.to_vec()))
+                .unwrap();
+            assert_eq!(
+                &got,
+                model.get(&k).unwrap_or(&Vec::new()),
+                "{reclaim:?} step {step}: writer's own view of {k} is wrong"
+            );
+            if step % 1000 == 0 {
+                for (mk, want) in &model {
+                    let mut mg: Vec<Vec<u8>> = Vec::new();
+                    store.read_all(mk.as_bytes(), |b| mg.push(b.to_vec())).unwrap();
+                    assert_eq!(&mg, want, "{reclaim:?} step {step}: sweep found {mk} wrong");
+                }
+            }
+        }
+
+        // And what the writer saw must be what a reader sees after publishing.
+        store.checkpoint().unwrap();
+        let r = supdb::Reader::open(&file).unwrap();
+        for (mk, want) in &model {
+            let mut rg: Vec<Vec<u8>> = Vec::new();
+            r.read_all(mk.as_bytes(), |b| rg.push(b.to_vec())).unwrap();
+            assert_eq!(&rg, want, "{reclaim:?}: reader disagrees with the model on {mk}");
+        }
+        drop(r);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

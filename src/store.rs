@@ -1085,6 +1085,110 @@ impl Store {
     /// a checkpoint that reached the slot but not the data would describe
     /// blocks that do not exist. Blocks written after the last checkpoint are
     /// simply unreachable after a crash -- leaked space, not corruption.
+    /// Read a key's values without publishing anything.
+    ///
+    /// The gap this closes is structural, not incremental. `Store` had no read
+    /// method, so seeing your own write meant `checkpoint()` plus a fresh
+    /// `Reader` -- and until recently that pair cost an index rewrite, two
+    /// device flushes and an O(key count) open. LMDB needs none of it: a write
+    /// is visible to the handle that made it, immediately. That difference is
+    /// the whole of `EXT.3`, and the reason the mixed YCSB workloads sit two
+    /// orders of magnitude behind while read-only sits ahead.
+    ///
+    /// A key's values can be in three places at once, and this reads all
+    /// three, oldest first:
+    ///
+    ///   1. **Sealed extents**, in blocks already written to the file.
+    ///   2. **Staged bytes**, pushed into the block builder but not yet
+    ///      written, so their block id does not exist yet.
+    ///   3. **Pending bytes**, buffered against the key and not yet sealed.
+    ///
+    /// A `put` complicates the order: it marks its pending value `replaces`,
+    /// and the sealed extents it supersedes are not cleared until the seal
+    /// happens. So a pending replacement hides everything before it, and a
+    /// staged replacement hides everything sealed. Getting that wrong would
+    /// resurrect deleted values, which is a bug this repository has already
+    /// had once and keeps a reproducer for.
+    ///
+    /// Returns the number of values emitted.
+    pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
+        let si = self.shard_of(key);
+        let mut sh = self.shards[si].lock().unwrap();
+        let Some(idx) = sh.keys.index_of(key) else {
+            return Ok(0);
+        };
+
+        // Staged members for this key, in the order they were pushed, and
+        // whether any of them replaces what came before.
+        let staged: Vec<(u32, u32, bool)> = sh
+            .members
+            .iter()
+            .filter(|(i, ..)| *i == idx)
+            .map(|(_, off, len, _, replaces)| (*off, *len, *replaces))
+            .collect();
+        let staged_replaces = staged.iter().any(|(_, _, r)| *r);
+
+        let (sealed, pending_buf, pending_replaces) = {
+            let e = sh.keys.entry_at(idx);
+            let sealed = e.extents.as_slice().to_vec();
+            let (buf, repl) = match &e.pending {
+                Some(p) => (p.buf.clone(), p.replaces),
+                None => (Vec::new(), false),
+            };
+            (sealed, buf, repl)
+        };
+
+        let mut n = 0u64;
+        let mut emit_count = |bytes: &[u8], f: &mut F| -> Result<()> {
+            let mut p = 0usize;
+            while p < bytes.len() {
+                let len = get_uvarint(bytes, &mut p) as usize;
+                let end = p
+                    .checked_add(len)
+                    .ok_or_else(|| corrupt("record length overflows"))?;
+                if end > bytes.len() {
+                    return Err(corrupt("record runs past the end of its extent"));
+                }
+                f(&bytes[p..end]);
+                n += 1;
+                p = end;
+            }
+            Ok(())
+        };
+
+        // A replacement anywhere later hides everything earlier.
+        if !pending_replaces && !staged_replaces {
+            for e in &sealed {
+                // read_extent already narrows to the extent's own bytes;
+                // slicing by `off` again reads from the wrong place.
+                let bytes = {
+                    let ap = self.appender.lock().unwrap();
+                    ap.read_extent(*e)?
+                };
+                emit_count(&bytes, &mut f)?;
+            }
+        }
+        if !pending_replaces {
+            // Skip anything a later staged replacement hides.
+            let from = staged
+                .iter()
+                .rposition(|(_, _, r)| *r)
+                .unwrap_or(0);
+            for (off, len, _) in &staged[from..] {
+                let (a, b) = (*off as usize, (*off + *len) as usize);
+                let slice = sh
+                    .builder
+                    .staged()
+                    .get(a..b)
+                    .ok_or_else(|| corrupt("staged extent runs past the builder"))?
+                    .to_vec();
+                emit_count(&slice, &mut f)?;
+            }
+        }
+        emit_count(&pending_buf, &mut f)?;
+        Ok(n)
+    }
+
     /// Publish and persist: make everything written so far visible to new
     /// readers, and flush it to the device according to `Options::sync`.
     pub fn checkpoint(&self) -> Result<u64> {

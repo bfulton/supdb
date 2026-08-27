@@ -227,6 +227,16 @@ impl BlockBuilder {
         off
     }
 
+    /// The bytes staged so far.
+    ///
+    /// A writer that wants to read its own writes has to see extents that are
+    /// in the builder but not yet in a block, because their block id does not
+    /// exist until the builder is flushed. Exposing the buffer is what lets
+    /// `Store::read_all` answer without sealing anything.
+    pub fn staged(&self) -> &[u8] {
+        &self.buf
+    }
+
     pub fn take(&mut self) -> Vec<u8> {
         std::mem::replace(&mut self.buf, Vec::with_capacity(self.cap))
     }

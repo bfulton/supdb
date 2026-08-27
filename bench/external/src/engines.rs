@@ -171,8 +171,10 @@ impl Engine for Supdb {
             // comparison that is meant to price its missing features.
             checksums: true,
             reopen_for_write: false,
-            // Only after a checkpoint and a reader rebuild, both O(keys).
-            read_your_writes: false,
+            // True since `Store::read_all`: the writer reads its own buffered,
+            // staged and sealed state directly, with no checkpoint and no
+            // reader rebuild. It was false when that cost a full publish.
+            read_your_writes: true,
             ordered_scan: true,
         }
     }
@@ -185,10 +187,13 @@ impl Engine for Supdb {
         Ok(())
     }
     fn get(&mut self, key: &[u8]) -> Res<usize> {
-        self.refresh()?;
-        let r = self.reader.as_ref().ok_or("no reader")?;
+        // Read the writer's own state. This used to call `refresh`, which
+        // checkpoints and reopens a Reader -- the read-your-writes path that
+        // put the mixed YCSB workloads two orders of magnitude behind LMDB,
+        // which needs neither.
+        let s = self.store.as_ref().ok_or("store closed")?;
         let mut n = 0usize;
-        r.read_all(key, |v| n += v.len())
+        s.read_all(key, |v| n += v.len())
             .map_err(|e| e.to_string())?;
         Ok(n)
     }
