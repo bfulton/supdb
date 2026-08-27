@@ -95,6 +95,7 @@ fn main() -> std::io::Result<()> {
             "f13-sync" => f13_sync(&args, profile)?,
             "f14-blocktable" => f14_blocktable(&args, profile)?,
             "f15-scancache" => f15_scancache(&args, profile)?,
+            "f16-slack" => f16_slack(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -123,6 +124,7 @@ fn main() -> std::io::Result<()> {
                 "f13-sync",
                 "f14-blocktable",
                 "f15-scancache",
+                "f16-slack",
                 "f4-durability",
                 "f3-multiproc",
                 "f1-outofcore",
@@ -1687,6 +1689,102 @@ fn f15_scancache(args: &Args, profile: Profile) -> std::io::Result<Record> {
         ),
     ));
     let _ = std::fs::remove_file(&file);
+    Ok(rec)
+}
+
+/// What does writing the key index's slack region cost?
+///
+/// The flat index reserves half its record region again so an in-place
+/// checkpoint has somewhere to put a lengthened record. Nothing reads that
+/// region until an update writes into it, and a file that has never been
+/// written there reads back zeroes either way -- so it can be reserved without
+/// being sent to the disk. At 1M keys it is 18MB of a 63MB index, on a bulk
+/// load that is bound by bytes written: this machine writes 986MB/s direct and
+/// 207MB/s through fsync, and both Supdb and LMDB load at around 100MB/s.
+///
+/// Throughput never travels alone, so this reports device-level write bytes
+/// from `/proc/self/io` beside it -- measured, not inferred from file size,
+/// which cannot see a hole at all.
+fn f16_slack(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+
+    let mut rec = Record::new("f16-slack", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .note("both arms interleaved in one process; the only difference is Options::write_index_slack");
+
+    let dir = scratch("f16");
+    let payload = Payload::new(value_size, 0.5, 0x16);
+    let on = [false, true];
+    let written = std::sync::Mutex::new([0u64; 2]);
+    let sizes = std::sync::Mutex::new([0u64; 2]);
+
+    let load = Trial::new(profile.reps()).run(2, |ci, rep| {
+        let file = dir.join(format!("s{ci}-{rep}.dat"));
+        let store = Store::create(
+            &file,
+            Options {
+                write_index_slack: on[ci],
+                ..default_opts(128)
+            },
+        )
+        .expect("create");
+        let mut vrng = Rng::new(0x16);
+        let mut kb = [0u8; 16];
+        let io0 = supdb::bench::env::IoCounters::read_now();
+        let t = Instant::now();
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+        }
+        store.flush().expect("flush");
+        store.checkpoint().expect("checkpoint");
+        let secs = t.elapsed().as_secs_f64();
+        let io = supdb::bench::env::IoCounters::read_now().since(&io0);
+        written.lock().unwrap()[ci] = io.write_bytes;
+        sizes.lock().unwrap()[ci] = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+        let _ = store.close();
+        let _ = std::fs::remove_file(&file);
+        keys as f64 / secs
+    });
+
+    let cmp = compare(&load[0], &load[1], supdb::bench::MIN_EFFECT);
+    let (sparse, dense) = (load[0].median(), load[1].median());
+    let w = *written.lock().unwrap();
+    let sz = *sizes.lock().unwrap();
+    rec.compare("hole_vs_written", cmp.clone());
+    rec.series(
+        "arms",
+        jobj! {
+            "hole_ops_per_s" => J::fp(sparse, 1),
+            "written_ops_per_s" => J::fp(dense, 1),
+            "hole_write_bytes" => J::u(w[0]),
+            "written_write_bytes" => J::u(w[1]),
+            "hole_file_bytes" => J::u(sz[0]),
+            "written_file_bytes" => J::u(sz[1]),
+        },
+    );
+    rec.finding(Finding::new(
+        "F16.1",
+        "not writing the index slack is worth measuring on a bulk load",
+        matches!(cmp.verdict, supdb::bench::stats::Verdict::Greater),
+        format!(
+            "{sparse:.0} ops/s leaving the slack a hole against {dense:.0} writing it ({})",
+            cmp.summary("hole", "written")
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F16.2",
+        "the two arms produce the same file size",
+        sz[0] == sz[1],
+        format!(
+            "{} bytes against {} bytes, with {} against {} sent to the device. The apparent size \
+             is identical because the slack is reserved either way; the difference is a hole, \
+             which file size cannot see and /proc/self/io can",
+            sz[0], sz[1], w[0], w[1]
+        ),
+    ));
     Ok(rec)
 }
 

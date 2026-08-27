@@ -245,6 +245,16 @@ pub struct Options {
     /// decides how large extents get before they are forced out.
     pub buffer_bytes: usize,
     pub compress: bool,
+    /// Write the flat key index's slack region instead of leaving it a hole.
+    ///
+    /// The index reserves half its record region again as slack so that an
+    /// in-place checkpoint has somewhere to put a lengthened record. Nothing
+    /// reads that region until an update writes into it, and a file that has
+    /// never been written there reads back zeroes either way -- so the bytes
+    /// can be reserved without being sent to the disk. At 1M keys the slack is
+    /// 18MB of a 63MB index. Off is the default; on is the old behaviour, kept
+    /// so `f16-slack` can price it in one process.
+    pub write_index_slack: bool,
     /// Independent write shards.
     ///
     /// More of them means each key table is smaller and its working set is
@@ -352,6 +362,7 @@ impl Default for Options {
             // latency-bound, which is why this is an option and not a
             // deletion.
             compress: false,
+            write_index_slack: false,
             shards: 64,
             cache_blocks: 4096,
             solo_threshold: 16 * 1024,
@@ -1365,8 +1376,8 @@ impl Store {
         // section. It declines on inputs it cannot address -- a key over 64KiB,
         // or a record region past 4GiB -- and falling back to the varint
         // encoder is correct there rather than an error.
-        let (key_idx, flat) = if in_place {
-            (Vec::new(), true)
+        let (key_idx, key_reserve, flat) = if in_place {
+            (Vec::new(), 0usize, true)
         } else {
             let ap = self.appender.lock().unwrap();
             let prev = ap.last_index.map(|loc| (loc, ap.generation, ap.timestamp));
@@ -1386,8 +1397,12 @@ impl Store {
                 None
             };
             match encoded {
-                Some(v) => (v, true),
-                None => (encode_key_index(&all, gen, prev), false),
+                Some((v, reserve)) => (v, reserve, true),
+                None => {
+                    let v = encode_key_index(&all, gen, prev);
+                    let n = v.len();
+                    (v, n, false)
+                }
             }
         };
         let mut ap = self.appender.lock().unwrap();
@@ -1406,11 +1421,17 @@ impl Store {
         // An in-place checkpoint leaves the key section exactly where it was.
         let key_loc = match (in_place, ap.last_index) {
             (true, Some(loc)) => loc,
-            _ if flat => write_section_raw(&mut ap, &key_idx, self.opts.reclaim)?,
+            _ if flat => {
+                let mut payload = key_idx;
+                if self.opts.write_index_slack {
+                    payload.resize(key_reserve, 0);
+                }
+                write_section_raw(&mut ap, &payload, key_reserve, self.opts.reclaim)?
+            }
             _ => write_section(&mut ap, &key_idx, self.opts.reclaim)?,
         };
         let blk_loc = if blk_flat {
-            write_section_raw(&mut ap, &blk_idx, self.opts.reclaim)?
+            write_section_raw(&mut ap, &blk_idx, blk_idx.len(), self.opts.reclaim)?
         } else {
             write_section(&mut ap, &blk_idx, self.opts.reclaim)?
         };
@@ -1898,7 +1919,22 @@ fn place_section(ap: &mut Appender, len: u32, policy: Reclaim, align: u64) -> (u
     (off, cap)
 }
 
-fn write_section_raw(ap: &mut Appender, payload: &[u8], policy: Reclaim) -> Result<BlockLoc> {
+/// Write a section verbatim, reserving `reserve` bytes for it.
+///
+/// `reserve` may exceed `payload.len()`. The flat key index ends in a run of
+/// slack that only in-place updates ever write into: reserving it without
+/// writing it leaves a hole, which reads back as the same zeroes and costs no
+/// bandwidth. At 1M keys that slack is half the record region.
+///
+/// The checksum covers the bytes actually written. A section whose tail is
+/// rewritten in place by design has no stable whole-section checksum to take,
+/// which is why nothing verifies one for this section.
+fn write_section_raw(
+    ap: &mut Appender,
+    payload: &[u8],
+    reserve: usize,
+    policy: Reclaim,
+) -> Result<BlockLoc> {
     use std::os::unix::fs::FileExt;
     // Aligned in the *file*, not just within itself.
     //
@@ -1911,11 +1947,12 @@ fn write_section_raw(ap: &mut Appender, payload: &[u8], policy: Reclaim) -> Resu
     // `keys()` stayed correct -- the header parsed, the records did not --
     // and it tracked checkpoint count rather than key count, which is what
     // made it look like a scale bug.
-    let (off, cap) = place_section(ap, payload.len() as u32, policy, 8);
+    let len = reserve.max(payload.len()) as u32;
+    let (off, cap) = place_section(ap, len, policy, 8);
     let loc = BlockLoc {
         off,
-        stored: payload.len() as u32,
-        uncompressed: payload.len() as u32,
+        stored: len,
+        uncompressed: len,
         cap,
         chunked: false,
         solo: false,

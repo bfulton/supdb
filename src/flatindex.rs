@@ -88,6 +88,11 @@ pub struct Plan {
     /// Record offset of each key, in sorted order.
     pub rec_offs: Vec<u32>,
     pub total: usize,
+    /// Bytes with anything in them. The slack is a trailing run of zeroes that
+    /// only in-place updates ever write to, so it does not have to be built in
+    /// memory or written to disk to be reserved -- a file can hold it as a
+    /// hole and read back the same zeroes for free.
+    pub written: usize,
 }
 
 fn record_len(klen: usize, next: usize) -> usize {
@@ -137,6 +142,7 @@ pub fn plan(all: &[(Vec<u8>, crate::index::Extents)]) -> Option<Plan> {
         recs_cap,
         rec_offs,
         total,
+        written: HEADER + cap * SLOT + all.len() * 4 + at,
     })
 }
 
@@ -150,9 +156,12 @@ pub fn encode(
     generation: u64,
     prev: Option<(u64, u64, u64, u64, u64)>,
     hash_of: fn(&[u8]) -> u64,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, usize)> {
     let p = plan(all)?;
-    let mut out = vec![0u8; p.total];
+    // Only the part with anything in it. The header still describes the full
+    // reserved region, so a reader maps the slack and an in-place update
+    // writes into it; it simply is not built here and not written.
+    let mut out = vec![0u8; p.written];
 
     let hash_off = HEADER;
     let dir_off = hash_off + p.hash_cap * SLOT;
@@ -221,7 +230,7 @@ pub fn encode(
             s = (s + 1) & mask;
         }
     }
-    Some(out)
+    Some((out, p.total))
 }
 
 /// A validated view of a mapped index: where the three regions are, and
@@ -490,6 +499,15 @@ mod tests {
     use super::*;
     use crate::index::Extents;
 
+    /// `encode` returns only the bytes with anything in them; the file holds
+    /// the rest as a hole that reads back as zeroes. A test reading the section
+    /// has to see what a reader sees, so it fills the hole in.
+    fn padded(x: (Vec<u8>, usize)) -> Vec<u8> {
+        let (mut v, reserve) = x;
+        v.resize(reserve, 0);
+        v
+    }
+
     fn h(key: &[u8]) -> u64 {
         let mut x: u64 = 0xcbf2_9ce4_8422_2325;
         for &b in key {
@@ -528,7 +546,7 @@ mod tests {
     #[test]
     fn every_key_is_found_with_its_extents() {
         let all = corpus(5000);
-        let sec = encode(&all, 7, None, h).expect("encode");
+        let sec = padded(encode(&all, 7, None, h).expect("encode"));
         let ix = FlatIndex::parse(&sec).expect("parse");
         assert_eq!(ix.len(), all.len());
         assert_eq!(ix.generation, 7);
@@ -541,7 +559,7 @@ mod tests {
     #[test]
     fn absent_keys_are_absent() {
         let all = corpus(2000);
-        let sec = encode(&all, 1, None, h).unwrap();
+        let sec = padded(encode(&all, 1, None, h).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         for i in 0..2000 {
             let k = format!("absent{i:012}").into_bytes();
@@ -552,7 +570,7 @@ mod tests {
     #[test]
     fn rank_order_matches_key_order() {
         let all = corpus(1000);
-        let sec = encode(&all, 1, None, h).unwrap();
+        let sec = padded(encode(&all, 1, None, h).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         for (i, (k, e)) in all.iter().enumerate() {
             let (gk, ge) = ix.at(&sec, i).expect("rank present");
@@ -565,7 +583,7 @@ mod tests {
     #[test]
     fn seek_finds_the_first_key_at_or_after() {
         let all = corpus(500);
-        let sec = encode(&all, 1, None, h).unwrap();
+        let sec = padded(encode(&all, 1, None, h).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         for (i, (k, _)) in all.iter().enumerate() {
             assert_eq!(ix.seek(&sec, k), i);
@@ -579,7 +597,7 @@ mod tests {
     #[test]
     fn damage_never_panics() {
         let all = corpus(300);
-        let sec = encode(&all, 1, None, h).unwrap();
+        let sec = padded(encode(&all, 1, None, h).unwrap());
         for i in 0..sec.len() {
             for bit in [0x01u8, 0x80] {
                 let mut d = sec.clone();
@@ -600,7 +618,7 @@ mod tests {
     #[test]
     fn truncation_never_panics() {
         let all = corpus(200);
-        let sec = encode(&all, 1, None, h).unwrap();
+        let sec = padded(encode(&all, 1, None, h).unwrap());
         for cut in 0..sec.len() {
             if let Some(ix) = FlatIndex::parse(&sec[..cut]) {
                 for (k, _) in all.iter().take(20) {
@@ -615,7 +633,7 @@ mod tests {
 
     #[test]
     fn an_empty_index_round_trips() {
-        let sec = encode(&[], 3, None, h).unwrap();
+        let sec = padded(encode(&[], 3, None, h).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         assert_eq!(ix.len(), 0);
         assert!(ix.lookup(&sec, b"anything", h).is_none());
@@ -625,7 +643,7 @@ mod tests {
     #[test]
     fn the_previous_index_is_carried() {
         let all = corpus(10);
-        let sec = encode(&all, 9, Some((8, 1234, 4096, 100, 200)), h).unwrap();
+        let sec = padded(encode(&all, 9, Some((8, 1234, 4096, 100, 200)), h).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         assert_eq!(ix.prev, Some((8, 1234, 4096, 100, 200)));
     }

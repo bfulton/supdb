@@ -435,6 +435,20 @@
    "profile": "full",
    "expect": "holds",
    "because": "Holding the current block across a scan's entries is worth 1.201x at 1M keys (17,342,159 against 14,441,442 entries/s, p=0.0022). A scan walks keys in rank order and consecutive keys usually share a block, so resolving one per entry re-reads the block table, re-bounds-checks the mapping and re-tests a checksum bit to learn what the previous entry already established. Finding it also turned up that the block was resolved *twice* per entry, since `check_extent` resolved it and then the read resolved it again; that fix is in both arms, so this figure understates what the work was worth. Worth recording that this is the sort of cost an instruction profile can see and a syscall-blind one cannot -- the exact opposite of the fsync case in f13."
+  },
+  {
+   "experiment": "f16-slack",
+   "id": "F16.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Leaving the index slack as a hole does not measurably speed up a bulk load: 1,127,944 ops/s against 973,803, ratio 1.158 at p=0.0553 -- over the line, so no difference. The hypothesis was that a load is bound by bytes written, since this machine writes 986MB/s direct and 207MB/s through fsync while both Supdb and LMDB load at around 100MB/s. The bytes did fall by 10.2% (F16.2) and the time did not follow, which says the load is not purely bandwidth-bound after all. Recorded as failing rather than quietly dropped: the change is kept because it writes 18MB less, not because it was shown to be faster."
+  },
+  {
+   "experiment": "f16-slack",
+   "id": "F16.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Both arms produce a 176,681,680-byte file, and send 157,949,952 against 175,951,872 bytes to the device -- 18MB, 10.2% fewer, for the same store. The flat index reserves half its record region again as slack so an in-place checkpoint has somewhere to put a lengthened record; nothing reads that region until an update writes into it, and an unwritten hole reads back as the same zeroes. This is exactly the pair CLAUDE.md means by measuring write amplification from /proc/self/io rather than inferring it from file size: file size cannot see a hole, and here the two answers differ by 18MB."
   }
  ],
  "metrics": [
