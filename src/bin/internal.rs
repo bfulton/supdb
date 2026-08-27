@@ -97,6 +97,7 @@ fn main() -> std::io::Result<()> {
             "f15-scancache" => f15_scancache(&args, profile)?,
             "f16-slack" => f16_slack(&args, profile)?,
             "f17-gather" => f17_gather(&args, profile)?,
+            "f18-fence" => f18_fence(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -127,6 +128,7 @@ fn main() -> std::io::Result<()> {
                 "f15-scancache",
                 "f16-slack",
                 "f17-gather",
+                "f18-fence",
                 "f4-durability",
                 "f3-multiproc",
                 "f1-outofcore",
@@ -1880,6 +1882,140 @@ fn f17_gather(args: &Args, profile: Profile) -> std::io::Result<Record> {
             c[1]
         ),
     ));
+    Ok(rec)
+}
+
+/// Does a fence make an ordered seek cheaper?
+///
+/// A scan's cost is linear in its length with a large constant: measured at 1M
+/// keys, `1637 + 20.8n` nanoseconds. The per-entry walk is competitive -- at
+/// length 400 it reaches 40M entries/s against LMDB's 47M -- so the whole scan
+/// deficit is that constant, and most of the constant is the seek. A seek
+/// binary-searches the record region, and each probe is two dependent loads at
+/// a scattered offset: the rank directory, then the record.
+///
+/// The fence copies every stride-th key out contiguously so the search can
+/// narrow before it touches a record. What it cannot do anything about is that
+/// the *upper* levels of a binary search over a static array visit the same
+/// few addresses on every search and are already cached; the fence replaces
+/// exactly those, and the expensive lower levels remain. Whether the trade is
+/// positive is the question, and predicting it wrong is why this exists.
+///
+/// Both arms are one process over one file; the fence is in the section either
+/// way and `ReadOptions::seek_fence` decides whether it is consulted.
+fn f18_fence(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let seeks = args.num("--seeks", profile.pick(50_000, 200_000, 500_000)) as u64;
+    let scans = args.num("--scans", profile.pick(5_000, 20_000, 40_000)) as u64;
+
+    let mut rec = Record::new("f18-fence", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .param("seeks", J::u(seeks))
+        .param("scans", J::u(scans))
+        .note("one file, two readers, interleaved; the only difference is ReadOptions::seek_fence");
+
+    let dir = scratch("f18");
+    let file = dir.join("fence.dat");
+    let payload = Payload::new(value_size, 0.5, 0x18);
+    {
+        let store = Store::create(&file, default_opts(128)).expect("create");
+        let mut vrng = Rng::new(0x18);
+        let mut kb = [0u8; 16];
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+        }
+        store.flush().expect("flush");
+        store.close().expect("close");
+    }
+    let on = [true, false];
+    let reader = |ci: usize| {
+        Reader::open_with(
+            &file,
+            supdb::ReadOptions {
+                seek_fence: on[ci],
+                ..Default::default()
+            },
+        )
+        .expect("open")
+    };
+
+    // The seek alone, which is what the fence changes.
+    let seek = Trial::new(profile.reps()).run(2, |ci, rep| {
+        let r = reader(ci);
+        let mut g = KeyGen::new(KeyDist::Uniform, keys, 0x18 + rep as u64);
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        let mut acc = 0usize;
+        for _ in 0..seeks {
+            db_key_into(g.next(), &mut kb);
+            acc += r.seek(&kb);
+        }
+        std::hint::black_box(acc);
+        seeks as f64 / t.elapsed().as_secs_f64()
+    });
+
+    // A 50-entry scan, which is the shape YCSB-E runs and where the seek is
+    // the largest single term.
+    let scan = Trial::new(profile.reps()).run(2, |ci, rep| {
+        let r = reader(ci);
+        let mut g = KeyGen::new(KeyDist::Uniform, keys.saturating_sub(50).max(1), 0x81 + rep as u64);
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        let mut n = 0u64;
+        for _ in 0..scans {
+            db_key_into(g.next(), &mut kb);
+            n += r
+                .scan(Some(&kb), 50, |_k, v| {
+                    std::hint::black_box(v);
+                })
+                .expect("scan");
+        }
+        n as f64 / t.elapsed().as_secs_f64()
+    });
+
+    let seek_cmp = compare(&seek[0], &seek[1], supdb::bench::MIN_EFFECT);
+    let scan_cmp = compare(&scan[0], &scan[1], supdb::bench::MIN_EFFECT);
+    let (sf, sn) = (seek[0].median(), seek[1].median());
+    let (cf, cn) = (scan[0].median(), scan[1].median());
+    rec.compare("seek_fenced_vs_plain", seek_cmp.clone());
+    rec.compare("scan_fenced_vs_plain", scan_cmp.clone());
+    rec.series(
+        "arms",
+        jobj! {
+            "seek_fenced_per_s" => J::fp(sf, 1),
+            "seek_plain_per_s" => J::fp(sn, 1),
+            "seek_fenced_ns" => J::fp(1e9 / sf.max(1e-9), 1),
+            "seek_plain_ns" => J::fp(1e9 / sn.max(1e-9), 1),
+            "scan50_fenced_entries_per_s" => J::fp(cf, 1),
+            "scan50_plain_entries_per_s" => J::fp(cn, 1),
+        },
+    );
+    rec.finding(Finding::new(
+        "F18.1",
+        "narrowing a seek with a fence makes it cheaper",
+        matches!(seek_cmp.verdict, supdb::bench::stats::Verdict::Greater),
+        format!(
+            "{:.0}ns fenced against {:.0}ns plain ({})",
+            1e9 / sf.max(1e-9),
+            1e9 / sn.max(1e-9),
+            seek_cmp.summary("fenced", "plain")
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F18.2",
+        "the fence is worth having on the workload it was built for",
+        matches!(scan_cmp.verdict, supdb::bench::stats::Verdict::Greater),
+        format!(
+            "50-entry scans at {cf:.0} entries/s fenced against {cn:.0} plain ({}). This is the \
+             one that decides whether the fence earns a format version; a seek that got faster \
+             without moving a scan would not",
+            scan_cmp.summary("fenced", "plain")
+        ),
+    ));
+    let _ = std::fs::remove_file(&file);
     Ok(rec)
 }
 

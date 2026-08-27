@@ -37,9 +37,15 @@ use crate::index::Ext;
 
 /// "SFIX", little-endian.
 const MAGIC: u32 = 0x5849_4653;
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 /// Header size, padded so the hash region starts 8-byte aligned.
-const HEADER: usize = 128;
+///
+/// Version 1 was 128 and used every slot but the last. Version 2 adds the
+/// fence, which needs three more. The version is bumped with the size: a
+/// reader that took a v1 header for a v2 one would read the fence offset as a
+/// record offset, and this repository has already shipped one misparse that
+/// presented as file corruption.
+const HEADER: usize = 192;
 /// Bytes per hash slot: a tag in the top eight bits, a record offset below.
 const SLOT: usize = 8;
 /// Records are 4-aligned so an extent array can be borrowed as `&[Ext]`.
@@ -58,6 +64,36 @@ const REC_ALIGN: usize = 4;
 /// reclaims every superseded record at the same time.
 const SLACK_NUM: usize = 1;
 const SLACK_DEN: usize = 2;
+
+/// Every `stride`-th key, copied out contiguously, so an ordered seek can
+/// binary-search a small hot array instead of the record region.
+///
+/// A seek was a binary search over the records themselves: about twenty probes
+/// for a million keys, each landing at a scattered offset in a 36MB region,
+/// each a cache miss. Measured, that is 1,637ns fixed per scan -- 61% of a
+/// 50-entry scan and 44% of a 100-entry one -- while the per-entry walk costs
+/// 20.8ns and is already competitive. The entire scan deficit against LMDB is
+/// this seek; LMDB descends a B-tree in about three page touches.
+///
+/// The fence holds whole keys, not prefixes. The obvious encoding -- the first
+/// eight bytes of each key -- is worthless on the keys this suite uses: they
+/// are sixteen zero-padded ASCII digits, so for a million keys the first ten
+/// bytes are identical on every one of them. Whole keys cost more space and
+/// work for any key shape.
+fn fence_target() -> usize {
+    std::env::var("SUPDB_FENCE_TARGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16384)
+}
+const FENCE_MIN_STRIDE: usize = 16;
+
+/// Stride for `n` keys: enough entries to narrow the search hard, few enough
+/// that the fence stays small enough to sit in cache.
+fn fence_stride(n: usize) -> usize {
+    let want = n.div_ceil(fence_target()).max(FENCE_MIN_STRIDE);
+    want.next_power_of_two()
+}
 
 /// Offsets are 32-bit, so the record region is bounded. At the ~40 bytes per
 /// key this format uses that is about 100M keys, past which the caller falls
@@ -87,6 +123,13 @@ pub struct Plan {
     pub recs_cap: usize,
     /// Record offset of each key, in sorted order.
     pub rec_offs: Vec<u32>,
+    /// Fence: number of entries, the stride they were sampled at, where the
+    /// offset array starts and where the key blob starts.
+    pub fence_n: usize,
+    pub fence_stride: usize,
+    pub fence_offs_off: usize,
+    pub fence_blob_off: usize,
+    pub fence_blob_len: usize,
     pub total: usize,
     /// Bytes with anything in them. The slack is a trailing run of zeroes that
     /// only in-place updates ever write to, so it does not have to be built in
@@ -135,14 +178,34 @@ pub fn plan(all: &[(&[u8], &crate::index::Extents)]) -> Option<Plan> {
     if recs_cap > MAX_RECS {
         return None;
     }
-    let total = HEADER + cap * SLOT + all.len() * 4 + recs_cap;
+
+    // The fence samples every `stride`-th key. `fence_n + 1` offsets, so an
+    // entry's key is the span between its offset and the next.
+    let stride = fence_stride(all.len());
+    let fence_n = all.len().div_ceil(stride);
+    let fence_blob_len: usize = (0..fence_n)
+        .map(|i| all[i * stride].0.len())
+        .try_fold(0usize, |a, b| a.checked_add(b))?;
+
+    let fence_offs_off = HEADER + cap * SLOT + all.len() * 4;
+    let fence_offs_len = if fence_n == 0 { 0 } else { (fence_n + 1) * 4 };
+    let fence_blob_off = fence_offs_off + fence_offs_len;
+    // Records are 4-aligned within the section, and the blob is bytes, so the
+    // record region is realigned after it.
+    let recs_off = align_up(fence_blob_off + fence_blob_len, REC_ALIGN);
+    let total = recs_off + recs_cap;
     Some(Plan {
         hash_cap: cap,
         recs_len: at,
         recs_cap,
         rec_offs,
+        fence_n,
+        fence_stride: stride,
+        fence_offs_off,
+        fence_blob_off,
+        fence_blob_len,
         total,
-        written: HEADER + cap * SLOT + all.len() * 4 + at,
+        written: recs_off + at,
     })
 }
 
@@ -165,7 +228,7 @@ pub fn encode(
 
     let hash_off = HEADER;
     let dir_off = hash_off + p.hash_cap * SLOT;
-    let recs_off = dir_off + all.len() * 4;
+    let recs_off = p.total - p.recs_cap;
 
     out[0..4].copy_from_slice(&MAGIC.to_le_bytes());
     out[4..8].copy_from_slice(&VERSION.to_le_bytes());
@@ -186,6 +249,9 @@ pub fn encode(
         p.recs_cap as u64,
         // Bump cursor: where the next in-place update writes its record.
         p.recs_len as u64,
+        p.fence_offs_off as u64,
+        p.fence_n as u64,
+        p.fence_stride as u64,
     ]
     .iter()
     .enumerate()
@@ -211,6 +277,21 @@ pub fn encode(
         }
         let d = dir_off + i * 4;
         out[d..d + 4].copy_from_slice(&p.rec_offs[i].to_le_bytes());
+    }
+
+    // The fence: every stride-th key copied out, with one more offset than
+    // entries so an entry's key is the span to the next.
+    let mut blob_at = p.fence_blob_off;
+    for i in 0..p.fence_n {
+        let k = all[i * p.fence_stride].0;
+        let o = p.fence_offs_off + i * 4;
+        out[o..o + 4].copy_from_slice(&((blob_at - p.fence_blob_off) as u32).to_le_bytes());
+        out[blob_at..blob_at + k.len()].copy_from_slice(k);
+        blob_at += k.len();
+    }
+    if p.fence_n > 0 {
+        let o = p.fence_offs_off + p.fence_n * 4;
+        out[o..o + 4].copy_from_slice(&(p.fence_blob_len as u32).to_le_bytes());
     }
 
     let mask = p.hash_cap - 1;
@@ -253,6 +334,12 @@ pub struct FlatIndex {
     recs_off: usize,
     recs_cap: usize,
     bump: usize,
+    /// Fence offsets, fence blob, entry count and stride. Zero entries means
+    /// no fence, and `seek` falls back to searching the records.
+    fence_offs: (usize, usize),
+    fence_blob: (usize, usize),
+    fence_n: usize,
+    fence_stride: usize,
     pub generation: u64,
     pub prev: Option<(u64, u64, u64, u64, u64)>,
 }
@@ -287,6 +374,9 @@ impl FlatIndex {
         let recs_len = rd_u64(sec, 96)? as usize;
         let recs_cap = rd_u64(sec, 104)?.max(recs_len as u64) as usize;
         let bump = rd_u64(sec, 112)?.clamp(recs_len as u64, recs_cap as u64) as usize;
+        let fence_offs_off = rd_u64(sec, 120)? as usize;
+        let fence_n = rd_u64(sec, 128)? as usize;
+        let fence_stride = rd_u64(sec, 136)? as usize;
 
         if hash_cap == 0 || !hash_cap.is_power_of_two() {
             return None;
@@ -303,6 +393,38 @@ impl FlatIndex {
         {
             return None;
         }
+
+        // The fence is an optimisation, so a fence that does not check out is
+        // dropped rather than failing the open: the records are still the
+        // authority and searching them is still correct, just slower. What is
+        // not acceptable is trusting an offset out of a damaged file.
+        let (fence_offs, fence_blob, fence_n, fence_stride) = (|| {
+            if fence_n == 0 || fence_stride == 0 || fence_n > nkeys {
+                return None;
+            }
+            if fence_n != nkeys.div_ceil(fence_stride) {
+                return None;
+            }
+            let offs_end = fence_offs_off.checked_add(fence_n.checked_add(1)?.checked_mul(4)?)?;
+            if fence_offs_off < dir_end || offs_end > recs_off {
+                return None;
+            }
+            let offs = sec.get(fence_offs_off..offs_end)?;
+            // The last offset is the blob length, and the blob sits directly
+            // after the offsets.
+            let blob_len = rd_u32(offs, fence_n * 4)? as usize;
+            let blob_end = offs_end.checked_add(blob_len)?;
+            if blob_end > recs_off {
+                return None;
+            }
+            Some((
+                (fence_offs_off, offs_end),
+                (offs_end, blob_end),
+                fence_n,
+                fence_stride,
+            ))
+        })()
+        .unwrap_or(((0, 0), (0, 0), 0, 0));
         Some(FlatIndex {
             hash: (hash_off, hash_end),
             dir: (dir_off, dir_end),
@@ -313,6 +435,10 @@ impl FlatIndex {
             recs_off,
             recs_cap,
             bump,
+            fence_offs,
+            fence_blob,
+            fence_n,
+            fence_stride,
             generation,
             prev: if prev_off > 0 {
                 Some((prev_gen, prev_ts, prev_off, prev_stored, prev_unc))
@@ -479,10 +605,92 @@ impl FlatIndex {
     }
 
     /// Position of the first key at or after `key`.
-    pub fn seek(&self, sec: &[u8], key: &[u8]) -> usize {
-        let (mut lo, mut hi) = (0usize, self.nkeys);
+    /// The fence key at entry `i`, borrowed from the blob.
+    fn fence_key<'a>(&self, sec: &'a [u8], i: usize) -> Option<&'a [u8]> {
+        if i >= self.fence_n {
+            return None;
+        }
+        let offs = sec.get(self.fence_offs.0..self.fence_offs.1)?;
+        let a = rd_u32(offs, i * 4)? as usize;
+        let b = rd_u32(offs, (i + 1) * 4)? as usize;
+        if a > b {
+            return None;
+        }
+        let blob = sec.get(self.fence_blob.0..self.fence_blob.1)?;
+        blob.get(a..b)
+    }
+
+    /// The rank range a key can lie in, according to the fence.
+    ///
+    /// Entry `i` is the key at rank `i * stride`, so finding the last entry not
+    /// greater than the target bounds the answer to one stride. The narrowing
+    /// is a binary search over a few hundred kilobytes of contiguous keys
+    /// rather than over tens of megabytes of scattered records.
+    fn fence_window(&self, sec: &[u8], key: &[u8]) -> (usize, usize) {
+        if self.fence_n == 0 || self.fence_stride == 0 {
+            return (0, self.nkeys);
+        }
+        let (mut lo, mut hi) = (0usize, self.fence_n);
         while lo < hi {
             let mid = (lo + hi) / 2;
+            match self.fence_key(sec, mid).map(|k| k.cmp(key)) {
+                Some(std::cmp::Ordering::Less) => lo = mid + 1,
+                // A fence entry that will not read sorts as "not less", the
+                // same rule the record search uses. That alone does not make
+                // the fence safe -- see `seek_with`, which checks the answer.
+                _ => hi = mid,
+            }
+        }
+        // `lo` is the first entry >= key, so the answer is at or after the
+        // entry before it and strictly before `lo`'s own stride boundary.
+        let start = lo.saturating_sub(1) * self.fence_stride;
+        let end = (lo * self.fence_stride).min(self.nkeys).max(start);
+        (start, end)
+    }
+
+    /// `fence` selects the arm: `f18-fence` runs both over one file.
+    pub fn seek_with(&self, sec: &[u8], key: &[u8], fence: bool) -> usize {
+        if fence && self.fence_n > 0 {
+            let (lo, hi) = self.fence_window(sec, key);
+            let r = self.search(sec, key, lo, hi);
+            // The fence is a hint, and a hint out of a file a corruption
+            // experiment damages has to be checked against the authority. A
+            // fence entry that will not read widens the window harmlessly, but
+            // one whose *bytes* were flipped still compares -- just wrongly --
+            // and can move the window past the answer. Two record probes catch
+            // that, against the twenty the fence saved, and a fence that fails
+            // them costs a full search rather than a wrong answer.
+            if self.brackets(sec, key, r) {
+                return r;
+            }
+        }
+        self.search(sec, key, 0, self.nkeys)
+    }
+
+    /// Is `r` the first rank whose key is not less than `key`?
+    fn brackets(&self, sec: &[u8], key: &[u8], r: usize) -> bool {
+        if r > self.nkeys {
+            return false;
+        }
+        if r > 0 {
+            match self.at(sec, r - 1).map(|(k, _)| k.cmp(key)) {
+                Some(std::cmp::Ordering::Less) => {}
+                _ => return false,
+            }
+        }
+        if r < self.nkeys {
+            match self.at(sec, r).map(|(k, _)| k.cmp(key)) {
+                Some(std::cmp::Ordering::Less) => return false,
+                None => return false,
+                _ => {}
+            }
+        }
+        true
+    }
+
+    fn search(&self, sec: &[u8], key: &[u8], mut lo: usize, mut hi: usize) -> usize {
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
             match self.at(sec, mid).map(|(k, _)| k.cmp(key)) {
                 Some(std::cmp::Ordering::Less) => lo = mid + 1,
                 // A record that will not decode sorts as "not less", which
@@ -586,16 +794,92 @@ mod tests {
         assert!(ix.at(&sec, all.len()).is_none());
     }
 
+    /// The fence is an optimisation, so the only thing that makes it safe is
+    /// that it cannot change an answer. Both arms are held to the same one for
+    /// every present key, every gap between keys, and both ends.
+    #[test]
+    fn the_fence_never_changes_where_a_seek_lands() {
+        for n in [0usize, 1, 17, 64, 65, 5000] {
+            let all = corpus(n);
+            let sec = padded(encode(&refs(&all), 1, None, h).unwrap());
+            let ix = FlatIndex::parse(&sec).expect("parse");
+            let mut probes: Vec<Vec<u8>> = Vec::new();
+            for (k, _) in &all {
+                probes.push(k.clone());
+                let mut before = k.clone();
+                before.pop();
+                probes.push(before);
+                let mut after = k.clone();
+                after.push(0xff);
+                probes.push(after);
+            }
+            probes.push(Vec::new());
+            probes.push(vec![0xff; 32]);
+            for p in &probes {
+                assert_eq!(
+                    ix.seek_with(&sec, p, true),
+                    ix.seek_with(&sec, p, false),
+                    "n={n} disagreed on {p:?}"
+                );
+            }
+        }
+    }
+
+    /// Damage anywhere in the fence must not change an answer.
+    ///
+    /// The first version of this test damaged the whole section and required
+    /// the two arms to agree, which is not a property anyone can have: a
+    /// flipped byte in the *records* leaves the array unsorted, and then both
+    /// arms binary-search a broken order and land in different wrong places.
+    /// The records are the authority, so what has to hold is that consulting
+    /// the fence never changes what the authority says -- which is why
+    /// `seek_with` checks the fence's conclusion against two records rather
+    /// than trusting it.
+    #[test]
+    fn a_damaged_fence_never_changes_an_answer() {
+        let all = corpus(2000);
+        let clean = padded(encode(&refs(&all), 1, None, h).unwrap());
+        // Header fields: the fence offsets start at 120, the records at 88.
+        let fence_from = rd_u64(&clean, 120).unwrap() as usize;
+        let fence_to = rd_u64(&clean, 88).unwrap() as usize;
+        assert!(fence_from > 0 && fence_from < fence_to);
+        let truth: Vec<usize> = all
+            .iter()
+            .step_by(53)
+            .map(|(k, _)| {
+                let ix = FlatIndex::parse(&clean).unwrap();
+                ix.seek_with(&clean, k, false)
+            })
+            .collect();
+        let mut damaged = 0usize;
+        for i in (fence_from..fence_to).step_by(7) {
+            let mut sec = clean.clone();
+            sec[i] ^= 0xff;
+            let Some(ix) = FlatIndex::parse(&sec) else {
+                continue;
+            };
+            damaged += 1;
+            for ((k, _), want) in all.iter().step_by(53).zip(&truth) {
+                assert_eq!(
+                    ix.seek_with(&sec, k, true),
+                    *want,
+                    "byte {i} of the fence changed a seek"
+                );
+            }
+        }
+        assert!(damaged > 100, "only {damaged} damaged sections were parsed");
+    }
+
     #[test]
     fn seek_finds_the_first_key_at_or_after() {
         let all = corpus(500);
         let sec = padded(encode(&refs(&all), 1, None, h).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         for (i, (k, _)) in all.iter().enumerate() {
-            assert_eq!(ix.seek(&sec, k), i);
+            assert_eq!(ix.seek_with(&sec, k, true), i);
         }
-        assert_eq!(ix.seek(&sec, b"\x00"), 0);
-        assert_eq!(ix.seek(&sec, b"\xff"), all.len());
+        assert_eq!(ix.seek_with(&sec, b"\x00", true), 0);
+        assert_eq!(ix.seek_with(&sec, b"\xff", true), all.len());
     }
 
     /// The reason this module exists rather than a struct with a `decode`:
@@ -615,7 +899,7 @@ mod tests {
                     for r in 0..ix.len().min(40) {
                         let _ = ix.at(&sec, r);
                     }
-                    let _ = ix.seek(&sec, b"key000000000100");
+                    let _ = ix.seek_with(&sec, b"key000000000100", true);
                 }
             }
         }
@@ -643,7 +927,7 @@ mod tests {
         let ix = FlatIndex::parse(&sec).unwrap();
         assert_eq!(ix.len(), 0);
         assert!(ix.lookup(&sec, b"anything", h).is_none());
-        assert_eq!(ix.seek(&sec, b"anything"), 0);
+        assert_eq!(ix.seek_with(&sec, b"anything", true), 0);
     }
 
     #[test]

@@ -185,6 +185,13 @@ pub struct ReadOptions {
     /// for an answer that has not changed. Off is the old behaviour, kept so
     /// `f15-scancache` can measure the difference in one process.
     pub scan_block_cache: bool,
+    /// Narrow an ordered seek with the index's fence before searching records.
+    ///
+    /// A seek without it binary-searches the record region directly: about
+    /// twenty probes for a million keys, each at a scattered offset in a 36MB
+    /// region. Off is the old behaviour, kept so `f18-fence` can price it in
+    /// one process over one file.
+    pub seek_fence: bool,
 }
 
 impl Default for ReadOptions {
@@ -192,6 +199,7 @@ impl Default for ReadOptions {
         ReadOptions {
             mapped_blocks: true,
             scan_block_cache: true,
+            seek_fence: true,
         }
     }
 }
@@ -2208,14 +2216,14 @@ impl Idx {
         }
     }
 
-    fn seek(&self, mmap: &Mmap, key: &[u8]) -> usize {
+    fn seek(&self, mmap: &Mmap, key: &[u8], fence: bool) -> usize {
         match self {
             Idx::Heap { entries, .. } => {
                 match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
                     Ok(i) | Err(i) => i,
                 }
             }
-            Idx::Flat { meta, .. } => meta.seek(self.section(mmap), key),
+            Idx::Flat { meta, .. } => meta.seek_with(self.section(mmap), key, fence),
         }
     }
 
@@ -3128,7 +3136,7 @@ impl Reader {
 
     /// Position of the first key at or after `key`.
     pub fn seek(&self, key: &[u8]) -> usize {
-        self.idx.seek(&self.mmap, key)
+        self.idx.seek(&self.mmap, key, self.opts.seek_fence)
     }
 
     /// Visit keys in order from `from`, handing each key's values to the

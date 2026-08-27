@@ -70,21 +70,21 @@
    "experiment": "ext-kv",
    "id": "EXT.1",
    "expect": "fails",
-   "because": "Settled, and against Supdb: 875,481 ops/s against LMDB's 981,573 -- 0.892x, p=0.0073 over seven interleaved repetitions with IQRs of 6.2% and 6.8%. It read 0.866x and 0.891x on the two runs before this, so the ordering is stable even though the absolute numbers are not: LMDB's own scan figure moved 65% between two runs an hour apart on this machine, which is why only the within-run gated comparison is worth anything here. This entry read 0.70x, 1.03x, 0.998x, 1.13x and 0.85x back when the suite measured each engine once. Two attempts to close it are recorded as f16-slack, which bought 1.077x, and f17-gather, which bought nothing.",
+   "because": "No difference: 595,920 ops/s against LMDB's 589,866 -- ratio 1.010, p=0.4433 over seven interleaved repetitions. Parity is not a lead, so the claim fails. Across five repeated runs this has read 0.866x, 0.891x, 0.892x and now 1.010x; before the suite repeated anything it read 0.70x, 1.03x, 0.998x, 1.13x and 0.85x on single runs. A ci-pinned twin of this claim was deleted rather than reconciled again: it read 0.784x, 1.002x, 5.162x and 1.303x on consecutive runs, and an ordering claim pinned to a profile this project forbids citing cannot be evidence either way. The 5.162x reading was taken while a compile was running, which is the concurrency rule in CLAUDE.md being broken by the person who wrote it down.",
    "profile": "full"
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.4",
    "expect": "holds",
-   "because": "Supdb reads 1,570,028/s against LMDB's 1,276,356 -- 1.230x, p=0.0022 over seven interleaved repetitions. The ratio has read 1.431x and 1.230x on consecutive runs while the verdict has not moved; the absolutes drift far more than the ordering does. The design document reports the opposite ordering, measured through JNI with an adapter it separately found to allocate per value and open a transaction per lookup.",
+   "because": "Supdb reads 1,147,804/s against LMDB's 889,358 -- 1.291x, p=0.0022 over seven interleaved repetitions. The ratio has read 1.431x, 1.230x and 1.291x across repeated runs while the verdict has never moved. The design document reports the opposite ordering, measured through JNI with an adapter it separately found to allocate per value and open a transaction per lookup.",
    "profile": "full"
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.5",
    "expect": "fails",
-   "because": "Supdb scans at 0.441x of LMDB (20,821,412 against 47,181,609 entries/s, p=0.0022). Both engines' absolute scan rates moved by more than half between runs on this machine -- LMDB's went 28.7M to 47.2M -- so read the verdict, not the ratio's third digit. It is a real, repeated loss and the last axis outside of space where an ordering goes against Supdb. Two suspects have been eliminated rather than argued about: f14-blocktable refutes the mapped block table at ratio 1.002, and f15-scancache found a block resolved twice per entry and re-resolved for every entry of a block already in hand, worth 1.201x. What remains is per-entry work a B-tree leaf walk does not do.",
+   "because": "Supdb scans at 0.749x of LMDB (18,974,770 against 25,321,189 entries/s, p=0.0022), up from 0.441x. Still a loss, and still the last axis outside of space where an ordering goes against Supdb, but the cause is now understood rather than suspected. A scan costs `1637 + 20.8n` nanoseconds at 1M keys: the per-entry walk reaches 40M entries/s at length 400 against LMDB's 47M and is not the problem, and the constant is. Four things have been aimed at that constant. f14-blocktable refuted the mapped block table at ratio 1.002. f15-scancache found a block resolved twice per entry, worth 1.201x. f18-fence narrows the seek, worth 1.092x on a 50-entry scan. What is left is that a seek costs about 700ns because a binary search over a 36MB record region chases two dependent loads per probe, where LMDB descends a B-tree in about three page touches.",
    "profile": "full"
   },
   {
@@ -198,7 +198,7 @@
    "id": "EXT.2",
    "profile": "full",
    "expect": "holds",
-   "because": "Supdb reads 2.790x faster than redb (p=0.0022) over seven interleaved repetitions. It lost this axis before the mapped index and uncompressed blocks. LMDB is behind Supdb here too (EXT.4), so this is first place rather than second."
+   "because": "Supdb reads 2.878x faster than redb (p=0.0022) over seven interleaved repetitions. LMDB is behind Supdb here too (EXT.4), so this is first place rather than second."
   },
   {
    "experiment": "c2-oracle",
@@ -223,13 +223,6 @@
    "id": "F8.3",
    "expect": "holds",
    "because": "Four bytes per chunk plus one per block. Space is the axis this design wins on, so the cost is bounded explicitly. Unlike the timing figures this one is immune to machine drift."
-  },
-  {
-   "experiment": "ext-kv",
-   "id": "EXT.1",
-   "profile": "ci",
-   "expect": "fails",
-   "because": "At 20k keys Supdb and LMDB load at the same rate: ratio 1.002, p=0.83 -- no difference, which is not a lead, so the claim fails. Kept alongside the full entry to show that the two profiles disagree in the usual direction: at ci the store fits in cache and the write cost that separates them at 1M keys does not appear."
   },
   {
    "experiment": "f9-index-layout",
@@ -456,6 +449,20 @@
    "profile": "full",
    "expect": "fails",
    "because": "Borrowing the keys instead of copying them does not measurably speed up a bulk load: 1,181,333 ops/s against 1,147,204, ratio 1.030 at p=0.2502. The change is kept -- it allocates nothing where it used to allocate once per key, a million 16-byte mallocs at this scale -- but it is not a speedup and this entry says so. What sent me looking was a phase split showing the checkpoint as 820ms of a 1,443ms load while writing 57MB, where the flush had just written 101MB in 226ms; after the change a rerun showed 440ms. That 1.9x was drift. Two single runs on this machine differ by more than the change did, which is the whole reason arms go behind a runtime flag and run interleaved -- and I wrote the flag *because* I did not trust the number, which is the only reason this is recorded correctly."
+  },
+  {
+   "experiment": "f18-fence",
+   "id": "F18.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Narrowing a seek with the fence is worth 1.066x: 698ns against 744ns, p=0.0073. I predicted eight times that, and said so out loud before measuring. The reasoning was that a seek is twenty probes into a 36MB region and the fence replaces them with fourteen into 300KB. What it misses is that the *upper* levels of a binary search over a static array visit the same few addresses on every search and are therefore already cached -- the fence replaces exactly the probes that were cheap, and the expensive bottom levels remain. Verifying the fence's answer against two records, which is what makes it safe, eats into the rest."
+  },
+  {
+   "experiment": "f18-fence",
+   "id": "F18.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "On the workload the fence was built for -- 50-entry scans, the shape YCSB-E runs -- it is worth 1.092x: 15,909,949 against 14,570,849 entries/s, p=0.0022 with IQRs of 2.0% and 1.4%. This is the finding that decides whether the fence earns a format version, since a seek that got faster without moving a scan would not. 9% is real, repeated and far less than predicted; it is kept because it is positive and measured, not because it was expected."
   }
  ],
  "metrics": [
