@@ -166,6 +166,26 @@ pub enum Sync {
     Never,
 }
 
+/// How a reader represents the block table.
+///
+/// A store's block table can be read in place out of the mapping or decoded
+/// into a private `Vec` at open. Mapped is the default, and is what lets many
+/// readers of one store share it instead of each holding a copy. This exists
+/// so both can run in one process: comparing them across two runs is what this
+/// repository has already learned not to do.
+#[derive(Clone, Copy, Debug)]
+pub struct ReadOptions {
+    pub mapped_blocks: bool,
+}
+
+impl Default for ReadOptions {
+    fn default() -> Self {
+        ReadOptions {
+            mapped_blocks: true,
+        }
+    }
+}
+
 /// When space belonging to a superseded value may be handed out again.
 ///
 /// Releasing a block only makes its space available; reuse is what actually
@@ -2344,6 +2364,17 @@ impl Reader {
     }
 
     pub fn open(path: &Path) -> Result<Reader> {
+        Reader::open_with(path, ReadOptions::default())
+    }
+
+    /// Open with the block table forced to one representation or the other.
+    ///
+    /// The mapped table exists so that readers of the same store share it
+    /// rather than each decoding a private copy. Whether that costs anything
+    /// on the read path is a question only an interleaved measurement can
+    /// answer, and it cannot be interleaved without a runtime choice --
+    /// `f14-blocktable` is that measurement.
+    pub fn open_with(path: &Path, opts: ReadOptions) -> Result<Reader> {
         // The superblock lives in the first page and so is always visible, but
         // it is written last and points at data that may lie beyond the length
         // this mapping captured -- a writer checkpointing between the open and
@@ -2374,7 +2405,7 @@ impl Reader {
                     // space this reader is about to walk while it is still
                     // decoding the index.
                     let claim = Self::claim(path, sb.generation);
-                    let mut r = Self::open_mapped(mmap, sb)?;
+                    let mut r = Self::open_mapped(mmap, sb, opts)?;
                     if let Some((slot, table)) = claim {
                         r.slot = Some(slot);
                         r.table = Some(table);
@@ -2388,7 +2419,7 @@ impl Reader {
                         _ => None,
                     } {
                         if older.high_water as usize <= mmap.len() {
-                            return Self::open_mapped(mmap, older);
+                            return Self::open_mapped(mmap, older, opts);
                         }
                     }
                 }
@@ -2410,21 +2441,44 @@ impl Reader {
         unreachable!()
     }
 
-    fn open_mapped(mmap: Mmap, sb: Super) -> Result<Reader> {
+    fn open_mapped(mmap: Mmap, sb: Super, opts: ReadOptions) -> Result<Reader> {
         // Same treatment as the key index: used where it lies when it is the
         // flat format, decoded otherwise.
         let blocks_src = {
             let off = sb.blk_off as usize;
             let len = sb.blk_stored as usize;
-            let mapped = if sb.blk_stored == sb.blk_uncompressed {
-                mmap.get(off..off.saturating_add(len))
-                    .and_then(flatindex::MappedBlocks::parse)
-            } else {
-                None
-            };
-            match mapped {
-                Some(meta) => BlocksSrc::Mapped { meta, off, len },
-                None => BlocksSrc::Owned(Self::decode_blocks(&read_section(
+            // A flat section is written uncompressed so it can be read where
+            // it lies; anything compressed is the varint format by
+            // construction. Which format it is decides how it is *decoded*;
+            // `mapped_blocks` decides only whether the decode is skipped.
+            let flat = sb.blk_stored == sb.blk_uncompressed
+                && mmap
+                    .get(off..off.saturating_add(len))
+                    .is_some_and(flatindex::is_block_section);
+            match flat {
+                true => {
+                    let sec = mmap
+                        .get(off..off.saturating_add(len))
+                        .ok_or_else(|| corrupt("block table runs past the mapping"))?;
+                    if opts.mapped_blocks {
+                        match flatindex::MappedBlocks::parse(sec) {
+                            Some(meta) => BlocksSrc::Mapped { meta, off, len },
+                            // Unaligned in this mapping, or an entry size this
+                            // build disagrees with. Copying it out still reads
+                            // it correctly; guessing the other format does not.
+                            None => BlocksSrc::Owned(
+                                flatindex::decode_blocks(sec)
+                                    .ok_or_else(|| corrupt("block table is not readable"))?,
+                            ),
+                        }
+                    } else {
+                        BlocksSrc::Owned(
+                            flatindex::decode_blocks(sec)
+                                .ok_or_else(|| corrupt("block table is not readable"))?,
+                        )
+                    }
+                }
+                false => BlocksSrc::Owned(Self::decode_blocks(&read_section(
                     &mmap,
                     sb.blk_off,
                     sb.blk_stored as usize,

@@ -84,7 +84,7 @@
    "experiment": "ext-kv",
    "id": "EXT.5",
    "expect": "fails",
-   "because": "Supdb scans 15,366,352 entries/s against LMDB's 28,231,754 -- 0.54x, having been 0.82x in the previous full run at 23,396,643. LMDB and redb moved less than 3% between the two runs, so this is a real regression in Supdb and not the machine. The suspect is `1b00d59`, which moved the block table into a mapped section: a scan resolves a block per entry and the mapped table revalidates bounds and alignment on every access where the owned Vec did not. That commit measured point reads and concluded the mapping cost nothing; it never measured a scan. Not yet established -- an interleaved arm is the only thing that would settle it, and until one exists this reads as a lead worth chasing rather than a cause.",
+   "because": "Supdb scans 15,366,352 entries/s against LMDB's 28,231,754 -- 0.54x, having been 0.82x in the previous full run at 23,396,643. LMDB and redb moved less than 3% between those runs, so this is Supdb and not the machine. The suspect was the commit that moved the block table into a mapped section, on the reasoning that a scan resolves a block per entry where a point read resolves one per lookup. `f14-blocktable` refutes it: at 1M keys, interleaved in one process, mapped and owned differ by 0.2% on scans (p=0.70) and 0.1% on point reads (p=0.90). The regression is real and its cause is not yet known. It is left here as a failing claim rather than explained away.",
    "profile": "full"
   },
   {
@@ -414,6 +414,20 @@
    "because": "And it is worth far more than the largest thing an instruction profile could see. Callgrind put the block table decode at 34% of all instructions; mapping it removed 4.75x of the total instruction count and moved throughput by nothing, because the workload waits on a syscall. This claim exists to keep that lesson attached to a number: an instruction profile answers where the CPU goes, not why a workload is slow. Pinned to full and to x86_64. The ratio is a property of this disk as much as of the engine -- a device with a faster flush would show less -- which is exactly why it is recorded as a measurement rather than folded into a design argument.",
    "profile": "full",
    "arch": "x86_64"
+  },
+  {
+   "experiment": "f14-blocktable",
+   "id": "F14.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "The mapped block table costs nothing on a scan: 13,717,970 entries/s mapped against 13,748,135 owned, ratio 1.002 at p=0.70. This experiment exists because a scan resolves a block for every entry it walks, and the change that introduced the mapping was measured only on point reads -- one lookup, one resolve. The reasoning was sound and the answer is still no. Recorded so the next person who suspects this structure finds it already asked."
+  },
+  {
+   "experiment": "f14-blocktable",
+   "id": "F14.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "The mapped block table costs nothing on a point read either: 1,996,309 ops/s against 1,995,093, ratio 0.999 at p=0.90. Kept alongside F14.1 so the two are read together -- the point of the pair is that a structure can be free on one access pattern and not on another, and here it happens to be free on both."
   }
  ],
  "metrics": [

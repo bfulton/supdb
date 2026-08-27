@@ -12,7 +12,7 @@
 //! fixed, remove the `#[ignore]` and flip its `claims.json` entry from `fails`
 //! to `holds` in the same commit.
 
-use supdb::{Options, Reader, Reclaim, Store};
+use supdb::{Options, ReadOptions, Reader, Reclaim, Store};
 
 /// A delete is lost if it lands between `seal_shard` and `flush_builder`.
 ///
@@ -704,4 +704,53 @@ fn a_writer_reads_its_own_writes() {
         drop(r);
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// A reader that would not map the block table read the wrong one.
+///
+/// The block table moved from a varint encoding to a flat one that a reader
+/// borrows out of the mapping. The reader chose between them by trying the
+/// flat parser and, on `None`, decoding the bytes as varints -- so "I cannot
+/// map this" and "this is the older format" were the same branch. Any reason
+/// to decline the mapping fed a flat section to the varint decoder, which read
+/// it as a shorter table of plausible-looking blocks and answered a scan with
+/// "extent names block 91 but the table has 83" on a store with nothing wrong
+/// with it. A misparse that presents as corruption is the worst shape for one:
+/// the error accuses the file.
+///
+/// FIXED: the format is decided by the section's magic, and the two decisions
+/// -- which format, and whether to map it -- are separate. Both arms of
+/// `ReadOptions::mapped_blocks` must now see the same store.
+#[test]
+fn a_reader_that_declines_the_mapping_still_reads_the_block_table() {
+    let _flag = CHECKSUM_FLAG.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join("supdb-test-blocktable-arms");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("bt.dat");
+    let n = 50_000u64;
+    let val = vec![b'v'; 100];
+    {
+        let s = Store::create(&path, Options::default()).unwrap();
+        for i in 0..n {
+            s.put(format!("{i:016}").as_bytes(), &val).unwrap();
+        }
+        s.flush().unwrap();
+        s.close().unwrap();
+    }
+    let mut seen = Vec::new();
+    for mapped_blocks in [true, false] {
+        let r = Reader::open_with(&path, ReadOptions { mapped_blocks }).unwrap();
+        let mut bytes = 0u64;
+        let got = r
+            .scan(None, usize::MAX, |_k, v| bytes += v.len() as u64)
+            .unwrap_or_else(|e| panic!("scan with mapped_blocks={mapped_blocks}: {e}"));
+        assert_eq!(got, n, "mapped_blocks={mapped_blocks} walked {got} keys");
+        seen.push((got, bytes));
+    }
+    assert_eq!(
+        seen[0], seen[1],
+        "the two block-table representations disagree about the same file"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

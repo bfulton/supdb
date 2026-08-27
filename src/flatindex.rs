@@ -723,6 +723,33 @@ pub struct MappedBlocks {
     n: usize,
 }
 
+/// Is this section the flat block table rather than the varint one?
+///
+/// The reader used to decide by "uncompressed, so probably flat", and fall
+/// back to the varint decoder for anything the flat parser refused. That
+/// fallback cannot tell "this is the older format" from "this is the newer
+/// format and I would not read it", so it answered a scan of a perfectly good
+/// store with 83 blocks where the table held 91 -- a wrong answer, not an
+/// error. The magic is the discriminator; whether to *map* it is a separate
+/// question.
+pub fn is_block_section(sec: &[u8]) -> bool {
+    rd_u32(sec, 0) == Some(BLK_MAGIC)
+}
+
+/// The flat block table copied out into an owned Vec.
+///
+/// The same bytes `MappedBlocks` borrows, so the two are a fair pair to
+/// measure against each other: one open that copies, against a borrow that
+/// revalidates per access.
+pub fn decode_blocks(sec: &[u8]) -> Option<Vec<crate::block::BlockLoc>> {
+    let meta = MappedBlocks::parse(sec)?;
+    let mut out = Vec::with_capacity(meta.len());
+    for i in 0..meta.len() {
+        out.push(meta.get(sec, i)?);
+    }
+    Some(out)
+}
+
 impl MappedBlocks {
     /// `None` for the varint format, for an entry size this build disagrees
     /// with, and for bytes the mapping did not land aligned -- each a reason to

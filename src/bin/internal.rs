@@ -93,6 +93,7 @@ fn main() -> std::io::Result<()> {
             "f11-flatindex" => f11_flatindex(&args, profile)?,
             "f12-compress" => f12_compress(&args, profile)?,
             "f13-sync" => f13_sync(&args, profile)?,
+            "f14-blocktable" => f14_blocktable(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -119,6 +120,7 @@ fn main() -> std::io::Result<()> {
                 "f11-flatindex",
                 "f12-compress",
                 "f13-sync",
+                "f14-blocktable",
                 "f4-durability",
                 "f3-multiproc",
                 "f1-outofcore",
@@ -1444,6 +1446,152 @@ fn f7_child(args: &Args) -> std::io::Result<()> {
 /// than on the CPU. This asks the question the profiler could not.
 ///
 /// Both arms in one process, interleaved, as f8 and f12 do.
+/// Does reading the block table out of the mapping cost anything on a scan?
+///
+/// The table was moved into a mapped section so that many readers of one store
+/// share it instead of each decoding a private copy. That change was measured
+/// on point reads, where it was worth nothing either way, and the conclusion
+/// recorded was that the decode had not been the bottleneck. It was never
+/// measured on a scan, which resolves a block for every entry it walks rather
+/// than one per lookup -- and between the run that recorded it and the next
+/// one, external scan throughput fell from 0.82x of LMDB to 0.54x while LMDB
+/// and redb moved less than 3%.
+///
+/// Both arms open the *same file* in the same process and are interleaved, so
+/// the only difference is `ReadOptions::mapped_blocks`.
+fn f14_blocktable(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let scan_len = args.num("--scan-len", 50);
+    let scans = args.num("--scans", profile.pick(2_000, 20_000, 60_000)) as u64;
+    let reads = args.num("--reads", profile.pick(50_000, 200_000, 500_000)) as u64;
+
+    let mut rec = Record::new("f14-blocktable", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .param("scan_len", J::u(scan_len as u64))
+        .param("scans", J::u(scans))
+        .param("reads", J::u(reads))
+        .note(
+            "one store, two readers over the same file, interleaved; the only difference is \
+             ReadOptions::mapped_blocks",
+        );
+
+    let dir = scratch("f14");
+    let file = dir.join("bt.dat");
+    let payload = Payload::new(value_size, 0.5, 0x14);
+    {
+        let store = Store::create(&file, default_opts(128)).expect("create");
+        let mut vrng = Rng::new(0x14);
+        let mut kb = [0u8; 16];
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+        }
+        store.flush().expect("flush");
+        store.close().expect("close");
+    }
+    let mapped = [true, false];
+
+    // Scans. A scan resolves a block per entry, so if revalidating the mapped
+    // table costs anything this is where it shows.
+    let scan = Trial::new(profile.reps()).run(2, |ci, rep| {
+        let r = Reader::open_with(
+            &file,
+            supdb::ReadOptions {
+                mapped_blocks: mapped[ci],
+            },
+        )
+        .expect("open");
+        let mut g = KeyGen::new(
+            KeyDist::Uniform,
+            keys.saturating_sub(scan_len as u64).max(1),
+            0x14 + rep as u64,
+        );
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        let mut n = 0u64;
+        for _ in 0..scans {
+            db_key_into(g.next(), &mut kb);
+            n += r
+                .scan(Some(&kb), scan_len, |_k, v| {
+                    std::hint::black_box(v);
+                })
+                .expect("scan");
+        }
+        n as f64 / t.elapsed().as_secs_f64()
+    });
+
+    // Point reads, the arm the original change was measured on.
+    let read = Trial::new(profile.reps()).run(2, |ci, rep| {
+        let r = Reader::open_with(
+            &file,
+            supdb::ReadOptions {
+                mapped_blocks: mapped[ci],
+            },
+        )
+        .expect("open");
+        let mut g = KeyGen::new(KeyDist::Uniform, keys, 0x41 + rep as u64);
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        for _ in 0..reads {
+            db_key_into(g.next(), &mut kb);
+            r.read_all(&kb, |v| {
+                std::hint::black_box(v);
+            })
+            .expect("read");
+        }
+        reads as f64 / t.elapsed().as_secs_f64()
+    });
+
+    let scan_cmp = compare(&scan[1], &scan[0], supdb::bench::MIN_EFFECT);
+    let read_cmp = compare(&read[1], &read[0], supdb::bench::MIN_EFFECT);
+    let (sm, so) = (scan[0].median(), scan[1].median());
+    let (rm, ro) = (read[0].median(), read[1].median());
+    rec.compare("scan_owned_vs_mapped", scan_cmp.clone());
+    rec.compare("read_owned_vs_mapped", read_cmp.clone());
+    rec.series(
+        "arms",
+        jobj! {
+            "scan_mapped_entries_per_s" => J::fp(sm, 1),
+            "scan_owned_entries_per_s" => J::fp(so, 1),
+            "read_mapped_ops_per_s" => J::fp(rm, 1),
+            "read_owned_ops_per_s" => J::fp(ro, 1),
+        },
+    );
+
+    rec.finding(Finding::new(
+        "F14.1",
+        "the mapped block table costs nothing on a scan",
+        matches!(
+            scan_cmp.verdict,
+            supdb::bench::stats::Verdict::NoDifference
+                | supdb::bench::stats::Verdict::Underpowered
+        ),
+        format!(
+            "scan {sm:.0} entries/s mapped against {so:.0} owned ({})",
+            scan_cmp.summary("owned", "mapped")
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F14.2",
+        "the mapped block table costs nothing on a point read",
+        matches!(
+            read_cmp.verdict,
+            supdb::bench::stats::Verdict::NoDifference
+                | supdb::bench::stats::Verdict::Underpowered
+        ),
+        format!(
+            "read {rm:.0} ops/s mapped against {ro:.0} owned ({}). This is the arm the change \
+             was originally measured on, and it is kept so the two can be read together: a \
+             structure can be free on one access pattern and not on another",
+            read_cmp.summary("owned", "mapped")
+        ),
+    ));
+    let _ = std::fs::remove_file(&file);
+    Ok(rec)
+}
+
 fn f13_sync(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let keys = args.num("--keys", profile.pick(20_000, 100_000, 500_000)) as u64;
     let ops = args.num("--ops", profile.pick(400, 2_000, 6_000)) as u64;
