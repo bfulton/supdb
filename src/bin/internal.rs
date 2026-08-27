@@ -94,6 +94,7 @@ fn main() -> std::io::Result<()> {
             "f12-compress" => f12_compress(&args, profile)?,
             "f13-sync" => f13_sync(&args, profile)?,
             "f14-blocktable" => f14_blocktable(&args, profile)?,
+            "f15-scancache" => f15_scancache(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -121,6 +122,7 @@ fn main() -> std::io::Result<()> {
                 "f12-compress",
                 "f13-sync",
                 "f14-blocktable",
+                "f15-scancache",
                 "f4-durability",
                 "f3-multiproc",
                 "f1-outofcore",
@@ -1500,6 +1502,7 @@ fn f14_blocktable(args: &Args, profile: Profile) -> std::io::Result<Record> {
             &file,
             supdb::ReadOptions {
                 mapped_blocks: mapped[ci],
+                ..Default::default()
             },
         )
         .expect("open");
@@ -1528,6 +1531,7 @@ fn f14_blocktable(args: &Args, profile: Profile) -> std::io::Result<Record> {
             &file,
             supdb::ReadOptions {
                 mapped_blocks: mapped[ci],
+                ..Default::default()
             },
         )
         .expect("open");
@@ -1586,6 +1590,100 @@ fn f14_blocktable(args: &Args, profile: Profile) -> std::io::Result<Record> {
              was originally measured on, and it is kept so the two can be read together: a \
              structure can be free on one access pattern and not on another",
             read_cmp.summary("owned", "mapped")
+        ),
+    ));
+    let _ = std::fs::remove_file(&file);
+    Ok(rec)
+}
+
+/// What does resolving a block per scan entry cost?
+///
+/// A scan walks keys in rank order and consecutive keys usually share a
+/// block, so resolving one per entry re-reads the block table, re-bounds-
+/// checks the mapping and re-tests a checksum bit for an answer that has not
+/// changed since the previous entry. Until this experiment existed the scan
+/// resolved it *twice* per entry, because `check_extent` resolved it and then
+/// the read resolved it again.
+///
+/// Both arms are one process over one file; the only difference is
+/// `ReadOptions::scan_block_cache`.
+fn f15_scancache(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let scan_len = args.num("--scan-len", 50);
+    let scans = args.num("--scans", profile.pick(2_000, 20_000, 40_000)) as u64;
+
+    let mut rec = Record::new("f15-scancache", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .param("scan_len", J::u(scan_len as u64))
+        .param("scans", J::u(scans))
+        .note("one file, two readers, interleaved; the only difference is ReadOptions::scan_block_cache");
+
+    let dir = scratch("f15");
+    let file = dir.join("sc.dat");
+    let payload = Payload::new(value_size, 0.5, 0x15);
+    {
+        let store = Store::create(&file, default_opts(128)).expect("create");
+        let mut vrng = Rng::new(0x15);
+        let mut kb = [0u8; 16];
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+        }
+        store.flush().expect("flush");
+        store.close().expect("close");
+    }
+    let cache = [true, false];
+    let scan = Trial::new(profile.reps()).run(2, |ci, rep| {
+        let r = Reader::open_with(
+            &file,
+            supdb::ReadOptions {
+                scan_block_cache: cache[ci],
+                ..Default::default()
+            },
+        )
+        .expect("open");
+        let mut g = KeyGen::new(
+            KeyDist::Uniform,
+            keys.saturating_sub(scan_len as u64).max(1),
+            0x15 + rep as u64,
+        );
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        let mut n = 0u64;
+        for _ in 0..scans {
+            db_key_into(g.next(), &mut kb);
+            n += r
+                .scan(Some(&kb), scan_len, |_k, v| {
+                    std::hint::black_box(v);
+                })
+                .expect("scan");
+        }
+        n as f64 / t.elapsed().as_secs_f64()
+    });
+
+    let cmp = compare(&scan[0], &scan[1], supdb::bench::MIN_EFFECT);
+    let (on, off) = (scan[0].median(), scan[1].median());
+    rec.compare("cached_vs_resolved", cmp.clone());
+    rec.series(
+        "arms",
+        jobj! {
+            "cached_entries_per_s" => J::fp(on, 1),
+            "resolved_entries_per_s" => J::fp(off, 1),
+            "speedup" => J::fp(on / off.max(1e-9), 3),
+        },
+    );
+    rec.finding(Finding::new(
+        "F15.1",
+        "holding the current block across a scan's entries is worth measuring",
+        matches!(cmp.verdict, supdb::bench::stats::Verdict::Greater),
+        format!(
+            "scan {on:.0} entries/s holding the block against {off:.0} resolving it per entry \
+             ({}). Resolving it was the shape the code had; whether that costs anything is not \
+             something an instruction count answers, since the work is a bounds check and an \
+             atomic load rather than a syscall",
+            cmp.summary("cached", "resolved")
         ),
     ));
     let _ = std::fs::remove_file(&file);

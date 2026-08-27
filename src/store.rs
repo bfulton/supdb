@@ -176,12 +176,22 @@ pub enum Sync {
 #[derive(Clone, Copy, Debug)]
 pub struct ReadOptions {
     pub mapped_blocks: bool,
+    /// Hold the current block across a scan's entries instead of resolving it
+    /// for each one.
+    ///
+    /// A scan walks keys in order and consecutive keys usually share a block,
+    /// so resolving it per entry -- twice, until this commit -- re-reads the
+    /// block table, re-bounds-checks the mapping and re-tests a checksum bit
+    /// for an answer that has not changed. Off is the old behaviour, kept so
+    /// `f15-scancache` can measure the difference in one process.
+    pub scan_block_cache: bool,
 }
 
 impl Default for ReadOptions {
     fn default() -> Self {
         ReadOptions {
             mapped_blocks: true,
+            scan_block_cache: true,
         }
     }
 }
@@ -2023,6 +2033,7 @@ pub struct Reader {
     /// Where this reader's block table lives: decoded onto the heap, or left
     /// in the mapping like the key index.
     blocks_src: BlocksSrc,
+    opts: ReadOptions,
     cache: BlockCache,
     /// Slot held in the reader table, released when this reader is dropped.
     slot: Option<usize>,
@@ -2344,6 +2355,15 @@ impl Reader {
 
     fn check_extent(&self, e: Ext) -> Result<()> {
         let loc = self.loc_of(e.block)?;
+        self.check_extent_loc(loc)
+    }
+
+    /// The same check, for a caller that already resolved the block.
+    ///
+    /// A scan resolved every extent's block twice -- once here and once for
+    /// the bytes -- which is one bounds-checked read of the block table per
+    /// entry that nothing needed.
+    fn check_extent_loc(&self, loc: BlockLoc) -> Result<()> {
         if self.overwritten.is_empty() {
             return Ok(());
         }
@@ -2494,7 +2514,7 @@ impl Reader {
             let len = sb.key_stored as usize;
             if let Some(sec) = mmap.get(off..off.saturating_add(len)) {
                 if let Some(meta) = FlatIndex::parse(sec) {
-                    return Self::build_flat(
+                    let mut r = Self::build_flat(
                         mmap,
                         meta,
                         off,
@@ -2502,7 +2522,9 @@ impl Reader {
                         blocks_src,
                         sb.timestamp,
                         sb.history_from,
-                    );
+                    )?;
+                    r.opts = opts;
+                    return Ok(r);
                 }
             }
         }
@@ -2512,7 +2534,9 @@ impl Reader {
             sb.key_stored as usize,
             sb.key_uncompressed as usize,
         )?;
-        Self::build(mmap, key_idx, blocks_src, sb.timestamp, sb.history_from)
+        let mut r = Self::build(mmap, key_idx, blocks_src, sb.timestamp, sb.history_from)?;
+        r.opts = opts;
+        Ok(r)
     }
 
     /// Publish the generation being read so the writer will not hand out the
@@ -2651,6 +2675,7 @@ impl Reader {
             idx: Idx::Flat { meta, off, len },
             verified,
             blocks_src,
+            opts: ReadOptions::default(),
             cache: BlockCache::new(4096),
             slot: None,
             table: None,
@@ -2770,6 +2795,7 @@ impl Reader {
             },
             verified,
             blocks_src,
+            opts: ReadOptions::default(),
             cache,
             slot: None,
             table: None,
@@ -3056,16 +3082,33 @@ impl Reader {
         // which chunks of the cached block have been decoded
         let mut have: Vec<u64> = Vec::new();
 
+        // The block the previous entry used. A scan walks keys in order and
+        // consecutive keys usually sit in the same block, so resolving it
+        // again means re-reading the block table, re-bounds-checking the
+        // mapping and re-testing a checksum bit to learn what is already
+        // known. It was resolved twice per entry -- `check_extent` did it and
+        // then the read did it again.
+        let mut held: Option<(u32, BlockLoc, &[u8])> = None;
+
         for i in start..end {
             let Some((key, exts)) = self.idx.at(&self.mmap, i) else {
                 continue;
             };
             for e in exts {
-                self.check_extent(*e)?;
-                let loc = self.loc_of(e.block)?;
-                let raw = self.raw_of(loc)?;
+                let (loc, raw) = match held {
+                    Some((b, loc, raw)) if self.opts.scan_block_cache && b == e.block => (loc, raw),
+                    _ => {
+                        let loc = self.loc_of(e.block)?;
+                        self.check_extent_loc(loc)?;
+                        let raw = self.raw_of(loc)?;
+                        if loc.is_plain() {
+                            self.verify_plain(e.block, raw, loc.crc)?;
+                        }
+                        held = Some((e.block, loc, raw));
+                        (loc, raw)
+                    }
+                };
                 let extent: &[u8] = if loc.is_plain() {
-                    self.verify_plain(e.block, raw, loc.crc)?;
                     &raw[e.off as usize..(e.off + e.len) as usize]
                 } else {
                     let un = loc.uncompressed as usize;

@@ -121,6 +121,15 @@ disk). F2.1 still fails — sub-linear is not independent — and so does F4.1, 
 38x.
 
 The compression change also took the size axis away: `EXT.6` moved from `holds`
-to `fails`, since Supdb now stores 4.7MB where LMDB stores 2.6. That was traded
-knowingly, and `EXT.5` is what it bought — Supdb now scans 1.29x faster than
-LMDB, having been 4.7x slower.
+to `fails`, since Supdb stores 168.6MB where LMDB stores 126.9. That was traded
+knowingly, and scans are what it bought — `EXT.5` went from 4.7x slower than
+LMDB to 0.58x of it. It is still a loss. The 1.29x this file used to claim came
+from a `ci` run, which is never citable; at `full` the same measurement was
+0.91x, and the habit of reading a `ci` number as evidence is the reason that
+sentence was wrong for as long as it was.
+
+The external suite repeats and interleaves its engines, like everything in
+`src/bench/`. It did not always: it ran each engine once, and `EXT.1` read
+0.70x, 1.03x, 0.998x, 1.13x and 0.85x across five such runs, flipping between
+holding and failing on margins as small as 0.2%. Seven repetitions settle it at
+0.866x with p=0.0106. If you add an engine or a metric there, it repeats too.

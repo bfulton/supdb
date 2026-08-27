@@ -70,21 +70,21 @@
    "experiment": "ext-kv",
    "id": "EXT.1",
    "expect": "fails",
-   "because": "Parity, landing on the wrong side of it: Supdb loads 712,164 ops/s against LMDB's 713,772 -- 0.998x. It was 0.70x when block compression was turned off, since uncompressed data is about five times more bytes and a full load is bound by writing them, and it read 1.03x in the run before this one. A claim that swings between holding and failing on a 0.2% margin is not measuring an ordering, it is measuring the machine; what it does establish is that the load gap closed. Read it as parity and read EXT.4 for an ordering that is not in doubt. Note also that LMDB commits durably per batch here and Supdb does not -- see the suite's own note and f13-sync.",
+   "because": "Settled, and against Supdb: 636,942 ops/s against LMDB's 735,358 -- 0.866x, p=0.0106 over seven interleaved repetitions with IQRs of 5.9% and 7.2%. This entry has read 0.70x, 1.03x, 0.998x, 1.13x and 0.85x across five *single* runs and flipped between holding and failing on margins as small as 0.2%, because the suite measured each engine once and a one-run ratio has no distribution to test. It now repeats and interleaves like every internal experiment, and the answer stops moving: the load gap block compression opened -- uncompressed data is about five times more bytes and a full load is bound by writing them -- narrowed but did not close.",
    "profile": "full"
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.4",
    "expect": "holds",
-   "because": "Supdb reads 1,311,881/s against LMDB's 910,007 -- 1.44x, where it was 0.55x before the mapped index and 1.57x in the previous full run. The design document claimed this ordering all along but measured LMDB through a Java harness with an adapter it separately found to allocate per value and open a transaction per lookup; this is the same ordering for honest reasons. Pinned to full: at ci the store fits in cache and the margin is a property of the working set rather than of the engine.",
+   "because": "Supdb reads 1,297,130/s against LMDB's 901,609 -- 1.439x, p=0.0022 over seven interleaved repetitions with IQRs of 2.7% and 1.3%. This is now an ordering rather than a run: it was 1.57x, 1.44x, 1.53x and 1.35x across four single runs, all of them the same answer but none of them evidence on their own. The design document reports the opposite ordering, measured through JNI with an adapter it separately found to allocate per value and open a transaction per lookup.",
    "profile": "full"
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.5",
    "expect": "fails",
-   "because": "Supdb scans 15,425,352 entries/s against LMDB's 31,505,320 -- 0.49x. The suspect was the commit that mapped the block table, since a scan resolves a block for every entry it walks; f14-blocktable refutes that at 1M keys, interleaved, at ratio 1.002 and p=0.70. What a bisect does show is that the loss is partly warm-up: the same scan measured three times in one process runs 14.4M, 19.1M and 19.3M entries/s, and the suite measures the first pass for every engine. The rest is per-entry work LMDB does not do -- resolve a block, bounds-check an extent, check a checksum bit -- once per entry where a B-tree leaf walk yields pointers. That is the thing to attack, and it has not been attacked yet.",
+   "because": "Supdb scans at 0.584x of LMDB (16,920,191 against 28,993,539 entries/s, p=0.0022, IQRs 3.2% and 2.1%). Real, repeated, and the last axis where an ordering goes against Supdb outside of space. Two suspects have been eliminated rather than argued about: f14-blocktable refutes the mapped block table at ratio 1.002, and f15-scancache found and fixed a block resolved twice per entry and then re-resolved for every entry of a block already in hand -- worth 1.11x at full, and this number already includes it. What remains is per-entry work a B-tree leaf walk does not do.",
    "profile": "full"
   },
   {
@@ -198,7 +198,7 @@
    "id": "EXT.2",
    "profile": "full",
    "expect": "holds",
-   "because": "Supdb reads 1,311,881/s against redb's 427,976 -- 3.07x. It lost this axis before the mapped index and uncompressed blocks. LMDB is no longer ahead of Supdb here either (EXT.4), so this is first place rather than second. Pinned to full."
+   "because": "Supdb reads 2.909x faster than redb (p=0.0022, IQRs 2.7% and 1.8%), over seven interleaved repetitions. It lost this axis before the mapped index and uncompressed blocks. LMDB is behind Supdb here too (EXT.4), so this is first place rather than second."
   },
   {
    "experiment": "c2-oracle",
@@ -228,8 +228,8 @@
    "experiment": "ext-kv",
    "id": "EXT.1",
    "profile": "ci",
-   "expect": "holds",
-   "because": "At 20k keys Supdb loads faster than LMDB again. This entry existed to record that the 8.5% write cost of checksumming had erased a 6% lead; it came back when the read path stopped forcing checkpoints between load batches. Kept pinned to ci and kept uncitable: it is here so the ci and full orderings can be seen to differ."
+   "expect": "fails",
+   "because": "At 20k keys Supdb and LMDB load at the same rate: ratio 1.002, p=0.83 -- no difference, which is not a lead, so the claim fails. Kept alongside the full entry to show that the two profiles disagree in the usual direction: at ci the store fits in cache and the write cost that separates them at 1M keys does not appear."
   },
   {
    "experiment": "f9-index-layout",
@@ -428,6 +428,13 @@
    "profile": "full",
    "expect": "holds",
    "because": "The mapped block table costs nothing on a point read either: 1,996,309 ops/s against 1,995,093, ratio 0.999 at p=0.90. Kept alongside F14.1 so the two are read together -- the point of the pair is that a structure can be free on one access pattern and not on another, and here it happens to be free on both."
+  },
+  {
+   "experiment": "f15-scancache",
+   "id": "F15.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Holding the current block across a scan's entries is worth 1.110x at 1M keys (18,346,506 against 16,533,303 entries/s, p=0.0022). A scan walks keys in rank order and consecutive keys usually share a block, so resolving one per entry re-reads the block table, re-bounds-checks the mapping and re-tests a checksum bit to learn what the previous entry already established. Finding it also turned up that the block was resolved *twice* per entry, since `check_extent` resolved it and then the read resolved it again; that fix is in both arms, so the 1.11x here understates what the commit was worth. Worth recording that this is the sort of cost an instruction profile can see and a syscall-blind one cannot -- the opposite of the fsync case in f13."
   }
  ],
  "metrics": [

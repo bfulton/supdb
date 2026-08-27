@@ -740,7 +740,7 @@ fn a_reader_that_declines_the_mapping_still_reads_the_block_table() {
     }
     let mut seen = Vec::new();
     for mapped_blocks in [true, false] {
-        let r = Reader::open_with(&path, ReadOptions { mapped_blocks }).unwrap();
+        let r = Reader::open_with(&path, ReadOptions { mapped_blocks, ..Default::default() }).unwrap();
         let mut bytes = 0u64;
         let got = r
             .scan(None, usize::MAX, |_k, v| bytes += v.len() as u64)
