@@ -255,6 +255,15 @@ pub struct Options {
     /// 18MB of a 63MB index. Off is the default; on is the old behaviour, kept
     /// so `f16-slack` can price it in one process.
     pub write_index_slack: bool,
+    /// Copy every key onto the heap before sorting them for a full checkpoint.
+    ///
+    /// The keys already lie contiguously in each shard's arena, so a rewrite
+    /// can borrow them and sort slices into a few large buffers. Copying means
+    /// one allocation per key -- a million 16-byte mallocs on a bulk load --
+    /// and a sort whose every comparison chases a pointer into a separate
+    /// allocation. Off is the default; on is the old behaviour, kept so
+    /// `f17-gather` can price it in one process.
+    pub checkpoint_copies_keys: bool,
     /// Independent write shards.
     ///
     /// More of them means each key table is smaller and its working set is
@@ -363,6 +372,7 @@ impl Default for Options {
             // deletion.
             compress: false,
             write_index_slack: false,
+            checkpoint_copies_keys: false,
             shards: 64,
             cache_blocks: 4096,
             solo_threshold: 16 * 1024,
@@ -1357,13 +1367,40 @@ impl Store {
 
         // Only the rewrite needs every key, and only then is the sort worth
         // paying for.
-        let mut all: Vec<(Vec<u8>, Extents)> = Vec::new();
+        //
+        // Borrowed, not copied. This used to build a `Vec<(Vec<u8>, Extents)>`,
+        // which is one heap allocation per key -- a million 16-byte mallocs on
+        // a bulk load -- and then sorted a million pointers into scattered
+        // allocations, so every comparison was a cache miss on a fresh
+        // cacheline. The keys already lie contiguously in each shard's arena,
+        // so holding every shard's lock for the gather lets the sort compare
+        // slices into a handful of large buffers instead.
+        //
+        // All shards, then the appender: the same order `read_all` takes them
+        // in, and no other path takes two shard locks at once.
+        let copies = self.opts.checkpoint_copies_keys;
+        let guards: Vec<_> = if in_place || copies {
+            Vec::new()
+        } else {
+            self.shards.iter().map(|s| s.lock().unwrap()).collect()
+        };
+        let mut owned: Vec<(Vec<u8>, Extents)> = Vec::new();
+        let mut all: Vec<(&[u8], &Extents)> = Vec::new();
         if !in_place {
-            for sh in &self.shards {
-                let sh = sh.lock().unwrap();
-                all.extend(sh.keys.iter().map(|(k, e)| (k.to_vec(), e.extents.clone())));
+            if copies {
+                for sh in &self.shards {
+                    let sh = sh.lock().unwrap();
+                    owned.extend(sh.keys.iter().map(|(k, e)| (k.to_vec(), e.extents.clone())));
+                }
+                owned.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                all.extend(owned.iter().map(|(k, e)| (k.as_slice(), e)));
+            } else {
+                all.reserve(nkeys);
+                for sh in &guards {
+                    all.extend(sh.keys.iter().map(|(k, e)| (k, &e.extents)));
+                }
+                all.sort_unstable_by(|a, b| a.0.cmp(b.0));
             }
-            all.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         }
 
         // The fast path: every key already in the published index, and enough
@@ -1793,7 +1830,7 @@ impl Store {
 }
 
 fn encode_key_index(
-    all: &[(Vec<u8>, Extents)],
+    all: &[(&[u8], &Extents)],
     generation: u64,
     prev: Option<(BlockLoc, u64, u64)>,
 ) -> Vec<u8> {

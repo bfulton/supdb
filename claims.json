@@ -70,21 +70,21 @@
    "experiment": "ext-kv",
    "id": "EXT.1",
    "expect": "fails",
-   "because": "Settled, and against Supdb: 654,686 ops/s against LMDB's 734,916 -- 0.891x, p=0.0049 over seven interleaved repetitions with IQRs of 3.3% and 6.9%. This entry read 0.70x, 1.03x, 0.998x, 1.13x and 0.85x across five *single* runs and flipped between holding and failing on margins as small as 0.2%, because the suite measured each engine once and a one-run ratio has no distribution to test. It now repeats and interleaves like every internal experiment, and the answer stops moving: the load gap block compression opened -- uncompressed data is about five times more bytes and a full load is bound by writing them -- narrowed but did not close.",
+   "because": "Settled, and against Supdb: 875,481 ops/s against LMDB's 981,573 -- 0.892x, p=0.0073 over seven interleaved repetitions with IQRs of 6.2% and 6.8%. It read 0.866x and 0.891x on the two runs before this, so the ordering is stable even though the absolute numbers are not: LMDB's own scan figure moved 65% between two runs an hour apart on this machine, which is why only the within-run gated comparison is worth anything here. This entry read 0.70x, 1.03x, 0.998x, 1.13x and 0.85x back when the suite measured each engine once. Two attempts to close it are recorded as f16-slack, which bought 1.077x, and f17-gather, which bought nothing.",
    "profile": "full"
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.4",
    "expect": "holds",
-   "because": "Supdb reads 1,300,708/s against LMDB's 908,672 -- 1.431x, p=0.0022 over seven interleaved repetitions with IQRs of 1.8% and 2.2%. This is an ordering rather than a run: it read 1.57x, 1.44x, 1.53x, 1.35x and 1.44x across five single runs, all the same answer but none of them evidence on its own. The design document reports the opposite ordering, measured through JNI with an adapter it separately found to allocate per value and open a transaction per lookup.",
+   "because": "Supdb reads 1,570,028/s against LMDB's 1,276,356 -- 1.230x, p=0.0022 over seven interleaved repetitions. The ratio has read 1.431x and 1.230x on consecutive runs while the verdict has not moved; the absolutes drift far more than the ordering does. The design document reports the opposite ordering, measured through JNI with an adapter it separately found to allocate per value and open a transaction per lookup.",
    "profile": "full"
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.5",
    "expect": "fails",
-   "because": "Supdb scans at 0.601x of LMDB (17,223,381 against 28,652,516 entries/s, p=0.0022, IQRs 3.0% and 2.7%). Real, repeated, and the last axis outside of space where an ordering goes against Supdb. Two suspects have been eliminated rather than argued about: f14-blocktable refutes the mapped block table at ratio 1.002, and f15-scancache found a block resolved twice per entry and then re-resolved for every entry of a block already in hand. Holding it is worth 1.201x at full, and this number includes that, plus hoisting the index section out of the per-entry path and dropping a bounds check each record decoded twice. What remains is per-entry work a B-tree leaf walk does not do, and it is not going to be closed by tightening this loop further.",
+   "because": "Supdb scans at 0.441x of LMDB (20,821,412 against 47,181,609 entries/s, p=0.0022). Both engines' absolute scan rates moved by more than half between runs on this machine -- LMDB's went 28.7M to 47.2M -- so read the verdict, not the ratio's third digit. It is a real, repeated loss and the last axis outside of space where an ordering goes against Supdb. Two suspects have been eliminated rather than argued about: f14-blocktable refutes the mapped block table at ratio 1.002, and f15-scancache found a block resolved twice per entry and re-resolved for every entry of a block already in hand, worth 1.201x. What remains is per-entry work a B-tree leaf walk does not do.",
    "profile": "full"
   },
   {
@@ -198,7 +198,7 @@
    "id": "EXT.2",
    "profile": "full",
    "expect": "holds",
-   "because": "Supdb reads 2.960x faster than redb (p=0.0022, IQRs 1.8% and 0.9%) over seven interleaved repetitions. It lost this axis before the mapped index and uncompressed blocks. LMDB is behind Supdb here too (EXT.4), so this is first place rather than second."
+   "because": "Supdb reads 2.790x faster than redb (p=0.0022) over seven interleaved repetitions. It lost this axis before the mapped index and uncompressed blocks. LMDB is behind Supdb here too (EXT.4), so this is first place rather than second."
   },
   {
    "experiment": "c2-oracle",
@@ -440,8 +440,8 @@
    "experiment": "f16-slack",
    "id": "F16.1",
    "profile": "full",
-   "expect": "fails",
-   "because": "Leaving the index slack as a hole does not measurably speed up a bulk load: 1,127,944 ops/s against 973,803, ratio 1.158 at p=0.0553 -- over the line, so no difference. The hypothesis was that a load is bound by bytes written, since this machine writes 986MB/s direct and 207MB/s through fsync while both Supdb and LMDB load at around 100MB/s. The bytes did fall by 10.2% (F16.2) and the time did not follow, which says the load is not purely bandwidth-bound after all. Recorded as failing rather than quietly dropped: the change is kept because it writes 18MB less, not because it was shown to be faster."
+   "expect": "holds",
+   "because": "Leaving the index slack as a hole is worth 1.077x on a bulk load (1,158,872 against 1,075,715 ops/s, p=0.0325) and 10.2% fewer bytes to the device (F16.2). It took 21 repetitions to say that. At the default seven it read 1.158x at p=0.0553 and then 1.132x at p=0.0409 on consecutive runs -- a verdict flipping without the engine changing, because the effect is around 10% and the repetition-to-repetition IQR is 17-19%. An underpowered measurement is not a cheap one, it is one that could not see, and the fix was more samples rather than a softer claim."
   },
   {
    "experiment": "f16-slack",
@@ -449,6 +449,13 @@
    "profile": "full",
    "expect": "holds",
    "because": "Both arms produce a 176,681,680-byte file, and send 157,949,952 against 175,951,872 bytes to the device -- 18MB, 10.2% fewer, for the same store. The flat index reserves half its record region again as slack so an in-place checkpoint has somewhere to put a lengthened record; nothing reads that region until an update writes into it, and an unwritten hole reads back as the same zeroes. This is exactly the pair CLAUDE.md means by measuring write amplification from /proc/self/io rather than inferring it from file size: file size cannot see a hole, and here the two answers differ by 18MB."
+  },
+  {
+   "experiment": "f17-gather",
+   "id": "F17.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Borrowing the keys instead of copying them does not measurably speed up a bulk load: 1,181,333 ops/s against 1,147,204, ratio 1.030 at p=0.2502. The change is kept -- it allocates nothing where it used to allocate once per key, a million 16-byte mallocs at this scale -- but it is not a speedup and this entry says so. What sent me looking was a phase split showing the checkpoint as 820ms of a 1,443ms load while writing 57MB, where the flush had just written 101MB in 226ms; after the change a rerun showed 440ms. That 1.9x was drift. Two single runs on this machine differ by more than the change did, which is the whole reason arms go behind a runtime flag and run interleaved -- and I wrote the flag *because* I did not trust the number, which is the only reason this is recorded correctly."
   }
  ],
  "metrics": [

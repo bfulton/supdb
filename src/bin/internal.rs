@@ -96,6 +96,7 @@ fn main() -> std::io::Result<()> {
             "f14-blocktable" => f14_blocktable(&args, profile)?,
             "f15-scancache" => f15_scancache(&args, profile)?,
             "f16-slack" => f16_slack(&args, profile)?,
+            "f17-gather" => f17_gather(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -125,6 +126,7 @@ fn main() -> std::io::Result<()> {
                 "f14-blocktable",
                 "f15-scancache",
                 "f16-slack",
+                "f17-gather",
                 "f4-durability",
                 "f3-multiproc",
                 "f1-outofcore",
@@ -1713,6 +1715,7 @@ fn f16_slack(args: &Args, profile: Profile) -> std::io::Result<Record> {
     rec.param("keys", J::u(keys))
         .param("value_size", J::u(value_size as u64))
         .note("both arms interleaved in one process; the only difference is Options::write_index_slack");
+    rec.param("reps", J::u(profile.pick(5, 11, 21) as u64));
 
     let dir = scratch("f16");
     let payload = Payload::new(value_size, 0.5, 0x16);
@@ -1720,7 +1723,14 @@ fn f16_slack(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let written = std::sync::Mutex::new([0u64; 2]);
     let sizes = std::sync::Mutex::new([0u64; 2]);
 
-    let load = Trial::new(profile.reps()).run(2, |ci, rep| {
+    // More repetitions than the default. The effect here is around 13% and the
+    // repetition-to-repetition IQR is 10-17%, so seven samples put the p-value
+    // on top of the threshold: the same measurement read 1.158x at p=0.0553 and
+    // 1.132x at p=0.0409 on consecutive runs, which is a finding that flips
+    // sign of verdict without the engine changing. An underpowered measurement
+    // is not a cheap one, it is one that could not see.
+    let reps = args.num("--reps", profile.pick(5, 11, 21));
+    let load = Trial::new(reps).run(2, |ci, rep| {
         let file = dir.join(format!("s{ci}-{rep}.dat"));
         let store = Store::create(
             &file,
@@ -1783,6 +1793,91 @@ fn f16_slack(args: &Args, profile: Profile) -> std::io::Result<Record> {
              is identical because the slack is reserved either way; the difference is a hole, \
              which file size cannot see and /proc/self/io can",
             sz[0], sz[1], w[0], w[1]
+        ),
+    ));
+    Ok(rec)
+}
+
+/// What does copying every key cost a full checkpoint?
+///
+/// A rewrite has to see every key in sorted order. It used to build that list
+/// as `Vec<(Vec<u8>, Extents)>` -- one heap allocation per key, a million
+/// 16-byte mallocs on a bulk load -- and then sort a million pointers into
+/// scattered allocations, so every comparison landed on a fresh cacheline. The
+/// keys already lie contiguously in each shard's arena and can be borrowed.
+///
+/// This experiment exists because the phase split said the checkpoint, not the
+/// data write, is what a bulk load spends its time on: 397ms putting, 226ms
+/// flushing 101MB, and 820ms checkpointing 57MB. Writing 57MB at the rate the
+/// flush achieved would be 128ms, so most of that was not I/O.
+fn f17_gather(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+
+    let mut rec = Record::new("f17-gather", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .note(
+            "both arms interleaved in one process; the only difference is \
+             Options::checkpoint_copies_keys",
+        );
+
+    let dir = scratch("f17");
+    let payload = Payload::new(value_size, 0.5, 0x17);
+    let copies = [false, true];
+    let ck = std::sync::Mutex::new([0f64; 2]);
+
+    // Load throughput end to end, which is what EXT.1 compares against LMDB.
+    let load = Trial::new(profile.reps()).run(2, |ci, rep| {
+        let file = dir.join(format!("g{ci}-{rep}.dat"));
+        let store = Store::create(
+            &file,
+            Options {
+                checkpoint_copies_keys: copies[ci],
+                ..default_opts(128)
+            },
+        )
+        .expect("create");
+        let mut vrng = Rng::new(0x17);
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+        }
+        store.flush().expect("flush");
+        let t2 = Instant::now();
+        store.checkpoint().expect("checkpoint");
+        ck.lock().unwrap()[ci] = t2.elapsed().as_secs_f64() * 1e3;
+        let secs = t.elapsed().as_secs_f64();
+        let _ = store.close();
+        let _ = std::fs::remove_file(&file);
+        keys as f64 / secs
+    });
+
+    let cmp = compare(&load[0], &load[1], supdb::bench::MIN_EFFECT);
+    let (borrow, copy) = (load[0].median(), load[1].median());
+    let c = *ck.lock().unwrap();
+    rec.compare("borrowed_vs_copied", cmp.clone());
+    rec.series(
+        "arms",
+        jobj! {
+            "borrowed_ops_per_s" => J::fp(borrow, 1),
+            "copied_ops_per_s" => J::fp(copy, 1),
+            "borrowed_checkpoint_ms" => J::fp(c[0], 1),
+            "copied_checkpoint_ms" => J::fp(c[1], 1),
+        },
+    );
+    rec.finding(Finding::new(
+        "F17.1",
+        "borrowing the keys instead of copying them speeds up a bulk load",
+        matches!(cmp.verdict, supdb::bench::stats::Verdict::Greater),
+        format!(
+            "{borrow:.0} ops/s borrowed against {copy:.0} copied ({}); the final checkpoint took \
+             {:.0}ms against {:.0}ms",
+            cmp.summary("borrowed", "copied"),
+            c[0],
+            c[1]
         ),
     ));
     Ok(rec)

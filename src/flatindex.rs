@@ -102,7 +102,7 @@ fn record_len(klen: usize, next: usize) -> usize {
 
 /// Measure the section before writing it, so the whole thing can be built into
 /// one allocation of the right size rather than grown.
-pub fn plan(all: &[(Vec<u8>, crate::index::Extents)]) -> Option<Plan> {
+pub fn plan(all: &[(&[u8], &crate::index::Extents)]) -> Option<Plan> {
     let mut cap = 1usize;
     while cap < all.len() * 2 {
         cap = cap.checked_mul(2)?;
@@ -152,7 +152,7 @@ pub fn plan(all: &[(Vec<u8>, crate::index::Extents)]) -> Option<Plan> {
 /// writer and the reader can never disagree about it -- a hash mismatch
 /// between the two would present as keys that exist and cannot be found.
 pub fn encode(
-    all: &[(Vec<u8>, crate::index::Extents)],
+    all: &[(&[u8], &crate::index::Extents)],
     generation: u64,
     prev: Option<(u64, u64, u64, u64, u64)>,
     hash_of: fn(&[u8]) -> u64,
@@ -502,6 +502,12 @@ mod tests {
     /// `encode` returns only the bytes with anything in them; the file holds
     /// the rest as a hole that reads back as zeroes. A test reading the section
     /// has to see what a reader sees, so it fills the hole in.
+    /// The encoder borrows keys out of the shard arenas rather than copying
+    /// them; a test that owns its corpus lends it the same way.
+    fn refs(all: &[(Vec<u8>, Extents)]) -> Vec<(&[u8], &Extents)> {
+        all.iter().map(|(k, e)| (k.as_slice(), e)).collect()
+    }
+
     fn padded(x: (Vec<u8>, usize)) -> Vec<u8> {
         let (mut v, reserve) = x;
         v.resize(reserve, 0);
@@ -546,7 +552,7 @@ mod tests {
     #[test]
     fn every_key_is_found_with_its_extents() {
         let all = corpus(5000);
-        let sec = padded(encode(&all, 7, None, h).expect("encode"));
+        let sec = padded(encode(&refs(&all), 7, None, h).expect("encode"));
         let ix = FlatIndex::parse(&sec).expect("parse");
         assert_eq!(ix.len(), all.len());
         assert_eq!(ix.generation, 7);
@@ -559,7 +565,7 @@ mod tests {
     #[test]
     fn absent_keys_are_absent() {
         let all = corpus(2000);
-        let sec = padded(encode(&all, 1, None, h).unwrap());
+        let sec = padded(encode(&refs(&all), 1, None, h).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         for i in 0..2000 {
             let k = format!("absent{i:012}").into_bytes();
@@ -570,7 +576,7 @@ mod tests {
     #[test]
     fn rank_order_matches_key_order() {
         let all = corpus(1000);
-        let sec = padded(encode(&all, 1, None, h).unwrap());
+        let sec = padded(encode(&refs(&all), 1, None, h).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         for (i, (k, e)) in all.iter().enumerate() {
             let (gk, ge) = ix.at(&sec, i).expect("rank present");
@@ -583,7 +589,7 @@ mod tests {
     #[test]
     fn seek_finds_the_first_key_at_or_after() {
         let all = corpus(500);
-        let sec = padded(encode(&all, 1, None, h).unwrap());
+        let sec = padded(encode(&refs(&all), 1, None, h).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         for (i, (k, _)) in all.iter().enumerate() {
             assert_eq!(ix.seek(&sec, k), i);
@@ -597,7 +603,7 @@ mod tests {
     #[test]
     fn damage_never_panics() {
         let all = corpus(300);
-        let sec = padded(encode(&all, 1, None, h).unwrap());
+        let sec = padded(encode(&refs(&all), 1, None, h).unwrap());
         for i in 0..sec.len() {
             for bit in [0x01u8, 0x80] {
                 let mut d = sec.clone();
@@ -618,7 +624,7 @@ mod tests {
     #[test]
     fn truncation_never_panics() {
         let all = corpus(200);
-        let sec = padded(encode(&all, 1, None, h).unwrap());
+        let sec = padded(encode(&refs(&all), 1, None, h).unwrap());
         for cut in 0..sec.len() {
             if let Some(ix) = FlatIndex::parse(&sec[..cut]) {
                 for (k, _) in all.iter().take(20) {
@@ -633,7 +639,7 @@ mod tests {
 
     #[test]
     fn an_empty_index_round_trips() {
-        let sec = padded(encode(&[], 3, None, h).unwrap());
+        let sec = padded(encode(&refs(&[]), 3, None, h).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         assert_eq!(ix.len(), 0);
         assert!(ix.lookup(&sec, b"anything", h).is_none());
@@ -643,7 +649,7 @@ mod tests {
     #[test]
     fn the_previous_index_is_carried() {
         let all = corpus(10);
-        let sec = padded(encode(&all, 9, Some((8, 1234, 4096, 100, 200)), h).unwrap());
+        let sec = padded(encode(&refs(&all), 9, Some((8, 1234, 4096, 100, 200)), h).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         assert_eq!(ix.prev, Some((8, 1234, 4096, 100, 200)));
     }
