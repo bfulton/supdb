@@ -1231,10 +1231,10 @@ impl Store {
                 let end = p
                     .checked_add(len)
                     .ok_or_else(|| corrupt("record length overflows"))?;
-                if end > bytes.len() {
+                let Some(rec) = bytes.get(p..end) else {
                     return Err(corrupt("record runs past the end of its extent"));
-                }
-                f(&bytes[p..end]);
+                };
+                f(rec);
                 n += 1;
                 p = end;
             }
@@ -3089,9 +3089,20 @@ impl Reader {
         // known. It was resolved twice per entry -- `check_extent` did it and
         // then the read did it again.
         let mut held: Option<(u32, BlockLoc, &[u8])> = None;
+        // The index section, sliced once. `Idx::at` takes the whole mapping and
+        // re-slices it to the section on every rank, which is a bounds check
+        // and two additions per entry to arrive at the same bytes.
+        let flat = match &self.idx {
+            Idx::Flat { meta, .. } => Some((meta, self.idx.section(&self.mmap))),
+            _ => None,
+        };
 
         for i in start..end {
-            let Some((key, exts)) = self.idx.at(&self.mmap, i) else {
+            let got = match flat {
+                Some((meta, sec)) => meta.at(sec, i),
+                None => self.idx.at(&self.mmap, i),
+            };
+            let Some((key, exts)) = got else {
                 continue;
             };
             for e in exts {
@@ -3143,10 +3154,12 @@ impl Reader {
                     let end = p
                         .checked_add(len)
                         .ok_or_else(|| corrupt("record length overflows"))?;
-                    if end > extent.len() {
+                    // `get` is the bounds check, so the explicit one it used to
+                    // do first was the same test run twice per record.
+                    let Some(rec) = extent.get(p..end) else {
                         return Err(corrupt("record runs past the end of its extent"));
-                    }
-                    f(key, &extent[p..end]);
+                    };
+                    f(key, rec);
                     n += 1;
                     p = end;
                 }

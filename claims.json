@@ -70,21 +70,21 @@
    "experiment": "ext-kv",
    "id": "EXT.1",
    "expect": "fails",
-   "because": "Settled, and against Supdb: 636,942 ops/s against LMDB's 735,358 -- 0.866x, p=0.0106 over seven interleaved repetitions with IQRs of 5.9% and 7.2%. This entry has read 0.70x, 1.03x, 0.998x, 1.13x and 0.85x across five *single* runs and flipped between holding and failing on margins as small as 0.2%, because the suite measured each engine once and a one-run ratio has no distribution to test. It now repeats and interleaves like every internal experiment, and the answer stops moving: the load gap block compression opened -- uncompressed data is about five times more bytes and a full load is bound by writing them -- narrowed but did not close.",
+   "because": "Settled, and against Supdb: 654,686 ops/s against LMDB's 734,916 -- 0.891x, p=0.0049 over seven interleaved repetitions with IQRs of 3.3% and 6.9%. This entry read 0.70x, 1.03x, 0.998x, 1.13x and 0.85x across five *single* runs and flipped between holding and failing on margins as small as 0.2%, because the suite measured each engine once and a one-run ratio has no distribution to test. It now repeats and interleaves like every internal experiment, and the answer stops moving: the load gap block compression opened -- uncompressed data is about five times more bytes and a full load is bound by writing them -- narrowed but did not close.",
    "profile": "full"
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.4",
    "expect": "holds",
-   "because": "Supdb reads 1,297,130/s against LMDB's 901,609 -- 1.439x, p=0.0022 over seven interleaved repetitions with IQRs of 2.7% and 1.3%. This is now an ordering rather than a run: it was 1.57x, 1.44x, 1.53x and 1.35x across four single runs, all of them the same answer but none of them evidence on their own. The design document reports the opposite ordering, measured through JNI with an adapter it separately found to allocate per value and open a transaction per lookup.",
+   "because": "Supdb reads 1,300,708/s against LMDB's 908,672 -- 1.431x, p=0.0022 over seven interleaved repetitions with IQRs of 1.8% and 2.2%. This is an ordering rather than a run: it read 1.57x, 1.44x, 1.53x, 1.35x and 1.44x across five single runs, all the same answer but none of them evidence on its own. The design document reports the opposite ordering, measured through JNI with an adapter it separately found to allocate per value and open a transaction per lookup.",
    "profile": "full"
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.5",
    "expect": "fails",
-   "because": "Supdb scans at 0.584x of LMDB (16,920,191 against 28,993,539 entries/s, p=0.0022, IQRs 3.2% and 2.1%). Real, repeated, and the last axis where an ordering goes against Supdb outside of space. Two suspects have been eliminated rather than argued about: f14-blocktable refutes the mapped block table at ratio 1.002, and f15-scancache found and fixed a block resolved twice per entry and then re-resolved for every entry of a block already in hand -- worth 1.11x at full, and this number already includes it. What remains is per-entry work a B-tree leaf walk does not do.",
+   "because": "Supdb scans at 0.601x of LMDB (17,223,381 against 28,652,516 entries/s, p=0.0022, IQRs 3.0% and 2.7%). Real, repeated, and the last axis outside of space where an ordering goes against Supdb. Two suspects have been eliminated rather than argued about: f14-blocktable refutes the mapped block table at ratio 1.002, and f15-scancache found a block resolved twice per entry and then re-resolved for every entry of a block already in hand. Holding it is worth 1.201x at full, and this number includes that, plus hoisting the index section out of the per-entry path and dropping a bounds check each record decoded twice. What remains is per-entry work a B-tree leaf walk does not do, and it is not going to be closed by tightening this loop further.",
    "profile": "full"
   },
   {
@@ -198,7 +198,7 @@
    "id": "EXT.2",
    "profile": "full",
    "expect": "holds",
-   "because": "Supdb reads 2.909x faster than redb (p=0.0022, IQRs 2.7% and 1.8%), over seven interleaved repetitions. It lost this axis before the mapped index and uncompressed blocks. LMDB is behind Supdb here too (EXT.4), so this is first place rather than second."
+   "because": "Supdb reads 2.960x faster than redb (p=0.0022, IQRs 1.8% and 0.9%) over seven interleaved repetitions. It lost this axis before the mapped index and uncompressed blocks. LMDB is behind Supdb here too (EXT.4), so this is first place rather than second."
   },
   {
    "experiment": "c2-oracle",
@@ -434,7 +434,7 @@
    "id": "F15.1",
    "profile": "full",
    "expect": "holds",
-   "because": "Holding the current block across a scan's entries is worth 1.110x at 1M keys (18,346,506 against 16,533,303 entries/s, p=0.0022). A scan walks keys in rank order and consecutive keys usually share a block, so resolving one per entry re-reads the block table, re-bounds-checks the mapping and re-tests a checksum bit to learn what the previous entry already established. Finding it also turned up that the block was resolved *twice* per entry, since `check_extent` resolved it and then the read resolved it again; that fix is in both arms, so the 1.11x here understates what the commit was worth. Worth recording that this is the sort of cost an instruction profile can see and a syscall-blind one cannot -- the opposite of the fsync case in f13."
+   "because": "Holding the current block across a scan's entries is worth 1.201x at 1M keys (17,342,159 against 14,441,442 entries/s, p=0.0022). A scan walks keys in rank order and consecutive keys usually share a block, so resolving one per entry re-reads the block table, re-bounds-checks the mapping and re-tests a checksum bit to learn what the previous entry already established. Finding it also turned up that the block was resolved *twice* per entry, since `check_extent` resolved it and then the read resolved it again; that fix is in both arms, so this figure understates what the work was worth. Worth recording that this is the sort of cost an instruction profile can see and a syscall-blind one cannot -- the exact opposite of the fsync case in f13."
   }
  ],
  "metrics": [

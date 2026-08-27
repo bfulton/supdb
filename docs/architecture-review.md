@@ -396,7 +396,28 @@ Two things found on the way are worth more than the speedup:
   history while, by its own documentation, reclaimed blocks could already have been
   overwritten. It now reports the truth.
 
-### 2.7b Read-your-writes costs a durable checkpoint — **high, and it is now the binding constraint**
+### 2.7b Read-your-writes costs a durable checkpoint — **FIXED; kept because of what it took to find**
+
+**Resolved by `Store::read_all`.** The writer now reads its own sealed, staged
+and pending state directly, and a sealed extent is served from a mapping rather
+than by preading its whole 64KiB block. Against LMDB, YCSB A went from 0.07x to
+**18.9x** and F from 0.08x to **18.4x**; EXT.3, which asks whether a mixed
+workload stays within 10x of a read-only one, moved from 13.5x to **0.76x**.
+The separate half — a scan needing a reader — was fixed by refreshing with
+`publish()` rather than `checkpoint()`, since a scan needs the writes to be
+*visible*, not durable; that took YCSB E from 0.15x to 0.43x of LMDB. E is the
+one workload still losing, because publishing rewrites index structure in
+proportion to the key count rather than to what changed.
+
+Two mistakes on the way are worth keeping. The first: the change that mattered
+was measured against a benchmark binary that did not contain it, because
+`cargo build --release` in this workspace built only the root package. The run
+reported the fix as worth 2%; it was worth 15x. `default-members` now makes the
+bare command build both. The second: a profile said the slow path was hot while
+a trace said it was never called — and *that contradiction*, not either
+measurement, is what exposed the stale binary.
+
+The original finding, left as written:
 
 `Store` exposes no read method, so a reader must be reopened to see a write —
 and to reopen it, the write must be published by `checkpoint()`, which calls
@@ -540,6 +561,31 @@ a double-release on a block with refcount 2 walks it 2→1→0 and frees it whil
 still points there — silently, with no assertion. I could not construct a reachable path in the
 current code, but the guard is there to suppress exactly the symptom that would reveal one.
 It should be a `debug_assert!`.
+
+### 2.14b The external suite measured each engine once — **FIXED**
+
+Every ordering the comparison suite reported was a one-run ratio: one load, one
+read phase, one scan per engine per invocation. There was no distribution, so
+`stats::compare` could not be applied and was not — the findings were written
+as `supdb > lmdb`.
+
+EXT.1, "Supdb loads faster than LMDB", read 0.70x, 1.03x, 0.998x, 1.13x and
+0.85x across five full runs and flipped between holding and failing on margins
+as small as 0.2%. It was measuring the machine. Seven interleaved repetitions
+settle it at **0.866x, p=0.0106** — Supdb is slower on load, and the earlier
+lead was drift.
+
+The suite now runs `reps` rounds with the engines interleaved round-robin,
+discards a warmup round, and gates every ordering on the same Mann-Whitney U
+test and minimum effect size the internal experiments use. This is rule 1 of
+`CLAUDE.md`, which the suite had been exempt from since it was written.
+
+Fixing it exposed a second defect. `heed` returns a cached `Env` for a path it
+has already opened, so reusing one directory per engine across repetitions
+handed LMDB its previous environment with the files unlinked underneath it: the
+directory read as empty, `size_mb` came out `0.0`, and every repetition after
+the first was loading into a database that already held the data. The
+repetition index is now part of the path.
 
 ### 2.14 Harness bugs
 
