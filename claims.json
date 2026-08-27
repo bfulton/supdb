@@ -512,6 +512,12 @@
    "profile": "full",
    "expect": "holds",
    "because": "On a skewed scan workload -- Zipfian keys, which is what YCSB runs and what real access looks like -- chunk verification is worth 1.162x: 55,285,646 entries/s against 47,589,779, p=0.0022. This is the regime where a scan touches part of a block and moves on, so hashing 4KiB instead of 64KiB is a real saving. It took two attempts. The first measured 0.908x -- chunking made it *slower* -- because whole-block verification is checked once per block-resolve and amortised over the ~600 entries in it, while per-chunk was checked per extent: the same trick f15-scancache needed, and holding the last verified chunk across entries is what turned a 0.908x loss into a 1.162x win. YCSB-E moved from 0.48x of LMDB to 0.57x."
+  },
+  {
+   "experiment": "c1-decoders",
+   "id": "C1.3",
+   "expect": "fails",
+   "because": "The writer's own read path checks nothing the reader's checks. Every damaged trial read through `Store::read_all` returned bytes that differed from what was written, with no error, while a `Reader` over the same file rejected every one. `Store::read_all` exists so a writer can read its own writes without a checkpoint -- it took the mixed YCSB workloads from 0.07x of LMDB to 18x -- and it goes from the mapping to the caller with no checksum in between. C1.2 said 'a read returns the bytes that were written, or an error' and was measured on one of the two ways to do one; its statement is now narrowed to name the reader. The scope is narrow -- `Store::create` truncates and there is no `Store::open`, so a writer only ever reads blocks it wrote this session, and what is unprotected is the file changing underneath it. It is recorded because the suite's feature table scores Supdb a point for checksums, because YCSB A through F route every read through the unchecked path, and because a `Store::scan` built on the writer's state would inherit this and look like a scan win."
   }
  ],
  "metrics": [

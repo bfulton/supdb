@@ -117,6 +117,89 @@ fn build_store(path: &Path, keys: u64, depth: u64, value_size: usize) -> std::io
 }
 
 // ------------------------------------------------------- C1: damaged bytes --
+// ---------------------------------------------- the other read path --
+/// Damage a live store's file underneath it and read through both paths.
+///
+/// Returns (values the writer served that differed from what was written,
+/// trials the reader rejected, trials run).
+fn writer_path_damage(
+    dir: &std::path::Path,
+    keys: u64,
+    value_size: usize,
+) -> std::io::Result<(u64, u64, u64)> {
+    use std::io::{Seek, Write};
+    let mut served = 0u64;
+    let mut caught = 0u64;
+    let mut trials = 0u64;
+    let val = vec![b'v'; value_size];
+    for t in 0..8u64 {
+        let path = dir.join(format!("writer-{t}.dat"));
+        let _ = std::fs::remove_file(&path);
+        let s = Store::create(
+            &path,
+            Options {
+                checksums: true,
+                ..Options::default()
+            },
+        )?;
+        let mut kb = [0u8; 16];
+        for k in 0..keys {
+            db_key_into(k, &mut kb);
+            s.put(&kb, &val)?;
+        }
+        s.flush()?;
+        s.checkpoint()?;
+
+        let clean = std::fs::read(&path)?;
+        let Some(at) = clean.windows(val.len()).position(|w| w == val.as_slice()) else {
+            continue;
+        };
+        let at = at + 8 + t as usize;
+        if at >= clean.len() {
+            continue;
+        }
+        {
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path)?;
+            f.seek(std::io::SeekFrom::Start(at as u64))?;
+            f.write_all(&[clean[at] ^ 0xff])?;
+            f.sync_all()?;
+        }
+        trials += 1;
+
+        let (mut wrong, mut err) = (false, false);
+        for k in 0..keys {
+            db_key_into(k, &mut kb);
+            match s.read_all(&kb, |v| {
+                if v != val.as_slice() {
+                    wrong = true;
+                }
+            }) {
+                Ok(_) => {}
+                Err(_) => err = true,
+            }
+        }
+        if wrong && !err {
+            served += 1;
+        }
+        if let Ok(r) = Reader::open(&path) {
+            let mut rerr = false;
+            for k in 0..keys {
+                db_key_into(k, &mut kb);
+                if r.read_all(&kb, |_| {}).is_err() {
+                    rerr = true;
+                }
+            }
+            if rerr {
+                caught += 1;
+            }
+        }
+        let _ = s.close();
+        let _ = std::fs::remove_file(&path);
+    }
+    Ok((served, caught, trials))
+}
+
+
 
 /// What a reader does with a file that is not quite what it wrote.
 ///
@@ -384,9 +467,35 @@ fn c1_decoders(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // that were mostly layout, not integrity.
     let payload_total: u64 = by_model[4].iter().sum();
     let payload_silent = by_model[4][2];
+    // The same claim, asked of the other read path.
+    //
+    // Every trial above opens a `Reader`. `Store::read_all` exists so a writer
+    // can read its own writes without a checkpoint -- it took the mixed YCSB
+    // workloads from 0.07x of LMDB to 18x -- and it goes from the mapping to
+    // the caller with no checksum in between. So C1.2 was stated about reads
+    // and measured on one of the two ways to do one.
+    //
+    // The scope is real but narrow: `Store::create` truncates and there is no
+    // `Store::open`, so a writer only ever reads blocks it wrote in this
+    // session. What is unprotected is the file changing underneath it, which
+    // is what this measures, through a second handle, because the appender
+    // maps the file shared.
+    let writer = writer_path_damage(&dir, keys.min(2_000), value_size)?;
+    rec.finding(Finding::new(
+        "C1.3",
+        "the writer's own read path checks what the reader's read path checks",
+        writer.0 == 0,
+        format!(
+            "{}/{} damaged reads through Store::read_all returned bytes that differed from what \
+             was written, with no error. Through a Reader over the same file, {} of the same \
+             trials errored. The feature table scores Supdb a point for checksums and YCSB A \
+             through F route every read through the unchecked path",
+            writer.0, writer.2, writer.1
+        ),
+    ));
     rec.finding(Finding::new(
         "C1.2",
-        "a read returns the bytes that were written, or an error -- never wrong data",
+        "a reader returns the bytes that were written, or an error -- never wrong data",
         served_corrupt == 0,
         format!(
             "{served_corrupt}/{n} trials served a value that differed from what was written. {}",

@@ -822,3 +822,99 @@ fn per_chunk_checksums_still_catch_damaged_payload() {
     assert!(caught > 0, "no damage was detected at all");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The writer's read path checks nothing the reader's read path checks.
+///
+/// `Reader::read_all` verifies a block's checksum before handing back bytes.
+/// `Store::read_all` -- added so a writer could read its own writes without a
+/// checkpoint, which took the mixed YCSB workloads from 0.07x of LMDB to 18x
+/// -- goes straight from the mapping to the caller. Two handles on the same
+/// store, two different guarantees, and nothing says so.
+///
+/// The scope is narrower than it first looks: `Store::create` truncates and
+/// there is no `Store::open`, so a writer only ever reads blocks it wrote in
+/// this session. What it does not protect against is the file changing
+/// underneath it -- which is what this test does, through a second handle,
+/// because the appender's mapping is shared.
+///
+/// It matters for two reasons beyond the guarantee. The suite's feature table
+/// scores Supdb a point for checksums, and YCSB A through F route every read
+/// through this path. And it means a `Store::scan` built on the writer's own
+/// state would inherit "no verification" and look like a scan win.
+///
+/// KNOWN-FAILING BY DESIGN, for now: this test asserts the *current*
+/// behaviour, so it turns red the day the writer starts verifying -- which is
+/// the point. Fixing it means deleting the first assertion.
+#[test]
+fn the_writer_reads_its_own_state_without_checking_it() {
+    use std::io::Write;
+    let _flag = CHECKSUM_FLAG.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join("supdb-test-writer-unverified");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("w.dat");
+    let val = vec![b'v'; 400];
+    let s = Store::create(
+        &path,
+        Options {
+            checksums: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for i in 0..2_000u64 {
+        s.put(format!("{i:016}").as_bytes(), &val).unwrap();
+    }
+    s.flush().unwrap();
+    s.checkpoint().unwrap();
+
+    // Find a byte of live payload and flip it, through a separate handle. The
+    // appender maps the file shared, so this is what the writer now sees.
+    let clean = std::fs::read(&path).unwrap();
+    let at = clean
+        .windows(val.len())
+        .position(|w| w == val.as_slice())
+        .expect("payload present")
+        + 8;
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        use std::io::Seek;
+        f.seek(std::io::SeekFrom::Start(at as u64)).unwrap();
+        f.write_all(&[clean[at] ^ 0xff]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    let mut writer_saw_damage = false;
+    let mut writer_err = false;
+    for i in 0..2_000u64 {
+        match s.read_all(format!("{i:016}").as_bytes(), |v| {
+            if v != val.as_slice() {
+                writer_saw_damage = true;
+            }
+        }) {
+            Ok(_) => {}
+            Err(_) => writer_err = true,
+        }
+    }
+
+    let r = Reader::open(&path).unwrap();
+    let mut reader_err = false;
+    for i in 0..2_000u64 {
+        if r.read_all(format!("{i:016}").as_bytes(), |_| {}).is_err() {
+            reader_err = true;
+        }
+    }
+
+    assert!(
+        writer_saw_damage && !writer_err,
+        "the writer path now notices damage -- if it verifies, delete this assertion \
+         and the claim that goes with it"
+    );
+    assert!(
+        reader_err,
+        "the reader path must reject the same damage the writer served"
+    );
+    drop(r);
+    let _ = s.close();
+    let _ = std::fs::remove_dir_all(&dir);
+}
