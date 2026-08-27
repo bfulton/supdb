@@ -393,6 +393,19 @@ struct Appender {
     free: FreeList,
     /// The reader table, in the reserved first page.
     table: MmapMut,
+    /// A read mapping of the file, for serving a sealed extent in place.
+    ///
+    /// `read_extent` preads the extent's whole block -- 64KiB -- into a fresh
+    /// Vec and copies the extent out of it, which is the right shape for the
+    /// occasional read during a merge and the wrong one for a read path. A
+    /// `Reader` never did that; it slices the extent straight out of its
+    /// mapping. Serving `read_all` the old way cost 20x on a read-only
+    /// workload against serving it this way.
+    ///
+    /// Only bytes below `off` are served from here. The file is truncated to
+    /// `off` when a section is reclaimed, and reading a mapped page past
+    /// end-of-file is a SIGBUS rather than an error.
+    map: Option<Mmap>,
     generation: u64,
     timestamp: u64,
     reuse_log: Vec<(u64, u32, u64)>,
@@ -487,6 +500,49 @@ impl Appender {
             self.free.release(loc.off, loc.cap, self.generation);
         }
         Ok(())
+    }
+
+    /// Make sure the read mapping covers at least `need` bytes.
+    ///
+    /// Remapping is rare: the map is only short when the file has grown since
+    /// it was made, and it is made over the whole file each time.
+    fn ensure_map(&mut self, need: u64) -> Result<()> {
+        let have = self.map.as_ref().map_or(0, |m| m.len() as u64);
+        if have >= need && self.map.is_some() {
+            return Ok(());
+        }
+        // A shared read mapping, so writes made through the file descriptor
+        // are visible without a remap. Only the length has to be chased.
+        self.map = Some(unsafe { Mmap::map(&self.file)? });
+        Ok(())
+    }
+
+    /// One extent's bytes, borrowed from the mapping when the block is stored
+    /// verbatim and decoded into `scratch` when it is not.
+    ///
+    /// The mapping is used only for a block that lies wholly below the
+    /// high-water mark and wholly inside the map, so a file that was trimmed
+    /// after the map was made cannot turn a read into a SIGBUS.
+    fn extent_bytes<'a>(&'a self, e: Ext, scratch: &'a mut Vec<u8>) -> Result<&'a [u8]> {
+        let loc = *self
+            .blocks
+            .get(e.block as usize)
+            .ok_or_else(|| corrupt("extent names a block that does not exist"))?;
+        let end = loc.off + loc.stored as u64;
+        let a = e.off as usize;
+        let b = a
+            .checked_add(e.len as usize)
+            .ok_or_else(|| corrupt("extent length overflows"))?;
+        if loc.is_plain() && b <= loc.uncompressed as usize && end <= self.off {
+            if let Some(m) = &self.map {
+                if end as usize <= m.len() {
+                    let base = loc.off as usize;
+                    return Ok(&m[base + a..base + b]);
+                }
+            }
+        }
+        *scratch = self.read_extent(e)?;
+        Ok(scratch.as_slice())
     }
 
     /// Read one extent back out, decompressing its block if needed.
@@ -687,6 +743,8 @@ impl Store {
             shards,
             appender: Mutex::new(Appender {
                 table,
+                map: None,
+               
                 file,
                 // the first page is reserved for the two superblock slots
                 off: SUPER,
@@ -1113,30 +1171,27 @@ impl Store {
     /// Returns the number of values emitted.
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
         let si = self.shard_of(key);
-        let mut sh = self.shards[si].lock().unwrap();
+        // Shared, not `mut`: every borrow below is a read, and taking the
+        // entry mutably forced this path to clone the extent list, the staged
+        // list and the pending buffer on every call.
+        let sh = self.shards[si].lock().unwrap();
         let Some(idx) = sh.keys.index_of(key) else {
             return Ok(0);
         };
-
-        // Staged members for this key, in the order they were pushed, and
-        // whether any of them replaces what came before.
-        let staged: Vec<(u32, u32, bool)> = sh
+        let e = sh.keys.entry(idx);
+        let sealed = e.extents.as_slice();
+        let (pending_buf, pending_replaces) = match &e.pending {
+            Some(p) => (p.buf.as_slice(), p.replaces),
+            None => (&[][..], false),
+        };
+        // The last staged member for this key that replaces what came before.
+        // Everything staged before it is hidden, and its presence hides the
+        // sealed extents entirely.
+        let last_replace = sh
             .members
             .iter()
-            .filter(|(i, ..)| *i == idx)
-            .map(|(_, off, len, _, replaces)| (*off, *len, *replaces))
-            .collect();
-        let staged_replaces = staged.iter().any(|(_, _, r)| *r);
-
-        let (sealed, pending_buf, pending_replaces) = {
-            let e = sh.keys.entry_at(idx);
-            let sealed = e.extents.as_slice().to_vec();
-            let (buf, repl) = match &e.pending {
-                Some(p) => (p.buf.clone(), p.replaces),
-                None => (Vec::new(), false),
-            };
-            (sealed, buf, repl)
-        };
+            .rposition(|(i, _, _, _, r)| *i == idx && *r);
+        let staged_replaces = last_replace.is_some();
 
         let mut n = 0u64;
         let mut emit_count = |bytes: &[u8], f: &mut F| -> Result<()> {
@@ -1156,36 +1211,45 @@ impl Store {
             Ok(())
         };
 
-        // A replacement anywhere later hides everything earlier.
-        if !pending_replaces && !staged_replaces {
-            for e in &sealed {
-                // read_extent already narrows to the extent's own bytes;
-                // slicing by `off` again reads from the wrong place.
-                let bytes = {
-                    let ap = self.appender.lock().unwrap();
-                    ap.read_extent(*e)?
-                };
-                emit_count(&bytes, &mut f)?;
+        // Oldest first: sealed, then staged, then pending. A replacement
+        // anywhere later hides everything earlier.
+        if !pending_replaces && !staged_replaces && !sealed.is_empty() {
+            let mut ap = self.appender.lock().unwrap();
+            // Map far enough for the furthest block these extents name, once,
+            // rather than testing the length per extent.
+            let need = sealed
+                .iter()
+                .filter_map(|e| ap.blocks.get(e.block as usize))
+                .map(|l| l.off + l.stored as u64)
+                .max()
+                .unwrap_or(0);
+            ap.ensure_map(need)?;
+            let ap = &*ap;
+            let mut scratch = Vec::new();
+            for e in sealed {
+                // `extent_bytes` narrows to the extent's own bytes; slicing by
+                // `off` again reads from the wrong place, which is how this
+                // first reported "extent runs past its block".
+                let bytes = ap.extent_bytes(*e, &mut scratch)?;
+                emit_count(bytes, &mut f)?;
             }
         }
         if !pending_replaces {
-            // Skip anything a later staged replacement hides.
-            let from = staged
-                .iter()
-                .rposition(|(_, _, r)| *r)
-                .unwrap_or(0);
-            for (off, len, _) in &staged[from..] {
+            let from = last_replace.unwrap_or(0);
+            for (pos, (i, off, len, _, _)) in sh.members.iter().enumerate() {
+                if *i != idx || pos < from {
+                    continue;
+                }
                 let (a, b) = (*off as usize, (*off + *len) as usize);
                 let slice = sh
                     .builder
                     .staged()
                     .get(a..b)
-                    .ok_or_else(|| corrupt("staged extent runs past the builder"))?
-                    .to_vec();
-                emit_count(&slice, &mut f)?;
+                    .ok_or_else(|| corrupt("staged extent runs past the builder"))?;
+                emit_count(slice, &mut f)?;
             }
         }
-        emit_count(&pending_buf, &mut f)?;
+        emit_count(pending_buf, &mut f)?;
         Ok(n)
     }
 
@@ -1655,8 +1719,11 @@ impl Store {
         }
         // trimming moved the high-water mark, so record the final state
         self.checkpoint_inner(Sync::Always)?;
-        let ap = self.appender.lock().unwrap();
+        // Shards first. `read_all` takes a shard and then the appender, so
+        // taking them the other way round here is a deadlock waiting for two
+        // threads to want it at once.
         let merges: u64 = self.shards.iter().map(|s| s.lock().unwrap().merges).sum();
+        let ap = self.appender.lock().unwrap();
         Ok(Stats {
             blocks: ap.blocks.len() as u64,
             bytes_written: ap.off,

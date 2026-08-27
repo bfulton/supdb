@@ -391,7 +391,9 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
 
     // The finding this suite exists to surface. A mixed read/write workload is
     // the shape no benchmark in the design document contains, and Supdb's
-    // snapshot read model has to checkpoint and rebuild a reader to serve one.
+    // snapshot read model used to have to checkpoint and rebuild a reader to
+    // serve one. `Store::read_all` removed that, so the ratio this reports is
+    // now the cost of the write itself rather than the cost of publishing it.
     let mixed: Vec<f64> = rows
         .iter()
         .filter(|r| {
@@ -419,8 +421,8 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
             c / a.max(1e-9) < 10.0,
             format!(
                 "YCSB-A (50/50) {a:.0} ops/s against YCSB-C (100% read) {c:.0} ops/s -> {:.1}x. \
-                 Store has no read method, so a read after a write requires a checkpoint and a \
-                 fresh Reader, both O(key count)",
+                 A read after a write is served from the writer's own state; when this \
+                 ratio was 13.5x it needed a checkpoint and a fresh Reader, both O(key count)",
                 c / a.max(1e-9)
             ),
         ));

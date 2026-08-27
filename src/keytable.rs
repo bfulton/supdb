@@ -255,6 +255,15 @@ impl<P> KeyTable<P> {
         out
     }
 
+    /// The entry an index refers to, without claiming the right to change it.
+    /// A read path that took `entry_at` had to clone what it wanted out, since
+    /// a `&mut` cannot coexist with the shared borrows the rest of the read
+    /// needs; on a read-only workload those clones were the read.
+    #[inline]
+    pub fn entry(&self, idx: u32) -> &Entry<P> {
+        &self.entries[idx as usize]
+    }
+
     #[inline]
     pub fn entry_at(&mut self, idx: u32) -> &mut Entry<P> {
         &mut self.entries[idx as usize]

@@ -1,5 +1,11 @@
 [workspace]
 members = [".", "bench/external"]
+# The root is itself a package, so a bare `cargo build --release` here builds
+# only the engine and leaves `bench/external` at whatever revision it was last
+# built at. That is how an engine change came to be measured against a
+# benchmark binary that did not contain it: the run reported the change as
+# worth 2%, and it was worth 15x.
+default-members = [".", "bench/external"]
 
 [package]
 name = "supdb"
