@@ -192,6 +192,12 @@ pub struct ReadOptions {
     /// region. Off is the old behaviour, kept so `f18-fence` can price it in
     /// one process over one file.
     pub seek_fence: bool,
+    /// Verify only the chunks an extent touches, when the block carries
+    /// per-chunk checksums, instead of the whole block.
+    ///
+    /// Off is the old behaviour, kept so `f20-chunkcrc` can price it over one
+    /// file.
+    pub chunk_verify: bool,
     /// Verify a plain block's checksum the first time this reader touches it.
     ///
     /// A reader checks each block once and remembers that, so a point-read
@@ -213,6 +219,7 @@ impl Default for ReadOptions {
             mapped_blocks: true,
             scan_block_cache: true,
             seek_fence: true,
+            chunk_verify: true,
             verify_checksums: true,
         }
     }
@@ -460,6 +467,10 @@ struct Appender {
     file: File,
     off: u64,
     blocks: Vec<BlockLoc>,
+    /// Per-chunk checksums, one fixed-size row per block, parallel to
+    /// `blocks`. Block ids are indices that are only ever appended, so the two
+    /// stay in step by construction.
+    chunk_crcs: Vec<[u32; block::MAX_CHUNK_CRCS]>,
     /// Extents still referencing each block. A block nobody references is
     /// garbage and its space can be handed back.
     live: Vec<u32>,
@@ -728,6 +739,16 @@ impl Appender {
                 (off, cap)
             }
         };
+        // A block stored verbatim gets per-chunk checksums beside it, so a
+        // reader can verify the 4KiB its extent lands in rather than all
+        // 64KiB. A compressed block already carries per-chunk checksums in its
+        // own directory, and a block too large to chunk this way falls back to
+        // the whole-block checksum.
+        let chunks = if block::checksums_on() && !chunked && stored.is_none() {
+            block::chunk_crcs(bytes)
+        } else {
+            None
+        };
         let loc = BlockLoc {
             off,
             stored: len,
@@ -735,6 +756,7 @@ impl Appender {
             cap,
             chunked,
             solo,
+            chunk_crc: chunks.is_some(),
             crc: if block::checksums_on() {
                 block::crc32(bytes)
             } else {
@@ -743,6 +765,8 @@ impl Appender {
         };
         self.file.write_all_at(bytes, off)?;
         self.blocks.push(loc);
+        self.chunk_crcs
+            .push(chunks.unwrap_or([0u32; block::MAX_CHUNK_CRCS]));
         self.live.push(0);
         Ok((self.blocks.len() - 1) as u32)
     }
@@ -822,6 +846,7 @@ impl Store {
                 // the first page is reserved for the two superblock slots
                 off: SUPER,
                 blocks: Vec::new(),
+                chunk_crcs: Vec::new(),
                 live: Vec::new(),
                 free: FreeList::new(),
                 generation: 0,
@@ -1470,7 +1495,7 @@ impl Store {
         // instructions in a checkpoint-heavy workload.
         let blk_flat = self.opts.flat_index;
         let blk_idx = if blk_flat {
-            flatindex::encode_blocks(&ap.blocks)
+            flatindex::encode_blocks(&ap.blocks, &ap.chunk_crcs)
         } else {
             encode_block_index(&ap.blocks)
         };
@@ -2015,6 +2040,9 @@ fn write_section_raw(
         cap,
         chunked: false,
         solo: false,
+        // Sections are not read through the block path, so per-chunk
+        // checksums would never be consulted.
+        chunk_crc: false,
         crc: if block::checksums_on() {
             block::crc32(payload)
         } else {
@@ -2037,6 +2065,7 @@ fn write_section(ap: &mut Appender, payload: &[u8], policy: Reclaim) -> Result<B
         cap,
         chunked: false,
         solo: false,
+        chunk_crc: false,
         crc: if block::checksums_on() {
             block::crc32(bytes)
         } else {
@@ -2734,6 +2763,9 @@ impl Reader {
                 cap,
                 solo: flags & 1 != 0,
                 chunked: flags & 2 != 0,
+                // The varint format predates per-chunk checksums and has
+                // nowhere to put them.
+                chunk_crc: false,
                 crc,
             });
         }
@@ -2763,7 +2795,7 @@ impl Reader {
         };
         let generation = meta.generation;
         let prev = meta.prev;
-        let verified = (0..nblocks.div_ceil(64))
+        let verified = (0..(nblocks * block::MAX_CHUNK_CRCS).div_ceil(64))
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect();
         Ok(Reader {
@@ -2879,7 +2911,7 @@ impl Reader {
         }
 
         let cache = BlockCache::new(4096);
-        let verified = (0..nblocks.div_ceil(64))
+        let verified = (0..(nblocks * block::MAX_CHUNK_CRCS).div_ceil(64))
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect();
         Ok(Reader {
@@ -2905,12 +2937,68 @@ impl Reader {
 
     /// Verify an uncompressed block's checksum, at most once per reader.
     #[inline]
+    /// Verify only the chunks an extent actually touches.
+    ///
+    /// `write_block` chunks a *compressed* block so a point read decompresses
+    /// one chunk rather than 64KiB -- 68x read amplification was the reason.
+    /// The checksum had the same shape and nobody said so: a plain block was
+    /// hashed in full to hand back a hundred bytes, and f19-coldscan priced
+    /// that at 0.715x on a cold scan. Chunks are verified once each and
+    /// remembered, so this converges to the same steady state either way; what
+    /// changes is the first touch.
+    ///
+    /// Every reason to doubt the per-chunk path -- a block that carries none,
+    /// a table that cannot be read, a range outside the block -- falls back to
+    /// verifying the whole block, never to skipping the check.
+    fn verify_range(&self, id: u32, loc: BlockLoc, raw: &[u8], lo: usize, hi: usize) -> Result<()> {
+        if !self.opts.verify_checksums || !block::checksums_on() {
+            return Ok(());
+        }
+        if !self.opts.chunk_verify || !loc.chunk_crc || hi > raw.len() || lo >= hi {
+            return self.verify_plain(id, raw, loc.crc);
+        }
+        let (meta, sec) = match &self.blocks_src {
+            BlocksSrc::Mapped { meta, off, len } => {
+                match self.mmap.get(*off..off.saturating_add(*len)) {
+                    Some(sec) => (meta, sec),
+                    None => return self.verify_plain(id, raw, loc.crc),
+                }
+            }
+            // The varint table has nowhere to keep them.
+            BlocksSrc::Owned(_) => return self.verify_plain(id, raw, loc.crc),
+        };
+        use std::sync::atomic::Ordering;
+        for j in (lo / block::CHUNK)..=((hi - 1) / block::CHUNK) {
+            let a = j * block::CHUNK;
+            let b = ((j + 1) * block::CHUNK).min(raw.len());
+            let (Some(want), true) = (meta.chunk_crc(sec, id as usize, j), a < b) else {
+                return self.verify_plain(id, raw, loc.crc);
+            };
+            let slot = id as usize * block::MAX_CHUNK_CRCS + j;
+            let (w, bit) = (slot / 64, 1u64 << (slot % 64));
+            let Some(cell) = self.verified.get(w) else {
+                return self.verify_plain(id, raw, loc.crc);
+            };
+            if cell.load(Ordering::Relaxed) & bit != 0 {
+                continue;
+            }
+            if block::crc32(&raw[a..b]) != want {
+                return Err(corrupt("block checksum mismatch"));
+            }
+            cell.fetch_or(bit, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     fn verify_plain(&self, id: u32, raw: &[u8], want: u32) -> Result<()> {
         if !self.opts.verify_checksums || !block::checksums_on() {
             return Ok(());
         }
         use std::sync::atomic::Ordering;
-        let (w, bit) = (id as usize / 64, 1u64 << (id as usize % 64));
+        // Slot zero of this block's chunk row, so the two schemes cannot mark
+        // each other's bits.
+        let slot = id as usize * block::MAX_CHUNK_CRCS;
+        let (w, bit) = (slot / 64, 1u64 << (slot % 64));
         let Some(cell) = self.verified.get(w) else {
             // No room to remember: check every time rather than skip.
             return if block::crc32(raw) == want {
@@ -2974,12 +3062,12 @@ impl Reader {
             let raw = &self.mmap[loc.off as usize..end];
             if loc.is_plain() {
                 // Stored verbatim, so there is no chunk directory to carry a
-                // checksum; the block index carries one instead.
-                self.verify_plain(e.block, raw, loc.crc)?;
+                // checksum; the block table carries them instead.
                 let (a, b) = (e.off as usize, (e.off + e.len) as usize);
                 if b > raw.len() {
                     return Err(corrupt("extent runs past its block"));
                 }
+                self.verify_range(e.block, loc, raw, a, b)?;
                 total += emit(&raw[a..b], &mut f)?;
             } else if loc.chunked || loc.solo {
                 if std::env::var_os("SUPDB_DEBUG").is_some() && loc.stored as usize > raw.len() {
@@ -3047,8 +3135,11 @@ impl Reader {
         let loc = self.loc_of(e.block)?;
         let raw = self.raw_of(loc)?;
         if loc.is_plain() {
-            self.verify_plain(e.block, raw, loc.crc)?;
-            let mut p = (e.off + at) as usize;
+            // A record length is a varint of at most ten bytes, so this needs
+            // the one chunk it lands in rather than the block.
+            let p0 = (e.off + at) as usize;
+            self.verify_range(e.block, loc, raw, p0, (p0 + 10).min(raw.len()))?;
+            let mut p = p0;
             return Ok(get_uvarint(raw, &mut p) as i32);
         }
         if loc.chunked || loc.solo {
@@ -3185,6 +3276,13 @@ impl Reader {
         // known. It was resolved twice per entry -- `check_extent` did it and
         // then the read did it again.
         let mut held: Option<(u32, BlockLoc, &[u8])> = None;
+        // The chunk the previous entry verified. Per-chunk verification is
+        // checked per *extent* where whole-block verification is checked once
+        // per block-resolve and amortised over every entry in it, which is how
+        // a change that hashes less ended up slower. A 4KiB chunk holds about
+        // thirty-five of these entries, and consecutive entries in a scan are
+        // in the same one.
+        let mut verified_chunk: (u32, usize) = (u32::MAX, usize::MAX);
         // The index section, sliced once. `Idx::at` takes the whole mapping and
         // re-slices it to the section on every rank, which is a bounds check
         // and two additions per entry to arrive at the same bytes.
@@ -3208,15 +3306,27 @@ impl Reader {
                         let loc = self.loc_of(e.block)?;
                         self.check_extent_loc(loc)?;
                         let raw = self.raw_of(loc)?;
-                        if loc.is_plain() {
-                            self.verify_plain(e.block, raw, loc.crc)?;
-                        }
                         held = Some((e.block, loc, raw));
                         (loc, raw)
                     }
                 };
                 let extent: &[u8] = if loc.is_plain() {
-                    &raw[e.off as usize..(e.off + e.len) as usize]
+                    // Verified per extent rather than per block: holding the
+                    // block across entries is what makes the scan fast, and
+                    // checksumming all of it on the first entry is what made
+                    // the first pass slow.
+                    let (a, b) = (e.off as usize, (e.off + e.len) as usize);
+                    let Some(bytes) = raw.get(a..b) else {
+                        return Err(corrupt("extent runs past its block"));
+                    };
+                    let (c0, c1) = (a / block::CHUNK, b.saturating_sub(1) / block::CHUNK);
+                    if c0 != c1 || verified_chunk != (e.block, c0) {
+                        self.verify_range(e.block, loc, raw, a, b)?;
+                        if c0 == c1 {
+                            verified_chunk = (e.block, c0);
+                        }
+                    }
+                    bytes
                 } else {
                     let un = loc.uncompressed as usize;
                     if cached != e.block {

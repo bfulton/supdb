@@ -176,6 +176,14 @@ pub struct BlockLoc {
     /// paths were the residue that survived chunk checksums -- 7.5% of damage
     /// to live payload still read back silently.
     pub crc: u32,
+    /// Per-chunk checksums for this block are stored in the block table.
+    ///
+    /// When set, a read verifies only the chunks its extent touches instead of
+    /// the whole block. `write_block` chunks the *compressed* path for exactly
+    /// this reason -- decompressing 64KiB to reach 960 bytes was 68x read
+    /// amplification -- and the same argument was never made about the
+    /// checksum, which hashed 64KiB to hand back 100 bytes.
+    pub chunk_crc: bool,
     /// This block holds a single key's extent.
     ///
     /// A solo block can never produce a cache hit for another key, so caching
@@ -338,6 +346,35 @@ pub fn decompress_into(src: &[u8], dst: &mut Vec<u8>, uncompressed: usize) -> st
 /// point read verifies only the chunk it decodes rather than the whole block --
 /// which is the whole reason the chunking exists.
 pub const CHUNK: usize = 4096;
+
+/// How many chunk checksums a block may carry beside it.
+///
+/// Sixteen covers a 64KiB block at `CHUNK` bytes each, which is every packed
+/// block. A solo block holding one oversized value can exceed it and falls
+/// back to the whole-block checksum -- correctly, because a solo block holds a
+/// single key's extent, so verifying all of it *is* verifying what was read.
+pub const MAX_CHUNK_CRCS: usize = 16;
+
+/// Per-chunk checksums for a block stored verbatim.
+///
+/// These live beside the block in the block table rather than inside it. A
+/// chunked block carries its checksums in its own directory, which it can do
+/// because it is decoded before it is used; a plain block is sliced straight
+/// out of the mapping and must stay byte-for-byte what the reader expects, so
+/// anything extra has to live elsewhere.
+///
+/// `None` when the block needs more chunks than there is room for.
+pub fn chunk_crcs(bytes: &[u8]) -> Option<[u32; MAX_CHUNK_CRCS]> {
+    let n = bytes.len().div_ceil(CHUNK);
+    if n == 0 || n > MAX_CHUNK_CRCS {
+        return None;
+    }
+    let mut out = [0u32; MAX_CHUNK_CRCS];
+    for (i, c) in bytes.chunks(CHUNK).enumerate() {
+        out[i] = crc32(c);
+    }
+    Some(out)
+}
 
 /// The chunk size is the read-amplification dial. A wide key holds under a
 /// kilobyte, so a 4 KiB chunk inflates 4 KiB to hand back 960 bytes. Smaller

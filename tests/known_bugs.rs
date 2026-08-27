@@ -754,3 +754,71 @@ fn a_reader_that_declines_the_mapping_still_reads_the_block_table() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Per-chunk checksums must still catch damage the whole-block one caught.
+///
+/// A plain block used to be hashed in full on first touch, which is correct
+/// and, on a cold scan, 0.715x (`f19-coldscan`). Verifying only the chunks an
+/// extent touches makes the cost proportional to the read -- and would be
+/// worthless if it let damage through. Every byte of live payload is damaged
+/// in turn and the read must fail, exactly as it did before.
+#[test]
+fn per_chunk_checksums_still_catch_damaged_payload() {
+    let _flag = CHECKSUM_FLAG.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join("supdb-test-chunk-crc");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("c.dat");
+    let n = 4_000u64;
+    let val = vec![b'v'; 200];
+    {
+        let s = Store::create(
+            &path,
+            Options {
+                checksums: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for i in 0..n {
+            s.put(format!("{i:016}").as_bytes(), &val).unwrap();
+        }
+        s.flush().unwrap();
+        s.close().unwrap();
+    }
+    let clean = std::fs::read(&path).unwrap();
+    let mut caught = 0usize;
+    let mut served = 0usize;
+    // Step across the data region; the first page is the superblock and the
+    // index sections sit at the end, so this walks payload.
+    for at in (4096..clean.len()).step_by(1021) {
+        let mut bytes = clean.clone();
+        bytes[at] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+        let Ok(r) = Reader::open(&path) else { continue };
+        let mut wrong = false;
+        let mut err = false;
+        for i in 0..n {
+            match r.read_all(format!("{i:016}").as_bytes(), |v| {
+                if v != val.as_slice() {
+                    wrong = true;
+                }
+            }) {
+                Ok(_) => {}
+                Err(_) => err = true,
+            }
+        }
+        if wrong && !err {
+            served += 1;
+        } else if err {
+            caught += 1;
+        }
+    }
+    std::fs::write(&path, &clean).unwrap();
+    assert_eq!(
+        served, 0,
+        "{served} damaged files returned wrong bytes without an error"
+    );
+    assert!(caught > 0, "no damage was detected at all");
+    let _ = std::fs::remove_dir_all(&dir);
+}

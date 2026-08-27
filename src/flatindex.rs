@@ -962,12 +962,14 @@ struct BlockRec {
     uncompressed: u32,
     cap: u32,
     crc: u32,
-    /// bit 0 solo, bit 1 chunked.
+    /// bit 0 solo, bit 1 chunked, bit 2 per-chunk checksums present.
     flags: u8,
     _pad: [u8; 7],
 }
 
 const BLK_ENTRY: usize = std::mem::size_of::<BlockRec>();
+/// Bytes of per-chunk checksums stored per block.
+const CRC_ROW: usize = crate::block::MAX_CHUNK_CRCS * 4;
 
 impl BlockRec {
     #[inline]
@@ -980,6 +982,7 @@ impl BlockRec {
             crc: self.crc,
             solo: self.flags & 1 != 0,
             chunked: self.flags & 2 != 0,
+            chunk_crc: self.flags & 4 != 0,
         }
     }
     #[inline]
@@ -990,7 +993,7 @@ impl BlockRec {
             uncompressed: b.uncompressed,
             cap: b.cap,
             crc: b.crc,
-            flags: (b.solo as u8) | ((b.chunked as u8) << 1),
+            flags: (b.solo as u8) | ((b.chunked as u8) << 1) | ((b.chunk_crc as u8) << 2),
             _pad: [0; 7],
         }
     }
@@ -1003,8 +1006,19 @@ impl BlockRec {
 /// 34% of all instructions in a checkpoint-heavy workload: it is O(block
 /// count), block count grows with overwrite churn, and every open paid it
 /// again. Same treatment the key index already gets, for the same reason.
-pub fn encode_blocks(blocks: &[crate::block::BlockLoc]) -> Vec<u8> {
-    let mut out = vec![0u8; BLK_HEADER + blocks.len() * BLK_ENTRY];
+/// The block table, followed by a fixed row of per-chunk checksums per block.
+///
+/// The checksums sit here rather than inside the blocks because a plain block
+/// is sliced straight out of the mapping and has to stay byte-for-byte what
+/// the extent offsets say it is. The row is fixed width so a block's
+/// checksums are at a computed offset with nothing to store per block; a block
+/// that has none carries a row of zeroes and its `chunk_crc` flag clear.
+pub fn encode_blocks(
+    blocks: &[crate::block::BlockLoc],
+    chunk_crcs: &[[u32; crate::block::MAX_CHUNK_CRCS]],
+) -> Vec<u8> {
+    let crcs_off = BLK_HEADER + blocks.len() * BLK_ENTRY;
+    let mut out = vec![0u8; crcs_off + blocks.len() * CRC_ROW];
     out[0..4].copy_from_slice(&BLK_MAGIC.to_le_bytes());
     out[4..8].copy_from_slice(&(BLK_ENTRY as u32).to_le_bytes());
     out[8..16].copy_from_slice(&(blocks.len() as u64).to_le_bytes());
@@ -1016,6 +1030,12 @@ pub fn encode_blocks(blocks: &[crate::block::BlockLoc]) -> Vec<u8> {
             unsafe { std::slice::from_raw_parts(&r as *const BlockRec as *const u8, BLK_ENTRY) };
         let at = BLK_HEADER + i * BLK_ENTRY;
         out[at..at + BLK_ENTRY].copy_from_slice(src);
+        if let Some(row) = chunk_crcs.get(i) {
+            for (j, c) in row.iter().enumerate() {
+                let at = crcs_off + i * CRC_ROW + j * 4;
+                out[at..at + 4].copy_from_slice(&c.to_le_bytes());
+            }
+        }
     }
     out
 }
@@ -1084,6 +1104,23 @@ impl MappedBlocks {
     /// `parse`: the section comes from a mapping a corruption experiment
     /// damages, and a shorter slice must be rejected rather than indexed.
     #[inline]
+    /// The stored checksum of chunk `j` of block `i`.
+    ///
+    /// `None` when the block has no per-chunk checksums, when the section is
+    /// too short to hold the row, or when the chunk is out of range -- each a
+    /// reason to fall back to the whole-block checksum rather than to accept
+    /// an unverified read.
+    pub fn chunk_crc(&self, sec: &[u8], i: usize, j: usize) -> Option<u32> {
+        if i >= self.n || j >= crate::block::MAX_CHUNK_CRCS {
+            return None;
+        }
+        let base = self.off.checked_add(self.n.checked_mul(BLK_ENTRY)?)?;
+        let at = base
+            .checked_add(i.checked_mul(CRC_ROW)?)?
+            .checked_add(j * 4)?;
+        rd_u32(sec, at)
+    }
+
     pub fn get(&self, sec: &[u8], i: usize) -> Option<crate::block::BlockLoc> {
         if i >= self.n {
             return None;
@@ -1102,12 +1139,27 @@ impl MappedBlocks {
 
 #[cfg(test)]
 mod block_tests {
+    /// One distinguishable checksum row per block, so a test can tell a row
+    /// read from the right block from one read from its neighbour.
+    fn crc_rows(n: usize) -> Vec<[u32; crate::block::MAX_CHUNK_CRCS]> {
+        (0..n)
+            .map(|i| {
+                let mut row = [0u32; crate::block::MAX_CHUNK_CRCS];
+                for (j, c) in row.iter_mut().enumerate() {
+                    *c = (i as u32) << 8 | j as u32;
+                }
+                row
+            })
+            .collect()
+    }
+
     use super::*;
     use crate::block::BlockLoc;
 
     fn corpus(n: usize) -> Vec<BlockLoc> {
         (0..n)
             .map(|i| BlockLoc {
+                chunk_crc: i % 3 == 0,
                 off: (i as u64) * 4096 + 7,
                 stored: i as u32 * 3,
                 uncompressed: i as u32 * 5,
@@ -1122,7 +1174,7 @@ mod block_tests {
     #[test]
     fn every_block_round_trips() {
         let blocks = corpus(5000);
-        let sec = encode_blocks(&blocks);
+        let sec = encode_blocks(&blocks, &crc_rows(blocks.len()));
         let m = MappedBlocks::parse(&sec).expect("parse");
         assert_eq!(m.len(), blocks.len());
         for (i, b) in blocks.iter().enumerate() {
@@ -1142,7 +1194,7 @@ mod block_tests {
     #[test]
     fn damage_never_produces_an_invalid_bool() {
         let blocks = corpus(200);
-        let sec = encode_blocks(&blocks);
+        let sec = encode_blocks(&blocks, &crc_rows(blocks.len()));
         for i in 0..sec.len() {
             let mut d = sec.clone();
             d[i] ^= 0xff;
@@ -1159,7 +1211,7 @@ mod block_tests {
     #[test]
     fn truncation_is_rejected_not_misread() {
         let blocks = corpus(100);
-        let sec = encode_blocks(&blocks);
+        let sec = encode_blocks(&blocks, &crc_rows(blocks.len()));
         for cut in 0..sec.len() {
             if let Some(m) = MappedBlocks::parse(&sec[..cut]) {
                 for j in 0..m.len() {

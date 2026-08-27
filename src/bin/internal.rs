@@ -99,6 +99,7 @@ fn main() -> std::io::Result<()> {
             "f17-gather" => f17_gather(&args, profile)?,
             "f18-fence" => f18_fence(&args, profile)?,
             "f19-coldscan" => f19_coldscan(&args, profile)?,
+            "f20-chunkcrc" => f20_chunkcrc(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -131,6 +132,7 @@ fn main() -> std::io::Result<()> {
                 "f17-gather",
                 "f18-fence",
                 "f19-coldscan",
+                "f20-chunkcrc",
                 "f4-durability",
                 "f3-multiproc",
                 "f1-outofcore",
@@ -2169,6 +2171,178 @@ fn f19_coldscan(args: &Args, profile: Profile) -> std::io::Result<Record> {
             warm[1] / off.max(1e-9),
             wait[0].major_faults,
             wait[0].off_cpu_fraction() * 100.0
+        ),
+    ));
+    let _ = std::fs::remove_file(&file);
+    Ok(rec)
+}
+
+/// Does verifying a chunk instead of a block make a cold scan cheaper?
+///
+/// f19-coldscan priced whole-block verification at 0.715x on a cold scan and
+/// showed the cold penalty is the checksum and almost nothing else -- zero
+/// major faults, zero time off CPU, pure CRC32C. The amplification is the
+/// reason: a 64KiB block hashed in full to hand back a 100-byte value.
+///
+/// `write_block` already chunks the compressed path for the same shape of
+/// problem, because decompressing 64KiB to reach 960 bytes was 68x read
+/// amplification. Plain blocks now carry per-chunk checksums beside them in
+/// the block table -- beside, because a plain block is sliced straight out of
+/// the mapping and has to stay byte-for-byte what the extent offsets say.
+///
+/// One file, two readers, arms differing only in
+/// `ReadOptions::chunk_verify`. Both verify; one verifies less.
+fn f20_chunkcrc(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::bench::env::Wait;
+
+    let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let scan_len = args.num("--scan-len", 100);
+    let scans = args.num("--scans", profile.pick(2_000, 10_000, 20_000)) as u64;
+
+    let mut rec = Record::new("f20-chunkcrc", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .param("scan_len", J::u(scan_len as u64))
+        .param("scans", J::u(scans))
+        .note("one file, two readers, interleaved; the only difference is ReadOptions::chunk_verify");
+
+    let dir = scratch("f20");
+    let file = dir.join("chunk.dat");
+    let payload = Payload::new(value_size, 0.5, 0x20);
+    {
+        let store = Store::create(
+            &file,
+            Options {
+                checksums: true,
+                ..default_opts(128)
+            },
+        )
+        .expect("create");
+        let mut vrng = Rng::new(0x20);
+        let mut kb = [0u8; 16];
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+        }
+        store.flush().expect("flush");
+        store.close().expect("close");
+    }
+
+    let chunked = [true, false];
+    let warm_out = std::sync::Mutex::new([0f64; 2]);
+    let cold = Trial::new(profile.reps()).run(2, |ci, rep| {
+        let r = Reader::open_with(
+            &file,
+            supdb::ReadOptions {
+                chunk_verify: chunked[ci],
+                ..Default::default()
+            },
+        )
+        .expect("open");
+        let pass = |seed: u64, dist: KeyDist| -> (f64, u64) {
+            let mut g = KeyGen::new(dist, keys.saturating_sub(scan_len as u64).max(1), seed);
+            let mut kb = [0u8; 16];
+            let a = Wait::read_now();
+            let mut n = 0u64;
+            for _ in 0..scans {
+                db_key_into(g.next(), &mut kb);
+                n += r
+                    .scan(Some(&kb), scan_len, |_k, v| {
+                        std::hint::black_box(v);
+                    })
+                    .expect("scan");
+            }
+            let w = Wait::read_now().since(&a);
+            (n as f64 / (w.wall_ns as f64 / 1e9), n)
+        };
+        let (first, _) = pass(0x20 + rep as u64, KeyDist::Uniform);
+        let (second, _) = pass(0x20 + rep as u64, KeyDist::Uniform);
+        warm_out.lock().unwrap()[ci] = second;
+        first
+    });
+
+    // The skewed case, which is the one chunking can help. A uniform sweep
+    // touches every chunk of every block it touches, and verifying all of a
+    // block's chunks is verifying the block -- the same bytes hashed, plus a
+    // bitset test per chunk. Only a workload that touches part of a block and
+    // does not come back pays less.
+    let skewed = Trial::new(profile.reps()).run(2, |ci, rep| {
+        let r = Reader::open_with(
+            &file,
+            supdb::ReadOptions {
+                chunk_verify: chunked[ci],
+                ..Default::default()
+            },
+        )
+        .expect("open");
+        let mut g = KeyGen::new(KeyDist::Zipfian, keys.saturating_sub(scan_len as u64).max(1), 0x02 + rep as u64);
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        let mut n = 0u64;
+        for _ in 0..scans {
+            db_key_into(g.next(), &mut kb);
+            n += r
+                .scan(Some(&kb), scan_len, |_k, v| {
+                    std::hint::black_box(v);
+                })
+                .expect("scan");
+        }
+        n as f64 / t.elapsed().as_secs_f64()
+    });
+
+    let cmp = compare(&cold[0], &cold[1], supdb::bench::MIN_EFFECT);
+    let (chunk, whole) = (cold[0].median(), cold[1].median());
+    let warm = *warm_out.lock().unwrap();
+    rec.compare("chunk_vs_whole", cmp.clone());
+    rec.series(
+        "arms",
+        jobj! {
+            "cold_chunk_entries_per_s" => J::fp(chunk, 1),
+            "cold_whole_entries_per_s" => J::fp(whole, 1),
+            "warm_chunk_entries_per_s" => J::fp(warm[0], 1),
+            "warm_whole_entries_per_s" => J::fp(warm[1], 1),
+            "skewed_chunk_entries_per_s" => J::fp(skewed[0].median(), 1),
+            "skewed_whole_entries_per_s" => J::fp(skewed[1].median(), 1),
+        },
+    );
+    let skew_cmp = compare(&skewed[0], &skewed[1], supdb::bench::MIN_EFFECT);
+    rec.compare("skewed_chunk_vs_whole", skew_cmp.clone());
+    rec.finding(Finding::new(
+        "F20.3",
+        "chunk verification pays on a skewed scan workload",
+        matches!(skew_cmp.verdict, supdb::bench::stats::Verdict::Greater),
+        format!(
+            "Zipfian scans at {:.0} entries/s per chunk against {:.0} per block ({}). This is the \
+             regime chunking can help in at all: a uniform sweep reaches every chunk of every \
+             block it touches, and verifying all of a block's chunks is verifying the block",
+            skewed[0].median(),
+            skewed[1].median(),
+            skew_cmp.summary("chunk", "whole")
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F20.1",
+        "verifying a chunk instead of a block makes a cold scan cheaper",
+        matches!(cmp.verdict, supdb::bench::stats::Verdict::Greater),
+        format!(
+            "cold scans at {chunk:.0} entries/s per chunk against {whole:.0} per block ({})",
+            cmp.summary("chunk", "whole")
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F20.2",
+        "the first pass now costs about what the steady state does",
+        warm[0] <= chunk * 1.15,
+        format!(
+            "per chunk: {chunk:.0} entries/s cold against {:.0} warm ({:.2}x). Per block: \
+             {whole:.0} against {:.0} ({:.2}x). f19-coldscan measured the whole-block ratio at \
+             1.65x, and closing it is the point of this change -- a scan that has to warm up is a \
+             scan whose first pass is charged for every block it will ever touch",
+            warm[0],
+            warm[0] / chunk.max(1e-9),
+            warm[1],
+            warm[1] / whole.max(1e-9)
         ),
     ));
     let _ = std::fs::remove_file(&file);

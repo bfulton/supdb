@@ -84,7 +84,7 @@
    "experiment": "ext-kv",
    "id": "EXT.5",
    "expect": "fails",
-   "because": "Supdb scans at 0.821x of LMDB (15,662,518 against 19,084,632 entries/s, p=0.0298, IQRs 28% and 17%). It has read 0.441x, 0.749x and 0.821x as the scan work landed, and the number is now understood rather than merely measured. ext-sweep fits Supdb's marginal cost at 27.19 ns/entry against LMDB's 47.37 (EXT.7) and finds it the faster engine at every scan length from 100 up; the whole deficit is a 395ns constant (EXT.8). This suite disagrees because it measures the first, cold pass, and f19-coldscan says that difference is the checksum: cold-with-verification runs 0.715x of cold-without, the first pass costs 1.65x the steady state with verification and 1.09x without, and the cold pass takes zero major faults and spends zero time off CPU. So this claim is, in part, Supdb being charged for a guarantee LMDB does not offer at all -- and the honest reading is not that the comparison is unfair but that the checksum's granularity is wrong: a 64KiB block is hashed in full to hand back 100 bytes.",
+   "because": "Supdb scans at 0.537x of LMDB on the kv suite's uniform scan (p=0.0022, IQRs 4.5% and 15.9%). Read the ratio, never the absolute: between two runs an hour apart on this machine LMDB's own per-entry scan cost moved from 47.37 to 23.22 ns and Supdb's from 27.19 to 19.93, so the magnitudes here are a property of the host as much as of either engine. What is stable across runs is the decomposition: ext-sweep has Supdb the faster walker every time (EXT.7, 1.742x then 1.165x) and the payer of the larger constant every time (EXT.8, 0.759x then 0.915x). This suite measures a uniform cold sweep, which is the one scan shape where none of the work done on this axis helps -- f20-chunkcrc pays on skewed access and does nothing here, because verifying every chunk of a block is verifying the block.",
    "profile": "full"
   },
   {
@@ -469,14 +469,14 @@
    "id": "EXT.7",
    "profile": "full",
    "expect": "holds",
-   "because": "Supdb walks a scan at 27.19 ns/entry against LMDB's 47.37 -- 1.742x better, p=0.0022, fitted over scan lengths 1 to 400 with both engines interleaved. I expected parity here and argued from first principles that the walk was bounded by memory bandwidth and therefore had little left in it; the bandwidth argument was right and the conclusion that both engines were at the bound was wrong. At ci, where the store is cache-resident, the two are identical at 17.76 and 17.83 ns/entry, so this is a memory-traffic difference that only exists at scale."
+   "because": "Supdb walks a scan at 19.93 ns/entry against LMDB's 23.22 -- 1.165x better, p=0.0022, fitted over scan lengths 1 to 400 with both engines interleaved. The ordering has held across runs while the magnitude has not: the previous run read 27.19 against 47.37, a 1.742x margin, on a host that was slower for both. I expected parity here and argued the walk was at the memory bandwidth bound for both engines; the bound was the right frame and the conclusion was wrong."
   },
   {
    "experiment": "ext-sweep",
    "id": "EXT.8",
    "profile": "full",
    "expect": "fails",
-   "because": "Supdb pays 1,634ns of fixed cost per scan against LMDB's 1,240 -- 1.32x worse, p=0.0022. With EXT.7 this locates the whole scan deficit in the constant: Supdb is slower at n=1 and n=2, level at n=50, and faster at every length from 100 up. The gap is 395ns, not the 3-5x a B-tree-versus-binary-search argument predicts -- LMDB's own constant is 1,240ns, nowhere near the ~300ns three page touches would cost, so whatever it is doing per scan is not just a descent either. Note this coefficient is everything paid once per scan, not the seek alone: an earlier draft of this experiment called it seek_ns and compared two engines' different fixed costs as though they were the same quantity."
+   "because": "Supdb pays 894ns of fixed cost per scan against LMDB's 819 -- 0.915x, p=0.0049. With EXT.7 this puts the whole scan deficit in the constant, as it did last run at 1,634 against 1,240. The gap is 75ns here and was 395ns there, on the same code: the constant is dominated by memory latency and this host's varies by more than the difference between the engines. Note this coefficient is everything paid once per scan and not the seek alone."
   },
   {
    "experiment": "f19-coldscan",
@@ -491,6 +491,27 @@
    "profile": "full",
    "expect": "fails",
    "because": "A scan's first pass costs 1.65x its steady state with verification on, and 1.09x with it off, so the cold penalty is the checksum and almost nothing else. The cold pass took 0 major faults and spent 0.0% of its wall time off CPU, which rules out page faults and I/O: this is CPU spent on CRC32C. That resolves the disagreement between ext-sweep, which discards a warmup and finds Supdb faster than LMDB at every scan length from 100 up, and ext-kv, which measures the first pass and finds it slower at exactly 100. Both are right about what they measure, and the difference between them is a guarantee LMDB does not offer -- Features::checksums is false for it."
+  },
+  {
+   "experiment": "f20-chunkcrc",
+   "id": "F20.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Verifying a chunk instead of a block makes no difference to a cold scan that sweeps the store uniformly: 39,663,014 entries/s against 40,341,188, ratio 0.983 at p=0.3067. This is the prediction failing on arithmetic I should have done first. Verifying every chunk of a block *is* verifying the block -- the same bytes hashed -- so chunking cannot save anything on a workload that reaches all of them. It only helps a read that touches part of a block and does not come back. f19-coldscan measured the cold penalty as a CRC over everything the scan reads, and a uniform sweep reads everything."
+  },
+  {
+   "experiment": "f20-chunkcrc",
+   "id": "F20.2",
+   "profile": "full",
+   "expect": "fails",
+   "because": "A uniform cold pass still costs 1.44x its steady state per chunk, against 1.47x per block, because on that workload the two hash the same bytes. F19.2 measured 1.65x for whole blocks and this does not close it. What closes it for a uniform sweep is not a smaller verification unit -- there isn't one -- it is verifying less often or not at all, which is what ReadOptions::verify_checksums is for."
+  },
+  {
+   "experiment": "f20-chunkcrc",
+   "id": "F20.3",
+   "profile": "full",
+   "expect": "holds",
+   "because": "On a skewed scan workload -- Zipfian keys, which is what YCSB runs and what real access looks like -- chunk verification is worth 1.162x: 55,285,646 entries/s against 47,589,779, p=0.0022. This is the regime where a scan touches part of a block and moves on, so hashing 4KiB instead of 64KiB is a real saving. It took two attempts. The first measured 0.908x -- chunking made it *slower* -- because whole-block verification is checked once per block-resolve and amortised over the ~600 entries in it, while per-chunk was checked per extent: the same trick f15-scancache needed, and holding the last verified chunk across entries is what turned a 0.908x loss into a 1.162x win. YCSB-E moved from 0.48x of LMDB to 0.57x."
   }
  ],
  "metrics": [
