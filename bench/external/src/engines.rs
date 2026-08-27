@@ -232,6 +232,8 @@ impl Engine for Supdb {
 pub struct Redb {
     db: redb::Database,
     path: PathBuf,
+    /// Held across operations for the same reason as LMDB's.
+    txn: Option<redb::ReadTransaction>,
 }
 
 const T: redb::TableDefinition<&[u8], &[u8]> = redb::TableDefinition::new("kv");
@@ -246,7 +248,19 @@ impl Redb {
             w.open_table(T).map_err(|e| e.to_string())?;
             w.commit().map_err(|e| e.to_string())?;
         }
-        Ok(Redb { db, path: p })
+        Ok(Redb {
+            db,
+            path: p,
+            txn: None,
+        })
+    }
+
+    /// The held read transaction, opened if there is not one.
+    fn snapshot(&mut self) -> Res<&redb::ReadTransaction> {
+        if self.txn.is_none() {
+            self.txn = Some(self.db.begin_read().map_err(|e| e.to_string())?);
+        }
+        Ok(self.txn.as_ref().expect("just filled"))
     }
 }
 
@@ -265,6 +279,7 @@ impl Engine for Redb {
         }
     }
     fn write_batch(&mut self, items: &[(Vec<u8>, Vec<u8>)]) -> Res<()> {
+        self.txn = None;
         let w = self.db.begin_write().map_err(|e| e.to_string())?;
         {
             let mut t = w.open_table(T).map_err(|e| e.to_string())?;
@@ -276,7 +291,7 @@ impl Engine for Redb {
         w.commit().map_err(|e| e.to_string())
     }
     fn get(&mut self, key: &[u8]) -> Res<usize> {
-        let r = self.db.begin_read().map_err(|e| e.to_string())?;
+        let r = self.snapshot()?;
         let t = r.open_table(T).map_err(|e| e.to_string())?;
         Ok(t.get(key)
             .map_err(|e| e.to_string())?
@@ -284,7 +299,7 @@ impl Engine for Redb {
             .unwrap_or(0))
     }
     fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
-        let r = self.db.begin_read().map_err(|e| e.to_string())?;
+        let r = self.snapshot()?;
         let t = r.open_table(T).map_err(|e| e.to_string())?;
         let mut bytes = 0usize;
         for row in t.range(from..).map_err(|e| e.to_string())?.take(n) {
@@ -313,6 +328,18 @@ pub struct Lmdb {
     env: heed::Env,
     db: heed::Database<heed::types::Bytes, heed::types::Bytes>,
     path: PathBuf,
+    /// A read transaction held across operations, dropped when a write makes
+    /// it stale.
+    ///
+    /// This adapter opened one per `get` and one per `range`. The comment
+    /// where it did called that "conservative against LMDB", which is exactly
+    /// backwards -- it is a cost LMDB pays and Supdb does not, since Supdb's
+    /// adapter caches its `Reader` across calls and rebuilds it only when
+    /// dirty. Worse, a transaction per lookup is the specific handicap the
+    /// architecture review criticised the design document's own LMDB adapter
+    /// for, and removing it there was worth 2.3x. Reproducing it here put the
+    /// same thumb on the same scale.
+    txn: Option<heed::RoTxn<'static>>,
 }
 
 impl Lmdb {
@@ -334,7 +361,21 @@ impl Lmdb {
             env,
             db,
             path: path.to_path_buf(),
+            txn: None,
         })
+    }
+
+    /// The held read transaction, opened if there is not one.
+    fn snapshot(&mut self) -> Res<&heed::RoTxn<'static>> {
+        if self.txn.is_none() {
+            self.txn = Some(
+                self.env
+                    .clone()
+                    .static_read_txn()
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        Ok(self.txn.as_ref().expect("just filled"))
     }
 }
 
@@ -353,6 +394,9 @@ impl Engine for Lmdb {
         }
     }
     fn write_batch(&mut self, items: &[(Vec<u8>, Vec<u8>)]) -> Res<()> {
+        // A held read transaction pins the version it was opened at, so it has
+        // to go before a write, exactly as Supdb's adapter drops its Reader.
+        self.txn = None;
         let mut w = self.env.write_txn().map_err(|e| e.to_string())?;
         for (k, v) in items {
             self.db.put(&mut w, k, v).map_err(|e| e.to_string())?;
@@ -360,35 +404,28 @@ impl Engine for Lmdb {
         w.commit().map_err(|e| e.to_string())
     }
     fn get(&mut self, key: &[u8]) -> Res<usize> {
-        // One transaction per lookup was the handicap the design document
-        // found in its own LMDB adapter and removed for 2.3x; a read txn here
-        // is cheap but a shared one would be cheaper still, so this is
-        // conservative against LMDB rather than for it.
-        let r = self.env.read_txn().map_err(|e| e.to_string())?;
+        let db = self.db;
+        let r = self.snapshot()?;
         // Values are borrowed from the mapping, never copied.
-        Ok(self
-            .db
-            .get(&r, key)
+        Ok(db
+            .get(r, key)
             .map_err(|e| e.to_string())?
             .map(|v| v.len())
             .unwrap_or(0))
     }
     fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
-        let r = self.env.read_txn().map_err(|e| e.to_string())?;
+        let db = self.db;
+        let r = self.snapshot()?;
         let mut bytes = 0usize;
         let range = (std::ops::Bound::Included(from), std::ops::Bound::Unbounded);
-        for row in self
-            .db
-            .range(&r, &range)
-            .map_err(|e| e.to_string())?
-            .take(n)
-        {
+        for row in db.range(r, &range).map_err(|e| e.to_string())?.take(n) {
             let (_, v) = row.map_err(|e| e.to_string())?;
             bytes += v.len();
         }
         Ok(bytes)
     }
     fn sync(&mut self) -> Res<()> {
+        self.txn = None;
         self.env.force_sync().map_err(|e| e.to_string())
     }
     fn size_bytes(&self) -> u64 {

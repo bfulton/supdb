@@ -88,6 +88,7 @@ fn main() -> std::io::Result<()> {
     let rec = match cmd.as_str() {
         "kv" => suite_kv(&args, profile, &engines)?,
         "ycsb" => suite_ycsb(&args, profile, &engines)?,
+        "sweep" => suite_sweep(&args, profile, &engines)?,
         "all" => {
             let a = suite_kv(&args, profile, &engines)?;
             a.print_summary();
@@ -99,7 +100,7 @@ fn main() -> std::io::Result<()> {
         }
         _ => {
             println!(
-                "external <kv|ycsb|all> [--profile ci|dev|full] [--engines supdb,redb,lmdb,sled]"
+                "external <kv|ycsb|sweep|all> [--profile ci|dev|full] [--engines supdb,redb,lmdb,sled]"
             );
             return Ok(());
         }
@@ -348,6 +349,209 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
          read-your-writes and ordered scan. Supdb provides one of six; a throughput comparison \
          against engines providing five or six is comparing promises as much as implementations",
     );
+    Ok(rec)
+}
+
+
+/// Decompose a scan into its constant and its slope, for every engine.
+///
+/// A scan is a seek plus a walk, and the two have completely different floors.
+/// The walk is bounded by memory bandwidth -- you must touch every byte you
+/// emit -- while the seek is bounded by the number of *dependent* memory
+/// accesses, since probe k+1 cannot issue until probe k returns. Reporting one
+/// blended entries/s figure hides which of the two an engine is losing on, and
+/// this suite has been reporting exactly that: EXT.5 is a single number at one
+/// scan length.
+///
+/// Measuring the same scan at many lengths separates them. Cost per scan is
+/// `a + b*n`: `a` is the seek and everything else fixed, `b` is the marginal
+/// cost of one more entry. Each repetition fits its own `a` and `b`, so the
+/// two coefficients get distributions and `stats::compare` can be applied to
+/// them like anything else here.
+///
+/// Engines are interleaved at the innermost level, and the entry budget per
+/// measurement is held constant so a long scan does not get more samples than
+/// a short one.
+fn suite_sweep(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Record> {
+    let n = args.num("--keys", profile.pick(20_000, 200_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let batch = args.num("--batch", 1_000);
+    let budget = args.num("--budget", profile.pick(20_000, 100_000, 400_000)) as u64;
+    let reps = args.num("--reps", profile.reps());
+    let lens: Vec<usize> = vec![1, 2, 5, 10, 25, 50, 100, 200, 400];
+
+    let mut rec = Record::new("ext-sweep", profile);
+    rec.param("keys", J::u(n))
+        .param("value_size", J::u(value_size as u64))
+        .param("entry_budget", J::u(budget))
+        .param("reps", J::u(reps as u64))
+        .note(
+            "cost per scan fitted as a + b*n over scan lengths 1..400; a is the seek and \
+             everything else fixed per scan, b is the marginal cost of one more entry",
+        )
+        .note(
+            "engines interleaved at the innermost level, one store per engine built once and \
+             swept repeatedly, entry budget held constant across lengths",
+        );
+
+    let payload = Payload::new(value_size, 0.5, 0xE3);
+    let root = scratch("sweep");
+    let mut engines: Vec<Box<dyn Engine>> = Vec::new();
+    let mut names: Vec<&str> = Vec::new();
+    for name in which {
+        let Some(mut e) = build(&root, &[name], 256).into_iter().next() else {
+            continue;
+        };
+        let mut vrng = Rng::new(0xE3);
+        let mut kb = [0u8; 16];
+        let mut buf: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch);
+        for i in 0..n {
+            db_key_into(i, &mut kb);
+            buf.push((kb.to_vec(), payload.get(&mut vrng).to_vec()));
+            if buf.len() == batch {
+                e.write_batch(&buf).expect("load");
+                buf.clear();
+            }
+        }
+        if !buf.is_empty() {
+            e.write_batch(&buf).expect("load");
+        }
+        e.sync().expect("sync");
+        engines.push(e);
+        names.push(name);
+    }
+
+    // ns per scan, indexed [engine][len], one Samples per pair.
+    let mut per: Vec<Vec<Samples>> = names
+        .iter()
+        .map(|_| lens.iter().map(|_| Samples::default()).collect())
+        .collect();
+    let warmup = 1usize;
+    for rep in 0..(warmup + reps) {
+        for (li, len) in lens.iter().enumerate() {
+            let scans = (budget / *len as u64).max(1);
+            for (ei, e) in engines.iter_mut().enumerate() {
+                let mut g = KeyGen::new(
+                    KeyDist::Uniform,
+                    n.saturating_sub(*len as u64).max(1),
+                    0xE3 + rep as u64,
+                );
+                let mut kb = [0u8; 16];
+                let t = Instant::now();
+                for _ in 0..scans {
+                    db_key_into(g.next(), &mut kb);
+                    let _ = e.range(&kb, *len).expect("range");
+                }
+                if rep >= warmup {
+                    per[ei][li].push(t.elapsed().as_secs_f64() * 1e9 / scans as f64);
+                }
+            }
+        }
+    }
+
+    // Least squares fit of ns_per_scan = a + b*n, one fit per repetition so
+    // both coefficients carry a distribution rather than a point estimate.
+    let fit = |ys: &[f64]| -> (f64, f64) {
+        let xs: Vec<f64> = lens.iter().map(|l| *l as f64).collect();
+        let k = xs.len() as f64;
+        let sx: f64 = xs.iter().sum();
+        let sy: f64 = ys.iter().sum();
+        let sxx: f64 = xs.iter().map(|x| x * x).sum();
+        let sxy: f64 = xs.iter().zip(ys).map(|(x, y)| x * y).sum();
+        let d = k * sxx - sx * sx;
+        if d.abs() < 1e-12 {
+            return (sy / k, 0.0);
+        }
+        let b = (k * sxy - sx * sy) / d;
+        ((sy - b * sx) / k, b)
+    };
+
+    // `a` is every cost a scan pays once, not the seek alone. Naming it
+    // "seek" in an earlier draft made it easy to compare two engines' very
+    // different fixed costs as though they were the same quantity.
+    let mut seek: Vec<Samples> = names.iter().map(|_| Samples::default()).collect();
+    let mut walk: Vec<Samples> = names.iter().map(|_| Samples::default()).collect();
+    for ei in 0..names.len() {
+        for r in 0..reps {
+            let ys: Vec<f64> = (0..lens.len()).map(|li| per[ei][li].values[r]).collect();
+            let (a, b) = fit(&ys);
+            seek[ei].push(a);
+            walk[ei].push(b);
+        }
+    }
+
+    let mut rows = Vec::new();
+    for (ei, name) in names.iter().enumerate() {
+        let points: Vec<J> = lens
+            .iter()
+            .enumerate()
+            .map(|(li, len)| {
+                let ns = per[ei][li].median();
+                jobj! {
+                    "n" => J::u(*len as u64),
+                    "ns_per_scan" => J::fp(ns, 1),
+                    "ns_per_entry" => J::fp(ns / *len as f64, 2),
+                    "entries_per_s" => J::fp(*len as f64 * 1e9 / ns.max(1e-9), 1)
+                }
+            })
+            .collect();
+        println!(
+            "  {name:6} fixed {:>8.0} ns/scan   per-entry {:>6.2} ns   ({:>10.0} entries/s at n=400)",
+            seek[ei].median(),
+            walk[ei].median(),
+            400.0 * 1e9 / per[ei][lens.len() - 1].median().max(1e-9)
+        );
+        rows.push(jobj! {
+            "engine" => J::s(*name),
+            "fixed_ns" => J::fp(seek[ei].median(), 1),
+            "per_entry_ns" => J::fp(walk[ei].median(), 3),
+            "fixed" => seek[ei].to_json(),
+            "per_entry" => walk[ei].to_json(),
+            "points" => J::arr(points)
+        });
+    }
+    rec.series("sweep", J::arr(rows));
+
+    let idx = |name: &str| names.iter().position(|w| *w == name);
+    if let (Some(s), Some(l)) = (idx("supdb"), idx("lmdb")) {
+        // Lower is better for both coefficients, so the comparison is the
+        // other way round from a throughput one.
+        let walk_cmp = compare(&walk[l], &walk[s], supdb::bench::MIN_EFFECT);
+        let seek_cmp = compare(&seek[l], &seek[s], supdb::bench::MIN_EFFECT);
+        rec.compare("walk_lmdb_vs_supdb", walk_cmp.clone());
+        rec.compare("fixed_lmdb_vs_supdb", seek_cmp.clone());
+        rec.finding(Finding::new(
+            "EXT.7",
+            "Supdb walks a scan with less work per entry than LMDB",
+            matches!(walk_cmp.verdict, Verdict::Greater),
+            format!(
+                "supdb {:.2} ns/entry against lmdb {:.2} ({}). The walk is bounded by memory \
+                 bandwidth rather than by structure, so this is the half of a scan where there \
+                 is little left to win",
+                walk[s].median(),
+                walk[l].median(),
+                walk_cmp.summary("lmdb", "supdb")
+            ),
+        ));
+        rec.finding(Finding::new(
+            "EXT.8",
+            "Supdb pays no more fixed cost per scan than LMDB",
+            // Lower is better, so this holds when LMDB's constant is the
+            // greater one or the two cannot be told apart. The first version
+            // of this line accepted `Less` as well, which is LMDB winning, and
+            // it duly reported a hold on a run where Supdb was 1.24x worse.
+            matches!(seek_cmp.verdict, Verdict::Greater | Verdict::NoDifference),
+            format!(
+                "supdb {:.0} ns against lmdb {:.0} ({}). This is the whole constant, not the seek \
+                 alone: it holds everything an engine pays once per scan regardless of length. \
+                 For Supdb that is the seek plus resolving the first block; for LMDB and redb it \
+                 was, until this commit, opening a read transaction per call",
+                seek[s].median(),
+                seek[l].median(),
+                seek_cmp.summary("lmdb", "supdb")
+            ),
+        ));
+    }
     Ok(rec)
 }
 

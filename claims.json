@@ -69,22 +69,22 @@
   {
    "experiment": "ext-kv",
    "id": "EXT.1",
-   "expect": "fails",
-   "because": "No difference: 595,920 ops/s against LMDB's 589,866 -- ratio 1.010, p=0.4433 over seven interleaved repetitions. Parity is not a lead, so the claim fails. Across five repeated runs this has read 0.866x, 0.891x, 0.892x and now 1.010x; before the suite repeated anything it read 0.70x, 1.03x, 0.998x, 1.13x and 0.85x on single runs. A ci-pinned twin of this claim was deleted rather than reconciled again: it read 0.784x, 1.002x, 5.162x and 1.303x on consecutive runs, and an ordering claim pinned to a profile this project forbids citing cannot be evidence either way. The 5.162x reading was taken while a compile was running, which is the concurrency rule in CLAUDE.md being broken by the person who wrote it down.",
+   "expect": "holds",
+   "because": "Supdb loads 619,158 ops/s against LMDB's 536,621 -- 1.154x, p=0.0073 over seven interleaved repetitions. Read this as a claim that sits on parity rather than as a lead: across repeated runs it has read 0.866x, 0.891x, 0.892x, 1.010x and now 1.154x, and LMDB's own figure has drifted 735k, 590k, 537k over the same runs on a machine whose within-run IQRs are 6-9%. What is established is that the gap block compression opened has closed. LMDB commits durably per batch here and Supdb does not; see the suite note and f13-sync.",
    "profile": "full"
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.4",
    "expect": "holds",
-   "because": "Supdb reads 1,147,804/s against LMDB's 889,358 -- 1.291x, p=0.0022 over seven interleaved repetitions. The ratio has read 1.431x, 1.230x and 1.291x across repeated runs while the verdict has never moved. The design document reports the opposite ordering, measured through JNI with an adapter it separately found to allocate per value and open a transaction per lookup.",
+   "because": "Supdb reads 1,267,118/s against LMDB's 804,634 -- 1.575x, p=0.0022. This is now measured against an LMDB that holds a read transaction across operations instead of opening one per lookup, which is the specific handicap the architecture review criticised the design document's own adapter for and which this adapter had reproduced. Fixing it did not move the ordering: the ratio has read 1.431x, 1.230x, 1.291x and 1.575x across repeated runs, all the same verdict.",
    "profile": "full"
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.5",
    "expect": "fails",
-   "because": "Supdb scans at 0.749x of LMDB (18,974,770 against 25,321,189 entries/s, p=0.0022), up from 0.441x. Still a loss, and still the last axis outside of space where an ordering goes against Supdb, but the cause is now understood rather than suspected. A scan costs `1637 + 20.8n` nanoseconds at 1M keys: the per-entry walk reaches 40M entries/s at length 400 against LMDB's 47M and is not the problem, and the constant is. Four things have been aimed at that constant. f14-blocktable refuted the mapped block table at ratio 1.002. f15-scancache found a block resolved twice per entry, worth 1.201x. f18-fence narrows the seek, worth 1.092x on a 50-entry scan. What is left is that a seek costs about 700ns because a binary search over a 36MB record region chases two dependent loads per probe, where LMDB descends a B-tree in about three page touches.",
+   "because": "Supdb scans at 0.821x of LMDB (15,662,518 against 19,084,632 entries/s, p=0.0298), with IQRs of 28% and 17% -- wide, and the weakest of the external orderings. It has read 0.441x, 0.749x and 0.821x as the scan work landed. ext-sweep now says something this number cannot: fitted over scan lengths 1 to 400, Supdb's marginal cost is 27.19 ns/entry against LMDB's 47.37 (EXT.7), and at every length from 100 upwards Supdb is the faster of the two. The deficit is entirely the constant (EXT.8), and it is 395ns. The two suites disagree because this one measures the first, cold pass and the sweep discards a warmup; the leading hypothesis for the difference is that a cold scan pays a whole-block CRC on first touch and LMDB offers no checksums at all, but that is a hypothesis and the last three did not survive contact with an experiment.",
    "profile": "full"
   },
   {
@@ -463,6 +463,20 @@
    "profile": "full",
    "expect": "holds",
    "because": "On the workload the fence was built for -- 50-entry scans, the shape YCSB-E runs -- it is worth 1.092x: 15,909,949 against 14,570,849 entries/s, p=0.0022 with IQRs of 2.0% and 1.4%. This is the finding that decides whether the fence earns a format version, since a seek that got faster without moving a scan would not. 9% is real, repeated and far less than predicted; it is kept because it is positive and measured, not because it was expected."
+  },
+  {
+   "experiment": "ext-sweep",
+   "id": "EXT.7",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Supdb walks a scan at 27.19 ns/entry against LMDB's 47.37 -- 1.742x better, p=0.0022, fitted over scan lengths 1 to 400 with both engines interleaved. I expected parity here and argued from first principles that the walk was bounded by memory bandwidth and therefore had little left in it; the bandwidth argument was right and the conclusion that both engines were at the bound was wrong. At ci, where the store is cache-resident, the two are identical at 17.76 and 17.83 ns/entry, so this is a memory-traffic difference that only exists at scale."
+  },
+  {
+   "experiment": "ext-sweep",
+   "id": "EXT.8",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Supdb pays 1,634ns of fixed cost per scan against LMDB's 1,240 -- 1.32x worse, p=0.0022. With EXT.7 this locates the whole scan deficit in the constant: Supdb is slower at n=1 and n=2, level at n=50, and faster at every length from 100 up. The gap is 395ns, not the 3-5x a B-tree-versus-binary-search argument predicts -- LMDB's own constant is 1,240ns, nowhere near the ~300ns three page touches would cost, so whatever it is doing per scan is not just a descent either. Note this coefficient is everything paid once per scan, not the seek alone: an earlier draft of this experiment called it seek_ns and compared two engines' different fixed costs as though they were the same quantity."
   }
  ],
  "metrics": [
