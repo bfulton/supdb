@@ -146,7 +146,11 @@ impl Supdb {
             return Ok(());
         }
         if let Some(s) = &self.store {
-            s.checkpoint().map_err(|e| e.to_string())?;
+            // Publish, not checkpoint. A scan needs the writes to be *visible*
+            // to a new reader; it does not need them to survive power loss,
+            // and `checkpoint` fsyncs twice to promise that. f13 priced an
+            // fsync at 31x on this shape.
+            s.publish().map_err(|e| e.to_string())?;
         }
         self.reader = Some(supdb::Reader::open(&self.path).map_err(|e| e.to_string())?);
         self.refreshes += 1;

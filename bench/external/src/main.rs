@@ -309,7 +309,15 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
         .param("operation_count", J::u(ops))
         .param("value_size", J::u(value_size as u64))
         .param("batch", J::u(batch as u64))
-        .note("YCSB core workloads A-F; Zipfian theta 0.99 as in the original");
+        .note("YCSB core workloads A-F; Zipfian theta 0.99 as in the original")
+        .note(
+            "read this against the feature table, not on its own: LMDB commits durably on \
+             every batch, and Supdb buffers and publishes without an fsync. That is what \
+             durable_commit=false in its Features means and it is why it scores 3/6 against \
+             LMDB's 5/6. f13-sync prices the difference at 31x on this shape, so the mixed \
+             workloads are a comparison of an engine that promises power-loss durability \
+             against one that does not",
+        );
 
     let payload = Payload::new(value_size, 0.5, 0xE2);
     let mut rows = Vec::new();

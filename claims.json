@@ -69,8 +69,8 @@
   {
    "experiment": "ext-kv",
    "id": "EXT.1",
-   "expect": "holds",
-   "because": "FIXED, and not by anything aimed at it. Supdb loads 723,985 ops/s against LMDB's 703,269 -- 1.03x, where it was 0.70x. It had been broken by turning block compression off: uncompressed data is about five times more bytes and a full load is bound by writing them. What bought it back is that the load path no longer interleaves with reader rebuilds. The margin is thin enough that it should be read as parity restored, not as a lead. Pinned to full: these orderings move with scale.",
+   "expect": "fails",
+   "because": "Parity, landing on the wrong side of it: Supdb loads 712,164 ops/s against LMDB's 713,772 -- 0.998x. It was 0.70x when block compression was turned off, since uncompressed data is about five times more bytes and a full load is bound by writing them, and it read 1.03x in the run before this one. A claim that swings between holding and failing on a 0.2% margin is not measuring an ordering, it is measuring the machine; what it does establish is that the load gap closed. Read it as parity and read EXT.4 for an ordering that is not in doubt. Note also that LMDB commits durably per batch here and Supdb does not -- see the suite's own note and f13-sync.",
    "profile": "full"
   },
   {
@@ -84,7 +84,7 @@
    "experiment": "ext-kv",
    "id": "EXT.5",
    "expect": "fails",
-   "because": "Supdb scans 15,366,352 entries/s against LMDB's 28,231,754 -- 0.54x, having been 0.82x in the previous full run at 23,396,643. LMDB and redb moved less than 3% between those runs, so this is Supdb and not the machine. The suspect was the commit that moved the block table into a mapped section, on the reasoning that a scan resolves a block per entry where a point read resolves one per lookup. `f14-blocktable` refutes it: at 1M keys, interleaved in one process, mapped and owned differ by 0.2% on scans (p=0.70) and 0.1% on point reads (p=0.90). The regression is real and its cause is not yet known. It is left here as a failing claim rather than explained away.",
+   "because": "Supdb scans 15,425,352 entries/s against LMDB's 31,505,320 -- 0.49x. The suspect was the commit that mapped the block table, since a scan resolves a block for every entry it walks; f14-blocktable refutes that at 1M keys, interleaved, at ratio 1.002 and p=0.70. What a bisect does show is that the loss is partly warm-up: the same scan measured three times in one process runs 14.4M, 19.1M and 19.3M entries/s, and the suite measures the first pass for every engine. The rest is per-entry work LMDB does not do -- resolve a block, bounds-check an extent, check a checksum bit -- once per entry where a B-tree leaf walk yields pointers. That is the thing to attack, and it has not been attacked yet.",
    "profile": "full"
   },
   {
