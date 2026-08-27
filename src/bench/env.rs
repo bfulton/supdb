@@ -329,3 +329,106 @@ mod tests {
         }
     }
 }
+
+/// Where a phase's wall-clock time went: on a CPU, or waiting.
+///
+/// This closes the gap `f13-sync` and `F13.2` are about. Callgrind counts
+/// instructions, so it can say the block table decode is 34% of them -- which
+/// was true, and mapping it changed throughput by nothing, because the
+/// workload was waiting on `fsync`. An instruction profile answers where the
+/// CPU goes, and the question it cannot answer is why a workload is slow when
+/// the CPU is not where it is going.
+///
+/// There is no PMU on this hypervisor, so `perf` reports `<not supported>`.
+/// None is needed for this: the kernel already tracks per-thread CPU time, and
+/// wall minus CPU is time the thread was not running -- blocked on I/O, on a
+/// page fault that reached the disk, or on a lock. `getrusage` supplies the
+/// reason: a major fault went to disk, a voluntary context switch is a thread
+/// that chose to block, an involuntary one is a thread that was preempted.
+///
+/// Thread-scoped, so it measures the caller and not whatever else the process
+/// is doing. Every timing benchmark here is single-threaded by rule.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Wait {
+    pub wall_ns: u64,
+    pub cpu_ns: u64,
+    /// Faults that had to read the backing store.
+    pub major_faults: u64,
+    pub minor_faults: u64,
+    /// Blocked on purpose: a syscall that slept.
+    pub voluntary_switches: u64,
+    /// Preempted: the scheduler took the CPU away.
+    pub involuntary_switches: u64,
+}
+
+fn clock_ns(id: libc::clockid_t) -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, fully initialized timespec and the clock ids
+    // used here are the POSIX constants.
+    if unsafe { libc::clock_gettime(id, &mut ts) } != 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+impl Wait {
+    pub fn read_now() -> Wait {
+        // SAFETY: `ru` is fully initialized before the call reads it, and
+        // RUSAGE_THREAD asks only about the calling thread.
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        let ok = unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut ru) } == 0;
+        Wait {
+            wall_ns: clock_ns(libc::CLOCK_MONOTONIC),
+            cpu_ns: clock_ns(libc::CLOCK_THREAD_CPUTIME_ID),
+            major_faults: if ok { ru.ru_majflt as u64 } else { 0 },
+            minor_faults: if ok { ru.ru_minflt as u64 } else { 0 },
+            voluntary_switches: if ok { ru.ru_nvcsw as u64 } else { 0 },
+            involuntary_switches: if ok { ru.ru_nivcsw as u64 } else { 0 },
+        }
+    }
+
+    pub fn since(&self, start: &Wait) -> Wait {
+        Wait {
+            wall_ns: self.wall_ns.saturating_sub(start.wall_ns),
+            cpu_ns: self.cpu_ns.saturating_sub(start.cpu_ns),
+            major_faults: self.major_faults.saturating_sub(start.major_faults),
+            minor_faults: self.minor_faults.saturating_sub(start.minor_faults),
+            voluntary_switches: self
+                .voluntary_switches
+                .saturating_sub(start.voluntary_switches),
+            involuntary_switches: self
+                .involuntary_switches
+                .saturating_sub(start.involuntary_switches),
+        }
+    }
+
+    /// Wall time the thread spent not running. The half an instruction profile
+    /// cannot see.
+    pub fn off_cpu_ns(&self) -> u64 {
+        self.wall_ns.saturating_sub(self.cpu_ns)
+    }
+
+    /// Fraction of wall time spent off CPU, in [0, 1].
+    pub fn off_cpu_fraction(&self) -> f64 {
+        if self.wall_ns == 0 {
+            return 0.0;
+        }
+        self.off_cpu_ns() as f64 / self.wall_ns as f64
+    }
+
+    pub fn to_json(&self) -> J {
+        jobj! {
+            "wall_ms" => J::fp(self.wall_ns as f64 / 1e6, 3),
+            "cpu_ms" => J::fp(self.cpu_ns as f64 / 1e6, 3),
+            "off_cpu_ms" => J::fp(self.off_cpu_ns() as f64 / 1e6, 3),
+            "off_cpu_fraction" => J::fp(self.off_cpu_fraction(), 4),
+            "major_faults" => J::u(self.major_faults),
+            "minor_faults" => J::u(self.minor_faults),
+            "voluntary_switches" => J::u(self.voluntary_switches),
+            "involuntary_switches" => J::u(self.involuntary_switches)
+        }
+    }
+}
