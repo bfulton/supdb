@@ -109,8 +109,19 @@ the same commit, and the review in `docs/` should be updated to say so.
 
 Fixed so far, with reproducers kept in `tests/known_bugs.rs`: delete
 resurrection, the double-free that handed one slot to three blocks, decoder
-panics on damaged input, silently-served corruption (now checksummed), and a
-checkpoint that appended three index sections and released none of them.
+panics on damaged input, silently-served corruption (now checksummed), a
+checkpoint that appended three index sections and released none of them, and a
+reader that fed a flat block-table section to the varint decoder and reported
+the misparse as file corruption.
+
+The largest one is `Store::read_all`. A writer can read its own sealed, staged
+and pending state, so a read after a write no longer needs a checkpoint and a
+fresh `Reader`; a scan refreshes with `publish` rather than `checkpoint`,
+because it needs the writes visible and not durable. `EXT.3` moved from 13.5x
+to 0.76x, and against LMDB the mixed YCSB workloads went from 0.07-0.14x to
+18.9x on A and 18.4x on F. YCSB-E is the one still losing, at 0.43x, because
+publishing rewrites index structure in proportion to the key count rather than
+to what changed.
 
 Two of the four above have moved from `fails` to `holds`. F2.2: reader open is
 sub-linear in key count since the key index became a mapped section
