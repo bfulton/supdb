@@ -98,6 +98,7 @@ fn main() -> std::io::Result<()> {
             "f16-slack" => f16_slack(&args, profile)?,
             "f17-gather" => f17_gather(&args, profile)?,
             "f18-fence" => f18_fence(&args, profile)?,
+            "f19-coldscan" => f19_coldscan(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -129,6 +130,7 @@ fn main() -> std::io::Result<()> {
                 "f16-slack",
                 "f17-gather",
                 "f18-fence",
+                "f19-coldscan",
                 "f4-durability",
                 "f3-multiproc",
                 "f1-outofcore",
@@ -2013,6 +2015,160 @@ fn f18_fence(args: &Args, profile: Profile) -> std::io::Result<Record> {
              one that decides whether the fence earns a format version; a seek that got faster \
              without moving a scan would not",
             scan_cmp.summary("fenced", "plain")
+        ),
+    ));
+    let _ = std::fs::remove_file(&file);
+    Ok(rec)
+}
+
+/// Why does a cold scan cost more than a warm one, and how much of it is the
+/// checksum?
+///
+/// `ext-sweep` fits Supdb faster than LMDB at every scan length from 100 up,
+/// and `ext-kv` reports it slower at exactly 100. The two are not measuring
+/// the same thing: the sweep discards a warmup repetition and the kv suite
+/// measures the first pass over a freshly opened reader. Something about the
+/// first pass is expensive, and this experiment says what.
+///
+/// A `Reader` verifies a plain block's CRC once and records that in a bitset,
+/// so the first scan that touches a block pays a checksum over the whole 64KiB
+/// of it and later scans pay nothing. On a cold reader every block is a first
+/// touch. LMDB offers no checksums at all -- `Features::checksums` is false
+/// for it -- so this is a guarantee Supdb provides and is charged for in a
+/// comparison that does not price it.
+///
+/// One store, built once with checksums on so the CRCs are in the file, and
+/// two arms that differ only in whether the reader verifies them. Each
+/// repetition opens a fresh reader for the cold pass and then reuses it, so
+/// the cold penalty and its decay are measured on the same reader.
+fn f19_coldscan(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::bench::env::Wait;
+
+    let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let scan_len = args.num("--scan-len", 100);
+    let scans = args.num("--scans", profile.pick(2_000, 10_000, 20_000)) as u64;
+
+    let mut rec = Record::new("f19-coldscan", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .param("scan_len", J::u(scan_len as u64))
+        .param("scans", J::u(scans))
+        .note(
+            "one file with checksums in it; the arms differ only in whether the reader verifies \
+             them. A fresh reader per repetition is what makes the first pass cold",
+        );
+
+    let dir = scratch("f19");
+    let file = dir.join("cold.dat");
+    let payload = Payload::new(value_size, 0.5, 0x19);
+    {
+        let store = Store::create(
+            &file,
+            Options {
+                checksums: true,
+                ..default_opts(128)
+            },
+        )
+        .expect("create");
+        let mut vrng = Rng::new(0x19);
+        let mut kb = [0u8; 16];
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+        }
+        store.flush().expect("flush");
+        store.close().expect("close");
+    }
+
+    let verify = [true, false];
+    let warm_out = std::sync::Mutex::new([0f64; 2]);
+    let wait_out = std::sync::Mutex::new([Wait::default(); 2]);
+
+    // The cold pass. A fresh reader has an empty verified bitset, so every
+    // block it touches is checked once.
+    let cold = Trial::new(profile.reps()).run(2, |ci, rep| {
+        let r = Reader::open_with(
+            &file,
+            supdb::ReadOptions {
+                verify_checksums: verify[ci],
+                ..Default::default()
+            },
+        )
+        .expect("open");
+        let pass = |seed: u64| -> (f64, Wait) {
+            let mut g = KeyGen::new(
+                KeyDist::Uniform,
+                keys.saturating_sub(scan_len as u64).max(1),
+                seed,
+            );
+            let mut kb = [0u8; 16];
+            let a = Wait::read_now();
+            let mut n = 0u64;
+            for _ in 0..scans {
+                db_key_into(g.next(), &mut kb);
+                n += r
+                    .scan(Some(&kb), scan_len, |_k, v| {
+                        std::hint::black_box(v);
+                    })
+                    .expect("scan");
+            }
+            let w = Wait::read_now().since(&a);
+            (n as f64 / (w.wall_ns as f64 / 1e9), w)
+        };
+        // Same key sequence both passes, so the second differs only in what
+        // the reader already knows.
+        let (first, w) = pass(0x19 + rep as u64);
+        let (second, _) = pass(0x19 + rep as u64);
+        warm_out.lock().unwrap()[ci] = second;
+        wait_out.lock().unwrap()[ci] = w;
+        first
+    });
+
+    let cmp = compare(&cold[0], &cold[1], supdb::bench::MIN_EFFECT);
+    let (on, off) = (cold[0].median(), cold[1].median());
+    let warm = *warm_out.lock().unwrap();
+    let wait = *wait_out.lock().unwrap();
+    rec.compare("cold_verified_vs_unverified", cmp.clone());
+    rec.series(
+        "arms",
+        jobj! {
+            "cold_verified_entries_per_s" => J::fp(on, 1),
+            "cold_unverified_entries_per_s" => J::fp(off, 1),
+            "warm_verified_entries_per_s" => J::fp(warm[0], 1),
+            "warm_unverified_entries_per_s" => J::fp(warm[1], 1),
+            "cold_verified_wait" => wait[0].to_json(),
+            "cold_unverified_wait" => wait[1].to_json()
+        },
+    );
+
+    rec.finding(Finding::new(
+        "F19.1",
+        "verifying block checksums costs nothing on a cold scan",
+        !matches!(cmp.verdict, supdb::bench::stats::Verdict::Less),
+        format!(
+            "cold scans at {on:.0} entries/s verified against {off:.0} unverified ({}). \
+             f8-checksums measured this cost at no difference on point reads, where a block is \
+             checked once and read many times; a scan over a fresh reader touches each block for \
+             the first time and pays for all of them",
+            cmp.summary("verified", "unverified")
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F19.2",
+        "a scan's first pass costs no more than its steady state",
+        warm[0] <= on * 1.05,
+        format!(
+            "verified: {on:.0} entries/s cold against {:.0} warm ({:.2}x). Unverified: {off:.0} \
+             against {:.0} ({:.2}x). Whatever remains after the checksum is subtracted is the \
+             cost of touching the mapping for the first time, and the cold pass took {} major \
+             faults with {:.1}% of its wall time off CPU",
+            warm[0],
+            warm[0] / on.max(1e-9),
+            warm[1],
+            warm[1] / off.max(1e-9),
+            wait[0].major_faults,
+            wait[0].off_cpu_fraction() * 100.0
         ),
     ));
     let _ = std::fs::remove_file(&file);

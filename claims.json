@@ -84,7 +84,7 @@
    "experiment": "ext-kv",
    "id": "EXT.5",
    "expect": "fails",
-   "because": "Supdb scans at 0.821x of LMDB (15,662,518 against 19,084,632 entries/s, p=0.0298), with IQRs of 28% and 17% -- wide, and the weakest of the external orderings. It has read 0.441x, 0.749x and 0.821x as the scan work landed. ext-sweep now says something this number cannot: fitted over scan lengths 1 to 400, Supdb's marginal cost is 27.19 ns/entry against LMDB's 47.37 (EXT.7), and at every length from 100 upwards Supdb is the faster of the two. The deficit is entirely the constant (EXT.8), and it is 395ns. The two suites disagree because this one measures the first, cold pass and the sweep discards a warmup; the leading hypothesis for the difference is that a cold scan pays a whole-block CRC on first touch and LMDB offers no checksums at all, but that is a hypothesis and the last three did not survive contact with an experiment.",
+   "because": "Supdb scans at 0.821x of LMDB (15,662,518 against 19,084,632 entries/s, p=0.0298, IQRs 28% and 17%). It has read 0.441x, 0.749x and 0.821x as the scan work landed, and the number is now understood rather than merely measured. ext-sweep fits Supdb's marginal cost at 27.19 ns/entry against LMDB's 47.37 (EXT.7) and finds it the faster engine at every scan length from 100 up; the whole deficit is a 395ns constant (EXT.8). This suite disagrees because it measures the first, cold pass, and f19-coldscan says that difference is the checksum: cold-with-verification runs 0.715x of cold-without, the first pass costs 1.65x the steady state with verification and 1.09x without, and the cold pass takes zero major faults and spends zero time off CPU. So this claim is, in part, Supdb being charged for a guarantee LMDB does not offer at all -- and the honest reading is not that the comparison is unfair but that the checksum's granularity is wrong: a 64KiB block is hashed in full to hand back 100 bytes.",
    "profile": "full"
   },
   {
@@ -477,6 +477,20 @@
    "profile": "full",
    "expect": "fails",
    "because": "Supdb pays 1,634ns of fixed cost per scan against LMDB's 1,240 -- 1.32x worse, p=0.0022. With EXT.7 this locates the whole scan deficit in the constant: Supdb is slower at n=1 and n=2, level at n=50, and faster at every length from 100 up. The gap is 395ns, not the 3-5x a B-tree-versus-binary-search argument predicts -- LMDB's own constant is 1,240ns, nowhere near the ~300ns three page touches would cost, so whatever it is doing per scan is not just a descent either. Note this coefficient is everything paid once per scan, not the seek alone: an earlier draft of this experiment called it seek_ns and compared two engines' different fixed costs as though they were the same quantity."
+  },
+  {
+   "experiment": "f19-coldscan",
+   "id": "F19.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Verifying block checksums costs 0.715x on a cold scan -- 39,251,416 entries/s against 54,902,165 unverified, p=0.0022 with IQRs of 4.5% and 4.6%. f8-checksums measured this cost at 'read -1.0%, no difference' and that measurement was not wrong, it was on the wrong workload: a reader checks each block once and records it, so a point-read workload reads every block many times and amortises the check away. A scan over a fresh reader touches each block for the first time and pays for all of them. The amplification is the point -- a 64KiB block is checksummed in full to hand back a 100-byte value."
+  },
+  {
+   "experiment": "f19-coldscan",
+   "id": "F19.2",
+   "profile": "full",
+   "expect": "fails",
+   "because": "A scan's first pass costs 1.65x its steady state with verification on, and 1.09x with it off, so the cold penalty is the checksum and almost nothing else. The cold pass took 0 major faults and spent 0.0% of its wall time off CPU, which rules out page faults and I/O: this is CPU spent on CRC32C. That resolves the disagreement between ext-sweep, which discards a warmup and finds Supdb faster than LMDB at every scan length from 100 up, and ext-kv, which measures the first pass and finds it slower at exactly 100. Both are right about what they measure, and the difference between them is a guarantee LMDB does not offer -- Features::checksums is false for it."
   }
  ],
  "metrics": [

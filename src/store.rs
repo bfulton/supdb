@@ -192,6 +192,19 @@ pub struct ReadOptions {
     /// region. Off is the old behaviour, kept so `f18-fence` can price it in
     /// one process over one file.
     pub seek_fence: bool,
+    /// Verify a plain block's checksum the first time this reader touches it.
+    ///
+    /// A reader checks each block once and remembers that, so a point-read
+    /// workload amortises it to nothing -- which is what f8-checksums measured
+    /// and why the cost looked free. A scan over a fresh reader touches every
+    /// block for the first time and pays for all of them, and `f19-coldscan`
+    /// is that case.
+    ///
+    /// This is per reader rather than per process, unlike `Options::checksums`
+    /// which is a global set at store creation (review 2.7c). A reader can
+    /// therefore decline to verify a file that has checksums in it, which is
+    /// the guarantee LMDB does not offer at all and is not charged for.
+    pub verify_checksums: bool,
 }
 
 impl Default for ReadOptions {
@@ -200,6 +213,7 @@ impl Default for ReadOptions {
             mapped_blocks: true,
             scan_block_cache: true,
             seek_fence: true,
+            verify_checksums: true,
         }
     }
 }
@@ -2892,7 +2906,7 @@ impl Reader {
     /// Verify an uncompressed block's checksum, at most once per reader.
     #[inline]
     fn verify_plain(&self, id: u32, raw: &[u8], want: u32) -> Result<()> {
-        if !block::checksums_on() {
+        if !self.opts.verify_checksums || !block::checksums_on() {
             return Ok(());
         }
         use std::sync::atomic::Ordering;
