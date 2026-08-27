@@ -100,6 +100,7 @@ fn main() -> std::io::Result<()> {
             "f18-fence" => f18_fence(&args, profile)?,
             "f19-coldscan" => f19_coldscan(&args, profile)?,
             "f20-chunkcrc" => f20_chunkcrc(&args, profile)?,
+            "f21-writerverify" => f21_writerverify(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -133,6 +134,7 @@ fn main() -> std::io::Result<()> {
                 "f18-fence",
                 "f19-coldscan",
                 "f20-chunkcrc",
+                "f21-writerverify",
                 "f4-durability",
                 "f3-multiproc",
                 "f1-outofcore",
@@ -2346,6 +2348,118 @@ fn f20_chunkcrc(args: &Args, profile: Profile) -> std::io::Result<Record> {
         ),
     ));
     let _ = std::fs::remove_file(&file);
+    Ok(rec)
+}
+
+/// What does verifying the writer's own reads cost?
+///
+/// `Store::read_all` served bytes with no checksum in between while a
+/// `Reader` over the same store verified (C1.3), so the same file answered
+/// with two guarantees depending on the handle -- and YCSB A through F, where
+/// Supdb leads LMDB by 3.6x to 20x, route every read through the unchecked
+/// one. RocksDB verifies every block it loads by default and a `Reader` here
+/// always has, so the writer now does too.
+///
+/// This is what that costs. The arms differ only in `Options::verify_reads`,
+/// which is the knob for a caller who wants LMDB's trade instead -- LMDB has
+/// no checksums at all.
+///
+/// Both a cold pass and a warm one, because a chunk is checked once and
+/// remembered: the steady state is nearly free and the first touch is not.
+fn f21_writerverify(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let reads = args.num("--reads", profile.pick(50_000, 200_000, 500_000)) as u64;
+
+    let mut rec = Record::new("f21-writerverify", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .param("reads", J::u(reads))
+        .note("both arms interleaved in one process; the only difference is Options::verify_reads");
+
+    let dir = scratch("f21");
+    let payload = Payload::new(value_size, 0.5, 0x21);
+    let on = [true, false];
+    let warm_out = std::sync::Mutex::new([0f64; 2]);
+
+    let cold = Trial::new(profile.reps()).run(2, |ci, rep| {
+        let file = dir.join(format!("v{ci}-{rep}.dat"));
+        let store = Store::create(
+            &file,
+            Options {
+                verify_reads: on[ci],
+                checksums: true,
+                ..default_opts(128)
+            },
+        )
+        .expect("create");
+        let mut vrng = Rng::new(0x21);
+        let mut kb = [0u8; 16];
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+        }
+        store.flush().expect("flush");
+        store.checkpoint().expect("checkpoint");
+
+        let pass = |seed: u64| -> f64 {
+            let mut g = KeyGen::new(KeyDist::Uniform, keys, seed);
+            let mut kb = [0u8; 16];
+            let t = Instant::now();
+            for _ in 0..reads {
+                db_key_into(g.next(), &mut kb);
+                store
+                    .read_all(&kb, |v| {
+                        std::hint::black_box(v);
+                    })
+                    .expect("read");
+            }
+            reads as f64 / t.elapsed().as_secs_f64()
+        };
+        let first = pass(0x21 + rep as u64);
+        warm_out.lock().unwrap()[ci] = pass(0x21 + rep as u64);
+        let _ = store.close();
+        let _ = std::fs::remove_file(&file);
+        first
+    });
+
+    let cmp = compare(&cold[1], &cold[0], supdb::bench::MIN_EFFECT);
+    let (verified, unverified) = (cold[0].median(), cold[1].median());
+    let warm = *warm_out.lock().unwrap();
+    rec.compare("unverified_vs_verified", cmp.clone());
+    rec.series(
+        "arms",
+        jobj! {
+            "cold_verified_ops_per_s" => J::fp(verified, 1),
+            "cold_unverified_ops_per_s" => J::fp(unverified, 1),
+            "warm_verified_ops_per_s" => J::fp(warm[0], 1),
+            "warm_unverified_ops_per_s" => J::fp(warm[1], 1),
+        },
+    );
+    rec.finding(Finding::new(
+        "F21.1",
+        "verifying the writer's own reads costs less than 25% on a cold pass",
+        verified >= unverified * 0.75,
+        format!(
+            "{verified:.0} ops/s verified against {unverified:.0} unverified ({}). This is the \
+             price of the guarantee RocksDB charges by default and LMDB does not offer, on the \
+             path YCSB A through F read through",
+            cmp.summary("unverified", "verified")
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F21.2",
+        "a warm read pays almost nothing for verification",
+        warm[0] >= warm[1] * 0.95,
+        format!(
+            "warm: {:.0} ops/s verified against {:.0} unverified ({:.3}x). A chunk is checked \
+             once and remembered, so the cost is a property of the first touch and not of the \
+             read path -- which is why f8-checksums, measuring warm point reads, found it free",
+            warm[0],
+            warm[1],
+            warm[0] / warm[1].max(1e-9)
+        ),
+    ));
     Ok(rec)
 }
 

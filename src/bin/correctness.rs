@@ -487,9 +487,11 @@ fn c1_decoders(args: &Args, profile: Profile) -> std::io::Result<Record> {
         writer.0 == 0,
         format!(
             "{}/{} damaged reads through Store::read_all returned bytes that differed from what \
-             was written, with no error. Through a Reader over the same file, {} of the same \
-             trials errored. The feature table scores Supdb a point for checksums and YCSB A \
-             through F route every read through the unchecked path",
+             was written with no error; a Reader over the same file rejected {}. Both paths now \
+             verify, which matters because the feature table scores Supdb a point for checksums \
+             and YCSB A through F route every read through the writer's path. It cost 1.135x on \
+             a cold read pass and 0.956x warm -- see f21-writerverify, and Options::verify_reads \
+             for callers who want LMDB's trade instead",
             writer.0, writer.2, writer.1
         ),
     ));

@@ -283,6 +283,19 @@ pub struct Options {
     /// can be reserved without being sent to the disk. At 1M keys the slack is
     /// 18MB of a 63MB index. Off is the default; on is the old behaviour, kept
     /// so `f16-slack` can price it in one process.
+    /// Verify checksums on the writer's own read path.
+    ///
+    /// `Reader` has always verified and `Store::read_all` never did, so the
+    /// same store answered with two different guarantees depending on which
+    /// handle you held, and the mixed YCSB workloads -- where Supdb leads by
+    /// 3.6x to 20x -- all ran on the unchecked one (C1.3). RocksDB verifies
+    /// every block it loads by default and so does a `Reader` here, so on is
+    /// the default and matching it is the point.
+    ///
+    /// Off is the faster setting, and it is a real one: LMDB has no checksums
+    /// at all, so a caller who wants that trade can have it and `f21-writerverify`
+    /// prices it.
+    pub verify_reads: bool,
     pub write_index_slack: bool,
     /// Copy every key onto the heap before sorting them for a full checkpoint.
     ///
@@ -400,6 +413,7 @@ impl Default for Options {
             // latency-bound, which is why this is an option and not a
             // deletion.
             compress: false,
+            verify_reads: true,
             write_index_slack: false,
             checkpoint_copies_keys: false,
             shards: 64,
@@ -471,6 +485,10 @@ struct Appender {
     /// `blocks`. Block ids are indices that are only ever appended, so the two
     /// stay in step by construction.
     chunk_crcs: Vec<[u32; block::MAX_CHUNK_CRCS]>,
+    /// Which chunks this writer has already checked, one bit each. A block is
+    /// checked on first touch and not again, which is what a `Reader` does and
+    /// what RocksDB does when it loads a block into its cache.
+    verified: Vec<std::sync::atomic::AtomicU64>,
     /// Extents still referencing each block. A block nobody references is
     /// garbage and its space can be handed back.
     live: Vec<u32>,
@@ -607,7 +625,48 @@ impl Appender {
     /// The mapping is used only for a block that lies wholly below the
     /// high-water mark and wholly inside the map, so a file that was trimmed
     /// after the map was made cannot turn a read into a SIGBUS.
-    fn extent_bytes<'a>(&'a self, e: Ext, scratch: &'a mut Vec<u8>) -> Result<&'a [u8]> {
+    /// Verify the chunks an extent touches, against the checksums this writer
+    /// computed when it wrote the block.
+    ///
+    /// The `Reader` reads its checksums out of the block table in the file;
+    /// the writer already has them in memory, so this needs no section and no
+    /// parse. Chunks are checked once each and remembered, so the steady state
+    /// is the same either way and only the first touch of a block costs.
+    fn verify_extent(&self, block: u32, raw: &[u8], a: usize, b: usize) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let Some(row) = self.chunk_crcs.get(block as usize) else {
+            return Ok(());
+        };
+        if a >= b || b > raw.len() {
+            return Ok(());
+        }
+        for j in (a / block::CHUNK)..=((b - 1) / block::CHUNK) {
+            let (lo, hi) = (j * block::CHUNK, ((j + 1) * block::CHUNK).min(raw.len()));
+            if lo >= hi || j >= block::MAX_CHUNK_CRCS {
+                return Ok(());
+            }
+            let slot = block as usize * block::MAX_CHUNK_CRCS + j;
+            let Some(cell) = self.verified.get(slot / 64) else {
+                return Ok(());
+            };
+            let bit = 1u64 << (slot % 64);
+            if cell.load(Ordering::Relaxed) & bit != 0 {
+                continue;
+            }
+            if block::crc32(&raw[lo..hi]) != row[j] {
+                return Err(corrupt("block checksum mismatch"));
+            }
+            cell.fetch_or(bit, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn extent_bytes<'a>(
+        &'a self,
+        e: Ext,
+        scratch: &'a mut Vec<u8>,
+        verify: bool,
+    ) -> Result<&'a [u8]> {
         let loc = *self
             .blocks
             .get(e.block as usize)
@@ -621,7 +680,11 @@ impl Appender {
             if let Some(m) = &self.map {
                 if end as usize <= m.len() {
                     let base = loc.off as usize;
-                    return Ok(&m[base + a..base + b]);
+                    let raw = &m[base..base + loc.stored as usize];
+                    if verify && loc.chunk_crc && block::checksums_on() {
+                        self.verify_extent(e.block, raw, a, b)?;
+                    }
+                    return Ok(&raw[a..b]);
                 }
             }
         }
@@ -767,6 +830,10 @@ impl Appender {
         self.blocks.push(loc);
         self.chunk_crcs
             .push(chunks.unwrap_or([0u32; block::MAX_CHUNK_CRCS]));
+        let want = (self.blocks.len() * block::MAX_CHUNK_CRCS).div_ceil(64);
+        while self.verified.len() < want {
+            self.verified.push(std::sync::atomic::AtomicU64::new(0));
+        }
         self.live.push(0);
         Ok((self.blocks.len() - 1) as u32)
     }
@@ -847,6 +914,7 @@ impl Store {
                 off: SUPER,
                 blocks: Vec::new(),
                 chunk_crcs: Vec::new(),
+                verified: Vec::new(),
                 live: Vec::new(),
                 free: FreeList::new(),
                 generation: 0,
@@ -1328,7 +1396,7 @@ impl Store {
                 // `extent_bytes` narrows to the extent's own bytes; slicing by
                 // `off` again reads from the wrong place, which is how this
                 // first reported "extent runs past its block".
-                let bytes = ap.extent_bytes(*e, &mut scratch)?;
+                let bytes = ap.extent_bytes(*e, &mut scratch, self.opts.verify_reads)?;
                 emit_count(bytes, &mut f)?;
             }
         }

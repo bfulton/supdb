@@ -823,30 +823,23 @@ fn per_chunk_checksums_still_catch_damaged_payload() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The writer's read path checks nothing the reader's read path checks.
+/// Both read paths must reject damage the other rejects.
 ///
-/// `Reader::read_all` verifies a block's checksum before handing back bytes.
-/// `Store::read_all` -- added so a writer could read its own writes without a
-/// checkpoint, which took the mixed YCSB workloads from 0.07x of LMDB to 18x
-/// -- goes straight from the mapping to the caller. Two handles on the same
-/// store, two different guarantees, and nothing says so.
+/// `Reader::read_all` has always verified a block's checksum. `Store::read_all`
+/// -- added so a writer could read its own writes without a checkpoint, which
+/// took the mixed YCSB workloads from 0.07x of LMDB to 18x -- went from the
+/// mapping to the caller with nothing in between, so the same store answered
+/// with two different guarantees depending on which handle you held. C1.2
+/// claimed "a read returns the bytes that were written, or an error" and every
+/// trial behind it opened a `Reader`.
 ///
-/// The scope is narrower than it first looks: `Store::create` truncates and
-/// there is no `Store::open`, so a writer only ever reads blocks it wrote in
-/// this session. What it does not protect against is the file changing
-/// underneath it -- which is what this test does, through a second handle,
-/// because the appender's mapping is shared.
-///
-/// It matters for two reasons beyond the guarantee. The suite's feature table
-/// scores Supdb a point for checksums, and YCSB A through F route every read
-/// through this path. And it means a `Store::scan` built on the writer's own
-/// state would inherit "no verification" and look like a scan win.
-///
-/// KNOWN-FAILING BY DESIGN, for now: this test asserts the *current*
-/// behaviour, so it turns red the day the writer starts verifying -- which is
-/// the point. Fixing it means deleting the first assertion.
+/// This test was written to assert the *broken* behaviour so it would turn red
+/// the day the writer started verifying. It did, on the commit that made it
+/// verify, and this is that assertion inverted. RocksDB verifies every block
+/// it loads by default; `Options::verify_reads` is the knob for callers who
+/// want LMDB's trade instead, and `f21-writerverify` prices it.
 #[test]
-fn the_writer_reads_its_own_state_without_checking_it() {
+fn both_read_paths_reject_damaged_payload() {
     use std::io::Write;
     let _flag = CHECKSUM_FLAG.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join("supdb-test-writer-unverified");
@@ -906,14 +899,11 @@ fn the_writer_reads_its_own_state_without_checking_it() {
     }
 
     assert!(
-        writer_saw_damage && !writer_err,
-        "the writer path now notices damage -- if it verifies, delete this assertion \
-         and the claim that goes with it"
+        !writer_saw_damage,
+        "the writer served bytes that differed from what was written"
     );
-    assert!(
-        reader_err,
-        "the reader path must reject the same damage the writer served"
-    );
+    assert!(writer_err, "the writer path did not reject the damage");
+    assert!(reader_err, "the reader path did not reject the damage");
     drop(r);
     let _ = s.close();
     let _ = std::fs::remove_dir_all(&dir);

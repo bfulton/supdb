@@ -516,8 +516,22 @@
   {
    "experiment": "c1-decoders",
    "id": "C1.3",
-   "expect": "fails",
-   "because": "The writer's own read path checks nothing the reader's checks. Every damaged trial read through `Store::read_all` returned bytes that differed from what was written, with no error, while a `Reader` over the same file rejected every one. `Store::read_all` exists so a writer can read its own writes without a checkpoint -- it took the mixed YCSB workloads from 0.07x of LMDB to 18x -- and it goes from the mapping to the caller with no checksum in between. C1.2 said 'a read returns the bytes that were written, or an error' and was measured on one of the two ways to do one; its statement is now narrowed to name the reader. The scope is narrow -- `Store::create` truncates and there is no `Store::open`, so a writer only ever reads blocks it wrote this session, and what is unprotected is the file changing underneath it. It is recorded because the suite's feature table scores Supdb a point for checksums, because YCSB A through F route every read through the unchecked path, and because a `Store::scan` built on the writer's state would inherit this and look like a scan win."
+   "expect": "holds",
+   "because": "FIXED. The writer's read path now verifies what the reader's verifies: 0/8 damaged trials read through `Store::read_all` returned wrong bytes, where every one of them did before. `Store::read_all` was added so a writer could read its own writes without a checkpoint -- it took the mixed YCSB workloads from 0.07x of LMDB to 18x -- and went from the mapping to the caller with no checksum in between, so the same store answered with two guarantees depending on the handle. C1.2 said 'a read returns the bytes that were written, or an error' and every trial behind it opened a `Reader`; its statement now names the reader and this asks the same question of the other path. RocksDB verifies every block it loads by default, which is the bar being matched here. f21-writerverify prices it at 1.135x on a cold read pass and 0.956x warm, and `Options::verify_reads` is the knob for a caller who wants LMDB's trade instead -- LMDB has no checksums at all."
+  },
+  {
+   "experiment": "f21-writerverify",
+   "id": "F21.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Verifying the writer's own reads costs 1.135x on a cold pass -- 1,417,715 ops/s against 1,608,870, p=0.0022 with IQRs of 0.9% and 3.8%. That is the price of the guarantee RocksDB charges by default and LMDB does not offer, on the path YCSB A through F read through. It was paid: A is 14.96x of LMDB with verification on where it was 17.69x with it off, C is 1.19x where it was 1.29x, and every ordering held."
+  },
+  {
+   "experiment": "f21-writerverify",
+   "id": "F21.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "A warm read pays 0.956x for verification -- almost nothing. A chunk is checked once and remembered, so the cost belongs to the first touch of a block rather than to the read path, which is exactly why f8-checksums measured warm point reads and found the whole thing free. Two experiments, the same mechanism, opposite-looking answers, and neither is wrong."
   }
  ],
  "metrics": [
