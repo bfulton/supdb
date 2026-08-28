@@ -110,12 +110,7 @@ fn dir_size(p: &Path) -> u64 {
 ///   * `Store::create` truncates, so a store cannot be reopened for writing.
 pub struct Supdb {
     store: Option<supdb::Store>,
-    reader: Option<supdb::Reader>,
     path: PathBuf,
-    /// Reader refreshes forced by a read after a write. Counted because it is
-    /// the cost of Supdb's snapshot read model under a mixed workload.
-    pub refreshes: u64,
-    dirty: bool,
 }
 
 impl Supdb {
@@ -133,30 +128,10 @@ impl Supdb {
         .map_err(|e| e.to_string())?;
         Ok(Supdb {
             store: Some(store),
-            reader: None,
             path: file,
-            refreshes: 0,
-            dirty: false,
         })
     }
 
-    /// Publish buffered writes and rebuild the snapshot a read can see.
-    fn refresh(&mut self) -> Res<()> {
-        if !self.dirty && self.reader.is_some() {
-            return Ok(());
-        }
-        if let Some(s) = &self.store {
-            // Publish, not checkpoint. A scan needs the writes to be *visible*
-            // to a new reader; it does not need them to survive power loss,
-            // and `checkpoint` fsyncs twice to promise that. f13 priced an
-            // fsync at 31x on this shape.
-            s.publish().map_err(|e| e.to_string())?;
-        }
-        self.reader = Some(supdb::Reader::open(&self.path).map_err(|e| e.to_string())?);
-        self.refreshes += 1;
-        self.dirty = false;
-        Ok(())
-    }
 }
 
 impl Engine for Supdb {
@@ -187,7 +162,6 @@ impl Engine for Supdb {
         for (k, v) in items {
             s.put(k, v).map_err(|e| e.to_string())?;
         }
-        self.dirty = true;
         Ok(())
     }
     fn get(&mut self, key: &[u8]) -> Res<usize> {
@@ -202,10 +176,15 @@ impl Engine for Supdb {
         Ok(n)
     }
     fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
-        self.refresh()?;
-        let r = self.reader.as_ref().ok_or("no reader")?;
+        // Ordered reads from the writer's own state. This used to call
+        // `refresh`, which published and then opened a `Reader` -- a second
+        // mapping of the same file with an empty verified bitset, so a scan
+        // re-verified a store this process had just written and checksummed.
+        // `Store::scan` publishes only when something is outstanding and asks
+        // the store itself, which is warm from the read path.
+        let s = self.store.as_ref().ok_or("store closed")?;
         let mut bytes = 0usize;
-        r.scan(Some(from), n, |_k, v| bytes += v.len())
+        s.scan(Some(from), n, |_k, v| bytes += v.len())
             .map_err(|e| e.to_string())?;
         Ok(bytes)
     }
@@ -214,7 +193,6 @@ impl Engine for Supdb {
             s.flush().map_err(|e| e.to_string())?;
             s.checkpoint().map_err(|e| e.to_string())?;
         }
-        self.dirty = true;
         Ok(())
     }
     fn size_bytes(&self) -> u64 {

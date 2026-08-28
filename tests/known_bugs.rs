@@ -908,3 +908,76 @@ fn both_read_paths_reject_damaged_payload() {
     let _ = s.close();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `Store::scan` must agree with `Reader::scan`, key for key.
+///
+/// It exists so a scan does not open a cold `Reader` over a store this
+/// process just wrote -- duplicating the mapping and starting a fresh
+/// verified bitset -- but a faster ordered walk that disagreed with the
+/// authoritative one would be worthless. Checked with writes outstanding
+/// (so the scan has to publish first), across replaces and deletes, from
+/// every kind of start position, under every reclaim policy.
+#[test]
+fn a_writer_scans_in_the_same_order_a_reader_does() {
+    let _flag = CHECKSUM_FLAG.lock().unwrap_or_else(|e| e.into_inner());
+    for policy in [Reclaim::Now, Reclaim::AfterReads, Reclaim::Never] {
+        let dir = std::env::temp_dir().join(format!("supdb-test-storescan-{policy:?}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.dat");
+        let n = 3_000u64;
+        let s = Store::create(
+            &path,
+            Options {
+                reclaim: policy,
+                buffer_bytes: 64 * 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for i in 0..n {
+            s.put(format!("{i:016}").as_bytes(), format!("v{i}").as_bytes())
+                .unwrap();
+        }
+        // Left outstanding on purpose: the scan has to publish to see them.
+        for i in (0..n).step_by(7) {
+            s.put(format!("{i:016}").as_bytes(), b"replaced").unwrap();
+        }
+        for i in (0..n).step_by(11) {
+            s.delete(format!("{i:016}").as_bytes()).unwrap();
+        }
+
+        let starts: Vec<Option<Vec<u8>>> = vec![
+            None,
+            Some(b"".to_vec()),
+            Some(format!("{0:016}", 0).into_bytes()),
+            Some(format!("{0:016}", 1500).into_bytes()),
+            Some(b"00000000000001500x".to_vec()),
+            Some(format!("{n:016}").into_bytes()),
+            Some(vec![0xff; 4]),
+        ];
+        for limit in [0usize, 1, 5, 200, 100_000] {
+            for st in &starts {
+                let mut want: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                let a = s
+                    .scan(st.as_deref(), limit, |k, v| {
+                        got.push((k.to_vec(), v.to_vec()))
+                    })
+                    .unwrap();
+                // The reader is opened after the scan published, so both see
+                // the same state.
+                let r = Reader::open(&path).unwrap();
+                let b = r
+                    .scan(st.as_deref(), limit, |k, v| {
+                        want.push((k.to_vec(), v.to_vec()))
+                    })
+                    .unwrap();
+                assert_eq!(a, b, "{policy:?} limit={limit} start={st:?}: counts differ");
+                assert_eq!(got, want, "{policy:?} limit={limit} start={st:?}");
+            }
+        }
+        let _ = s.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

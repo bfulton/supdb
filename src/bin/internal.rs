@@ -101,6 +101,7 @@ fn main() -> std::io::Result<()> {
             "f19-coldscan" => f19_coldscan(&args, profile)?,
             "f20-chunkcrc" => f20_chunkcrc(&args, profile)?,
             "f21-writerverify" => f21_writerverify(&args, profile)?,
+            "f22-storescan" => f22_storescan(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -135,6 +136,7 @@ fn main() -> std::io::Result<()> {
                 "f19-coldscan",
                 "f20-chunkcrc",
                 "f21-writerverify",
+                "f22-storescan",
                 "f4-durability",
                 "f3-multiproc",
                 "f1-outofcore",
@@ -2458,6 +2460,124 @@ fn f21_writerverify(args: &Args, profile: Profile) -> std::io::Result<Record> {
             warm[0],
             warm[1],
             warm[0] / warm[1].max(1e-9)
+        ),
+    ));
+    Ok(rec)
+}
+
+/// What is a scan through the writer worth against a scan through a reader?
+///
+/// The kv suite reads through `Store::read_all` and then scans, and until
+/// `Store::scan` existed the scan opened a `Reader`: a second mapping of the
+/// same file with an empty verified bitset, so it re-verified a store this
+/// process had just written. LMDB does both through one handle. That was the
+/// explanation offered for why the suite has Supdb scanning at 0.65x while an
+/// interleaved sweep has it ahead on the walk.
+///
+/// It is also unmeasurable across runs. Between two suite runs an hour apart
+/// both engines' scan throughput roughly doubled, so the ratio moved for
+/// reasons that have nothing to do with the code. Hence an arm.
+///
+/// Each repetition warms the writer with a read pass first, exactly as the kv
+/// suite does, then scans -- through the store, or through a reader opened
+/// once for that repetition, which is what the adapter used to do.
+fn f22_storescan(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let scan_len = args.num("--scan-len", 100);
+    let scans = args.num("--scans", profile.pick(2_000, 10_000, 10_000)) as u64;
+    let warm_reads = args.num("--warm-reads", profile.pick(20_000, 100_000, 200_000)) as u64;
+
+    let mut rec = Record::new("f22-storescan", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .param("scan_len", J::u(scan_len as u64))
+        .param("scans", J::u(scans))
+        .param("warm_reads", J::u(warm_reads))
+        .note(
+            "one store per repetition, warmed by a read pass as the kv suite warms it, then \
+             scanned through the writer or through a reader opened once for that repetition",
+        );
+
+    let dir = scratch("f22");
+    let payload = Payload::new(value_size, 0.5, 0x22);
+    let scan = Trial::new(profile.reps()).run(2, |ci, rep| {
+        let file = dir.join(format!("s{ci}-{rep}.dat"));
+        let store = Store::create(&file, default_opts(128)).expect("create");
+        let mut vrng = Rng::new(0x22);
+        let mut kb = [0u8; 16];
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+        }
+        store.flush().expect("flush");
+        store.checkpoint().expect("checkpoint");
+
+        // The read phase, which warms the writer's mapping and its verified
+        // bitset and leaves a reader's entirely cold.
+        let mut g = KeyGen::new(KeyDist::Uniform, keys, 0x22 + rep as u64);
+        for _ in 0..warm_reads {
+            db_key_into(g.next(), &mut kb);
+            store
+                .read_all(&kb, |v| {
+                    std::hint::black_box(v);
+                })
+                .expect("read");
+        }
+
+        let mut g = KeyGen::new(
+            KeyDist::Uniform,
+            keys.saturating_sub(scan_len as u64).max(1),
+            0x2A + rep as u64,
+        );
+        let t = Instant::now();
+        let mut n = 0u64;
+        if ci == 0 {
+            for _ in 0..scans {
+                db_key_into(g.next(), &mut kb);
+                n += store
+                    .scan(Some(&kb), scan_len, |_k, v| {
+                        std::hint::black_box(v);
+                    })
+                    .expect("scan");
+            }
+        } else {
+            store.publish().expect("publish");
+            let r = Reader::open(&file).expect("open");
+            for _ in 0..scans {
+                db_key_into(g.next(), &mut kb);
+                n += r
+                    .scan(Some(&kb), scan_len, |_k, v| {
+                        std::hint::black_box(v);
+                    })
+                    .expect("scan");
+            }
+        }
+        let rate = n as f64 / t.elapsed().as_secs_f64();
+        let _ = store.close();
+        let _ = std::fs::remove_file(&file);
+        rate
+    });
+
+    let cmp = compare(&scan[0], &scan[1], supdb::bench::MIN_EFFECT);
+    let (writer, reader) = (scan[0].median(), scan[1].median());
+    rec.compare("store_vs_reader", cmp.clone());
+    rec.series(
+        "arms",
+        jobj! {
+            "store_entries_per_s" => J::fp(writer, 1),
+            "reader_entries_per_s" => J::fp(reader, 1),
+        },
+    );
+    rec.finding(Finding::new(
+        "F22.1",
+        "scanning through the writer beats opening a reader for it",
+        matches!(cmp.verdict, supdb::bench::stats::Verdict::Greater),
+        format!(
+            "{writer:.0} entries/s through Store::scan against {reader:.0} through a Reader \
+             ({}). The reader duplicates a mapping the writer already has and starts a verified \
+             bitset the writer has already filled",
+            cmp.summary("store", "reader")
         ),
     ));
     Ok(rec)
