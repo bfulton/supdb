@@ -107,7 +107,8 @@ fn dir_size(p: &Path) -> u64 {
 ///   * `Store` has no read method at all. Reading requires `Reader::open`,
 ///     which is a snapshot of the last checkpoint -- so serving a read
 ///     requires a checkpoint and a fresh reader, and both are O(key count).
-///   * `Store::create` truncates, so a store cannot be reopened for writing.
+///   * a reopened store declares history before the reopen broken, since the
+///     reuse log is not carried across.
 pub struct Supdb {
     store: Option<supdb::Store>,
     path: PathBuf,
@@ -149,7 +150,12 @@ impl Engine for Supdb {
             // which understated the engine by a feature point in the one
             // comparison that is meant to price its missing features.
             checksums: true,
-            reopen_for_write: false,
+            // True since `Store::open`. `Store::create` truncates, so until it
+            // existed a store could be written once and thereafter only read
+            // -- the review lists that first among critical defects and it had
+            // no test, because a limitation preventing the second session also
+            // prevents the test of the second session.
+            reopen_for_write: true,
             // True since `Store::read_all`: the writer reads its own buffered,
             // staged and sealed state directly, with no checkpoint and no
             // reader rebuild. It was false when that cost a full publish.

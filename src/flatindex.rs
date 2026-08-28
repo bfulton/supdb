@@ -1141,6 +1141,38 @@ impl MappedBlocks {
 mod block_tests {
     /// One distinguishable checksum row per block, so a test can tell a row
     /// read from the right block from one read from its neighbour.
+    /// Per-chunk checksums must come back out where they went in.
+    ///
+    /// `Store::open` reads them from this section to rebuild the appender's
+    /// copy and writes them out again at the next checkpoint. If they came
+    /// back zeroed, the flag saying a block has them would still be set, and
+    /// every reader afterwards would verify live data against zero.
+    #[test]
+    fn chunk_checksums_round_trip() {
+        let blocks: Vec<crate::block::BlockLoc> = (0..40)
+            .map(|i| crate::block::BlockLoc {
+                off: 4096 * (i as u64 + 1),
+                stored: 1000,
+                uncompressed: 1000,
+                cap: 4096,
+                chunked: false,
+                solo: false,
+                chunk_crc: true,
+                crc: 7 + i,
+            })
+            .collect();
+        let rows = crc_rows(blocks.len());
+        let sec = encode_blocks(&blocks, &rows);
+        let meta = MappedBlocks::parse(&sec).expect("parse");
+        assert_eq!(meta.len(), blocks.len());
+        for (i, row) in rows.iter().enumerate() {
+            assert!(meta.get(&sec, i).expect("block").chunk_crc, "flag lost at {i}");
+            for (j, want) in row.iter().enumerate() {
+                assert_eq!(meta.chunk_crc(&sec, i, j), Some(*want), "block {i} chunk {j}");
+            }
+        }
+    }
+
     fn crc_rows(n: usize) -> Vec<[u32; crate::block::MAX_CHUNK_CRCS]> {
         (0..n)
             .map(|i| {

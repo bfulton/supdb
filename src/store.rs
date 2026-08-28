@@ -842,7 +842,15 @@ impl Appender {
     /// Read one extent back out, decompressing its block if needed.
     fn read_extent(&self, e: Ext) -> Result<Vec<u8>> {
         use std::os::unix::fs::FileExt;
-        let loc = self.blocks[e.block as usize];
+        // Checked, because `e` comes out of an index that a corruption
+        // experiment damages. `Reader` has had `loc_of` for this since a
+        // damaged file took the process down through `scan`; the writer's copy
+        // indexed straight into the table and had never been asked, because
+        // nothing could reopen a store to ask it.
+        let loc = *self
+            .blocks
+            .get(e.block as usize)
+            .ok_or_else(|| corrupt("extent names a block that does not exist"))?;
         let mut raw = vec![0u8; loc.stored as usize];
         self.file.read_exact_at(&mut raw, loc.off)?;
         // a chunked block is a chunk directory plus per-chunk streams, not a
@@ -862,7 +870,10 @@ impl Appender {
         } else {
             block::decompress(&raw, loc.uncompressed as usize)?
         };
-        Ok(full[e.off as usize..(e.off + e.len) as usize].to_vec())
+        let (a, b) = (e.off as usize, (e.off + e.len) as usize);
+        full.get(a..b)
+            .map(|s| s.to_vec())
+            .ok_or_else(|| corrupt("extent runs past its block"))
     }
 }
 
@@ -1038,6 +1049,224 @@ pub struct Store {
 }
 
 impl Store {
+
+    /// Reopen an existing store for writing.
+    ///
+    /// `create` truncates, and until now there was no other way in: a store
+    /// could be written once and then only ever read. The architecture review
+    /// calls that critical and lists it first, `CLAUDE.md` heads its
+    /// known-failing list with it, and the comparison suite docks a feature
+    /// point for it -- and it had no claim and no experiment, because the
+    /// limitation made itself untestable.
+    ///
+    /// What has to be rebuilt is everything the appender keeps that the file
+    /// does not spell out. The block table and its per-chunk checksums are
+    /// read back from their section. The key tables are refilled from the
+    /// published index, resharded by whatever `Options::shards` says now
+    /// rather than what it said then, since the hash is over the key and
+    /// nothing on disk depends on the split. Reference counts are not
+    /// persisted at all and are recounted from the extents that survive,
+    /// which is also how the free list gets seeded: a block that nothing
+    /// points at is space this store may hand out again.
+    ///
+    /// Two things are deliberately given up rather than guessed at.
+    ///
+    /// `history_from` is set to the generation being opened, so snapshots
+    /// older than the reopen are refused rather than served. The reuse log
+    /// records which byte ranges were handed out again and in which
+    /// generation; it is what lets a reader at an older generation fail
+    /// loudly instead of reading whatever now occupies those bytes. Carrying
+    /// a log across a reopen and then appending to it is the kind of
+    /// bookkeeping that is wrong once and silently wrong forever, so this
+    /// declares the break instead.
+    ///
+    /// The in-place checkpoint state starts empty, so the first checkpoint
+    /// after a reopen rewrites the index rather than editing it. That costs
+    /// one full checkpoint and cannot be wrong.
+    pub fn open(path: &Path, opts: Options) -> Result<Store> {
+        block::CHECKSUMS.store(opts.checksums, std::sync::atomic::Ordering::Relaxed);
+
+        // Everything about the format, the two superblock slots and their
+        // validation is already correct in `Reader::open`; duplicating it here
+        // would mean two decoders that have to agree forever.
+        let (generation, timestamp, blocks, chunk_crcs, nkeys, entries) = {
+            let r = Reader::open(path)?;
+            let blocks = r.all_blocks()?;
+            let crcs = r.all_chunk_crcs();
+            let n = r.keys();
+            let mut entries: Vec<(Vec<u8>, Extents)> = Vec::with_capacity(n);
+            for rank in 0..n {
+                let Some((k, exts)) = r.entry_at(rank) else {
+                    return Err(corrupt("published index is shorter than it says"));
+                };
+                let mut e = Extents::None;
+                for x in exts {
+                    e.push(*x);
+                }
+                entries.push((k.to_vec(), e));
+            }
+            let (g, t) = r.version();
+            (g, t, blocks, crcs, n, entries)
+        };
+
+        // The high-water mark is the appender's cursor and the reader has no
+        // use for it, so it comes from the superblock directly.
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let sb = {
+            let map = unsafe { Mmap::map(&file)? };
+            if map.len() < SUPER as usize {
+                return Err(corrupt("file is shorter than its superblock"));
+            }
+            let a = Super::decode(&map[0..120]);
+            let b = Super::decode(&map[SLOT as usize..SLOT as usize + 120]);
+            match (a, b) {
+                (Some(x), Some(y)) if y.generation > x.generation => y,
+                (Some(x), _) => x,
+                (None, Some(y)) => y,
+                (None, None) => return Err(corrupt("no readable superblock")),
+            }
+        };
+        let high_water = sb.high_water;
+        // Where the published index lives, so `scan` has an order to walk and
+        // the next checkpoint has a predecessor to point at. Its reserved
+        // capacity is not recorded anywhere, so `stored` stands in: releasing
+        // it later then frees less than was taken, which leaks padding. The
+        // other rounding would free bytes belonging to whatever follows.
+        let last_index = (sb.key_stored > 0).then(|| BlockLoc {
+            off: sb.key_off,
+            stored: sb.key_stored as u32,
+            uncompressed: sb.key_uncompressed as u32,
+            cap: sb.key_stored as u32,
+            chunked: false,
+            solo: false,
+            chunk_crc: false,
+            crc: 0,
+        });
+        if high_water < SUPER || high_water > file.metadata()?.len() {
+            return Err(corrupt("superblock's high-water mark is outside the file"));
+        }
+
+        let shards: Vec<Mutex<Shard>> = (0..opts.shards)
+            .map(|_| {
+                Mutex::new(Shard {
+                    merges: 0,
+                    keys: KeyTable::new(),
+                    pending_bytes: 0,
+                    builder: BlockBuilder::new(opts.block_size),
+                    members: Vec::new(),
+                    dirty: Vec::new(),
+                })
+            })
+            .collect();
+
+        // Refcounts are not on disk. Every surviving extent is one reference,
+        // and a block nothing references is free space this store may reuse --
+        // which is where the free list comes from too, since it is not
+        // persisted either.
+        let mut live = vec![0u32; blocks.len()];
+        let table = unsafe { MmapMut::map_mut(&file)? };
+        let store = Store {
+            unpublished: std::sync::atomic::AtomicBool::new(false),
+            shards,
+            appender: Mutex::new(Appender {
+                table,
+                map: None,
+                file,
+                off: high_water,
+                blocks,
+                chunk_crcs,
+                verified: Vec::new(),
+                live: Vec::new(),
+                free: FreeList::new(),
+                generation,
+                timestamp,
+                reuse_log: Vec::new(),
+                last_index,
+                index_history: Vec::new(),
+                since_sync: 0,
+                last_sync: std::time::Instant::now(),
+                unsynced: false,
+                // History before this reopen is declared broken rather than
+                // guessed at; see the note above.
+                history_from: generation,
+                live_index: None,
+                live_key_off: None,
+            }),
+            opts,
+            path: path.to_path_buf(),
+        };
+
+        for (key, exts) in entries {
+            for e in exts.as_slice() {
+                match live.get_mut(e.block as usize) {
+                    Some(c) => *c += 1,
+                    None => return Err(corrupt("index names a block the table does not have")),
+                }
+            }
+            let si = store.shard_of(&key);
+            let mut sh = store.shards[si].lock().unwrap();
+            sh.keys.get_or_insert(&key).extents = exts;
+        }
+        {
+            let mut ap = store.appender.lock().unwrap();
+            let nblocks = ap.blocks.len();
+            ap.verified = (0..(nblocks * block::MAX_CHUNK_CRCS).div_ceil(64))
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect();
+            // Free space is the complement of what is occupied, not the union
+            // of what looks dead. A block id is never reused, so `blocks`
+            // keeps entries for blocks released long ago -- and their offsets
+            // may since have been handed to a section or another block.
+            // Releasing every zero-refcount entry hands out space that is no
+            // longer its own, which is how this first presented: twenty keys
+            // of a thousand read back as a checksum mismatch under
+            // Reclaim::Now, after `close` trimmed a file whose free list
+            // claimed the tail was empty. This repository has met that shape
+            // before, in the double release that gave one range to two blocks.
+            let mut used: Vec<(u64, u64)> = Vec::with_capacity(ap.blocks.len() + 3);
+            for (i, c) in live.iter().enumerate() {
+                if *c > 0 {
+                    let loc = ap.blocks[i];
+                    used.push((loc.off, loc.off + loc.cap as u64));
+                }
+            }
+            // The three sections the superblock points at are occupied too,
+            // and none of them is a block. Their reserved capacity is not
+            // recorded, so `stored` stands in: the padding past it is not read
+            // by anyone, so handing it out cannot corrupt what is.
+            for (off, len) in [
+                (sb.key_off, sb.key_stored),
+                (sb.blk_off, sb.blk_stored),
+                (sb.reuse_off, sb.reuse_stored),
+            ] {
+                if off > 0 && len > 0 {
+                    used.push((off, off + len));
+                }
+            }
+            used.sort_unstable();
+            let mut at = SUPER;
+            for (lo, hi) in used {
+                if lo > at {
+                    ap.free.release(at, (lo - at) as u32, generation);
+                }
+                at = at.max(hi);
+            }
+            if at < high_water {
+                ap.free.release(at, (high_water - at) as u32, generation);
+            }
+            ap.live = live;
+        }
+        debug_assert_eq!(
+            store
+                .shards
+                .iter()
+                .map(|s| s.lock().unwrap().keys.len())
+                .sum::<usize>(),
+            nkeys
+        );
+        Ok(store)
+    }
+
     pub fn create(path: &Path, opts: Options) -> Result<Store> {
         // opened for reading too: compaction reads written extents back
         let file = OpenOptions::new()
@@ -3586,6 +3815,37 @@ impl Reader {
     #[inline]
     fn lookup(&self, key: &[u8]) -> Option<&[Ext]> {
         self.idx.lookup(&self.mmap, key)
+    }
+
+    /// Every block this reader can see, in id order.
+    ///
+    /// For `Store::open`, which has to rebuild the appender's block table and
+    /// would otherwise duplicate the format handling, the superblock slot
+    /// selection and the bounds checking that getting here already did.
+    pub(crate) fn all_blocks(&self) -> Result<Vec<BlockLoc>> {
+        (0..self.nblocks() as u32).map(|i| self.loc_of(i)).collect()
+    }
+
+    /// Per-chunk checksums for every block, in id order. Zeroed rows for
+    /// blocks that carry none.
+    pub(crate) fn all_chunk_crcs(&self) -> Vec<[u32; block::MAX_CHUNK_CRCS]> {
+        let n = self.nblocks();
+        let mut out = vec![[0u32; block::MAX_CHUNK_CRCS]; n];
+        if let BlocksSrc::Mapped { meta, off, len } = &self.blocks_src {
+            if let Some(sec) = self.mmap.get(*off..off.saturating_add(*len)) {
+                for (i, row) in out.iter_mut().enumerate() {
+                    for (j, c) in row.iter_mut().enumerate() {
+                        *c = meta.chunk_crc(sec, i, j).unwrap_or(0);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Every key and its extents, in rank order.
+    pub(crate) fn entry_at(&self, rank: usize) -> Option<(&[u8], &[Ext])> {
+        self.idx.at(&self.mmap, rank)
     }
 
     /// The readahead advice actually in force, with `Auto` resolved.

@@ -69,15 +69,15 @@
   {
    "experiment": "ext-kv",
    "id": "EXT.1",
-   "expect": "fails",
-   "because": "Parity: 1,079,571 ops/s against LMDB's 1,034,797 -- ratio 1.043, p=0.3711, no difference, and no difference is not a lead. This entry has now read 0.866x, 0.891x, 0.892x, 1.010x, 1.154x and 1.043x across six repeated runs, crossing parity in both directions with the code unchanged between several of them. It is the clearest single demonstration in this repository that a 5-15% margin on this host is not a property of the engine. What is established is that the load gap block compression opened has closed; what is not established is an ordering. LMDB commits durably per batch here and Supdb does not -- see the suite note and f13-sync.",
+   "expect": "holds",
+   "because": "Supdb loads 676,246 ops/s against LMDB's 508,205 -- 1.331x, p=0.0022. Do not read this as an ordering. Across seven repeated, interleaved, statistically gated runs this entry has read 0.866x, 0.891x, 0.892x, 1.010x, 1.154x, 1.043x and now 1.331x, crossing parity in both directions with the code unchanged between several of them, and LMDB's own figure has ranged from 508,205 to 1,034,797 over the same runs. Seven repetitions settle a comparison against drift *within* a run and do nothing about drift *between* them. What is established is that the load gap block compression opened has closed; what is not established, after seven attempts, is which engine is faster. LMDB commits durably per batch here and Supdb does not.",
    "profile": "full"
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.4",
-   "expect": "holds",
-   "because": "Supdb reads 1,267,118/s against LMDB's 804,634 -- 1.575x, p=0.0022. This is now measured against an LMDB that holds a read transaction across operations instead of opening one per lookup, which is the specific handicap the architecture review criticised the design document's own adapter for and which this adapter had reproduced. Fixing it did not move the ordering: the ratio has read 1.431x, 1.230x, 1.291x and 1.575x across repeated runs, all the same verdict.",
+   "expect": "fails",
+   "because": "No difference this run: 1,067,472 reads/s against LMDB's 968,681, ratio 1.102 at p=0.1599. The ratio has read 1.431x, 1.230x, 1.291x, 1.575x, 1.193x and 1.102x across six repeated runs and the verdict held every time until this one, where the margin fell inside the noise floor rather than reversing. Recorded as failing because no difference is not a lead, and left as evidence that a 10-40% margin on this host is not a measurement anyone should bank. The design document reports the opposite ordering, measured through JNI with an adapter it separately found to allocate per value and open a transaction per lookup.",
    "profile": "full"
   },
   {
@@ -588,6 +588,12 @@
    "profile": "ci",
    "expect": "holds",
    "because": "At 556MB the crossover is 0.75, below 1 -- so the same claim holds here and fails at full. That disagreement is the finding: the crossover is not a constant of the engine, it moves with store size, and any single threshold is a compromise across scales rather than a law. Pinned to both profiles deliberately so the pair cannot be read as one answer."
+  },
+  {
+   "experiment": "c1-decoders",
+   "id": "C1.4",
+   "expect": "holds",
+   "because": "A damaged store is refused by `Store::open` or read correctly, never opened onto: 0/24 damaged files were accepted and then disagreed with what was written, and 2 were refused outright. This matters more than an ordinary read path because reopening rebuilds the block table, the key tables and every reference count from the file, and then *writes on top of* whatever it believed. Building it found a live defect: `Appender::read_extent` indexed `self.blocks[e.block]` unchecked and took the process down on a damaged index. `Reader` has had `loc_of` for exactly that since a damaged file panicked through `scan`; the writer's copy had never been asked, because nothing could reopen a store to ask it. That is the shape of this whole entry: the limitation prevented the test of the limitation."
   }
  ],
  "metrics": [

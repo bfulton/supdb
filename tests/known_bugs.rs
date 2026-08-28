@@ -1040,3 +1040,91 @@ fn readahead_advice_never_changes_what_is_read() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A store can be reopened for writing, and survives being reopened repeatedly.
+///
+/// `Store::create` truncates, so until `Store::open` existed a store could be
+/// written once and thereafter only read. The architecture review lists that
+/// first and calls it critical; the comparison suite docks a feature point for
+/// it; and it had no test, because a limitation that prevents the second
+/// session also prevents the test of the second session.
+///
+/// Three sessions, because one reopen can pass by accident. Every key written
+/// in every session must survive, replaced values must stay replaced, deleted
+/// keys must stay deleted, and a `Reader` must agree with the writer at the
+/// end.
+#[test]
+fn a_store_can_be_reopened_and_written_again() {
+    let _flag = CHECKSUM_FLAG.lock().unwrap_or_else(|e| e.into_inner());
+    for reclaim in [Reclaim::Now, Reclaim::AfterReads, Reclaim::Never] {
+        let dir = std::env::temp_dir().join(format!("supdb-test-reopen-{reclaim:?}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.dat");
+        let opts = || Options {
+            reclaim,
+            buffer_bytes: 64 * 1024,
+            ..Default::default()
+        };
+        let mut model: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
+            std::collections::BTreeMap::new();
+
+        for session in 0..3u64 {
+            let s = if session == 0 {
+                Store::create(&path, opts()).unwrap()
+            } else {
+                Store::open(&path, opts()).expect("reopen")
+            };
+            // Everything written in an earlier session is still here.
+            for (k, v) in &model {
+                let mut got = Vec::new();
+                s.read_all(k, |x| got.extend_from_slice(x)).unwrap();
+                assert_eq!(&got, v, "{reclaim:?} session {session}: lost {k:?}");
+            }
+            for i in 0..500u64 {
+                let k = format!("s{session}-k{i:08}").into_bytes();
+                let v = format!("session-{session}-value-{i}").into_bytes();
+                s.put(&k, &v).unwrap();
+                model.insert(k, v);
+            }
+            // Replace and delete across the session boundary, so the reopened
+            // state is mutated rather than only appended to.
+            let old: Vec<Vec<u8>> = model.keys().take(80).cloned().collect();
+            for (n, k) in old.iter().enumerate() {
+                if n % 2 == 0 {
+                    let v = format!("rewritten-in-{session}").into_bytes();
+                    s.put(k, &v).unwrap();
+                    model.insert(k.clone(), v);
+                } else {
+                    s.delete(k).unwrap();
+                    model.remove(k);
+                }
+            }
+            s.flush().unwrap();
+            s.close().unwrap();
+        }
+
+        let s = Store::open(&path, opts()).expect("final reopen");
+        for (k, v) in &model {
+            let mut got = Vec::new();
+            s.read_all(k, |x| got.extend_from_slice(x)).unwrap();
+            assert_eq!(&got, v, "{reclaim:?}: final writer disagrees for {k:?}");
+        }
+        let mut walked = 0usize;
+        s.scan(None, usize::MAX, |k, v| {
+            walked += 1;
+            assert_eq!(model.get(k).map(|x| x.as_slice()), Some(v), "scan {k:?}");
+        })
+        .unwrap();
+        assert_eq!(walked, model.len(), "{reclaim:?}: scan saw {walked} keys");
+        s.close().unwrap();
+
+        let r = Reader::open(&path).unwrap();
+        for (k, v) in &model {
+            let mut got = Vec::new();
+            r.read_all(k, |x| got.extend_from_slice(x)).unwrap();
+            assert_eq!(&got, v, "{reclaim:?}: reader disagrees for {k:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

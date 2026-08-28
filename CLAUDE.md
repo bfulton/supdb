@@ -92,8 +92,9 @@ lunch, it is a measurement that could not see.
 Do not "fix" these casually; each is load-bearing evidence and each is
 described in `claims.json`:
 
-- `Store::create` truncates and there is no `Store::open` — a store cannot be
-  reopened for writing.
+- A reopened store declares history before the reopen broken. `Store::open`
+  does not carry the reuse log across, so `history_from` is set to the
+  generation opened and older snapshots are refused rather than served.
 - Reader open grows with key count, though no longer in proportion to it: 20x
   for 100x the keys, and what remains is the block table rather than the key
   index. The index is 57 bytes per key in a mapped section readers share; it

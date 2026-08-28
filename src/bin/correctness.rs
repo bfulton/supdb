@@ -117,6 +117,70 @@ fn build_store(path: &Path, keys: u64, depth: u64, value_size: usize) -> std::io
 }
 
 // ------------------------------------------------------- C1: damaged bytes --
+
+/// Reopen deliberately damaged stores and see whether anything wrong is served.
+///
+/// Returns (files opened that then disagreed with what was written, files
+/// refused, files tried).
+fn reopen_damage(
+    dir: &std::path::Path,
+    keys: u64,
+    value_size: usize,
+) -> std::io::Result<(u64, u64, u64)> {
+    let val = vec![b'r'; value_size];
+    let path = dir.join("reopen-src.dat");
+    let _ = std::fs::remove_file(&path);
+    {
+        let s = Store::create(&path, Options::default())?;
+        let mut kb = [0u8; 16];
+        for k in 0..keys {
+            db_key_into(k, &mut kb);
+            s.put(&kb, &val)?;
+        }
+        s.flush()?;
+        s.close()?;
+    }
+    let clean = std::fs::read(&path)?;
+    let (mut wrong, mut refused, mut tried) = (0u64, 0u64, 0u64);
+    let target = dir.join("reopen-damaged.dat");
+    for i in 0..24usize {
+        let at = (clean.len() / 24) * i + 17;
+        if at >= clean.len() {
+            continue;
+        }
+        let mut bytes = clean.clone();
+        bytes[at] ^= 0xff;
+        std::fs::write(&target, &bytes)?;
+        tried += 1;
+        let Ok(s) = Store::open(&target, Options::default()) else {
+            refused += 1;
+            continue;
+        };
+        let mut bad = false;
+        let mut kb = [0u8; 16];
+        for k in 0..keys {
+            db_key_into(k, &mut kb);
+            let mut got = Vec::new();
+            match s.read_all(&kb, |v| got.extend_from_slice(v)) {
+                Ok(0) => {}
+                Ok(_) => {
+                    if got != val {
+                        bad = true;
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+        if bad {
+            wrong += 1;
+        }
+        let _ = s.close();
+    }
+    let _ = std::fs::remove_file(&target);
+    let _ = std::fs::remove_file(&path);
+    Ok((wrong, refused, tried))
+}
+
 // ---------------------------------------------- the other read path --
 /// Damage a live store's file underneath it and read through both paths.
 ///
@@ -481,6 +545,20 @@ fn c1_decoders(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // is what this measures, through a second handle, because the appender
     // maps the file shared.
     let writer = writer_path_damage(&dir, keys.min(2_000), value_size)?;
+    // Reopening is a read of the whole index through a path that then *writes*
+    // to the file, so a damaged store must be refused rather than opened onto.
+    let reopen = reopen_damage(&dir, keys.min(1_000), value_size)?;
+    rec.finding(Finding::new(
+        "C1.4",
+        "a damaged store is refused by Store::open, never opened onto",
+        reopen.0 == 0,
+        format!(
+            "{}/{} damaged files opened for writing and then disagreed with what was written; \
+             {} were refused outright. `Store::open` rebuilds the block table, the key tables and \
+             every reference count from the file, so anything it accepts it then writes on top of",
+            reopen.0, reopen.2, reopen.1
+        ),
+    ));
     rec.finding(Finding::new(
         "C1.3",
         "the writer's own read path checks what the reader's read path checks",
