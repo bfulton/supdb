@@ -102,6 +102,7 @@ fn main() -> std::io::Result<()> {
             "f20-chunkcrc" => f20_chunkcrc(&args, profile)?,
             "f21-writerverify" => f21_writerverify(&args, profile)?,
             "f22-storescan" => f22_storescan(&args, profile)?,
+            "f23-madvise" => f23_madvise(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -137,6 +138,7 @@ fn main() -> std::io::Result<()> {
                 "f20-chunkcrc",
                 "f21-writerverify",
                 "f22-storescan",
+                "f23-madvise",
                 "f4-durability",
                 "f3-multiproc",
                 "f1-outofcore",
@@ -2580,6 +2582,192 @@ fn f22_storescan(args: &Args, profile: Profile) -> std::io::Result<Record> {
             cmp.summary("store", "reader")
         ),
     ));
+    Ok(rec)
+}
+
+/// What does the kernel's default readahead cost a random read?
+///
+/// F1.2 is the worst number in this repository: 338,681 reads/s resident
+/// against 370 out-of-core, a 916x collapse once the store no longer fits in
+/// memory. Its recorded diagnosis is that the engine reads through an mmap
+/// with no `madvise` anywhere, so it has no readahead control, no asynchronous
+/// I/O and no influence over eviction. No advice means `MADV_NORMAL`: on a
+/// miss the kernel faults in a cluster of pages around it, on the assumption
+/// that a read is the start of a sequential run.
+///
+/// For a random point read that assumption is wrong twice. It fetches a
+/// window to return a hundred bytes, and the pages it fetched speculatively
+/// evict pages something was still using.
+///
+/// The measurement that settles it is not throughput, it is bytes. The page
+/// cache is dropped before each pass and `/proc/self/io` counts what the
+/// device was actually asked for, so the answer is read amplification: device
+/// bytes per value returned. A store far larger than the reads will touch,
+/// with a fraction of its pages read, so nearly every read is a cold miss.
+fn f23_madvise(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::bench::env::{IoCounters, Wait};
+
+    let keys = args.num("--keys", profile.pick(200_000, 2_000_000, 8_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let reads = args.num("--reads", profile.pick(2_000, 10_000, 20_000)) as u64;
+
+    let mut rec = Record::new("f23-madvise", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .param("reads", J::u(reads))
+        .note(
+            "page cache dropped before every pass; read amplification measured from /proc/self/io \
+             rather than inferred. Both arms read the same file in the same process and differ \
+             only in ReadOptions::readahead",
+        );
+
+    let dir = scratch("f23");
+    let file = dir.join("ooc.dat");
+    let payload = Payload::new(value_size, 0.5, 0x23);
+    {
+        let store = Store::create(&file, default_opts(256)).expect("create");
+        let mut vrng = Rng::new(0x23);
+        let mut kb = [0u8; 16];
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+        }
+        store.flush().expect("flush");
+        store.close().expect("close");
+    }
+    let file_bytes = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+    rec.param("file_bytes", J::u(file_bytes));
+
+    // Out-of-core is a ratio, not a size. Capping the cgroup after the build
+    // makes the ratio a parameter of the experiment instead of a property of
+    // whatever host it lands on -- and it is the only way this hazard is
+    // reachable on a machine with 15GB of RAM and 20GB of free disk.
+    // Capped at every profile, so the hazard is exercised in seconds at ci
+    // rather than only on a machine with more RAM than this one has. The cap
+    // is sized under the store the profile builds.
+    let cap_mb = args.num("--cap-mb", profile.pick(16, 128, 512)) as u64;
+    let capped = cap_mb > 0 && supdb::bench::env::cap_memory(cap_mb << 20);
+    let ratio = if capped {
+        file_bytes as f64 / ((cap_mb << 20) as f64)
+    } else {
+        0.0
+    };
+    rec.param("memory_cap_bytes", J::u(if capped { cap_mb << 20 } else { 0 }))
+        .param("file_over_cap", J::fp(ratio, 2));
+    if cap_mb > 0 && !capped {
+        eprintln!("# WARNING: could not cap memory; this run is not out-of-core");
+    }
+
+    let advice = [supdb::Readahead::Random, supdb::Readahead::Default];
+    let io_out = std::sync::Mutex::new([0u64; 2]);
+    let flt_out = std::sync::Mutex::new([0u64; 2]);
+    let cold = Trial::new(profile.reps()).run(2, |ci, rep| {
+        // A cold measurement has to be able to prove it was cold, which is
+        // F1.1's whole point; the major-fault count below is that proof.
+        if !supdb::bench::env::drop_caches() {
+            eprintln!("# WARNING: could not drop the page cache -- this pass is not cold");
+        }
+        let r = Reader::open_with(
+            &file,
+            supdb::ReadOptions {
+                readahead: advice[ci],
+                ..Default::default()
+            },
+        )
+        .expect("open");
+        let mut g = KeyGen::new(KeyDist::Uniform, keys, 0x23 + rep as u64);
+        let mut kb = [0u8; 16];
+        let io0 = IoCounters::read_now();
+        let w0 = Wait::read_now();
+        let mut got = 0u64;
+        for _ in 0..reads {
+            db_key_into(g.next(), &mut kb);
+            r.read_all(&kb, |v| {
+                got += v.len() as u64;
+            })
+            .expect("read");
+        }
+        let w = Wait::read_now().since(&w0);
+        let io = IoCounters::read_now().since(&io0);
+        io_out.lock().unwrap()[ci] = io.read_bytes;
+        flt_out.lock().unwrap()[ci] = w.major_faults;
+        std::hint::black_box(got);
+        reads as f64 / (w.wall_ns as f64 / 1e9)
+    });
+
+    let cmp = compare(&cold[0], &cold[1], supdb::bench::MIN_EFFECT);
+    let (random, default_) = (cold[0].median(), cold[1].median());
+    let io = *io_out.lock().unwrap();
+    let flt = *flt_out.lock().unwrap();
+    let amp = |bytes: u64| bytes as f64 / (reads * value_size as u64) as f64;
+    rec.compare("random_vs_default", cmp.clone());
+    rec.series(
+        "arms",
+        jobj! {
+            "random_reads_per_s" => J::fp(random, 1),
+            "default_reads_per_s" => J::fp(default_, 1),
+            "random_device_bytes" => J::u(io[0]),
+            "default_device_bytes" => J::u(io[1]),
+            "random_bytes_per_value" => J::fp(io[0] as f64 / reads as f64, 1),
+            "default_bytes_per_value" => J::fp(io[1] as f64 / reads as f64, 1),
+            "random_read_amplification" => J::fp(amp(io[0]), 2),
+            "default_read_amplification" => J::fp(amp(io[1]), 2),
+            "random_major_faults" => J::u(flt[0]),
+            "default_major_faults" => J::u(flt[1])
+        },
+    );
+
+    // The precondition. Rule 3: a finding whose condition was not met is
+    // not_exercised, never a pass.
+    rec.finding(if capped && ratio > 1.2 {
+        Finding::new(
+            "F23.0",
+            "the store is larger than the memory allowed to cache it",
+            true,
+            format!(
+                "{file_bytes} bytes against a {}MB cap, ratio {ratio:.2}",
+                cap_mb
+            ),
+        )
+    } else {
+        Finding::not_exercised(
+            "F23.0",
+            "the store is larger than the memory allowed to cache it",
+            format!(
+                "no cap in force (--cap-mb {cap_mb}), so every arm below reads a store that fits \
+                 and measures the resident regime, not the out-of-core one"
+            ),
+        )
+    });
+    rec.finding(Finding::new(
+        "F23.1",
+        "the default readahead does not amplify a random read",
+        amp(io[1]) <= amp(io[0]) * 1.25,
+        format!(
+            "{:.0} device bytes per {value_size}-byte value with the default advice against {:.0} \
+             with MADV_RANDOM -- {:.1}x against {:.1}x amplification. Measured from /proc/self/io \
+             with the page cache dropped first, so these are bytes the device was asked for and \
+             not bytes inferred from file size",
+            io[1] as f64 / reads as f64,
+            io[0] as f64 / reads as f64,
+            amp(io[1]),
+            amp(io[0])
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F23.2",
+        "telling the kernel a random read is random makes it faster",
+        matches!(cmp.verdict, supdb::bench::stats::Verdict::Greater),
+        format!(
+            "{random:.0} reads/s with MADV_RANDOM against {default_:.0} with the default ({}). \
+             Major faults: {} against {} -- the proof that these passes were cold, and the count \
+             of times the engine stopped for the disk",
+            cmp.summary("random", "default"),
+            flt[0],
+            flt[1]
+        ),
+    ));
+    let _ = std::fs::remove_file(&file);
     Ok(rec)
 }
 

@@ -166,6 +166,41 @@ pub enum Sync {
     Never,
 }
 
+/// What the kernel is told about how a mapping will be read.
+///
+/// The engine passed no advice at all, which means `MADV_NORMAL`: the kernel
+/// faults in a cluster of pages around every miss on the assumption that a
+/// read is the start of a sequential run. For a random point read that is
+/// 100 bytes wanted and a readahead window fetched, and when the store no
+/// longer fits in memory the pages it fetched speculatively evict the ones
+/// something was still using. F1.2 measures the end of that road: 338,681
+/// reads/s resident against 370 out-of-core, a 916x collapse.
+///
+/// `Random` turns readahead off for the mapping. `Sequential` asks for more of
+/// it, which is what a scan wants and a point read does not -- the two are
+/// opposite, which is why this is a choice and not a constant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Readahead {
+    /// Whatever the kernel does by default. What the engine did until now.
+    Default,
+    /// No readahead: fetch the page that faulted and nothing around it.
+    Random,
+    /// More readahead than the default.
+    Sequential,
+}
+
+impl Readahead {
+    fn apply(self, m: &Mmap) {
+        let a = match self {
+            Readahead::Default => return,
+            Readahead::Random => memmap2::Advice::Random,
+            Readahead::Sequential => memmap2::Advice::Sequential,
+        };
+        // Advisory by definition: a kernel that declines still serves reads.
+        let _ = m.advise(a);
+    }
+}
+
 /// How a reader represents the block table.
 ///
 /// A store's block table can be read in place out of the mapping or decoded
@@ -211,6 +246,8 @@ pub struct ReadOptions {
     /// therefore decline to verify a file that has checksums in it, which is
     /// the guarantee LMDB does not offer at all and is not charged for.
     pub verify_checksums: bool,
+    /// What to tell the kernel about this reader's mapping.
+    pub readahead: Readahead,
 }
 
 impl Default for ReadOptions {
@@ -221,6 +258,7 @@ impl Default for ReadOptions {
             seek_fence: true,
             chunk_verify: true,
             verify_checksums: true,
+            readahead: Readahead::Default,
         }
     }
 }
@@ -2778,6 +2816,8 @@ impl Reader {
     }
 
     fn open_mapped(mmap: Mmap, sb: Super, opts: ReadOptions) -> Result<Reader> {
+        // Before anything is read out of it, so the first fault already knows.
+        opts.readahead.apply(&mmap);
         // Same treatment as the key index: used where it lies when it is the
         // flat format, decoded otherwise.
         let blocks_src = {

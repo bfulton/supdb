@@ -117,7 +117,7 @@
    "id": "F1.2",
    "profile": "full",
    "expect": "fails",
-   "because": "Measured at 23.0GB against 15.7GB of RAM: 338,681 reads/s resident against 370 out-of-core, a 916x degradation. The engine reads through a read-only mmap with no madvise anywhere, so it has no readahead control, no asynchronous I/O and no influence over eviction -- the failure modes Crotty et al. (CIDR'22) enumerate."
+   "because": "Measured at 23.0GB against 15.7GB of RAM: 338,681 reads/s resident against 370 out-of-core, a 916x degradation. The engine reads through a read-only mmap with no madvise anywhere, so it has no readahead control, no asynchronous I/O and no influence over eviction -- the failure modes Crotty et al. (CIDR'22) enumerate. MECHANISM FOUND: f23-madvise reproduces this collapse under a memory cgroup and attributes it to readahead thrashing -- 86,977x read amplification with the default advice against 141x with MADV_RANDOM, and 25.2x on throughput. The engine still has no asynchronous I/O and no influence over eviction, so this remains a failing claim, but 'no madvise anywhere' is now a measured cause rather than a plausible one."
   },
   {
    "experiment": "f1-outofcore",
@@ -539,6 +539,27 @@
    "profile": "full",
    "expect": "holds",
    "because": "Scanning through the writer is worth 1.593x against opening a `Reader` for it: 35,123,371 entries/s against 22,043,018, p=0.0022 with IQRs of 2.6% and 6.1%. The shape is the kv suite's -- read through `Store::read_all`, then scan -- and the reader loses because it duplicates a mapping the writer already has and starts a verified bitset the writer has already filled, so it re-verifies a store this process just wrote. At ci there is no difference, because a cache-resident store has nothing to warm. This needed an arm: between two suite runs an hour apart both engines' scan throughput roughly doubled, so no cross-run number could have shown it."
+  },
+  {
+   "experiment": "f23-madvise",
+   "id": "F23.0",
+   "profile": "full",
+   "expect": "holds",
+   "because": "The precondition, and the reason this experiment exists in this shape: 1,414,698,744 bytes of store against a 512MB cap, ratio 2.64. f1-outofcore reaches the same condition by building 23GB on a machine with more RAM than this one has, which is why F1.2 is not_exercised at every profile below full and unrunnable here at all -- 15GB of RAM and 20GB of free disk cannot produce it. Out-of-core is a ratio, not a size, and a memory cgroup makes the ratio a parameter of the experiment instead of a property of the host. Page cache is charged to the cgroup that faults it in, so capping the cgroup caps the cache."
+  },
+  {
+   "experiment": "f23-madvise",
+   "id": "F23.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "The default readahead amplifies an out-of-core random read by 86,977x: 8,697,724 device bytes to return a 100-byte value, against 14,149 with MADV_RANDOM. Passing no advice means MADV_NORMAL, so every miss faults in a cluster of pages on the assumption that a read is the start of a sequential run. For a random point read that is wrong twice -- it fetches a window to return a hundred bytes, and the pages it fetched speculatively evict pages something was still using, so they are fetched again. Measured from /proc/self/io with the page cache dropped before each pass, so these are bytes the device was asked for rather than bytes inferred from file size."
+  },
+  {
+   "experiment": "f23-madvise",
+   "id": "F23.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Telling the kernel a random read is random is worth 25.2x out of core: 5,143 reads/s against 204, p=0.0022. The 204 is the point -- F1.2 records 370 reads/s out-of-core against 338,681 resident and blames an engine with no madvise anywhere, and this reproduces that collapse at a sixteenth of the scale and then removes most of it with one syscall. It is regime-dependent and the opposite way round when the store fits: resident and uncapped, MADV_RANDOM is about 15x *slower*, because readahead is a working prefetcher when the pages it fetches survive. That is why `Readahead` is a knob and why the default is unchanged; an adaptive `Auto` is the obvious follow-up and has not been measured, so it does not exist yet."
   }
  ],
  "metrics": [

@@ -432,3 +432,51 @@ impl Wait {
         }
     }
 }
+
+/// Cap the memory this process may use, page cache included.
+///
+/// The out-of-core hazard (`F1.2`, a 916x collapse) needs a store larger than
+/// the memory available to cache it, and the experiment that measures it
+/// therefore builds 23GB and is `not_exercised` anywhere smaller. A machine
+/// with 15GB of RAM and 20GB of free disk cannot run it at all.
+///
+/// A memory cgroup makes the ratio a parameter instead of a property of the
+/// host. Page cache is charged to the cgroup that faults it in, so capping the
+/// cgroup caps the cache and reclaim starts at the limit -- which is the
+/// pressure the hazard is about. A 6GB store under a 2GB cap is out-of-core by
+/// the same 3:1 ratio as 45GB on this host would be, and fits.
+///
+/// Join *after* building, since anonymous memory counts against the same
+/// limit. Returns false when there is no cgroup filesystem to write to, which
+/// is not an error -- it means the experiment cannot claim to have exercised
+/// the condition, and `Finding::not_exercised` is what that is for.
+pub fn cap_memory(bytes: u64) -> bool {
+    let root = "/sys/fs/cgroup/memory";
+    if !std::path::Path::new(root).is_dir() {
+        return false;
+    }
+    let dir = format!("{root}/supdb-{}", std::process::id());
+    if fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    if fs::write(format!("{dir}/memory.limit_in_bytes"), bytes.to_string()).is_err() {
+        return false;
+    }
+    // Best effort: without this the cap applies to page cache only once the
+    // process is inside, so a failure here means the cap does nothing.
+    fs::write(
+        format!("{dir}/cgroup.procs"),
+        std::process::id().to_string(),
+    )
+    .is_ok()
+}
+
+/// The cap actually in force, if any.
+pub fn memory_cap() -> Option<u64> {
+    let dir = format!("/sys/fs/cgroup/memory/supdb-{}", std::process::id());
+    read(&format!("{dir}/memory.limit_in_bytes"))?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|v| *v < u64::MAX / 2)
+}
