@@ -981,3 +981,62 @@ fn a_writer_scans_in_the_same_order_a_reader_does() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// `Readahead::Auto` must resolve to something, and to the same data.
+///
+/// It picks between telling the kernel a mapping is random and leaving its
+/// readahead alone, from the file's size against the memory allowed to cache
+/// it -- a decision worth up to 30x out of core (f24) and about 15x the other
+/// way when a store fits many times over (f23). Advice is advisory, so the
+/// only thing that can go wrong silently is the *reads*, and that is what this
+/// checks: every advice must return identical bytes for every key.
+#[test]
+fn readahead_advice_never_changes_what_is_read() {
+    use supdb::Readahead;
+    let _flag = CHECKSUM_FLAG.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join("supdb-test-readahead");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("r.dat");
+    let n = 5_000u64;
+    {
+        let s = Store::create(&path, Options::default()).unwrap();
+        for i in 0..n {
+            s.put(format!("{i:016}").as_bytes(), format!("value-{i}").as_bytes())
+                .unwrap();
+        }
+        s.flush().unwrap();
+        s.close().unwrap();
+    }
+    let mut seen: Vec<Vec<(Vec<u8>, Vec<u8>)>> = Vec::new();
+    for advice in [
+        Readahead::Auto,
+        Readahead::Default,
+        Readahead::Random,
+        Readahead::Sequential,
+    ] {
+        let r = Reader::open_with(
+            &path,
+            ReadOptions {
+                readahead: advice,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Auto must resolve to a concrete advice, never report itself.
+        assert_ne!(
+            r.advice(),
+            Readahead::Auto,
+            "Auto was not resolved at open for {advice:?}"
+        );
+        let mut got = Vec::new();
+        r.scan(None, usize::MAX, |k, v| got.push((k.to_vec(), v.to_vec())))
+            .unwrap();
+        assert_eq!(got.len(), n as usize, "{advice:?} walked {} keys", got.len());
+        seen.push(got);
+    }
+    for w in seen.windows(2) {
+        assert_eq!(w[0], w[1], "two readahead advices disagreed about the data");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

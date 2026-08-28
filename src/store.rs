@@ -181,6 +181,8 @@ pub enum Sync {
 /// opposite, which is why this is a choice and not a constant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Readahead {
+    /// Choose from the file's size against the memory available to cache it.
+    Auto,
     /// Whatever the kernel does by default. What the engine did until now.
     Default,
     /// No readahead: fetch the page that faulted and nothing around it.
@@ -189,10 +191,115 @@ pub enum Readahead {
     Sequential,
 }
 
+/// Memory this process may actually use to cache a file, in bytes.
+///
+/// `MemAvailable` is the host's answer and is wrong inside a container: the
+/// cgroup limit is what the page cache will be reclaimed against, and it can
+/// be a fraction of the host's. Both are consulted and the smaller wins.
+///
+/// v1 and v2 are both read because the layout differs and either can be the
+/// one in force. A missing or absent limit is not an error -- it means no cap,
+/// and the host figure stands.
+fn available_memory() -> Option<u64> {
+    fn field(path: &str, key: &str) -> Option<u64> {
+        std::fs::read_to_string(path).ok()?.lines().find_map(|l| {
+            let rest = l.strip_prefix(key)?;
+            rest.split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+                .map(|kb| kb * 1024)
+        })
+    }
+    fn limit(path: &str) -> Option<u64> {
+        let v = std::fs::read_to_string(path).ok()?;
+        let v = v.trim();
+        if v == "max" {
+            return None;
+        }
+        // A cgroup with no limit stores a number near u64::MAX rather than
+        // saying so, and treating that as a cap would advise Random for every
+        // store on earth.
+        v.parse::<u64>().ok().filter(|b| *b < u64::MAX / 2)
+    }
+    // Which cgroup this process is in, for the v2 layout.
+    let v2 = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("0::").map(|p| p.to_string()))
+        })
+        .and_then(|p| limit(&format!("/sys/fs/cgroup{p}/memory.max")));
+    // The *memory* controller's line, not whichever line came first. Taking
+    // field three of line one reads the systemd hierarchy's path and then
+    // looks for a memory limit that was never going to be there, so every
+    // store looks like it fits and `Auto` never advises anything.
+    let v1 = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| {
+                    l.split(':')
+                        .nth(1)
+                        .is_some_and(|c| c.split(',').any(|n| n == "memory"))
+                })
+                .and_then(|l| l.split(':').nth(2))
+                .map(|p| p.to_string())
+        })
+        .and_then(|p| limit(&format!("/sys/fs/cgroup/memory{p}/memory.limit_in_bytes")))
+        .or_else(|| limit("/sys/fs/cgroup/memory/memory.limit_in_bytes"));
+    let host = field("/proc/meminfo", "MemAvailable:")
+        .or_else(|| field("/proc/meminfo", "MemTotal:"));
+    [host, v1, v2].into_iter().flatten().min()
+}
+
+/// Above this ratio of file size to available memory, `Auto` advises Random.
+///
+/// Measured, and the first value I picked was wrong by a factor of two in the
+/// expensive direction. `f24-autoreadahead` sweeps the ratio with all three
+/// advices interleaved at every point, at 1M keys:
+///
+///   ratio   default   random
+///    0.25    16,172    4,920    default 3.3x ahead
+///    1.00    15,024    4,792    default 3.1x ahead
+///    1.50       709    4,813    default 6.8x behind
+///    3.00       167    4,803    default 29x behind
+///
+/// The crossover is a cliff between 1.0 and 1.5, not a slope, and readahead
+/// keeps paying right up to it -- a store that merely *approaches* the memory
+/// available to it is still one whose speculative pages get used. A threshold
+/// of 0.5, which looked conservative, advised Random across the whole 0.5-1.0
+/// band where the default is three times faster.
+///
+/// So: advise Random when the store does not fit, and not before -- but not
+/// at exactly one. A cgroup rounds its limit down to a page multiple, so a
+/// store sized to its memory comes out a couple of kilobytes over and lands on
+/// the wrong side of the cliff; at ratio 1.00 the sweep duly caught `Auto`
+/// choosing Random where the default is 3.1x faster. A store sized to fit is
+/// the common case, not an edge one, so the threshold sits clear of it. At
+/// 1.25 the measurement is already 2,682 against 4,887 and firmly Random's.
+const AUTO_RANDOM_ABOVE: f64 = 1.1;
+
 impl Readahead {
+    /// What this advice means for a file of `bytes`, with `Auto` resolved.
+    fn resolve(self, bytes: u64) -> Readahead {
+        match self {
+            Readahead::Auto => match available_memory() {
+                Some(avail) if bytes as f64 > avail as f64 * AUTO_RANDOM_ABOVE => {
+                    Readahead::Random
+                }
+                // No reading on how much memory there is means no basis for
+                // overriding the kernel, so leave it alone.
+                _ => Readahead::Default,
+            },
+            other => other,
+        }
+    }
+
     fn apply(self, m: &Mmap) {
         let a = match self {
-            Readahead::Default => return,
+            // Already resolved by the caller; nothing to apply.
+            Readahead::Auto | Readahead::Default => return,
             Readahead::Random => memmap2::Advice::Random,
             Readahead::Sequential => memmap2::Advice::Sequential,
         };
@@ -258,7 +365,9 @@ impl Default for ReadOptions {
             seek_fence: true,
             chunk_verify: true,
             verify_checksums: true,
-            readahead: Readahead::Default,
+            // Out of the box, because the choice depends on a ratio the caller
+            // usually does not know and the cost of getting it wrong is 30x.
+            readahead: Readahead::Auto,
         }
     }
 }
@@ -2388,6 +2497,9 @@ pub struct Reader {
     /// in the mapping like the key index.
     blocks_src: BlocksSrc,
     opts: ReadOptions,
+    /// What `Readahead::Auto` resolved to, so a caller can see the choice
+    /// rather than infer it.
+    advice: Readahead,
     cache: BlockCache,
     /// Slot held in the reader table, released when this reader is dropped.
     slot: Option<usize>,
@@ -2817,7 +2929,9 @@ impl Reader {
 
     fn open_mapped(mmap: Mmap, sb: Super, opts: ReadOptions) -> Result<Reader> {
         // Before anything is read out of it, so the first fault already knows.
-        opts.readahead.apply(&mmap);
+        // Resolved against the mapping's own length, which is the file's.
+        let advice = opts.readahead.resolve(mmap.len() as u64);
+        advice.apply(&mmap);
         // Same treatment as the key index: used where it lies when it is the
         // flat format, decoded otherwise.
         let blocks_src = {
@@ -2880,6 +2994,7 @@ impl Reader {
                         sb.history_from,
                     )?;
                     r.opts = opts;
+                    r.advice = advice;
                     return Ok(r);
                 }
             }
@@ -2892,6 +3007,7 @@ impl Reader {
         )?;
         let mut r = Self::build(mmap, key_idx, blocks_src, sb.timestamp, sb.history_from)?;
         r.opts = opts;
+        r.advice = advice;
         Ok(r)
     }
 
@@ -3035,6 +3151,7 @@ impl Reader {
             verified,
             blocks_src,
             opts: ReadOptions::default(),
+            advice: Readahead::Default,
             cache: BlockCache::new(4096),
             slot: None,
             table: None,
@@ -3155,6 +3272,7 @@ impl Reader {
             verified,
             blocks_src,
             opts: ReadOptions::default(),
+            advice: Readahead::Default,
             cache,
             slot: None,
             table: None,
@@ -3468,6 +3586,11 @@ impl Reader {
     #[inline]
     fn lookup(&self, key: &[u8]) -> Option<&[Ext]> {
         self.idx.lookup(&self.mmap, key)
+    }
+
+    /// The readahead advice actually in force, with `Auto` resolved.
+    pub fn advice(&self) -> Readahead {
+        self.advice
     }
 
     /// Position of the first key at or after `key`.

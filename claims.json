@@ -560,6 +560,34 @@
    "profile": "full",
    "expect": "holds",
    "because": "Telling the kernel a random read is random is worth 25.2x out of core: 5,143 reads/s against 204, p=0.0022. The 204 is the point -- F1.2 records 370 reads/s out-of-core against 338,681 resident and blames an engine with no madvise anywhere, and this reproduces that collapse at a sixteenth of the scale and then removes most of it with one syscall. It is regime-dependent and the opposite way round when the store fits: resident and uncapped, MADV_RANDOM is about 15x *slower*, because readahead is a working prefetcher when the pages it fetches survive. That is why `Readahead` is a knob and why the default is unchanged; an adaptive `Auto` is the obvious follow-up and has not been measured, so it does not exist yet."
+  },
+  {
+   "experiment": "f24-autoreadahead",
+   "id": "F24.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "`Readahead::Auto` picks the faster advice at every swept ratio where the two differ by more than the noise floor. At 1M keys the default is 3.2-3.4x ahead from a ratio of 0.05 up to 1.00, and behind by 1.7x at 1.25, 6.5x at 1.50 and 28x at 3.00; Auto tracks the switch. The threshold took three attempts and the experiment caught both wrong ones. 0.5 looked conservative and advised Random across the whole 0.5-1.0 band where the default is three times faster. 1.0 sat exactly on the common case -- a cgroup rounds its limit down to a page multiple, so a store sized to its memory comes out a couple of kilobytes over and takes the wrong branch, which the sweep duly caught at ratio 1.00. 1.1 clears it."
+  },
+  {
+   "experiment": "f24-autoreadahead",
+   "id": "F24.1",
+   "profile": "ci",
+   "expect": "fails",
+   "because": "The same threshold mispicks on a smaller store, and this entry exists so that is on the record rather than hidden by a profile that is never cited. At 556MB the crossover is around 0.75 rather than 1.25, so `Auto` keeps the default advice at 0.75 and 1.00 where Random is 8-16% ahead. The crossover moves with store size because what actually decides it is access density -- how much of the store a workload touches -- and a single constant over the file-to-memory ratio cannot express that. The constant is tuned where it costs the most: mispicking at ci is worth 16%, picking right at full is worth 3.3x."
+  },
+  {
+   "experiment": "f24-autoreadahead",
+   "id": "F24.2",
+   "profile": "full",
+   "expect": "fails",
+   "because": "My statement was that readahead stops paying somewhere below a file-to-memory ratio of 1. It does not: at 1M keys MADV_RANDOM first overtakes the default at 1.25. Readahead keeps paying right up to and past the point where the store no longer fits, because the pages it fetches speculatively are still being used before they are evicted. Recorded as failing rather than reworded, because it is the sentence that produced two wrong thresholds."
+  },
+  {
+   "experiment": "f24-autoreadahead",
+   "id": "F24.2",
+   "profile": "ci",
+   "expect": "holds",
+   "because": "At 556MB the crossover is 0.75, below 1 -- so the same claim holds here and fails at full. That disagreement is the finding: the crossover is not a constant of the engine, it moves with store size, and any single threshold is a compromise across scales rather than a law. Pinned to both profiles deliberately so the pair cannot be read as one answer."
   }
  ],
  "metrics": [

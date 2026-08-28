@@ -103,6 +103,7 @@ fn main() -> std::io::Result<()> {
             "f21-writerverify" => f21_writerverify(&args, profile)?,
             "f22-storescan" => f22_storescan(&args, profile)?,
             "f23-madvise" => f23_madvise(&args, profile)?,
+            "f24-autoreadahead" => f24_autoreadahead(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -139,6 +140,7 @@ fn main() -> std::io::Result<()> {
                 "f21-writerverify",
                 "f22-storescan",
                 "f23-madvise",
+                "f24-autoreadahead",
                 "f4-durability",
                 "f3-multiproc",
                 "f1-outofcore",
@@ -2766,6 +2768,192 @@ fn f23_madvise(args: &Args, profile: Profile) -> std::io::Result<Record> {
             flt[0],
             flt[1]
         ),
+    ));
+    let _ = std::fs::remove_file(&file);
+    Ok(rec)
+}
+
+/// Where does readahead stop paying, and does `Auto` find it?
+///
+/// f23 measured the two ends and they point opposite ways. Resident, the
+/// kernel's default readahead is a working prefetcher -- it turns many small
+/// faults into few large ones, and forbidding it costs about 15x. Out of core
+/// the pages it fetches are evicted before use and fetched again: 86,977x read
+/// amplification and a 25x collapse. So the right advice depends on a ratio
+/// the caller usually does not know, which is what `Readahead::Auto` is for.
+///
+/// A threshold picked by taste would be a guess wearing a constant's clothes.
+/// This sweeps the ratio of file size to the memory allowed to cache it, holds
+/// all three advices against each other at every point, and reports where the
+/// crossover actually is -- and whether `Auto` lands on the winning side of it
+/// at every ratio, which is the only property that matters.
+///
+/// One store, built once. The cap is what moves, because out-of-core is a
+/// ratio and a cgroup makes the ratio adjustable.
+/// Never cap below this: a cgroup limit under the process's own anonymous
+/// memory is an OOM kill rather than an experiment.
+const CAP_FLOOR: u64 = 96 << 20;
+
+fn f24_autoreadahead(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::bench::env::Wait;
+    use supdb::Readahead;
+
+    // Sized so the ratios below are reachable above the cap floor: the floor
+    // exists because a cgroup limit under the process's own anonymous memory
+    // is an OOM kill, and a sweep that silently clamps its own independent
+    // variable measures nothing. The first version of this did exactly that.
+    let keys = args.num("--keys", profile.pick(3_000_000, 6_000_000, 8_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let reads = args.num("--reads", profile.pick(1_000, 5_000, 10_000)) as u64;
+
+    let mut rec = Record::new("f24-autoreadahead", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .param("reads", J::u(reads))
+        .note(
+            "one store, swept against a moving memory cap; three advices interleaved at every \
+             ratio, page cache dropped before every pass",
+        );
+
+    let dir = scratch("f24");
+    let file = dir.join("auto.dat");
+    let payload = Payload::new(value_size, 0.5, 0x24);
+    {
+        let store = Store::create(&file, default_opts(256)).expect("create");
+        let mut vrng = Rng::new(0x24);
+        let mut kb = [0u8; 16];
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+        }
+        store.flush().expect("flush");
+        store.close().expect("close");
+    }
+    let file_bytes = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+    rec.param("file_bytes", J::u(file_bytes));
+
+    let advices = [Readahead::Auto, Readahead::Default, Readahead::Random];
+    let names = ["auto", "default", "random"];
+    // File over cap. Below 1 the store fits in the cache it is allowed.
+    // Down to 0.05, because the case for the default advice lives at the low
+    // end: a store that fits many times over is one readahead can prefetch
+    // almost entirely, and a sweep starting at 0.25 never sees that and would
+    // talk itself into advising Random for everything.
+    let ratios = [0.05f64, 0.1, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 3.0];
+    let mut rows = Vec::new();
+    let mut auto_ok = true;
+    let mut worst = f64::INFINITY;
+    let mut crossover: Option<f64> = None;
+
+    for r in ratios {
+        let cap = ((file_bytes as f64 / r) as u64).max(CAP_FLOOR);
+        // What the cap actually achieved, which is what the row reports. The
+        // requested ratio is not the measured one whenever the floor binds.
+        let effective = file_bytes as f64 / cap as f64;
+        if !supdb::bench::env::cap_memory(cap) {
+            eprintln!("# WARNING: could not set a {cap}-byte cap; skipping ratio {r}");
+            continue;
+        }
+        let chosen = std::sync::Mutex::new(Readahead::Default);
+        let arms = Trial::new(profile.reps()).run(3, |ci, rep| {
+            supdb::bench::env::drop_caches();
+            let rd = Reader::open_with(
+                &file,
+                supdb::ReadOptions {
+                    readahead: advices[ci],
+                    ..Default::default()
+                },
+            )
+            .expect("open");
+            if ci == 0 {
+                *chosen.lock().unwrap() = rd.advice();
+            }
+            let mut g = KeyGen::new(KeyDist::Uniform, keys, 0x24 + rep as u64);
+            let mut kb = [0u8; 16];
+            let w0 = Wait::read_now();
+            for _ in 0..reads {
+                db_key_into(g.next(), &mut kb);
+                rd.read_all(&kb, |v| {
+                    std::hint::black_box(v);
+                })
+                .expect("read");
+            }
+            let w = Wait::read_now().since(&w0);
+            reads as f64 / (w.wall_ns as f64 / 1e9)
+        });
+
+        let (auto, deflt, rand) = (
+            arms[0].median(),
+            arms[1].median(),
+            arms[2].median(),
+        );
+        let best = deflt.max(rand);
+        let rel = auto / best.max(1e-9);
+        worst = worst.min(rel);
+        // The property is about the *choice*, not about timing noise. Auto
+        // runs one of the two fixed arms, so holding it to its own arm's
+        // sampled throughput just measures the trial's variance -- an earlier
+        // version failed at 0.88x on a ratio where Auto had picked correctly.
+        // What it owes is picking the faster side wherever the two differ by
+        // more than the noise floor `stats::compare` itself insists on.
+        let gap = (deflt - rand).abs() / deflt.max(rand).max(1e-9);
+        if gap > supdb::bench::MIN_EFFECT {
+            let want_random = rand > deflt;
+            if (*chosen.lock().unwrap() == Readahead::Random) != want_random {
+                auto_ok = false;
+            }
+        }
+        // Beyond the noise floor, not merely ahead: at ratio 0.05 the two
+        // differed by 0.2%, and calling that a crossover would set a threshold
+        // on a coin flip.
+        if crossover.is_none() && rand > deflt * (1.0 + supdb::bench::MIN_EFFECT) {
+            crossover = Some(effective);
+        }
+        println!(
+            "  ratio {effective:>4.2}  auto {auto:>9.0}  default {deflt:>9.0}  random {rand:>9.0}  \
+             auto/best {rel:.2}  chose {:?}",
+            *chosen.lock().unwrap()
+        );
+        rows.push(jobj! {
+            "file_over_cap" => J::fp(effective, 2),
+            "file_over_cap_requested" => J::fp(r, 2),
+            "cap_bytes" => J::u(cap),
+            "auto_reads_per_s" => J::fp(auto, 1),
+            "default_reads_per_s" => J::fp(deflt, 1),
+            "random_reads_per_s" => J::fp(rand, 1),
+            "auto_over_best" => J::fp(rel, 3),
+            "auto_chose" => J::s(if *chosen.lock().unwrap() == Readahead::Random { "random" } else { "default" })
+        });
+        let _ = names;
+    }
+    rec.series("sweep", J::arr(rows));
+
+    rec.finding(Finding::new(
+        "F24.1",
+        "Auto picks the faster advice wherever the two differ",
+        auto_ok,
+        format!(
+            "at every swept ratio where default and random differ by more than the {:.0}% noise \
+             floor, Auto chose the faster one; its own throughput ran {worst:.2}x of the better \
+             arm at worst, which is trial variance rather than a wrong choice. This is the whole \
+             contract: a caller who does not know whether their store will fit in memory should \
+             not lose for saying so",
+            supdb::bench::MIN_EFFECT * 100.0
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F24.2",
+        "readahead stops paying somewhere below a file-to-memory ratio of 1",
+        crossover.is_some_and(|c| c < 1.0),
+        match crossover {
+            Some(c) => format!(
+                "MADV_RANDOM first overtakes the default at a ratio of {c:.2}, which is why the \
+                 threshold is a measurement and not a taste. A store need not exceed memory to \
+                 suffer from readahead -- it only has to be close enough that the pages fetched \
+                 speculatively are the ones evicted"
+            ),
+            None => "the default advice won at every ratio swept".into(),
+        },
     ));
     let _ = std::fs::remove_file(&file);
     Ok(rec)
