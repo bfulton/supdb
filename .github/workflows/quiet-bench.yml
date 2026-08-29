@@ -139,7 +139,14 @@ jobs:
         with:
           shared-key: apple-silicon-sweep
       - name: Build
-        run: cargo build --release --workspace
+        # Only the two binaries this job runs. `--workspace` also builds
+        # internal, correctness, verify and indexlab's dependencies, and the
+        # whole job -- build included -- has to finish inside localmost's
+        # 600-second kill. Minutes spent compiling what this job never
+        # executes are minutes the measurement does not get.
+        run: |
+          cargo build --release -p supdb --bin indexlab
+          cargo build --release -p supdb-external --bin external
 
       - name: Record the machine and what else it was doing
         run: |
