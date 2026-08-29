@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use supdb::bench::{
     compare, db_key_into, env, Finding, Hist, IoCounters, KeyDist, KeyGen, Payload, Profile,
-    Record, Rng, Trial, J,
+    Record, Rng, Samples, Trial, J,
 };
 use supdb::jobj;
 use supdb::{Options, Reader, Reclaim, Store};
@@ -3669,6 +3669,14 @@ fn f25_arena(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let payload = Payload::new(value_size, 0.5, 0xF25);
     let on = [true, false];
 
+    // Rule 4, and a question the arena raises rather than settles: it reserves
+    // the shard's whole buffer budget on first use, so it trades address space
+    // for never copying. Across two separate ext-kv runs resident memory rose
+    // 178.5MB to 218.3MB, which is exactly the kind of cross-run difference
+    // this project does not accept as attribution -- so it is measured here,
+    // in the same interleaved trial as the throughput.
+    let rss: std::sync::Mutex<Vec<(usize, f64)>> = std::sync::Mutex::new(Vec::new());
+
     // Bulk load through `put`, which is the shape EXT.10 measures: one value
     // per key, every key new.
     let trial = Trial::new(profile.reps());
@@ -3684,6 +3692,7 @@ fn f25_arena(args: &Args, profile: Profile) -> std::io::Result<Record> {
         .expect("create");
         let mut vrng = Rng::new(0xF25 + rep as u64);
         let mut kb = [0u8; 16];
+        let rss0 = supdb::bench::env::rss_bytes();
         let t = Instant::now();
         for i in 0..keys {
             db_key_into(i, &mut kb);
@@ -3691,6 +3700,10 @@ fn f25_arena(args: &Args, profile: Profile) -> std::io::Result<Record> {
         }
         store.flush().expect("flush");
         let secs = t.elapsed().as_secs_f64();
+        let grew = supdb::bench::env::rss_bytes().saturating_sub(rss0);
+        rss.lock()
+            .unwrap()
+            .push((ci, grew as f64 / 1_048_576.0));
         let _ = store.close();
         let _ = std::fs::remove_file(&file);
         keys as f64 / secs
@@ -3724,6 +3737,21 @@ fn f25_arena(args: &Args, profile: Profile) -> std::io::Result<Record> {
         (keys * depth) as f64 / secs
     });
 
+    let rss_arm: Vec<Samples> = {
+        let all = rss.lock().unwrap();
+        (0..2)
+            .map(|ci| {
+                Samples::new(
+                    all.iter()
+                        .filter(|(c, _)| *c == ci)
+                        .map(|(_, v)| *v)
+                        .collect(),
+                )
+            })
+            .collect()
+    };
+    let rc = compare(&rss_arm[1], &rss_arm[0], supdb::bench::MIN_EFFECT);
+    rec.compare("rss_perkey_vs_arena", rc.clone());
     let lc = compare(&load[0], &load[1], supdb::bench::MIN_EFFECT);
     let ac = compare(&appended[0], &appended[1], supdb::bench::MIN_EFFECT);
     rec.compare("load_arena_vs_per_key", lc.clone());
@@ -3736,6 +3764,8 @@ fn f25_arena(args: &Args, profile: Profile) -> std::io::Result<Record> {
                     jobj! {
                         "pending_arena" => J::Bool(on[ci]),
                         "load_ops_per_s" => J::fp(load[ci].median(), 1),
+                        "load_rss_mb" => J::fp(rss_arm[ci].median(), 1),
+                        "load_rss" => rss_arm[ci].to_json(),
                         "load" => load[ci].to_json(),
                         "append_ops_per_s" => J::fp(appended[ci].median(), 1),
                         "append" => appended[ci].to_json()
@@ -3755,6 +3785,20 @@ fn f25_arena(args: &Args, profile: Profile) -> std::io::Result<Record> {
             load[0].median(),
             load[1].median(),
             lc.summary("arena", "per-key")
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F25.3",
+        "The arena does not cost resident memory",
+        !matches!(rc.verdict, supdb::bench::Verdict::Less),
+        format!(
+            "arena {:.1} MB against per-key {:.1} MB across the same load ({}). The arena reserves \
+             the shard's whole buffer budget on first use rather than growing into it, so this is \
+             the axis where it could be paying for its speed. Lower is better and the comparison \
+             is the other way round from a throughput one",
+            rss_arm[0].median(),
+            rss_arm[1].median(),
+            rc.summary("per-key", "arena")
         ),
     ));
     rec.finding(Finding::new(
