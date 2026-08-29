@@ -1,3 +1,6 @@
 /target
 /bench/external/vendor
 *.dat
+
+# Subagent worktrees: separate checkouts, never part of this tree
+.claude/worktrees/
