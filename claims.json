@@ -650,6 +650,13 @@
    "profile": "full",
    "expect": "holds",
    "because": "1,834,782 ops/s at a 4MB buffer against 1,827,426 at 256MB -- 1.004x at p=0.7015, no difference -- while resident memory falls from 279.9 MB to 173.0, a 38% saving for nothing given up. All four arms (4, 16, 64, 256MB) are statistically tied on throughput, so the choice is free and smaller strictly dominates. The external adapter configures 256MB, which is larger than the 105MB dataset, so Supdb holds all of it -- and that is a straightforward part of why EXT.10 shows 218MB resident against LMDB's 46. This experiment could not have been run at all before `Options::seal_on_put`: `append` sealed when a shard's buffer filled and `put` never checked, so a put-only workload ignored `buffer_bytes` entirely and every arm here would have behaved identically. What is left after the fix is Supdb's key index, which stays resident through a load at roughly 57 bytes per key, and no buffer setting touches that."
+  },
+  {
+   "experiment": "f27-ckptshape",
+   "id": "F27.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Updating existing keys under Sync::Always runs 173,446 ops/s; inserting new ones runs 42,079 -- 4.122x at p=0.0022, on identical operation counts, identical checkpoint counts and the same durability policy. So durability is not what EXT.9's 0.010x is made of. Insertion under durability is. `checkpoint_in_place` edits the mapped index through slack instead of rewriting it, and opens with `if nkeys != meta.len() { return Ok(false) }` -- any key added or removed sends the checkpoint down the full-rewrite path, and every batch of a bulk load adds. The margin scales the way an O(key count) rewrite must: 1.067x at 20k keys, 3.282x at 100k, 4.122x at 200k. It is visible in device bytes too, 1,269.6 MB against 984.4 for the same work. This is the measurement that says where to spend: a durable Supdb is not slow, a *growing* durable Supdb is, and the in-place path already exists and is simply declined."
   }
  ],
  "metrics": [

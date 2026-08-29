@@ -106,6 +106,7 @@ fn main() -> std::io::Result<()> {
             "f24-autoreadahead" => f24_autoreadahead(&args, profile)?,
             "f25-arena" => f25_arena(&args, profile)?,
             "f26-buffer" => f26_buffer(&args, profile)?,
+            "f27-ckptshape" => f27_ckptshape(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -145,6 +146,7 @@ fn main() -> std::io::Result<()> {
                 "f24-autoreadahead",
                 "f25-arena",
                 "f26-buffer",
+                "f27-ckptshape",
                 "f4-durability",
                 "f3-multiproc",
                 "f1-outofcore",
@@ -3637,6 +3639,131 @@ fn f11_child(args: &Args) -> std::io::Result<()> {
 /// bit flip, a torn write or a reused slot returns silently wrong data,
 /// because LZ4 decodes many corrupted inputs into plausible bytes. The
 /// question is only what it costs.
+/// Is a durable checkpoint expensive, or is *inserting* expensive?
+///
+/// EXT.9 has a durable Supdb at 0.010x of LMDB, with 270x write
+/// amplification -- 29.9GB for 116MB of data. `checkpoint_in_place` exists
+/// precisely to avoid that: it edits the mapped index through slack rather
+/// than rewriting it. But it opens with
+///
+///     if nkeys != meta.len() { return Ok(false) }
+///
+/// so a checkpoint that follows any *insertion* falls back to the full
+/// rewrite, and every batch of a bulk load inserts. If that reading is right,
+/// then durability is not inherently expensive here -- inserting under
+/// durability is -- and the two arms below will differ by a wide margin on
+/// identical checkpoint counts and identical operation counts.
+///
+/// Same store size, same number of checkpoints, same number of puts. The only
+/// difference is whether the keys are new.
+fn f27_ckptshape(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let keys = args.num("--keys", profile.pick(20_000, 100_000, 200_000)) as u64;
+    let ops = args.num("--ops", profile.pick(20_000, 100_000, 200_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+
+    let mut rec = Record::new("f27-ckptshape", profile);
+    rec.param("keys", J::u(keys))
+        .param("ops", J::u(ops))
+        .param("checkpoint_every_ops", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .note("both arms interleaved; identical op count and checkpoint count, Sync::Always")
+        .note("arm 0 inserts new keys, arm 1 updates keys already in the index");
+
+    let dir = scratch("f27");
+    let payload = Payload::new(value_size, 0.5, 0xF27);
+    let io: std::sync::Mutex<Vec<(usize, f64)>> = std::sync::Mutex::new(Vec::new());
+    let trial = Trial::new(profile.reps());
+    let tp = trial.run(2, |ci, rep| {
+        let file = dir.join(format!("c{ci}-{rep}.dat"));
+        let store = Store::create(&file, default_opts(64)).expect("create");
+        let mut vrng = Rng::new(0xF27 + rep as u64);
+        let mut kb = [0u8; 16];
+        // The update arm needs the keys to exist first, and that preload is
+        // not timed -- it is the insert arm's whole workload, so timing it
+        // here would measure the same thing twice.
+        if ci == 1 {
+            for i in 0..keys {
+                db_key_into(i, &mut kb);
+                store.put(&kb, payload.get(&mut vrng)).expect("preload");
+            }
+            store.checkpoint().expect("preload checkpoint");
+        }
+        let io0 = IoCounters::read_now();
+        let t = Instant::now();
+        for i in 0..ops {
+            // Arm 0: every key is new. Arm 1: every key already exists.
+            let k = if ci == 0 { keys + i } else { i % keys };
+            db_key_into(k, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+            if (i + 1) % batch == 0 {
+                store.checkpoint().expect("checkpoint");
+            }
+        }
+        let secs = t.elapsed().as_secs_f64();
+        let wrote = IoCounters::read_now().since(&io0).write_bytes;
+        io.lock()
+            .unwrap()
+            .push((ci, wrote as f64 / 1_048_576.0));
+        let _ = store.close();
+        let _ = std::fs::remove_file(&file);
+        ops as f64 / secs
+    });
+
+    let io_arm: Vec<Samples> = {
+        let all = io.lock().unwrap();
+        (0..2)
+            .map(|ci| {
+                Samples::new(
+                    all.iter()
+                        .filter(|(c, _)| *c == ci)
+                        .map(|(_, v)| *v)
+                        .collect(),
+                )
+            })
+            .collect()
+    };
+    let cmp = compare(&tp[1], &tp[0], supdb::bench::MIN_EFFECT);
+    rec.compare("update_vs_insert", cmp.clone());
+    rec.series(
+        "arms",
+        J::arr(
+            (0..2)
+                .map(|ci| {
+                    jobj! {
+                        "keys_are_new" => J::Bool(ci == 0),
+                        "ops_per_s" => J::fp(tp[ci].median(), 1),
+                        "ops" => tp[ci].to_json(),
+                        "device_write_mb" => J::fp(io_arm[ci].median(), 1),
+                        "write_amp" => J::fp(
+                            io_arm[ci].median() * 1048576.0
+                                / (ops as f64 * (16.0 + value_size as f64)).max(1.0),
+                            2
+                        )
+                    }
+                })
+                .collect(),
+        ),
+    );
+    rec.finding(Finding::new(
+        "F27.1",
+        "A durable checkpoint is expensive because of insertion, not because of durability",
+        matches!(cmp.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "updating existing keys runs {:.0} ops/s and writes {:.1} MB; inserting new ones runs \
+             {:.0} ops/s and writes {:.1} MB ({}). Identical op and checkpoint counts, both with \
+             Sync::Always. `checkpoint_in_place` bails to a full index rewrite whenever a key was \
+             added, and every batch of a bulk load adds",
+            tp[1].median(),
+            io_arm[1].median(),
+            tp[0].median(),
+            io_arm[0].median(),
+            cmp.summary("update", "insert")
+        ),
+    ));
+    Ok(rec)
+}
+
 /// Does the write buffer want to be smaller than the workload?
 ///
 /// EXT.10 has Supdb losing bulk ingest to an LMDB that is not syncing, and the
