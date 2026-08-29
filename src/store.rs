@@ -12,7 +12,7 @@ use std::io::{Result, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const MAGIC: u64 = 0x5355_5044_4200_0001;
+const MAGIC: u64 = 0x5355_5044_4200_0002;
 
 /// Two superblock slots live in the first sector-pair of the file, and a
 /// checkpoint alternates between them.
@@ -25,6 +25,12 @@ const MAGIC: u64 = 0x5355_5044_4200_0001;
 /// valid slot with the higher generation.
 const SUPER: u64 = 4096;
 const SLOT: u64 = 512;
+/// Encoded size of a superblock: the fields, then the magic, then the
+/// checksum. Named because eight call sites used to slice the literal, and
+/// adding two fields to `Super` left every one of them reading a prefix that
+/// no longer contained the checksum -- a format change that presented itself
+/// as "no valid supdb checkpoint" on a healthy file.
+const SUPER_BYTES: usize = 136;
 
 #[derive(Clone, Copy, Default, Debug)]
 struct Super {
@@ -55,10 +61,23 @@ struct Super {
     reuse_stored: u64,
     reuse_uncompressed: u64,
     high_water: u64,
+    /// The redo log: where the records written since the last full index
+    /// rewrite begin, and how many bytes of them there are.
+    ///
+    /// A checkpoint has always done two jobs -- make writes durable, and make
+    /// them findable by a fresh reader -- and only the second needs the index.
+    /// f27 measured what conflating them costs: inserting under `Sync::Always`
+    /// runs at 42,079 ops/s against 173,446 for updating the same number of
+    /// keys with the same number of checkpoints, because any insertion sends
+    /// `checkpoint_in_place` to the full-rewrite path. The log makes a
+    /// durability point proportional to what changed; the index rewrite
+    /// becomes something that happens occasionally, to bound replay.
+    log_off: u64,
+    log_len: u64,
 }
 
 impl Super {
-    fn fields(&self) -> [u64; 13] {
+    fn fields(&self) -> [u64; 15] {
         [
             self.generation,
             self.history_from,
@@ -73,6 +92,8 @@ impl Super {
             self.reuse_stored,
             self.reuse_uncompressed,
             self.high_water,
+            self.log_off,
+            self.log_len,
         ]
     }
 
@@ -89,24 +110,24 @@ impl Super {
         h
     }
 
-    fn encode(&self) -> [u8; 120] {
-        let mut out = [0u8; 120];
+    fn encode(&self) -> [u8; SUPER_BYTES] {
+        let mut out = [0u8; SUPER_BYTES];
         for (i, v) in self.fields().iter().enumerate() {
             out[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
         }
-        out[104..112].copy_from_slice(&MAGIC.to_le_bytes());
-        out[112..120].copy_from_slice(&self.checksum().to_le_bytes());
+        out[120..128].copy_from_slice(&MAGIC.to_le_bytes());
+        out[128..136].copy_from_slice(&self.checksum().to_le_bytes());
         out
     }
 
     fn decode(buf: &[u8]) -> Option<Super> {
-        if buf.len() < 120 {
+        if buf.len() < SUPER_BYTES {
             return None;
         }
-        let f: Vec<u64> = (0..13)
+        let f: Vec<u64> = (0..15)
             .map(|i| u64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap()))
             .collect();
-        if u64::from_le_bytes(buf[104..112].try_into().unwrap()) != MAGIC {
+        if u64::from_le_bytes(buf[120..128].try_into().unwrap()) != MAGIC {
             return None;
         }
         let s = Super {
@@ -123,8 +144,10 @@ impl Super {
             reuse_stored: f[10],
             reuse_uncompressed: f[11],
             high_water: f[12],
+            log_off: f[13],
+            log_len: f[14],
         };
-        if u64::from_le_bytes(buf[112..120].try_into().unwrap()) != s.checksum() {
+        if u64::from_le_bytes(buf[128..136].try_into().unwrap()) != s.checksum() {
             return None;
         }
         Some(s)
@@ -1197,8 +1220,8 @@ impl Store {
             if map.len() < SUPER as usize {
                 return Err(corrupt("file is shorter than its superblock"));
             }
-            let a = Super::decode(&map[0..120]);
-            let b = Super::decode(&map[SLOT as usize..SLOT as usize + 120]);
+            let a = Super::decode(&map[0..SUPER_BYTES]);
+            let b = Super::decode(&map[SLOT as usize..SLOT as usize + SUPER_BYTES]);
             match (a, b) {
                 (Some(x), Some(y)) if y.generation > x.generation => y,
                 (Some(x), _) => x,
@@ -2374,6 +2397,10 @@ impl Store {
             reuse_stored: reuse_loc.stored as u64,
             reuse_uncompressed: reuse_loc.uncompressed as u64,
             high_water: ap.off,
+            // A full index rewrite is what makes the log redundant: every
+            // record in it is now in the index that this superblock names.
+            log_off: 0,
+            log_len: 0,
         };
         // The superblock's high water mark is the append cursor, and the
         // cursor runs ahead of the bytes actually written: a block advances it
@@ -3128,8 +3155,8 @@ impl Reader {
     fn load_overwritten(&mut self, path: &Path) -> Result<()> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        let a = Super::decode(&mmap[0..120]);
-        let b = Super::decode(&mmap[SLOT as usize..SLOT as usize + 120]);
+        let a = Super::decode(&mmap[0..SUPER_BYTES]);
+        let b = Super::decode(&mmap[SLOT as usize..SLOT as usize + SUPER_BYTES]);
         let sb = match (a, b) {
             (Some(x), Some(y)) => {
                 if x.generation >= y.generation {
@@ -3289,8 +3316,8 @@ impl Reader {
                     "file too short to hold a superblock",
                 ));
             }
-            let a = Super::decode(&mmap[0..120]);
-            let b = Super::decode(&mmap[SLOT as usize..SLOT as usize + 120]);
+            let a = Super::decode(&mmap[0..SUPER_BYTES]);
+            let b = Super::decode(&mmap[SLOT as usize..SLOT as usize + SUPER_BYTES]);
             let newest = match (a, b) {
                 (Some(x), Some(y)) => Some(if x.generation >= y.generation { x } else { y }),
                 (Some(x), None) => Some(x),
@@ -3454,8 +3481,8 @@ impl Reader {
     ) -> Result<Reader> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        let a = Super::decode(&mmap[0..120]);
-        let b = Super::decode(&mmap[SLOT as usize..SLOT as usize + 120]);
+        let a = Super::decode(&mmap[0..SUPER_BYTES]);
+        let b = Super::decode(&mmap[SLOT as usize..SLOT as usize + SUPER_BYTES]);
         let sb = match (a, b) {
             (Some(x), Some(y)) => {
                 if x.generation >= y.generation {
