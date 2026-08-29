@@ -59,33 +59,32 @@ jobs:
           WINDOW: ${{ inputs.pickup_timeout_minutes || '10' }}
         run: |
           set -uo pipefail
-          deadline=$(( WINDOW * 2 ))
+          deadline=$(( WINDOW * 2 ))   # polls, at 30s each
           for i in $(seq 1 "$deadline"); do
             job=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
-              --jq '.jobs[] | select(.name=="bench") | "\(.status) \(.conclusion) \(.runner_name)"' \
-              2>/dev/null || echo "")
-            set -- $job
-            status="${1:-}"; conclusion="${2:-}"; runner="${3:-}"
+              --jq '.jobs[] | select(.name=="bench") | "\(.status)|\(.runner_name)"' \
+              2>&1 || true)
+            status="${job%%|*}"
+            runner="${job##*|}"
+            echo "poll $i: status='$status' runner='$runner'"
             case "$status" in
-              in_progress)
-                echo "bench claimed by ${runner:-?} after $(( i * 30 ))s"
+              queued|"")
+                # Still waiting, or the API did not answer. Keep waiting.
+                ;;
+              *)
+                # Anything else means a runner has it or has had it. This job
+                # is about pickup, and pickup has happened.
+                echo "bench picked up by ${runner:-?} after $(( i * 30 ))s"
                 exit 0
                 ;;
-              completed)
-                # Completed is not the same as claimed. A job cancelled while
-                # queued is also completed, and an earlier version of this
-                # check read that as success and reported "claimed after 210s"
-                # for a job no runner ever touched -- runner_id 0, runner_name
-                # empty. The runner name is the thing that distinguishes them.
-                if [ -n "$runner" ] && [ "$runner" != "null" ]; then
-                  echo "bench ran on $runner"
-                  exit 0
-                fi
-                echo "::error::bench completed as '\''$conclusion'\'' without ever being claimed."
-                echo "::error::A heartbeat says the Mac is up; this says no runner took the job."
-                echo "::error::Check Settings > Actions > Runners: registrations expire, and a"
-                echo "::error::stale one leaves the app heartbeating with nothing listening."
-                exit 1
+            esac
+            sleep 30
+          done
+          echo "::error::bench was still queued after ${WINDOW}m and no runner took it."
+          echo "::error::Check Settings > Actions > Runners: registrations expire, and a"
+          echo "::error::stale one leaves the localmost app heartbeating with nothing listening."
+          gh api -X POST "repos/$REPO/actions/runs/$RUN_ID/cancel" >/dev/null || true
+          exit 1
                 ;;
               "")
                 # The job has not been created yet, or the API hiccupped.
