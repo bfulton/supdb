@@ -1146,3 +1146,96 @@ fn a_store_can_be_reopened_and_written_again() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// The arena must be invisible: both buffering paths answer identically.
+///
+/// `Options::pending_arena` changes where a buffered value lives -- one arena
+/// per shard rather than one `Vec` per key -- and nothing else. It was worth
+/// doing because a load scattered its writes across one malloc block per key
+/// and paid 21x LMDB's last-level misses for it (docs/profiling.md), but a
+/// buffering change reaches every read path in the engine: `put` replaces a
+/// run, `append` extends one and has to keep it contiguous when another key
+/// has appended in between, `delete` abandons one, and the writer, the scan
+/// and a fresh reader all have to see the same bytes either way.
+///
+/// So this drives all four operations with a shape that forces relocation --
+/// appends interleaved across keys that share a shard -- and compares the two
+/// arms against each other rather than against a hand-written expectation.
+#[test]
+fn the_pending_arena_changes_no_answer() {
+    type Seen = (Vec<(Vec<u8>, Vec<u8>)>, Vec<(Vec<u8>, Vec<u8>)>);
+    fn run(arena: bool, dir: &std::path::Path) -> Seen {
+        let path = dir.join("s.dat");
+        let opts = Options {
+            pending_arena: arena,
+            buffer_bytes: 1 << 16,
+            reclaim: Reclaim::AfterReads,
+            ..Default::default()
+        };
+        let s = Store::create(&path, opts).unwrap();
+        // Interleaved appends: every key's run is broken by another key's, so
+        // the arena has to relocate rather than extend in place.
+        for round in 0..40u32 {
+            for k in 0..25u32 {
+                let key = format!("key-{k:04}");
+                s.append(key.as_bytes(), format!("v{k}-{round}").as_bytes())
+                    .unwrap();
+            }
+        }
+        // Replacements abandon a run mid-arena; deletes drop one entirely.
+        for k in (0..25u32).step_by(3) {
+            s.put(format!("key-{k:04}").as_bytes(), b"replaced").unwrap();
+        }
+        for k in (0..25u32).step_by(7) {
+            s.delete(format!("key-{k:04}").as_bytes()).unwrap();
+        }
+        // What the writer sees before anything is sealed. `scan` yields one
+        // entry per value, so it is kept as-is rather than folded into the
+        // read_all view -- they are different questions and both must match.
+        let mut scanned = Vec::new();
+        s.scan(None, usize::MAX, |k, v| {
+            scanned.push((k.to_vec(), v.to_vec()));
+        })
+        .unwrap();
+        let mut keys: Vec<Vec<u8>> = scanned.iter().map(|(k, _)| k.clone()).collect();
+        keys.dedup();
+        let mut whole = Vec::new();
+        for k in &keys {
+            let mut got = Vec::new();
+            s.read_all(k, |x| got.extend_from_slice(x)).unwrap();
+            whole.push((k.clone(), got));
+        }
+        s.flush().unwrap();
+        s.checkpoint().unwrap();
+        s.close().unwrap();
+        // And the same questions through a fresh reader after sealing.
+        let r = Reader::open(&path).unwrap();
+        let mut reread = Vec::new();
+        for k in &keys {
+            let mut got = Vec::new();
+            r.read_all(k, |x| got.extend_from_slice(x)).unwrap();
+            reread.push((k.clone(), got));
+        }
+        assert_eq!(
+            whole, reread,
+            "arena={arena}: the writer and a fresh reader disagree"
+        );
+        (scanned, whole)
+    }
+
+    let base = std::env::temp_dir().join(format!("supdb-arena-{}", std::process::id()));
+    let (a, b) = (base.join("on"), base.join("off"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let off = run(false, &b);
+    let on = run(true, &a);
+    assert!(
+        on.0.len() > 100 && on.1.len() > 5,
+        "the shape stopped exercising anything: {} scanned, {} keys",
+        on.0.len(),
+        on.1.len()
+    );
+    assert_eq!(on.0, off.0, "the arena changed what a scan yields");
+    assert_eq!(on.1, off.1, "the arena changed what read_all returns");
+    let _ = std::fs::remove_dir_all(&base);
+}

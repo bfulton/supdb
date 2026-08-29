@@ -622,6 +622,20 @@
    "profile": "full",
    "expect": "fails",
    "because": "Supdb scans at 31,373,098 entries/s against LMDB's 39,940,773 -- 0.785x at p=0.0106 -- with the checksum axis equalized. Note this disagrees with ext-sweep, which has the two engines indistinguishable on every scan axis it measures (EXT.7, EXT.8). The suites differ in shape: ext-sweep builds one store per engine and sweeps it repeatedly, so it measures a warm walk, while this one loads a fresh store per repetition and scans it once. Which of those a reader should care about depends on the workload, and the honest answer today is that Supdb is level on a warm scan and behind on a cold one. Do not average them."
+  },
+  {
+   "experiment": "f25-arena",
+   "id": "F25.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "2,224,684 ops/s against 1,874,508 -- 1.187x at p=0.0215. Pending values are appended into one arena per shard instead of one Vec per key. This came out of profiling EXT.10, where Supdb loses bulk ingest to an LMDB that is not syncing either: the gap is not compute (1.37x the instructions) but memory (21x the last-level misses per key), because every buffered value used to get its own allocation -- 50,305 live heap blocks against LMDB's 2,077. Two things worth keeping: at `dev` this read 1.076x at p=0.2963, invisible, and only `full` resolved it, which is the same lesson f8-checksums already carries. And the deterministic counters disagreed -- the arena cuts instructions 16% per key and *raises* last-level misses 21%, and reserving it up front to remove every growth memcpy did not change that. Wall clock followed the instruction count. A cache simulation is evidence, not a verdict."
+  },
+  {
+   "experiment": "f25-arena",
+   "id": "F25.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "2,605,757 ops/s against 2,277,210 -- 1.144x at p=0.0022. This is the workload the arena could have lost outright: an append must keep a key's run contiguous, so when another key has appended in between, the run is copied to the arena tail. Measured on a shape where that copy is paid on nearly every call, it is still 14% faster than one allocation per key. The claim is written as 'does not slow down' rather than 'speeds up' because not-slower was the bar it had to clear; that it clears the higher one is recorded here rather than in the statement."
   }
  ],
  "metrics": [

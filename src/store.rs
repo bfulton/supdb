@@ -522,6 +522,15 @@ pub struct Options {
     /// comparing two runs taken hours apart, which measures the machine as
     /// much as the code.
     pub checksums: bool,
+    /// Buffer pending values in one arena per shard instead of one `Vec` per
+    /// key.
+    ///
+    /// On by default. `EXT.10` had Supdb losing bulk ingest 1.85x to an LMDB
+    /// that was not syncing either, and the profile said why: 1.37x the
+    /// instructions but 21x the last-level misses per key, because every
+    /// buffered value used to get its own allocation. f25-arena prices the
+    /// change with both arms interleaved.
+    pub pending_arena: bool,
     /// Write the key index in a shape a reader can use where it lies, instead
     /// of one it has to decode into the heap first.
     ///
@@ -588,6 +597,7 @@ impl Default for Options {
             solo_chunk_size: block::CHUNK,
             merge_threshold: 4,
             checksums: true,
+            pending_arena: true,
             // On, now that the space cost is bounded.
             //
             // It was off while a checkpoint appended a whole index section
@@ -1015,7 +1025,20 @@ impl Appender {
 /// A key's extent while it is still being built.
 #[derive(Default)]
 struct Pending {
+    /// The buffered value, when `Options::pending_arena` is off.
+    ///
+    /// One heap allocation per key, and dhat measured what that costs: 50,305
+    /// live blocks against LMDB's 2,077 on a 50k-key load, and 9.4 last-level
+    /// misses per key against LMDB's 0.45. A load scatters its writes across
+    /// tens of megabytes of small objects, five times the last-level cache,
+    /// touched in hash order. See docs/profiling.md.
     buf: Vec<u8>,
+    /// Where this key's buffered run lives in the shard arena, when
+    /// `Options::pending_arena` is on. `len` is zero exactly when the arena is
+    /// not in use for this entry, since a record always carries at least its
+    /// own length varint.
+    off: u32,
+    len: u32,
     /// Offset of the most recently appended record within `buf`.
     last: u32,
     /// Extents this pending value replaces, to be released when it is sealed
@@ -1026,11 +1049,40 @@ struct Pending {
     replaces: bool,
 }
 
+impl Pending {
+    /// The buffered bytes, from whichever place holds them.
+    #[inline]
+    fn bytes<'a>(&'a self, arena: &'a [u8]) -> &'a [u8] {
+        if self.len > 0 {
+            &arena[self.off as usize..][..self.len as usize]
+        } else {
+            &self.buf
+        }
+    }
+    #[inline]
+    fn nbytes(&self) -> usize {
+        if self.len > 0 {
+            self.len as usize
+        } else {
+            self.buf.len()
+        }
+    }
+}
+
 struct Shard {
     merges: u64,
     /// One table holding both a key's sealed extents and the value still
     /// buffered for it, so a put probes once rather than twice.
     keys: KeyTable<Pending>,
+    /// Buffered values for every key in this shard, appended end to end.
+    ///
+    /// The point is the write *pattern*, not the allocation count: values land
+    /// consecutively and stream out of cache instead of scattering across one
+    /// malloc block per key. A replaced value leaves its old bytes behind as
+    /// garbage until the next seal clears the whole arena, which is why
+    /// `pending_bytes` tracks the arena length rather than the live total --
+    /// the seal threshold should fire on memory actually held.
+    arena: Vec<u8>,
     pending_bytes: usize,
     builder: BlockBuilder,
     /// Extents already placed in the current block, awaiting its id.
@@ -1167,6 +1219,7 @@ impl Store {
                     keys: KeyTable::new(),
                     pending_bytes: 0,
                     builder: BlockBuilder::new(opts.block_size),
+                    arena: Vec::new(),
                     members: Vec::new(),
                     dirty: Vec::new(),
                 })
@@ -1297,6 +1350,7 @@ impl Store {
                     keys: KeyTable::new(),
                     pending_bytes: 0,
                     builder: BlockBuilder::new(opts.block_size),
+                    arena: Vec::new(),
                     members: Vec::new(),
                     dirty: Vec::new(),
                 })
@@ -1354,16 +1408,48 @@ impl Store {
         self.mark_unpublished();
         let si = self.shard_of(key);
         let mut sh = self.shards[si].lock().unwrap();
-        let grew = {
-            let e = sh.keys.get_or_insert(key);
+        let arena_on = self.opts.pending_arena;
+        let budget = self.opts.buffer_bytes / self.shards.len();
+        {
+            let Shard {
+                keys,
+                arena,
+                pending_bytes,
+                ..
+            } = &mut *sh;
+            let e = keys.get_or_insert(key);
             let p = e.pending.get_or_insert_with(Pending::default);
-            let before = p.buf.len();
-            p.last = before as u32;
-            put_uvarint(&mut p.buf, value.len() as u64);
-            p.buf.extend_from_slice(value);
-            p.buf.len() - before
-        };
-        sh.pending_bytes += grew;
+            if arena_on {
+                if arena.capacity() == 0 {
+                    arena.reserve(budget);
+                }
+                // A key's run has to stay contiguous, and another key may have
+                // appended since this one last did. When that has happened,
+                // copy the run to the tail first; when it has not -- which is
+                // every append in a run of appends to the same key -- extend
+                // in place and copy nothing.
+                if p.len > 0 && (p.off + p.len) as usize != arena.len() {
+                    let (from, n) = (p.off as usize, p.len as usize);
+                    let moved = arena.len() as u32;
+                    arena.extend_from_within(from..from + n);
+                    p.off = moved;
+                }
+                if p.len == 0 {
+                    p.off = arena.len() as u32;
+                }
+                p.last = p.len;
+                put_uvarint(arena, value.len() as u64);
+                arena.extend_from_slice(value);
+                p.len = arena.len() as u32 - p.off;
+                *pending_bytes = arena.len();
+            } else {
+                let before = p.buf.len();
+                p.last = before as u32;
+                put_uvarint(&mut p.buf, value.len() as u64);
+                p.buf.extend_from_slice(value);
+                *pending_bytes += p.buf.len() - before;
+            }
+        }
 
         if sh.pending_bytes >= self.opts.buffer_bytes / self.shards.len() {
             self.seal_shard(&mut sh)?;
@@ -1383,6 +1469,11 @@ impl Store {
         }
         let mut batch: Vec<(u32, Pending)> = sh.keys.take_pending();
         sh.pending_bytes = 0;
+        // Taken out rather than borrowed so the loop can hold `&arena` while
+        // it mutates `builder` and `members`. The capacity comes back at the
+        // end; an error path loses the buffered bytes, which is already true
+        // of `batch` and `pending_bytes` above.
+        let arena = std::mem::take(&mut sh.arena);
         // sorted by the keys the indices point at, with no key copied
         sh.keys.sort_by_key(&mut batch);
 
@@ -1419,20 +1510,21 @@ impl Store {
                     ap.release(e.block)?;
                 }
             }
-            if p.buf.len() >= self.opts.solo_threshold {
+            let pbytes = p.bytes(&arena);
+            if pbytes.len() >= self.opts.solo_threshold {
                 // big enough to compress on its own; giving it a private block
                 // means a read of this key decompresses only this key
                 let id = {
                     let mut ap = self.appender.lock().unwrap();
                     ap.write_block(
-                        &p.buf,
+                        pbytes,
                         self.opts.compress,
                         true,
                         self.opts.solo_chunk_size,
                         self.opts.reclaim,
                     )?
                 };
-                let len = p.buf.len() as u32;
+                let len = pbytes.len() as u32;
                 self.appender.lock().unwrap().retain(id);
                 let ext = Ext {
                     block: id,
@@ -1452,13 +1544,17 @@ impl Store {
                 self.merge_key(sh, idx)?;
                 continue;
             }
-            if sh.builder.would_overflow(p.buf.len()) {
+            if sh.builder.would_overflow(pbytes.len()) {
                 self.flush_builder(sh)?;
             }
-            let off = sh.builder.push(&p.buf);
+            let off = sh.builder.push(pbytes);
             sh.members
-                .push((idx, off, p.buf.len() as u32, p.last, p.replaces));
+                .push((idx, off, pbytes.len() as u32, p.last, p.replaces));
         }
+        // Keep the capacity: clearing is what makes the next batch of writes
+        // land in already-reserved memory instead of growing again.
+        sh.arena = arena;
+        sh.arena.clear();
         Ok(())
     }
 
@@ -1531,18 +1627,57 @@ impl Store {
         // and a probe on the hot path, and the index is already in hand at
         // seal time, where the new extent has to be recorded anyway. Putting a
         // value therefore touches one map, not two.
-        let (before, after) = {
-            let e = sh.keys.get_or_insert(key);
+        let arena_on = self.opts.pending_arena;
+        let budget = self.opts.buffer_bytes / self.shards.len();
+        {
+            // Disjoint field borrows: the entry lives in `keys` and the bytes
+            // go in `arena`, so both are needed at once. Probing twice to
+            // avoid that would undo the single-probe property this path was
+            // built for.
+            let Shard {
+                keys,
+                arena,
+                pending_bytes,
+                ..
+            } = &mut *sh;
+            let e = keys.get_or_insert(key);
             let p = e.pending.get_or_insert_with(Pending::default);
-            let before = p.buf.len();
-            p.buf.clear();
-            put_uvarint(&mut p.buf, value.len() as u64);
-            p.buf.extend_from_slice(value);
+            let before = p.nbytes();
+            if arena_on {
+                // Reserve the shard's whole budget the first time it is used.
+                // Growing by doubling from empty was worse than the per-key
+                // allocations it replaced: it cut instructions 14% and *added*
+                // 19% to last-level misses, because every doubling memcpys the
+                // arena and those copies stream through the cache. The
+                // capacity is what `buffer_bytes` already promised, and
+                // reserving it costs address space rather than pages.
+                if arena.capacity() == 0 {
+                    arena.reserve(budget);
+                }
+                // A replacement abandons the old run where it lies. The bytes
+                // stay until the next seal clears the arena; reclaiming them
+                // here would mean moving everything after them.
+                let off = arena.len() as u32;
+                put_uvarint(arena, value.len() as u64);
+                arena.extend_from_slice(value);
+                p.off = off;
+                p.len = arena.len() as u32 - off;
+                p.buf = Vec::new();
+            } else {
+                p.buf.clear();
+                put_uvarint(&mut p.buf, value.len() as u64);
+                p.buf.extend_from_slice(value);
+                p.len = 0;
+            }
             p.last = 0;
             p.replaces = true;
-            (before, p.buf.len())
-        };
-        sh.pending_bytes = sh.pending_bytes + after - before;
+            let after = p.nbytes();
+            if arena_on {
+                *pending_bytes = arena.len();
+            } else {
+                *pending_bytes = *pending_bytes + after - before;
+            }
+        }
         // Same hazard as `delete`: a replacement supersedes every earlier
         // value, including one already staged in the block builder by an
         // inline seal. Left in place, `flush_builder` would push the
@@ -1565,7 +1700,7 @@ impl Store {
         let mut sh = self.shards[si].lock().unwrap();
         let (freed, old) = {
             let e = sh.keys.get_or_insert(key);
-            let freed = e.pending.take().map(|p| p.buf.len()).unwrap_or(0);
+            let freed = e.pending.take().map(|p| p.nbytes()).unwrap_or(0);
             let old = e.extents.as_slice().to_vec();
             e.extents = Extents::None;
             (freed, old)
@@ -1753,7 +1888,7 @@ impl Store {
         let e = sh.keys.entry(idx);
         let sealed = e.extents.as_slice();
         let (pending_buf, pending_replaces) = match &e.pending {
-            Some(p) => (p.buf.as_slice(), p.replaces),
+            Some(p) => (p.bytes(&sh.arena), p.replaces),
             None => (&[][..], false),
         };
         // The last staged member for this key that replaces what came before.

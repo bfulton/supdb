@@ -104,6 +104,7 @@ fn main() -> std::io::Result<()> {
             "f22-storescan" => f22_storescan(&args, profile)?,
             "f23-madvise" => f23_madvise(&args, profile)?,
             "f24-autoreadahead" => f24_autoreadahead(&args, profile)?,
+            "f25-arena" => f25_arena(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -141,6 +142,7 @@ fn main() -> std::io::Result<()> {
                 "f22-storescan",
                 "f23-madvise",
                 "f24-autoreadahead",
+                "f25-arena",
                 "f4-durability",
                 "f3-multiproc",
                 "f1-outofcore",
@@ -3633,6 +3635,144 @@ fn f11_child(args: &Args) -> std::io::Result<()> {
 /// bit flip, a torn write or a reused slot returns silently wrong data,
 /// because LZ4 decodes many corrupted inputs into plausible bytes. The
 /// question is only what it costs.
+/// What the pending arena costs or buys, both arms interleaved.
+///
+/// `EXT.10` has Supdb losing bulk ingest 1.85x to an LMDB that is not syncing
+/// either, and the profile put the gap in memory rather than compute: 1.37x
+/// the instructions but 21x the last-level misses per key, because every
+/// buffered value used to get its own allocation (docs/profiling.md).
+/// `Options::pending_arena` appends them into one buffer per shard instead.
+///
+/// The deterministic counters disagree about whether that is an improvement.
+/// Instructions fall 16% per key. Last-level misses *rise* 21%, and reserving
+/// the arena up front -- which removes every growth memcpy -- did not change
+/// that, so the doubling was not the cause. The plausible remainder is that
+/// the per-key path was accidentally cache-friendly, since malloc hands back
+/// blocks the driver freed moments ago while an arena marches through memory
+/// nothing has touched.
+///
+/// Two exact counters pointing opposite ways is exactly the case where only
+/// wall clock decides, and only interleaved: this is the experiment, not the
+/// cachegrind run, and if it says the arena loses then the arena loses.
+fn f25_arena(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let depth = args.num("--depth", 4) as u64;
+
+    let mut rec = Record::new("f25-arena", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .param("values_per_key", J::u(depth))
+        .note("both arms interleaved in one process; the only difference is Options::pending_arena");
+
+    let dir = scratch("f25");
+    let payload = Payload::new(value_size, 0.5, 0xF25);
+    let on = [true, false];
+
+    // Bulk load through `put`, which is the shape EXT.10 measures: one value
+    // per key, every key new.
+    let trial = Trial::new(profile.reps());
+    let load = trial.run(2, |ci, rep| {
+        let file = dir.join(format!("l{ci}-{rep}.dat"));
+        let store = Store::create(
+            &file,
+            Options {
+                pending_arena: on[ci],
+                ..default_opts(256)
+            },
+        )
+        .expect("create");
+        let mut vrng = Rng::new(0xF25 + rep as u64);
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+        }
+        store.flush().expect("flush");
+        let secs = t.elapsed().as_secs_f64();
+        let _ = store.close();
+        let _ = std::fs::remove_file(&file);
+        keys as f64 / secs
+    });
+
+    // And through `append`, where a key's run must stay contiguous and the
+    // arena has to relocate when another key has appended in between. That is
+    // the case the arena could plausibly lose outright, so it is measured
+    // rather than argued about.
+    let appended = trial.run(2, |ci, rep| {
+        let file = dir.join(format!("a{ci}-{rep}.dat"));
+        let store = Store::create(
+            &file,
+            Options {
+                pending_arena: on[ci],
+                ..default_opts(256)
+            },
+        )
+        .expect("create");
+        let mut vrng = Rng::new(0xF25 + rep as u64);
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        for i in 0..(keys * depth) {
+            db_key_into(i % keys, &mut kb);
+            store.append(&kb, payload.get(&mut vrng)).expect("append");
+        }
+        store.flush().expect("flush");
+        let secs = t.elapsed().as_secs_f64();
+        let _ = store.close();
+        let _ = std::fs::remove_file(&file);
+        (keys * depth) as f64 / secs
+    });
+
+    let lc = compare(&load[0], &load[1], supdb::bench::MIN_EFFECT);
+    let ac = compare(&appended[0], &appended[1], supdb::bench::MIN_EFFECT);
+    rec.compare("load_arena_vs_per_key", lc.clone());
+    rec.compare("append_arena_vs_per_key", ac.clone());
+    rec.series(
+        "arms",
+        J::arr(
+            (0..2)
+                .map(|ci| {
+                    jobj! {
+                        "pending_arena" => J::Bool(on[ci]),
+                        "load_ops_per_s" => J::fp(load[ci].median(), 1),
+                        "load" => load[ci].to_json(),
+                        "append_ops_per_s" => J::fp(appended[ci].median(), 1),
+                        "append" => appended[ci].to_json()
+                    }
+                })
+                .collect(),
+        ),
+    );
+    rec.finding(Finding::new(
+        "F25.1",
+        "Buffering pending values in one arena per shard speeds up a bulk load",
+        matches!(lc.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "arena {:.0} ops/s against per-key {:.0} ({}). cachegrind has the arena at 16% fewer \
+             instructions per key and 21% *more* last-level misses, so the two exact counters \
+             disagree and this is the measurement that decides",
+            load[0].median(),
+            load[1].median(),
+            lc.summary("arena", "per-key")
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F25.2",
+        "The arena does not slow down an append-heavy workload",
+        !matches!(ac.verdict, supdb::bench::Verdict::Less),
+        format!(
+            "arena {:.0} ops/s against per-key {:.0} ({}). An append has to keep a key's run \
+             contiguous, so when another key has appended in between the arena copies the run to \
+             the tail. This is the workload where that copy is paid on almost every call",
+            appended[0].median(),
+            appended[1].median(),
+            ac.summary("arena", "per-key")
+        ),
+    ));
+    Ok(rec)
+}
+
 fn f8_checksums(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
     let depth = args.num("--depth", 4) as u64;
