@@ -27,8 +27,14 @@ on:
         description: 'Engines to compare'
         default: 'supdb,lmdb'
       suite:
-        description: 'kv or ycsb'
+        description: 'kv or ycsb (ignored when `internal` is set)'
         default: 'kv'
+      internal:
+        description: 'An internal experiment (e.g. f25-arena) to run instead of the comparison'
+        default: ''
+      args:
+        description: 'Extra args for the experiment, e.g. --keys 400000 to fit the 9-minute cap'
+        default: ''
       pickup_timeout_minutes:
         description: 'Cancel the run if no self-hosted runner claims the bench within this many minutes'
         default: '10'
@@ -144,6 +150,8 @@ jobs:
         # whole job -- build included -- has to finish inside localmost's
         # 600-second kill. Minutes spent compiling what this job never
         # executes are minutes the measurement does not get.
+        env:
+          WANT_INTERNAL: ${{ inputs.internal }}
         run: |
           set -euo pipefail
           # Offline: see the note in apple-silicon.yml. The sandbox proxy
@@ -153,9 +161,16 @@ jobs:
           # index protocol, because localmost's allowlist has crates.io and
           # static.crates.io but not index.crates.io, which is the host cargo's
           # sparse index actually uses.
+          # `internal` is built only when asked for: it is another binary to
+          # compile inside the same 600-second kill, and the comparison runs
+          # do not use it.
           build() {
-            cargo build --release --locked "$@" -p supdb --bin indexlab \
-              && cargo build --release --locked "$@" -p supdb-external --bin external
+            cargo build --release --locked "$@" -p supdb --bin indexlab || return 1
+            if [ -n "${WANT_INTERNAL:-}" ]; then
+              cargo build --release --locked "$@" -p supdb --bin internal
+            else
+              cargo build --release --locked "$@" -p supdb-external --bin external
+            fi
           }
           if build --offline; then
             echo "built from the local cargo cache"
@@ -174,18 +189,35 @@ jobs:
           ./target/release/indexlab machine | tee bench-env.txt
           echo "# loadavg before: $(sysctl -n vm.loadavg)" | tee -a bench-env.txt
 
-      - name: Comparison
+      - name: Measure
+        # An internal experiment measures Supdb against itself with both arms
+        # interleaved, so unlike the comparison it answers a question about
+        # *this* machine's memory system rather than about another engine --
+        # which is the point of running it on a second architecture. Apple
+        # Silicon is 128-byte lines and 16KiB pages against x86's 64 and 4KiB;
+        # for anything cache-shaped that is a different machine, not a quieter
+        # one, and a result here replicates nothing pinned to x86.
+        env:
+          INTERNAL: ${{ inputs.internal }}
+          EXTRA: ${{ inputs.args }}
         run: |
-          ./target/release/external '${{ inputs.suite }}' \
-            --profile full \
-            --engines '${{ inputs.engines }}' \
-            --out out \
-            | tee -a bench-env.txt
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          if [ -n "$INTERNAL" ]; then
+            ./target/release/internal "$INTERNAL" --profile full --out out $EXTRA \
+              | tee -a bench-env.txt
+          else
+            ./target/release/external '${{ inputs.suite }}' \
+              --profile full \
+              --engines '${{ inputs.engines }}' \
+              --out out $EXTRA \
+              | tee -a bench-env.txt
+          fi
           echo "# loadavg after: $(sysctl -n vm.loadavg)" | tee -a bench-env.txt
 
       - uses: actions/upload-artifact@v4
         with:
-          name: quiet-bench-${{ inputs.suite }}
+          name: quiet-bench-${{ inputs.internal || inputs.suite }}
           path: |
             out/
             bench-env.txt
@@ -193,7 +225,7 @@ jobs:
       - name: Summary
         run: |
           {
-            echo '## ext-${{ inputs.suite }}, Apple Silicon, full profile'
+            echo '## ${{ inputs.internal || format('ext-{0}', inputs.suite) }}, Apple Silicon, full profile'
             echo
             echo 'Not evidence yet. `results/` is the source of truth, this'
             echo 'artifact is not in it, and one run on a quiet machine is'
