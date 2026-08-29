@@ -112,17 +112,50 @@ fn dir_size(p: &Path) -> u64 {
 pub struct Supdb {
     store: Option<supdb::Store>,
     path: PathBuf,
+    /// Take a durability point at the end of every batch, the way LMDB's
+    /// `commit` does.
+    ///
+    /// Without this Supdb buffers the whole load and reaches the device once,
+    /// at `sync`. LMDB opens a write transaction per batch and commits it, and
+    /// heed sets no MDB_NOSYNC, so every one of those commits is an fsync. The
+    /// two were being compared on load anyway, with the difference noted in
+    /// prose and never measured. `Options::sync` is already `Sync::Always`
+    /// here; what this changes is when a checkpoint happens, not whether it
+    /// reaches the device.
+    durable: bool,
 }
 
 impl Supdb {
     pub fn create(path: &Path, buffer_mb: usize) -> Res<Supdb> {
+        Supdb::with_durability(path, buffer_mb, false)
+    }
+
+    /// The same engine committing on the same boundary as its comparator.
+    pub fn create_durable(path: &Path, buffer_mb: usize) -> Res<Supdb> {
+        Supdb::with_durability(path, buffer_mb, true)
+    }
+
+    fn with_durability(path: &Path, buffer_mb: usize, durable: bool) -> Res<Supdb> {
         let file = path.join("supdb.dat");
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         let store = supdb::Store::create(
             &file,
             supdb::Options {
                 buffer_bytes: buffer_mb << 20,
-                reclaim: supdb::Reclaim::AfterReads,
+                // `AfterReads` cannot function in a load-only phase -- there
+                // are no reads -- and the durable arm appends an index section
+                // per batch, so it is the arm that most needs sections back.
+                // Measured both ways at `dev`: `Now` gives 41,305 ops/s and a
+                // 479MB file, `AfterReads` 36,715 and 610MB. The verdict is
+                // the same either way (0.051x against 0.054x of LMDB), so this
+                // is not the thumb on the scale it would be if it were -- it
+                // is here so nobody has to wonder whether the durable arm lost
+                // because of a policy whose precondition it never meets.
+                reclaim: if durable {
+                    supdb::Reclaim::Now
+                } else {
+                    supdb::Reclaim::AfterReads
+                },
                 ..Default::default()
             },
         )
@@ -130,17 +163,22 @@ impl Supdb {
         Ok(Supdb {
             store: Some(store),
             path: file,
+            durable,
         })
     }
 }
 
 impl Engine for Supdb {
     fn name(&self) -> &'static str {
-        "supdb"
+        if self.durable {
+            "supdb-durable"
+        } else {
+            "supdb"
+        }
     }
     fn features(&self) -> Features {
         Features {
-            durable_commit: false,
+            durable_commit: self.durable,
             transactions: false,
             // True since the CRC-32C work: `Options::checksums` defaults on,
             // this adapter takes that default, and f8-checksums measures what
@@ -166,6 +204,10 @@ impl Engine for Supdb {
         let s = self.store.as_ref().ok_or("store closed")?;
         for (k, v) in items {
             s.put(k, v).map_err(|e| e.to_string())?;
+        }
+        if self.durable {
+            // `Options::sync` is Sync::Always, so this reaches the device.
+            s.checkpoint().map_err(|e| e.to_string())?;
         }
         Ok(())
     }

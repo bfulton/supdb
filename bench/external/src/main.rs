@@ -58,6 +58,9 @@ fn build(root: &std::path::Path, which: &[&str], buffer_mb: usize) -> Vec<Box<dy
         let dir = root.join(name);
         let e: Result<Box<dyn Engine>, String> = match *name {
             "supdb" => Supdb::create(&dir, buffer_mb).map(|e| Box::new(e) as Box<dyn Engine>),
+            "supdb-durable" => {
+                Supdb::create_durable(&dir, buffer_mb).map(|e| Box::new(e) as Box<dyn Engine>)
+            }
             "redb" => Redb::create(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
             "lmdb" => Lmdb::create(&dir, 8).map(|e| Box::new(e) as Box<dyn Engine>),
             "sled" => Sled::create(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
@@ -267,28 +270,42 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
     rec.series("engines", J::arr(rows.clone()));
 
     let idx = |name: &str| which.iter().position(|w| *w == name);
+    // `mine` is the left-hand engine. It is a parameter rather than always
+    // "supdb" because EXT.9 compares the durable arm, and an engine comparing
+    // itself against a comparator on a boundary the comparator does not use is
+    // the thing EXT.9 exists to stop.
+    let ordering_of = |rec: &mut Record,
+                       id: &str,
+                       title: &str,
+                       mine: &str,
+                       other: &str,
+                       s: &[Samples],
+                       unit: &str,
+                       tail: &str| {
+        let (Some(si), Some(oi)) = (idx(mine), idx(other)) else {
+            return;
+        };
+        if s[si].is_empty() || s[oi].is_empty() {
+            return;
+        }
+        let cmp = compare(&s[si], &s[oi], supdb::bench::MIN_EFFECT);
+        let holds = matches!(cmp.verdict, Verdict::Greater);
+        rec.compare(&format!("{id}_{mine}_vs_{other}"), cmp.clone());
+        rec.finding(Finding::new(
+            id,
+            title,
+            holds,
+            format!(
+                "{mine} {:.0} {unit} vs {other} {:.0} {unit} ({}){tail}",
+                s[si].median(),
+                s[oi].median(),
+                cmp.summary(mine, other)
+            ),
+        ));
+    };
     let ordering =
         |rec: &mut Record, id: &str, title: &str, other: &str, s: &[Samples], unit: &str| {
-            let (Some(si), Some(oi)) = (idx("supdb"), idx(other)) else {
-                return;
-            };
-            if s[si].is_empty() || s[oi].is_empty() {
-                return;
-            }
-            let cmp = compare(&s[si], &s[oi], supdb::bench::MIN_EFFECT);
-            let holds = matches!(cmp.verdict, Verdict::Greater);
-            rec.compare(&format!("{id}_supdb_vs_{other}"), cmp.clone());
-            rec.finding(Finding::new(
-                id,
-                title,
-                holds,
-                format!(
-                    "supdb {:.0} {unit} vs {other} {:.0} {unit} ({})",
-                    s[si].median(),
-                    s[oi].median(),
-                    cmp.summary("supdb", other)
-                ),
-            ));
+            ordering_of(rec, id, title, "supdb", other, s, unit, "")
         };
 
     ordering(
@@ -327,6 +344,35 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         "lmdb",
         &scan,
         "entries/s",
+    );
+
+    // The comparison every write-side number here has been resting on.
+    //
+    // LMDB opens a write transaction per batch and commits it, and heed sets
+    // no MDB_NOSYNC, so each of those commits is an fsync: acknowledged writes
+    // survive power loss. Supdb buffers the whole load and reaches the device
+    // once, at the end. EXT.1 compares the two anyway. Both this file and
+    // claims.json have said so in prose for as long as EXT.1 has existed --
+    // "LMDB commits durably per batch here and Supdb does not" -- and neither
+    // ever measured it, which left the project's loudest number resting on a
+    // difference nobody had priced.
+    //
+    // `supdb-durable` is the same engine checkpointing on the same boundary
+    // LMDB commits on. Whatever this says is the like-for-like load result,
+    // and EXT.1 should be read next to it rather than on its own.
+    ordering_of(
+        &mut rec,
+        "EXT.9",
+        "Supdb loads faster than LMDB when both commit durably on the same boundary",
+        "supdb-durable",
+        "lmdb",
+        &load,
+        "ops/s",
+        ". Both engines take a durability point every batch here, so this is \
+         the comparison EXT.1 is not: EXT.1 has Supdb buffering the whole load \
+         and reaching the device once. Read the two together -- the gap \
+         between them is what Supdb's headline load figure is buying with the \
+         guarantee it does not make",
     );
     if let (Some(si), Some(li)) = (idx("supdb"), idx("lmdb")) {
         if !load[si].is_empty() && !load[li].is_empty() {
