@@ -567,6 +567,25 @@ pub struct Options {
     /// `put` ignored `buffer_bytes` and buffered a whole workload until
     /// `flush`, which no benchmark here reached the size to notice.
     pub seal_on_put: bool,
+    /// Make a durable checkpoint proportional to what changed, by writing a
+    /// redo log instead of rewriting the key index.
+    ///
+    /// Off by default, and the default is deliberate: a logged checkpoint is
+    /// durable and is replayed by `Store::open`, but a `Reader` opened before
+    /// the next full rewrite does not see it. That is a real narrowing of what
+    /// `checkpoint` has always promised -- durable *and* visible to anyone --
+    /// so it is opt-in until the reader replays too, and F28.2 records the
+    /// limitation rather than leaving it to be discovered.
+    ///
+    /// f27 is why this exists: inserting under `Sync::Always` runs at 42,079
+    /// ops/s against 173,446 for updating the same keys with the same
+    /// checkpoint count, because any insertion sends `checkpoint_in_place` to
+    /// the full-rewrite path.
+    pub redo_log: bool,
+    /// Bytes reserved for the redo log at each full rewrite. When it fills,
+    /// the next checkpoint rewrites the index and starts a fresh one, which is
+    /// what bounds replay.
+    pub log_bytes: usize,
     /// Write the key index in a shape a reader can use where it lies, instead
     /// of one it has to decode into the heap first.
     ///
@@ -635,6 +654,8 @@ impl Default for Options {
             checksums: true,
             pending_arena: true,
             seal_on_put: true,
+            redo_log: false,
+            log_bytes: 4 << 20,
             // On, now that the space cost is bounded.
             //
             // It was off while a checkpoint appended a whole index section
@@ -704,6 +725,16 @@ struct Appender {
     free: FreeList,
     /// The reader table, in the reserved first page.
     table: MmapMut,
+    /// The redo log arena: where it starts, how big it is, how much is used.
+    ///
+    /// `used` is not persisted anywhere. The arena is written zeroed, every
+    /// record carries its length and a CRC, and replay stops at the first zero
+    /// length or bad checksum -- so the log describes its own extent and a
+    /// durability point costs the records plus one fsync, with no superblock
+    /// write at all. A crash mid-record leaves a partial tail that the CRC
+    /// rejects, and everything before it is intact, which is the whole reason
+    /// a log is written this way rather than with a length field to update.
+    log: Option<(u64, u64, u64)>,
     /// A read mapping of the file, for serving a sealed extent in place.
     ///
     /// `read_extent` preads the extent's whole block -- 64KiB -- into a fresh
@@ -1230,6 +1261,26 @@ impl Store {
             }
         };
         let high_water = sb.high_water;
+        // Replay the redo log over the published index.
+        //
+        // The records are the writes that were made durable without rewriting
+        // the index, so they are newer than everything in it by construction,
+        // and a key appearing in both takes its logged extents. Applied in
+        // order, because a key may appear more than once and the last record
+        // is the current one.
+        let (logged, log_used): (Vec<(Vec<u8>, Extents)>, u64) = if sb.log_len == 0 {
+            (Vec::new(), 0)
+        } else {
+            let map = unsafe { Mmap::map(&file)? };
+            let (o, l) = (sb.log_off as usize, sb.log_len as usize);
+            match map.get(o..o.saturating_add(l)) {
+                Some(arena) => log_replay(arena),
+                // A log the file is too short to contain is corruption, not an
+                // empty log: pretending it is empty would silently drop writes
+                // that were acknowledged as durable.
+                None => return Err(corrupt("redo log lies outside the file")),
+            }
+        };
         // Where the published index lives, so `scan` has an order to walk and
         // the next checkpoint has a predecessor to point at. Its reserved
         // capacity is not recorded anywhere, so `stored` stands in: releasing
@@ -1274,6 +1325,7 @@ impl Store {
             shards,
             appender: Mutex::new(Appender {
                 table,
+            log: None,
                 map: None,
                 file,
                 off: high_water,
@@ -1300,19 +1352,65 @@ impl Store {
             path: path.to_path_buf(),
         };
 
-        for (key, exts) in entries {
-            for e in exts.as_slice() {
-                match live.get_mut(e.block as usize) {
-                    Some(c) => *c += 1,
-                    None => return Err(corrupt("index names a block the table does not have")),
-                }
-            }
+        // Logged records last, so a key present in both takes the newer
+        // extents. `put`-style replacement is what a log record means: it
+        // carries the key's whole extent list as of that checkpoint, not a
+        // delta against it.
+        let replayed: Vec<Vec<u8>> = logged.iter().map(|(k, _)| k.clone()).collect();
+        for (key, exts) in entries.into_iter().chain(logged) {
             let si = store.shard_of(&key);
             let mut sh = store.shards[si].lock().unwrap();
             sh.keys.get_or_insert(&key).extents = exts;
         }
+        // A replayed record is durable and *not* published: it is in no index
+        // section, so `scan`, which walks the published order, cannot see it.
+        // Marking the keys dirty and the store unpublished says exactly that,
+        // and the next publish or checkpoint writes them into the index.
+        //
+        // Without this the two read paths disagreed after a reopen --
+        // `read_all` answered from the shards and found every replayed key,
+        // while `scan` walked the index and saw only what predated the log.
+        // A test that checked just `read_all` would have passed.
+        if !replayed.is_empty() {
+            for key in &replayed {
+                let si = store.shard_of(key);
+                let mut sh = store.shards[si].lock().unwrap();
+                if let Some(idx) = sh.keys.index_of(key) {
+                    sh.dirty.push(idx);
+                }
+            }
+            store
+                .unpublished
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        // Refcounts are taken from the merged result, not from each list as it
+        // arrives. A key present in both the index and the log would otherwise
+        // be counted twice -- once for extents the log has already superseded
+        // -- and those blocks would never be reclaimed. Over-counting leaks
+        // rather than corrupts, which is why it would have gone unnoticed.
+        for sh in &store.shards {
+            let sh = sh.lock().unwrap();
+            for (_, e) in sh.keys.iter() {
+                for x in e.extents.as_slice() {
+                    match live.get_mut(x.block as usize) {
+                        Some(c) => *c += 1,
+                        None => {
+                            return Err(corrupt("index names a block the table does not have"))
+                        }
+                    }
+                }
+            }
+        }
         {
             let mut ap = store.appender.lock().unwrap();
+            // Resume the arena where replay stopped, so a reopened store keeps
+            // logging instead of falling back to a full rewrite on its next
+            // durable checkpoint. `log_used` is where the walk ended, which is
+            // the first byte not covered by an intact record -- so a torn tail
+            // from a crash is overwritten rather than kept.
+            if sb.log_len > 0 && store.opts.redo_log {
+                ap.log = Some((sb.log_off, sb.log_len, log_used));
+            }
             let nblocks = ap.blocks.len();
             ap.verified = (0..(nblocks * block::MAX_CHUNK_CRCS).div_ceil(64))
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
@@ -1338,6 +1436,13 @@ impl Store {
             // and none of them is a block. Their reserved capacity is not
             // recorded, so `stored` stands in: the padding past it is not read
             // by anyone, so handing it out cannot corrupt what is.
+            // The log arena is the fourth. Leaving it out is how a reopened
+            // store hands its own live redo log to the next allocation: the
+            // comment above describes that symptom exactly, and this is a
+            // second way to reach it.
+            if sb.log_len > 0 {
+                used.push((sb.log_off, sb.log_off + sb.log_len));
+            }
             for (off, len) in [
                 (sb.key_off, sb.key_stored),
                 (sb.blk_off, sb.blk_stored),
@@ -1401,6 +1506,7 @@ impl Store {
             shards,
             appender: Mutex::new(Appender {
                 table,
+            log: None,
                 map: None,
 
                 file,
@@ -2184,7 +2290,38 @@ impl Store {
                 changed.push((key, exts));
             }
         }
-        let in_place = self.checkpoint_in_place(&changed, nkeys)?;
+        let in_place_edit = self.checkpoint_in_place(&changed, nkeys)?;
+        // Only a durability point may use the log. `publish` passes
+        // `Sync::Never` and wants *visibility*, which the log does not give: a
+        // logged record is durable and replayed by `Store::open`, and a
+        // `Reader` opened before the next full rewrite does not see it. Taking
+        // this path for a publish would make a scan miss writes that the
+        // writer had already been told were published.
+        let logged = !in_place_edit
+            && !matches!(policy, Sync::Never)
+            && self.checkpoint_to_log(&changed)?;
+        // Downstream the two mean the same thing: do not rewrite the index.
+        let in_place = in_place_edit || logged;
+        if logged {
+            // A logged checkpoint made the writes durable and did not publish
+            // them: they are in no index section. Saying otherwise is what
+            // made `scan` walk a stale index and report one key where the
+            // store held sixteen, and the writes were on disk the whole time.
+            //
+            // The dirty marks go back for the same reason. `checkpoint_inner`
+            // takes them before it knows which path it will take, and the next
+            // in-place attempt needs them to find what still has not been
+            // written into the index.
+            self.unpublished
+                .store(true, std::sync::atomic::Ordering::Release);
+            for (k, _) in &changed {
+                let si = self.shard_of(k);
+                let mut sh = self.shards[si].lock().unwrap();
+                if let Some(idx) = sh.keys.index_of(k) {
+                    sh.dirty.push(idx);
+                }
+            }
+        }
 
         // Only the rewrite needs every key, and only then is the sort worth
         // paying for.
@@ -2383,6 +2520,43 @@ impl Store {
         }
         let history_from = ap.history_from;
 
+        // A full rewrite makes every logged record redundant -- each one is
+        // now in the index this superblock names -- so the old arena is
+        // abandoned and a fresh one allocated. Written zeroed, because replay
+        // stops at the first zero length and reclaimed space is not
+        // necessarily zero.
+        //
+        // In-place and logged checkpoints keep the arena they have: they did
+        // not rewrite the index, so the records still matter.
+        let log_arena: Option<(u64, u64)> = if !self.opts.redo_log {
+            None
+        } else if in_place {
+            ap.log.map(|(o, c, _)| (o, c))
+        } else {
+            let want = self.opts.log_bytes.max(LOG_HDR);
+            let loc = write_section_raw(&mut ap, &vec![0u8; want], want, self.opts.reclaim)?;
+            // `cap` is the space actually reserved, which the allocator rounds
+            // up from what was asked for, and it is what has to be recorded --
+            // both so replay knows the extent and so the free-list
+            // reconstruction in `open` covers all of it. Recording the
+            // requested size instead left the rounded-up tail looking free,
+            // and the next allocation was handed bytes belonging to a live
+            // log: a block checksum mismatch several sessions later. The
+            // comment on that loop describes the same symptom by another
+            // route, and this is a third.
+            let cap = loc.cap as u64;
+            // Zero the part beyond what the payload covered, because replay
+            // stops at the first zero length and reclaimed space is not
+            // necessarily zero.
+            if cap > want as u64 {
+                use std::os::unix::fs::FileExt;
+                let pad = vec![0u8; (cap - want as u64) as usize];
+                ap.file.write_all_at(&pad, loc.off + want as u64)?;
+            }
+            ap.log = Some((loc.off, cap, 0));
+            Some((loc.off, cap))
+        };
+
         let sb = Super {
             generation: gen,
             history_from,
@@ -2397,10 +2571,8 @@ impl Store {
             reuse_stored: reuse_loc.stored as u64,
             reuse_uncompressed: reuse_loc.uncompressed as u64,
             high_water: ap.off,
-            // A full index rewrite is what makes the log redundant: every
-            // record in it is now in the index that this superblock names.
-            log_off: 0,
-            log_len: 0,
+            log_off: log_arena.map(|(o, _)| o).unwrap_or(0),
+            log_len: log_arena.map(|(_, c)| c).unwrap_or(0),
         };
         // The superblock's high water mark is the append cursor, and the
         // cursor runs ahead of the bytes actually written: a block advances it
@@ -2508,6 +2680,57 @@ impl Store {
     /// checkpoint will observe the new values. For a store whose extents only
     /// ever grow that is more data, not wrong data, and it is the trade that
     /// buys an O(changed) checkpoint.
+    /// Append what changed to the redo log and make it durable, without
+    /// touching the index.
+    ///
+    /// This is the split f27 argued for. A checkpoint has always done two jobs
+    /// -- make writes durable, and make them findable by a fresh reader -- and
+    /// only the second needs the index rewritten. Inserting under
+    /// `Sync::Always` ran at 42,079 ops/s against 173,446 for updating the
+    /// same keys with the same checkpoint count, because any insertion sends
+    /// `checkpoint_in_place` to the full-rewrite path. Here an insertion costs
+    /// its own record.
+    ///
+    /// Returns false when there is no arena or it is full, and the caller then
+    /// rewrites the index, which is what bounds replay.
+    fn checkpoint_to_log(&self, changed: &[(Vec<u8>, Extents)]) -> Result<bool> {
+        use std::os::unix::fs::FileExt;
+        if !self.opts.redo_log {
+            return Ok(false);
+        }
+        let mut ap = self.appender.lock().unwrap();
+        let Some((off, cap, used)) = ap.log else {
+            return Ok(false);
+        };
+        let mut buf = Vec::new();
+        for (k, exts) in changed {
+            let Some(rec) = log_encode(k, exts.as_slice()) else {
+                return Ok(false);
+            };
+            buf.extend_from_slice(&rec);
+        }
+        // The terminator matters: a previous generation may have left records
+        // beyond this one, and replay must stop here rather than resurrect
+        // them. The arena is zeroed when allocated, so this only has to be
+        // written when something follows -- but writing it always is one word
+        // and removes the case analysis.
+        if used + buf.len() as u64 + LOG_HDR as u64 > cap {
+            return Ok(false);
+        }
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        ap.file.write_all_at(&buf, off + used)?;
+        // The records are the durability point. Nothing else is updated --
+        // not the superblock, not the index -- because the arena describes its
+        // own extent: replay stops at the first zero length or bad CRC.
+        ap.file.sync_data()?;
+        ap.unsynced = false;
+        ap.since_sync = 0;
+        ap.last_sync = std::time::Instant::now();
+        // The terminator is not counted, so the next append overwrites it.
+        ap.log = Some((off, cap, used + buf.len() as u64 - 4));
+        Ok(true)
+    }
+
     fn checkpoint_in_place(&self, changed: &[(Vec<u8>, Extents)], nkeys: usize) -> Result<bool> {
         use std::sync::atomic::{AtomicU64, Ordering};
         let mut ap = self.appender.lock().unwrap();
@@ -2526,13 +2749,24 @@ impl Store {
 
         // Work out the edits first, so nothing is written until every one of
         // them is known to fit.
-        let mut edits: Vec<(usize, u64, usize, Vec<u8>)> = Vec::new();
+        // (record offset in section, hash slot value, hash slot offset,
+        //  directory entry offset, record bytes)
+        #[allow(clippy::type_complexity)]
+        let mut edits: Vec<(usize, u64, usize, usize, u32, Vec<u8>)> = Vec::new();
         let mut probe =
             FlatIndex::parse(sec).ok_or_else(|| corrupt("live index no longer parses"))?;
         probe.set_bump(meta.bump());
         for (k, exts) in changed {
             let slice = exts.as_slice();
             let Some(slot_at) = meta.slot_of(sec, k, key_hash) else {
+                return Ok(false);
+            };
+            // The directory is the other way to reach a record, and it has to
+            // be republished with the hash or the two disagree: a point lookup
+            // would return the new value and a scan the old one. That is what
+            // used to happen, silently, for every key an in-place checkpoint
+            // touched.
+            let Some(dir_at) = meta.dir_slot_of(sec, k) else {
                 return Ok(false);
             };
             match meta.lookup(sec, k, key_hash) {
@@ -2549,6 +2783,8 @@ impl Store {
                 off + at,
                 FlatIndex::slot_value(k, rel, key_hash),
                 off + slot_at,
+                off + dir_at,
+                rel,
                 bytes,
             ));
         }
@@ -2558,11 +2794,19 @@ impl Store {
 
         // Records first. Nothing points at them yet, so a crash here leaks
         // slack and loses nothing.
-        for (at, _, _, bytes) in &edits {
+        for (at, _, _, _, _, bytes) in &edits {
             map[*at..*at + bytes.len()].copy_from_slice(bytes);
         }
+        // The directory entry is published before the hash slot, and both
+        // point at a record that is already written. A reader taking either
+        // route mid-update gets the old record or the new one, never a
+        // mismatch between them, because neither offset is ever partially
+        // written: a directory entry is one aligned 4-byte store.
+        for (_, _, _, dir_at, rel, _) in &edits {
+            map[*dir_at..*dir_at + 4].copy_from_slice(&rel.to_le_bytes());
+        }
         // Then the slots, one aligned store each. This is the publish.
-        for (_, value, slot_at, _) in &edits {
+        for (_, value, slot_at, _, _, _) in &edits {
             debug_assert_eq!(
                 slot_at % 8,
                 0,
@@ -2791,6 +3035,57 @@ fn place_section(ap: &mut Appender, len: u32, policy: Reclaim, align: u64) -> (u
 /// The checksum covers the bytes actually written. A section whose tail is
 /// rewritten in place by design has no stable whole-section checksum to take,
 /// which is why nothing verifies one for this section.
+/// Header on every redo-log record: payload length, then a CRC of it.
+const LOG_HDR: usize = 8;
+
+/// One redo-log record: `[u32 len][u32 crc32c][payload]`.
+///
+/// The payload is exactly what `FlatIndex::encode_record` produces, so the log
+/// and the index agree on how a key and its extents are spelled and there is
+/// only one encoder to keep correct.
+fn log_encode(key: &[u8], exts: &[Ext]) -> Option<Vec<u8>> {
+    let payload = FlatIndex::encode_record(key, exts)?;
+    let mut out = Vec::with_capacity(LOG_HDR + payload.len());
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&block::crc32(&payload).to_le_bytes());
+    out.extend_from_slice(&payload);
+    Some(out)
+}
+
+/// Walk a log arena, stopping at the first record that is not intact.
+///
+/// The arena is written zeroed, so a zero length is the end. A torn tail from
+/// a crash mid-append fails its CRC and ends the walk there, with every record
+/// before it still good -- which is the property that makes this a log rather
+/// than a file that has to be rewritten to be extended.
+fn log_replay(arena: &[u8]) -> (Vec<(Vec<u8>, Extents)>, u64) {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at + LOG_HDR <= arena.len() {
+        let len = u32::from_le_bytes(arena[at..at + 4].try_into().unwrap()) as usize;
+        if len == 0 || at + LOG_HDR + len > arena.len() {
+            break;
+        }
+        let want = u32::from_le_bytes(arena[at + 4..at + 8].try_into().unwrap());
+        let payload = &arena[at + LOG_HDR..at + LOG_HDR + len];
+        if block::crc32(payload) != want {
+            break;
+        }
+        match FlatIndex::decode_record(payload) {
+            Some((k, exts)) => {
+                let mut e = Extents::None;
+                for x in exts {
+                    e.push(x);
+                }
+                out.push((k, e));
+            }
+            None => break,
+        }
+        at += LOG_HDR + len;
+    }
+    (out, at as u64)
+}
+
 fn write_section_raw(
     ap: &mut Appender,
     payload: &[u8],

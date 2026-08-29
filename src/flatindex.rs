@@ -516,7 +516,35 @@ impl FlatIndex {
         self.record(sec, off)
     }
 
-    /// Where in the section a key's hash slot lives, if the key is present.
+    /// Where in the section a key's *directory* entry lives, if it is present.
+    ///
+    /// The flat index carries two ways to reach a record: the hash, for a
+    /// point lookup, and a rank-ordered directory of record offsets, for a
+    /// scan. An in-place update writes a new record into the slack and
+    /// republishes it by storing its offset -- and it has to store that offset
+    /// in *both*, or the two disagree.
+    ///
+    /// They did. `checkpoint_in_place` updated the hash and not the directory,
+    /// so after any in-place checkpoint `read_all` returned the new value and
+    /// `scan` returned the old one, silently, for every key updated that way.
+    /// A reduced reproducer is `a_scan_sees_what_an_in_place_checkpoint_wrote`.
+    ///
+    /// The rank is unchanged by an update -- only an insertion moves ranks,
+    /// and `checkpoint_in_place` declines those -- so this is a search for
+    /// where the key already sits, not a re-sort.
+    pub fn dir_slot_of(&self, sec: &[u8], key: &[u8]) -> Option<usize> {
+        let rank = self.seek_with(sec, key, true);
+        if rank >= self.nkeys {
+            return None;
+        }
+        let (k, _) = self.at(sec, rank)?;
+        if k != key {
+            return None;
+        }
+        Some(self.dir.0 + rank * 4)
+    }
+
+    /// Where in the section a key's hash slot lives, if the key is present.    /// Where in the section a key's hash slot lives, if the key is present.
     ///
     /// The one thing an incremental update needs: the address of the word to
     /// store into. Returns the slot's byte offset within the section.
@@ -574,6 +602,33 @@ impl FlatIndex {
             at += 16;
         }
         Some(out)
+    }
+
+    /// The inverse of `encode_record`, for a buffer that is not a mapping.
+    ///
+    /// `record` borrows `&[Ext]` straight out of a mapping and is the read
+    /// path; this copies, and exists for the redo log, whose records are read
+    /// once at open and applied to an in-memory table rather than served. It
+    /// takes the same length and alignment care as `record` does, because a
+    /// log is exactly as likely to be damaged as any other part of the file
+    /// and `c1-decoders` will feed it garbage on purpose.
+    pub fn decode_record(rec: &[u8]) -> Option<(Vec<u8>, Vec<Ext>)> {
+        let klen = rd_u16(rec, 0)? as usize;
+        let n = rd_u16(rec, 2)? as usize;
+        let key = rec.get(4..4 + klen)?.to_vec();
+        let mut at = align_up(4 + klen, REC_ALIGN);
+        let mut exts = Vec::with_capacity(n);
+        for _ in 0..n {
+            let b = rec.get(at..at + 16)?;
+            exts.push(Ext {
+                block: u32::from_le_bytes(b[0..4].try_into().ok()?),
+                off: u32::from_le_bytes(b[4..8].try_into().ok()?),
+                len: u32::from_le_bytes(b[8..12].try_into().ok()?),
+                last: u32::from_le_bytes(b[12..16].try_into().ok()?),
+            });
+            at += 16;
+        }
+        Some((key, exts))
     }
 
     /// Reserve room for a record in the slack. Returns its section offset and
