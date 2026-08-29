@@ -69,22 +69,22 @@
   {
    "experiment": "ext-kv",
    "id": "EXT.1",
-   "expect": "holds",
-   "because": "Supdb loads 676,246 ops/s against LMDB's 508,205 -- 1.331x, p=0.0022. Do not read this as an ordering. Across seven repeated, interleaved, statistically gated runs this entry has read 0.866x, 0.891x, 0.892x, 1.010x, 1.154x, 1.043x and now 1.331x, crossing parity in both directions with the code unchanged between several of them, and LMDB's own figure has ranged from 508,205 to 1,034,797 over the same runs. Seven repetitions settle a comparison against drift *within* a run and do nothing about drift *between* them. What is established is that the load gap block compression opened has closed; what is not established, after seven attempts, is which engine is faster. LMDB commits durably per batch here and Supdb does not.",
+   "expect": "not_exercised",
+   "because": "WITHDRAWN as an ordering. `supdb` does not commit durably and LMDB does, and `supdb` checksums and LMDB does not; both axes could have been equalized and neither was. The suite recorded 863,005 ops/s against 674,858 and called it a 1.28x win for as long as this claim has existed, with the difference sitting in a features table two lines away. It was never a load result. EXT.9 and EXT.10 are the comparisons, at both levels of promise: matched durable, Supdb loses 91x; matched non-durable, it loses 1.85x. `Features::unmatched` now refuses to rank a pair that differs on an equalizable axis, so this cannot recur by being forgotten.",
    "profile": "full"
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.4",
-   "expect": "fails",
-   "because": "No difference this run: 1,067,472 reads/s against LMDB's 968,681, ratio 1.102 at p=0.1599. The ratio has read 1.431x, 1.230x, 1.291x, 1.575x, 1.193x and 1.102x across six repeated runs and the verdict held every time until this one, where the margin fell inside the noise floor rather than reversing. Recorded as failing because no difference is not a lead, and left as evidence that a 10-40% margin on this host is not a measurement anyone should bank. The design document reports the opposite ordering, measured through JNI with an adapter it separately found to allocate per value and open a transaction per lookup.",
+   "expect": "not_exercised",
+   "because": "WITHDRAWN as an ordering: `supdb` verifies checksums and LMDB has none to verify. This one ran in the direction nobody was watching -- the unmatched figure is 994,780 reads/s against LMDB's 1,093,321, so Supdb was *behind* here while paying a cost its comparator does not. f8 prices verification at +8.5% on writes. Equalized, EXT.11 reads 1.042x at p=0.2013, which is parity. The point of matching is not that it flatters Supdb; it is that unmatched comparisons are not comparisons whichever way they fall.",
    "profile": "full"
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.5",
-   "expect": "fails",
-   "because": "No difference: Supdb scans 25,119,613 entries/s against LMDB's 26,178,916, ratio 0.960 at p=0.3711. Recorded as failing because no difference is not a lead. This entry used to read \"0.65x\" and say the ext-sweep decomposition was the stable thing to read instead; both halves were wrong. The 0.65x was prose left behind when Store::scan regenerated the result file two commits earlier -- `verify` gates the recorded verdict against `expect` and never reads this sentence, so it drifted without turning anything red. And the decomposition it pointed at was a straight line fitted through a bent curve; measured rather than fitted, EXT.7 and EXT.8 are both no difference too, which is the same answer this experiment gives end to end. The three measurements were never in conflict. Two of them were being reported through a model that did not fit.",
+   "expect": "not_exercised",
+   "because": "WITHDRAWN as an ordering, same reason as EXT.4: the checksum axis was never equalized and a scan verifies. Recorded unmatched at 27,798,545 entries/s against LMDB's 39,940,773. EXT.12 is the matched version and reads 0.785x, so equalizing recovers some of the gap and does not close it. The prose here used to say '0.65x' and point at the ext-sweep decomposition as the stable thing to read instead; both halves were wrong, and the decomposition turned out to be a straight line fitted through a bent curve. See EXT.7 and EXT.8.",
    "profile": "full"
   },
   {
@@ -594,6 +594,34 @@
    "id": "C1.4",
    "expect": "holds",
    "because": "A damaged store is refused by `Store::open` or read correctly, never opened onto: 0/24 damaged files were accepted and then disagreed with what was written, and 2 were refused outright. This matters more than an ordinary read path because reopening rebuilds the block table, the key tables and every reference count from the file, and then *writes on top of* whatever it believed. Building it found a live defect: `Appender::read_extent` indexed `self.blocks[e.block]` unchecked and took the process down on a damaged index. `Reader` has had `loc_of` for exactly that since a damaged file panicked through `scan`; the writer's copy had never been asked, because nothing could reopen a store to ask it. That is the shape of this whole entry: the limitation prevented the test of the limitation."
+  },
+  {
+   "experiment": "ext-kv",
+   "id": "EXT.9",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Supdb loads at 7,394 ops/s against LMDB's 674,858 when both commit on the same boundary -- 0.011x at p=0.0022, LMDB 91x faster. This is the comparison EXT.1 should always have been. The cause is on the books already: `checkpoint` rewrites the whole key index rather than what changed, so a per-batch commit over 1M keys pays O(key count) a thousand times. Rule 4 makes the shape of it visible for the first time -- 29,933.7 MB sent to the block layer for 116 MB of logical data, a write amplification of 270.6x against LMDB's 2.1x, leaving a 7,354 MB file for a 126.9 MB dataset. It was known as a time cost and it is a device cost of the same origin. LMDB is also still transactional and Supdb is not, so 91x is a lower bound."
+  },
+  {
+   "experiment": "ext-kv",
+   "id": "EXT.10",
+   "profile": "full",
+   "expect": "fails",
+   "because": "The one that hurts. Equalize durability *downward* -- take LMDB's fsync away rather than adding Supdb's -- and Supdb still loses the load axis: 964,147 ops/s against lmdb-nosync's 1,779,498, 0.542x at p=0.0073. An append-structured store beaten 1.85x at bulk ingest by a B-tree that is not syncing either is a defect, not a tradeoff; ingest is the one axis this design exists to win. Two things are already known and neither has been measured as the cause: `Store::put` never seals -- only `append` checks whether the shard buffer is full -- so the load buffers every key and flushes once, which shows up as 178.5 MB resident against LMDB's 46.2 for the same data; and the keys are strictly sequential, which is a B-tree's best case and an append store's least differentiating shape. `external loadprof` exists to find out which, and until it has, this entry records the loss and not an excuse for it."
+  },
+  {
+   "experiment": "ext-kv",
+   "id": "EXT.11",
+   "profile": "full",
+   "expect": "fails",
+   "because": "No difference: 1,139,523 reads/s against LMDB's 1,093,321, ratio 1.042 at p=0.2013. Recorded as failing because no difference is not a lead. Reads were the last axis Supdb was ahead on against LMDB, and matched, it is level. Worth reading against EXT.4, which is the same measurement with Supdb paying for checksums LMDB does not have and coming out at 0.91x: verification is the difference between level and behind, and f8 says it costs +8.5% on writes for what it buys on reads. LMDB is still transactional, so parity here is not yet parity."
+  },
+  {
+   "experiment": "ext-kv",
+   "id": "EXT.12",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Supdb scans at 31,373,098 entries/s against LMDB's 39,940,773 -- 0.785x at p=0.0106 -- with the checksum axis equalized. Note this disagrees with ext-sweep, which has the two engines indistinguishable on every scan axis it measures (EXT.7, EXT.8). The suites differ in shape: ext-sweep builds one store per engine and sweeps it repeatedly, so it measures a warm walk, while this one loads a fresh store per repetition and scans it once. Which of those a reader should care about depends on the workload, and the honest answer today is that Supdb is level on a warm scan and behind on a cold one. Do not average them."
   }
  ],
  "metrics": [
