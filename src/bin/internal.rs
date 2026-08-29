@@ -105,6 +105,7 @@ fn main() -> std::io::Result<()> {
             "f23-madvise" => f23_madvise(&args, profile)?,
             "f24-autoreadahead" => f24_autoreadahead(&args, profile)?,
             "f25-arena" => f25_arena(&args, profile)?,
+            "f26-buffer" => f26_buffer(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -143,6 +144,7 @@ fn main() -> std::io::Result<()> {
                 "f23-madvise",
                 "f24-autoreadahead",
                 "f25-arena",
+                "f26-buffer",
                 "f4-durability",
                 "f3-multiproc",
                 "f1-outofcore",
@@ -3635,6 +3637,126 @@ fn f11_child(args: &Args) -> std::io::Result<()> {
 /// bit flip, a torn write or a reused slot returns silently wrong data,
 /// because LZ4 decodes many corrupted inputs into plausible bytes. The
 /// question is only what it costs.
+/// Does the write buffer want to be smaller than the workload?
+///
+/// EXT.10 has Supdb losing bulk ingest to an LMDB that is not syncing, and the
+/// profile put the gap in memory: 218MB resident against LMDB's 46MB for the
+/// same 105MB of data, and 21x the last-level misses per key. LMDB streams
+/// pages out as it goes. Supdb buffers, and until `Options::seal_on_put` it
+/// buffered without limit -- `append` sealed when a shard filled and `put`
+/// never checked, so every load phase in the external suite ignored
+/// `buffer_bytes` and grew until `flush`. At 1M values of 100 bytes against a
+/// 256MB budget that is invisible, because the threshold is never reached.
+///
+/// Which raises the question this experiment asks: the adapter picked 256MB,
+/// larger than the whole dataset, so Supdb held all of it. Is that the best
+/// setting, or does sealing during the load win by keeping the working set in
+/// cache? A store that streams is the same shape LMDB is winning with.
+fn f26_buffer(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let mb = [4usize, 16, 64, 256];
+
+    let mut rec = Record::new("f26-buffer", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .param("buffer_mb", J::arr(mb.iter().map(|m| J::u(*m as u64)).collect()))
+        .note("buffer sizes interleaved in one process; seal_on_put is on for every arm")
+        .note(
+            "the dataset is about 105MB at the full profile, so the 256MB arm is the one that \
+             never seals during the load and holds everything -- which is what the external \
+             adapter has always configured",
+        );
+
+    let dir = scratch("f26");
+    let payload = Payload::new(value_size, 0.5, 0xF26);
+    let rss: std::sync::Mutex<Vec<(usize, f64)>> = std::sync::Mutex::new(Vec::new());
+    let trial = Trial::new(profile.reps());
+    let load = trial.run(mb.len(), |ci, rep| {
+        let file = dir.join(format!("b{ci}-{rep}.dat"));
+        let store = Store::create(
+            &file,
+            Options {
+                seal_on_put: true,
+                ..default_opts(mb[ci])
+            },
+        )
+        .expect("create");
+        let mut vrng = Rng::new(0xF26 + rep as u64);
+        let mut kb = [0u8; 16];
+        let rss0 = env::rss_bytes();
+        let t = Instant::now();
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+        }
+        store.flush().expect("flush");
+        let secs = t.elapsed().as_secs_f64();
+        rss.lock().unwrap().push((
+            ci,
+            env::rss_bytes().saturating_sub(rss0) as f64 / 1_048_576.0,
+        ));
+        let _ = store.close();
+        let _ = std::fs::remove_file(&file);
+        keys as f64 / secs
+    });
+
+    let rss_arm: Vec<Samples> = {
+        let all = rss.lock().unwrap();
+        (0..mb.len())
+            .map(|ci| {
+                Samples::new(
+                    all.iter()
+                        .filter(|(c, _)| *c == ci)
+                        .map(|(_, v)| *v)
+                        .collect(),
+                )
+            })
+            .collect()
+    };
+    rec.series(
+        "buffers",
+        J::arr(
+            (0..mb.len())
+                .map(|ci| {
+                    jobj! {
+                        "buffer_mb" => J::u(mb[ci] as u64),
+                        "load_ops_per_s" => J::fp(load[ci].median(), 1),
+                        "load" => load[ci].to_json(),
+                        "load_rss_mb" => J::fp(rss_arm[ci].median(), 1),
+                        "load_rss" => rss_arm[ci].to_json()
+                    }
+                })
+                .collect(),
+        ),
+    );
+
+    // Smallest against largest: the question is whether streaming costs
+    // throughput, so the comparison that matters is the extreme one.
+    let cmp = compare(&load[0], &load[mb.len() - 1], supdb::bench::MIN_EFFECT);
+    rec.compare("load_4mb_vs_256mb", cmp.clone());
+    let best = (0..mb.len())
+        .max_by(|a, b| load[*a].median().total_cmp(&load[*b].median()))
+        .unwrap_or(0);
+    rec.finding(Finding::new(
+        "F26.1",
+        "A write buffer smaller than the workload does not cost load throughput",
+        !matches!(cmp.verdict, supdb::bench::Verdict::Less),
+        format!(
+            "4MB {:.0} ops/s at {:.1} MB resident, against 256MB {:.0} ops/s at {:.1} MB ({}). \
+             Fastest arm was {}MB. The 256MB arm never seals during a load of this size, which is \
+             what the external adapter configures and why Supdb holds 218MB where LMDB holds 46",
+            load[0].median(),
+            rss_arm[0].median(),
+            load[mb.len() - 1].median(),
+            rss_arm[mb.len() - 1].median(),
+            cmp.summary("4MB", "256MB"),
+            mb[best]
+        ),
+    ));
+    Ok(rec)
+}
+
 /// What the pending arena costs or buys, both arms interleaved.
 ///
 /// `EXT.10` has Supdb losing bulk ingest 1.85x to an LMDB that is not syncing

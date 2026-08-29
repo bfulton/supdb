@@ -643,6 +643,13 @@
    "profile": "full",
    "expect": "fails",
    "because": "The arena's price, now 197.2 MB against 132.7 MB for the same load -- 0.664x at p=0.0100, where it was 0.450x. It reserved each shard's whole `buffer_bytes` share on first use, on the theory that growth memcpys explained the 21% rise in last-level misses the arena caused. They did not: reserving removed every one of those copies and the misses did not move, so the reservation was the answer to a question it was not the answer to, and it cost 2.2x resident memory. It starts at 128KB and grows now, which recovered a third of the memory and changed neither the append gain (1.080x against 1.079x) nor the absent load gain. What remains is `Vec` doubling slack -- capacity up to twice length -- and a chunked arena would remove that too. Recorded as failing because 1.5x resident memory for an 8% append-path gain that flips one run in five (F25.2) is not yet a trade worth defending; it is a cost with a known next step."
+  },
+  {
+   "experiment": "f26-buffer",
+   "id": "F26.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "1,834,782 ops/s at a 4MB buffer against 1,827,426 at 256MB -- 1.004x at p=0.7015, no difference -- while resident memory falls from 279.9 MB to 173.0, a 38% saving for nothing given up. All four arms (4, 16, 64, 256MB) are statistically tied on throughput, so the choice is free and smaller strictly dominates. The external adapter configures 256MB, which is larger than the 105MB dataset, so Supdb holds all of it -- and that is a straightforward part of why EXT.10 shows 218MB resident against LMDB's 46. This experiment could not have been run at all before `Options::seal_on_put`: `append` sealed when a shard's buffer filled and `put` never checked, so a put-only workload ignored `buffer_bytes` entirely and every arm here would have behaved identically. What is left after the fix is Supdb's key index, which stays resident through a load at roughly 57 bytes per key, and no buffer setting touches that."
   }
  ],
  "metrics": [

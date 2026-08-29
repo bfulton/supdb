@@ -538,6 +538,12 @@ pub struct Options {
     /// buffered value used to get its own allocation. f25-arena prices the
     /// change with both arms interleaved.
     pub pending_arena: bool,
+    /// Seal a shard from `put` when its buffer fills, as `append` does.
+    ///
+    /// On by default. Off is the old behaviour, kept so f26 can price it:
+    /// `put` ignored `buffer_bytes` and buffered a whole workload until
+    /// `flush`, which no benchmark here reached the size to notice.
+    pub seal_on_put: bool,
     /// Write the key index in a shape a reader can use where it lies, instead
     /// of one it has to decode into the heap first.
     ///
@@ -605,6 +611,7 @@ impl Default for Options {
             merge_threshold: 4,
             checksums: true,
             pending_arena: true,
+            seal_on_put: true,
             // On, now that the space cost is bounded.
             //
             // It was off while a checkpoint appended a whole index section
@@ -1695,6 +1702,23 @@ impl Store {
         // superseded extent onto the entry after this replacement lands.
         if let Some(idx) = sh.keys.index_of(key) {
             sh.members.retain(|m| m.0 != idx);
+        }
+        // Honour the buffer the caller asked for. `append` has always sealed
+        // here and `put` never did, so a put-only workload -- which is every
+        // load phase in the external suite -- ignored `buffer_bytes` entirely
+        // and grew until `flush`. At the sizes measured that is invisible,
+        // because 1M values of 100 bytes is 105MB against a 256MB budget and
+        // the threshold is never reached. It is not invisible at ten times the
+        // keys, where the buffer the caller set is the difference between
+        // streaming and running out of memory.
+        //
+        // The comment above is the reason this is safe to add rather than a
+        // new hazard: `put` already had to cope with an extent staged by an
+        // inline seal, because `append` could cause one.
+        if self.opts.seal_on_put
+            && sh.pending_bytes >= self.opts.buffer_bytes / self.shards.len()
+        {
+            self.seal_shard(&mut sh)?;
         }
         Ok(())
     }
