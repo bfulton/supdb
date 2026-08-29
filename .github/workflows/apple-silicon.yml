@@ -141,12 +141,31 @@ jobs:
           set -uo pipefail
           deadline=$(( WINDOW * 2 ))   # polls, at 30s each
           for i in $(seq 1 "$deadline"); do
-            status=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
-              --jq '.jobs[] | select(.name=="sweep") | .status' 2>/dev/null || echo "")
+            job=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
+              --jq '.jobs[] | select(.name=="sweep") | "\(.status) \(.conclusion) \(.runner_name)"' \
+              2>/dev/null || echo "")
+            set -- $job
+            status="${1:-}"; conclusion="${2:-}"; runner="${3:-}"
             case "$status" in
-              in_progress|completed)
-                echo "sweep claimed after $(( i * 30 ))s"
+              in_progress)
+                echo "sweep claimed by ${runner:-?} after $(( i * 30 ))s"
                 exit 0
+                ;;
+              completed)
+                # Completed is not the same as claimed. A job cancelled while
+                # queued is also completed, and an earlier version of this
+                # check read that as success and reported "claimed after 210s"
+                # for a job no runner ever touched -- runner_id 0, runner_name
+                # empty. The runner name is the thing that distinguishes them.
+                if [ -n "$runner" ] && [ "$runner" != "null" ]; then
+                  echo "sweep ran on $runner"
+                  exit 0
+                fi
+                echo "::error::sweep completed as '\''$conclusion'\'' without ever being claimed."
+                echo "::error::A heartbeat says the Mac is up; this says no runner took the job."
+                echo "::error::Check Settings > Actions > Runners: registrations expire, and a"
+                echo "::error::stale one leaves the app heartbeating with nothing listening."
+                exit 1
                 ;;
               "")
                 # The job has not been created yet, or the API hiccupped.
