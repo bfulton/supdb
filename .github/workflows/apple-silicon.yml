@@ -71,7 +71,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --release --bin indexlab
+        run: |
+          set -euo pipefail
+          # Offline, because localmost's sandbox allowlists egress: cargo's
+          # reach for the crates.io index comes back "CONNECT tunnel failed,
+          # response 403", exactly as rustup's reach for static.rust-lang.org
+          # did. The runner uses this machine's own CARGO_HOME, so whatever has
+          # been fetched here already is available; nothing needs downloading
+          # to build a tree whose Cargo.lock has not moved.
+          if ! cargo build --release --offline --locked --bin indexlab; then
+            echo "::error::Offline build failed: a dependency is not in this"
+            echo "::error::machine's cargo cache. Run 'cargo fetch --locked' once"
+            echo "::error::in a supdb checkout on the Mac, or allowlist"
+            echo "::error::static.crates.io in localmost's proxy."
+            exit 1
+          fi
 
       - name: What the machine reports about itself
         run: ./target/release/indexlab machine

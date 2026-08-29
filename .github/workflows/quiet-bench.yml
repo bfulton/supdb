@@ -145,8 +145,18 @@ jobs:
         # 600-second kill. Minutes spent compiling what this job never
         # executes are minutes the measurement does not get.
         run: |
-          cargo build --release -p supdb --bin indexlab
-          cargo build --release -p supdb-external --bin external
+          set -euo pipefail
+          # Offline: see the note in apple-silicon.yml. The sandbox proxy
+          # answers cargo's crates.io fetch with a 403, and this machine's
+          # cargo cache already has what a build of this lockfile needs.
+          if ! cargo build --release --offline --locked -p supdb --bin indexlab \
+            || ! cargo build --release --offline --locked -p supdb-external --bin external; then
+            echo "::error::Offline build failed: a dependency is not in this"
+            echo "::error::machine's cargo cache. Run 'cargo fetch --locked' once"
+            echo "::error::in a supdb checkout on the Mac, or allowlist"
+            echo "::error::static.crates.io in localmost's proxy."
+            exit 1
+          fi
 
       - name: Record the machine and what else it was doing
         run: |
