@@ -96,6 +96,7 @@ fn main() -> std::io::Result<()> {
         "kv" => suite_kv(&args, profile, &engines)?,
         "ycsb" => suite_ycsb(&args, profile, &engines)?,
         "sweep" => suite_sweep(&args, profile, &engines)?,
+        "loadprof" => return load_profile(&args, &engines),
         "all" => {
             let a = suite_kv(&args, profile, &engines)?;
             a.print_summary();
@@ -107,13 +108,65 @@ fn main() -> std::io::Result<()> {
         }
         _ => {
             println!(
-                "external <kv|ycsb|sweep|all> [--profile ci|dev|full] [--engines supdb,redb,lmdb,sled]"
+                "external <kv|ycsb|sweep|all|loadprof> [--profile ci|dev|full] \
+                 [--engines supdb,redb,lmdb,sled]"
             );
             return Ok(());
         }
     };
     rec.print_summary();
     rec.write(&out)?;
+    Ok(())
+}
+
+/// One engine, one bulk load, then exit -- the shape a profiler can attribute.
+///
+/// callgrind and cachegrind attribute to the process, so a driver that also
+/// reads and scans mixes three access patterns into one instruction count.
+/// This does the load and nothing else. Run it once with `--keys 0` and
+/// subtract to remove store creation and the payload generator, exactly as
+/// `docs/profiling.md` does with `indexlab probe --lookups 0`.
+///
+/// It exists because EXT.10 says Supdb loads at 0.54x of an LMDB that is not
+/// syncing either -- a B-tree beating an append-structured store at bulk
+/// ingest, which is the one thing this design is supposed to win. That is a
+/// defect to find rather than a tradeoff to accept, and no timing harness can
+/// say where it went.
+fn load_profile(args: &Args, which: &[&str]) -> std::io::Result<()> {
+    let n = args.num("--keys", 200_000) as u64;
+    let value_size = args.num("--value-size", 100);
+    let batch = args.num("--batch", 1_000).max(1);
+    let name = which.first().copied().unwrap_or("supdb-buffered");
+    let root = scratch(&format!("loadprof-{name}"));
+    let Some(mut e) = build(&root, &[name], 256).into_iter().next() else {
+        eprintln!("# no engine {name}");
+        return Ok(());
+    };
+    let payload = Payload::new(value_size, 0.5, 0xE1);
+    let mut vrng = Rng::new(0xE1);
+    let mut kb = [0u8; 16];
+    let mut buf: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch);
+    let t = Instant::now();
+    for i in 0..n {
+        db_key_into(i, &mut kb);
+        buf.push((kb.to_vec(), payload.get(&mut vrng).to_vec()));
+        if buf.len() == batch {
+            e.write_batch(&buf).expect("write");
+            buf.clear();
+        }
+    }
+    if !buf.is_empty() {
+        e.write_batch(&buf).expect("write");
+    }
+    e.sync().expect("sync");
+    let secs = t.elapsed().as_secs_f64();
+    println!(
+        "{name} loaded {n} keys in {secs:.3}s ({:.0} ops/s), {:.1} MB",
+        n as f64 / secs.max(1e-9),
+        e.size_bytes() as f64 / 1048576.0
+    );
+    drop(e);
+    let _ = std::fs::remove_dir_all(&root);
     Ok(())
 }
 
@@ -148,6 +201,12 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
             "workload shape follows redb's own benchmark; batch size is identical for every engine",
         )
         .note(
+            "load_rss_mb is the delta of current RSS across the load, not a peak: VmHWM never \
+             falls, so with several engines interleaved in one process a high-water mark set by \
+             one contaminates every engine after it. load_device_write_mb comes from \
+             /proc/self/io and is a different quantity from file size",
+        )
+        .note(
             "engines interleaved round-robin over reps, one warmup round discarded; medians \
              reported, and every ordering gated on stats::compare",
         );
@@ -157,6 +216,19 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
     let mut load: Vec<Samples> = vec![Samples::default(); ne];
     let mut read: Vec<Samples> = vec![Samples::default(); ne];
     let mut scan: Vec<Samples> = vec![Samples::default(); ne];
+    // Rule 4: throughput never travels alone. This suite has reported load
+    // rates, read latency and file size since it was written, and never the
+    // other two the rule names. That mattered more than it looked: `Store::put`
+    // does not seal when the shard buffer fills -- only `append` does -- so a
+    // load buffers every key in memory and flushes once at the end, and the
+    // load figure has partly been measuring "defer everything, then do it at
+    // once" with nothing beside it to say what that costs.
+    //
+    // RSS is the delta of *current* RSS across the load, not the peak: VmHWM
+    // never falls, so with six engines interleaved in one process a high-water
+    // mark set by the first contaminates every one after it.
+    let mut rss: Vec<Samples> = vec![Samples::default(); ne];
+    let mut wrote: Vec<Samples> = vec![Samples::default(); ne];
     let mut hists: Vec<Hist> = (0..ne).map(|_| Hist::new()).collect();
     let mut size = vec![0f64; ne];
     let mut hit = vec![0f64; ne];
@@ -182,6 +254,8 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
             let mut vrng = Rng::new(0xE1);
 
             // Bulk load.
+            let rss0 = supdb::bench::env::rss_bytes();
+            let io0 = supdb::bench::IoCounters::read_now();
             let t = Instant::now();
             let mut buf: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch);
             let mut kb = [0u8; 16];
@@ -198,6 +272,8 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
             }
             e.sync().expect("sync");
             let load_s = t.elapsed().as_secs_f64();
+            let load_rss = supdb::bench::env::rss_bytes().saturating_sub(rss0);
+            let load_wrote = supdb::bench::IoCounters::read_now().since(&io0).write_bytes;
 
             // Random reads, with the distribution recorded.
             let mut g = KeyGen::new(KeyDist::Uniform, n, 7);
@@ -235,6 +311,8 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
                 hists[ei] = h;
                 hit[ei] = hits as f64 / reads as f64;
                 size[ei] = e.size_bytes() as f64 / 1048576.0;
+                rss[ei].push(load_rss as f64 / 1048576.0);
+                wrote[ei].push(load_wrote as f64 / 1048576.0);
             }
             drop(e);
             // Four stores of this size per round filled the disk once already,
@@ -257,17 +335,29 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
             "read_ops_per_s" => J::fp(read[ei].median(), 1),
             "read" => read[ei].to_json(),
             "read_hit_rate" => J::fp(hit[ei], 4),
+            "load_rss_mb" => J::fp(rss[ei].median(), 1),
+            "load_rss" => rss[ei].to_json(),
+            // From /proc/self/io, never inferred from file size: the two are
+            // different quantities and the rule says so.
+            "load_device_write_mb" => J::fp(wrote[ei].median(), 1),
+            "load_write_amp" => J::fp(
+                wrote[ei].median() * 1048576.0 / (n as f64 * (16.0 + value_size as f64)).max(1.0),
+                3
+            ),
             "scan_entries_per_s" => J::fp(scan[ei].median(), 1),
             "scan" => scan[ei].to_json(),
             "read_latency" => hists[ei].to_json(),
             "size_mb" => J::fp(size[ei], 2)
         });
         println!(
-            "  {name:6} load {:>9.0}/s  read {:>9.0}/s  scan {:>10.0}/s  {:>7.1} MB  features {}/6",
+            "  {name:14} load {:>9.0}/s  read {:>9.0}/s  scan {:>10.0}/s  {:>7.1} MB  \
+             rss {:>7.1} MB  wrote {:>7.1} MB  features {}/6",
             load[ei].median(),
             read[ei].median(),
             scan[ei].median(),
             size[ei],
+            rss[ei].median(),
+            wrote[ei].median(),
             f.score()
         );
     }
