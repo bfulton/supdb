@@ -628,21 +628,21 @@
    "id": "F25.1",
    "profile": "full",
    "expect": "fails",
-   "because": "NOT ESTABLISHED, and recorded as failing because no difference is not a lead. Two full runs: 1,903,048 ops/s against 1,812,864 -- 1.050x at p=0.2013 -- where the first read 1.187x at p=0.0215. A marginal p that did not replicate, which is the EXT.1 failure mode this repository already carries a paragraph about, walked into anyway by writing a claim from one run. The arena's load benefit is not shown. What is shown is F25.2, which replicated (1.144x then 1.117x), and F25.3, which is the cost. Keep the arena for the append path and for removing 50,305 live allocations per 50k keys; do not cite it as a bulk-load win."
+   "because": "NOT ESTABLISHED, across five full runs: 1.187x (p=0.0215), 1.050x, 1.021x, 1.007x and 1.035x, no difference in four of the five. The first is the one I wrote a claim from, and a marginal p from a single run is exactly the EXT.1 failure mode this repository already documents. The arena's bulk-load benefit does not exist at a size this host can resolve. What the arena does do is remove 50,305 live allocations per 50k keys and cut instructions 16% per key -- neither of which shows up as load throughput, which is itself the finding: this load is not instruction-bound."
   },
   {
    "experiment": "f25-arena",
    "id": "F25.2",
    "profile": "full",
    "expect": "holds",
-   "because": "2,390,222 ops/s against 2,140,678 -- 1.117x at p=0.0152, and 1.144x at p=0.0022 on the run before, so this one replicated across two full runs. It is also the workload the arena could have lost outright: an append must keep a key's run contiguous, so when another key has appended in between, the run is copied to the arena tail, and this shape pays that copy on nearly every call. The claim is written as 'does not slow down' because not-slower was the bar; that it clears the higher one is recorded here rather than in the statement."
+   "because": "Holds, but marginally, and the margin is falling: across five full runs the ratio has read 1.144x (p=0.0022), 1.117x, 1.079x, 1.028x and 1.083x, clearing the gate in four and missing it in the fifth at p=0.0553 -- a hair the wrong side of it. Read this as about 8% and fragile rather than as a result. It is still the workload where the arena could have lost outright, since an append must keep a key's run contiguous and copies it to the arena tail whenever another key has appended in between. Set against F25.3's 2.2x resident memory, an 8% append-path gain that flips one run in five is a poor trade, and the next thing to try is removing the up-front reservation rather than defending it."
   },
   {
    "experiment": "f25-arena",
    "id": "F25.3",
    "profile": "full",
    "expect": "fails",
-   "because": "The arena's price, and it is not small: 197.2 MB resident against 88.7 MB for the same load, 0.450x at p=0.0101, with ci agreeing at 0.452x. It reserves each shard's whole buffer budget on first use rather than growing into it. I reserved it believing that growth memcpys explained the 21% rise in last-level misses the arena caused; after reserving, the misses did not move, so that hypothesis was wrong and the reservation is buying nothing anyone has demonstrated. Read with F25.1, which did not replicate, the trade is currently 2.2x memory for an append-path win and no established load win. This entry exists so shrinking the reservation is a deliberate act with a number to beat rather than a tidy-up."
+   "because": "The arena's price, now 197.2 MB against 132.7 MB for the same load -- 0.664x at p=0.0100, where it was 0.450x. It reserved each shard's whole `buffer_bytes` share on first use, on the theory that growth memcpys explained the 21% rise in last-level misses the arena caused. They did not: reserving removed every one of those copies and the misses did not move, so the reservation was the answer to a question it was not the answer to, and it cost 2.2x resident memory. It starts at 128KB and grows now, which recovered a third of the memory and changed neither the append gain (1.080x against 1.079x) nor the absent load gain. What remains is `Vec` doubling slack -- capacity up to twice length -- and a chunked arena would remove that too. Recorded as failing because 1.5x resident memory for an 8% append-path gain that flips one run in five (F25.2) is not yet a trade worth defending; it is a cost with a known next step."
   }
  ],
  "metrics": [

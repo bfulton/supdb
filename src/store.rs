@@ -300,6 +300,13 @@ fn available_memory() -> Option<u64> {
 /// 1.25 the measurement is already 2,682 against 4,887 and firmly Random's.
 const AUTO_RANDOM_ABOVE: f64 = 1.1;
 
+/// Initial capacity of a shard's pending arena, before it grows.
+///
+/// Large enough that a batch does not spend its life doubling from nothing,
+/// small enough that 64 shards cost a few megabytes rather than the whole
+/// buffer budget. See F25.3.
+const ARENA_START: usize = 128 * 1024;
+
 impl Readahead {
     /// What this advice means for a file of `bytes`, with `Auto` resolved.
     fn resolve(self, bytes: u64) -> Readahead {
@@ -1644,15 +1651,19 @@ impl Store {
             let p = e.pending.get_or_insert_with(Pending::default);
             let before = p.nbytes();
             if arena_on {
-                // Reserve the shard's whole budget the first time it is used.
-                // Growing by doubling from empty was worse than the per-key
-                // allocations it replaced: it cut instructions 14% and *added*
-                // 19% to last-level misses, because every doubling memcpys the
-                // arena and those copies stream through the cache. The
-                // capacity is what `buffer_bytes` already promised, and
-                // reserving it costs address space rather than pages.
+                // Start at a size that covers a batch or two and let it grow
+                // from there.
+                //
+                // This used to reserve the shard's whole `buffer_bytes` share
+                // on first use, on the theory that growth memcpys explained
+                // the 21% rise in last-level misses the arena caused. They did
+                // not: reserving removed every one of those copies and the
+                // misses did not move. So the reservation was answering a
+                // question it turned out not to be the answer to, while
+                // costing 2.2x resident memory (F25.3) for an 8% append-path
+                // gain that flips one run in five (F25.2).
                 if arena.capacity() == 0 {
-                    arena.reserve(budget);
+                    arena.reserve(ARENA_START.min(budget));
                 }
                 // A replacement abandons the old run where it lies. The bytes
                 // stay until the next seal clears the arena; reclaiming them
