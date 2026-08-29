@@ -399,6 +399,30 @@ impl Trial {
     }
 }
 
+/// Least squares fit of `y = a + b*x`.
+///
+/// Neither coefficient is a quantity unless the data is actually affine, and
+/// that is a claim about the data like any other. `ext-sweep` fitted this over
+/// scan lengths 1..400 and reported `a` as an engine's fixed cost per scan,
+/// across a range where the marginal cost of one more entry falls from about
+/// 89ns to 15 before settling near 20. It read 952ns for a scan that had been
+/// observed to finish in 692. Check the intercept against the smallest point
+/// you measured before calling it a floor -- see the test below, which carries
+/// the curve that refuted it.
+pub fn affine_fit(xs: &[f64], ys: &[f64]) -> (f64, f64) {
+    let k = xs.len() as f64;
+    let sx: f64 = xs.iter().sum();
+    let sy: f64 = ys.iter().sum();
+    let sxx: f64 = xs.iter().map(|x| x * x).sum();
+    let sxy: f64 = xs.iter().zip(ys).map(|(x, y)| x * y).sum();
+    let d = k * sxx - sx * sx;
+    if d.abs() < 1e-12 {
+        return (sy / k, 0.0);
+    }
+    let b = (k * sxy - sx * sy) / d;
+    ((sy - b * sx) / k, b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,6 +518,38 @@ mod tests {
             *order.borrow(),
             vec![0, 1, 0, 1, 0, 1],
             "must be round-robin, not blocked"
+        );
+    }
+    /// A fitted intercept is not a floor. These are Supdb's measured scan
+    /// costs at lengths 1, 2, 5, 10, 25, 50, 100, 200 and 400 from
+    /// `results/ext-sweep.full.json`. A least-squares line through them puts
+    /// the per-scan constant 261ns ABOVE the one-entry scan that was actually
+    /// observed -- a constant larger than the cheapest thing it is supposed to
+    /// bound. `ext-sweep` reported that number as Supdb's fixed cost, and
+    /// compared it against LMDB's version of the same artifact, for as long as
+    /// it fitted rather than measured. Both quantities are read off the curve
+    /// directly now; this keeps the case that made the difference visible.
+    #[test]
+    fn a_fitted_intercept_is_not_a_floor() {
+        let xs = [1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 400.0];
+        let ys = [
+            691.6, 781.0, 969.6, 1218.1, 1678.3, 2243.7, 2995.4, 5009.1, 8894.7,
+        ];
+        let (a, b) = affine_fit(&xs, &ys);
+        assert!(
+            b > 19.0 && b < 21.0,
+            "the slope was always about right; it is the intercept that breaks: b={b}"
+        );
+        assert!(
+            a > ys[0],
+            "if this ever stops holding the curve changed, not the argument: a={a} floor={}",
+            ys[0]
+        );
+        // The size of the lie, not merely its direction.
+        assert!(
+            (a - ys[0]) > 250.0,
+            "intercept exceeds the floor by only {}",
+            a - ys[0]
         );
     }
 }

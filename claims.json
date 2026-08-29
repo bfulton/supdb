@@ -84,7 +84,7 @@
    "experiment": "ext-kv",
    "id": "EXT.5",
    "expect": "fails",
-   "because": "Supdb scans at 0.65x of LMDB on the kv suite's uniform scan. The suite now scans through `Store::scan` rather than by opening a `Reader`, which f22-storescan prices at 1.593x on exactly this shape -- and the ratio against LMDB barely moved, because between the two runs both engines' absolute scan throughput roughly doubled. Read the decomposition instead, which is stable: ext-sweep has Supdb the faster walker every time (EXT.7) and the payer of the larger constant every time (EXT.8). This suite measures a uniform cold sweep at one length, which is the shape that flatters neither the fence, nor per-chunk verification, nor a warm writer.",
+   "because": "No difference: Supdb scans 25,119,613 entries/s against LMDB's 26,178,916, ratio 0.960 at p=0.3711. Recorded as failing because no difference is not a lead. This entry used to read \"0.65x\" and say the ext-sweep decomposition was the stable thing to read instead; both halves were wrong. The 0.65x was prose left behind when Store::scan regenerated the result file two commits earlier -- `verify` gates the recorded verdict against `expect` and never reads this sentence, so it drifted without turning anything red. And the decomposition it pointed at was a straight line fitted through a bent curve; measured rather than fitted, EXT.7 and EXT.8 are both no difference too, which is the same answer this experiment gives end to end. The three measurements were never in conflict. Two of them were being reported through a model that did not fit.",
    "profile": "full"
   },
   {
@@ -468,15 +468,15 @@
    "experiment": "ext-sweep",
    "id": "EXT.7",
    "profile": "full",
-   "expect": "holds",
-   "because": "Supdb walks a scan at 20.10 ns/entry against LMDB's 21.52 -- 1.071x, p=0.0409. The ordering has held across every run of this experiment while the margin has read 1.742x, 1.165x and 1.071x, on a host whose absolute scan cost has moved by more than a factor of two between runs an hour apart. I expected parity here and argued the walk was at the memory bandwidth bound for both engines; the bound was the right frame and the conclusion was wrong."
+   "expect": "fails",
+   "because": "WAS 'holds', now measured rather than fitted, and the margin does not survive the change: Supdb walks at 24.41 ns/entry against LMDB's 22.99, ratio 0.942 at p=0.5229. This flip is not the engine getting worse and not the experiment going blind -- it is the experiment starting to measure the quantity it names. The per-entry cost is now the difference quotient between scans of 200 and 400 entries, which is what 'the cost of one more entry' means; it was the slope of a least-squares line fitted over lengths 1..400, across a range where the marginal cost of an entry falls from about 89ns to 15 before settling near 20. On this coefficient the fit was nearly right, and its problem was never arithmetic: it reported p=0.0409 for a margin the direct measurement cannot find at all. Across two runs an hour apart this ratio reads 1.018 and 0.942, crossing parity in both directions, no difference each time. Supdb and LMDB walk a scan at the same speed as far as this host can resolve."
   },
   {
    "experiment": "ext-sweep",
    "id": "EXT.8",
    "profile": "full",
-   "expect": "fails",
-   "because": "Supdb pays 952ns of fixed cost per scan against LMDB's 812 -- 0.853x, p=0.0022. With EXT.7 this puts the whole scan deficit in the constant, as it has in every run of this experiment. One version of that constant was self-inflicted and is gone: the first `Store::scan` asked all 64 shards whether anything was unpublished, taking 64 mutexes to answer one bit, and put 883ns on the constant -- more than the entire gap it was built to close. `Store::unpublished` is one atomic load. State that knows whether it is stale was the point; asking sixty-four locks is polling with extra steps."
+   "expect": "holds",
+   "because": "FIXED, in the sense that the loss was never really measured: Supdb's shortest scan costs 857 ns against LMDB's 924, ratio 1.079 at p=0.6093, no difference. The old value -- 952 ns against 812, 0.853x at p=0.0022, a confident loss -- was the intercept of a straight line fitted over scan lengths 1..400, and that line is refuted by its own data. Its intercept lands ABOVE the measured cost of a one-entry scan for every engine in the suite and in every run since: +330ns for Supdb, +143 for LMDB, +9 for redb here, and +279/+208/+174 an hour earlier. A per-scan constant greater than the cheapest scan ever observed is not a constant, and two engines' versions of it are not a comparison. The floor is now read straight off the n=1 point with no model, and reads 0.947x and 1.079x across two runs -- across parity in both directions, where the fitted version said 0.853x at p=0.0022. With EXT.7 this removes the 'faster walker, larger constant' story entirely: both halves were fit artifacts pointing in opposite directions, and neither axis separates the two engines. full_range_fit is kept in every ext-sweep record so the refuted model stays visible rather than merely deleted, and src/bench/stats.rs carries the curve that refutes it as a test."
   },
   {
    "experiment": "f19-coldscan",

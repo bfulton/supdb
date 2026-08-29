@@ -263,8 +263,6 @@ fn writer_path_damage(
     Ok((served, caught, trials))
 }
 
-
-
 /// What a reader does with a file that is not quite what it wrote.
 ///
 /// Three damage models, all of which happen in the field: a single flipped bit

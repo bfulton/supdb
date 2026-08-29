@@ -502,9 +502,7 @@ fn a_superseded_index_section_is_released_exactly_once() {
             for (k, want) in &model {
                 let mut got: Vec<Vec<u8>> = Vec::new();
                 r.read_all(k.as_bytes(), |v| got.push(v.to_vec()))
-                    .unwrap_or_else(|e| {
-                        panic!("flat={flat} round {round} key {k}: {e}")
-                    });
+                    .unwrap_or_else(|e| panic!("flat={flat} round {round} key {k}: {e}"));
                 assert_eq!(&got, want, "flat={flat} round {round} key {k}");
             }
         }
@@ -687,7 +685,9 @@ fn a_writer_reads_its_own_writes() {
             if step % 1000 == 0 {
                 for (mk, want) in &model {
                     let mut mg: Vec<Vec<u8>> = Vec::new();
-                    store.read_all(mk.as_bytes(), |b| mg.push(b.to_vec())).unwrap();
+                    store
+                        .read_all(mk.as_bytes(), |b| mg.push(b.to_vec()))
+                        .unwrap();
                     assert_eq!(&mg, want, "{reclaim:?} step {step}: sweep found {mk} wrong");
                 }
             }
@@ -699,7 +699,10 @@ fn a_writer_reads_its_own_writes() {
         for (mk, want) in &model {
             let mut rg: Vec<Vec<u8>> = Vec::new();
             r.read_all(mk.as_bytes(), |b| rg.push(b.to_vec())).unwrap();
-            assert_eq!(&rg, want, "{reclaim:?}: reader disagrees with the model on {mk}");
+            assert_eq!(
+                &rg, want,
+                "{reclaim:?}: reader disagrees with the model on {mk}"
+            );
         }
         drop(r);
         let _ = std::fs::remove_dir_all(&dir);
@@ -740,7 +743,14 @@ fn a_reader_that_declines_the_mapping_still_reads_the_block_table() {
     }
     let mut seen = Vec::new();
     for mapped_blocks in [true, false] {
-        let r = Reader::open_with(&path, ReadOptions { mapped_blocks, ..Default::default() }).unwrap();
+        let r = Reader::open_with(
+            &path,
+            ReadOptions {
+                mapped_blocks,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let mut bytes = 0u64;
         let got = r
             .scan(None, usize::MAX, |_k, v| bytes += v.len() as u64)
@@ -1002,8 +1012,11 @@ fn readahead_advice_never_changes_what_is_read() {
     {
         let s = Store::create(&path, Options::default()).unwrap();
         for i in 0..n {
-            s.put(format!("{i:016}").as_bytes(), format!("value-{i}").as_bytes())
-                .unwrap();
+            s.put(
+                format!("{i:016}").as_bytes(),
+                format!("value-{i}").as_bytes(),
+            )
+            .unwrap();
         }
         s.flush().unwrap();
         s.close().unwrap();
@@ -1032,7 +1045,12 @@ fn readahead_advice_never_changes_what_is_read() {
         let mut got = Vec::new();
         r.scan(None, usize::MAX, |k, v| got.push((k.to_vec(), v.to_vec())))
             .unwrap();
-        assert_eq!(got.len(), n as usize, "{advice:?} walked {} keys", got.len());
+        assert_eq!(
+            got.len(),
+            n as usize,
+            "{advice:?} walked {} keys",
+            got.len()
+        );
         seen.push(got);
     }
     for w in seen.windows(2) {

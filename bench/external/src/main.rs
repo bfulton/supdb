@@ -25,8 +25,8 @@ use engines::{Engine, Features, Lmdb, Redb, Sled, Supdb};
 use std::path::PathBuf;
 use std::time::Instant;
 use supdb::bench::{
-    compare, db_key_into, Finding, Hist, KeyDist, KeyGen, Payload, Profile, Record, Rng, Samples,
-    Verdict, J,
+    compare, db_key_into, Comparison, Finding, Hist, KeyDist, KeyGen, Payload, Profile, Record,
+    Rng, Samples, Verdict, J,
 };
 use supdb::jobj;
 
@@ -109,7 +109,6 @@ fn main() -> std::io::Result<()> {
     rec.write(&out)?;
     Ok(())
 }
-
 
 /// redb's benchmark shape, with Supdb added.
 ///
@@ -352,7 +351,6 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
     Ok(rec)
 }
 
-
 /// Decompose a scan into its constant and its slope, for every engine.
 ///
 /// A scan is a seek plus a walk, and the two have completely different floors.
@@ -386,8 +384,10 @@ fn suite_sweep(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result
         .param("entry_budget", J::u(budget))
         .param("reps", J::u(reps as u64))
         .note(
-            "cost per scan fitted as a + b*n over scan lengths 1..400; a is the seek and \
-             everything else fixed per scan, b is the marginal cost of one more entry",
+            "cost per scan measured at each length; the floor is the observed cost at n=1 and \
+             the per-entry cost is the difference quotient between the top two lengths. Neither \
+             is fitted: a least-squares line over the whole range put its intercept above the \
+             one-entry scan it was meant to bound, and full_range_fit keeps that on the record",
         )
         .note(
             "engines interleaved at the innermost level, one store per engine built once and \
@@ -449,35 +449,57 @@ fn suite_sweep(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result
         }
     }
 
-    // Least squares fit of ns_per_scan = a + b*n, one fit per repetition so
-    // both coefficients carry a distribution rather than a point estimate.
-    let fit = |ys: &[f64]| -> (f64, f64) {
-        let xs: Vec<f64> = lens.iter().map(|l| *l as f64).collect();
-        let k = xs.len() as f64;
-        let sx: f64 = xs.iter().sum();
-        let sy: f64 = ys.iter().sum();
-        let sxx: f64 = xs.iter().map(|x| x * x).sum();
-        let sxy: f64 = xs.iter().zip(ys).map(|(x, y)| x * y).sum();
-        let d = k * sxx - sx * sx;
-        if d.abs() < 1e-12 {
-            return (sy / k, 0.0);
-        }
-        let b = (k * sxy - sx * sy) / d;
-        ((sy - b * sx) / k, b)
-    };
+    // The earlier version of this experiment fitted ns_per_scan = a + b*n by
+    // least squares over the whole range 1..400 and reported both coefficients
+    // as quantities. The model is testable and it is false: the marginal cost
+    // of one more entry falls from about 89ns to about 15 before it settles
+    // near 20, so a straight line through the whole curve lands its intercept
+    // ABOVE the measured cost of a one-entry scan -- 952ns of "fixed cost" for
+    // a scan observed to finish in 692, and 812 against 665 for LMDB. A
+    // constant greater than the floor it claims to be is not a constant, and
+    // two engines' versions of it are not a comparison.
+    //
+    // Both quantities are measurable without the model, so measure them:
+    //
+    //   floor    the cost of the shortest scan the sweep performs, observed at
+    //            n=1. What an engine pays before anyone asks for a second entry.
+    //   walk     the cost of one more entry at the top of the range, as the
+    //            difference quotient between the last two lengths. What an
+    //            entry costs once the per-scan work is amortised away.
+    //
+    // The whole-range fit is kept in the record as a diagnostic, so the reason
+    // it was abandoned stays visible rather than only the fact of it.
 
-    // `a` is every cost a scan pays once, not the seek alone. Naming it
-    // "seek" in an earlier draft made it easy to compare two engines' very
-    // different fixed costs as though they were the same quantity.
-    let mut seek: Vec<Samples> = names.iter().map(|_| Samples::default()).collect();
+    // A difference quotient at the top of the range is only a property of the
+    // engine if the curve has stopped bending by then. So measure the last two
+    // quotients as distributions and put them through the same gate as every
+    // other comparison here: if they are distinguishable, the sweep did not
+    // reach the regime it is trying to describe and there is no marginal cost
+    // to report. The first version of this check compared the two medians
+    // against a hand-picked 10% -- a hand-rolled comparison of exactly the kind
+    // `stats::compare` exists to stop, and on this data it was reading noise as
+    // curvature: LMDB's tail quotients run 22.4, 21.7, 23.7 ns/entry, bouncing
+    // either side of settled rather than climbing towards it.
+    let last = lens.len() - 1;
+    let quotient =
+        |ys: &[f64], hi: usize| -> f64 { (ys[hi] - ys[hi - 1]) / (lens[hi] - lens[hi - 1]) as f64 };
+
+    let mut floor: Vec<Samples> = names.iter().map(|_| Samples::default()).collect();
     let mut walk: Vec<Samples> = names.iter().map(|_| Samples::default()).collect();
+    let mut below: Vec<Samples> = names.iter().map(|_| Samples::default()).collect();
+    let mut settled: Vec<Comparison> = Vec::with_capacity(names.len());
+    let mut full_fit: Vec<(f64, f64)> = vec![(0.0, 0.0); names.len()];
     for ei in 0..names.len() {
+        let med: Vec<f64> = (0..lens.len()).map(|li| per[ei][li].median()).collect();
+        let all: Vec<f64> = lens.iter().map(|l| *l as f64).collect();
+        full_fit[ei] = supdb::bench::stats::affine_fit(&all, &med);
         for r in 0..reps {
             let ys: Vec<f64> = (0..lens.len()).map(|li| per[ei][li].values[r]).collect();
-            let (a, b) = fit(&ys);
-            seek[ei].push(a);
-            walk[ei].push(b);
+            floor[ei].push(ys[0]);
+            walk[ei].push(quotient(&ys, last));
+            below[ei].push(quotient(&ys, last - 1));
         }
+        settled.push(compare(&below[ei], &walk[ei], supdb::bench::MIN_EFFECT));
     }
 
     let mut rows = Vec::new();
@@ -495,18 +517,34 @@ fn suite_sweep(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result
                 }
             })
             .collect();
+        let (fa, fb) = full_fit[ei];
         println!(
-            "  {name:6} fixed {:>8.0} ns/scan   per-entry {:>6.2} ns   ({:>10.0} entries/s at n=400)",
-            seek[ei].median(),
+            "  {name:6} floor {:>8.0} ns/scan   per-entry {:>6.2} ns at n={}   ({})",
+            floor[ei].median(),
             walk[ei].median(),
-            400.0 * 1e9 / per[ei][lens.len() - 1].median().max(1e-9)
+            lens[last],
+            if matches!(settled[ei].verdict, Verdict::NoDifference) {
+                "settled"
+            } else {
+                "STILL BENDING"
+            }
         );
         rows.push(jobj! {
             "engine" => J::s(*name),
-            "fixed_ns" => J::fp(seek[ei].median(), 1),
+            "floor_ns" => J::fp(floor[ei].median(), 1),
+            "floor" => floor[ei].to_json(),
             "per_entry_ns" => J::fp(walk[ei].median(), 3),
-            "fixed" => seek[ei].to_json(),
             "per_entry" => walk[ei].to_json(),
+            "per_entry_measured_over" => J::s(format!("n={}..{}", lens[last - 1], lens[last])),
+            "settled" => settled[ei].to_json(),
+            // Why the whole-range fit was dropped, kept as evidence rather
+            // than as a claim: an intercept this far above the measured floor
+            // cannot be a per-scan constant.
+            "full_range_fit" => jobj! {
+                "fixed_ns" => J::fp(fa, 1),
+                "per_entry_ns" => J::fp(fb, 3),
+                "intercept_over_measured_floor_ns" => J::fp(fa - floor[ei].median(), 1)
+            },
             "points" => J::arr(points)
         });
     }
@@ -514,41 +552,79 @@ fn suite_sweep(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result
 
     let idx = |name: &str| names.iter().position(|w| *w == name);
     if let (Some(s), Some(l)) = (idx("supdb"), idx("lmdb")) {
-        // Lower is better for both coefficients, so the comparison is the
+        // Lower is better for both quantities, so the comparisons are the
         // other way round from a throughput one.
         let walk_cmp = compare(&walk[l], &walk[s], supdb::bench::MIN_EFFECT);
-        let seek_cmp = compare(&seek[l], &seek[s], supdb::bench::MIN_EFFECT);
+        let floor_cmp = compare(&floor[l], &floor[s], supdb::bench::MIN_EFFECT);
         rec.compare("walk_lmdb_vs_supdb", walk_cmp.clone());
-        rec.compare("fixed_lmdb_vs_supdb", seek_cmp.clone());
-        rec.finding(Finding::new(
-            "EXT.7",
-            "Supdb walks a scan with less work per entry than LMDB",
-            matches!(walk_cmp.verdict, Verdict::Greater),
-            format!(
-                "supdb {:.2} ns/entry against lmdb {:.2} ({}). The walk is bounded by memory \
-                 bandwidth rather than by structure, so this is the half of a scan where there \
-                 is little left to win",
-                walk[s].median(),
-                walk[l].median(),
-                walk_cmp.summary("lmdb", "supdb")
-            ),
-        ));
+        rec.compare("floor_lmdb_vs_supdb", floor_cmp.clone());
+
+        let unsettled = [s, l]
+            .iter()
+            .filter(|ei| !matches!(settled[**ei].verdict, Verdict::NoDifference))
+            .map(|ei| format!("{} ({})", names[*ei], settled[*ei].summary("below", "top")))
+            .collect::<Vec<_>>();
+        if unsettled.is_empty() {
+            rec.finding(Finding::new(
+                "EXT.7",
+                "Supdb walks a scan with less work per entry than LMDB",
+                matches!(walk_cmp.verdict, Verdict::Greater),
+                format!(
+                    "supdb {:.2} ns/entry against lmdb {:.2} ({}), measured as the difference \
+                     quotient between scans of {} and {} entries rather than fitted. The walk is \
+                     bounded by memory bandwidth rather than by structure, so this is the half of \
+                     a scan where there is little left to win. The fit this replaces put the \
+                     slope at {:.2} against {:.2}, so on this coefficient it was close -- it was \
+                     the intercept the straight line destroyed, not the slope",
+                    walk[s].median(),
+                    walk[l].median(),
+                    walk_cmp.summary("lmdb", "supdb"),
+                    lens[last - 1],
+                    lens[last],
+                    full_fit[s].1,
+                    full_fit[l].1
+                ),
+            ));
+        } else {
+            rec.finding(Finding::not_exercised(
+                "EXT.7",
+                "Supdb walks a scan with less work per entry than LMDB",
+                format!(
+                    "the cost curve has not stopped bending by n={}: the marginal cost over \
+                     {}..{} is still distinguishable from the one over {}..{} for {}. A marginal \
+                     cost taken where the curve is still turning is a property of the sweep's \
+                     range rather than of the engine, so this run declines to report one",
+                    lens[last],
+                    lens[last - 1],
+                    lens[last],
+                    lens[last - 2],
+                    lens[last - 1],
+                    unsettled.join(" and ")
+                ),
+            ));
+        }
+
         rec.finding(Finding::new(
             "EXT.8",
             "Supdb pays no more fixed cost per scan than LMDB",
-            // Lower is better, so this holds when LMDB's constant is the
-            // greater one or the two cannot be told apart. The first version
-            // of this line accepted `Less` as well, which is LMDB winning, and
-            // it duly reported a hold on a run where Supdb was 1.24x worse.
-            matches!(seek_cmp.verdict, Verdict::Greater | Verdict::NoDifference),
+            // Lower is better, so this holds when LMDB's floor is the greater
+            // one or the two cannot be told apart. The first version of this
+            // line accepted `Less` as well, which is LMDB winning, and it duly
+            // reported a hold on a run where Supdb was 1.24x worse.
+            matches!(floor_cmp.verdict, Verdict::Greater | Verdict::NoDifference),
             format!(
-                "supdb {:.0} ns against lmdb {:.0} ({}). This is the whole constant, not the seek \
-                 alone: it holds everything an engine pays once per scan regardless of length. \
-                 For Supdb that is the seek plus resolving the first block; for LMDB and redb it \
-                 was, until this commit, opening a read transaction per call",
-                seek[s].median(),
-                seek[l].median(),
-                seek_cmp.summary("lmdb", "supdb")
+                "supdb {:.0} ns against lmdb {:.0} ({}). This is the observed cost of a \
+                 one-entry scan, not a fitted intercept: what an engine pays before anyone asks \
+                 it for a second entry. For Supdb that is the seek plus resolving the first \
+                 block; for LMDB and redb it was, until this commit, opening a read transaction \
+                 per call. The fitted version of this number read {:.0}ns against {:.0} -- each \
+                 above the one-entry scan it was supposed to bound, which is how a straight line \
+                 through a bent curve reports a floor that no measurement ever touched",
+                floor[s].median(),
+                floor[l].median(),
+                floor_cmp.summary("lmdb", "supdb"),
+                full_fit[s].0,
+                full_fit[l].0
             ),
         ));
     }

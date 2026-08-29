@@ -135,10 +135,28 @@ disk). F2.1 still fails — sub-linear is not independent — and so does F4.1, 
 The compression change also took the size axis away: `EXT.6` moved from `holds`
 to `fails`, since Supdb stores 168.6MB where LMDB stores 126.9. That was traded
 knowingly, and scans are what it bought — `EXT.5` went from 4.7x slower than
-LMDB to 0.58x of it. It is still a loss. The 1.29x this file used to claim came
-from a `ci` run, which is never citable; at `full` the same measurement was
-0.91x, and the habit of reading a `ci` number as evidence is the reason that
-sentence was wrong for as long as it was.
+LMDB to 0.96x of it, which is `no_difference` at p=0.37 rather than a lead.
+Two earlier versions of that sentence were wrong in the same way twice: it
+claimed 1.29x from a `ci` run, which is never citable, and then 0.65x from a
+`full` run whose result file had since been regenerated underneath it. `verify`
+compares the recorded verdict against `expect` and never reads the prose, so a
+number quoted in a `because` can rot for as long as nobody re-derives it. When
+you cite a figure here or in `claims.json`, read it out of `results/` first.
+
+Scan is the one axis where Supdb and LMDB cannot be told apart, and it took a
+methodology fix to see that. `ext-sweep` used to decompose scan cost by fitting
+`a + b*n` over lengths 1..400 and report both coefficients: `EXT.7` had Supdb
+the faster walker and `EXT.8` had it paying the larger constant. The marginal
+cost of an entry falls from about 89ns to 15 over that range before settling
+near 20, and a straight line through it lands its intercept *above* the measured
+cost of a one-entry scan — 952ns of "fixed cost" for a scan observed to finish
+in 692, and the same for LMDB and redb. Both quantities are now measured rather
+than fitted: the floor is the observed n=1 point, the per-entry cost is the
+difference quotient between the top two lengths. Measured that way neither axis
+separates the engines, `EXT.7` moved to `fails` and `EXT.8` to `holds`, and all
+three scan measurements finally agree. A model is a claim about the data and
+belongs under the same gate as everything else; `full_range_fit` stays in every
+`ext-sweep` record so the refuted one is visible rather than deleted.
 
 The external suite repeats and interleaves its engines, like everything in
 `src/bench/`. It did not always: it ran each engine once, and `EXT.1` read

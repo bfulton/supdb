@@ -1166,9 +1166,16 @@ mod block_tests {
         let meta = MappedBlocks::parse(&sec).expect("parse");
         assert_eq!(meta.len(), blocks.len());
         for (i, row) in rows.iter().enumerate() {
-            assert!(meta.get(&sec, i).expect("block").chunk_crc, "flag lost at {i}");
+            assert!(
+                meta.get(&sec, i).expect("block").chunk_crc,
+                "flag lost at {i}"
+            );
             for (j, want) in row.iter().enumerate() {
-                assert_eq!(meta.chunk_crc(&sec, i, j), Some(*want), "block {i} chunk {j}");
+                assert_eq!(
+                    meta.chunk_crc(&sec, i, j),
+                    Some(*want),
+                    "block {i} chunk {j}"
+                );
             }
         }
     }
@@ -1212,8 +1219,24 @@ mod block_tests {
         for (i, b) in blocks.iter().enumerate() {
             let g = m.get(&sec, i).expect("present");
             assert_eq!(
-                (g.off, g.stored, g.uncompressed, g.cap, g.crc, g.solo, g.chunked),
-                (b.off, b.stored, b.uncompressed, b.cap, b.crc, b.solo, b.chunked),
+                (
+                    g.off,
+                    g.stored,
+                    g.uncompressed,
+                    g.cap,
+                    g.crc,
+                    g.solo,
+                    g.chunked
+                ),
+                (
+                    b.off,
+                    b.stored,
+                    b.uncompressed,
+                    b.cap,
+                    b.crc,
+                    b.solo,
+                    b.chunked
+                ),
                 "block {i}"
             );
         }

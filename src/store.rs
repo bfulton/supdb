@@ -305,9 +305,7 @@ impl Readahead {
     fn resolve(self, bytes: u64) -> Readahead {
         match self {
             Readahead::Auto => match available_memory() {
-                Some(avail) if bytes as f64 > avail as f64 * AUTO_RANDOM_ABOVE => {
-                    Readahead::Random
-                }
+                Some(avail) if bytes as f64 > avail as f64 * AUTO_RANDOM_ABOVE => Readahead::Random,
                 // No reading on how much memory there is means no basis for
                 // overriding the kernel, so leave it alone.
                 _ => Readahead::Default,
@@ -619,10 +617,7 @@ impl Default for Options {
                 .unwrap_or(true),
             sync: match std::env::var("SUPDB_SYNC").ok().as_deref() {
                 Some("0") => Sync::Never,
-                Some(v) => v
-                    .parse::<u32>()
-                    .map(Sync::EveryN)
-                    .unwrap_or(Sync::Always),
+                Some(v) => v.parse::<u32>().map(Sync::EveryN).unwrap_or(Sync::Always),
                 None => Sync::Always,
             },
             reclaim: Reclaim::AfterReads,
@@ -1069,7 +1064,6 @@ pub struct Store {
 }
 
 impl Store {
-
     /// Reopen an existing store for writing.
     ///
     /// `create` truncates, and until now there was no other way in: a store
@@ -1317,7 +1311,7 @@ impl Store {
             appender: Mutex::new(Appender {
                 table,
                 map: None,
-               
+
                 file,
                 // the first page is reserved for the two superblock slots
                 off: SUPER,

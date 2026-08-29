@@ -1587,8 +1587,7 @@ fn f14_blocktable(args: &Args, profile: Profile) -> std::io::Result<Record> {
         "the mapped block table costs nothing on a scan",
         matches!(
             scan_cmp.verdict,
-            supdb::bench::stats::Verdict::NoDifference
-                | supdb::bench::stats::Verdict::Underpowered
+            supdb::bench::stats::Verdict::NoDifference | supdb::bench::stats::Verdict::Underpowered
         ),
         format!(
             "scan {sm:.0} entries/s mapped against {so:.0} owned ({})",
@@ -1600,8 +1599,7 @@ fn f14_blocktable(args: &Args, profile: Profile) -> std::io::Result<Record> {
         "the mapped block table costs nothing on a point read",
         matches!(
             read_cmp.verdict,
-            supdb::bench::stats::Verdict::NoDifference
-                | supdb::bench::stats::Verdict::Underpowered
+            supdb::bench::stats::Verdict::NoDifference | supdb::bench::stats::Verdict::Underpowered
         ),
         format!(
             "read {rm:.0} ops/s mapped against {ro:.0} owned ({}). This is the arm the change \
@@ -1973,7 +1971,11 @@ fn f18_fence(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // the largest single term.
     let scan = Trial::new(profile.reps()).run(2, |ci, rep| {
         let r = reader(ci);
-        let mut g = KeyGen::new(KeyDist::Uniform, keys.saturating_sub(50).max(1), 0x81 + rep as u64);
+        let mut g = KeyGen::new(
+            KeyDist::Uniform,
+            keys.saturating_sub(50).max(1),
+            0x81 + rep as u64,
+        );
         let mut kb = [0u8; 16];
         let t = Instant::now();
         let mut n = 0u64;
@@ -2213,7 +2215,9 @@ fn f20_chunkcrc(args: &Args, profile: Profile) -> std::io::Result<Record> {
         .param("value_size", J::u(value_size as u64))
         .param("scan_len", J::u(scan_len as u64))
         .param("scans", J::u(scans))
-        .note("one file, two readers, interleaved; the only difference is ReadOptions::chunk_verify");
+        .note(
+            "one file, two readers, interleaved; the only difference is ReadOptions::chunk_verify",
+        );
 
     let dir = scratch("f20");
     let file = dir.join("chunk.dat");
@@ -2284,7 +2288,11 @@ fn f20_chunkcrc(args: &Args, profile: Profile) -> std::io::Result<Record> {
             },
         )
         .expect("open");
-        let mut g = KeyGen::new(KeyDist::Zipfian, keys.saturating_sub(scan_len as u64).max(1), 0x02 + rep as u64);
+        let mut g = KeyGen::new(
+            KeyDist::Zipfian,
+            keys.saturating_sub(scan_len as u64).max(1),
+            0x02 + rep as u64,
+        );
         let mut kb = [0u8; 16];
         let t = Instant::now();
         let mut n = 0u64;
@@ -2654,8 +2662,11 @@ fn f23_madvise(args: &Args, profile: Profile) -> std::io::Result<Record> {
     } else {
         0.0
     };
-    rec.param("memory_cap_bytes", J::u(if capped { cap_mb << 20 } else { 0 }))
-        .param("file_over_cap", J::fp(ratio, 2));
+    rec.param(
+        "memory_cap_bytes",
+        J::u(if capped { cap_mb << 20 } else { 0 }),
+    )
+    .param("file_over_cap", J::fp(ratio, 2));
     if cap_mb > 0 && !capped {
         eprintln!("# WARNING: could not cap memory; this run is not out-of-core");
     }
@@ -2882,11 +2893,7 @@ fn f24_autoreadahead(args: &Args, profile: Profile) -> std::io::Result<Record> {
             reads as f64 / (w.wall_ns as f64 / 1e9)
         });
 
-        let (auto, deflt, rand) = (
-            arms[0].median(),
-            arms[1].median(),
-            arms[2].median(),
-        );
+        let (auto, deflt, rand) = (arms[0].median(), arms[1].median(), arms[2].median());
         let best = deflt.max(rand);
         let rel = auto / best.max(1e-9);
         worst = worst.min(rel);
@@ -2983,7 +2990,11 @@ fn f13_sync(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let store = Store::create(
             &file,
             Options {
-                sync: if on[ci] { supdb::Sync::Always } else { supdb::Sync::Never },
+                sync: if on[ci] {
+                    supdb::Sync::Always
+                } else {
+                    supdb::Sync::Never
+                },
                 ..default_opts(256)
             },
         )
