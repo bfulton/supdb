@@ -210,7 +210,24 @@ jobs:
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # No `dtolnay/rust-toolchain` here, unlike the hosted jobs. That action
+      # provisions a toolchain on an ephemeral runner; this runner is somebody's
+      # Mac and already has one. Running it anyway made `rustup toolchain
+      # install stable` reach for static.rust-lang.org through localmost's
+      # sandbox proxy, which answered `tunnel error: unsuccessful`, and the job
+      # died two seconds in having been claimed successfully. Use what is
+      # installed, and say so plainly if nothing is.
+      - name: Use the toolchain this machine already has
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null; then
+            echo "::error::No cargo on this runner and this job will not install one:"
+            echo "::error::the sandbox has no route to static.rust-lang.org. Install a"
+            echo "::error::stable toolchain on the Mac itself, once."
+            exit 1
+          fi
+          cargo --version
+          rustc --version
       # localmost publishes four runner slots and each has its own workspace,
       # so a job lands on a cold target/ about three times in four. A cold
       # release build is minutes of the job's budget spent before the
@@ -218,6 +235,10 @@ jobs:
       # allowance compiling. The shared cache is keyed on the lockfile, not on
       # the slot, so all four warm each other.
       - uses: Swatinem/rust-cache@v2
+        # Best effort: this reaches GitHub's cache service, and a runner whose
+        # egress is proxied may not get there. A cold build is slower; a failed
+        # cache step would cost the whole measurement.
+        continue-on-error: true
         with:
           shared-key: apple-silicon-sweep
       - name: Build
