@@ -376,10 +376,18 @@ fn clock_ns(id: libc::clockid_t) -> u64 {
 
 impl Wait {
     pub fn read_now() -> Wait {
+        // Thread-scoped where the platform has it. `RUSAGE_THREAD` is a Linux
+        // extension and does not exist on macOS, where this asks about the
+        // process instead -- which is the same answer here, because no timing
+        // benchmark in this repository is allowed to run beside another one.
+        #[cfg(target_os = "linux")]
+        let who = libc::RUSAGE_THREAD;
+        #[cfg(not(target_os = "linux"))]
+        let who = libc::RUSAGE_SELF;
         // SAFETY: `ru` is fully initialized before the call reads it, and
-        // RUSAGE_THREAD asks only about the calling thread.
+        // `who` is one of the POSIX constants.
         let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-        let ok = unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut ru) } == 0;
+        let ok = unsafe { libc::getrusage(who, &mut ru) } == 0;
         Wait {
             wall_ns: clock_ns(libc::CLOCK_MONOTONIC),
             cpu_ns: clock_ns(libc::CLOCK_THREAD_CPUTIME_ID),

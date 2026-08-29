@@ -200,6 +200,20 @@ pub enum Readahead {
 /// v1 and v2 are both read because the layout differs and either can be the
 /// one in force. A missing or absent limit is not an error -- it means no cap,
 /// and the host figure stands.
+#[cfg(target_os = "macos")]
+fn sysctl_memsize() -> Option<u64> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sysctl_memsize() -> Option<u64> {
+    None
+}
+
 fn available_memory() -> Option<u64> {
     fn field(path: &str, key: &str) -> Option<u64> {
         std::fs::read_to_string(path).ok()?.lines().find_map(|l| {
@@ -248,8 +262,14 @@ fn available_memory() -> Option<u64> {
         })
         .and_then(|p| limit(&format!("/sys/fs/cgroup/memory{p}/memory.limit_in_bytes")))
         .or_else(|| limit("/sys/fs/cgroup/memory/memory.limit_in_bytes"));
+    // `/proc` is Linux's. Without a reading, `Auto` has no basis for
+    // overriding the kernel and leaves readahead alone -- which is safe, and
+    // silently disables the whole feature on macOS. `hw.memsize` is the total
+    // rather than what is available, so it errs towards a larger denominator
+    // and therefore towards the default advice: the conservative direction.
     let host = field("/proc/meminfo", "MemAvailable:")
-        .or_else(|| field("/proc/meminfo", "MemTotal:"));
+        .or_else(|| field("/proc/meminfo", "MemTotal:"))
+        .or_else(sysctl_memsize);
     [host, v1, v2].into_iter().flatten().min()
 }
 
