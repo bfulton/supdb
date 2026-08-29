@@ -149,12 +149,23 @@ jobs:
           # Offline: see the note in apple-silicon.yml. The sandbox proxy
           # answers cargo's crates.io fetch with a 403, and this machine's
           # cargo cache already has what a build of this lockfile needs.
-          if ! cargo build --release --offline --locked -p supdb --bin indexlab \
-            || ! cargo build --release --offline --locked -p supdb-external --bin external; then
-            echo "::error::Offline build failed: a dependency is not in this"
-            echo "::error::machine's cargo cache. Run 'cargo fetch --locked' once"
-            echo "::error::in a supdb checkout on the Mac, or allowlist"
-            echo "::error::static.crates.io in localmost's proxy."
+          # See the note in apple-silicon.yml: offline first, then the git
+          # index protocol, because localmost's allowlist has crates.io and
+          # static.crates.io but not index.crates.io, which is the host cargo's
+          # sparse index actually uses.
+          build() {
+            cargo build --release --locked "$@" -p supdb --bin indexlab \
+              && cargo build --release --locked "$@" -p supdb-external --bin external
+          }
+          if build --offline; then
+            echo "built from the local cargo cache"
+          elif CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git build; then
+            echo "built via the git index protocol"
+          else
+            echo "::error::Neither the local cache nor the git index protocol"
+            echo "::error::could build this. Add index.crates.io to localmost's"
+            echo "::error::DEFAULT_ALLOWED_HOSTS, or run 'cargo fetch --locked'"
+            echo "::error::once in a supdb checkout on this Mac."
             exit 1
           fi
 

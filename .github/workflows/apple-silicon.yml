@@ -79,11 +79,27 @@ jobs:
           # did. The runner uses this machine's own CARGO_HOME, so whatever has
           # been fetched here already is available; nothing needs downloading
           # to build a tree whose Cargo.lock has not moved.
-          if ! cargo build --release --offline --locked --bin indexlab; then
-            echo "::error::Offline build failed: a dependency is not in this"
-            echo "::error::machine's cargo cache. Run 'cargo fetch --locked' once"
-            echo "::error::in a supdb checkout on the Mac, or allowlist"
-            echo "::error::static.crates.io in localmost's proxy."
+          # Two ways through localmost's allowlist, tried in order.
+          #
+          # Offline first: the runner uses this machine's own CARGO_HOME, so a
+          # tree whose Cargo.lock has not moved may need nothing at all.
+          #
+          # Then the git index protocol. Cargo 1.70+ defaults to the sparse
+          # index at index.crates.io, and localmost's allowlist has crates.io
+          # and static.crates.io but not index.crates.io -- which is why the
+          # failure was "download of config.json failed, CONNECT tunnel failed,
+          # response 403". The older git protocol reads the index from
+          # github.com, which is allowlisted, so it goes through.
+          if cargo build --release --offline --locked --bin indexlab; then
+            echo "built from the local cargo cache"
+          elif CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git \
+               cargo build --release --locked --bin indexlab; then
+            echo "built via the git index protocol"
+          else
+            echo "::error::Neither the local cache nor the git index protocol"
+            echo "::error::could build this. Add index.crates.io to localmost's"
+            echo "::error::DEFAULT_ALLOWED_HOSTS, or run 'cargo fetch --locked'"
+            echo "::error::once in a supdb checkout on this Mac."
             exit 1
           fi
 
