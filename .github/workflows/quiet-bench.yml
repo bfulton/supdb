@@ -1,0 +1,131 @@
+name: quiet-bench
+
+# The competitor comparison, run somewhere that holds still.
+#
+# `ext-kv` repeats and interleaves its engines and gates every ordering on a
+# Mann-Whitney U test, which settles drift *within* a run. It does nothing
+# about drift *between* runs, and on the cloud VM that produced every number
+# in `results/` there is a great deal of it: EXT.1 has read 0.866x, 0.891x,
+# 0.892x, 1.010x, 1.154x, 1.043x and 1.331x across seven such runs with the
+# code unchanged between several of them, and LMDB's own load figure has
+# ranged from 508,205 to 1,034,797 over the same runs.
+#
+# So the point here is not a faster machine, it is a quieter one -- and
+# whether it is quieter is itself a measurement. Dispatch this twice and
+# compare the spread against that list. If a laptop somebody is using turns
+# out to wander as much as a shared VM, that is worth knowing before any of
+# these numbers get cited.
+#
+# Two engines rather than four, and kv rather than the whole suite, because
+# localmost kills a job at 600 seconds. supdb against lmdb is what EXT.1,
+# EXT.4 and EXT.5 are about.
+
+on:
+  workflow_dispatch:
+    inputs:
+      engines:
+        description: 'Engines to compare'
+        default: 'supdb,lmdb'
+      suite:
+        description: 'kv or ycsb'
+        default: 'kv'
+      pickup_timeout_minutes:
+        description: 'Cancel the run if no self-hosted runner claims the bench within this many minutes'
+        default: '10'
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    uses: bfulton/localmost/.github/workflows/check.yaml@main
+
+  pickup-watchdog:
+    needs: [check]
+    if: needs.check.outputs.runner == 'self-hosted'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Wait for a self-hosted runner to claim the bench
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          WINDOW: ${{ inputs.pickup_timeout_minutes || '10' }}
+        run: |
+          set -uo pipefail
+          deadline=$(( WINDOW * 2 ))
+          for i in $(seq 1 "$deadline"); do
+            status=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
+              --jq '.jobs[] | select(.name=="bench") | .status' 2>/dev/null || echo "")
+            case "$status" in
+              in_progress|completed) echo "bench claimed after $(( i * 30 ))s"; exit 0 ;;
+              "") echo "waiting: bench job not visible yet" ;;
+              *) echo "waiting: bench is $status ($(( i * 30 ))s)" ;;
+            esac
+            sleep 30
+          done
+          echo "::error::No self-hosted runner claimed the bench within ${WINDOW}m."
+          gh api -X POST "repos/$REPO/actions/runs/$RUN_ID/cancel" >/dev/null || true
+          exit 1
+
+  bench:
+    needs: [check]
+    # No fallback to a hosted runner, for the same reason the sweep has none:
+    # a shared virtualised runner returns a number that looks like a
+    # measurement and is not, and this job exists precisely to escape one.
+    if: needs.check.outputs.runner == 'self-hosted'
+    runs-on: ${{ needs.check.outputs.runner }}
+    timeout-minutes: 9
+    concurrency:
+      group: timing-benchmark
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: apple-silicon-sweep
+      - name: Build
+        run: cargo build --release --workspace
+
+      - name: Record the machine and what else it was doing
+        run: |
+          ./target/release/indexlab machine | tee bench-env.txt
+          echo "# loadavg before: $(sysctl -n vm.loadavg)" | tee -a bench-env.txt
+
+      - name: Comparison
+        run: |
+          ./target/release/external '${{ inputs.suite }}' \
+            --profile full \
+            --engines '${{ inputs.engines }}' \
+            --out out \
+            | tee -a bench-env.txt
+          echo "# loadavg after: $(sysctl -n vm.loadavg)" | tee -a bench-env.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quiet-bench-${{ inputs.suite }}
+          path: |
+            out/
+            bench-env.txt
+
+      - name: Summary
+        run: |
+          {
+            echo '## ext-${{ inputs.suite }}, Apple Silicon, full profile'
+            echo
+            echo 'Not evidence yet. `results/` is the source of truth, this'
+            echo 'artifact is not in it, and one run on a quiet machine is'
+            echo 'still one run. The question this is here to answer is how'
+            echo 'far two of them differ.'
+            echo
+            echo '```'
+            cat bench-env.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
