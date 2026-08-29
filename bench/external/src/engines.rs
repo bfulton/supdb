@@ -13,11 +13,30 @@
 //!     defect the design document confesses to in its own LMDB adapter.
 //!   * **No allocation per value on the read path** where the API allows it.
 //!     That handicap was worth 2.3x on LMDB when it was removed.
-//!   * **What each engine promises is recorded**, not assumed. Supdb has no
-//!     write-ahead log, no transactions, and cannot reopen a store for
-//!     writing; it does checksum, since the CRC-32C work. Comparing its
-//!     throughput against engines that provide the rest without saying so is
-//!     the comparison the review objected to.
+//!   * **Guarantees are matched, not merely recorded.** This rule used to read
+//!     "what each engine promises is recorded, not assumed", and recording is
+//!     not controlling. The features table below said for months that Supdb
+//!     does not commit durably and LMDB does; EXT.1 compared their load
+//!     throughput anyway and reported Supdb 1.33x ahead. Measured with the two
+//!     committing on the same boundary, LMDB is about 19x faster. That is the
+//!     same defect as the first rule -- "committing once per operation is not
+//!     being compared, it is being handicapped" -- except that when the
+//!     handicap fell on the comparator it was called a defect and fixed, and
+//!     when it fell in Supdb's favour it was written into a table.
+//!
+//!     So every axis that can be equalized is, in the adapter, before a number
+//!     is reported: `supdb-durable` checkpoints on LMDB's commit boundary, and
+//!     `lmdb-nosync` gives up durability the way Supdb's default does. The
+//!     checksum axis equalizes downward, since LMDB has none to turn on -- and
+//!     that one was costing Supdb 8.5% on every write number in the other
+//!     direction, unequalized for just as long.
+//!
+//!     One axis cannot be equalized: LMDB cannot stop being transactional.
+//!     That residual runs *against* LMDB -- it pays for atomic commit and
+//!     isolation that Supdb does not provide -- so a matched comparison Supdb
+//!     loses is a lower bound on the loss, and one it wins is not yet a win.
+//!     `ordering_of` enforces the matching and names the residual; the table
+//!     is a precondition now rather than a disclaimer.
 
 use std::path::{Path, PathBuf};
 use supdb::bench::J;
@@ -46,6 +65,45 @@ impl Features {
             "ordered_scan" => J::Bool(self.ordered_scan),
         }
     }
+    /// Axes where two engines promise different things and could have been
+    /// made to promise the same, restricted to those that bear on this metric.
+    ///
+    /// A non-empty answer means the pair is not comparable on that metric --
+    /// not that the number is noisy, that it is not an ordering. `durable`
+    /// says whether the metric touches the write path; a read or a scan does
+    /// not care when a commit reaches the device, and does care about
+    /// verification.
+    pub fn unmatched(&self, other: &Features, durable: bool) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if durable && self.durable_commit != other.durable_commit {
+            v.push("durable_commit");
+        }
+        if self.checksums != other.checksums {
+            v.push("checksums");
+        }
+        if self.read_your_writes != other.read_your_writes {
+            v.push("read_your_writes");
+        }
+        if self.ordered_scan != other.ordered_scan {
+            v.push("ordered_scan");
+        }
+        if self.reopen_for_write != other.reopen_for_write {
+            v.push("reopen_for_write");
+        }
+        v
+    }
+
+    /// The asymmetry that cannot be equalized, and which way it leans.
+    ///
+    /// LMDB cannot stop being transactional, so a pair matched on everything
+    /// else still has one engine paying for atomic commit and isolation the
+    /// other does not provide. That is not a reason to refuse the comparison;
+    /// it is a reason to read it as a bound. `true` means *this* engine is the
+    /// one getting the free ride.
+    pub fn free_ride(&self, other: &Features) -> bool {
+        other.transactions && !self.transactions
+    }
+
     /// How many of the six an engine provides. A throughput comparison
     /// between engines with different scores is a comparison of promises as
     /// much as of implementations.
@@ -117,31 +175,49 @@ pub struct Supdb {
     ///
     /// Without this Supdb buffers the whole load and reaches the device once,
     /// at `sync`. LMDB opens a write transaction per batch and commits it, and
-    /// heed sets no MDB_NOSYNC, so every one of those commits is an fsync. The
-    /// two were being compared on load anyway, with the difference noted in
-    /// prose and never measured. `Options::sync` is already `Sync::Always`
-    /// here; what this changes is when a checkpoint happens, not whether it
-    /// reaches the device.
+    /// heed sets no MDB_NOSYNC, so every one of those commits is an fsync.
+    /// `Options::sync` is already `Sync::Always` here; what this changes is
+    /// when a checkpoint happens, not whether it reaches the device.
     durable: bool,
+    /// Off in the matched arms, because LMDB has no checksums to turn on.
+    ///
+    /// This axis was unequalized in Supdb's *dis*favour for as long as
+    /// durability was unequalized in its favour: f8 prices verification at
+    /// +8.5% on writes, and every EXT.1 and EXT.4 figure has been paying it
+    /// against a comparator that does not.
+    checksums: bool,
 }
 
 impl Supdb {
+    /// The shipping defaults: buffered writes, checksums on.
     pub fn create(path: &Path, buffer_mb: usize) -> Res<Supdb> {
-        Supdb::with_durability(path, buffer_mb, false)
+        Supdb::with_guarantees(path, buffer_mb, false, true)
     }
 
-    /// The same engine committing on the same boundary as its comparator.
+    /// Matched to `lmdb`: commits on the same boundary, checksums neither.
     pub fn create_durable(path: &Path, buffer_mb: usize) -> Res<Supdb> {
-        Supdb::with_durability(path, buffer_mb, true)
+        Supdb::with_guarantees(path, buffer_mb, true, false)
     }
 
-    fn with_durability(path: &Path, buffer_mb: usize, durable: bool) -> Res<Supdb> {
+    /// Matched to `lmdb-nosync`: neither reaches the device per batch,
+    /// checksums neither.
+    pub fn create_buffered(path: &Path, buffer_mb: usize) -> Res<Supdb> {
+        Supdb::with_guarantees(path, buffer_mb, false, false)
+    }
+
+    fn with_guarantees(
+        path: &Path,
+        buffer_mb: usize,
+        durable: bool,
+        checksums: bool,
+    ) -> Res<Supdb> {
         let file = path.join("supdb.dat");
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         let store = supdb::Store::create(
             &file,
             supdb::Options {
                 buffer_bytes: buffer_mb << 20,
+                checksums,
                 // `AfterReads` cannot function in a load-only phase -- there
                 // are no reads -- and the durable arm appends an index section
                 // per batch, so it is the arm that most needs sections back.
@@ -164,16 +240,17 @@ impl Supdb {
             store: Some(store),
             path: file,
             durable,
+            checksums,
         })
     }
 }
 
 impl Engine for Supdb {
     fn name(&self) -> &'static str {
-        if self.durable {
-            "supdb-durable"
-        } else {
-            "supdb"
+        match (self.durable, self.checksums) {
+            (true, _) => "supdb-durable",
+            (false, false) => "supdb-buffered",
+            (false, true) => "supdb",
         }
     }
     fn features(&self) -> Features {
@@ -186,7 +263,7 @@ impl Engine for Supdb {
             // disk). The table said false long after that stopped being so,
             // which understated the engine by a feature point in the one
             // comparison that is meant to price its missing features.
-            checksums: true,
+            checksums: self.checksums,
             // True since `Store::open`. `Store::create` truncates, so until it
             // existed a store could be written once and thereafter only read
             // -- the review lists that first among critical defects and it had
@@ -365,16 +442,33 @@ pub struct Lmdb {
     /// for, and removing it there was worth 2.3x. Reproducing it here put the
     /// same thumb on the same scale.
     txn: Option<heed::RoTxn<'static>>,
+    /// MDB_NOSYNC: commit stops reaching the device.
+    ///
+    /// The other half of matching guarantees. `supdb-durable` brings Supdb up
+    /// to LMDB's boundary; this brings LMDB down to Supdb's default, so the
+    /// pair can be compared at both levels of promise rather than at neither.
+    nosync: bool,
 }
 
 impl Lmdb {
     pub fn create(path: &Path, map_gb: usize) -> Res<Lmdb> {
+        Lmdb::with_sync(path, map_gb, true)
+    }
+
+    /// Matched to Supdb's default: a commit that does not reach the device.
+    pub fn create_nosync(path: &Path, map_gb: usize) -> Res<Lmdb> {
+        Lmdb::with_sync(path, map_gb, false)
+    }
+
+    fn with_sync(path: &Path, map_gb: usize, sync: bool) -> Res<Lmdb> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         let env = unsafe {
-            heed::EnvOpenOptions::new()
-                .map_size(map_gb * 1024 * 1024 * 1024)
-                .max_dbs(4)
-                .open(path)
+            let mut o = heed::EnvOpenOptions::new();
+            o.map_size(map_gb * 1024 * 1024 * 1024).max_dbs(4);
+            if !sync {
+                o.flags(heed::EnvFlags::NO_SYNC);
+            }
+            o.open(path)
         }
         .map_err(|e| e.to_string())?;
         let mut w = env.write_txn().map_err(|e| e.to_string())?;
@@ -387,6 +481,7 @@ impl Lmdb {
             db,
             path: path.to_path_buf(),
             txn: None,
+            nosync: !sync,
         })
     }
 
@@ -406,11 +501,15 @@ impl Lmdb {
 
 impl Engine for Lmdb {
     fn name(&self) -> &'static str {
-        "lmdb"
+        if self.nosync {
+            "lmdb-nosync"
+        } else {
+            "lmdb"
+        }
     }
     fn features(&self) -> Features {
         Features {
-            durable_commit: true,
+            durable_commit: !self.nosync,
             transactions: true,
             checksums: false,
             reopen_for_write: true,

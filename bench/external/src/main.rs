@@ -61,6 +61,10 @@ fn build(root: &std::path::Path, which: &[&str], buffer_mb: usize) -> Vec<Box<dy
             "supdb-durable" => {
                 Supdb::create_durable(&dir, buffer_mb).map(|e| Box::new(e) as Box<dyn Engine>)
             }
+            "supdb-buffered" => {
+                Supdb::create_buffered(&dir, buffer_mb).map(|e| Box::new(e) as Box<dyn Engine>)
+            }
+            "lmdb-nosync" => Lmdb::create_nosync(&dir, 8).map(|e| Box::new(e) as Box<dyn Engine>),
             "redb" => Redb::create(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
             "lmdb" => Lmdb::create(&dir, 8).map(|e| Box::new(e) as Box<dyn Engine>),
             "sled" => Sled::create(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
@@ -274,6 +278,12 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
     // "supdb" because EXT.9 compares the durable arm, and an engine comparing
     // itself against a comparator on a boundary the comparator does not use is
     // the thing EXT.9 exists to stop.
+    // `writes` says whether the metric touches the write path, which decides
+    // whether the durability axis has to match for the ordering to mean
+    // anything. Everything else that can be equalized must match on every
+    // metric; when it does not, the pair is `not_exercised` rather than
+    // ranked. That is the whole of the fix: the features table used to be a
+    // note printed beside a number, and it is a precondition now.
     let ordering_of = |rec: &mut Record,
                        id: &str,
                        title: &str,
@@ -281,22 +291,57 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
                        other: &str,
                        s: &[Samples],
                        unit: &str,
-                       tail: &str| {
+                       writes: bool| {
         let (Some(si), Some(oi)) = (idx(mine), idx(other)) else {
             return;
         };
         if s[si].is_empty() || s[oi].is_empty() {
             return;
         }
+        let (Some(fa), Some(fb)) = (feats[si], feats[oi]) else {
+            return;
+        };
+        let gap = fa.unmatched(&fb, writes);
+        if !gap.is_empty() {
+            rec.finding(Finding::not_exercised(
+                id,
+                title,
+                format!(
+                    "not an ordering: {mine} and {other} do not promise the same thing on {}, and \
+                     each of those could have been equalized. {mine} measured {:.0} {unit} and \
+                     {other} {:.0}, which is recorded because it is what the run did, not because \
+                     it ranks them. Use the matched arms",
+                    gap.join(", "),
+                    s[si].median(),
+                    s[oi].median()
+                ),
+            ));
+            return;
+        }
         let cmp = compare(&s[si], &s[oi], supdb::bench::MIN_EFFECT);
         let holds = matches!(cmp.verdict, Verdict::Greater);
         rec.compare(&format!("{id}_{mine}_vs_{other}"), cmp.clone());
+        // Transactions are the one axis that cannot be equalized, so say which
+        // way the remainder leans instead of pretending it is not there.
+        let residual = if fa.free_ride(&fb) {
+            format!(
+                ". {other} is still transactional and {mine} is not, which no configuration can \
+                 equalize, so read this as a bound: a loss here is at least this large and a win \
+                 is not yet a win"
+            )
+        } else if fb.free_ride(&fa) {
+            format!(
+                ". {mine} is still transactional and {other} is not, so this understates {mine}"
+            )
+        } else {
+            String::new()
+        };
         rec.finding(Finding::new(
             id,
             title,
             holds,
             format!(
-                "{mine} {:.0} {unit} vs {other} {:.0} {unit} ({}){tail}",
+                "{mine} {:.0} {unit} vs {other} {:.0} {unit} ({}){residual}",
                 s[si].median(),
                 s[oi].median(),
                 cmp.summary(mine, other)
@@ -304,10 +349,18 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         ));
     };
     let ordering =
-        |rec: &mut Record, id: &str, title: &str, other: &str, s: &[Samples], unit: &str| {
-            ordering_of(rec, id, title, "supdb", other, s, unit, "")
-        };
+        |rec: &mut Record,
+         id: &str,
+         title: &str,
+         other: &str,
+         s: &[Samples],
+         unit: &str,
+         writes: bool| { ordering_of(rec, id, title, "supdb", other, s, unit, writes) };
 
+    // EXT.1, EXT.4 and EXT.5 are kept, and all three are now `not_exercised`
+    // against LMDB: plain `supdb` checksums and LMDB does not, and on load it
+    // also does not commit durably. Their numbers stay in the record because
+    // they are what the run did. They were never orderings.
     ordering(
         &mut rec,
         "EXT.1",
@@ -315,6 +368,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         "lmdb",
         &load,
         "ops/s",
+        true,
     );
     ordering(
         &mut rec,
@@ -323,6 +377,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         "redb",
         &read,
         "reads/s",
+        false,
     );
     // The design document's headline read comparison, restated as a claim.
     // Its own figures put Supdb ahead of LMDB on warm reads (330,732/s against
@@ -336,6 +391,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         "lmdb",
         &read,
         "reads/s",
+        false,
     );
     ordering(
         &mut rec,
@@ -344,35 +400,58 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         "lmdb",
         &scan,
         "entries/s",
+        false,
     );
 
-    // The comparison every write-side number here has been resting on.
+    // ---- the matched comparisons -------------------------------------------
     //
-    // LMDB opens a write transaction per batch and commits it, and heed sets
-    // no MDB_NOSYNC, so each of those commits is an fsync: acknowledged writes
-    // survive power loss. Supdb buffers the whole load and reaches the device
-    // once, at the end. EXT.1 compares the two anyway. Both this file and
-    // claims.json have said so in prose for as long as EXT.1 has existed --
-    // "LMDB commits durably per batch here and Supdb does not" -- and neither
-    // ever measured it, which left the project's loudest number resting on a
-    // difference nobody had priced.
-    //
-    // `supdb-durable` is the same engine checkpointing on the same boundary
-    // LMDB commits on. Whatever this says is the like-for-like load result,
-    // and EXT.1 should be read next to it rather than on its own.
+    // Four claims that actually rank the engines, because on each one the two
+    // arms promise the same thing. The load axis is measured at both levels of
+    // promise rather than at neither: EXT.9 has both committing to the device
+    // per batch, EXT.10 has neither. Whichever guarantee a reader cares about,
+    // one of these is the comparison for it, and EXT.1 is not.
     ordering_of(
         &mut rec,
         "EXT.9",
-        "Supdb loads faster than LMDB when both commit durably on the same boundary",
+        "Supdb loads faster than LMDB when both commit durably per batch",
         "supdb-durable",
         "lmdb",
         &load,
         "ops/s",
-        ". Both engines take a durability point every batch here, so this is \
-         the comparison EXT.1 is not: EXT.1 has Supdb buffering the whole load \
-         and reaching the device once. Read the two together -- the gap \
-         between them is what Supdb's headline load figure is buying with the \
-         guarantee it does not make",
+        true,
+    );
+    ordering_of(
+        &mut rec,
+        "EXT.10",
+        "Supdb loads faster than LMDB when neither commits to the device",
+        "supdb-buffered",
+        "lmdb-nosync",
+        &load,
+        "ops/s",
+        true,
+    );
+    // Durability does not touch a read or a scan, so these need only the
+    // checksum axis matched -- and that one was costing Supdb 8.5% on every
+    // EXT.4 figure ever recorded, in the direction nobody was watching.
+    ordering_of(
+        &mut rec,
+        "EXT.11",
+        "Supdb reads faster than LMDB when neither verifies checksums",
+        "supdb-buffered",
+        "lmdb",
+        &read,
+        "reads/s",
+        false,
+    );
+    ordering_of(
+        &mut rec,
+        "EXT.12",
+        "Supdb scans faster than LMDB when neither verifies checksums",
+        "supdb-buffered",
+        "lmdb",
+        &scan,
+        "entries/s",
+        false,
     );
     if let (Some(si), Some(li)) = (idx("supdb"), idx("lmdb")) {
         if !load[si].is_empty() && !load[li].is_empty() {
