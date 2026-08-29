@@ -90,24 +90,32 @@ much stronger evidence than either alone.
 
 `EXT.10` has Supdb loading at 0.542x of an LMDB that is not syncing either.
 An append-structured store beaten 1.85x at bulk ingest by a B-tree is a defect
-rather than a tradeoff, and no timing harness can say where it went. Three
-tools, one driver (`external loadprof`, which loads and exits so the counters
-attribute to one access pattern):
+rather than a tradeoff, and no timing harness can say where it went.
 
-| | Supdb | LMDB | ratio |
+**Subtract the baseline, or the answer is wrong.** The first version of this
+table compared raw totals from `loadprof --keys 20000` and concluded 1.11x on
+instructions and 3.22x on D1. Both were understated, because the driver's own
+setup dominates at that size: `Payload::new` alone accounts for 28% of D1
+write misses and 46% of last-level write misses, and it is common to every
+engine. Run each engine at `--keys 0` and subtract, exactly as this file
+already says to do for `indexlab probe --lookups 0`. Per key of real work:
+
+| per key, 20k keys | Supdb | LMDB | ratio |
 |---|---|---|---|
-| instructions (20k keys) | 234,915,197 | 211,668,372 | 1.11x |
-| D refs | 72,525,951 | 59,014,034 | 1.23x |
-| **D1 misses** | 1,294,495 | 402,320 | **3.22x** |
-| **LL misses** | 328,317 | 146,879 | **2.24x** |
-| LLd read misses | 39,701 | 5,874 | 6.76x |
-| dhat live blocks at peak (50k keys) | 50,305 | 2,077 | 24.2x |
-| dhat total blocks | 252,546 | 100,159 | -- |
+| instructions | 4,358 | 3,191 | 1.37x |
+| D1 misses | 57.7 | 13.3 | **4.34x** |
+| **LL misses** | **9.4** | **0.45** | **20.96x** |
 
-**The negative result is the useful one.** Supdb executes only 1.11x the
-instructions for a 1.85x wall-clock loss, so the gap is not compute and no
-amount of shaving the `put` path will find it. It takes 3.2x the L1 data
-misses. Bulk ingest here is memory-bound.
+| totals, dhat at 50k keys | Supdb | LMDB |
+|---|---|---|
+| live blocks at peak | 50,305 | 2,077 |
+| bytes at peak | 39.6 MB | 20.3 MB |
+
+**Bulk ingest here is DRAM-bound, and only for Supdb.** LMDB takes
+essentially no last-level misses per key. Supdb takes 9.4, which at roughly
+80ns each is about 750ns of its measured 1,037ns per key -- most of the load.
+The instruction gap is 1.37x and cannot explain a 1.85x wall-clock loss;
+the memory gap is 21x and comfortably can.
 
 dhat names the structure. Both engines run the same driver, which allocates
 twice per key, so subtract 100,000 blocks from each: Supdb makes about three
@@ -120,19 +128,20 @@ heap allocations per key and LMDB makes none. Attributed:
   `sh.keys.key_at(idx).to_vec()` copying every dirty key onto the heap to
   build `changed`. On a bulk load every key is dirty.
 
-The allocation *count* is worth perhaps 9% of the load. The allocation
-*pattern* is worth much more, and it is what the miss counts are showing: each
-buffered value lands in its own malloc block, so writing the load scatters
-across 40MB of small objects, while LMDB writes sequentially into B-tree
-pages. 50,305 live blocks against 2,077 is the same fact from the other side.
+The allocation *count* is the smaller half. The *pattern* is what the misses
+are showing: each buffered value lands in its own malloc block, so a load
+scatters writes across 39.6MB of small objects -- five times the 8MB
+last-level cache, touched in hash order -- while LMDB appends into pages that
+stay resident until they are written out. 50,305 live blocks against 2,077 is
+the same fact from the other side.
 
-That is a design defect rather than a tuning one, and it has a shape:
+That is a design defect rather than a tuning one, and it has a shape.
 `Store::put` buffers per key, where `append` already stages into a shared
 block builder at seal time. A per-shard arena that pending values are appended
 into, with each key entry holding an offset and length, removes all three
 allocations and makes the write pattern sequential. It is the change the miss
-counts argue for, and it should be measured the way everything here is --
-both arms behind a flag, interleaved in one process -- rather than assumed.
+counts argue for, and it gets measured the way everything here is -- both arms
+behind a flag, interleaved in one process -- rather than assumed.
 
 ## Reproducibility, independent of tooling
 
