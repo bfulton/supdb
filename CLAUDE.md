@@ -152,7 +152,16 @@ resurrection, the double-free that handed one slot to three blocks, decoder
 panics on damaged input, silently-served corruption (now checksummed), a
 checkpoint that appended three index sections and released none of them, and a
 reader that fed a flat block-table section to the varint decoder and reported
-the misparse as file corruption.
+the misparse as file corruption, and an in-place checkpoint that republished a
+record into its hash slot and not its directory entry -- so `read_all` returned
+the new value and `scan` the previous one, silently, for every key it touched.
+
+That last one needs a reopen to show: a fresh store takes the full-rewrite path
+until an index section exists with a matching key count, and every scan test
+here built its store in one session, so the in-place path was never under test
+when a scan was checked. `c2-oracle` does not exercise reopen-then-update
+either, which is why the differential oracle did not catch it. Until it does,
+that shape is covered only by its reproducer.
 
 The largest one is `Store::read_all`. A writer can read its own sealed, staged
 and pending state, so a read after a write no longer needs a checkpoint and a
