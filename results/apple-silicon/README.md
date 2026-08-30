@@ -36,3 +36,23 @@ where 2.3x is larger than Linux's 1.1-1.6x but at least measures the same
 thing on both.
 
 What these files are for is the *spread*, not the values.
+
+
+## Second campaign: the axes x86 cannot read
+
+With `.localmostrc` approved (strict sandbox, six declared hosts), three runs
+on the current engine (8a4a2fc):
+
+**Buffered load pair** -- the EXT.10 axis, twice: supdb-buffered vs
+lmdb-nosync at 0.857x (p=0.0073) and 0.852x (p=0.1599), engines drifting
+<=1.5% between runs. The sequential-arrival deficit is ~15%, not the 47% the
+drifting x86 host suggested.
+
+**Durable pair** -- EXT.9's shape under F_FULLFSYNC: 0.411x where Linux says
+0.081x. LMDB's durable commit collapses 4x on macOS while supdb's improves;
+the axis belongs to whichever engine forces less writeback under fsync,
+confirming f36's ledger decomposition from a second platform.
+
+Portability notes recorded with the runs: `load_rss_mb` and the device-byte
+columns read zero on macOS (`/proc` does not exist); throughput and file
+size are unaffected.
