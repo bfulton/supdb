@@ -6,17 +6,27 @@
 // shims and reflection a generator would add to something the size budget in
 // R3.3 is explicitly about. `web/build.sh` measures what ships.
 //
-// Two byte sources, one API:
+// Three byte sources, one API:
 //
 //   openMemory(bytes)   the object is already an ArrayBuffer in this realm
 //   openSyncHandle(h)   the object is a file in OPFS and `h` is a
 //                       FileSystemSyncAccessHandle over it
+//   openCached(cache)   the object stays in object storage and `cache` is a
+//                       CachedBytes (cache.mjs) holding only the parts
+//                       queries touch, under a byte budget
 //
-// The second is the one logshed uses and the reason nothing here is async
-// past `load`. `FileSystemSyncAccessHandle.read(buf, {at})` is a synchronous
-// random read, so the Rust side never has to await, and `flatindex` can go on
-// handing back borrows into the index. It is only available inside a Web
-// Worker, which is where `worker.mjs` runs it.
+// The second and third are what logshed uses and the reason nothing here is
+// async past `load`/`ensure`. `FileSystemSyncAccessHandle.read(buf, {at})` is
+// a synchronous random read, so the Rust side never has to await, and
+// `flatindex` can go on handing back borrows into the index. Both are only
+// available inside a Web Worker, which is where `worker.mjs` runs them.
+//
+// The third source works because a lookup is already a plan (R6.2): the
+// module names the byte ranges a query will touch *before* reading any of
+// them (`supdb_open_plan` for the open, `supdb_ranges` for a set of keys),
+// JavaScript awaits fetching those ranges into the cache, and the read then
+// runs synchronously and cannot miss. The await lives out here; nothing
+// inside the module ever suspends, so no Asyncify, no JSPI, no size cost.
 
 const NO_HANDLE = -1;
 
@@ -63,6 +73,20 @@ class Module {
     } finally {
       e.supdb_free(ptr, bytes.length);
     }
+  }
+
+  // Decode a range frame from the out buffer: u32 n, then n pairs of
+  // (u32 off, u32 len). Absolute file offsets -- nothing here assumes the
+  // caller holds any other part of the file.
+  ranges() {
+    const base = this.instance.exports.supdb_out_ptr();
+    const dv = this.view;
+    const n = dv.getUint32(base, true);
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      out[i] = [dv.getUint32(base + 4 + i * 8, true), dv.getUint32(base + 8 + i * 8, true)];
+    }
+    return out;
   }
 }
 
@@ -180,6 +204,47 @@ export class SupdbReader {
     );
   }
 
+  /// R6.2 -- the byte ranges a read of these keys will touch, before any of
+  /// them is read. Sorted, merged, absolute file offsets. What `ensure`
+  /// hands to the cache; exposed for callers that batch their own fetching.
+  ///
+  /// Covers data reads only: the superblock, key index and block table are
+  /// fetched whole at open (planned by `supdb_open_plan`) and are resident
+  /// after. That split costs ~nothing while key cardinality is bounded --
+  /// a logshed segment is ~100 keys of index over megabytes of postings --
+  /// and it is the premise that expires if keys become unbounded, e.g. a
+  /// trigram or free-text index. Do not index free text over this source
+  /// without revisiting it; the ranges stay absolute so that day changes
+  /// this file, not the ABI.
+  planRanges(keys) {
+    const m = this.mod;
+    const packed = keys.map((k) => (typeof k === "string" ? m.enc.encode(k) : k));
+    let total = 4;
+    for (const k of packed) total += 4 + k.length;
+    const buf = new Uint8Array(total);
+    const dv = new DataView(buf.buffer);
+    dv.setUint32(0, packed.length, true);
+    let at = 4;
+    for (const k of packed) {
+      dv.setUint32(at, k.length, true);
+      at += 4;
+      buf.set(k, at);
+      at += k.length;
+    }
+    m.withKey(buf, (p, l) =>
+      this.check(this.exports.supdb_ranges(this.handle, p, l), 0xffffffff),
+    );
+    return m.ranges();
+  }
+
+  /// Plan-then-fetch for a reader opened over a cache: after this resolves,
+  /// `lookup`/`count` for these keys run synchronously with no miss. The
+  /// only awaits in a cached reader's life are `openCached` and this. A
+  /// no-op on whole-object sources, which hold everything already.
+  async ensure(keys) {
+    if (this.cache) await this.cache.ensure(this.planRanges(keys));
+  }
+
   scanFrame(call, from) {
     const m = this.mod;
     m.withKey(from, (p, l) => this.check(call(p, l), 0xffffffff));
@@ -283,6 +348,63 @@ export async function openSyncHandle(wasm, handle) {
   const h = instance.exports.supdb_open_host();
   if (h === 0xffffffff) throw new Error(mod.lastError());
   return new SupdbReader(mod, h);
+}
+
+/// Open over a `CachedBytes` (cache.mjs): the object stays in object
+/// storage, and only the parts queries touch become resident. R6.
+///
+/// The open itself is planned, not faulted: fetch the superblock probe, ask
+/// the module (`supdb_open_plan`) which ranges the open will read -- the key
+/// index, the block table, and the redo log's emptiness word -- fetch those,
+/// then open. No format knowledge lives in JavaScript; a hand-copied
+/// superblock constant has drifted out from under this library once already,
+/// and the plan call is how it does not happen again.
+///
+/// After open the index and block table are resident inside the module, so
+/// planning is free and `countFixed`/`scanCountsFixed` answer with no fetch
+/// at all. Point reads want `await reader.ensure([...keys])` first; the
+/// cache throws `SupdbCacheMiss` rather than serve a byte it does not hold.
+export async function openCached(wasm, cache) {
+  let mem = null;
+  const host = {
+    supdb_host_len: () => cache.length,
+    supdb_host_read: (off, ptr, len) => {
+      try {
+        // Via a detached buffer, same reason as openSyncHandle: the wasm
+        // memory can grow between planning this call and making it.
+        const tmp = new Uint8Array(len);
+        cache.readInto(off, tmp);
+        new Uint8Array(mem.buffer).set(tmp, ptr);
+        return 0;
+      } catch (e) {
+        // Surfaced on the JS side too: the module reports "host refused",
+        // and this names which byte was not resident.
+        cache.lastReadError = e;
+        return 1;
+      }
+    },
+  };
+  const instance = await instantiate(wasm, host);
+  mem = instance.exports.memory;
+  const mod = new Module(instance, "cached");
+  const e = instance.exports;
+
+  const probe = e.supdb_open_probe();
+  await cache.ensure([[0, probe]]);
+  const head = new Uint8Array(Math.min(probe, cache.length));
+  cache.readInto(0, head);
+  const framed = mod.withKey(head, (p, l) => e.supdb_open_plan(p, l, cache.length));
+  if (framed === 0xffffffff) throw new Error(mod.lastError());
+  await cache.ensure(mod.ranges());
+
+  const h = e.supdb_open_host();
+  if (h === 0xffffffff) {
+    const why = cache.lastReadError ? ` (${cache.lastReadError})` : "";
+    throw new Error(mod.lastError() + why);
+  }
+  const reader = new SupdbReader(mod, h);
+  reader.cache = cache;
+  return reader;
 }
 
 /// Download an object into OPFS once and hand back a synchronous handle.
