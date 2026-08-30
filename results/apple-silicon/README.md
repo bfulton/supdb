@@ -81,7 +81,7 @@ The x86 read comparison (`EXT.11`) uses the buffered arm and cannot
 separate the engines; if a read lead exists anywhere, this host is where
 to measure it properly.
 
-## The read axis, where x86 could not answer (run 1 of 2)
+## The read axis, where x86 could not answer (replicated)
 
 The same day EXT.11 flipped to `fails` on x86 -- 1.243x at p=0.37 and 1.179x
 at p=0.13, two runs unable to separate the engines -- the buffered pair on
@@ -92,7 +92,9 @@ this host separated them at the first attempt
 corroborates from a different supdb arm: 2.25M reads/s against the same
 lmdb 1.07M, comparator agreeing across the two runs to 0.2%.
 
-Provisional until run 2 of the pair lands, per house rule. If it holds, the
+Run 2 (`ext-kv-buffered-read.run2.json`) replicates it: reads 2.414x at
+p=0.0022 (2,584,672 vs 1,070,531 -- each arm agreeing with run 1 to under
+0.4%), scan 1.178x, and it held that tightness under loadavg 4.6-5.6. The
 honest statement is architecture-conditional: on x86 the read paths cannot
 be told apart; on Apple Silicon (128-byte lines, 16 KiB pages) supdb reads
 2.4x faster and scans 1.17x faster. Which of the two mechanisms -- the

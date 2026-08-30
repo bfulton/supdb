@@ -115,7 +115,7 @@ The matched scorecard against LMDB, `full`, all four failing:
 |---|---|---|---|
 | load, both durable (`EXT.9`) | 152,990/s | 687,389/s | **0.223x** |
 | load, neither (`EXT.10`) | 783,142/s | 1,304,518/s | unmeasurable, see below |
-| read (`EXT.11`) | 1,411,746/s | 1,135,799/s | 1.243x, no difference |
+| read (`EXT.11`) | 1,411,746/s | 1,135,799/s | 1.243x, no difference; 2.42x on Apple Silicon, replicated |
 | scan, cold (`EXT.12`) | 29.4M/s | 28.1M/s | 1.046x, no difference |
 
 `EXT.9` has moved twice, each time for a decomposed reason: 6,735 -> 54,333
