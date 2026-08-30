@@ -2477,7 +2477,7 @@ impl Store {
                     0
                 };
                 let t = std::time::Instant::now();
-            let r = flatindex::encode(&all, gen, p, key_hash, slack);
+            let r = flatindex::encode(&all, gen, p, key_hash, slack, self.opts.parallel_index);
             ckpt_phase("encode", t, Some(all.len()));
             r
             } else {
@@ -3349,6 +3349,13 @@ pub fn take_phases() -> Phases {
         pwrite_ns: P_PWRITE.swap(0, Relaxed),
         fsync_ns: P_FSYNC.swap(0, Relaxed),
         bytes: CKPT_BYTES.swap(0, Relaxed),
+    }
+}
+
+/// Sub-phases of `flatindex::encode`, printed under the same env var.
+pub(crate) fn enc_phase(what: &str, t: std::time::Instant) {
+    if std::env::var_os("SUPDB_CKPT_PHASES").is_some() {
+        eprintln!("      enc:{what} {:.4}s", t.elapsed().as_secs_f64());
     }
 }
 

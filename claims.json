@@ -800,14 +800,14 @@
    "id": "F34.1",
    "profile": "full",
    "expect": "holds",
-   "because": "0.0418s against 0.0697s -- 1.667x at p=0.0009 on four cores. The gathered keys are split, the parts sorted on scoped threads and the runs merged sequentially. A comparison here is a memcmp of two keys, so the sort is comparison bound rather than move bound, which is the shape that parallelises. Below 64k keys it does not engage at all: the threads cost more than the sort, and small checkpoints are the common case."
+   "because": "0.087s against 0.1678s -- 1.930x at p=0.0009 on four cores, for the whole index build. Every part of it is threaded: the sort splits and merges (0.079s to 0.051s); the record loop splits because `rec_offs` is a prefix sum, so a range of keys owns a contiguous range of record bytes and its directory entries are `i*4`, disjoint by construction (0.035s to 0.012s); and the hash claims slots with compare-exchange (0.069s to 0.035s). The hash was two thirds of the encode and the last part done, which is why the first version of this claim measured only 1.253x -- parallelising the visible half of a phase and stopping is how an inch gets left behind. Below 64k keys none of it engages: threads cost more than the work, and small checkpoints are the common case."
   },
   {
    "experiment": "f34-parallelindex",
    "id": "F34.2",
    "profile": "full",
    "expect": "fails",
-   "because": "961,011 ops/s against 920,444 -- 1.044x at p=0.1252, no difference. The sort really is 1.667x faster (F34.1) and it saves 0.028s of a 1.04s load, which is 2.7% and under this host's noise. f31 priced the ceiling at 7% for the sort alone before this was written, and that is the point of having decomposed the load first: an optimisation whose best case is single digits has to clear the variance of the thing it sits inside, and 'the sort got faster' is a different question from 'the load got faster'. Set against F33.1, where making the index 37% smaller moved the same load by 1.403x, the conclusion is that on this shape the bytes are the bottleneck and the CPU that produces them is not. Recorded as failing rather than deleted so the ceiling stays visible: parallelising the encode as well would roughly double the saving and still be under 6%."
+   "because": "995,460 ops/s against 957,516 -- 1.040x at p=0.2502, still no difference, with the build now 1.930x faster rather than 1.667x. It saves 0.081s of a 1.0s load, which is 8%, and this host cannot resolve 8% end to end: EXT.1 has moved 0.866x to 1.331x here with no code change at all. Recorded as failing because that is what the gate says, and the useful form of the result is the pair -- gate the phase, where 1.930x at p=0.0009 is unambiguous, and report the load contribution as arithmetic. An 8% saving that cannot be measured end to end on the available machine is still 8%; what it is not is evidence, and the two should not be confused. The Mac runner holds ratios to 1.2-5.0% across runs and could resolve it."
   }
  ],
  "metrics": [

@@ -259,6 +259,7 @@ pub fn encode(
     prev: Option<(u64, u64, u64, u64, u64)>,
     hash_of: fn(&[u8]) -> u64,
     insert_slack: usize,
+    parallel: bool,
 ) -> Option<(Vec<u8>, usize)> {
     let p = plan(all, insert_slack)?;
     // Only the part with anything in it. The header still describes the full
@@ -319,24 +320,85 @@ pub fn encode(
     }
 
     // Records, then the rank directory, then the hash over them.
-    for (i, (k, exts)) in all.iter().enumerate() {
-        let base = recs_off + p.rec_offs[i] as usize;
-        let slice = exts.as_slice();
-        out[base..base + 2].copy_from_slice(&(k.len() as u16).to_le_bytes());
-        out[base + 2..base + 4].copy_from_slice(&(slice.len() as u16).to_le_bytes());
-        out[base + 4..base + 4 + k.len()].copy_from_slice(k);
-        let mut e_at = base + align_up(4 + k.len(), REC_ALIGN);
-        for e in slice {
-            out[e_at..e_at + 4].copy_from_slice(&e.block.to_le_bytes());
-            out[e_at + 4..e_at + 8].copy_from_slice(&e.off.to_le_bytes());
-            out[e_at + 8..e_at + 12].copy_from_slice(&e.len.to_le_bytes());
-            out[e_at + 12..e_at + 16].copy_from_slice(&e.last.to_le_bytes());
-            e_at += 16;
+    //
+    // A key's record goes at `rec_offs[i]`, which is a prefix sum, so a range
+    // of keys writes a *contiguous* range of record bytes; its directory entry
+    // goes at `i * 4`. Both regions are disjoint per key and the two regions
+    // are disjoint from each other, so this loop splits cleanly across threads
+    // with no synchronisation and no atomics -- the offsets were already
+    // computed by `plan`.
+    let _t_enc = std::time::Instant::now();
+    let write_records = |recs: &mut [u8], dir: &mut [u8], from: usize, upto: usize| {
+        // `from == upto` on an empty index, and there is no first record to
+        // take a base from.
+        if from >= upto {
+            return;
         }
-        let d = dir_off + i * 4;
-        out[d..d + 4].copy_from_slice(&p.rec_offs[i].to_le_bytes());
+        let rec_base = p.rec_offs[from] as usize;
+        for (i, (k, exts)) in all.iter().enumerate().take(upto).skip(from) {
+            let (k, exts) = (*k, *exts);
+            let base = p.rec_offs[i] as usize - rec_base;
+            let slice = exts.as_slice();
+            recs[base..base + 2].copy_from_slice(&(k.len() as u16).to_le_bytes());
+            recs[base + 2..base + 4].copy_from_slice(&(slice.len() as u16).to_le_bytes());
+            recs[base + 4..base + 4 + k.len()].copy_from_slice(k);
+            let mut e_at = base + align_up(4 + k.len(), REC_ALIGN);
+            for e in slice {
+                recs[e_at..e_at + 4].copy_from_slice(&e.block.to_le_bytes());
+                recs[e_at + 4..e_at + 8].copy_from_slice(&e.off.to_le_bytes());
+                recs[e_at + 8..e_at + 12].copy_from_slice(&e.len.to_le_bytes());
+                recs[e_at + 12..e_at + 16].copy_from_slice(&e.last.to_le_bytes());
+                e_at += 16;
+            }
+            let d = (i - from) * 4;
+            dir[d..d + 4].copy_from_slice(&p.rec_offs[i].to_le_bytes());
+        }
+    };
+
+    let threads = if parallel {
+        std::thread::available_parallelism()
+            .map(|t| t.get())
+            .unwrap_or(1)
+            .min(8)
+    } else {
+        1
+    };
+    if threads < 2 || all.len() < 64 * 1024 {
+        let (head, recs) = out.split_at_mut(recs_off);
+        let dir = &mut head[dir_off..dir_off + all.len() * 4];
+        write_records(recs, dir, 0, all.len());
+    } else {
+        let per = all.len().div_ceil(threads);
+        let (head, mut recs) = out.split_at_mut(recs_off);
+        let mut dir = &mut head[dir_off..dir_off + all.len() * 4];
+        let mut parts: Vec<(&mut [u8], &mut [u8], usize, usize)> = Vec::with_capacity(threads);
+        let mut from = 0usize;
+        while from < all.len() {
+            let upto = (from + per).min(all.len());
+            // The record bytes this range owns run to the next range's first
+            // record, or to the end of what was written for the last range.
+            let rec_end = if upto == all.len() {
+                recs.len()
+            } else {
+                p.rec_offs[upto] as usize - p.rec_offs[from] as usize
+            };
+            let (r, rrest) = recs.split_at_mut(rec_end);
+            let (d, drest) = dir.split_at_mut((upto - from) * 4);
+            parts.push((r, d, from, upto));
+            recs = rrest;
+            dir = drest;
+            from = upto;
+        }
+        std::thread::scope(|sc| {
+            for (r, d, a, b) in parts {
+                let f = &write_records;
+                sc.spawn(move || f(r, d, a, b));
+            }
+        });
     }
 
+    crate::store::enc_phase("recs", _t_enc);
+    let _t_enc = std::time::Instant::now();
     // The fence: every stride-th key copied out, with one more offset than
     // entries so an entry's key is the span to the next.
     let mut blob_at = p.fence_blob_off;
@@ -352,22 +414,96 @@ pub fn encode(
         out[o..o + 4].copy_from_slice(&(p.fence_blob_len as u32).to_le_bytes());
     }
 
+    crate::store::enc_phase("fence", _t_enc);
+    let _t_enc = std::time::Instant::now();
     let mask = p.hash_cap - 1;
-    for (i, (k, _)) in all.iter().enumerate() {
-        let h = hash_of(k);
-        // The tag is forced non-zero so an occupied slot is never all zero,
-        // which is what marks a slot empty.
-        let tag = ((h >> 56) | 1) & 0xff;
-        let packed = (tag << 56) | p.rec_offs[i] as u64;
-        let mut s = (h as usize) & mask;
-        loop {
-            let at = hash_off + s * SLOT;
-            if rd_u64(&out, at) == Some(0) {
-                out[at..at + 8].copy_from_slice(&packed.to_le_bytes());
-                break;
+    // The hash is two thirds of the encode: the probe writes land at random
+    // slots in a table that is 16MB at a million keys, so it is miss-bound
+    // rather than compute-bound, which is the shape more memory-level
+    // parallelism helps most.
+    //
+    // Claiming a slot with compare-exchange makes it safe to do from several
+    // threads -- each key ends up owning exactly one slot. It does change
+    // where colliding keys land: the sequential loop always gives the earlier
+    // key the earlier slot, and here it goes to whichever thread arrived
+    // first. Every lookup still finds every key.
+    //
+    // I wrote "and the file is no longer reproducible byte for byte" here and
+    // then checked it, which was wrong: two *sequential* builds of the same
+    // input already differ, so this introduces no reproducibility that was
+    // there to lose. A superblock timestamp is enough on its own. The claim
+    // that survives is narrower -- the index section's slot order becomes
+    // scheduling-dependent -- and it is not a cost anything in this repository
+    // currently relies on.
+    let aligned = (out.as_ptr() as usize + hash_off).is_multiple_of(8);
+    if !parallel || threads < 2 || all.len() < 64 * 1024 || !aligned {
+        for (i, (k, _)) in all.iter().enumerate() {
+            let h = hash_of(k);
+            // The tag is forced non-zero so an occupied slot is never all zero,
+            // which is what marks a slot empty.
+            let tag = ((h >> 56) | 1) & 0xff;
+            let packed = (tag << 56) | p.rec_offs[i] as u64;
+            let mut s = (h as usize) & mask;
+            loop {
+                let at = hash_off + s * SLOT;
+                if rd_u64(&out, at) == Some(0) {
+                    out[at..at + 8].copy_from_slice(&packed.to_le_bytes());
+                    break;
+                }
+                s = (s + 1) & mask;
             }
-            s = (s + 1) & mask;
         }
+    } else {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        /// The slot array, shared across the scope. Every write is a
+        /// compare-exchange on one `AtomicU64`, and the region is checked
+        /// 8-aligned above, so this is a shared `&[AtomicU64]` in all but
+        /// spelling.
+        struct Slots(*mut AtomicU64, usize);
+        // SAFETY: the pointer addresses `hash_cap` slots inside `out`, which
+        // outlives the scope; every access below is an atomic on one slot.
+        unsafe impl Sync for Slots {}
+        let slots = Slots(
+            unsafe { out.as_mut_ptr().add(hash_off) as *mut AtomicU64 },
+            p.hash_cap,
+        );
+        let per = all.len().div_ceil(threads);
+        std::thread::scope(|sc| {
+            for t in 0..threads {
+                let from = t * per;
+                let upto = ((t + 1) * per).min(all.len());
+                if from >= upto {
+                    break;
+                }
+                let slots = &slots;
+                let rec_offs = &p.rec_offs;
+                sc.spawn(move || {
+                    for (i, (k, _)) in all.iter().enumerate().take(upto).skip(from) {
+                        let h = hash_of(k);
+                        let tag = ((h >> 56) | 1) & 0xff;
+                        let packed = (tag << 56) | rec_offs[i] as u64;
+                        let mut s = (h as usize) & mask;
+                        loop {
+                            debug_assert!(s < slots.1);
+                            // SAFETY: `s` is masked to the table size.
+                            let cell = unsafe { &*slots.0.add(s) };
+                            if cell
+                                .compare_exchange(
+                                    0,
+                                    packed,
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                )
+                                .is_ok()
+                            {
+                                break;
+                            }
+                            s = (s + 1) & mask;
+                        }
+                    }
+                });
+            }
+        });
     }
     Some((out, p.total))
 }
@@ -999,7 +1135,7 @@ mod tests {
     #[test]
     fn every_key_is_found_with_its_extents() {
         let all = corpus(5000);
-        let sec = padded(encode(&refs(&all), 7, None, h, 0).expect("encode"));
+        let sec = padded(encode(&refs(&all), 7, None, h, 0, false).expect("encode"));
         let ix = FlatIndex::parse(&sec).expect("parse");
         assert_eq!(ix.len(), all.len());
         assert_eq!(ix.generation, 7);
@@ -1012,7 +1148,7 @@ mod tests {
     #[test]
     fn absent_keys_are_absent() {
         let all = corpus(2000);
-        let sec = padded(encode(&refs(&all), 1, None, h, 0).unwrap());
+        let sec = padded(encode(&refs(&all), 1, None, h, 0, false).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         for i in 0..2000 {
             let k = format!("absent{i:012}").into_bytes();
@@ -1023,7 +1159,7 @@ mod tests {
     #[test]
     fn rank_order_matches_key_order() {
         let all = corpus(1000);
-        let sec = padded(encode(&refs(&all), 1, None, h, 0).unwrap());
+        let sec = padded(encode(&refs(&all), 1, None, h, 0, false).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         for (i, (k, e)) in all.iter().enumerate() {
             let (gk, ge) = ix.at(&sec, i).expect("rank present");
@@ -1040,7 +1176,7 @@ mod tests {
     fn the_fence_never_changes_where_a_seek_lands() {
         for n in [0usize, 1, 17, 64, 65, 5000] {
             let all = corpus(n);
-            let sec = padded(encode(&refs(&all), 1, None, h, 0).unwrap());
+            let sec = padded(encode(&refs(&all), 1, None, h, 0, false).unwrap());
             let ix = FlatIndex::parse(&sec).expect("parse");
             let mut probes: Vec<Vec<u8>> = Vec::new();
             for (k, _) in &all {
@@ -1077,7 +1213,7 @@ mod tests {
     #[test]
     fn a_damaged_fence_never_changes_an_answer() {
         let all = corpus(2000);
-        let clean = padded(encode(&refs(&all), 1, None, h, 0).unwrap());
+        let clean = padded(encode(&refs(&all), 1, None, h, 0, false).unwrap());
         // Header fields: the fence offsets start at 120, the records at 88.
         let fence_from = rd_u64(&clean, 120).unwrap() as usize;
         let fence_to = rd_u64(&clean, 88).unwrap() as usize;
@@ -1112,7 +1248,7 @@ mod tests {
     #[test]
     fn seek_finds_the_first_key_at_or_after() {
         let all = corpus(500);
-        let sec = padded(encode(&refs(&all), 1, None, h, 0).unwrap());
+        let sec = padded(encode(&refs(&all), 1, None, h, 0, false).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         for (i, (k, _)) in all.iter().enumerate() {
             assert_eq!(ix.seek_with(&sec, k, true), i);
@@ -1126,7 +1262,7 @@ mod tests {
     #[test]
     fn damage_never_panics() {
         let all = corpus(300);
-        let sec = padded(encode(&refs(&all), 1, None, h, 0).unwrap());
+        let sec = padded(encode(&refs(&all), 1, None, h, 0, false).unwrap());
         for i in 0..sec.len() {
             for bit in [0x01u8, 0x80] {
                 let mut d = sec.clone();
@@ -1147,7 +1283,7 @@ mod tests {
     #[test]
     fn truncation_never_panics() {
         let all = corpus(200);
-        let sec = padded(encode(&refs(&all), 1, None, h, 0).unwrap());
+        let sec = padded(encode(&refs(&all), 1, None, h, 0, false).unwrap());
         for cut in 0..sec.len() {
             if let Some(ix) = FlatIndex::parse(&sec[..cut]) {
                 for (k, _) in all.iter().take(20) {
@@ -1162,7 +1298,7 @@ mod tests {
 
     #[test]
     fn an_empty_index_round_trips() {
-        let sec = padded(encode(&refs(&[]), 3, None, h, 0).unwrap());
+        let sec = padded(encode(&refs(&[]), 3, None, h, 0, false).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         assert_eq!(ix.len(), 0);
         assert!(ix.lookup(&sec, b"anything", h).is_none());
@@ -1172,7 +1308,7 @@ mod tests {
     #[test]
     fn the_previous_index_is_carried() {
         let all = corpus(10);
-        let sec = padded(encode(&refs(&all), 9, Some((8, 1234, 4096, 100, 200)), h, 0).unwrap());
+        let sec = padded(encode(&refs(&all), 9, Some((8, 1234, 4096, 100, 200)), h, 0, false).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         assert_eq!(ix.prev, Some((8, 1234, 4096, 100, 200)));
     }

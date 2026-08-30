@@ -3710,7 +3710,7 @@ fn f34_parallelindex(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let ph = supdb::take_phases();
         rows.lock()
             .unwrap()
-            .push((ci, ph.sort_ns as f64 / 1e9, secs));
+            .push((ci, (ph.sort_ns + ph.encode_ns) as f64 / 1e9, secs));
         let _ = store.close();
         let _ = std::fs::remove_file(&file);
         keys as f64 / secs
@@ -3743,10 +3743,13 @@ fn f34_parallelindex(args: &Args, profile: Profile) -> std::io::Result<Record> {
     );
     rec.finding(Finding::new(
         "F34.1",
-        "Sorting the key index across threads speeds up the sort",
+        "Building the key index across threads speeds up the build",
         matches!(sort_cmp.verdict, supdb::bench::Verdict::Greater),
         format!(
-            "sort {:.4}s parallel against {:.4}s sequential ({})",
+            "sort plus encode {:.4}s parallel against {:.4}s sequential ({}). Both halves are \
+             threaded now: the sort splits and merges, and the record loop splits because \
+              is a prefix sum, so a range of keys owns a contiguous range of record \
+             bytes and its directory entries are  -- disjoint by construction, no atomics",
             sort[0].median(),
             sort[1].median(),
             sort_cmp.summary("sequential", "parallel")
