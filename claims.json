@@ -819,6 +819,41 @@
    "profile": "full",
    "expect": "fails",
    "because": "995,460 ops/s against 957,516 -- 1.040x at p=0.2502, still no difference, with the build now 1.930x faster rather than 1.667x. It saves 0.081s of a 1.0s load, which is 8%, and this host cannot resolve 8% end to end: EXT.1 has moved 0.866x to 1.331x here with no code change at all. Recorded as failing because that is what the gate says, and the useful form of the result is the pair -- gate the phase, where 1.930x at p=0.0009 is unambiguous, and report the load contribution as arithmetic. An 8% saving that cannot be measured end to end on the available machine is still 8%; what it is not is evidence, and the two should not be confused. The Mac runner holds ratios to 1.2-5.0% across runs and could resolve it."
+  },
+  {
+   "experiment": "ext-analytics",
+   "id": "EXT.15",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Supdb ranks the 2,000-key day dictionary at 9.22 ns/key against lmdb-dup's 35.09 -- 3.81x at p=0.0022, and 3.91x on the second run of the pair -- scan_counts_fixed against a NEXT_NODUP cursor plus mdb_cursor_count on a DUPSORT|DUPFIXED database, LMDB's genuinely best shape for this data. W2.4's 283x was this walk against Supdb's own varint decode; this is it against an engine that stores the count in its dup tree, and extent arithmetic on a mapped section still beats a B-tree step per key by 3.8x. The checksums-on arm measures 9.15 ns -- identical, because a fixed-stride count touches no block, which doubles as the rig's null check. lmdb-dup is still transactional, so read the win as a bound. Warm, like ext-sweep; EXT.12 owns cold."
+  },
+  {
+   "experiment": "ext-analytics",
+   "id": "EXT.16",
+   "profile": "full",
+   "expect": "holds",
+   "because": "count_fixed answers a point posting-count in 34.73 ns/probe against MDB_SET plus mdb_cursor_count's 257.7 -- 7.42x at p=0.0022, 7.43x on the paired run. W2.2's 27.1x was count_fixed against Supdb's own O(values) walk; this is it against an engine that stores the count, which is exactly the format change W2.3 priced at 14.9 ns for Supdb and declined. The declined four bytes per extent are not what separates the engines: the gap is one hash probe plus a division against a cursor descent."
+  },
+  {
+   "experiment": "ext-analytics",
+   "id": "EXT.17",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Supdb intersects two terms' posting lists at 9,729 ns/pair against lmdb-dup's 7,486 -- 0.769x at p=0.0022 -- recorded as failing on purpose. Supdb's arm is the NAIVE decode-both merge: read_all both lists into reused buffers, then a two-pointer count, because the shipped read paths expose no streaming merge -- every posting is varint-decoded and copied before the merge sees it, where LMDB merges in place across GET_MULTIPLE pages and copies nothing. This entry prices the missing merge kernel; the rank-5 FixedRun work owns building it, and 0.769x is the number it has to move."
+  },
+  {
+   "experiment": "ext-analytics",
+   "id": "EXT.18",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Reading one term's full posting list: 3.44 ns/posting against lmdb-dup's 1.06 -- 0.307x at p=0.0022. The baseline that keeps EXT.15 and EXT.16 honest, and the shape DUPFIXED is built for: 4-byte postings packed end to end, a page per GET_MULTIPLE call, no per-value work. Supdb pays a varint length prefix per posting -- a 5-byte stride for 4-byte data -- and the serial dependent decode W2.1 documents. Claimed as parity and it is not parity; the counts are where the format wins, not the bulk read. One consolation recorded because it is measured: Supdb's file is 5.02 MB against lmdb-dup's 7.33 for the same million postings -- the size axis, lost on ext-kv's 100-byte values, flips on 4-byte fixed-width ones."
+  },
+  {
+   "experiment": "f36-commit",
+   "id": "F36.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "The durable-load device bill is dominated by traffic the engine never explicitly writes. Per-region ledger at full, EXT.9's shape: the log-extents arm sends 608.21 MB to the device, of which explicit writes are 76.4 (log 19.3, blocks 19.3, key section 33.8, block table 4.0, superblocks 0.05) and the RESIDUAL -- mmap-dirtied pages flushed under fsync, plus metadata -- is 531.76 MB, 87.4%. With the log off it is worse: 706.62 of 765.07, 92.4%. The panel's ruling was that the unowned 523 MB from f29 had to decompose before any durability claim moved; it decomposes to one term. The lever this names is not writing fewer bytes -- the explicit ledger is already small -- it is scoping the durability point so fsync stops flushing every scattered 4 KiB index page the batch dirtied: a separate log fd with fdatasync, or sync_file_range on the arena extent. That is rank 1's remaining work, and this is the number it has to move."
   }
  ],
  "metrics": [

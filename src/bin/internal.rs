@@ -3770,7 +3770,27 @@ fn f36_commit(args: &Args, profile: Profile) -> std::io::Result<Record> {
             "residual_pct" => J::fp(100.0 * residual / io_mb.max(1e-9), 1)
         });
     }
-    rec.series("arms", J::arr(out));
+    rec.series("arms", J::arr(out.clone()));
+    // The finding is about the shape of the bill, not a race between arms:
+    // does traffic the engine never explicitly wrote dominate the device
+    // bytes of a durable load?
+    if let Some(first) = out.first() {
+        let residual_pct = first.num("residual_pct").unwrap_or(0.0);
+        let io = first.num("device_write_mb").unwrap_or(0.0);
+        let ledger = first.num("ledger_total_mb").unwrap_or(0.0);
+        rec.finding(Finding::new(
+            "F36.1",
+            "A durable load's device bytes are dominated by writes the engine never made explicitly",
+            residual_pct > 50.0,
+            format!(
+                "{io:.1} MB reach the device; the explicit per-region ledger accounts for \
+                 {ledger:.1} MB and the residual -- mmap-dirtied pages flushed under fsync, plus \
+                 filesystem metadata -- is {residual_pct:.1}%. The lever this names is not \
+                 writing fewer bytes; it is scoping the durability point so fsync stops flushing \
+                 every scattered 4KiB index page the batch dirtied"
+            ),
+        ));
+    }
     Ok(rec)
 }
 
