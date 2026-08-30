@@ -222,6 +222,13 @@ the misparse as file corruption, and an in-place checkpoint that republished a
 record into its hash slot and not its directory entry -- so `read_all` returned
 the new value and `scan` the previous one, silently, for every key it touched.
 
+Also fixed: `put` probed the key table twice per call -- `get_or_insert` and
+then `index_of` -- immediately below a comment saying it probes once. One
+probe now, 11.3% of the put path's instructions, measured with cachegrind
+because the path is memory bound and the saving is compute: 1,739 to 1,543
+instructions per key, D1 misses unchanged at 26. No wall-clock claim is made
+and none should be.
+
 Also fixed: a store recorded nothing about the byte order that wrote it. Every
 scalar goes to disk little-endian, but the two structures that make this format
 fast are addressed in place regardless -- `flatindex` hands back `&[Ext]`

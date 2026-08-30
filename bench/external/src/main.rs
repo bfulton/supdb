@@ -39,6 +39,11 @@ fn scratch(name: &str) -> PathBuf {
 
 struct Args(Vec<String>);
 impl Args {
+    /// A bare flag, with no value after it. `get` would return whatever
+    /// followed, which for a trailing flag is nothing at all.
+    fn has(&self, n: &str) -> bool {
+        self.0.iter().any(|a| a == n)
+    }
     fn get(&self, n: &str) -> Option<&str> {
         self.0
             .iter()
@@ -365,7 +370,15 @@ fn load_profile(args: &Args, which: &[&str]) -> std::io::Result<()> {
     // worth measuring directly rather than inferring from a miss profile.
     let puts = t.elapsed().as_secs_f64();
     let ts = Instant::now();
-    e.sync().expect("sync");
+    // `--skip-sync` leaves the flush and the checkpoint out entirely, because
+    // cachegrind attributes to the process: a run that syncs mixes the put
+    // path with `checkpoint_inner` and `seal_shard`, and those dominate. The
+    // first attempt at this profile did exactly that and had to be thrown
+    // away -- the giveaway was `checkpoint_inner` at 13.6% of write misses in
+    // what was supposed to be a put-only trace.
+    if !args.has("--skip-sync") {
+        e.sync().expect("sync");
+    }
     let sync = ts.elapsed().as_secs_f64();
     let secs = puts + sync;
     println!(

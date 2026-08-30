@@ -193,6 +193,54 @@ design. The 41% is I/O on a structure whose size is a format decision already
 measured elsewhere. A miss count says where misses are, not which phase is
 slow, and an instruction count says neither.
 
+## The put path, and the profile that had to be thrown away
+
+The whole-load decomposition (F31.1) puts 43% in `put`, against LMDB's
+equivalent 0.100s lower. That difference is larger than everything lever 2
+saved and it had never been looked at, because it is the phase that was
+never the suspect.
+
+**The first attempt at this profile was invalid and looked fine.** `loadprof`
+syncs at the end, and cachegrind attributes to the process, so the trace was
+the put path *plus* `checkpoint_inner` and `seal_shard` -- and those dominate.
+The giveaway was `checkpoint_inner` at 13.6% of write misses in what was
+supposed to be a put-only run. `--skip-sync` exists for this, and the fix is
+worth stating: a profile of "phase X" that contains phase Y is not a noisy
+profile, it is a profile of something else.
+
+Measured properly, 200k keys, baseline-subtracted, per key:
+
+| | Supdb | LMDB | |
+|---|---|---|---|
+| instructions | 1,739 | 3,450 | Supdb uses **half** |
+| D1 misses | 26.1 | 13.2 | 2.0x |
+| **LL misses** | **10.2** | **0.25** | **41x** |
+
+**Supdb's put path is memory bound and LMDB's is compute bound.** Supdb does
+half the work per key and is still 1.29x slower in wall clock. `cg_annotate`
+puts 56% of the read misses and 55% of the writes in `__memcpy`, which is the
+value being copied into the shard arena -- inherent, since a buffered write
+has to buffer. LMDB reuses a small set of dirty pages that stay cache
+resident; Supdb accumulates into arenas that are written once and never read,
+so every cache line is compulsory.
+
+That is a design property rather than a defect, and it bounds what tuning the
+put path can return. What it does not excuse is redundant work, and there was
+some: `put` called `get_or_insert(key)` and then `index_of(key)` -- two hash
+probes of the same key -- directly below a comment reading "a put probes once
+rather than twice". `slot_or_insert` returns the index, so it does now:
+
+| put path, per key | before | after |
+|---|---|---|
+| instructions | 1,739 | **1,543** |
+| D1 misses | 26.1 | 26.0 |
+
+Exact, because cachegrind is a simulation and does not need repetitions.
+11.3% of the path's instructions, and no claim is made about wall clock: the
+path is memory bound, the saving is compute, and this host cannot resolve
+either at that size. An instruction count is the right unit for a change like
+this precisely because it is not a timing.
+
 ## Reproducibility, independent of tooling
 
 These matter more than the tools and cost nothing. Every one is now checked at

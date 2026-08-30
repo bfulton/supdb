@@ -1847,6 +1847,7 @@ impl Store {
         // value therefore touches one map, not two.
         let arena_on = self.opts.pending_arena;
         let budget = self.opts.buffer_bytes / self.shards.len();
+        let put_idx;
         {
             // Disjoint field borrows: the entry lives in `keys` and the bytes
             // go in `arena`, so both are needed at once. Probing twice to
@@ -1858,7 +1859,9 @@ impl Store {
                 pending_bytes,
                 ..
             } = &mut *sh;
-            let e = keys.get_or_insert(key);
+            let idx = keys.slot_or_insert(key);
+            put_idx = idx;
+            let e = keys.entry_at(idx);
             let p = e.pending.get_or_insert_with(Pending::default);
             let before = p.nbytes();
             if arena_on {
@@ -1904,8 +1907,9 @@ impl Store {
         // value, including one already staged in the block builder by an
         // inline seal. Left in place, `flush_builder` would push the
         // superseded extent onto the entry after this replacement lands.
-        if let Some(idx) = sh.keys.index_of(key) {
-            sh.members.retain(|m| m.0 != idx);
+        // The index came from the probe above rather than a second one.
+        if !sh.members.is_empty() {
+            sh.members.retain(|m| m.0 != put_idx);
         }
         // Honour the buffer the caller asked for. `append` has always sealed
         // here and `put` never did, so a put-only workload -- which is every

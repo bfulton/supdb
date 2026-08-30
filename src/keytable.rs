@@ -165,9 +165,21 @@ impl<P> KeyTable<P> {
 
     /// Find the key, inserting an empty entry if it is not present.
     pub fn get_or_insert(&mut self, key: &[u8]) -> &mut Entry<P> {
+        let idx = self.slot_or_insert(key);
+        &mut self.entries[idx as usize]
+    }
+
+    /// The same, returning the index instead of the entry.
+    ///
+    /// `put` needs both: the entry to write the pending value into, and the
+    /// index to cancel any staged member for the key. It used to call
+    /// `get_or_insert` and then `index_of`, which is two probes of the same
+    /// key on every put -- with a comment two lines above claiming "a put
+    /// probes once rather than twice". It does now.
+    pub fn slot_or_insert(&mut self, key: &[u8]) -> u32 {
         let h = hash(key);
         if let Some(idx) = self.find(key, h) {
-            return &mut self.entries[idx as usize];
+            return idx;
         }
         if (self.entries.len() + 1) * LOAD_DEN > self.slots.len() * LOAD_NUM {
             self.grow();
@@ -182,7 +194,7 @@ impl<P> KeyTable<P> {
             pending: None,
         });
         self.place(h, idx, key, key_off);
-        &mut self.entries[idx as usize]
+        idx
     }
 
     fn place(&mut self, h: u64, idx: u32, key: &[u8], key_off: u32) {
