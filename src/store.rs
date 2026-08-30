@@ -628,6 +628,14 @@ pub struct Options {
     /// 169 MB/s (docs/profiling.md), which is slow for what should mostly be
     /// page-cache writes, and the obvious suspect is block allocation on a
     /// growing file rather than bandwidth. f32 settles it.
+    /// Sort the key index across threads instead of on the checkpointing one.
+    ///
+    /// Off by default until measured. f31 puts the sort and the encode at 33%
+    /// of a checkpoint, so this is the half of that split which parallelises
+    /// -- the fsync does not -- and f31 already priced its ceiling at 15% of a
+    /// bulk load. The gather still holds every shard lock, so this shortens
+    /// the span rather than removing it.
+    pub parallel_index: bool,
     pub preallocate: bool,
     pub index_inserts: bool,
     pub redo_log: bool,
@@ -703,6 +711,7 @@ impl Default for Options {
             checksums: true,
             pending_arena: true,
             seal_on_put: true,
+            parallel_index: false,
             preallocate: false,
             index_inserts: false,
             redo_log: false,
@@ -2424,7 +2433,11 @@ impl Store {
                     all.extend(sh.keys.iter().map(|(k, e)| (k, &e.extents)));
                 }
                 let t = std::time::Instant::now();
-                all.sort_unstable_by(|a, b| a.0.cmp(b.0));
+                if self.opts.parallel_index {
+                    sort_keys_parallel(&mut all);
+                } else {
+                    all.sort_unstable_by(|a, b| a.0.cmp(b.0));
+                }
                 ckpt_phase("sort", t, Some(all.len()));
             }
         }
@@ -3360,6 +3373,89 @@ fn ckpt_phase(what: &str, t: std::time::Instant, extra: Option<usize>) {
         Some(n) => eprintln!("  {what} {secs:.4}s ({n})"),
         None => eprintln!("  {what} {secs:.4}s"),
     }
+}
+
+/// Sort the gathered keys across threads, then merge the runs.
+///
+/// A comparison here is a `memcmp` of two keys, so the sort is comparison
+/// bound rather than move bound, which is the shape that parallelises well.
+/// The merge is sequential and linear, and with four runs it is cheap next to
+/// the sort it replaces.
+///
+/// Scoped threads because the items borrow from shard guards the caller is
+/// holding: nothing outlives this call, so nothing has to be copied to be
+/// sent.
+fn sort_keys_parallel(all: &mut Vec<(&[u8], &Extents)>) {
+    let n = all.len();
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1)
+        .min(8);
+    // Below this the threads cost more than the sort. Measured rather than
+    // guessed would be better; this is a floor to keep small checkpoints off
+    // the thread path entirely, and small checkpoints are the common case.
+    if threads < 2 || n < 64 * 1024 {
+        all.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        return;
+    }
+    let chunk = n.div_ceil(threads);
+    {
+        let mut rest: &mut [(&[u8], &Extents)] = all.as_mut_slice();
+        let mut parts: Vec<&mut [(&[u8], &Extents)]> = Vec::with_capacity(threads);
+        while !rest.is_empty() {
+            let take = chunk.min(rest.len());
+            let (a, b) = rest.split_at_mut(take);
+            parts.push(a);
+            rest = b;
+        }
+        std::thread::scope(|s| {
+            for p in parts {
+                s.spawn(move || p.sort_unstable_by(|a, b| a.0.cmp(b.0)));
+            }
+        });
+    }
+    // Merge the sorted runs. Repeated pairwise merging rather than a heap:
+    // with at most eight runs the heap's bookkeeping costs more than the
+    // extra passes, and the passes are sequential memory.
+    let mut bounds: Vec<(usize, usize)> = (0..n)
+        .step_by(chunk)
+        .map(|a| (a, (a + chunk).min(n)))
+        .collect();
+    let mut src: Vec<(&[u8], &Extents)> = std::mem::take(all);
+    let mut dst: Vec<(&[u8], &Extents)> = Vec::with_capacity(n);
+    while bounds.len() > 1 {
+        dst.clear();
+        let mut next = Vec::with_capacity(bounds.len().div_ceil(2));
+        let mut i = 0;
+        while i < bounds.len() {
+            let (a0, a1) = bounds[i];
+            if i + 1 == bounds.len() {
+                let start = dst.len();
+                dst.extend_from_slice(&src[a0..a1]);
+                next.push((start, dst.len()));
+                break;
+            }
+            let (b0, b1) = bounds[i + 1];
+            let start = dst.len();
+            let (mut x, mut y) = (a0, b0);
+            while x < a1 && y < b1 {
+                if src[x].0 <= src[y].0 {
+                    dst.push(src[x]);
+                    x += 1;
+                } else {
+                    dst.push(src[y]);
+                    y += 1;
+                }
+            }
+            dst.extend_from_slice(&src[x..a1]);
+            dst.extend_from_slice(&src[y..b1]);
+            next.push((start, dst.len()));
+            i += 2;
+        }
+        std::mem::swap(&mut src, &mut dst);
+        bounds = next;
+    }
+    *all = src;
 }
 
 fn write_section_raw(

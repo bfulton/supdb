@@ -1561,3 +1561,63 @@ fn inserting_in_place_changes_no_answer() {
     assert_eq!(on, off, "double-buffering the directory changed an answer");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Sorting the key index across threads produces the same index.
+///
+/// `Options::parallel_index` splits the gathered keys, sorts the parts on
+/// separate threads and merges the runs. f31 puts the sort and the encode at
+/// a third of a checkpoint, and the sort is the half that parallelises.
+///
+/// A sort is exactly the kind of change that can be subtly wrong and still
+/// look right: an off-by-one at a run boundary loses or duplicates a key in
+/// the middle of a million, and every spot check passes. So this compares the
+/// whole published order, key by key, against the single-threaded arm -- and
+/// uses enough keys to clear the threshold below which the parallel path
+/// declines to engage at all, because a test that silently takes the
+/// sequential branch tests nothing.
+#[test]
+fn sorting_the_index_in_parallel_changes_no_order() {
+    fn build(parallel: bool, dir: &std::path::Path) -> Vec<Vec<u8>> {
+        let path = dir.join("s.dat");
+        let s = Store::create(
+            &path,
+            Options {
+                parallel_index: parallel,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Above the 64k floor, and deliberately not a multiple of the chunk
+        // size, so the last run is short and the merge has an odd tail.
+        let n = 70_001u32;
+        let mut kb = [0u8; 12];
+        for i in 0..n {
+            // Scattered, so the sort has real work: sequential keys would be
+            // sorted already and a broken merge could still look correct.
+            let k = i.wrapping_mul(2_654_435_761);
+            kb[..4].copy_from_slice(&k.to_le_bytes());
+            kb[4..8].copy_from_slice(&i.to_le_bytes());
+            s.put(&kb, b"v").unwrap();
+        }
+        s.checkpoint().unwrap();
+        let mut order = Vec::with_capacity(n as usize);
+        s.scan(None, usize::MAX, |k, _| order.push(k.to_vec())).unwrap();
+        s.close().unwrap();
+        assert_eq!(order.len(), n as usize, "parallel={parallel}: lost keys");
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(order, sorted, "parallel={parallel}: not in key order");
+        order
+    }
+
+    let base = std::env::temp_dir().join(format!("supdb-psort-{}", std::process::id()));
+    let (a, b) = (base.join("par"), base.join("seq"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    assert_eq!(
+        build(true, &a),
+        build(false, &b),
+        "the parallel sort changed the published order"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -794,6 +794,20 @@
    "profile": "full",
    "expect": "fails",
    "because": "1,884,035 reads/s flat against 1,906,483 varint -- 0.988x at p=0.6365, no difference at 1M keys. F11.3 measures 1.25x for the flat index at 5M keys and both are right: the heap index it replaces costs 186 bytes per key resident, which is 930MB at 5M keys and comfortable at 1M. So the flat index's read advantage arrives with scale, while its costs are paid at every size -- 1.403x on a bulk load (F33.1) and +73.5% on the file (F11.4). Recorded as failing because a layout chosen for reads that does not help reads at the size being measured is a cost with no return there, and the honest conclusion is not that the flat index is wrong but that fixing it at compile time is: this is the same shape as `Readahead::Auto`, which picks by file-to-memory ratio rather than being set once."
+  },
+  {
+   "experiment": "f34-parallelindex",
+   "id": "F34.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "0.0418s against 0.0697s -- 1.667x at p=0.0009 on four cores. The gathered keys are split, the parts sorted on scoped threads and the runs merged sequentially. A comparison here is a memcmp of two keys, so the sort is comparison bound rather than move bound, which is the shape that parallelises. Below 64k keys it does not engage at all: the threads cost more than the sort, and small checkpoints are the common case."
+  },
+  {
+   "experiment": "f34-parallelindex",
+   "id": "F34.2",
+   "profile": "full",
+   "expect": "fails",
+   "because": "961,011 ops/s against 920,444 -- 1.044x at p=0.1252, no difference. The sort really is 1.667x faster (F34.1) and it saves 0.028s of a 1.04s load, which is 2.7% and under this host's noise. f31 priced the ceiling at 7% for the sort alone before this was written, and that is the point of having decomposed the load first: an optimisation whose best case is single digits has to clear the variance of the thing it sits inside, and 'the sort got faster' is a different question from 'the load got faster'. Set against F33.1, where making the index 37% smaller moved the same load by 1.403x, the conclusion is that on this shape the bytes are the bottleneck and the CPU that produces them is not. Recorded as failing rather than deleted so the ceiling stays visible: parallelising the encode as well would roughly double the saving and still be under 6%."
   }
  ],
  "metrics": [

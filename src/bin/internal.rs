@@ -112,6 +112,7 @@ fn main() -> std::io::Result<()> {
             "f31-loadphases" => f31_loadphases(&args, profile)?,
             "f32-prealloc" => f32_prealloc(&args, profile)?,
             "f33-indexsize" => f33_indexsize(&args, profile)?,
+            "f34-parallelindex" => f34_parallelindex(&args, profile)?,
             "f28-count" => f28_count(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
@@ -158,6 +159,7 @@ fn main() -> std::io::Result<()> {
                 "f31-loadphases",
                 "f32-prealloc",
                 "f33-indexsize",
+                "f34-parallelindex",
                 "f28-count",
                 "f4-durability",
                 "f3-multiproc",
@@ -3651,6 +3653,122 @@ fn f11_child(args: &Args) -> std::io::Result<()> {
 /// bit flip, a torn write or a reused slot returns silently wrong data,
 /// because LZ4 decodes many corrupted inputs into plausible bytes. The
 /// question is only what it costs.
+/// Does sorting the index across threads pay for itself?
+///
+/// f31 measured the ceiling before this was built: sort plus encode is 0.165s
+/// of a 1.016s load, so parallelising the whole build caps at 15%, and this
+/// does only the sort -- 0.072s of it, so about 7% if it were free and
+/// perfect. Four cores here.
+///
+/// The point of measuring a change whose ceiling is already known is that the
+/// ceiling is not the answer. Threads cost something to start, the merge is
+/// sequential, and the gather still holds every shard lock, so what this
+/// actually returns is a question rather than an estimate.
+fn f34_parallelindex(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let keys = args.num("--keys", profile.pick(200_000, 500_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+
+    let mut rec = Record::new("f34-parallelindex", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .param(
+            "threads",
+            J::u(std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1) as u64),
+        )
+        .note("both arms interleaved; the only difference is Options::parallel_index");
+
+    let dir = scratch("f34");
+    let payload = Payload::new(value_size, 0.5, 0xF34);
+    let on = [true, false];
+    type Row = (usize, f64, f64);
+    let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
+    let trial = Trial::new(profile.reps());
+    let load = trial.run(2, |ci, rep| {
+        let file = dir.join(format!("p{ci}-{rep}.dat"));
+        let _ = std::fs::remove_file(&file);
+        let store = Store::create(
+            &file,
+            Options {
+                parallel_index: on[ci],
+                ..default_opts(256)
+            },
+        )
+        .expect("create");
+        let _ = supdb::take_phases();
+        let mut vrng = Rng::new(0xF34 + rep as u64);
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+        }
+        store.flush().expect("flush");
+        store.checkpoint().expect("checkpoint");
+        let secs = t.elapsed().as_secs_f64();
+        let ph = supdb::take_phases();
+        rows.lock()
+            .unwrap()
+            .push((ci, ph.sort_ns as f64 / 1e9, secs));
+        let _ = store.close();
+        let _ = std::fs::remove_file(&file);
+        keys as f64 / secs
+    });
+
+    let pick = |c: usize, f: fn(&Row) -> f64| -> Samples {
+        let all = rows.lock().unwrap();
+        Samples::new(all.iter().filter(|r| r.0 == c).map(f).collect())
+    };
+    let sort: Vec<Samples> = (0..2).map(|c| pick(c, |r| r.1)).collect();
+    // Lower is better for the sort itself, so that comparison runs the other
+    // way round from the throughput one.
+    let sort_cmp = compare(&sort[1], &sort[0], supdb::bench::MIN_EFFECT);
+    let load_cmp = compare(&load[0], &load[1], supdb::bench::MIN_EFFECT);
+    rec.compare("sort_sequential_vs_parallel", sort_cmp.clone());
+    rec.compare("load_parallel_vs_sequential", load_cmp.clone());
+    rec.series(
+        "arms",
+        J::arr(
+            (0..2)
+                .map(|ci| {
+                    jobj! {
+                        "parallel_index" => J::Bool(on[ci]),
+                        "load_ops_per_s" => J::fp(load[ci].median(), 1),
+                        "sort_s" => J::fp(sort[ci].median(), 4)
+                    }
+                })
+                .collect(),
+        ),
+    );
+    rec.finding(Finding::new(
+        "F34.1",
+        "Sorting the key index across threads speeds up the sort",
+        matches!(sort_cmp.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "sort {:.4}s parallel against {:.4}s sequential ({})",
+            sort[0].median(),
+            sort[1].median(),
+            sort_cmp.summary("sequential", "parallel")
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F34.2",
+        "That speed-up is visible in the load it is part of",
+        matches!(load_cmp.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "{:.0} ops/s parallel against {:.0} sequential ({}). f31 put the ceiling at 7% for the \
+             sort alone before this was written, which is the point of measuring it: a change \
+             whose best case is single digits has to clear the noise of the thing it is embedded \
+             in, and that is a different question from whether the sort got faster",
+            load[0].median(),
+            load[1].median(),
+            load_cmp.summary("parallel", "sequential")
+        ),
+    ));
+    Ok(rec)
+}
+
 /// Does a smaller index make a bulk load faster?
 ///
 /// f31 decomposed a 1M-key ordered load and found the excess over LMDB split
