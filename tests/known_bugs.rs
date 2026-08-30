@@ -1239,3 +1239,165 @@ fn the_pending_arena_changes_no_answer() {
     assert_eq!(on.1, off.1, "the arena changed what read_all returns");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A logged checkpoint is durable: reopening finds everything it acknowledged.
+///
+/// `Options::redo_log` splits what `checkpoint` had conflated. f27 measured
+/// the reason: inserting under `Sync::Always` ran at 42,079 ops/s against
+/// 173,446 for updating the same keys with the same checkpoint count, because
+/// any insertion sends `checkpoint_in_place` down the full-rewrite path. A
+/// logged checkpoint writes what changed and fsyncs that, and rewrites the
+/// index only when the arena fills.
+///
+/// The arena is deliberately tiny and the store is reopened repeatedly,
+/// because both bugs this found live at those boundaries rather than away
+/// from them. The first was the log arena missing from the free-list
+/// reconstruction in `Store::open` -- it is a region the superblock points at
+/// and is not one of the three that loop knew about, so a reopened store
+/// handed its own live log to the next allocation and read back a block
+/// checksum mismatch. The comment above that loop describes the same symptom
+/// arriving by a different route. The second was quieter: replayed records are
+/// durable and *unpublished*, so `read_all` found them from the shards while
+/// `scan` walked the index and did not, and a test that checked only
+/// `read_all` would have passed.
+#[test]
+fn a_logged_checkpoint_survives_reopen() {
+    let dir = std::env::temp_dir().join(format!("supdb-redolog-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.dat");
+    let opts = || Options {
+        redo_log: true,
+        // Small enough that the arena fills, is abandoned and reallocated
+        // several times inside one session.
+        log_bytes: 4 * 1024,
+        buffer_bytes: 1 << 16,
+        ..Default::default()
+    };
+
+    let mut model: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = Default::default();
+    {
+        let s = Store::create(&path, opts()).unwrap();
+        s.put(b"seed", b"0").unwrap();
+        model.insert(b"seed".to_vec(), b"0".to_vec());
+        s.checkpoint().unwrap();
+        s.close().unwrap();
+    }
+
+    // Several sessions, each ending in a close, each reopening what the last
+    // one logged. A single round would not have found the free-list bug.
+    for session in 0..6u32 {
+        let s = Store::open(&path, opts()).expect("reopen");
+        for round in 0..12u32 {
+            for k in 0..15u32 {
+                let key = format!("s{session}-k{k:03}");
+                let val = format!("v-{session}-{k}-{round}");
+                s.put(key.as_bytes(), val.as_bytes()).unwrap();
+                model.insert(key.into_bytes(), val.into_bytes());
+            }
+            // Replace a key from an earlier session, so replay has to apply
+            // records in order rather than merge them, and delete another so
+            // the log carries an empty extent list.
+            if session > 0 {
+                let hit = format!("s{}-k000", session - 1);
+                s.put(hit.as_bytes(), b"overwritten").unwrap();
+                model.insert(hit.into_bytes(), b"overwritten".to_vec());
+                let gone = format!("s{}-k001", session - 1);
+                s.delete(gone.as_bytes()).unwrap();
+                model.remove(gone.as_bytes());
+            }
+            s.checkpoint().unwrap();
+        }
+        // Everything acknowledged is readable by both paths before close.
+        for (k, v) in &model {
+            let mut got = Vec::new();
+            s.read_all(k, |x| got.extend_from_slice(x)).unwrap();
+            assert_eq!(&got, v, "session {session}: read_all lost {k:?}");
+        }
+        let mut walked = 0usize;
+        s.scan(None, usize::MAX, |k, v| {
+            walked += 1;
+            assert_eq!(model.get(k).map(|x| x.as_slice()), Some(v), "scan {k:?}");
+        })
+        .unwrap();
+        assert_eq!(walked, model.len(), "session {session}: scan saw {walked}");
+        s.close().unwrap();
+
+        // And by a fresh reader, which only ever sees the published index.
+        let r = Reader::open(&path).unwrap();
+        for (k, v) in &model {
+            let mut got = Vec::new();
+            r.read_all(k, |x| got.extend_from_slice(x)).unwrap();
+            assert_eq!(&got, v, "session {session}: reader disagrees for {k:?}");
+        }
+    }
+    assert!(model.len() > 80, "the shape stopped exercising anything");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A scan sees what an in-place checkpoint wrote.
+///
+/// The flat index carries two routes to a record: the hash, which a point
+/// lookup takes, and a rank-ordered directory of record offsets, which a scan
+/// takes. `checkpoint_in_place` republished an updated record by storing its
+/// new offset into the key's hash slot -- and not into its directory entry. So
+/// after any in-place checkpoint, `read_all` returned the new value and `scan`
+/// returned the old one, for every key that checkpoint touched, with no error
+/// anywhere.
+///
+/// It needs a reopen to show, which is why nothing caught it: a store opened
+/// fresh takes the full-rewrite path for a while, and the in-place path only
+/// engages once an index section exists with the same key count. Found while
+/// building the redo log, on a test that had the log turned off.
+#[test]
+fn a_scan_sees_what_an_in_place_checkpoint_wrote() {
+    let dir = std::env::temp_dir().join(format!("supdb-inplace-scan-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.dat");
+    let opts = || Options {
+        buffer_bytes: 1 << 16,
+        ..Default::default()
+    };
+
+    let mut model: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = Default::default();
+    {
+        let s = Store::create(&path, opts()).unwrap();
+        s.put(b"seed", b"0").unwrap();
+        model.insert(b"seed".to_vec(), b"0".to_vec());
+        s.checkpoint().unwrap();
+        s.close().unwrap();
+    }
+    // Reopened, so an index section exists and the in-place path engages.
+    let s = Store::open(&path, opts()).unwrap();
+    for round in 0..12u32 {
+        for k in 0..15u32 {
+            let key = format!("k-{k:03}");
+            let val = format!("v-{k}-{round}");
+            s.put(key.as_bytes(), val.as_bytes()).unwrap();
+            model.insert(key.into_bytes(), val.into_bytes());
+        }
+        s.checkpoint().unwrap();
+    }
+    // The two routes must agree. Before the fix, every key here came back one
+    // checkpoint stale through `scan` and current through `read_all`.
+    let mut walked = 0usize;
+    s.scan(None, usize::MAX, |k, v| {
+        walked += 1;
+        assert_eq!(
+            model.get(k).map(|x| x.as_slice()),
+            Some(v),
+            "scan is stale for {:?}",
+            String::from_utf8_lossy(k)
+        );
+    })
+    .unwrap();
+    assert_eq!(walked, model.len(), "scan saw {walked} of {}", model.len());
+    for (k, v) in &model {
+        let mut got = Vec::new();
+        s.read_all(k, |x| got.extend_from_slice(x)).unwrap();
+        assert_eq!(&got, v, "read_all disagrees for {k:?}");
+    }
+    s.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

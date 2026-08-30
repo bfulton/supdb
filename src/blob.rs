@@ -91,16 +91,42 @@ fn fixed_count(exts: &[Ext], stride: u64) -> Option<u64> {
 /// Superblock magic and geometry.
 ///
 /// Duplicated from `store.rs` rather than shared, because `store.rs` does not
-/// compile for wasm -- it is the write path and it maps files -- and moving
-/// the type out of it would renumber a file whose line numbers the
-/// architecture review cites. The duplication is held honest by
-/// `tests/blob.rs`, which opens a store written by `store.rs` and fails if
-/// this decoder disagrees with it about anything.
-const MAGIC: u64 = 0x5355_5044_4200_0001;
+/// compile for wasm -- it is the write path and it maps files -- so this
+/// reader cannot call into it.
+///
+/// A duplicated format constant is a liability and this one has already gone
+/// off. `store.rs` grew two superblock fields, the encoded size went from 120
+/// bytes to 136 and the magic to version 2, and this decoder went on slicing
+/// 120 -- reading a prefix that no longer reached the checksum, and reporting
+/// a perfectly healthy file as "no valid supdb checkpoint". That is the same
+/// trap the commit which added those fields describes eight instances of
+/// inside `store.rs` itself; this was the ninth, in another module.
+///
+/// Two things catch it now. `tests/blob.rs` opens a store written by
+/// `store.rs` and fails on six paths at once, which is how it was found. And
+/// the constants below are asserted equal to `store.rs`'s at compile time on
+/// every native build, which says *why* in one line instead of six stack
+/// traces.
+const MAGIC: u64 = 0x5355_5044_4200_0002;
 const SUPER: u64 = 4096;
 const SLOT: u64 = 512;
-const SB_BYTES: usize = 120;
-const SB_FIELDS: usize = 13;
+const SB_BYTES: usize = 136;
+const SB_FIELDS: usize = 15;
+
+// The write path is not compiled for wasm, so this can only be checked where
+// it is -- which is every build that could have changed it.
+#[cfg(not(target_family = "wasm"))]
+const _: () = {
+    assert!(MAGIC == crate::store::MAGIC, "superblock magic drifted");
+    assert!(
+        SB_BYTES == crate::store::SUPER_BYTES,
+        "the superblock changed size and blob.rs still slices the old one"
+    );
+    assert!(SUPER == crate::store::SUPER);
+    assert!(SLOT == crate::store::SLOT);
+    // The fields, then the magic, then the checksum.
+    assert!(SB_BYTES == SB_FIELDS * 8 + 16, "field count disagrees");
+};
 
 #[derive(Clone, Copy, Debug)]
 struct Super {
@@ -123,7 +149,7 @@ impl Super {
         let f: Vec<u64> = (0..SB_FIELDS)
             .map(|i| u64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap()))
             .collect();
-        if u64::from_le_bytes(buf[104..112].try_into().unwrap()) != MAGIC {
+        if u64::from_le_bytes(buf[SB_FIELDS * 8..SB_FIELDS * 8 + 8].try_into().unwrap()) != MAGIC {
             return None;
         }
         // FNV-1a over the fields and the magic, exactly as the writer computes
@@ -135,7 +161,7 @@ impl Super {
                 h = h.wrapping_mul(0x1000_0000_01b3);
             }
         }
-        if u64::from_le_bytes(buf[112..120].try_into().unwrap()) != h {
+        if u64::from_le_bytes(buf[SB_FIELDS * 8 + 8..SB_BYTES].try_into().unwrap()) != h {
             return None;
         }
         Some(Super {

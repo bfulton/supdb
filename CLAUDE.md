@@ -158,23 +158,23 @@ to lose. `Blob::zero_copy()` is asserted in the test, because a native reader
 that started copying would still pass every correctness check.
 
 **A count is not free, and the reason is the format.** `f28-count` runs four
-arms interleaved. Resolving a key and stopping is 73 ns; counting its values by
-walking their length prefixes is 2,421 ns; reading them all is 2,420. Counting
+arms interleaved. Resolving a key and stopping is 77 ns; counting its values by
+walking their length prefixes is 2,493 ns; reading them all is 2,516. Counting
 without decoding is *not* cheaper than reading — W2.1 is recorded as failing so
 that premise cannot come back. An `Ext` is block, offset, byte length and the
 offset of the last record, and none of those is a count. What is 28x faster is
 `count_fixed`: a fixed-width value carries a fixed-width length prefix, so a
 posting list's count is arithmetic on `Ext::len` with no block touched. That is
 a property of the schema, not of the format. Adding a per-extent count to the
-format would recover at most 6.7 ns of the gap between those two, for four
+format would recover at most 14.9 ns of the gap between those two, for four
 bytes on a 16-byte `Ext` paid by every store forever, so it was priced and
 declined.
 
 The same difference decides whether a browser can rank a dictionary at all.
 `scan_counts` pays a `count` per key, so it is O(every posting in the range) —
 for a day index, the whole file — and `scan_counts_fixed` is O(extents). Over
-2,000 keys that is 1,308 ns/key against 5.0, a factor of 262, so a day's whole
-term dictionary ranks in about 40 µs and nothing has to be precomputed at roll
+2,000 keys that is 1,226 ns/key against 4.3, a factor of 283, so a day's whole
+term dictionary ranks in about 34 µs and nothing has to be precomputed at roll
 time.
 
 `count_fixed` claims a count only when two independent quantities agree: the
@@ -218,7 +218,16 @@ resurrection, the double-free that handed one slot to three blocks, decoder
 panics on damaged input, silently-served corruption (now checksummed), a
 checkpoint that appended three index sections and released none of them, and a
 reader that fed a flat block-table section to the varint decoder and reported
-the misparse as file corruption.
+the misparse as file corruption, and an in-place checkpoint that republished a
+record into its hash slot and not its directory entry -- so `read_all` returned
+the new value and `scan` the previous one, silently, for every key it touched.
+
+That last one needs a reopen to show: a fresh store takes the full-rewrite path
+until an index section exists with a matching key count, and every scan test
+here built its store in one session, so the in-place path was never under test
+when a scan was checked. `c2-oracle` does not exercise reopen-then-update
+either, which is why the differential oracle did not catch it. Until it does,
+that shape is covered only by its reproducer.
 
 The largest one is `Store::read_all`. A writer can read its own sealed, staged
 and pending state, so a read after a write no longer needs a checkpoint and a

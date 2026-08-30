@@ -57,8 +57,8 @@ A *fixed-width* posting list does not need to walk: its count is arithmetic on
 postings are four-byte line ordinals, so `countFixed` is the call it makes.
 
 The same applies to `scanCounts` versus `scanCountsFixed`, and there the
-factor is 262. The walked form is O(every posting in the range) and the extent
-form is O(extents), so a whole day's term dictionary ranks in about 40
+factor is 283. The walked form is O(every posting in the range) and the extent
+form is O(extents), so a whole day's term dictionary ranks in about 34
 microseconds. That is the answer to "does the browser need a scan, or should
 the roll precompute the panels": it needs a scan, and precomputing buys
 nothing.

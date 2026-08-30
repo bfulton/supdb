@@ -840,21 +840,21 @@ first-class part of this engine's performance envelope and is documented nowhere
 a value count without decoding the values, and hoped it could come out of the extent list. It
 cannot: an `Ext` is block, offset, byte length and the offset of the last record, and none of
 those is a count. The experiment runs four arms interleaved over one file and the useful
-result is the one that refutes the request: walking the length prefixes costs 2,304.6 ns
-against 2,342.1 to read every value — *no difference*. Skipping a payload does not skip the
+result is the one that refutes the request: walking the length prefixes costs 2,492.9 ns
+against 2,516.3 to read every value — *no difference*. Skipping a payload does not skip the
 cache lines it lies in, and the walk is a serial dependent chain.
 
 What is 28x is arithmetic on a schema rather than a change to the format: a fixed-width value
 carries a fixed-width length prefix, so a posting list's count falls out of `Ext::len`,
 cross-checked against `Ext::last`. And the cost of adding a per-extent count is now a number
-rather than an opinion — at most 6.7 ns per lookup, against four bytes on a 16-byte `Ext` paid
+rather than an opinion — at most 14.9 ns per lookup, against four bytes on a 16-byte `Ext` paid
 by every store forever. Declined, with the measurement attached.
 
 **25. `w3-bundle` — a size budget with a control.** A wasm module measured alone cannot say
 whether it is large because the engine is large or because a Rust `cdylib` starts out large,
 and those want different responses. `web/floor/` is an empty module with the same
 standard-library surface built the same way, so the difference is the engine's actual marginal
-cost: 23,866 gzipped bytes of a 36,536-byte module, with the remaining 35% being the
+cost: 23,870 gzipped bytes of a 36,540-byte module, with the remaining 35% being the
 allocator, the panic machinery and `core::fmt` that `std::io::Error` pulls in whatever it is
 reporting. Every size claim in this repository should have had a control and this is the first
 one that does.
