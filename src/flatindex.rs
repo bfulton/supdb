@@ -123,6 +123,23 @@ fn rd_u64(b: &[u8], at: usize) -> Option<u64> {
 /// What the writer needs to know before it can lay the section out.
 pub struct Plan {
     pub hash_cap: usize,
+    /// Entries reserved per directory buffer, and there are two of them when
+    /// this exceeds the key count.
+    ///
+    /// The directory is the only thing standing between an insertion and an
+    /// in-place checkpoint. Records have slack and the hash runs at half load,
+    /// so both can take a new key where they lie -- but the directory is a
+    /// sorted array of record offsets and an insertion shifts everything after
+    /// it, which is not a change a concurrent reader can be allowed to catch
+    /// half-done. So it is written into the inactive buffer and published with
+    /// one aligned store of `dir_state`, exactly as a record is written into
+    /// the slack and published with one store of its hash slot.
+    ///
+    /// Zero when no room for insertion was asked for, and then there is one
+    /// buffer and the layout is what it always was. Doubling costs 4 bytes per
+    /// key on an index that is about 57, and Supdb already loses the size
+    /// axis, so it is opt-in rather than always.
+    pub dir_cap: usize,
     pub recs_len: usize,
     /// Record bytes reserved, including slack for in-place updates.
     pub recs_cap: usize,
@@ -150,7 +167,9 @@ fn record_len(klen: usize, next: usize) -> usize {
 
 /// Measure the section before writing it, so the whole thing can be built into
 /// one allocation of the right size rather than grown.
-pub fn plan(all: &[(&[u8], &crate::index::Extents)]) -> Option<Plan> {
+/// `insert_slack` is how many keys beyond the current set the directory should
+/// have room for. Zero reproduces the single-buffer layout byte for byte.
+pub fn plan(all: &[(&[u8], &crate::index::Extents)], insert_slack: usize) -> Option<Plan> {
     let mut cap = 1usize;
     while cap < all.len() * 2 {
         cap = cap.checked_mul(2)?;
@@ -192,7 +211,18 @@ pub fn plan(all: &[(&[u8], &crate::index::Extents)]) -> Option<Plan> {
         .map(|i| all[i * stride].0.len())
         .try_fold(0usize, |a, b| a.checked_add(b))?;
 
-    let fence_offs_off = HEADER + cap * SLOT + all.len() * 4;
+    // One buffer when nothing asked for insert room, two when something did.
+    let dir_cap = if insert_slack == 0 {
+        0
+    } else {
+        all.len().checked_add(insert_slack)?
+    };
+    let dir_bytes = if dir_cap == 0 {
+        all.len() * 4
+    } else {
+        dir_cap.checked_mul(8)?
+    };
+    let fence_offs_off = HEADER + cap * SLOT + dir_bytes;
     let fence_offs_len = if fence_n == 0 { 0 } else { (fence_n + 1) * 4 };
     let fence_blob_off = fence_offs_off + fence_offs_len;
     // Records are 4-aligned within the section, and the blob is bytes, so the
@@ -201,6 +231,7 @@ pub fn plan(all: &[(&[u8], &crate::index::Extents)]) -> Option<Plan> {
     let total = recs_off + recs_cap;
     Some(Plan {
         hash_cap: cap,
+        dir_cap,
         recs_len: at,
         recs_cap,
         rec_offs,
@@ -219,13 +250,17 @@ pub fn plan(all: &[(&[u8], &crate::index::Extents)]) -> Option<Plan> {
 /// `hash_of` is the store's key hash, passed in rather than duplicated so the
 /// writer and the reader can never disagree about it -- a hash mismatch
 /// between the two would present as keys that exist and cannot be found.
+/// `insert_slack` reserves directory room, and a second buffer to publish into,
+/// so a later checkpoint can add keys without rewriting the section. Zero
+/// reproduces the single-buffer layout byte for byte.
 pub fn encode(
     all: &[(&[u8], &crate::index::Extents)],
     generation: u64,
     prev: Option<(u64, u64, u64, u64, u64)>,
     hash_of: fn(&[u8]) -> u64,
+    insert_slack: usize,
 ) -> Option<(Vec<u8>, usize)> {
-    let p = plan(all)?;
+    let p = plan(all, insert_slack)?;
     // Only the part with anything in it. The header still describes the full
     // reserved region, so a reader maps the slack and an in-place update
     // writes into it; it simply is not built here and not written.
@@ -263,6 +298,18 @@ pub fn encode(
         p.fence_offs_off as u64,
         p.fence_n as u64,
         p.fence_stride as u64,
+        // Entries reserved per directory buffer, 0 when there is one buffer.
+        p.dir_cap as u64,
+        // The publish word: which directory is live, and how many keys it
+        // holds. Packed into one u64 so an insertion, which changes both,
+        // becomes a single aligned store rather than two writes a reader could
+        // catch between. Zero means "the header's dir_off and nkeys stand",
+        // which is the single-buffer layout.
+        if p.dir_cap == 0 {
+            0
+        } else {
+            ((dir_off as u64) << 32) | all.len() as u64
+        },
     ]
     .iter()
     .enumerate()
@@ -336,6 +383,10 @@ pub fn encode(
 pub struct FlatIndex {
     hash: (usize, usize),
     dir: (usize, usize),
+    /// Entries reserved per directory buffer, and where the pair starts.
+    /// Zero `dir_cap` means one buffer and no room to insert.
+    dir_cap: usize,
+    dir_base: usize,
     recs: (usize, usize),
     hash_cap: usize,
     mask: usize,
@@ -411,13 +462,39 @@ impl FlatIndex {
         let fence_offs_off = rd_u64(sec, 120)? as usize;
         let fence_n = rd_u64(sec, 128)? as usize;
         let fence_stride = rd_u64(sec, 136)? as usize;
+        let dir_cap = rd_u64(sec, 144)? as usize;
+        let dir_state = rd_u64(sec, 152)?;
 
         if hash_cap == 0 || !hash_cap.is_power_of_two() {
             return None;
         }
+        // `dir_state` is what an in-place insertion publishes, so it is the
+        // authority when present -- and it comes out of a file a corruption
+        // experiment damages on purpose, so it is checked rather than trusted.
+        // The live directory has to be one of the two reserved buffers and no
+        // longer than one of them holds.
+        let (dir_off, nkeys) = if dir_cap == 0 {
+            (dir_off, nkeys)
+        } else {
+            let live_off = (dir_state >> 32) as usize;
+            let live_n = (dir_state & 0xffff_ffff) as usize;
+            let second = dir_off.checked_add(dir_cap.checked_mul(4)?)?;
+            if (live_off != dir_off && live_off != second) || live_n > dir_cap {
+                return None;
+            }
+            (live_off, live_n)
+        };
         // Each region must lie inside the section and after the one before it.
         let hash_end = hash_off.checked_add(hash_cap.checked_mul(SLOT)?)?;
-        let dir_end = dir_off.checked_add(nkeys.checked_mul(4)?)?;
+        // The whole reserved directory region, not just the live half: the
+        // inactive buffer is written by an insertion and must be inside the
+        // section too.
+        let dir_region_end = if dir_cap == 0 {
+            dir_off.checked_add(nkeys.checked_mul(4)?)?
+        } else {
+            rd_u64(sec, 80)? as usize + dir_cap.checked_mul(8)?
+        };
+        let dir_end = dir_region_end;
         let recs_end = recs_off.checked_add(recs_cap)?;
         if hash_off < HEADER
             || hash_end > dir_off
@@ -462,6 +539,8 @@ impl FlatIndex {
         Some(FlatIndex {
             hash: (hash_off, hash_end),
             dir: (dir_off, dir_end),
+            dir_cap,
+            dir_base: rd_u64(sec, 80)? as usize,
             recs: (recs_off, recs_end),
             hash_cap,
             mask: hash_cap - 1,
@@ -540,7 +619,32 @@ impl FlatIndex {
         None
     }
 
-    /// The record at `rank` in key order.
+    /// Where an insertion would write the next directory, and how big a set it
+    /// may hold. `None` when this index was built without room to insert.
+    ///
+    /// The inactive buffer, always: the live one is being read.
+    pub fn spare_dir(&self) -> Option<(usize, usize)> {
+        if self.dir_cap == 0 {
+            return None;
+        }
+        let second = self.dir_base + self.dir_cap * 4;
+        let spare = if self.dir.0 == self.dir_base {
+            second
+        } else {
+            self.dir_base
+        };
+        Some((spare, self.dir_cap))
+    }
+
+    /// The word that publishes a directory: which buffer, and how many keys.
+    pub fn dir_state(at: usize, nkeys: usize) -> u64 {
+        ((at as u64) << 32) | nkeys as u64
+    }
+
+    /// Byte offset of the publish word within the section.
+    pub const DIR_STATE_AT: usize = 152;
+
+    /// The record at `rank` in key order.    /// The record at `rank` in key order.
     pub fn at<'a>(&self, sec: &'a [u8], rank: usize) -> Option<(&'a [u8], &'a [Ext])> {
         if rank >= self.nkeys {
             return None;
@@ -550,7 +654,53 @@ impl FlatIndex {
         self.record(sec, off)
     }
 
-    /// Where in the section a key's *directory* entry lives, if it is present.
+    /// Where a key that is *not* present would claim a hash slot.
+    ///
+    /// The probe stops at the first empty slot, which is where a lookup for
+    /// this key would give up, so storing there is what makes it findable.
+    /// Returns None if the key is already present -- the caller wants
+    /// `slot_of` for that -- or if the table is too full to take another,
+    /// which is the load factor `plan` sizes for.
+    pub fn slot_for_insert(
+        &self,
+        sec: &[u8],
+        key: &[u8],
+        hash_of: fn(&[u8]) -> u64,
+    ) -> Option<usize> {
+        let hash = sec.get(self.hash.0..self.hash.1)?;
+        let h = hash_of(key);
+        let tag = ((h >> 56) | 1) & 0xff;
+        let mut s = (h as usize) & self.mask;
+        for _ in 0..self.hash_cap {
+            let at = s * SLOT;
+            let packed = rd_u64(hash, at)?;
+            if packed == 0 {
+                return Some(self.hash.0 + at);
+            }
+            if packed >> 56 == tag {
+                let off = (packed & 0x00ff_ffff_ffff_ffff) as usize;
+                if let Some((k, _)) = self.record(sec, off) {
+                    if k == key {
+                        return None;
+                    }
+                }
+            }
+            s = (s + 1) & self.mask;
+        }
+        None
+    }
+
+    /// The rank a key sits at, or would be inserted at to keep the order.
+    pub fn rank_for(&self, sec: &[u8], key: &[u8]) -> usize {
+        self.seek_with(sec, key, true).min(self.nkeys)
+    }
+
+    /// The live directory's entries, for building the next one.
+    pub fn dir_entries<'a>(&self, sec: &'a [u8]) -> Option<&'a [u8]> {
+        sec.get(self.dir.0..self.dir.0 + self.nkeys * 4)
+    }
+
+    /// Where in the section a key's *directory* entry lives, if it is present.    /// Where in the section a key's *directory* entry lives, if it is present.
     ///
     /// The flat index carries two ways to reach a record: the hash, for a
     /// point lookup, and a rank-ordered directory of record offsets, for a
@@ -849,7 +999,7 @@ mod tests {
     #[test]
     fn every_key_is_found_with_its_extents() {
         let all = corpus(5000);
-        let sec = padded(encode(&refs(&all), 7, None, h).expect("encode"));
+        let sec = padded(encode(&refs(&all), 7, None, h, 0).expect("encode"));
         let ix = FlatIndex::parse(&sec).expect("parse");
         assert_eq!(ix.len(), all.len());
         assert_eq!(ix.generation, 7);
@@ -862,7 +1012,7 @@ mod tests {
     #[test]
     fn absent_keys_are_absent() {
         let all = corpus(2000);
-        let sec = padded(encode(&refs(&all), 1, None, h).unwrap());
+        let sec = padded(encode(&refs(&all), 1, None, h, 0).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         for i in 0..2000 {
             let k = format!("absent{i:012}").into_bytes();
@@ -873,7 +1023,7 @@ mod tests {
     #[test]
     fn rank_order_matches_key_order() {
         let all = corpus(1000);
-        let sec = padded(encode(&refs(&all), 1, None, h).unwrap());
+        let sec = padded(encode(&refs(&all), 1, None, h, 0).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         for (i, (k, e)) in all.iter().enumerate() {
             let (gk, ge) = ix.at(&sec, i).expect("rank present");
@@ -890,7 +1040,7 @@ mod tests {
     fn the_fence_never_changes_where_a_seek_lands() {
         for n in [0usize, 1, 17, 64, 65, 5000] {
             let all = corpus(n);
-            let sec = padded(encode(&refs(&all), 1, None, h).unwrap());
+            let sec = padded(encode(&refs(&all), 1, None, h, 0).unwrap());
             let ix = FlatIndex::parse(&sec).expect("parse");
             let mut probes: Vec<Vec<u8>> = Vec::new();
             for (k, _) in &all {
@@ -927,7 +1077,7 @@ mod tests {
     #[test]
     fn a_damaged_fence_never_changes_an_answer() {
         let all = corpus(2000);
-        let clean = padded(encode(&refs(&all), 1, None, h).unwrap());
+        let clean = padded(encode(&refs(&all), 1, None, h, 0).unwrap());
         // Header fields: the fence offsets start at 120, the records at 88.
         let fence_from = rd_u64(&clean, 120).unwrap() as usize;
         let fence_to = rd_u64(&clean, 88).unwrap() as usize;
@@ -962,7 +1112,7 @@ mod tests {
     #[test]
     fn seek_finds_the_first_key_at_or_after() {
         let all = corpus(500);
-        let sec = padded(encode(&refs(&all), 1, None, h).unwrap());
+        let sec = padded(encode(&refs(&all), 1, None, h, 0).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         for (i, (k, _)) in all.iter().enumerate() {
             assert_eq!(ix.seek_with(&sec, k, true), i);
@@ -976,7 +1126,7 @@ mod tests {
     #[test]
     fn damage_never_panics() {
         let all = corpus(300);
-        let sec = padded(encode(&refs(&all), 1, None, h).unwrap());
+        let sec = padded(encode(&refs(&all), 1, None, h, 0).unwrap());
         for i in 0..sec.len() {
             for bit in [0x01u8, 0x80] {
                 let mut d = sec.clone();
@@ -997,7 +1147,7 @@ mod tests {
     #[test]
     fn truncation_never_panics() {
         let all = corpus(200);
-        let sec = padded(encode(&refs(&all), 1, None, h).unwrap());
+        let sec = padded(encode(&refs(&all), 1, None, h, 0).unwrap());
         for cut in 0..sec.len() {
             if let Some(ix) = FlatIndex::parse(&sec[..cut]) {
                 for (k, _) in all.iter().take(20) {
@@ -1012,7 +1162,7 @@ mod tests {
 
     #[test]
     fn an_empty_index_round_trips() {
-        let sec = padded(encode(&refs(&[]), 3, None, h).unwrap());
+        let sec = padded(encode(&refs(&[]), 3, None, h, 0).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         assert_eq!(ix.len(), 0);
         assert!(ix.lookup(&sec, b"anything", h).is_none());
@@ -1022,7 +1172,7 @@ mod tests {
     #[test]
     fn the_previous_index_is_carried() {
         let all = corpus(10);
-        let sec = padded(encode(&refs(&all), 9, Some((8, 1234, 4096, 100, 200)), h).unwrap());
+        let sec = padded(encode(&refs(&all), 9, Some((8, 1234, 4096, 100, 200)), h, 0).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         assert_eq!(ix.prev, Some((8, 1234, 4096, 100, 200)));
     }

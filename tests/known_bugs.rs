@@ -1469,3 +1469,95 @@ fn a_file_from_the_other_byte_order_is_refused_by_name() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Inserting a key does not have to rewrite the index section.
+///
+/// `checkpoint_in_place` used to decline every insertion outright: records
+/// carry half again in slack and the hash runs at half load, so both could
+/// take a new key where they lie, but the directory is a sorted array of
+/// record offsets and growing it shifts everything after -- not a change a
+/// reader may catch half-done. f27 priced that refusal at 4.122x on a workload
+/// that only inserts, and it is the reason EXT.9 reads 0.010x.
+///
+/// With `Options::index_inserts` the directory is double-buffered: the spliced
+/// copy goes into the buffer nobody is reading and one aligned store of
+/// `dir_state` publishes which buffer is live and how many keys it holds.
+///
+/// What this asserts is that it is invisible. Both arms must answer every
+/// lookup and every scan identically, through the writer and through a fresh
+/// reader, with keys inserted in an order that forces splices at the front,
+/// the middle and the end of the directory.
+#[test]
+fn inserting_in_place_changes_no_answer() {
+    type Walked = (Vec<(Vec<u8>, Vec<u8>)>, u64);
+    fn run(inserts: bool, dir: &std::path::Path) -> Walked {
+        let path = dir.join("s.dat");
+        let opts = || Options {
+            index_inserts: inserts,
+            buffer_bytes: 1 << 16,
+            ..Default::default()
+        };
+        let mut model: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = Default::default();
+        {
+            let s = Store::create(&path, opts()).unwrap();
+            for k in (0..40u32).step_by(2) {
+                let key = format!("k-{k:04}");
+                s.put(key.as_bytes(), b"first").unwrap();
+                model.insert(key.into_bytes(), b"first".to_vec());
+            }
+            s.checkpoint().unwrap();
+            s.close().unwrap();
+        }
+        // Reopened, so an index section exists and the in-place path engages.
+        let s = Store::open(&path, opts()).unwrap();
+        for round in 0..6u32 {
+            // Odd keys interleave with the even ones already indexed, so each
+            // batch splices at ranks scattered through the directory. The
+            // 9000s land after everything and the 0000s before it.
+            for k in (1..40u32).step_by(2) {
+                let key = format!("k-{k:04}");
+                let val = format!("odd-{k}-{round}");
+                s.put(key.as_bytes(), val.as_bytes()).unwrap();
+                model.insert(key.into_bytes(), val.into_bytes());
+            }
+            let head = format!("a-{round:04}");
+            let tail = format!("z-{round:04}");
+            s.put(head.as_bytes(), b"head").unwrap();
+            model.insert(head.into_bytes(), b"head".to_vec());
+            s.put(tail.as_bytes(), b"tail").unwrap();
+            model.insert(tail.into_bytes(), b"tail".to_vec());
+            s.checkpoint().unwrap();
+        }
+        let mut scanned = Vec::new();
+        let n = s
+            .scan(None, usize::MAX, |k, v| {
+                scanned.push((k.to_vec(), v.to_vec()));
+            })
+            .unwrap();
+        for (k, v) in &model {
+            let mut got = Vec::new();
+            s.read_all(k, |x| got.extend_from_slice(x)).unwrap();
+            assert_eq!(&got, v, "inserts={inserts}: read_all disagrees for {k:?}");
+        }
+        s.close().unwrap();
+        let r = Reader::open(&path).unwrap();
+        for (k, v) in &model {
+            let mut got = Vec::new();
+            r.read_all(k, |x| got.extend_from_slice(x)).unwrap();
+            assert_eq!(&got, v, "inserts={inserts}: reader disagrees for {k:?}");
+        }
+        let want: Vec<(Vec<u8>, Vec<u8>)> = model.into_iter().collect();
+        assert_eq!(scanned, want, "inserts={inserts}: scan is not the model");
+        (scanned, n)
+    }
+
+    let base = std::env::temp_dir().join(format!("supdb-ins-{}", std::process::id()));
+    let (a, b) = (base.join("on"), base.join("off"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let on = run(true, &a);
+    let off = run(false, &b);
+    assert!(on.0.len() > 50, "the shape stopped exercising anything");
+    assert_eq!(on, off, "double-buffering the directory changed an answer");
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -108,6 +108,7 @@ fn main() -> std::io::Result<()> {
             "f26-buffer" => f26_buffer(&args, profile)?,
             "f27-ckptshape" => f27_ckptshape(&args, profile)?,
             "f29-redolog" => f29_redolog(&args, profile)?,
+            "f30-insertindex" => f30_insertindex(&args, profile)?,
             "f28-count" => f28_count(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
@@ -150,6 +151,7 @@ fn main() -> std::io::Result<()> {
                 "f26-buffer",
                 "f27-ckptshape",
                 "f29-redolog",
+                "f30-insertindex",
                 "f28-count",
                 "f4-durability",
                 "f3-multiproc",
@@ -3643,6 +3645,150 @@ fn f11_child(args: &Args) -> std::io::Result<()> {
 /// bit flip, a torn write or a reused slot returns silently wrong data,
 /// because LZ4 decodes many corrupted inputs into plausible bytes. The
 /// question is only what it costs.
+/// What it costs to publish an insertion instead of rewriting for it.
+///
+/// f27 found that a durable checkpoint is expensive because of *insertion*:
+/// `checkpoint_in_place` declined any key the index did not already have, so
+/// every batch of a load rewrote the whole section. The records and the hash
+/// always had room for a new key -- records carry half again in slack, the
+/// hash runs at half load -- and only the directory did not, because it is a
+/// sorted array and growing it shifts everything after.
+///
+/// `Options::index_inserts` double-buffers it: the spliced copy goes into the
+/// buffer nobody is reading, and one aligned store of `dir_state` publishes
+/// which buffer is live and how many keys it holds. That costs about 4 bytes
+/// per key on an index that is about 57, and Supdb already loses the size
+/// axis, so both halves are measured here rather than one.
+///
+/// The store is reopened before the timed phase because the in-place path only
+/// engages once a published index exists -- a fresh store rewrites regardless,
+/// and timing that would compare a thing against itself.
+fn f30_insertindex(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let seed = args.num("--seed-keys", profile.pick(10_000, 50_000, 100_000)) as u64;
+    let add = args.num("--add-keys", profile.pick(10_000, 50_000, 100_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+
+    let mut rec = Record::new("f30-insertindex", profile);
+    rec.param("seed_keys", J::u(seed))
+        .param("added_keys", J::u(add))
+        .param("checkpoint_every_ops", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .note("both arms interleaved; the only difference is Options::index_inserts")
+        .note("the seed load and the reopen are untimed: the timed phase is insertion only");
+
+    let dir = scratch("f30");
+    let payload = Payload::new(value_size, 0.5, 0xF30);
+    let on = [true, false];
+    let io: std::sync::Mutex<Vec<(usize, f64, f64)>> = std::sync::Mutex::new(Vec::new());
+    let trial = Trial::new(profile.reps());
+    let tp = trial.run(2, |ci, rep| {
+        let file = dir.join(format!("i{ci}-{rep}.dat"));
+        let _ = std::fs::remove_file(&file);
+        let opts = || Options {
+            index_inserts: on[ci],
+            ..default_opts(64)
+        };
+        let mut vrng = Rng::new(0xF30 + rep as u64);
+        let mut kb = [0u8; 16];
+        {
+            let store = Store::create(&file, opts()).expect("create");
+            for i in 0..seed {
+                db_key_into(i, &mut kb);
+                store.put(&kb, payload.get(&mut vrng)).expect("seed");
+            }
+            store.checkpoint().expect("seed checkpoint");
+            let _ = store.close();
+        }
+        // Reopened: now a published index exists and in-place can engage.
+        let store = Store::open(&file, opts()).expect("open");
+        let io0 = IoCounters::read_now();
+        let t = Instant::now();
+        for i in 0..add {
+            db_key_into(seed + i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+            if (i + 1) % batch == 0 {
+                store.checkpoint().expect("checkpoint");
+            }
+        }
+        let secs = t.elapsed().as_secs_f64();
+        let wrote = IoCounters::read_now().since(&io0).write_bytes;
+        let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+        io.lock().unwrap().push((
+            ci,
+            wrote as f64 / 1_048_576.0,
+            size as f64 / 1_048_576.0,
+        ));
+        let _ = store.close();
+        let _ = std::fs::remove_file(&file);
+        add as f64 / secs
+    });
+
+    let pick = |which: usize, f: fn(&(usize, f64, f64)) -> f64| -> Samples {
+        let all = io.lock().unwrap();
+        Samples::new(
+            all.iter()
+                .filter(|(c, _, _)| *c == which)
+                .map(f)
+                .collect(),
+        )
+    };
+    let wrote: Vec<Samples> = (0..2).map(|c| pick(c, |x| x.1)).collect();
+    let size: Vec<Samples> = (0..2).map(|c| pick(c, |x| x.2)).collect();
+
+    let cmp = compare(&tp[0], &tp[1], supdb::bench::MIN_EFFECT);
+    // Lower is better for size, so this comparison runs the other way round.
+    let size_cmp = compare(&size[1], &size[0], supdb::bench::MIN_EFFECT);
+    rec.compare("inplace_vs_rewrite", cmp.clone());
+    rec.compare("size_rewrite_vs_inplace", size_cmp.clone());
+    rec.series(
+        "arms",
+        J::arr(
+            (0..2)
+                .map(|ci| {
+                    jobj! {
+                        "index_inserts" => J::Bool(on[ci]),
+                        "ops_per_s" => J::fp(tp[ci].median(), 1),
+                        "ops" => tp[ci].to_json(),
+                        "device_write_mb" => J::fp(wrote[ci].median(), 1),
+                        "file_mb" => J::fp(size[ci].median(), 2)
+                    }
+                })
+                .collect(),
+        ),
+    );
+    rec.finding(Finding::new(
+        "F30.1",
+        "Publishing an insertion in place beats rewriting the index for it",
+        matches!(cmp.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "in place {:.0} ops/s writing {:.1} MB, against rewriting {:.0} ops/s writing {:.1} MB \
+             ({}). Every key is new, which is the case `checkpoint_in_place` declined outright \
+             until the directory was double-buffered, and which f27 priced at 4.122x",
+            tp[0].median(),
+            wrote[0].median(),
+            tp[1].median(),
+            wrote[1].median(),
+            cmp.summary("in place", "rewrite")
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F30.2",
+        "Room to insert does not cost file size",
+        !matches!(size_cmp.verdict, supdb::bench::Verdict::Less),
+        format!(
+            "{:.2} MB with room to insert against {:.2} MB without ({}). The directory is doubled \
+             so an insertion can be published with one store, which is about 4 bytes per key on \
+             an index that is about 57. Supdb already loses the size axis to LMDB (EXT.6), so \
+             this is the axis where the change could pay for its speed twice over",
+            size[0].median(),
+            size[1].median(),
+            size_cmp.summary("rewrite", "in place")
+        ),
+    ));
+    Ok(rec)
+}
+
 /// What the redo log buys, and what it costs in visibility.
 ///
 /// f27 established that durability is not what EXT.9's 0.010x is made of --

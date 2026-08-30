@@ -606,6 +606,19 @@ pub struct Options {
     /// ops/s against 173,446 for updating the same keys with the same
     /// checkpoint count, because any insertion sends `checkpoint_in_place` to
     /// the full-rewrite path.
+    /// Reserve directory room so a later checkpoint can add keys in place
+    /// instead of rewriting the whole index section.
+    ///
+    /// Off by default because it is not free: the directory is double-buffered
+    /// so an insertion can be published with one aligned store, which costs
+    /// about 4 bytes per key on an index that is about 57, and Supdb already
+    /// loses the size axis (EXT.6). f30 prices both halves.
+    ///
+    /// The records and the hash already had room -- records carry half again
+    /// in slack, and the hash runs at half load -- so the directory was the
+    /// only reason `checkpoint_in_place` declined every insertion, which f27
+    /// measured at 4.122x on a workload that only inserts.
+    pub index_inserts: bool,
     pub redo_log: bool,
     /// Bytes reserved for the redo log at each full rewrite. When it fills,
     /// the next checkpoint rewrites the index and starts a fresh one, which is
@@ -679,6 +692,7 @@ impl Default for Options {
             checksums: true,
             pending_arena: true,
             seal_on_put: true,
+            index_inserts: false,
             redo_log: false,
             log_bytes: 4 << 20,
             // On, now that the space cost is bounded.
@@ -2422,7 +2436,15 @@ impl Store {
                         loc.uncompressed as u64,
                     )
                 });
-                flatindex::encode(&all, gen, p, key_hash)
+                // Half again, matching the record slack: enough that a store
+                // growing steadily keeps publishing in place, and bounded so
+                // the reserved directory cannot dwarf what it indexes.
+                let slack = if self.opts.index_inserts {
+                    (all.len() / 2).max(16)
+                } else {
+                    0
+                };
+                flatindex::encode(&all, gen, p, key_hash, slack)
             } else {
                 None
             };
@@ -2771,16 +2793,41 @@ impl Store {
         Ok(true)
     }
 
+    ///  already returned Some on this path; this is the unwrap that
+    /// says so without a panic branch in the hot loop.
+    #[inline]
+    fn slot_at_of(present: Option<usize>) -> usize {
+        present.unwrap_or(usize::MAX)
+    }
+
     fn checkpoint_in_place(&self, changed: &[(Vec<u8>, Extents)], nkeys: usize) -> Result<bool> {
         use std::sync::atomic::{AtomicU64, Ordering};
         let mut ap = self.appender.lock().unwrap();
         let Some((map, meta, sec_off, sec_len)) = ap.live_index.as_mut() else {
             return Ok(false);
         };
-        if nkeys != meta.len() {
-            // A key was added or removed: the hash and the sorted directory
-            // both have to change, which is the rewrite this path avoids.
+        // A key added since the last rewrite is only a problem for the
+        // directory. Records carry half again in slack and the hash runs at
+        // half load, so both can take a new key where they lie; the directory
+        // is a sorted array and an insertion shifts everything after it, which
+        // is not a change a reader may catch half-done.
+        //
+        // When the section was built with room (`Options::index_inserts`), the
+        // new directory is written into the inactive buffer and published with
+        // one aligned store, exactly as a record is written into the slack and
+        // published with one store of its hash slot. Without that room this
+        // still declines, which is what it always did -- and what f27 priced
+        // at 4.122x on a workload that only inserts.
+        let inserting = nkeys.saturating_sub(meta.len());
+        let spare = meta.spare_dir();
+        if nkeys < meta.len() {
             return Ok(false);
+        }
+        if inserting > 0 {
+            match spare {
+                Some((_, cap)) if nkeys <= cap => {}
+                _ => return Ok(false),
+            }
         }
         let (off, len) = (*sec_off as usize, *sec_len as usize);
         let Some(sec) = map.get(off..off + len) else {
@@ -2796,38 +2843,116 @@ impl Store {
         let mut probe =
             FlatIndex::parse(sec).ok_or_else(|| corrupt("live index no longer parses"))?;
         probe.set_bump(meta.bump());
+        // Keys the index does not have yet, with the rank each belongs at and
+        // the record offset it will get. Empty on the update-only path, which
+        // is left exactly as it was.
+        let mut inserts: Vec<(usize, u32)> = Vec::new();
         for (k, exts) in changed {
             let slice = exts.as_slice();
-            let Some(slot_at) = meta.slot_of(sec, k, key_hash) else {
+            let present = meta.slot_of(sec, k, key_hash);
+            if present.is_none() && inserting == 0 {
+                // Counted as an update but not in the index: something is
+                // inconsistent, and guessing is not the answer.
                 return Ok(false);
-            };
-            // The directory is the other way to reach a record, and it has to
-            // be republished with the hash or the two disagree: a point lookup
-            // would return the new value and a scan the old one. That is what
-            // used to happen, silently, for every key an in-place checkpoint
-            // touched.
-            let Some(dir_at) = meta.dir_slot_of(sec, k) else {
-                return Ok(false);
-            };
-            match meta.lookup(sec, k, key_hash) {
-                Some(cur) if cur == slice => continue,
-                _ => {}
             }
-            let Some(bytes) = FlatIndex::encode_record(k, slice) else {
-                return Ok(false);
-            };
-            let Some((at, rel)) = probe.reserve(bytes.len()) else {
-                return Ok(false);
-            };
-            edits.push((
-                off + at,
-                FlatIndex::slot_value(k, rel, key_hash),
-                off + slot_at,
-                off + dir_at,
-                rel,
-                bytes,
-            ));
+            if let Some(slot_at) = present {
+                // The directory is the other way to reach a record, and it has
+                // to be republished with the hash or the two disagree: a point
+                // lookup would return the new value and a scan the old one.
+                // That is what used to happen, silently, for every key an
+                // in-place checkpoint touched.
+                let Some(dir_at) = meta.dir_slot_of(sec, k) else {
+                    return Ok(false);
+                };
+                match meta.lookup(sec, k, key_hash) {
+                    Some(cur) if cur == slice => continue,
+                    _ => {}
+                }
+                let Some(bytes) = FlatIndex::encode_record(k, slice) else {
+                    return Ok(false);
+                };
+                let Some((at, rel)) = probe.reserve(bytes.len()) else {
+                    return Ok(false);
+                };
+                edits.push((
+                    off + at,
+                    FlatIndex::slot_value(k, rel, key_hash),
+                    off + slot_at,
+                    off + dir_at,
+                    rel,
+                    bytes,
+                ));
+            } else {
+                // New key: claim the slot a lookup would stop at, take record
+                // space from the slack, and remember where it belongs in key
+                // order so the next directory can be spliced rather than
+                // rebuilt from the records.
+                let Some(slot_at) = meta.slot_for_insert(sec, k, key_hash) else {
+                    return Ok(false);
+                };
+                let Some(bytes) = FlatIndex::encode_record(k, slice) else {
+                    return Ok(false);
+                };
+                let Some((at, rel)) = probe.reserve(bytes.len()) else {
+                    return Ok(false);
+                };
+                inserts.push((meta.rank_for(sec, k), rel));
+                edits.push((
+                    off + at,
+                    FlatIndex::slot_value(k, rel, key_hash),
+                    off + slot_at,
+                    // No directory entry to overwrite; the splice places it.
+                    usize::MAX,
+                    rel,
+                    bytes,
+                ));
+            }
         }
+        // With insertions, the whole directory moves: the old one is spliced
+        // into the inactive buffer with the new entries at their ranks, and
+        // published by a single store of `dir_state`. Copying is why the
+        // buffer is doubled -- a reader is walking the live one throughout,
+        // and a sorted array cannot be grown in place without a window in
+        // which it is neither the old order nor the new.
+        //
+        // A splice, not a rebuild: `rank_for` binary-searches each new key, so
+        // this moves 4 bytes per key rather than re-reading every record to
+        // re-derive the order.
+        let published_dir = if inserts.is_empty() {
+            None
+        } else {
+            let Some((spare_at, cap)) = spare else {
+                return Ok(false);
+            };
+            let old_n = meta.len();
+            let Some(old) = meta.dir_entries(sec).map(|d| d.to_vec()) else {
+                return Ok(false);
+            };
+            let mut ins = inserts.clone();
+            // By rank, and stably, so two keys landing at the same rank keep
+            // the order `changed` had them in.
+            ins.sort_by_key(|(rank, _)| *rank);
+            if old_n + ins.len() > cap {
+                return Ok(false);
+            }
+            let mut next: Vec<u8> = Vec::with_capacity((old_n + ins.len()) * 4);
+            let mut at = 0usize;
+            for (rank, rel) in &ins {
+                let upto = (*rank).min(old_n);
+                if upto * 4 > old.len() || at > upto {
+                    return Ok(false);
+                }
+                next.extend_from_slice(&old[at * 4..upto * 4]);
+                next.extend_from_slice(&rel.to_le_bytes());
+                at = upto;
+            }
+            next.extend_from_slice(&old[at * 4..]);
+            let want = (old_n + ins.len()) * 4;
+            if next.len() != want || spare_at + want > len {
+                return Ok(false);
+            }
+            Some((spare_at, old_n + ins.len(), next))
+        };
         if edits.is_empty() {
             return Ok(true);
         }
@@ -2843,7 +2968,15 @@ impl Store {
         // mismatch between them, because neither offset is ever partially
         // written: a directory entry is one aligned 4-byte store.
         for (_, _, _, dir_at, rel, _) in &edits {
+            if *dir_at == usize::MAX {
+                continue;
+            }
             map[*dir_at..*dir_at + 4].copy_from_slice(&rel.to_le_bytes());
+        }
+        // The spliced directory goes down next, into the buffer nobody is
+        // reading. Still nothing points at it.
+        if let Some((spare_at, _, next)) = &published_dir {
+            map[off + spare_at..off + spare_at + next.len()].copy_from_slice(next);
         }
         // Then the slots, one aligned store each. This is the publish.
         for (_, value, slot_at, _, _, _) in &edits {
@@ -2854,6 +2987,19 @@ impl Store {
             );
             let cell = unsafe { &*(map.as_ptr().add(*slot_at) as *const AtomicU64) };
             cell.store(*value, Ordering::Release);
+        }
+        // Last, the word that says which directory is live and how many keys
+        // it holds. One aligned store, so a reader sees the old directory with
+        // the old count or the new with the new -- never a count that outruns
+        // the entries behind it.
+        if let Some((spare_at, n, _)) = published_dir {
+            let at = off + FlatIndex::DIR_STATE_AT;
+            debug_assert_eq!(at % 8, 0, "the publish word must be 8-byte aligned");
+            let cell = unsafe { &*(map.as_ptr().add(at) as *const AtomicU64) };
+            cell.store(
+                FlatIndex::dir_state(spare_at, n),
+                std::sync::atomic::Ordering::Release,
+            );
         }
         // Finally the bump cursor, so a later open knows where the slack
         // starts. After the records, never before.

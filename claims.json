@@ -607,21 +607,21 @@
    "id": "EXT.10",
    "profile": "full",
    "expect": "fails",
-   "because": "The one that hurts, and the one that is moving. Equalize durability *downward* -- take LMDB's fsync away rather than adding Supdb's -- and Supdb still loses the load axis: 1,014,759 ops/s against lmdb-nosync's 1,629,108, 0.6229x at p=0.0022. It read 0.542x before the pending arena and f25-arena prices that change at 1.187x interleaved, which is consistent with the movement; the movement itself is two separate runs and this project does not accept those as attribution, so f25 is the evidence and this is the scoreboard. An append-structured store still losing 1.6x at bulk ingest to a B-tree that is not syncing either remains a defect rather than a tradeoff. What profiling established (docs/profiling.md): the gap is memory, not compute -- 1.37x the instructions and 21x the last-level misses per key before the arena. What is still unaddressed: `Store::put` never seals, only `append` checks whether the shard buffer is full, so the load buffers everything and flushes once, and resident memory is 218.3 MB against LMDB's 46.2 for the same data. And the keys are strictly sequential, a B-tree's best case and an append store's least differentiating shape, which is measured nowhere yet."
+   "because": "Equalize durability *downward* -- take LMDB's fsync away rather than adding Supdb's -- and Supdb still loses the load axis: 848,086 ops/s against lmdb-nosync's 1,604,233, 0.5287x at p=0.0022. It has read 0.542x, 0.623x and now 0.529x across three runs, so the pending arena's 1.187x -- which did not replicate either (F25.1) -- is not visible here and nothing else has moved it. An append-structured store losing bulk ingest to a B-tree that is not syncing either remains a defect rather than a tradeoff. Profiling put the gap in memory rather than compute: 1.37x the instructions and 21x the last-level misses per key (docs/profiling.md). Two things remain unaddressed: resident memory is 241.8 MB against LMDB's 46.2 for the same data, which f26 shows is mostly the 256MB buffer this adapter asks for and never needed; and the keys are strictly sequential, a B-tree's best case and an append store's least differentiating shape, which is measured nowhere."
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.11",
    "profile": "full",
    "expect": "fails",
-   "because": "No difference: 1,181,192 reads/s against LMDB's 1,132,129, ratio 1.0433 at p=0.4433. Recorded as failing because no difference is not a lead. Reads were the last axis Supdb was ahead on against LMDB, and matched, it is level -- and has now read 1.042x and 1.043x across two runs, so the parity is at least stable. Worth reading against EXT.4, which is the same measurement with Supdb paying for checksums LMDB does not have and coming out behind: verification is the difference between level and losing. LMDB is still transactional, so parity here is not yet parity."
+   "because": "No difference: 1,100,105 reads/s against LMDB's 1,090,215, ratio 1.0091 at p=0.8983, and 1.043x and 1.042x on the two runs before, so the parity is stable across three. Recorded as failing because no difference is not a lead. LMDB is still transactional, so parity here is not yet parity."
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.12",
    "profile": "full",
    "expect": "fails",
-   "because": "Supdb scans at 32,360,515 entries/s against LMDB's 41,293,756 -- 0.7837x at p=0.0152 -- with the checksum axis equalized, and 0.785x on the run before, so this one is stable. Note it disagrees with ext-sweep, which has the two engines indistinguishable on every scan axis it measures (EXT.7, EXT.8). The suites differ in shape: ext-sweep builds one store per engine and sweeps it repeatedly, so it measures a warm walk, while this one loads a fresh store per repetition and scans it once. Which a reader should care about depends on the workload, and the honest answer is that Supdb is level on a warm scan and behind on a cold one. Do not average them."
+   "because": "No difference now: 32,404,617 entries/s against LMDB's 33,153,633, ratio 0.9774 at p=0.0736, where the two runs before read 0.784x and 0.785x as a loss. Recorded as failing because no difference is not a lead. This moved, and the honest position is that I cannot attribute it: between those runs the engine gained a pending arena, `seal_on_put`, a fix to an in-place checkpoint that had been publishing records into the hash and not the directory, and a byte-order mark -- and this host has moved EXT.1 from 0.866x to 1.331x with no code change at all. What it does mean is that ext-kv and ext-sweep no longer disagree: cold and warm, Supdb and LMDB scan at the same speed as far as this host can resolve."
   },
   {
    "experiment": "f25-arena",
@@ -731,6 +731,20 @@
    "profile": "full",
    "expect": "fails",
    "because": "The price, and it is why `redo_log` is off by default: 0 of 500 keys that a logged checkpoint made durable are visible to a reader opened before the next full rewrite. A logged checkpoint writes its records and fsyncs them and publishes nothing; a reader reads the published index, and the index does not have them. `Store::open` replays, so the writer loses nothing across a restart -- but a concurrent reader is looking at an older state than the one the writer has been told is durable, and that is a narrowing of what `checkpoint` has always promised: durable *and* visible to anyone. Recorded as failing rather than described in a doc comment so that making readers replay the log turns this red and forces the decision to be deliberate."
+  },
+  {
+   "experiment": "f30-insertindex",
+   "id": "F30.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "139,402 ops/s against 29,112 -- 4.788x at p=0.0022 -- for a workload that only inserts, with 1.85x fewer device bytes (509.8 MB against 944.5). It scales the way avoiding an O(key count) rewrite must: 1.582x at 20k keys, 3.254x at 100k, 4.788x at 200k. `checkpoint_in_place` declined every insertion outright, and f27 priced that refusal at 4.122x -- which is what this recovers, to within the noise. The records and the hash always had room for a new key; only the directory did not, because it is a sorted array and growing it shifts everything after. It is double-buffered now, so the spliced copy goes into the buffer nobody is reading and one aligned store of `dir_state` publishes which is live and how many keys it holds -- the same discipline the record path already used, where the bytes go down first and a single store publishes them."
+  },
+  {
+   "experiment": "f30-insertindex",
+   "id": "F30.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "52.56 MB against 385.21 -- the file is 7.33x SMALLER with room to insert, at p=0.0001, and the prediction was the opposite. Doubling the directory costs about 4 bytes per key on an index that is about 57, and Supdb already loses the size axis to LMDB (EXT.6), so this claim was written expecting to have to defend a size regression. It does not: rewriting the index for every insertion appends a fresh section each time and reclaims them more slowly than they accumulate, which costs far more than the second buffer ever could. The reserved directory is the smaller half of a trade whose larger half nobody had measured."
   }
  ],
  "metrics": [
