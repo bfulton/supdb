@@ -222,6 +222,18 @@ the misparse as file corruption, and an in-place checkpoint that republished a
 record into its hash slot and not its directory entry -- so `read_all` returned
 the new value and `scan` the previous one, silently, for every key it touched.
 
+Also fixed: a store recorded nothing about the byte order that wrote it. Every
+scalar goes to disk little-endian, but the two structures that make this format
+fast are addressed in place regardless -- `flatindex` hands back `&[Ext]`
+borrowed out of the mapping, and a block table's records are reinterpreted
+rather than decoded -- so a file is self-consistent only on the byte order that
+wrote it. A big-endian-written store would have been read, with every extent
+field silently byte-swapped, rather than refused. The three magics are now
+written `to_ne_bytes`, which is a byte-order mark that costs nothing and
+changes no file already written: identical bytes on a little-endian machine,
+and swapped on any other, so the magic check itself does the refusing. Both
+open paths name it rather than reporting damage.
+
 That last one needs a reopen to show: a fresh store takes the full-rewrite path
 until an index section exists with a matching key count, and every scan test
 here built its store in one session, so the in-place path was never under test

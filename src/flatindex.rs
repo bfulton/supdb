@@ -108,6 +108,11 @@ fn align_up(n: usize, to: usize) -> usize {
 fn rd_u16(b: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?))
 }
+/// Read the byte-order mark, which is the one field stored native-endian.
+fn rd_ne_u32(b: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_ne_bytes(b.get(at..at + 4)?.try_into().ok()?))
+}
+
 fn rd_u32(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
 }
@@ -230,7 +235,13 @@ pub fn encode(
     let dir_off = hash_off + p.hash_cap * SLOT;
     let recs_off = p.total - p.recs_cap;
 
-    out[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+    // Native-endian, and the only field here written that way: this section
+    // is the one a lookup addresses in place, handing back `&[Ext]` borrowed
+    // from the mapping, so it is meaningful only on the byte order that wrote
+    // it. On a little-endian machine these bytes are what `to_le_bytes`
+    // produced, so no file already written changes. `is_flat` then rejects a
+    // section of the other order instead of reinterpreting its extents.
+    out[0..4].copy_from_slice(&MAGIC.to_ne_bytes());
     out[4..8].copy_from_slice(&VERSION.to_le_bytes());
     let (pg, pt, po, ps, pu) = prev.unwrap_or((0, 0, 0, 0, 0));
     for (i, v) in [
@@ -369,7 +380,7 @@ pub fn key_hash(key: &[u8]) -> u64 {
 
 /// True if `sec` looks like this format rather than the varint one.
 pub fn is_flat(sec: &[u8]) -> bool {
-    rd_u32(sec, 0) == Some(MAGIC) && rd_u32(sec, 4) == Some(VERSION)
+    rd_ne_u32(sec, 0) == Some(MAGIC) && rd_u32(sec, 4) == Some(VERSION)
 }
 
 impl FlatIndex {
@@ -1097,7 +1108,9 @@ pub fn encode_blocks(
 ) -> Vec<u8> {
     let crcs_off = BLK_HEADER + blocks.len() * BLK_ENTRY;
     let mut out = vec![0u8; crcs_off + blocks.len() * CRC_ROW];
-    out[0..4].copy_from_slice(&BLK_MAGIC.to_le_bytes());
+    // Native-endian for the same reason as the index section's: `BlockRec` is
+    // reinterpreted in place rather than decoded.
+    out[0..4].copy_from_slice(&BLK_MAGIC.to_ne_bytes());
     out[4..8].copy_from_slice(&(BLK_ENTRY as u32).to_le_bytes());
     out[8..16].copy_from_slice(&(blocks.len() as u64).to_le_bytes());
     for (i, b) in blocks.iter().enumerate() {
@@ -1139,7 +1152,7 @@ pub struct MappedBlocks {
 /// error. The magic is the discriminator; whether to *map* it is a separate
 /// question.
 pub fn is_block_section(sec: &[u8]) -> bool {
-    rd_u32(sec, 0) == Some(BLK_MAGIC)
+    rd_ne_u32(sec, 0) == Some(BLK_MAGIC)
 }
 
 /// The flat block table copied out into an owned Vec.

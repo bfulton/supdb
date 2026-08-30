@@ -115,9 +115,34 @@ impl Super {
         for (i, v) in self.fields().iter().enumerate() {
             out[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
         }
-        out[120..128].copy_from_slice(&MAGIC.to_le_bytes());
+        // Native-endian, deliberately, and it is the only field written that
+        // way. Every scalar here is little-endian on the wire, but the paths
+        // that make this format fast are not: `flatindex` hands back `&[Ext]`
+        // borrowed straight out of the mapping and `BlockRec` is reinterpreted
+        // in place, both native-endian. So a file is self-consistent only on a
+        // machine of the same byte order as the one that wrote it, and until
+        // now nothing recorded which that was -- a big-endian-written file
+        // would have been read, not refused.
+        //
+        // Writing the magic with `to_ne_bytes` makes it a byte-order mark at
+        // no cost: on a little-endian machine the bytes are identical to what
+        // `to_le_bytes` produced, so every file already written stays valid,
+        // and a reader of the other order sees the magic byte-swapped and
+        // stops. `wrong_endian` turns that into an error that says so.
+        out[120..128].copy_from_slice(&MAGIC.to_ne_bytes());
         out[128..136].copy_from_slice(&self.checksum().to_le_bytes());
         out
+    }
+
+    /// True when this slot holds a superblock written by a machine of the
+    /// opposite byte order: the magic is present but swapped.
+    ///
+    /// Distinguished from damage so the error can say which. "No readable
+    /// superblock" on a perfectly intact file written on the other kind of
+    /// machine is a diagnosis that would cost somebody a day.
+    fn wrong_endian(buf: &[u8]) -> bool {
+        buf.len() >= SUPER_BYTES
+            && u64::from_ne_bytes(buf[120..128].try_into().unwrap()) == MAGIC.swap_bytes()
     }
 
     fn decode(buf: &[u8]) -> Option<Super> {
@@ -127,7 +152,7 @@ impl Super {
         let f: Vec<u64> = (0..15)
             .map(|i| u64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap()))
             .collect();
-        if u64::from_le_bytes(buf[120..128].try_into().unwrap()) != MAGIC {
+        if u64::from_ne_bytes(buf[120..128].try_into().unwrap()) != MAGIC {
             return None;
         }
         let s = Super {
@@ -1257,7 +1282,17 @@ impl Store {
                 (Some(x), Some(y)) if y.generation > x.generation => y,
                 (Some(x), _) => x,
                 (None, Some(y)) => y,
-                (None, None) => return Err(corrupt("no readable superblock")),
+                (None, None) => {
+                    let foreign = Super::wrong_endian(&map[0..SUPER_BYTES])
+                        || Super::wrong_endian(&map[SLOT as usize..SLOT as usize + SUPER_BYTES]);
+                    return Err(corrupt(if foreign {
+                        "this store was written on a machine of the opposite byte order; \
+                         Supdb addresses its index in place, so a file is only self-consistent \
+                         on the byte order that wrote it"
+                    } else {
+                        "no readable superblock"
+                    }));
+                }
             }
         };
         let high_water = sb.high_water;
@@ -3652,10 +3687,39 @@ impl Reader {
                     }
                 }
                 None => {
+                    // An intact file of the other byte order reads as damage
+                    // unless it is named, and "no valid supdb checkpoint" on a
+                    // healthy file is a diagnosis that would cost somebody a
+                    // day.
+                    let foreign = mmap.len() >= SUPER as usize
+                        && (Super::wrong_endian(&mmap[0..SUPER_BYTES])
+                            || Super::wrong_endian(
+                                &mmap[SLOT as usize..SLOT as usize + SUPER_BYTES],
+                            ));
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        "no valid supdb checkpoint",
-                    ))
+                        if foreign {
+                            format!(
+                                "this store was written on a {} machine and this is a {} one. \
+                             Supdb's index is addressed in place -- `&[Ext]` is borrowed \
+                             straight out of the mapping -- so a file is only self-consistent \
+                             on the byte order that wrote it, and it is refused rather than \
+                             misread",
+                            if cfg!(target_endian = "little") {
+                                "big-endian"
+                            } else {
+                                "little-endian"
+                            },
+                            if cfg!(target_endian = "little") {
+                                "little-endian"
+                            } else {
+                                "big-endian"
+                            }
+                            )
+                        } else {
+                            "no valid supdb checkpoint".to_string()
+                        },
+                    ));
                 }
             }
             if attempt >= 16 {

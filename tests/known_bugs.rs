@@ -1401,3 +1401,71 @@ fn a_scan_sees_what_an_in_place_checkpoint_wrote() {
     s.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A file written on the other byte order is refused, and says so.
+///
+/// Supdb writes every scalar little-endian and then addresses two structures
+/// in place regardless: `flatindex` hands back `&[Ext]` borrowed straight out
+/// of the mapping, and a block table's records are reinterpreted rather than
+/// decoded. So a file is self-consistent only on the byte order that wrote it
+/// -- and nothing recorded which that was, so a big-endian-written store would
+/// have been *read*, with extents whose fields were all byte-swapped, rather
+/// than refused.
+///
+/// The fix costs nothing and breaks no existing file: the three magics are
+/// written `to_ne_bytes` instead of `to_le_bytes`, which is the same bytes on
+/// a little-endian machine and a byte-order mark everywhere else.
+///
+/// This machine is little-endian, so the other order is simulated by swapping
+/// the mark in a file that is otherwise perfectly intact. That is exactly what
+/// a big-endian writer would have produced for that field.
+#[test]
+fn a_file_from_the_other_byte_order_is_refused_by_name() {
+    let dir = std::env::temp_dir().join(format!("supdb-endian-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.dat");
+    {
+        let s = Store::create(&path, Options::default()).unwrap();
+        for k in 0..8u32 {
+            s.put(format!("k{k}").as_bytes(), b"v").unwrap();
+        }
+        s.checkpoint().unwrap();
+        s.close().unwrap();
+    }
+    // Intact as written: both readers open it.
+    Reader::open(&path).expect("a same-endian file opens");
+    Store::open(&path, Options::default())
+        .expect("a same-endian file opens for writing")
+        .close()
+        .unwrap();
+
+    // Swap the byte-order mark in both superblock slots, and nothing else.
+    // The checksum is computed over the field *values*, so it still matches:
+    // this file is damaged in exactly one way, and it is the way that says
+    // "another machine wrote me".
+    let mut bytes = std::fs::read(&path).unwrap();
+    for slot in [0usize, 512] {
+        let at = slot + 120;
+        bytes[at..at + 8].reverse();
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let msg = match Reader::open(&path) {
+        Ok(_) => panic!("a foreign-endian file must not open"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("endian"),
+        "the error must name the byte order, not read as damage: {msg}"
+    );
+    let msg = match Store::open(&path, Options::default()) {
+        Ok(_) => panic!("a foreign-endian file must not open for writing"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("byte order"),
+        "Store::open must name it too: {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
