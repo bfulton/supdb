@@ -814,6 +814,59 @@ checkpoint state, no read observes a partial one. Record histories, check offlin
 free-list fragmentation, merge rate and latency percentiles over time. Fix §2.14 first, or the
 space-amplification column is off by 211×.
 
+## Tier 5 — the engine somewhere it was not designed to run
+
+Part 3 lists portability as a gap and is specific about it: "`prefetch` is x86_64-only",
+"the engine is Unix-only (`FileExt::write_all_at`)". Three experiments now exist because a
+consumer asked for the reader in a browser, and each of them settled a decision that would
+otherwise have been made on taste.
+
+**23. `w1-daysize` — what an index of a given shape costs, and therefore what is possible.**
+An index that fits in a download budget can be read synchronously through an OPFS access
+handle, and the API keeps its shape; one that does not forces a plan-then-fetch API over
+ranged GETs. That is an architectural fork decided by a single number, so the number came
+first: 36.14 bytes per log line over a 580 KB fixed cost, which puts a 32 MB budget at
+912,522 lines a day. It is a *space* experiment, so it is exempt from the interleaving rule —
+a file length does not drift with the machine — and it reports a difference quotient between
+measured points rather than a fitted slope, for the reason `ext-sweep` documents.
+
+It also found the largest number in this repository that is not a defect in the engine.
+Appending a day's postings in log-line order writes 831 MB where grouping them by term first
+writes 36.7: 22.6x, from 44,629 inline merges against zero. That is §2's inline-merge cost
+(F5.1's latency tail) arriving on the space axis, and it means the *caller's* write order is a
+first-class part of this engine's performance envelope and is documented nowhere else.
+
+**24. `f28-count` — pricing a format change instead of arguing about one.** A consumer wanted
+a value count without decoding the values, and hoped it could come out of the extent list. It
+cannot: an `Ext` is block, offset, byte length and the offset of the last record, and none of
+those is a count. The experiment runs four arms interleaved over one file and the useful
+result is the one that refutes the request: walking the length prefixes costs 2,304.6 ns
+against 2,342.1 to read every value — *no difference*. Skipping a payload does not skip the
+cache lines it lies in, and the walk is a serial dependent chain.
+
+What is 28x is arithmetic on a schema rather than a change to the format: a fixed-width value
+carries a fixed-width length prefix, so a posting list's count falls out of `Ext::len`,
+cross-checked against `Ext::last`. And the cost of adding a per-extent count is now a number
+rather than an opinion — at most 6.7 ns per lookup, against four bytes on a 16-byte `Ext` paid
+by every store forever. Declined, with the measurement attached.
+
+**25. `w3-bundle` — a size budget with a control.** A wasm module measured alone cannot say
+whether it is large because the engine is large or because a Rust `cdylib` starts out large,
+and those want different responses. `web/floor/` is an empty module with the same
+standard-library surface built the same way, so the difference is the engine's actual marginal
+cost: 23,866 gzipped bytes of a 36,536-byte module, with the remaining 35% being the
+allocator, the panic machinery and `core::fmt` that `std::io::Error` pulls in whatever it is
+reporting. Every size claim in this repository should have had a control and this is the first
+one that does.
+
+The portability gap itself is now half-closed and half-documented. The reader compiles for
+`wasm32-unknown-unknown` and runs in a browser against a real OPFS handle; the writer does
+not and is excluded by `cfg` rather than ported. And Part 3's "endianness is explicit and
+correct throughout" is not quite right: every *scalar* is written little-endian, but the
+zero-copy paths reinterpret `&[Ext]` and `BlockRec` arrays as native-endian, so the format is
+only self-consistent on a little-endian machine. `Blob::open` refuses a big-endian target
+explicitly; `store::Reader` has the same hazard and does not.
+
 ## The single artifact worth building
 
 One harness that, for every cell of
