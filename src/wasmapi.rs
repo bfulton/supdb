@@ -202,6 +202,62 @@ pub extern "C" fn supdb_out_ptr() -> *const u8 {
     STATE.with(|s| s.borrow().out.as_ptr())
 }
 
+// ------------------------------------------------------------------ plans --
+
+/// Frame byte ranges into `out`: `u32 n`, then `n` records of `u32 off,
+/// u32 len`. Offsets fit, because this ABI refuses objects at or over 4 GiB
+/// at open (`MAX_OBJECT`), and an open plan is bounded by the `object_len`
+/// the caller passes.
+fn frame_ranges(ranges: &[(u64, u64)], out: &mut Vec<u8>) -> u32 {
+    out.clear();
+    out.extend_from_slice(&(ranges.len() as u32).to_le_bytes());
+    for (off, len) in ranges {
+        out.extend_from_slice(&(*off as u32).to_le_bytes());
+        out.extend_from_slice(&(*len as u32).to_le_bytes());
+    }
+    out.len() as u32
+}
+
+/// How many leading bytes of the object the host must have before
+/// `supdb_open_plan` can name the rest. A constant of the format, exported
+/// rather than duplicated in JavaScript -- the superblock geometry has
+/// drifted out from under a hand-copied constant once already.
+#[no_mangle]
+pub extern "C" fn supdb_open_probe() -> u32 {
+    crate::blob::open_probe() as u32
+}
+
+/// Plan the open: the byte ranges `supdb_open_host` will read, from the
+/// first `supdb_open_probe()` bytes of an `object_len`-byte object.
+///
+/// Framed as `u32 n`, then `n` records of `u32 off, u32 len`, at
+/// `supdb_out_ptr()`. Returns the framed length, or `u32::MAX` on failure --
+/// including everything open itself would refuse about the header, so a
+/// caller holding ranges knows the open will not stumble on it either.
+///
+/// This is the boundary of the planning seam: the ranges here (superblock
+/// probe, key index, block table) are read once at open and resident after,
+/// and `supdb_ranges` covers only the data reads that come after. See
+/// `Blob::ranges_for` for when that split stops being cheap.
+///
+/// # Safety
+/// `ptr` must point at `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn supdb_open_plan(ptr: *const u8, len: u32, object_len: u32) -> u32 {
+    let head = std::slice::from_raw_parts(ptr, len as usize);
+    match crate::blob::open_ranges(head, object_len as u64) {
+        Ok(ranges) => STATE.with(|s| {
+            let mut st = s.borrow_mut();
+            st.err.clear();
+            let mut out = std::mem::take(&mut st.out);
+            let n = frame_ranges(&ranges, &mut out);
+            st.out = out;
+            n
+        }),
+        Err(e) => fail(e.to_string(), u32::MAX),
+    }
+}
+
 // ------------------------------------------------------------------ open --
 
 /// Open over bytes in this module's memory. Takes ownership of them.
@@ -259,6 +315,56 @@ macro_rules! on {
             AnyBlob::Host(x) => x.$m($($a),*),
         }
     };
+}
+
+/// The data ranges a read of these keys will touch. R6.2.
+///
+/// Input at `ptr`: `u32 nkeys`, then per key `u32 klen` followed by `klen`
+/// key bytes. Output framed like `supdb_open_plan`: `u32 n`, then `n`
+/// records of `u32 off, u32 len` -- sorted, deduped, merged, absolute.
+/// Returns the framed length, or `u32::MAX` on error.
+///
+/// The contract this enables: the host awaits fetching these ranges, then
+/// `supdb_lookup`/`supdb_count` for the same keys run synchronously and
+/// cannot miss. Nothing inside the module ever suspends -- the plan crosses
+/// the boundary instead of the await. A key that is not there contributes no
+/// ranges, and reading it will answer empty without touching the source.
+///
+/// # Safety
+/// `ptr` must point at `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn supdb_ranges(h: u32, ptr: *const u8, len: u32) -> u32 {
+    let buf = std::slice::from_raw_parts(ptr, len as usize);
+    with_blob(h, u32::MAX, |b, out| {
+        fn bad(what: &str) -> std::io::Error {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("supdb_ranges: {what}"),
+            )
+        }
+        fn take_u32(buf: &[u8], p: &mut usize) -> Result<u32> {
+            let end = p.checked_add(4).ok_or_else(|| bad("truncated key list"))?;
+            let bytes = buf.get(*p..end).ok_or_else(|| bad("truncated key list"))?;
+            *p = end;
+            Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+        }
+        let mut keys: Vec<&[u8]> = Vec::new();
+        let mut p = 0usize;
+        let n = take_u32(buf, &mut p)?;
+        for _ in 0..n {
+            let klen = take_u32(buf, &mut p)? as usize;
+            let end = p
+                .checked_add(klen)
+                .ok_or_else(|| bad("a key runs past the list"))?;
+            let key = buf
+                .get(p..end)
+                .ok_or_else(|| bad("a key runs past the list"))?;
+            p = end;
+            keys.push(key);
+        }
+        let ranges = on!(b, ranges_for_many, &keys)?;
+        Ok(frame_ranges(&ranges, out))
+    })
 }
 
 /// Number of distinct keys. R4.5.

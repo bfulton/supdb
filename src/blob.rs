@@ -139,6 +139,24 @@ struct Super {
     blk_stored: u64,
     blk_uncompressed: u64,
     high_water: u64,
+    /// The redo log arena (fields 13 and 14). `log_len` is the arena's
+    /// *capacity*, not its used bytes -- a store written with
+    /// `Options::redo_log` (the default) carries an arena even when nothing
+    /// is in it, because a full index rewrite allocates a fresh one with a
+    /// single zero length-word at its head, which is how replay knows to
+    /// stop immediately.
+    ///
+    /// `store::Reader` replays the log; this reader does not, deliberately --
+    /// replay is a write-path concern and the wasm build exists to not carry
+    /// one. That is only sound when the log holds no records, so `open`
+    /// probes the arena's first length word and refuses a nonzero one: those
+    /// records are newer than everything in the index by construction, and a
+    /// reader that ignored them would quietly serve the previous state. A
+    /// *sealed* object -- a logshed day index after its closing checkpoint --
+    /// always probes empty; a non-empty log means a writer's working store,
+    /// which was never this reader's contract.
+    log_off: u64,
+    log_len: u64,
 }
 
 impl Super {
@@ -174,8 +192,124 @@ impl Super {
             blk_stored: f[7],
             blk_uncompressed: f[8],
             high_water: f[12],
+            log_off: f[13],
+            log_len: f[14],
         })
     }
+}
+
+/// Decode the superblock pair in `head` and validate what it describes,
+/// exactly as `open` will. One function, because `open_ranges` must promise
+/// the same ranges `open` goes on to read, and two copies of "which slot
+/// wins" is how they would come to differ.
+fn pick_super(head: &[u8], object_len: u64) -> Result<Super> {
+    if object_len < SUPER {
+        return Err(corrupt("file too short to hold a superblock"));
+    }
+    let want = (SLOT as usize) + SB_BYTES;
+    if head.len() < want {
+        return Err(short(0, want, head.len() as u64));
+    }
+    let a = Super::decode(&head[0..SB_BYTES]);
+    let b = Super::decode(&head[SLOT as usize..SLOT as usize + SB_BYTES]);
+    // Both slots are read and the valid one with the higher generation
+    // wins, so a file whose last checkpoint was interrupted opens at the
+    // previous complete state rather than failing.
+    let sb = match (a, b) {
+        (Some(x), Some(y)) => {
+            if x.generation >= y.generation {
+                x
+            } else {
+                y
+            }
+        }
+        (Some(x), None) => x,
+        (None, Some(y)) => y,
+        (None, None) => return Err(corrupt("no valid supdb checkpoint")),
+    };
+    if sb.high_water > object_len {
+        return Err(corrupt(
+            "the superblock describes more bytes than the object holds: it is truncated",
+        ));
+    }
+    // A section that was compressed cannot be addressed where it lies, and
+    // this reader has no reason to support the varint formats -- they are
+    // what `flat_index` replaced, and a logshed day index is written by a
+    // current writer with the current defaults.
+    if sb.key_stored != sb.key_uncompressed || sb.blk_stored != sb.blk_uncompressed {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "this file's index sections are compressed, so they cannot be read where they \
+             lie. Write it with the default options, which store both sections verbatim",
+        ));
+    }
+    Ok(sb)
+}
+
+/// Does the arena the superblock names hold a record? Four bytes decide:
+/// replay stops at the first zero length-word, so a nonzero first word is a
+/// record this reader would be ignoring. See `Super::log_off` for why that
+/// is refused rather than tolerated. An arena too small for a length word
+/// cannot hold a record and reads as empty.
+fn log_probe_range(sb: &Super) -> Option<(u64, u64)> {
+    (sb.log_len >= 4).then_some((sb.log_off, 4))
+}
+
+/// How many leading bytes of the object `open` must see before every other
+/// byte it will read can be named. `open_ranges` turns those bytes into the
+/// rest of the plan.
+pub fn open_probe() -> u64 {
+    SLOT + SB_BYTES as u64
+}
+
+/// The byte ranges `Blob::open` will read, from the first `open_probe()`
+/// bytes of an `object_len`-byte object. Sorted, merged, absolute.
+///
+/// This is the open-time half of the planning seam (R6.2): a caching byte
+/// source fetches `0..open_probe()`, hands the bytes here, fetches what comes
+/// back, and `open` then runs synchronously with no read it can miss. The
+/// plan is the superblock probe itself plus the key index and block table
+/// sections -- the two sections `open` copies out once and keeps, which is
+/// what makes every later `lookup` a pure plan over resident bytes.
+///
+/// Refuses everything `open` would refuse about the superblock -- no valid
+/// checkpoint, a truncated object, compressed sections, an unreplayed redo
+/// log -- so a caller that gets ranges back knows the open will not stumble
+/// on the header either.
+pub fn open_ranges(head: &[u8], object_len: u64) -> Result<Vec<(u64, u64)>> {
+    let sb = pick_super(head, object_len)?;
+    let mut v = vec![
+        (0, open_probe()),
+        (sb.key_off, sb.key_stored),
+        (sb.blk_off, sb.blk_stored),
+    ];
+    // The redo-log probe: four bytes `open` reads to prove the log empty.
+    if let Some(r) = log_probe_range(&sb) {
+        v.push(r);
+    }
+    merge_ranges(&mut v);
+    Ok(v)
+}
+
+/// Sort byte ranges and merge the overlapping and the adjacent.
+///
+/// Adjacency merges too, because the consumer of a plan is a range fetcher
+/// and two touching HTTP ranges are strictly worse than one. Zero-length
+/// entries are dropped: they name no byte.
+fn merge_ranges(v: &mut Vec<(u64, u64)>) {
+    v.retain(|(_, len)| *len > 0);
+    v.sort_unstable();
+    let mut out = 0usize;
+    for i in 0..v.len() {
+        if out > 0 && v[i].0 <= v[out - 1].0 + v[out - 1].1 {
+            let end = (v[i].0 + v[i].1).max(v[out - 1].0 + v[out - 1].1);
+            v[out - 1].1 = end - v[out - 1].0;
+        } else {
+            v[out] = v[i];
+            out += 1;
+        }
+    }
+    v.truncate(out);
 }
 
 /// A section of the file: lent by the source, or copied out of it once.
@@ -281,38 +415,24 @@ impl<B: Bytes> Blob<B> {
         }
         let mut head = [0u8; (SLOT as usize) + SB_BYTES];
         src.read_at(0, &mut head)?;
-        let a = Super::decode(&head[0..SB_BYTES]);
-        let b = Super::decode(&head[SLOT as usize..SLOT as usize + SB_BYTES]);
-        // Both slots are read and the valid one with the higher generation
-        // wins, so a file whose last checkpoint was interrupted opens at the
-        // previous complete state rather than failing.
-        let sb = match (a, b) {
-            (Some(x), Some(y)) => {
-                if x.generation >= y.generation {
-                    x
-                } else {
-                    y
-                }
+        // Everything `open` checks about the header lives in `pick_super`,
+        // shared with `open_ranges` so the plan and the open cannot drift.
+        let sb = pick_super(&head, src.len())?;
+        // The log-emptiness probe: this reader does not replay the redo log,
+        // which is only sound when there is nothing to replay. See
+        // `Super::log_off`. Four bytes, because replay itself stops at the
+        // first zero length-word -- the arena describes its own extent.
+        if let Some((off, _)) = log_probe_range(&sb) {
+            let mut word = [0u8; 4];
+            src.read_at(off, &mut word)?;
+            if word != [0u8; 4] {
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    "this store's redo log holds records newer than its index, and this reader \
+                     does not replay a log. It reads sealed objects; seal the store with a full \
+                     checkpoint (a rolled day index already is) before reading it here",
+                ));
             }
-            (Some(x), None) => x,
-            (None, Some(y)) => y,
-            (None, None) => return Err(corrupt("no valid supdb checkpoint")),
-        };
-        if sb.high_water > src.len() {
-            return Err(corrupt(
-                "the superblock describes more bytes than the object holds: it is truncated",
-            ));
-        }
-        // A section that was compressed cannot be addressed where it lies, and
-        // this reader has no reason to support the varint formats -- they are
-        // what `flat_index` replaced, and a logshed day index is written by a
-        // current writer with the current defaults.
-        if sb.key_stored != sb.key_uncompressed || sb.blk_stored != sb.blk_uncompressed {
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                "this file's index sections are compressed, so they cannot be read where they \
-                 lie. Write it with the default options, which store both sections verbatim",
-            ));
         }
         let key = Sec::read(&src, sb.key_off, sb.key_stored as usize)?;
         let blk = Sec::read(&src, sb.blk_off, sb.blk_stored as usize)?;
@@ -414,6 +534,72 @@ impl<B: Bytes> Blob<B> {
 
     fn exts_at(&self, rank: usize) -> Option<(&[u8], &[Ext])> {
         self.idx.at(self.key_sec().ok()?, rank)
+    }
+
+    // ------------------------------------------------------------ planning --
+
+    /// The byte ranges a read of `key` will touch in the source. R6.2.
+    ///
+    /// A lookup is already a plan: it consults the key index and returns
+    /// extents, and reads no data. An extent names a block, the block table
+    /// names the block's bytes, and both sections are resident after `open` --
+    /// so every byte a `read_all`, `count` or `scan` of this key will ask the
+    /// source for is known before any of them runs. This hands that knowledge
+    /// out, so a host that fetches lazily can fetch first, asynchronously,
+    /// and the read then runs synchronously and cannot miss.
+    ///
+    /// **The granularity is the stored block, not the extent.** The read path
+    /// reads a whole block from the source per extent -- `with_extent` takes
+    /// `BlockLoc::stored` bytes at `BlockLoc::off` however the block is
+    /// encoded, and verification and decompression both want the enclosing
+    /// bytes, not the extent's slice of them. A plan at extent granularity
+    /// would under-report, and the exactness test in `tests/ranges.rs` is
+    /// built to catch exactly that.
+    ///
+    /// **What it does not cover, and until when.** The superblock probe, the
+    /// key index and the block table are read at `open` (planned by
+    /// `open_ranges`) and are resident from then on; this call names only the
+    /// data reads that come after. That split is cheap today because the
+    /// sections are small when key cardinality is bounded -- a logshed
+    /// segment is ~100 keys of index over megabytes of postings, since terms
+    /// come from fields with tens of values each. It stops being cheap the
+    /// day the keys are unbounded -- a trigram or free-text index -- and the
+    /// index would then need to be planned and fetched sparsely too. The
+    /// ranges here are absolute file offsets with no assumption that the
+    /// caller holds the rest of the file, so that day changes the host, not
+    /// this ABI.
+    ///
+    /// Sorted, merged (overlapping and adjacent), absolute. Empty for a key
+    /// that is not there: no extents, no bytes, and the read will answer zero
+    /// values without touching the source.
+    pub fn ranges_for(&self, key: &[u8]) -> Result<Vec<(u64, u64)>> {
+        let mut v = Vec::new();
+        self.plan_key(key, &mut v)?;
+        merge_ranges(&mut v);
+        Ok(v)
+    }
+
+    /// One plan for a set of keys: the union of each key's ranges, deduped
+    /// and merged. This is the form a range fetcher wants -- two keys in the
+    /// same block cost one fetch, and adjacent blocks cost one request.
+    pub fn ranges_for_many(&self, keys: &[&[u8]]) -> Result<Vec<(u64, u64)>> {
+        let mut v = Vec::new();
+        for key in keys {
+            self.plan_key(key, &mut v)?;
+        }
+        merge_ranges(&mut v);
+        Ok(v)
+    }
+
+    fn plan_key(&self, key: &[u8], out: &mut Vec<(u64, u64)>) -> Result<()> {
+        let Some(exts) = self.lookup(key) else {
+            return Ok(());
+        };
+        for e in exts {
+            let loc = self.loc_of(e.block)?;
+            out.push((loc.off, loc.stored as u64));
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------ blocks --
