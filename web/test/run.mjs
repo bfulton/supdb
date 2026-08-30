@@ -127,6 +127,118 @@ async function main() {
     await rpc(worker, "close");
     worker.terminate();
   }
+
+  await cachedSource();
+}
+
+// R6: a reader over ranged HTTP with a cache smaller than the file. The
+// index is never downloaded whole -- the open fetches the sections it
+// plans, a point read fetches the blocks its key lives in, and the extent
+// counts fetch nothing at all. The fixture is segment-shaped on purpose:
+// ~100 keys of index over megabytes of data, which is where sparseness
+// pays, rather than a wide dictionary that would flatter the index side.
+async function cachedSource() {
+  const seg = await (await fetch("./out/expected-segment.json")).json();
+  const worker = new Worker("../worker.mjs", { type: "module" });
+  const opened = await rpc(worker, "open", {
+    wasmUrl: new URL("../supdb.wasm", location.href).href,
+    indexUrl: new URL("./out/segment.supdb", location.href).href,
+    // A fresh cache per run: the cache is named for the object *version*,
+    // and the fixture is rebuilt per run.
+    name: `segment-${Date.now()}`,
+    source: "cached",
+    budgetBytes: seg.cache_budget_bytes,
+  });
+
+  assert(
+    "cached: the budget is smaller than the file, or this proves nothing",
+    seg.cache_budget_bytes < seg.file_bytes,
+    `budget ${seg.cache_budget_bytes} vs file ${seg.file_bytes}`,
+  );
+  check("cached: keys", opened.keys, seg.keys);
+  check("cached: object length seen over HTTP", opened.length, seg.file_bytes);
+  // The up-front cost is the planned open, not the object: superblock probe,
+  // key index, block table, log word -- page-rounded. This equality is the
+  // "you did not download the file" proof, and the native fixture computed
+  // the number from `open_ranges` so it also pins JS paging to the plan.
+  check("cached: open fetched exactly its plan", opened.openFetchedBytes, seg.open_fetch_bytes);
+  assert(
+    "cached: the open fetch is a fraction of the object",
+    opened.openFetchedBytes < seg.file_bytes / 4,
+    `${opened.openFetchedBytes} of ${seg.file_bytes}`,
+  );
+
+  // Extent counts and the dictionary scan: answered from the resident
+  // sections, so the cache must not fetch another byte for them.
+  const afterOpen = await rpc(worker, "cacheStats");
+  for (const p of seg.probes) {
+    check(
+      `cached: countFixed ${p.key}`,
+      await rpc(worker, "countFixed", { key: p.key, width: seg.value_bytes }),
+      p.count,
+    );
+    check(
+      `cached: storedBytes ${p.key}`,
+      await rpc(worker, "storedBytes", { key: p.key }),
+      p.stored_bytes,
+    );
+  }
+  const fixed = await rpc(worker, "scanCountsFixed", {
+    from: seg.scan.from,
+    limit: seg.scan.limit,
+    width: seg.value_bytes,
+  });
+  check("cached: scanCountsFixed ranks the dictionary", fixed, seg.scan.rows);
+  const afterCounts = await rpc(worker, "cacheStats");
+  check(
+    "cached: counts and the scan fetched nothing",
+    afterCounts.fetchedBytes,
+    afterOpen.fetchedBytes,
+  );
+
+  // Point reads: plan, ensure, then read -- and the values themselves are
+  // checked against the native reader through the fixture's FNV hash.
+  for (const p of seg.probes) {
+    const plan = await rpc(worker, "planRanges", { keys: [p.key] });
+    assert(
+      `cached: ${p.key} plans its data before reading it`,
+      plan.length >= 1 && plan.reduce((n, r) => n + r[1], 0) >= p.stored_bytes,
+      JSON.stringify(plan),
+    );
+    await rpc(worker, "ensure", { keys: [p.key] });
+    const got = await rpc(worker, "lookupHash", { key: p.key });
+    check(`cached: lookup ${p.key}`, got, { count: p.count, hash: p.value_hash });
+    check(`cached: count ${p.key}`, await rpc(worker, "count", { key: p.key }), p.count);
+  }
+
+  // An absent key plans nothing, fetches nothing, answers zero.
+  await rpc(worker, "ensure", { keys: ["no=such"] });
+  check("cached: absent key counts zero", await rpc(worker, "count", { key: "no=such" }), 0);
+
+  const stats = await rpc(worker, "cacheStats");
+  assert(
+    "cached: total fetched is less than the file",
+    stats.fetchedBytes < seg.file_bytes,
+    `${stats.fetchedBytes} of ${seg.file_bytes}`,
+  );
+  assert(
+    "cached: total fetched is less than the data region alone",
+    stats.fetchedBytes < seg.data_bytes,
+    `${stats.fetchedBytes} of ${seg.data_bytes} data bytes`,
+  );
+  assert(
+    "cached: resident bytes never exceed the budget",
+    stats.residentBytes <= stats.budgetBytes,
+    `${stats.residentBytes} resident vs ${stats.budgetBytes}`,
+  );
+  assert(
+    "cached: the budget evicted, which is what makes it a budget",
+    stats.evicted > 0,
+    JSON.stringify(stats),
+  );
+
+  await rpc(worker, "close");
+  worker.terminate();
 }
 
 main()

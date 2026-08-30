@@ -20,6 +20,9 @@
 //!   logshed build    write one day index and describe it
 //!   logshed budget   sweep day sizes against the download budget
 //!   logshed fixture  write the browser test's index and its expected answers
+//!   logshed segment  write the cached-reader test's index (small dictionary,
+//!                    large data region) and its expected answers
+//!   logshed ranges   record that a read plan is exact and what it saves (R6)
 //!   logshed bundle   record the browser bundle's size against its budget
 
 use std::path::{Path, PathBuf};
@@ -201,6 +204,194 @@ fn build_day(path: &Path, lines: u64, seed: u64, order: Order) -> std::io::Resul
         free_bytes: stats.free_bytes,
         payload_bytes: postings * (POSTING_BYTES as u64 + 1),
     })
+}
+
+// ---------------------------------------------------------------- segment --
+
+/// The fields of a logshed *segment*, as they actually are: term cardinality
+/// bounded by the schema at tens of values per field, so the whole dictionary
+/// is ~100 keys however much traffic the segment holds. This is the shape
+/// that makes R6.2's premise -- index and block table resident after open --
+/// cost approximately nothing: the sections are kilobytes over a data region
+/// of megabytes, and sparseness pays where the bytes are, in the data.
+const SEG_FIELDS: &[(&str, usize)] = &[("app", 8), ("level", 6), ("host", 30), ("route", 60)];
+
+/// A segment value is a fixed 64-byte record (ordinal plus payload), so the
+/// fixture exercises `count_fixed` and `scan_counts_fixed` -- the calls a
+/// breakdown panel makes, and the ones that read no data at all.
+const SEG_VALUE_BYTES: usize = 64;
+
+/// FNV-1a over bytes, 32-bit. The browser test computes the same hash over
+/// the values it reads back, so a multi-kilobyte lookup can be checked
+/// byte-for-byte without shipping the bytes in the fixture JSON.
+fn fnv32(h: u32, bytes: &[u8]) -> u32 {
+    let mut h = h;
+    for b in bytes {
+        h ^= *b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+fn seg_value(key: &[u8], ord: u32, out: &mut [u8; SEG_VALUE_BYTES]) {
+    out[..4].copy_from_slice(&ord.to_le_bytes());
+    let mut x = fnv32(0x811c_9dc5, key) ^ ord.wrapping_mul(0x9E37_79B9);
+    for b in out[4..].iter_mut() {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *b = x as u8;
+    }
+}
+
+/// Build a segment-shaped store: every event carries one value per field,
+/// values appended grouped by term (the roll sorts by key first -- W1.3 is
+/// the 22.6x reason), event `e` of field with cardinality `c` landing under
+/// value `e % c` so run lengths are even and bounded rather than Zipf-headed.
+fn build_segment(path: &Path, events: u64) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(path);
+    let store = Store::create(path, Options::default())?;
+    let mut key = Vec::with_capacity(32);
+    let mut val = [0u8; SEG_VALUE_BYTES];
+    for (field, card) in SEG_FIELDS {
+        for v in 0..*card {
+            term(field, v, &mut key);
+            let mut e = v as u64;
+            while e < events {
+                seg_value(&key, e as u32, &mut val);
+                store.append(&key, &val)?;
+                e += *card as u64;
+            }
+        }
+    }
+    store.checkpoint()?;
+    store.close()?;
+    Ok(())
+}
+
+/// Ranks that probe the segment dictionary across all four fields.
+fn seg_probe_ranks(keys: usize) -> Vec<usize> {
+    let mut v = vec![0usize, 10, 25, 50, 75, 100];
+    v.retain(|r| *r < keys);
+    if keys > 0 {
+        v.push(keys - 1);
+    }
+    v.dedup();
+    v
+}
+
+/// The bytes a cache actually fetches to satisfy `ranges`, given that it
+/// fetches whole 64 KiB pages clamped to the object's end.
+fn paged_bytes(ranges: &[(u64, u64)], object_len: u64, page: u64) -> u64 {
+    let mut pages: Vec<u64> = Vec::new();
+    for (off, len) in ranges {
+        if *len == 0 {
+            continue;
+        }
+        let last = (off + len - 1).min(object_len.saturating_sub(1));
+        let mut p = off / page;
+        while p <= last / page {
+            pages.push(p);
+            p += 1;
+        }
+    }
+    pages.sort_unstable();
+    pages.dedup();
+    pages.iter().map(|p| page.min(object_len - p * page)).sum()
+}
+
+/// Write the index the cached-reader browser test opens, and its answers.
+///
+/// Small dictionary, large data region -- see `SEG_FIELDS`. The expected
+/// answers come from the native reader, so the browser test stays the same
+/// differential test the whole `web/` suite is: hand-written expectations
+/// would only confirm what their author believed. Lookups are checked by a
+/// 32-bit FNV over the concatenated values rather than by shipping them; a
+/// probe key's run here is kilobytes, not the handful of bytes the day
+/// fixture compares inline.
+fn segment_fixture(dir: &Path, events: u64) -> std::io::Result<()> {
+    const PAGE: u64 = 64 << 10;
+    // Small enough that eviction must happen over the probe set (the point
+    // of a budget), large enough that any single query's plan fits (its
+    // contract). Recorded in the fixture so the test and the cache agree.
+    const CACHE_BUDGET: u64 = 512 << 10;
+
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join("segment.supdb");
+    build_segment(&path, events)?;
+    let file_bytes = std::fs::metadata(&path)?.len();
+    let blob = Blob::open(MmapBytes::open(&path)?)?;
+
+    // What the open will fetch through a 64 KiB-page cache: the superblock
+    // probe and both sections, page-rounded (a closed store carries no log
+    // arena, so there is no emptiness word to fetch). This
+    // is the "you did not download the file" number the test asserts.
+    let head = {
+        let all = std::fs::read(&path)?;
+        all[..supdb::blob::open_probe() as usize].to_vec()
+    };
+    let open_plan = supdb::blob::open_ranges(&head, file_bytes)?;
+    let open_fetch_bytes = paged_bytes(&open_plan, file_bytes, PAGE);
+
+    assert!(
+        CACHE_BUDGET < file_bytes,
+        "the fixture exists to show a cache smaller than the file; \
+         {events} events left only {file_bytes} bytes"
+    );
+
+    let mut probes = Vec::new();
+    for rank in seg_probe_ranks(blob.keys()) {
+        let key = blob.key_at(rank).expect("probe rank").to_vec();
+        let mut hash = 0x811c_9dc5u32;
+        let count = blob.read_all(&key, |v| hash = fnv32(hash, v))?;
+        assert_eq!(
+            blob.count_fixed(&key, SEG_VALUE_BYTES as u32),
+            Some(count),
+            "the fixture's values are fixed-width by construction"
+        );
+        probes.push(jobj! {
+            "key" => J::s(String::from_utf8_lossy(&key).into_owned()),
+            "count" => J::u(count),
+            "stored_bytes" => J::u(blob.stored_bytes(&key)),
+            "value_hash" => J::u(hash as u64),
+        });
+    }
+
+    let mut rows = Vec::new();
+    blob.scan_counts_fixed(b"", 12, SEG_VALUE_BYTES as u32, |k, n| {
+        rows.push(jobj! {
+            "key" => J::s(String::from_utf8_lossy(k).into_owned()),
+            "count" => J::u(n.expect("fixed-width by construction")),
+        });
+        true
+    })?;
+
+    let doc = jobj! {
+        "events" => J::u(events),
+        "file_bytes" => J::u(file_bytes),
+        "data_bytes" => J::u(SEG_FIELDS.len() as u64 * events * (SEG_VALUE_BYTES as u64 + 1)),
+        "keys" => J::u(blob.keys() as u64),
+        "index_bytes" => J::u(blob.index_bytes() as u64),
+        "value_bytes" => J::u(SEG_VALUE_BYTES as u64),
+        "page_size" => J::u(PAGE),
+        "cache_budget_bytes" => J::u(CACHE_BUDGET),
+        "open_fetch_bytes" => J::u(open_fetch_bytes),
+        "probes" => J::arr(probes),
+        "scan" => jobj! {
+            "from" => J::s(""),
+            "limit" => J::u(12),
+            "rows" => J::arr(rows),
+        },
+    };
+    std::fs::write(dir.join("expected-segment.json"), doc.render())?;
+    eprintln!(
+        "# wrote {} ({} bytes, {} keys; open fetches {} of it) and expected-segment.json",
+        path.display(),
+        file_bytes,
+        blob.keys(),
+        open_fetch_bytes
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------- the budget --
@@ -566,6 +757,263 @@ fn bundle(profile: Profile, wasm: u64, wasm_gz: u64, floor: u64, floor_gz: u64) 
     rec
 }
 
+// ---------------------------------------------------------------- ranges --
+
+/// A byte source that cannot lend and remembers every read, so a plan can be
+/// held against what a read actually did. The same rig as `tests/ranges.rs`;
+/// duplicated because a bin cannot use a test's helpers, and kept as small
+/// as the duplication deserves.
+struct Recording {
+    data: Vec<u8>,
+    log: std::rc::Rc<std::cell::RefCell<Vec<(u64, u64)>>>,
+}
+
+impl supdb::Bytes for Recording {
+    fn len(&self) -> u64 {
+        self.data.len() as u64
+    }
+    fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
+        self.log.borrow_mut().push((off, dst.len() as u64));
+        let end = off as usize + dst.len();
+        if end > self.data.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "short",
+            ));
+        }
+        dst.copy_from_slice(&self.data[off as usize..end]);
+        Ok(())
+    }
+}
+
+fn merge_ranges(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut v: Vec<(u64, u64)> = ranges.iter().copied().filter(|r| r.1 > 0).collect();
+    v.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (off, len) in v {
+        match out.last_mut() {
+            Some(last) if off <= last.0 + last.1 => {
+                let end = (off + len).max(last.0 + last.1);
+                last.1 = end - last.0;
+            }
+            _ => out.push((off, len)),
+        }
+    }
+    out
+}
+
+fn range_bytes(ranges: &[(u64, u64)]) -> u64 {
+    ranges.iter().map(|r| r.1).sum()
+}
+
+/// What one shape's probes measured.
+struct Planned {
+    probes: usize,
+    exact: bool,
+    open_bytes: u64,
+    plan_bytes: u64,
+    file_bytes: u64,
+    disjoint_ranges: usize,
+    widest_plan: u64,
+}
+
+/// Open a store over a recording source and hold every probe's plan against
+/// the reads it goes on to make. The heart of W4.1.
+fn plan_shape(path: &Path, ranks: &[usize]) -> std::io::Result<Planned> {
+    let data = std::fs::read(path)?;
+    let file_bytes = data.len() as u64;
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let blob = Blob::open(Recording {
+        data,
+        log: log.clone(),
+    })?;
+    let open_bytes = range_bytes(&merge_ranges(&log.borrow()));
+    let mut mark = log.borrow().len();
+    let mut touched = |log: &std::rc::Rc<std::cell::RefCell<Vec<(u64, u64)>>>| {
+        let l = log.borrow();
+        let out = merge_ranges(&l[mark..]);
+        mark = l.len();
+        out
+    };
+
+    // `usize::MAX` stands for "the last key", whatever the dictionary size.
+    let keys: Vec<Vec<u8>> = ranks
+        .iter()
+        .map(|r| (*r).min(blob.keys().saturating_sub(1)))
+        .filter_map(|r| blob.key_at(r).map(|k| k.to_vec()))
+        .collect();
+    let mut exact = true;
+    let mut widest_plan = 0u64;
+    for key in &keys {
+        let plan = blob.ranges_for(key)?;
+        let _ = touched(&log); // planning reads nothing; discard to be sure
+        blob.read_all(key, |_| {})?;
+        let read = touched(&log);
+        blob.count(key)?;
+        let counted = touched(&log);
+        exact &= plan == read && plan == counted && !plan.is_empty();
+        widest_plan = widest_plan.max(range_bytes(&plan));
+    }
+    // The absent key: no ranges, no reads.
+    let none = blob.ranges_for(b"absent=key")?;
+    blob.read_all(b"absent=key", |_| {})?;
+    exact &= none.is_empty() && touched(&log).is_empty();
+
+    // One plan for the whole probe set, deduped and merged -- and reading
+    // every key touches exactly it.
+    let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+    let many = blob.ranges_for_many(&refs)?;
+    let _ = touched(&log);
+    for key in &keys {
+        blob.read_all(key, |_| {})?;
+    }
+    exact &= touched(&log) == many;
+
+    Ok(Planned {
+        probes: keys.len(),
+        exact,
+        open_bytes,
+        plan_bytes: range_bytes(&many),
+        file_bytes,
+        disjoint_ranges: many.len(),
+        widest_plan,
+    })
+}
+
+/// R6, measured: the plan is exact, the extent counts read nothing, and a
+/// cached reader's working set is a fraction of the object. Byte counts
+/// only -- immune to machine drift, like every size figure here -- so this
+/// does not need interleaving and is safe to run beside anything.
+fn ranges(profile: Profile) -> std::io::Result<Record> {
+    let mut rec = Record::new("w4-ranges", profile);
+    let dir = std::env::temp_dir().join("supdb-logshed-ranges");
+    std::fs::create_dir_all(&dir)?;
+
+    // Both shapes this library serves. The day index has a wide dictionary
+    // and Zipf-headed posting lists; the segment has ~100 keys over a data
+    // region that grows with traffic, which is the shape logshed actually
+    // rolls and the one where sparse fetching pays.
+    let day_lines: u64 = profile.pick(20_000, 100_000, 250_000);
+    let seg_events: u64 = profile.pick(12_000, 50_000, 120_000);
+    rec.param("day_lines", J::u(day_lines));
+    rec.param("segment_events", J::u(seg_events));
+
+    let day_path = dir.join("day.supdb");
+    build_day(&day_path, day_lines, 0x5109_5ed0, Order::Term)?;
+    let day = plan_shape(&day_path, &[0, 1, 7, 64, 512, 2048, usize::MAX])?;
+
+    let seg_path = dir.join("segment.supdb");
+    build_segment(&seg_path, seg_events)?;
+    let seg_keys = Blob::open(MmapBytes::open(&seg_path)?)?.keys();
+    let seg = plan_shape(&seg_path, &seg_probe_ranks(seg_keys))?;
+
+    let row = |p: &Planned| -> J {
+        jobj! {
+            "probes" => J::u(p.probes as u64),
+            "exact" => J::Bool(p.exact),
+            "open_bytes" => J::u(p.open_bytes),
+            "plan_bytes" => J::u(p.plan_bytes),
+            "file_bytes" => J::u(p.file_bytes),
+            "disjoint_ranges" => J::u(p.disjoint_ranges as u64),
+            "widest_single_plan_bytes" => J::u(p.widest_plan),
+            "working_set_over_file" =>
+                J::fp((p.open_bytes + p.plan_bytes) as f64 / p.file_bytes as f64, 4),
+        }
+    };
+    rec.series("day", row(&day));
+    rec.series("segment", row(&seg));
+
+    // W4.1 -- the property the design rests on, so it is asserted with the
+    // reads themselves rather than argued. Non-vacuity is checked alongside:
+    // plans are non-empty for present keys, at least one plan spans blocks,
+    // and the probe set's shared plan is not one contiguous range.
+    let spans_blocks = seg.widest_plan > 64 << 10;
+    let disjoint = day.disjoint_ranges >= 2 && seg.disjoint_ranges >= 2;
+    rec.finding(Finding::new(
+        "W4.1",
+        "the byte ranges `ranges_for` reports for a key are exactly the ranges a subsequent read touches, on both index shapes, through recorded reads",
+        day.exact && seg.exact && spans_blocks && disjoint,
+        format!(
+            "{} day probes and {} segment probes: every `read_all` and `count` touched \
+             exactly its plan, an absent key planned and read nothing, and the shared plan \
+             for each probe set equals the union of its reads ({} and {} disjoint ranges; \
+             widest single plan {} bytes, so runs span blocks). The granularity is the \
+             stored block, because that is what the read path fetches per extent",
+            day.probes, seg.probes, day.disjoint_ranges, seg.disjoint_ranges, seg.widest_plan
+        ),
+    ));
+
+    // W4.2 -- the counts a breakdown panel uses read nothing, measured with
+    // the same recorder rather than asserted from the code.
+    let (fixed_reads, fixed_ok) = {
+        let data = std::fs::read(&seg_path)?;
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let blob = Blob::open(Recording {
+            data,
+            log: log.clone(),
+        })?;
+        let mark = log.borrow().len();
+        let mut ok = true;
+        for rank in seg_probe_ranks(seg_keys) {
+            let key = blob.key_at(rank).map(|k| k.to_vec());
+            let Some(key) = key else { continue };
+            ok &= blob.count_fixed(&key, SEG_VALUE_BYTES as u32).is_some();
+            ok &= blob.stored_bytes(&key) > 0;
+        }
+        let mut rows = 0usize;
+        blob.scan_counts_fixed(b"", usize::MAX, SEG_VALUE_BYTES as u32, |_, c| {
+            ok &= c.is_some();
+            rows += 1;
+            true
+        })?;
+        ok &= rows == seg_keys;
+        let reads = log.borrow().len() - mark;
+        (reads, ok)
+    };
+    rec.finding(Finding::new(
+        "W4.2",
+        "count_fixed, stored_bytes and scan_counts_fixed answer from the resident sections: over a caching source they fetch nothing after open",
+        fixed_reads == 0 && fixed_ok,
+        format!(
+            "{fixed_reads} source reads across {} extent-counted probes and a \
+             {seg_keys}-key dictionary scan, against {} bytes the walked count of the same \
+             probes reads. This is W2.2's 27x and W2.4's 283x carried to the network axis: \
+             what was a cache-line saving native becomes bytes never fetched",
+            seg.probes, seg.plan_bytes
+        ),
+    ));
+
+    // W4.3 -- what R6 buys, stated as bytes. The premise (index and block
+    // table fetched whole at open) is priced in `open_bytes`, and it stays
+    // cheap exactly while key cardinality is bounded; a trigram or free-text
+    // index would break it, and that expiry is written where the premise is.
+    let fraction = (seg.open_bytes + seg.plan_bytes) as f64 / seg.file_bytes as f64;
+    let day_fraction = (day.open_bytes + day.plan_bytes) as f64 / day.file_bytes as f64;
+    rec.finding(Finding::new(
+        "W4.3",
+        "opening a segment index and answering its probe set out of a cold cache needs less than half the object; the rest is never fetched",
+        fraction <= 0.5,
+        format!(
+            "open reads {} bytes (superblock probe, key index, block table) and \
+             the probe set plans {} more, {:.1}% of a {}-byte object; the day shape reads \
+             {:.1}% of {} bytes. The resident sections are small because the dictionary is \
+             bounded by field cardinality -- ~{} keys however large the segment -- which is \
+             the premise, and its expiry condition: an index with unbounded keys (trigram, \
+             free text) would need the index fetched sparsely too, which changes the host, \
+             not the ABI, since every range is an absolute file offset",
+            seg.open_bytes,
+            seg.plan_bytes,
+            fraction * 100.0,
+            seg.file_bytes,
+            day_fraction * 100.0,
+            day.file_bytes,
+            seg_keys
+        ),
+    ));
+
+    Ok(rec)
+}
+
 // ---------------------------------------------------------------- main --
 
 fn main() -> std::io::Result<()> {
@@ -612,6 +1060,26 @@ fn main() -> std::io::Result<()> {
             let lines: u64 = arg("--lines").and_then(|v| v.parse().ok()).unwrap_or(20_000);
             fixture(&dir, lines)
         }
+        "segment" => {
+            let dir = PathBuf::from(arg("--dir").unwrap_or_else(|| "web/test/out".into()));
+            let events: u64 = arg("--events")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(12_000);
+            segment_fixture(&dir, events)
+        }
+        "ranges" => {
+            let profile =
+                Profile::parse(arg("--profile").as_deref().unwrap_or("ci")).unwrap_or(Profile::Ci);
+            let out = PathBuf::from(arg("--out").unwrap_or_else(|| "results".into()));
+            let rec = ranges(profile)?;
+            rec.print_summary();
+            rec.write(&out)?;
+            if rec.all_findings_hold() {
+                Ok(())
+            } else {
+                std::process::exit(1)
+            }
+        }
         "bundle" => {
             let profile =
                 Profile::parse(arg("--profile").as_deref().unwrap_or("ci")).unwrap_or(Profile::Ci);
@@ -650,6 +1118,8 @@ fn main() -> std::io::Result<()> {
                 "logshed build   --path P --lines N [--order term|line]\n\
                  logshed budget  --profile ci|dev|full [--out results]\n\
                  logshed fixture --dir web/test/out [--lines N]\n\
+                 logshed segment --dir web/test/out [--events N]\n\
+                 logshed ranges  --profile ci|dev|full [--out results]\n\
                  logshed bundle  --profile P --wasm-bytes N --wasm-gzip N \
                  --floor-bytes N --floor-gzip N"
             );

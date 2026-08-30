@@ -6,24 +6,58 @@
 // returning a borrow instead of a promise.
 //
 // The shape is: one asynchronous step at startup (download the object into
-// OPFS), then every query after that is synchronous inside the worker and
-// asynchronous only in the sense that it is on another thread.
+// OPFS -- or, for the cached source, fetch only what the open plans), then
+// every query after that is synchronous inside the worker, except that the
+// cached source's point reads want an `ensure` first: the module plans the
+// ranges (R6.2), the ensure awaits fetching them, and the read itself is
+// synchronous as ever. The await lives here, never inside wasm.
 
-import { openSyncHandle, openMemory, fetchIntoOpfs } from "./supdb.mjs";
+import { openSyncHandle, openMemory, openCached, fetchIntoOpfs } from "./supdb.mjs";
+import { CachedBytes, httpRangeFetcher } from "./cache.mjs";
 
 let reader = null;
 let handle = null;
+let cache = null;
 
-async function open({ wasmUrl, indexUrl, name, source }) {
+async function open({ wasmUrl, indexUrl, name, source, budgetBytes }) {
   const wasmBytes = await (await fetch(wasmUrl)).arrayBuffer();
   if (source === "memory") {
     const bytes = new Uint8Array(await (await fetch(indexUrl)).arrayBuffer());
     reader = await openMemory(wasmBytes, bytes);
     return { source: "memory", keys: reader.keys };
   }
+  if (source === "cached") {
+    cache = await CachedBytes.open({
+      name,
+      fetcher: httpRangeFetcher(indexUrl),
+      budgetBytes,
+    });
+    reader = await openCached(wasmBytes, cache);
+    return {
+      source: "cached",
+      keys: reader.keys,
+      length: cache.length,
+      openFetchedBytes: cache.stats.fetchedBytes,
+    };
+  }
   handle = await fetchIntoOpfs(indexUrl, name);
   reader = await openSyncHandle(wasmBytes, handle);
   return { source: "opfs", keys: reader.keys, size: handle.getSize() };
+}
+
+// FNV-1a 32, the same hash `logshed segment` records, so a multi-kilobyte
+// lookup is checked byte-for-byte without shipping the bytes in the fixture.
+function fnv32(values) {
+  let h = 0x811c9dc5 >>> 0;
+  let n = 0;
+  for (const v of values) {
+    n += 1;
+    for (const b of v) {
+      h = (h ^ b) >>> 0;
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+  }
+  return { count: n, hash: h >>> 0 };
 }
 
 const ops = {
@@ -33,17 +67,33 @@ const ops = {
   generation: () => reader.generation,
   lookup: ({ key }) =>
     reader.lookup(key).map((v) => Array.from(v)),
+  lookupHash: ({ key }) => fnv32(reader.lookup(key)),
   count: ({ key }) => reader.count(key),
   countFixed: ({ key, width }) => reader.countFixed(key, width),
   storedBytes: ({ key }) => reader.storedBytes(key),
   scanCounts: ({ from, limit }) => reader.scanCounts(from, limit),
   scanCountsFixed: ({ from, limit, width }) =>
     reader.scanCountsFixed(from, limit, width),
+  // R6.2: the plan, and the plan-then-fetch that makes reads miss-proof.
+  planRanges: ({ keys }) => reader.planRanges(keys),
+  ensure: async ({ keys }) => {
+    await reader.ensure(keys);
+    return true;
+  },
+  cacheStats: () =>
+    cache && {
+      ...cache.stats,
+      length: cache.length,
+      budgetBytes: cache.budgetBytes,
+      residentBytes: cache.residentBytes,
+    },
   close: () => {
     if (reader) reader.close();
     if (handle) handle.close();
+    if (cache) cache.close();
     reader = null;
     handle = null;
+    cache = null;
     return true;
   },
 };

@@ -42,8 +42,31 @@ function serve(dir) {
       const s = await stat(path);
       if (!s.isFile()) throw new Error("not a file");
       const body = await readFile(path);
+      const type = TYPES[extname(path)] ?? "application/octet-stream";
+      // Range support, because the cached byte source reads the fixture the
+      // way it would read S3: by ranged GET, never whole. Single ranges
+      // only -- that is all a range fetcher sends -- and out-of-bounds asks
+      // get the 416 a real object store would give.
+      const range = /^bytes=(\d+)-(\d+)$/.exec(req.headers.range ?? "");
+      if (range) {
+        const a = Number(range[1]);
+        const b = Math.min(Number(range[2]), body.length - 1);
+        if (a >= body.length || a > b) {
+          res
+            .writeHead(416, { "content-range": `bytes */${body.length}` })
+            .end();
+          return;
+        }
+        res.writeHead(206, {
+          "content-type": type,
+          "content-length": b - a + 1,
+          "content-range": `bytes ${a}-${b}/${body.length}`,
+        });
+        res.end(body.subarray(a, b + 1));
+        return;
+      }
       res.writeHead(200, {
-        "content-type": TYPES[extname(path)] ?? "application/octet-stream",
+        "content-type": type,
         "content-length": body.length,
       });
       res.end(body);
