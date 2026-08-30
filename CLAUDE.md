@@ -113,17 +113,20 @@ The matched scorecard against LMDB, `full`, all four failing:
 
 | | Supdb | LMDB | |
 |---|---|---|---|
-| load, both durable (`EXT.9`) | 54,333/s | 667,338/s | **0.081x** |
+| load, both durable (`EXT.9`) | 152,990/s | 687,389/s | **0.223x** |
 | load, neither (`EXT.10`) | 783,142/s | 1,304,518/s | unmeasurable, see below |
-| read (`EXT.11`) | 1,280,981/s | 998,513/s | 1.283x |
+| read (`EXT.11`) | 1,411,746/s | 1,135,799/s | 1.243x, no difference |
 | scan, cold (`EXT.12`) | 29.4M/s | 28.1M/s | 1.046x, no difference |
 
-`EXT.9` is the one thing that moved for a reason: 6,735 ops/s to 54,333, 8.1x,
-because `Options::index_inserts` stopped every batch of a load rewriting the
-whole key index. It carries the rest of the shape with it -- 29.9 GB to the
-block layer becomes 11.6, write amplification 270x becomes 105x, and the file
-for 126.9 MB of data goes from 7,354 MB to 280. Still 12x behind, so still
-recorded as failing.
+`EXT.9` has moved twice, each time for a decomposed reason: 6,735 -> 54,333
+ops/s when `Options::index_inserts` stopped every batch rewriting the whole
+key index, then -> ~150,600 when durability points went log-first with a
+single fsync -- f36's ledger had convicted mmap writeback under the per-batch
+fsync at 87.4% of all device bytes, and the reorder took it to 31.3%. Write
+amplification went 270x -> 105x -> 13.2x; the file for 126.9 MB of data went
+7,354 MB -> 280 -> 309. Still 4.4x behind, so still recorded as failing; the
+value-carrying log that removes the seal from the point entirely is the next
+step on this axis.
 
 `EXT.10` cannot currently be read at all. Two consecutive runs gave 1.06x and
 0.60x because `lmdb-nosync`, which nothing here touches, moved 85% between

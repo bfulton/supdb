@@ -1788,7 +1788,20 @@ fn replay_never_applies_a_record_over_newer_index_state() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("s.dat");
-    let opts = Options::default; // flat index on, redo_log on: the defaults
+    // Defaults, except the arena is pinned to its 4 KiB minimum. Durability
+    // points now try the log FIRST, so with a roomy arena the third
+    // checkpoint would log too and this test would pass without ever
+    // reaching the window it guards. A 4 KiB arena holds the second
+    // checkpoint's 40 grown records (~2.4 KB) and not also the third's 80,
+    // so the third falls through to the in-place path -- verified by path
+    // trace when this was written. If the record encoding ever changes size
+    // enough that both checkpoints fit, this test goes quiet rather than
+    // red; the trace line under SUPDB_CKPT_TRACE is how to check it still
+    // reaches the in-place arm.
+    let opts = || Options {
+        log_bytes: 4096,
+        ..Default::default()
+    };
     {
         let s = Store::create(&path, opts()).unwrap();
         for k in 0..100u32 {

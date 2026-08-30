@@ -2426,23 +2426,31 @@ impl Store {
             }
         }
         let closing = self.closing.load(std::sync::atomic::Ordering::Acquire);
-        // In-place stays legal while closing -- it lands state durably in the
-        // mapped index, which is exactly where a final checkpoint wants it,
-        // and forcing the full rewrite instead was measured to inflate a tiny
-        // store by two extra quarantined section generations. Only the LOG
-        // path is forbidden below: a closing store is about to release its
-        // arena, and records appended to a structure being released are lost.
-        let in_place_edit = self.checkpoint_in_place(&changed, nkeys)?;
-        // Only a durability point may use the log. `publish` passes
-        // `Sync::Never` and wants *visibility*, which the log does not give: a
-        // logged record is durable and replayed by `Store::open`, and a
-        // `Reader` opened before the next full rewrite does not see it. Taking
-        // this path for a publish would make a scan miss writes that the
-        // writer had already been told were published.
-        let logged = !closing
-            && !in_place_edit
-            && !matches!(policy, Sync::Never)
-            && self.checkpoint_to_log(&changed)?;
+        // A DURABILITY point tries the log FIRST; a publish tries in-place
+        // first. The order used to be in-place unconditionally first, and f36
+        // measured what that costs a durable load: 87.4% of all device bytes
+        // were mmap writeback -- in-place absorbs a batch by dirtying record,
+        // slot and spliced-directory pages scattered across a 68 MB mapped
+        // index, and the fsync that makes the batch durable then flushes
+        // every one of those pages, every batch. A logged point writes a few
+        // contiguous KB into the arena instead, so the same fsync flushes
+        // almost nothing else. In-place is still the right tool when the
+        // caller wants VISIBILITY (publish: live-mapped readers see edits, and
+        // Sync::Never must not pay an fsync) and still the fallback when the
+        // arena is full -- where it also flushes the accumulated splice pages
+        // once per arena cycle instead of once per batch, which is the whole
+        // amortization.
+        //
+        // The log path is forbidden while closing: a closing store is about
+        // to release its arena, and records appended to a structure being
+        // released are lost.
+        let want_durable = !matches!(policy, Sync::Never);
+        let logged = !closing && want_durable && self.checkpoint_to_log(&changed)?;
+        let in_place_edit = if logged {
+            false
+        } else {
+            self.checkpoint_in_place(&changed, nkeys)?
+        };
         if std::env::var_os("SUPDB_CKPT_TRACE").is_some() {
             eprintln!("ckpt path: in_place={in_place_edit} logged={logged} changed={}", changed.len());
         }
@@ -2756,6 +2764,23 @@ impl Store {
             None
         } else if !self.opts.redo_log {
             None
+        } else if in_place_edit {
+            // An in-place edit just wrote the newest state of every dirty key
+            // into the index -- including every key the log was carrying,
+            // because logged keys stay dirty until a non-log checkpoint takes
+            // them. The arena's records are now strictly older than
+            // index_gen, so replay already ignores them; resetting the cursor
+            // reclaims the space so the log-first fast path keeps working
+            // instead of reporting a full arena forever. The zero word is an
+            // ordinary unsynced pwrite: if it is lost in a crash, the stale
+            // records it would have truncated are filtered by their stamps.
+            if let Some((off, cap, used)) = ap.log {
+                if used > 0 {
+                    ap.file.write_all_at(&0u32.to_le_bytes(), off)?;
+                    ap.log = Some((off, cap, 0));
+                }
+            }
+            ap.log.map(|(o, c, _)| (o, c))
         } else if in_place {
             ap.log.map(|(o, c, _)| (o, c))
         } else {
@@ -2866,7 +2891,17 @@ impl Store {
             Some(CKPT_BYTES.swap(0, std::sync::atomic::Ordering::Relaxed) as usize),
         );
         let t_fsync = std::time::Instant::now();
-        if do_sync {
+        if logged {
+            // checkpoint_to_log already appended and fsynced: the point is
+            // durable, and repeating sync_data here would flush every page
+            // the file has dirtied since -- the exact cost this path exists
+            // to avoid. The superblock written above rides to disk with the
+            // next flush of any kind; until then recovery uses the previous
+            // superblock and walks the self-describing arena further, which
+            // the generation stamps make safe.
+            ap.since_sync = 0;
+            ap.last_sync = std::time::Instant::now();
+        } else if do_sync {
             ap.file.sync_data()?;
             ckpt_phase("fsync", t_fsync, None);
             ap.since_sync = 0;
