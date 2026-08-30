@@ -158,14 +158,31 @@ export class SupdbReader {
 
   /// R4.4 -- the dictionary in key order from `from`, with each key's count.
   /// What a "top paths" or "countries" panel is made of.
+  ///
+  /// This form costs a walk over every posting in the range, which for a day
+  /// index is the whole file. Prefer `scanCountsFixed` for a posting list.
   scanCounts(from, limit) {
-    const m = this.mod;
-    m.withKey(from, (p, l) =>
-      this.check(
-        this.exports.supdb_scan_counts(this.handle, p, l, limit),
-        0xffffffff,
-      ),
+    return this.scanFrame((p, l) =>
+      this.exports.supdb_scan_counts(this.handle, p, l, limit),
+      from,
     );
+  }
+
+  /// The same, counted in O(extents) for a fixed-width posting list.
+  ///
+  /// Bounded by the dictionary rather than by the traffic, and no block is
+  /// touched. A key whose values are not all `width` bytes comes back with
+  /// `count: null`; fall back to `count(key)` for that one key.
+  scanCountsFixed(from, limit, width) {
+    return this.scanFrame(
+      (p, l) => this.exports.supdb_scan_counts_fixed(this.handle, p, l, limit, width),
+      from,
+    );
+  }
+
+  scanFrame(call, from) {
+    const m = this.mod;
+    m.withKey(from, (p, l) => this.check(call(p, l), 0xffffffff));
     const base = this.exports.supdb_out_ptr();
     const dv = m.view;
     const count = dv.getUint32(base, true);
@@ -176,9 +193,12 @@ export class SupdbReader {
       const lo = dv.getUint32(at + 4, true);
       const hi = dv.getUint32(at + 8, true);
       at += 12;
+      // Both halves set is the sentinel for "this key's values are not all
+      // the width you asked about", which only `scanCountsFixed` produces.
+      const missing = lo === 0xffffffff && hi === 0xffffffff;
       out[i] = {
         key: m.dec.decode(m.mem.subarray(at, at + klen)),
-        count: hi * 0x100000000 + lo,
+        count: missing ? null : hi * 0x100000000 + lo,
       };
       at += klen;
     }

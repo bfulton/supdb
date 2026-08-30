@@ -110,6 +110,16 @@ async function main() {
     });
     check(`${source}: scanCounts`, scanned, expected.scan.rows);
 
+    // The O(extents) form must give the identical answer on a fixed-width
+    // posting list. If it ever does not, the arithmetic is wrong and a
+    // breakdown panel would be quietly wrong with it.
+    const fixed = await rpc(worker, "scanCountsFixed", {
+      from: expected.scan.from,
+      limit: expected.scan.limit,
+      width: expected.posting_bytes,
+    });
+    check(`${source}: scanCountsFixed agrees with scanCounts`, fixed, expected.scan.rows);
+
     // A key that is not there answers, rather than throwing.
     check(`${source}: absent key counts zero`, await rpc(worker, "count", { key: "no=such" }), 0);
     check(`${source}: absent key looks up empty`, await rpc(worker, "lookup", { key: "no=such" }), []);

@@ -49,6 +49,45 @@ fn varint_len(mut v: u64) -> u64 {
     n
 }
 
+/// The record count of a run of fixed-width values, from the extent list
+/// alone. `None` when the extents are not consistent with that width.
+///
+/// Two independent checks, and the second is what makes this usable. The
+/// first is that the run is a whole number of strides -- necessary, and on
+/// its own badly insufficient: a fixture of variable-length `k:i` strings
+/// produced a run of 17 values whose bytes divided exactly by a stride of 4
+/// and this returned 23. `tests/blob.rs` carries that case.
+///
+/// The second is `Ext::last`, the offset of the final record in the run,
+/// which the format already stores so that reading the newest value is O(1).
+/// For `n` records of one stride it must be exactly `(n - 1) * stride`. That
+/// pins the arithmetic against a second quantity the writer recorded
+/// independently, and it rejects the 17-value case: the 17th record starts at
+/// 87 where 23 records would put the last at 88.
+///
+/// Still not a proof -- a run could be crafted to satisfy both -- so the
+/// contract remains that the caller knows its own schema. It is the
+/// difference between a check that catches an honest mistake and one that
+/// does not.
+fn fixed_count(exts: &[Ext], stride: u64) -> Option<u64> {
+    if stride == 0 {
+        return None;
+    }
+    let mut total = 0u64;
+    for e in exts {
+        let len = e.len as u64;
+        if len == 0 || !len.is_multiple_of(stride) {
+            return None;
+        }
+        let n = len / stride;
+        if e.last as u64 != (n - 1) * stride {
+            return None;
+        }
+        total += n;
+    }
+    Some(total)
+}
+
 /// Superblock magic and geometry.
 ///
 /// Duplicated from `store.rs` rather than shared, because `store.rs` does not
@@ -593,14 +632,11 @@ impl<B: Bytes> Blob<B> {
     /// worse than a slow one.
     pub fn count_fixed(&self, key: &[u8], width: u32) -> Option<u64> {
         let stride = width as u64 + varint_len(width as u64);
-        if stride == 0 {
-            return None;
+        match self.lookup(key) {
+            Some(exts) => fixed_count(exts, stride),
+            // A key that is not there holds no values, which is a count.
+            None => Some(0),
         }
-        let stored = self.stored_bytes(key);
-        if !stored.is_multiple_of(stride) {
-            return None;
-        }
-        Some(stored / stride)
     }
 
     /// Walk the dictionary in key order from `from`, with each key's value
@@ -640,6 +676,45 @@ impl<B: Bytes> Blob<B> {
                     Ok(c)
                 })?;
             }
+            seen += 1;
+            rank += 1;
+            if !f(k, n) {
+                break;
+            }
+        }
+        Ok(seen)
+    }
+
+    /// The same walk, counting in O(extents) for a fixed-width schema.
+    ///
+    /// This is the one a breakdown panel should call, and the difference is
+    /// not a detail. `scan_counts` costs a `count` per key, so a dictionary
+    /// scan is O(every posting in the range) -- for a day index that is the
+    /// whole file. This is O(extents), so it is bounded by the dictionary
+    /// rather than by the traffic, and no block is touched at all.
+    ///
+    /// `f` is handed `None` for a key whose stored bytes are not a multiple of
+    /// the stride, meaning its values are not all `width` bytes; the caller
+    /// can fall back to `count` for that key alone rather than for the scan.
+    ///
+    /// `f28-count` W2.4 measures the two against each other over a whole
+    /// dictionary, because that is what settles whether a browser can answer
+    /// top-N itself or whether the roll has to precompute it.
+    pub fn scan_counts_fixed<F: FnMut(&[u8], Option<u64>) -> bool>(
+        &self,
+        from: &[u8],
+        limit: usize,
+        width: u32,
+        mut f: F,
+    ) -> Result<usize> {
+        let stride = width as u64 + varint_len(width as u64);
+        let mut rank = self.seek(from);
+        let mut seen = 0usize;
+        while seen < limit {
+            let Some((k, exts)) = self.exts_at(rank) else {
+                break;
+            };
+            let n = fixed_count(exts, stride);
             seen += 1;
             rank += 1;
             if !f(k, n) {

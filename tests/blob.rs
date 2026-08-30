@@ -207,6 +207,28 @@ fn scanning_walks_the_dictionary_in_key_order_with_counts() {
     .unwrap();
     assert_eq!(n, 5);
 
+    // The O(extents) form must agree key for key. The fixture's values are
+    // `k:i` strings of varying length, so most keys are *not* fixed width and
+    // must come back as None rather than as a wrong number -- which is the
+    // half of this that matters.
+    let mut fixed: Vec<(Vec<u8>, Option<u64>)> = Vec::new();
+    blob.scan_counts_fixed(b"term=", usize::MAX, 3, |k, n| {
+        fixed.push((k.to_vec(), n));
+        true
+    })
+    .expect("scan fixed");
+    assert_eq!(fixed.len(), seen.len(), "both scans visit the same keys");
+    for ((k, got), (wk, want)) in fixed.iter().zip(seen.iter()) {
+        assert_eq!(k, wk, "the two scans must walk in the same order");
+        if let Some(got) = got {
+            assert_eq!(got, want, "a count it claims must be the right one");
+        }
+    }
+    assert!(
+        fixed.iter().any(|(_, n)| n.is_none()),
+        "this fixture has variable-width values, so the guard must fire somewhere"
+    );
+
     // The full scan visits the same keys and every value under them.
     let mut pairs = 0usize;
     blob.scan(b"term=", usize::MAX, |_, _| pairs += 1).unwrap();
@@ -294,6 +316,77 @@ fn a_fixed_width_schema_counts_without_touching_a_block() {
     // doc comment says so.
     assert_eq!(blob.count(b"mixed").unwrap(), 2);
     assert_eq!(blob.count_fixed(b"mixed", 4), None);
+
+    // The dictionary scan in its O(extents) form, which is what a breakdown
+    // panel calls. Every fixed-width key must come back with the count the
+    // walk gives, and the one mixed key must come back as None.
+    let mut rows: Vec<(Vec<u8>, Option<u64>)> = Vec::new();
+    blob.scan_counts_fixed(b"", usize::MAX, 4, |k, n| {
+        rows.push((k.to_vec(), n));
+        true
+    })
+    .expect("scan fixed");
+    assert_eq!(rows.len(), want.len() + 1, "every key, plus `mixed`");
+    for (key, n) in &want {
+        let (_, got) = rows.iter().find(|(k, _)| k == key).expect("known key");
+        assert_eq!(*got, Some(*n), "{}", String::from_utf8_lossy(key));
+    }
+    assert_eq!(
+        rows.iter().find(|(k, _)| k == b"mixed").map(|(_, n)| *n),
+        Some(None),
+        "the mixed key must decline rather than guess"
+    );
+}
+
+/// The case that made `count_fixed` check `Ext::last` as well as divisibility.
+///
+/// Seventeen values of varying length whose bytes happen to divide exactly by
+/// a stride of four: divisibility alone answers 23, confidently and wrongly.
+/// `Ext::last` is the offset of the final record, which the format already
+/// stores so that reading the newest value is O(1), and for 23 records of
+/// stride 4 it would have to be 88 where it is actually 87. Two independent
+/// quantities have to agree before a count is claimed.
+#[test]
+fn a_count_from_the_extent_list_checks_two_quantities_not_one() {
+    let path = scratch("guard");
+    let store = Store::create(&path, Options::default()).expect("create");
+    // "2:0".."2:16" -- three bytes for the first ten, four for the rest, so
+    // 10*(1+3) + 7*(1+4) = 75 bytes, which is not divisible by 4. Pad to the
+    // shape that fooled the old check: the fixture in `build` produces it at
+    // k=2, so reproduce that key exactly.
+    // "16:0".."16:16": ten values of four bytes and seven of five, each with
+    // a one-byte length prefix, so 10*5 + 7*6 = 92 stored bytes -- exactly
+    // 23 strides of 4. This is key 16 of the fixture `build` writes, and it
+    // is where the old check was found to be wrong.
+    let key = b"term=00000016";
+    for i in 0..17 {
+        store
+            .append(key, format!("16:{i}").as_bytes())
+            .expect("append");
+    }
+    store.checkpoint().expect("checkpoint");
+    store.close().expect("close");
+
+    let blob = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
+    assert_eq!(blob.count(key).unwrap(), 17, "the walk is the authority");
+    // 92 stored bytes over a stride of 4 is 23, and 23 is not 17.
+    assert_eq!(blob.stored_bytes(key) % 4, 0, "the trap needs divisibility");
+    assert_eq!(
+        blob.count_fixed(key, 3),
+        None,
+        "divisibility alone would have answered {}",
+        blob.stored_bytes(key) / 4
+    );
+    // The same key really is fixed width at its own width, and is answered.
+    let path2 = scratch("guard-ok");
+    let store = Store::create(&path2, Options::default()).expect("create");
+    for i in 0..17u32 {
+        store.append(key, &i.to_le_bytes()).expect("append");
+    }
+    store.checkpoint().expect("checkpoint");
+    store.close().expect("close");
+    let blob = Blob::open(MmapBytes::open(&path2).unwrap()).expect("blob open");
+    assert_eq!(blob.count_fixed(key, 4), Some(17));
 }
 
 #[test]

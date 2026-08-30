@@ -37,6 +37,8 @@ const ops = {
   countFixed: ({ key, width }) => reader.countFixed(key, width),
   storedBytes: ({ key }) => reader.storedBytes(key),
   scanCounts: ({ from, limit }) => reader.scanCounts(from, limit),
+  scanCountsFixed: ({ from, limit, width }) =>
+    reader.scanCountsFixed(from, limit, width),
   close: () => {
     if (reader) reader.close();
     if (handle) handle.close();

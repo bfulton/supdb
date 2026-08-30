@@ -4412,6 +4412,73 @@ fn f28_count(args: &Args, profile: Profile) -> std::io::Result<Record> {
         ),
     ));
 
+    // W2.4 -- open question 4 of the requirements: does the browser need a
+    // dictionary scan at all, or should the roll precompute the breakdown
+    // panels? That turns entirely on what a scan costs, and the two forms of
+    // it are not the same order of growth. `scan_counts` pays a `count` per
+    // key, so it is O(every posting in the range) -- for a day index, the
+    // whole file. `scan_counts_fixed` is O(extents), bounded by the
+    // dictionary rather than by the traffic.
+    let span = args.num("--scan-keys", 2_000).min(keys as usize);
+    let scans = args.num("--scans", profile.pick(20, 200, 500));
+    let scan = Trial::new(profile.reps()).run(2, |ci, rep| {
+        let mut g = KeyGen::new(
+            KeyDist::Uniform,
+            keys.saturating_sub(span as u64).max(1),
+            0x2C + rep as u64,
+        );
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        let mut sink = 0u64;
+        for _ in 0..scans {
+            db_key_into(g.next(), &mut kb);
+            if ci == 0 {
+                blob.scan_counts(&kb, span, |_k, n| {
+                    sink += n;
+                    true
+                })
+                .expect("scan");
+            } else {
+                blob.scan_counts_fixed(&kb, span, width as u32, |_k, n| {
+                    sink += n.unwrap_or(0);
+                    true
+                })
+                .expect("scan");
+            }
+        }
+        std::hint::black_box(sink);
+        (scans * span) as f64 / t.elapsed().as_secs_f64()
+    });
+    let scan_cmp = compare(&scan[1], &scan[0], min);
+    rec.compare("scan_counts_fixed_vs_scan_counts", scan_cmp.clone());
+    rec.series(
+        "dictionary_scan",
+        jobj! {
+            "keys_per_scan" => J::u(span as u64),
+            "scans" => J::u(scans as u64),
+            "walked_keys_per_s" => J::fp(scan[0].median(), 1),
+            "fixed_keys_per_s" => J::fp(scan[1].median(), 1),
+            "walked_ns_per_key" => J::fp(1e9 / scan[0].median(), 1),
+            "fixed_ns_per_key" => J::fp(1e9 / scan[1].median(), 1),
+        },
+    );
+    rec.finding(Finding::new(
+        "W2.4",
+        "a browser can compute a top-N breakdown from the dictionary itself, because counting it from the extent list is at least 10x walking it",
+        scan_cmp.ratio >= 10.0
+            && matches!(scan_cmp.verdict, supdb::bench::stats::Verdict::Greater),
+        format!(
+            "over {span} keys: {:.1} ns/key walked against {:.1} counted from the extent list \
+             ({}). The walk is O(every posting in the range) and the extent form is O(extents), \
+             so the gap widens with the traffic a day carries rather than with its dictionary. \
+             This is what makes precomputing the breakdown panels at roll time unnecessary: the \
+             browser can rank the whole dictionary without touching a block",
+            1e9 / scan[0].median(),
+            1e9 / scan[1].median(),
+            scan_cmp.summary("scan_counts_fixed", "scan_counts")
+        ),
+    ));
+
     let _ = std::fs::remove_file(&file);
     Ok(rec)
 }

@@ -373,3 +373,44 @@ pub unsafe extern "C" fn supdb_scan_counts(
         Ok(out.len() as u32)
     })
 }
+
+/// The same scan, counting in O(extents) for a fixed-width posting list.
+///
+/// The one a breakdown panel wants: `supdb_scan_counts` costs a walk over
+/// every posting in the range, and this is bounded by the dictionary instead.
+/// A key whose values are not all `width` bytes is framed with a count of
+/// `u32::MAX` in both halves, so the caller can retry that key with
+/// `supdb_count` rather than abandon the scan. Same framing otherwise.
+///
+/// # Safety
+/// `fptr` must point at `flen` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn supdb_scan_counts_fixed(
+    h: u32,
+    fptr: *const u8,
+    flen: u32,
+    limit: u32,
+    width: u32,
+) -> u32 {
+    let from = std::slice::from_raw_parts(fptr, flen as usize);
+    with_blob(h, u32::MAX, |b, out| {
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let n = on!(
+            b,
+            scan_counts_fixed,
+            from,
+            limit as usize,
+            width,
+            |k: &[u8], c: Option<u64>| {
+                let c = c.unwrap_or(u64::MAX);
+                out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(c as u32).to_le_bytes());
+                out.extend_from_slice(&((c >> 32) as u32).to_le_bytes());
+                out.extend_from_slice(k);
+                true
+            }
+        )?;
+        out[0..4].copy_from_slice(&(n as u32).to_le_bytes());
+        Ok(out.len() as u32)
+    })
+}

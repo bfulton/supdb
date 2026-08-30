@@ -48,12 +48,24 @@ open, because a source that cannot lend its bytes -- which an OPFS handle
 cannot -- should pay per section rather than per lookup.
 
 `count(key)` and `countFixed(key, width)` are two different things and the
-difference is 28x. See `f28-count` and W2.1-W2.3 in `claims.json`: an `Ext`
+difference is 28x. See `f28-count` and W2.1-W2.4 in `claims.json`: an `Ext`
 records block, offset, byte length and the offset of the last record, and none
-of those is a count, so the general count walks the values. A *fixed-width*
-posting list does not need to -- its count is arithmetic on `Ext::len` with no
-block touched. logshed's postings are four-byte line ordinals, so `countFixed`
-is the call it makes.
+of those is a count, so the general count walks the values -- and walking them
+is *not* cheaper than reading them, which is W2.1 and is recorded as failing.
+A *fixed-width* posting list does not need to walk: its count is arithmetic on
+`Ext::len`, checked against `Ext::last`, with no block touched. logshed's
+postings are four-byte line ordinals, so `countFixed` is the call it makes.
+
+The same applies to `scanCounts` versus `scanCountsFixed`, and there the
+factor is 262. The walked form is O(every posting in the range) and the extent
+form is O(extents), so a whole day's term dictionary ranks in about 40
+microseconds. That is the answer to "does the browser need a scan, or should
+the roll precompute the panels": it needs a scan, and precomputing buys
+nothing.
+
+`countFixed` and `scanCountsFixed` answer `null` rather than guessing when a
+key's values are not all the width you named. That is a check, not a proof --
+the contract is that you know your own schema.
 
 ## Size
 

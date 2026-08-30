@@ -166,9 +166,24 @@ offset of the last record, and none of those is a count. What is 28x faster is
 `count_fixed`: a fixed-width value carries a fixed-width length prefix, so a
 posting list's count is arithmetic on `Ext::len` with no block touched. That is
 a property of the schema, not of the format. Adding a per-extent count to the
-format would recover at most 11.4 ns of the 12 between those two, for four
+format would recover at most 6.7 ns of the gap between those two, for four
 bytes on a 16-byte `Ext` paid by every store forever, so it was priced and
 declined.
+
+The same difference decides whether a browser can rank a dictionary at all.
+`scan_counts` pays a `count` per key, so it is O(every posting in the range) —
+for a day index, the whole file — and `scan_counts_fixed` is O(extents). Over
+2,000 keys that is 1,308 ns/key against 5.0, a factor of 262, so a day's whole
+term dictionary ranks in about 40 µs and nothing has to be precomputed at roll
+time.
+
+`count_fixed` claims a count only when two independent quantities agree: the
+run is a whole number of strides, *and* `Ext::last` — the offset of the final
+record, stored so that reading the newest value is O(1) — is exactly
+`(n-1)*stride`. Divisibility alone is not enough and was not: a run of 17
+variable-length values divided exactly by a stride of 4 and the first version
+answered 23. Two quantities is still not a proof, so the contract is that the
+caller knows its schema; `tests/blob.rs` carries the case either way.
 
 **How the roll writes decides the file size, by 22.6x.** Appending a day's
 postings in log-line order writes 831 MB where grouping them by term first
