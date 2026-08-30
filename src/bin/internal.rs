@@ -109,6 +109,7 @@ fn main() -> std::io::Result<()> {
             "f27-ckptshape" => f27_ckptshape(&args, profile)?,
             "f29-redolog" => f29_redolog(&args, profile)?,
             "f30-insertindex" => f30_insertindex(&args, profile)?,
+            "f31-loadphases" => f31_loadphases(&args, profile)?,
             "f28-count" => f28_count(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
@@ -152,6 +153,7 @@ fn main() -> std::io::Result<()> {
                 "f27-ckptshape",
                 "f29-redolog",
                 "f30-insertindex",
+                "f31-loadphases",
                 "f28-count",
                 "f4-durability",
                 "f3-multiproc",
@@ -3645,6 +3647,101 @@ fn f11_child(args: &Args) -> std::io::Result<()> {
 /// bit flip, a torn write or a reused slot returns silently wrong data,
 /// because LZ4 decodes many corrupted inputs into plausible bytes. The
 /// question is only what it costs.
+/// Where a bulk load's time actually goes.
+///
+/// EXT.13 established that Supdb loses ordered arrival 3.3x and wins shuffled
+/// 2.8x, and ordered arrival is the common shape -- time series, log ingest,
+/// anything keyed by an increasing id -- so the loss is worth chasing.
+///
+/// Two profiles disagreed about where it lives. cachegrind put 62x LMDB's
+/// last-level misses per key on this shape, which reads like a scattered write
+/// pattern; but it also put only 1% of them in the hash probe and most of them
+/// in `checkpoint_inner`, `seal_shard` and the memcpy inside them. Timing the
+/// phases directly settles it: the put path is within 1.17x of LMDB and the
+/// whole gap is the flush. This splits that flush in two, because "the flush"
+/// is two different things -- writing the buffered data out, and building a
+/// sorted key index over it, which LMDB never does at all because its B-tree
+/// is the index.
+fn f31_loadphases(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let keys = args.num("--keys", profile.pick(100_000, 500_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+
+    let mut rec = Record::new("f31-loadphases", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .note("keys arrive in order, which is the shape EXT.13 finds Supdb 3.3x behind on")
+        .note("one store per repetition; put, flush and checkpoint timed separately");
+
+    let dir = scratch("f31");
+    let payload = Payload::new(value_size, 0.5, 0xF31);
+    let phases: std::sync::Mutex<Vec<(f64, f64, f64)>> = std::sync::Mutex::new(Vec::new());
+    let trial = Trial::new(profile.reps());
+    // One configuration: this is a decomposition, not a comparison, so the
+    // Trial is here for repetition and the interleaving has nothing to
+    // interleave with.
+    let total = trial.run(1, |_, rep| {
+        let file = dir.join(format!("p{rep}.dat"));
+        let _ = std::fs::remove_file(&file);
+        let store = Store::create(&file, default_opts(256)).expect("create");
+        let mut vrng = Rng::new(0xF31 + rep as u64);
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+        }
+        let puts = t.elapsed().as_secs_f64();
+        let tf = Instant::now();
+        store.flush().expect("flush");
+        let flush = tf.elapsed().as_secs_f64();
+        let tc = Instant::now();
+        store.checkpoint().expect("checkpoint");
+        let ckpt = tc.elapsed().as_secs_f64();
+        phases.lock().unwrap().push((puts, flush, ckpt));
+        let _ = store.close();
+        let _ = std::fs::remove_file(&file);
+        keys as f64 / (puts + flush + ckpt)
+    });
+
+    let all = phases.lock().unwrap().clone();
+    let med = |f: fn(&(f64, f64, f64)) -> f64| {
+        let mut v: Vec<f64> = all.iter().map(f).collect();
+        v.sort_by(|a, b| a.total_cmp(b));
+        v.get(v.len() / 2).copied().unwrap_or(0.0)
+    };
+    let (p, f, c) = (med(|x| x.0), med(|x| x.1), med(|x| x.2));
+    let whole = (p + f + c).max(1e-9);
+    rec.series(
+        "phases",
+        J::arr(vec![jobj! {
+            "put_s" => J::fp(p, 4),
+            "flush_s" => J::fp(f, 4),
+            "checkpoint_s" => J::fp(c, 4),
+            "put_pct" => J::fp(100.0 * p / whole, 1),
+            "flush_pct" => J::fp(100.0 * f / whole, 1),
+            "checkpoint_pct" => J::fp(100.0 * c / whole, 1),
+            "ops_per_s" => J::fp(total[0].median(), 1)
+        }]),
+    );
+    rec.finding(Finding::new(
+        "F31.1",
+        "A bulk load spends most of its time putting, not indexing",
+        p > f + c,
+        format!(
+            "put {p:.3}s ({:.0}%), flush {f:.3}s ({:.0}%), checkpoint {c:.3}s ({:.0}%). The \
+             checkpoint is where a sorted key index gets built over everything just written, at \
+             about 57 bytes per key -- work LMDB never does, because its B-tree is both the data \
+             and the index. That is the same fixed cost that makes Supdb indifferent to arrival \
+             order (EXT.14), so it is the price of the property rather than an oversight, and the \
+             question this answers is how large it is",
+            100.0 * p / whole,
+            100.0 * f / whole,
+            100.0 * c / whole
+        ),
+    ));
+    Ok(rec)
+}
+
 /// What it costs to publish an insertion instead of rewriting for it.
 ///
 /// f27 found that a durable checkpoint is expensive because of *insertion*:

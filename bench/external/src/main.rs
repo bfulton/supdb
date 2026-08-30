@@ -359,12 +359,22 @@ fn load_profile(args: &Args, which: &[&str]) -> std::io::Result<()> {
     if !buf.is_empty() {
         e.write_batch(&buf).expect("write");
     }
+    // Split the two halves. cachegrind put a third of this workload's
+    // last-level misses in `checkpoint_inner`, `seal_shard` and the memcpy
+    // inside them, and only 1% in the hash probe -- so where the time goes is
+    // worth measuring directly rather than inferring from a miss profile.
+    let puts = t.elapsed().as_secs_f64();
+    let ts = Instant::now();
     e.sync().expect("sync");
-    let secs = t.elapsed().as_secs_f64();
+    let sync = ts.elapsed().as_secs_f64();
+    let secs = puts + sync;
     println!(
-        "{name} loaded {n} keys in {secs:.3}s ({:.0} ops/s), {:.1} MB",
+        "{name} loaded {n} keys in {secs:.3}s ({:.0} ops/s), {:.1} MB \
+         [puts {puts:.3}s {:.0}%, sync {sync:.3}s {:.0}%]",
         n as f64 / secs.max(1e-9),
-        e.size_bytes() as f64 / 1048576.0
+        e.size_bytes() as f64 / 1048576.0,
+        100.0 * puts / secs.max(1e-9),
+        100.0 * sync / secs.max(1e-9)
     );
     drop(e);
     let _ = std::fs::remove_dir_all(&root);

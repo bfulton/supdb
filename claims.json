@@ -759,6 +759,13 @@
    "profile": "full",
    "expect": "holds",
    "because": "Supdb loads at 605,369/s in order and 683,781 shuffled -- a factor of 0.89, so marginally *faster* out of order. LMDB goes 1,987,572 to 245,565, a factor of 8.10, and 813,207 to 58,507 when durable, a factor of 13.9. That is the architectural difference rather than a ranking: a B-tree taking keys in order fills pages left to right and splits almost never, and the same tree taking them shuffled splits constantly, while an append-structured store writes where the cursor already is either way. It is the property Supdb should have and the first measurement here that shows it, and it is worth more than either ordering, because a store whose ingest rate does not depend on what the keys look like is one you can size capacity for."
+  },
+  {
+   "experiment": "f31-loadphases",
+   "id": "F31.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "It does not: put 0.434s (42.4%), flush 0.136s (13.3%), checkpoint 0.453s (44.3%) for 1M keys arriving in order. Building the key index is the largest phase of a bulk load, and it costs 3.3x more than the flush that writes 105MB of actual data -- so it is the sort and the encode, not I/O. This is where EXT.13's 3.3x loss on ordered arrival lives. Two earlier readings were wrong about it and are worth keeping: cachegrind reports 62x LMDB's last-level misses per key on this shape, which reads like a scattered write path, and I took it for one -- but the same profile puts 1% of those misses in the hash probe and the rest in `checkpoint_inner`, `seal_shard` and the memcpy inside them. Timed directly, Supdb's put path is within 1.17x of LMDB's; the whole gap is the flush. A miss count says where the misses are, not which phase is slow. This is the same fixed cost that makes Supdb indifferent to arrival order (EXT.14), so it is the price of that property rather than an oversight -- but it is embarrassingly parallel across 64 shards and is done on one thread, which is the obvious thing to try next."
   }
  ],
  "metrics": [
