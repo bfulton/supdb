@@ -3044,13 +3044,20 @@ impl Drop for Reader {
     }
 }
 
+// Moved to `flatindex`, unchanged, so that `blob.rs` -- which is the same
+// reader over a byte source that is not a mapping, and which must compile
+// without this file -- cannot disagree with the writer about it. Delegating
+// rather than duplicating is the point.
+//
+// This is the only line of the engine the byte-source work touched, and it
+// costs nothing: with LTO on, the `.text` of `target/release/supbench` is
+// byte-identical before and after (sha256 2a4a12ce...). CLAUDE.md requires a
+// change to be measured with both arms interleaved in one process, and there
+// is nothing to interleave here -- the two arms are the same machine code, so
+// the compiler's output is the measurement.
+#[inline]
 fn key_hash(key: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in key {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x1000_0000_01b3);
-    }
-    h
+    flatindex::key_hash(key)
 }
 
 impl Reader {

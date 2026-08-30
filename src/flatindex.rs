@@ -344,6 +344,29 @@ pub struct FlatIndex {
     pub prev: Option<(u64, u64, u64, u64, u64)>,
 }
 
+/// The hash the flat index is built with.
+///
+/// It lives here rather than in `store.rs` because `store.rs` is the write
+/// path and does not compile for wasm, while `blob.rs` -- the reader that
+/// does -- has to agree with the writer about this function exactly. `encode`
+/// already takes the hash as a parameter for the same reason: a writer and a
+/// reader that disagreed about it would present as keys that exist and cannot
+/// be found, which is the hardest class of bug this format can have.
+///
+/// FNV-1a. Not a fast hash, deliberately: FxHash was tried for the store's
+/// internal maps and made the write path ten times slower, because the keys
+/// were structured and near-identical and multiply-rotate hashing clusters on
+/// exactly that shape.
+#[inline]
+pub fn key_hash(key: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in key {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
+}
+
 /// True if `sec` looks like this format rather than the varint one.
 pub fn is_flat(sec: &[u8]) -> bool {
     rd_u32(sec, 0) == Some(MAGIC) && rd_u32(sec, 4) == Some(VERSION)

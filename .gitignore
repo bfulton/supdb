@@ -1,3 +1,6 @@
 /target
 /bench/external/vendor
 *.dat
+/web/supdb.wasm
+/web/test/out
+/web/floor/target

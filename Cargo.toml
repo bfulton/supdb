@@ -12,9 +12,24 @@ name = "supdb"
 version = "0.0.1"
 edition = "2021"
 
+# A wasm build gets the reader and nothing else. `cdylib` is what the browser
+# loads; `rlib` is what the bins and tests link.
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
-memmap2 = "0.9"
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
+
+# Not merely unused on wasm -- unreachable there, by cfg rather than by hoping.
+#
+# `memmap2` *resolves* for wasm32-unknown-unknown: the errors a naive build
+# gets are about `Advice`, not about `Mmap` being absent, so the type compiles
+# and there are no files to map. Excluding the dependency turns "compiles, then
+# has nothing to map" into "does not build", which is R1.3. `libc` goes with it
+# because only `src/bench` uses it, and `src/bench` is not a wasm target
+# either.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+memmap2 = "0.9"
 libc = "0.2"
 
 [profile.release]
@@ -22,6 +37,18 @@ opt-level = 3
 lto = true
 codegen-units = 1
 debug = true
+
+# What the browser downloads. Size is the axis here, not speed: `opt-level`
+# "z", one codegen unit, LTO, no unwinding tables and no debug info. R3.3 sets
+# the budget and `web/build.sh` measures the blob against it.
+[profile.wasm]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
 
 [[bin]]
 name = "supbench"
@@ -70,3 +97,7 @@ path = "src/bin/correctness.rs"
 [[bin]]
 name = "indexlab"
 path = "src/bin/indexlab.rs"
+
+[[bin]]
+name = "logshed"
+path = "src/bin/logshed.rs"

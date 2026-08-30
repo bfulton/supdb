@@ -55,9 +55,12 @@ is not a measurement.
 |---|---|
 | `src/` | the engine, vendored from the design artifact **verbatim** |
 | `src/bench/` | the measurement substrate — stats, histogram, plotting, env capture |
+| `src/bytes.rs`, `src/blob.rs` | the read path over any byte source; compiles for wasm |
 | `src/bin/internal.rs` | falsification suite (f1–f7) |
 | `src/bin/correctness.rs` | damaged files, model oracle, crash injection (c1–c3) |
+| `src/bin/logshed.rs` | day-index shape, size budget, browser-test fixture |
 | `bench/external/` | Supdb inside other projects' evaluations (redb, LMDB, sled) |
+| `web/` | the browser reader, its size control and its browser test |
 | `results/` | committed measurements — the source of truth |
 | `figures/` | generated from `results/`, never drawn by hand |
 | `docs/architecture-review.md` | why every experiment here exists |
@@ -125,6 +128,54 @@ names, until it did: the durable arm sends **29.9 GB to the block layer for
 116 MB of data**, a write amplification of 270x against LMDB's 2.1x, and
 leaves a 7.35 GB file. `checkpoint` being O(key count) was on the books as a
 time cost and is a device cost of the same origin.
+
+## The second reader
+
+There are now two read paths. `store::Reader` maps a file; `blob::Blob<B>`
+reads through a `Bytes` source and so runs where there is no file to map — a
+browser, over an object fetched out of S3. Same format, same `flatindex`, same
+`block` decoder. A second read path is a liability, because its failure mode is
+not a crash but a browser quietly answering a different question from the
+server, so `tests/blob.rs` opens a store written by `store.rs` and requires the
+two to agree on every key, every value, every count and the checkpoint
+identity. It has already caught two: `Blob` reporting the superblock's
+generation where `Reader` reports the index section's, and a `value_bytes` that
+counted the varint length prefixes it claimed to exclude.
+
+Nothing in that path is asynchronous, and that is the constraint rather than an
+accident. `flatindex::lookup` returns a borrow into the index section and a
+borrow cannot survive an `await`, so the byte source is synchronous: JS
+downloads the object into OPFS once, and every read after that is
+`FileSystemSyncAccessHandle.read`. That is only viable because a day fits —
+`w1-daysize` puts a 32 MB download at 912,522 log lines — and it is why that
+was measured before any of it was built. `web/README.md` has the rest.
+
+`Bytes` has two halves for one reason: `read_at` copies and every source can
+answer it, `slice_at` lends and only a source backed by memory can. Native
+takes the second for every access and copies nothing, which is the axis
+`flatindex` exists to win and the one a byte-source abstraction is most likely
+to lose. `Blob::zero_copy()` is asserted in the test, because a native reader
+that started copying would still pass every correctness check.
+
+**A count is not free, and the reason is the format.** `f28-count` runs four
+arms interleaved. Resolving a key and stopping is 73 ns; counting its values by
+walking their length prefixes is 2,421 ns; reading them all is 2,420. Counting
+without decoding is *not* cheaper than reading — W2.1 is recorded as failing so
+that premise cannot come back. An `Ext` is block, offset, byte length and the
+offset of the last record, and none of those is a count. What is 28x faster is
+`count_fixed`: a fixed-width value carries a fixed-width length prefix, so a
+posting list's count is arithmetic on `Ext::len` with no block touched. That is
+a property of the schema, not of the format. Adding a per-extent count to the
+format would recover at most 11.4 ns of the 12 between those two, for four
+bytes on a 16-byte `Ext` paid by every store forever, so it was priced and
+declined.
+
+**How the roll writes decides the file size, by 22.6x.** Appending a day's
+postings in log-line order writes 831 MB where grouping them by term first
+writes 36.7 — 44,629 inline merges against zero, which is F5.1's latency tail
+showing up on the space axis. The ratio grows with the day, so the naive roll
+degrades exactly where it matters. Any tool that builds an index here sorts by
+key first.
 
 ## Known-failing on purpose
 
