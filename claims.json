@@ -600,21 +600,21 @@
    "id": "EXT.9",
    "profile": "full",
    "expect": "fails",
-   "because": "Supdb loads at 7,596 ops/s against LMDB's 753,439 when both commit on the same boundary -- 0.0101x at p=0.0022, LMDB 99x faster. This is the comparison EXT.1 should always have been. The cause is on the books already: `checkpoint` rewrites the whole key index rather than what changed, so a per-batch commit over 1M keys pays O(key count) a thousand times. Rule 4 makes the shape of it visible -- 29,933.7 MB sent to the block layer for 116 MB of logical data, a write amplification of 270.6x against LMDB's 2.1x, leaving a 7,354 MB file for a 126.9 MB dataset. It was known as a time cost and it is a device cost of the same origin. The pending arena (F25.1) does not touch this axis: the bottleneck here is the index rewrite, not the buffering. LMDB is also still transactional and Supdb is not, so 99x is a lower bound."
+   "because": "Supdb loads at 54,333 ops/s against LMDB's 667,338 when both commit on the same boundary -- 0.081x at p=0.0022, still 12x behind. It was 0.0105, so this is 8.1x better in absolute terms (6,735 to 54,333) and it is attributable rather than drift: across two consecutive runs the durable arm moved 1.0% and LMDB's durable arm 5.5%, where lmdb-nosync moved 85% in the same pair and is why nothing else here can be claimed. `Options::index_inserts` is the cause -- every batch of a load inserts, and `checkpoint_in_place` used to decline any insertion and rewrite the whole key index, which f27 priced at 4.122x and f30 at 4.788x. The rest of the picture moved with it, byte-identically across both runs: 29,933.7 MB to the block layer becomes 11,631.8, write amplification 270.6x becomes 105.1x, and the file for 126.9 MB of data goes from 7,354.1 MB to 280.5 -- 26x smaller, because a rewrite per batch appended a fresh index section each time and reclaimed them more slowly than they accumulated. Still recorded as failing: 12x behind is behind."
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.10",
    "profile": "full",
    "expect": "fails",
-   "because": "Supdb loads at 848,086 ops/s against lmdb-nosync's 1,604,233 -- 0.5287x at p=0.0022, and it has read 0.542x, 0.623x and 0.529x across three runs. Read it with EXT.13, which is the same comparison with one thing varied that this suite had never varied: every load phase here walks `i` in `0..n`, and `KeyDist::Sequential`'s own documentation calls that \"the best case for any structure with sorted layout\". Shuffle the same key set and the ordering reverses to 2.785x. So this entry is a claim about ordered arrival, which is a real and common shape -- time series, log ingest, anything with an increasing id -- and not about loads in general, which is how it read. Both numbers stand. The instruction and cache profile in docs/profiling.md was taken on this shape too."
+   "because": "Unchanged and currently unmeasurable on this host. The two most recent runs read 1.0592x (no difference) and 0.6003x, because lmdb-nosync -- which nothing in this repository touches -- moved 85.3% between them, 703,954 to 1,304,518 ops/s. Supdb's own arm moved 5.0%. Earlier runs read 0.542x, 0.623x and 0.529x. Nothing shipped this session should move this: it is a load with no checkpoint per batch, so `index_inserts` and the redo log are both inert here, and `parallel_index` is worth about 8% which is well inside that swing. The defect stands as f31 and the put-path profile describe it -- Supdb writes a separate index LMDB does not have -- and the measurement needs the quiet host before it can be re-read."
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.11",
    "profile": "full",
-   "expect": "fails",
-   "because": "No difference: 1,100,105 reads/s against LMDB's 1,090,215, ratio 1.0091 at p=0.8983, and 1.043x and 1.042x on the two runs before, so the parity is stable across three. Recorded as failing because no difference is not a lead. LMDB is still transactional, so parity here is not yet parity."
+   "expect": "holds",
+   "because": "Supdb reads 1,280,981/s against LMDB's 998,513 -- 1.283x at p=0.0033 -- and the previous run gave 1.14x, also clearing the gate, where the three before that were 1.042x, 1.043x and 1.009x, all no difference. So it has moved and it replicated once, which is more than most things here manage on this host. What is honest about the attribution: nothing shipped this session was aimed at the read path. `index_inserts` doubles the directory region, which changes index locality, and that is the only plausible mechanism -- untested, and offered as a hypothesis rather than a cause. LMDB is still transactional and Supdb is not, so read the win as a bound that is not yet a win. If the next full run puts this back inside the noise, that is the honest outcome and this entry flips back."
   },
   {
    "experiment": "ext-kv",
