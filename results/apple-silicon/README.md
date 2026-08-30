@@ -56,3 +56,27 @@ confirming f36's ledger decomposition from a second platform.
 Portability notes recorded with the runs: `load_rss_mb` and the device-byte
 columns read zero on macOS (`/proc` does not exist); throughput and file
 size are unaffected.
+
+## Third campaign: pricing log-first under a real barrier
+
+One run on e286a86, the commit that made durability points log-first
+(`ext-kv-durable-pair.run2.json`): supdb-durable 70,316 ops/s vs lmdb
+165,249, **0.426x** at p=0.0022, rel_iqr 5.2%/1.2%. Against run1 on the
+pre-fix engine: lmdb, which nothing touched, moved 1.8%; supdb moved +5.4%.
+
+That flatness is the finding. The same change moved Linux from 0.081x to
+0.223x, because there the per-batch fsync was flushing a 68 MB mapping's
+dirty pages and log-first shrank the flushed footprint to a few KB. On
+macOS `F_FULLFSYNC` is a full device barrier whose cost barely depends on
+the bytes riding it, so shrinking the footprint buys ~5%: the durable-point
+cost here is the *barrier count*, and both engines pay exactly one per
+batch. Two platforms, two different dominant terms, both now measured --
+and the same conclusion from both: what remains on this axis is amortizing
+work per point (the seal, the 64-shard block writes), not shrinking the
+synced bytes further.
+
+Aside, observed but not gated (no finding is emitted for it): in this pair
+supdb-durable read at 2.25M ops/s against lmdb's 1.07M on the loaded store.
+The x86 read comparison (`EXT.11`) uses the buffered arm and cannot
+separate the engines; if a read lead exists anywhere, this host is where
+to measure it properly.
