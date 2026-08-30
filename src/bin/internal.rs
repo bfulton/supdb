@@ -3778,7 +3778,8 @@ fn f31_loadphases(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let dir = scratch("f31");
     let payload = Payload::new(value_size, 0.5, 0xF31);
-    let phases: std::sync::Mutex<Vec<(f64, f64, f64)>> = std::sync::Mutex::new(Vec::new());
+    type Split = (f64, f64, f64, f64, f64, f64, f64, f64);
+    let phases: std::sync::Mutex<Vec<Split>> = std::sync::Mutex::new(Vec::new());
     let trial = Trial::new(profile.reps());
     // One configuration: this is a decomposition, not a comparison, so the
     // Trial is here for repetition and the interleaving has nothing to
@@ -3787,6 +3788,7 @@ fn f31_loadphases(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let file = dir.join(format!("p{rep}.dat"));
         let _ = std::fs::remove_file(&file);
         let store = Store::create(&file, default_opts(256)).expect("create");
+        let _ = supdb::take_phases();
         let mut vrng = Rng::new(0xF31 + rep as u64);
         let mut kb = [0u8; 16];
         let t = Instant::now();
@@ -3801,19 +3803,37 @@ fn f31_loadphases(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let tc = Instant::now();
         store.checkpoint().expect("checkpoint");
         let ckpt = tc.elapsed().as_secs_f64();
-        phases.lock().unwrap().push((puts, flush, ckpt));
+        let ph = supdb::take_phases();
+        let ns = |v: u64| v as f64 / 1e9;
+        phases.lock().unwrap().push((
+            puts,
+            flush,
+            ckpt,
+            ns(ph.sort_ns),
+            ns(ph.encode_ns),
+            ns(ph.crc_ns),
+            ns(ph.pwrite_ns),
+            ns(ph.fsync_ns),
+        ));
         let _ = store.close();
         let _ = std::fs::remove_file(&file);
         keys as f64 / (puts + flush + ckpt)
     });
 
     let all = phases.lock().unwrap().clone();
-    let med = |f: fn(&(f64, f64, f64)) -> f64| {
+    let med = |f: fn(&Split) -> f64| {
         let mut v: Vec<f64> = all.iter().map(f).collect();
         v.sort_by(|a, b| a.total_cmp(b));
         v.get(v.len() / 2).copied().unwrap_or(0.0)
     };
     let (p, f, c) = (med(|x| x.0), med(|x| x.1), med(|x| x.2));
+    let (sort, enc, crc, pw, fs) = (
+        med(|x| x.3),
+        med(|x| x.4),
+        med(|x| x.5),
+        med(|x| x.6),
+        med(|x| x.7),
+    );
     let whole = (p + f + c).max(1e-9);
     rec.series(
         "phases",
@@ -3824,9 +3844,34 @@ fn f31_loadphases(args: &Args, profile: Profile) -> std::io::Result<Record> {
             "put_pct" => J::fp(100.0 * p / whole, 1),
             "flush_pct" => J::fp(100.0 * f / whole, 1),
             "checkpoint_pct" => J::fp(100.0 * c / whole, 1),
-            "ops_per_s" => J::fp(total[0].median(), 1)
+            "ops_per_s" => J::fp(total[0].median(), 1),
+            // Inside the checkpoint. These are what say the phase is a
+            // durability point rather than an index build.
+            "sort_s" => J::fp(sort, 4),
+            "encode_s" => J::fp(enc, 4),
+            "crc_s" => J::fp(crc, 4),
+            "pwrite_s" => J::fp(pw, 4),
+            "fsync_s" => J::fp(fs, 4)
         }]),
     );
+    rec.finding(Finding::new(
+        "F31.2",
+        "No single phase dominates the checkpoint",
+        fs.max(sort + enc) < 0.5 * c,
+        format!(
+            "inside the {c:.3}s checkpoint: sort {sort:.3}s, encode {enc:.3}s, crc {crc:.3}s, \
+             pwrite {pw:.3}s, fsync {fs:.3}s. Building the index is {:.0}% and making it durable \
+             is {:.0}%, so neither is the one thing to remove -- which is the finding, because \
+             three separate profiles each looked like it was. cachegrind reported 62x LMDB's \
+             last-level misses per key and `cg_annotate` put 1% of them in the hash probe. The \
+             phase that looked like a 57MB section write took 4.7x what a bare 57MB write costs on \
+             this machine, measured at 0.087s, which is what finally exposed the `sync_data` \
+             sitting inside it. And the pwrite it appeared to be is {:.0}% of the checkpoint",
+            100.0 * (sort + enc) / c.max(1e-9),
+            100.0 * fs / c.max(1e-9),
+            100.0 * pw / c.max(1e-9)
+        ),
+    ));
     rec.finding(Finding::new(
         "F31.1",
         "A bulk load spends most of its time putting, not indexing",

@@ -2540,7 +2540,9 @@ impl Store {
             Sync::Interval(d) => ap.last_sync.elapsed() >= d,
         };
         if do_sync {
+            let t = std::time::Instant::now();
             ap.file.sync_data()?;
+            ckpt_phase("  sync-data(1st)", t, None);
         }
 
         let gen = ap.generation + 1;
@@ -2693,7 +2695,11 @@ impl Store {
             let other = if at == 0 { SLOT } else { 0 };
             ap.file.write_all_at(&sb.encode(), other)?;
         }
-        ckpt_phase("write-sections", t_write, None);
+        ckpt_phase(
+            "write-sections",
+            t_write,
+            Some(CKPT_BYTES.swap(0, std::sync::atomic::Ordering::Relaxed) as usize),
+        );
         let t_fsync = std::time::Instant::now();
         if do_sync {
             ap.file.sync_data()?;
@@ -3291,23 +3297,68 @@ fn log_replay(arena: &[u8]) -> (Vec<(Vec<u8>, Extents)>, u64) {
     (out, at as u64)
 }
 
-/// Phase timings inside a checkpoint, printed when `SUPDB_CKPT_PHASES` is set.
+/// Where a checkpoint's time goes, accumulated in nanoseconds.
 ///
-/// Off by default and free when off. It is here because two profiles pointed
-/// the wrong way before this did: cachegrind put 62x LMDB's last-level misses
-/// per key on a sequential load, which reads like a scattered write path, and
-/// 1% of them were in the hash probe. Timing the phases said the checkpoint
-/// dominates; timing *inside* the checkpoint said the sort and the encode are
-/// a third of it and writing the index section is the rest. Neither miss
-/// counts nor instruction counts would have said that.
+/// Recorded rather than printed, because the answer was not what two profiles
+/// said it was. cachegrind put 62x LMDB's last-level misses per key on an
+/// ordered load, which reads like a scattered write path; `cg_annotate` put 1%
+/// of them in the hash probe. Timing the phases said the checkpoint dominates.
+/// Timing inside the checkpoint said the sort and the encode are a third of
+/// it -- and then a control said a bare 57MB write costs 0.087s on this
+/// machine against the 0.406s the phase was taking, which is what finally
+/// pointed at the `sync_data` sitting in the middle of it.
+///
+/// `SUPDB_CKPT_PHASES=1` also prints them, which is how they were found.
+#[derive(Default)]
+pub struct Phases {
+    pub sort_ns: u64,
+    pub encode_ns: u64,
+    pub crc_ns: u64,
+    pub pwrite_ns: u64,
+    pub fsync_ns: u64,
+    pub bytes: u64,
+}
+
+static P_SORT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static P_ENCODE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static P_CRC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static P_PWRITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static P_FSYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CKPT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read the counters and zero them, so a caller measures one span.
+pub fn take_phases() -> Phases {
+    use std::sync::atomic::Ordering::Relaxed;
+    Phases {
+        sort_ns: P_SORT.swap(0, Relaxed),
+        encode_ns: P_ENCODE.swap(0, Relaxed),
+        crc_ns: P_CRC.swap(0, Relaxed),
+        pwrite_ns: P_PWRITE.swap(0, Relaxed),
+        fsync_ns: P_FSYNC.swap(0, Relaxed),
+        bytes: CKPT_BYTES.swap(0, Relaxed),
+    }
+}
+
 #[inline]
 fn ckpt_phase(what: &str, t: std::time::Instant, extra: Option<usize>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let d = t.elapsed();
+    let ns = d.as_nanos() as u64;
+    match what {
+        "sort" => P_SORT.fetch_add(ns, Relaxed),
+        "encode" => P_ENCODE.fetch_add(ns, Relaxed),
+        "  crc" => P_CRC.fetch_add(ns, Relaxed),
+        "  pwrite" => P_PWRITE.fetch_add(ns, Relaxed),
+        "  sync-data(1st)" | "fsync" => P_FSYNC.fetch_add(ns, Relaxed),
+        _ => 0,
+    };
     if std::env::var_os("SUPDB_CKPT_PHASES").is_none() {
         return;
     }
+    let secs = d.as_secs_f64();
     match extra {
-        Some(n) => eprintln!("  {what} {:.4}s ({n} keys)", t.elapsed().as_secs_f64()),
-        None => eprintln!("  {what} {:.4}s", t.elapsed().as_secs_f64()),
+        Some(n) => eprintln!("  {what} {secs:.4}s ({n})"),
+        None => eprintln!("  {what} {secs:.4}s"),
     }
 }
 
@@ -3341,10 +3392,15 @@ fn write_section_raw(
         // Sections are not read through the block path, so per-chunk
         // checksums would never be consulted.
         chunk_crc: false,
-        crc: if block::checksums_on() {
-            block::crc32(payload)
-        } else {
-            0
+        crc: {
+            let t = std::time::Instant::now();
+            let c = if block::checksums_on() {
+                block::crc32(payload)
+            } else {
+                0
+            };
+            ckpt_phase("  crc", t, Some(payload.len()));
+            c
         },
     };
     // Reserve the bytes before writing them, so the filesystem allocates once
@@ -3370,7 +3426,10 @@ fn write_section_raw(
             }
         }
     }
+    let t = std::time::Instant::now();
     ap.file.write_all_at(payload, off)?;
+    ckpt_phase("  pwrite", t, Some(payload.len()));
+    CKPT_BYTES.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
     Ok(loc)
 }
 

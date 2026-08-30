@@ -773,6 +773,13 @@
    "profile": "full",
    "expect": "fails",
    "because": "It does not: 0.5798s preallocated against 0.5759s plain, ratio 0.993 at p=0.3184, and the whole load is 0.982x -- no difference either way, at dev and at full. So the 169 MB/s f31 measured for the index write is not the filesystem extending the file, and `posix_fallocate` was aimed at the wrong layer: it reserves disk blocks, and what a 68.5MB `write_all_at` into fresh page cache actually costs is the kernel allocating and populating those pages, which preallocation does not touch. The option is kept, defaulted off, because a refuted lever that can be re-measured is worth more than one that has to be rebuilt to re-ask the question. What it rules out matters more than what it found: with allocation eliminated, the remaining lever on the 41% of a sequential load that is the index write is writing less of it, or writing it once instead of twice -- `encode` builds a 68.5MB Vec and `write_all_at` copies it, where encoding straight into a mapping would not. Neither is an optimisation; both are format or write-path changes with F11.4's +73.5% attached."
+  },
+  {
+   "experiment": "f31-loadphases",
+   "id": "F31.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Inside a 0.468s checkpoint over 1M keys: sort 0.067s, encode 0.086s, crc 0.009s, pwrite 0.015s, fsync 0.186s. Building the index is 33% and making it durable is 40%, and neither is the one thing to remove. That is the finding, because three separate profiles each looked like it was. cachegrind reported 62x LMDB's last-level misses per key on an ordered load, which reads like a scattered write path -- `cg_annotate` puts 1% of them in the hash probe. The phase that looked like a 57MB section write took 4.7x what a bare 57MB write costs on this machine, which is 0.087s measured against a control, and that gap is what finally exposed the `sync_data` sitting inside the phase; the pwrite it appeared to be is 3% of the checkpoint. And f32 refuted preallocation, which had been the explanation for the write being slow, by aiming at disk blocks when the cost was never there. Against LMDB's 0.49s for the same load, Supdb's excess splits roughly evenly between building an index LMDB does not have and flushing the 1.33x bytes that index adds -- one root cause, two costs, and no single phase to delete."
   }
  ],
  "metrics": [

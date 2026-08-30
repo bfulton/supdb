@@ -76,4 +76,6 @@ pub use bytes::{Bytes, SliceBytes, VecBytes};
 #[cfg(not(target_family = "wasm"))]
 pub use bytes::MmapBytes;
 #[cfg(not(target_family = "wasm"))]
-pub use store::{Options, ReadOptions, Readahead, Reader, Reclaim, Stats, Store, Sync};
+pub use store::{
+    take_phases, Options, Phases, ReadOptions, Readahead, Reader, Reclaim, Stats, Store, Sync,
+};
