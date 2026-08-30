@@ -722,8 +722,8 @@
    "experiment": "f29-redolog",
    "id": "F29.1",
    "profile": "full",
-   "expect": "holds",
-   "because": "1.1156x at p=0.0049, and it used to be 5.112x. Nothing about the log changed; what changed is what it is being compared against. `Options::index_inserts` is on by default now, so the other arm no longer rewrites the whole key index for an insertion -- it splices the new keys into the published directory and publishes with one store. The 5.112x was the log against a full rewrite per batch, and the full rewrite is gone. So the two mechanisms overlap almost entirely: fixing insertion in place recovers most of what f27 priced at 4.122x, and the log adds 12% on top of that. Worth knowing before treating the log as the answer -- it is the smaller half of a pair, and the larger half is simpler and has no visibility cost."
+   "expect": "fails",
+   "because": "It does not, and the shape of the trade is the finding: 125,684 ops/s against 133,630 -- 0.941x at p=0.0106, 6% slower -- while writing 523.3 MB against 763.5, which is 31% fewer bytes to the device and a write amplification of 23.65x against 34.51x. The log carries values now rather than extents, so a durability point needs no seal: it was `checkpoint_inner` opening with `flush` that turned a 1,000-key batch spread across 64 shards into 64 nearly-empty blocks. Removing that removes most of the bytes and costs a little time, because the values are written twice -- once to the log and once to a block later -- and each durability point pays an extra fsync. Recorded as failing because the statement is about being cheaper in time and it is not. Whether the trade is worth taking is a question about which resource is scarce, and the honest answer for this engine is that bytes are: EXT.6 loses the size axis and EXT.9's amplification started this session at 270x."
   },
   {
    "experiment": "f29-redolog",

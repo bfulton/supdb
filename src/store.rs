@@ -2905,6 +2905,25 @@ impl Store {
         }
         // Gathered before the appender lock, in the order `read_all` takes
         // them, so a shard is never held while waiting for the appender.
+        // Write out blocks that are already staged, and nothing else.
+        //
+        // A key can be in three states, not two: buffered as pending bytes,
+        // published in the index, and -- the one this missed -- staged in the
+        // block builder by an inline seal, with no extents until the builder
+        // is flushed. Those have no pending bytes to log and no extents to log
+        // either, so they were silently absent: a 200-key round produced a
+        // 123-entry overlay and the other 77 read as their previous value.
+        //
+        // `flush_builder` is not `flush`. It writes blocks that a shard
+        // already sealed under buffer pressure, which are full and would be
+        // written anyway, and it returns immediately for a shard whose builder
+        // is empty. What it does not do is `seal_shard`, which is the part
+        // that turns a small pending buffer into a nearly-empty block -- the
+        // cost this whole path exists to avoid.
+        for sh in &self.shards {
+            let mut sh = sh.lock().unwrap();
+            self.flush_builder(&mut sh)?;
+        }
         let mut buf = Vec::new();
         {
             let guards: Vec<_> = self.shards.iter().map(|s| s.lock().unwrap()).collect();
@@ -3925,12 +3944,21 @@ enum Where {
     Overlay(usize),
 }
 
-/// What the log knows about a key: where its values are, or what they are.
-enum OverVal {
-    Sealed(Extents),
-    /// The bytes themselves, length-prefixed exactly as a block record is, so
-    /// the read path splits them the same way it splits an extent's payload.
-    Value(Vec<u8>, bool),
+/// What the log knows about a key, which can be two things at once.
+///
+/// A key sealed under buffer pressure and then written to again has extents
+/// for the sealed part *and* pending bytes for the rest, and both are logged.
+/// Keeping only the newest record dropped one of them: a key with seven sealed
+/// values and one pending came back with just the pending one.
+#[derive(Default)]
+struct OverVal {
+    /// Extents from the newest `Sealed` record, overriding the published
+    /// index. An empty list is a delete the log carried.
+    sealed: Option<Extents>,
+    /// Bytes from the newest `Value` record -- the shard's pending buffer
+    /// verbatim, `[varint len][value]` per record, the same shape an extent's
+    /// payload has -- and whether they replace what came before.
+    inline: Option<(Vec<u8>, bool)>,
 }
 
 #[derive(Default)]
@@ -5119,29 +5147,26 @@ impl Reader {
         // a durability point writes when nothing has been sealed yet, so a
         // reader has to serve those bytes directly or it cannot see a write
         // the writer was told was durable.
-        let mut entries: Vec<(Vec<u8>, OverVal)> = records
-            .into_iter()
-            .map(|r| match r {
-                LogRec::Sealed(k, e) => (k, OverVal::Sealed(e)),
-                // Already length-prefixed: what was logged is the shard's
-                // pending buffer verbatim, which is `[varint len][value]` per
-                // record, the same shape an extent's payload has. Prefixing it
-                // again handed the prefix back as data.
-                LogRec::Value(k, v, replaces) => (k, OverVal::Value(v, replaces)),
-            })
-            .collect();
-        // Stable, so equal keys keep log order: older first, newer last.
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        entries.dedup_by(|a, b| {
-            if a.0 == b.0 {
-                // `dedup_by` keeps `b` and drops `a`, and `a` is the later of
-                // the pair, so move its payload across.
-                b.1 = std::mem::replace(&mut a.1, OverVal::Sealed(Extents::None));
-                true
-            } else {
-                false
+        // One entry per key, folding the records in log order so the newest of
+        // each kind wins independently. What was logged is the shard's pending
+        // buffer verbatim -- `[varint len][value]` per record, the same shape
+        // an extent's payload has -- so nothing is re-prefixed on the way in.
+        let mut by_key: std::collections::BTreeMap<Vec<u8>, OverVal> = Default::default();
+        for r in records {
+            match r {
+                LogRec::Sealed(k, e) => {
+                    let slot = by_key.entry(k).or_default();
+                    slot.sealed = Some(e);
+                    // A seal absorbs whatever was pending when it ran, so a
+                    // tail logged before it is already inside those extents.
+                    slot.inline = None;
+                }
+                LogRec::Value(k, v, replaces) => {
+                    by_key.entry(k).or_default().inline = Some((v, replaces));
+                }
             }
-        });
+        }
+        let entries: Vec<(Vec<u8>, OverVal)> = by_key.into_iter().collect();
         let mut inserts: Vec<(usize, usize, usize)> = Vec::new();
         for (i, (k, _)) in entries.iter().enumerate() {
             if self.idx.lookup(&self.mmap, k).is_none() {
@@ -5187,45 +5212,44 @@ impl Reader {
     /// `Some` means the log has the bytes themselves and no block holds them
     /// yet, so this is the answer and the extents are not consulted.
     fn overlay_inline(&self, key: &[u8]) -> Option<(&[u8], bool)> {
-        match self.overlay.find(key)? {
-            OverVal::Value(v, replaces) => Some((v.as_slice(), *replaces)),
-            OverVal::Sealed(_) => None,
-        }
+        let (v, replaces) = self.overlay.find(key)?.inline.as_ref()?;
+        Some((v.as_slice(), *replaces))
     }
 
     /// A key's extents, the log's version winning where it has one.
     fn merged_lookup(&self, key: &[u8]) -> Option<&[Ext]> {
-        if let Some(e) = self.overlay.find(key) {
-            return match e {
+        if let Some(over) = self.overlay.find(key) {
+            if let Some(x) = &over.sealed {
                 // An empty extent list is a delete the log carried, and it has
                 // to read as absent rather than falling through to the
                 // published index, which still has the key.
-                OverVal::Sealed(x) if x.as_slice().is_empty() => None,
-                OverVal::Sealed(x) => Some(x.as_slice()),
-                // The caller wants extents and there are none: the bytes are
-                // in the log. `overlay_inline` is the path for that, and every
-                // read site checks it first.
-                OverVal::Value(..) => None,
-            };
+                let sl = x.as_slice();
+                return if sl.is_empty() { None } else { Some(sl) };
+            }
+            // Only a pending tail: whatever this key already had sealed is
+            // still where the published index says it is. Returning None here
+            // dropped every one of those values.
         }
         self.idx.lookup(&self.mmap, key)
     }
 
     fn merged_at(&self, rank: usize) -> Option<(&[u8], &[Ext])> {
         match self.overlay.resolve(rank) {
-            Where::Overlay(i) => match &self.overlay.entries[i] {
-                (k, OverVal::Sealed(e)) => Some((k.as_slice(), e.as_slice())),
-                // Inline values have no extents to hand back; `scan` reads
-                // them through `overlay_inline` before it resolves any.
-                (k, OverVal::Value(..)) => Some((k.as_slice(), &[][..])),
-            },
+            Where::Overlay(i) => {
+                let (k, v) = &self.overlay.entries[i];
+                // A key the log only knows inline has no extents to hand
+                // back; `scan` reads its bytes through `overlay_inline`.
+                Some((
+                    k.as_slice(),
+                    v.sealed.as_ref().map_or(&[][..], |e| e.as_slice()),
+                ))
+            }
             Where::Published(r) => {
                 let (k, e) = self.idx.at(&self.mmap, r)?;
                 // The published rank is still the right key; its extents may
                 // have been superseded by a record the log carries.
-                match self.overlay.find(k) {
-                    Some(OverVal::Sealed(over)) => Some((k, over.as_slice())),
-                    Some(OverVal::Value(..)) => Some((k, &[][..])),
+                match self.overlay.find(k).and_then(|o| o.sealed.as_ref()) {
+                    Some(over) => Some((k, over.as_slice())),
                     None => Some((k, e)),
                 }
             }
