@@ -2,16 +2,27 @@
 # src/shared/localmostrc.ts). Applied per job after one-time approval in the
 # localmost app; hosts here extend the proxy's DEFAULT_ALLOWED_HOSTS.
 #
-# Why each host: a Rust build needs cargo's sparse registry index
-# (index.crates.io -- the host modern cargo actually uses, absent from the
-# default list, which is why every CI run here used to fall back to the git
-# index protocol through github.com), the crate downloads themselves, and
-# rustup's dist server for the day a runner is missing a toolchain. Nothing
-# else: benchmarks must not talk to the network.
+# Why each host, given that strict mode grants ONLY the runner's own
+# infrastructure (github.com, api.github.com, *.actions.githubusercontent.com,
+# *.blob.core.windows.net) and everything else must be declared here:
+#
+#   codeload.github.com   the runner downloads action packages (actions/
+#                         checkout, Swatinem/rust-cache, upload-artifact) as
+#                         tarballs from here; without it no step even starts
+#   index.crates.io       cargo's sparse registry index -- the host modern
+#                         cargo actually uses; its absence is why every CI run
+#                         here used to fall back to the git index protocol
+#   crates.io             registry API
+#   static.crates.io      the crate downloads themselves
+#   static.rust-lang.org  rustup's dist server, for the day a runner is
+#                         missing a toolchain
+#
+# Nothing else: benchmarks must not talk to the network.
 version: 1
 shared:
   network:
     allow:
+      - codeload.github.com
       - index.crates.io
       - crates.io
       - static.crates.io
