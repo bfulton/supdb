@@ -237,6 +237,21 @@ the misparse as file corruption, and an in-place checkpoint that republished a
 record into its hash slot and not its directory entry -- so `read_all` returned
 the new value and `scan` the previous one, silently, for every key it touched.
 
+Also fixed: log replay applied records over newer index state. A logged
+checkpoint leaves records in the arena and restores its keys to `dirty`,
+which usually keeps every later checkpoint on the log path too -- the masking
+that hid this. But a delete shrinks a record to a few bytes, so tombstoning
+logged keys let the next checkpoint go in place: index newest, arena older,
+nothing saying which. On crash-reopen, replay resurrected all forty deleted
+keys. Every log record now carries its checkpoint's generation inside the
+CRC'd frame, the superblock carries `index_gen` (last index-updating
+checkpoint), and both replay paths apply a record only if its stamp is newer.
+Found by writing the reproducer for a suspicion the design panel had also
+flagged ("replay ordering across record kinds is the sharp edge") -- the
+first repro came back clean and was inconclusive until a path trace showed
+it never reached the in-place arm, which is its own lesson: a clean result
+proves nothing about a path the test never took.
+
 Also fixed: `freelist::class_of` underflowed for every length of 4 KiB or
 less -- which is every block a store of short postings produces. Debug builds
 panicked on the subtraction; release builds wrapped and filed the block into

@@ -107,11 +107,11 @@ fn fixed_count(exts: &[Ext], stride: u64) -> Option<u64> {
 /// the constants below are asserted equal to `store.rs`'s at compile time on
 /// every native build, which says *why* in one line instead of six stack
 /// traces.
-const MAGIC: u64 = 0x5355_5044_4200_0002;
+const MAGIC: u64 = 0x5355_5044_4200_0003;
 const SUPER: u64 = 4096;
 const SLOT: u64 = 512;
-const SB_BYTES: usize = 136;
-const SB_FIELDS: usize = 15;
+const SB_BYTES: usize = 144;
+const SB_FIELDS: usize = 16;
 
 // The write path is not compiled for wasm, so this can only be checked where
 // it is -- which is every build that could have changed it.

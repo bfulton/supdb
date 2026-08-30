@@ -12,7 +12,7 @@ use std::io::{Result, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-pub(crate) const MAGIC: u64 = 0x5355_5044_4200_0002;
+pub(crate) const MAGIC: u64 = 0x5355_5044_4200_0003;
 
 /// Two superblock slots live in the first sector-pair of the file, and a
 /// checkpoint alternates between them.
@@ -30,7 +30,7 @@ pub(crate) const SLOT: u64 = 512;
 /// adding two fields to `Super` left every one of them reading a prefix that
 /// no longer contained the checksum -- a format change that presented itself
 /// as "no valid supdb checkpoint" on a healthy file.
-pub(crate) const SUPER_BYTES: usize = 136;
+pub(crate) const SUPER_BYTES: usize = 144;
 
 #[derive(Clone, Copy, Default, Debug)]
 struct Super {
@@ -74,10 +74,20 @@ struct Super {
     /// becomes something that happens occasionally, to bound replay.
     log_off: u64,
     log_len: u64,
+    /// Generation of the last checkpoint that updated the key index -- a full
+    /// rewrite or an in-place edit, never a logged point.
+    ///
+    /// This is what makes log replay safe to order. A logged record is newer
+    /// than the index if and only if its stamped generation exceeds this;
+    /// without the comparison, replay applied whatever the arena held over
+    /// whatever the index said, and the repro was ugly: log a batch, delete
+    /// it, let the tombstones fit the in-place slack, crash -- and all forty
+    /// deleted keys came back on reopen.
+    index_gen: u64,
 }
 
 impl Super {
-    fn fields(&self) -> [u64; 15] {
+    fn fields(&self) -> [u64; 16] {
         [
             self.generation,
             self.history_from,
@@ -94,6 +104,7 @@ impl Super {
             self.high_water,
             self.log_off,
             self.log_len,
+            self.index_gen,
         ]
     }
 
@@ -129,8 +140,8 @@ impl Super {
         // `to_le_bytes` produced, so every file already written stays valid,
         // and a reader of the other order sees the magic byte-swapped and
         // stops. `wrong_endian` turns that into an error that says so.
-        out[120..128].copy_from_slice(&MAGIC.to_ne_bytes());
-        out[128..136].copy_from_slice(&self.checksum().to_le_bytes());
+        out[128..136].copy_from_slice(&MAGIC.to_ne_bytes());
+        out[136..144].copy_from_slice(&self.checksum().to_le_bytes());
         out
     }
 
@@ -142,17 +153,17 @@ impl Super {
     /// machine is a diagnosis that would cost somebody a day.
     fn wrong_endian(buf: &[u8]) -> bool {
         buf.len() >= SUPER_BYTES
-            && u64::from_ne_bytes(buf[120..128].try_into().unwrap()) == MAGIC.swap_bytes()
+            && u64::from_ne_bytes(buf[128..136].try_into().unwrap()) == MAGIC.swap_bytes()
     }
 
     fn decode(buf: &[u8]) -> Option<Super> {
         if buf.len() < SUPER_BYTES {
             return None;
         }
-        let f: Vec<u64> = (0..15)
+        let f: Vec<u64> = (0..16)
             .map(|i| u64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap()))
             .collect();
-        if u64::from_ne_bytes(buf[120..128].try_into().unwrap()) != MAGIC {
+        if u64::from_ne_bytes(buf[128..136].try_into().unwrap()) != MAGIC {
             return None;
         }
         let s = Super {
@@ -171,8 +182,9 @@ impl Super {
             high_water: f[12],
             log_off: f[13],
             log_len: f[14],
+            index_gen: f[15],
         };
-        if u64::from_le_bytes(buf[128..136].try_into().unwrap()) != s.checksum() {
+        if u64::from_le_bytes(buf[136..144].try_into().unwrap()) != s.checksum() {
             return None;
         }
         Some(s)
@@ -785,6 +797,8 @@ struct Appender {
     /// rejects, and everything before it is intact, which is the whole reason
     /// a log is written this way rather than with a length field to update.
     log: Option<(u64, u64, u64)>,
+    /// Generation of the last index-updating checkpoint. See Super::index_gen.
+    index_gen: u64,
     /// The arena the *previous* generation's superblock still names.
     ///
     /// A rewrite makes the current arena redundant, but not immediately
@@ -1352,7 +1366,22 @@ impl Store {
             let map = unsafe { Mmap::map(&file)? };
             let (o, l) = (sb.log_off as usize, sb.log_len as usize);
             match map.get(o..o.saturating_add(l)) {
-                Some(arena) => log_replay(arena),
+                Some(arena) => {
+                    let (recs, used) = log_replay(arena);
+                    // Only records newer than the index. An in-place
+                    // checkpoint after a logged one leaves older records in
+                    // the arena with nothing else marking them stale, and
+                    // replaying them resurrected forty deleted keys in the
+                    // reproducer. The stamp is the arbiter; the walk offset
+                    // still covers every intact record so appends resume in
+                    // the right place.
+                    let keep: Vec<(Vec<u8>, Extents)> = recs
+                        .into_iter()
+                        .filter(|(g, _, _)| *g > sb.index_gen)
+                        .map(|(_, k, e)| (k, e))
+                        .collect();
+                    (keep, used)
+                }
                 // A log the file is too short to contain is corruption, not an
                 // empty log: pretending it is empty would silently drop writes
                 // that were acknowledged as durable.
@@ -1405,6 +1434,7 @@ impl Store {
             appender: Mutex::new(Appender {
                 table,
             log: None,
+            index_gen: 0,
             prev_log: None,
                 map: None,
                 file,
@@ -1493,6 +1523,9 @@ impl Store {
             // from a crash is overwritten rather than kept.
             if sb.log_len > 0 && store.opts.redo_log {
                 ap.log = Some((sb.log_off, sb.log_len, log_used));
+            }
+            ap.index_gen = sb.index_gen;
+            {
             }
             let nblocks = ap.blocks.len();
             ap.verified = (0..(nblocks * block::MAX_CHUNK_CRCS).div_ceil(64))
@@ -1591,6 +1624,7 @@ impl Store {
             appender: Mutex::new(Appender {
                 table,
             log: None,
+            index_gen: 0,
             prev_log: None,
                 map: None,
 
@@ -2409,6 +2443,9 @@ impl Store {
             && !in_place_edit
             && !matches!(policy, Sync::Never)
             && self.checkpoint_to_log(&changed)?;
+        if std::env::var_os("SUPDB_CKPT_TRACE").is_some() {
+            eprintln!("ckpt path: in_place={in_place_edit} logged={logged} changed={}", changed.len());
+        }
         // Downstream the two mean the same thing: do not rewrite the index.
         let in_place = in_place_edit || logged;
         if logged {
@@ -2644,6 +2681,11 @@ impl Store {
         }
 
         let gen = ap.generation + 1;
+        // A logged point leaves the index as it was; everything else -- full
+        // rewrite, in-place edit, a closing fold -- makes the index current.
+        if !logged {
+            ap.index_gen = gen;
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -2778,6 +2820,7 @@ impl Store {
             reuse_stored: reuse_loc.stored as u64,
             reuse_uncompressed: reuse_loc.uncompressed as u64,
             high_water: ap.off,
+            index_gen: ap.index_gen,
             log_off: log_arena.map(|(o, _)| o).unwrap_or(0),
             log_len: log_arena.map(|(_, c)| c).unwrap_or(0),
         };
@@ -2929,9 +2972,10 @@ impl Store {
         let Some((off, cap, used)) = ap.log else {
             return Ok(false);
         };
+        let gen = ap.generation + 1;
         let mut buf = Vec::new();
         for (k, exts) in changed {
-            let Some(rec) = log_encode(k, exts.as_slice()) else {
+            let Some(rec) = log_encode(k, exts.as_slice(), gen) else {
                 return Ok(false);
             };
             buf.extend_from_slice(&rec);
@@ -3389,8 +3433,13 @@ const LOG_HDR: usize = 8;
 /// The payload is exactly what `FlatIndex::encode_record` produces, so the log
 /// and the index agree on how a key and its extents are spelled and there is
 /// only one encoder to keep correct.
-fn log_encode(key: &[u8], exts: &[Ext]) -> Option<Vec<u8>> {
-    let payload = FlatIndex::encode_record(key, exts)?;
+fn log_encode(key: &[u8], exts: &[Ext], gen: u64) -> Option<Vec<u8>> {
+    let rec = FlatIndex::encode_record(key, exts)?;
+    // The generation is inside the CRC'd payload, so a torn stamp fails the
+    // frame the same way torn data does.
+    let mut payload = Vec::with_capacity(8 + rec.len());
+    payload.extend_from_slice(&gen.to_le_bytes());
+    payload.extend_from_slice(&rec);
     let mut out = Vec::with_capacity(LOG_HDR + payload.len());
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(&block::crc32(&payload).to_le_bytes());
@@ -3404,7 +3453,7 @@ fn log_encode(key: &[u8], exts: &[Ext]) -> Option<Vec<u8>> {
 /// a crash mid-append fails its CRC and ends the walk there, with every record
 /// before it still good -- which is the property that makes this a log rather
 /// than a file that has to be rewritten to be extended.
-fn log_replay(arena: &[u8]) -> (Vec<(Vec<u8>, Extents)>, u64) {
+fn log_replay(arena: &[u8]) -> (Vec<(u64, Vec<u8>, Extents)>, u64) {
     let mut out = Vec::new();
     let mut at = 0usize;
     while at + LOG_HDR <= arena.len() {
@@ -3417,14 +3466,17 @@ fn log_replay(arena: &[u8]) -> (Vec<(Vec<u8>, Extents)>, u64) {
         if block::crc32(payload) != want {
             break;
         }
-        match FlatIndex::decode_record(payload) {
-            Some((k, exts)) => {
-                let mut e = Extents::None;
-                for x in exts {
-                    e.push(x);
-                }
-                out.push((k, e));
+        let parsed = payload.get(0..8).and_then(|g| {
+            let gen = u64::from_le_bytes(g.try_into().ok()?);
+            let (k, exts) = FlatIndex::decode_record(&payload[8..])?;
+            let mut e = Extents::None;
+            for x in exts {
+                e.push(x);
             }
+            Some((gen, k, e))
+        });
+        match parsed {
+            Some(r) => out.push(r),
             None => break,
         }
         at += LOG_HDR + len;
@@ -4418,7 +4470,7 @@ impl Reader {
                     r.advice = advice;
                     // After `opts`, because the replay seeks with the fence
                     // setting this reader was opened with.
-                    r.attach_log(sb.log_off, sb.log_len);
+                    r.attach_log(sb.log_off, sb.log_len, sb.index_gen);
                     return Ok(r);
                 }
             }
@@ -4432,7 +4484,7 @@ impl Reader {
         let mut r = Self::build(mmap, key_idx, blocks_src, sb.timestamp, sb.history_from)?;
         r.opts = opts;
         r.advice = advice;
-        r.attach_log(sb.log_off, sb.log_len);
+        r.attach_log(sb.log_off, sb.log_len, sb.index_gen);
         Ok(r)
     }
 
@@ -5021,7 +5073,7 @@ impl Reader {
     /// record whose key is already published replaces its extents and moves
     /// nothing; one whose key is new takes a rank, and every published rank at
     /// or after it shifts by one.
-    fn attach_log(&mut self, off: u64, len: u64) {
+    fn attach_log(&mut self, off: u64, len: u64, index_gen: u64) {
         if len == 0 {
             return;
         }
@@ -5037,6 +5089,13 @@ impl Reader {
             return;
         };
         let (records, _) = log_replay(arena);
+        // Same stamp filter as Store::open: a record at or below the index
+        // generation describes state the index has since superseded.
+        let records: Vec<(Vec<u8>, Extents)> = records
+            .into_iter()
+            .filter(|(g, _, _)| *g > index_gen)
+            .map(|(_, k, e)| (k, e))
+            .collect();
         if records.is_empty() {
             return;
         }

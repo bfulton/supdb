@@ -1446,7 +1446,9 @@ fn a_file_from_the_other_byte_order_is_refused_by_name() {
     // "another machine wrote me".
     let mut bytes = std::fs::read(&path).unwrap();
     for slot in [0usize, 512] {
-        let at = slot + 120;
+        // The magic sits in the last sixteen bytes of the encoded superblock;
+        // 128 tracks SUPER_BYTES - 16 for the v3 (144-byte) layout.
+        let at = slot + 128;
         bytes[at..at + 8].reverse();
     }
     std::fs::write(&path, &bytes).unwrap();
@@ -1757,5 +1759,70 @@ fn a_tiny_store_takes_the_smallest_size_class() {
     s.read_all(b"term", |v| got.push(v.to_vec())).unwrap();
     assert_eq!(got, vec![b"aaaaaaaa".to_vec(), b"bbbbbbbb".to_vec(), b"cccccccc".to_vec()]);
     s.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Log replay must never apply a record over newer index state.
+///
+/// The sequence that broke it, each step verified by path trace: a checkpoint
+/// whose changed set exceeds the in-place slack goes to the LOG (records in
+/// the arena, index untouched); the keys stay dirty, so later checkpoints
+/// keep re-including them -- which usually keeps every later checkpoint on
+/// the log path too, and that masking is why no existing test saw this. But
+/// a DELETE shrinks a record to a few bytes, so tombstoning the logged keys
+/// made the whole changed set fit the slack and the next checkpoint went IN
+/// PLACE: index newest (tombstones), arena still holding the older records,
+/// and nothing anywhere saying which was newer. On crash-reopen, replay
+/// applied the arena over the index and all forty deleted keys came back.
+///
+/// The fix is a generation stamp: every log record carries the generation of
+/// the checkpoint that wrote it, inside the CRC'd payload; the superblock
+/// carries index_gen, the generation of the last checkpoint that updated the
+/// index; and both replay paths (Store::open and Reader::attach_log) apply a
+/// record only if its stamp exceeds index_gen. A clean close() is not enough
+/// to rely on -- close drops the arena, which is exactly why this needed a
+/// crash (mem::forget) to reproduce.
+#[test]
+fn replay_never_applies_a_record_over_newer_index_state() {
+    let dir = std::env::temp_dir().join(format!("supdb-stalereplay-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.dat");
+    let opts = Options::default; // flat index on, redo_log on: the defaults
+    {
+        let s = Store::create(&path, opts()).unwrap();
+        for k in 0..100u32 {
+            s.put(format!("k-{k:03}").as_bytes(), b"seed").unwrap();
+        }
+        s.checkpoint().unwrap();
+        // Grow 40 records past the slack: this checkpoint goes to the log.
+        for k in 0..40u32 {
+            s.append(format!("k-{k:03}").as_bytes(), b"a").unwrap();
+        }
+        s.checkpoint().unwrap();
+        // Tombstone all 40: the changed set (40 restored + 40 deletes, all
+        // tombstone-sized) fits the slack, so this checkpoint goes in place.
+        for k in 0..40u32 {
+            s.delete(format!("k-{k:03}").as_bytes()).unwrap();
+        }
+        s.checkpoint().unwrap();
+        std::mem::forget(s); // crash, not close
+    }
+    // Both replay paths must agree with the tombstones.
+    let s = Store::open(&path, opts()).unwrap();
+    for k in 0..40u32 {
+        let mut n = 0usize;
+        s.read_all(format!("k-{k:03}").as_bytes(), |v| n += v.len())
+            .unwrap();
+        assert_eq!(n, 0, "k-{k:03} resurrected through Store::open replay");
+    }
+    std::mem::forget(s);
+    let r = Reader::open(&path).unwrap();
+    for k in 0..40u32 {
+        let mut n = 0usize;
+        r.read_all(format!("k-{k:03}").as_bytes(), |v| n += v.len())
+            .unwrap();
+        assert_eq!(n, 0, "k-{k:03} resurrected through Reader replay");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
