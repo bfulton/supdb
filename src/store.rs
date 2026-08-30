@@ -1238,6 +1238,13 @@ pub struct Store {
     /// Cleared before a checkpoint gathers, so a write that lands during one
     /// sets it again rather than being lost.
     unpublished: std::sync::atomic::AtomicBool,
+    /// Set for the lifetime of `close()`. A closing store takes the full
+    /// rewrite unconditionally -- an in-place or logged final checkpoint would
+    /// leave state in structures that only exist to defer work there will
+    /// never be another chance to do -- and it ends with no log arena, because
+    /// a store nothing will append to again has no use for 4 MB of reserved
+    /// zeroes that every download of the file pays for.
+    closing: std::sync::atomic::AtomicBool,
     shards: Vec<Mutex<Shard>>,
     appender: Mutex<Appender>,
     opts: Options,
@@ -1393,6 +1400,7 @@ impl Store {
         let table = unsafe { MmapMut::map_mut(&file)? };
         let store = Store {
             unpublished: std::sync::atomic::AtomicBool::new(false),
+            closing: std::sync::atomic::AtomicBool::new(false),
             shards,
             appender: Mutex::new(Appender {
                 table,
@@ -1578,6 +1586,7 @@ impl Store {
         let table = unsafe { MmapMut::map_mut(&file)? };
         Ok(Store {
             unpublished: std::sync::atomic::AtomicBool::new(false),
+            closing: std::sync::atomic::AtomicBool::new(false),
             shards,
             appender: Mutex::new(Appender {
                 table,
@@ -2382,6 +2391,13 @@ impl Store {
                 changed.push((key, exts));
             }
         }
+        let closing = self.closing.load(std::sync::atomic::Ordering::Acquire);
+        // In-place stays legal while closing -- it lands state durably in the
+        // mapped index, which is exactly where a final checkpoint wants it,
+        // and forcing the full rewrite instead was measured to inflate a tiny
+        // store by two extra quarantined section generations. Only the LOG
+        // path is forbidden below: a closing store is about to release its
+        // arena, and records appended to a structure being released are lost.
         let in_place_edit = self.checkpoint_in_place(&changed, nkeys)?;
         // Only a durability point may use the log. `publish` passes
         // `Sync::Never` and wants *visibility*, which the log does not give: a
@@ -2389,7 +2405,8 @@ impl Store {
         // `Reader` opened before the next full rewrite does not see it. Taking
         // this path for a publish would make a scan miss writes that the
         // writer had already been told were published.
-        let logged = !in_place_edit
+        let logged = !closing
+            && !in_place_edit
             && !matches!(policy, Sync::Never)
             && self.checkpoint_to_log(&changed)?;
         // Downstream the two mean the same thing: do not rewrite the index.
@@ -2510,6 +2527,40 @@ impl Store {
             }
         };
         let mut ap = self.appender.lock().unwrap();
+        if closing {
+            // A store nothing will append to again has no use for a log
+            // arena, and the arena is 4 MB of reserved zeroes that every
+            // download of the file pays for -- measured as the difference
+            // between a 580 KB and a 4.8 MB fixed cost per day-index segment.
+            // Dropped HERE, before sections are placed, for two reasons: the
+            // final sections can then land in the reclaimed space instead of
+            // beyond it, and the tail case can be trimmed directly -- the
+            // release-into-the-free-list version of this failed silently,
+            // because close's trim reads free.coalesced(), which rightly
+            // excludes slots still in generation quarantine, and a slot
+            // released during close is the youngest slot there is.
+            let mut drops: Vec<(u64, u64)> = Vec::new();
+            if let Some((o, c, _)) = ap.log.take() {
+                drops.push((o, c));
+            }
+            if let Some((o, c)) = ap.prev_log.take() {
+                drops.push((o, c));
+            }
+            drops.sort_unstable();
+            while let Some(&(o, c)) = drops.last() {
+                if o + c == ap.off {
+                    ap.off = o;
+                    let _ = ap.file.set_len(o);
+                    drops.pop();
+                } else {
+                    break;
+                }
+            }
+            let gen_now = ap.generation + 1;
+            for (o, c) in drops {
+                ap.free.release(o, c as u32, gen_now);
+            }
+        }
         // Flat and uncompressed, for the same reason as the key index: it is
         // read on every open, and decoding it measured 34% of all
         // instructions in a checkpoint-heavy workload.
@@ -2657,7 +2708,11 @@ impl Store {
         //
         // In-place and logged checkpoints keep the arena they have: they did
         // not rewrite the index, so the records still matter.
-        let log_arena: Option<(u64, u64)> = if !self.opts.redo_log {
+        let log_arena: Option<(u64, u64)> = if closing {
+            // Taken and trimmed at the top of this function, before sections
+            // were placed. Nothing to rotate and nothing to record.
+            None
+        } else if !self.opts.redo_log {
             None
         } else if in_place {
             ap.log.map(|(o, c, _)| (o, c))
@@ -3135,6 +3190,7 @@ impl Store {
     /// so the index itself compresses (adjacent keys share prefixes) and so a
     /// future ordered scan can binary-search it directly.
     pub fn close(self) -> Result<Stats> {
+        self.closing.store(true, std::sync::atomic::Ordering::Release);
         let keys: u64 = {
             let mut n = 0u64;
             for sh in &self.shards {

@@ -162,7 +162,7 @@ accident. `flatindex::lookup` returns a borrow into the index section and a
 borrow cannot survive an `await`, so the byte source is synchronous: JS
 downloads the object into OPFS once, and every read after that is
 `FileSystemSyncAccessHandle.read`. That is only viable because a day fits —
-`w1-daysize` puts a 32 MB download at 912,522 log lines — and it is why that
+`w1-daysize` puts a 32 MB download at 911,192 log lines — and it is why that
 was measured before any of it was built. `web/README.md` has the rest.
 
 `Bytes` has two halves for one reason: `read_at` copies and every source can
@@ -236,6 +236,18 @@ reader that fed a flat block-table section to the varint decoder and reported
 the misparse as file corruption, and an in-place checkpoint that republished a
 record into its hash slot and not its directory entry -- so `read_all` returned
 the new value and `scan` the previous one, silently, for every key it touched.
+
+Also fixed: `freelist::class_of` underflowed for every length of 4 KiB or
+less -- which is every block a store of short postings produces. Debug builds
+panicked on the subtraction; release builds wrapped and filed the block into
+the largest sub-class of the smallest octave, so `capacity_for` reserved 7,680
+bytes per tiny placement and every small store silently paid ~1.9x on every
+section it wrote, visible to benchmarks as size rather than as a fault.
+Reported by the logshed session from a three-posting repro whose 65,536-byte
+file the fixed arithmetic reproduces exactly. Found the same day: a closed
+store kept its 4 MB redo-log arena in the file -- close() now drops what
+nothing can ever append to, which took the fixed cost of a day-index segment
+from 4.8 MB back to 618 KB.
 
 Also fixed: `live_key_off` named the live key section only when the index was
 flat *and* could be adopted for in-place editing. With the varint layout it

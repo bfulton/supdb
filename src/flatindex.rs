@@ -397,6 +397,8 @@ pub fn encode(
         });
     }
 
+    // `store` is cfg'd off the wasm build; the timing hook goes with it.
+    #[cfg(not(target_family = "wasm"))]
     crate::store::enc_phase("recs", _t_enc);
     let _t_enc = std::time::Instant::now();
     // The fence: every stride-th key copied out, with one more offset than
@@ -414,6 +416,8 @@ pub fn encode(
         out[o..o + 4].copy_from_slice(&(p.fence_blob_len as u32).to_le_bytes());
     }
 
+    // `store` is cfg'd off the wasm build; the timing hook goes with it.
+    #[cfg(not(target_family = "wasm"))]
     crate::store::enc_phase("fence", _t_enc);
     let _t_enc = std::time::Instant::now();
     let mask = p.hash_cap - 1;

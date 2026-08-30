@@ -45,8 +45,20 @@ fn class_of(len: u32) -> usize {
     let oct = oct.saturating_sub(CLASS_MIN_SHIFT as usize);
     let base = 1u64 << (CLASS_MIN_SHIFT as usize + oct);
     // which eighth of this octave does it fall into
+    //
+    // `l <= base` is every length at or below the class floor: after the
+    // clamp above, that is every block of 4 KiB or fewer, which is every
+    // block a store of short postings produces. `(l - 1) - base` is -1 there,
+    // and this underflowed: a debug build panicked on the subtraction, and a
+    // release build wrapped, divided, and the min() below filed the block
+    // into the LARGEST sub-class of the smallest octave -- so three postings
+    // totalling 24 bytes reserved 7,680 bytes of capacity per placement, and
+    // a small store paid ~1.9x on every section and small block it wrote.
+    // Reported by the logshed session, whose segments are ~100 keys and sit
+    // entirely inside the broken range; found because their debug suite
+    // panicked where every release benchmark had silently paid the size.
     let step = base / SUB as u64;
-    let sub = if step == 0 {
+    let sub = if step == 0 || l <= base {
         0
     } else {
         (((l - 1) - base) / step) as usize + 1
@@ -174,5 +186,44 @@ impl FreeList {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The boundary table for the underflow class. Debug builds panicked on
+    /// the subtraction for every entry in the first group; release builds
+    /// wrapped and reserved 7,680 bytes for each. Runs under both profiles,
+    /// and the debug run is the one that proves the arithmetic rather than
+    /// the clamp.
+    #[test]
+    fn small_lengths_take_the_smallest_class() {
+        for len in [1u32, 24, 512, 4095, 4096] {
+            assert_eq!(class_of(len), 0, "class of {len}");
+            assert_eq!(capacity_for(len), 4096, "capacity for {len}");
+        }
+        // First length past the floor steps into the next sub-class.
+        assert_eq!(capacity_for(4097), 4608);
+        // Exact sub-class boundary lands in its own class, not the next.
+        assert_eq!(capacity_for(4608), 4608);
+        assert_eq!(capacity_for(4609), 5120);
+    }
+
+    /// A slot released at the capacity `capacity_for` reserved must land in a
+    /// class that a request for the original length takes from -- otherwise
+    /// space is reserved by one formula and found by another, which is the
+    /// consistency the bug report declined to guess at.
+    #[test]
+    fn release_and_take_agree_across_the_fixed_range() {
+        for len in [1u32, 24, 4095, 4096, 4097, 7680, 8192, 65_536] {
+            let cap = capacity_for(len);
+            assert!(cap >= len);
+            assert!(
+                class_of(cap) >= class_of(len),
+                "a released cap must be findable by the class that reserved it: len {len}"
+            );
+        }
     }
 }

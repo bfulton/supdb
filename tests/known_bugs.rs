@@ -1701,3 +1701,61 @@ fn a_reader_replays_the_log_in_order() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Three postings under one key: the smallest store must not pay 1.9x for it.
+///
+/// `freelist::class_of` underflowed for any length of 4096 bytes or fewer --
+/// which is every block a store of short postings produces. `l` clamps up to
+/// the 4 KiB class floor, `base` is that same 4096, and `(l - 1) - base` is
+/// -1 on a u64. A debug build panicked on the subtraction at freelist.rs:52;
+/// a release build was worse, because it wrapped, divided, and the clamp
+/// filed the block into the LARGEST sub-class of the smallest octave, so
+/// `capacity_for` reserved 7,680 bytes per tiny placement and a small store's
+/// file was ~1.9x what it should be -- visible to every release benchmark as
+/// size rather than as a fault.
+///
+/// Reported by the logshed session, whose ~100-key segments sit entirely
+/// inside the broken range, and whose debug suite panicked where release
+/// probes had silently paid. The boundary table lives in freelist's own unit
+/// tests; this is the end-to-end shape, with the size consequence asserted so
+/// a release build catches a regression the way debug catches the underflow.
+#[test]
+fn a_tiny_store_takes_the_smallest_size_class() {
+    let dir = std::env::temp_dir().join(format!("supdb-clsof-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.dat");
+    // redo_log off so the 4MB log arena hole does not dominate the file
+    // length this test exists to bound.
+    let opts = || Options {
+        redo_log: false,
+        ..Default::default()
+    };
+    {
+        let s = Store::create(&path, opts()).unwrap();
+        for v in [b"aaaaaaaa".as_slice(), b"bbbbbbbb", b"cccccccc"] {
+            s.append(b"term", v).unwrap();
+        }
+        s.checkpoint().unwrap();
+        s.close().unwrap();
+    }
+    let len = std::fs::metadata(&path).unwrap().len();
+    // Nine placements: the superblock region, plus two generations of
+    // key/block-table/reuse sections (the older trio quarantined, correctly,
+    // for readers that may still hold it) and the data block. Post-fix that
+    // is 9 x 4,096 = 36,864. Pre-fix, eight of those placements reserved
+    // 7,680 each: 4,096 + 8 x 7,680 = 65,536 -- byte for byte the file size
+    // in the original bug report, which is the kind of agreement that says
+    // the mechanism is understood rather than patched.
+    assert!(
+        len <= 45_000,
+        "24 bytes of postings produced a {len}-byte file: small placements \
+         are over-reserving again"
+    );
+    let s = Store::open(&path, opts()).unwrap();
+    let mut got = Vec::new();
+    s.read_all(b"term", |v| got.push(v.to_vec())).unwrap();
+    assert_eq!(got, vec![b"aaaaaaaa".to_vec(), b"bbbbbbbb".to_vec(), b"cccccccc".to_vec()]);
+    s.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
