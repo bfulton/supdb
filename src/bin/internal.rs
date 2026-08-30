@@ -113,6 +113,7 @@ fn main() -> std::io::Result<()> {
             "f33-indexsize" => f33_indexsize(&args, profile)?,
             "f34-parallelindex" => f34_parallelindex(&args, profile)?,
             "f35-indexauto" => f35_indexauto(&args, profile)?,
+            "f36-commit" => f36_commit(&args, profile)?,
             "f28-count" => f28_count(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
@@ -160,6 +161,7 @@ fn main() -> std::io::Result<()> {
                 "f33-indexsize",
                 "f34-parallelindex",
                 "f35-indexauto",
+                "f36-commit",
                 "f28-count",
                 "f4-durability",
                 "f3-multiproc",
@@ -3653,6 +3655,125 @@ fn f11_child(args: &Args) -> std::io::Result<()> {
 /// bit flip, a torn write or a reused slot returns silently wrong data,
 /// because LZ4 decodes many corrupted inputs into plausible bytes. The
 /// question is only what it costs.
+/// Where every device byte of a durable load goes, by file region.
+///
+/// The design panel's first ruling on the durability roadmap: no claim moves
+/// until the residual is convicted term by term. f29 measured 523.3 MB
+/// reaching the device for 23 MB of data with the value log on, and the
+/// hypotheses -- quadratic re-log, publish-under-fsync, full rewrites -- were
+/// exactly that, hypotheses. This experiment is the ledger: explicit writes
+/// attributed by region (log arena, data blocks, key section, block table,
+/// reuse log, superblocks, defrag copies), against the /proc/self/io
+/// write_bytes delta. The gap between the two is what reached the device by
+/// routes the engine did not call write on -- mmap-dirtied index pages
+/// flushed under fsync, and filesystem metadata -- which is one of the
+/// suspects, now measurable instead of arguable.
+///
+/// Arms are the durability configurations that exist on this branch today;
+/// the log-first and log-only arms land behind the same experiment as they
+/// are built, so the decomposition and the design carry the same name: f36.
+fn f36_commit(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let keys = args.num("--keys", profile.pick(20_000, 100_000, 200_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+
+    let mut rec = Record::new("f36-commit", profile);
+    rec.param("keys", J::u(keys))
+        .param("checkpoint_every_ops", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .note("arms interleaved in one process; every key is new (the EXT.9 shape)")
+        .note(
+            "regions are explicit write_all_at bytes attributed at the call site; residual = \
+             /proc/self/io write_bytes minus the ledger sum, i.e. mmap writeback under fsync \
+             plus filesystem metadata",
+        );
+
+    let dir = scratch("f36");
+    let payload = Payload::new(value_size, 0.5, 0xF36);
+    // Arm 0: today's default (extents to the log where possible, index left
+    // in place). Arm 1: the log disabled outright, the pre-log shape.
+    let arms: &[(&str, bool)] = &[("log-extents", true), ("no-log", false)];
+    type Row = (usize, f64, supdb::WriteLedger, f64);
+    let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
+    let trial = Trial::new(profile.reps());
+    let tp = trial.run(arms.len(), |ci, rep| {
+        let file = dir.join(format!("c{ci}-{rep}.dat"));
+        let _ = std::fs::remove_file(&file);
+        let store = Store::create(
+            &file,
+            Options {
+                redo_log: arms[ci].1,
+                ..default_opts(64)
+            },
+        )
+        .expect("create");
+        let _ = supdb::take_write_ledger();
+        let mut vrng = Rng::new(0xF36 + rep as u64);
+        let mut kb = [0u8; 16];
+        let io0 = IoCounters::read_now();
+        let t = Instant::now();
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+            if (i + 1) % batch == 0 {
+                store.checkpoint().expect("checkpoint");
+            }
+        }
+        let secs = t.elapsed().as_secs_f64();
+        let led = supdb::take_write_ledger();
+        let wrote = IoCounters::read_now().since(&io0).write_bytes;
+        rows.lock()
+            .unwrap()
+            .push((ci, wrote as f64 / 1_048_576.0, led, secs));
+        let _ = store.close();
+        let _ = std::fs::remove_file(&file);
+        keys as f64 / secs
+    });
+
+    let mb = |v: u64| v as f64 / 1_048_576.0;
+    let mut out = Vec::new();
+    for (ci, (name, _)) in arms.iter().enumerate() {
+        let all = rows.lock().unwrap();
+        let mine: Vec<&Row> = all.iter().filter(|r| r.0 == ci).collect();
+        // Median rep by io delta, so the ledger and the io figure come from
+        // the same run rather than being medians of different ones.
+        let mut sorted: Vec<&&Row> = mine.iter().collect();
+        sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let Some(mid) = sorted.get(sorted.len() / 2) else { continue };
+        let (_, io_mb, led, _) = ***mid;
+        let ledger_mb = mb(led.total());
+        let residual = io_mb - ledger_mb;
+        println!(
+            "  {name:<12} io {io_mb:>8.1} MB | log {:>7.1} blocks {:>7.1} keysec {:>7.1} \
+             blktab {:>6.1} reuse {:>6.1} super {:>5.2} | residual {residual:>7.1} MB ({:.0}%)",
+            mb(led.log),
+            mb(led.blocks),
+            mb(led.key_section),
+            mb(led.block_table),
+            mb(led.reuse),
+            mb(led.superblock),
+            100.0 * residual / io_mb.max(1e-9),
+        );
+        out.push(jobj! {
+            "arm" => J::s(*name),
+            "ops_per_s" => J::fp(tp[ci].median(), 1),
+            "device_write_mb" => J::fp(io_mb, 2),
+            "log_mb" => J::fp(mb(led.log), 2),
+            "blocks_mb" => J::fp(mb(led.blocks), 2),
+            "key_section_mb" => J::fp(mb(led.key_section), 2),
+            "block_table_mb" => J::fp(mb(led.block_table), 2),
+            "reuse_mb" => J::fp(mb(led.reuse), 2),
+            "superblock_mb" => J::fp(mb(led.superblock), 2),
+            "defrag_mb" => J::fp(mb(led.defrag), 2),
+            "ledger_total_mb" => J::fp(ledger_mb, 2),
+            "residual_mb" => J::fp(residual, 2),
+            "residual_pct" => J::fp(100.0 * residual / io_mb.max(1e-9), 1)
+        });
+    }
+    rec.series("arms", J::arr(out));
+    Ok(rec)
+}
+
 /// Where does the flat index start earning its cost?
 ///
 /// F33 measured the two arms at 1M keys: the flat index costs 1.403x on a

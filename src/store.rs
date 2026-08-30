@@ -1137,6 +1137,7 @@ impl Appender {
                 0
             },
         };
+        wled(&WL_BLOCKS, bytes.len());
         self.file.write_all_at(bytes, off)?;
         self.blocks.push(loc);
         self.chunk_crcs
@@ -2021,6 +2022,7 @@ impl Store {
             let loc = ap.blocks[id];
             let mut buf = vec![0u8; loc.stored as usize];
             ap.file.read_exact_at(&mut buf, loc.off)?;
+            wled(&WL_DEFRAG, buf.len());
             ap.file.write_all_at(&buf, hole_off)?;
             // one entry changes; every extent pointing here is untouched
             ap.blocks[id].off = hole_off;
@@ -2529,14 +2531,30 @@ impl Store {
                 if self.opts.write_index_slack {
                     payload.resize(key_reserve, 0);
                 }
-                write_section_raw(&mut ap, &payload, key_reserve, self.opts.reclaim)?
+                {
+                    let l = write_section_raw(&mut ap, &payload, key_reserve, self.opts.reclaim)?;
+                    wled(&WL_KEYSEC, l.stored as usize);
+                    l
+                }
             }
-            _ => write_section(&mut ap, &key_idx, self.opts.reclaim)?
+            _ => {
+                let l = write_section(&mut ap, &key_idx, self.opts.reclaim)?;
+                wled(&WL_KEYSEC, l.stored as usize);
+                l
+            }
         };
         let blk_loc = if blk_flat {
-            write_section_raw(&mut ap, &blk_idx, blk_idx.len(), self.opts.reclaim)?
+            {
+                let l = write_section_raw(&mut ap, &blk_idx, blk_idx.len(), self.opts.reclaim)?;
+                wled(&WL_BLKSEC, l.stored as usize);
+                l
+            }
         } else {
-            write_section(&mut ap, &blk_idx, self.opts.reclaim)?
+            {
+                let l = write_section(&mut ap, &blk_idx, self.opts.reclaim)?;
+                wled(&WL_BLKSEC, l.stored as usize);
+                l
+            }
         };
         // Drop entries older than any reader could still be relying on. A
         // reader outside the grace window is already unsafe and is told so, so
@@ -2551,6 +2569,7 @@ impl Store {
         ap.reuse_log.retain(|(_, _, gen)| *gen >= horizon);
         let reuse = encode_reuse_log(&ap.reuse_log);
         let reuse_loc = write_section(&mut ap, &reuse, self.opts.reclaim)?;
+        wled(&WL_REUSE, reuse_loc.stored as usize);
         // Before the superblock, so a power loss cannot leave one pointing at
         // sections that never landed. Skipped when the caller has accepted
         // losing checkpoints on power loss; the CRCs and the alternating
@@ -2660,6 +2679,7 @@ impl Store {
             // the index rewrite it was there to avoid -- the logged arm wrote
             // 30.8MB against 15.3 for rewriting, and ran at the same speed.
             let loc = write_section_raw(&mut ap, &0u32.to_le_bytes(), want, self.opts.reclaim)?;
+            wled(&WL_LOG, 4);
             // `cap` is the space actually reserved, which the allocator rounds
             // up from what was asked for, and it is what has to be recorded --
             // both so replay knows the extent and so the free-list
@@ -2723,6 +2743,7 @@ impl Store {
         }
 
         let at = if gen % 2 == 0 { 0 } else { SLOT };
+        wled(&WL_SUPER, SUPER_BYTES);
         ap.file.write_all_at(&sb.encode(), at)?;
         // An in-place checkpoint mutates the key section rather than writing a
         // new one, and the two superblock slots exist on the assumption that
@@ -2738,6 +2759,7 @@ impl Store {
         // which is the situation the alternation was already designed for.
         if in_place {
             let other = if at == 0 { SLOT } else { 0 };
+            wled(&WL_SUPER, SUPER_BYTES);
             ap.file.write_all_at(&sb.encode(), other)?;
         }
         ckpt_phase(
@@ -2868,6 +2890,7 @@ impl Store {
             return Ok(false);
         }
         buf.extend_from_slice(&0u32.to_le_bytes());
+        wled(&WL_LOG, buf.len());
         ap.file.write_all_at(&buf, off + used)?;
         // The records are the durability point. Nothing else is updated --
         // not the superblock, not the index -- because the arena describes its
@@ -3381,6 +3404,61 @@ static P_CRC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0
 static P_PWRITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static P_FSYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CKPT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Explicit bytes handed to write_all_at, attributed by file region.
+///
+/// This exists to convict a residual. f29 measured 523.3 MB reaching the
+/// device for 23 MB of data with the value log on, and nobody owned the
+/// difference; the design panel's first ruling was that no durability claim
+/// moves until that number decomposes term by term. The ledger counts what
+/// the engine wrote on purpose; the gap between its sum and /proc/self/io
+/// write_bytes is what reached the device by other routes -- mmap-dirtied
+/// index pages flushed under fsync, and filesystem metadata -- which is
+/// itself one of the terms under suspicion.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct WriteLedger {
+    pub log: u64,
+    pub blocks: u64,
+    pub key_section: u64,
+    pub block_table: u64,
+    pub reuse: u64,
+    pub superblock: u64,
+    pub defrag: u64,
+}
+
+static WL_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WL_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WL_KEYSEC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WL_BLKSEC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WL_REUSE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WL_SUPER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WL_DEFRAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn wled(cell: &std::sync::atomic::AtomicU64, n: usize) {
+    cell.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the counters and zero them, so a caller measures one span.
+pub fn take_write_ledger() -> WriteLedger {
+    use std::sync::atomic::Ordering::Relaxed;
+    WriteLedger {
+        log: WL_LOG.swap(0, Relaxed),
+        blocks: WL_BLOCKS.swap(0, Relaxed),
+        key_section: WL_KEYSEC.swap(0, Relaxed),
+        block_table: WL_BLKSEC.swap(0, Relaxed),
+        reuse: WL_REUSE.swap(0, Relaxed),
+        superblock: WL_SUPER.swap(0, Relaxed),
+        defrag: WL_DEFRAG.swap(0, Relaxed),
+    }
+}
+
+impl WriteLedger {
+    pub fn total(&self) -> u64 {
+        self.log + self.blocks + self.key_section + self.block_table + self.reuse
+            + self.superblock + self.defrag
+    }
+}
 
 /// Read the counters and zero them, so a caller measures one span.
 pub fn take_phases() -> Phases {
