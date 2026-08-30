@@ -31,6 +31,9 @@ pub(crate) const SLOT: u64 = 512;
 /// no longer contained the checksum -- a format change that presented itself
 /// as "no valid supdb checkpoint" on a healthy file.
 pub(crate) const SUPER_BYTES: usize = 136;
+/// How far ahead `Options::preallocate` reserves, so a load pays a handful of
+/// allocations rather than one per section.
+const PREALLOC_CHUNK: u64 = 64 << 20;
 
 #[derive(Clone, Copy, Default, Debug)]
 struct Super {
@@ -618,6 +621,14 @@ pub struct Options {
     /// in slack, and the hash runs at half load -- so the directory was the
     /// only reason `checkpoint_in_place` declined every insertion, which f27
     /// measured at 4.122x on a workload that only inserts.
+    /// Allocate file space ahead of writing a section, instead of letting each
+    /// write extend the file.
+    ///
+    /// Off by default until measured. The checkpoint writes 68.5MB of index at
+    /// 169 MB/s (docs/profiling.md), which is slow for what should mostly be
+    /// page-cache writes, and the obvious suspect is block allocation on a
+    /// growing file rather than bandwidth. f32 settles it.
+    pub preallocate: bool,
     pub index_inserts: bool,
     pub redo_log: bool,
     /// Bytes reserved for the redo log at each full rewrite. When it fills,
@@ -692,6 +703,7 @@ impl Default for Options {
             checksums: true,
             pending_arena: true,
             seal_on_put: true,
+            preallocate: false,
             index_inserts: false,
             redo_log: false,
             log_bytes: 4 << 20,
@@ -774,6 +786,9 @@ struct Appender {
     /// rejects, and everything before it is intact, which is the whole reason
     /// a log is written this way rather than with a length field to update.
     log: Option<(u64, u64, u64)>,
+    /// Whether to reserve file space before writing into it. Carried here
+    /// because `write_section_raw` is a free function with no view of Options.
+    prealloc: bool,
     /// A read mapping of the file, for serving a sealed extent in place.
     ///
     /// `read_extent` preads the extent's whole block -- 64KiB -- into a fresh
@@ -1375,6 +1390,7 @@ impl Store {
             appender: Mutex::new(Appender {
                 table,
             log: None,
+            prealloc: opts.preallocate,
                 map: None,
                 file,
                 off: high_water,
@@ -1556,6 +1572,7 @@ impl Store {
             appender: Mutex::new(Appender {
                 table,
             log: None,
+            prealloc: opts.preallocate,
                 map: None,
 
                 file,
@@ -2802,13 +2819,6 @@ impl Store {
         Ok(true)
     }
 
-    ///  already returned Some on this path; this is the unwrap that
-    /// says so without a panic branch in the hot loop.
-    #[inline]
-    fn slot_at_of(present: Option<usize>) -> usize {
-        present.unwrap_or(usize::MAX)
-    }
-
     fn checkpoint_in_place(&self, changed: &[(Vec<u8>, Extents)], nkeys: usize) -> Result<bool> {
         use std::sync::atomic::{AtomicU64, Ordering};
         let mut ap = self.appender.lock().unwrap();
@@ -3337,6 +3347,29 @@ fn write_section_raw(
             0
         },
     };
+    // Reserve the bytes before writing them, so the filesystem allocates once
+    // for a run of sections rather than extending the file under every write.
+    // `posix_fallocate` allocates real blocks; `set_len` would only make the
+    // file longer and leave a hole, which is what is already happening.
+    if ap.prealloc {
+        let end = off + len as u64;
+        let cur = ap.file.metadata().map(|m| m.len()).unwrap_or(0);
+        if end > cur {
+            // Round up so a load of many sections pays a handful of these
+            // rather than one each.
+            let want = end.next_multiple_of(PREALLOC_CHUNK);
+            use std::os::unix::io::AsRawFd;
+            // Best effort: a filesystem that will not preallocate is not a
+            // reason to fail a write that would have extended it anyway.
+            unsafe {
+                libc::posix_fallocate(
+                    ap.file.as_raw_fd(),
+                    cur as libc::off_t,
+                    (want - cur) as libc::off_t,
+                );
+            }
+        }
+    }
     ap.file.write_all_at(payload, off)?;
     Ok(loc)
 }

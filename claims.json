@@ -766,6 +766,13 @@
    "profile": "full",
    "expect": "fails",
    "because": "It does not: put 0.434s (42.4%), flush 0.136s (13.3%), checkpoint 0.453s (44.3%) for 1M keys arriving in order. Building the key index is the largest phase of a bulk load, and it costs 3.3x more than the flush that writes 105MB of actual data -- so it is the sort and the encode, not I/O. This is where EXT.13's 3.3x loss on ordered arrival lives. Two earlier readings were wrong about it and are worth keeping: cachegrind reports 62x LMDB's last-level misses per key on this shape, which reads like a scattered write path, and I took it for one -- but the same profile puts 1% of those misses in the hash probe and the rest in `checkpoint_inner`, `seal_shard` and the memcpy inside them. Timed directly, Supdb's put path is within 1.17x of LMDB's; the whole gap is the flush. A miss count says where the misses are, not which phase is slow. This is the same fixed cost that makes Supdb indifferent to arrival order (EXT.14), so it is the price of that property rather than an oversight -- but it is embarrassingly parallel across 64 shards and is done on one thread, which is the obvious thing to try next."
+  },
+  {
+   "experiment": "f32-prealloc",
+   "id": "F32.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "It does not: 0.5798s preallocated against 0.5759s plain, ratio 0.993 at p=0.3184, and the whole load is 0.982x -- no difference either way, at dev and at full. So the 169 MB/s f31 measured for the index write is not the filesystem extending the file, and `posix_fallocate` was aimed at the wrong layer: it reserves disk blocks, and what a 68.5MB `write_all_at` into fresh page cache actually costs is the kernel allocating and populating those pages, which preallocation does not touch. The option is kept, defaulted off, because a refuted lever that can be re-measured is worth more than one that has to be rebuilt to re-ask the question. What it rules out matters more than what it found: with allocation eliminated, the remaining lever on the 41% of a sequential load that is the index write is writing less of it, or writing it once instead of twice -- `encode` builds a 68.5MB Vec and `write_all_at` copies it, where encoding straight into a mapping would not. Neither is an optimisation; both are format or write-path changes with F11.4's +73.5% attached."
   }
  ],
  "metrics": [
