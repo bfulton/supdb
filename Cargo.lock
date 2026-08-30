@@ -606,6 +606,7 @@ name = "supdb-external"
 version = "0.0.1"
 dependencies = [
  "heed",
+ "lmdb-master-sys",
  "redb",
  "sled",
  "supdb",

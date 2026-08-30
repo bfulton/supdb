@@ -11,6 +11,10 @@
 //!   ycsb      YCSB core workloads A-F (Cooper et al., SoCC'10), uniform and
 //!             Zipfian. The standard no key-value store is taken seriously
 //!             without.
+//!   analytics the day-index scorecard against LMDB's genuinely best shape
+//!             for the same data (MDB_DUPSORT|MDB_DUPFIXED), because W2.2 and
+//!             W2.4 were measured against Supdb's own varint walk and a claim
+//!             measured against yourself is not yet a claim about the field.
 //!
 //! Two rules make the comparison honest rather than flattering:
 //!
@@ -21,12 +25,12 @@
 
 mod engines;
 
-use engines::{Engine, Features, Lmdb, Redb, Sled, Supdb};
+use engines::{Engine, Features, Lmdb, LmdbDup, Redb, Sled, Supdb};
 use std::path::PathBuf;
 use std::time::Instant;
 use supdb::bench::{
     compare, db_key_into, Comparison, Finding, Hist, KeyDist, KeyGen, Payload, Profile, Record,
-    Rng, Samples, Verdict, J,
+    Rng, Samples, Trial, Verdict, J,
 };
 use supdb::jobj;
 
@@ -101,6 +105,7 @@ fn main() -> std::io::Result<()> {
         "kv" => suite_kv(&args, profile, &engines)?,
         "ycsb" => suite_ycsb(&args, profile, &engines)?,
         "sweep" => suite_sweep(&args, profile, &engines)?,
+        "analytics" => suite_analytics(&args, profile)?,
         "loadprof" => return load_profile(&args, &engines),
         "loadshape" => suite_loadshape(&args, profile, &engines)?,
         "all" => {
@@ -114,8 +119,9 @@ fn main() -> std::io::Result<()> {
         }
         _ => {
             println!(
-                "external <kv|ycsb|sweep|all|loadshape|loadprof> [--profile ci|dev|full] \
-                 [--engines supdb,redb,lmdb,sled]"
+                "external <kv|ycsb|sweep|analytics|all|loadshape|loadprof> \
+                 [--profile ci|dev|full] [--engines supdb,redb,lmdb,sled] \
+                 (analytics fields its own arms and ignores --engines)"
             );
             return Ok(());
         }
@@ -1218,5 +1224,737 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
             ),
         ));
     }
+    Ok(rec)
+}
+
+// ------------------------------------------------------------- analytics --
+
+/// logshed's term key shape: field name, '=', eight zero-padded digits, so
+/// the dictionary sorts the way a scan wants it. Copied from
+/// `src/bin/logshed.rs` rather than imported, because that file is a binary.
+fn term_key(field: &str, i: usize, out: &mut Vec<u8>) {
+    out.clear();
+    out.extend_from_slice(field.as_bytes());
+    out.push(b'=');
+    let mut buf = [0u8; 8];
+    let mut v = i;
+    for slot in buf.iter_mut().rev() {
+        *slot = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    out.extend_from_slice(&buf);
+}
+
+/// logshed's zipf: u^2 concentrates mass at the head without needing a
+/// table. `status=200` takes most of the traffic and the tail is nearly
+/// empty, and that skew is the shape q1's ranking exists to answer over.
+fn zipf_pick(rng: &mut Rng, n: usize) -> usize {
+    if n <= 1 {
+        return 0;
+    }
+    let u = rng.unit();
+    let i = (u * u * n as f64) as usize;
+    i.min(n - 1)
+}
+
+/// Fixed-capacity top-N accumulator. Both engines' q1 arms feed this same
+/// struct, so everything outside the engine -- the compare, the occasional
+/// key copy when a candidate enters -- costs both sides identically.
+struct TopN {
+    cap: usize,
+    entries: Vec<(u64, Vec<u8>)>,
+    min: u64,
+}
+
+impl TopN {
+    fn new(cap: usize) -> TopN {
+        TopN {
+            cap,
+            entries: Vec::with_capacity(cap),
+            min: 0,
+        }
+    }
+    fn reset(&mut self) {
+        self.entries.clear();
+        self.min = 0;
+    }
+    fn offer(&mut self, key: &[u8], count: u64) {
+        if self.entries.len() < self.cap {
+            self.entries.push((count, key.to_vec()));
+            if self.entries.len() == self.cap {
+                self.min = self.entries.iter().map(|e| e.0).min().unwrap_or(0);
+            }
+            return;
+        }
+        if count <= self.min {
+            return;
+        }
+        let i = self
+            .entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, e)| e.0)
+            .map(|(i, _)| i)
+            .expect("capacity is nonzero");
+        let slot = &mut self.entries[i];
+        slot.0 = count;
+        // Reuse the evicted entry's buffer rather than allocating.
+        slot.1.clear();
+        slot.1.extend_from_slice(key);
+        self.min = self.entries.iter().map(|e| e.0).min().unwrap_or(0);
+    }
+    fn counts_sorted(&self) -> Vec<u64> {
+        let mut v: Vec<u64> = self.entries.iter().map(|e| e.0).collect();
+        v.sort_unstable();
+        v
+    }
+    fn sum(&self) -> u64 {
+        self.entries.iter().map(|e| e.0).sum()
+    }
+}
+
+/// Decode one key's postings into a reused buffer, through the shipped read
+/// path. The buffer amortises to no allocation per value; the decode itself
+/// is the cost q4's finding is about.
+fn decode_postings(blob: &supdb::Blob<supdb::MmapBytes>, key: &[u8], out: &mut Vec<u32>) {
+    out.clear();
+    blob.read_all(key, |v| {
+        out.push(u32::from_be_bytes(v.try_into().expect("4-byte posting")));
+    })
+    .expect("read_all");
+}
+
+/// q4's Supdb arm, and deliberately the naive one: decode both lists in
+/// full, then count matches with a two-pointer walk. The shipped read paths
+/// expose no streaming merge -- building that kernel is rank 5's work, not
+/// this suite's -- so this is what an application could write today, and the
+/// finding says so rather than dressing it up.
+fn naive_merge(
+    blob: &supdb::Blob<supdb::MmapBytes>,
+    ka: &[u8],
+    kb: &[u8],
+    bufa: &mut Vec<u32>,
+    bufb: &mut Vec<u32>,
+) -> u64 {
+    decode_postings(blob, ka, bufa);
+    decode_postings(blob, kb, bufb);
+    intersect_sorted(bufa, bufb)
+}
+
+fn intersect_sorted(a: &[u32], b: &[u32]) -> u64 {
+    let (mut i, mut j, mut n) = (0usize, 0usize, 0u64);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Equal => {
+                n += 1;
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+        }
+    }
+    n
+}
+
+/// The day-index scorecard: Supdb's analytics read paths against LMDB's
+/// genuinely best shape for the same data.
+///
+/// W2.2 (`count_fixed`, 27.1x) and W2.4 (`scan_counts_fixed`, 283x) are the
+/// flashiest numbers in this repository, and both were measured against
+/// Supdb's own varint walk. That establishes the fixed-width arithmetic
+/// beats the general answer *inside this engine* and says nothing about the
+/// field. LMDB's best for a posting list is `MDB_DUPSORT|MDB_DUPFIXED`:
+/// packed fixed-width dups, a stored per-key count behind
+/// `mdb_cursor_count`, a page of postings per `MDB_GET_MULTIPLE` call. This
+/// suite runs the two against each other so the numbers either become
+/// cross-engine claims or get retired; an expected loss is recorded as
+/// permanently as a win.
+///
+/// Four queries, each engine doing it the best way it can through shipped
+/// read paths:
+///
+///   q1  rank the whole dictionary by posting count, top-N out.
+///       Supdb: `scan_counts_fixed`. LMDB: NEXT_NODUP + cursor_count.
+///   q2  the count of one key, many probes.
+///       Supdb: `count_fixed`. LMDB: MDB_SET + cursor_count.
+///   q3  read every posting of one key -- the baseline that keeps q1 and q2
+///       honest, and the one DUPFIXED is genuinely built for.
+///   q4  intersect two keys' posting lists. Supdb's arm is the naive
+///       decode-both merge and the finding says so; LMDB merges in place
+///       across GET_MULTIPLE pages.
+///
+/// The dataset is one synthetic day in logshed's shape (`src/bin/logshed.rs`):
+/// two fields of zipf-skewed terms, one 4-byte line-ordinal posting per field
+/// per line, appended grouped by term because W1.3 showed the naive roll
+/// costs 22.6x the file. ~2,000 term keys and ~1M postings at `full`.
+///
+/// Read-only over immutable stores built once and probed repeatedly, so
+/// every number is warm, like ext-sweep's -- EXT.12 owns cold -- and
+/// durability does not bind. The checksum axis does: supdb-nocksum is built
+/// without checksums and read without verification, which is the read-side
+/// counterpart of ext-kv's supdb-buffered arm, because LMDB has none to turn
+/// on. Plain supdb (checksums on, the shipping default) is recorded beside
+/// it and gates nothing.
+fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    const WIDTH: usize = 4;
+    let lines = args.num("--lines", profile.pick(20_000, 150_000, 500_000)) as u64;
+    let fields: [(&str, usize); 2] = [("path", 1600), ("ua", 400)];
+    let top_n = args.num("--top-n", 10);
+    let rank_budget = args.num("--rank-keys", profile.pick(100_000, 1_000_000, 4_000_000)) as u64;
+    let count_probes = args.num("--count-probes", profile.pick(20_000, 100_000, 500_000)) as u64;
+    let read_probes = args.num("--read-probes", profile.pick(2_000, 20_000, 60_000)) as u64;
+    let pairs = args.num("--pairs", profile.pick(1_000, 5_000, 30_000)) as u64;
+    let reps = args.num("--reps", profile.reps());
+
+    let mut rec = Record::new("ext-analytics", profile);
+    rec.param("lines", J::u(lines))
+        .param("fields", J::s("path:1600, ua:400"))
+        .param("value_width", J::u(WIDTH as u64))
+        .param("top_n", J::u(top_n as u64))
+        .param("rank_key_budget", J::u(rank_budget))
+        .param("count_probes", J::u(count_probes))
+        .param("read_probes", J::u(read_probes))
+        .param("pairs", J::u(pairs))
+        .param("reps", J::u(reps as u64))
+        .note(
+            "one synthetic day in logshed's shape: per line, one 4-byte line-ordinal posting \
+             under a zipf-picked term of each field, appended grouped by term (W1.3). Postings \
+             are big-endian here where logshed writes little-endian: Supdb never compares value \
+             bytes so it costs Supdb nothing, and it makes LMDB's dup comparator agree with \
+             numeric order, so both engines walk ascending lists and the intersection needs no \
+             comparator shim",
+        )
+        .note(
+            "read-only over immutable stores built once and probed repeatedly: every number is \
+             warm, like ext-sweep's, and EXT.12 owns cold. Durability does not bind on a read; \
+             the checksum axis does, and supdb-nocksum -- built without checksums, read without \
+             verification, the read-side counterpart of ext-kv's supdb-buffered -- is the \
+             matched arm for every claim, since LMDB has none to turn on. Plain supdb is \
+             recorded beside it and gates nothing",
+        )
+        .note(
+            "engines and queries interleaved round-robin over reps, one warmup discarded, every \
+             ordering gated on stats::compare. Before anything is timed, all three read paths \
+             must agree with the generator on every key's count, on sampled posting sums, on \
+             sampled intersections and on the top-N, so the arms are provably answering the \
+             same question",
+        )
+        .note(
+            "q4's supdb arm is the NAIVE merge -- read_all both lists into reused buffers, then \
+             a two-pointer count -- because the shipped read paths expose no streaming merge. \
+             The finding prices that missing kernel; rank 5 owns building it",
+        );
+
+    // ---- one day's postings, generated once, identical for every engine ----
+    //
+    // (field, term, line) packed into one u64 and sorted, exactly as
+    // logshed's Order::Term roll does: one sort puts every term's postings
+    // together, ascending by line within a term, and the pack order is also
+    // the keys' lexicographic order ("path=" < "ua=", digits zero-padded).
+    let mut rng = Rng::new(0xDA7);
+    let mut recs: Vec<u64> = Vec::with_capacity((lines as usize) * fields.len());
+    for line in 0..lines {
+        for (f, (_, card)) in fields.iter().enumerate() {
+            let i = zipf_pick(&mut rng, *card);
+            recs.push(((f as u64) << 56) | ((i as u64) << 32) | line);
+        }
+    }
+    recs.sort_unstable();
+
+    let mut dict: Vec<Vec<u8>> = Vec::new();
+    let mut counts: Vec<u64> = Vec::new();
+    let mut starts: Vec<usize> = Vec::new();
+    let mut postings: Vec<u32> = Vec::with_capacity(recs.len());
+    let mut cur = u64::MAX;
+    for p in &recs {
+        let head = p >> 32;
+        if head != cur {
+            cur = head;
+            let (f, i) = ((head >> 24) as usize, (head & 0xff_ffff) as usize);
+            let mut k = Vec::with_capacity(16);
+            term_key(fields[f].0, i, &mut k);
+            dict.push(k);
+            counts.push(0);
+            starts.push(postings.len());
+        }
+        *counts.last_mut().expect("a key was just pushed") += 1;
+        postings.push(*p as u32);
+    }
+    starts.push(postings.len());
+    drop(recs);
+    let dict_len = dict.len();
+    let a_keys = dict.iter().take_while(|k| k.starts_with(b"path=")).count();
+    assert!(
+        a_keys > 0 && a_keys < dict_len,
+        "both fields must be present for q4 to intersect across them"
+    );
+
+    // ---- build all three stores from the same stream ----
+    //
+    // `Options::checksums` is a process-global set by `Store::create`, so the
+    // no-checksum file is built FIRST and the checksummed one second: the
+    // global is then still on when the checksummed arm reads, and the nocksum
+    // arm opts out per-reader with `BlobOptions::verify_checksums`.
+    let root = scratch("analytics");
+    let build_store = |path: &std::path::Path, checksums: bool| {
+        let store = supdb::Store::create(
+            path,
+            supdb::Options {
+                buffer_bytes: 256 << 20,
+                checksums,
+                ..Default::default()
+            },
+        )
+        .expect("create");
+        for (i, key) in dict.iter().enumerate() {
+            for p in &postings[starts[i]..starts[i + 1]] {
+                store.append(key, &p.to_be_bytes()).expect("append");
+            }
+        }
+        store.checkpoint().expect("checkpoint");
+        store.close().expect("close");
+    };
+    let nock_path = root.join("supdb-nocksum.dat");
+    build_store(&nock_path, false);
+    let ck_path = root.join("supdb.dat");
+    build_store(&ck_path, true);
+
+    let mut ldb = LmdbDup::create(&root.join("lmdb-dup"), 8).expect("lmdb-dup create");
+    ldb.begin_load().expect("begin_load");
+    for (i, key) in dict.iter().enumerate() {
+        for p in &postings[starts[i]..starts[i + 1]] {
+            ldb.put(key, &p.to_be_bytes()).expect("put");
+        }
+    }
+    ldb.end_load().expect("end_load");
+
+    let blob =
+        supdb::Blob::open(supdb::MmapBytes::open(&ck_path).expect("map")).expect("blob open");
+    let nock = supdb::Blob::open_with(
+        supdb::MmapBytes::open(&nock_path).expect("map"),
+        supdb::BlobOptions {
+            verify_checksums: false,
+        },
+    )
+    .expect("blob open");
+    assert!(blob.zero_copy(), "the native arm must not be copying");
+    assert!(nock.zero_copy(), "the native arm must not be copying");
+
+    // ---- the differential check that makes the ranking mean something ----
+    //
+    // All three read paths against the generator, before any of them is
+    // timed: every key's count, posting sums on a sample plus the smallest
+    // and largest keys (the smallest exercises LMDB's single-inline-dup
+    // page path), intersections across the fields, and the top-N multiset.
+    // A benchmark over engines that disagree is not a benchmark.
+    for (i, key) in dict.iter().enumerate() {
+        assert_eq!(
+            blob.count_fixed(key, WIDTH as u32),
+            Some(counts[i]),
+            "supdb count for key {i}"
+        );
+        assert_eq!(
+            nock.count_fixed(key, WIDTH as u32),
+            Some(counts[i]),
+            "supdb-nocksum count for key {i}"
+        );
+        assert_eq!(
+            ldb.count(key).expect("lmdb count"),
+            counts[i],
+            "lmdb-dup count for key {i}"
+        );
+    }
+    let truth_sum = |i: usize| -> u64 {
+        postings[starts[i]..starts[i + 1]]
+            .iter()
+            .map(|p| *p as u64)
+            .sum()
+    };
+    let min_i = (0..dict_len).min_by_key(|i| counts[*i]).expect("nonempty");
+    let max_i = (0..dict_len).max_by_key(|i| counts[*i]).expect("nonempty");
+    let mut sample: Vec<usize> = (0..dict_len).step_by((dict_len / 29).max(1)).collect();
+    sample.push(min_i);
+    sample.push(max_i);
+    for i in sample {
+        let key = &dict[i];
+        let mut s1 = 0u64;
+        blob.read_all(key, |v| {
+            s1 += u32::from_be_bytes(v.try_into().expect("4-byte posting")) as u64;
+        })
+        .expect("read_all");
+        let mut s2 = 0u64;
+        ldb.read_postings(key, |page| {
+            for c in page.chunks_exact(WIDTH) {
+                s2 += u32::from_be_bytes(c.try_into().expect("stride")) as u64;
+            }
+        })
+        .expect("read_postings");
+        assert_eq!(s1, truth_sum(i), "supdb posting sum for key {i}");
+        assert_eq!(s2, truth_sum(i), "lmdb-dup posting sum for key {i}");
+    }
+    let (mut bufa, mut bufb): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    for ai in [0, a_keys / 2, a_keys - 1] {
+        for bi in [a_keys, a_keys + (dict_len - a_keys) / 2, dict_len - 1] {
+            let want = intersect_sorted(
+                &postings[starts[ai]..starts[ai + 1]],
+                &postings[starts[bi]..starts[bi + 1]],
+            );
+            let got = naive_merge(&blob, &dict[ai], &dict[bi], &mut bufa, &mut bufb);
+            assert_eq!(got, want, "supdb intersection {ai}x{bi}");
+            let got = ldb
+                .intersect_fixed(&dict[ai], &dict[bi], WIDTH)
+                .expect("intersect");
+            assert_eq!(got, want, "lmdb-dup intersection {ai}x{bi}");
+        }
+    }
+    let mut want_top: Vec<u64> = counts.clone();
+    want_top.sort_unstable();
+    let want_top: Vec<u64> = want_top.into_iter().rev().take(top_n).rev().collect();
+    let mut topn = TopN::new(top_n);
+    blob.scan_counts_fixed(b"", dict_len, WIDTH as u32, |k, n| {
+        topn.offer(k, n.expect("fixed-width by construction"));
+        true
+    })
+    .expect("scan_counts_fixed");
+    assert_eq!(topn.counts_sorted(), want_top, "supdb top-N");
+    topn.reset();
+    let visited = ldb.rank_pass(|k, n| topn.offer(k, n)).expect("rank_pass");
+    assert_eq!(visited as usize, dict_len, "lmdb-dup dictionary size");
+    assert_eq!(topn.counts_sorted(), want_top, "lmdb-dup top-N");
+
+    // ---- the measured arms: 3 engines x 4 queries, interleaved ----
+    let arm = ["supdb", "supdb-nocksum", "lmdb-dup"];
+    let qname = ["q1-rank", "q2-count", "q3-read", "q4-intersect"];
+    let unit = ["keys/s", "probes/s", "postings/s", "pairs/s"];
+    let rank_passes = (rank_budget / dict_len as u64).max(1);
+    rec.param("rank_passes_per_sample", J::u(rank_passes));
+
+    let rates = Trial::new(reps).run(12, |ci, rep| {
+        let (qi, ei) = (ci / 3, ci % 3);
+        match qi {
+            // q1: rank the whole dictionary, top-N maintained identically.
+            0 => {
+                let t = Instant::now();
+                let mut sink = 0u64;
+                for _ in 0..rank_passes {
+                    topn.reset();
+                    match ei {
+                        0 | 1 => {
+                            let b = if ei == 0 { &blob } else { &nock };
+                            b.scan_counts_fixed(b"", dict_len, WIDTH as u32, |k, n| {
+                                topn.offer(k, n.expect("fixed-width by construction"));
+                                true
+                            })
+                            .expect("scan_counts_fixed");
+                        }
+                        _ => {
+                            ldb.rank_pass(|k, n| topn.offer(k, n)).expect("rank_pass");
+                        }
+                    }
+                    sink += topn.sum();
+                }
+                std::hint::black_box(sink);
+                (rank_passes * dict_len as u64) as f64 / t.elapsed().as_secs_f64()
+            }
+            // q2: one key's count, uniform probes.
+            1 => {
+                let mut r = Rng::new(0xC0 + rep as u64);
+                let t = Instant::now();
+                let mut sink = 0u64;
+                for _ in 0..count_probes {
+                    let k = &dict[r.below(dict_len as u64) as usize];
+                    sink += match ei {
+                        0 => blob.count_fixed(k, WIDTH as u32).expect("fixed"),
+                        1 => nock.count_fixed(k, WIDTH as u32).expect("fixed"),
+                        _ => ldb.count(k).expect("count"),
+                    };
+                }
+                std::hint::black_box(sink);
+                count_probes as f64 / t.elapsed().as_secs_f64()
+            }
+            // q3: every posting under one key, uniform probes; the rate is
+            // postings visited per second, and the probe sequence is
+            // identical across arms so the visits are too.
+            2 => {
+                let mut r = Rng::new(0xD0 + rep as u64);
+                let t = Instant::now();
+                let mut sum = 0u64;
+                let mut seen = 0u64;
+                for _ in 0..read_probes {
+                    let k = &dict[r.below(dict_len as u64) as usize];
+                    match ei {
+                        0 | 1 => {
+                            let b = if ei == 0 { &blob } else { &nock };
+                            seen += b
+                                .read_all(k, |v| {
+                                    sum = sum.wrapping_add(u32::from_be_bytes(
+                                        v.try_into().expect("4-byte posting"),
+                                    )
+                                        as u64);
+                                })
+                                .expect("read_all");
+                        }
+                        _ => {
+                            let bytes = ldb
+                                .read_postings(k, |page| {
+                                    for c in page.chunks_exact(WIDTH) {
+                                        sum = sum.wrapping_add(u32::from_be_bytes(
+                                            c.try_into().expect("stride"),
+                                        )
+                                            as u64);
+                                    }
+                                })
+                                .expect("read_postings");
+                            seen += bytes / WIDTH as u64;
+                        }
+                    }
+                }
+                std::hint::black_box(sum);
+                seen as f64 / t.elapsed().as_secs_f64()
+            }
+            // q4: intersect one key from each field.
+            _ => {
+                let mut r = Rng::new(0xE0 + rep as u64);
+                let t = Instant::now();
+                let mut matches = 0u64;
+                for _ in 0..pairs {
+                    let ka = &dict[r.below(a_keys as u64) as usize];
+                    let kb = &dict[a_keys + r.below((dict_len - a_keys) as u64) as usize];
+                    matches += match ei {
+                        0 | 1 => {
+                            let b = if ei == 0 { &blob } else { &nock };
+                            naive_merge(b, ka, kb, &mut bufa, &mut bufb)
+                        }
+                        _ => ldb.intersect_fixed(ka, kb, WIDTH).expect("intersect"),
+                    };
+                }
+                std::hint::black_box(matches);
+                pairs as f64 / t.elapsed().as_secs_f64()
+            }
+        }
+    });
+
+    // ---- report ----
+    let ns = |s: &Samples| 1e9 / s.median().max(1e-9);
+    let mut rows = Vec::new();
+    for qi in 0..4 {
+        for ei in 0..3 {
+            let s = &rates[qi * 3 + ei];
+            println!(
+                "  {:12} {:14} {:>13.0} {:11}  ({:>9.1} ns/unit)",
+                qname[qi],
+                arm[ei],
+                s.median(),
+                unit[qi],
+                ns(s)
+            );
+            rows.push(jobj! {
+                "engine" => J::s(arm[ei]),
+                "query" => J::s(qname[qi]),
+                "unit" => J::s(unit[qi]),
+                "per_s" => J::fp(s.median(), 1),
+                "ns_per_unit" => J::fp(ns(s), 2),
+                "rel_iqr" => J::fp(s.rel_iqr(), 4),
+                "samples" => s.to_json()
+            });
+        }
+    }
+    rec.series("arms", J::arr(rows));
+
+    // The supdb rows mirror the `Supdb` adapter's features with the checksum
+    // axis split across the two arms; the store behind both is durably
+    // checkpointed at build, and durable=false below says no metric here
+    // touches the write path anyway.
+    let sup_feats = Features {
+        durable_commit: true,
+        transactions: false,
+        checksums: true,
+        reopen_for_write: true,
+        read_your_writes: true,
+        ordered_scan: true,
+    };
+    let nock_feats = Features {
+        checksums: false,
+        ..sup_feats
+    };
+    let dup_feats = ldb.features();
+    let feats = [sup_feats, nock_feats, dup_feats];
+    rec.series(
+        "features",
+        J::arr(
+            arm.iter()
+                .zip(feats.iter())
+                .map(|(name, f)| {
+                    jobj! {
+                        "engine" => J::s(*name),
+                        "features" => f.to_json(),
+                        "feature_score" => J::u(f.score() as u64)
+                    }
+                })
+                .collect(),
+        ),
+    );
+
+    let mut med_sorted: Vec<u64> = counts.clone();
+    med_sorted.sort_unstable();
+    rec.series(
+        "dataset",
+        jobj! {
+            "keys" => J::u(dict_len as u64),
+            "keys_path" => J::u(a_keys as u64),
+            "keys_ua" => J::u((dict_len - a_keys) as u64),
+            "postings" => J::u(postings.len() as u64),
+            "min_postings_per_key" => J::u(med_sorted[0]),
+            "median_postings_per_key" => J::u(med_sorted[dict_len / 2]),
+            "max_postings_per_key" => J::u(med_sorted[dict_len - 1]),
+            "supdb_file_mb" => J::fp(
+                std::fs::metadata(&ck_path).map(|m| m.len()).unwrap_or(0) as f64 / 1048576.0, 2),
+            "supdb_nocksum_file_mb" => J::fp(
+                std::fs::metadata(&nock_path).map(|m| m.len()).unwrap_or(0) as f64 / 1048576.0, 2),
+            "lmdb_dup_mb" => J::fp(ldb.size_bytes() as f64 / 1048576.0, 2)
+        },
+    );
+
+    // What verification costs on each query, engine against itself. q1 and
+    // q2 touch no block, so their pairs double as a null check on the rig.
+    for qi in 0..4 {
+        rec.compare(
+            &format!("{}_checksums_off_vs_on", qname[qi]),
+            compare(&rates[qi * 3 + 1], &rates[qi * 3], supdb::bench::MIN_EFFECT),
+        );
+    }
+
+    // ---- the claims, gated on the matched pair ----
+    let gap = nock_feats.unmatched(&dup_feats, false);
+    let titles = [
+        (
+            "EXT.15",
+            "Supdb ranks a day's whole term dictionary faster than LMDB's best shape counts it",
+        ),
+        (
+            "EXT.16",
+            "Supdb answers a single term's posting count faster than LMDB's stored dup count",
+        ),
+        (
+            "EXT.18",
+            "Supdb reads a full posting list as fast as LMDB's page-at-a-time DUPFIXED reads",
+        ),
+        (
+            "EXT.17",
+            "Supdb intersects two terms' posting lists faster than LMDB walks its dup lists",
+        ),
+    ];
+    if !gap.is_empty() {
+        for (id, title) in titles {
+            rec.finding(Finding::not_exercised(
+                id,
+                title,
+                format!(
+                    "not an ordering: supdb-nocksum and lmdb-dup do not promise the same thing \
+                     on {}, and each of those could have been equalized",
+                    gap.join(", ")
+                ),
+            ));
+        }
+        return Ok(rec);
+    }
+    let residual = ". lmdb-dup is still transactional and Supdb is not, which no configuration \
+                    can equalize, so read a win as a bound that is not yet a win and a loss as \
+                    at least that large";
+    let mk = |qi: usize| {
+        let c = compare(
+            &rates[qi * 3 + 1],
+            &rates[qi * 3 + 2],
+            supdb::bench::MIN_EFFECT,
+        );
+        (matches!(c.verdict, Verdict::Greater), c)
+    };
+
+    let (h, c) = mk(0);
+    rec.compare("EXT.15_supdb-nocksum_vs_lmdb-dup", c.clone());
+    rec.finding(Finding::new(
+        "EXT.15",
+        titles[0].1,
+        h,
+        format!(
+            "supdb-nocksum ranks the {dict_len}-key dictionary at {:.1} ns/key against \
+             lmdb-dup's {:.1} ({}), {rank_passes} whole-dictionary passes per sample, top-{top_n} \
+             maintained by the same accumulator in both arms. W2.4's 283x was scan_counts_fixed \
+             against Supdb's own varint walk; this is the same walk against LMDB's best shape -- \
+             a NEXT_NODUP step plus mdb_cursor_count per key, a count the dup tree stores rather \
+             than computes. Supdb's arm is O(extents) arithmetic on the mapped index and touches \
+             no block{residual}",
+            ns(&rates[1]),
+            ns(&rates[2]),
+            c.summary("supdb-nocksum", "lmdb-dup")
+        ),
+    ));
+
+    let (h, c) = mk(1);
+    rec.compare("EXT.16_supdb-nocksum_vs_lmdb-dup", c.clone());
+    rec.finding(Finding::new(
+        "EXT.16",
+        titles[1].1,
+        h,
+        format!(
+            "count_fixed answers a point count in {:.1} ns/probe against MDB_SET plus \
+             mdb_cursor_count's {:.1} ({}), uniform probes over the dictionary. W2.2's 27.1x was \
+             count_fixed against Supdb's own O(values) walk; this is it against an engine that \
+             stores the count -- which is exactly the format change W2.3 priced at 14.9 ns for \
+             Supdb and declined. Whichever way this ordering reads, it is the cross-engine \
+             price of that decision{residual}",
+            ns(&rates[4]),
+            ns(&rates[5]),
+            c.summary("supdb-nocksum", "lmdb-dup")
+        ),
+    ));
+
+    let (_, c) = mk(2);
+    rec.compare("EXT.18_supdb-nocksum_vs_lmdb-dup", c.clone());
+    rec.finding(Finding::new(
+        "EXT.18",
+        titles[2].1,
+        // "As fast as" holds on a tie: this is the baseline LMDB is built
+        // for, and the claim is parity, not a lead.
+        matches!(c.verdict, Verdict::Greater | Verdict::NoDifference),
+        format!(
+            "supdb-nocksum reads postings at {:.2} ns/posting against lmdb-dup's {:.2} ({}), \
+             uniform probes, identical probe sequences, the rate counted in postings visited. \
+             This is the baseline that keeps q1 and q2 honest, and the shape DUPFIXED is \
+             genuinely built for: 4-byte postings packed end to end, a page per GET_MULTIPLE \
+             call, no per-value work at all. Supdb pays a varint length prefix per posting -- a \
+             5-byte stride for 4-byte data -- and the serial dependent walk W2.1 documents. \
+             Claimed as parity, not a lead: holds on Greater or NoDifference{residual}",
+            ns(&rates[7]),
+            ns(&rates[8]),
+            c.summary("supdb-nocksum", "lmdb-dup")
+        ),
+    ));
+
+    let (h, c) = mk(3);
+    rec.compare("EXT.17_supdb-nocksum_vs_lmdb-dup", c.clone());
+    rec.finding(Finding::new(
+        "EXT.17",
+        titles[3].1,
+        h,
+        format!(
+            "supdb-nocksum intersects at {:.1} us/pair against lmdb-dup's {:.1} ({}), each pair \
+             one key from each field, both engines walking the same ascending lists. Supdb's \
+             arm is the NAIVE merge -- read_all both lists into reused buffers, then a \
+             two-pointer count -- because the shipped read paths expose no streaming merge: \
+             every posting is varint-decoded and copied before the merge sees it. LMDB merges \
+             in place across GET_MULTIPLE pages and copies nothing. This entry prices the \
+             missing kernel, and rank 5's merge is the thing that has to move it{residual}",
+            ns(&rates[10]) / 1e3,
+            ns(&rates[11]) / 1e3,
+            c.summary("supdb-nocksum", "lmdb-dup")
+        ),
+    ));
+
+    drop(blob);
+    drop(nock);
+    drop(ldb);
+    let _ = std::fs::remove_dir_all(&root);
     Ok(rec)
 }

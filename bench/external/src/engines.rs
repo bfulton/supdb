@@ -38,6 +38,7 @@
 //!     `ordering_of` enforces the matching and names the residual; the table
 //!     is a precondition now rather than a disclaimer.
 
+use lmdb_master_sys as mdb;
 use std::path::{Path, PathBuf};
 use supdb::bench::J;
 use supdb::jobj;
@@ -620,5 +621,422 @@ impl Engine for Sled {
     }
     fn size_bytes(&self) -> u64 {
         dir_size(&self.path)
+    }
+}
+
+// --------------------------------------------------------------- lmdb-dup --
+
+/// LMDB in its genuinely best shape for a day index: `MDB_DUPSORT |
+/// MDB_DUPFIXED`, postings stored as fixed-width duplicate values under their
+/// term key.
+///
+/// Exists for `ext-analytics`. The flashiest numbers in this repository --
+/// `count_fixed` at 27x and `scan_counts_fixed` at 283x (W2.2, W2.4) -- were
+/// measured against Supdb's own varint walk, never against a competitor's
+/// best effort. This adapter is that best effort: DUPFIXED packs same-width
+/// dups end to end with no per-value header, `mdb_cursor_count` answers a
+/// per-key count from a count the B-tree already stores rather than by
+/// walking anything -- the exact format change W2.3 priced for Supdb and
+/// declined -- and `MDB_GET_MULTIPLE`/`MDB_NEXT_MULTIPLE` hand back a page of
+/// postings per call. Feeding postings through the plain `Lmdb` adapter above
+/// -- values concatenated by hand, or one key per (term, line) pair -- would
+/// be the design document's Java-harness mistake again: a comparison against
+/// a configuration nobody would deploy.
+///
+/// It deliberately does **not** implement `Engine`. On a DUPSORT database
+/// `put` inserts another value under the key where every `Engine` here
+/// overwrites, so entering it into the kv/ycsb shapes would time a different
+/// operation and print it in the same column. It has exactly the operations
+/// the analytics suite measures, plus the build path.
+///
+/// Raw `lmdb-master-sys` rather than heed, and that needs saying: heed 0.20
+/// exposes neither cursors nor its sys crate, and every query here is a
+/// cursor operation (`mdb_cursor_count`, `MDB_GET_MULTIPLE`,
+/// `MDB_NEXT_NODUP`). The sys crate is the same build of the same LMDB
+/// (0.9.70) that the `Lmdb` adapter above links through heed -- one crate
+/// instance in the lockfile, so the C code under measurement is
+/// byte-identical -- and what this adapter skips is heed's typed wrapper,
+/// which if it is anything is a bias in LMDB's favour.
+///
+/// The fairness rules from the top of this file, applied: one read
+/// transaction held for the life of the adapter (the store is immutable once
+/// built), cursors opened once and repositioned with `MDB_SET` rather than
+/// reopened, and no allocation per value anywhere -- pages and single values
+/// are handed out as borrows from the map.
+pub struct LmdbDup {
+    env: *mut mdb::MDB_env,
+    dbi: mdb::MDB_dbi,
+    /// The build transaction, alive between `begin_load` and `end_load`.
+    wtxn: *mut mdb::MDB_txn,
+    /// The held read transaction, opened by `end_load`, and the two cursors
+    /// bound to it. Two, because an intersection walks two dup lists at once.
+    rtxn: *mut mdb::MDB_txn,
+    cur: *mut mdb::MDB_cursor,
+    cur2: *mut mdb::MDB_cursor,
+    path: PathBuf,
+}
+
+fn mdb_err(rc: std::os::raw::c_int, what: &str) -> String {
+    // mdb_strerror hands back a static string for every code LMDB defines.
+    let msg = unsafe { std::ffi::CStr::from_ptr(mdb::mdb_strerror(rc)) };
+    format!("{what}: {}", msg.to_string_lossy())
+}
+
+fn ck(rc: std::os::raw::c_int, what: &str) -> Res<()> {
+    if rc == mdb::MDB_SUCCESS {
+        Ok(())
+    } else {
+        Err(mdb_err(rc, what))
+    }
+}
+
+/// An input `MDB_val`. LMDB never writes through the pointer on the get and
+/// put paths used here, so the cast from `*const` is sound.
+fn mval(b: &[u8]) -> mdb::MDB_val {
+    mdb::MDB_val {
+        mv_size: b.len(),
+        mv_data: b.as_ptr() as *mut _,
+    }
+}
+
+fn mval_out() -> mdb::MDB_val {
+    mdb::MDB_val {
+        mv_size: 0,
+        mv_data: std::ptr::null_mut(),
+    }
+}
+
+/// # Safety
+/// `v` must have been filled in by a successful `mdb_cursor_get` on a
+/// transaction that is still live; the slice borrows the map for `'a`, which
+/// the caller must keep inside that transaction's lifetime.
+unsafe fn mslice<'a>(v: &mdb::MDB_val) -> &'a [u8] {
+    if v.mv_size == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(v.mv_data as *const u8, v.mv_size)
+    }
+}
+
+/// A dup list walked page-at-a-time: `MDB_GET_MULTIPLE` for the first page,
+/// `MDB_NEXT_MULTIPLE` for the rest. The one wrinkle is a key with a single
+/// value: LMDB stores it inline with no dup sub-structure, `GET_MULTIPLE`
+/// then returns success *without touching the output val* (mdb.c breaks out
+/// before `fetchm`), and the value has to come from `MDB_GET_CURRENT`
+/// instead. The null `mv_data` this struct initialises is how that case is
+/// detected.
+struct DupPages {
+    cur: *mut mdb::MDB_cursor,
+    page: mdb::MDB_val,
+    pos: usize,
+}
+
+impl DupPages {
+    /// Position `cur` on `key` and fetch the first page. `None` when the key
+    /// is absent.
+    fn start(cur: *mut mdb::MDB_cursor, key: &[u8]) -> Res<Option<DupPages>> {
+        unsafe {
+            let mut k = mval(key);
+            let mut d = mval_out();
+            let rc = mdb::mdb_cursor_get(cur, &mut k, &mut d, mdb::MDB_SET);
+            if rc == mdb::MDB_NOTFOUND {
+                return Ok(None);
+            }
+            ck(rc, "mdb_cursor_get(MDB_SET)")?;
+            let mut page = mval_out();
+            let rc = mdb::mdb_cursor_get(cur, &mut k, &mut page, mdb::MDB_GET_MULTIPLE);
+            if rc == mdb::MDB_NOTFOUND {
+                return Ok(None);
+            }
+            ck(rc, "mdb_cursor_get(MDB_GET_MULTIPLE)")?;
+            if page.mv_data.is_null() {
+                // Single inline value, no sub-page: the "page" is the value
+                // itself, via GET_CURRENT.
+                let mut d = mval_out();
+                ck(
+                    mdb::mdb_cursor_get(cur, &mut k, &mut d, mdb::MDB_GET_CURRENT),
+                    "mdb_cursor_get(MDB_GET_CURRENT)",
+                )?;
+                page = d;
+            }
+            Ok(Some(DupPages { cur, page, pos: 0 }))
+        }
+    }
+
+    /// The current page's remaining bytes.
+    fn rest(&self) -> &[u8] {
+        // Safety: `page` was filled by a successful cursor_get and the read
+        // transaction outlives this struct's use.
+        unsafe { &mslice(&self.page)[self.pos..] }
+    }
+
+    /// Step `width` bytes forward, crossing to the next page when this one is
+    /// exhausted. `false` when the list ends.
+    fn advance(&mut self, width: usize) -> Res<bool> {
+        self.pos += width;
+        if self.pos < self.page.mv_size {
+            return Ok(true);
+        }
+        unsafe {
+            let mut k = mval_out();
+            let mut page = mval_out();
+            let rc = mdb::mdb_cursor_get(self.cur, &mut k, &mut page, mdb::MDB_NEXT_MULTIPLE);
+            if rc == mdb::MDB_NOTFOUND {
+                return Ok(false);
+            }
+            ck(rc, "mdb_cursor_get(MDB_NEXT_MULTIPLE)")?;
+            self.page = page;
+            self.pos = 0;
+            Ok(true)
+        }
+    }
+}
+
+impl LmdbDup {
+    pub fn create(path: &Path, map_gb: usize) -> Res<LmdbDup> {
+        std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+        let cpath = std::ffi::CString::new(path.to_str().ok_or("non-utf8 path")?)
+            .map_err(|e| e.to_string())?;
+        unsafe {
+            let mut env: *mut mdb::MDB_env = std::ptr::null_mut();
+            ck(mdb::mdb_env_create(&mut env), "mdb_env_create")?;
+            ck(
+                mdb::mdb_env_set_mapsize(env, map_gb << 30),
+                "mdb_env_set_mapsize",
+            )?;
+            // Flags 0 and mode 0644, exactly as heed opens the `Lmdb` engine
+            // above: full sync on commit, readahead on.
+            let rc = mdb::mdb_env_open(env, cpath.as_ptr(), 0, 0o644);
+            if rc != mdb::MDB_SUCCESS {
+                mdb::mdb_env_close(env);
+                return Err(mdb_err(rc, "mdb_env_open"));
+            }
+            // The unnamed database, with the dup flags made persistent by a
+            // committed write transaction.
+            let mut txn: *mut mdb::MDB_txn = std::ptr::null_mut();
+            ck(
+                mdb::mdb_txn_begin(env, std::ptr::null_mut(), 0, &mut txn),
+                "mdb_txn_begin",
+            )?;
+            let mut dbi: mdb::MDB_dbi = 0;
+            ck(
+                mdb::mdb_dbi_open(
+                    txn,
+                    std::ptr::null(),
+                    mdb::MDB_DUPSORT | mdb::MDB_DUPFIXED,
+                    &mut dbi,
+                ),
+                "mdb_dbi_open",
+            )?;
+            ck(mdb::mdb_txn_commit(txn), "mdb_txn_commit")?;
+            Ok(LmdbDup {
+                env,
+                dbi,
+                wtxn: std::ptr::null_mut(),
+                rtxn: std::ptr::null_mut(),
+                cur: std::ptr::null_mut(),
+                cur2: std::ptr::null_mut(),
+                path: path.to_path_buf(),
+            })
+        }
+    }
+
+    /// What this engine promises, honestly. It is the `lmdb` row: the build
+    /// commits with a full sync, reads are transactional snapshots, and there
+    /// are no checksums to turn on. DUPFIXED changes the layout, not the
+    /// guarantees.
+    pub fn features(&self) -> Features {
+        Features {
+            durable_commit: true,
+            transactions: true,
+            checksums: false,
+            reopen_for_write: true,
+            read_your_writes: true,
+            ordered_scan: true,
+        }
+    }
+
+    // ---- build ----
+
+    pub fn begin_load(&mut self) -> Res<()> {
+        unsafe {
+            let mut txn: *mut mdb::MDB_txn = std::ptr::null_mut();
+            ck(
+                mdb::mdb_txn_begin(self.env, std::ptr::null_mut(), 0, &mut txn),
+                "mdb_txn_begin(load)",
+            )?;
+            self.wtxn = txn;
+        }
+        Ok(())
+    }
+
+    /// One posting. The analytics suite feeds these grouped by term and
+    /// ascending within a term, which is a sorted insert for this database --
+    /// the shape LMDB likes best. The build is not timed either way.
+    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Res<()> {
+        if self.wtxn.is_null() {
+            return Err("put outside begin_load/end_load".into());
+        }
+        unsafe {
+            let mut k = mval(key);
+            let mut v = mval(value);
+            ck(
+                mdb::mdb_put(self.wtxn, self.dbi, &mut k, &mut v, 0),
+                "mdb_put",
+            )
+        }
+    }
+
+    /// Commit the build, then open the held read transaction and both
+    /// cursors. After this the adapter is read-only.
+    pub fn end_load(&mut self) -> Res<()> {
+        unsafe {
+            ck(mdb::mdb_txn_commit(self.wtxn), "mdb_txn_commit(load)")?;
+            self.wtxn = std::ptr::null_mut();
+            let mut txn: *mut mdb::MDB_txn = std::ptr::null_mut();
+            ck(
+                mdb::mdb_txn_begin(self.env, std::ptr::null_mut(), mdb::MDB_RDONLY, &mut txn),
+                "mdb_txn_begin(read)",
+            )?;
+            self.rtxn = txn;
+            ck(
+                mdb::mdb_cursor_open(self.rtxn, self.dbi, &mut self.cur),
+                "mdb_cursor_open",
+            )?;
+            ck(
+                mdb::mdb_cursor_open(self.rtxn, self.dbi, &mut self.cur2),
+                "mdb_cursor_open",
+            )?;
+        }
+        Ok(())
+    }
+
+    // ---- the four queries ----
+
+    /// q2: the count of one key's postings. `MDB_SET` positions, and
+    /// `mdb_cursor_count` reads `md_entries` out of the dup tree's header --
+    /// a stored count, not a walk. Zero for a key that is not there.
+    pub fn count(&mut self, key: &[u8]) -> Res<u64> {
+        unsafe {
+            let mut k = mval(key);
+            let mut d = mval_out();
+            let rc = mdb::mdb_cursor_get(self.cur, &mut k, &mut d, mdb::MDB_SET);
+            if rc == mdb::MDB_NOTFOUND {
+                return Ok(0);
+            }
+            ck(rc, "mdb_cursor_get(MDB_SET)")?;
+            let mut n: mdb::mdb_size_t = 0;
+            ck(mdb::mdb_cursor_count(self.cur, &mut n), "mdb_cursor_count")?;
+            Ok(n as u64)
+        }
+    }
+
+    /// q1: one pass over the whole dictionary, handing `f` every key and its
+    /// stored count. `MDB_NEXT_NODUP` steps over each dup list without
+    /// entering it. Returns the number of keys visited.
+    pub fn rank_pass<F: FnMut(&[u8], u64)>(&mut self, mut f: F) -> Res<u64> {
+        unsafe {
+            let mut k = mval_out();
+            let mut d = mval_out();
+            let mut rc = mdb::mdb_cursor_get(self.cur, &mut k, &mut d, mdb::MDB_FIRST);
+            let mut keys = 0u64;
+            while rc == mdb::MDB_SUCCESS {
+                let mut n: mdb::mdb_size_t = 0;
+                ck(mdb::mdb_cursor_count(self.cur, &mut n), "mdb_cursor_count")?;
+                f(mslice(&k), n as u64);
+                keys += 1;
+                rc = mdb::mdb_cursor_get(self.cur, &mut k, &mut d, mdb::MDB_NEXT_NODUP);
+            }
+            if rc != mdb::MDB_NOTFOUND {
+                return Err(mdb_err(rc, "mdb_cursor_get(MDB_NEXT_NODUP)"));
+            }
+            Ok(keys)
+        }
+    }
+
+    /// q3: every posting under one key, a `MDB_GET_MULTIPLE` page at a time.
+    /// `f` is handed each page (fixed-width values packed end to end) as a
+    /// borrow from the map; nothing is copied. Returns total bytes visited.
+    pub fn read_postings<F: FnMut(&[u8])>(&mut self, key: &[u8], mut f: F) -> Res<u64> {
+        let Some(mut pages) = DupPages::start(self.cur, key)? else {
+            return Ok(0);
+        };
+        let mut bytes = 0u64;
+        loop {
+            let rest = pages.rest();
+            bytes += rest.len() as u64;
+            f(rest);
+            // Jump to the end of the page; `advance` then fetches the next
+            // one or reports the end of the list.
+            pages.pos = pages.page.mv_size;
+            if !pages.advance(0)? {
+                return Ok(bytes);
+            }
+        }
+    }
+
+    /// q4: how many values two keys' dup lists share. A two-pointer merge
+    /// over both lists, page-at-a-time on each side, comparing fixed-width
+    /// values as byte strings -- which is dup order on this database, and
+    /// numeric order for the suite's big-endian postings. A seek-based
+    /// leapfrog (`MDB_GET_BOTH_RANGE`) exists and is not exercised here; for
+    /// the day-index shape the lists are dense enough that stepping is the
+    /// honest default.
+    pub fn intersect_fixed(&mut self, ka: &[u8], kb: &[u8], width: usize) -> Res<u64> {
+        let a = DupPages::start(self.cur, ka)?;
+        let b = DupPages::start(self.cur2, kb)?;
+        let (Some(mut a), Some(mut b)) = (a, b) else {
+            return Ok(0);
+        };
+        let mut matches = 0u64;
+        loop {
+            let av = &a.rest()[..width];
+            let bv = &b.rest()[..width];
+            match av.cmp(bv) {
+                std::cmp::Ordering::Equal => {
+                    matches += 1;
+                    if !a.advance(width)? || !b.advance(width)? {
+                        break;
+                    }
+                }
+                std::cmp::Ordering::Less => {
+                    if !a.advance(width)? {
+                        break;
+                    }
+                }
+                std::cmp::Ordering::Greater => {
+                    if !b.advance(width)? {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(matches)
+    }
+
+    pub fn size_bytes(&self) -> u64 {
+        dir_size(&self.path)
+    }
+}
+
+impl Drop for LmdbDup {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.cur.is_null() {
+                mdb::mdb_cursor_close(self.cur);
+            }
+            if !self.cur2.is_null() {
+                mdb::mdb_cursor_close(self.cur2);
+            }
+            if !self.rtxn.is_null() {
+                mdb::mdb_txn_abort(self.rtxn);
+            }
+            if !self.wtxn.is_null() {
+                mdb::mdb_txn_abort(self.wtxn);
+            }
+            if !self.env.is_null() {
+                mdb::mdb_env_close(self.env);
+            }
+        }
     }
 }
