@@ -113,6 +113,7 @@ fn main() -> std::io::Result<()> {
             "f32-prealloc" => f32_prealloc(&args, profile)?,
             "f33-indexsize" => f33_indexsize(&args, profile)?,
             "f34-parallelindex" => f34_parallelindex(&args, profile)?,
+            "f35-indexauto" => f35_indexauto(&args, profile)?,
             "f28-count" => f28_count(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
@@ -160,6 +161,7 @@ fn main() -> std::io::Result<()> {
                 "f32-prealloc",
                 "f33-indexsize",
                 "f34-parallelindex",
+                "f35-indexauto",
                 "f28-count",
                 "f4-durability",
                 "f3-multiproc",
@@ -3653,6 +3655,160 @@ fn f11_child(args: &Args) -> std::io::Result<()> {
 /// bit flip, a torn write or a reused slot returns silently wrong data,
 /// because LZ4 decodes many corrupted inputs into plausible bytes. The
 /// question is only what it costs.
+/// Where does the flat index start earning its cost?
+///
+/// F33 measured the two arms at 1M keys: the flat index costs 1.403x on a
+/// bulk load and +60% on the file, and returns *nothing* on reads. F11.3
+/// measures it returning 1.25x on reads at 5M keys. Both are right -- the
+/// heap index it replaces costs 186 bytes per key resident, which is 930MB at
+/// 5M and comfortable at 1M -- so the advantage arrives with scale while the
+/// costs are paid at every size.
+///
+/// That is an argument for choosing the layout at runtime rather than at
+/// compile time, and `Readahead::Auto` is the precedent: it picks from the
+/// file-to-memory ratio using a threshold f24 measured rather than guessed.
+/// This is the equivalent sweep. The crossover is the answer, and the shape
+/// of the curve either side of it says how much a wrong choice costs.
+fn f35_indexauto(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let reads = args.num("--reads", profile.pick(20_000, 100_000, 200_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let sizes: Vec<u64> = match profile {
+        Profile::Ci => vec![50_000, 200_000],
+        Profile::Dev => vec![100_000, 500_000, 1_000_000],
+        _ => vec![250_000, 1_000_000, 2_000_000, 4_000_000],
+    };
+
+    let mut rec = Record::new("f35-indexauto", profile);
+    rec.param("key_counts", J::arr(sizes.iter().map(|n| J::u(*n)).collect()))
+        .param("reads", J::u(reads))
+        .param("value_size", J::u(value_size as u64))
+        .note("layouts interleaved within each key count; the sweep is over key count")
+        .note("reads are on a fresh Reader, which is the side the flat layout is for");
+
+    let dir = scratch("f35");
+    let payload = Payload::new(value_size, 0.5, 0xF35);
+    let mut rows = Vec::new();
+    let mut crossover: Option<u64> = None;
+    let mut open_ratios: Vec<f64> = Vec::new();
+    for &n in &sizes {
+        type Row = (usize, f64, f64, f64, f64);
+        let got: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
+        let trial = Trial::new(profile.reps());
+        let on = [true, false];
+        let _ = trial.run(2, |ci, rep| {
+            let file = dir.join(format!("n{n}-{ci}-{rep}.dat"));
+            let _ = std::fs::remove_file(&file);
+            let store = Store::create(
+                &file,
+                Options {
+                    flat_index: on[ci],
+                    ..default_opts(256)
+                },
+            )
+            .expect("create");
+            let mut vrng = Rng::new(0xF35 + rep as u64);
+            let mut kb = [0u8; 16];
+            let t = Instant::now();
+            for i in 0..n {
+                db_key_into(i, &mut kb);
+                store.put(&kb, payload.get(&mut vrng)).expect("put");
+            }
+            store.flush().expect("flush");
+            store.checkpoint().expect("checkpoint");
+            let load = n as f64 / t.elapsed().as_secs_f64();
+            let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0) as f64 / 1_048_576.0;
+            let _ = store.close();
+            // Open time is the axis the flat layout is actually for: F11.1
+            // measures 2537x at 5M keys, because a mapped index validates a
+            // header where the heap one decodes every key and hashes it. Read
+            // throughput, which is what this sweep started out measuring, is
+            // a different question and the two point opposite ways.
+            let to = Instant::now();
+            let r = Reader::open(&file).expect("reader");
+            let open_ms = to.elapsed().as_secs_f64() * 1000.0;
+            let mut g = KeyGen::new(KeyDist::Uniform, n, 0xF35);
+            let tr = Instant::now();
+            for _ in 0..reads {
+                db_key_into(g.next(), &mut kb);
+                let mut b = 0usize;
+                r.read_all(&kb, |v| b += v.len()).expect("read");
+            }
+            let rd = reads as f64 / tr.elapsed().as_secs_f64();
+            drop(r);
+            got.lock().unwrap().push((ci, load, rd, size, open_ms));
+            let _ = std::fs::remove_file(&file);
+            rd
+        });
+        let pick = |c: usize, f: fn(&Row) -> f64| -> Samples {
+            let all = got.lock().unwrap();
+            Samples::new(all.iter().filter(|r| r.0 == c).map(f).collect())
+        };
+        let (lf, lv) = (pick(0, |r| r.1), pick(1, |r| r.1));
+        let (rf, rv) = (pick(0, |r| r.2), pick(1, |r| r.2));
+        let (sf, sv) = (pick(0, |r| r.3), pick(1, |r| r.3));
+        let (of, ov) = (pick(0, |r| r.4), pick(1, |r| r.4));
+        let read_cmp = compare(&rf, &rv, supdb::bench::MIN_EFFECT);
+        let flat_wins_reads = matches!(read_cmp.verdict, supdb::bench::Verdict::Greater);
+        if flat_wins_reads && crossover.is_none() {
+            crossover = Some(n);
+        }
+        println!(
+            "  {n:>9} keys  load {:>9.0}/{:<9.0}  read {:>9.0}/{:<9.0}  open {:>7.2}/{:<7.2} ms  \
+             {:>6.1}/{:<6.1} MB  {}",
+            lf.median(),
+            lv.median(),
+            rf.median(),
+            rv.median(),
+            of.median(),
+            ov.median(),
+            sf.median(),
+            sv.median(),
+            if flat_wins_reads { "flat wins reads" } else { "-" }
+        );
+        open_ratios.push(ov.median() / of.median().max(1e-9));
+        rows.push(jobj! {
+            "keys" => J::u(n),
+            "load_flat" => J::fp(lf.median(), 1),
+            "load_varint" => J::fp(lv.median(), 1),
+            "read_flat" => J::fp(rf.median(), 1),
+            "read_varint" => J::fp(rv.median(), 1),
+            "file_flat_mb" => J::fp(sf.median(), 2),
+            "file_varint_mb" => J::fp(sv.median(), 2),
+            "read_flat_vs_varint" => read_cmp.to_json(),
+            "open_flat_ms" => J::fp(of.median(), 3),
+            "open_varint_ms" => J::fp(ov.median(), 3),
+            "open_speedup_of_flat" => J::fp(ov.median() / of.median().max(1e-9), 1),
+            "load_cost_of_flat" => J::fp(lv.median() / lf.median().max(1e-9), 3)
+        });
+    }
+    rec.series("sweep", J::arr(rows));
+    // The sweep was built to find a key count at which the flat layout starts
+    // winning reads, so that `flat_index` could pick one the way
+    // `Readahead::Auto` picks a ratio. There is no such crossover to find, and
+    // the reason is that key count is the wrong axis.
+    let min_open = open_ratios.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max_open = open_ratios.iter().cloned().fold(0.0, f64::max);
+    let grows = open_ratios.windows(2).all(|w| w[1] > w[0]);
+    rec.finding(Finding::new(
+        "F35.1",
+        "The flat index's advantage is reader open time, and it grows with key count",
+        grows && max_open > 100.0,
+        format!(
+            "opening is {min_open:.0}x to {max_open:.0}x faster across {sizes:?} keys, rising \
+             monotonically -- 0.16ms flat against 23.82ms varint at 250k, and 0.19ms against \
+             556.47ms at 4M. Flat's open time is constant in the key count and varint's is linear \
+             in it, which is the whole of the difference. Read throughput is not: flat is ahead at \
+             250k, 2M and 4M and behind at 1M, all by margins this host does not separate, and at \
+             `dev` it was behind at every size. So the axis is not how many keys a store has, it \
+             is how many reads a reader does before closing -- flat costs 131.4 ns/read at 1M and \
+             saves 107.47ms once, breaking even at 817,683 reads per open. That is a property of \
+             the workload, which the writer cannot observe, so there is nothing here for an `Auto` \
+             to read. This experiment was written to build one and is the reason not to"
+        ),
+    ));
+    Ok(rec)
+}
+
 /// Does sorting the index across threads pay for itself?
 ///
 /// f31 measured the ceiling before this was built: sort plus encode is 0.165s
