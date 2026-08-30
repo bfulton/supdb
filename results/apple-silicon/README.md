@@ -80,3 +80,22 @@ supdb-durable read at 2.25M ops/s against lmdb's 1.07M on the loaded store.
 The x86 read comparison (`EXT.11`) uses the buffered arm and cannot
 separate the engines; if a read lead exists anywhere, this host is where
 to measure it properly.
+
+## The read axis, where x86 could not answer (run 1 of 2)
+
+The same day EXT.11 flipped to `fails` on x86 -- 1.243x at p=0.37 and 1.179x
+at p=0.13, two runs unable to separate the engines -- the buffered pair on
+this host separated them at the first attempt
+(`ext-kv-buffered-read.run1.json`): reads 2,590,359/s against 1,066,747,
+**2.428x at p=0.0022**, rel_iqr 0.2%/0.3%; warm scan 62.0M entries/s against
+52.8M, **1.174x at p=0.0022**. The durable pair taken 30 minutes earlier
+corroborates from a different supdb arm: 2.25M reads/s against the same
+lmdb 1.07M, comparator agreeing across the two runs to 0.2%.
+
+Provisional until run 2 of the pair lands, per house rule. If it holds, the
+honest statement is architecture-conditional: on x86 the read paths cannot
+be told apart; on Apple Silicon (128-byte lines, 16 KiB pages) supdb reads
+2.4x faster and scans 1.17x faster. Which of the two mechanisms -- the
+flatindex probe touching one line where a B-tree descent touches several,
+or the page size quartering LMDB's tree depth-to-bytes ratio -- carries the
+difference is not yet decomposed; do not guess it into prose.
