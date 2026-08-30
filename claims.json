@@ -607,7 +607,7 @@
    "id": "EXT.10",
    "profile": "full",
    "expect": "fails",
-   "because": "Equalize durability *downward* -- take LMDB's fsync away rather than adding Supdb's -- and Supdb still loses the load axis: 848,086 ops/s against lmdb-nosync's 1,604,233, 0.5287x at p=0.0022. It has read 0.542x, 0.623x and now 0.529x across three runs, so the pending arena's 1.187x -- which did not replicate either (F25.1) -- is not visible here and nothing else has moved it. An append-structured store losing bulk ingest to a B-tree that is not syncing either remains a defect rather than a tradeoff. Profiling put the gap in memory rather than compute: 1.37x the instructions and 21x the last-level misses per key (docs/profiling.md). Two things remain unaddressed: resident memory is 241.8 MB against LMDB's 46.2 for the same data, which f26 shows is mostly the 256MB buffer this adapter asks for and never needed; and the keys are strictly sequential, a B-tree's best case and an append store's least differentiating shape, which is measured nowhere."
+   "because": "Supdb loads at 848,086 ops/s against lmdb-nosync's 1,604,233 -- 0.5287x at p=0.0022, and it has read 0.542x, 0.623x and 0.529x across three runs. Read it with EXT.13, which is the same comparison with one thing varied that this suite had never varied: every load phase here walks `i` in `0..n`, and `KeyDist::Sequential`'s own documentation calls that \"the best case for any structure with sorted layout\". Shuffle the same key set and the ordering reverses to 2.785x. So this entry is a claim about ordered arrival, which is a real and common shape -- time series, log ingest, anything with an increasing id -- and not about loads in general, which is how it read. Both numbers stand. The instruction and cache profile in docs/profiling.md was taken on this shape too."
   },
   {
    "experiment": "ext-kv",
@@ -745,6 +745,20 @@
    "profile": "full",
    "expect": "holds",
    "because": "52.56 MB against 385.21 -- the file is 7.33x SMALLER with room to insert, at p=0.0001, and the prediction was the opposite. Doubling the directory costs about 4 bytes per key on an index that is about 57, and Supdb already loses the size axis to LMDB (EXT.6), so this claim was written expecting to have to defend a size regression. It does not: rewriting the index for every insertion appends a fresh section each time and reclaims them more slowly than they accumulate, which costs far more than the second buffer ever could. The reserved directory is the smaller half of a trade whose larger half nobody had measured."
+  },
+  {
+   "experiment": "ext-loadshape",
+   "id": "EXT.13",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Supdb loads a shuffled key set at 683,781 ops/s against lmdb-nosync's 245,565 -- 2.785x at p=0.0022 -- where the same run has it at 0.305x on the same keys arriving in order. A swing of 9x on arrival order alone, with the engines, the guarantees and the key set identical. EXT.10 measured only the ordered arm, and the suite has been reading it as a statement about loads. Both arms are real: ordered arrival is a common shape and Supdb is 3.3x behind on it. What changes is that the comparison now says which shape it is about. lmdb-nosync is still transactional, so read this as a bound."
+  },
+  {
+   "experiment": "ext-loadshape",
+   "id": "EXT.14",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Supdb loads at 605,369/s in order and 683,781 shuffled -- a factor of 0.89, so marginally *faster* out of order. LMDB goes 1,987,572 to 245,565, a factor of 8.10, and 813,207 to 58,507 when durable, a factor of 13.9. That is the architectural difference rather than a ranking: a B-tree taking keys in order fills pages left to right and splits almost never, and the same tree taking them shuffled splits constantly, while an append-structured store writes where the cursor already is either way. It is the property Supdb should have and the first measurement here that shows it, and it is worth more than either ordering, because a store whose ingest rate does not depend on what the keys look like is one you can size capacity for."
   }
  ],
  "metrics": [

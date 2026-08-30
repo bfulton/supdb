@@ -97,6 +97,7 @@ fn main() -> std::io::Result<()> {
         "ycsb" => suite_ycsb(&args, profile, &engines)?,
         "sweep" => suite_sweep(&args, profile, &engines)?,
         "loadprof" => return load_profile(&args, &engines),
+        "loadshape" => suite_loadshape(&args, profile, &engines)?,
         "all" => {
             let a = suite_kv(&args, profile, &engines)?;
             a.print_summary();
@@ -108,7 +109,7 @@ fn main() -> std::io::Result<()> {
         }
         _ => {
             println!(
-                "external <kv|ycsb|sweep|all|loadprof> [--profile ci|dev|full] \
+                "external <kv|ycsb|sweep|all|loadshape|loadprof> [--profile ci|dev|full] \
                  [--engines supdb,redb,lmdb,sled]"
             );
             return Ok(());
@@ -117,6 +118,206 @@ fn main() -> std::io::Result<()> {
     rec.print_summary();
     rec.write(&out)?;
     Ok(())
+}
+
+/// Does the load comparison depend on the order the keys arrive in?
+///
+/// `EXT.10` has Supdb loading at 0.529x of an LMDB that is not syncing either,
+/// and it has read 0.542x, 0.623x and 0.529x across three runs, so it is not
+/// drift. An append-structured store losing bulk ingest to a B-tree is the one
+/// result this design should not produce, and one thing about how it is
+/// measured has never been varied: every load phase in this suite walks `i` in
+/// `0..n`. `KeyDist::Sequential`'s own documentation calls that "the best case
+/// for any structure with sorted layout", which is what a B-tree is and what
+/// an append store is not.
+///
+/// So load the same keys in a shuffled order and see whether the ordering
+/// survives. Both shapes are reported. The point is not to find a workload
+/// Supdb wins -- it is that a claim measured on one arrival order is a claim
+/// about that order, and the suite has been making it about loads in general.
+fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Record> {
+    let n = args.num("--keys", profile.pick(20_000, 200_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let batch = args.num("--batch", 1_000);
+    let reps = args.num("--reps", profile.reps());
+
+    let mut rec = Record::new("ext-loadshape", profile);
+    rec.param("keys", J::u(n))
+        .param("value_size", J::u(value_size as u64))
+        .param("batch", J::u(batch as u64))
+        .param("reps", J::u(reps as u64))
+        .note("the same key set both ways: sequential is 0..n, shuffled is a permutation of it")
+        .note(
+            "engines and orders interleaved round-robin over reps, one warmup discarded, every \
+             ordering gated on stats::compare",
+        );
+
+    let payload = Payload::new(value_size, 0.5, 0xE4);
+    let orders = [false, true]; // false = sequential, true = shuffled
+    let ne = which.len() * 2;
+    let mut load: Vec<Samples> = vec![Samples::default(); ne];
+    let mut feats: Vec<Option<Features>> = vec![None; ne];
+    let warmup = 1usize;
+
+    for rep in 0..(warmup + reps) {
+        for (ei, (name, shuffled)) in which
+            .iter()
+            .flat_map(|nm| orders.iter().map(move |o| (nm, *o)))
+            .enumerate()
+        {
+            let root = scratch(&format!("shape-{name}-{}-{rep}", shuffled as u8));
+            let Some(mut e) = build(&root, &[name], 256).into_iter().next() else {
+                continue;
+            };
+            feats[ei] = Some(e.features());
+            // The same keys either way. A permutation rather than random
+            // draws, so both arms insert exactly one of each and the two files
+            // hold the same thing.
+            let mut order: Vec<u64> = (0..n).collect();
+            if shuffled {
+                let mut r = Rng::new(0xE4 + rep as u64);
+                for i in (1..order.len()).rev() {
+                    order.swap(i, (r.next() % (i as u64 + 1)) as usize);
+                }
+            }
+            let mut vrng = Rng::new(0xE4);
+            let mut kb = [0u8; 16];
+            let mut buf: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch);
+            let t = Instant::now();
+            for i in &order {
+                db_key_into(*i, &mut kb);
+                buf.push((kb.to_vec(), payload.get(&mut vrng).to_vec()));
+                if buf.len() == batch {
+                    e.write_batch(&buf).expect("write");
+                    buf.clear();
+                }
+            }
+            if !buf.is_empty() {
+                e.write_batch(&buf).expect("write");
+            }
+            e.sync().expect("sync");
+            let secs = t.elapsed().as_secs_f64();
+            if rep >= warmup {
+                load[ei].push(n as f64 / secs);
+            }
+            drop(e);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    let label = |ei: usize| {
+        format!(
+            "{}-{}",
+            which[ei / 2],
+            if ei.is_multiple_of(2) { "seq" } else { "shuffled" }
+        )
+    };
+    let mut rows = Vec::new();
+    for ei in 0..ne {
+        if load[ei].is_empty() {
+            continue;
+        }
+        println!("  {:<24} load {:>10.0}/s", label(ei), load[ei].median());
+        rows.push(jobj! {
+            "arm" => J::s(label(ei)),
+            "engine" => J::s(which[ei / 2]),
+            "shuffled" => J::Bool(ei % 2 == 1),
+            "load_ops_per_s" => J::fp(load[ei].median(), 1),
+            "load" => load[ei].to_json()
+        });
+    }
+    rec.series("arms", J::arr(rows));
+
+    let idx = |name: &str, shuffled: bool| {
+        which
+            .iter()
+            .position(|w| *w == name)
+            .map(|i| i * 2 + shuffled as usize)
+    };
+    // How much each engine cares about arrival order, which is the property
+    // rather than the ranking. Same engine, same guarantees, same key set --
+    // so nothing needs matching and there is no residual to bound.
+    for name in ["supdb-buffered", "lmdb-nosync", "supdb", "lmdb"] {
+        let (Some(a), Some(b)) = (idx(name, false), idx(name, true)) else {
+            continue;
+        };
+        if load[a].is_empty() || load[b].is_empty() {
+            continue;
+        }
+        rec.compare(
+            &format!("{name}_seq_vs_shuffled"),
+            compare(&load[a], &load[b], supdb::bench::MIN_EFFECT),
+        );
+    }
+    if let (Some(sa), Some(sb), Some(la), Some(lb)) = (
+        idx("supdb-buffered", false),
+        idx("supdb-buffered", true),
+        idx("lmdb-nosync", false),
+        idx("lmdb-nosync", true),
+    ) {
+        if !load[sa].is_empty() && !load[lb].is_empty() {
+            let supdb_swing = load[sa].median() / load[sb].median().max(1e-9);
+            let lmdb_swing = load[la].median() / load[lb].median().max(1e-9);
+            rec.finding(Finding::new(
+                "EXT.14",
+                "Supdb's load rate depends less on key arrival order than LMDB's",
+                supdb_swing < lmdb_swing,
+                format!(
+                    "Supdb loads at {:.0}/s in order and {:.0} shuffled, a factor of \
+                     {supdb_swing:.2}; LMDB at {:.0} and {:.0}, a factor of {lmdb_swing:.2}. This \
+                     is the architectural difference rather than a ranking: a B-tree writing keys \
+                     in order fills pages left to right and splits almost never, and the same \
+                     B-tree taking them shuffled splits constantly, while an append-structured \
+                     store writes where the cursor already is either way. Both engines are \
+                     measured on the same permutation of the same keys",
+                    load[sa].median(),
+                    load[sb].median(),
+                    load[la].median(),
+                    load[lb].median()
+                ),
+            ));
+        }
+    }
+    if let (Some(ss), Some(sl)) = (
+        idx("supdb-buffered", true),
+        idx("lmdb-nosync", true),
+    ) {
+        if !load[ss].is_empty() && !load[sl].is_empty() {
+            let (Some(fa), Some(fb)) = (feats[ss], feats[sl]) else {
+                return Ok(rec);
+            };
+            let gap = fa.unmatched(&fb, true);
+            if !gap.is_empty() {
+                rec.finding(Finding::not_exercised(
+                    "EXT.13",
+                    "Supdb loads faster than LMDB when the keys do not arrive in order",
+                    format!("not an ordering: the arms differ on {}", gap.join(", ")),
+                ));
+                return Ok(rec);
+            }
+            let cmp = compare(&load[ss], &load[sl], supdb::bench::MIN_EFFECT);
+            rec.compare("EXT.13_shuffled", cmp.clone());
+            let seq = idx("supdb-buffered", false).zip(idx("lmdb-nosync", false));
+            let seq_ratio = seq
+                .map(|(a, b)| load[a].median() / load[b].median().max(1e-9))
+                .unwrap_or(f64::NAN);
+            rec.finding(Finding::new(
+                "EXT.13",
+                "Supdb loads faster than LMDB when the keys do not arrive in order",
+                matches!(cmp.verdict, Verdict::Greater),
+                format!(
+                    "shuffled, {:.0} ops/s against {:.0} ({}). Sequential, in the same run, is \
+                     {seq_ratio:.3}x -- which is what EXT.10 measures and the only arrival order \
+                     this suite had ever used. Neither commits to the device and neither \
+                     checksums; lmdb-nosync is still transactional, so read this as a bound",
+                    load[ss].median(),
+                    load[sl].median(),
+                    cmp.summary("supdb-buffered", "lmdb-nosync")
+                ),
+            ));
+        }
+    }
+    Ok(rec)
 }
 
 /// One engine, one bulk load, then exit -- the shape a profiler can attribute.
