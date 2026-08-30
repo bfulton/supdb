@@ -1338,7 +1338,7 @@ impl Store {
         // and a key appearing in both takes its logged extents. Applied in
         // order, because a key may appear more than once and the last record
         // is the current one.
-        let (logged, log_used): (Vec<(Vec<u8>, Extents)>, u64) = if sb.log_len == 0 {
+        let (logged, log_used): (Vec<LogRec>, u64) = if sb.log_len == 0 {
             (Vec::new(), 0)
         } else {
             let map = unsafe { Mmap::map(&file)? };
@@ -1427,14 +1427,34 @@ impl Store {
         // extents. `put`-style replacement is what a log record means: it
         // carries the key's whole extent list as of that checkpoint, not a
         // delta against it.
-        let replayed: Vec<Vec<u8>> = logged.iter().map(|(k, _)| k.clone()).collect();
+        // A sealed record re-points a key at extents that already exist; a
+        // value record carries bytes that were never sealed, and is re-applied
+        // as a put so it lands back in the shard buffer exactly as it was.
+        let replayed: Vec<Vec<u8>> = logged
+            .iter()
+            .map(|r| match r {
+                LogRec::Sealed(k, _) => k.clone(),
+                LogRec::Value(k, ..) => k.clone(),
+            })
+            .collect();
+        let mut sealed_over: Vec<(Vec<u8>, Extents)> = Vec::new();
+        let mut values_over: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for r in logged {
+            match r {
+                LogRec::Sealed(k, e) => sealed_over.push((k, e)),
+                LogRec::Value(k, v, _) => values_over.push((k, v)),
+            }
+        }
         // Not chained with `logged`: the reader those entries came from now
         // replays the log itself, so they already carry it. Applying it twice
         // was harmless for extents, which replace, and wrong for the count.
-        for (key, exts) in entries {
+        for (key, exts) in entries.into_iter().chain(sealed_over) {
             let si = store.shard_of(&key);
             let mut sh = store.shards[si].lock().unwrap();
             sh.keys.get_or_insert(&key).extents = exts;
+        }
+        for (key, val) in &values_over {
+            store.put(key, val)?;
         }
         // A replayed record is durable and *not* published: it is in no index
         // section, so `scan`, which walks the published order, cannot see it.
@@ -2359,7 +2379,23 @@ impl Store {
     /// store's: `publish` passes `Never` for a single call.
     fn checkpoint_inner(&self, policy: Sync) -> Result<u64> {
         use std::os::unix::fs::FileExt;
-        self.flush()?;
+        // A durability point that the log can absorb needs no seal at all, so
+        // this is tried before `flush` rather than after it. `publish` passes
+        // `Sync::Never` and wants visibility, which values in a log do not
+        // give a fresh reader without a merge, so it takes the sealing path.
+        // A durability point the log can absorb needs no *seal*: the bytes go
+        // to the log and the blocks are written later, in full. What it still
+        // needs is the block table and the superblock, because a logged record
+        // that names extents names block ids, and a reader resolves those
+        // through the published table. Skipping that produced exactly the
+        // error it should: "index names a block the table does not have".
+        //
+        // So only the flush is skipped. The rest of the checkpoint runs with
+        // the key index left alone, which is what `in_place` already means.
+        let logged_values = !matches!(policy, Sync::Never) && self.log_pending_values()?;
+        if !logged_values {
+            self.flush()?;
+        }
         // Gather only what moved. Asking every shard for every key just to
         // find the handful that changed is O(key count) before any work
         // starts, and that was the whole cost the in-place path exists to
@@ -2380,16 +2416,21 @@ impl Store {
                 changed.push((key, exts));
             }
         }
-        let in_place_edit = self.checkpoint_in_place(&changed, nkeys)?;
+        let in_place_edit = if logged_values {
+            false
+        } else {
+            self.checkpoint_in_place(&changed, nkeys)?
+        };
         // Only a durability point may use the log. `publish` passes
         // `Sync::Never` and wants *visibility*, which the log does not give: a
         // logged record is durable and replayed by `Store::open`, and a
         // `Reader` opened before the next full rewrite does not see it. Taking
         // this path for a publish would make a scan miss writes that the
         // writer had already been told were published.
-        let logged = !in_place_edit
-            && !matches!(policy, Sync::Never)
-            && self.checkpoint_to_log(&changed)?;
+        let logged = logged_values
+            || (!in_place_edit
+                && !matches!(policy, Sync::Never)
+                && self.checkpoint_to_log(&changed)?);
         // Downstream the two mean the same thing: do not rewrite the index.
         let in_place = in_place_edit || logged;
         if logged {
@@ -2843,6 +2884,78 @@ impl Store {
     ///
     /// Returns false when there is no arena or it is full, and the caller then
     /// rewrites the index, which is what bounds replay.
+    /// Make the unsealed writes durable by logging their values, with no seal.
+    ///
+    /// This is the whole point of the log carrying values. A durable
+    /// checkpoint used to open with `flush`, which seals every shard that has
+    /// anything pending -- and a batch spread across 64 shards by key hash
+    /// seals 64 nearly-empty blocks. EXT.9 measured 11.6 MB reaching the
+    /// device per batch to make 116 KB durable.
+    ///
+    /// Here the bytes go to the log and nothing is sealed. The blocks are
+    /// written later, in full, when a shard's buffer actually fills.
+    ///
+    /// Returns false when there is no arena or the batch will not fit, and the
+    /// caller then falls back to the sealing path, which is also what bounds
+    /// replay: the arena never holds more than `Options::log_bytes`.
+    fn log_pending_values(&self) -> Result<bool> {
+        use std::os::unix::fs::FileExt;
+        if !self.opts.redo_log {
+            return Ok(false);
+        }
+        // Gathered before the appender lock, in the order `read_all` takes
+        // them, so a shard is never held while waiting for the appender.
+        let mut buf = Vec::new();
+        {
+            let guards: Vec<_> = self.shards.iter().map(|s| s.lock().unwrap()).collect();
+            for sh in &guards {
+                // Two kinds, because a key can be in two states at once. What
+                // `seal_on_put` already wrote into a block has extents and no
+                // pending bytes, and those extents are in no published index
+                // yet -- logging only the pending values left every such key
+                // invisible to a reader, which is what a 123-of-200 overlay
+                // turned out to mean.
+                for idx in &sh.dirty {
+                    let k = sh.keys.key_at(*idx);
+                    let e = sh.keys.entry(*idx);
+                    let Some(rec) = log_encode_sealed(k, e.extents.as_slice()) else {
+                        return Ok(false);
+                    };
+                    buf.extend_from_slice(&rec);
+                }
+                for (k, e) in sh.keys.iter() {
+                    let Some(p) = &e.pending else { continue };
+                    let bytes = p.bytes(&sh.arena);
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    let Some(rec) = log_encode_value(k, bytes, p.replaces) else {
+                        return Ok(false);
+                    };
+                    buf.extend_from_slice(&rec);
+                }
+            }
+        }
+        if buf.is_empty() {
+            return Ok(false);
+        }
+        let mut ap = self.appender.lock().unwrap();
+        let Some((off, cap, used)) = ap.log else {
+            return Ok(false);
+        };
+        if used + buf.len() as u64 + LOG_HDR as u64 > cap {
+            return Ok(false);
+        }
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        ap.file.write_all_at(&buf, off + used)?;
+        ap.file.sync_data()?;
+        ap.unsynced = false;
+        ap.since_sync = 0;
+        ap.last_sync = std::time::Instant::now();
+        ap.log = Some((off, cap, used + buf.len() as u64 - 4));
+        Ok(true)
+    }
+
     fn checkpoint_to_log(&self, changed: &[(Vec<u8>, Extents)]) -> Result<bool> {
         use std::os::unix::fs::FileExt;
         if !self.opts.redo_log {
@@ -2854,7 +2967,7 @@ impl Store {
         };
         let mut buf = Vec::new();
         for (k, exts) in changed {
-            let Some(rec) = log_encode(k, exts.as_slice()) else {
+            let Some(rec) = log_encode_sealed(k, exts.as_slice()) else {
                 return Ok(false);
             };
             buf.extend_from_slice(&rec);
@@ -3305,18 +3418,71 @@ fn place_section(ap: &mut Appender, len: u32, policy: Reclaim, align: u64) -> (u
 /// Header on every redo-log record: payload length, then a CRC of it.
 const LOG_HDR: usize = 8;
 
-/// One redo-log record: `[u32 len][u32 crc32c][payload]`.
+/// What a redo-log record carries.
 ///
-/// The payload is exactly what `FlatIndex::encode_record` produces, so the log
-/// and the index agree on how a key and its extents are spelled and there is
-/// only one encoder to keep correct.
-fn log_encode(key: &[u8], exts: &[Ext]) -> Option<Vec<u8>> {
-    let payload = FlatIndex::encode_record(key, exts)?;
+/// The log began carrying extents, which is why `checkpoint_inner` opened with
+/// `self.flush()`: an extent only exists once the value is sealed into a
+/// block, so making a write durable meant sealing first. On a per-batch
+/// durable load that is the whole cost -- a batch of 1,000 keys is spread
+/// across 64 shards by key hash, so a flush writes 64 nearly-empty blocks, and
+/// EXT.9 measured 11.6 MB going to the device per batch to make 116 KB of data
+/// durable while the checkpoint's own sections were 9,712 bytes.
+///
+/// A value record needs no seal. Durability becomes "append the bytes, fsync",
+/// and the blocks get written later, in full, on the store's own schedule --
+/// which is what a write-ahead log is for.
+#[derive(Debug)]
+enum LogRec {
+    /// `FlatIndex::encode_record`: a key and where its values already live.
+    /// Written when a checkpoint has sealed, so replay only has to re-point.
+    Sealed(Vec<u8>, Extents),
+    /// A key and the value bytes themselves, still unsealed. Replay re-applies
+    /// it as a put.
+    Value(Vec<u8>, Vec<u8>, bool),
+}
+
+const LOG_KIND_SEALED: u8 = 0;
+const LOG_KIND_VALUE: u8 = 1;
+
+/// One redo-log record: `[u32 len][u32 crc32c][u8 kind][payload]`.
+///
+/// The length and CRC cover the kind byte too, so a torn tail fails the same
+/// way whatever it was going to be.
+fn log_encode_sealed(key: &[u8], exts: &[Ext]) -> Option<Vec<u8>> {
+    let rec = FlatIndex::encode_record(key, exts)?;
+    let mut payload = Vec::with_capacity(1 + rec.len());
+    payload.push(LOG_KIND_SEALED);
+    payload.extend_from_slice(&rec);
+    Some(frame(&payload))
+}
+
+/// `[u8 kind][u16 klen][u32 vlen][key][value]`, where `value` is the shard's
+/// pending buffer verbatim: a run of `[varint len][bytes]` records, exactly
+/// what an extent's payload holds. Keeping the same shape means the read path
+/// splits a logged value and a sealed one with the same loop.
+fn log_encode_value(key: &[u8], value: &[u8], replaces: bool) -> Option<Vec<u8>> {
+    if key.len() > u16::MAX as usize {
+        return None;
+    }
+    let mut payload = Vec::with_capacity(8 + key.len() + value.len());
+    payload.push(LOG_KIND_VALUE);
+    // Whether these bytes are the key's whole value or a suffix of it. A
+    // `put` replaces and an `append` does not, and a reader that assumed
+    // replace dropped everything a key already had sealed.
+    payload.push(replaces as u8);
+    payload.extend_from_slice(&(key.len() as u16).to_le_bytes());
+    payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    payload.extend_from_slice(key);
+    payload.extend_from_slice(value);
+    Some(frame(&payload))
+}
+
+fn frame(payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(LOG_HDR + payload.len());
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    out.extend_from_slice(&block::crc32(&payload).to_le_bytes());
-    out.extend_from_slice(&payload);
-    Some(out)
+    out.extend_from_slice(&block::crc32(payload).to_le_bytes());
+    out.extend_from_slice(payload);
+    out
 }
 
 /// Walk a log arena, stopping at the first record that is not intact.
@@ -3325,7 +3491,7 @@ fn log_encode(key: &[u8], exts: &[Ext]) -> Option<Vec<u8>> {
 /// a crash mid-append fails its CRC and ends the walk there, with every record
 /// before it still good -- which is the property that makes this a log rather
 /// than a file that has to be rewritten to be extended.
-fn log_replay(arena: &[u8]) -> (Vec<(Vec<u8>, Extents)>, u64) {
+fn log_replay(arena: &[u8]) -> (Vec<LogRec>, u64) {
     let mut out = Vec::new();
     let mut at = 0usize;
     while at + LOG_HDR <= arena.len() {
@@ -3338,14 +3504,29 @@ fn log_replay(arena: &[u8]) -> (Vec<(Vec<u8>, Extents)>, u64) {
         if block::crc32(payload) != want {
             break;
         }
-        match FlatIndex::decode_record(payload) {
-            Some((k, exts)) => {
+        let Some((&kind, body)) = payload.split_first() else {
+            break;
+        };
+        let rec = match kind {
+            LOG_KIND_SEALED => FlatIndex::decode_record(body).map(|(k, exts)| {
                 let mut e = Extents::None;
                 for x in exts {
                     e.push(x);
                 }
-                out.push((k, e));
-            }
+                LogRec::Sealed(k, e)
+            }),
+            LOG_KIND_VALUE => (|| {
+                let replaces = *body.first()? != 0;
+                let klen = u16::from_le_bytes(body.get(1..3)?.try_into().ok()?) as usize;
+                let vlen = u32::from_le_bytes(body.get(3..7)?.try_into().ok()?) as usize;
+                let key = body.get(7..7 + klen)?.to_vec();
+                let val = body.get(7 + klen..7 + klen + vlen)?.to_vec();
+                Some(LogRec::Value(key, val, replaces))
+            })(),
+            _ => None,
+        };
+        match rec {
+            Some(r) => out.push(r),
             None => break,
         }
         at += LOG_HDR + len;
@@ -3744,10 +3925,18 @@ enum Where {
     Overlay(usize),
 }
 
+/// What the log knows about a key: where its values are, or what they are.
+enum OverVal {
+    Sealed(Extents),
+    /// The bytes themselves, length-prefixed exactly as a block record is, so
+    /// the read path splits them the same way it splits an extent's payload.
+    Value(Vec<u8>, bool),
+}
+
 #[derive(Default)]
 struct Overlay {
     /// Sorted by key, one entry per key, last record winning.
-    entries: Vec<(Vec<u8>, Extents)>,
+    entries: Vec<(Vec<u8>, OverVal)>,
     /// Each insertion as (published rank it belongs before, merged rank it
     /// occupies, index into `entries`), sorted. Overlay entries whose key
     /// already exists in the published index are not here: they replace
@@ -3772,7 +3961,7 @@ impl Overlay {
         self.inserts.len()
     }
 
-    fn find(&self, key: &[u8]) -> Option<&Extents> {
+    fn find(&self, key: &[u8]) -> Option<&OverVal> {
         self.entries
             .binary_search_by(|(k, _)| k.as_slice().cmp(key))
             .ok()
@@ -4680,10 +4869,24 @@ impl Reader {
     /// Visit every value of a key in append order. Values are handed out as
     /// slices of the block, so a read allocates nothing per value.
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
+        // What the log carries inline, and whether it stands alone. A `put`
+        // replaces, so the logged bytes are the key's whole value; an `append`
+        // does not, and the values it already had are still in sealed extents
+        // that have to be read first and in order.
+        let inline = self.overlay_inline(key);
+        if let Some((_, true)) = inline {
+            return self.emit_inline(inline.unwrap().0, &mut f);
+        }
         let Some(exts) = self.lookup(key) else {
-            return Ok(0);
+            // Nothing sealed, but the log may still hold an appended run for a
+            // key that has never been written to a block.
+            return match inline {
+                Some((buf, _)) => self.emit_inline(buf, &mut f),
+                None => Ok(0),
+            };
         };
         let mut total = 0u64;
+        let tail = inline.map(|(b, _)| b);
         for e in exts {
             self.check_extent(*e)?;
             let loc = self.loc_of(e.block)?;
@@ -4764,6 +4967,9 @@ impl Reader {
                 }
                 total += emit(&sl[a..z], &mut f)?;
             }
+        }
+        if let Some(buf) = tail {
+            total += self.emit_inline(buf, &mut f)?;
         }
         Ok(total)
     }
@@ -4908,13 +5114,29 @@ impl Reader {
         }
         // Last record for a key wins, and the result is sorted so a lookup is
         // a binary search and the merge is a walk.
-        let mut entries = records;
+        // Both kinds land in one list keyed by key: a sealed record says where
+        // the values are, a value record carries them. A value record is what
+        // a durability point writes when nothing has been sealed yet, so a
+        // reader has to serve those bytes directly or it cannot see a write
+        // the writer was told was durable.
+        let mut entries: Vec<(Vec<u8>, OverVal)> = records
+            .into_iter()
+            .map(|r| match r {
+                LogRec::Sealed(k, e) => (k, OverVal::Sealed(e)),
+                // Already length-prefixed: what was logged is the shard's
+                // pending buffer verbatim, which is `[varint len][value]` per
+                // record, the same shape an extent's payload has. Prefixing it
+                // again handed the prefix back as data.
+                LogRec::Value(k, v, replaces) => (k, OverVal::Value(v, replaces)),
+            })
+            .collect();
+        // Stable, so equal keys keep log order: older first, newer last.
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         entries.dedup_by(|a, b| {
             if a.0 == b.0 {
                 // `dedup_by` keeps `b` and drops `a`, and `a` is the later of
-                // the pair, so move its extents across.
-                b.1 = std::mem::replace(&mut a.1, Extents::None);
+                // the pair, so move its payload across.
+                b.1 = std::mem::replace(&mut a.1, OverVal::Sealed(Extents::None));
                 true
             } else {
                 false
@@ -4941,30 +5163,69 @@ impl Reader {
         self.idx.len() + self.overlay.extra()
     }
 
+    /// Walk a length-prefixed run and hand each record to the callback.
+    ///
+    /// The same shape as an extent's payload, which is the point: a logged
+    /// value and a sealed one are split by identical code.
+    fn emit_inline<F: FnMut(&[u8])>(&self, buf: &[u8], f: &mut F) -> Result<u64> {
+        let mut n = 0u64;
+        let mut p = 0usize;
+        while p < buf.len() {
+            let len = get_uvarint(buf, &mut p) as usize;
+            let Some(rec) = buf.get(p..p + len) else {
+                return Err(corrupt("logged value runs past its record"));
+            };
+            f(rec);
+            n += 1;
+            p += len;
+        }
+        Ok(n)
+    }
+
+    /// Values the log carries inline for this key, already length-prefixed.
+    ///
+    /// `Some` means the log has the bytes themselves and no block holds them
+    /// yet, so this is the answer and the extents are not consulted.
+    fn overlay_inline(&self, key: &[u8]) -> Option<(&[u8], bool)> {
+        match self.overlay.find(key)? {
+            OverVal::Value(v, replaces) => Some((v.as_slice(), *replaces)),
+            OverVal::Sealed(_) => None,
+        }
+    }
+
     /// A key's extents, the log's version winning where it has one.
     fn merged_lookup(&self, key: &[u8]) -> Option<&[Ext]> {
         if let Some(e) = self.overlay.find(key) {
-            // An empty extent list is a delete the log carried, and it has to
-            // read as absent rather than falling through to the published
-            // index, which still has the key.
-            let s = e.as_slice();
-            return if s.is_empty() { None } else { Some(s) };
+            return match e {
+                // An empty extent list is a delete the log carried, and it has
+                // to read as absent rather than falling through to the
+                // published index, which still has the key.
+                OverVal::Sealed(x) if x.as_slice().is_empty() => None,
+                OverVal::Sealed(x) => Some(x.as_slice()),
+                // The caller wants extents and there are none: the bytes are
+                // in the log. `overlay_inline` is the path for that, and every
+                // read site checks it first.
+                OverVal::Value(..) => None,
+            };
         }
         self.idx.lookup(&self.mmap, key)
     }
 
     fn merged_at(&self, rank: usize) -> Option<(&[u8], &[Ext])> {
         match self.overlay.resolve(rank) {
-            Where::Overlay(i) => {
-                let (k, e) = &self.overlay.entries[i];
-                Some((k.as_slice(), e.as_slice()))
-            }
+            Where::Overlay(i) => match &self.overlay.entries[i] {
+                (k, OverVal::Sealed(e)) => Some((k.as_slice(), e.as_slice())),
+                // Inline values have no extents to hand back; `scan` reads
+                // them through `overlay_inline` before it resolves any.
+                (k, OverVal::Value(..)) => Some((k.as_slice(), &[][..])),
+            },
             Where::Published(r) => {
                 let (k, e) = self.idx.at(&self.mmap, r)?;
                 // The published rank is still the right key; its extents may
                 // have been superseded by a record the log carries.
                 match self.overlay.find(k) {
-                    Some(over) => Some((k, over.as_slice())),
+                    Some(OverVal::Sealed(over)) => Some((k, over.as_slice())),
+                    Some(OverVal::Value(..)) => Some((k, &[][..])),
                     None => Some((k, e)),
                 }
             }
@@ -5082,6 +5343,31 @@ impl Reader {
             let Some((key, exts)) = got else {
                 continue;
             };
+            // A key the log carries inline has no extents to resolve: its
+            // bytes are in the overlay. Serving it here rather than falling
+            // through is what keeps `scan` and `read_all` agreeing -- the two
+            // disagreeing is the shape of the in-place/directory bug this
+            // engine already shipped once.
+            let inline = self.overlay_inline(key);
+            if let Some((buf, replaces)) = inline {
+                if replaces {
+                    let mut p = 0usize;
+                    while p < buf.len() {
+                        let len = get_uvarint(buf, &mut p) as usize;
+                        let Some(rec) = buf.get(p..p + len) else {
+                            return Err(corrupt("logged value runs past its record"));
+                        };
+                        f(key, rec);
+                        n += 1;
+                        p += len;
+                    }
+                    continue;
+                }
+            }
+            let tail = match inline {
+                Some((buf, false)) => Some(buf),
+                _ => None,
+            };
             for e in exts {
                 let (loc, raw) = match held {
                     Some((b, loc, raw)) if self.opts.scan_block_cache && b == e.block => (loc, raw),
@@ -5151,6 +5437,20 @@ impl Reader {
                     f(key, rec);
                     n += 1;
                     p = end;
+                }
+            }
+            // An appended run the log carries comes after the sealed values,
+            // in the order it was written.
+            if let Some(buf) = tail {
+                let mut q = 0usize;
+                while q < buf.len() {
+                    let len = get_uvarint(buf, &mut q) as usize;
+                    let Some(rec) = buf.get(q..q + len) else {
+                        return Err(corrupt("logged value runs past its record"));
+                    };
+                    f(key, rec);
+                    n += 1;
+                    q += len;
                 }
             }
         }
