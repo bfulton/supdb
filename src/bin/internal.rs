@@ -107,6 +107,7 @@ fn main() -> std::io::Result<()> {
             "f25-arena" => f25_arena(&args, profile)?,
             "f26-buffer" => f26_buffer(&args, profile)?,
             "f27-ckptshape" => f27_ckptshape(&args, profile)?,
+            "f29-redolog" => f29_redolog(&args, profile)?,
             "f28-count" => f28_count(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
@@ -148,6 +149,7 @@ fn main() -> std::io::Result<()> {
                 "f25-arena",
                 "f26-buffer",
                 "f27-ckptshape",
+                "f29-redolog",
                 "f28-count",
                 "f4-durability",
                 "f3-multiproc",
@@ -3641,6 +3643,185 @@ fn f11_child(args: &Args) -> std::io::Result<()> {
 /// bit flip, a torn write or a reused slot returns silently wrong data,
 /// because LZ4 decodes many corrupted inputs into plausible bytes. The
 /// question is only what it costs.
+/// What the redo log buys, and what it costs in visibility.
+///
+/// f27 established that durability is not what EXT.9's 0.010x is made of --
+/// inserting under durability is, because any insertion sends
+/// `checkpoint_in_place` to the full-rewrite path. `Options::redo_log` splits
+/// the two jobs a checkpoint had conflated: the records are written and
+/// fsynced, and the index is rewritten only when the arena fills.
+///
+/// The second finding is the price, and it is measured here rather than
+/// asserted in a doc comment. A logged checkpoint is durable and is replayed
+/// by `Store::open`; a `Reader` opened before the next full rewrite does not
+/// see it, because a reader reads the published index and nothing published
+/// it. That is a real narrowing of what `checkpoint` has always promised --
+/// durable *and* visible to anyone -- and it is why the flag is off by
+/// default. F29.2 exists so it cannot be forgotten, and so that a future
+/// change making readers replay the log turns the build red rather than
+/// passing quietly.
+fn f29_redolog(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let keys = args.num("--keys", profile.pick(20_000, 100_000, 200_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+
+    let mut rec = Record::new("f29-redolog", profile);
+    rec.param("keys", J::u(keys))
+        .param("checkpoint_every_ops", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .note("both arms interleaved in one process; the only difference is Options::redo_log")
+        .note("every key is new, which is the shape f27 found expensive and EXT.9 measures");
+
+    let dir = scratch("f29");
+    let payload = Payload::new(value_size, 0.5, 0xF29);
+    let on = [true, false];
+    let io: std::sync::Mutex<Vec<(usize, f64)>> = std::sync::Mutex::new(Vec::new());
+    let trial = Trial::new(profile.reps());
+    let tp = trial.run(2, |ci, rep| {
+        let file = dir.join(format!("r{ci}-{rep}.dat"));
+        let store = Store::create(
+            &file,
+            Options {
+                redo_log: on[ci],
+                ..default_opts(64)
+            },
+        )
+        .expect("create");
+        let mut vrng = Rng::new(0xF29 + rep as u64);
+        let mut kb = [0u8; 16];
+        let io0 = IoCounters::read_now();
+        let t = Instant::now();
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+            if (i + 1) % batch == 0 {
+                store.checkpoint().expect("checkpoint");
+            }
+        }
+        let secs = t.elapsed().as_secs_f64();
+        let wrote = IoCounters::read_now().since(&io0).write_bytes;
+        io.lock().unwrap().push((ci, wrote as f64 / 1_048_576.0));
+        let _ = store.close();
+        let _ = std::fs::remove_file(&file);
+        keys as f64 / secs
+    });
+
+    let io_arm: Vec<Samples> = {
+        let all = io.lock().unwrap();
+        (0..2)
+            .map(|ci| {
+                Samples::new(
+                    all.iter()
+                        .filter(|(c, _)| *c == ci)
+                        .map(|(_, v)| *v)
+                        .collect(),
+                )
+            })
+            .collect()
+    };
+    let cmp = compare(&tp[0], &tp[1], supdb::bench::MIN_EFFECT);
+    rec.compare("logged_vs_rewritten", cmp.clone());
+    rec.series(
+        "arms",
+        J::arr(
+            (0..2)
+                .map(|ci| {
+                    jobj! {
+                        "redo_log" => J::Bool(on[ci]),
+                        "ops_per_s" => J::fp(tp[ci].median(), 1),
+                        "ops" => tp[ci].to_json(),
+                        "device_write_mb" => J::fp(io_arm[ci].median(), 1),
+                        "write_amp" => J::fp(
+                            io_arm[ci].median() * 1048576.0
+                                / (keys as f64 * (16.0 + value_size as f64)).max(1.0),
+                            2
+                        )
+                    }
+                })
+                .collect(),
+        ),
+    );
+    rec.finding(Finding::new(
+        "F29.1",
+        "A redo log makes a durable checkpoint cheaper when keys are being inserted",
+        matches!(cmp.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "logged {:.0} ops/s writing {:.1} MB, against rewriting the index {:.0} ops/s writing \
+             {:.1} MB ({}). Every key is new, so `checkpoint_in_place` declines every time and \
+             the unlogged arm rewrites the whole key index once per batch -- which is what f27 \
+             priced at 4.122x and what EXT.9 shows as 270x write amplification",
+            tp[0].median(),
+            io_arm[0].median(),
+            tp[1].median(),
+            io_arm[1].median(),
+            cmp.summary("logged", "rewritten")
+        ),
+    ));
+
+    // The price, demonstrated. A reader opened after a logged checkpoint and
+    // before the next full rewrite is asked for keys the writer was told were
+    // durable.
+    let file = dir.join("visibility.dat");
+    let _ = std::fs::remove_file(&file);
+    let (seen, want) = {
+        let store = Store::create(
+            &file,
+            Options {
+                redo_log: true,
+                ..default_opts(64)
+            },
+        )
+        .expect("create");
+        let mut vrng = Rng::new(0xF29);
+        let mut kb = [0u8; 16];
+        // One full checkpoint, so an index and an arena exist.
+        db_key_into(0, &mut kb);
+        store.put(&kb, payload.get(&mut vrng)).expect("put");
+        store.checkpoint().expect("checkpoint");
+        // Then writes that only the log carries.
+        let n = 500u64;
+        for i in 1..=n {
+            db_key_into(i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+        }
+        store.checkpoint().expect("logged checkpoint");
+        let r = Reader::open(&file).expect("reader");
+        let mut seen = 0u64;
+        for i in 1..=n {
+            db_key_into(i, &mut kb);
+            let mut got = 0usize;
+            if r.read_all(&kb, |v| got += v.len()).is_ok() && got > 0 {
+                seen += 1;
+            }
+        }
+        drop(r);
+        let _ = store.close();
+        (seen, n)
+    };
+    let _ = std::fs::remove_file(&file);
+    rec.series(
+        "visibility",
+        J::arr(vec![jobj! {
+            "durable_keys" => J::u(want),
+            "visible_to_a_fresh_reader" => J::u(seen)
+        }]),
+    );
+    rec.finding(Finding::new(
+        "F29.2",
+        "A reader sees what a logged checkpoint made durable",
+        seen == want,
+        format!(
+            "{seen} of {want} keys. A logged checkpoint writes its records and fsyncs them, and \
+             publishes nothing: a reader reads the index, and the index does not have them until \
+             the arena fills and a rewrite happens. `Store::open` replays, so the writer loses \
+             nothing across a restart, and a concurrent reader is looking at an older state than \
+             the one the writer has been told is durable. That is why `redo_log` is off by \
+             default, and this entry is what makes a change to it deliberate"
+        ),
+    ));
+    Ok(rec)
+}
+
 /// Is a durable checkpoint expensive, or is *inserting* expensive?
 ///
 /// EXT.9 has a durable Supdb at 0.010x of LMDB, with 270x write

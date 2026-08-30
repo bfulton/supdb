@@ -2568,8 +2568,21 @@ impl Store {
         } else if in_place {
             ap.log.map(|(o, c, _)| (o, c))
         } else {
+            // The old arena's records are all in the index this superblock
+            // names, so its space goes back.
+            if let Some((old_off, old_cap, _)) = ap.log {
+                ap.free.release(old_off, old_cap as u32, gen);
+            }
             let want = self.opts.log_bytes.max(LOG_HDR);
-            let loc = write_section_raw(&mut ap, &vec![0u8; want], want, self.opts.reclaim)?;
+            // Reserve the arena, write four bytes into it.
+            //
+            // Zeroing the whole thing is what a self-describing log seems to
+            // ask for, and it is not: replay stops at the *first* zero length,
+            // so an empty arena needs one zero word at its head and nothing
+            // else. Writing 4MB of zeros per rewrite instead cost more than
+            // the index rewrite it was there to avoid -- the logged arm wrote
+            // 30.8MB against 15.3 for rewriting, and ran at the same speed.
+            let loc = write_section_raw(&mut ap, &0u32.to_le_bytes(), want, self.opts.reclaim)?;
             // `cap` is the space actually reserved, which the allocator rounds
             // up from what was asked for, and it is what has to be recorded --
             // both so replay knows the extent and so the free-list
@@ -2580,14 +2593,6 @@ impl Store {
             // comment on that loop describes the same symptom by another
             // route, and this is a third.
             let cap = loc.cap as u64;
-            // Zero the part beyond what the payload covered, because replay
-            // stops at the first zero length and reclaimed space is not
-            // necessarily zero.
-            if cap > want as u64 {
-                use std::os::unix::fs::FileExt;
-                let pad = vec![0u8; (cap - want as u64) as usize];
-                ap.file.write_all_at(&pad, loc.off + want as u64)?;
-            }
             ap.log = Some((loc.off, cap, 0));
             Some((loc.off, cap))
         };

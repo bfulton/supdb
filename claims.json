@@ -717,8 +717,21 @@
    "id": "W3.3",
    "expect": "holds",
    "because": "23,870 bytes gzipped above the floor against a 32 KB ceiling. This is the number that moves when the reader grows, where W3.1 is the number the user pays; separating them means a future change that adds 5 KB of reader is visible here even though W3.1 would still have room."
+  },
+  {
+   "experiment": "f29-redolog",
+   "id": "F29.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "157,172 ops/s writing 172.7 MB, against 30,745 writing 1,269.6 MB when the same durable checkpoints rewrite the index -- 5.112x at p=0.0022, and 7.3x fewer bytes to the device. Write amplification falls from 57.38x to 7.81x. It scales the way avoiding an O(key count) rewrite must: 1.178x at 20k keys, 3.138x at 100k, 5.112x at 200k. Read against f27, which measured updating existing keys at 173,446 ops/s: a logged insert is now within 10% of an update, and the gap f27 found was the whole of EXT.9's problem. The first version of this wrote a zeroed 4MB arena on every full rewrite and came out at 1.000x while writing twice as much as the thing it replaced -- replay stops at the first zero length, so an empty arena needs one zero word at its head and not four megabytes."
+  },
+  {
+   "experiment": "f29-redolog",
+   "id": "F29.2",
+   "profile": "full",
+   "expect": "fails",
+   "because": "The price, and it is why `redo_log` is off by default: 0 of 500 keys that a logged checkpoint made durable are visible to a reader opened before the next full rewrite. A logged checkpoint writes its records and fsyncs them and publishes nothing; a reader reads the published index, and the index does not have them. `Store::open` replays, so the writer loses nothing across a restart -- but a concurrent reader is looking at an older state than the one the writer has been told is durable, and that is a narrowing of what `checkpoint` has always promised: durable *and* visible to anyone. Recorded as failing rather than described in a doc comment so that making readers replay the log turns this red and forces the decision to be deliberate."
   }
-
  ],
  "metrics": [
   {
