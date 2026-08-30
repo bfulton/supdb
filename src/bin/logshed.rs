@@ -323,7 +323,8 @@ fn segment_fixture(dir: &Path, events: u64) -> std::io::Result<()> {
     let blob = Blob::open(MmapBytes::open(&path)?)?;
 
     // What the open will fetch through a 64 KiB-page cache: the superblock
-    // probe, both sections, and the log-emptiness word, page-rounded. This
+    // probe and both sections, page-rounded (a closed store carries no log
+    // arena, so there is no emptiness word to fetch). This
     // is the "you did not download the file" number the test asserts.
     let head = {
         let all = std::fs::read(&path)?;
@@ -993,7 +994,7 @@ fn ranges(profile: Profile) -> std::io::Result<Record> {
         "opening a segment index and answering its probe set out of a cold cache needs less than half the object; the rest is never fetched",
         fraction <= 0.5,
         format!(
-            "open reads {} bytes (superblock probe, key index, block table, log word) and \
+            "open reads {} bytes (superblock probe, key index, block table) and \
              the probe set plans {} more, {:.1}% of a {}-byte object; the day shape reads \
              {:.1}% of {} bytes. The resident sections are small because the dictionary is \
              bounded by field cardinality -- ~{} keys however large the segment -- which is \

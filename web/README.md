@@ -61,8 +61,9 @@ Three ABI calls carry the plans (framed as `u32 n`, then `n` pairs of
 
 - `supdb_open_probe()` -- how many leading bytes the open needs first;
 - `supdb_open_plan(head, len, object_len)` -- the ranges the open will read:
-  the probe itself, the key index, the block table, and the redo log's
-  emptiness word. Format knowledge stays in Rust; a superblock constant
+  the probe itself, the key index, the block table, and -- only for a store
+  that was never cleanly closed and so still carries a log arena -- the redo
+  log's emptiness word. Format knowledge stays in Rust; a superblock constant
   hand-copied into another module has drifted once already;
 - `supdb_ranges(h, keys, len)` -- the data ranges a read of these keys will
   touch, deduped and merged. Input is `u32 nkeys`, then per key `u32 klen`
@@ -100,7 +101,7 @@ That split costs approximately nothing today because logshed's key
 cardinality is bounded by its field schema -- a real segment is ~100 keys
 and single-digit kilobytes of index over megabytes of postings, so the open
 fetches a few pages and everything after is sparse (`w4-ranges` prices the
-open at under 20 KB of a 35 MB object). It stops being cheap the day the
+open at under 20 KB of a 31 MB object). It stops being cheap the day the
 keys are unbounded: a trigram or free-text index has a dictionary that grows
 with the data, and would need the *index* planned and fetched sparsely too.
 Do not index free text over this source without revisiting that. The ranges

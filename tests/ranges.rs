@@ -360,17 +360,29 @@ fn open_ranges_names_exactly_what_open_reads() {
 
 #[test]
 fn a_store_with_unreplayed_log_records_is_refused_not_misread() {
-    // A sealed store carries an *empty* redo-log arena -- `log_len` in the
-    // superblock is the arena's capacity, and a full rewrite leaves a zero
-    // length-word at its head. This reader does not replay a log, which is
-    // only sound while that word stays zero: a record there is newer than
-    // everything in the index by construction, and ignoring it would serve
-    // the previous state, silently. So `open` probes the word and refuses a
-    // nonzero one. Checked by byte surgery -- write a nonzero length into
-    // the arena of a clean store -- so the test does not depend on which
-    // shapes the writer currently sends to the log.
+    // A cleanly closed store has no redo-log arena at all -- `close` drops
+    // it -- so this probe is about the store that was *never* cleanly
+    // closed: a writer's working file, or what a crash leaves. Such a file's
+    // superblock names an arena (`log_len` is its capacity), and its first
+    // length-word decides everything: zero means replay would find nothing
+    // and the index is complete; nonzero means records newer than the index,
+    // which this reader does not replay and must therefore refuse rather
+    // than serve the previous state, silently. Built by checkpointing
+    // *without* close -- the only writer shape that leaves an arena behind
+    // -- then byte surgery on the word, so the test does not depend on
+    // which shapes the writer currently sends to the log.
     let path = scratch("logbytes");
-    build(&path, 20, Options::default());
+    let store = Store::create(&path, Options::default()).expect("create");
+    for k in 0..20 {
+        let key = format!("term={k:08}").into_bytes();
+        for i in 0..5u32 {
+            store.append(&key, &i.to_le_bytes()).expect("append");
+        }
+    }
+    store.checkpoint().expect("checkpoint");
+    // Dropped, not closed: the file stays exactly as the checkpoint
+    // published it, arena and all.
+    drop(store);
     let mut data = std::fs::read(&path).unwrap();
 
     // Find the winning superblock's log arena, exactly as the decoder does.
@@ -379,11 +391,15 @@ fn a_store_with_unreplayed_log_records_is_refused_not_misread() {
     };
     let slot = if field(0, 0) >= field(512, 0) { 0 } else { 512 };
     let (log_off, log_len) = (field(slot, 13) as usize, field(slot, 14));
-    assert!(log_len >= 4, "a default store carries a log arena");
+    assert!(
+        log_len >= 4,
+        "a checkpointed-but-not-closed store carries a log arena; \
+         if this fails, the writer stopped leaving one and this test needs a new fixture"
+    );
 
-    // A sealed store's arena head really is the zero word the reader relies
-    // on -- assert it before breaking it, so the surgery below is known to
-    // be the only difference between the two opens.
+    // An unclosed store with an *empty* arena still opens -- the probe reads
+    // the zero word and passes. Asserted before breaking it, so the surgery
+    // below is known to be the only difference between the two opens.
     assert_eq!(&data[log_off..log_off + 4], &[0u8; 4]);
     assert!(Blob::open(supdb::VecBytes(data.clone())).is_ok());
 

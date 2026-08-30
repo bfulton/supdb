@@ -140,21 +140,24 @@ struct Super {
     blk_uncompressed: u64,
     high_water: u64,
     /// The redo log arena (fields 13 and 14). `log_len` is the arena's
-    /// *capacity*, not its used bytes -- a store written with
-    /// `Options::redo_log` (the default) carries an arena even when nothing
-    /// is in it, because a full index rewrite allocates a fresh one with a
-    /// single zero length-word at its head, which is how replay knows to
-    /// stop immediately.
+    /// *capacity*, not its used bytes -- a mid-life full rewrite allocates a
+    /// fresh arena with a single zero length-word at its head, which is how
+    /// replay knows to stop immediately. A cleanly *closed* store records no
+    /// arena at all: `Store::close` drops it, because a store nothing will
+    /// append to again has no use for 4 MB of reserved zeroes that every
+    /// download of the file pays for.
     ///
     /// `store::Reader` replays the log; this reader does not, deliberately --
     /// replay is a write-path concern and the wasm build exists to not carry
-    /// one. That is only sound when the log holds no records, so `open`
-    /// probes the arena's first length word and refuses a nonzero one: those
-    /// records are newer than everything in the index by construction, and a
-    /// reader that ignored them would quietly serve the previous state. A
-    /// *sealed* object -- a logshed day index after its closing checkpoint --
-    /// always probes empty; a non-empty log means a writer's working store,
-    /// which was never this reader's contract.
+    /// one. That is only sound when the log holds no records, so where an
+    /// arena exists, `open` probes its first length word and refuses a
+    /// nonzero one: those records are newer than everything in the index by
+    /// construction, and a reader that ignored them would quietly serve the
+    /// previous state. A sealed object -- a logshed segment after its
+    /// closing checkpoint -- never trips this, having no arena to probe; the
+    /// probe fires only for a store that was never cleanly closed, a
+    /// writer's working file or a crash leftover, which was never this
+    /// reader's contract to serve.
     log_off: u64,
     log_len: u64,
 }
