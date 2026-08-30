@@ -143,6 +143,56 @@ allocations and makes the write pattern sequential. It is the change the miss
 counts argue for, and it gets measured the way everything here is -- both arms
 behind a flag, interleaved in one process -- rather than assumed.
 
+## When a miss profile points the wrong way
+
+`EXT.13` has Supdb 3.3x behind LMDB on keys arriving in order, which is the
+common shape. Three tools were pointed at it and the first two misled.
+
+**cachegrind, subtracted, per key of a 50k sequential load:**
+
+| | Supdb | LMDB | ratio |
+|---|---|---|---|
+| instructions | 3,755 | 3,303 | 1.14x |
+| D1 misses | 59.0 | 13.2 | 4.47x |
+| LL misses | 18.0 | 0.29 | **62.5x** |
+
+Sixty-two times the DRAM traffic per key reads like a scattered write path,
+and there is an obvious story to hang on it: Supdb shards by key hash, so
+keys arriving in order land in 64 different places while a B-tree fills one
+page. That story is wrong. `cg_annotate` puts **1% of those misses in the
+hash probe** and the rest in `checkpoint_inner`, `seal_shard` and the memcpy
+inside them.
+
+**Timing the phases directly, 1M keys in order:**
+
+| phase | Supdb | LMDB |
+|---|---|---|
+| put | 0.420s (43%) | 0.341s (70%) |
+| flush + checkpoint | 0.591s (57%) | 0.149s (30%) |
+
+The put path is within 1.17x. The whole gap is the flush.
+
+**Timing inside the checkpoint** (`SUPDB_CKPT_PHASES=1`):
+
+| | |
+|---|---|
+| sort 1M keys | 0.057s |
+| encode the index | 0.089s |
+| **write the sections** | **0.406s** |
+| fsync | 0.0007s |
+
+68.5MB of index at 169 MB/s. So the checkpoint is not sorting or encoding, it
+is *writing*, and what it writes is a structure LMDB does not have: F11.4
+prices the mapped index at +73.5% on the file, deliberately, because a section
+read in place cannot be compressed.
+
+**What this rules out, which is the point.** Parallelising the index build
+across shards is the obvious move and its ceiling is sort + encode: 0.146s of
+a 0.985s load, so 15% at best, for a background thread in a single-writer
+design. The 41% is I/O on a structure whose size is a format decision already
+measured elsewhere. A miss count says where misses are, not which phase is
+slow, and an instruction count says neither.
+
 ## Reproducibility, independent of tooling
 
 These matter more than the tools and cost nothing. Every one is now checked at

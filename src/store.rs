@@ -2406,7 +2406,9 @@ impl Store {
                 for sh in &guards {
                     all.extend(sh.keys.iter().map(|(k, e)| (k, &e.extents)));
                 }
+                let t = std::time::Instant::now();
                 all.sort_unstable_by(|a, b| a.0.cmp(b.0));
+                ckpt_phase("sort", t, Some(all.len()));
             }
         }
 
@@ -2444,7 +2446,10 @@ impl Store {
                 } else {
                     0
                 };
-                flatindex::encode(&all, gen, p, key_hash, slack)
+                let t = std::time::Instant::now();
+            let r = flatindex::encode(&all, gen, p, key_hash, slack);
+            ckpt_phase("encode", t, Some(all.len()));
+            r
             } else {
                 None
             };
@@ -2471,6 +2476,7 @@ impl Store {
         // is a section copied into every reader's heap, which is the cost this
         // format exists to remove.
         // An in-place checkpoint leaves the key section exactly where it was.
+        let t_write = std::time::Instant::now();
         let key_loc = match (in_place, ap.last_index) {
             (true, Some(loc)) => loc,
             _ if flat => {
@@ -2670,8 +2676,11 @@ impl Store {
             let other = if at == 0 { SLOT } else { 0 };
             ap.file.write_all_at(&sb.encode(), other)?;
         }
+        ckpt_phase("write-sections", t_write, None);
+        let t_fsync = std::time::Instant::now();
         if do_sync {
             ap.file.sync_data()?;
+            ckpt_phase("fsync", t_fsync, None);
             ap.since_sync = 0;
             ap.last_sync = std::time::Instant::now();
             ap.unsynced = false;
@@ -3270,6 +3279,26 @@ fn log_replay(arena: &[u8]) -> (Vec<(Vec<u8>, Extents)>, u64) {
         at += LOG_HDR + len;
     }
     (out, at as u64)
+}
+
+/// Phase timings inside a checkpoint, printed when `SUPDB_CKPT_PHASES` is set.
+///
+/// Off by default and free when off. It is here because two profiles pointed
+/// the wrong way before this did: cachegrind put 62x LMDB's last-level misses
+/// per key on a sequential load, which reads like a scattered write path, and
+/// 1% of them were in the hash probe. Timing the phases said the checkpoint
+/// dominates; timing *inside* the checkpoint said the sort and the encode are
+/// a third of it and writing the index section is the rest. Neither miss
+/// counts nor instruction counts would have said that.
+#[inline]
+fn ckpt_phase(what: &str, t: std::time::Instant, extra: Option<usize>) {
+    if std::env::var_os("SUPDB_CKPT_PHASES").is_none() {
+        return;
+    }
+    match extra {
+        Some(n) => eprintln!("  {what} {:.4}s ({n} keys)", t.elapsed().as_secs_f64()),
+        None => eprintln!("  {what} {:.4}s", t.elapsed().as_secs_f64()),
+    }
 }
 
 fn write_section_raw(
