@@ -1,0 +1,18 @@
+# Sandbox policy for localmost self-hosted runners (see bfulton/localmost,
+# src/shared/localmostrc.ts). Applied per job after one-time approval in the
+# localmost app; hosts here extend the proxy's DEFAULT_ALLOWED_HOSTS.
+#
+# Why each host: a Rust build needs cargo's sparse registry index
+# (index.crates.io -- the host modern cargo actually uses, absent from the
+# default list, which is why every CI run here used to fall back to the git
+# index protocol through github.com), the crate downloads themselves, and
+# rustup's dist server for the day a runner is missing a toolchain. Nothing
+# else: benchmarks must not talk to the network.
+version: 1
+shared:
+  network:
+    allow:
+      - index.crates.io
+      - crates.io
+      - static.crates.io
+      - static.rust-lang.org
