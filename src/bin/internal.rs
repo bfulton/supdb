@@ -111,6 +111,7 @@ fn main() -> std::io::Result<()> {
             "f30-insertindex" => f30_insertindex(&args, profile)?,
             "f31-loadphases" => f31_loadphases(&args, profile)?,
             "f32-prealloc" => f32_prealloc(&args, profile)?,
+            "f33-indexsize" => f33_indexsize(&args, profile)?,
             "f28-count" => f28_count(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
@@ -156,6 +157,7 @@ fn main() -> std::io::Result<()> {
                 "f30-insertindex",
                 "f31-loadphases",
                 "f32-prealloc",
+                "f33-indexsize",
                 "f28-count",
                 "f4-durability",
                 "f3-multiproc",
@@ -3649,6 +3651,161 @@ fn f11_child(args: &Args) -> std::io::Result<()> {
 /// bit flip, a torn write or a reused slot returns silently wrong data,
 /// because LZ4 decodes many corrupted inputs into plausible bytes. The
 /// question is only what it costs.
+/// Does a smaller index make a bulk load faster?
+///
+/// f31 decomposed a 1M-key ordered load and found the excess over LMDB split
+/// roughly evenly between building an index LMDB does not have (33% of the
+/// checkpoint) and flushing the 1.33x bytes that index adds (40%). One root
+/// cause, two costs -- so the lever that hits both is making the index
+/// smaller, and it is the only one that does.
+///
+/// Most of the 57 bytes per key cannot move. The hash is 16 of them and its
+/// capacity is a power of two, so asking for a denser load factor changes
+/// nothing at 1M keys. The record is 36 and half of that is the key itself,
+/// which a lookup needs to verify, and 16 is an `Ext` that cannot be
+/// varint-packed without giving up the `&[Ext]` borrow the format exists for.
+///
+/// What does exist is `Options::flat_index`, whose other arm is the varint
+/// index that F11.4 prices at 73.5% less space. Its space cost is measured;
+/// its effect on load time never was. If the flush half of f31's split is
+/// real, a 73.5% smaller index should show up as a faster checkpoint -- and
+/// the read side is what it costs, which is why both are measured here.
+fn f33_indexsize(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let keys = args.num("--keys", profile.pick(100_000, 500_000, 1_000_000)) as u64;
+    let reads = args.num("--reads", profile.pick(50_000, 200_000, 500_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+
+    let mut rec = Record::new("f33-indexsize", profile);
+    rec.param("keys", J::u(keys))
+        .param("reads", J::u(reads))
+        .param("value_size", J::u(value_size as u64))
+        .note("both arms interleaved; the only difference is Options::flat_index")
+        .note("keys arrive in order, the shape EXT.13 finds Supdb behind on");
+
+    let dir = scratch("f33");
+    let payload = Payload::new(value_size, 0.5, 0xF33);
+    let on = [true, false];
+    type Row = (usize, f64, f64, f64, f64);
+    let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
+    let trial = Trial::new(profile.reps());
+    let load = trial.run(2, |ci, rep| {
+        let file = dir.join(format!("s{ci}-{rep}.dat"));
+        let _ = std::fs::remove_file(&file);
+        let store = Store::create(
+            &file,
+            Options {
+                flat_index: on[ci],
+                ..default_opts(256)
+            },
+        )
+        .expect("create");
+        let _ = supdb::take_phases();
+        let mut vrng = Rng::new(0xF33 + rep as u64);
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            store.put(&kb, payload.get(&mut vrng)).expect("put");
+        }
+        store.flush().expect("flush");
+        let tc = Instant::now();
+        store.checkpoint().expect("checkpoint");
+        let ckpt = tc.elapsed().as_secs_f64();
+        let secs = t.elapsed().as_secs_f64();
+        let ph = supdb::take_phases();
+        let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0) as f64 / 1_048_576.0;
+        let _ = store.close();
+        // Reads on a fresh reader, which is the side a smaller index is
+        // supposed to cost.
+        let r = Reader::open(&file).expect("reader");
+        let mut g = KeyGen::new(KeyDist::Uniform, keys, 0xF33);
+        let tr = Instant::now();
+        let mut hits = 0u64;
+        for _ in 0..reads {
+            db_key_into(g.next(), &mut kb);
+            let mut n = 0usize;
+            r.read_all(&kb, |v| n += v.len()).expect("read");
+            hits += (n > 0) as u64;
+        }
+        let rd = reads as f64 / tr.elapsed().as_secs_f64();
+        assert!(hits > 0, "the read arm found nothing");
+        drop(r);
+        rows.lock()
+            .unwrap()
+            .push((ci, size, rd, ckpt, ph.fsync_ns as f64 / 1e9));
+        let _ = std::fs::remove_file(&file);
+        keys as f64 / secs
+    });
+
+    let pick = |c: usize, f: fn(&Row) -> f64| -> Samples {
+        let all = rows.lock().unwrap();
+        Samples::new(all.iter().filter(|r| r.0 == c).map(f).collect())
+    };
+    let size: Vec<Samples> = (0..2).map(|c| pick(c, |r| r.1)).collect();
+    let read: Vec<Samples> = (0..2).map(|c| pick(c, |r| r.2)).collect();
+    let ckpt: Vec<Samples> = (0..2).map(|c| pick(c, |r| r.3)).collect();
+    let fsync: Vec<Samples> = (0..2).map(|c| pick(c, |r| r.4)).collect();
+
+    let load_cmp = compare(&load[1], &load[0], supdb::bench::MIN_EFFECT);
+    let read_cmp = compare(&read[0], &read[1], supdb::bench::MIN_EFFECT);
+    rec.compare("load_varint_vs_flat", load_cmp.clone());
+    rec.compare("read_flat_vs_varint", read_cmp.clone());
+    rec.series(
+        "arms",
+        J::arr(
+            (0..2)
+                .map(|ci| {
+                    jobj! {
+                        "flat_index" => J::Bool(on[ci]),
+                        "load_ops_per_s" => J::fp(load[ci].median(), 1),
+                        "read_ops_per_s" => J::fp(read[ci].median(), 1),
+                        "file_mb" => J::fp(size[ci].median(), 2),
+                        "checkpoint_s" => J::fp(ckpt[ci].median(), 4),
+                        "fsync_s" => J::fp(fsync[ci].median(), 4)
+                    }
+                })
+                .collect(),
+        ),
+    );
+    rec.finding(Finding::new(
+        "F33.1",
+        "A smaller index makes a bulk load faster",
+        matches!(load_cmp.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "varint index {:.0} ops/s against flat {:.0} ({}), with the file at {:.1} MB against \
+             {:.1} and the checkpoint at {:.3}s against {:.3}s, of which fsync is {:.3}s against \
+             {:.3}s. This is f31's flush half tested directly: if the bytes the index adds are \
+             what the checkpoint is paying for, removing 73.5% of them has to show here",
+            load[1].median(),
+            load[0].median(),
+            load_cmp.summary("varint", "flat"),
+            size[1].median(),
+            size[0].median(),
+            ckpt[1].median(),
+            ckpt[0].median(),
+            fsync[1].median(),
+            fsync[0].median()
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F33.2",
+        "The flat index's read advantage is present at this scale",
+        matches!(read_cmp.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "flat {:.0} reads/s against varint {:.0} ({}) at these keys. F11.3 measures 1.25x for \
+             the flat index at 5M keys, and both are right: the heap index it replaces costs 186 \
+             bytes per key resident, which is 930MB at 5M and comfortable at 1M. So the read \
+             advantage arrives with scale while the costs -- 1.4x on a bulk load, +60% on the file \
+             -- are paid at every size. That is an argument for choosing the layout by key count \
+             rather than fixing it, the way `Readahead::Auto` chooses by file-to-memory ratio",
+            read[0].median(),
+            read[1].median(),
+            read_cmp.summary("flat", "varint")
+        ),
+    ));
+    Ok(rec)
+}
+
 /// Is the checkpoint's section write slow because of block allocation?
 ///
 /// f31 put 41% of a sequential bulk load in one place: writing 68.5MB of key

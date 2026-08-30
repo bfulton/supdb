@@ -780,6 +780,20 @@
    "profile": "full",
    "expect": "holds",
    "because": "Inside a 0.468s checkpoint over 1M keys: sort 0.067s, encode 0.086s, crc 0.009s, pwrite 0.015s, fsync 0.186s. Building the index is 33% and making it durable is 40%, and neither is the one thing to remove. That is the finding, because three separate profiles each looked like it was. cachegrind reported 62x LMDB's last-level misses per key on an ordered load, which reads like a scattered write path -- `cg_annotate` puts 1% of them in the hash probe. The phase that looked like a 57MB section write took 4.7x what a bare 57MB write costs on this machine, which is 0.087s measured against a control, and that gap is what finally exposed the `sync_data` sitting inside the phase; the pwrite it appeared to be is 3% of the checkpoint. And f32 refuted preallocation, which had been the explanation for the write being slow, by aiming at disk blocks when the cost was never there. Against LMDB's 0.49s for the same load, Supdb's excess splits roughly evenly between building an index LMDB does not have and flushing the 1.33x bytes that index adds -- one root cause, two costs, and no single phase to delete."
+  },
+  {
+   "experiment": "f33-indexsize",
+   "id": "F33.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "1,145,201 ops/s with the varint index against 816,259 with the flat one -- 1.403x at p=0.0022 -- with the file at 105.5 MB against 168.6 and the checkpoint at 0.342s against 0.663s, of which fsync is 0.132s against 0.233s. This is f31's flush half tested directly: it said the excess over LMDB splits between building an index LMDB does not have and flushing the bytes that index adds, and removing 37% of those bytes moves the load by 1.4x. The lever is real and it is the only one that hits both halves at once, because the same bytes are what the sort and the encode produce and what the fsync then has to push. Note it is not free and not a recommendation on its own: see F33.2."
+  },
+  {
+   "experiment": "f33-indexsize",
+   "id": "F33.2",
+   "profile": "full",
+   "expect": "fails",
+   "because": "1,884,035 reads/s flat against 1,906,483 varint -- 0.988x at p=0.6365, no difference at 1M keys. F11.3 measures 1.25x for the flat index at 5M keys and both are right: the heap index it replaces costs 186 bytes per key resident, which is 930MB at 5M keys and comfortable at 1M. So the flat index's read advantage arrives with scale, while its costs are paid at every size -- 1.403x on a bulk load (F33.1) and +73.5% on the file (F11.4). Recorded as failing because a layout chosen for reads that does not help reads at the size being measured is a cost with no return there, and the honest conclusion is not that the flat index is wrong but that fixing it at compile time is: this is the same shape as `Readahead::Auto`, which picks by file-to-memory ratio rather than being set once."
   }
  ],
  "metrics": [
