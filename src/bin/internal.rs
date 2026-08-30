@@ -110,7 +110,6 @@ fn main() -> std::io::Result<()> {
             "f29-redolog" => f29_redolog(&args, profile)?,
             "f30-insertindex" => f30_insertindex(&args, profile)?,
             "f31-loadphases" => f31_loadphases(&args, profile)?,
-            "f32-prealloc" => f32_prealloc(&args, profile)?,
             "f33-indexsize" => f33_indexsize(&args, profile)?,
             "f34-parallelindex" => f34_parallelindex(&args, profile)?,
             "f35-indexauto" => f35_indexauto(&args, profile)?,
@@ -158,7 +157,6 @@ fn main() -> std::io::Result<()> {
                 "f29-redolog",
                 "f30-insertindex",
                 "f31-loadphases",
-                "f32-prealloc",
                 "f33-indexsize",
                 "f34-parallelindex",
                 "f35-indexauto",
@@ -4078,108 +4076,6 @@ fn f33_indexsize(args: &Args, profile: Profile) -> std::io::Result<Record> {
             read[0].median(),
             read[1].median(),
             read_cmp.summary("flat", "varint")
-        ),
-    ));
-    Ok(rec)
-}
-
-/// Is the checkpoint's section write slow because of block allocation?
-///
-/// f31 put 41% of a sequential bulk load in one place: writing 68.5MB of key
-/// index at 169 MB/s. That is slow for writes that should mostly land in the
-/// page cache, and the suspect is the filesystem extending the file under
-/// every write rather than raw bandwidth. `Options::preallocate` reserves the
-/// space with `posix_fallocate` first.
-///
-/// If this does nothing, the 169 MB/s is real bandwidth and the only lever
-/// left on sequential loads is writing less -- which is a format decision
-/// (F11.4 prices the mapped index at +73.5% on the file) rather than an
-/// optimisation. Either answer is worth having before anyone builds the
-/// parallel index builder, whose ceiling f31 already measured at 15%.
-fn f32_prealloc(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    let keys = args.num("--keys", profile.pick(100_000, 500_000, 1_000_000)) as u64;
-    let value_size = args.num("--value-size", 100);
-
-    let mut rec = Record::new("f32-prealloc", profile);
-    rec.param("keys", J::u(keys))
-        .param("value_size", J::u(value_size as u64))
-        .note("both arms interleaved; the only difference is Options::preallocate")
-        .note("keys arrive in order, the shape EXT.13 finds Supdb behind on");
-
-    let dir = scratch("f32");
-    let payload = Payload::new(value_size, 0.5, 0xF32);
-    let on = [true, false];
-    let split: std::sync::Mutex<Vec<(usize, f64, f64)>> = std::sync::Mutex::new(Vec::new());
-    let trial = Trial::new(profile.reps());
-    let tp = trial.run(2, |ci, rep| {
-        let file = dir.join(format!("a{ci}-{rep}.dat"));
-        let _ = std::fs::remove_file(&file);
-        let store = Store::create(
-            &file,
-            Options {
-                preallocate: on[ci],
-                ..default_opts(256)
-            },
-        )
-        .expect("create");
-        let mut vrng = Rng::new(0xF32 + rep as u64);
-        let mut kb = [0u8; 16];
-        let t = Instant::now();
-        for i in 0..keys {
-            db_key_into(i, &mut kb);
-            store.put(&kb, payload.get(&mut vrng)).expect("put");
-        }
-        let puts = t.elapsed().as_secs_f64();
-        let tc = Instant::now();
-        store.flush().expect("flush");
-        store.checkpoint().expect("checkpoint");
-        let ckpt = tc.elapsed().as_secs_f64();
-        split.lock().unwrap().push((ci, puts, ckpt));
-        let _ = store.close();
-        let _ = std::fs::remove_file(&file);
-        keys as f64 / (puts + ckpt)
-    });
-
-    let pick = |c: usize, f: fn(&(usize, f64, f64)) -> f64| -> Samples {
-        let all = split.lock().unwrap();
-        Samples::new(all.iter().filter(|(x, _, _)| *x == c).map(f).collect())
-    };
-    // The checkpoint is where the section write lives, so that is the arm the
-    // hypothesis is actually about; total load is reported beside it because a
-    // change that only moves cost around is not an improvement.
-    let ckpt: Vec<Samples> = (0..2).map(|c| pick(c, |x| x.2)).collect();
-    let cmp = compare(&ckpt[1], &ckpt[0], supdb::bench::MIN_EFFECT);
-    let total = compare(&tp[0], &tp[1], supdb::bench::MIN_EFFECT);
-    rec.compare("checkpoint_plain_vs_prealloc", cmp.clone());
-    rec.compare("load_prealloc_vs_plain", total.clone());
-    rec.series(
-        "arms",
-        J::arr(
-            (0..2)
-                .map(|ci| {
-                    jobj! {
-                        "preallocate" => J::Bool(on[ci]),
-                        "ops_per_s" => J::fp(tp[ci].median(), 1),
-                        "put_s" => J::fp(pick(ci, |x| x.1).median(), 4),
-                        "checkpoint_s" => J::fp(ckpt[ci].median(), 4)
-                    }
-                })
-                .collect(),
-        ),
-    );
-    rec.finding(Finding::new(
-        "F32.1",
-        "Preallocating the file speeds up the checkpoint's section write",
-        matches!(cmp.verdict, supdb::bench::Verdict::Greater),
-        format!(
-            "checkpoint {:.4}s preallocated against {:.4}s plain ({}); whole load {:.0} ops/s \
-             against {:.0}. f31 measured that write at 169 MB/s for 68.5MB of index, and this is \
-             the test of whether that is block allocation or bandwidth",
-            ckpt[0].median(),
-            ckpt[1].median(),
-            cmp.summary("plain", "preallocated"),
-            tp[0].median(),
-            tp[1].median()
         ),
     ));
     Ok(rec)

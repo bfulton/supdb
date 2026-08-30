@@ -31,9 +31,6 @@ pub(crate) const SLOT: u64 = 512;
 /// no longer contained the checksum -- a format change that presented itself
 /// as "no valid supdb checkpoint" on a healthy file.
 pub(crate) const SUPER_BYTES: usize = 136;
-/// How far ahead `Options::preallocate` reserves, so a load pays a handful of
-/// allocations rather than one per section.
-const PREALLOC_CHUNK: u64 = 64 << 20;
 
 #[derive(Clone, Copy, Default, Debug)]
 struct Super {
@@ -621,22 +618,16 @@ pub struct Options {
     /// in slack, and the hash runs at half load -- so the directory was the
     /// only reason `checkpoint_in_place` declined every insertion, which f27
     /// measured at 4.122x on a workload that only inserts.
-    /// Allocate file space ahead of writing a section, instead of letting each
-    /// write extend the file.
+    /// Sort and encode the key index across threads instead of on the
+    /// checkpointing one.
     ///
-    /// Off by default until measured. The checkpoint writes 68.5MB of index at
-    /// 169 MB/s (docs/profiling.md), which is slow for what should mostly be
-    /// page-cache writes, and the obvious suspect is block allocation on a
-    /// growing file rather than bandwidth. f32 settles it.
-    /// Sort the key index across threads instead of on the checkpointing one.
-    ///
-    /// Off by default until measured. f31 puts the sort and the encode at 33%
-    /// of a checkpoint, so this is the half of that split which parallelises
-    /// -- the fsync does not -- and f31 already priced its ceiling at 15% of a
-    /// bulk load. The gather still holds every shard lock, so this shortens
-    /// the span rather than removing it.
+    /// On by default. f34 measures the build at 1.930x with all three parts
+    /// threaded -- the sort splits and merges, the record loop splits because
+    /// `rec_offs` is a prefix sum, and the hash claims slots with
+    /// compare-exchange. It is about 8% of a bulk load, which this host cannot
+    /// resolve end to end, so the phase is what is gated and the contribution
+    /// is arithmetic.
     pub parallel_index: bool,
-    pub preallocate: bool,
     pub index_inserts: bool,
     pub redo_log: bool,
     /// Bytes reserved for the redo log at each full rewrite. When it fills,
@@ -711,9 +702,8 @@ impl Default for Options {
             checksums: true,
             pending_arena: true,
             seal_on_put: true,
-            parallel_index: false,
-            preallocate: false,
-            index_inserts: false,
+            parallel_index: true,
+            index_inserts: true,
             redo_log: false,
             log_bytes: 4 << 20,
             // On, now that the space cost is bounded.
@@ -795,9 +785,16 @@ struct Appender {
     /// rejects, and everything before it is intact, which is the whole reason
     /// a log is written this way rather than with a length field to update.
     log: Option<(u64, u64, u64)>,
-    /// Whether to reserve file space before writing into it. Carried here
-    /// because `write_section_raw` is a free function with no view of Options.
-    prealloc: bool,
+    /// The arena the *previous* generation's superblock still names.
+    ///
+    /// A rewrite makes the current arena redundant, but not immediately
+    /// reusable: the superblock being replaced still points at it, and a
+    /// reader that opened on that generation is still entitled to replay it.
+    /// Releasing it in the same checkpoint hands its bytes straight back to
+    /// the next section -- `place_section` returned the identical offset -- so
+    /// it is held one generation, which is the same hysteresis
+    /// `index_history` gives a superseded key section.
+    prev_log: Option<(u64, u64)>,
     /// A read mapping of the file, for serving a sealed extent in place.
     ///
     /// `read_extent` preads the extent's whole block -- 64KiB -- into a fresh
@@ -1399,7 +1396,7 @@ impl Store {
             appender: Mutex::new(Appender {
                 table,
             log: None,
-            prealloc: opts.preallocate,
+            prev_log: None,
                 map: None,
                 file,
                 off: high_water,
@@ -1431,7 +1428,10 @@ impl Store {
         // carries the key's whole extent list as of that checkpoint, not a
         // delta against it.
         let replayed: Vec<Vec<u8>> = logged.iter().map(|(k, _)| k.clone()).collect();
-        for (key, exts) in entries.into_iter().chain(logged) {
+        // Not chained with `logged`: the reader those entries came from now
+        // replays the log itself, so they already carry it. Applying it twice
+        // was harmless for extents, which replace, and wrong for the count.
+        for (key, exts) in entries {
             let si = store.shard_of(&key);
             let mut sh = store.shards[si].lock().unwrap();
             sh.keys.get_or_insert(&key).extents = exts;
@@ -1581,7 +1581,7 @@ impl Store {
             appender: Mutex::new(Appender {
                 table,
             log: None,
-            prealloc: opts.preallocate,
+            prev_log: None,
                 map: None,
 
                 file,
@@ -1962,6 +1962,17 @@ impl Store {
         // member, so the refcount stays correct.
         if let Some(idx) = sh.keys.index_of(key) {
             sh.members.retain(|m| m.0 != idx);
+            // A tombstone is a change like any other, and it was not recorded
+            // as one. `checkpoint_in_place` and the redo log both publish only
+            // what `dirty` names, so a delete they were asked to carry was
+            // simply dropped and the key stayed readable at its old extents.
+            //
+            // It was invisible while any insertion forced a full rewrite,
+            // because a rewrite reads every key from the shards and sees the
+            // tombstone directly. `Options::index_inserts` removes that
+            // rewrite, which is what exposed it -- the bug is older than
+            // either flag.
+            sh.dirty.push(idx);
         }
         if self.opts.reclaim.releases() {
             let mut ap = self.appender.lock().unwrap();
@@ -2632,11 +2643,13 @@ impl Store {
         } else if in_place {
             ap.log.map(|(o, c, _)| (o, c))
         } else {
-            // The old arena's records are all in the index this superblock
-            // names, so its space goes back.
-            if let Some((old_off, old_cap, _)) = ap.log {
-                ap.free.release(old_off, old_cap as u32, gen);
+            // One generation behind: the arena this rewrite supersedes is
+            // still named by the superblock being replaced, so what goes back
+            // now is the one before it.
+            if let Some((older_off, older_cap)) = ap.prev_log.take() {
+                ap.free.release(older_off, older_cap as u32, gen);
             }
+            ap.prev_log = ap.log.map(|(o, c, _)| (o, c));
             let want = self.opts.log_bytes.max(LOG_HDR);
             // Reserve the arena, write four bytes into it.
             //
@@ -2657,6 +2670,21 @@ impl Store {
             // comment on that loop describes the same symptom by another
             // route, and this is a third.
             let cap = loc.cap as u64;
+            // The arena is reserved, not written: only its first word goes
+            // down, because replay stops at the first zero length. But the
+            // *file* still has to cover it, because `high_water` moved past
+            // it and a reader refuses a superblock whose high-water mark is
+            // outside the mapping -- it falls back to an older slot, and the
+            // older slot decodes as damage. Extending leaves a hole, which
+            // reads as the zeroes replay wants and costs no blocks.
+            //
+            // This is the cost of the earlier optimisation that stopped
+            // writing 4MB of zeros per rewrite: that write was doing two jobs
+            // and only one of them was visible.
+            let end = loc.off + cap;
+            if ap.file.metadata().map(|m| m.len()).unwrap_or(0) < end {
+                ap.file.set_len(end)?;
+            }
             ap.log = Some((loc.off, cap, 0));
             Some((loc.off, cap))
         };
@@ -3510,32 +3538,9 @@ fn write_section_raw(
             c
         },
     };
-    // Reserve the bytes before writing them, so the filesystem allocates once
-    // for a run of sections rather than extending the file under every write.
-    // `posix_fallocate` allocates real blocks; `set_len` would only make the
-    // file longer and leave a hole, which is what is already happening.
-    if ap.prealloc {
-        let end = off + len as u64;
-        let cur = ap.file.metadata().map(|m| m.len()).unwrap_or(0);
-        if end > cur {
-            // Round up so a load of many sections pays a handful of these
-            // rather than one each.
-            let want = end.next_multiple_of(PREALLOC_CHUNK);
-            use std::os::unix::io::AsRawFd;
-            // Best effort: a filesystem that will not preallocate is not a
-            // reason to fail a write that would have extended it anyway.
-            unsafe {
-                libc::posix_fallocate(
-                    ap.file.as_raw_fd(),
-                    cur as libc::off_t,
-                    (want - cur) as libc::off_t,
-                );
-            }
-        }
-    }
-    let t = std::time::Instant::now();
+    let t_w = std::time::Instant::now();
     ap.file.write_all_at(payload, off)?;
-    ckpt_phase("  pwrite", t, Some(payload.len()));
+    ckpt_phase("  pwrite", t_w, Some(payload.len()));
     CKPT_BYTES.fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
     Ok(loc)
 }
@@ -3622,6 +3627,11 @@ fn emit<F: FnMut(&[u8])>(extent: &[u8], f: &mut F) -> Result<u64> {
 
 pub struct Reader {
     mmap: Mmap,
+    /// Redo-log records this reader replayed, merged into the published order.
+    /// Empty for a store that has no outstanding log, which is every store
+    /// written without `Options::redo_log` and every one whose last checkpoint
+    /// rewrote the index.
+    overlay: Overlay,
     /// Where this reader's keys live: decoded onto the heap, or left in the
     /// mapping and addressed where they lie.
     idx: Idx,
@@ -3702,6 +3712,82 @@ enum Idx {
         off: usize,
         len: usize,
     },
+}
+
+/// Redo-log records a reader has replayed, spliced into the published order.
+///
+/// This is what lets `redo_log` be the engine rather than an option. A logged
+/// checkpoint makes writes durable without publishing them, so until this
+/// existed a `Reader` opened before the next full rewrite could not see them
+/// -- F29.2 measured that as 0 of 500 durable keys visible, and it is the only
+/// reason the log was off by default.
+///
+/// The published index is untouched: it is mapped, shared between processes
+/// and read in place, and none of that survives being edited per reader. So
+/// the records are held beside it and merged on the way out. The log is
+/// bounded by `Options::log_bytes`, so the overlay is bounded too -- this is
+/// not a second copy of the index.
+/// Which side of the merge a rank came from.
+enum Where {
+    Published(usize),
+    Overlay(usize),
+}
+
+#[derive(Default)]
+struct Overlay {
+    /// Sorted by key, one entry per key, last record winning.
+    entries: Vec<(Vec<u8>, Extents)>,
+    /// Each insertion as (published rank it belongs before, merged rank it
+    /// occupies, index into `entries`), sorted. Overlay entries whose key
+    /// already exists in the published index are not here: they replace
+    /// extents in place and move no rank.
+    ///
+    /// The merged rank is stored rather than derived. The k-th insertion sits
+    /// at `at + k`, and computing k inside a `partition_point` predicate as
+    /// "how many sorted before `at`" gives two insertions at the *same*
+    /// published rank the same answer, so they resolve to one merged rank and
+    /// the other is unreachable. That presented as "published index is shorter
+    /// than it says" on reopen.
+    inserts: Vec<(usize, usize, usize)>,
+}
+
+impl Overlay {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Extra ranks this overlay adds to the published order.
+    fn extra(&self) -> usize {
+        self.inserts.len()
+    }
+
+    fn find(&self, key: &[u8]) -> Option<&Extents> {
+        self.entries
+            .binary_search_by(|(k, _)| k.as_slice().cmp(key))
+            .ok()
+            .map(|i| &self.entries[i].1)
+    }
+
+    /// How many insertions sort before published rank `r`.
+    fn before(&self, r: usize) -> usize {
+        self.inserts.partition_point(|(at, _, _)| *at < r)
+    }
+
+    /// Resolve a merged rank to either a published rank or an overlay entry.
+    ///
+    /// The k-th insertion, which belongs before published rank `at`, occupies
+    /// merged rank `at + k`: everything before it is `at` published entries
+    /// plus the `k` insertions that sorted earlier.
+    fn resolve(&self, merged: usize) -> Where {
+        let k = self.inserts.partition_point(|&(_, at_merged, _)| at_merged <= merged);
+        if k > 0 {
+            let (_, at_merged, which) = self.inserts[k - 1];
+            if at_merged == merged {
+                return Where::Overlay(which);
+            }
+        }
+        Where::Published(merged - k)
+    }
 }
 
 impl Idx {
@@ -4041,7 +4127,12 @@ impl Reader {
                 (None, None) => None,
             };
             match newest {
-                Some(sb) if sb.high_water as usize <= mmap.len() => {
+                Some(sb) if {
+                    if std::env::var_os("SUPDB_ARENA_TRACE").is_some() {
+                        eprintln!("reader: hw={} maplen={} log_off={} log_len={}", sb.high_water, mmap.len(), sb.log_off, sb.log_len);
+                    }
+                    sb.high_water as usize <= mmap.len()
+                } => {
                     // Claim the slot before parsing anything. Registration has
                     // to precede the slow part, or the writer can reuse the
                     // space this reader is about to walk while it is still
@@ -4180,6 +4271,9 @@ impl Reader {
                     )?;
                     r.opts = opts;
                     r.advice = advice;
+                    // After `opts`, because the replay seeks with the fence
+                    // setting this reader was opened with.
+                    r.attach_log(sb.log_off, sb.log_len);
                     return Ok(r);
                 }
             }
@@ -4193,6 +4287,7 @@ impl Reader {
         let mut r = Self::build(mmap, key_idx, blocks_src, sb.timestamp, sb.history_from)?;
         r.opts = opts;
         r.advice = advice;
+        r.attach_log(sb.log_off, sb.log_len);
         Ok(r)
     }
 
@@ -4332,6 +4427,7 @@ impl Reader {
             .collect();
         Ok(Reader {
             mmap,
+            overlay: Overlay::default(),
             idx: Idx::Flat { meta, off, len },
             verified,
             blocks_src,
@@ -4449,6 +4545,7 @@ impl Reader {
             .collect();
         Ok(Reader {
             mmap,
+            overlay: Overlay::default(),
             idx: Idx::Heap {
                 entries,
                 hash,
@@ -4717,7 +4814,7 @@ impl Reader {
     }
 
     pub fn keys(&self) -> usize {
-        self.idx.len()
+        self.merged_len()
     }
 
     /// Bytes the key index occupies, as stored.
@@ -4749,8 +4846,11 @@ impl Reader {
         // correctly so, and counting it as undetected corruption would
         // overstate the gap a second time.
         let mut referenced = vec![false; self.nblocks()];
-        for r in 0..self.idx.len() {
-            let Some((_, exts)) = self.idx.at(&self.mmap, r) else {
+        // Merged, so a block that only a logged record points at counts as
+        // referenced. It is live -- a reader can reach it -- and calling it
+        // unreferenced would let c1 treat damage there as undetectable.
+        for r in 0..self.merged_len() {
+            let Some((_, exts)) = self.merged_at(r) else {
                 continue;
             };
             for e in exts {
@@ -4769,8 +4869,104 @@ impl Reader {
     }
 
     #[inline]
-    fn lookup(&self, key: &[u8]) -> Option<&[Ext]> {
+    /// Replay the redo log over the published index.
+    ///
+    /// Called once, at open, after the index exists -- the insert positions
+    /// are ranks *in that index*, so they cannot be computed before it. A
+    /// record whose key is already published replaces its extents and moves
+    /// nothing; one whose key is new takes a rank, and every published rank at
+    /// or after it shifts by one.
+    fn attach_log(&mut self, off: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let Some(arena) = self
+            .mmap
+            .get(off as usize..(off as usize).saturating_add(len as usize))
+        else {
+            // A log outside the mapping is corruption, and a reader that
+            // silently ignored it would serve a state the writer was told was
+            // durable. `Store::open` refuses outright; a reader has no error
+            // channel here, so it keeps the overlay empty and the caller sees
+            // the last published state -- which is stale, not wrong.
+            return;
+        };
+        let (records, _) = log_replay(arena);
+        if records.is_empty() {
+            return;
+        }
+        // Last record for a key wins, and the result is sorted so a lookup is
+        // a binary search and the merge is a walk.
+        let mut entries = records;
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.dedup_by(|a, b| {
+            if a.0 == b.0 {
+                // `dedup_by` keeps `b` and drops `a`, and `a` is the later of
+                // the pair, so move its extents across.
+                b.1 = std::mem::replace(&mut a.1, Extents::None);
+                true
+            } else {
+                false
+            }
+        });
+        let mut inserts: Vec<(usize, usize, usize)> = Vec::new();
+        for (i, (k, _)) in entries.iter().enumerate() {
+            if self.idx.lookup(&self.mmap, k).is_none() {
+                let at = self.idx.seek(&self.mmap, k, self.opts.seek_fence);
+                inserts.push((at, 0, i));
+            }
+        }
+        // `entries` is sorted by key, so the insertions are already in key
+        // order; sorting by published rank keeps ties in that order.
+        inserts.sort_by_key(|(at, _, _)| *at);
+        for (k, e) in inserts.iter_mut().enumerate() {
+            e.1 = e.0 + k;
+        }
+        self.overlay = Overlay { entries, inserts };
+    }
+
+    /// Published keys plus the log's insertions.
+    fn merged_len(&self) -> usize {
+        self.idx.len() + self.overlay.extra()
+    }
+
+    /// A key's extents, the log's version winning where it has one.
+    fn merged_lookup(&self, key: &[u8]) -> Option<&[Ext]> {
+        if let Some(e) = self.overlay.find(key) {
+            // An empty extent list is a delete the log carried, and it has to
+            // read as absent rather than falling through to the published
+            // index, which still has the key.
+            let s = e.as_slice();
+            return if s.is_empty() { None } else { Some(s) };
+        }
         self.idx.lookup(&self.mmap, key)
+    }
+
+    fn merged_at(&self, rank: usize) -> Option<(&[u8], &[Ext])> {
+        match self.overlay.resolve(rank) {
+            Where::Overlay(i) => {
+                let (k, e) = &self.overlay.entries[i];
+                Some((k.as_slice(), e.as_slice()))
+            }
+            Where::Published(r) => {
+                let (k, e) = self.idx.at(&self.mmap, r)?;
+                // The published rank is still the right key; its extents may
+                // have been superseded by a record the log carries.
+                match self.overlay.find(k) {
+                    Some(over) => Some((k, over.as_slice())),
+                    None => Some((k, e)),
+                }
+            }
+        }
+    }
+
+    fn merged_seek(&self, key: &[u8]) -> usize {
+        let r = self.idx.seek(&self.mmap, key, self.opts.seek_fence);
+        r + self.overlay.before(r)
+    }
+
+    fn lookup(&self, key: &[u8]) -> Option<&[Ext]> {
+        self.merged_lookup(key)
     }
 
     /// Every block this reader can see, in id order.
@@ -4801,7 +4997,7 @@ impl Reader {
 
     /// Every key and its extents, in rank order.
     pub(crate) fn entry_at(&self, rank: usize) -> Option<(&[u8], &[Ext])> {
-        self.idx.at(&self.mmap, rank)
+        self.merged_at(rank)
     }
 
     /// The readahead advice actually in force, with `Auto` resolved.
@@ -4811,7 +5007,7 @@ impl Reader {
 
     /// Position of the first key at or after `key`.
     pub fn seek(&self, key: &[u8]) -> usize {
-        self.idx.seek(&self.mmap, key, self.opts.seek_fence)
+        self.merged_seek(key)
     }
 
     /// Visit keys in order from `from`, handing each key's values to the
@@ -4832,7 +5028,7 @@ impl Reader {
         mut f: F,
     ) -> Result<u64> {
         let start = from.map(|k| self.seek(k)).unwrap_or(0);
-        let end = (start + limit).min(self.idx.len());
+        let end = (start + limit).min(self.merged_len());
         let mut n = 0u64;
         let mut cached: u32 = u32::MAX;
         let mut buf: Vec<u8> = Vec::new();
@@ -4856,15 +5052,21 @@ impl Reader {
         // The index section, sliced once. `Idx::at` takes the whole mapping and
         // re-slices it to the section on every rank, which is a bounds check
         // and two additions per entry to arrive at the same bytes.
+        // The shortcut is only sound when there is nothing to merge: it goes
+        // straight to the mapped section by rank, which is exactly what the
+        // overlay reorders and supersedes. With a log outstanding the scan
+        // takes the merged path, which is slower and correct.
         let flat = match &self.idx {
-            Idx::Flat { meta, .. } => Some((meta, self.idx.section(&self.mmap))),
+            Idx::Flat { meta, .. } if self.overlay.is_empty() => {
+                Some((meta, self.idx.section(&self.mmap)))
+            }
             _ => None,
         };
 
         for i in start..end {
             let got = match flat {
                 Some((meta, sec)) => meta.at(sec, i),
-                None => self.idx.at(&self.mmap, i),
+                None => self.merged_at(i),
             };
             let Some((key, exts)) = got else {
                 continue;

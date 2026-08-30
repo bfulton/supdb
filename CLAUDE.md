@@ -222,6 +222,15 @@ the misparse as file corruption, and an in-place checkpoint that republished a
 record into its hash slot and not its directory entry -- so `read_all` returned
 the new value and `scan` the previous one, silently, for every key it touched.
 
+Also fixed: a delete was never marked dirty. `checkpoint_in_place` and the redo
+log both publish only what `dirty` names, so a tombstone they were asked to
+carry was dropped and the key stayed readable at its old extents. It was
+invisible for as long as any insertion forced a full rewrite -- a rewrite reads
+every key from the shards and sees the tombstone directly -- so turning
+`Options::index_inserts` on is what exposed it. The bug is older than the flag,
+which is the argument against leaving things behind flags: a path only one arm
+exercises is a path nothing tests.
+
 Also fixed: `put` probed the key table twice per call -- `get_or_insert` and
 then `index_of` -- immediately below a comment saying it probes once. One
 probe now, 11.3% of the put path's instructions, measured with cachegrind

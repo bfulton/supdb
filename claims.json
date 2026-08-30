@@ -723,14 +723,14 @@
    "id": "F29.1",
    "profile": "full",
    "expect": "holds",
-   "because": "157,172 ops/s writing 172.7 MB, against 30,745 writing 1,269.6 MB when the same durable checkpoints rewrite the index -- 5.112x at p=0.0022, and 7.3x fewer bytes to the device. Write amplification falls from 57.38x to 7.81x. It scales the way avoiding an O(key count) rewrite must: 1.178x at 20k keys, 3.138x at 100k, 5.112x at 200k. Read against f27, which measured updating existing keys at 173,446 ops/s: a logged insert is now within 10% of an update, and the gap f27 found was the whole of EXT.9's problem. The first version of this wrote a zeroed 4MB arena on every full rewrite and came out at 1.000x while writing twice as much as the thing it replaced -- replay stops at the first zero length, so an empty arena needs one zero word at its head and not four megabytes."
+   "because": "1.1156x at p=0.0049, and it used to be 5.112x. Nothing about the log changed; what changed is what it is being compared against. `Options::index_inserts` is on by default now, so the other arm no longer rewrites the whole key index for an insertion -- it splices the new keys into the published directory and publishes with one store. The 5.112x was the log against a full rewrite per batch, and the full rewrite is gone. So the two mechanisms overlap almost entirely: fixing insertion in place recovers most of what f27 priced at 4.122x, and the log adds 12% on top of that. Worth knowing before treating the log as the answer -- it is the smaller half of a pair, and the larger half is simpler and has no visibility cost."
   },
   {
    "experiment": "f29-redolog",
    "id": "F29.2",
    "profile": "full",
-   "expect": "fails",
-   "because": "The price, and it is why `redo_log` is off by default: 0 of 500 keys that a logged checkpoint made durable are visible to a reader opened before the next full rewrite. A logged checkpoint writes its records and fsyncs them and publishes nothing; a reader reads the published index, and the index does not have them. `Store::open` replays, so the writer loses nothing across a restart -- but a concurrent reader is looking at an older state than the one the writer has been told is durable, and that is a narrowing of what `checkpoint` has always promised: durable *and* visible to anyone. Recorded as failing rather than described in a doc comment so that making readers replay the log turns this red and forces the decision to be deliberate."
+   "expect": "holds",
+   "because": "FIXED: 500 of 500 keys that a logged checkpoint made durable are now visible to a reader opened before the next full rewrite, where it was 0 of 500. A `Reader` replays the log at open and merges it over the published index -- the index itself is untouched, because it is mapped, shared between processes and read in place, and none of that survives being edited per reader. The merge is the whole of the work: a record whose key already exists replaces its extents and moves nothing, and one whose key is new takes a rank and shifts every published rank at or after it, so `keys`, `seek` and `scan` all see the merged order and the fast path that walks the mapped section by rank stands down whenever there is anything to merge. This was the stated reason `redo_log` defaulted off. It is still off, for a different and narrower one: a rewrite releases the superseded arena, and holding it one generation is not enough to keep it from being handed to the next compressed section -- `a_superseded_index_section_is_released_exactly_once` fails with the log on and passes with it off, which is a reclamation interaction rather than a visibility one."
   },
   {
    "experiment": "f30-insertindex",
@@ -766,13 +766,6 @@
    "profile": "full",
    "expect": "fails",
    "because": "It does not: put 0.434s (42.4%), flush 0.136s (13.3%), checkpoint 0.453s (44.3%) for 1M keys arriving in order. Building the key index is the largest phase of a bulk load, and it costs 3.3x more than the flush that writes 105MB of actual data -- so it is the sort and the encode, not I/O. This is where EXT.13's 3.3x loss on ordered arrival lives. Two earlier readings were wrong about it and are worth keeping: cachegrind reports 62x LMDB's last-level misses per key on this shape, which reads like a scattered write path, and I took it for one -- but the same profile puts 1% of those misses in the hash probe and the rest in `checkpoint_inner`, `seal_shard` and the memcpy inside them. Timed directly, Supdb's put path is within 1.17x of LMDB's; the whole gap is the flush. A miss count says where the misses are, not which phase is slow. This is the same fixed cost that makes Supdb indifferent to arrival order (EXT.14), so it is the price of that property rather than an oversight -- but it is embarrassingly parallel across 64 shards and is done on one thread, which is the obvious thing to try next."
-  },
-  {
-   "experiment": "f32-prealloc",
-   "id": "F32.1",
-   "profile": "full",
-   "expect": "fails",
-   "because": "It does not: 0.5798s preallocated against 0.5759s plain, ratio 0.993 at p=0.3184, and the whole load is 0.982x -- no difference either way, at dev and at full. So the 169 MB/s f31 measured for the index write is not the filesystem extending the file, and `posix_fallocate` was aimed at the wrong layer: it reserves disk blocks, and what a 68.5MB `write_all_at` into fresh page cache actually costs is the kernel allocating and populating those pages, which preallocation does not touch. The option is kept, defaulted off, because a refuted lever that can be re-measured is worth more than one that has to be rebuilt to re-ask the question. What it rules out matters more than what it found: with allocation eliminated, the remaining lever on the 41% of a sequential load that is the index write is writing less of it, or writing it once instead of twice -- `encode` builds a 68.5MB Vec and `write_all_at` copies it, where encoding straight into a mapping would not. Neither is an optimisation; both are format or write-path changes with F11.4's +73.5% attached."
   },
   {
    "experiment": "f31-loadphases",

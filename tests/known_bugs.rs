@@ -1621,3 +1621,83 @@ fn sorting_the_index_in_parallel_changes_no_order() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A reader sees a logged checkpoint, in every order and by every route.
+///
+/// `Options::redo_log` makes a durable checkpoint proportional to what
+/// changed by writing records and fsyncing them instead of rebuilding the key
+/// index. Until the reader replayed them, that was durable-but-invisible:
+/// F29.2 measured 0 of 500 keys reaching a `Reader` opened before the next
+/// full rewrite, and it was the only reason the flag defaulted off.
+///
+/// A point lookup is the easy half. The hard half is ordered access, because
+/// a logged record whose key is *new* takes a rank and shifts every published
+/// rank at or after it -- so `scan`, `keys()` and `seek` all have to see the
+/// merged order, and the fast path that walks the mapped section by rank has
+/// to stand down when there is anything to merge. This drives all of it: keys
+/// that update, keys that insert before the first published key, between two,
+/// and after the last.
+#[test]
+fn a_reader_replays_the_log_in_order() {
+    let dir = std::env::temp_dir().join(format!("supdb-replay-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s.dat");
+    let opts = || Options {
+        redo_log: true,
+        log_bytes: 1 << 20,
+        ..Default::default()
+    };
+
+    let mut model: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = Default::default();
+    let s = Store::create(&path, opts()).unwrap();
+    // Published: m-0000 .. m-0019, with a full rewrite to put them in an index.
+    for k in 0..20u32 {
+        let key = format!("m-{k:04}");
+        s.put(key.as_bytes(), b"published").unwrap();
+        model.insert(key.into_bytes(), b"published".to_vec());
+    }
+    s.checkpoint().unwrap();
+
+    // Logged only: updates to published keys, plus inserts that sort before
+    // everything (a-), between (m-0005x) and after (z-).
+    for k in (0..20u32).step_by(2) {
+        let key = format!("m-{k:04}");
+        s.put(key.as_bytes(), b"updated").unwrap();
+        model.insert(key.into_bytes(), b"updated".to_vec());
+    }
+    for (key, val) in [
+        ("a-first", "before all"),
+        ("m-0005x", "between"),
+        ("m-0011x", "between too"),
+        ("z-last", "after all"),
+    ] {
+        s.put(key.as_bytes(), val.as_bytes()).unwrap();
+        model.insert(key.as_bytes().to_vec(), val.as_bytes().to_vec());
+    }
+    s.checkpoint().unwrap();
+    s.close().unwrap();
+
+    let r = Reader::open(&path).unwrap();
+    assert_eq!(r.keys(), model.len(), "keys() must count the log's insertions");
+    // Every key, by point lookup.
+    for (k, v) in &model {
+        let mut got = Vec::new();
+        r.read_all(k, |x| got.extend_from_slice(x)).unwrap();
+        assert_eq!(&got, v, "read_all disagrees for {k:?}");
+    }
+    // And in order, which is where a mis-spliced rank shows up.
+    let mut walked: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    r.scan(None, usize::MAX, |k, v| walked.push((k.to_vec(), v.to_vec())))
+        .unwrap();
+    let want: Vec<(Vec<u8>, Vec<u8>)> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    assert_eq!(walked, want, "the merged scan is not the model");
+    // A seek lands on the merged rank, including onto an inserted key.
+    for from in ["a-first", "m-0005x", "m-0011x", "z-last", "m-0010"] {
+        let mut first = Vec::new();
+        r.scan(Some(from.as_bytes()), 1, |k, _| first = k.to_vec())
+            .unwrap();
+        assert_eq!(first, from.as_bytes(), "seek to {from:?} landed elsewhere");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
