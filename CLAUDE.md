@@ -222,6 +222,17 @@ the misparse as file corruption, and an in-place checkpoint that republished a
 record into its hash slot and not its directory entry -- so `read_all` returned
 the new value and `scan` the previous one, silently, for every key it touched.
 
+Also fixed: `live_key_off` named the live key section only when the index was
+flat *and* could be adopted for in-place editing. With the varint layout it
+stayed `None`, so the pruning loop compared every historical key section
+against "the live one", found no match, and released the one still in use. It
+was survivable for as long as every checkpoint rewrote the key section, because
+then the previous one really was superseded. The redo log breaks that
+assumption -- a logged checkpoint publishes no key section, so the last one
+outlives its generation -- and the next block table was placed on top of the
+index every reader was using. It presented as lz4 failing to decompress a
+section nobody had written there, which is three layers away from the cause.
+
 Also fixed: a delete was never marked dirty. `checkpoint_in_place` and the redo
 log both publish only what `dirty` names, so a tombstone they were asked to
 carry was dropped and the key stayed readable at its old extents. It was

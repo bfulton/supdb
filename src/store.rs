@@ -704,7 +704,7 @@ impl Default for Options {
             seal_on_put: true,
             parallel_index: true,
             index_inserts: true,
-            redo_log: false,
+            redo_log: true,
             log_bytes: 4 << 20,
             // On, now that the space cost is bounded.
             //
@@ -2531,7 +2531,7 @@ impl Store {
                 }
                 write_section_raw(&mut ap, &payload, key_reserve, self.opts.reclaim)?
             }
-            _ => write_section(&mut ap, &key_idx, self.opts.reclaim)?,
+            _ => write_section(&mut ap, &key_idx, self.opts.reclaim)?
         };
         let blk_loc = if blk_flat {
             write_section_raw(&mut ap, &blk_idx, blk_idx.len(), self.opts.reclaim)?
@@ -2789,17 +2789,28 @@ impl Store {
             }
         }
         ap.live_index = None;
+        // Whatever section the superblock names is the live one, whether or
+        // not it is the flat format and whether or not it could be adopted for
+        // in-place editing. This used to be set only inside the `flat` branch
+        // and only when adoption succeeded, which was survivable while every
+        // checkpoint rewrote the key section -- the previous one really was
+        // superseded, so releasing it was right.
+        //
+        // The redo log breaks that assumption: a logged checkpoint publishes
+        // no key section, so the previous one stays live across generations.
+        // With `live_key_off` left at None the pruning loop saw a key section
+        // that did not match "the live one" and released it, and the next
+        // block table was placed on top of the index every reader was using.
+        // It surfaced as lz4 failing to decompress a section that was never
+        // written there.
+        ap.live_key_off = Some(key_loc.off);
         if flat {
             if let Ok(map) = unsafe { MmapMut::map_mut(&ap.file) } {
                 let (o, l) = (key_loc.off as usize, key_loc.stored as usize);
-                let adopted = map
+                ap.live_index = map
                     .get(o..o.saturating_add(l))
                     .and_then(FlatIndex::parse)
                     .map(|meta| (map, meta, key_loc.off, key_loc.stored as u64));
-                if adopted.is_some() {
-                    ap.live_key_off = Some(key_loc.off);
-                }
-                ap.live_index = adopted;
             }
         }
         Ok(gen)
