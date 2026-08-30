@@ -12,7 +12,7 @@ use std::io::{Result, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-const MAGIC: u64 = 0x5355_5044_4200_0002;
+pub(crate) const MAGIC: u64 = 0x5355_5044_4200_0002;
 
 /// Two superblock slots live in the first sector-pair of the file, and a
 /// checkpoint alternates between them.
@@ -23,14 +23,14 @@ const MAGIC: u64 = 0x5355_5044_4200_0002;
 /// that matters -- a torn write can damage at most the slot being written,
 /// and the other still describes a complete, older state. Recovery picks the
 /// valid slot with the higher generation.
-const SUPER: u64 = 4096;
-const SLOT: u64 = 512;
+pub(crate) const SUPER: u64 = 4096;
+pub(crate) const SLOT: u64 = 512;
 /// Encoded size of a superblock: the fields, then the magic, then the
 /// checksum. Named because eight call sites used to slice the literal, and
 /// adding two fields to `Super` left every one of them reading a prefix that
 /// no longer contained the checksum -- a format change that presented itself
 /// as "no valid supdb checkpoint" on a healthy file.
-const SUPER_BYTES: usize = 136;
+pub(crate) const SUPER_BYTES: usize = 136;
 
 #[derive(Clone, Copy, Default, Debug)]
 struct Super {
@@ -3366,13 +3366,20 @@ impl Drop for Reader {
     }
 }
 
+// Moved to `flatindex`, unchanged, so that `blob.rs` -- which is the same
+// reader over a byte source that is not a mapping, and which must compile
+// without this file -- cannot disagree with the writer about it. Delegating
+// rather than duplicating is the point.
+//
+// This is the only line of the engine the byte-source work touched, and it
+// costs nothing: with LTO on, the `.text` of `target/release/supbench` is
+// byte-identical before and after (sha256 2a4a12ce...). CLAUDE.md requires a
+// change to be measured with both arms interleaved in one process, and there
+// is nothing to interleave here -- the two arms are the same machine code, so
+// the compiler's output is the measurement.
+#[inline]
 fn key_hash(key: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in key {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x1000_0000_01b3);
-    }
-    h
+    flatindex::key_hash(key)
 }
 
 impl Reader {

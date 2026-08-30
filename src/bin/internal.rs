@@ -107,6 +107,7 @@ fn main() -> std::io::Result<()> {
             "f25-arena" => f25_arena(&args, profile)?,
             "f26-buffer" => f26_buffer(&args, profile)?,
             "f27-ckptshape" => f27_ckptshape(&args, profile)?,
+            "f28-count" => f28_count(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -147,6 +148,7 @@ fn main() -> std::io::Result<()> {
                 "f25-arena",
                 "f26-buffer",
                 "f27-ckptshape",
+                "f28-count",
                 "f4-durability",
                 "f3-multiproc",
                 "f1-outofcore",
@@ -4208,5 +4210,275 @@ fn f8_checksums(args: &Args, profile: Profile) -> std::io::Result<Record> {
         scost < 1.0,
         format!("{scost:+.3}% on disk: four bytes per chunk plus one per block"),
     ));
+    Ok(rec)
+}
+
+/// What does counting a key's values actually cost?
+///
+/// R4.3 of the logshed requirements asks for `count(key)` "without decoding
+/// the values", and hopes it can come out of the extent list. It cannot, and
+/// this is the experiment that says so rather than a paragraph asserting it.
+/// An `Ext` is four `u32`s -- block, offset, byte length, offset of the last
+/// record -- and none of them is a count. The values inside an extent are
+/// length-prefixed varints laid end to end, so the only general way to know
+/// how many there are is to step over them.
+///
+/// Four arms, interleaved in one process over one file, which is the only way
+/// this repository allows a difference to be claimed:
+///
+///   lookup       resolve the key and stop. This is the floor, and it is
+///                exactly what an O(extents) count would cost -- so it also
+///                prices the format change that would add a per-extent count.
+///   count_fixed  the floor plus one division. Available *today*, with no
+///                format change, for a posting list whose values are all the
+///                same width -- which logshed's four-byte line ordinals are.
+///   count        the varint walk: one length prefix read per value, payload
+///                skipped, nothing handed to a callback.
+///   read_all     what exists today, with a closure that only increments.
+///
+/// The interesting comparison is not count against read_all. It is
+/// count_fixed against lookup, because that difference is the whole value of
+/// adding four bytes per extent to the format -- and it is a division.
+fn f28_count(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::bytes::MmapBytes;
+    use supdb::Blob;
+
+    let keys = args.num("--keys", profile.pick(2_000, 20_000, 50_000)) as u64;
+    let run_len = args.num("--run-len", 200) as u64;
+    let long_run = args.num("--long-run", 4_000) as u64;
+    let probes = args.num("--probes", profile.pick(20_000, 200_000, 500_000)) as u64;
+    // Four bytes, because that is what a posting is: a line ordinal.
+    let width = 4usize;
+
+    let mut rec = Record::new("f28-count", profile);
+    rec.param("keys", J::u(keys))
+        .param("run_len", J::u(run_len))
+        .param("long_run", J::u(long_run))
+        .param("probes", J::u(probes))
+        .param("value_width", J::u(width as u64))
+        .note(
+            "one file, four arms, interleaved in one process. Every arm answers the same \
+             question about the same keys and differs only in how much of the extent it has to \
+             touch to answer it",
+        );
+
+    let dir = scratch("f28");
+    let file = dir.join("count.dat");
+    // Grouped by key, which is how a day index is built -- see w1-daysize
+    // W1.3, where the alternative costs nine times the file.
+    {
+        let store = Store::create(&file, default_opts(256)).expect("create");
+        let mut kb = [0u8; 16];
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            // Every sixteenth key is long, so the file carries both the shape
+            // a breakdown panel asks about and the shape it does not.
+            let n = if i % 16 == 0 { long_run } else { run_len };
+            for v in 0..n {
+                store
+                    .append(&kb, &(v as u32).to_le_bytes()[..width])
+                    .expect("append");
+            }
+        }
+        store.checkpoint().expect("checkpoint");
+        store.close().expect("close");
+    }
+
+    let blob = Blob::open(MmapBytes::open(&file).expect("map")).expect("blob open");
+    assert!(blob.zero_copy(), "the native arm must not be copying");
+
+    let arm_names = ["lookup", "count_fixed", "count", "read_all"];
+    let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
+        let mut g = KeyGen::new(KeyDist::Uniform, keys, 0x28 + rep as u64);
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        let mut sink = 0u64;
+        for _ in 0..probes {
+            db_key_into(g.next(), &mut kb);
+            sink += match ci {
+                0 => blob.lookup(&kb).map(|e| e.len() as u64).unwrap_or(0),
+                1 => blob.count_fixed(&kb, width as u32).unwrap_or(0),
+                2 => blob.count(&kb).expect("count"),
+                _ => {
+                    let mut n = 0u64;
+                    blob.read_all(&kb, |v| {
+                        std::hint::black_box(v);
+                        n += 1;
+                    })
+                    .expect("read_all");
+                    n
+                }
+            };
+        }
+        std::hint::black_box(sink);
+        probes as f64 / t.elapsed().as_secs_f64()
+    });
+
+    let ns = |s: &supdb::bench::Samples| 1e9 / s.median();
+    rec.series(
+        "arms",
+        J::arr(
+            arm_names
+                .iter()
+                .zip(rates.iter())
+                .map(|(name, s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "probes_per_s" => J::fp(s.median(), 1),
+                        "ns_per_probe" => J::fp(ns(s), 1),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4),
+                    }
+                })
+                .collect(),
+        ),
+    );
+
+    let min = supdb::bench::MIN_EFFECT;
+    let vs_read = compare(&rates[2], &rates[3], min);
+    let fixed_vs_lookup = compare(&rates[1], &rates[0], min);
+    let count_vs_fixed = compare(&rates[1], &rates[2], min);
+    rec.compare("count_vs_read_all", vs_read.clone());
+    rec.compare("count_fixed_vs_lookup", fixed_vs_lookup.clone());
+    rec.compare("count_fixed_vs_count", count_vs_fixed.clone());
+
+    // W2.1 -- is the walk worth having at all? If counting costs what reading
+    // costs, `count` is an API convenience and should be described as one.
+    rec.finding(Finding::new(
+        "W2.1",
+        "counting a key's values by walking their length prefixes is faster than reading them",
+        matches!(vs_read.verdict, supdb::bench::stats::Verdict::Greater),
+        format!(
+            "{:.0} ns/probe to count against {:.0} to read ({}). Skipping the payload does not \
+             skip the cache lines it lies in, and the walk is a serial dependent chain -- each \
+             record's position is the previous record's length -- so there is nothing to \
+             overlap. In native Rust the callback `read_all` adds inlines to an increment, which \
+             is the rest of the difference. This is the premise R4.3 was written on and it does \
+             not hold: `count` is the correct general answer, not a cheaper one. What it is \
+             still worth is the wasm boundary, where `read_all` frames every value into a buffer \
+             for JavaScript and `count` returns one integer -- that crossing is not measured \
+             here and is not claimed",
+            ns(&rates[2]),
+            ns(&rates[3]),
+            vs_read.summary("count", "read_all")
+        ),
+    ));
+
+    // W2.2 -- the finding R4.3 actually asked about, stated as a negative.
+    rec.finding(Finding::new(
+        "W2.2",
+        "a count that is O(extents) rather than O(values) is not available from the extent list, and the difference is large",
+        matches!(count_vs_fixed.verdict, supdb::bench::stats::Verdict::Greater),
+        format!(
+            "the O(extents) form costs {:.0} ns/probe and the walk costs {:.0} ({}). An Ext \
+             records block, offset, byte length and the offset of the last record, and none of \
+             those is a count, so `count` steps over every value. `count_fixed` recovers the \
+             count in O(extents) only because a fixed-width value carries a fixed-width length \
+             prefix -- it is arithmetic on Ext::len, not a general answer",
+            ns(&rates[1]),
+            ns(&rates[2]),
+            count_vs_fixed.summary("count_fixed", "count")
+        ),
+    ));
+
+    // W2.3 -- and therefore: is the format change worth making? `lookup` is
+    // the floor a per-extent count could reach, because summing a field over
+    // a borrowed slice is nothing next to resolving the key. The gap between
+    // `lookup` and `count_fixed` is an *upper bound* on the saving: a stored
+    // count still has to iterate the extents, so it would recover the
+    // division and not the walk over them.
+    //
+    // Stated as a threshold rather than as "no difference". At `ci` these two
+    // are 4.1ns apart and the gate calls it noise; at `full` they are 9.6ns
+    // apart at p=0.0022 and it is a real difference. A claim resting on a
+    // null result would have flipped between profiles for a reason that says
+    // nothing about the engine -- which is the trap `f8-checksums` documents
+    // from the other direction.
+    const WORTH_FOUR_BYTES_NS: f64 = 20.0;
+    let saving = ns(&rates[1]) - ns(&rates[0]);
+    rec.finding(Finding::new(
+        "W2.3",
+        "storing a per-extent record count would save less than 20 ns per lookup, which is not worth four bytes per extent",
+        saving < WORTH_FOUR_BYTES_NS,
+        format!(
+            "resolving the key and stopping costs {:.0} ns/probe; the O(extents) count costs \
+             {:.0}, so at most {saving:+.1} ns is on the table and most of it is one 64-bit \
+             division ({}). Four bytes per extent is 25% on top of a 16-byte Ext and it is paid \
+             by every store forever, including the ones that never ask for a count. A schema \
+             with variable-width values is where the change would pay, and it is the case \
+             logshed does not have",
+            ns(&rates[0]),
+            ns(&rates[1]),
+            fixed_vs_lookup.summary("count_fixed", "lookup")
+        ),
+    ));
+
+    // W2.4 -- open question 4 of the requirements: does the browser need a
+    // dictionary scan at all, or should the roll precompute the breakdown
+    // panels? That turns entirely on what a scan costs, and the two forms of
+    // it are not the same order of growth. `scan_counts` pays a `count` per
+    // key, so it is O(every posting in the range) -- for a day index, the
+    // whole file. `scan_counts_fixed` is O(extents), bounded by the
+    // dictionary rather than by the traffic.
+    let span = args.num("--scan-keys", 2_000).min(keys as usize);
+    let scans = args.num("--scans", profile.pick(20, 200, 500));
+    let scan = Trial::new(profile.reps()).run(2, |ci, rep| {
+        let mut g = KeyGen::new(
+            KeyDist::Uniform,
+            keys.saturating_sub(span as u64).max(1),
+            0x2C + rep as u64,
+        );
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        let mut sink = 0u64;
+        for _ in 0..scans {
+            db_key_into(g.next(), &mut kb);
+            if ci == 0 {
+                blob.scan_counts(&kb, span, |_k, n| {
+                    sink += n;
+                    true
+                })
+                .expect("scan");
+            } else {
+                blob.scan_counts_fixed(&kb, span, width as u32, |_k, n| {
+                    sink += n.unwrap_or(0);
+                    true
+                })
+                .expect("scan");
+            }
+        }
+        std::hint::black_box(sink);
+        (scans * span) as f64 / t.elapsed().as_secs_f64()
+    });
+    let scan_cmp = compare(&scan[1], &scan[0], min);
+    rec.compare("scan_counts_fixed_vs_scan_counts", scan_cmp.clone());
+    rec.series(
+        "dictionary_scan",
+        jobj! {
+            "keys_per_scan" => J::u(span as u64),
+            "scans" => J::u(scans as u64),
+            "walked_keys_per_s" => J::fp(scan[0].median(), 1),
+            "fixed_keys_per_s" => J::fp(scan[1].median(), 1),
+            "walked_ns_per_key" => J::fp(1e9 / scan[0].median(), 1),
+            "fixed_ns_per_key" => J::fp(1e9 / scan[1].median(), 1),
+        },
+    );
+    rec.finding(Finding::new(
+        "W2.4",
+        "a browser can compute a top-N breakdown from the dictionary itself, because counting it from the extent list is at least 10x walking it",
+        scan_cmp.ratio >= 10.0
+            && matches!(scan_cmp.verdict, supdb::bench::stats::Verdict::Greater),
+        format!(
+            "over {span} keys: {:.1} ns/key walked against {:.1} counted from the extent list \
+             ({}). The walk is O(every posting in the range) and the extent form is O(extents), \
+             so the gap widens with the traffic a day carries rather than with its dictionary. \
+             This is what makes precomputing the breakdown panels at roll time unnecessary: the \
+             browser can rank the whole dictionary without touching a block",
+            1e9 / scan[0].median(),
+            1e9 / scan[1].median(),
+            scan_cmp.summary("scan_counts_fixed", "scan_counts")
+        ),
+    ));
+
+    let _ = std::fs::remove_file(&file);
     Ok(rec)
 }

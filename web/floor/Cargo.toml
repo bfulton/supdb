@@ -1,0 +1,31 @@
+# The floor: what a wasm cdylib costs before any supdb code is in it.
+#
+# R3.3 asks for a size budget and a measurement against it. A measurement of
+# the blob alone cannot say whether it is large because supdb is large or
+# because a Rust `cdylib` on wasm starts out large, and those want different
+# responses. This crate is the control: the same profile, the same std surface
+# the reader uses -- `Vec`, `String`, `format!`, `std::io::Error` and a
+# fallible entry point -- and none of supdb. `web/build.sh` builds both and
+# reports the difference, which is supdb's actual marginal cost.
+#
+# Detached from the root workspace on purpose, so it is never built or linted
+# as part of the engine.
+[workspace]
+
+[package]
+name = "supdb-wasm-floor"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false

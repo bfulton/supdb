@@ -657,7 +657,68 @@
    "profile": "full",
    "expect": "holds",
    "because": "Updating existing keys under Sync::Always runs 173,446 ops/s; inserting new ones runs 42,079 -- 4.122x at p=0.0022, on identical operation counts, identical checkpoint counts and the same durability policy. So durability is not what EXT.9's 0.010x is made of. Insertion under durability is. `checkpoint_in_place` edits the mapped index through slack instead of rewriting it, and opens with `if nkeys != meta.len() { return Ok(false) }` -- any key added or removed sends the checkpoint down the full-rewrite path, and every batch of a bulk load adds. The margin scales the way an O(key count) rewrite must: 1.067x at 20k keys, 3.282x at 100k, 4.122x at 200k. It is visible in device bytes too, 1,269.6 MB against 984.4 for the same work. This is the measurement that says where to spend: a durable Supdb is not slow, a *growing* durable Supdb is, and the in-place path already exists and is simply declined."
+  },
+  {
+   "experiment": "w1-daysize",
+   "id": "W1.1",
+   "expect": "holds",
+   "because": "The budget arithmetic under W1.2 is only arithmetic if the marginal cost of a log line is stable. Measured at full it is: 35.99 B/line between 50k and 250k lines against 36.14 between 250k and 1M, 0.4% apart, over a fixed cost of 580,221 bytes. Both quantities are difference quotients between measured points rather than the coefficients of a fitted line -- `ext-sweep` is the standing reminder of what fitting a straight line through a curve costs, where the intercept came out above the smallest point actually measured. The key count is bounded by the field cardinalities and so lands in the fixed term; the postings are one per line per indexed field and are the whole of the marginal one."
+  },
+  {
+   "experiment": "w1-daysize",
+   "id": "W1.2",
+   "expect": "holds",
+   "because": "This is the claim the whole browser design rests on, and it was settled before any of it was built. 36.14 B/line over 580,221 fixed puts a 32 MB download budget at 912,522 log lines per day at seven indexed fields. A day that fits can be downloaded whole, which means the byte source can be an OPFS synchronous access handle (R2.2(a)) and the reader API needs no asynchronous shape change -- so `flatindex::lookup` goes on returning a borrow instead of a promise. Had it not fitted, the API would have had to turn inside out into plan-then-fetch over ranged GETs. A busier day is sharded rather than downloaded: at this rate a 10M-line day is 11 objects, each under budget and each skippable by a query with a time range. The 32 MB budget is a product decision, not a measurement, and its reasoning is in `src/bin/logshed.rs`; the finding checks the engine against it."
+  },
+  {
+   "experiment": "w1-daysize",
+   "id": "W1.3",
+   "expect": "holds",
+   "because": "How the daily roll feeds the store matters more than anything else measured here. At 1M lines, appending postings in log-line order writes 831,308,040 bytes and grouping them by term first writes 36,715,464 -- 22.6x, from 44,629 inline merges against zero. Line order interleaves every key, so a hot key's run is sealed into many small extents and `merge_threshold` rewrites the whole run each time it crosses four; the dead space is F5.1's inline-merge cost showing up on the space axis instead of the latency one. The ratio grows with the day -- 5.6x at 50k lines, 11.9x at 250k, 22.6x at 1M -- so the naive roll gets worse exactly where it matters. Threshold set at 3x so the statement holds at every profile; the measured figure is in the record. This also settles open question 2 in the requirements: the roll has to sort a day's postings by term before writing them, which is a batch job in native Rust rather than anything a browser or a streaming Lambda does incidentally."
+  },
+  {
+   "experiment": "f28-count",
+   "id": "W2.1",
+   "expect": "fails",
+   "because": "R4.3 of the logshed requirements asks for a count 'without decoding the values' on the premise that this is much cheaper than reading them. It is not, and the number says so: 2,492.9 ns/probe to walk the length prefixes against 2,516.3 to read every value, a ratio of 1.009 at p=1.0000. Skipping a payload does not skip the cache lines it sits in, and the walk is a serial dependent chain -- each record's position is the previous record's length -- so there is nothing to overlap; meanwhile the callback `read_all` adds inlines to an increment. `Blob::count` is kept because it is the correct general answer and because across the wasm boundary it returns one integer where `read_all` frames every value into a buffer for JavaScript, but that crossing is not measured and is not claimed. This claim is recorded as failing so that the premise cannot be quietly re-adopted; the useful answer is W2.2."
+  },
+  {
+   "experiment": "f28-count",
+   "id": "W2.2",
+   "expect": "holds",
+   "because": "The count logshed wants is available, and it does not come from a general walk. `Blob::count_fixed` answers in 91.9 ns/probe where `Blob::count` takes 2,492.9 -- 27.1x at p=0.0022 -- because a fixed-width value carries a fixed-width length prefix, so a run of them is exactly n*(width + varint_len(width)) bytes and the count is arithmetic on `Ext::len` with no block touched at all. logshed's postings are four-byte line ordinals, so this is the call it makes. It is arithmetic on a schema, not a property of the format: an `Ext` is block, offset, byte length and the offset of the last record, and none of those is a count, which is why `count` has to step over every value. `count_fixed` checks two independent quantities before it claims a count: that the run is a whole number of strides, and that `Ext::last` -- the offset of the final record, which the format already stores so that reading the newest value is O(1) -- is exactly (n-1)*stride. The first alone is badly insufficient and was: a fixture of variable-length values produced a 17-value run whose bytes divided exactly by a stride of 4, and divisibility answered 23. `Ext::last` rejects it, because 23 records would put the last at 88 where it is at 87. Two quantities agreeing is not a proof either -- a run could be crafted to satisfy both -- so the contract is still that the caller knows its own schema, and `tests/blob.rs` carries the case."
+  },
+  {
+   "experiment": "f28-count",
+   "id": "W2.3",
+   "expect": "holds",
+   "because": "Whether to add a per-extent record count to the format, priced rather than argued. Resolving a key and stopping costs 77.0 ns/probe and the O(extents) count costs 91.9, so at most 14.9 ns is on the table and most of it is one 64-bit division -- a stored count would still have to iterate the extents. Four bytes on a 16-byte Ext is 25%, paid by every store forever including the ones that never ask for a count. So: not worth making, for a posting list. It would be worth making for a schema with variable-width values, which is the case logshed does not have. Stated as a threshold rather than as a null result on purpose: across four full runs of this experiment the pair has come out 11.4, 9.6, 6.7 and 14.9 ns apart, at p=0.0215, 0.0022, 0.0736 and 0.0022 -- three times a real difference and once not -- so a claim resting on 'no difference' would have flipped run to run for a reason that says nothing about the engine. The threshold does not."
+  },
+  {
+   "experiment": "f28-count",
+   "id": "W2.4",
+   "expect": "holds",
+   "because": "Open question 4 of the requirements -- whether a browser needs a dictionary scan at all, or whether the roll should precompute the breakdown panels -- answered with a number. Over 2,000 keys, `scan_counts` costs 1,226.4 ns/key and `scan_counts_fixed` costs 4.3: 283.0x at p=0.0022. They are different orders of growth rather than different constants, because the walked form pays a `count` per key and is therefore O(every posting in the range) -- for a day index, the whole file -- while the extent form is O(extents) and touches no block. So a 7,806-term day dictionary ranks in about 34 microseconds instead of nine milliseconds, the browser can answer top-N itself, and nothing has to be precomputed at roll time. The gap widens with the traffic a day carries rather than with the size of its dictionary, so it gets better where it matters."
+  },
+  {
+   "experiment": "w3-bundle",
+   "id": "W3.1",
+   "expect": "holds",
+   "because": "R3.3 asks for a size budget stated up front and measured against. 64 KB gzipped, and the module is 36,540 (78,293 raw). The budget is five times logshed's entire 12 KB gzipped client, which sounds generous until W3.2: the first 12.7 KB of it is the Rust standard library's floor and is not reducible from this side. It is one round trip, it is immutable and cached so it is paid per deploy rather than per query, and it is 0.1% of the 32 MB index budget it exists to read. No binding generator -- the ABI is eleven hand-written C functions passing integers and byte ranges, because a generator's shim and descriptor sections are exactly what this budget is about."
+  },
+  {
+   "experiment": "w3-bundle",
+   "id": "W3.2",
+   "expect": "holds",
+   "because": "A blob measured alone cannot say whether it is large because supdb is large or because a Rust cdylib on wasm starts out large, and those want different responses. `web/floor/` is the control: same profile, same standard-library surface (Vec, String, format!, std::io::Error, a fallible entry point), none of supdb. It is 12,670 bytes gzipped, so the floor is 35% of what ships and supdb's marginal cost is 23,870. Worth knowing before optimising: dropping lz4 from the wasm build -- which would make a compressed file unreadable in the browser -- was tried and saved 2,717 gzipped bytes, about a tenth, so it was not taken."
+  },
+  {
+   "experiment": "w3-bundle",
+   "id": "W3.3",
+   "expect": "holds",
+   "because": "23,870 bytes gzipped above the floor against a 32 KB ceiling. This is the number that moves when the reader grows, where W3.1 is the number the user pays; separating them means a future change that adds 5 KB of reader is visible here even though W3.1 would still have room."
   }
+
  ],
  "metrics": [
   {

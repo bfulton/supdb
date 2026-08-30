@@ -2,5 +2,11 @@
 /bench/external/vendor
 *.dat
 
+# Build artifacts of the browser reader: `web/build.sh` writes the module,
+# `logshed fixture` writes the day index the browser test opens.
+/web/supdb.wasm
+/web/test/out
+/web/floor/target
+
 # Subagent worktrees: separate checkouts, never part of this tree
 .claude/worktrees/
