@@ -26,7 +26,6 @@
 //! replays the whole memtable or a complete renamed segment plus a WAL
 //! whose sealed prefix is skipped by sequence number.
 
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Result, Write};
 use std::path::{Path, PathBuf};
@@ -192,19 +191,165 @@ impl Wal {
     }
 }
 
-/// Values for one key, varint-length-framed end to end -- the same framing
-/// the store's extents use, so a seal is a straight walk.
-#[derive(Default)]
-struct Run {
-    bytes: Vec<u8>,
+/// The memtable, built so that an append allocates nothing per key or per
+/// value: f42's decomposition priced the HashMap<Box<[u8]>, Vec> version at
+/// 456k ops/s of the gap to the floor, more than the seal itself (F42.3).
+/// Keys live in one bump arena; values live in another as per-key backward
+/// chains (each chunk records the previous chunk's offset, and a read or
+/// seal walks the chain and reverses it); the table is open-addressed with
+/// linear probing at load <= 0.5, resized by rehash of the fixed-size
+/// entries only -- key and value bytes never move.
+struct MemTable {
+    entries: Vec<MemEntry>,
+    mask: usize,
+    len: usize,
+    keys: Vec<u8>,
+    vals: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct MemEntry {
+    hash: u64,
+    key_off: u32,
+    key_len: u32,
+    /// Offset+1 of this key's newest chunk in `vals`; 0 = vacant slot.
+    head: u64,
     count: u64,
+}
+
+const NO_CHUNK: u64 = u64::MAX;
+
+fn mem_hash(key: &[u8]) -> u64 {
+    // FNV-1a, then a splitmix finish; the std SipHash was part of what f42
+    // priced.
+    let mut h = 0xcbf29ce484222325u64;
+    for &b in key {
+        h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+    }
+    h = (h ^ (h >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    h | 1 // 0 marks a vacant slot
+}
+
+impl MemTable {
+    fn new() -> MemTable {
+        MemTable {
+            entries: vec![MemEntry::default(); 1024],
+            mask: 1023,
+            len: 0,
+            keys: Vec::new(),
+            vals: Vec::new(),
+        }
+    }
+
+    fn key_of<'a>(keys: &'a [u8], e: &MemEntry) -> &'a [u8] {
+        &keys[e.key_off as usize..(e.key_off + e.key_len) as usize]
+    }
+
+    fn grow(&mut self) {
+        let cap = self.entries.len() * 2;
+        let mut entries = vec![MemEntry::default(); cap];
+        let mask = cap - 1;
+        for e in self.entries.iter().filter(|e| e.hash != 0) {
+            let mut i = (e.hash as usize) & mask;
+            while entries[i].hash != 0 {
+                i = (i + 1) & mask;
+            }
+            entries[i] = *e;
+        }
+        self.entries = entries;
+        self.mask = mask;
+    }
+
+    fn append(&mut self, key: &[u8], value: &[u8]) {
+        if (self.len + 1) * 2 > self.entries.len() {
+            self.grow();
+        }
+        let hash = mem_hash(key);
+        let mut i = (hash as usize) & self.mask;
+        loop {
+            let e = self.entries[i];
+            if e.hash == 0 {
+                let key_off = self.keys.len() as u32;
+                self.keys.extend_from_slice(key);
+                let head = self.push_chunk(NO_CHUNK, value);
+                self.entries[i] = MemEntry {
+                    hash,
+                    key_off,
+                    key_len: key.len() as u32,
+                    head: head + 1,
+                    count: 1,
+                };
+                self.len += 1;
+                return;
+            }
+            if e.hash == hash && MemTable::key_of(&self.keys, &e) == key {
+                let head = self.push_chunk(e.head - 1, value);
+                self.entries[i].head = head + 1;
+                self.entries[i].count += 1;
+                return;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    fn push_chunk(&mut self, prev: u64, value: &[u8]) -> u64 {
+        let off = self.vals.len() as u64;
+        self.vals.extend_from_slice(&prev.to_le_bytes());
+        put_uvarint(&mut self.vals, value.len() as u64);
+        self.vals.extend_from_slice(value);
+        off
+    }
+
+    /// Chunk offsets for one entry, oldest first.
+    fn chain(&self, e: &MemEntry) -> Vec<usize> {
+        let mut offs = Vec::with_capacity(e.count as usize);
+        let mut at = e.head - 1;
+        while at != NO_CHUNK {
+            offs.push(at as usize);
+            at = u64::from_le_bytes(self.vals[at as usize..at as usize + 8].try_into().unwrap());
+        }
+        offs.reverse();
+        offs
+    }
+
+    fn value_at(&self, off: usize) -> &[u8] {
+        let mut p = off + 8;
+        let len = get_uvarint(&self.vals, &mut p).expect("memtable framing") as usize;
+        &self.vals[p..p + len]
+    }
+
+    fn get(&self, key: &[u8]) -> Option<&MemEntry> {
+        let hash = mem_hash(key);
+        let mut i = (hash as usize) & self.mask;
+        loop {
+            let e = &self.entries[i];
+            if e.hash == 0 {
+                return None;
+            }
+            if e.hash == hash && MemTable::key_of(&self.keys, e) == key {
+                return Some(e);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn clear(&mut self) {
+        self.entries.iter_mut().for_each(|e| *e = MemEntry::default());
+        self.len = 0;
+        self.keys.clear();
+        self.vals.clear();
+    }
 }
 
 pub struct Db {
     dir: PathBuf,
     opts: NextOptions,
     wal: Wal,
-    mem: HashMap<Box<[u8]>, Run>,
+    mem: MemTable,
     mem_bytes: usize,
     /// Sequence number of the first record NOT covered by a sealed segment;
     /// persisted implicitly by the WAL reset (a reset WAL means everything
@@ -241,7 +386,7 @@ impl Db {
             dir: dir.to_path_buf(),
             opts,
             wal,
-            mem: HashMap::new(),
+            mem: MemTable::new(),
             mem_bytes: 0,
             sealed_seq: 0,
             segs: Vec::new(),
@@ -279,14 +424,11 @@ impl Db {
         // the last seal; everything before it is covered and skipped, which
         // is what makes the rename-then-reset crash window safe.
         let sealed = seg_ids.last().map_or(0, |&(_, end)| end);
-        let mut mem: HashMap<Box<[u8]>, Run> = HashMap::new();
+        let mut mem = MemTable::new();
         let mut mem_bytes = 0usize;
         let wal_path = Db::wal_path(dir);
         let next_seq = Wal::replay(&wal_path, sealed, |k, v| {
-            let run = mem.entry(k.into()).or_default();
-            put_uvarint(&mut run.bytes, v.len() as u64);
-            run.bytes.extend_from_slice(v);
-            run.count += 1;
+            mem.append(k, v);
             mem_bytes += k.len() + v.len();
         })?;
         let file = OpenOptions::new().create(true).append(true).open(&wal_path)?;
@@ -307,10 +449,7 @@ impl Db {
     /// which is the read-your-writes contract `Store::read_all` set.
     pub fn append(&mut self, key: &[u8], value: &[u8]) {
         self.wal.append(key, value);
-        let run = self.mem.entry(key.into()).or_default();
-        put_uvarint(&mut run.bytes, value.len() as u64);
-        run.bytes.extend_from_slice(value);
-        run.count += 1;
+        self.mem.append(key, value);
         self.mem_bytes += key.len() + value.len();
     }
 
@@ -337,16 +476,12 @@ impl Db {
         {
             let store = Store::create(&tmp, Db::segment_opts(&self.opts))
                 .map_err(|e| err(&format!("seal create: {e}")))?;
-            for (key, run) in self.mem.iter() {
-                let mut p = 0usize;
-                while p < run.bytes.len() {
-                    let len = get_uvarint(&run.bytes, &mut p)
-                        .ok_or_else(|| err("memtable framing is malformed"))?
-                        as usize;
+            for e in self.mem.entries.iter().filter(|e| e.hash != 0) {
+                let key = MemTable::key_of(&self.mem.keys, e);
+                for off in self.mem.chain(e) {
                     store
-                        .append(key, &run.bytes[p..p + len])
+                        .append(key, self.mem.value_at(off))
                         .map_err(|e| err(&format!("seal append: {e}")))?;
-                    p += len;
                 }
             }
             store.checkpoint().map_err(|e| err(&format!("seal checkpoint: {e}")))?;
@@ -375,15 +510,11 @@ impl Db {
                 .read_all(key, &mut f)
                 .map_err(|e| err(&format!("segment read: {e}")))?;
         }
-        if let Some(run) = self.mem.get(key) {
-            let mut p = 0usize;
-            while p < run.bytes.len() {
-                let len = get_uvarint(&run.bytes, &mut p)
-                    .ok_or_else(|| err("memtable framing is malformed"))? as usize;
-                f(&run.bytes[p..p + len]);
-                p += len;
+        if let Some(e) = self.mem.get(key) {
+            for off in self.mem.chain(e) {
+                f(self.mem.value_at(off));
             }
-            n += run.count;
+            n += e.count;
         }
         Ok(n)
     }
