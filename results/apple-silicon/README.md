@@ -75,6 +75,30 @@ and the same conclusion from both: what remains on this axis is amortizing
 work per point (the seal, the 64-shard block writes), not shrinking the
 synced bytes further.
 
+## Fourth campaign: the value log under the same barrier
+
+Run 3 on 3f08f11, the head that carries `Options::log_values`
+(`ext-kv-durable-pair.run3-valuelog.json`): supdb-durable 83,865 ops/s vs
+lmdb 171,108, **0.490x** at p=0.0022, rel_iqr 1.9%/2.0%. The comparator
+moved 3.5% over the run2 pair; supdb moved **+19.3%**.
+
+The third campaign ended by predicting exactly this experiment: it said the
+synced bytes were already off the table and "what remains on this axis is
+amortizing work per point (the seal, the 64-shard block writes)". The value
+log is that amortization -- a durability point now appends unsealed bytes
+and seals nothing -- and it bought 19.3% under a barrier whose cost the
+bytes cannot move. Against the same change's +30.6% on Linux, the gain
+compressed but did not vanish: the seal-and-section work was a real minority
+term even under `F_FULLFSYNC`, and the residual 2.04x gap with both engines
+paying exactly one barrier per batch is the barrier-count floor, now
+measured on both sides of the change.
+
+This is also the first run on this host with the device-byte column
+populated (`proc_pid_rusage` landed between run2 and run3): supdb-durable
+sends 831.9 MB per load against lmdb's 199.1, ~7.2x amplification against
+1.7x -- and the x86 record for the identical workload reads ~834 MB, the
+two platforms agreeing on the write path's footprint to within 0.3%.
+
 Aside, observed but not gated (no finding is emitted for it): in this pair
 supdb-durable read at 2.25M ops/s against lmdb's 1.07M on the loaded store.
 The x86 read comparison (`EXT.11`) uses the buffered arm and cannot
