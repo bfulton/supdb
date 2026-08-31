@@ -430,12 +430,13 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         .note(
             "workload shape follows redb's own benchmark; batch size is identical for every engine",
         )
-        .note(
+        .note(format!(
             "load_rss_mb is the delta of current RSS across the load, not a peak: VmHWM never \
              falls, so with several engines interleaved in one process a high-water mark set by \
              one contaminates every engine after it. load_device_write_mb comes from \
-             /proc/self/io and is a different quantity from file size",
-        )
+             {} and is a different quantity from file size",
+            supdb::bench::env::device_write_counter_source()
+        ))
         .note(
             "engines interleaved round-robin over reps, one warmup round discarded; medians \
              reported, and every ordering gated on stats::compare",
@@ -567,8 +568,9 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
             "read_hit_rate" => J::fp(hit[ei], 4),
             "load_rss_mb" => J::fp(rss[ei].median(), 1),
             "load_rss" => rss[ei].to_json(),
-            // From /proc/self/io, never inferred from file size: the two are
-            // different quantities and the rule says so.
+            // From the device-level counter (named per platform in this
+            // record's env block and note), never inferred from file size:
+            // the two are different quantities and the rule says so.
             "load_device_write_mb" => J::fp(wrote[ei].median(), 1),
             "load_write_amp" => J::fp(
                 wrote[ei].median() * 1048576.0 / (n as f64 * (16.0 + value_size as f64)).max(1.0),

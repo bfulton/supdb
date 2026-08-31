@@ -159,6 +159,11 @@ impl Env {
             "pmu_available" => J::Bool(self.pmu_available),
             "smt_on" => J::Bool(self.smt_on),
             "aslr_disabled" => J::Bool(self.aslr_disabled),
+            // Provenance for the two counters whose platform analogues are not
+            // the same quantity. A write-amp figure is only comparable to
+            // another one when both records name the same counter here.
+            "rss_counter" => J::s(rss_counter_source()),
+            "device_write_counter" => J::s(device_write_counter_source()),
             "machine" => super::machine::Machine::detect().to_json(),
             "warnings" => J::arr(self.warnings().iter().map(J::s).collect()),
         }
@@ -181,11 +186,21 @@ pub fn mem_total_bytes() -> u64 {
 ///
 /// A fully resident key index is memory spent to buy read speed. Reporting it
 /// alongside throughput is what turns an unqualified win into a stated trade.
+#[cfg(not(target_os = "macos"))]
 pub fn peak_rss_bytes() -> u64 {
     first_line_after("/proc/self/status", "VmHWM")
         .and_then(|v| v.split_whitespace().next().map(|s| s.to_string()))
         .and_then(|v| v.parse::<u64>().ok())
         .map(|kb| kb * 1024)
+        .unwrap_or(0)
+}
+
+/// macOS: `resident_size_max` from mach `task_info`, the analogue of VmHWM.
+/// See the `darwin` module for what "analogue" does and does not promise.
+#[cfg(target_os = "macos")]
+pub fn peak_rss_bytes() -> u64 {
+    darwin::task_basic_info()
+        .map(|i| i.resident_size_max)
         .unwrap_or(0)
 }
 
@@ -196,6 +211,7 @@ pub fn peak_rss_bytes() -> u64 {
 /// building the inputs spiked resident memory above what the structure itself
 /// occupies, the delta between two peak readings is zero. That produced
 /// "2.1 bytes per key" for a structure that plainly costs seventeen.
+#[cfg(not(target_os = "macos"))]
 pub fn rss_bytes() -> u64 {
     first_line_after("/proc/self/status", "VmRSS")
         .and_then(|v| v.split_whitespace().next().map(|s| s.to_string()))
@@ -204,11 +220,105 @@ pub fn rss_bytes() -> u64 {
         .unwrap_or(0)
 }
 
+/// macOS: `resident_size` from mach `task_info`, the analogue of VmRSS.
+#[cfg(target_os = "macos")]
+pub fn rss_bytes() -> u64 {
+    darwin::task_basic_info()
+        .map(|i| i.resident_size)
+        .unwrap_or(0)
+}
+
+/// Names the counter behind `rss_bytes` / `peak_rss_bytes` on this platform.
+/// Recorded in every env block so a record taken on macOS cannot be silently
+/// read as a Linux /proc figure.
+pub fn rss_counter_source() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "mach task_info MACH_TASK_BASIC_INFO resident_size (process-level analogue of \
+         /proc/self/status VmRSS/VmHWM, not the identical quantity)"
+    } else {
+        "/proc/self/status"
+    }
+}
+
+/// Names the counter behind `IoCounters::write_bytes` on this platform.
+///
+/// The Linux quantity is specific -- bytes this process caused to be sent to
+/// the block layer -- and rule 4 says write amplification is measured from it,
+/// never inferred from file size. The macOS counter is the closest
+/// process-level analogue xnu keeps, not the same quantity, so the env block
+/// of every record names which one produced the number: a Mac record must not
+/// be read as a Linux-comparable write-amp figure.
+pub fn device_write_counter_source() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "proc_pid_rusage RUSAGE_INFO_V2 ri_diskio_byteswritten (process-level analogue of \
+         /proc/self/io write_bytes, not the identical quantity)"
+    } else {
+        "/proc/self/io"
+    }
+}
+
+/// The macOS analogues of the /proc counters, kept in one place.
+///
+/// These are process-level analogues, not the Linux quantities under other
+/// names: `ri_diskio_byteswritten` is xnu's per-process disk-I/O ledger where
+/// /proc/self/io `write_bytes` counts bytes sent to the block layer, and mach
+/// `resident_size` is the task's resident footprint where VmRSS is the
+/// process's. Close enough to make a Mac record legible, not close enough to
+/// compare against a Linux one -- which is why `rss_counter_source` and
+/// `device_write_counter_source` go into every env block.
+///
+/// Every call here degrades to "counter absent" on a syscall failure, and the
+/// callers above turn that into 0 -- exactly what the /proc reads used to
+/// return on this platform -- rather than panicking. A wrong answer from the
+/// kernel loses a column, not a run.
+#[cfg(target_os = "macos")]
+mod darwin {
+    /// `MACH_TASK_BASIC_INFO` for this task, or `None` if the kernel refused.
+    pub fn task_basic_info() -> Option<libc::mach_task_basic_info> {
+        let mut info: libc::mach_task_basic_info = unsafe { std::mem::zeroed() };
+        let mut count: libc::mach_msg_type_number_t = libc::MACH_TASK_BASIC_INFO_COUNT;
+        // SAFETY: `info` is a zero-initialized mach_task_basic_info, `count`
+        // holds its size in natural_t units as the call requires, and
+        // mach_task_self() names the calling task.
+        let kr = unsafe {
+            libc::task_info(
+                libc::mach_task_self(),
+                libc::MACH_TASK_BASIC_INFO,
+                &mut info as *mut libc::mach_task_basic_info as libc::task_info_t,
+                &mut count,
+            )
+        };
+        (kr == libc::KERN_SUCCESS).then_some(info)
+    }
+
+    /// `RUSAGE_INFO_V2` for this process, or `None` if the kernel refused.
+    pub fn rusage_v2() -> Option<libc::rusage_info_v2> {
+        let mut ru: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+        // SAFETY: the RUSAGE_INFO_V2 flavor tells the kernel the buffer is a
+        // rusage_info_v2, which it is, and the pid names this process. The
+        // double-pointer-looking cast matches Apple's own declaration --
+        // `rusage_info_t *buffer` where rusage_info_t is `void *` -- and the
+        // convention every caller of it uses: a pointer to the struct itself,
+        // cast to that parameter type.
+        let rc = unsafe {
+            libc::proc_pid_rusage(
+                std::process::id() as libc::c_int,
+                libc::RUSAGE_INFO_V2,
+                &mut ru as *mut libc::rusage_info_v2 as *mut libc::rusage_info_t,
+            )
+        };
+        (rc == 0).then_some(ru)
+    }
+}
+
 /// Bytes this process has actually caused to be sent to storage.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IoCounters {
     /// From /proc/self/io `write_bytes`: bytes sent to the block layer.
     /// Unlike file size, this counts data that was later reused or truncated.
+    /// On macOS this is `ri_diskio_byteswritten` instead -- a process-level
+    /// analogue, not the identical quantity; `device_write_counter_source`
+    /// names which one a record was taken with.
     pub write_bytes: u64,
     pub read_bytes: u64,
     /// Logical bytes passed to write syscalls, for comparison. The gap between
@@ -217,6 +327,25 @@ pub struct IoCounters {
 }
 
 impl IoCounters {
+    /// macOS: the disk-I/O ledger from `proc_pid_rusage`. `write_bytes` and
+    /// `read_bytes` are process-level analogues of the Linux counters, not the
+    /// identical quantities (`device_write_counter_source` says so in every
+    /// record). There is no macOS counter for `wchar`, so it stays 0 and
+    /// page-cache absorption reads as unmeasured rather than as zero pages
+    /// absorbed.
+    #[cfg(target_os = "macos")]
+    pub fn read_now() -> IoCounters {
+        match darwin::rusage_v2() {
+            Some(ru) => IoCounters {
+                write_bytes: ru.ri_diskio_byteswritten,
+                read_bytes: ru.ri_diskio_bytesread,
+                wchar: 0,
+            },
+            None => IoCounters::default(),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub fn read_now() -> IoCounters {
         let mut c = IoCounters::default();
         if let Some(s) = read("/proc/self/io") {
