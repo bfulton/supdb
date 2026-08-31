@@ -345,6 +345,12 @@ pub struct Db {
     /// out; `join_seal` collects the finished segment.
     frozen: Option<std::sync::Arc<MemTable>>,
     sealing: Option<std::thread::JoinHandle<Result<PathBuf>>>,
+    /// Sorted keys of the unsealed sources (memtable + frozen), built lazily
+    /// by `scan` and reused until a write or a seal changes what is
+    /// unsealed. Without this, every scan walked the whole memtable: the
+    /// ext-kv scan phase spent 15 minutes a rep in that walk, twice -- once
+    /// through the live table and once through the frozen one.
+    scan_keys: std::cell::RefCell<Option<(u64, Vec<Vec<u8>>)>>,
 }
 
 impl Db {
@@ -383,6 +389,7 @@ impl Db {
             next_seg: 0,
             frozen: None,
             sealing: None,
+            scan_keys: std::cell::RefCell::new(None),
         })
     }
 
@@ -455,6 +462,7 @@ impl Db {
             next_seg,
             frozen: None,
             sealing: None,
+            scan_keys: std::cell::RefCell::new(None),
         })
     }
 
@@ -602,7 +610,31 @@ impl Db {
         limit: usize,
         mut f: F,
     ) -> Result<usize> {
-        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let gen = self.wal.seq ^ (self.next_seg << 48) ^ ((self.frozen.is_some() as u64) << 63);
+        {
+            let mut cache = self.scan_keys.borrow_mut();
+            let stale = cache.as_ref().is_none_or(|(g, _)| *g != gen);
+            if stale {
+                let mut all: Vec<Vec<u8>> = Vec::with_capacity(self.mem.len);
+                let mut take = |mem: &MemTable| {
+                    for e in mem.entries.iter().filter(|e| e.hash != 0) {
+                        all.push(MemTable::key_of(&mem.keys, e).to_vec());
+                    }
+                };
+                if let Some(fr) = &self.frozen {
+                    take(fr);
+                }
+                take(&self.mem);
+                all.sort_unstable();
+                all.dedup();
+                *cache = Some((gen, all));
+            }
+        }
+        let cache = self.scan_keys.borrow();
+        let unsealed = &cache.as_ref().expect("scan snapshot").1;
+        let start = unsealed.partition_point(|k| k.as_slice() < from);
+        let mut keys: Vec<Vec<u8>> =
+            unsealed[start..start + limit.min(unsealed.len() - start)].to_vec();
         for seg in &self.segs {
             seg.scan_counts(from, limit, |k, _| {
                 keys.push(k.to_vec());
@@ -610,18 +642,6 @@ impl Db {
             })
             .map_err(|e| err(&format!("segment scan: {e}")))?;
         }
-        let mut mem_keys = |mem: &MemTable| {
-            for e in mem.entries.iter().filter(|e| e.hash != 0) {
-                let k = MemTable::key_of(&mem.keys, e);
-                if k >= from {
-                    keys.push(k.to_vec());
-                }
-            }
-        };
-        if let Some(fr) = &self.frozen {
-            mem_keys(fr);
-        }
-        mem_keys(&self.mem);
         keys.sort_unstable();
         keys.dedup();
         keys.truncate(limit);

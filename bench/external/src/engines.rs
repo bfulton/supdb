@@ -389,11 +389,13 @@ impl Engine for Next {
     }
     fn sync(&mut self) -> Res<()> {
         if let Some(db) = self.db.as_mut() {
-            // Drain at the phase boundary, as a deployment would before a
-            // read-heavy period: commit, seal, AND join. seal() alone left
-            // the frozen memtable readable for the whole scan phase and the
-            // 15-minute-per-rep artifact came straight back through it.
-            db.flush().map_err(|e| e.to_string())?;
+            // Just the durability contract: the WAL made everything durable
+            // and the read path serves the memtable, so sync() owes nothing
+            // more. An earlier version drained (seal + join) here to dodge a
+            // scan artifact, which charged ~2s of segment writing into the
+            // suite's load window -- the artifact is now fixed where it
+            // lived, in Db::scan's per-call memtable walk.
+            db.commit().map_err(|e| e.to_string())?;
         }
         Ok(())
     }
