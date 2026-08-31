@@ -485,6 +485,74 @@ fn a_deferred_consolidated_store_reads_the_same_and_counts_exactly() {
     assert_eq!(blob.count_fixed(b"mixed", 10), None);
 }
 
+/// The under-return the downstream requirements document reported: corrupt a
+/// byte *inside* a data block and the store still opens cleanly -- the header,
+/// key index and block table are untouched -- so the only place the damage can
+/// surface is the read itself. It must surface as an error. An empty or
+/// partial answer here is the browser quietly answering a different question,
+/// which is the single thing this index may never do.
+///
+/// The engine side already held: `verify` fails the checksum and `read_all`
+/// propagates it. What swallowed it was the JS glue comparing a wasm `u32`
+/// failure sentinel (arriving as a signed -1) against 4294967295; this test
+/// pins the native half, `web/test/node.mjs` pins the JS half.
+#[test]
+fn a_corrupted_block_byte_fails_the_read_rather_than_under_returning() {
+    let path = scratch("corrupt-block");
+    let want = build(&path, 120, Options::default());
+    // k=2 holds 17 values: one extent, so its block range is unambiguous.
+    let key = want[2].0.clone();
+    let clean = std::fs::read(&path).unwrap();
+
+    // Find a byte inside the key's own extent -- not merely inside its block,
+    // whose other chunks belong to other keys and are not verified by this
+    // key's read. `ranges_for` names the extent's block as (off, stored), and
+    // the extent's bytes start `e.off` into it.
+    let blob = Blob::open(VecBytes(clean.clone())).expect("clean open");
+    let exts = blob.lookup(&key).expect("key exists");
+    assert_eq!(exts.len(), 1, "the fixture key must hold a single extent");
+    let e = exts[0];
+    let ranges = blob.ranges_for(&key).expect("plan");
+    assert_eq!(ranges.len(), 1);
+    let at = (ranges[0].0 + e.off as u64 + e.len as u64 / 2) as usize;
+    // A key that lives in a different block: verification granularity is the
+    // block, so a neighbour in the same one would rightly fail too.
+    let (other, other_vals) = want
+        .iter()
+        .find(|(k, _)| blob.ranges_for(k).unwrap() != ranges)
+        .expect("the fixture spans more than one block")
+        .clone();
+    drop(blob);
+
+    let mut bytes = clean;
+    bytes[at] ^= 0xff;
+    let blob = Blob::open(VecBytes(bytes)).expect("damage inside a block does not stop the open");
+
+    let err = blob
+        .read_all(&key, |_| {})
+        .expect_err("a checksum mismatch must fail the read, not empty it");
+    assert!(err.to_string().contains("checksum"), "unhelpful error: {err}");
+    // The *second* read of the same block is its own regression: the first
+    // version of `Blob::verify` marked a chunk verified before comparing its
+    // checksum, so one failed read poisoned the bitmap and the next read
+    // served the corrupt bytes as already-verified.
+    let err = blob
+        .count(&key)
+        .expect_err("the walked count reads the block and must fail with it");
+    assert!(err.to_string().contains("checksum"), "unhelpful error: {err}");
+    let err = blob
+        .read_all(&key, |_| {})
+        .expect_err("the failure must repeat, not report once and go quiet");
+    assert!(err.to_string().contains("checksum"), "unhelpful error: {err}");
+
+    // A key in another block still answers: the damage is one block's, not
+    // the file's.
+    let mut got = Vec::new();
+    blob.read_all(&other, |v| got.push(v.to_vec()))
+        .expect("undamaged key");
+    assert_eq!(got, other_vals);
+}
+
 #[test]
 fn a_truncated_object_is_refused_at_open() {
     let path = scratch("truncated");

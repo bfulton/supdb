@@ -101,9 +101,17 @@ export class SupdbReader {
     return this.mod.instance.exports;
   }
 
+  // Every wasm return crosses this. A wasm u32 arrives in JavaScript as a
+  // *signed* i32 and a u64 as a signed BigInt, so a failure sentinel of
+  // u32::MAX arrives as -1 and a comparison against 4294967295 can never
+  // match -- which meant every error check in this file was dead and a
+  // failed call was indistinguishable from an empty answer. The convention
+  // is: normalize to unsigned at the boundary, compare unsigned, return the
+  // unsigned value. `web/test/node.mjs` carries the zeroed-object repro.
   check(v, sentinel) {
-    if (v === sentinel) throw new Error(this.mod.lastError());
-    return v;
+    const u = typeof v === "bigint" ? BigInt.asUintN(64, v) : v >>> 0;
+    if (u === sentinel) throw new Error(this.mod.lastError());
+    return u;
   }
 
   /// R4.5
@@ -151,9 +159,8 @@ export class SupdbReader {
   /// boundary per value. See `countFixed` for the O(extents) form.
   count(key) {
     const v = this.mod.withKey(key, (p, l) =>
-      this.exports.supdb_count(this.handle, p, l),
+      this.check(this.exports.supdb_count(this.handle, p, l), 0xffffffffffffffffn),
     );
-    if (v === 0xffffffffffffffffn) throw new Error(this.mod.lastError());
     return Number(v);
   }
 
@@ -166,7 +173,8 @@ export class SupdbReader {
     const v = this.mod.withKey(key, (p, l) =>
       this.exports.supdb_count_fixed(this.handle, p, l, width),
     );
-    if (v === 0xffffffffffffffffn) return null;
+    // Signed on arrival, like every i64 return -- normalize before comparing.
+    if (BigInt.asUintN(64, v) === 0xffffffffffffffffn) return null;
     return Number(v);
   }
 
@@ -174,9 +182,8 @@ export class SupdbReader {
   /// O(extents). This is the input to "is the index cheaper than a scan".
   storedBytes(key) {
     const v = this.mod.withKey(key, (p, l) =>
-      this.exports.supdb_stored_bytes(this.handle, p, l),
+      this.check(this.exports.supdb_stored_bytes(this.handle, p, l), 0xffffffffffffffffn),
     );
-    if (v === 0xffffffffffffffffn) throw new Error(this.mod.lastError());
     return Number(v);
   }
 
@@ -260,6 +267,9 @@ export class SupdbReader {
       at += 12;
       // Both halves set is the sentinel for "this key's values are not all
       // the width you asked about", which only `scanCountsFixed` produces.
+      // `getUint32` already answers unsigned, so no `>>> 0` is needed here --
+      // this is the one sentinel in the file that never had the i32 problem,
+      // because it is read out of the frame rather than returned by a call.
       const missing = lo === 0xffffffff && hi === 0xffffffff;
       out[i] = {
         key: m.dec.decode(m.mem.subarray(at, at + klen)),
@@ -310,7 +320,10 @@ export async function openMemory(wasm, bytes) {
   const mod = new Module(instance, "memory");
   const ptr = instance.exports.supdb_alloc(u8.length);
   new Uint8Array(instance.exports.memory.buffer).set(u8, ptr);
-  const h = instance.exports.supdb_open_mem(ptr, u8.length);
+  // `>>> 0`, because the u32 handle arrives as a signed i32 and u32::MAX as
+  // -1. This exact comparison was dead for as long as it compared raw, and a
+  // reader over an object that failed to open answered [] for every key.
+  const h = instance.exports.supdb_open_mem(ptr, u8.length) >>> 0;
   if (h === 0xffffffff) throw new Error(mod.lastError());
   return new SupdbReader(mod, h);
 }
@@ -345,7 +358,7 @@ export async function openSyncHandle(wasm, handle) {
   const instance = await instantiate(wasm, host);
   mem = instance.exports.memory;
   const mod = new Module(instance, "opfs");
-  const h = instance.exports.supdb_open_host();
+  const h = instance.exports.supdb_open_host() >>> 0;
   if (h === 0xffffffff) throw new Error(mod.lastError());
   return new SupdbReader(mod, h);
 }
@@ -393,11 +406,11 @@ export async function openCached(wasm, cache) {
   await cache.ensure([[0, probe]]);
   const head = new Uint8Array(Math.min(probe, cache.length));
   cache.readInto(0, head);
-  const framed = mod.withKey(head, (p, l) => e.supdb_open_plan(p, l, cache.length));
+  const framed = mod.withKey(head, (p, l) => e.supdb_open_plan(p, l, cache.length)) >>> 0;
   if (framed === 0xffffffff) throw new Error(mod.lastError());
   await cache.ensure(mod.ranges());
 
-  const h = e.supdb_open_host();
+  const h = e.supdb_open_host() >>> 0;
   if (h === 0xffffffff) {
     const why = cache.lastReadError ? ` (${cache.lastReadError})` : "";
     throw new Error(mod.lastError() + why);

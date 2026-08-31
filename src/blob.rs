@@ -625,18 +625,29 @@ impl<B: Bytes> Blob<B> {
     }
 
     /// Has chunk `j` of block `i` already been checksummed by this reader?
-    fn mark_verified(&self, i: u32, j: usize) -> bool {
+    ///
+    /// Asking and recording are separate on purpose, and the order is the
+    /// point: a chunk is marked only *after* its checksum matched. The first
+    /// version test-and-set before comparing, so one failed verification
+    /// poisoned the bitmap and the very next read of the same block served
+    /// the corrupt bytes as already-verified -- an error that reported once
+    /// and then stopped. `store::Reader::verify_range` always had the right
+    /// order; `tests/blob.rs` now pins this one.
+    fn is_verified(&self, i: u32, j: usize) -> bool {
         let slot = i as usize * block::MAX_CHUNK_CRCS + j;
         let (w, bit) = (slot / 64, 1u64 << (slot % 64));
-        let mut v = self.verified.borrow_mut();
-        match v.get_mut(w) {
-            Some(cell) => {
-                let seen = *cell & bit != 0;
-                *cell |= bit;
-                seen
-            }
-            // No room to remember: check every time rather than skip.
-            None => false,
+        // Out of room means never remembered: check every time rather than skip.
+        self.verified
+            .borrow()
+            .get(w)
+            .is_some_and(|cell| cell & bit != 0)
+    }
+
+    fn set_verified(&self, i: u32, j: usize) {
+        let slot = i as usize * block::MAX_CHUNK_CRCS + j;
+        let (w, bit) = (slot / 64, 1u64 << (slot % 64));
+        if let Some(cell) = self.verified.borrow_mut().get_mut(w) {
+            *cell |= bit;
         }
     }
 
@@ -650,12 +661,13 @@ impl<B: Bytes> Blob<B> {
             return Ok(());
         }
         let whole = |this: &Self| -> Result<()> {
-            if this.mark_verified(id, 0) {
+            if this.is_verified(id, 0) {
                 return Ok(());
             }
             if block::crc32(raw) != loc.crc {
                 return Err(corrupt("block checksum mismatch"));
             }
+            this.set_verified(id, 0);
             Ok(())
         };
         if !loc.chunk_crc || hi > raw.len() || lo >= hi {
@@ -671,12 +683,13 @@ impl<B: Bytes> Blob<B> {
             let (Some(want), true) = (self.blocks.chunk_crc(sec, id as usize, j), a < b) else {
                 return whole(self);
             };
-            if self.mark_verified(id, j) {
+            if self.is_verified(id, j) {
                 continue;
             }
             if block::crc32(&raw[a..b]) != want {
                 return Err(corrupt("block checksum mismatch"));
             }
+            self.set_verified(id, j);
         }
         Ok(())
     }

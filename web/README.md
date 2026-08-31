@@ -17,7 +17,7 @@ web/test/run.sh        # build a real day index and read it in Chromium
 | `worker.mjs` | the Web Worker the reader runs in, and why it has to |
 | `build.sh` | builds the module and the floor, records `w3-bundle` |
 | `floor/` | an empty cdylib with the same std surface -- the size control |
-| `test/` | two real index files, a real browser, OPFS and ranged HTTP |
+| `test/` | two real index files, a real browser, OPFS and ranged HTTP; `test/node.mjs` runs the error paths in Node, where the browser suite only walks the happy path |
 
 ## The one decision everything else follows from
 
@@ -149,6 +149,21 @@ R6's planning seam is the first thing to have moved the marginal number --
 before any of your code is in it, so the floor is built the same way with the
 same standard-library surface and none of supdb. The difference is supdb's
 actual marginal cost.
+
+## Signedness at the boundary
+
+A wasm `u32` return arrives in JavaScript as a *signed* i32, and a `u64` as a
+signed BigInt, so the failure sentinels (`u32::MAX`, `u64::MAX`) arrive as
+`-1` and `-1n`. The first version of `supdb.mjs` compared them unnormalized,
+which made every error check in the library dead: a reader over an object
+that failed to open answered `[]` for every key, and a lookup whose block
+failed its checksum came back empty — an under-return, which is the one
+thing this index may never do, reported by the first downstream integration.
+The convention now is one rule applied everywhere: normalize to unsigned at
+the boundary (`v >>> 0`, `BigInt.asUintN(64, v)`), compare unsigned, return
+unsigned. `web/test/node.mjs` holds the door shut, from the zeroed-object
+repro down to a corrupt block byte throwing on every read rather than only
+the first.
 
 ## Endianness
 

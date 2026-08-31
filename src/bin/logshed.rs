@@ -639,6 +639,34 @@ fn fixture(dir: &Path, lines: u64) -> std::io::Result<()> {
         });
     }
 
+    // The corruption regression's coordinates, computed natively because only
+    // the engine knows which byte belongs to which key: a byte inside one
+    // probe key's own extent (flipping it must fail that key's reads with a
+    // checksum error, never empty them), and an intact key whose block the
+    // damage cannot reach (its answers must not change). Verification
+    // granularity is the block, so "different key" is not enough -- the
+    // intact key's planned ranges must be disjoint from the damaged one's.
+    let corrupt = probes
+        .iter()
+        .find_map(|k| {
+            let exts = blob.lookup(k)?;
+            if exts.len() != 1 {
+                return None;
+            }
+            let ranges = blob.ranges_for(k).ok()?;
+            let (off, len) = *ranges.first()?;
+            let at = off + exts[0].off as u64 + exts[0].len as u64 / 2;
+            let intact = probes.iter().find(|ik| {
+                blob.ranges_for(ik).is_ok_and(|r| {
+                    !r.is_empty() && r.iter().all(|(o, l)| o + l <= off || *o >= off + len)
+                })
+            })?;
+            Some((k.clone(), at, intact.clone()))
+        })
+        .ok_or_else(|| {
+            std::io::Error::other("no probe key suits the corruption regression")
+        })?;
+
     let from = FIELDS[3].0;
     let mut rows = Vec::new();
     blob.scan_counts(from.as_bytes(), 12, |k, n| {
@@ -661,6 +689,11 @@ fn fixture(dir: &Path, lines: u64) -> std::io::Result<()> {
             "from" => J::s(from),
             "limit" => J::u(12),
             "rows" => J::arr(rows),
+        },
+        "corrupt" => jobj! {
+            "key" => J::s(String::from_utf8_lossy(&corrupt.0).into_owned()),
+            "at" => J::u(corrupt.1),
+            "intact_key" => J::s(String::from_utf8_lossy(&corrupt.2).into_owned()),
         },
     };
     std::fs::write(dir.join("expected.json"), doc.render())?;
