@@ -987,6 +987,27 @@
    "profile": "full",
    "expect": "fails",
    "because": "Failing again, exactly as the holds-era prose predicted it would, and this failure is the design working: with the seal off the committing thread (WAL rotation, milestone 2b), sealing inside the timed window costs 23,380 ops/s -- statistically nothing (1.029x, p=0.44) -- and the 190k residual to the floor is all that remains, in the WAL framing and memtable walk. The entry's full history: seal 270k/memtable 456k at milestone 1, seal 420k/memtable 175k after the arena, seal ~0/residual 190k now. Three decompositions, each naming the next fix, each kept."
+  },
+  {
+   "experiment": "ext-kv",
+   "id": "EXT.22",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Recorded as failing because a tie is not the claimed win, and the tie is the story: next 650,882 ops/s against lmdb 637,423 in the same process, both committing durably per batch, checksums equalized -- 1.021x at p=1.0, statistically indistinguishable. In this same record the current engine reads 0.394x on the identical comparison, and the project opened at 91x behind. The residual that cannot be equalized still leans LMDB's way (it is transactional, next is not), so the tie is a bound, not a hidden lead. Rule 4 travels with it: next sent 134.7 MB to the device for the durable load -- fewer than LMDB's 237, a quarter of supdb-durable's 841.7, and fewer than supdb's own buffered arm -- so the WAL-only engine is durable at 1.15x write amplification. First full-profile reading; a second run replicates or retires it per the two-runs rule."
+  },
+  {
+   "experiment": "ext-kv",
+   "id": "EXT.23",
+   "profile": "full",
+   "expect": "holds",
+   "because": "next reads 1,497,136/s against lmdb's 1,034,805 -- 1.447x at p=0.0022, same process, checksums equalized. The read fans over segments plus the memtable with no routing yet, and still clears the current engine's own buffered figure in this record (1.077x): the arena memtable probe is cheap enough that half the keys living unsealed costs nothing. The transactional residual leans against next, so this is a floor. First full reading; the second run gates it like everything else."
+  },
+  {
+   "experiment": "ext-kv",
+   "id": "EXT.24",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Failing by design and recorded so the design has to answer for it: next scans 1.4M entries/s against lmdb's 35.2M, 0.040x. A scan currently merges candidates from every segment plus a sorted snapshot of the unsealed keys -- the unrouted fan on the ordered axis. compaction-plan.md P4.1 registers the prediction that range-partitioned compaction takes this to at least 0.5x; that milestone, not tuning, is what moves this claim."
   }
  ],
  "metrics": [
