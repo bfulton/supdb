@@ -6024,9 +6024,14 @@ fn f43_compact(args: &Args, profile: Profile) -> std::io::Result<Record> {
         "scan_compactT8_vs_compactT4",
         compare(&scan_rate[2], &scan_rate[1], supdb::bench::MIN_EFFECT),
     );
+    // T8 against T4, in that order: a looser tail bound merges less often
+    // and should therefore send fewer bytes. The first version of this line
+    // compared T4 against T8 under the T8-vs-T4 name -- the number was
+    // right and the label inverted it, which is the kind of rot `verify`
+    // cannot catch because it reads verdicts and not names.
     rec.compare(
         "device_compactT8_vs_compactT4",
-        compare(&io_mb[1], &io_mb[2], supdb::bench::MIN_EFFECT),
+        compare(&io_mb[2], &io_mb[1], supdb::bench::MIN_EFFECT),
     );
 
     Ok(rec)

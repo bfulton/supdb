@@ -1008,6 +1008,34 @@
    "profile": "full",
    "expect": "fails",
    "because": "Failing by design, replicated at 0.040x and then 0.038x: a scan merges candidates from every segment plus the sorted unsealed-key snapshot -- the unrouted fan on the ordered axis. compaction-plan.md P4.1 registers the prediction that range-partitioned compaction takes this to at least 0.5x of LMDB; that milestone, not tuning, is what moves this claim."
+  },
+  {
+   "experiment": "f43-compact",
+   "id": "F43.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "The registered prediction is refuted and its MECHANISM was wrong, which is the finding. compaction-plan.md's P4.1 said range partitioning recovers the ordered-scan axis by at least 12x, the factor EXT.24's 0.040x needs to reach 0.5x of LMDB. Measured: 1,739,978 entries/s against the unrouted fan's 1,272,770 -- 1.367x at p=0.0009, replicated at 1.417x in the run before it. Partitioning is not what the scan axis was losing to. Building the experiment found the actual cost: `Db::scan` enumerated candidates with the posting-COUNTING walk (2,493ns a key against scan_counts_fixed's 4.3, W2.1/W2.4) and then re-read every candidate through `read_all`, a hash probe per key per source -- a sequence of lookups wearing a scan's name. A forward-only rank cursor per source fixed that, and it helps BOTH arms, which is why the ratio between them is small. EXT.24 must now be re-measured against LMDB to say where the axis actually stands; this entry stays failing until it is."
+  },
+  {
+   "experiment": "f43-compact",
+   "id": "F43.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P4.2 asked that routing not cost the read path and it pays instead: 1,182,066 reads/s routed against 1,058,027 unrouted, 1.117x at p=0.0019, while holding 23 live segments against 16. A read binary-searches disjoint fences to at most one partition and then asks a bounded Bloomed tail, so more segments cost less -- the arithmetic F38.1 (90ns an unrouted probe) and F40.1 (a Bloom in one cache line) predicted. An earlier version checked every fence linearly and this claim failed; O(log P) is what F40/F41 actually bought."
+  },
+  {
+   "experiment": "f43-compact",
+   "id": "F43.3",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P4.3's registered ceiling was 2x and the merge costs 1.43x: 129.9 MB to the device against 90.6 MB for never compacting, for the same 57 MB on disk. The tail bound is the dial -- T8 sends 0.898x of T4's bytes (p=0.0008) and scans 0.910x as fast (p=0.0039), which is the policy trade measured rather than argued: a looser bound merges less often and reads a little slower. Note the ceiling holds at 300k keys and a 2MB seal; every merge rewrites the whole live set, so this ratio grows with the store until the merge is made incremental."
+  },
+  {
+   "experiment": "f43-compact",
+   "id": "F43.4",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P4.4 said the durable load would not feel a merge that runs on its own thread. It does: 534,968 ops/s with compaction against 681,958 without -- 0.784x at p=0.0022, replicated at 0.833x. The prediction's refutation clause said a regression convicts the backpressure, and it is half right. Blocking was removed (a merge in flight defers the next trigger instead of stalling a seal) and the loss remained, so what is left is contention rather than waiting: the merge rewrites the ENTIRE live set every time it runs, competing with the load for CPU and device. That is O(store) per merge and O(store^2) over a load, the same shape F37 convicted in the inline merge policy -- an incremental merge that rewrites only the partitions the tail overlaps is the fix, and this claim is where it will be measured."
   }
  ],
  "metrics": [

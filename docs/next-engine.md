@@ -99,7 +99,9 @@ interleaved where the harness allows:
   is conceded and the brief's premise was wrong.
 - **P-B, the read lead survives:** EXT.11's shape with live segment counts
   under the compaction policy stays **≥ 1.2x** on x86. This is F38's arithmetic
-  obligation: routing must recover what fan-out spends.
+  obligation: routing must recover what fan-out spends. Standing at 1.447x
+  and 1.405x against LMDB in two full runs (EXT.23), and f43 shows routing
+  paying rather than costing at 23 live segments (F43.2, 1.117x).
 - **P-C, the durability curve flattens:** the F4-durability sweep shows
   window cost independent of key count — the 25x at a 1,000-op window
   (F4.1) becomes a bounded, window-size-only cost. F4.1 flips or the design
@@ -115,9 +117,20 @@ interleaved where the harness allows:
 - ~~Filter choice~~ — **answered by f40/f41**: fences via range-partitioned
   compaction for sealed levels, per-segment Blooms for the overlapping
   tail; global routing structures rejected by measurement twice.
-- **Partitioned compaction policy** — how many overlapping tail segments to
-  tolerate before a partitioning merge, which is F37's ladder with a
-  range-split step; needs its own sweep against the tail's bloom cost.
+- **Partitioned compaction policy** — built and measured (f43). The tail
+  bound is a real dial: T8 sends 0.898x of T4's device bytes and scans
+  0.910x as fast. What f43 also convicted is the merge itself — it
+  rewrites the whole live set every time, so it costs 21.6% of durable
+  load throughput (F43.4, a refuted P4.4) and its device ratio grows with
+  the store. **An incremental merge — rewriting only the partitions the
+  tail overlaps — is the open work**, and F43.4 is where it gets measured.
+- **What the ordered axis actually costs.** P4.1 predicted partitioning
+  recovers scans 12x; measured, it is 1.367x (F43.1, refuted). The axis
+  was losing to the scan implementation, not to the fan: candidate
+  enumeration through the posting-counting walk, and a hash probe per key
+  per source. Both are fixed and both arms gained. EXT.24 needs
+  re-measuring against LMDB before anyone knows where the ordered axis
+  stands.
 - **Segment size** — trades WAL replay length against segment count; needs
   its own sweep.
 - **Group commit** — whether concurrent writers share a barrier; matters
