@@ -58,6 +58,16 @@ impl Args {
     fn num(&self, n: &str, d: usize) -> usize {
         self.get(n).and_then(|v| v.parse().ok()).unwrap_or(d)
     }
+    /// A comma-separated list of integers, e.g. `--keys-list 100000,1000000`.
+    /// Entries that do not parse are dropped rather than defaulted, so a typo
+    /// shrinks the sweep visibly instead of silently substituting a shape.
+    fn list(&self, n: &str, d: &str) -> Vec<u64> {
+        self.get(n)
+            .unwrap_or(d)
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect()
+    }
 }
 
 /// Build the field. Supdb first, then the comparators.
@@ -105,6 +115,7 @@ fn main() -> std::io::Result<()> {
         "kv" => suite_kv(&args, profile, &engines)?,
         "ycsb" => suite_ycsb(&args, profile, &engines)?,
         "sweep" => suite_sweep(&args, profile, &engines)?,
+        "readdecomp" => suite_readdecomp(&args, profile, &engines)?,
         "analytics" => suite_analytics(&args, profile)?,
         "loadprof" => return load_profile(&args, &engines),
         "loadshape" => suite_loadshape(&args, profile, &engines)?,
@@ -119,9 +130,10 @@ fn main() -> std::io::Result<()> {
         }
         _ => {
             println!(
-                "external <kv|ycsb|sweep|analytics|all|loadshape|loadprof> \
+                "external <kv|ycsb|sweep|readdecomp|analytics|all|loadshape|loadprof> \
                  [--profile ci|dev|full] [--engines supdb,redb,lmdb,sled] \
-                 (analytics fields its own arms and ignores --engines)"
+                 (analytics fields its own arms and ignores --engines; readdecomp \
+                 wants --engines supdb-buffered,lmdb)"
             );
             return Ok(());
         }
@@ -795,6 +807,600 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
          read-your-writes and ordered scan. Supdb provides one of six; a throughput comparison \
          against engines providing five or six is comparing promises as much as implementations",
     );
+    Ok(rec)
+}
+
+/// Decompose the point-read comparison against LMDB into its candidate
+/// mechanisms.
+///
+/// The fact this exists to split: EXT.11 (supdb-buffered vs lmdb, uniform
+/// point reads at 1M keys) is a tie on the x86 host -- 1.243x p=0.37 and
+/// 1.179x p=0.13 across two full runs, unable to separate -- and a replicated
+/// 2.42x/2.41x win on Apple Silicon at p=0.0022 with rel_iqr under 1.3%
+/// (`results/apple-silicon/ext-kv-buffered-read.run{1,2}.json`). Nothing on
+/// the books says *why*. The candidate mechanisms:
+///
+///   (a) 128-byte cache lines: Supdb's flatindex probe touches ~1 line where
+///       LMDB's descent touches several per node, so a wider line forgives
+///       LMDB's node search less than it forgives a single probe.
+///   (b) 16 KiB pages: fewer TLB entries cover the same file, and a descent
+///       touches ~depth distinct pages per lookup where a hash probe touches
+///       ~2, so TLB relief compounds differently.
+///   (c) O(1) probe vs O(log n) descent: depth itself, priced differently
+///       per level on the two memory systems.
+///   (d) something else -- value handling, memory bandwidth, mmap fault
+///       behavior.
+///
+/// None of these can be toggled without recompiling LMDB, so the split is by
+/// workload shape, three axes in one process, every arm interleaved:
+///
+///   * **key count** (100k / 1M / 4M at `full`): descent depth grows with
+///     log n and a hash probe does not. If (c) is the mechanism, the
+///     supdb/lmdb ratio grows with n -- on both architectures.
+///   * **hot subset** (uniform over the first 4k / 256k key ids at the anchor
+///     count): a contiguous-id hot set is compact in both engines -- adjacent
+///     leaves for LMDB, adjacent value blocks for Supdb -- so at 4k keys the
+///     touched data fits in cache and the memory system leaves the picture.
+///     If the lead needs DRAM misses to exist (a/b), it shrinks here; if it
+///     is the work itself (c-as-compute, d), it survives. The residual leans
+///     against Supdb and is recorded: its hash probe scatters the hot keys
+///     across the whole index section, so Supdb keeps a TLB cost in the hot
+///     cell that LMDB's clustered leaves shed -- a hot-cell lead is therefore
+///     conservative.
+///   * **value size** (8B / 100B / 1KB at the anchor count): the read cost is
+///     lookup plus value bytes. If the lead lives in the lookup, shrinking
+///     the value widens the ratio and growing it compresses the ratio toward
+///     the bandwidth bound; a ratio flat in value size says the differential
+///     is not in the structure walk at all.
+///
+/// What this deliberately is not: `ext-kv` loads a fresh store per rep and
+/// reads it once; this builds each store once and sweeps it warm, the
+/// `ext-sweep` precedent, because rebuilding a 4M-key LMDB store per rep does
+/// not fit any host's budget. Compare shapes *within* this record; do not
+/// average its absolute ratios with EXT.11's, they are different experiments.
+/// The prediction table -- which outcome convicts which mechanism, written
+/// before the first run -- is `read-decomposition-plan.md` at the repo root.
+fn suite_readdecomp(
+    args: &Args,
+    profile: Profile,
+    engines_arg: &[&str],
+) -> std::io::Result<Record> {
+    // The pair the findings are about. `main` defaults --engines to the
+    // four-engine field, which is not what a decomposition of EXT.11 wants,
+    // so an absent flag means the matched pair rather than the field.
+    let which: Vec<&str> = if args.get("--engines").is_some() {
+        engines_arg.to_vec()
+    } else {
+        vec!["supdb-buffered", "lmdb"]
+    };
+    let keys_list = args.list(
+        "--keys-list",
+        profile.pick(
+            "2000,8000,32000",
+            "50000,200000,800000",
+            "100000,1000000,4000000",
+        ),
+    );
+    let hot_list = args.list(
+        "--hot-list",
+        profile.pick("64,512", "1024,65536", "4096,262144"),
+    );
+    let extra_values = args.list("--value-sizes", "8,1024");
+    let base_value = args.num("--value-size", 100);
+    let reads = args.num("--reads", profile.pick(2_000, 100_000, 500_000)) as u64;
+    let batch = args.num("--batch", 1_000).max(1);
+    let reps = args.num("--reps", profile.reps());
+    // The anchor: the key count the hot and value axes pivot on. The middle
+    // of the list, which at the defaults is 1M -- EXT.11's own shape.
+    let anchor = keys_list[keys_list.len() / 2];
+
+    let mut rec = Record::new("ext-readdecomp", profile);
+    rec.param(
+        "keys_list",
+        J::arr(keys_list.iter().map(|k| J::u(*k)).collect()),
+    )
+    .param("anchor_keys", J::u(anchor))
+    .param(
+        "hot_list",
+        J::arr(hot_list.iter().map(|h| J::u(*h)).collect()),
+    )
+    .param("value_size", J::u(base_value as u64))
+    .param(
+        "extra_value_sizes",
+        J::arr(extra_values.iter().map(|v| J::u(*v)).collect()),
+    )
+    .param("reads_per_cell", J::u(reads))
+    .param("batch", J::u(batch as u64))
+    .param("reps", J::u(reps as u64))
+    .note(
+        "stores built once per (keys, value_size) and swept warm, the ext-sweep precedent; \
+             compare shapes within this record, never its absolute ratios against ext-kv's, \
+             which rebuilds per rep",
+    )
+    .note(
+        "hot cells draw uniformly from the first K key ids: contiguous ids are adjacent \
+             leaves for LMDB and adjacent value blocks for Supdb, so both engines' touched data \
+             is compact. The residual leans against Supdb -- its hash probe scatters K keys \
+             across the whole index section, so it keeps a TLB cost in the hot cell that LMDB \
+             sheds -- and a hot-cell lead is therefore conservative",
+    )
+    .note(
+        "cells and engines interleaved round-robin over reps, engine innermost, one warmup \
+             round discarded, every ordering gated on stats::compare. Per-read latency is \
+             sampled 1-in-8 so the Instant overhead stays out of the throughput it decorates; \
+             the sampling is identical for every arm",
+    )
+    .note(
+        "point reads move no device bytes; latency distributions travel per cell and store \
+             sizes per arm, and the load phase's RSS and device-write accounting for this \
+             workload shape live in ext-kv's record",
+    );
+
+    // ---- the stores: one per (key count, value size) per engine ------------
+    let mut pairs: Vec<(u64, usize)> = keys_list.iter().map(|k| (*k, base_value)).collect();
+    for v in &extra_values {
+        let v = *v as usize;
+        if v != base_value && !pairs.contains(&(anchor, v)) {
+            pairs.push((anchor, v));
+        }
+    }
+    let anchor_pair = pairs
+        .iter()
+        .position(|p| *p == (anchor, base_value))
+        .expect("anchor comes from keys_list");
+
+    let ne = which.len();
+    let mut stores: Vec<Vec<Option<Box<dyn Engine>>>> = Vec::with_capacity(pairs.len());
+    let mut feats: Vec<Option<Features>> = vec![None; ne];
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut store_rows: Vec<J> = Vec::new();
+    for (n, vs) in &pairs {
+        let mut row: Vec<Option<Box<dyn Engine>>> = Vec::with_capacity(ne);
+        for (ei, name) in which.iter().enumerate() {
+            let root = scratch(&format!("rdec-{name}-{n}-{vs}"));
+            let e = build(&root, &[name], 256).into_iter().next();
+            let e = e.map(|mut e| {
+                feats[ei] = Some(e.features());
+                let payload = Payload::new(*vs, 0.5, 0xD3);
+                let mut vrng = Rng::new(0xD3);
+                let mut kb = [0u8; 16];
+                let mut buf: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch);
+                for i in 0..*n {
+                    db_key_into(i, &mut kb);
+                    buf.push((kb.to_vec(), payload.get(&mut vrng).to_vec()));
+                    if buf.len() == batch {
+                        e.write_batch(&buf).expect("load");
+                        buf.clear();
+                    }
+                }
+                if !buf.is_empty() {
+                    e.write_batch(&buf).expect("load");
+                }
+                e.sync().expect("sync");
+                store_rows.push(jobj! {
+                    "engine" => J::s(*name),
+                    "keys" => J::u(*n),
+                    "value_size" => J::u(*vs as u64),
+                    "size_mb" => J::fp(e.size_bytes() as f64 / 1048576.0, 2)
+                });
+                e
+            });
+            row.push(e);
+            roots.push(root);
+        }
+        stores.push(row);
+    }
+    rec.series("stores", J::arr(store_rows));
+
+    // ---- the cells: (store, key span to draw from) --------------------------
+    struct Cell {
+        label: String,
+        pair: usize,
+        span: u64,
+    }
+    let mut cells: Vec<Cell> = Vec::new();
+    for (pi, k) in keys_list.iter().enumerate() {
+        cells.push(Cell {
+            label: format!("n{k}"),
+            pair: pi,
+            span: *k,
+        });
+    }
+    for h in &hot_list {
+        if *h >= anchor {
+            eprintln!("# SKIPPED hot={h}: not a subset of the {anchor}-key anchor store");
+            continue;
+        }
+        cells.push(Cell {
+            label: format!("hot{h}"),
+            pair: anchor_pair,
+            span: *h,
+        });
+    }
+    for (pi, (n, vs)) in pairs.iter().enumerate() {
+        if pi >= keys_list.len() {
+            debug_assert_eq!(*n, anchor);
+            cells.push(Cell {
+                label: format!("v{vs}"),
+                pair: pi,
+                span: anchor,
+            });
+        }
+    }
+
+    // ---- measure -------------------------------------------------------------
+    let nc = cells.len();
+    let mut rate: Vec<Vec<Samples>> = (0..nc).map(|_| vec![Samples::default(); ne]).collect();
+    let mut hists: Vec<Vec<Hist>> = (0..nc)
+        .map(|_| (0..ne).map(|_| Hist::new()).collect())
+        .collect();
+    let mut miss = vec![vec![0u64; ne]; nc];
+    let si = which.iter().position(|w| *w == "supdb-buffered");
+    let li = which.iter().position(|w| *w == "lmdb");
+    let mut ratio: Vec<Samples> = (0..nc).map(|_| Samples::default()).collect();
+
+    let warmup = 1usize;
+    for rep in 0..(warmup + reps) {
+        for (ci, cell) in cells.iter().enumerate() {
+            let mut rep_rate = vec![f64::NAN; ne];
+            for (ei, slot) in stores[cell.pair].iter_mut().enumerate() {
+                let Some(e) = slot.as_mut() else { continue };
+                // The same key sequence for every engine in a cell, varied
+                // across reps so a rep is not a replay of the last one.
+                let mut g = KeyGen::new(KeyDist::Uniform, cell.span, 0xD3C0 + rep as u64);
+                let mut kb = [0u8; 16];
+                let mut misses = 0u64;
+                let t = Instant::now();
+                for i in 0..reads {
+                    db_key_into(g.next(), &mut kb);
+                    if i % 8 == 0 {
+                        let t1 = Instant::now();
+                        let got = e.get(&kb).expect("get");
+                        if rep >= warmup {
+                            hists[ci][ei].record(t1.elapsed().as_nanos() as u64);
+                        }
+                        if got == 0 {
+                            misses += 1;
+                        }
+                    } else if e.get(&kb).expect("get") == 0 {
+                        misses += 1;
+                    }
+                }
+                let secs = t.elapsed().as_secs_f64();
+                rep_rate[ei] = reads as f64 / secs.max(1e-12);
+                if rep >= warmup {
+                    rate[ci][ei].push(rep_rate[ei]);
+                    miss[ci][ei] += misses;
+                }
+            }
+            if rep >= warmup {
+                if let (Some(s), Some(l)) = (si, li) {
+                    if rep_rate[s].is_finite() && rep_rate[l].is_finite() {
+                        // Paired within the rep, so drift moves both arms of a
+                        // ratio together -- the same reason the engines are
+                        // interleaved at all.
+                        ratio[ci].push(rep_rate[s] / rep_rate[l]);
+                    }
+                }
+            }
+        }
+    }
+
+    // Everything is measured; the stores can go before the record is built,
+    // because at full this is several GB of scratch.
+    drop(stores);
+    for root in &roots {
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ---- record ---------------------------------------------------------------
+    let mut rows = Vec::new();
+    for (ci, cell) in cells.iter().enumerate() {
+        let mut arms = Vec::new();
+        for (ei, name) in which.iter().enumerate() {
+            if rate[ci][ei].is_empty() {
+                continue;
+            }
+            let total = reads * reps as u64;
+            arms.push(jobj! {
+                "engine" => J::s(*name),
+                "read_ops_per_s" => J::fp(rate[ci][ei].median(), 1),
+                "read" => rate[ci][ei].to_json(),
+                "read_hit_rate" => J::fp(1.0 - miss[ci][ei] as f64 / total.max(1) as f64, 6),
+                "read_latency" => hists[ci][ei].to_json()
+            });
+        }
+        println!(
+            "  {:<10} {}",
+            cell.label,
+            which
+                .iter()
+                .enumerate()
+                .filter(|(ei, _)| !rate[ci][*ei].is_empty())
+                .map(|(ei, name)| format!("{name} {:>9.0}/s", rate[ci][ei].median()))
+                .collect::<Vec<_>>()
+                .join("  ")
+        );
+        rows.push(jobj! {
+            "cell" => J::s(&cell.label),
+            "keys" => J::u(pairs[cell.pair].0),
+            "value_size" => J::u(pairs[cell.pair].1 as u64),
+            "span" => J::u(cell.span),
+            "engines" => J::arr(arms),
+            "ratio" => ratio[ci].to_json()
+        });
+    }
+    rec.series("cells", J::arr(rows));
+
+    // Per-cell orderings for the pair, and each engine's own cross-shape
+    // sensitivity -- which is what says *who* moved when a ratio moves.
+    let cell_of = |label: &str| cells.iter().position(|c| c.label == label);
+    if let (Some(s), Some(l)) = (si, li) {
+        for (ci, cell) in cells.iter().enumerate() {
+            if !rate[ci][s].is_empty() && !rate[ci][l].is_empty() {
+                rec.compare(
+                    &format!("read_{}", cell.label),
+                    compare(&rate[ci][s], &rate[ci][l], supdb::bench::MIN_EFFECT),
+                );
+            }
+        }
+        let n_lo = keys_list.iter().copied().min().unwrap_or(anchor);
+        let n_hi = keys_list.iter().copied().max().unwrap_or(anchor);
+        let hot_lo = hot_list.iter().copied().filter(|h| *h < anchor).min();
+        for ei in [s, l] {
+            if let (Some(a), Some(b)) = (cell_of(&format!("n{n_hi}")), cell_of(&format!("n{n_lo}")))
+            {
+                if !rate[a][ei].is_empty() && !rate[b][ei].is_empty() {
+                    rec.compare(
+                        &format!("{}_n{n_hi}_vs_n{n_lo}", which[ei]),
+                        compare(&rate[a][ei], &rate[b][ei], supdb::bench::MIN_EFFECT),
+                    );
+                }
+            }
+            if let Some(h) = hot_lo {
+                if let (Some(a), Some(b)) =
+                    (cell_of(&format!("hot{h}")), cell_of(&format!("n{anchor}")))
+                {
+                    if !rate[a][ei].is_empty() && !rate[b][ei].is_empty() {
+                        rec.compare(
+                            &format!("{}_hot{h}_vs_full", which[ei]),
+                            compare(&rate[a][ei], &rate[b][ei], supdb::bench::MIN_EFFECT),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- the three findings, behind their preconditions ------------------------
+    //
+    // Each pins one mechanism's signature; the prediction table in
+    // read-decomposition-plan.md says what each combination of verdicts
+    // convicts. The statements are about *this run's host* -- the whole point
+    // is that the two architectures are expected to answer differently.
+    let mut blockers: Vec<String> = Vec::new();
+    match (si, li) {
+        (Some(s), Some(l)) => {
+            match (feats[s], feats[l]) {
+                (Some(fa), Some(fb)) => {
+                    let gap = fa.unmatched(&fb, false);
+                    if !gap.is_empty() {
+                        blockers.push(format!("the arms differ on {}", gap.join(", ")));
+                    }
+                }
+                _ => blockers
+                    .push("an arm recorded no features, so matching cannot be checked".into()),
+            }
+            for (ci, cell) in cells.iter().enumerate() {
+                for ei in [s, l] {
+                    if rate[ci][ei].is_empty() {
+                        blockers.push(format!("{} recorded nothing in {}", which[ei], cell.label));
+                    } else if miss[ci][ei] > 0 {
+                        // A miss is a different code path -- usually a shorter
+                        // one -- so a cell that missed measured something else.
+                        blockers.push(format!(
+                            "{} missed {} of its reads in {}",
+                            which[ei], miss[ci][ei], cell.label
+                        ));
+                    }
+                }
+            }
+        }
+        _ => {
+            blockers.push(
+                "the pair this decomposition is about (supdb-buffered vs lmdb) was not fielded"
+                    .into(),
+            );
+        }
+    }
+
+    let not_yet = |rec: &mut Record, id: &str, title: &str, why: &str| {
+        rec.finding(Finding::not_exercised(id, title, why.to_string()));
+    };
+
+    // EXT.19 -- the depth signature.
+    let t19 = "Supdb's point-read lead over LMDB grows with key count on this host";
+    let n_lo = keys_list.iter().copied().min().unwrap_or(anchor);
+    let n_hi = keys_list.iter().copied().max().unwrap_or(anchor);
+    let depth_cells = (cell_of(&format!("n{n_hi}")), cell_of(&format!("n{n_lo}")));
+    if !blockers.is_empty() {
+        not_yet(&mut rec, "EXT.19", t19, &blockers.join("; "));
+    } else if n_lo == n_hi {
+        not_yet(
+            &mut rec,
+            "EXT.19",
+            t19,
+            "the key-count axis has a single point, so growth in n is not testable",
+        );
+    } else if let (Some(hi), Some(lo)) = depth_cells {
+        let cmp = compare(&ratio[hi], &ratio[lo], supdb::bench::MIN_EFFECT);
+        rec.compare("EXT.19_lead_at_max_vs_min_keys", cmp.clone());
+        if matches!(cmp.verdict, Verdict::Underpowered) {
+            not_yet(
+                &mut rec,
+                "EXT.19",
+                t19,
+                "underpowered: too few repetitions to compare the leads",
+            );
+        } else {
+            let per_n = keys_list
+                .iter()
+                .filter_map(|k| {
+                    cell_of(&format!("n{k}"))
+                        .map(|ci| format!("{k} keys {:.3}x", ratio[ci].median()))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            rec.finding(Finding::new(
+                "EXT.19",
+                t19,
+                matches!(cmp.verdict, Verdict::Greater),
+                format!(
+                    "the supdb/lmdb read ratio, per rep and interleaved, across the key axis: \
+                     {per_n} ({}). A B-tree descent deepens with log n and a hash probe does \
+                     not, so a lead that grows with n implicates depth (mechanism c) on this \
+                     host, and a flat lead says the per-lookup difference is per-access -- \
+                     cache-line, TLB, or compute -- rather than per-level",
+                    cmp.summary(&format!("lead@{n_hi}"), &format!("lead@{n_lo}"))
+                ),
+            ));
+        }
+    } else {
+        not_yet(
+            &mut rec,
+            "EXT.19",
+            t19,
+            "the key-axis cells were not measured",
+        );
+    }
+
+    // EXT.20 -- the memory-system signature.
+    let t20 = "Supdb's point-read lead over LMDB survives a cache-resident working set";
+    let hot_lo = hot_list.iter().copied().filter(|h| *h < anchor).min();
+    if !blockers.is_empty() {
+        not_yet(&mut rec, "EXT.20", t20, &blockers.join("; "));
+    } else if let Some(h) = hot_lo {
+        let hc = cell_of(&format!("hot{h}"));
+        let ac = cell_of(&format!("n{anchor}"));
+        if let ((Some(s), Some(l)), Some(hc), Some(ac)) = ((si, li), hc, ac) {
+            let footprint_kb = h as f64 * (16.0 + base_value as f64 + 57.0) / 1024.0;
+            let hot_cmp = compare(&rate[hc][s], &rate[hc][l], supdb::bench::MIN_EFFECT);
+            let lead_cmp = compare(&ratio[hc], &ratio[ac], supdb::bench::MIN_EFFECT);
+            rec.compare("EXT.20_read_hot", hot_cmp.clone());
+            rec.compare("EXT.20_lead_hot_vs_uniform", lead_cmp.clone());
+            if matches!(hot_cmp.verdict, Verdict::Underpowered) {
+                not_yet(
+                    &mut rec,
+                    "EXT.20",
+                    t20,
+                    "underpowered: too few repetitions to order the hot cell",
+                );
+            } else {
+                rec.finding(Finding::new(
+                    "EXT.20",
+                    t20,
+                    matches!(hot_cmp.verdict, Verdict::Greater),
+                    format!(
+                        "uniform reads over the first {h} key ids of the {anchor}-key store, \
+                         ~{footprint_kb:.0} KB of touched keys, values and index lines, small \
+                         enough that the memory system leaves the picture: {} -- and the lead \
+                         itself moved from {:.3}x uniform to {:.3}x hot ({}). A lead that needs \
+                         DRAM misses to exist (cache-line width or TLB reach, mechanisms a/b) \
+                         dies here; one that survives is the work itself -- fewer dependent \
+                         accesses, fewer instructions (c as compute, or d). Supdb's index probes \
+                         stay scattered across the whole index section even in this cell, so the \
+                         residual TLB cost leans against it and a surviving lead is conservative",
+                        hot_cmp.summary("supdb-buffered", "lmdb"),
+                        ratio[ac].median(),
+                        ratio[hc].median(),
+                        lead_cmp.summary("lead@hot", "lead@uniform")
+                    ),
+                ));
+            }
+        } else {
+            not_yet(
+                &mut rec,
+                "EXT.20",
+                t20,
+                "the hot or anchor cell was not measured",
+            );
+        }
+    } else {
+        not_yet(
+            &mut rec,
+            "EXT.20",
+            t20,
+            "no hot-set size below the anchor key count was requested",
+        );
+    }
+
+    // EXT.21 -- the value-axis signature.
+    let t21 = "Supdb's point-read lead over LMDB is independent of value size";
+    let mut vs_all: Vec<usize> = extra_values.iter().map(|v| *v as usize).collect();
+    vs_all.push(base_value);
+    vs_all.sort_unstable();
+    vs_all.dedup();
+    let vcell = |v: usize| {
+        if v == base_value {
+            cell_of(&format!("n{anchor}"))
+        } else {
+            cell_of(&format!("v{v}"))
+        }
+    };
+    if !blockers.is_empty() {
+        not_yet(&mut rec, "EXT.21", t21, &blockers.join("; "));
+    } else if vs_all.len() < 2 {
+        not_yet(
+            &mut rec,
+            "EXT.21",
+            t21,
+            "the value axis has a single point, so independence is not testable",
+        );
+    } else {
+        let (v_lo, v_hi) = (vs_all[0], vs_all[vs_all.len() - 1]);
+        if let (Some(a), Some(b)) = (vcell(v_lo), vcell(v_hi)) {
+            let cmp = compare(&ratio[a], &ratio[b], supdb::bench::MIN_EFFECT);
+            rec.compare("EXT.21_lead_at_min_vs_max_value", cmp.clone());
+            if matches!(cmp.verdict, Verdict::Underpowered) {
+                not_yet(
+                    &mut rec,
+                    "EXT.21",
+                    t21,
+                    "underpowered: too few repetitions to compare the leads",
+                );
+            } else {
+                let per_v = vs_all
+                    .iter()
+                    .filter_map(|v| vcell(*v).map(|ci| format!("{v}B {:.3}x", ratio[ci].median())))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                rec.finding(Finding::new(
+                    "EXT.21",
+                    t21,
+                    matches!(cmp.verdict, Verdict::NoDifference),
+                    format!(
+                        "the lead across the value axis at {anchor} keys: {per_v} ({}). A read \
+                         is a lookup plus the value bytes, and only the lookup differs \
+                         structurally between a hash table and a B-tree -- so if the lead lives \
+                         in the lookup, tiny values widen it and large values compress it toward \
+                         the bandwidth bound, and this finding fails in the Greater direction. \
+                         Flat-in-value-size instead says the differential is not the structure \
+                         walk. Failing Less -- a lead that grows with value size -- would point \
+                         at value handling itself (mechanism d) and convict none of a/b/c",
+                        cmp.summary(&format!("lead@{v_lo}B"), &format!("lead@{v_hi}B"))
+                    ),
+                ));
+            }
+        } else {
+            not_yet(
+                &mut rec,
+                "EXT.21",
+                t21,
+                "a value-axis cell was not measured",
+            );
+        }
+    }
+
     Ok(rec)
 }
 
