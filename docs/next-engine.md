@@ -107,7 +107,8 @@ interleaved where the harness allows:
   cache hit; at 116MB it does not. So the read lead `flatindex` earns is
   not currently preserved by the routing built to protect it, and the
   decomposition of why — segment count, mapping count, tail size, filter
-  false positives — is the open work this refutation names.
+  false positives — is the open work this refutation names. Replicated at
+  0.850x on a second full run, next's arm moving 1.3% and LMDB's 1.9%.
 - **P-C, the durability curve flattens:** the F4-durability sweep shows
   window cost independent of key count — the 25x at a 1,000-op window
   (F4.1) becomes a bounded, window-size-only cost. F4.1 flips or the design
