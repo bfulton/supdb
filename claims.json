@@ -966,6 +966,27 @@
    "profile": "full",
    "expect": "fails",
    "because": "The fingerprint table does not beat per-segment blooms: 791ns against 806, no difference at p=0.0736, while costing 8.39 B/key against the blooms' 1.25 -- a 6.7x memory price for a tie. Registered as the decision gate and it decided: global routing is not worth its mutability concession at any price measured across f40 and f41. The next engine keeps routing inside immutable per-segment state (blooms for segments with overlapping ranges) and buys the rest with range-partitioned compaction, where the fence F40.3 showed inert on overlapping ranges becomes a two-comparison router that touches no side structure at all."
+  },
+  {
+   "experiment": "f42-next",
+   "id": "F42.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Milestone 1 misses the brief's registered P-A gate: 287,763 ops/s durably at batch 1000 against the promised 600,000. Recorded as failing so the promise cannot quietly deflate; the decomposition arm names where the shortfall lives (F42.3) and milestone 2 exists to move this to holds. Device bytes travel with it per rule 4: 297.8 MB for 110.6 MB of records, 2.7x amplification against today's 8.1x on the same shape."
+  },
+  {
+   "experiment": "f42-next",
+   "id": "F42.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "The first engine this design ever ran beats the tuned current engine on the axis the redesign exists for: 287,763 against 248,931 ops/s (1.156x, p=0.0106) with 297.8 MB to the device against 890.9 -- 3x fewer bytes for the same durable load, from deleting the per-point section work F39.3 priced rather than optimizing it."
+  },
+  {
+   "experiment": "f42-next",
+   "id": "F42.3",
+   "profile": "full",
+   "expect": "fails",
+   "because": "The registered suspicion was that sealing on the committing thread is the larger share of the gap to the floor; it is the smaller. Seal-on-thread costs 270,103 ops/s (next 287,763 vs next-lazyseal 557,867, 1.939x, p=0.0022) but the residual from lazyseal to f39's raw+index floor is 456,136 -- the memtable and framing, whose per-key Box and Vec allocations the floor's bare hash map never paid. And lazyseal alone still sits under the 600k gate, so milestone 2 needs both: an arena memtable with no per-key allocation, and the seal moved off the committing thread via WAL rotation. This entry flips only when seal-off-thread is the bigger measured share, which after the memtable fix it may be."
   }
  ],
  "metrics": [
