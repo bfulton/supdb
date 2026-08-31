@@ -61,9 +61,21 @@ checkpoint.
   segments indistinguishable from one store), and unrouted probes cost
   90ns each (F38.1), which kills the read lead already at four segments
   (F38.3, a registered prediction refuted — the plan said the lead survives
-  k=4 and it does not). **Routing is therefore required, not optional**: a
-  per-segment existence filter or key-range fence with a per-probe cost well
-  under 90ns. This is the design's one new data structure.
+  k=4 and it does not). **Routing is therefore required, not optional** —
+  and f40/f41 measured every candidate shape. Per-segment blocked Blooms
+  keep 82% of k1 (F40.1: a fixed probe order queries ~8.5 filters per
+  lookup). A generic global map manages 62% of the ceiling (F40.2, refuted)
+  and a purpose-built one-line fingerprint table 71.5% at 6.7x the blooms'
+  memory for a statistical tie with them (F41.1, F41.2, both refuted): at
+  1M keys any router consulted per lookup pays a DRAM miss on a keys-sized
+  structure. The conclusion is structural — the only free routing is
+  information the reader already holds, so **routing belongs to compaction,
+  not to filters**: compacted levels are key-range partitioned and a
+  two-comparison fence routes them for nothing (the same fence F40.3 shows
+  inert on overlapping ranges), while the small unpartitioned tail of
+  recent segments carries per-segment Blooms. The perfectly-routed ceiling
+  is worth reaching: sixteen quarter-size indexes read 20% faster than one
+  store (566ns against 522 — oracle16 vs k1, f41).
 - **Compact** = merge segments under the policy f37 already priced: geometric
   size ladders bought 3.963x on fragmenting writes for a 0.762x read tax
   (F37.1, F37.3), and F38.2 says read cost does not force merging — only
@@ -100,8 +112,12 @@ interleaved where the harness allows:
 
 ## Open, and deliberately so
 
-- **Filter choice** (blocked bloom vs range fence vs both) — decided by an
-  interleaved experiment against the 90ns budget, not by literature.
+- ~~Filter choice~~ — **answered by f40/f41**: fences via range-partitioned
+  compaction for sealed levels, per-segment Blooms for the overlapping
+  tail; global routing structures rejected by measurement twice.
+- **Partitioned compaction policy** — how many overlapping tail segments to
+  tolerate before a partitioning merge, which is F37's ladder with a
+  range-split step; needs its own sweep against the tail's bloom cost.
 - **Segment size** — trades WAL replay length against segment count; needs
   its own sweep.
 - **Group commit** — whether concurrent writers share a barrier; matters

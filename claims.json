@@ -952,6 +952,20 @@
    "profile": "full",
    "expect": "holds",
    "because": "Min/max fences prune nothing when segment key-ranges overlap: fence16 within noise of the unfiltered fan (0.918x, p=0.0553, no difference). Round-robin dealing makes every segment's range cover every key and the fence admits every probe. Recorded so the design never assumes fences route without key-partitioned sealing; they are a compaction-policy benefit, not a general router."
+  },
+  {
+   "experiment": "f41-segroute",
+   "id": "F41.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Registered prediction P1 said a purpose-built one-line-load fingerprint table routes at 85-100% of the perfect-routing ceiling; it routes at 71.5% (791ns/read against the oracle's 566, p=0.0022, max observed spill 2 buckets). The ~225ns it pays over the oracle is the DRAM miss on an 8.4MB side structure -- the same order as f40's generic hash map once its hashing overhead is stripped. The refutation generalizes: at 1M keys, ANY router consulted per lookup costs a memory miss on a keys-sized structure. The only free routing is information the reader already holds -- which is what fences over key-partitioned segments are, and why compaction policy owns this problem rather than filter engineering."
+  },
+  {
+   "experiment": "f41-segroute",
+   "id": "F41.2",
+   "profile": "full",
+   "expect": "fails",
+   "because": "The fingerprint table does not beat per-segment blooms: 791ns against 806, no difference at p=0.0736, while costing 8.39 B/key against the blooms' 1.25 -- a 6.7x memory price for a tie. Registered as the decision gate and it decided: global routing is not worth its mutability concession at any price measured across f40 and f41. The next engine keeps routing inside immutable per-segment state (blooms for segments with overlapping ranges) and buys the rest with range-partitioned compaction, where the fence F40.3 showed inert on overlapping ranges becomes a two-comparison router that touches no side structure at all."
   }
  ],
  "metrics": [
