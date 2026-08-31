@@ -539,6 +539,40 @@ impl<B: Bytes> Blob<B> {
         self.idx.at(self.key_sec().ok()?, rank)
     }
 
+    /// Every value at `rank`, in append order: reads blocks, resolves
+    /// nothing. With `seek` and the existing `key_at` this completes an
+    /// ordered cursor, which is what `next::Db` merges segments with --
+    /// advancing each source's rank instead of re-resolving every key in
+    /// every source. A hash probe per key per source is what an ordered
+    /// read must not pay, and it is the whole difference between a scan
+    /// and a sequence of lookups.
+    pub fn values_at<F: FnMut(&[u8])>(&self, rank: usize, mut f: F) -> Result<u64> {
+        let Some((_, exts)) = self.exts_at(rank) else {
+            return Ok(0);
+        };
+        let mut n = 0u64;
+        for e in exts {
+            n += self.with_extent(*e, |run| {
+                let mut p = 0usize;
+                let mut seen = 0u64;
+                while p < run.len() {
+                    let len = get_uvarint(run, &mut p) as usize;
+                    let end = p
+                        .checked_add(len)
+                        .ok_or_else(|| corrupt("record length overflows"))?;
+                    if end > run.len() {
+                        return Err(corrupt("record runs past the end of its extent"));
+                    }
+                    f(&run[p..end]);
+                    seen += 1;
+                    p = end;
+                }
+                Ok(seen)
+            })?;
+        }
+        Ok(n)
+    }
+
     // ------------------------------------------------------------ planning --
 
     /// The byte ranges a read of `key` will touch in the source. R6.2.

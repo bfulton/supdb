@@ -825,7 +825,13 @@ impl Db {
         for name in &live {
             segs.push(Seg::open(dir, name)?);
         }
-        segs.sort_by(|a, b| b.level.cmp(&a.level).then(a.name.cmp(&b.name)));
+        // Partitions first in KEY order (the binary search in `read_all`
+        // depends on it), then L0 oldest to newest by name.
+        segs.sort_by(|a, b| {
+            b.level
+                .cmp(&a.level)
+                .then_with(|| if a.level > 0 { a.lo.cmp(&b.lo) } else { a.name.cmp(&b.name) })
+        });
         let seg_ids: Vec<(u64, u64)> = live
             .iter()
             .filter_map(|n| Some((Db::name_id(n)?, Db::name_end_seq(n)?)))
@@ -913,7 +919,6 @@ impl Db {
             return Ok(());
         }
         self.join_seal()?;
-        self.join_compact()?;
         let frozen = std::sync::Arc::new(std::mem::replace(&mut self.mem, MemTable::new()));
         self.mem_bytes = 0;
         let old_wal = std::mem::replace(
@@ -1005,7 +1010,16 @@ impl Db {
     /// outputs, so a reader during the merge sees the old set and a crash
     /// during it leaves the old set.
     fn start_compact(&mut self) -> Result<()> {
-        self.join_compact()?;
+        if let Some((_, h)) = &self.compacting {
+            if !h.is_finished() {
+                // A merge is still running. The tail grows past its bound
+                // until it lands, which costs reads a few extra Bloom
+                // checks -- cheaper than blocking a commit behind a merge,
+                // and the reason P4.4 can hold at all.
+                return Ok(());
+            }
+            self.join_compact()?;
+        }
         let inputs: Vec<String> = self.live_names();
         if inputs.is_empty() {
             return Ok(());
@@ -1049,7 +1063,11 @@ impl Db {
         // Partitions first (older, disjoint), then whatever L0 arrived
         // while the merge ran, oldest to newest.
         merged.extend(kept);
-        merged.sort_by(|a, b| b.level.cmp(&a.level).then(a.name.cmp(&b.name)));
+        merged.sort_by(|a, b| {
+            b.level
+                .cmp(&a.level)
+                .then_with(|| if a.level > 0 { a.lo.cmp(&b.lo) } else { a.name.cmp(&b.name) })
+        });
         self.segs = merged;
         self.publish()?;
         for name in &inputs {
@@ -1068,7 +1086,25 @@ impl Db {
     /// holds nothing for this key.
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
         let mut n = 0u64;
-        for seg in &self.segs {
+        // Partitions sort first and are disjoint, so at most one can hold
+        // the key and a binary search finds it: the promise F40/F41 bought
+        // was two comparisons, not one per partition. Checking every fence
+        // linearly would put the partition count back into the read cost,
+        // which is the cost partitioning exists to remove.
+        let np = self.segs.partition_point(|s| s.level > 0);
+        let at = self.segs[..np]
+            .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+        if let Some(seg) = self.segs[..np].get(at) {
+            if seg.may_hold(key) {
+                n += seg
+                    .blob
+                    .read_all(key, &mut f)
+                    .map_err(|e| err(&format!("segment read: {e}")))?;
+            }
+        }
+        // The L0 tail overlaps arbitrarily and is bounded by `l0_trigger`,
+        // so every one of them is asked -- through its Bloom.
+        for seg in &self.segs[np..] {
             if !seg.may_hold(key) {
                 continue;
             }
@@ -1129,28 +1165,93 @@ impl Db {
         }
         let cache = self.scan_keys.borrow();
         let unsealed = &cache.as_ref().expect("scan snapshot").1;
-        let start = unsealed.partition_point(|k| k.as_slice() < from);
+        let at = unsealed.partition_point(|k| k.as_slice() < from);
         let mut keys: Vec<Vec<u8>> =
-            unsealed[start..start + limit.min(unsealed.len() - start)].to_vec();
-        for seg in &self.segs {
-            // A partition whose whole range sorts before `from` cannot
-            // contribute a candidate, and skipping it is the ordered-axis
-            // half of the same fence.
-            if !seg.may_reach(from) {
-                continue;
+            unsealed[at..at + limit.min(unsealed.len() - at)].to_vec();
+
+        // Partitions are disjoint and ordered, so the first `limit` keys at
+        // or after `from` come from the partition holding `from` and spill
+        // into its successors only when it runs out. Walking them in key
+        // order and stopping is what makes the partition COUNT irrelevant
+        // to a scan's cost -- the version that seeked into every partition
+        // above the cursor made a compacted store scan slower than an
+        // uncompacted one, which is the opposite of the point.
+        let mut parts: Vec<&Seg> =
+            self.segs.iter().filter(|s| s.level > 0 && s.may_reach(from)).collect();
+        parts.sort_by(|a, b| a.lo.cmp(&b.lo));
+        let mut used: Vec<&Seg> = Vec::new();
+        let mut taken = 0usize;
+        for seg in parts {
+            if taken >= limit {
+                break;
             }
-            seg.blob
-                .scan_counts(from, limit, |k, _| {
+            let start = if seg.lo.as_slice() > from { seg.lo.as_slice() } else { from };
+            let got = seg
+                .blob
+                .scan_counts_fixed(start, limit - taken, 8, |k, _| {
                     keys.push(k.to_vec());
                     true
                 })
                 .map_err(|e| err(&format!("segment scan: {e}")))?;
+            if got > 0 {
+                used.push(seg);
+            }
+            taken += got;
         }
+        // L0 segments overlap each other and everything else, so each one
+        // has to be asked. The tail is bounded by `l0_trigger`, which is
+        // what keeps this loop short.
+        for seg in self.segs.iter().filter(|s| s.level == 0) {
+            seg.blob
+                .scan_counts_fixed(from, limit, 8, |k, _| {
+                    keys.push(k.to_vec());
+                    true
+                })
+                .map_err(|e| err(&format!("segment scan: {e}")))?;
+            used.push(seg);
+        }
+
         keys.sort_unstable();
         keys.dedup();
         keys.truncate(limit);
+        let Some(last) = keys.last() else {
+            return Ok(0);
+        };
+
+        // The merged walk: one forward-only rank cursor per contributing
+        // source, so a key costs a comparison per source rather than a
+        // hash probe per source. Over `limit` keys that is the difference
+        // between an ordered read and `limit` lookups.
+        let sources: Vec<&Seg> = used
+            .into_iter()
+            .filter(|s| s.lo.as_slice() <= last.as_slice())
+            .collect();
+        let mut cursors: Vec<usize> = sources.iter().map(|s| s.blob.seek(from)).collect();
         for key in &keys {
-            self.read_all(key, |v| f(key, v))?;
+            for (si, seg) in sources.iter().enumerate() {
+                let mut rank = cursors[si];
+                while seg.blob.key_at(rank).is_some_and(|k| k < key.as_slice()) {
+                    rank += 1;
+                }
+                cursors[si] = rank;
+                if seg.blob.key_at(rank) == Some(key.as_slice()) {
+                    seg.blob
+                        .values_at(rank, |v| f(key, v))
+                        .map_err(|e| err(&format!("segment scan read: {e}")))?;
+                }
+            }
+            if let Some(fr) = &self.frozen {
+                if let Some(e) = fr.get(key) {
+                    for off in fr.chain(e) {
+                        f(key, fr.value_at(off));
+                    }
+                }
+            }
+            if let Some(e) = self.mem.get(key) {
+                for off in self.mem.chain(e) {
+                    f(key, self.mem.value_at(off));
+                }
+            }
         }
         Ok(keys.len())
     }

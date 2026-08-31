@@ -121,6 +121,7 @@ fn main() -> std::io::Result<()> {
             "f40-filter" => f40_filter(&args, profile)?,
             "f41-segroute" => f41_segroute(&args, profile)?,
             "f42-next" => f42_next(&args, profile)?,
+            "f43-compact" => f43_compact(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -5785,6 +5786,248 @@ fn f38_fanout(args: &Args, profile: Profile) -> std::io::Result<Record> {
             keep16 * 1.355
         ),
     ));
+
+    Ok(rec)
+}
+
+/// The compaction milestone adjudicated: compaction-plan.md's P4.1-P4.4,
+/// registered before the merge existed. Three arms interleaved -- the
+/// unrouted fan of milestone 3, and range-partitioned compaction at two
+/// tail bounds -- each loading the same keys durably, then answering the
+/// same reads and the same ordered scans over what it built. Every metric
+/// is gated: load through `Trial`, the rest through `Samples` filled per
+/// rep and compared the same way.
+fn f43_compact(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::next::{Db, NextOptions};
+
+    let keys = args.num("--keys", profile.pick(20_000, 100_000, 300_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+    let seal_kb = args.num("--seal-kb", profile.pick(256, 1_024, 2_048));
+    let probes = args.num("--probes", profile.pick(10_000, 50_000, 100_000)) as u64;
+    let scans = args.num("--scans", profile.pick(100, 300, 500)) as u64;
+    let scan_len = args.num("--scan-len", 100);
+
+    let mut rec = Record::new("f43-compact", profile);
+    rec.param("keys", J::u(keys))
+        .param("batch", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .param("seal_kb", J::u(seal_kb as u64))
+        .param("probes", J::u(probes))
+        .param("scans", J::u(scans))
+        .param("scan_len", J::u(scan_len as u64))
+        .note(
+            "three arms interleaved in one process, fresh store per rep: no-compact keeps every \
+             segment in the unrouted L0 fan (milestone 3 exactly), compact-T4 and compact-T8 \
+             merge the tail into disjoint fence-routed partitions at two tail bounds. Load, \
+             then reads, then ordered scans, all over the store the arm just built",
+        )
+        .note(
+            "seal_bytes is set small so a full-profile load produces enough segments to compact \
+             several times; the absolute throughputs are therefore not comparable with f42, \
+             whose seal threshold is the shipping default. The comparison here is between arms",
+        )
+        .note("predictions registered in compaction-plan.md before the merge was written");
+
+    let dir = scratch("f43");
+    let payload = Payload::new(value_size, 0.5, 0xF43);
+    let arm_names = ["no-compact", "compact-T4", "compact-T8"];
+    let arm_cfg = [(false, 0usize), (true, 4), (true, 8)];
+    let ne = arm_names.len();
+    let reads: std::sync::Mutex<Vec<Samples>> =
+        std::sync::Mutex::new(vec![Samples::default(); ne]);
+    let scan_rate: std::sync::Mutex<Vec<Samples>> =
+        std::sync::Mutex::new(vec![Samples::default(); ne]);
+    let io_mb: std::sync::Mutex<Vec<Samples>> =
+        std::sync::Mutex::new(vec![Samples::default(); ne]);
+    let disk_mb: std::sync::Mutex<Vec<Samples>> =
+        std::sync::Mutex::new(vec![Samples::default(); ne]);
+    let segs: std::sync::Mutex<Vec<Samples>> =
+        std::sync::Mutex::new(vec![Samples::default(); ne]);
+
+    let rates = Trial::new(profile.reps()).run(ne, |ci, rep| {
+        let (compact, trigger) = arm_cfg[ci];
+        let d = dir.join(format!("a{ci}-{rep}"));
+        let _ = std::fs::remove_dir_all(&d);
+        let opts = NextOptions {
+            seal_bytes: seal_kb << 10,
+            l0_trigger: if trigger == 0 { usize::MAX } else { trigger },
+            compact,
+            ..Default::default()
+        };
+        let mut db = Db::create(&d, opts).expect("create");
+        let mut vrng = Rng::new(0xF43 + rep as u64);
+        let mut kb = [0u8; 16];
+
+        let io0 = IoCounters::read_now();
+        let t = Instant::now();
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            db.append(&kb, payload.get(&mut vrng));
+            if (i + 1) % batch == 0 {
+                db.commit().expect("commit");
+            }
+        }
+        db.flush().expect("flush");
+        let load = keys as f64 / t.elapsed().as_secs_f64();
+        io_mb.lock().unwrap()[ci]
+            .push(IoCounters::read_now().since(&io0).write_bytes as f64 / 1_048_576.0);
+
+        // Reads over what the arm built: routed by fence and Bloom in the
+        // compacting arms, an unrouted fan in the other.
+        let mut g = KeyGen::new(KeyDist::Uniform, keys, 0x43 + rep as u64);
+        let t = Instant::now();
+        let mut got = 0u64;
+        for _ in 0..probes {
+            db_key_into(g.next(), &mut kb);
+            got += db.read_all(&kb, |v| {
+                std::hint::black_box(v);
+            })
+            .expect("read");
+        }
+        assert_eq!(got, probes, "every key holds exactly one value");
+        reads.lock().unwrap()[ci].push(probes as f64 / t.elapsed().as_secs_f64());
+
+        // Ordered scans: the axis EXT.24 records failing, and the one
+        // partitioning is supposed to recover.
+        let mut g2 = KeyGen::new(KeyDist::Uniform, keys.saturating_sub(scan_len as u64).max(1), 43);
+        let t = Instant::now();
+        let mut entries = 0u64;
+        for _ in 0..scans {
+            db_key_into(g2.next(), &mut kb);
+            db.scan(&kb, scan_len, |_k, v| {
+                std::hint::black_box(v);
+            })
+            .expect("scan");
+            entries += scan_len as u64;
+        }
+        scan_rate.lock().unwrap()[ci].push(entries as f64 / t.elapsed().as_secs_f64());
+
+        let (par, l0) = db.levels();
+        segs.lock().unwrap()[ci].push((par + l0) as f64);
+        db.close().expect("close");
+        let mut bytes = 0u64;
+        for e in std::fs::read_dir(&d).expect("dir") {
+            bytes += e.expect("entry").metadata().expect("meta").len();
+        }
+        disk_mb.lock().unwrap()[ci].push(bytes as f64 / 1_048_576.0);
+        let _ = std::fs::remove_dir_all(&d);
+        load
+    });
+
+    let take = |m: &std::sync::Mutex<Vec<Samples>>| m.lock().unwrap().clone();
+    let (reads, scan_rate, io_mb, disk_mb, segs) = (
+        take(&reads),
+        take(&scan_rate),
+        take(&io_mb),
+        take(&disk_mb),
+        take(&segs),
+    );
+    rec.series(
+        "arms",
+        J::arr(
+            (0..ne)
+                .map(|i| {
+                    jobj! {
+                        "arm" => J::s(arm_names[i]),
+                        "load_ops_per_s" => J::fp(rates[i].median(), 1),
+                        "load_rel_iqr" => J::fp(rates[i].rel_iqr(), 4),
+                        "reads_per_s" => J::fp(reads[i].median(), 1),
+                        "scan_entries_per_s" => J::fp(scan_rate[i].median(), 1),
+                        "device_write_mb" => J::fp(io_mb[i].median(), 1),
+                        "disk_mb" => J::fp(disk_mb[i].median(), 1),
+                        "live_segments" => J::fp(segs[i].median(), 1)
+                    }
+                })
+                .collect(),
+        ),
+    );
+
+    // P4.1: the scan axis. EXT.24 read 0.040x of LMDB on the unrouted fan,
+    // so reaching the registered 0.5x needs better than a twelvefold
+    // recovery here.
+    let cmp_scan = compare(&scan_rate[1], &scan_rate[0], supdb::bench::MIN_EFFECT);
+    rec.compare("scan_compactT4_vs_nocompact", cmp_scan.clone());
+    let scan_gain = scan_rate[1].median() / scan_rate[0].median().max(1e-9);
+    rec.finding(Finding::new(
+        "F43.1",
+        "range-partitioned compaction recovers the ordered-scan axis by at least 12x",
+        scan_gain >= 12.0 && matches!(cmp_scan.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "compact-T4 scans {:.0} entries/s against the unrouted fan's {:.0} -- {scan_gain:.1}x \
+             ({}), over {:.0} live segments against {:.0}. EXT.24 measured the fan at 0.040x of \
+             LMDB, so 12x is what compaction-plan.md's P4.1 needs to reach the registered 0.5x; \
+             the ext-kv suite is where that claim is actually settled",
+            scan_rate[1].median(),
+            scan_rate[0].median(),
+            cmp_scan.summary("compact-T4", "no-compact"),
+            segs[1].median(),
+            segs[0].median()
+        ),
+    ));
+
+    // P4.2: routing must not cost the read path. Holding is "no slower".
+    let cmp_read = compare(&reads[1], &reads[0], supdb::bench::MIN_EFFECT);
+    rec.compare("read_compactT4_vs_nocompact", cmp_read.clone());
+    rec.finding(Finding::new(
+        "F43.2",
+        "fence-and-Bloom routing does not cost the read path",
+        !matches!(cmp_read.verdict, supdb::bench::Verdict::Less),
+        format!(
+            "compact-T4 reads {:.0}/s against the unrouted fan's {:.0} ({}). The fan probes every \
+             segment; the routed arm probes one partition plus a bounded Bloomed tail, which is \
+             the arithmetic F38.1 and F40.1 priced",
+            reads[1].median(),
+            reads[0].median(),
+            cmp_read.summary("compact-T4", "no-compact")
+        ),
+    ));
+
+    // P4.3: the merge's device cost, registered at under 2x.
+    let io_ratio = io_mb[1].median() / io_mb[0].median().max(1e-9);
+    rec.finding(Finding::new(
+        "F43.3",
+        "compaction costs less than 2x the device bytes of never compacting",
+        io_ratio < 2.0,
+        format!(
+            "compact-T4 sent {:.1} MB to the device against {:.1} without compaction -- \
+             {io_ratio:.2}x, on disk {:.1} MB against {:.1}. Every merge rewrites what it \
+             touches, so this is the write amplification the tail bound buys the read path with",
+            io_mb[1].median(),
+            io_mb[0].median(),
+            disk_mb[1].median(),
+            disk_mb[0].median()
+        ),
+    ));
+
+    // P4.4: the merge runs on its own thread, so the durable load should
+    // not feel it. Holding is "no slower".
+    let cmp_load = compare(&rates[1], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("load_compactT4_vs_nocompact", cmp_load.clone());
+    rec.finding(Finding::new(
+        "F43.4",
+        "compaction does not slow the durable load path",
+        !matches!(cmp_load.verdict, supdb::bench::Verdict::Less),
+        format!(
+            "compact-T4 loads {:.0} ops/s against {:.0} without compaction ({}). The merge runs \
+             on a background thread and the commit path never waits on it; a regression here \
+             convicts the backpressure, not the merge",
+            rates[1].median(),
+            rates[0].median(),
+            cmp_load.summary("compact-T4", "no-compact")
+        ),
+    ));
+
+    // T8 against T4 is the policy sweep the brief asked for, reported
+    // rather than gated: neither value is a claim yet.
+    rec.compare(
+        "scan_compactT8_vs_compactT4",
+        compare(&scan_rate[2], &scan_rate[1], supdb::bench::MIN_EFFECT),
+    );
+    rec.compare(
+        "device_compactT8_vs_compactT4",
+        compare(&io_mb[1], &io_mb[2], supdb::bench::MIN_EFFECT),
+    );
 
     Ok(rec)
 }
