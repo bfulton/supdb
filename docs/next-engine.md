@@ -73,13 +73,25 @@ checkpoint.
   not to filters**: compacted levels are key-range partitioned and a
   two-comparison fence routes them for nothing (the same fence F40.3 shows
   inert on overlapping ranges), while the small unpartitioned tail of
-  recent segments carries per-segment Blooms. The perfectly-routed ceiling
-  is worth reaching: sixteen quarter-size indexes read 20% faster than one
-  store (566ns against 522 — oracle16 vs k1, f41).
+  recent segments carries per-segment Blooms. **The ceiling this paragraph
+  was written around did not survive contact.** f41 had sixteen
+  perfectly-routed segments reading 20% *faster* than one store (566ns
+  against 522) — but that oracle knew the segment by arithmetic. Built,
+  with a fence search and Blooms and a real tail, the same shape reads
+  **71.4%** of one store at the same scale (F44.2). The routing conclusion
+  above still stands on its own evidence; what does not stand is the
+  assumption that routing recovers everything fan-out spends.
 - **Compact** = merge segments under the policy f37 already priced: geometric
   size ladders bought 3.963x on fragmenting writes for a 0.762x read tax
-  (F37.1, F37.3), and F38.2 says read cost does not force merging — only
-  filter false-positive accumulation and space do.
+  (F37.1, F37.3). The clause that used to follow — "F38.2 says read cost
+  does not force merging" — is **wrong as built**: unrouted segments read
+  864,624/s against ~1,020,000 routed at 1M keys (f44), so merging is what
+  buys routing and reads do force it. What f44 also shows is that the
+  merge cannot keep up: it rewrites the whole live set, so the tail
+  settles where merge duration puts it (5–6) no matter what `l0_trigger`
+  says, and compaction costs 42% of the durable load. **The incremental
+  merge is the design's largest outstanding debt**, named independently by
+  F43.4 and F44.1.
 - **Write scaling** = one active memtable+WAL per shard or per writer;
   segments make the shared-appender mutex (F6.1) unnecessary rather than
   cheaper.
