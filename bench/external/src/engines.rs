@@ -346,6 +346,17 @@ impl Next {
         // fairness gate refused to rank this arm until it was made here too.
         let opts = supdb::next::NextOptions {
             segment: supdb::Options { checksums: false, ..Default::default() },
+            // 8 MB rather than the 64 MB default, because this suite loads
+            // 116 MB: at the default the store would hold two segments and
+            // half its data in an unsealed arena, which is a property of
+            // the benchmark's size and not of the engine. Eight megabytes
+            // puts ~15 segments under a store this size -- the segments-per-
+            // store ratio a deployment with a 64 MB memtable and a hundred
+            // gigabytes would see -- so the level structure, the routing
+            // and the compaction are all actually exercised. Every seal and
+            // merge it causes happens inside the timed load, as it would in
+            // production.
+            seal_bytes: 8 << 20,
             ..Default::default()
         };
         let db = supdb::next::Db::create(path, opts).map_err(|e| e.to_string())?;
