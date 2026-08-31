@@ -942,7 +942,17 @@ impl Db {
             {
                 let store = Store::create(&tmp, opts)
                     .map_err(|e| err(&format!("seal create: {e}")))?;
-                for e in mem.entries.iter().filter(|e| e.hash != 0) {
+                // In KEY order, not hash order. A segment written in the
+                // memtable's iteration order scatters each key's values
+                // across blocks by hash, so an ordered scan walks the file
+                // randomly; written sorted, a scan walks it forwards. This
+                // is W1.3's finding in the new engine -- how the roll
+                // writes decides what the read costs -- and the sort is
+                // affordable because a seal is off the commit path.
+                let mut order: Vec<&MemEntry> =
+                    mem.entries.iter().filter(|e| e.hash != 0).collect();
+                order.sort_unstable_by_key(|e| MemTable::key_of(&mem.keys, e));
+                for e in order {
                     let key = MemTable::key_of(&mem.keys, e);
                     for off in mem.chain(e) {
                         store
@@ -1165,95 +1175,73 @@ impl Db {
         }
         let cache = self.scan_keys.borrow();
         let unsealed = &cache.as_ref().expect("scan snapshot").1;
-        let at = unsealed.partition_point(|k| k.as_slice() < from);
-        let mut keys: Vec<Vec<u8>> =
-            unsealed[at..at + limit.min(unsealed.len() - at)].to_vec();
+        let mut mi = unsealed.partition_point(|k| k.as_slice() < from);
 
-        // Partitions are disjoint and ordered, so the first `limit` keys at
-        // or after `from` come from the partition holding `from` and spill
-        // into its successors only when it runs out. Walking them in key
-        // order and stopping is what makes the partition COUNT irrelevant
-        // to a scan's cost -- the version that seeked into every partition
-        // above the cursor made a compacted store scan slower than an
-        // uncompacted one, which is the opposite of the point.
-        let mut parts: Vec<&Seg> =
-            self.segs.iter().filter(|s| s.level > 0 && s.may_reach(from)).collect();
-        parts.sort_by(|a, b| a.lo.cmp(&b.lo));
-        let mut used: Vec<&Seg> = Vec::new();
-        let mut taken = 0usize;
-        for seg in parts {
-            if taken >= limit {
-                break;
-            }
-            let start = if seg.lo.as_slice() > from { seg.lo.as_slice() } else { from };
-            let got = seg
-                .blob
-                .scan_counts_fixed(start, limit - taken, 8, |k, _| {
-                    keys.push(k.to_vec());
-                    true
-                })
-                .map_err(|e| err(&format!("segment scan: {e}")))?;
-            if got > 0 {
-                used.push(seg);
-            }
-            taken += got;
-        }
-        // L0 segments overlap each other and everything else, so each one
-        // has to be asked. The tail is bounded by `l0_trigger`, which is
-        // what keeps this loop short.
-        for seg in self.segs.iter().filter(|s| s.level == 0) {
-            seg.blob
-                .scan_counts_fixed(from, limit, 8, |k, _| {
-                    keys.push(k.to_vec());
-                    true
-                })
-                .map_err(|e| err(&format!("segment scan: {e}")))?;
-            used.push(seg);
-        }
-
-        keys.sort_unstable();
-        keys.dedup();
-        keys.truncate(limit);
-        let Some(last) = keys.last() else {
-            return Ok(0);
-        };
-
-        // The merged walk: one forward-only rank cursor per contributing
-        // source, so a key costs a comparison per source rather than a
-        // hash probe per source. Over `limit` keys that is the difference
-        // between an ordered read and `limit` lookups.
-        let sources: Vec<&Seg> = used
-            .into_iter()
-            .filter(|s| s.lo.as_slice() <= last.as_slice())
+        // A k-way merge over rank cursors, allocating nothing per key.
+        //
+        // The version before this one materialised every candidate key from
+        // every source, sorted them and re-read each one: three copies and
+        // a sort per key, which cost more than the reads. `Blob::key_at`
+        // borrows out of the mapped index and the unsealed snapshot is
+        // already sorted, so the merge can run on borrowed keys and emit
+        // values straight from the position it is already holding.
+        let mut cursors: Vec<(&Seg, usize)> = self
+            .segs
+            .iter()
+            .filter(|s| s.may_reach(from))
+            .map(|s| {
+                let start = if s.lo.as_slice() > from { s.lo.as_slice() } else { from };
+                (s, s.blob.seek(start))
+            })
             .collect();
-        let mut cursors: Vec<usize> = sources.iter().map(|s| s.blob.seek(from)).collect();
-        for key in &keys {
-            for (si, seg) in sources.iter().enumerate() {
-                let mut rank = cursors[si];
-                while seg.blob.key_at(rank).is_some_and(|k| k < key.as_slice()) {
-                    rank += 1;
-                }
-                cursors[si] = rank;
-                if seg.blob.key_at(rank) == Some(key.as_slice()) {
-                    seg.blob
-                        .values_at(rank, |v| f(key, v))
-                        .map_err(|e| err(&format!("segment scan read: {e}")))?;
-                }
-            }
-            if let Some(fr) = &self.frozen {
-                if let Some(e) = fr.get(key) {
-                    for off in fr.chain(e) {
-                        f(key, fr.value_at(off));
+
+        let mut seen = 0usize;
+        while seen < limit {
+            // The next key is the smallest any source is holding.
+            let mut next: Option<&[u8]> = None;
+            for (seg, rank) in &cursors {
+                if let Some(k) = seg.blob.key_at(*rank) {
+                    if next.is_none_or(|n| k < n) {
+                        next = Some(k);
                     }
                 }
             }
-            if let Some(e) = self.mem.get(key) {
-                for off in self.mem.chain(e) {
-                    f(key, self.mem.value_at(off));
+            if let Some(k) = unsealed.get(mi) {
+                if next.is_none_or(|n| k.as_slice() < n) {
+                    next = Some(k.as_slice());
                 }
             }
+            let Some(key) = next else { break };
+
+            // Emit in append order -- partitions, then L0 oldest to
+            // newest, then the frozen memtable, then the live one -- and
+            // advance every cursor that was sitting on this key.
+            for (seg, rank) in cursors.iter_mut() {
+                if seg.blob.key_at(*rank) == Some(key) {
+                    seg.blob
+                        .values_at(*rank, |v| f(key, v))
+                        .map_err(|e| err(&format!("segment scan read: {e}")))?;
+                    *rank += 1;
+                }
+            }
+            if unsealed.get(mi).map(|k| k.as_slice()) == Some(key) {
+                if let Some(fr) = &self.frozen {
+                    if let Some(e) = fr.get(key) {
+                        for off in fr.chain(e) {
+                            f(key, fr.value_at(off));
+                        }
+                    }
+                }
+                if let Some(e) = self.mem.get(key) {
+                    for off in self.mem.chain(e) {
+                        f(key, self.mem.value_at(off));
+                    }
+                }
+                mi += 1;
+            }
+            seen += 1;
         }
-        Ok(keys.len())
+        Ok(seen)
     }
 
     pub fn segments(&self) -> usize {
