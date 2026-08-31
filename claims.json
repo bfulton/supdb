@@ -971,22 +971,22 @@
    "experiment": "f42-next",
    "id": "F42.1",
    "profile": "full",
-   "expect": "fails",
-   "because": "Milestone 2a (the arena memtable -- an append allocates nothing) moved the durable load 287,763 -> 418,239 ops/s, still under the registered 600k gate, so this stays failing. But the decomposition now points one place: next-lazyseal reads 838,581, past the gate and at 82.7% of f39's raw+index floor, so the WAL-and-memtable half of the engine is nearly at its ceiling and everything between 418k and 838k is the seal running on the committing thread. Milestone 2b is that seal moved off-thread via WAL rotation; this claim flips when it lands and measures. Device bytes per rule 4: 297.8 MB for 110.6 of records, 2.7x, against today's 8.1x."
+   "expect": "holds",
+   "because": "The promise registered before the engine existed, kept: 800,526 ops/s durably at batch 1000, past the 600k gate, past LMDB's recorded 572,416 (context), at 79% of f39's raw+index floor. The arc that got here is three decomposition-named steps in the record's history: 287,763 at milestone 1, 418,239 after the arena memtable removed the per-key allocations F42.3 convicted, 800,526 after WAL rotation moved the seal off the committing thread. Device bytes per rule 4: 297.8 MB for 110.6 of records, 2.7x amplification, against today's engine at 8.1x and LMDB's recorded 1.7x."
   },
   {
    "experiment": "f42-next",
    "id": "F42.2",
    "profile": "full",
    "expect": "holds",
-   "because": "With the arena memtable the new design beats the tuned current engine 1.712x on durable load (418,239 vs 244,303, p=0.0022) with 3x fewer device bytes (297.8 vs 890.9 MB). At milestone 1 this read 1.156x; the gap is widening as the design sheds the work F39.3 priced."
+   "because": "The new design beats the tuned current engine 3.250x on durable load (800,526 vs 246,298, p=0.0022) with 3x fewer device bytes. This read 1.156x at milestone 1 and 1.712x after the arena memtable; the multiple is the per-point work F39.3 priced, now actually deleted rather than deferred."
   },
   {
    "experiment": "f42-next",
    "id": "F42.3",
    "profile": "full",
-   "expect": "holds",
-   "because": "Flipped from fails in the same change as the record that moved it, as the original entry predicted it might: after milestone 2a removed the memtable's allocations, sealing on the committing thread became the larger share -- 420,342 ops/s of gap (418,239 vs lazyseal's 838,581, 2.005x, p=0.0022) against a 175k residual to the floor. The first full run had it the other way (270k seal, 456k memtable); both decompositions are in the record's history. This names milestone 2b: the seal off the committing thread via WAL rotation, after which this claim should fail again -- and that failure will be the design working."
+   "expect": "fails",
+   "because": "Failing again, exactly as the holds-era prose predicted it would, and this failure is the design working: with the seal off the committing thread (WAL rotation, milestone 2b), sealing inside the timed window costs 23,380 ops/s -- statistically nothing (1.029x, p=0.44) -- and the 190k residual to the floor is all that remains, in the WAL framing and memtable walk. The entry's full history: seal 270k/memtable 456k at milestone 1, seal 420k/memtable 175k after the arena, seal ~0/residual 190k now. Three decompositions, each naming the next fix, each kept."
   }
  ],
  "metrics": [
