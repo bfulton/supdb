@@ -117,6 +117,7 @@ fn main() -> std::io::Result<()> {
             "f37-consolidate" => f37_consolidate(&args, profile)?,
             "f28-count" => f28_count(&args, profile)?,
             "f38-fanout" => f38_fanout(&args, profile)?,
+            "f39-walfloor" => f39_walfloor(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -5779,6 +5780,167 @@ fn f38_fanout(args: &Args, profile: Profile) -> std::io::Result<Record> {
             keep16 * 100.0,
             keep4 * 1.355,
             keep16 * 1.355
+        ),
+    ));
+
+    Ok(rec)
+}
+
+/// The one-barrier floor, measured before the next engine promises to reach
+/// it. A WAL-only durable batch is append + fdatasync and nothing else; this
+/// prices that shape on this host with all engine work removed, then with
+/// only the bookkeeping no engine can skip, then as today's engine actually
+/// commits. EXT.9's LMDB figure is cited as context and nothing gates on a
+/// cross-run comparison. Predictions registered in walfloor-plan.md: P1 the
+/// raw floor lands in 600k-2.5M ops/s, P2 the memtable tax is under 20%, P3
+/// today's engine sits 3-8x below the floor.
+fn f39_walfloor(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use std::io::Write as _;
+
+    let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+
+    let mut rec = Record::new("f39-walfloor", profile);
+    rec.param("keys", J::u(keys))
+        .param("batch", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .note(
+            "three arms interleaved in one process, fresh file per rep, the EXT.9 load shape: \
+             every key new, a durability point every batch. raw-wal is write_all + fdatasync \
+             of the framed batch and nothing else; raw+index adds a hash-map insert per op; \
+             supdb is put + checkpoint under the shipped value-carrying log",
+        )
+        .note(
+            "predictions registered in walfloor-plan.md before the first full run. EXT.9's \
+             recorded lmdb 572,416 ops/s is context only -- no finding compares across runs",
+        );
+
+    let dir = scratch("f39");
+    let payload = Payload::new(value_size, 0.5, 0xF39);
+    let arm_names = ["raw-wal", "raw-wal+index", "supdb"];
+    let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
+        let file = dir.join(format!("w{ci}-{rep}.dat"));
+        let _ = std::fs::remove_file(&file);
+        let mut vrng = Rng::new(0xF39 + rep as u64);
+        let mut kb = [0u8; 16];
+        let secs = match ci {
+            2 => {
+                let store = Store::create(&file, default_opts(64)).expect("create");
+                let t = Instant::now();
+                for i in 0..keys {
+                    db_key_into(i, &mut kb);
+                    store.put(&kb, payload.get(&mut vrng)).expect("put");
+                    if (i + 1) % batch == 0 {
+                        store.checkpoint().expect("checkpoint");
+                    }
+                }
+                let secs = t.elapsed().as_secs_f64();
+                let _ = store.close();
+                secs
+            }
+            _ => {
+                let mut f = std::fs::File::create(&file).expect("create wal");
+                let mut index: std::collections::HashMap<u64, (u64, u32)> =
+                    std::collections::HashMap::new();
+                if ci == 1 {
+                    index.reserve(keys as usize);
+                }
+                let mut buf: Vec<u8> = Vec::with_capacity((batch as usize) * (value_size + 24));
+                let mut off = 0u64;
+                let t = Instant::now();
+                for i in 0..keys {
+                    db_key_into(i, &mut kb);
+                    let v = payload.get(&mut vrng);
+                    buf.extend_from_slice(&(kb.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(&kb);
+                    buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(v);
+                    if ci == 1 {
+                        index.insert(i, (off + buf.len() as u64, v.len() as u32));
+                    }
+                    if (i + 1) % batch == 0 {
+                        f.write_all(&buf).expect("append");
+                        f.sync_data().expect("fdatasync");
+                        off += buf.len() as u64;
+                        buf.clear();
+                    }
+                }
+                let secs = t.elapsed().as_secs_f64();
+                std::hint::black_box(index.len());
+                secs
+            }
+        };
+        let _ = std::fs::remove_file(&file);
+        keys as f64 / secs
+    });
+
+    rec.series(
+        "arms",
+        J::arr(
+            arm_names
+                .iter()
+                .zip(rates.iter())
+                .map(|(name, s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "ops_per_s" => J::fp(s.median(), 1),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4),
+                    }
+                })
+                .collect(),
+        ),
+    );
+
+    let floor = rates[0].median();
+    rec.finding(Finding::new(
+        "F39.1",
+        "a log-only durable batch clears the registered floor band on this host",
+        (600_000.0..=2_500_000.0).contains(&floor),
+        format!(
+            "raw append + fdatasync sustains {:.0} ops/s at batch {batch} ({:.2}ms per \
+             barrier). The registered band is 600k-2.5M; below it a one-barrier commit \
+             cannot beat LMDB's recorded 572,416 ops/s and the redesign's durable-load \
+             promise dies here, above it the fsync is suspect and needs O_DSYNC scrutiny \
+             before belief",
+            floor,
+            1e3 * batch as f64 / floor
+        ),
+    ));
+
+    let cmp_idx = compare(&rates[1], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("index_vs_raw", cmp_idx.clone());
+    let keep = rates[1].median() / rates[0].median();
+    rec.finding(Finding::new(
+        "F39.2",
+        "memtable bookkeeping costs under 20% of the raw floor",
+        keep >= 0.80,
+        format!(
+            "raw+index {:.0} ops/s against raw {:.0} ({}), keeping {:.1}%. Failing means \
+             the memtable, not the log, is the next engine's write-path problem",
+            rates[1].median(),
+            floor,
+            cmp_idx.summary("raw+index", "raw"),
+            keep * 100.0
+        ),
+    ));
+
+    let cmp_eng = compare(&rates[0], &rates[2], supdb::bench::MIN_EFFECT);
+    rec.compare("raw_vs_supdb", cmp_eng.clone());
+    let gap = floor / rates[2].median();
+    rec.finding(Finding::new(
+        "F39.3",
+        "today's engine sits 3-8x below the one-barrier floor",
+        (3.0..=8.0).contains(&gap) && matches!(cmp_eng.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "supdb {:.0} ops/s against the raw floor's {:.0} -- {:.2}x below ({}). This gap \
+             is what a WAL-only engine claims to recover; under 3x the rewrite buys little \
+             on this axis, over 8x the per-point work is worse than EXT.9's decomposition \
+             suggests",
+            rates[2].median(),
+            floor,
+            gap,
+            cmp_eng.summary("raw", "supdb")
         ),
     ));
 
