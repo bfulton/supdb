@@ -889,6 +889,27 @@
    "profile": "full",
    "expect": "holds",
    "because": "File after close: deferred 1,287.6 MB against inline 4,699.6 (0.274x, p=0.0004). The same mechanism read through the file: what inline rewrote and left dead, deferred never wrote. Downstream, flipping the default took w1's line-ordered day index from 740.5 MB to 190.0 -- the naive-roll penalty W1.3 prices fell from 22.6x to 5.17x while the claim itself kept holding, since term order still writes less than a third."
+  },
+  {
+   "experiment": "f38-fanout",
+   "id": "F38.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "The unfiltered fan tax is linear and inside the band registered in fanout-plan.md before the run: 90ns per extra probe at four segments, 92 at sixteen (k1 554ns/read, fan4 689, fan16 1247, both p=0.0022). The ci smoke read 21-27ns and argued the band was too high; full scale restored it, because at 1M keys a failed hash probe misses cache like everything else. A per-segment existence filter earns its place only by adjudicating presence in well under 90ns; that number is now the filter's budget rather than a guess."
+  },
+  {
+   "experiment": "f38-fanout",
+   "id": "F38.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Segmentation itself is free: perfectly-routed reads over four and sixteen segments are indistinguishable from the single store (1.068x and 1.120x, p=0.0553, no difference -- leaning positive if anything, the ci run's smaller-index cache effect shrunk into noise at 1M keys). The entire fan-out cost is the probing, none of it the splitting, so the next engine buys write-side segmentation at zero read cost IF routing is solved -- and F38.1 prices what routing must beat."
+  },
+  {
+   "experiment": "f38-fanout",
+   "id": "F38.3",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Registered prediction P3 said the x86 read lead survives an unfiltered four-segment fan; it does not, and this entry records the refutation. fan4 keeps 80.5% of k1 (threshold was 85%), which puts EXT.11's 1.355x lead at 1.09x -- inside that comparison's own noise on this host -- and fan16 keeps 44.4%, lead 0.60x, gone outright. The design consequence is stronger than predicted: routing or filtering is required from k=4 up, not merely at large k. Read with F38.2, the shape is settled -- segments cost nothing, unrouted probes cost everything."
   }
  ],
  "metrics": [
