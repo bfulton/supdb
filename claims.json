@@ -910,6 +910,27 @@
    "profile": "full",
    "expect": "fails",
    "because": "Registered prediction P3 said the x86 read lead survives an unfiltered four-segment fan; it does not, and this entry records the refutation. fan4 keeps 80.5% of k1 (threshold was 85%), which puts EXT.11's 1.355x lead at 1.09x -- inside that comparison's own noise on this host -- and fan16 keeps 44.4%, lead 0.60x, gone outright. The design consequence is stronger than predicted: routing or filtering is required from k=4 up, not merely at large k. Read with F38.2, the shape is settled -- segments cost nothing, unrouted probes cost everything."
+  },
+  {
+   "experiment": "f39-walfloor",
+   "id": "F39.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "A raw log-only durable batch -- framed append + fdatasync, no engine -- sustains 1,191,125 ops/s at batch 1000 on this host, 0.84ms per barrier, inside the 600k-2.5M band registered in walfloor-plan.md. That is 2.08x LMDB's recorded durable load (EXT.9, 572,416, context only), so a one-barrier commit has the headroom to win the axis this engine has always lost; whether an engine can stay near its own floor is now the design question, not whether the floor is high enough."
+  },
+  {
+   "experiment": "f39-walfloor",
+   "id": "F39.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Adding a hash-map insert per op -- the memtable bookkeeping no engine can skip -- keeps 85.1% of the raw floor (1,014,003 against 1,191,125, p=0.0298). The tax is real but small: the write path's budget is spent at the barrier and the log, not in the map, so the next engine's durable-load promise is registered against the raw+index arm, ~1.0M ops/s on this host."
+  },
+  {
+   "experiment": "f39-walfloor",
+   "id": "F39.3",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Today's engine commits at 203,603 ops/s against the 1,191,125 floor -- 5.85x below, p=0.0022, mid-band of the registered 3-8x. The gap is per-point arena append + section work that a WAL-only design deletes rather than optimizes, and 5.85x is the number the rewrite is claiming to recover. Read with F39.1: the floor clears LMDB by 2.08x and today's engine sits 2.8x below LMDB, so the whole 0.348x deficit on EXT.9 lives between the engine and its own floor, none of it in the hardware."
   }
  ],
  "metrics": [
