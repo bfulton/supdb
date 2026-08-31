@@ -118,6 +118,7 @@ fn main() -> std::io::Result<()> {
             "f28-count" => f28_count(&args, profile)?,
             "f38-fanout" => f38_fanout(&args, profile)?,
             "f39-walfloor" => f39_walfloor(&args, profile)?,
+            "f40-filter" => f40_filter(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -5780,6 +5781,289 @@ fn f38_fanout(args: &Args, profile: Profile) -> std::io::Result<Record> {
             keep16 * 100.0,
             keep4 * 1.355,
             keep16 * 1.355
+        ),
+    ));
+
+    Ok(rec)
+}
+
+/// Routing priced against the 90ns budget F38.1 set. Six arms over the f38
+/// builds: the unfiltered fan, per-segment min/max fences, per-segment
+/// blocked Bloom filters, a global key->segment map, and the k1/oracle
+/// anchors. Predictions registered in filter-plan.md: P1 per-segment
+/// filters only halve the tax at k=16 (a fixed probe order queries ~8.5
+/// filters per lookup), P2 the global route recovers >=95% of the oracle,
+/// P3 fences prune nothing when segment ranges overlap.
+fn f40_filter(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::bytes::MmapBytes;
+    use supdb::Blob;
+
+    let keys = args.num("--keys", profile.pick(20_000, 200_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let probes = args.num("--probes", profile.pick(20_000, 100_000, 500_000)) as u64;
+    let k = args.num("--segments", 16) as u64;
+
+    let mut rec = Record::new("f40-filter", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .param("probes", J::u(probes))
+        .param("segments", J::u(k))
+        .note(
+            "six arms interleaved in one process over two builds (one store, k segments, keys \
+             dealt round-robin so segment key-ranges fully overlap). fence16 consults per-\
+             segment min/max before probing; bloom16 a per-segment blocked Bloom (~10 bits/key, \
+             one 64-byte block per query); route16 a global key->segment hash map built at \
+             open; k1/fan16/oracle16 are f38's arms re-run so every comparison is same-run",
+        )
+        .note("predictions registered in filter-plan.md before the first full run");
+
+    // A tiny 2-out mixer for filter hashing; splitmix-style, no dependency.
+    fn mix(key: &[u8; 16], seed: u64) -> u64 {
+        let a = u64::from_le_bytes(key[..8].try_into().unwrap());
+        let b = u64::from_le_bytes(key[8..].try_into().unwrap());
+        let mut x = a ^ b.rotate_left(31) ^ seed;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+        x ^ (x >> 31)
+    }
+
+    /// One 64-byte block per query: the block is picked by the high hash
+    /// bits, eight probe bits are derived from the low ones.
+    struct BlockedBloom {
+        blocks: Vec<[u64; 8]>,
+    }
+    impl BlockedBloom {
+        fn build(n: usize) -> BlockedBloom {
+            // ~10 bits/key rounded up to whole 512-bit blocks.
+            let blocks = (n * 10).div_ceil(512).max(1);
+            BlockedBloom { blocks: vec![[0u64; 8]; blocks] }
+        }
+        fn slots(&self, kb: &[u8; 16]) -> (usize, [(usize, u64); 4]) {
+            let h = mix(kb, 0x40);
+            let bi = (h >> 32) as usize % self.blocks.len();
+            let mut probes = [(0usize, 0u64); 4];
+            let mut s = h;
+            for p in &mut probes {
+                s = s.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(1);
+                let bit = (s >> 55) as usize & 511;
+                *p = (bit >> 6, 1u64 << (bit & 63));
+            }
+            (bi, probes)
+        }
+        fn insert(&mut self, kb: &[u8; 16]) {
+            let (bi, probes) = self.slots(kb);
+            for (w, m) in probes {
+                self.blocks[bi][w] |= m;
+            }
+        }
+        #[inline]
+        fn contains(&self, kb: &[u8; 16]) -> bool {
+            let (bi, probes) = self.slots(kb);
+            let b = &self.blocks[bi];
+            probes.iter().all(|&(w, m)| b[w] & m != 0)
+        }
+    }
+
+    let dir = scratch("f40");
+    let payload = Payload::new(value_size, 0.5, 0xF40);
+    let configs = [1u64, k];
+    let mut builds: Vec<Vec<Blob<MmapBytes>>> = Vec::new();
+    let mut blooms: Vec<BlockedBloom> = Vec::new();
+    let mut fences: Vec<([u8; 16], [u8; 16])> = Vec::new();
+    let mut route: std::collections::HashMap<u64, u8> = std::collections::HashMap::new();
+    route.reserve(keys as usize);
+    for &kc in &configs {
+        let mut segs = Vec::with_capacity(kc as usize);
+        for s in 0..kc {
+            let path = dir.join(format!("k{kc}-seg{s}.dat"));
+            let store = Store::create(&path, default_opts(64)).expect("create");
+            let mut vrng = Rng::new(0xF40 ^ (kc << 32) ^ s);
+            let mut kb = [0u8; 16];
+            let mut bloom = BlockedBloom::build(keys.div_ceil(kc) as usize);
+            let mut lo = [0xffu8; 16];
+            let mut hi = [0u8; 16];
+            let mut i = s;
+            while i < keys {
+                db_key_into(i, &mut kb);
+                store.append(&kb, payload.get(&mut vrng)).expect("append");
+                if kc == k {
+                    bloom.insert(&kb);
+                    route.insert(i, s as u8);
+                    if kb < lo {
+                        lo = kb;
+                    }
+                    if kb > hi {
+                        hi = kb;
+                    }
+                }
+                i += kc;
+            }
+            store.checkpoint().expect("checkpoint");
+            store.close().expect("close");
+            let b = Blob::open(MmapBytes::open(&path).expect("map")).expect("blob open");
+            assert!(b.zero_copy(), "the native arm must not be copying");
+            segs.push(b);
+            if kc == k {
+                blooms.push(bloom);
+                fences.push((lo, hi));
+            }
+        }
+        builds.push(segs);
+    }
+
+    let arm_names = ["k1", "fan16", "fence16", "bloom16", "route16", "oracle16"];
+    let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
+        let segs = if ci == 0 { &builds[0] } else { &builds[1] };
+        let mut g = KeyGen::new(KeyDist::Uniform, keys, 0x40 + rep as u64);
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        let mut sink = 0u64;
+        for _ in 0..probes {
+            let i = g.next();
+            db_key_into(i, &mut kb);
+            let each = |v: &[u8]| {
+                std::hint::black_box(v);
+            };
+            let mut n = 0u64;
+            match ci {
+                0 | 1 => {
+                    for seg in segs.iter() {
+                        n += seg.read_all(&kb, each).expect("read_all");
+                        if n > 0 {
+                            break;
+                        }
+                    }
+                }
+                2 => {
+                    for (s, seg) in segs.iter().enumerate() {
+                        let (lo, hi) = &fences[s];
+                        if kb < *lo || kb > *hi {
+                            continue;
+                        }
+                        n += seg.read_all(&kb, each).expect("read_all");
+                        if n > 0 {
+                            break;
+                        }
+                    }
+                }
+                3 => {
+                    for (s, seg) in segs.iter().enumerate() {
+                        if !blooms[s].contains(&kb) {
+                            continue;
+                        }
+                        n += seg.read_all(&kb, each).expect("read_all");
+                        if n > 0 {
+                            break;
+                        }
+                    }
+                }
+                4 => {
+                    let s = *route.get(&i).expect("routed") as usize;
+                    n += segs[s].read_all(&kb, each).expect("read_all");
+                }
+                _ => {
+                    n += segs[(i % k) as usize].read_all(&kb, each).expect("read_all");
+                }
+            }
+            sink += n;
+        }
+        assert_eq!(sink, probes, "every probed key holds exactly one value");
+        probes as f64 / t.elapsed().as_secs_f64()
+    });
+
+    let ns = |s: &Samples| 1e9 / s.median();
+    rec.series(
+        "arms",
+        J::arr(
+            arm_names
+                .iter()
+                .zip(rates.iter())
+                .map(|(name, s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "reads_per_s" => J::fp(s.median(), 1),
+                        "ns_per_read" => J::fp(ns(s), 1),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4),
+                    }
+                })
+                .collect(),
+        ),
+    );
+
+    let keep = |i: usize| rates[i].median() / rates[0].median();
+    rec.series(
+        "fraction_of_k1_kept",
+        jobj! {
+            "fan16" => J::fp(keep(1), 3),
+            "fence16" => J::fp(keep(2), 3),
+            "bloom16" => J::fp(keep(3), 3),
+            "route16" => J::fp(keep(4), 3),
+            "oracle16" => J::fp(keep(5), 3)
+        },
+    );
+
+    // P1: bloom against both bounds -- must clear the fan and is predicted
+    // NOT to reach the oracle.
+    let cmp_bf = compare(&rates[3], &rates[1], supdb::bench::MIN_EFFECT);
+    let cmp_bo = compare(&rates[3], &rates[5], supdb::bench::MIN_EFFECT);
+    rec.compare("bloom16_vs_fan16", cmp_bf.clone());
+    rec.compare("bloom16_vs_oracle16", cmp_bo.clone());
+    let kb_ = keep(3);
+    rec.finding(Finding::new(
+        "F40.1",
+        "per-segment blooms recover only part of the fan tax at sixteen segments",
+        matches!(cmp_bf.verdict, supdb::bench::Verdict::Greater)
+            && (0.60..=0.85).contains(&kb_)
+            && matches!(cmp_bo.verdict, supdb::bench::Verdict::Less),
+        format!(
+            "bloom16 keeps {:.1}% of k1, between fan16's {:.1}% and oracle16's {:.1}% \
+             (vs fan {}; vs oracle {}). A fixed probe order pays ~{:.1} filter queries per \
+             lookup before its first data probe, which is why a per-segment filter cannot \
+             reach the ceiling at this k",
+            kb_ * 100.0,
+            keep(1) * 100.0,
+            keep(5) * 100.0,
+            cmp_bf.summary("bloom16", "fan16"),
+            cmp_bo.summary("bloom16", "oracle16"),
+            (k as f64 + 1.0) / 2.0
+        ),
+    ));
+
+    // P2: the global route against the ceiling.
+    let cmp_ro = compare(&rates[4], &rates[5], supdb::bench::MIN_EFFECT);
+    rec.compare("route16_vs_oracle16", cmp_ro.clone());
+    let rr = rates[4].median() / rates[5].median();
+    rec.finding(Finding::new(
+        "F40.2",
+        "a global key->segment map recovers at least 95% of perfect routing",
+        rr >= 0.95,
+        format!(
+            "route16 at {:.0}ns/read against oracle16's {:.0} ({}), {:.1}% of the ceiling \
+             and {:.1}% of k1. One hash lookup buys what sixteen filters cannot; the price \
+             is the one concession to global mutable state the next engine makes, and this \
+             is the number that justifies it",
+            ns(&rates[4]),
+            ns(&rates[5]),
+            cmp_ro.summary("route16", "oracle16"),
+            rr * 100.0,
+            keep(4) * 100.0
+        ),
+    ));
+
+    // P3: fences on overlapping ranges. "Holds" is the negative result.
+    let cmp_fe = compare(&rates[2], &rates[1], supdb::bench::MIN_EFFECT);
+    rec.compare("fence16_vs_fan16", cmp_fe.clone());
+    rec.finding(Finding::new(
+        "F40.3",
+        "min/max fences prune nothing when segment key-ranges overlap",
+        !matches!(cmp_fe.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "fence16 {:.0}ns/read against fan16 {:.0} ({}). Round-robin dealing makes every \
+             segment's range cover every key, so the fence admits every probe; recorded so \
+             the design never assumes fences route without key-partitioned sealing",
+            ns(&rates[2]),
+            ns(&rates[1]),
+            cmp_fe.summary("fence16", "fan16")
         ),
     ));
 
