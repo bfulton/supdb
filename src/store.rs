@@ -1647,7 +1647,7 @@ impl Store {
         let replayed: Vec<Vec<u8>> = logged
             .iter()
             .filter_map(|r| match r {
-                LogRec::Sealed(k, _) => Some(k.clone()),
+                LogRec::Sealed(k, ..) => Some(k.clone()),
                 _ => None,
             })
             .collect();
@@ -1665,14 +1665,16 @@ impl Store {
         // point), so `replaces` is honored for the first record of a
         // replacing run and everything after it appends.
         //
-        // A Value record BEFORE the key's last Sealed record is superseded:
-        // the seal absorbed those bytes into the extents the Sealed record
-        // carries, and re-applying them would serve them twice.
+        // A Value record BEFORE a Sealed record that does NOT keep the tail
+        // is superseded: the seal absorbed those bytes into the extents, and
+        // re-applying them would serve them twice. A Sealed record that
+        // KEEPS the tail is a re-log of a still-dirty key -- its Value
+        // records stay live.
         let last_sealed: std::collections::HashMap<&[u8], usize> = logged
             .iter()
             .enumerate()
             .filter_map(|(i, r)| match r {
-                LogRec::Sealed(k, _) => Some((k.as_slice(), i)),
+                LogRec::Sealed(k, _, false) => Some((k.as_slice(), i)),
                 _ => None,
             })
             .collect();
@@ -3392,7 +3394,11 @@ impl Store {
             for idx in &sh.dirty {
                 let k = sh.keys.key_at(*idx);
                 let e = sh.keys.entry(*idx);
-                let Some(rec) = log_encode_sealed(k, e.extents.as_slice(), gen) else {
+                // A live pending run with logged bytes means these extents do
+                // NOT absorb the key's logged tail -- this Sealed record is a
+                // re-log of a still-dirty key, not the product of a seal.
+                let keeps_tail = e.pending.as_ref().is_some_and(|p| p.logged > 0);
+                let Some(rec) = log_encode_sealed(k, e.extents.as_slice(), keeps_tail, gen) else {
                     return Ok(false);
                 };
                 buf.extend_from_slice(&rec);
@@ -3507,7 +3513,9 @@ impl Store {
             ));
         }
         for (k, exts) in changed {
-            let Some(rec) = log_encode_sealed(k, exts.as_slice(), gen) else {
+            // This path runs after `flush`, so every pending run was just
+            // sealed into these extents: nothing keeps a tail.
+            let Some(rec) = log_encode_sealed(k, exts.as_slice(), false, gen) else {
                 return Ok(false);
             };
             buf.extend_from_slice(&rec);
@@ -3973,8 +3981,13 @@ const LOG_HDR: usize = 8;
 enum LogRec {
     /// `FlatIndex::encode_record`: a key and where its values already live.
     /// Written for keys the index has not published yet, so replay only has
-    /// to re-point.
-    Sealed(Vec<u8>, Extents),
+    /// to re-point. The flag says whether a logged VALUE tail is still live
+    /// alongside these extents: a Sealed record written because a seal
+    /// absorbed the pending clears the tail (false), but a key stays dirty
+    /// across logged points and gets RE-logged while its tail still stands
+    /// -- and a fold that treated every Sealed as absorbing lost one round
+    /// of acknowledged appends in the reproducer (true keeps the tail).
+    Sealed(Vec<u8>, Extents, bool),
     /// A key and value bytes still unsealed, in the pending buffer's own
     /// shape (`[varint len][bytes]` per record). The flag says whether these
     /// bytes replace everything before them (a `put`) or append (an
@@ -4010,11 +4023,12 @@ const LOG_KIND_BLOCKS: u8 = 2;
 /// A sealed body is exactly what `FlatIndex::encode_record` produces, so the
 /// log and the index agree on how a key and its extents are spelled and there
 /// is only one encoder to keep correct.
-fn log_encode_sealed(key: &[u8], exts: &[Ext], gen: u64) -> Option<Vec<u8>> {
+fn log_encode_sealed(key: &[u8], exts: &[Ext], keeps_tail: bool, gen: u64) -> Option<Vec<u8>> {
     let rec = FlatIndex::encode_record(key, exts)?;
-    let mut payload = Vec::with_capacity(9 + rec.len());
+    let mut payload = Vec::with_capacity(10 + rec.len());
     payload.extend_from_slice(&gen.to_le_bytes());
     payload.push(LOG_KIND_SEALED);
+    payload.push(keeps_tail as u8);
     payload.extend_from_slice(&rec);
     Some(log_frame(&payload))
 }
@@ -4089,12 +4103,13 @@ fn log_replay(arena: &[u8]) -> (Vec<(u64, LogRec)>, u64) {
             let (&kind, body) = payload[8..].split_first()?;
             let rec = match kind {
                 LOG_KIND_SEALED => {
-                    let (k, exts) = FlatIndex::decode_record(body)?;
+                    let (&keeps_tail, rec) = body.split_first()?;
+                    let (k, exts) = FlatIndex::decode_record(rec)?;
                     let mut e = Extents::None;
                     for x in exts {
                         e.push(x);
                     }
-                    LogRec::Sealed(k, e)
+                    LogRec::Sealed(k, e, keeps_tail != 0)
                 }
                 LOG_KIND_VALUE => {
                     let replaces = *body.first()? != 0;
@@ -5865,10 +5880,12 @@ impl Reader {
         let mut by_key: std::collections::BTreeMap<Vec<u8>, OverVal> = Default::default();
         for (_, r) in records {
             match r {
-                LogRec::Sealed(k, e) => {
+                LogRec::Sealed(k, e, keeps_tail) => {
                     let slot = by_key.entry(k).or_default();
                     slot.sealed = Some(e);
-                    slot.inline = None;
+                    if !keeps_tail {
+                        slot.inline = None;
+                    }
                 }
                 LogRec::Value(k, v, replaces) => {
                     let slot = by_key.entry(k).or_default();

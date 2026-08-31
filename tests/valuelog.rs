@@ -215,3 +215,38 @@ fn a_fresh_reader_serves_logged_values() {
     drop(r);
     drop(store);
 }
+
+/// A key stays dirty across logged points and its Sealed record is RE-logged
+/// while a logged tail is still live. A fold that treated every Sealed as
+/// absorbing lost that tail -- one whole round of acknowledged appends in the
+/// consolidation crash test that caught it. The re-log must keep the tail.
+#[test]
+fn a_relogged_sealed_record_keeps_the_live_tail() {
+    let path = dir("relog").join("s.supdb");
+    let o = Options {
+        shards: 1,
+        buffer_bytes: 4 << 10, // tiny: appends seal under pressure
+        ..opts()
+    };
+    let store = Store::create(&path, o.clone()).unwrap();
+    store.checkpoint().unwrap();
+    let sb = snapshot_sb(&path);
+    // Enough to seal (extents + dirty), then a tail that stays pending.
+    for i in 0..40u32 {
+        store.append(b"k", format!("v{i:03}").as_bytes()).unwrap();
+    }
+    store.checkpoint().unwrap(); // logs Sealed(+tail Value)
+    store.append(b"other", b"x").unwrap();
+    store.checkpoint().unwrap(); // k still dirty: Sealed RE-logged after k's tail
+    std::mem::forget(store);
+    crash_to(&path, &sb);
+    let s = Store::open(&path, o).unwrap();
+    let got = read_vec(&s, b"k");
+    assert_eq!(got.len(), 40, "the re-logged Sealed record dropped the live tail");
+    for (i, v) in got.iter().enumerate() {
+        assert_eq!(v, format!("v{i:03}").as_bytes(), "order lost at {i}");
+    }
+    drop(s);
+    let r = Reader::open_with(&path, ReadOptions::default()).unwrap();
+    assert_eq!(reader_vec(&r, b"k").len(), 40, "fresh reader dropped the tail");
+}

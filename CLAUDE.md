@@ -113,19 +113,19 @@ The matched scorecard against LMDB, `full`:
 
 | | Supdb | LMDB | |
 |---|---|---|---|
-| load, both durable (`EXT.9`) | 188,506/s | 631,836/s | **0.298x**, failing |
-| load, neither (`EXT.10`) | 644,346/s | 710,573/s | 0.907x on a noisy night; 0.85x on Apple Silicon, replicated |
-| read (`EXT.11`) | 1,251,963/s | 862,846/s | 1.451x, holds -- unstable on this host; 2.42x on Apple Silicon, replicated |
-| scan (`EXT.12`) | 20.4M/s | 17.6M/s | 1.155x, holds; 1.17x on Apple Silicon, replicated |
+| load, both durable (`EXT.9`) | 199,485/s | 572,416/s | **0.348x**, failing |
+| load, neither (`EXT.10`) | 628,814/s | 652,367/s | no difference here; 0.85x on Apple Silicon, replicated |
+| read (`EXT.11`) | 1,172,769/s | 865,587/s | 1.355x, holds -- unstable on this host; 2.42x on Apple Silicon, replicated |
+| scan (`EXT.12`) | 17.4M/s | 18.6M/s | coin toss here (1.16x sig, then 0.93x nd, same night); 1.17x on Apple Silicon, replicated |
 
 `EXT.9` has moved three times, each for a decomposed reason: 6,735 -> 54,333
 ops/s when `Options::index_inserts` stopped every batch rewriting the whole
 key index; -> ~152,800 when durability points went log-first with a single
 fsync (f36's ledger had convicted mmap writeback under the per-batch fsync at
-87.4% of all device bytes); -> 188,506 when the log started carrying VALUES
+87.4% of all device bytes); -> ~200,000 when the log started carrying VALUES
 (`Options::log_values`), so a durability point appends unsealed bytes and
 seals nothing -- blocks are written later, full, on the store's own schedule.
-Write amplification went 270x -> 105x -> 13.2x -> ~7x. Still 3.4x behind, so
+Write amplification went 270x -> 105x -> 13.2x -> ~7x. Still ~3x behind, so
 still recorded as failing; what remains is the per-batch append+fsync+section
 work against LMDB's single page-chain commit, and the macOS F_FULLFSYNC pair
 says the floor there is the fsync count itself. The value-log step was nearly
