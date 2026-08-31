@@ -389,14 +389,11 @@ impl Engine for Next {
     }
     fn sync(&mut self) -> Res<()> {
         if let Some(db) = self.db.as_mut() {
-            db.commit().map_err(|e| e.to_string())?;
-            // Seal at the phase boundary, as a deployment would before a
-            // read-heavy period. Without this the first full run spent ~15
-            // minutes per rep inside Db::scan walking a ~550k-key memtable
-            // once per scan call -- 100% CPU, zero io, an artifact of the
-            // milestone-3 scan collecting live-memtable candidates rather
-            // than a cost of the engine's segments.
-            db.seal().map_err(|e| e.to_string())?;
+            // Drain at the phase boundary, as a deployment would before a
+            // read-heavy period: commit, seal, AND join. seal() alone left
+            // the frozen memtable readable for the whole scan phase and the
+            // 15-minute-per-rep artifact came straight back through it.
+            db.flush().map_err(|e| e.to_string())?;
         }
         Ok(())
     }

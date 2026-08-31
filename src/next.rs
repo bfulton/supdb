@@ -535,6 +535,19 @@ impl Db {
         Ok(())
     }
 
+    /// Commit, seal, and wait for the segment: the full drain, for a caller
+    /// entering a read-heavy phase. `seal` alone leaves the frozen memtable
+    /// readable until an eventual join, which is right for a writer that
+    /// keeps committing and wrong for one that stops: the ext-kv adapter
+    /// sealed without draining and every scan walked the 550k-key frozen
+    /// table for the rest of the phase -- the same artifact the seal was
+    /// supposed to remove, back through the side door.
+    pub fn flush(&mut self) -> Result<()> {
+        self.wal.commit()?;
+        self.seal()?;
+        self.join_seal()
+    }
+
     /// Collect a finished (or in-flight) seal: join the thread, open its
     /// segment, retire the frozen memtable.
     fn join_seal(&mut self) -> Result<()> {
@@ -629,9 +642,7 @@ impl Db {
     }
 
     fn close_inner(&mut self) -> Result<()> {
-        self.wal.commit()?;
-        self.seal()?;
-        self.join_seal()
+        self.flush()
     }
 }
 
