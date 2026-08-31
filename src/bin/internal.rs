@@ -5822,17 +5822,26 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let dir = scratch("f42");
     let payload = Payload::new(value_size, 0.5, 0xF42);
-    let arm_names = ["next", "supdb"];
+    // next-lazyseal never seals inside the timed window (threshold above the
+    // dataset), so next minus next-lazyseal is the cost of sealing on the
+    // committing thread -- the milestone-1 shortcut -- and next-lazyseal
+    // against f39's raw+index floor is the memtable-and-framing overhead.
+    let arm_names = ["next", "next-lazyseal", "supdb"];
     type Row = (usize, f64, f64);
     let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
     let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
         let mut vrng = Rng::new(0xF42 + rep as u64);
         let mut kb = [0u8; 16];
         let io0 = IoCounters::read_now();
-        let (secs, disk_mb) = if ci == 0 {
-            let d = dir.join(format!("next-{rep}"));
+        let (secs, disk_mb) = if ci <= 1 {
+            let d = dir.join(format!("next-{ci}-{rep}"));
             let _ = std::fs::remove_dir_all(&d);
-            let mut db = Db::create(&d, NextOptions::default()).expect("create");
+            let opts = if ci == 1 {
+                NextOptions { seal_bytes: usize::MAX, ..Default::default() }
+            } else {
+                NextOptions::default()
+            };
+            let mut db = Db::create(&d, opts).expect("create");
             let t = Instant::now();
             for i in 0..keys {
                 db_key_into(i, &mut kb);
@@ -5915,7 +5924,9 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
         ),
     ));
 
-    let cmp = compare(&rates[0], &rates[1], supdb::bench::MIN_EFFECT);
+    let cmp_seal = compare(&rates[1], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("lazyseal_vs_next", cmp_seal.clone());
+    let cmp = compare(&rates[0], &rates[2], supdb::bench::MIN_EFFECT);
     rec.compare("next_vs_supdb", cmp.clone());
     rec.finding(Finding::new(
         "F42.2",
@@ -5926,10 +5937,29 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
              F39.3 priced today's engine 5.85x under its own floor on per-point work this \
              design deletes; this is that deletion, measured",
             next_tp,
-            rates[1].median(),
+            rates[2].median(),
             cmp.summary("next", "supdb"),
             med(0, |r| r.1),
-            med(1, |r| r.1)
+            med(2, |r| r.1)
+        ),
+    ));
+
+    rec.finding(Finding::new(
+        "F42.3",
+        "sealing on the committing thread is the larger share of the gap to the floor",
+        matches!(cmp_seal.verdict, supdb::bench::Verdict::Greater)
+            && (rates[1].median() - rates[0].median())
+                >= (1_014_003.0 - rates[1].median()),
+        format!(
+            "next-lazyseal {:.0} ops/s against next {:.0} ({}): sealing inside the timed \
+             window costs {:.0} ops/s, and the residual from lazyseal to f39's raw+index \
+             floor (1,014,003, cited) is {:.0}. Whichever is larger names milestone 2: \
+             seal off-thread, or a cheaper memtable",
+            rates[1].median(),
+            rates[0].median(),
+            cmp_seal.summary("lazyseal", "next"),
+            rates[1].median() - rates[0].median(),
+            1_014_003.0 - rates[1].median()
         ),
     ));
 
