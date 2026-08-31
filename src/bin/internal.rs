@@ -120,6 +120,7 @@ fn main() -> std::io::Result<()> {
             "f39-walfloor" => f39_walfloor(&args, profile)?,
             "f40-filter" => f40_filter(&args, profile)?,
             "f41-segroute" => f41_segroute(&args, profile)?,
+            "f42-next" => f42_next(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -5782,6 +5783,153 @@ fn f38_fanout(args: &Args, profile: Profile) -> std::io::Result<Record> {
             keep16 * 100.0,
             keep4 * 1.355,
             keep16 * 1.355
+        ),
+    ));
+
+    Ok(rec)
+}
+
+/// The brief's P-A, measured on milestone 1. EXT.9's exact shape -- every
+/// key new, 100B values, a durable point every 1,000 ops -- with the next
+/// engine (WAL commit + seal-off-path, src/next.rs) interleaved against
+/// today's engine committing through the value-carrying log. The registered
+/// promise (docs/next-engine.md): >= 600,000 ops/s, within 1.7x of f39's
+/// raw+index floor and past LMDB's recorded 572,416; below 600k the design
+/// has a leak that must be named. Rule 4: device bytes and on-disk size
+/// travel with the throughput.
+fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::next::{Db, NextOptions};
+
+    let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+
+    let mut rec = Record::new("f42-next", profile);
+    rec.param("keys", J::u(keys))
+        .param("batch", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .note(
+            "two arms interleaved in one process, fresh store per rep, the EXT.9 load shape. \
+             next commits by WAL append + fdatasync with seals off the commit path (64MB \
+             memtable); supdb commits by put + checkpoint under the shipped value-carrying \
+             log. Device bytes from /proc/self/io per rep; disk bytes are the store's files \
+             after close",
+        )
+        .note(
+            "the gate is the brief's registered P-A: >= 600,000 ops/s, past LMDB's recorded \
+             572,416 (EXT.9, cited as context -- no finding compares across runs)",
+        );
+
+    let dir = scratch("f42");
+    let payload = Payload::new(value_size, 0.5, 0xF42);
+    let arm_names = ["next", "supdb"];
+    type Row = (usize, f64, f64);
+    let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
+    let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
+        let mut vrng = Rng::new(0xF42 + rep as u64);
+        let mut kb = [0u8; 16];
+        let io0 = IoCounters::read_now();
+        let (secs, disk_mb) = if ci == 0 {
+            let d = dir.join(format!("next-{rep}"));
+            let _ = std::fs::remove_dir_all(&d);
+            let mut db = Db::create(&d, NextOptions::default()).expect("create");
+            let t = Instant::now();
+            for i in 0..keys {
+                db_key_into(i, &mut kb);
+                db.append(&kb, payload.get(&mut vrng));
+                if (i + 1) % batch == 0 {
+                    db.commit().expect("commit");
+                }
+            }
+            let secs = t.elapsed().as_secs_f64();
+            db.close().expect("close");
+            let mut bytes = 0u64;
+            for e in std::fs::read_dir(&d).expect("dir") {
+                bytes += e.expect("entry").metadata().expect("meta").len();
+            }
+            let _ = std::fs::remove_dir_all(&d);
+            (secs, bytes as f64 / 1_048_576.0)
+        } else {
+            let file = dir.join(format!("supdb-{rep}.dat"));
+            let _ = std::fs::remove_file(&file);
+            let store = Store::create(&file, default_opts(64)).expect("create");
+            let t = Instant::now();
+            for i in 0..keys {
+                db_key_into(i, &mut kb);
+                store.put(&kb, payload.get(&mut vrng)).expect("put");
+                if (i + 1) % batch == 0 {
+                    store.checkpoint().expect("checkpoint");
+                }
+            }
+            let secs = t.elapsed().as_secs_f64();
+            let _ = store.close();
+            let bytes = std::fs::metadata(&file).expect("meta").len();
+            let _ = std::fs::remove_file(&file);
+            (secs, bytes as f64 / 1_048_576.0)
+        };
+        let io_mb = IoCounters::read_now().since(&io0).write_bytes as f64 / 1_048_576.0;
+        rows.lock().unwrap().push((ci, io_mb, disk_mb));
+        keys as f64 / secs
+    });
+
+    let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
+        let all = rows.lock().unwrap();
+        let mut v: Vec<f64> = all.iter().filter(|r| r.0 == ci).map(pick).collect();
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
+    rec.series(
+        "arms",
+        J::arr(
+            arm_names
+                .iter()
+                .enumerate()
+                .zip(rates.iter())
+                .map(|((ci, name), s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "ops_per_s" => J::fp(s.median(), 1),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4),
+                        "device_write_mb" => J::fp(med(ci, |r| r.1), 1),
+                        "disk_mb" => J::fp(med(ci, |r| r.2), 1)
+                    }
+                })
+                .collect(),
+        ),
+    );
+
+    let next_tp = rates[0].median();
+    rec.finding(Finding::new(
+        "F42.1",
+        "the next engine's durable load clears the brief's registered P-A gate of 600k ops/s",
+        next_tp >= 600_000.0,
+        format!(
+            "next loads {:.0} ops/s durably at batch {batch} ({:.1} MB to the device, {:.1} \
+             MB on disk for {:.1} MB of records). The promise registered before this engine \
+             existed was >= 600,000 -- within 1.7x of f39's raw+index floor and past LMDB's \
+             recorded 572,416; a miss is a design leak to name, not a number to accept",
+            next_tp,
+            med(0, |r| r.1),
+            med(0, |r| r.2),
+            keys as f64 * (value_size as f64 + 16.0) / 1_048_576.0
+        ),
+    ));
+
+    let cmp = compare(&rates[0], &rates[1], supdb::bench::MIN_EFFECT);
+    rec.compare("next_vs_supdb", cmp.clone());
+    rec.finding(Finding::new(
+        "F42.2",
+        "the next engine beats today's engine on the axis the redesign exists for",
+        matches!(cmp.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "next {:.0} ops/s against supdb {:.0} ({}); device bytes {:.1} against {:.1} MB. \
+             F39.3 priced today's engine 5.85x under its own floor on per-point work this \
+             design deletes; this is that deletion, measured",
+            next_tp,
+            rates[1].median(),
+            cmp.summary("next", "supdb"),
+            med(0, |r| r.1),
+            med(1, |r| r.1)
         ),
     ));
 
