@@ -5867,6 +5867,12 @@ fn f41_segroute(args: &Args, profile: Profile) -> std::io::Result<Record> {
     }
 
     /// 64-byte buckets of sixteen u32 slots: fingerprint<<4 | seg, 0 = empty.
+    /// The first full run refuted "one spill bucket suffices at load 0.5":
+    /// at 1M keys the Poisson tail overflows a few hundred of 125k buckets
+    /// and occasionally the neighbor too. The window is 8 and the observed
+    /// maximum is recorded, so the one-line claim rests on the measured
+    /// distribution rather than on the assertion that crashed.
+    const SPILL: usize = 8;
     struct SegTable {
         buckets: Vec<[u32; 16]>,
         mask: usize,
@@ -5883,27 +5889,27 @@ fn f41_segroute(args: &Args, profile: Profile) -> std::io::Result<Record> {
             let fp = ((h as u32) >> 4) | 1;
             (h >> 32, fp)
         }
-        fn insert(&mut self, kb: &[u8; 16], seg: u8) {
+        fn insert(&mut self, kb: &[u8; 16], seg: u8) -> u32 {
             let (bh, fp) = Self::slot(kb);
             let entry = (fp << 4) | seg as u32;
             let mut bi = bh as usize & self.mask;
-            for _ in 0..2 {
+            for hop in 0..SPILL {
                 for s in self.buckets[bi].iter_mut() {
                     if *s == 0 {
                         *s = entry;
-                        return;
+                        return hop as u32;
                     }
                 }
                 bi = (bi + 1) & self.mask;
             }
-            panic!("segtable spill exceeded one bucket at load 0.5");
+            panic!("segtable spill exceeded {SPILL} buckets at load 0.5");
         }
         #[inline]
         fn route(&self, kb: &[u8; 16]) -> Option<u8> {
             let (bh, fp) = Self::slot(kb);
             let want = fp << 4;
             let mut bi = bh as usize & self.mask;
-            for _ in 0..2 {
+            for _ in 0..SPILL {
                 let mut full = true;
                 for &s in self.buckets[bi].iter() {
                     if s & !0xf == want {
@@ -5926,6 +5932,7 @@ fn f41_segroute(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let mut builds: Vec<Vec<Blob<MmapBytes>>> = Vec::new();
     let mut blooms: Vec<BlockedBloom> = Vec::new();
     let mut table = SegTable::build(keys as usize);
+    let mut max_spill = 0u32;
     for &kc in &configs {
         let mut segs = Vec::with_capacity(kc as usize);
         for s in 0..kc {
@@ -5940,7 +5947,7 @@ fn f41_segroute(args: &Args, profile: Profile) -> std::io::Result<Record> {
                 store.append(&kb, payload.get(&mut vrng)).expect("append");
                 if kc == k {
                     bloom.insert(&kb);
-                    table.insert(&kb, s as u8);
+                    max_spill = max_spill.max(table.insert(&kb, s as u8));
                 }
                 i += kc;
             }
@@ -6033,6 +6040,7 @@ fn f41_segroute(args: &Args, profile: Profile) -> std::io::Result<Record> {
             "table" => J::fp((table.buckets.len() * 64) as f64 / keys as f64, 2)
         },
     );
+    rec.series("table_max_spill_buckets", J::u(max_spill as u64));
 
     let cmp_to = compare(&rates[2], &rates[3], supdb::bench::MIN_EFFECT);
     rec.compare("table16_vs_oracle16", cmp_to.clone());
