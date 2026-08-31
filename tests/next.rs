@@ -98,7 +98,7 @@ fn a_torn_frame_stops_replay_at_the_crash_point() {
 
     // Tear the last frame: chop bytes off the WAL tail, the state a crash
     // mid-write leaves.
-    let wal = d.join("wal");
+    let wal = d.join("wal-00000000");
     let len = std::fs::metadata(&wal).unwrap().len();
     let f = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
     f.set_len(len - 3).unwrap();
@@ -123,7 +123,7 @@ fn crash_between_rename_and_wal_reset_does_not_duplicate() {
 
     // Emulate: copy the WAL aside, seal (which resets it), then put the
     // pre-seal WAL back. Disk state is now exactly rename-done, reset-lost.
-    let wal = d.join("wal");
+    let wal = d.join("wal-00000000");
     let saved = std::fs::read(&wal).unwrap();
     db.seal().unwrap();
     drop(db);

@@ -133,15 +133,6 @@ impl Wal {
         Ok(())
     }
 
-    /// After a seal has been renamed into place and the directory synced,
-    /// nothing in the WAL is needed: every record is in the segment.
-    fn reset(&mut self) -> Result<()> {
-        self.file.set_len(0)?;
-        self.file.sync_data()?;
-        self.file = OpenOptions::new().write(true).open(&self.path)?;
-        Ok(())
-    }
-
     /// Replay a WAL into `apply`, stopping cleanly at a torn tail: a frame
     /// whose length runs past the buffer or whose CRC fails is the crash
     /// point, not corruption to report -- everything durable precedes it.
@@ -349,21 +340,27 @@ pub struct Db {
     dir: PathBuf,
     opts: NextOptions,
     wal: Wal,
+    wal_id: u64,
     mem: MemTable,
     mem_bytes: usize,
-    /// Sequence number of the first record NOT covered by a sealed segment;
-    /// persisted implicitly by the WAL reset (a reset WAL means everything
-    /// sealed) and in memory between.
-    sealed_seq: u64,
     /// Sealed segments, oldest first; read_all visits them in order so a
     /// key's values come back in append order across seals.
     segs: Vec<Blob<MmapBytes>>,
     next_seg: u64,
+    /// A seal in flight: the frozen memtable stays readable (it is newer
+    /// than every segment and older than `mem`) while a thread writes it
+    /// out; `join_seal` collects the finished segment.
+    frozen: Option<std::sync::Arc<MemTable>>,
+    sealing: Option<std::thread::JoinHandle<Result<PathBuf>>>,
 }
 
 impl Db {
-    fn wal_path(dir: &Path) -> PathBuf {
-        dir.join("wal")
+    /// WAL files are numbered and rotate at each seal: the sealing thread
+    /// owns the old file and deletes it once its segment is renamed into
+    /// place, while commits continue into the next file. Replay walks them
+    /// in id order; sequence numbers are continuous across the boundary.
+    fn wal_path(dir: &Path, id: u64) -> PathBuf {
+        dir.join(format!("wal-{id:08}"))
     }
 
     /// The end-of-covered-sequence rides the file name so the rename that
@@ -381,16 +378,18 @@ impl Db {
 
     pub fn create(dir: &Path, opts: NextOptions) -> Result<Db> {
         std::fs::create_dir_all(dir)?;
-        let wal = Wal::create(&Db::wal_path(dir))?;
+        let wal = Wal::create(&Db::wal_path(dir, 0))?;
         Ok(Db {
             dir: dir.to_path_buf(),
             opts,
             wal,
+            wal_id: 0,
             mem: MemTable::new(),
             mem_bytes: 0,
-            sealed_seq: 0,
             segs: Vec::new(),
             next_seg: 0,
+            frozen: None,
+            sealing: None,
         })
     }
 
@@ -424,24 +423,45 @@ impl Db {
         // the last seal; everything before it is covered and skipped, which
         // is what makes the rename-then-reset crash window safe.
         let sealed = seg_ids.last().map_or(0, |&(_, end)| end);
+        let mut wal_ids: Vec<u64> = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let name = entry?.file_name();
+            let name = name.to_string_lossy();
+            if let Some(id) = name.strip_prefix("wal-") {
+                wal_ids.push(id.parse().map_err(|_| err("wal file name is malformed"))?);
+            }
+        }
+        wal_ids.sort_unstable();
         let mut mem = MemTable::new();
         let mut mem_bytes = 0usize;
-        let wal_path = Db::wal_path(dir);
-        let next_seq = Wal::replay(&wal_path, sealed, |k, v| {
-            mem.append(k, v);
-            mem_bytes += k.len() + v.len();
-        })?;
+        let mut from = sealed;
+        for &id in &wal_ids {
+            from = Wal::replay(&Db::wal_path(dir, id), from, |k, v| {
+                mem.append(k, v);
+                mem_bytes += k.len() + v.len();
+            })?;
+        }
+        // A crash can leave a fully-covered WAL the sealing thread never
+        // deleted; every record in it was skipped above, and it is garbage
+        // now. Keep only the newest file and continue appending to it.
+        for &id in wal_ids.iter().rev().skip(1) {
+            let _ = std::fs::remove_file(Db::wal_path(dir, id));
+        }
+        let wal_id = wal_ids.last().copied().unwrap_or(0);
+        let wal_path = Db::wal_path(dir, wal_id);
         let file = OpenOptions::new().create(true).append(true).open(&wal_path)?;
         let next_seg = seg_ids.last().map_or(0, |&(n, _)| n + 1);
         Ok(Db {
             dir: dir.to_path_buf(),
             opts,
-            wal: Wal { file, path: wal_path, seq: next_seq, pending: Vec::new() },
+            wal: Wal { file, path: wal_path, seq: from, pending: Vec::new() },
+            wal_id,
             mem,
             mem_bytes,
-            sealed_seq: sealed,
             segs,
             next_seg,
+            frozen: None,
+            sealing: None,
         })
     }
 
@@ -458,44 +478,80 @@ impl Db {
     /// batch's durability never waits on a segment write.
     pub fn commit(&mut self) -> Result<()> {
         self.wal.commit()?;
+        if self.sealing.as_ref().is_some_and(|h| h.is_finished()) {
+            self.join_seal()?;
+        }
         if self.mem_bytes >= self.opts.seal_bytes {
             self.seal()?;
         }
         Ok(())
     }
 
-    /// Write the memtable as one immutable segment in today's store format,
-    /// fsync, rename into place, fsync the directory, then reset the WAL.
+    /// Freeze the memtable, rotate the WAL, and hand the frozen table to a
+    /// thread that writes it as one immutable segment in today's store
+    /// format -- fsync, rename into place (the name carrying the covered
+    /// end-sequence), fsync the directory, delete the rotated-out WAL.
+    /// Commits continue into the new WAL while it runs; at most one seal is
+    /// in flight, so a second trigger joins the first (backpressure).
     pub fn seal(&mut self) -> Result<()> {
         self.wal.commit()?;
         if self.mem.is_empty() {
             return Ok(());
         }
-        let tmp = self.dir.join(format!("seal-{:08}.tmp", self.next_seg));
-        let _ = std::fs::remove_file(&tmp);
-        {
-            let store = Store::create(&tmp, Db::segment_opts(&self.opts))
-                .map_err(|e| err(&format!("seal create: {e}")))?;
-            for e in self.mem.entries.iter().filter(|e| e.hash != 0) {
-                let key = MemTable::key_of(&self.mem.keys, e);
-                for off in self.mem.chain(e) {
-                    store
-                        .append(key, self.mem.value_at(off))
-                        .map_err(|e| err(&format!("seal append: {e}")))?;
-                }
-            }
-            store.checkpoint().map_err(|e| err(&format!("seal checkpoint: {e}")))?;
-            store.close().map_err(|e| err(&format!("seal close: {e}")))?;
-        }
-        let path = Db::seg_path(&self.dir, self.next_seg, self.wal.seq);
-        std::fs::rename(&tmp, &path)?;
-        File::open(&self.dir)?.sync_all()?;
-        self.segs.push(Blob::open(MmapBytes::open(&path)?).map_err(|e| err(&format!("{e}")))?);
-        self.next_seg += 1;
-        self.sealed_seq = self.wal.seq;
-        self.mem.clear();
+        self.join_seal()?;
+        let frozen = std::sync::Arc::new(std::mem::replace(&mut self.mem, MemTable::new()));
         self.mem_bytes = 0;
-        self.wal.reset()?;
+        let old_wal = std::mem::replace(
+            &mut self.wal,
+            Wal::create(&Db::wal_path(&self.dir, self.wal_id + 1))?,
+        );
+        self.wal_id += 1;
+        self.wal.seq = old_wal.seq;
+        let seg_id = self.next_seg;
+        self.next_seg += 1;
+        let dir = self.dir.clone();
+        let opts = Db::segment_opts(&self.opts);
+        let end_seq = old_wal.seq;
+        let old_wal_path = old_wal.path.clone();
+        drop(old_wal);
+        let mem = frozen.clone();
+        self.frozen = Some(frozen);
+        self.sealing = Some(std::thread::spawn(move || {
+            let tmp = dir.join(format!("seal-{seg_id:08}.tmp"));
+            let _ = std::fs::remove_file(&tmp);
+            {
+                let store = Store::create(&tmp, opts)
+                    .map_err(|e| err(&format!("seal create: {e}")))?;
+                for e in mem.entries.iter().filter(|e| e.hash != 0) {
+                    let key = MemTable::key_of(&mem.keys, e);
+                    for off in mem.chain(e) {
+                        store
+                            .append(key, mem.value_at(off))
+                            .map_err(|e| err(&format!("seal append: {e}")))?;
+                    }
+                }
+                store.checkpoint().map_err(|e| err(&format!("seal checkpoint: {e}")))?;
+                store.close().map_err(|e| err(&format!("seal close: {e}")))?;
+            }
+            let path = Db::seg_path(&dir, seg_id, end_seq);
+            std::fs::rename(&tmp, &path)?;
+            File::open(&dir)?.sync_all()?;
+            let _ = std::fs::remove_file(&old_wal_path);
+            Ok(path)
+        }));
+        Ok(())
+    }
+
+    /// Collect a finished (or in-flight) seal: join the thread, open its
+    /// segment, retire the frozen memtable.
+    fn join_seal(&mut self) -> Result<()> {
+        let Some(handle) = self.sealing.take() else {
+            return Ok(());
+        };
+        let path = handle.join().map_err(|_| err("seal thread panicked"))??;
+        self.segs
+            .push(Blob::open(MmapBytes::open(&path)?).map_err(|e| err(&format!("{e}")))?);
+        self.frozen = None;
         Ok(())
     }
 
@@ -510,6 +566,14 @@ impl Db {
                 .read_all(key, &mut f)
                 .map_err(|e| err(&format!("segment read: {e}")))?;
         }
+        if let Some(fr) = &self.frozen {
+            if let Some(e) = fr.get(key) {
+                for off in fr.chain(e) {
+                    f(fr.value_at(off));
+                }
+                n += e.count;
+            }
+        }
         if let Some(e) = self.mem.get(key) {
             for off in self.mem.chain(e) {
                 f(self.mem.value_at(off));
@@ -520,13 +584,30 @@ impl Db {
     }
 
     pub fn segments(&self) -> usize {
-        self.segs.len()
+        self.segs.len() + usize::from(self.sealing.is_some())
     }
 
     /// Commit what is pending, seal the rest. Close is a convenience, not a
     /// durability point -- the WAL already made everything durable.
     pub fn close(mut self) -> Result<()> {
+        self.close_inner()
+    }
+
+    fn close_inner(&mut self) -> Result<()> {
         self.wal.commit()?;
-        self.seal()
+        self.seal()?;
+        self.join_seal()
+    }
+}
+
+/// Dropping a `Db` without `close` emulates a crash in tests, but the seal
+/// thread is not a crash casualty in-process: it would keep mutating the
+/// directory under whoever reopens it. Join it; the WAL it rotated out
+/// still covers everything either way, so crash semantics are unchanged.
+impl Drop for Db {
+    fn drop(&mut self) {
+        if let Some(h) = self.sealing.take() {
+            let _ = h.join();
+        }
     }
 }
