@@ -116,6 +116,7 @@ fn main() -> std::io::Result<()> {
             "f36-commit" => f36_commit(&args, profile)?,
             "f37-consolidate" => f37_consolidate(&args, profile)?,
             "f28-count" => f28_count(&args, profile)?,
+            "f38-fanout" => f38_fanout(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -5578,6 +5579,209 @@ fn f8_checksums(args: &Args, profile: Profile) -> std::io::Result<Record> {
         scost < 1.0,
         format!("{scost:+.3}% on disk: four bytes per chunk plus one per block"),
     ));
+    Ok(rec)
+}
+
+/// The read lead priced against segmentation, before the next engine bets on
+/// it. An immutable-segment write side turns every point read into a probe
+/// across k segments; EXT.11's lead is per-lookup compute (ext-readdecomp),
+/// which is exactly what extra probes spend. Five arms over three builds of
+/// the same data -- one store, four segments, sixteen -- with two probe
+/// policies: `fan` tries segments in fixed order until a read answers (the
+/// unfiltered LSM shape; a miss is one failed hash probe, `read_all` on an
+/// absent key is Ok(0) and touches no block), and `oracle` consults the
+/// segment that holds the key directly, the upper bound of a perfect
+/// existence filter. k1 is `fan` over one segment, which is today's engine
+/// exactly. Predictions registered in fanout-plan.md before the first full
+/// run: P1 40-120ns per extra probe, P2 oracle within noise of k1, P3 the
+/// x86 lead survives fan4 and dies by fan16.
+fn f38_fanout(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::bytes::MmapBytes;
+    use supdb::Blob;
+
+    let keys = args.num("--keys", profile.pick(20_000, 200_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let probes = args.num("--probes", profile.pick(20_000, 100_000, 500_000)) as u64;
+
+    let mut rec = Record::new("f38-fanout", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .param("probes", J::u(probes))
+        .note(
+            "five arms interleaved in one process over three builds of the same data: one \
+             store, four segments, sixteen. Keys are dealt round-robin, so a fan probe's hit \
+             position is uniform and costs (k+1)/2 segment lookups on average; every arm runs \
+             the same code path and differs only in segment count and probe policy",
+        )
+        .note(
+            "predictions registered in fanout-plan.md before the first full run; the EXT.11 \
+             read shape (uniform present keys, one 100B value each) so the k1 arm is \
+             comparable to the recorded lead",
+        );
+
+    let dir = scratch("f38");
+    let configs = [1usize, 4, 16];
+    let payload = Payload::new(value_size, 0.5, 0xF38);
+    let mut builds: Vec<Vec<Blob<MmapBytes>>> = Vec::new();
+    for &k in &configs {
+        let mut segs = Vec::with_capacity(k);
+        for s in 0..k {
+            let path = dir.join(format!("k{k}-seg{s}.dat"));
+            let store = Store::create(&path, default_opts(64)).expect("create");
+            let mut vrng = Rng::new(0xF38 ^ ((k as u64) << 32) ^ s as u64);
+            let mut kb = [0u8; 16];
+            let mut i = s as u64;
+            while i < keys {
+                db_key_into(i, &mut kb);
+                store.append(&kb, payload.get(&mut vrng)).expect("append");
+                i += k as u64;
+            }
+            store.checkpoint().expect("checkpoint");
+            store.close().expect("close");
+            let b = Blob::open(MmapBytes::open(&path).expect("map")).expect("blob open");
+            assert!(b.zero_copy(), "the native arm must not be copying");
+            segs.push(b);
+        }
+        builds.push(segs);
+    }
+
+    // (build index, oracle?) per arm. k1 runs the fan policy over one
+    // segment, which is byte-for-byte today's single-store read.
+    let arm_names = ["k1", "fan4", "oracle4", "fan16", "oracle16"];
+    let arm_cfg = [(0usize, false), (1, false), (1, true), (2, false), (2, true)];
+    let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
+        let (cfg, oracle) = arm_cfg[ci];
+        let segs = &builds[cfg];
+        let k = segs.len() as u64;
+        let mut g = KeyGen::new(KeyDist::Uniform, keys, 0x38 + rep as u64);
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        let mut sink = 0u64;
+        for _ in 0..probes {
+            let i = g.next();
+            db_key_into(i, &mut kb);
+            let mut n = 0u64;
+            let each = |v: &[u8]| {
+                std::hint::black_box(v);
+            };
+            if oracle {
+                n += segs[(i % k) as usize].read_all(&kb, each).expect("read_all");
+            } else {
+                for seg in segs.iter() {
+                    n += seg.read_all(&kb, each).expect("read_all");
+                    if n > 0 {
+                        break;
+                    }
+                }
+            }
+            sink += n;
+        }
+        assert_eq!(sink, probes, "every probed key holds exactly one value");
+        probes as f64 / t.elapsed().as_secs_f64()
+    });
+
+    let ns = |s: &Samples| 1e9 / s.median();
+    rec.series(
+        "arms",
+        J::arr(
+            arm_names
+                .iter()
+                .zip(rates.iter())
+                .map(|(name, s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "reads_per_s" => J::fp(s.median(), 1),
+                        "ns_per_read" => J::fp(ns(s), 1),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4),
+                    }
+                })
+                .collect(),
+        ),
+    );
+
+    // P1: the fan tax, per extra probe. fan4 pays 1.5 extra probes on
+    // average, fan16 pays 7.5.
+    let cmp_fan4 = compare(&rates[1], &rates[0], supdb::bench::MIN_EFFECT);
+    let cmp_fan16 = compare(&rates[3], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("fan4_vs_k1", cmp_fan4.clone());
+    rec.compare("fan16_vs_k1", cmp_fan16.clone());
+    let per_probe = |fan: &Samples, extra: f64| (ns(fan) - ns(&rates[0])) / extra;
+    let pp4 = per_probe(&rates[1], 1.5);
+    let pp16 = per_probe(&rates[3], 7.5);
+    rec.series(
+        "fan_tax_ns_per_extra_probe",
+        jobj! { "fan4" => J::fp(pp4, 1), "fan16" => J::fp(pp16, 1) },
+    );
+    rec.finding(Finding::new(
+        "F38.1",
+        "unfiltered fan-out taxes reads linearly, at 40-120ns per extra segment probed",
+        (40.0..=120.0).contains(&pp4) && (40.0..=120.0).contains(&pp16),
+        format!(
+            "k1 {:.0}ns/read; fan4 {:.0}ns ({}), {:.0}ns per extra probe; fan16 {:.0}ns \
+             ({}), {:.0}ns per extra probe. The registered band is 40-120ns from f28's 77ns \
+             resolve-and-stop; below it fan-out is nearly free and filters are unnecessary, \
+             above it the per-probe cost is superlinear and segment counts must stay tiny",
+            ns(&rates[0]),
+            ns(&rates[1]),
+            cmp_fan4.summary("fan4", "k1"),
+            pp4,
+            ns(&rates[3]),
+            cmp_fan16.summary("fan16", "k1"),
+            pp16
+        ),
+    ));
+
+    // P2: segmentation without probing. Holding is "no slower", so the
+    // finding fails only when oracle16 is significantly below k1.
+    let cmp_o4 = compare(&rates[2], &rates[0], supdb::bench::MIN_EFFECT);
+    let cmp_o16 = compare(&rates[4], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("oracle4_vs_k1", cmp_o4.clone());
+    rec.compare("oracle16_vs_k1", cmp_o16.clone());
+    rec.finding(Finding::new(
+        "F38.2",
+        "segmentation itself is free: a perfectly-routed read costs the same at 16 segments as at one",
+        !matches!(cmp_o16.verdict, supdb::bench::Verdict::Less),
+        format!(
+            "oracle4 {:.0}ns/read against k1 {:.0} ({}); oracle16 {:.0} ({}). If this \
+             fails, splitting the data across mappings taxes reads even with a perfect \
+             filter, and the next engine needs fewer, larger segments rather than better \
+             filters",
+            ns(&rates[2]),
+            ns(&rates[0]),
+            cmp_o4.summary("oracle4", "k1"),
+            ns(&rates[4]),
+            cmp_o16.summary("oracle16", "k1")
+        ),
+    ));
+
+    // P3: what the fan does to the recorded x86 lead. EXT.11's canonical
+    // full record has the lead at 1.355x; the fan multiplies it by
+    // fan_k/k1. This is arithmetic on this record plus a cited one, so it
+    // is reported as metrics and the finding gates only on what this
+    // experiment measured itself: whether fan4 keeps 85% of k1.
+    let keep4 = rates[1].median() / rates[0].median();
+    let keep16 = rates[3].median() / rates[0].median();
+    rec.series(
+        "fraction_of_k1_kept",
+        jobj! { "fan4" => J::fp(keep4, 3), "fan16" => J::fp(keep16, 3) },
+    );
+    rec.finding(Finding::new(
+        "F38.3",
+        "a four-segment fan keeps at least 85% of the single-store read rate",
+        keep4 >= 0.85 && matches!(cmp_fan16.verdict, supdb::bench::Verdict::Less),
+        format!(
+            "fan4 keeps {:.1}% of k1, fan16 keeps {:.1}%. Against EXT.11's recorded 1.355x \
+             x86 lead that is {:.2}x and {:.2}x -- read the second factor against the \
+             registered prediction that the unfiltered lead dies by sixteen segments. The \
+             finding also requires fan16 to be a significant loss: if it is not, the fan is \
+             free and this claim is asking the wrong question",
+            keep4 * 100.0,
+            keep16 * 100.0,
+            keep4 * 1.355,
+            keep16 * 1.355
+        ),
+    ));
+
     Ok(rec)
 }
 
