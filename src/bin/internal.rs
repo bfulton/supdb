@@ -119,6 +119,7 @@ fn main() -> std::io::Result<()> {
             "f38-fanout" => f38_fanout(&args, profile)?,
             "f39-walfloor" => f39_walfloor(&args, profile)?,
             "f40-filter" => f40_filter(&args, profile)?,
+            "f41-segroute" => f41_segroute(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -5781,6 +5782,291 @@ fn f38_fanout(args: &Args, profile: Profile) -> std::io::Result<Record> {
             keep16 * 100.0,
             keep4 * 1.355,
             keep16 * 1.355
+        ),
+    ));
+
+    Ok(rec)
+}
+
+/// Routing in one cache miss, or not at all. f40 capped per-segment blooms
+/// at 82.1% of k1 (the ~8.5 queries a fixed probe order pays) and refuted
+/// the generic global map at 61.7% of the oracle (SipHash + DRAM walk); the
+/// registered refutation clause demanded a structure that answers in one
+/// line load. This is that structure: a flat bucketized fingerprint table,
+/// 64-byte buckets of sixteen u32 entries (28-bit fingerprint, 4-bit
+/// segment id), load 0.5, one spill bucket at most, ~8 bytes/key against
+/// the blooms' 1.25. A false fingerprint match routes to a segment whose
+/// read answers empty and falls back to the fan, so correctness never rests
+/// on the filter. Predictions in segroute-plan.md: P1 table16 at 85-100% of
+/// the oracle, P2 table16 beats bloom16 gated, else global routing is not
+/// worth its mutability concession.
+fn f41_segroute(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::bytes::MmapBytes;
+    use supdb::Blob;
+
+    let keys = args.num("--keys", profile.pick(20_000, 200_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let probes = args.num("--probes", profile.pick(20_000, 100_000, 500_000)) as u64;
+    let k = args.num("--segments", 16) as u64;
+
+    let mut rec = Record::new("f41-segroute", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .param("probes", J::u(probes))
+        .param("segments", J::u(k))
+        .note(
+            "four arms interleaved in one process, same-run: k1, per-segment blooms (f40's \
+             structure to beat), the bucketized fingerprint table, and the oracle ceiling. \
+             The table is one 64-byte bucket load and a 16-way compare per query at load \
+             0.5; a false fingerprint match falls back to the fan, so correctness never \
+             rests on it",
+        )
+        .note("predictions registered in segroute-plan.md before the first full run");
+
+    fn mix(key: &[u8; 16], seed: u64) -> u64 {
+        let a = u64::from_le_bytes(key[..8].try_into().unwrap());
+        let b = u64::from_le_bytes(key[8..].try_into().unwrap());
+        let mut x = a ^ b.rotate_left(31) ^ seed;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+        x ^ (x >> 31)
+    }
+
+    struct BlockedBloom {
+        blocks: Vec<[u64; 8]>,
+    }
+    impl BlockedBloom {
+        fn build(n: usize) -> BlockedBloom {
+            let blocks = (n * 10).div_ceil(512).max(1);
+            BlockedBloom { blocks: vec![[0u64; 8]; blocks] }
+        }
+        fn slots(&self, kb: &[u8; 16]) -> (usize, [(usize, u64); 4]) {
+            let h = mix(kb, 0x40);
+            let bi = (h >> 32) as usize % self.blocks.len();
+            let mut probes = [(0usize, 0u64); 4];
+            let mut s = h;
+            for p in &mut probes {
+                s = s.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(1);
+                let bit = (s >> 55) as usize & 511;
+                *p = (bit >> 6, 1u64 << (bit & 63));
+            }
+            (bi, probes)
+        }
+        fn insert(&mut self, kb: &[u8; 16]) {
+            let (bi, probes) = self.slots(kb);
+            for (w, m) in probes {
+                self.blocks[bi][w] |= m;
+            }
+        }
+        #[inline]
+        fn contains(&self, kb: &[u8; 16]) -> bool {
+            let (bi, probes) = self.slots(kb);
+            let b = &self.blocks[bi];
+            probes.iter().all(|&(w, m)| b[w] & m != 0)
+        }
+    }
+
+    /// 64-byte buckets of sixteen u32 slots: fingerprint<<4 | seg, 0 = empty.
+    struct SegTable {
+        buckets: Vec<[u32; 16]>,
+        mask: usize,
+    }
+    impl SegTable {
+        fn build(n: usize) -> SegTable {
+            let buckets = ((n * 2).div_ceil(16)).next_power_of_two().max(2);
+            SegTable { buckets: vec![[0u32; 16]; buckets], mask: buckets - 1 }
+        }
+        #[inline]
+        fn slot(kb: &[u8; 16]) -> (u64, u32) {
+            let h = mix(kb, 0x41);
+            // A zero fingerprint would collide with "empty"; force a bit.
+            let fp = ((h as u32) >> 4) | 1;
+            (h >> 32, fp)
+        }
+        fn insert(&mut self, kb: &[u8; 16], seg: u8) {
+            let (bh, fp) = Self::slot(kb);
+            let entry = (fp << 4) | seg as u32;
+            let mut bi = bh as usize & self.mask;
+            for _ in 0..2 {
+                for s in self.buckets[bi].iter_mut() {
+                    if *s == 0 {
+                        *s = entry;
+                        return;
+                    }
+                }
+                bi = (bi + 1) & self.mask;
+            }
+            panic!("segtable spill exceeded one bucket at load 0.5");
+        }
+        #[inline]
+        fn route(&self, kb: &[u8; 16]) -> Option<u8> {
+            let (bh, fp) = Self::slot(kb);
+            let want = fp << 4;
+            let mut bi = bh as usize & self.mask;
+            for _ in 0..2 {
+                let mut full = true;
+                for &s in self.buckets[bi].iter() {
+                    if s & !0xf == want {
+                        return Some((s & 0xf) as u8);
+                    }
+                    full &= s != 0;
+                }
+                if !full {
+                    return None;
+                }
+                bi = (bi + 1) & self.mask;
+            }
+            None
+        }
+    }
+
+    let dir = scratch("f41");
+    let payload = Payload::new(value_size, 0.5, 0xF41);
+    let configs = [1u64, k];
+    let mut builds: Vec<Vec<Blob<MmapBytes>>> = Vec::new();
+    let mut blooms: Vec<BlockedBloom> = Vec::new();
+    let mut table = SegTable::build(keys as usize);
+    for &kc in &configs {
+        let mut segs = Vec::with_capacity(kc as usize);
+        for s in 0..kc {
+            let path = dir.join(format!("k{kc}-seg{s}.dat"));
+            let store = Store::create(&path, default_opts(64)).expect("create");
+            let mut vrng = Rng::new(0xF41 ^ (kc << 32) ^ s);
+            let mut kb = [0u8; 16];
+            let mut bloom = BlockedBloom::build(keys.div_ceil(kc) as usize);
+            let mut i = s;
+            while i < keys {
+                db_key_into(i, &mut kb);
+                store.append(&kb, payload.get(&mut vrng)).expect("append");
+                if kc == k {
+                    bloom.insert(&kb);
+                    table.insert(&kb, s as u8);
+                }
+                i += kc;
+            }
+            store.checkpoint().expect("checkpoint");
+            store.close().expect("close");
+            let b = Blob::open(MmapBytes::open(&path).expect("map")).expect("blob open");
+            assert!(b.zero_copy(), "the native arm must not be copying");
+            segs.push(b);
+            if kc == k {
+                blooms.push(bloom);
+            }
+        }
+        builds.push(segs);
+    }
+
+    let arm_names = ["k1", "bloom16", "table16", "oracle16"];
+    let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
+        let segs = if ci == 0 { &builds[0] } else { &builds[1] };
+        let mut g = KeyGen::new(KeyDist::Uniform, keys, 0x41 + rep as u64);
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        let mut sink = 0u64;
+        for _ in 0..probes {
+            let i = g.next();
+            db_key_into(i, &mut kb);
+            let each = |v: &[u8]| {
+                std::hint::black_box(v);
+            };
+            let mut n = 0u64;
+            match ci {
+                0 => {
+                    n += segs[0].read_all(&kb, each).expect("read_all");
+                }
+                1 => {
+                    for (s, seg) in segs.iter().enumerate() {
+                        if !blooms[s].contains(&kb) {
+                            continue;
+                        }
+                        n += seg.read_all(&kb, each).expect("read_all");
+                        if n > 0 {
+                            break;
+                        }
+                    }
+                }
+                2 => {
+                    if let Some(s) = table.route(&kb) {
+                        n += segs[s as usize].read_all(&kb, each).expect("read_all");
+                    }
+                    if n == 0 {
+                        for seg in segs.iter() {
+                            n += seg.read_all(&kb, each).expect("read_all");
+                            if n > 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    n += segs[(i % k) as usize].read_all(&kb, each).expect("read_all");
+                }
+            }
+            sink += n;
+        }
+        assert_eq!(sink, probes, "every probed key holds exactly one value");
+        probes as f64 / t.elapsed().as_secs_f64()
+    });
+
+    let ns = |s: &Samples| 1e9 / s.median();
+    rec.series(
+        "arms",
+        J::arr(
+            arm_names
+                .iter()
+                .zip(rates.iter())
+                .map(|(name, s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "reads_per_s" => J::fp(s.median(), 1),
+                        "ns_per_read" => J::fp(ns(s), 1),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4),
+                    }
+                })
+                .collect(),
+        ),
+    );
+    rec.series(
+        "route_bytes_per_key",
+        jobj! {
+            "bloom" => J::fp(10.0 / 8.0, 2),
+            "table" => J::fp((table.buckets.len() * 64) as f64 / keys as f64, 2)
+        },
+    );
+
+    let cmp_to = compare(&rates[2], &rates[3], supdb::bench::MIN_EFFECT);
+    rec.compare("table16_vs_oracle16", cmp_to.clone());
+    let ro = rates[2].median() / rates[3].median();
+    rec.finding(Finding::new(
+        "F41.1",
+        "a one-line fingerprint table routes at 85-100% of the perfect-routing ceiling",
+        (0.85..=1.0).contains(&ro),
+        format!(
+            "table16 {:.0}ns/read against oracle16 {:.0} ({}), {:.1}% of the ceiling. \
+             Below the band even one global cache miss is too dear and per-segment blooms \
+             win by default; above it the measurement is suspect, not celebrated",
+            ns(&rates[2]),
+            ns(&rates[3]),
+            cmp_to.summary("table16", "oracle16"),
+            ro * 100.0
+        ),
+    ));
+
+    let cmp_tb = compare(&rates[2], &rates[1], supdb::bench::MIN_EFFECT);
+    rec.compare("table16_vs_bloom16", cmp_tb.clone());
+    rec.finding(Finding::new(
+        "F41.2",
+        "the fingerprint table beats per-segment blooms outright",
+        matches!(cmp_tb.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "table16 {:.0}ns/read against bloom16 {:.0} ({}); the table costs {:.2} B/key \
+             against the blooms' 1.25. If this is not a gated win, global routing is not \
+             worth its mutability concession at any price measured so far and the design \
+             keeps routing inside immutable per-segment state",
+            ns(&rates[2]),
+            ns(&rates[1]),
+            cmp_tb.summary("table16", "bloom16"),
+            (table.buckets.len() * 64) as f64 / keys as f64
         ),
     ));
 
