@@ -1839,3 +1839,63 @@ fn replay_never_applies_a_record_over_newer_index_state() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A logged durability point named blocks the durable table did not have.
+///
+/// `checkpoint_to_log` fsynced extent records naming blocks sealed in the
+/// same batch -- but the block-table section mapping those ids to offsets
+/// was written AFTER the fsync and rode unsynced behind it. At the ack
+/// point, a crash left the previous superblock's table, the log named block
+/// ids beyond it, and `Store::open` refused the whole store with "index
+/// names a block the table does not have". Every durable batch that sealed
+/// a block had this window, from the day the redo log shipped.
+///
+/// Fixed by making the log self-describing: a `Blocks` record carries the
+/// table extension in the same CRC'd, generation-stamped stream, before any
+/// extent record that needs it, under the same fsync. The crash is emulated
+/// by restoring both superblock slots to their pre-batch bytes, which is
+/// exactly what rides unsynced behind the arena fsync.
+#[test]
+fn a_logged_checkpoint_survives_losing_its_superblock() {
+    for log_values in [false, true] {
+        let dir = std::env::temp_dir().join(format!(
+            "sbhole-{log_values}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.supdb");
+        let o = Options {
+            shards: 1,
+            sync: supdb::Sync::Always,
+            log_values,
+            ..Default::default()
+        };
+        let store = Store::create(&path, o.clone()).unwrap();
+        for i in 0..100u32 {
+            store
+                .put(format!("k{i:04}").as_bytes(), &[1u8; 100])
+                .unwrap();
+        }
+        store.checkpoint().unwrap();
+        let sb = std::fs::read(&path).unwrap()[0..4096].to_vec();
+        // Enough bytes through one shard to force inline seals: the logged
+        // point's records name blocks the durable table has never heard of.
+        for i in 0..100u32 {
+            store
+                .put(format!("m{i:04}").as_bytes(), &[2u8; 2000])
+                .unwrap();
+        }
+        store.checkpoint().unwrap(); // the ack
+        std::mem::forget(store); // crash, not close
+        let mut now = std::fs::read(&path).unwrap();
+        now[0..4096].copy_from_slice(&sb);
+        std::fs::write(&path, &now).unwrap();
+        let s = Store::open(&path, o).expect("open after losing the superblock");
+        for i in 0..100u32 {
+            let mut got = 0;
+            s.read_all(format!("m{i:04}").as_bytes(), |_| got += 1)
+                .unwrap();
+            assert_eq!(got, 1, "key m{i:04} lost (log_values={log_values})");
+        }
+    }
+}

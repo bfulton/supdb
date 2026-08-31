@@ -3690,9 +3690,15 @@ fn f36_commit(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let dir = scratch("f36");
     let payload = Payload::new(value_size, 0.5, 0xF36);
-    // Arm 0: today's default (extents to the log where possible, index left
-    // in place). Arm 1: the log disabled outright, the pre-log shape.
-    let arms: &[(&str, bool)] = &[("log-extents", true), ("no-log", false)];
+    // Arm 0: today's default (the log carries VALUES: a durability point is
+    // an arena append with no seal). Arm 1: the log carries only extents, so
+    // every point opens with a 64-shard seal -- the shape f36 originally
+    // convicted. Arm 2: the log off outright, the pre-log shape.
+    let arms: &[(&str, bool, bool)] = &[
+        ("log-values", true, true),
+        ("log-extents", true, false),
+        ("no-log", false, false),
+    ];
     type Row = (usize, f64, supdb::WriteLedger, f64);
     let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
     let trial = Trial::new(profile.reps());
@@ -3703,6 +3709,7 @@ fn f36_commit(args: &Args, profile: Profile) -> std::io::Result<Record> {
             &file,
             Options {
                 redo_log: arms[ci].1,
+                log_values: arms[ci].2,
                 ..default_opts(64)
             },
         )
@@ -3732,7 +3739,7 @@ fn f36_commit(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let mb = |v: u64| v as f64 / 1_048_576.0;
     let mut out = Vec::new();
-    for (ci, (name, _)) in arms.iter().enumerate() {
+    for (ci, (name, _, _)) in arms.iter().enumerate() {
         let all = rows.lock().unwrap();
         let mine: Vec<&Row> = all.iter().filter(|r| r.0 == ci).collect();
         // Median rep by io delta, so the ledger and the io figure come from
@@ -3771,6 +3778,14 @@ fn f36_commit(args: &Args, profile: Profile) -> std::io::Result<Record> {
         });
     }
     rec.series("arms", J::arr(out.clone()));
+    rec.compare(
+        "values_vs_extents",
+        compare(&tp[0], &tp[1], supdb::bench::MIN_EFFECT),
+    );
+    rec.compare(
+        "values_vs_nolog",
+        compare(&tp[0], &tp[2], supdb::bench::MIN_EFFECT),
+    );
     // The finding is about the shape of the bill, not a race between arms:
     // does traffic the engine never explicitly wrote dominate the device
     // bytes of a durable load?

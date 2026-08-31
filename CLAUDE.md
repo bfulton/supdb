@@ -109,24 +109,30 @@ and `lmdb-nosync` neither do. Where an axis cannot be equalized -- LMDB cannot
 stop being transactional -- say which way the residual leans and read the
 result as a bound: a loss is at least that large, a win is not yet a win.
 
-The matched scorecard against LMDB, `full`, all four failing:
+The matched scorecard against LMDB, `full`:
 
 | | Supdb | LMDB | |
 |---|---|---|---|
-| load, both durable (`EXT.9`) | 152,990/s | 687,389/s | **0.223x** |
-| load, neither (`EXT.10`) | 783,142/s | 1,304,518/s | unmeasurable, see below |
-| read (`EXT.11`) | 1,411,746/s | 1,135,799/s | 1.243x, no difference; 2.42x on Apple Silicon, replicated |
-| scan, cold (`EXT.12`) | 29.4M/s | 28.1M/s | 1.046x, no difference |
+| load, both durable (`EXT.9`) | 188,506/s | 631,836/s | **0.298x**, failing |
+| load, neither (`EXT.10`) | 644,346/s | 710,573/s | 0.907x on a noisy night; 0.85x on Apple Silicon, replicated |
+| read (`EXT.11`) | 1,251,963/s | 862,846/s | 1.451x, holds -- unstable on this host; 2.42x on Apple Silicon, replicated |
+| scan (`EXT.12`) | 20.4M/s | 17.6M/s | 1.155x, holds; 1.17x on Apple Silicon, replicated |
 
-`EXT.9` has moved twice, each time for a decomposed reason: 6,735 -> 54,333
+`EXT.9` has moved three times, each for a decomposed reason: 6,735 -> 54,333
 ops/s when `Options::index_inserts` stopped every batch rewriting the whole
-key index, then -> ~150,600 when durability points went log-first with a
-single fsync -- f36's ledger had convicted mmap writeback under the per-batch
-fsync at 87.4% of all device bytes, and the reorder took it to 31.3%. Write
-amplification went 270x -> 105x -> 13.2x; the file for 126.9 MB of data went
-7,354 MB -> 280 -> 309. Still 4.4x behind, so still recorded as failing; the
-value-carrying log that removes the seal from the point entirely is the next
-step on this axis.
+key index; -> ~152,800 when durability points went log-first with a single
+fsync (f36's ledger had convicted mmap writeback under the per-batch fsync at
+87.4% of all device bytes); -> 188,506 when the log started carrying VALUES
+(`Options::log_values`), so a durability point appends unsealed bytes and
+seals nothing -- blocks are written later, full, on the store's own schedule.
+Write amplification went 270x -> 105x -> 13.2x -> ~7x. Still 3.4x behind, so
+still recorded as failing; what remains is the per-batch append+fsync+section
+work against LMDB's single page-chain commit, and the macOS F_FULLFSYNC pair
+says the floor there is the fsync count itself. The value-log step was nearly
+refuted by its own gate: the first version scanned every key per point for
+unlogged bytes, an O(keys^2) tax invisible at f36's 200k keys (1.435x ahead)
+and fatal at EXT.9's 1M (0.149x); a per-shard queue of keys with unlogged
+bytes -- `dirty`'s twin -- removed it, and both 1M runs are kept.
 
 `EXT.10` cannot currently be read at all. Two consecutive runs gave 1.06x and
 0.60x because `lmdb-nosync`, which nothing here touches, moved 85% between
@@ -239,6 +245,35 @@ reader that fed a flat block-table section to the varint decoder and reported
 the misparse as file corruption, and an in-place checkpoint that republished a
 record into its hash slot and not its directory entry -- so `read_all` returned
 the new value and `scan` the previous one, silently, for every key it touched.
+
+Also fixed: a logged durability point could be lost WHOLE, store refusing to
+open. `checkpoint_to_log` fsynced extent records naming blocks sealed in the
+same batch, but the block-table section mapping those ids to offsets was
+written after the fsync and rode unsynced -- so a crash at the ack point left
+a log naming blocks the recovered table did not have, and `open` refused the
+file with "index names a block the table does not have". Every durable batch
+that sealed a block had this window, from the day the redo log shipped; no
+crash test ever placed a crash between the ack and the section writes. The
+log is now self-describing: a `Blocks` record carries the table extension in
+the same CRC'd, generation-stamped stream, before any extent record that
+needs it, under the same fsync. The reproducer emulates the crash by
+restoring the pre-batch superblock slots -- exactly what rides unsynced
+behind an arena fsync -- and runs both log shapes.
+
+Also fixed, before it shipped: the first value-carrying log walked every key
+in every shard at every durability point to find the ones with unlogged
+bytes. O(keys) per point, O(keys^2) per load: invisible at 200k keys, fatal
+at 1M. The fix is `Shard::log_queue`, and its first version had a bug the
+release suite caught the same hour -- a key that seals, re-queues and seals
+again inside one interval was queued twice and logged the SAME delta twice,
+four copies of one value in the reproducer. Dedupe at the gather. The lesson
+is the panel's again: the sharp edges of a log are all in the bookkeeping
+around it, never in the append.
+
+Also fixed: under `Sync::EveryN` and `Sync::Interval`, every logged point
+fsynced -- log-first had quietly made EveryN mean Always. The log append is
+now unconditional and the fsync obeys the policy, which restores EveryN's
+stated contract (bounded loss, amortized flush) on the log path.
 
 Also fixed: log replay applied records over newer index state. A logged
 checkpoint leaves records in the arena and restores its keys to `dirty`,
