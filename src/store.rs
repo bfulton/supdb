@@ -593,9 +593,12 @@ pub struct Options {
     /// extent list -- no per-key state is added, so there is nothing new to
     /// persist, replay, or crash-recover, and the file format is untouched.
     ///
-    /// Off by default until `f37-consolidate` prices both arms at `full`;
-    /// the flag exists so that experiment can run them interleaved in one
-    /// process, the way f8-checksums measures `Options::checksums`.
+    /// ON by default since f37 priced both arms at `full`: 3.963x on
+    /// fragmenting appends, p99.9 tail 3.4x shorter (502us -> 146us), 3.65x
+    /// fewer device bytes and a 3.65x smaller file, for a 0.762x read-back
+    /// pass over fragmented keys -- F37.3 records that loss so it cannot be
+    /// forgotten. The flag remains the measurement instrument, the way
+    /// f8-checksums measures `Options::checksums`.
     pub defer_merge: bool,
     pub reclaim: Reclaim,
     /// An extent at least this large gets a block to itself.
@@ -763,7 +766,7 @@ impl Default for Options {
             chunk_size: 1024,
             solo_chunk_size: block::CHUNK,
             merge_threshold: 4,
-            defer_merge: false,
+            defer_merge: true,
             checksums: true,
             pending_arena: true,
             seal_on_put: true,

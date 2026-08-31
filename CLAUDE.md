@@ -209,12 +209,14 @@ variable-length values divided exactly by a stride of 4 and the first version
 answered 23. Two quantities is still not a proof, so the contract is that the
 caller knows its schema; `tests/blob.rs` carries the case either way.
 
-**How the roll writes decides the file size, by 22.6x.** Appending a day's
-postings in log-line order writes 831 MB where grouping them by term first
-writes 36.7 — 44,629 inline merges against zero, which is F5.1's latency tail
-showing up on the space axis. The ratio grows with the day, so the naive roll
-degrades exactly where it matters. Any tool that builds an index here sorts by
-key first.
+**How the roll writes decides the file size, by 5.17x (was 22.6x).** Appending
+a day's postings in log-line order wrote 831 MB where grouping them by term
+first writes 36.7 — 44,629 inline merges against zero, which is F5.1's latency
+tail showing up on the space axis. Deferred consolidation
+(`Options::defer_merge`, default on since f37 priced it at 3.963x on
+fragmenting appends for a 0.762x read-back cost) cut the line-ordered day to
+190 MB, so the penalty is 5.17x now — but it still grows with the day, and any
+tool that builds an index here still sorts by key first.
 
 ## Known-failing on purpose
 

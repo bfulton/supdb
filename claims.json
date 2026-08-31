@@ -854,6 +854,41 @@
    "profile": "full",
    "expect": "fails",
    "because": "FIXED, in two steps the three-arm decomposition now prices separately. Log-first points took the residual from 87.4% to 31.3% (fsync stopped flushing a 68 MB mapping's dirty pages); the value-carrying log then removed the seal from the point entirely and took the whole bill down: 79.2 MB reach the device for the log-values arm against 161.4 for log-extents and 765.1 for no-log, residual 19.1%. values_vs_extents reads 1.764x and values_vs_nolog 2.851x at 200k keys (p=0.0022; arms 339,332 / 192,425 / 119,014 ops/s at 79.2 / 157.0 / 765.1 MB); at 1M keys the same arms read 1.814x and 4.819x -- but only after an O(keys) scan per point was replaced by a per-shard queue, and the unfixed 1M run that read 0.718x is kept in results history as the shape of that quadratic. The ledger stays in the experiment so the next regression of this kind is a diff, not a hunt."
+  },
+  {
+   "experiment": "f37-consolidate",
+   "id": "F37.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Deferred (geometric suffix) consolidation lifts fragmenting append throughput 3.963x over the inline whole-run merge (137,660 vs 34,734 ops/s, p=0.0022) -- ABOVE the 1.6-3.5x prediction band registered before the run, with the refutation floor at 1.3x. Inline rewrites O(n^2) bytes per key over its life; deferred absorbs an older extent only into a run at least its own size, so a byte is copied O(log n) times. Default ON since this record; the flag remains the measurement instrument."
+  },
+  {
+   "experiment": "f37-consolidate",
+   "id": "F37.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Deferred consolidation shortens the append p99.9 3.427x: 501.8us inline to 146.4us deferred, worst single append 202.0ms to 70.1ms. This is F5.1's tail measured against the policy that causes it. Note what deferral does NOT do: the biggest cascade merge is still O(run) -- it bounds how often the big rewrites happen, not how big the biggest one is."
+  },
+  {
+   "experiment": "f37-consolidate",
+   "id": "F37.3",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Recorded as failing ON PURPOSE: deferred consolidation taxes the read-back pass at 0.762x (30.98 vs 40.68 Mvalues/s), because a deferred key holds O(threshold + log n) extents where inline holds at most threshold, and reads pay per extent. This is the price of the 3.96x write-side win and this entry is what keeps it from being forgotten. The default flipped ON with this loss on the books; if a read-heavy deployment finds it unacceptable, the policy needs a list-length cap, and this entry is where that decision lives."
+  },
+  {
+   "experiment": "f37-consolidate",
+   "id": "F37.4",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Inline sends 4,699.7 MB to the block layer where deferred sends 1,286.7, for 113.3 MB of appended records -- 3.652x fewer device bytes (p=0.0014). The O(n^2) rewrite is a device cost before it is a latency cost, which is how W1.3 saw it first on the space axis."
+  },
+  {
+   "experiment": "f37-consolidate",
+   "id": "F37.5",
+   "profile": "full",
+   "expect": "holds",
+   "because": "File after close: deferred 1,287.6 MB against inline 4,699.6 (0.274x, p=0.0004). The same mechanism read through the file: what inline rewrote and left dead, deferred never wrote. Downstream, flipping the default took w1's line-ordered day index from 740.5 MB to 190.0 -- the naive-roll penalty W1.3 prices fell from 22.6x to 5.17x while the claim itself kept holding, since term order still writes less than a third."
   }
  ],
  "metrics": [
