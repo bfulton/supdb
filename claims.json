@@ -931,6 +931,27 @@
    "profile": "full",
    "expect": "holds",
    "because": "Today's engine commits at 203,603 ops/s against the 1,191,125 floor -- 5.85x below, p=0.0022, mid-band of the registered 3-8x. The gap is per-point arena append + section work that a WAL-only design deletes rather than optimizes, and 5.85x is the number the rewrite is claiming to recover. Read with F39.1: the floor clears LMDB by 2.08x and today's engine sits 2.8x below LMDB, so the whole 0.348x deficit on EXT.9 lives between the engine and its own floor, none of it in the hardware."
+  },
+  {
+   "experiment": "f40-filter",
+   "id": "F40.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Per-segment blocked Blooms keep 82.1% of the single-store read rate at sixteen segments -- 1.693x over the unfiltered fan (p=0.0022) but only 0.683x of the oracle, inside the 60-85% band registered in filter-plan.md. The mechanism is structural, not tunable: a fixed probe order queries ~8.5 filters per lookup before its first data probe, so per-segment filtering recreates the fan tax at a smaller constant and cannot reach the ceiling at this k."
+  },
+  {
+   "experiment": "f40-filter",
+   "id": "F40.2",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Registered prediction P2 said a global key->segment map recovers 95% of perfect routing; it recovers 61.7% (765ns/read against the oracle's 472, p=0.0022) and loses to the per-segment blooms it was supposed to beat. The refutation clause named the cause in advance: a routing map's real cost is not its lookup arithmetic but its memory misses -- a std hash map at 1M entries pays ~290ns of SipHash and DRAM walk per query. The re-examination it demanded is f41: a routing structure has to answer in one cache miss or it is not a routing structure."
+  },
+  {
+   "experiment": "f40-filter",
+   "id": "F40.3",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Min/max fences prune nothing when segment key-ranges overlap: fence16 within noise of the unfiltered fan (0.918x, p=0.0553, no difference). Round-robin dealing makes every segment's range cover every key and the fence admits every probe. Recorded so the design never assumes fences route without key-partitioned sealing; they are a compaction-policy benefit, not a general router."
   }
  ],
  "metrics": [
