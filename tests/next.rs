@@ -203,7 +203,17 @@ fn model_oracle_over_random_ops_and_crashes() {
             13 => {
                 drop(db); // crash: uncommitted appends vanish
                 uncommitted.clear();
-                db = Db::open(&d, NextOptions::default()).unwrap();
+                db = match Db::open(&d, NextOptions::default()) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        let mut files: Vec<String> = std::fs::read_dir(&d)
+                            .unwrap()
+                            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                            .collect();
+                        files.sort();
+                        panic!("open failed at step {step}: {e}; dir = {files:?}");
+                    }
+                };
                 for (k, want) in &model {
                     assert_eq!(&read_vec(&db, k), want, "after crash at step {step}");
                 }
@@ -217,5 +227,130 @@ fn model_oracle_over_random_ops_and_crashes() {
     }
     for (k, want) in &model {
         assert_eq!(&read_vec(&db, k), want);
+    }
+}
+
+fn small_opts(l0_trigger: usize) -> NextOptions {
+    // Small enough that a few hundred records seal and compact, so the
+    // level machinery is exercised at test scale rather than described.
+    NextOptions { seal_bytes: 4 << 10, l0_trigger, ..NextOptions::default() }
+}
+
+#[test]
+fn compaction_partitions_the_key_space_and_keeps_every_value() {
+    let d = dir("compact");
+    let mut db = Db::create(&d, small_opts(3)).unwrap();
+    let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+    for round in 0u32..12 {
+        for k in 0u32..200 {
+            let key = format!("key-{k:05}").into_bytes();
+            let val = format!("r{round}-{k}").into_bytes();
+            db.append(&key, &val);
+            model.entry(key).or_default().push(val);
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    let (partitioned, l0) = db.levels();
+    assert!(partitioned > 1, "the merge should have split the key space, got {partitioned}");
+    assert!(l0 <= 3, "the tail stays bounded by l0_trigger, got {l0}");
+    for (key, want) in &model {
+        assert_eq!(&read_vec(&db, key), want, "key {}", String::from_utf8_lossy(key));
+    }
+    // Ordered scan over a compacted store: keys ascending, no duplicates.
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    db.scan(b"", 1000, |k, _| {
+        if seen.last().map(|l| l.as_slice()) != Some(k) {
+            seen.push(k.to_vec());
+        }
+    })
+    .unwrap();
+    let mut sorted = seen.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(seen, sorted, "scan must be ordered and duplicate-free");
+    assert_eq!(seen.len(), 200);
+}
+
+#[test]
+fn a_compacted_store_reopens_with_the_same_answers() {
+    let d = dir("compactreopen");
+    let mut db = Db::create(&d, small_opts(2)).unwrap();
+    let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+    for round in 0u32..10 {
+        for k in 0u32..150 {
+            let key = format!("k{k:04}").into_bytes();
+            let val = format!("v{round}-{k}").into_bytes();
+            db.append(&key, &val);
+            model.entry(key).or_default().push(val);
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    drop(db);
+
+    let db = Db::open(&d, small_opts(2)).unwrap();
+    for (key, want) in &model {
+        assert_eq!(&read_vec(&db, key), want, "after reopen: {}", String::from_utf8_lossy(key));
+    }
+}
+
+#[test]
+fn a_crash_before_the_manifest_lands_keeps_the_pre_merge_store() {
+    // The window the manifest exists for: partitions written and renamed
+    // into place, then the process dies before the manifest names them.
+    // Those files are unreachable, and open must delete them rather than
+    // read them alongside the inputs they duplicate.
+    let d = dir("mergewin");
+    let mut db = Db::create(&d, small_opts(2)).unwrap();
+    let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+    for round in 0u32..6 {
+        for k in 0u32..100 {
+            let key = format!("k{k:04}").into_bytes();
+            let val = format!("v{round}-{k}").into_bytes();
+            db.append(&key, &val);
+            model.entry(key).or_default().push(val);
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    let manifest = std::fs::read(d.join("manifest")).unwrap();
+
+    // Emulate: keep every file the merge produced, restore the manifest to
+    // the state it had before the merge published.
+    let mut db2 = Db::open(&d, small_opts(2)).unwrap();
+    for k in 0u32..100 {
+        db2.append(format!("k{k:04}").as_bytes(), b"extra");
+    }
+    db2.commit().unwrap();
+    db2.flush().unwrap();
+    drop(db2);
+    let before: Vec<String> = std::fs::read_dir(&d)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sup"))
+        .collect();
+    std::fs::write(d.join("manifest"), &manifest).unwrap();
+
+    let db = Db::open(&d, small_opts(2)).unwrap();
+    let after: Vec<String> = std::fs::read_dir(&d)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sup"))
+        .collect();
+    // The window is only exercised if segments the restored manifest does
+    // not name were actually present and actually swept. A test that
+    // reaches no orphan proves nothing about orphans.
+    assert!(
+        after.len() < before.len(),
+        "no orphan was swept: before {before:?}, after {after:?} -- the window was not reached"
+    );
+    for (key, want) in &model {
+        assert_eq!(
+            &read_vec(&db, key),
+            want,
+            "the pre-merge manifest must serve the pre-merge store, no duplicates: {}",
+            String::from_utf8_lossy(key)
+        );
     }
 }

@@ -78,11 +78,23 @@ pub struct NextOptions {
     /// once and never reopened for writing -- the logshed finding that a
     /// 4 MiB redo arena in a write-once file is pure waste.
     pub segment: Options,
+    /// How many overlapping L0 segments to tolerate before a partitioning
+    /// merge. The brief's open "partitioned compaction policy" question in
+    /// one number; f43 sweeps it.
+    pub l0_trigger: usize,
+    /// The measurement instrument: false keeps every segment in the
+    /// unrouted L0 fan, which is milestone 3's behaviour exactly.
+    pub compact: bool,
 }
 
 impl Default for NextOptions {
     fn default() -> NextOptions {
-        NextOptions { seal_bytes: 64 << 20, segment: Options::default() }
+        NextOptions {
+            seal_bytes: 64 << 20,
+            segment: Options::default(),
+            l0_trigger: 4,
+            compact: true,
+        }
     }
 }
 
@@ -179,6 +191,183 @@ impl Wal {
             p = end;
         }
         Ok(next_seq)
+    }
+}
+
+/// A conservative key fence, encoded into a segment's file name.
+///
+/// Exactness is not required and truncation is not a bug: a fence may only
+/// be *widened*, never narrowed, because a wide fence costs an unnecessary
+/// probe while a narrow one loses a key. So the low bound is a 16-byte
+/// prefix of the true minimum (a prefix sorts at or before the key it came
+/// from) and the high bound is a 16-byte prefix of the true maximum with
+/// the last byte carried up (which sorts strictly after every key sharing
+/// that prefix). Keys of any length therefore fit in a bounded file name.
+const FENCE_MAX: usize = 16;
+
+fn fence_lo(min_key: &[u8]) -> Vec<u8> {
+    min_key[..min_key.len().min(FENCE_MAX)].to_vec()
+}
+
+/// `None` means unbounded above: every prefix byte was 0xff, so no
+/// representable bound is greater.
+fn fence_hi(max_key: &[u8]) -> Option<Vec<u8>> {
+    let mut b = max_key[..max_key.len().min(FENCE_MAX)].to_vec();
+    while let Some(last) = b.pop() {
+        if last != 0xff {
+            b.push(last + 1);
+            return Some(b);
+        }
+    }
+    None
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok())
+        .collect()
+}
+
+/// One 64-byte block per query, four probe bits inside it: the structure
+/// f40 measured at 82.1% of a single store when it is the only routing
+/// there is (F40.1). Here it guards only the bounded L0 tail, because
+/// F41.1/F41.2 refuted every keys-sized global router -- the partitioned
+/// levels below are routed by fences that cost two comparisons.
+pub(crate) struct BlockedBloom {
+    blocks: Vec<[u64; 8]>,
+}
+
+impl BlockedBloom {
+    fn with_capacity(n: usize) -> BlockedBloom {
+        BlockedBloom { blocks: vec![[0u64; 8]; (n * 10).div_ceil(512).max(1)] }
+    }
+
+    fn hash(key: &[u8]) -> u64 {
+        let mut h = 0xcbf29ce484222325u64;
+        for &b in key {
+            h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+        }
+        h = (h ^ (h >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        h ^ (h >> 31)
+    }
+
+    fn slots(&self, key: &[u8]) -> (usize, [(usize, u64); 4]) {
+        let h = BlockedBloom::hash(key);
+        let bi = (h >> 32) as usize % self.blocks.len();
+        let mut probes = [(0usize, 0u64); 4];
+        let mut x = h;
+        for p in &mut probes {
+            x = x.wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(1);
+            let bit = (x >> 55) as usize & 511;
+            *p = (bit >> 6, 1u64 << (bit & 63));
+        }
+        (bi, probes)
+    }
+
+    fn insert(&mut self, key: &[u8]) {
+        let (bi, probes) = self.slots(key);
+        for (w, m) in probes {
+            self.blocks[bi][w] |= m;
+        }
+    }
+
+    #[inline]
+    fn maybe_contains(&self, key: &[u8]) -> bool {
+        let (bi, probes) = self.slots(key);
+        let b = &self.blocks[bi];
+        probes.iter().all(|&(w, m)| b[w] & m != 0)
+    }
+}
+
+/// A merge in flight: the input names it will retire, and the thread
+/// producing the outputs that replace them.
+type Compaction = (Vec<String>, std::thread::JoinHandle<Result<Vec<String>>>);
+
+/// A live segment: the mapped store, where it sits in the level structure,
+/// and whatever routing it carries. L0 segments come straight from a seal,
+/// overlap each other freely, and are gated by a Bloom; L1 segments come
+/// from a partitioning merge, are disjoint, and are gated by their fence.
+struct Seg {
+    blob: Blob<MmapBytes>,
+    name: String,
+    level: u8,
+    lo: Vec<u8>,
+    hi: Option<Vec<u8>>,
+    bloom: Option<BlockedBloom>,
+}
+
+impl Seg {
+    /// Cheap ordered key walk: O(extents), no block touched -- the property
+    /// `scan_counts_fixed` exists for. The width argument is irrelevant
+    /// here because only the keys are wanted.
+    fn for_each_key(blob: &Blob<MmapBytes>, mut f: impl FnMut(&[u8])) -> Result<()> {
+        blob.scan_counts_fixed(b"", usize::MAX, 8, |k, _| {
+            f(k);
+            true
+        })
+        .map_err(|e| err(&format!("segment key walk: {e}")))?;
+        Ok(())
+    }
+
+    fn open(dir: &Path, name: &str) -> Result<Seg> {
+        let blob = Blob::open(MmapBytes::open(&dir.join(name))?)
+            .map_err(|e| err(&format!("segment {name}: {e}")))?;
+        if let Some(rest) = name.strip_prefix("par-").and_then(|r| r.strip_suffix(".sup")) {
+            // par-<id>-<endseq>-<lo hex>-<hi hex>: fences route this one,
+            // so nothing is walked at open. The unbounded high fence is the
+            // empty string.
+            let f: Vec<&str> = rest.split('-').collect();
+            if f.len() != 4 {
+                return Err(err("partitioned segment name is malformed"));
+            }
+            let lo = unhex(f[2]).ok_or_else(|| err("segment fence is malformed"))?;
+            let hi = if f[3].is_empty() {
+                None
+            } else {
+                Some(unhex(f[3]).ok_or_else(|| err("segment fence is malformed"))?)
+            };
+            return Ok(Seg { blob, name: name.to_string(), level: 1, lo, hi, bloom: None });
+        }
+        // L0: build the Bloom by walking the segment's keys. That walk is
+        // O(keys) and it is affordable for exactly one reason -- L0 is
+        // bounded at `l0_trigger` segments of at most `seal_bytes` each, so
+        // this cost is bounded where the level below it is not.
+        let mut bloom = BlockedBloom::with_capacity(blob.keys());
+        Seg::for_each_key(&blob, |k| bloom.insert(k))?;
+        Ok(Seg {
+            blob,
+            name: name.to_string(),
+            level: 0,
+            lo: Vec::new(),
+            hi: None,
+            bloom: Some(bloom),
+        })
+    }
+
+    /// Could this segment hold `key`? A fence answers exactly; a Bloom
+    /// answers with false positives and never a false negative.
+    #[inline]
+    fn may_hold(&self, key: &[u8]) -> bool {
+        if key < self.lo.as_slice() {
+            return false;
+        }
+        if self.hi.as_ref().is_some_and(|h| key >= h.as_slice()) {
+            return false;
+        }
+        self.bloom.as_ref().is_none_or(|b| b.maybe_contains(key))
+    }
+
+    /// Could this segment hold anything at or after `from`?
+    #[inline]
+    fn may_reach(&self, from: &[u8]) -> bool {
+        self.hi.as_ref().is_none_or(|h| from < h.as_slice())
     }
 }
 
@@ -329,6 +518,161 @@ impl MemTable {
     }
 }
 
+/// The live segment set, named atomically.
+///
+/// A compaction writes new files and retires old ones, and a crash between
+/// those two acts would otherwise leave both on disk -- every merged record
+/// readable twice. The manifest is the swap point: it is written to a temp
+/// name, fsynced, renamed over the old one and the directory fsynced, so a
+/// reopen sees exactly one of the two sets. Segment files not named by it
+/// are orphans from an interrupted job and are deleted at open.
+///
+/// `SUPDBMAN\x01 | u32 body_len | u32 crc | body`, body being the covered
+/// WAL sequence and then each live segment's name.
+const MANIFEST_MAGIC: &[u8; 9] = b"SUPDBMAN\x01";
+
+fn manifest_write(dir: &Path, covered_seq: u64, names: &[String]) -> Result<()> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&covered_seq.to_le_bytes());
+    body.extend_from_slice(&(names.len() as u32).to_le_bytes());
+    for n in names {
+        body.extend_from_slice(&(n.len() as u16).to_le_bytes());
+        body.extend_from_slice(n.as_bytes());
+    }
+    let mut out = Vec::with_capacity(body.len() + 17);
+    out.extend_from_slice(MANIFEST_MAGIC);
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&crc32(&body).to_le_bytes());
+    out.extend_from_slice(&body);
+
+    let tmp = dir.join("manifest.tmp");
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(&out)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, dir.join("manifest"))?;
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// `None` when no manifest exists -- a store that has never sealed, or one
+/// written before manifests. A manifest that fails its CRC is a torn write
+/// of the file that is supposed to be atomic, so it is refused rather than
+/// guessed at.
+fn manifest_read(dir: &Path) -> Result<Option<(u64, Vec<String>)>> {
+    let mut buf = Vec::new();
+    match File::open(dir.join("manifest")) {
+        Ok(mut f) => f.read_to_end(&mut buf)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if buf.len() < 17 || &buf[..9] != MANIFEST_MAGIC {
+        return Err(err("manifest magic is wrong"));
+    }
+    let len = u32::from_le_bytes(buf[9..13].try_into().unwrap()) as usize;
+    let crc = u32::from_le_bytes(buf[13..17].try_into().unwrap());
+    let body = buf.get(17..17 + len).ok_or_else(|| err("manifest is truncated"))?;
+    if crc32(body) != crc {
+        return Err(err("manifest failed its checksum"));
+    }
+    let covered = u64::from_le_bytes(body[..8].try_into().unwrap());
+    let n = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
+    let mut names = Vec::with_capacity(n);
+    let mut p = 12usize;
+    for _ in 0..n {
+        let l = u16::from_le_bytes(
+            body.get(p..p + 2).ok_or_else(|| err("manifest is truncated"))?.try_into().unwrap(),
+        ) as usize;
+        p += 2;
+        let raw = body.get(p..p + l).ok_or_else(|| err("manifest is truncated"))?;
+        names.push(String::from_utf8(raw.to_vec()).map_err(|_| err("manifest name is not utf8"))?);
+        p += l;
+    }
+    Ok(Some((covered, names)))
+}
+
+/// The partitioning merge, run on a background thread.
+///
+/// Every input's keys are walked cheaply, unioned and sorted, then split
+/// into `parts` contiguous ranges; each range is written as one segment
+/// whose fence is its own boundaries, so the result is disjoint and routes
+/// by two comparisons. Values for a key are appended input by input in age
+/// order, which is what keeps a multivalue key's append order intact across
+/// a merge.
+///
+/// The union key list is materialised rather than streamed, because `Blob`
+/// hands out keys through a callback and not an iterator. It is the one
+/// place this milestone spends memory proportional to the store; a
+/// streaming k-way merge is the fix if it ever matters.
+fn compact_job(
+    dir: PathBuf,
+    inputs: Vec<String>,
+    first_id: u64,
+    end_seq: u64,
+    parts: usize,
+    opts: Options,
+) -> Result<Vec<String>> {
+    let mut blobs = Vec::with_capacity(inputs.len());
+    for name in &inputs {
+        blobs.push(
+            Blob::open(MmapBytes::open(&dir.join(name))?)
+                .map_err(|e| err(&format!("compact input {name}: {e}")))?,
+        );
+    }
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    for b in &blobs {
+        Seg::for_each_key(b, |k| keys.push(k.to_vec()))?;
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parts = parts.max(1).min(keys.len());
+    let per = keys.len().div_ceil(parts);
+
+    let mut out = Vec::with_capacity(parts);
+    for (pi, chunk) in keys.chunks(per).enumerate() {
+        let id = first_id + pi as u64;
+        let lo = fence_lo(&chunk[0]);
+        // The high fence is open-ended for the last partition so that a key
+        // beyond every key seen here still routes somewhere.
+        let hi = if pi + 1 == keys.len().div_ceil(per) {
+            None
+        } else {
+            fence_hi(chunk.last().expect("chunk is non-empty"))
+        };
+        let name = format!(
+            "par-{id:08}-{end_seq:016}-{}-{}.sup",
+            hex(&lo),
+            hi.as_deref().map(hex).unwrap_or_default()
+        );
+        let tmp = dir.join(format!("compact-{id:08}.tmp"));
+        let _ = std::fs::remove_file(&tmp);
+        {
+            let store = Store::create(&tmp, opts.clone())
+                .map_err(|e| err(&format!("compact create: {e}")))?;
+            for key in chunk {
+                for b in &blobs {
+                    b.read_all(key, |v| {
+                        // `Store::append` cannot fail for a value already in
+                        // a segment, and the callback cannot return.
+                        let _ = store.append(key, v);
+                    })
+                    .map_err(|e| err(&format!("compact read: {e}")))?;
+                }
+            }
+            store.checkpoint().map_err(|e| err(&format!("compact checkpoint: {e}")))?;
+            store.close().map_err(|e| err(&format!("compact close: {e}")))?;
+        }
+        std::fs::rename(&tmp, dir.join(&name))?;
+        out.push(name);
+    }
+    File::open(&dir)?.sync_all()?;
+    Ok(out)
+}
+
 pub struct Db {
     dir: PathBuf,
     opts: NextOptions,
@@ -336,15 +680,38 @@ pub struct Db {
     wal_id: u64,
     mem: MemTable,
     mem_bytes: usize,
-    /// Sealed segments, oldest first; read_all visits them in order so a
-    /// key's values come back in append order across seals.
-    segs: Vec<Blob<MmapBytes>>,
+    /// Live segments. Partitioned (L1) first and disjoint, then L0 oldest
+    /// to newest: a key's values come back in append order because a merge
+    /// preserves it and everything L0 holds is newer than everything L1
+    /// holds.
+    segs: Vec<Seg>,
     next_seg: u64,
+    /// WAL files whose records no segment has been *named* as covering
+    /// yet. One rule governs every one of them: a WAL may be deleted only
+    /// after the manifest names a segment that covers its records. The
+    /// model oracle found this twice in one afternoon -- the seal thread
+    /// deleting the rotated WAL on rename, before the publish that made its
+    /// segment reachable, and `open` deleting older WALs once it had
+    /// replayed them into a memtable that lives only in memory. Both were
+    /// the same mistake: treating "the data is somewhere" as "the data is
+    /// durable somewhere a reopen can find".
+    retiring_wals: Vec<PathBuf>,
+    /// The WAL sequence every live segment covers between them. Kept as a
+    /// monotone field rather than derived from segment names: a compaction
+    /// renames the whole live set, and deriving the bound from the names it
+    /// happens to produce let it move BACKWARDS -- caught by the model
+    /// oracle as "wal sequence gap: a durable record is missing" on the
+    /// reopen after a merge. A durability bound may only ever rise.
+    covered_seq: u64,
+    /// A partitioning merge in flight. Its inputs stay live and readable
+    /// until the manifest names its outputs instead, which is what makes
+    /// the swap atomic across a crash.
+    compacting: Option<Compaction>,
     /// A seal in flight: the frozen memtable stays readable (it is newer
     /// than every segment and older than `mem`) while a thread writes it
     /// out; `join_seal` collects the finished segment.
     frozen: Option<std::sync::Arc<MemTable>>,
-    sealing: Option<std::thread::JoinHandle<Result<PathBuf>>>,
+    sealing: Option<std::thread::JoinHandle<Result<String>>>,
     /// Sorted keys of the unsealed sources (memtable + frozen), built lazily
     /// by `scan` and reused until a write or a seal changes what is
     /// unsealed. Without this, every scan walked the whole memtable: the
@@ -367,8 +734,29 @@ impl Db {
     /// covers. A crash between the rename and the WAL reset then leaves a
     /// WAL whose covered prefix is skipped by sequence on replay instead of
     /// replayed into duplicates.
-    fn seg_path(dir: &Path, n: u64, end_seq: u64) -> PathBuf {
-        dir.join(format!("seg-{n:08}-{end_seq:016}.sup"))
+    fn seg_name(n: u64, end_seq: u64) -> String {
+        format!("seg-{n:08}-{end_seq:016}.sup")
+    }
+
+    /// Both `seg-` and `par-` names carry id then covered end-sequence in
+    /// their first two fields, so one parser serves the manifest, the
+    /// orphan sweep and the replay bound.
+    fn name_field(name: &str, i: usize) -> Option<u64> {
+        let rest = name.strip_prefix("seg-").or_else(|| name.strip_prefix("par-"))?;
+        rest.strip_suffix(".sup")?.split('-').nth(i)?.parse().ok()
+    }
+
+    fn name_id(name: &str) -> Option<u64> {
+        Db::name_field(name, 0)
+    }
+
+    fn name_end_seq(name: &str) -> Option<u64> {
+        Db::name_field(name, 1)
+    }
+
+    /// The live set, in the order the manifest should record it.
+    fn live_names(&self) -> Vec<String> {
+        self.segs.iter().map(|s| s.name.clone()).collect()
     }
 
     fn segment_opts(opts: &NextOptions) -> Options {
@@ -389,6 +777,9 @@ impl Db {
             next_seg: 0,
             frozen: None,
             sealing: None,
+            compacting: None,
+            retiring_wals: Vec::new(),
+            covered_seq: 0,
             scan_keys: std::cell::RefCell::new(None),
         })
     }
@@ -399,30 +790,46 @@ impl Db {
     /// with no segments and only a WAL is a store killed before its first
     /// seal, and it opens -- the brief's P-E.
     pub fn open(dir: &Path, opts: NextOptions) -> Result<Db> {
-        let mut seg_ids: Vec<(u64, u64)> = Vec::new();
+        // The manifest is the truth when it exists. Without one -- a store
+        // killed before its first seal -- the directory is scanned, which
+        // is also how a store written before manifests still opens.
+        let mut on_disk: Vec<String> = Vec::new();
         for entry in std::fs::read_dir(dir)? {
-            let name = entry?.file_name();
-            let name = name.to_string_lossy();
-            if let Some(rest) = name.strip_prefix("seg-").and_then(|s| s.strip_suffix(".sup")) {
-                let (id, end) =
-                    rest.split_once('-').ok_or_else(|| err("segment file name is malformed"))?;
-                seg_ids.push((
-                    id.parse().map_err(|_| err("segment file name is malformed"))?,
-                    end.parse().map_err(|_| err("segment file name is malformed"))?,
-                ));
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if (name.starts_with("seg-") || name.starts_with("par-")) && name.ends_with(".sup") {
+                on_disk.push(name);
             }
         }
-        seg_ids.sort_unstable();
-        let mut segs = Vec::with_capacity(seg_ids.len());
-        for &(id, end) in &seg_ids {
-            let blob = Blob::open(MmapBytes::open(&Db::seg_path(dir, id, end))?)
-                .map_err(|e| err(&format!("segment {id}: {e}")))?;
-            segs.push(blob);
+        let (sealed, live) = match manifest_read(dir)? {
+            Some((covered, names)) => (covered, names),
+            None => {
+                let mut names: Vec<String> =
+                    on_disk.iter().filter(|n| n.starts_with("seg-")).cloned().collect();
+                names.sort_unstable();
+                let covered = names
+                    .last()
+                    .and_then(|n| Db::name_end_seq(n))
+                    .unwrap_or(0);
+                (covered, names)
+            }
+        };
+        // Orphans: files a crash left behind from a merge or a seal whose
+        // manifest never landed. The manifest says what is live, so
+        // anything else is unreachable and is removed rather than kept.
+        for name in &on_disk {
+            if !live.contains(name) {
+                let _ = std::fs::remove_file(dir.join(name));
+            }
         }
-        // Everything at or past the newest segment's end-sequence outlived
-        // the last seal; everything before it is covered and skipped, which
-        // is what makes the rename-then-reset crash window safe.
-        let sealed = seg_ids.last().map_or(0, |&(_, end)| end);
+        let mut segs = Vec::with_capacity(live.len());
+        for name in &live {
+            segs.push(Seg::open(dir, name)?);
+        }
+        segs.sort_by(|a, b| b.level.cmp(&a.level).then(a.name.cmp(&b.name)));
+        let seg_ids: Vec<(u64, u64)> = live
+            .iter()
+            .filter_map(|n| Some((Db::name_id(n)?, Db::name_end_seq(n)?)))
+            .collect();
         let mut wal_ids: Vec<u64> = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let name = entry?.file_name();
@@ -441,16 +848,19 @@ impl Db {
                 mem_bytes += k.len() + v.len();
             })?;
         }
-        // A crash can leave a fully-covered WAL the sealing thread never
-        // deleted; every record in it was skipped above, and it is garbage
-        // now. Keep only the newest file and continue appending to it.
-        for &id in wal_ids.iter().rev().skip(1) {
-            let _ = std::fs::remove_file(Db::wal_path(dir, id));
-        }
+        // Older WALs are kept, not swept: their records are in the
+        // memtable and the memtable is not durable. They retire at the
+        // next seal, when a named segment covers them.
+        let retiring: Vec<PathBuf> = wal_ids
+            .iter()
+            .rev()
+            .skip(1)
+            .map(|&id| Db::wal_path(dir, id))
+            .collect();
         let wal_id = wal_ids.last().copied().unwrap_or(0);
         let wal_path = Db::wal_path(dir, wal_id);
         let file = OpenOptions::new().create(true).append(true).open(&wal_path)?;
-        let next_seg = seg_ids.last().map_or(0, |&(n, _)| n + 1);
+        let next_seg = seg_ids.iter().map(|&(n, _)| n + 1).max().unwrap_or(0);
         Ok(Db {
             dir: dir.to_path_buf(),
             opts,
@@ -462,6 +872,9 @@ impl Db {
             next_seg,
             frozen: None,
             sealing: None,
+            compacting: None,
+            retiring_wals: retiring,
+            covered_seq: sealed,
             scan_keys: std::cell::RefCell::new(None),
         })
     }
@@ -500,6 +913,7 @@ impl Db {
             return Ok(());
         }
         self.join_seal()?;
+        self.join_compact()?;
         let frozen = std::sync::Arc::new(std::mem::replace(&mut self.mem, MemTable::new()));
         self.mem_bytes = 0;
         let old_wal = std::mem::replace(
@@ -513,7 +927,7 @@ impl Db {
         let dir = self.dir.clone();
         let opts = Db::segment_opts(&self.opts);
         let end_seq = old_wal.seq;
-        let old_wal_path = old_wal.path.clone();
+        self.retiring_wals.push(old_wal.path.clone());
         drop(old_wal);
         let mem = frozen.clone();
         self.frozen = Some(frozen);
@@ -534,11 +948,10 @@ impl Db {
                 store.checkpoint().map_err(|e| err(&format!("seal checkpoint: {e}")))?;
                 store.close().map_err(|e| err(&format!("seal close: {e}")))?;
             }
-            let path = Db::seg_path(&dir, seg_id, end_seq);
-            std::fs::rename(&tmp, &path)?;
+            let name = Db::seg_name(seg_id, end_seq);
+            std::fs::rename(&tmp, dir.join(&name))?;
             File::open(&dir)?.sync_all()?;
-            let _ = std::fs::remove_file(&old_wal_path);
-            Ok(path)
+            Ok(name)
         }));
         Ok(())
     }
@@ -553,7 +966,8 @@ impl Db {
     pub fn flush(&mut self) -> Result<()> {
         self.wal.commit()?;
         self.seal()?;
-        self.join_seal()
+        self.join_seal()?;
+        self.join_compact()
     }
 
     /// Collect a finished (or in-flight) seal: join the thread, open its
@@ -562,21 +976,104 @@ impl Db {
         let Some(handle) = self.sealing.take() else {
             return Ok(());
         };
-        let path = handle.join().map_err(|_| err("seal thread panicked"))??;
-        self.segs
-            .push(Blob::open(MmapBytes::open(&path)?).map_err(|e| err(&format!("{e}")))?);
+        let name = handle.join().map_err(|_| err("seal thread panicked"))??;
+        self.covered_seq = self.covered_seq.max(Db::name_end_seq(&name).unwrap_or(0));
+        self.segs.push(Seg::open(&self.dir, &name)?);
         self.frozen = None;
+        self.publish()?;
+        for old in std::mem::take(&mut self.retiring_wals) {
+            let _ = std::fs::remove_file(old);
+        }
+        if self.opts.compact && self.l0_len() >= self.opts.l0_trigger {
+            self.start_compact()?;
+        }
         Ok(())
     }
 
-    /// Every value for `key`, in append order across seals: segments oldest
-    /// first, memtable last. Milestone 1 queries every source -- the
-    /// unfiltered fan F38.1 prices at 90ns per segment; routing lands with
-    /// the compaction milestone.
+    fn l0_len(&self) -> usize {
+        self.segs.iter().filter(|s| s.level == 0).count()
+    }
+
+    /// Name the live set durably. Everything before this call is a file on
+    /// disk that nothing reaches; everything after it is the store.
+    fn publish(&mut self) -> Result<()> {
+        manifest_write(&self.dir, self.covered_seq, &self.live_names())
+    }
+
+    /// Merge the L0 tail and every partition it overlaps into a new
+    /// disjoint set. Inputs stay live until `join_compact` publishes the
+    /// outputs, so a reader during the merge sees the old set and a crash
+    /// during it leaves the old set.
+    fn start_compact(&mut self) -> Result<()> {
+        self.join_compact()?;
+        let inputs: Vec<String> = self.live_names();
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        let bytes: u64 = inputs
+            .iter()
+            .filter_map(|n| std::fs::metadata(self.dir.join(n)).ok())
+            .map(|m| m.len())
+            .sum();
+        let parts = (bytes as usize).div_ceil(self.opts.seal_bytes.max(1)).max(1);
+        let end_seq = self.covered_seq;
+        let first_id = self.next_seg;
+        self.next_seg += parts as u64;
+        let dir = self.dir.clone();
+        let opts = Db::segment_opts(&self.opts);
+        let job_inputs = inputs.clone();
+        let handle = std::thread::spawn(move || {
+            compact_job(dir, job_inputs, first_id, end_seq, parts, opts)
+        });
+        self.compacting = Some((inputs, handle));
+        Ok(())
+    }
+
+    /// Collect a merge: swap its outputs in, name them in the manifest --
+    /// the atomic instant -- and only then delete the inputs.
+    fn join_compact(&mut self) -> Result<()> {
+        let Some((inputs, handle)) = self.compacting.take() else {
+            return Ok(());
+        };
+        let outputs = handle.join().map_err(|_| err("compaction thread panicked"))??;
+        let mut kept: Vec<Seg> = Vec::new();
+        for seg in self.segs.drain(..) {
+            if !inputs.contains(&seg.name) {
+                kept.push(seg);
+            }
+        }
+        let mut merged = Vec::with_capacity(outputs.len());
+        for name in &outputs {
+            merged.push(Seg::open(&self.dir, name)?);
+        }
+        // Partitions first (older, disjoint), then whatever L0 arrived
+        // while the merge ran, oldest to newest.
+        merged.extend(kept);
+        merged.sort_by(|a, b| b.level.cmp(&a.level).then(a.name.cmp(&b.name)));
+        self.segs = merged;
+        self.publish()?;
+        for name in &inputs {
+            let _ = std::fs::remove_file(self.dir.join(name));
+        }
+        Ok(())
+    }
+
+    /// Every value for `key`, in append order: partitions first, then L0
+    /// oldest to newest, then the frozen memtable, then the live one.
+    ///
+    /// `may_hold` is the routing F38-F41 settled. A partition answers from
+    /// its fence in two comparisons and no memory beyond the `Seg`; an L0
+    /// segment answers from a Bloom in one cache line. Neither can produce
+    /// a false negative, so a skipped segment is a segment that provably
+    /// holds nothing for this key.
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
         let mut n = 0u64;
         for seg in &self.segs {
+            if !seg.may_hold(key) {
+                continue;
+            }
             n += seg
+                .blob
                 .read_all(key, &mut f)
                 .map_err(|e| err(&format!("segment read: {e}")))?;
         }
@@ -636,11 +1133,18 @@ impl Db {
         let mut keys: Vec<Vec<u8>> =
             unsealed[start..start + limit.min(unsealed.len() - start)].to_vec();
         for seg in &self.segs {
-            seg.scan_counts(from, limit, |k, _| {
-                keys.push(k.to_vec());
-                true
-            })
-            .map_err(|e| err(&format!("segment scan: {e}")))?;
+            // A partition whose whole range sorts before `from` cannot
+            // contribute a candidate, and skipping it is the ordered-axis
+            // half of the same fence.
+            if !seg.may_reach(from) {
+                continue;
+            }
+            seg.blob
+                .scan_counts(from, limit, |k, _| {
+                    keys.push(k.to_vec());
+                    true
+                })
+                .map_err(|e| err(&format!("segment scan: {e}")))?;
         }
         keys.sort_unstable();
         keys.dedup();
@@ -653,6 +1157,13 @@ impl Db {
 
     pub fn segments(&self) -> usize {
         self.segs.len() + usize::from(self.sealing.is_some())
+    }
+
+    /// Live segment count by level: (partitioned, L0). The compaction
+    /// experiment reports both, because "how many segments does a read
+    /// touch" is the whole question.
+    pub fn levels(&self) -> (usize, usize) {
+        (self.segs.len() - self.l0_len(), self.l0_len())
     }
 
     /// Commit what is pending, seal the rest. Close is a convenience, not a
@@ -673,6 +1184,9 @@ impl Db {
 impl Drop for Db {
     fn drop(&mut self) {
         if let Some(h) = self.sealing.take() {
+            let _ = h.join();
+        }
+        if let Some((_, h)) = self.compacting.take() {
             let _ = h.join();
         }
     }
