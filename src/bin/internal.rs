@@ -122,6 +122,7 @@ fn main() -> std::io::Result<()> {
             "f41-segroute" => f41_segroute(&args, profile)?,
             "f42-next" => f42_next(&args, profile)?,
             "f43-compact" => f43_compact(&args, profile)?,
+            "f44-tail" => f44_tail(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -5790,6 +5791,207 @@ fn f38_fanout(args: &Args, profile: Profile) -> std::io::Result<Record> {
     Ok(rec)
 }
 
+/// Is the L0 tail what costs the read lead? tail-plan.md registers the
+/// predictions; the diagnostic that prompted it is in the plan's table.
+/// Five arms at ext-kv's own scale: no compaction, then `l0_trigger` at 8,
+/// 4, 2 and 1, plus a single-store baseline built through the same engine
+/// with sealing effectively disabled -- the arrangement P44.2 measures
+/// against, built in the same process by the same code so the comparison
+/// is not across runs.
+fn f44_tail(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::next::{Db, NextOptions};
+
+    let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+    let seal_kb = args.num("--seal-kb", 8_192);
+    let probes = args.num("--probes", profile.pick(20_000, 100_000, 200_000)) as u64;
+
+    let mut rec = Record::new("f44-tail", profile);
+    rec.param("keys", J::u(keys))
+        .param("batch", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .param("seal_kb", J::u(seal_kb as u64))
+        .param("probes", J::u(probes))
+        .note(
+            "six arms interleaved in one process, ext-kv's shape and scale: one-store (sealing \
+             disabled, the whole load in a single segment at close), no-compact (every segment \
+             unrouted), and compaction at l0_trigger 8, 4, 2, 1. The read phase runs over what \
+             each arm built",
+        )
+        .note("predictions registered in tail-plan.md before the first run");
+
+    let dir = scratch("f44");
+    let payload = Payload::new(value_size, 0.5, 0xF44);
+    let arm_names = ["one-store", "no-compact", "T8", "T4", "T2", "T1"];
+    // (seal enabled, compact, trigger)
+    let arm_cfg: [(bool, bool, usize); 6] = [
+        (false, false, 0),
+        (true, false, 0),
+        (true, true, 8),
+        (true, true, 4),
+        (true, true, 2),
+        (true, true, 1),
+    ];
+    let ne = arm_names.len();
+    let loads: std::sync::Mutex<Vec<Samples>> =
+        std::sync::Mutex::new(vec![Samples::default(); ne]);
+    let io_mb: std::sync::Mutex<Vec<Samples>> =
+        std::sync::Mutex::new(vec![Samples::default(); ne]);
+    let par_n: std::sync::Mutex<Vec<Samples>> =
+        std::sync::Mutex::new(vec![Samples::default(); ne]);
+    let l0_n: std::sync::Mutex<Vec<Samples>> =
+        std::sync::Mutex::new(vec![Samples::default(); ne]);
+
+    let rates = Trial::new(profile.reps()).run(ne, |ci, rep| {
+        let (seals, compact, trigger) = arm_cfg[ci];
+        let d = dir.join(format!("a{ci}-{rep}"));
+        let _ = std::fs::remove_dir_all(&d);
+        let opts = NextOptions {
+            seal_bytes: if seals { seal_kb << 10 } else { usize::MAX },
+            l0_trigger: if trigger == 0 { usize::MAX } else { trigger },
+            compact,
+            ..Default::default()
+        };
+        let mut db = Db::create(&d, opts).expect("create");
+        let mut vrng = Rng::new(0xF44 + rep as u64);
+        let mut kb = [0u8; 16];
+
+        let io0 = IoCounters::read_now();
+        let t = Instant::now();
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            db.append(&kb, payload.get(&mut vrng));
+            if (i + 1) % batch == 0 {
+                db.commit().expect("commit");
+            }
+        }
+        db.flush().expect("flush");
+        loads.lock().unwrap()[ci].push(keys as f64 / t.elapsed().as_secs_f64());
+        io_mb.lock().unwrap()[ci]
+            .push(IoCounters::read_now().since(&io0).write_bytes as f64 / 1_048_576.0);
+        let (par, l0) = db.levels();
+        par_n.lock().unwrap()[ci].push(par as f64);
+        l0_n.lock().unwrap()[ci].push(l0 as f64);
+
+        let mut g = KeyGen::new(KeyDist::Uniform, keys, 0x44 + rep as u64);
+        let t = Instant::now();
+        let mut got = 0u64;
+        for _ in 0..probes {
+            db_key_into(g.next(), &mut kb);
+            got += db.read_all(&kb, |v| {
+                std::hint::black_box(v);
+            })
+            .expect("read");
+        }
+        assert_eq!(got, probes, "every key holds exactly one value");
+        let rate = probes as f64 / t.elapsed().as_secs_f64();
+        db.close().expect("close");
+        let _ = std::fs::remove_dir_all(&d);
+        rate
+    });
+
+    let take = |m: &std::sync::Mutex<Vec<Samples>>| m.lock().unwrap().clone();
+    let (loads, io_mb, par_n, l0_n) = (take(&loads), take(&io_mb), take(&par_n), take(&l0_n));
+    rec.series(
+        "arms",
+        J::arr(
+            (0..ne)
+                .map(|i| {
+                    jobj! {
+                        "arm" => J::s(arm_names[i]),
+                        "reads_per_s" => J::fp(rates[i].median(), 1),
+                        "read_rel_iqr" => J::fp(rates[i].rel_iqr(), 4),
+                        "load_ops_per_s" => J::fp(loads[i].median(), 1),
+                        "partitions" => J::fp(par_n[i].median(), 1),
+                        "l0_tail" => J::fp(l0_n[i].median(), 1),
+                        "device_write_mb" => J::fp(io_mb[i].median(), 1)
+                    }
+                })
+                .collect(),
+        ),
+    );
+
+    // P44.1: the tail is the dial.
+    let cmp_t1t8 = compare(&rates[5], &rates[2], supdb::bench::MIN_EFFECT);
+    rec.compare("read_T1_vs_T8", cmp_t1t8.clone());
+    let gain = rates[5].median() / rates[2].median().max(1e-9);
+    rec.finding(Finding::new(
+        "F44.1",
+        "read throughput rises as the unrouted L0 tail shrinks",
+        gain >= 1.15 && matches!(cmp_t1t8.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "reads by tail bound: no-compact {:.0}/s over {:.0} unrouted segments, T8 {:.0} over \
+             {:.0}, T4 {:.0} over {:.0}, T2 {:.0} over {:.0}, T1 {:.0} over {:.0}. T1 against T8 \
+             is {gain:.3}x ({}). A flat curve would mean the tail is not the cost and the fence \
+             search or the mapping count is",
+            rates[1].median(),
+            l0_n[1].median(),
+            rates[2].median(),
+            l0_n[2].median(),
+            rates[3].median(),
+            l0_n[3].median(),
+            rates[4].median(),
+            l0_n[4].median(),
+            rates[5].median(),
+            l0_n[5].median(),
+            cmp_t1t8.summary("T1", "T8")
+        ),
+    ));
+
+    // P44.2: how close a minimal tail gets to one store holding the same
+    // data, built by the same code in the same process.
+    let cmp_one = compare(&rates[5], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("read_T1_vs_one_store", cmp_one.clone());
+    let frac = rates[5].median() / rates[0].median().max(1e-9);
+    rec.finding(Finding::new(
+        "F44.2",
+        "a minimally-tailed store reads within 10% of the same data in one segment",
+        frac >= 0.90,
+        format!(
+            "T1 reads {:.0}/s against one-store's {:.0} -- {:.1}% of it ({}), over {:.0} \
+             partitions and {:.0} unrouted segments against a single one. F38.2 measured \
+             perfectly-routed segmentation as free at this key count, but its oracle paid no \
+             fence search, no Bloom and had no tail; this is that measurement with the routing \
+             the engine actually has",
+            rates[5].median(),
+            rates[0].median(),
+            frac * 100.0,
+            cmp_one.summary("T1", "one-store"),
+            par_n[5].median(),
+            l0_n[5].median()
+        ),
+    ));
+
+    // P44.3: and what the read side costs the write side.
+    let cmp_load = compare(&loads[2], &loads[5], supdb::bench::MIN_EFFECT);
+    rec.compare("load_T8_vs_T1", cmp_load.clone());
+    let load_frac = loads[5].median() / loads[2].median().max(1e-9);
+    rec.finding(Finding::new(
+        "F44.3",
+        "a tighter tail bound is bought with load throughput",
+        load_frac <= 0.77 && matches!(cmp_load.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "loads by tail bound: T8 {:.0} ops/s ({:.1} MB to the device), T4 {:.0} ({:.1}), T2 \
+             {:.0} ({:.1}), T1 {:.0} ({:.1}). T1 keeps {:.1}% of T8's load ({}). Every seal at \
+             T1 triggers a merge that rewrites the live set, which is the trade curve F43.4 \
+             priced at one point and this measures along",
+            loads[2].median(),
+            io_mb[2].median(),
+            loads[3].median(),
+            io_mb[3].median(),
+            loads[4].median(),
+            io_mb[4].median(),
+            loads[5].median(),
+            io_mb[5].median(),
+            load_frac * 100.0,
+            cmp_load.summary("T8", "T1")
+        ),
+    ));
+
+    Ok(rec)
+}
+
 /// The compaction milestone adjudicated: compaction-plan.md's P4.1-P4.4,
 /// registered before the merge existed. Three arms interleaved -- the
 /// unrouted fan of milestone 3, and range-partitioned compaction at two
@@ -5843,6 +6045,11 @@ fn f43_compact(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let disk_mb: std::sync::Mutex<Vec<Samples>> =
         std::sync::Mutex::new(vec![Samples::default(); ne]);
     let segs: std::sync::Mutex<Vec<Samples>> =
+        std::sync::Mutex::new(vec![Samples::default(); ne]);
+    // The tail on its own, because "how many segments" and "how many
+    // UNROUTED segments" are different questions and only the second one
+    // is bounded by policy.
+    let tail: std::sync::Mutex<Vec<Samples>> =
         std::sync::Mutex::new(vec![Samples::default(); ne]);
 
     let rates = Trial::new(profile.reps()).run(ne, |ci, rep| {
@@ -5905,6 +6112,7 @@ fn f43_compact(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
         let (par, l0) = db.levels();
         segs.lock().unwrap()[ci].push((par + l0) as f64);
+        tail.lock().unwrap()[ci].push(l0 as f64);
         db.close().expect("close");
         let mut bytes = 0u64;
         for e in std::fs::read_dir(&d).expect("dir") {
@@ -5916,12 +6124,13 @@ fn f43_compact(args: &Args, profile: Profile) -> std::io::Result<Record> {
     });
 
     let take = |m: &std::sync::Mutex<Vec<Samples>>| m.lock().unwrap().clone();
-    let (reads, scan_rate, io_mb, disk_mb, segs) = (
+    let (reads, scan_rate, io_mb, disk_mb, segs, tail) = (
         take(&reads),
         take(&scan_rate),
         take(&io_mb),
         take(&disk_mb),
         take(&segs),
+        take(&tail),
     );
     rec.series(
         "arms",
@@ -5936,7 +6145,8 @@ fn f43_compact(args: &Args, profile: Profile) -> std::io::Result<Record> {
                         "scan_entries_per_s" => J::fp(scan_rate[i].median(), 1),
                         "device_write_mb" => J::fp(io_mb[i].median(), 1),
                         "disk_mb" => J::fp(disk_mb[i].median(), 1),
-                        "live_segments" => J::fp(segs[i].median(), 1)
+                        "live_segments" => J::fp(segs[i].median(), 1),
+                        "l0_tail" => J::fp(tail[i].median(), 1)
                     }
                 })
                 .collect(),
