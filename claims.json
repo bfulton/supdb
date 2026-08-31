@@ -993,21 +993,21 @@
    "id": "EXT.22",
    "profile": "full",
    "expect": "fails",
-   "because": "Recorded as failing because a tie is not the claimed win, and the tie is the story: next 650,882 ops/s against lmdb 637,423 in the same process, both committing durably per batch, checksums equalized -- 1.021x at p=1.0, statistically indistinguishable. In this same record the current engine reads 0.394x on the identical comparison, and the project opened at 91x behind. The residual that cannot be equalized still leans LMDB's way (it is transactional, next is not), so the tie is a bound, not a hidden lead. Rule 4 travels with it: next sent 134.7 MB to the device for the durable load -- fewer than LMDB's 237, a quarter of supdb-durable's 841.7, and fewer than supdb's own buffered arm -- so the WAL-only engine is durable at 1.15x write amplification. First full-profile reading; a second run replicates or retires it per the two-runs rule."
+   "because": "Recorded as failing because the claimed win is not established, and two runs say what is: run 1 read next 650,882 against lmdb 637,423 (1.021x, no difference at p=1.0), run 2 read 536,993 against 668,282 (0.804x, no difference at p=0.31). Both ties, point estimates straddling 1.0 -- and the comparator discipline names the instability as OURS: lmdb moved 4.8% between runs while next's arm moved 17.5%, almost certainly the seal schedule interacting with rep boundaries. So the reading is: the durable-load axis is in LMDB's neighborhood -- from 91x behind at the project's start and 0.394x for the current engine in these same records -- but next does not yet have a stable number, and stabilizing the seal cadence is engineering the compaction milestone touches anyway. What IS stable is the device column: next wrote 134.7 then 130.7 MB durably (3% apart) against lmdb's 237.0 both times -- durable at 0.55-0.57x of LMDB's device bytes, 1.15x amplification, replicated."
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.23",
    "profile": "full",
    "expect": "holds",
-   "because": "next reads 1,497,136/s against lmdb's 1,034,805 -- 1.447x at p=0.0022, same process, checksums equalized. The read fans over segments plus the memtable with no routing yet, and still clears the current engine's own buffered figure in this record (1.077x): the arena memtable probe is cheap enough that half the keys living unsealed costs nothing. The transactional residual leans against next, so this is a floor. First full reading; the second run gates it like everything else."
+   "because": "Replicated: next reads 1.447x over LMDB (1,497,136 vs 1,034,805, p=0.0022) and then 1.405x (1,521,996 vs 1,083,456, p=0.0022) in the second run, next's arm moving 1.7% and the comparator 4.7%. Same process, checksums equalized, no routing built yet, half the keys served from the unsealed memtable -- and the transactional residual leans against next, so 1.4x is a floor. The read lead the old engine could only show buffered on this host, the new one shows durable, twice."
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.24",
    "profile": "full",
    "expect": "fails",
-   "because": "Failing by design and recorded so the design has to answer for it: next scans 1.4M entries/s against lmdb's 35.2M, 0.040x. A scan currently merges candidates from every segment plus a sorted snapshot of the unsealed keys -- the unrouted fan on the ordered axis. compaction-plan.md P4.1 registers the prediction that range-partitioned compaction takes this to at least 0.5x; that milestone, not tuning, is what moves this claim."
+   "because": "Failing by design, replicated at 0.040x and then 0.038x: a scan merges candidates from every segment plus the sorted unsealed-key snapshot -- the unrouted fan on the ordered axis. compaction-plan.md P4.1 registers the prediction that range-partitioned compaction takes this to at least 0.5x of LMDB; that milestone, not tuning, is what moves this claim."
   }
  ],
  "metrics": [
