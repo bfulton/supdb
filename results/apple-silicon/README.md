@@ -101,3 +101,25 @@ be told apart; on Apple Silicon (128-byte lines, 16 KiB pages) supdb reads
 flatindex probe touching one line where a B-tree descent touches several,
 or the page size quartering LMDB's tree depth-to-bytes ratio -- carries the
 difference is not yet decomposed; do not guess it into prose.
+
+## The mechanism of the read lead, decomposed and replicated
+
+Two runs of `ext-readdecomp` (`ext-readdecomp.run{1,2}.json`), verdicts
+agreeing on every axis that clears the gate:
+
+- **Depth acquitted.** The lead does not grow from 100k to 4M keys -- it
+  shrinks if anything (0.663x nd, then 0.641x at p=0.03). An O(log n)
+  descent against an O(1) probe would show the opposite.
+- **Memory geometry acquitted, compute convicted.** Cache-resident, the
+  lead does not merely survive -- it widens to 4.758x and 4.505x (2.6-3.0x
+  over the uniform working set). A lead that needed 128-byte lines or
+  16 KiB pages to exist would die when nothing misses; this one grows when
+  memory stalls stop masking it. The probe simply executes less work than
+  the descent, and Apple Silicon's wide core makes the difference visible
+  where the x86 host's noise floor does not.
+- **Value size: unresolved.** 0.756x at p=0.03 in run 1, 1.158x nd in run
+  2 -- did not replicate, recorded as noise.
+
+Practical reading: the 2.4x buffered read lead on this host is not an
+artifact of Apple's memory system; it is the flatindex probe being cheaper
+than a B-tree walk, visible wherever the core is wide enough to show it.
