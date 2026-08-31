@@ -327,13 +327,6 @@ impl MemTable {
     fn is_empty(&self) -> bool {
         self.len == 0
     }
-
-    fn clear(&mut self) {
-        self.entries.iter_mut().for_each(|e| *e = MemEntry::default());
-        self.len = 0;
-        self.keys.clear();
-        self.vals.clear();
-    }
 }
 
 pub struct Db {
