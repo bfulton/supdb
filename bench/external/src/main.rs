@@ -25,7 +25,7 @@
 
 mod engines;
 
-use engines::{Engine, Features, Lmdb, LmdbDup, Redb, Sled, Supdb};
+use engines::{Engine, Features, Lmdb, LmdbDup, Redb, Sled, Supdb, Next};
 use std::path::PathBuf;
 use std::time::Instant;
 use supdb::bench::{
@@ -77,6 +77,7 @@ fn build(root: &std::path::Path, which: &[&str], buffer_mb: usize) -> Vec<Box<dy
         let dir = root.join(name);
         let e: Result<Box<dyn Engine>, String> = match *name {
             "supdb" => Supdb::create(&dir, buffer_mb).map(|e| Box::new(e) as Box<dyn Engine>),
+            "next" => Next::create(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
             "supdb-durable" => {
                 Supdb::create_durable(&dir, buffer_mb).map(|e| Box::new(e) as Box<dyn Engine>)
             }
@@ -763,6 +764,40 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &load,
         "ops/s",
         true,
+    );
+    // The next engine (supdb::next), measured on the same three axes against
+    // the same LMDB in the same process. Its commit is a WAL append plus one
+    // fdatasync per batch -- LMDB's own boundary -- so the load comparison is
+    // matched the way EXT.9 is, with the same transactional residual.
+    ordering_of(
+        &mut rec,
+        "EXT.22",
+        "The next engine loads faster than LMDB when both commit durably per batch",
+        "next",
+        "lmdb",
+        &load,
+        "ops/s",
+        true,
+    );
+    ordering_of(
+        &mut rec,
+        "EXT.23",
+        "The next engine reads faster than LMDB",
+        "next",
+        "lmdb",
+        &read,
+        "reads/s",
+        false,
+    );
+    ordering_of(
+        &mut rec,
+        "EXT.24",
+        "The next engine scans no slower than LMDB",
+        "next",
+        "lmdb",
+        &scan,
+        "entries/s",
+        false,
     );
     // Durability does not touch a read or a scan, so these need only the
     // checksum axis matched -- and that one was costing Supdb 8.5% on every

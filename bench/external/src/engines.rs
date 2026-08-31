@@ -325,6 +325,79 @@ impl Engine for Supdb {
     }
 }
 
+// ------------------------------------------------------------------- next --
+
+/// The next engine (`supdb::next`): a WAL-only commit with sealed segments in
+/// today's store format. Always durable -- a commit is a WAL append plus one
+/// fdatasync, which is LMDB's own boundary, so this arm is guarantee-matched
+/// against `lmdb` the way `supdb-durable` is. Scans pay the unrouted fan
+/// (every segment contributes candidates) until range-partitioned compaction
+/// lands; that cost is the arm's to show, not to hide.
+pub struct Next {
+    db: Option<supdb::next::Db>,
+    path: PathBuf,
+}
+
+impl Next {
+    pub fn create(path: &Path) -> Res<Next> {
+        std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+        // Checksums off in the segments, because LMDB has none and the axis
+        // is equalizable -- the same call `supdb-durable` makes, and the
+        // fairness gate refused to rank this arm until it was made here too.
+        let opts = supdb::next::NextOptions {
+            segment: supdb::Options { checksums: false, ..Default::default() },
+            ..Default::default()
+        };
+        let db = supdb::next::Db::create(path, opts).map_err(|e| e.to_string())?;
+        Ok(Next { db: Some(db), path: path.to_path_buf() })
+    }
+}
+
+impl Engine for Next {
+    fn name(&self) -> &'static str {
+        "next"
+    }
+    fn features(&self) -> Features {
+        Features {
+            durable_commit: true,
+            transactions: false,
+            // Equalized off, matching lmdb -- see create().
+            checksums: false,
+            reopen_for_write: true,
+            read_your_writes: true,
+            ordered_scan: true,
+        }
+    }
+    fn write_batch(&mut self, items: &[(Vec<u8>, Vec<u8>)]) -> Res<()> {
+        let db = self.db.as_mut().ok_or("db closed")?;
+        for (k, v) in items {
+            db.append(k, v);
+        }
+        db.commit().map_err(|e| e.to_string())
+    }
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        let db = self.db.as_ref().ok_or("db closed")?;
+        let mut n = 0usize;
+        db.read_all(key, |v| n += v.len()).map_err(|e| e.to_string())?;
+        Ok(n)
+    }
+    fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
+        let db = self.db.as_ref().ok_or("db closed")?;
+        let mut bytes = 0usize;
+        db.scan(from, n, |_k, v| bytes += v.len()).map_err(|e| e.to_string())?;
+        Ok(bytes)
+    }
+    fn sync(&mut self) -> Res<()> {
+        if let Some(db) = self.db.as_mut() {
+            db.commit().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+    fn size_bytes(&self) -> u64 {
+        dir_size(&self.path)
+    }
+}
+
 // ------------------------------------------------------------------- redb --
 
 /// redb: the closest architectural sibling in the field.

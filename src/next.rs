@@ -576,6 +576,48 @@ impl Db {
         Ok(n)
     }
 
+    /// Ordered scan from `from`, at most `limit` distinct keys, values in
+    /// append order within each key. Milestone 3's merge is the unrouted fan
+    /// on the scan axis: every segment contributes up to `limit` candidate
+    /// keys via its own index walk, the memtables contribute theirs, and the
+    /// union is sorted and re-read through `read_all`. Range-partitioned
+    /// compaction is what will make this cost one segment instead of all of
+    /// them; until then this is priced as what it is.
+    pub fn scan<F: FnMut(&[u8], &[u8])>(
+        &self,
+        from: &[u8],
+        limit: usize,
+        mut f: F,
+    ) -> Result<usize> {
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for seg in &self.segs {
+            seg.scan_counts(from, limit, |k, _| {
+                keys.push(k.to_vec());
+                true
+            })
+            .map_err(|e| err(&format!("segment scan: {e}")))?;
+        }
+        let mut mem_keys = |mem: &MemTable| {
+            for e in mem.entries.iter().filter(|e| e.hash != 0) {
+                let k = MemTable::key_of(&mem.keys, e);
+                if k >= from {
+                    keys.push(k.to_vec());
+                }
+            }
+        };
+        if let Some(fr) = &self.frozen {
+            mem_keys(fr);
+        }
+        mem_keys(&self.mem);
+        keys.sort_unstable();
+        keys.dedup();
+        keys.truncate(limit);
+        for key in &keys {
+            self.read_all(key, |v| f(key, v))?;
+        }
+        Ok(keys.len())
+    }
+
     pub fn segments(&self) -> usize {
         self.segs.len() + usize::from(self.sealing.is_some())
     }
