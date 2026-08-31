@@ -109,6 +109,15 @@ interleaved where the harness allows:
   decomposition of why — segment count, mapping count, tail size, filter
   false positives — is the open work this refutation names. Replicated at
   0.850x on a second full run, next's arm moving 1.3% and LMDB's 1.9%.
+  **f44 decomposed the first layer of it.** The tail is not the cause: the
+  read curve is flat across every tail bound (F44.1), because a merge that
+  rewrites the whole live set is slower than the seals feeding it, so the
+  tail settles at 5–6 whatever `l0_trigger` says and the policy knob is
+  disconnected. The cause is segmentation itself as routed today —
+  1,030,151/s against 1,442,938 for the same data in one segment, **71.4%**
+  (F44.2), which is exactly the distance EXT.23 fell. F38.2's "segmentation
+  is free" survives as what it measured: an oracle that paid no fence
+  search, no Bloom, and had no tail.
 - **P-C, the durability curve flattens:** the F4-durability sweep shows
   window cost independent of key count — the 25x at a 1,000-op window
   (F4.1) becomes a bounded, window-size-only cost. F4.1 flips or the design
@@ -131,6 +140,11 @@ interleaved where the harness allows:
   load throughput (F43.4, a refuted P4.4) and its device ratio grows with
   the store. **An incremental merge — rewriting only the partitions the
   tail overlaps — is the open work**, and F43.4 is where it gets measured.
+  f44 raises its priority twice over: compaction now costs 42% of the
+  durable load at 1M keys against F43.4's 21.6% at 300k (the whole-live-set
+  rewrite growing with the store, as F43.3 warned), and because the merge
+  cannot keep up with seals, the tail bound does not control the tail
+  (F44.1). An incremental merge is what would make the policy knob real.
 - **What the ordered axis actually costs.** P4.1 predicted partitioning
   recovers scans 12x; measured, it is 1.367x (F43.1, refuted). The axis
   was losing to the scan implementation, not to the fan: candidate

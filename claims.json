@@ -1036,6 +1036,27 @@
    "profile": "full",
    "expect": "fails",
    "because": "P4.4 said the durable load would not feel a merge that runs on its own thread. It does: 534,968 ops/s with compaction against 681,958 without -- 0.784x at p=0.0022, replicated at 0.833x. The prediction's refutation clause said a regression convicts the backpressure, and it is half right. Blocking was removed (a merge in flight defers the next trigger instead of stalling a seal) and the loss remained, so what is left is contention rather than waiting: the merge rewrites the ENTIRE live set every time it runs, competing with the load for CPU and device. That is O(store) per merge and O(store^2) over a load, the same shape F37 convicted in the inline merge policy -- an incremental merge that rewrites only the partitions the tail overlaps is the fix, and this claim is where it will be measured."
+  },
+  {
+   "experiment": "f44-tail",
+   "id": "F44.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "The read curve against the tail bound is FLAT once compaction is on -- T8 988,256/s, T4 1,021,112, T2 1,005,968, T1 1,030,151, T1-vs-T8 a no-difference at p=0.2502 against a registered 1.15x -- and the reason is the finding: EVERY compacting arm ends with the same 5-6 segment tail no matter what its trigger says. `l0_trigger` is not the control variable. A merge rewrites the whole live set and takes longer than the seals that feed it, so when the trigger fires with a merge in flight the engine defers, and the tail settles at whatever merge DURATION allows. Turning the dial from 8 to 1 changes only how often a merge is attempted (device bytes 401.2 MB to 500.6) and not the state it converges to. Compaction still matters -- 14 unrouted segments read 864,624/s against ~1,020,000 routed -- but its policy knob is disconnected until the merge is incremental."
+  },
+  {
+   "experiment": "f44-tail",
+   "id": "F44.2",
+   "profile": "full",
+   "expect": "fails",
+   "because": "The one that matters, and it is a clean refutation: the best-routed arm reads 1,030,151/s against 1,442,938 for the same data in a single segment -- 71.4%, p=0.0022, built by the same code in the same process so nothing is comparing across runs. Segmentation with the routing this engine actually has costs 28.6% of the read path, and that is precisely the distance that turned EXT.23 from a 1.4x lead into a 0.85x loss. F38.2 measured segmentation as free at this key count and it is not wrong -- its oracle knew the segment, paid no fence search, consulted no Bloom, and had no unrouted tail. The gap between that idealisation and 16 partitions plus a 5-segment tail IS the 28.6%. So the read premise of the design does not hold as built, and the open work is the decomposition F38 deferred: how much is the fence search, how much the Bloom checks, how much k mappings against one, and how much a 1M-key contiguous index against sixteen 60k-key ones."
+  },
+  {
+   "experiment": "f44-tail",
+   "id": "F44.3",
+   "profile": "full",
+   "expect": "fails",
+   "because": "The registered trade was that a tighter tail costs load -- T1 at most 0.77x of T8 -- and it keeps 85.5% instead (426,377 against 498,874, p=0.0014). The prediction assumed the dial worked; F44.1 shows it does not, so the arms differ only in how many merges they attempt and not in the tail they reach. What the load curve does show is the merge's real price: 736,341 ops/s with no compaction at all, ~430,000 with it, and device bytes from 301.9 MB to 500.6. Compaction costs 42% of the durable load here against F43.4's 21.6% at 300k keys, which is the whole-live-set rewrite growing with the store exactly as F43.3 warned it would."
   }
  ],
  "metrics": [
