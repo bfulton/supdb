@@ -80,7 +80,11 @@ synced bytes further.
 Run 3 on 3f08f11, the head that carries `Options::log_values`
 (`ext-kv-durable-pair.run3-valuelog.json`): supdb-durable 83,865 ops/s vs
 lmdb 171,108, **0.490x** at p=0.0022, rel_iqr 1.9%/2.0%. The comparator
-moved 3.5% over the run2 pair; supdb moved **+19.3%**.
+moved 3.5% over the run2 pair; supdb moved **+19.3%**. Run 4
+(`ext-kv-durable-pair.run4-valuelog.json`) replicates it to a degree the
+buffered arm never managed: 84,183 vs 172,975, **0.487x** at p=0.0022 --
+supdb within 0.38% of run 3, lmdb within 1.1%, and the device-byte column
+identical to the tenth of a megabyte (831.9 / 199.1 both times).
 
 The third campaign ended by predicting exactly this experiment: it said the
 synced bytes were already off the table and "what remains on this axis is
