@@ -97,11 +97,17 @@ interleaved where the harness allows:
   host — within 1.7x of the raw+index floor and past LMDB's recorded rate.
   Below 600k the design has a leak that must be named; below 572k the axis
   is conceded and the brief's premise was wrong.
-- **P-B, the read lead survives:** EXT.11's shape with live segment counts
-  under the compaction policy stays **≥ 1.2x** on x86. This is F38's arithmetic
-  obligation: routing must recover what fan-out spends. Standing at 1.447x
-  and 1.405x against LMDB in two full runs (EXT.23), and f43 shows routing
-  paying rather than costing at 23 live segments (F43.2, 1.117x).
+- **P-B, the read lead survives: REFUTED.** The test was "EXT.11's shape
+  with live segment counts under the compaction policy stays ≥ 1.2x on
+  x86", and with the levels actually live it reads **0.846x** (EXT.23,
+  p=0.0022). The three runs that had it at 1.4-1.7x all had the structure
+  idle: a 64MB seal threshold over 116MB of data left two segments and
+  half the store in a resident hash memtable. f43 shows routing *paying*
+  at 23 segments (F43.2) but on a 35MB store where an extra probe is a
+  cache hit; at 116MB it does not. So the read lead `flatindex` earns is
+  not currently preserved by the routing built to protect it, and the
+  decomposition of why — segment count, mapping count, tail size, filter
+  false positives — is the open work this refutation names.
 - **P-C, the durability curve flattens:** the F4-durability sweep shows
   window cost independent of key count — the 25x at a 1,000-op window
   (F4.1) becomes a bounded, window-size-only cost. F4.1 flips or the design
