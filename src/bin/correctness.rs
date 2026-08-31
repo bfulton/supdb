@@ -631,10 +631,17 @@ fn c2_oracle(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // policy-dependent and running one policy hides the other: under
     // AfterReads the write path dies before the comparison can run, and under
     // Never it survives and diverges.
-    let policies: Vec<(&str, Reclaim)> = vec![
-        ("AfterReads", Reclaim::AfterReads),
-        ("Never", Reclaim::Never),
-        ("OnClose", Reclaim::OnClose),
+    //
+    // Plus one deferred-consolidation arm, under the policy that actually
+    // releases and reuses space mid-run -- a suffix merge releases only the
+    // extents it consumed and repoints the list mid-run, and "a path only one
+    // arm exercises is a path nothing tests" is a lesson this repository has
+    // already paid for once, on a dropped tombstone.
+    let policies: Vec<(&str, Reclaim, bool)> = vec![
+        ("AfterReads", Reclaim::AfterReads, false),
+        ("Never", Reclaim::Never, false),
+        ("OnClose", Reclaim::OnClose, false),
+        ("AfterReads+defer", Reclaim::AfterReads, true),
     ];
 
     let mut rows = Vec::new();
@@ -642,8 +649,8 @@ fn c2_oracle(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let mut any_divergence = false;
     let mut worst = String::new();
 
-    for (name, reclaim) in &policies {
-        let r = run_oracle(*reclaim, rounds, ops_per_round, keyspace, seed)?;
+    for (name, reclaim, defer) in &policies {
+        let r = run_oracle(*reclaim, *defer, rounds, ops_per_round, keyspace, seed)?;
         if r.write_error.is_some() {
             any_write_error = true;
         }
@@ -662,6 +669,7 @@ fn c2_oracle(args: &Args, profile: Profile) -> std::io::Result<Record> {
         );
         rows.push(jobj! {
             "reclaim" => J::s(*name),
+            "defer_merge" => J::Bool(*defer),
             "keys_compared" => J::u(r.checked),
             "mismatches" => J::u(r.mismatches),
             "read_errors" => J::u(r.read_errors),
@@ -724,6 +732,7 @@ struct OracleRun {
 /// found it.
 fn run_oracle(
     reclaim: Reclaim,
+    defer_merge: bool,
     rounds: usize,
     ops_per_round: usize,
     keyspace: u64,
@@ -735,7 +744,7 @@ fn run_oracle(
         .unwrap_or(4);
     use std::collections::BTreeMap;
 
-    let dir = scratch(&format!("c2-{reclaim:?}"));
+    let dir = scratch(&format!("c2-{reclaim:?}-{defer_merge}"));
     let file = dir.join("s.dat");
     let store = Store::create(
         &file,
@@ -743,6 +752,7 @@ fn run_oracle(
             buffer_bytes: 1 << 20,
             reclaim,
             merge_threshold,
+            defer_merge,
             ..Default::default()
         },
     )?;

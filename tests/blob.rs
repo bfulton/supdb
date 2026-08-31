@@ -389,6 +389,102 @@ fn a_count_from_the_extent_list_checks_two_quantities_not_one() {
     assert_eq!(blob.count_fixed(key, 4), Some(17));
 }
 
+/// A store consolidated by the deferred policy reads identically through
+/// both paths, and its fragmented runs keep `count_fixed`'s contract.
+///
+/// `Options::defer_merge` leaves a key holding a geometric ladder of extents
+/// where the inline policy leaves one, so this is the store shape with the
+/// most extents per key either reader will ever see. Two things must hold.
+/// First, `Blob` and `Reader` agree on every key, value, order and count --
+/// the standing bar for a second read path. Second, `count_fixed` checks its
+/// two quantities *per extent*, so a fragmented fixed-width run must still
+/// answer exactly, and a fragmented mixed-width run must still decline: a
+/// merge that concatenated fragments but miscomputed the merged extent's
+/// `last` would break the first, and a policy that produced a coincidental
+/// stride-multiple would break the second.
+///
+/// The fragmentation is asserted, not assumed: interleaved appends against a
+/// tiny buffer must leave at least one key spilled across several extents,
+/// or the test has quietly stopped covering the shape it exists for.
+#[test]
+fn a_deferred_consolidated_store_reads_the_same_and_counts_exactly() {
+    let path = scratch("deferred");
+    let store = Store::create(
+        &path,
+        Options {
+            defer_merge: true,
+            buffer_bytes: 1 << 16,
+            ..Default::default()
+        },
+    )
+    .expect("create");
+    // Interleaved fixed-width appends: every key's run is broken by every
+    // other key's, which is the fragmenting shape, and four-byte values are
+    // logshed's posting schema -- the caller count_fixed exists for.
+    let keys = 60u32;
+    let depth = 300u32;
+    for i in 0..depth {
+        for k in 0..keys {
+            let key = format!("term={k:08}").into_bytes();
+            store.append(&key, &i.to_le_bytes()).expect("append");
+        }
+    }
+    // One mixed-width key, fragmented the same way, to prove the guard still
+    // fires on a multi-extent run.
+    for i in 0..40u32 {
+        let v = if i % 3 == 0 {
+            vec![b'x'; 4]
+        } else {
+            vec![b'y'; 10]
+        };
+        store.append(b"mixed", &v).expect("append");
+    }
+    store.checkpoint().expect("checkpoint");
+    let stats = store.close().expect("close");
+    assert!(stats.merges > 0, "nothing merged, so nothing was deferred");
+
+    let blob = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
+    assert!(blob.zero_copy(), "the native path must not start copying");
+    let r = Reader::open(&path).expect("reader open");
+    assert_eq!(blob.keys(), r.keys(), "key count");
+    assert_eq!(blob.version(), r.version(), "checkpoint identity");
+
+    let mut spilled = 0usize;
+    for k in 0..keys {
+        let key = format!("term={k:08}").into_bytes();
+        let exts = blob.lookup(&key).expect("every key is in the index");
+        spilled += usize::from(exts.len() > 1);
+
+        // Both readers, same values, same order.
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        blob.read_all(&key, |v| got.push(v.to_vec())).expect("blob");
+        let want: Vec<Vec<u8>> = (0..depth).map(|i| i.to_le_bytes().to_vec()).collect();
+        assert_eq!(got, want, "values of {}", String::from_utf8_lossy(&key));
+        let mut from_reader: Vec<Vec<u8>> = Vec::new();
+        r.read_all(&key, |v| from_reader.push(v.to_vec()))
+            .expect("reader");
+        assert_eq!(got, from_reader, "the two readers disagree");
+
+        // The O(extents) count must agree with the walk on every fragment
+        // ladder the policy produced.
+        assert_eq!(blob.count(&key).unwrap(), depth as u64, "walked count");
+        assert_eq!(
+            blob.count_fixed(&key, 4),
+            Some(depth as u64),
+            "count_fixed on the fragmented run of {}",
+            String::from_utf8_lossy(&key)
+        );
+    }
+    assert!(
+        spilled > 0,
+        "no key was left multi-extent, so the fragmented shape was never under test"
+    );
+    // The mixed-width key declines rather than guesses, however it fragmented.
+    assert_eq!(blob.count(b"mixed").unwrap(), 40);
+    assert_eq!(blob.count_fixed(b"mixed", 4), None);
+    assert_eq!(blob.count_fixed(b"mixed", 10), None);
+}
+
 #[test]
 fn a_truncated_object_is_refused_at_open() {
     let path = scratch("truncated");

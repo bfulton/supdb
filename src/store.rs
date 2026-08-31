@@ -572,6 +572,31 @@ pub struct Options {
     /// distinction from LSM levelled compaction, which rewrites everything on
     /// a schedule regardless of need.
     pub merge_threshold: usize,
+    /// Consolidate a fragmented key geometrically instead of inline at the
+    /// threshold.
+    ///
+    /// The inline policy merges a key's whole run back to one extent every
+    /// time the list reaches `merge_threshold`, so a key touched n times
+    /// rewrites O(n^2) bytes over its life: F5.1 records that as the append
+    /// latency tail, and W1.3 records the same cost arriving as dead space --
+    /// a line-ordered day index writes 18x the bytes a term-ordered one does,
+    /// from 44,629 inline merges against zero.
+    ///
+    /// Deferred consolidation merges only a geometric *suffix* of the list:
+    /// walking back from the newest extent, an older extent joins the merge
+    /// only while it is no larger than everything newer combined, and the
+    /// suffix is merged only once it has `merge_threshold` members. An extent
+    /// absorbed that way lands in a run at least twice its own size, so a
+    /// byte is rewritten O(log n) times instead of O(n / threshold), and the
+    /// list stays O(threshold + log n) long, so reads still walk a short
+    /// list. The decision is a pure function of the lengths already in the
+    /// extent list -- no per-key state is added, so there is nothing new to
+    /// persist, replay, or crash-recover, and the file format is untouched.
+    ///
+    /// Off by default until `f37-consolidate` prices both arms at `full`;
+    /// the flag exists so that experiment can run them interleaved in one
+    /// process, the way f8-checksums measures `Options::checksums`.
+    pub defer_merge: bool,
     pub reclaim: Reclaim,
     /// An extent at least this large gets a block to itself.
     ///
@@ -738,6 +763,7 @@ impl Default for Options {
             chunk_size: 1024,
             solo_chunk_size: block::CHUNK,
             merge_threshold: 4,
+            defer_merge: false,
             checksums: true,
             pending_arena: true,
             seal_on_put: true,
@@ -1264,6 +1290,46 @@ impl Pending {
         } else {
             self.buf.len()
         }
+    }
+}
+
+/// Which suffix of a key's extents to consolidate, if any.
+///
+/// The shipped policy is inline: once the list reaches `threshold` extents,
+/// merge all of it back to one. That keeps reads walking at most `threshold`
+/// extents, and it makes a key touched n times rewrite O(n^2) bytes over its
+/// life -- F5.1 records the latency tail, and W1.3 records the same cost
+/// arriving as dead space on a line-ordered day index.
+///
+/// The deferred policy (`Options::defer_merge`) is geometric: walk back from
+/// the newest extent, absorbing the next-older one while it is no larger than
+/// everything newer combined, and consolidate the suffix only once it has
+/// `threshold` members. The bound comes from the absorption rule -- an extent
+/// joins a merge only when the bytes newer than it already match its own
+/// size, so the run holding a byte at least doubles every time that byte is
+/// rewritten. A byte is therefore copied O(log n) times over a key's life
+/// instead of O(n / threshold), and between merges the list stays
+/// O(threshold + log n) long, so a read still walks a short list. No per-key
+/// state is added: the decision is a pure function of the lengths already in
+/// the extent list, which is what keeps it out of the file format, the redo
+/// log and crash replay.
+fn merge_from(exts: &[Ext], threshold: usize, deferred: bool) -> Option<usize> {
+    if exts.is_empty() || exts.len() < threshold {
+        return None;
+    }
+    if !deferred {
+        return Some(0);
+    }
+    let mut from = exts.len() - 1;
+    let mut sum = exts[from].len as u64;
+    while from > 0 && exts[from - 1].len as u64 <= sum {
+        from -= 1;
+        sum += exts[from].len as u64;
+    }
+    if exts.len() - from >= threshold {
+        Some(from)
+    } else {
+        None
     }
 }
 
@@ -2303,18 +2369,25 @@ impl Store {
         Ok(moved)
     }
 
-    /// Merge one key's extents into a single contiguous run, in place.
+    /// Merge a suffix of one key's extents into a single contiguous run, in
+    /// place. Which suffix, and when, is `merge_from`'s decision -- see that
+    /// function for the two policies and `Options::defer_merge` for why both
+    /// exist.
     ///
     /// Called from the seal path, so the writer that fragmented the key pays
     /// for it. The old extents are released, which punches their blocks out
     /// once nothing references them.
     fn merge_key(&self, sh: &mut Shard, idx: u32) -> Result<()> {
-        let exts = {
+        let (from, exts) = {
             let e = &sh.keys.entry_at(idx).extents;
-            if e.as_slice().len() < self.opts.merge_threshold {
-                return Ok(());
+            match merge_from(
+                e.as_slice(),
+                self.opts.merge_threshold,
+                self.opts.defer_merge,
+            ) {
+                Some(from) => (from, e.as_slice()[from..].to_vec()),
+                None => return Ok(()),
             }
-            e.as_slice().to_vec()
         };
         let mut buf = Vec::new();
         let mut last = 0u32;
@@ -2345,12 +2418,22 @@ impl Store {
         }
         drop(ap);
         sh.dirty.push(idx);
-        sh.keys.entry_at(idx).extents = Extents::One(Ext {
+        let merged = Ext {
             block: id,
             off: 0,
             len,
             last,
-        });
+        };
+        let entry = sh.keys.entry_at(idx);
+        if from == 0 {
+            entry.extents = Extents::One(merged);
+        } else {
+            // A suffix merge keeps the head untouched, so the values stay in
+            // append order: head extents, then the run that replaced the tail.
+            let mut all = entry.extents.as_slice()[..from].to_vec();
+            all.push(merged);
+            entry.extents = Extents::Many(all);
+        }
         sh.merges += 1;
         Ok(())
     }
@@ -6133,4 +6216,107 @@ impl Store {
 #[allow(dead_code)]
 fn unused_seek(f: &mut File) -> Result<u64> {
     f.seek(SeekFrom::Current(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{merge_from, Ext};
+
+    fn ext(len: u32) -> Ext {
+        Ext {
+            block: 0,
+            off: 0,
+            len,
+            last: 0,
+        }
+    }
+
+    /// The inline policy is untouched: everything merges at the threshold.
+    #[test]
+    fn inline_merges_the_whole_list_at_the_threshold() {
+        let three: Vec<Ext> = (0..3).map(|_| ext(100)).collect();
+        let four: Vec<Ext> = (0..4).map(|_| ext(100)).collect();
+        assert_eq!(merge_from(&three, 4, false), None);
+        assert_eq!(merge_from(&four, 4, false), Some(0));
+    }
+
+    /// A consolidated base is not rewritten by every fresh fragment: the
+    /// deferred walk stops at an extent larger than everything newer than it.
+    #[test]
+    fn deferred_leaves_a_large_base_alone() {
+        let mut exts = vec![ext(4_000)];
+        exts.extend((0..4).map(|_| ext(100)));
+        // The four tail fragments qualify; the 4,000-byte base does not.
+        assert_eq!(merge_from(&exts, 4, true), Some(1));
+        // Three fragments are below the fan-in, wherever their sizes stand.
+        assert_eq!(merge_from(&exts[..4], 4, true), None);
+    }
+
+    /// The cascade fires exactly when the tail has caught the base up: the
+    /// suffix sum reaching the older extent's size is what pulls it in.
+    #[test]
+    fn deferred_cascades_when_the_tail_matches_the_base() {
+        let mut exts = vec![ext(400)];
+        exts.extend((0..4).map(|_| ext(100)));
+        // 4 x 100 == 400, so the base joins and the whole list merges.
+        assert_eq!(merge_from(&exts, 4, true), Some(0));
+    }
+
+    /// The amortized bounds, checked by simulation rather than asserted by
+    /// comment: over n equal appends, the deferred policy rewrites O(n log n)
+    /// bytes where inline rewrites O(n^2 / threshold), and the extent list
+    /// stays around threshold + log2(n) long. The constants below are slack
+    /// enough not to flake and tight enough that a broken policy -- one that
+    /// merges every append, or never bounds the list -- fails them.
+    #[test]
+    fn deferred_rewrite_cost_is_near_linear_and_the_list_stays_short() {
+        fn simulate(n: usize, threshold: usize, deferred: bool) -> (u64, usize) {
+            let mut exts: Vec<Ext> = Vec::new();
+            let mut rewritten = 0u64;
+            let mut max_len = 0usize;
+            for _ in 0..n {
+                exts.push(ext(100));
+                if let Some(from) = merge_from(&exts, threshold, deferred) {
+                    let merged: u64 = exts[from..].iter().map(|e| e.len as u64).sum();
+                    rewritten += merged;
+                    exts.truncate(from);
+                    exts.push(ext(merged as u32));
+                }
+                max_len = max_len.max(exts.len());
+            }
+            (rewritten, max_len)
+        }
+
+        let n = 10_000usize;
+        let appended = (n as u64) * 100;
+        let (inline_bytes, inline_max) = simulate(n, 4, false);
+        let (deferred_bytes, deferred_max) = simulate(n, 4, true);
+
+        // Inline: a merge every (threshold - 1) appends, each rewriting the
+        // whole run -- two decimal orders past what was appended, at this n.
+        assert!(
+            inline_bytes > 100 * appended,
+            "inline rewrote only {inline_bytes} for {appended} appended -- the \
+             quadratic this experiment exists to show has gone missing"
+        );
+        assert!(inline_max <= 4, "inline holds the list at the threshold");
+
+        // Deferred: log2(10_000) is 13.3, so 14x the appended bytes is the
+        // analytic ceiling and the observed figure sits well under it.
+        assert!(
+            deferred_bytes <= 14 * appended,
+            "deferred rewrote {deferred_bytes} for {appended} appended, \
+             past the O(n log n) ceiling"
+        );
+        // threshold + log2(n) with a little headroom for the tier in flight.
+        assert!(
+            deferred_max <= 4 + 14 + 3,
+            "the deferred list reached {deferred_max} extents"
+        );
+        assert!(
+            deferred_bytes * 20 < inline_bytes,
+            "the two policies should be separated by well over an order of \
+             magnitude at n = {n}: deferred {deferred_bytes}, inline {inline_bytes}"
+        );
+    }
 }

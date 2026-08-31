@@ -114,6 +114,7 @@ fn main() -> std::io::Result<()> {
             "f34-parallelindex" => f34_parallelindex(&args, profile)?,
             "f35-indexauto" => f35_indexauto(&args, profile)?,
             "f36-commit" => f36_commit(&args, profile)?,
+            "f37-consolidate" => f37_consolidate(&args, profile)?,
             "f28-count" => f28_count(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
@@ -162,6 +163,7 @@ fn main() -> std::io::Result<()> {
                 "f34-parallelindex",
                 "f35-indexauto",
                 "f36-commit",
+                "f37-consolidate",
                 "f28-count",
                 "f4-durability",
                 "f3-multiproc",
@@ -4697,6 +4699,313 @@ fn f29_redolog(args: &Args, profile: Profile) -> std::io::Result<Record> {
              default, and this entry is what makes a change to it deliberate"
         ),
     ));
+    Ok(rec)
+}
+
+// --------------------- F37: geometric deferred consolidation --------------
+
+/// What inline merging costs on the workload that fragments, and what
+/// deferring it geometrically buys back.
+///
+/// `merge_key` rewrites a key's whole run every time its extent list reaches
+/// `merge_threshold`, so a key appended to n times rewrites O(n^2) bytes over
+/// its life. That cost is already on the books three times: F5.1 records it
+/// as the append latency tail, W1.3 records it as 18.08x of dead space on a
+/// line-ordered day index (44,629 inline merges against zero), and the f28
+/// family records the read-side value of short extent lists that the policy
+/// is buying. `Options::defer_merge` consolidates a geometric *suffix*
+/// instead -- an extent is rewritten only into a run at least its own size --
+/// which amortizes to O(n log n) total rewrite and leaves the list
+/// O(threshold + log n) long.
+///
+/// Both arms run interleaved in one process, the f8-checksums pattern; the
+/// only difference between them is the flag. The workload is line-ordered
+/// appends -- every key's run broken by every other key's -- against a buffer
+/// small enough to seal constantly, which is the fragmenting shape W1.3
+/// measures and the one an update-heavy consumer (YCSB-E's insert half, a
+/// naive logshed roll) actually produces.
+///
+/// Rule 4: throughput never travels alone. Each arm carries the append
+/// latency distribution (the F5.1 axis), device write bytes from
+/// /proc/self/io, the file size it leaves, and a verified read-back pass over
+/// every key -- because a merge policy's most likely failure mode is winning
+/// writes by taxing reads, and its second most likely is winning both by
+/// quietly dropping values.
+fn f37_consolidate(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    // Full goes deeper rather than wider: the inline policy's cost is
+    // quadratic in a key's depth, not in the key count, so depth is the axis
+    // that separates the arms -- and the axis where the ci scale understates
+    // the gap, because at 48 values a run never outgrows the smallest
+    // free-list size class and the per-merge floor dominates the rewrite.
+    let keys = args.num("--keys", profile.pick(2_000, 5_000, 4_000)) as u64;
+    let depth = args.num("--depth", profile.pick(48, 96, 256)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let buffer_kb = args.num("--buffer-kb", 1024);
+
+    let mut rec = Record::new("f37-consolidate", profile);
+    rec.param("keys", J::u(keys))
+        .param("values_per_key", J::u(depth))
+        .param("value_size", J::u(value_size as u64))
+        .param("buffer_kb", J::u(buffer_kb as u64))
+        .note("both arms interleaved in one process; the only difference is Options::defer_merge")
+        .note(
+            "line-ordered appends: every key's run is broken by every other key's, so every \
+             key fragments and the merge policy is the thing under load -- the shape W1.3 \
+             prices at 18.08x on the space axis",
+        )
+        .note(
+            "peak RSS is process-wide and the arms share the process, so it is reported once \
+             and bounds both",
+        );
+
+    let dir = scratch("f37");
+    let payload = Payload::new(value_size, 0.5, 0xF37);
+    let on = [false, true]; // arm 0 inline (shipped), arm 1 deferred
+    struct Side {
+        p999_us: f64,
+        max_ms: f64,
+        io_mb: f64,
+        file_mb: f64,
+        merges: f64,
+        read_mps: f64,
+        hist: Hist,
+    }
+    let side: std::sync::Mutex<Vec<(usize, Side)>> = std::sync::Mutex::new(Vec::new());
+    let trial = Trial::new(profile.reps());
+    let tp = trial.run(2, |ci, rep| {
+        let file = dir.join(format!("c{ci}-{rep}.dat"));
+        let store = Store::create(
+            &file,
+            Options {
+                defer_merge: on[ci],
+                buffer_bytes: buffer_kb << 10,
+                ..default_opts(64)
+            },
+        )
+        .expect("create");
+        let mut vrng = Rng::new(0xF37 + rep as u64);
+        let mut kb = [0u8; 16];
+        let mut h = Hist::new();
+        let total = keys * depth;
+        let io0 = IoCounters::read_now();
+        let t = Instant::now();
+        for i in 0..total {
+            db_key_into(i % keys, &mut kb);
+            let v = payload.get(&mut vrng);
+            let ta = Instant::now();
+            store.append(&kb, v).expect("append");
+            h.record(ta.elapsed().as_nanos() as u64);
+        }
+        let secs = t.elapsed().as_secs_f64();
+        // Read every key back through the writer's own read path and verify
+        // the count: a policy that lost or duplicated a value must fail here,
+        // not shade a ratio.
+        let tr = Instant::now();
+        let mut values = 0u64;
+        for k in 0..keys {
+            db_key_into(k, &mut kb);
+            values += store.read_all(&kb, |_| {}).expect("read_all");
+        }
+        let read_secs = tr.elapsed().as_secs_f64();
+        assert_eq!(values, total, "arm {ci} rep {rep}: values went missing");
+        let stats = store.close().expect("close");
+        let wrote = IoCounters::read_now().since(&io0).write_bytes;
+        let fsize = file_len(&file);
+        let _ = std::fs::remove_file(&file);
+        // rep 0 is the warmup Trial discards; keep the side channels aligned
+        // with the throughput samples by discarding it here too.
+        if rep >= 1 {
+            side.lock().unwrap().push((
+                ci,
+                Side {
+                    p999_us: h.percentile(99.9) as f64 / 1e3,
+                    max_ms: h.max() as f64 / 1e6,
+                    io_mb: wrote as f64 / 1_048_576.0,
+                    file_mb: fsize as f64 / 1_048_576.0,
+                    merges: stats.merges as f64,
+                    read_mps: values as f64 / read_secs / 1e6,
+                    hist: h,
+                },
+            ));
+        }
+        total as f64 / secs
+    });
+
+    let side = side.into_inner().unwrap();
+    let pick = |ci: usize, f: &dyn Fn(&Side) -> f64| -> Samples {
+        Samples::new(
+            side.iter()
+                .filter(|(c, _)| *c == ci)
+                .map(|(_, s)| f(s))
+                .collect(),
+        )
+    };
+    let arm_hist: Vec<Hist> = (0..2)
+        .map(|ci| {
+            let mut h = Hist::new();
+            for (c, s) in &side {
+                if *c == ci {
+                    h.merge(&s.hist);
+                }
+            }
+            h
+        })
+        .collect();
+    let p999 = [pick(0, &|s| s.p999_us), pick(1, &|s| s.p999_us)];
+    let io_mb = [pick(0, &|s| s.io_mb), pick(1, &|s| s.io_mb)];
+    let file_mb = [pick(0, &|s| s.file_mb), pick(1, &|s| s.file_mb)];
+    let merges = [pick(0, &|s| s.merges), pick(1, &|s| s.merges)];
+    let reads = [pick(0, &|s| s.read_mps), pick(1, &|s| s.read_mps)];
+    let worst = [pick(0, &|s| s.max_ms), pick(1, &|s| s.max_ms)];
+
+    let logical = (keys * depth) as f64 * (16.0 + value_size as f64);
+    rec.series(
+        "arms",
+        J::arr(
+            (0..2)
+                .map(|ci| {
+                    jobj! {
+                        "defer_merge" => J::Bool(on[ci]),
+                        "append_ops_per_s" => J::fp(tp[ci].median(), 1),
+                        "ops" => tp[ci].to_json(),
+                        "read_back_mvalues_per_s" => J::fp(reads[ci].median(), 3),
+                        "append_latency" => arm_hist[ci].to_json(),
+                        "append_p999_us" => J::fp(p999[ci].median(), 1),
+                        "append_max_ms" => J::fp(worst[ci].median(), 3),
+                        "merges" => J::fp(merges[ci].median(), 0),
+                        "device_write_mb" => J::fp(io_mb[ci].median(), 1),
+                        "write_amp" => J::fp(io_mb[ci].median() * 1_048_576.0 / logical, 2),
+                        "file_mb" => J::fp(file_mb[ci].median(), 2)
+                    }
+                })
+                .collect(),
+        ),
+    );
+    rec.series(
+        "memory",
+        jobj! { "peak_rss_mb" => J::fp(env::peak_rss_bytes() as f64 / 1048576.0, 1) },
+    );
+
+    // Rule 3: if the inline arm never merged, the workload never fragmented
+    // and nothing below compares anything.
+    if merges[0].median() < 1.0 {
+        for (id, statement) in [
+            (
+                "F37.1",
+                "deferred consolidation lifts fragmenting append throughput",
+            ),
+            (
+                "F37.2",
+                "deferred consolidation shortens the append latency tail",
+            ),
+            (
+                "F37.3",
+                "deferred consolidation does not slow the read-back pass",
+            ),
+            (
+                "F37.4",
+                "deferred consolidation sends fewer bytes to the device",
+            ),
+            ("F37.5", "deferred consolidation does not grow the file"),
+        ] {
+            rec.finding(Finding::not_exercised(
+                id,
+                statement,
+                "the inline arm recorded zero merges, so the workload never fragmented past \
+                 the threshold and the merge policy was never under load",
+            ));
+        }
+        return Ok(rec);
+    }
+
+    let cmp_tp = compare(&tp[1], &tp[0], supdb::bench::MIN_EFFECT);
+    rec.compare("append_deferred_vs_inline", cmp_tp.clone());
+    rec.finding(Finding::new(
+        "F37.1",
+        "deferred consolidation lifts fragmenting append throughput",
+        matches!(cmp_tp.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "deferred {:.0} ops/s against inline {:.0} ({}); the inline arm merged {:.0} times \
+             where the deferred arm merged {:.0}",
+            tp[1].median(),
+            tp[0].median(),
+            cmp_tp.summary("deferred", "inline"),
+            merges[0].median(),
+            merges[1].median()
+        ),
+    ));
+
+    // The F5.1 axis. Lower is better, so inline > deferred is the win.
+    let cmp_tail = compare(&p999[0], &p999[1], supdb::bench::MIN_EFFECT);
+    rec.compare("append_p999_inline_vs_deferred", cmp_tail.clone());
+    rec.finding(Finding::new(
+        "F37.2",
+        "deferred consolidation shortens the append latency tail",
+        matches!(cmp_tail.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "append p99.9: inline {:.1}us, deferred {:.1}us ({}); worst single append \
+             {:.2}ms against {:.2}ms. This is F5.1's tail, measured against the policy \
+             that causes it",
+            p999[0].median(),
+            p999[1].median(),
+            cmp_tail.summary("inline_p999", "deferred_p999"),
+            worst[0].median(),
+            worst[1].median()
+        ),
+    ));
+
+    // The axis deferral is most likely to lose: a longer extent list per key
+    // makes every read walk further. Holding is "no slower", not "faster".
+    let cmp_read = compare(&reads[1], &reads[0], supdb::bench::MIN_EFFECT);
+    rec.compare("readback_deferred_vs_inline", cmp_read.clone());
+    rec.finding(Finding::new(
+        "F37.3",
+        "deferred consolidation does not slow the read-back pass",
+        !matches!(cmp_read.verdict, supdb::bench::Verdict::Less),
+        format!(
+            "read-back at {:.3} Mvalues/s deferred against {:.3} inline ({}). The deferred \
+             arm walks O(threshold + log n) extents per key where inline walks at most \
+             threshold, and this is what that costs",
+            reads[1].median(),
+            reads[0].median(),
+            cmp_read.summary("deferred", "inline")
+        ),
+    ));
+
+    let cmp_io = compare(&io_mb[0], &io_mb[1], supdb::bench::MIN_EFFECT);
+    rec.compare("device_write_inline_vs_deferred", cmp_io.clone());
+    rec.finding(Finding::new(
+        "F37.4",
+        "deferred consolidation sends fewer bytes to the device",
+        matches!(cmp_io.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "inline {:.1} MB to the block layer against deferred {:.1} for {:.1} MB of \
+             appended records ({}). The O(n^2) rewrite is a device cost before it is a \
+             latency cost, which is how W1.3 saw it first",
+            io_mb[0].median(),
+            io_mb[1].median(),
+            logical / 1_048_576.0,
+            cmp_io.summary("inline_mb", "deferred_mb")
+        ),
+    ));
+
+    // Space is exempt from drift, but the arms are interleaved anyway.
+    // Holding is "no larger": merged runs land in solo blocks either way, and
+    // what deferral avoids is the dead copies reclaim has not caught up with.
+    let cmp_file = compare(&file_mb[1], &file_mb[0], supdb::bench::MIN_EFFECT);
+    rec.compare("file_size_deferred_vs_inline", cmp_file.clone());
+    rec.finding(Finding::new(
+        "F37.5",
+        "deferred consolidation does not grow the file",
+        !matches!(cmp_file.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "file after close: deferred {:.2} MB against inline {:.2} ({})",
+            file_mb[1].median(),
+            file_mb[0].median(),
+            cmp_file.summary("deferred_mb", "inline_mb")
+        ),
+    ));
+
     Ok(rec)
 }
 
