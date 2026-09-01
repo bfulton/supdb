@@ -114,27 +114,48 @@ interleaved where the harness allows:
   work a batch waits for.
 
   What that leaves is not on the commit path at all. Against LMDB in the
-  external suite the durable load reads **0.299x** (EXT.22), because
-  there the seal and the flush's partitioning land *inside* the timed
-  window: roughly 3.5 of 4.5 seconds. That is overhead rather than bytes,
-  and half of it is a policy choice — EXT.25 measures **1.985x more
+  external suite the durable load read **0.299x** when this was first
+  written and reads **0.486x** now (EXT.22), with **0.724x** when
+  partitioning is left to compaction (EXT.25); the whole of that move is
+  below. The gap is there because the seal and the flush's partitioning
+  land *inside* the timed window. That is overhead rather than bytes,
+  and half of it is a policy choice -- EXT.25 measures **1.985x more
   ingest** and 36% fewer device bytes from leaving partitioning to
   background compaction, for 5% of read throughput, with EXT.26 gating
-  what it costs the ordered scan (2.007x). The rest is the seal writing
-  each segment through `Store`'s general put path — hash table, freelist,
-  arena, per-key bookkeeping — for input that is already sorted,
-  immutable and written once. **That writer was priced and declined**:
-  f46 puts its FLOOR at 2.04–2.06x the general path (F46.1, replicated),
-  below the 3x registered as the price of a second writer in the format
-  layer — and the floor omits the block table, checksums and superblock,
-  so a real one lands under 2x. The index build is only 19% of it
-  (F46.2), and a checkpoint pays that call anyway. So the put path is not
-  carrying much fat, and the cheap policy win (EXT.25, 1.985x for one
-  bit) had already taken more than the expensive rewrite would.
+  what it costs the ordered scan (2.007x). The rest was the seal writing
+  each segment through `Store`'s general put path -- hash table, freelist,
+  arena, per-key bookkeeping, a checkpoint publishing a million-key index
+  -- for input that is already sorted, immutable and written once.
 
-  What is left on ingest after that is the partitioning pass itself,
-  which EXT.25 makes optional, and the merge's own write amplification —
-  not the seal.
+  **That writer was priced, declined, and then built.** f46 put its FLOOR
+  at 2.04-2.06x the general path (F46.1, replicated), under the 3x
+  registered as the price of a second writer in the format layer, and it
+  was declined. The standing priority then changed -- complexity is spent
+  for time -- and `next::SegmentWriter` now writes every seal and merge
+  output in one forward pass, same format, same `Blob`, `store::Reader`
+  included. f49 ran both writers interleaved in one process on the f42
+  shape with the drain inside the window, three times: the seal phase is
+  **2.5-3.2x** faster (F49.2) and ingest-to-routed **1.28-1.48x** (F49.1,
+  p=0.0022 each run; report the range, the host moved between them). The
+  merge's input side -- collect every key, sort, one hash probe per key per
+  input -- then went to a k-way walk over rank cursors, worth 1.305x on the
+  merge phase and 1.104x on the window (F49.5, F49.6, both *under* their
+  registered bars), for **1.416x** at the shipping configuration in the
+  same run. Three registered predictions fell the other way and each names
+  its mechanism: the disk saving is 0.945x rather than the 0.9x promised
+  (F49.3 -- the 180 MB is records, key index and tables, not slack); reads
+  over bulk segments are **1.09-1.13x faster** where a tie was registered
+  (F49.4 -- same layout after the drain and F49.7's control ties, so it is
+  the writer's block placement, not yet isolated); and the merge is
+  **write-bound now** -- its remaining 1.2s is 116 MB of output at the
+  writer's own speed plus its fsync (F49.5), so finding keys faster was
+  worth a third, not a half.
+
+  What is left on ingest after that is bytes and barriers, not bookkeeping:
+  the routed shape reads and writes the data a second time by design, the
+  seal's and the merge's fsyncs sit on the drain, and the commit phase
+  rises when a seal runs beside it (F49.1). The partitioning pass itself
+  stays optional (EXT.25).
 - **P-B, the read lead survives: HELD, with its condition stated.** The
   test was "EXT.11's shape with live segment counts under the compaction
   policy stays ≥ 1.2x on x86". At the shipping configuration it reads

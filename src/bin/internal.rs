@@ -5819,8 +5819,10 @@ fn f49_bulkseal(args: &Args, profile: Profile) -> std::io::Result<Record> {
         .note(
             "two arms interleaved in one process, fresh store per rep, the f42 load shape \
              (durable per batch, partitioning on). The arms differ only in \
-             NextOptions::bulk_writer: general writes every piece through \
-             Store::create/append/checkpoint/close, bulk through SegmentWriter. The timed \
+             NextOptions::bulk_writer and cursor_merge: general writes every piece through \
+             Store::create/append/checkpoint/close and finds merge keys by collect-sort-probe, \
+             bulk writes through SegmentWriter with the same probe merge, bulk-cursors adds \
+             the k-way rank merge (the shipping default). The timed \
              window is the load PLUS the drain (flush: seal, join, partition), the shape the \
              external suite times, because on the loop alone the seal overlaps the commits \
              and most of its cost is hidden (F42.3). load_s is the loop by itself. Device \
@@ -5832,16 +5834,24 @@ fn f49_bulkseal(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let dir = scratch("f49");
     let payload = Payload::new(value_size, 0.5, 0xF49);
-    let arm_names = ["general", "bulk"];
-    // ci, device MB, disk MB, load-only s, commit s, seal s, merge s, reads/s
-    type Row = (usize, f64, f64, f64, f64, f64, f64, f64);
+    // general: Store writer, probe merge -- the engine as f44 measured it.
+    // bulk: SegmentWriter, probe merge. bulk-cursors: SegmentWriter and the
+    // k-way rank merge, which is the shipping default.
+    let arm_names = ["general", "bulk", "bulk-cursors"];
+    // ci, device MB, disk MB, load-only s, commit s, seal s, merge s, reads/s,
+    // partitioned segments after the drain, L0 segments after the drain
+    type Row = (usize, f64, f64, f64, f64, f64, f64, f64, f64, f64);
     let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
     let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
         let mut vrng = Rng::new(0xF49 + rep as u64);
         let mut kb = [0u8; 16];
         let d = dir.join(format!("f49-{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
-        let opts = NextOptions { bulk_writer: ci == 1, ..Default::default() };
+        let opts = NextOptions {
+            bulk_writer: ci >= 1,
+            cursor_merge: ci == 2,
+            ..Default::default()
+        };
         let mut db = Db::create(&d, opts).expect("create");
         let io0 = IoCounters::read_now();
         let t = Instant::now();
@@ -5857,6 +5867,9 @@ fn f49_bulkseal(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let secs = t.elapsed().as_secs_f64();
         let (c, s, m) = db.phase_ns();
         let io_mb = IoCounters::read_now().since(&io0).write_bytes as f64 / 1_048_576.0;
+        // What the drain left behind decides what a read routes through,
+        // and a seal that finishes sooner changes when compaction starts.
+        let (parts, l0) = db.levels();
 
         // Random point reads over the drained store, both arms routed.
         let mut x = 0x9EAD_5EED_u64 ^ (rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -5893,6 +5906,8 @@ fn f49_bulkseal(args: &Args, profile: Profile) -> std::io::Result<Record> {
             s as f64 / 1e9,
             m as f64 / 1e9,
             reads_per_s,
+            parts as f64,
+            l0 as f64,
         ));
         keys as f64 / secs
     });
@@ -5923,7 +5938,9 @@ fn f49_bulkseal(args: &Args, profile: Profile) -> std::io::Result<Record> {
                         "merge_s" => J::fp(med(ci, |r| r.6), 3),
                         "device_write_mb" => J::fp(med(ci, |r| r.1), 1),
                         "disk_mb" => J::fp(med(ci, |r| r.2), 1),
-                        "reads_per_s" => J::fp(med(ci, |r| r.7), 1)
+                        "reads_per_s" => J::fp(med(ci, |r| r.7), 1),
+                        "partitions" => J::fp(med(ci, |r| r.8), 1),
+                        "l0" => J::fp(med(ci, |r| r.9), 1)
                     }
                 })
                 .collect(),
@@ -5999,6 +6016,7 @@ fn f49_bulkseal(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let rd_g = Samples::new(col(0, |r| r.7));
     let rd_b = Samples::new(col(1, |r| r.7));
+    let rd_c = Samples::new(col(2, |r| r.7));
     let rd = compare(&rd_b, &rd_g, supdb::bench::MIN_EFFECT);
     rec.compare("bulk_vs_general_reads", rd.clone());
     rec.finding(Finding::new(
@@ -6007,11 +6025,85 @@ fn f49_bulkseal(args: &Args, profile: Profile) -> std::io::Result<Record> {
         matches!(rd.verdict, supdb::bench::Verdict::NoDifference),
         format!(
             "{reads} random point reads after the drain: bulk {:.0}/s against general {:.0}/s \
-             ({}). Same format, same Blob, same routing; a difference either way would mean \
-             the writers pack blocks differently enough to matter",
+             ({}). Segments after the drain, partitioned + L0: bulk {:.0}+{:.0} against \
+             general {:.0}+{:.0}. Same format, same Blob, same routing; a difference either \
+             way means the writers lay blocks down differently or the drain leaves a \
+             different layout behind",
             rd_b.median(),
             rd_g.median(),
             rd.summary("bulk", "general"),
+            med(1, |r| r.8),
+            med(1, |r| r.9),
+            med(0, |r| r.8),
+            med(0, |r| r.9),
+        ),
+    ));
+
+    let merge_b = Samples::new(col(1, |r| r.6));
+    let merge_c = Samples::new(col(2, |r| r.6));
+    let mg = compare(&merge_b, &merge_c, supdb::bench::MIN_EFFECT);
+    rec.compare("bulk_vs_cursors_merge_s", mg.clone());
+    rec.finding(Finding::new(
+        "F49.5",
+        "the merge phase is at least 1.5x faster finding keys by rank cursors than by probes, same writer",
+        matches!(mg.verdict, supdb::bench::Verdict::Greater) && mg.ratio >= 1.5,
+        format!(
+            "merge phase {:.3}s with the probe merge against {:.3}s with rank cursors ({}), both \
+             writing through SegmentWriter. The probe merge collects every key into a vector, \
+             sorts and deduplicates it, then probes each input's index once per key; the \
+             cursor merge walks each input's key section forwards once and hashes nothing",
+            merge_b.median(),
+            merge_c.median(),
+            mg.summary("probes", "cursors"),
+        ),
+    ));
+
+    let ing = compare(&rates[2], &rates[1], supdb::bench::MIN_EFFECT);
+    rec.compare("cursors_vs_bulk_ingest", ing.clone());
+    rec.finding(Finding::new(
+        "F49.6",
+        "ingest-to-routed with the cursor merge is at least 1.15x the bulk arm's",
+        matches!(ing.verdict, supdb::bench::Verdict::Greater) && ing.ratio >= 1.15,
+        format!(
+            "bulk-cursors {:.0} ops/s against bulk {:.0} ({}); seal {:.3}s against {:.3}s, merge \
+             {:.3}s against {:.3}s, device bytes {:.1} against {:.1} MB, disk {:.1} against \
+             {:.1} MB. Against the general arm's {:.0} ops/s the shipping configuration is \
+             {:.3}x",
+            rates[2].median(),
+            rates[1].median(),
+            ing.summary("bulk-cursors", "bulk"),
+            med(2, |r| r.5),
+            med(1, |r| r.5),
+            med(2, |r| r.6),
+            med(1, |r| r.6),
+            med(2, |r| r.1),
+            med(1, |r| r.1),
+            med(2, |r| r.2),
+            med(1, |r| r.2),
+            rates[0].median(),
+            rates[2].median() / rates[0].median(),
+        ),
+    ));
+
+    let rdc = compare(&rd_c, &rd_b, supdb::bench::MIN_EFFECT);
+    rec.compare("cursors_vs_bulk_reads", rdc.clone());
+    rec.finding(Finding::new(
+        "F49.7",
+        "reads after the drain do not differ between the probe and cursor merges, same writer",
+        matches!(rdc.verdict, supdb::bench::Verdict::NoDifference),
+        format!(
+            "bulk-cursors {:.0}/s against bulk {:.0}/s ({}); segments after the drain {:.0}+{:.0} \
+             against {:.0}+{:.0}. Same writer, same blocks; only how the inputs were walked \
+             differs. The control for F49.4: if these tie and the segment counts match, the \
+             read difference against general is the writer's layout or the drain's, not the \
+             merge's",
+            rd_c.median(),
+            rd_b.median(),
+            rdc.summary("bulk-cursors", "bulk"),
+            med(2, |r| r.8),
+            med(2, |r| r.9),
+            med(1, |r| r.8),
+            med(1, |r| r.9),
         ),
     ));
 

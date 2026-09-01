@@ -164,13 +164,13 @@ fn reopen_after_seal_serves_both_old_and_new_writes() {
     );
 }
 
-fn oracle(bulk: bool) {
+fn oracle(bulk: bool, cursors: bool) {
     // The c2-oracle discipline at milestone-1 scale: random appends,
     // commits, seals, and crash-reopens, checked against a HashMap after
     // every reopen. Uncommitted writes are trimmed from the model at a
     // crash, which is the durability contract.
-    let d = dir(if bulk { "oracle" } else { "oracle-general" });
-    let opts = NextOptions { bulk_writer: bulk, ..NextOptions::default() };
+    let d = dir(&format!("oracle-{}-{}", if bulk { "bulk" } else { "general" }, if cursors { "cursors" } else { "probes" }));
+    let opts = NextOptions { bulk_writer: bulk, cursor_merge: cursors, ..NextOptions::default() };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
     let mut uncommitted: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -232,14 +232,20 @@ fn oracle(bulk: bool) {
 
 #[test]
 fn model_oracle_over_random_ops_and_crashes() {
-    oracle(true)
+    oracle(true, true)
 }
 
-/// The general `Store` writer stays behind `bulk_writer` as f49's comparison
-/// arm, and a path only one arm exercises is a path nothing tests.
+/// The general `Store` writer stays behind `bulk_writer` and the probe merge
+/// behind `cursor_merge`, as f49's comparison arms -- and a path only one arm
+/// exercises is a path nothing tests.
 #[test]
 fn the_general_writer_arm_passes_the_same_oracle() {
-    oracle(false)
+    oracle(false, true)
+}
+
+#[test]
+fn the_probe_merge_arm_passes_the_same_oracle() {
+    oracle(true, false)
 }
 
 fn small_opts(l0_trigger: usize) -> NextOptions {

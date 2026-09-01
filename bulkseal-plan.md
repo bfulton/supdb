@@ -59,3 +59,27 @@ If P49.1 holds, re-run the canonical `ext-kv` at `full` (next and
 next-ingest against LMDB), record EXT.22/EXT.25 from `results/`, and only
 then rewrite the brief's P-A paragraph that currently says the writer was
 priced and declined.
+
+## Amendment, registered before f49's third run
+
+Run 1 (kept as `results/f49-bulkseal.full.run1.json`) had the merge phase
+at 1.117s with the bulk writer against 1.731s general: the writer took the
+output side and the input side is what remains -- every key collected into
+a vector, sorted, deduplicated, then one hash probe per key per input
+segment, on an index of a million keys that does not fit in cache. A k-way
+merge over rank cursors (`Blob::key_at`, `values_at`) walks each input's
+key section sequentially instead and never probes. It goes behind
+`NextOptions::cursor_merge` and f49 gains a third arm, `bulk-cursors`,
+which is the shipping default; `bulk` keeps the probe merge.
+
+- **P49.5 — the merge phase is at least 1.5x faster with cursors than with
+  probes, same writer.** Refuted means the merge's time was in the writes
+  after all, or in the values, not in finding the keys.
+- **P49.6 — ingest-to-routed with cursors is at least 1.15x the bulk arm's.**
+  The merge is roughly 40% of the bulk arm's window; taking a third of it
+  is 1.15x.
+- **P49.7 — reads after the drain do not differ between `bulk` and
+  `bulk-cursors`.** Same writer, same blocks; only how the inputs were
+  walked differs. This is the control for F49.4: if these two tie and the
+  segment counts match, the read difference against `general` is the
+  writer's block layout or the drain's segment layout, not the merge.

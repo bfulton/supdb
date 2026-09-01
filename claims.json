@@ -993,21 +993,21 @@
    "id": "EXT.22",
    "profile": "full",
    "expect": "fails",
-   "because": "Loads 220,467 ops/s against lmdb's 657,334 -- 0.335x, p=0.0022 -- and the number got worse for an honest reason. The adapter now drains at sync, so sealing 116MB into segments lands inside the timed window where before roughly half of it simply never happened; and a flush partitions what it sealed, which is a second pass over the data bought deliberately for the read axis. This is the design's trade stated in one line: EXT.23's 1.4-1.6x read lead is paid for here. The earlier readings on this axis (a 0.9x tie, then 0.48x) were taken against stores that had not written all their data."
+   "because": "Loads 283,841 ops/s against lmdb's 584,194 -- 0.486x, p=0.0022 -- up from 0.335x, and the whole of the move is the seal and the merge writing through SegmentWriter with the cursor merge finding keys (F49.1, F49.6), because nothing on the commit path changed. The adapter drains at sync, so sealing 116 MB into segments and partitioning what it sealed both land inside the timed window; that is the design's trade in one line -- EXT.23's read lead is paid for here -- and EXT.25 prices the half of it that is a policy choice. lmdb's own load moved from 812k to 584k between the previous run and this one (host state; its rel_iqr 7.7%), so the ratio is the number and the absolutes are not. Earlier readings on this axis (a 0.9x tie, then 0.48x) were taken against stores that had not written all their data and do not count."
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.23",
    "profile": "full",
    "expect": "holds",
-   "because": "Held in four consecutive full runs at the shipping configuration -- 1.419x, 1.441x, 1.580x and 1.644x, each p<=0.0022 (the fourth on a restarted container where lmdb's own rate fell 25%, so its ratio counts and its absolutes do not) -- the last reading 1,574,329 reads/s against lmdb's 996,226. Report the range, not the best: lmdb's own rate moved 10.5% across those runs and next's moved 15%, so the honest summary is 'about 1.4-1.6x, and the axis is won'. Two things had to be true at once and neither was configuration-hunting. Every key is sealed on both sides now (the adapter drains before reading, where earlier next arms served a large share of their keys from a resident hash memtable -- a different thing from the engine they were measured against), and the store is left ROUTED (a flush partitions what it sealed, so a read touches exactly one segment instead of paying a Bloom check on each of several overlapping ones). The engine now reads at or above what f44 measures for the same data in a single segment, which is its ceiling for this shape: segmentation costs nothing here, and further gains need fewer cache misses per lookup rather than better arrangement. P-B, refuted twice at 8+ segments, holds at the operating point the design is for -- and the condition is part of the claim, because f44 has the same data at 0.77x when spread over eight segments."
+   "because": "Held in five consecutive full runs at the shipping configuration -- 1.419x, 1.441x, 1.580x, 1.644x and 1.603x, each p<=0.0022 (the fourth on a restarted container where lmdb's own rate fell 25%, the fifth after the bulk segment writer: 1,349,310 reads/s against lmdb's 841,833). Report the range, not the best: the honest summary is 'about 1.4-1.6x, and the axis is won'. Two things had to be true at once and neither was configuration-hunting. Every key is sealed on both sides now (the adapter drains before reading, where earlier next arms served a large share of their keys from a resident hash memtable -- a different thing from the engine they were measured against), and the store is left ROUTED (a flush partitions what it sealed, so a read touches exactly one segment instead of paying a Bloom check on each of several overlapping ones). The engine now reads at or above what f44 measures for the same data in a single segment, which is its ceiling for this shape: segmentation costs nothing here, and further gains need fewer cache misses per lookup rather than better arrangement. P-B, refuted twice at 8+ segments, holds at the operating point the design is for -- and the condition is part of the claim, because f44 has the same data at 0.77x when spread over eight segments."
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.24",
    "profile": "full",
    "expect": "fails",
-   "because": "A TIE, and the arc is the point: 0.040x when this claim was written, 0.137x after the merged-cursor rewrite, 0.495x after seals wrote in key order, 0.769x after the single-source path came back, and now 19,632,899 entries/s against lmdb's 18,622,113 -- 1.054x, no difference at p=0.8983. Recorded as FAILING because the gate is Greater and a tie is not a win; the title says 'no slower', which a tie satisfies, and that mismatch is mine to fix rather than to argue around. Caveat on this particular run: rel_iqr 38.9% on next's read arm and lmdb's own scan down to 18.6M from 27.6M, so the host was noisy and the ratio is worth more than the absolutes. What closed the gap last was resolving a block once per run of keys instead of once per key -- f45 priced that indirection at 60.1ns of a 90.8ns scan, and removing it took the scan to 53.6ns, within 14% of a keys-inline layout that would have cost 16% more space and a second read path."
+   "because": "A TIE, twice, and the arc is the point: 0.040x when this claim was written, 0.137x after the merged-cursor rewrite, 0.495x after seals wrote in key order, 0.769x after the single-source path came back, 1.054x (p=0.90) last run, and now 28,170,655 entries/s against lmdb's 28,231,337 -- 0.998x, no difference at p=0.7983, on a quiet host this time (rel_iqr 8.6% and 2.2%). Recorded as FAILING because the gate is Greater and a tie is not a win; the title says 'no slower', which a tie satisfies, and that mismatch is mine to fix rather than to argue around. What closed the gap last was resolving a block once per run of keys instead of once per key -- f45 priced that indirection at 60.1ns of a 90.8ns scan, and removing it took the scan to 53.6ns, within 14% of a keys-inline layout that would have cost 16% more space and a second read path."
   },
   {
    "experiment": "f43-compact",
@@ -1084,14 +1084,14 @@
    "id": "EXT.25",
    "profile": "full",
    "expect": "holds",
-   "because": "Leaving partitioning to background compaction ingests 1.985x faster than doing it at flush: 481,881 ops/s against 242,715, p=0.0022, and 301.6 MB to the device against 472.7. Same engine, same guarantees, one policy bit apart and interleaved in one run, so nothing needs matching and there is no residual to bound -- which is the point of measuring it this way rather than across two runs, as a first attempt did while lmdb's own load moved 86% between them. Point reads barely notice (1.483M/s against 1.606M, both above lmdb's 1.062M) because a couple of overlapping segments is what the Blooms are for. What it costs is the ordered scan, which EXT.26 gates."
+   "because": "Leaving partitioning to background compaction ingests 1.491x faster than doing it at flush: 423,118 ops/s against 283,841, p=0.0022. It was 1.985x before the bulk writer and the cursor merge made the partitioning pass cheaper; the gap between the two policies is exactly what those two changes took out of it. Same engine, same guarantees, one policy bit apart and interleaved in one run, so nothing needs matching and there is no residual to bound -- which is the point of measuring it this way rather than across two runs, as a first attempt did while lmdb's own load moved 86% between them. Point reads barely notice (1.210M/s against 1.349M, both above lmdb's 0.842M) because a couple of overlapping segments is what the Blooms are for. What it costs is the ordered scan, which EXT.26 gates."
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.26",
    "profile": "full",
    "expect": "holds",
-   "because": "The other half of EXT.25's trade, gated so it cannot be quoted alone: partitioning at flush scans 2.007x faster than leaving it to compaction -- 31,739,387 entries/s against 15,814,149, p=0.0022. A scan over disjoint partitions walks each in turn through one key resolution per key; a scan over overlapping segments runs the k-way merge. Both entries hold, which is the honest shape of a trade: an ingest-heavy writer that reads points wants partitioning off and lets compaction reach it on its own schedule, a store that scans wants it on, and this benchmark is too short to show background compaction closing the gap for the first case."
+   "because": "The other half of EXT.25's trade, gated so it cannot be quoted alone: partitioning at flush scans 1.549x faster than leaving it to compaction -- 28,170,655 entries/s against 18,187,008, p=0.0022 (2.007x the run before; both arms' absolutes moved and the direction did not). A scan over disjoint partitions walks each in turn through one key resolution per key; a scan over overlapping segments runs the k-way merge. Both entries hold, which is the honest shape of a trade: an ingest-heavy writer that reads points wants partitioning off and lets compaction reach it on its own schedule, a store that scans wants it on, and this benchmark is too short to show background compaction closing the gap for the first case."
   },
   {
    "experiment": "f46-segwrite",
@@ -1148,6 +1148,55 @@
    "profile": "full",
    "expect": "holds",
    "because": "P48.3 held, and it is the contract that makes F48.1 sellable: 23 commits under EveryN(16), the WAL torn inside the unsynced tail, reopened -- every record behind the last barrier present, the torn frame served zero values, nothing duplicated. Bounded loss means the tail is lost whole and never in part, and it is measured beside the speed rather than assumed."
+  },
+  {
+   "experiment": "f49-bulkseal",
+   "id": "F49.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P49.1 held in three consecutive full runs: bulk against general ingest-to-routed 1.476x, 1.419x and 1.282x (p=0.0022 each), the third on a host state where the general arm itself ran 15% slower than in the first -- report the range, 1.28-1.48x, and read the ratio rather than the absolutes. Run 3: bulk 259,014 ops/s against general 201,976 on 1M keys in 1,000-record durable batches with the drain inside the window. The loop alone never moved in the writer's favour (run 3: 1.777s against 1.623s, commit phase 1.047s against 0.917s) -- the commit path never touches the writer, and the direction is consistent with a seal that now finishes while commits are still running and contends with their fdatasyncs, which is not decomposed here. What moved is the drain: seal 1.346s to 0.539s and merge 1.960s to 1.606s in run 3. f46 put this writer's floor at 2.04x on the seal alone (F46.1) and it was declined under a 3x bar; under a priority that spends complexity for time it was built, and with the cursor merge behind it (F49.6) the shipping configuration ingests 1.416x the general path in the same run."
+  },
+  {
+   "experiment": "f49-bulkseal",
+   "id": "F49.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P49.2 held past its bar in all three runs: the seal phase is 3.236x, 3.065x and 2.501x faster with the bulk writer (run 3: 1.342s against 0.537s, p=0.0009), where f46's floor said 2.04x. The floor measured a seal alone; a seal through Store also pays a checkpoint that publishes an index for a million keys, which F31.1 had at 44% of a bulk load, and the bulk writer builds that index once from an already-sorted list. Merge outputs go through the same two writers and the merge phase moved 1.960s to 1.606s with the probe merge still finding the keys; F49.5 has what the cursor merge took off the rest."
+  },
+  {
+   "experiment": "f49-bulkseal",
+   "id": "F49.3",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P49.3 refuted, identically in three runs because bytes do not drift: 180.2 MB on disk with the bulk writer against 190.6 with the general one, 0.945x, over the 0.9x registered. The general path's slack on this shape was smaller than assumed -- with 64 KiB blocks the freelist rounding is small, the 4 MB redo-log arena is dropped at close, and the key sections are the same encode() output -- so the writer removes about 10 MB, and the rest of the 180 MB is 110.6 MB of records, roughly 57 MB of key index and the block tables and count files, none of which is the writer's to shrink. Device bytes went the other way, 491.0 against 472.7 MB (1.04x), and are recorded rather than explained."
+  },
+  {
+   "experiment": "f49-bulkseal",
+   "id": "F49.4",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P49.4 refuted, in the writer's favour, three times: reads over bulk segments run 1.109x, 1.090x and 1.131x faster than over general ones (run 3: 1,234,347/s against 1,090,971, p=0.0054), where 'no difference' was registered. Both arms drain to the same layout -- three partitions and no level-0 segment, recorded per rep from run 2 on -- so it is not routing; and F49.7's control, probe against cursor merge on the same writer, ties at 0.987x, so it is not the merge. What is left is what the writers lay down: the bulk writer packs each block in one pass in key order and places the block table and key section contiguously after the data, where Store seals out of a pending arena and places its sections through the freelist. Which of those the extra tenth comes from is not isolated. Recorded failing so the assumption that the writers are read-equivalent cannot stand, not as a read win."
+  },
+  {
+   "experiment": "f49-bulkseal",
+   "id": "F49.5",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P49.5 refuted: the merge phase is 1.305x faster finding keys by rank cursors than by collect-sort-probe (1.573s against 1.206s, p=0.0009, the same SegmentWriter on both arms), under the 1.5x registered. The input side was about 0.37s of the probe arm's merge, not the majority of it; what remains -- 1.2s for 116 MB of output -- is the write side: values pulled through values_at, blocks written, a million-key index encoded, one fsync, at roughly the seal's own bytes per second (0.54s for the flush's ~52 MB seal in the same run). The merge is write-bound now, at the writer's speed, and the next unit of merge time comes from writing fewer bytes or overlapping the fsync, not from finding keys faster."
+  },
+  {
+   "experiment": "f49-bulkseal",
+   "id": "F49.6",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P49.6 refuted narrowly: ingest-to-routed with the cursor merge is 1.104x the probe arm's (286,055 against 259,014 ops/s, p=0.0152), under the 1.15x registered, because the merge's input side was a smaller share of the window than the plan assumed (F49.5). Device and disk bytes are identical between the two arms (491.0 MB, 180.2 MB), as they must be for a change that only walks inputs differently. Against the general arm's 201,976 in the same run the shipping configuration -- bulk writer and cursor merge -- ingests 1.416x."
+  },
+  {
+   "experiment": "f49-bulkseal",
+   "id": "F49.7",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P49.7 held: 1,218,131/s against 1,234,347, no difference at p=0.79, with three partitions and no level-0 segment on both arms. Same writer, same blocks; only how the merge found its keys differed. This is the control that lets F49.4 blame the writer's layout rather than the merge."
   }
  ],
  "metrics": [

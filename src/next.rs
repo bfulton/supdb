@@ -121,6 +121,10 @@ pub struct NextOptions {
     /// arms interleaved in one process -- f49 does that -- and a number
     /// against an old run would mostly have been the machine.
     pub bulk_writer: bool,
+    /// Find the keys a merge writes by a k-way walk of the inputs' rank
+    /// order (the default) rather than by collecting, sorting and probing
+    /// them. The probe path is kept as f49's comparison arm.
+    pub cursor_merge: bool,
 }
 
 impl Default for NextOptions {
@@ -133,6 +137,7 @@ impl Default for NextOptions {
             compact: true,
             partition_on_flush: true,
             bulk_writer: true,
+            cursor_merge: true,
         }
     }
 }
@@ -1115,39 +1120,189 @@ struct MergePlan {
     max_keys: usize,
     opts: Options,
     bulk: bool,
+    cursors: bool,
 }
 
 fn compact_job(plan: MergePlan) -> Result<Vec<String>> {
-    let MergePlan { dir, inputs, first_id, end_seq, parts, fences, max_keys, opts, bulk } = plan;
-    compact_run(dir, inputs, first_id, end_seq, parts, fences, max_keys, opts, bulk)
+    compact_run(plan)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn compact_run(
-    dir: PathBuf,
-    inputs: Vec<String>,
-    first_id: u64,
-    end_seq: u64,
-    parts: usize,
-    // `Some` names the exact output fences: one segment per fence, keys
-    // assigned by it. That is how boundaries stay STABLE once they exist
-    // -- a merge that re-derived them would misalign every piece sealed
-    // under the old ones, forcing another full merge, and that loop is
-    // what kept device bytes at the full-rewrite level. `None` is the
-    // first partitioning only, which has no boundaries to preserve.
-    fences: Option<Vec<Fence>>,
-    // Keys a partition may hold before the merge splits it in two. Stable
-    // boundaries keep pieces aligned, but a boundary set that NEVER grows
-    // leaves partitions growing with the store: at 1M keys the store had
-    // settled into 8 partitions of 14.5MB each, and a bigger partition is
-    // a bigger index section and more misses per probe. A range splits
-    // when it outgrows this, which disturbs only its own pieces and only
-    // until the next seal.
-    max_keys: usize,
-    opts: Options,
+/// Distinct keys of a merge, in order, in one allocation -- pass one of the
+/// merge. The slicing addresses keys by rank exactly as the sorted vector
+/// this replaced did, without a million allocations, a sort or a dedup.
+struct KeyList {
+    bytes: Vec<u8>,
+    offs: Vec<usize>,
+}
+
+impl KeyList {
+    fn new() -> KeyList {
+        KeyList { bytes: Vec::new(), offs: vec![0] }
+    }
+
+    fn push(&mut self, k: &[u8]) {
+        self.bytes.extend_from_slice(k);
+        self.offs.push(self.bytes.len());
+    }
+
+    fn len(&self) -> usize {
+        self.offs.len() - 1
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn get(&self, i: usize) -> &[u8] {
+        &self.bytes[self.offs[i]..self.offs[i + 1]]
+    }
+
+    /// First rank whose key fails `pred`, for a `pred` that is true on a
+    /// prefix of the list.
+    fn partition_point(&self, pred: impl Fn(&[u8]) -> bool) -> usize {
+        let (mut lo, mut hi) = (0usize, self.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if pred(self.get(mid)) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+}
+
+/// K-way walk of the inputs in rank order: `f` sees each distinct key once,
+/// with `(input, rank)` for every input that holds it, oldest input first.
+/// Inputs are ordered oldest to newest, so draining those cursors in the
+/// order given returns a key's values in append order -- the order the probe
+/// path got by asking each input in turn. Each input's key section is read
+/// forwards, once, and nothing is hashed.
+fn merge_ranks(
+    blobs: &[Blob<MmapBytes>],
+    mut f: impl FnMut(&[u8], &[(usize, usize)]) -> Result<()>,
+) -> Result<()> {
+    let n: Vec<usize> = blobs.iter().map(|b| b.keys()).collect();
+    let mut rank = vec![0usize; blobs.len()];
+    let mut tied: Vec<(usize, usize)> = Vec::with_capacity(blobs.len());
+    loop {
+        let mut min: Option<&[u8]> = None;
+        tied.clear();
+        for (i, b) in blobs.iter().enumerate() {
+            if rank[i] >= n[i] {
+                continue;
+            }
+            let k = b
+                .key_at(rank[i])
+                .ok_or_else(|| err("segment key walk: a rank the index does not have"))?;
+            match min {
+                None => {
+                    min = Some(k);
+                    tied.push((i, rank[i]));
+                }
+                Some(m) => match k.cmp(m) {
+                    std::cmp::Ordering::Less => {
+                        min = Some(k);
+                        tied.clear();
+                        tied.push((i, rank[i]));
+                    }
+                    std::cmp::Ordering::Equal => tied.push((i, rank[i])),
+                    std::cmp::Ordering::Greater => {}
+                },
+            }
+        }
+        let Some(k) = min else {
+            return Ok(());
+        };
+        f(k, &tied)?;
+        for &(i, _) in &tied {
+            rank[i] += 1;
+        }
+    }
+}
+
+/// One output of a merge: the ranks it holds, the fence it must contain,
+/// and its names on disk.
+struct Piece {
+    from: usize,
+    to: usize,
+    lo: Vec<u8>,
+    hi: Option<Vec<u8>>,
+    name: String,
+    tmp: PathBuf,
+}
+
+/// Pass two of a merge: keys arrive in rank order and go into the piece
+/// their rank belongs to, with a writer opened at each piece's first rank
+/// and finished, renamed and given its sidecar at its last. The same
+/// emitter serves both ways of finding keys, so the arms f49 compares
+/// differ only in that.
+struct Emitter<'a> {
+    dir: &'a Path,
+    opts: &'a Options,
     bulk: bool,
-) -> Result<Vec<String>> {
-    let _ = &parts;
+    pieces: Vec<Piece>,
+    pi: usize,
+    r: usize,
+    w: Option<PieceWriter>,
+    counts: Vec<u32>,
+    out: Vec<String>,
+}
+
+impl Emitter<'_> {
+    fn key(&mut self, k: &[u8], pull: impl FnOnce(&mut PieceWriter) -> Result<u32>) -> Result<()> {
+        let p = self
+            .pieces
+            .get(self.pi)
+            .ok_or_else(|| err("merge visited a key past its last piece"))?;
+        // The slices tile the ranks; a key that belongs to no piece is a
+        // key that would have been dropped, silently, on the way to disk.
+        if self.r < p.from || self.r >= p.to {
+            return Err(err("merge slices leave a key unassigned"));
+        }
+        // Insurance against the class of bug that produced this line: a
+        // merge told to write a fence must contain what it writes, or the
+        // read path will deny it and no test will say so.
+        if k < p.lo.as_slice() || p.hi.as_ref().is_some_and(|h| k >= h.as_slice()) {
+            return Err(err("compaction would write a key outside its fence"));
+        }
+        if self.r == p.from {
+            let _ = std::fs::remove_file(&p.tmp);
+            self.w = Some(
+                PieceWriter::create(&p.tmp, self.opts, self.bulk)
+                    .map_err(|e| err(&format!("compact create: {e}")))?,
+            );
+            self.counts.clear();
+        }
+        let w = self.w.as_mut().ok_or_else(|| err("merge piece not open"))?;
+        w.begin(k)?;
+        let n = pull(w)?;
+        w.end()?;
+        self.counts.push(n);
+        self.r += 1;
+        if self.r == p.to {
+            let w = self.w.take().ok_or_else(|| err("merge piece not open"))?;
+            w.finish().map_err(|e| err(&format!("compact finish: {e}")))?;
+            std::fs::rename(&p.tmp, self.dir.join(&p.name))?;
+            write_counts(self.dir, &p.name, &self.counts)?;
+            self.out.push(p.name.clone());
+            self.pi += 1;
+        }
+        Ok(())
+    }
+
+    fn finish(self, total: usize) -> Result<Vec<String>> {
+        if self.r != total || self.pi != self.pieces.len() {
+            return Err(err("merge ended with a piece still open"));
+        }
+        Ok(self.out)
+    }
+}
+
+fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
+    let MergePlan { dir, inputs, first_id, end_seq, parts, fences, max_keys, opts, bulk, cursors } =
+        plan;
     let mut blobs = Vec::with_capacity(inputs.len());
     for name in &inputs {
         blobs.push(
@@ -1155,12 +1310,25 @@ fn compact_run(
                 .map_err(|e| err(&format!("compact input {name}: {e}")))?,
         );
     }
-    let mut keys: Vec<Vec<u8>> = Vec::new();
-    for b in &blobs {
-        Seg::for_each_key(b, |k| keys.push(k.to_vec()))?;
+
+    // Pass one: every distinct key once, in order.
+    let mut keys = KeyList::new();
+    if cursors {
+        merge_ranks(&blobs, |k, _| {
+            keys.push(k);
+            Ok(())
+        })?;
+    } else {
+        let mut all: Vec<Vec<u8>> = Vec::new();
+        for b in &blobs {
+            Seg::for_each_key(b, |k| all.push(k.to_vec()))?;
+        }
+        all.sort_unstable();
+        all.dedup();
+        for k in &all {
+            keys.push(k);
+        }
     }
-    keys.sort_unstable();
-    keys.dedup();
     if keys.is_empty() {
         return Ok(Vec::new());
     }
@@ -1168,7 +1336,6 @@ fn compact_run(
         Some(f) => f.len().max(1),
         None => parts.max(1).min(keys.len()),
     };
-    let _ = parts;
     let per = keys.len().div_ceil(parts);
 
     // The partition set must TILE the key space: every key routes to
@@ -1187,7 +1354,7 @@ fn compact_run(
     let mut bounds: Vec<Vec<u8>> = Vec::new();
     if fences.is_none() {
         for i in 1..parts {
-            let b = fence_lo(&keys[(i * per).min(keys.len() - 1)]);
+            let b = fence_lo(keys.get((i * per).min(keys.len() - 1)));
             if bounds.last().is_none_or(|p| p != &b) {
                 bounds.push(b);
             }
@@ -1200,9 +1367,9 @@ fn compact_run(
     match &fences {
         Some(fs) => {
             for (lo, hi) in fs {
-                let from = keys.partition_point(|k| k.as_slice() < lo.as_slice());
+                let from = keys.partition_point(|k| k < lo.as_slice());
                 let to = match hi {
-                    Some(h) => keys.partition_point(|k| k.as_slice() < h.as_slice()),
+                    Some(h) => keys.partition_point(|k| k < h.as_slice()),
                     None => keys.len(),
                 };
                 let to = to.max(from);
@@ -1217,13 +1384,8 @@ fn compact_run(
                     // Sub-fences tile the fence they came from: the first
                     // keeps its low bound, the last its high bound, and the
                     // joins are single shared values.
-                    let sub_lo =
-                        if i == 0 { lo.clone() } else { fence_lo(&keys[sf]) };
-                    let sub_hi = if st == to {
-                        hi.clone()
-                    } else {
-                        Some(fence_lo(&keys[st]))
-                    };
+                    let sub_lo = if i == 0 { lo.clone() } else { fence_lo(keys.get(sf)) };
+                    let sub_hi = if st == to { hi.clone() } else { Some(fence_lo(keys.get(st))) };
                     slices.push((sf, st));
                     given.push((sub_lo, sub_hi));
                 }
@@ -1232,7 +1394,7 @@ fn compact_run(
         None => {
             let mut at = 0usize;
             for b in &bounds {
-                let end = keys.partition_point(|k| k.as_slice() < b.as_slice());
+                let end = keys.partition_point(|k| k < b.as_slice());
                 if end > at {
                     slices.push((at, end));
                     at = end;
@@ -1242,10 +1404,9 @@ fn compact_run(
         }
     }
 
-    let mut out = Vec::with_capacity(slices.len());
+    let mut pieces = Vec::with_capacity(slices.len());
     for (pi, &(from, to)) in slices.iter().enumerate() {
-        let chunk = &keys[from..to];
-        if chunk.is_empty() {
+        if from >= to {
             continue;
         }
         let id = first_id + pi as u64;
@@ -1264,37 +1425,49 @@ fn compact_run(
             hi.as_deref().map(hex).unwrap_or_default()
         );
         let tmp = dir.join(format!("compact-{id:08}.tmp"));
-        let _ = std::fs::remove_file(&tmp);
-        let mut counts: Vec<u32> = Vec::with_capacity(chunk.len());
-        {
-            let mut w = PieceWriter::create(&tmp, &opts, bulk)
-                .map_err(|e| err(&format!("compact create: {e}")))?;
-            for key in chunk {
-                // Insurance against the class of bug that produced this
-                // line: a merge told to write a fence must contain what it
-                // writes, or the read path will deny it and no test will
-                // say so.
-                if key.as_slice() < lo.as_slice()
-                    || hi.as_ref().is_some_and(|h| key.as_slice() >= h.as_slice())
-                {
-                    return Err(err("compaction would write a key outside its fence"));
+        pieces.push(Piece { from, to, lo, hi, name, tmp });
+    }
+
+    // Pass two: values, in rank order, into one piece per slice.
+    let mut em = Emitter {
+        dir: &dir,
+        opts: &opts,
+        bulk,
+        pieces,
+        pi: 0,
+        r: 0,
+        w: None,
+        counts: Vec::new(),
+        out: Vec::new(),
+    };
+    if cursors {
+        merge_ranks(&blobs, |k, tied| {
+            em.key(k, |w| {
+                let mut n = 0u32;
+                for &(i, rank) in tied {
+                    n += blobs[i]
+                        .values_at(rank, |v| w.value(v))
+                        .map_err(|e| err(&format!("compact read: {e}")))?
+                        as u32;
                 }
-                w.begin(key)?;
+                Ok(n)
+            })
+        })?;
+    } else {
+        for r in 0..keys.len() {
+            let k = keys.get(r);
+            em.key(k, |w| {
                 let mut n = 0u32;
                 for b in &blobs {
                     n += b
-                        .read_all(key, |v| w.value(v))
+                        .read_all(k, |v| w.value(v))
                         .map_err(|e| err(&format!("compact read: {e}")))? as u32;
                 }
-                w.end()?;
-                counts.push(n);
-            }
-            w.finish().map_err(|e| err(&format!("compact finish: {e}")))?;
+                Ok(n)
+            })?;
         }
-        std::fs::rename(&tmp, dir.join(&name))?;
-        write_counts(&dir, &name, &counts)?;
-        out.push(name);
     }
+    let out = em.finish(keys.len())?;
     File::open(&dir)?.sync_all()?;
     Ok(out)
 }
@@ -1897,6 +2070,7 @@ impl Db {
         let dir = self.dir.clone();
         let opts = Db::segment_opts(&self.opts);
         let bulk = self.opts.bulk_writer;
+        let cursors = self.opts.cursor_merge;
         let job_inputs = inputs.clone();
         let handle = std::thread::spawn(move || {
             compact_job(MergePlan {
@@ -1909,6 +2083,7 @@ impl Db {
                 max_keys,
                 opts,
                 bulk,
+                cursors,
             })
         });
         self.compacting = Some((inputs, handle));
