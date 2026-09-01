@@ -5890,15 +5890,23 @@ fn f45_scanfloor(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let mut kb = [0u8; 16];
         let t = Instant::now();
         let mut sink = 0u64;
+        // Entries actually visited, not entries requested. The single-blob
+        // arms walk ONE partition, so a range starting in another lands
+        // past its end and visits nothing -- and dividing by the entries
+        // it never touched would have credited it for the work it skipped.
+        // The first full run did exactly that and made an index walk look
+        // like 9.6% of a scan.
+        let mut done = 0u64;
         for _ in 0..scans {
             let start = g.next();
             db_key_into(start, &mut kb);
             match ci {
                 0 => {
-                    db.scan(&kb, scan_len, |_k, v| {
-                        sink += v.len() as u64;
-                    })
-                    .expect("scan");
+                    done += db
+                        .scan(&kb, scan_len, |_k, v| {
+                            sink += v.len() as u64;
+                        })
+                        .expect("scan") as u64;
                 }
                 1 => {
                     // What the index alone costs: a key per rank, no value.
@@ -5909,6 +5917,7 @@ fn f45_scanfloor(args: &Args, profile: Profile) -> std::io::Result<Record> {
                             None => break,
                         }
                         rank += 1;
+                        done += 1;
                     }
                 }
                 2 => {
@@ -5922,12 +5931,14 @@ fn f45_scanfloor(args: &Args, profile: Profile) -> std::io::Result<Record> {
                             break;
                         }
                         rank += 1;
+                        done += 1;
                     }
                 }
                 _ => {
                     // The ceiling: one linear pass, nothing resolved.
                     let mut p = offsets[start as usize] as usize;
                     for _ in 0..scan_len {
+                        done += 1;
                         if p + 4 > flat_bytes.len() {
                             break;
                         }
@@ -5948,7 +5959,7 @@ fn f45_scanfloor(args: &Args, profile: Profile) -> std::io::Result<Record> {
             }
         }
         std::hint::black_box(sink);
-        (scans as f64 * scan_len as f64) / t.elapsed().as_secs_f64()
+        done as f64 / t.elapsed().as_secs_f64()
     });
 
     rec.series(
@@ -5967,6 +5978,11 @@ fn f45_scanfloor(args: &Args, profile: Profile) -> std::io::Result<Record> {
                 })
                 .collect(),
         ),
+    );
+    rec.note(
+        "entries_per_s counts entries VISITED, not requested: the single-blob arms walk one \
+         partition and stop where it ends, and crediting them for a whole range would price the \
+         work they skipped",
     );
     rec.series(
         "bytes",
