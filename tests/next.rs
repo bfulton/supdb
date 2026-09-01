@@ -470,18 +470,31 @@ fn a_crash_before_the_manifest_lands_keeps_the_pre_merge_store() {
 
 #[test]
 fn every_key_survives_partitioning_and_range_merges_at_scale() {
+    scale(true)
+}
+
+/// The original flush -- re-partition everything from every key -- stays
+/// behind `flush_ranges: false` as f54's comparison arm, and a path only one
+/// arm exercises is a path nothing tests.
+#[test]
+fn every_key_survives_the_full_flush_too() {
+    scale(false)
+}
+
+fn scale(flush_ranges: bool) {
     // The contract tests above use stores too small to make a partition
     // boundary interesting. This one loads enough to force the initial
     // partitioning AND several per-range merges, then demands every key
     // back. A fence that does not tile the key space loses keys silently
     // here and nowhere smaller.
-    let d = dir("scale");
+    let d = dir(if flush_ranges { "scale" } else { "scale-fullflush" });
     let mut db = Db::create(
         &d,
         NextOptions {
             seal_bytes: 512 << 10,
             l0_trigger: 3,
             partition_bytes: None,
+            flush_ranges,
             ..NextOptions::default()
         },
     )

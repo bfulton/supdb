@@ -202,10 +202,11 @@ interleaved where the harness allows:
 - **P-B, the read lead survives: HELD, with its condition stated.** The
   test was "EXT.11's shape with live segment counts under the compaction
   policy stays ≥ 1.2x on x86". At the shipping configuration it reads
-  **1.39-1.64x** across seven consecutive full runs (EXT.23, each
-  p=0.0022), the seventh at 1.391x under the new seal and partition
-  sizes. Report the range rather than the best: LMDB's own rate moves
-  between runs and so does next's.
+  **1.39-2.36x** across eight consecutive full runs (EXT.23, each
+  p=0.0022), the eighth at 2.358x with inline runs on a degraded host
+  state where every other engine's reads fell and next's rose. Report the
+  range rather than the best, and repeat the eighth on a quiet host before
+  quoting it.
 
   Getting here took two corrections and one refutation worth keeping.
   The refutation: at 8+ segments the same data reads **0.846x** and

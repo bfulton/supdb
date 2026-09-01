@@ -116,14 +116,15 @@ The matched scorecard against LMDB, `full`:
 |---|---|---|---|
 | load, both durable (`EXT.9`) | 199,485/s | 572,416/s | **0.348x**, failing |
 | load, neither (`EXT.10`) | 628,814/s | 652,367/s | no difference here; 0.85x on Apple Silicon, replicated |
-| read (`EXT.11`) | 1,106,133/s | 1,060,077/s | 1.043x, a tie in the latest run and recorded as failing (1.196x, 1.092x, 1.043x across the runs since format v5); 2.42x on Apple Silicon, replicated |
+| read (`EXT.11`) | 1,073,573/s | 778,580/s | 1.379x, holding again after a tie the run before (1.196x, 1.092x, 1.043x, 1.379x: the comparator moves with the host); 2.42x on Apple Silicon, replicated |
 | scan (`EXT.12`) | 17.4M/s | 18.6M/s | coin toss here (1.16x sig, then 0.93x nd, same night); 1.17x on Apple Silicon, replicated |
 
 The next engine (`src/next.rs`), matched on durability *and* transactions
-since it gained atomic batches and `Txn`: durable load **0.452x** of LMDB in
-the latest canonical run under 32 MB seals over 64 MB partitions (`EXT.22`;
-0.39-0.49x in the runs before), point reads **1.39-1.64x** over seven runs
-(`EXT.23`), ordered scan a tie four runs running (`EXT.24`). Leaving
+since it gained atomic batches and `Txn`: durable load **0.49x** of LMDB in
+the latest canonical run (`EXT.22`; 0.39-0.49x across the runs since the
+bulk writer), point reads **1.39-2.36x** over eight runs (`EXT.23`; the
+2.36x is the first run with inline runs, on a degraded host that needs its
+repeat), ordered scan a tie five runs running (`EXT.24`). Leaving
 partitioning to compaction no longer separates the arms at this load
 (`EXT.25`, `EXT.26`: ties, because the trigger fires at the fourth 32 MB
 seal either way). Its story is in `docs/next-engine.md`; every number there

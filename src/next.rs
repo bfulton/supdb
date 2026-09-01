@@ -159,6 +159,11 @@ pub struct NextOptions {
     /// streams blocks, so its dirty pages leave in slices rather than in
     /// one flush at the end. Zero syncs at the end only (f51).
     pub seal_sync_every: usize,
+    /// How a flush drains level 0 once partitions exist: merge only the
+    /// ranges that hold pieces, under the live fences (`true`), or
+    /// re-partition everything from every key (`false`, the original). f54
+    /// prices the difference (merge-plan.md).
+    pub flush_ranges: bool,
     /// Runs of values up to this many bytes are stored inline in the index
     /// record rather than in a block, so a point read of such a key touches
     /// the hash slot and the record and nothing else. Zero disables; f53
@@ -191,6 +196,7 @@ impl Default for NextOptions {
             seal_sync_every: 0,
             inline_bytes: 256,
             partition_bytes: Some(64 << 20),
+            flush_ranges: true,
         }
     }
 }
@@ -2387,14 +2393,77 @@ impl Db {
         // Partitioning them costs one merge now and makes every later read
         // touch exactly one segment, which is the arrangement the read
         // lead was measured in.
-        if self.opts.compact
-            && self.opts.partition_on_flush
-            && self.segs.iter().any(|s| s.level == 0)
-        {
-            self.start_compact(None)?;
+        if !(self.opts.compact && self.opts.partition_on_flush) {
+            return Ok(());
+        }
+        // With `flush_ranges`, each round merges only the ranges that hold
+        // pieces, under the live fences -- one piece is enough to be due
+        // here, where the background trigger waits for several -- so a
+        // flush after an ordered or skewed load rewrites the partitions it
+        // touched and not the store. Without it, or before the first
+        // partitioning, everything is re-partitioned from every key.
+        let mut rounds = 0usize;
+        while self.segs.iter().any(|s| s.level == 0) {
+            let plan = if self.opts.flush_ranges { self.merge_due(1) } else { None };
+            match plan {
+                Some(fences) if !fences.is_empty() => self.start_compact(Some(fences))?,
+                _ => self.start_compact(None)?,
+            }
             self.join_compact()?;
+            rounds += 1;
+            if rounds > 64 {
+                return Err(err("flush: level 0 did not drain in 64 merge rounds"));
+            }
         }
         Ok(())
+    }
+
+    /// The fences a range merge should rewrite now, or `None` when the store
+    /// is not partitioned yet (the first partitioning takes every key). A
+    /// piece that is not aligned to a live range -- sealed during the first
+    /// partitioning against fences that no longer exist -- selects every
+    /// range it overlaps; otherwise a range is selected when it holds at
+    /// least `threshold` pieces. `maybe_compact` uses the trigger as the
+    /// threshold; a flush uses one.
+    fn merge_due(&self, threshold: usize) -> Option<Vec<Fence>> {
+        let parts: Vec<Fence> = self
+            .segs
+            .iter()
+            .filter(|s| s.level > 0)
+            .map(|s| (s.lo.clone(), s.hi.clone()))
+            .collect();
+        if parts.is_empty() {
+            return None;
+        }
+        if let Some(wide) = self
+            .segs
+            .iter()
+            .find(|s| s.level == 0 && !parts.iter().any(|f| (s.lo.clone(), s.hi.clone()) == *f))
+        {
+            let (wlo, whi) = (wide.lo.clone(), wide.hi.clone());
+            return Some(
+                parts
+                    .into_iter()
+                    .filter(|(lo, hi)| {
+                        let below = hi.as_ref().is_some_and(|h| &wlo >= h);
+                        let above = whi.as_ref().is_some_and(|h| h <= lo);
+                        !below && !above
+                    })
+                    .collect(),
+            );
+        }
+        Some(
+            parts
+                .into_iter()
+                .filter(|f| {
+                    self.segs
+                        .iter()
+                        .filter(|s| s.level == 0 && s.lo == f.0 && s.hi == f.1)
+                        .count()
+                        >= threshold
+                })
+                .collect(),
+        )
     }
 
     /// Collect a finished (or in-flight) seal: join the thread, open its
@@ -2446,67 +2515,29 @@ impl Db {
         if self.compacting.as_ref().is_some_and(|(_, h)| h.is_finished()) {
             self.join_compact()?;
         }
-        let parts: Vec<Fence> = self
-            .segs
-            .iter()
-            .filter(|s| s.level > 0)
-            .map(|s| (s.lo.clone(), s.hi.clone()))
-            .collect();
-        if parts.is_empty() {
-            if self.l0_len() >= self.opts.l0_trigger {
-                return self.start_compact(None);
+        // One selection rule for both schedulers, so they cannot drift: a
+        // range is due when it holds `l0_trigger` pieces, a piece not
+        // aligned to the live ranges selects every range it overlaps, and
+        // before the first partitioning the trigger counts every piece.
+        match self.merge_due(self.opts.l0_trigger) {
+            None => {
+                if self.l0_len() >= self.opts.l0_trigger {
+                    return self.start_compact(None);
+                }
+                Ok(())
             }
-            return Ok(());
+            Some(due) if !due.is_empty() => self.start_compact(Some(due)),
+            Some(_) => Ok(()),
         }
-        // A seal that finished DURING the initial partitioning wrote a
-        // full-range segment against the fences that existed when it
-        // started, so it now spans several partitions. Folding it into one
-        // range would write keys outside that range's fence and the read
-        // path would then deny them -- silent loss, which is exactly how
-        // this was found. Anything not aligned to a live range forces a
-        // full re-partitioning instead.
-        if let Some(wide) = self
-            .segs
-            .iter()
-            .find(|s| s.level == 0 && !parts.iter().any(|f| (s.lo.clone(), s.hi.clone()) == *f))
-        {
-            // It spans several ranges: merge it into every partition it
-            // overlaps, each output keeping its own existing fence. The
-            // boundaries do not move, so nothing else becomes misaligned.
-            let (wlo, whi) = (wide.lo.clone(), wide.hi.clone());
-            let touched: Vec<Fence> = parts
-                .into_iter()
-                .filter(|(lo, hi)| {
-                    let below = hi.as_ref().is_some_and(|h| &wlo >= h);
-                    let above = whi.as_ref().is_some_and(|h| h <= lo);
-                    !below && !above
-                })
-                .collect();
-            return self.start_compact(Some(touched));
-        }
-        // EVERY range that is over its bound, in one job -- not just the
-        // worst. A per-range merge has to run once per range where the
-        // whole-store merge ran once, so picking a single range per seal
-        // starves it: with sixteen ranges and one merge in flight, pieces
-        // accumulated faster than they were consumed and a read ended up
-        // walking ten of them. That starvation cost more than the
-        // whole-store rewrite it replaced (EXT.23 0.846x -> 0.561x), which
-        // is the measurement that produced this loop.
-        let due: Vec<Fence> = parts
-            .into_iter()
-            .filter(|f| {
-                self.segs
-                    .iter()
-                    .filter(|s| s.level == 0 && s.lo == f.0 && s.hi == f.1)
-                    .count()
-                    >= self.opts.l0_trigger
-            })
-            .collect();
-        if !due.is_empty() {
-            return self.start_compact(Some(due));
-        }
-        Ok(())
     }
+    // The starvation lesson that shaped `merge_due`: EVERY range that is
+    // over its bound merges in one job, not just the worst. A per-range
+    // merge has to run once per range where the whole-store merge ran once,
+    // so picking a single range per seal starved it -- with sixteen ranges
+    // and one merge in flight, pieces accumulated faster than they were
+    // consumed and a read ended up walking ten of them. That starvation
+    // cost more than the whole-store rewrite it replaced (EXT.23 0.846x ->
+    // 0.561x), which is the measurement that produced the rule.
 
     fn l0_len(&self) -> usize {
         self.segs.iter().filter(|s| s.level == 0).count()
