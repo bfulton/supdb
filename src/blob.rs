@@ -987,6 +987,19 @@ impl<B: Bytes> Blob<B> {
     }
 
     /// Walk keys in order from `from`, visiting every value. R4.4.
+    ///
+    /// Resolves each block ONCE for a run of keys that share it, rather
+    /// than per key. A segment written by a seal or a merge holds its keys
+    /// in key order (both sort before writing), so consecutive keys land in
+    /// the same block and the per-key `loc_of` + slice + buffer dance was
+    /// re-deriving an answer it already had. f45 priced that indirection at
+    /// 60.1ns of an ordered scan's 90.8, against 14.5 for walking the index
+    /// -- the cost is here, not in resolving keys.
+    ///
+    /// The cache holds only what a borrowed source can lend. A copying
+    /// source, or a compressed or chunk-CRC'd block, takes the original
+    /// path, which is also the one `tests/blob.rs` checks against
+    /// `store.rs`.
     pub fn scan<F: FnMut(&[u8], &[u8])>(
         &self,
         from: &[u8],
@@ -995,26 +1008,74 @@ impl<B: Bytes> Blob<B> {
     ) -> Result<usize> {
         let mut rank = self.seek(from);
         let mut seen = 0usize;
+        let mut cached: Option<(u32, &[u8])> = None;
         while seen < limit {
             let Some((k, exts)) = self.exts_at(rank) else {
                 break;
             };
             for e in exts {
-                self.with_extent(*e, |run| {
-                    let mut p = 0usize;
-                    while p < run.len() {
-                        let len = get_uvarint(run, &mut p) as usize;
-                        let end = p
-                            .checked_add(len)
-                            .ok_or_else(|| corrupt("record length overflows"))?;
-                        if end > run.len() {
-                            return Err(corrupt("record runs past the end of its extent"));
+                // The fast path wants a lending source and a plain block:
+                // anything else falls back, because a decompressed block
+                // lives in a buffer this loop cannot hold across keys.
+                let run = match cached {
+                    Some((id, bytes)) if id == e.block => Some(bytes),
+                    _ => match self.loc_of(e.block) {
+                        Ok(loc) if loc.is_plain() => {
+                            match self.src.slice_at(loc.off, loc.stored as usize) {
+                                Some(bytes) => {
+                                    self.verify(e.block, loc, bytes, 0, bytes.len())?;
+                                    cached = Some((e.block, bytes));
+                                    Some(bytes)
+                                }
+                                None => None,
+                            }
                         }
-                        f(k, &run[p..end]);
-                        p = end;
+                        _ => None,
+                    },
+                };
+                match run {
+                    Some(bytes) => {
+                        let (a, b) = (
+                            e.off as usize,
+                            (e.off as usize).saturating_add(e.len as usize),
+                        );
+                        if b > bytes.len() {
+                            return Err(corrupt("extent runs past its block"));
+                        }
+                        let run = &bytes[a..b];
+                        let mut p = 0usize;
+                        while p < run.len() {
+                            let len = get_uvarint(run, &mut p) as usize;
+                            let end = p
+                                .checked_add(len)
+                                .ok_or_else(|| corrupt("record length overflows"))?;
+                            if end > run.len() {
+                                return Err(corrupt("record runs past the end of its extent"));
+                            }
+                            f(k, &run[p..end]);
+                            p = end;
+                        }
                     }
-                    Ok(())
-                })?;
+                    None => {
+                        self.with_extent(*e, |run| {
+                            let mut p = 0usize;
+                            while p < run.len() {
+                                let len = get_uvarint(run, &mut p) as usize;
+                                let end = p
+                                    .checked_add(len)
+                                    .ok_or_else(|| corrupt("record length overflows"))?;
+                                if end > run.len() {
+                                    return Err(corrupt(
+                                        "record runs past the end of its extent",
+                                    ));
+                                }
+                                f(k, &run[p..end]);
+                                p = end;
+                            }
+                            Ok(())
+                        })?;
+                    }
+                }
             }
             seen += 1;
             rank += 1;
