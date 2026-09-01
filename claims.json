@@ -1314,35 +1314,35 @@
    "id": "F53.1",
    "profile": "full",
    "expect": "holds",
-   "because": "P53.1 held, past its bar: point reads over a drained store run 1.722x faster with inline runs -- 2,363,665/s (423 ns) against 1,391,212 (719 ns), p=0.0009 -- where 1.25x was registered. An inline read touches the hash slot and the record; a block-backed one goes on to the block table row and the block, two more misses at a million keys, and the difference measures them. This is the lever the brief named for reads past the arrangement ceiling, and it is the largest single read gain in the project."
+   "because": "P53.1 held in three full runs, each past its 1.25x bar: point reads over a drained store run 1.722x, 1.364x and 1.546x faster with inline runs (run 3: 2,274,809/s, 440 ns, against 1,470,201/s, 680 ns; p=0.0009 each time). An inline read touches the hash slot and the record; a block-backed one goes on to the block table row and the block, two more misses at a million keys, and the difference measures them. This is the lever the brief named for reads past the arrangement ceiling, and it is the largest single read gain in the project. Runs 1 and 2 are in git (c38a20f) and beside this record as run2."
   },
   {
    "experiment": "f53-inline",
    "id": "F53.2",
    "profile": "full",
    "expect": "holds",
-   "because": "P53.2 held: 165.8 MB on disk with inline runs against 163.0 with blocks, 1.017x; device bytes 465.3 against 459.9 MB. Values move from blocks into records and nothing is duplicated. Both arms are 19 MB smaller than the same load was before this change (182.1 MB in f52), which is the flat index's half-again record slack that an immutable segment never used and the writer no longer reserves."
+   "because": "P53.2 held: 165.8 MB on disk with inline runs against 163.0 with blocks, 1.017x, identical in all three runs; device bytes 465.3 against 459.9 MB. Values move from blocks into records and nothing is duplicated. Both arms are 19 MB smaller than the same load was before this change (182.1 MB in f52), which is the flat index's half-again record slack that an immutable segment never used and the writer no longer reserves."
   },
   {
    "experiment": "f53-inline",
    "id": "F53.3",
    "profile": "full",
-   "expect": "holds",
-   "because": "P53.3 held, narrowly: the ordered scan reads 34,147,202 entries/s with inline runs against 36,952,677 with blocks, 0.905x, no difference at p=0.066. The walk is over records in key order either way; an inline run is where the walk already is, and a block-backed one resolves a block per run of keys, so the tie says the wider records cost about what the block resolution saved."
+   "expect": "fails",
+   "because": "P53.3 refuted, and the refutation is the price: the ordered scan reads 0.905x, 0.858x and 0.884x as fast over inline records (run 3: 34,233,764 against 38,570,899 entries/s, p=0.0009). The walk is over records in key order either way, and a record that carries its values is 140 bytes here where one that names a block is 40; the block resolution it saves is worth less than the bytes it adds. Recorded failing so the trade is visible beside F53.1 rather than netted against it."
   },
   {
    "experiment": "f53-inline",
    "id": "F53.4",
    "profile": "full",
-   "expect": "holds",
-   "because": "P53.4 held at the edge of its bar: the dictionary count through scan_counts costs 21.89 ns/key over inline records against 11.42 over block-backed ones, 1.917x against the 2x registered. Wider records mean more bytes per key under the walk; a day's 2,000-term dictionary still ranks in about 44 us, and the price is recorded rather than discovered."
+   "expect": "fails",
+   "because": "P53.4 refuted: the dictionary count through scan_counts costs 1.917x, 2.877x and 2.349x per key over inline records (run 3: 25.81 against 10.99 ns/key), over the 2x registered in two of three runs. Wider records mean more bytes per key under the walk; a day's 2,000-term dictionary ranks in about 50 us instead of 22, and logshed's own indexes are written by Store, which never inlines, so W2.5 stands as measured. The price is recorded rather than netted."
   },
   {
    "experiment": "f53-inline",
    "id": "F53.5",
    "profile": "full",
-   "expect": "fails",
-   "because": "P53.5 refuted: ingest-to-routed is 0.807x with inline runs, 216,053 against 267,785 ops/s at p=0.03, and the phases say where -- seal 0.924s against 0.632s, merge 1.988s against 1.212s, with the commit phase unchanged. The bytes are the same (F53.2); their timing is not. With runs in blocks the writer streams data through a 1 MB buffer as the pass runs and the kernel writes it back in the background, so the fsync at finish has little left to flush; with runs inline nothing streams during the pass, the whole key section (140 B a key here) is built in memory and written at the end, and its fsync flushes all of it at once on the critical path. The fix is a layout the writer can stream -- records first in the section, hash and directory after -- which is registered as the next change; this claim stays failing until that run."
+   "expect": "holds",
+   "because": "Held under its restated gate, after the layout that made it fail was replaced. Run 1 refuted the original 'within 5%' at 0.807x: with runs inline nothing streamed during the writer's pass, the whole key section was built in memory and written at finish, and its fsync flushed 140 B a key at once. The records-first layout streams each record as its key closes and puts the fences, directory and hash slots after them, and runs 2 and 3 read 1.149x and 1.163x FASTER with inline runs (run 3: 333,069 against 286,522 ops/s, p=0.003; seal 0.484s against 0.678s, merge 0.846s against 1.222s). That overshot the 5% band upward, which is a decision rather than a rerun: the gate is now 'no slower', and the arc from 0.807x to 1.16x is the record."
   }
  ],
  "metrics": [

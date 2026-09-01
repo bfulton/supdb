@@ -222,11 +222,21 @@ interleaved where the harness allows:
   it partitions what it sealed — so a read touches exactly one segment
   rather than paying a Bloom check on each of several overlapping ones.
 
-  The engine now reads at or above what f44 measures for the same data
-  in a single segment, so segmentation costs nothing at this operating
-  point and the read path itself is the ceiling. Past ~1.6x needs fewer
-  cache misses per lookup (inlining small values in the index is the
-  candidate), not better arrangement.
+  The engine reads at or above what f44 measures for the same data in a
+  single segment, so segmentation costs nothing at this operating point
+  and the read path itself was the ceiling. Past that ceiling needed
+  fewer cache misses per lookup, and that is what inline runs are: a run
+  of values up to 256 bytes lives in its index record, and a read of it
+  touches the hash slot and the record and never the block table or a
+  block. f53 measured it interleaved against block-backed runs three
+  times: point reads **1.36-1.72x faster** (F53.1), disk within 1.7%
+  (F53.2), and -- once the writer streamed the section records-first
+  instead of building it at the end -- ingest **1.15-1.16x faster** too
+  (F53.5, whose first run at 0.807x is the record of why the layout
+  changed). The prices are on the sequential walks, where a record that
+  carries its values is wider: the ordered scan 0.86-0.90x (F53.3) and
+  the dictionary count 2.3-2.9x per key (F53.4), both registered as the
+  trade rather than netted against the gain.
 - **P-C, the durability curve flattens:** the F4-durability sweep shows
   window cost independent of key count — the 25x at a 1,000-op window
   (F4.1) becomes a bounded, window-size-only cost. F4.1 flips or the design
