@@ -112,7 +112,15 @@ checkpoint.
   through it see its own staged writes, and drop is abort with nothing to
   undo. The engine is single-writer and a read borrows it, so no read
   observes a batch half-applied. That is the external suite's transactions
-  axis, which LMDB held over every Supdb arm until now.
+  axis, which LMDB held over every Supdb arm until now. f50 measured
+  what all of it costs: the commit frame is free (F50.1, a tie on the raw
+  shape); a tenth of the keys deleted before the drain leaves 0.913x the
+  disk (F50.2); a deleted key costs a miss, 170 against 194 ns (F50.3);
+  present-key reads after the drain are unaffected because partitions
+  never carry tombstones (F50.4); and the merge is unaffected (F50.5).
+  Format v5's count field, which the tombstone bit rides on, costs 6 B a
+  key -- decomposed to the byte in F7.2 and F11.2, beside the 8 B a key
+  `index_inserts` had already added.
 - **Write scaling** = one active memtable+WAL per shard or per writer;
   segments make the shared-appender mutex (F6.1) unnecessary rather than
   cheaper.
@@ -136,10 +144,13 @@ interleaved where the harness allows:
 
   What that leaves is not on the commit path at all. Against LMDB in the
   external suite the durable load read **0.299x** when this was first
-  written and reads **0.486x** now (EXT.22), with **0.724x** when
-  partitioning is left to compaction (EXT.25); the whole of that move is
-  below. The gap is there because the seal and the flush's partitioning
-  land *inside* the timed window. That is overhead rather than bytes,
+  written and reads **0.39-0.49x** across the last two runs (EXT.22 --
+  LMDB's own load moved 24% between them and next's 1%; the latest is the
+  first with the transactions axis matched, so it is a measurement and
+  not a bound), with **0.63-0.72x** when partitioning is left to
+  compaction (EXT.25); the whole of that move is below. The gap is there
+  because the seal and the flush's partitioning land *inside* the timed
+  window. That is overhead rather than bytes,
   and half of it is a policy choice -- EXT.25 measures **1.985x more
   ingest** and 36% fewer device bytes from leaving partitioning to
   background compaction, for 5% of read throughput, with EXT.26 gating
@@ -175,14 +186,23 @@ interleaved where the harness allows:
   What is left on ingest after that is bytes and barriers, not bookkeeping:
   the routed shape reads and writes the data a second time by design, the
   seal's and the merge's fsyncs sit on the drain, and the commit phase
-  rises when a seal runs beside it (F49.1). The partitioning pass itself
-  stays optional (EXT.25).
+  rises when a seal runs beside it (F49.1). f51 tried the two cheap answers
+  to that last one -- idle I/O priority for the seal and merge threads, and
+  spreading the segment writer's syncs -- and both are inert on this host
+  (F51.1-F51.4, every comparison a tie), so the barrier's growth is not a
+  queueing-order effect here and both knobs ship off. The partitioning
+  pass itself stays optional (EXT.25). What is owed next is the
+  segment-size sweep this brief has listed as open since it was written:
+  smaller seals move the merges off the drain and onto the machine's other
+  cores, at a write amplification the sweep will price (f52, registered
+  in segsize-plan.md).
 - **P-B, the read lead survives: HELD, with its condition stated.** The
   test was "EXT.11's shape with live segment counts under the compaction
   policy stays ≥ 1.2x on x86". At the shipping configuration it reads
-  **1.419x, 1.441x and 1.580x** across three consecutive full runs
-  (EXT.23, each p=0.0022). Report the range rather than the best: LMDB's
-  own rate moved 10.5% across them and next's moved 15%.
+  **1.42-1.64x** across six consecutive full runs (EXT.23, each
+  p=0.0022), the sixth at 1.441x with the transactions axis matched and
+  the format at v5. Report the range rather than the best: LMDB's own
+  rate moves between runs and so does next's.
 
   Getting here took two corrections and one refutation worth keeping.
   The refutation: at 8+ segments the same data reads **0.846x** and

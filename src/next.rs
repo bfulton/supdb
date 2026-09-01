@@ -86,6 +86,34 @@ pub enum SyncPolicy {
     EveryN(u32),
 }
 
+/// I/O priority for the seal and merge threads. `Idle` asks the block layer
+/// to serve everything else -- the commit path's barrier above all -- before
+/// this thread's pages; f49 found the commit phase slowing whenever a seal
+/// ran beside it, and f51 prices this as the answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundIo {
+    Normal,
+    Idle,
+}
+
+/// Lower the calling thread's I/O priority to the idle class. Linux only;
+/// elsewhere a no-op. A failure is ignored on purpose: a scheduler that does
+/// not honour classes leaves the writes where they were, which is a fact
+/// about the host that the measurement records rather than an error.
+fn idle_io_priority() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        // IOPRIO_WHO_PROCESS = 1, who = 0 is this thread, class IDLE = 3
+        // sits in bits 13 and up of the priority value.
+        let _ = libc::syscall(
+            libc::SYS_ioprio_set,
+            1 as libc::c_int,
+            0 as libc::c_int,
+            (3 << 13) as libc::c_int,
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct NextOptions {
     pub sync: SyncPolicy,
@@ -125,6 +153,12 @@ pub struct NextOptions {
     /// order (the default) rather than by collecting, sorting and probing
     /// them. The probe path is kept as f49's comparison arm.
     pub cursor_merge: bool,
+    /// I/O priority of the seal and merge threads (f51).
+    pub background_io: BackgroundIo,
+    /// Have the segment writer fdatasync every this many bytes as it
+    /// streams blocks, so its dirty pages leave in slices rather than in
+    /// one flush at the end. Zero syncs at the end only (f51).
+    pub seal_sync_every: usize,
 }
 
 impl Default for NextOptions {
@@ -138,6 +172,8 @@ impl Default for NextOptions {
             partition_on_flush: true,
             bulk_writer: true,
             cursor_merge: true,
+            background_io: BackgroundIo::Normal,
+            seal_sync_every: 0,
         }
     }
 }
@@ -484,6 +520,9 @@ pub struct SegmentWriter {
     last: usize,
     records: u32,
     parallel_index: bool,
+    /// fdatasync every this many block bytes; zero for the end only.
+    sync_every: u64,
+    since_sync: u64,
 }
 
 /// One superblock slot, field for field what `store::Super::encode` writes:
@@ -540,7 +579,15 @@ impl SegmentWriter {
             last: 0,
             records: 0,
             parallel_index: opts.parallel_index,
+            sync_every: 0,
+            since_sync: 0,
         })
+    }
+
+    /// Spread the writer's syncs: fdatasync every `bytes` of blocks written
+    /// instead of once at `finish`. Zero restores the single sync.
+    pub fn set_sync_every(&mut self, bytes: usize) {
+        self.sync_every = bytes as u64;
     }
 
     /// Start a key. Keys must arrive in strictly increasing order; the
@@ -634,6 +681,14 @@ impl SegmentWriter {
         });
         self.out.write_all(&bytes)?;
         self.pos += bytes.len() as u64;
+        if self.sync_every > 0 {
+            self.since_sync += bytes.len() as u64;
+            if self.since_sync >= self.sync_every {
+                self.out.flush()?;
+                self.out.get_ref().sync_data()?;
+                self.since_sync = 0;
+            }
+        }
         Ok(())
     }
 
@@ -750,9 +805,11 @@ enum PieceWriter {
 }
 
 impl PieceWriter {
-    fn create(path: &Path, opts: &Options, bulk: bool) -> Result<PieceWriter> {
+    fn create(path: &Path, opts: &Options, bulk: bool, sync_every: usize) -> Result<PieceWriter> {
         if bulk {
-            Ok(PieceWriter::Bulk(Box::new(SegmentWriter::create(path, opts)?)))
+            let mut w = SegmentWriter::create(path, opts)?;
+            w.set_sync_every(sync_every);
+            Ok(PieceWriter::Bulk(Box::new(w)))
         } else {
             Ok(PieceWriter::General {
                 store: Box::new(crate::Store::create(path, opts.clone())?),
@@ -1264,6 +1321,8 @@ struct MergePlan {
     opts: Options,
     bulk: bool,
     cursors: bool,
+    background_io: BackgroundIo,
+    sync_every: usize,
 }
 
 fn compact_job(plan: MergePlan) -> Result<Vec<String>> {
@@ -1385,6 +1444,7 @@ struct Emitter<'a> {
     dir: &'a Path,
     opts: &'a Options,
     bulk: bool,
+    sync_every: usize,
     pieces: Vec<Piece>,
     pi: usize,
     r: usize,
@@ -1418,7 +1478,7 @@ impl Emitter<'_> {
         if self.r == from {
             let _ = std::fs::remove_file(&tmp);
             self.w = Some(
-                PieceWriter::create(&tmp, self.opts, self.bulk)
+                PieceWriter::create(&tmp, self.opts, self.bulk, self.sync_every)
                     .map_err(|e| err(&format!("compact create: {e}")))?,
             );
         }
@@ -1468,8 +1528,23 @@ impl Emitter<'_> {
 }
 
 fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
-    let MergePlan { dir, inputs, first_id, end_seq, parts, fences, max_keys, opts, bulk, cursors } =
-        plan;
+    let MergePlan {
+        dir,
+        inputs,
+        first_id,
+        end_seq,
+        parts,
+        fences,
+        max_keys,
+        opts,
+        bulk,
+        cursors,
+        background_io,
+        sync_every,
+    } = plan;
+    if background_io == BackgroundIo::Idle {
+        idle_io_priority();
+    }
     let mut blobs = Vec::with_capacity(inputs.len());
     for name in &inputs {
         blobs.push(
@@ -1600,6 +1675,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         dir: &dir,
         opts: &opts,
         bulk,
+        sync_every,
         pieces,
         pi: 0,
         r: 0,
@@ -2012,12 +2088,17 @@ impl Db {
         let dir = self.dir.clone();
         let opts = Db::segment_opts(&self.opts);
         let bulk = self.opts.bulk_writer;
+        let background_io = self.opts.background_io;
+        let sync_every = self.opts.seal_sync_every;
         let end_seq = old_wal.seq;
         self.retiring_wals.push(old_wal.path.clone());
         drop(old_wal);
         let mem = frozen.clone();
         self.frozen = Some(frozen);
         self.sealing = Some(std::thread::spawn(move || {
+            if background_io == BackgroundIo::Idle {
+                idle_io_priority();
+            }
             // In KEY order, not hash order. A segment written in the
             // memtable's iteration order scatters each key's values across
             // blocks by hash, so an ordered scan walks the file randomly;
@@ -2053,7 +2134,7 @@ impl Db {
                 let tmp = dir.join(format!("seal-{id:08}.tmp"));
                 let _ = std::fs::remove_file(&tmp);
                 {
-                    let mut w = PieceWriter::create(&tmp, &opts, bulk)
+                    let mut w = PieceWriter::create(&tmp, &opts, bulk, sync_every)
                         .map_err(|e| err(&format!("seal create: {e}")))?;
                     for e in &order[start..at] {
                         let key = MemTable::key_of(&mem.keys, e);
@@ -2311,6 +2392,8 @@ impl Db {
         let opts = Db::segment_opts(&self.opts);
         let bulk = self.opts.bulk_writer;
         let cursors = self.opts.cursor_merge;
+        let background_io = self.opts.background_io;
+        let sync_every = self.opts.seal_sync_every;
         let job_inputs = inputs.clone();
         let handle = std::thread::spawn(move || {
             compact_job(MergePlan {
@@ -2324,6 +2407,8 @@ impl Db {
                 opts,
                 bulk,
                 cursors,
+                background_io,
+                sync_every,
             })
         });
         self.compacting = Some((inputs, handle));

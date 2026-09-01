@@ -143,7 +143,7 @@
    "experiment": "f7-index",
    "id": "F7.2",
    "expect": "fails",
-   "because": "A reader's index is 57 bytes per key, against the 131 it cost when decoded onto the heap, and it now lives in a file-backed section that every reader process shares rather than a private copy each. Still above the 32-byte bar this claim sets, so it stays failing -- but the per-process multiplier, which was the substance of the objection, is gone. Measured as the size of the structure rather than the reader's resident set: a mapped index is demand-faulted, so resident size after open measures how little has been read, and resident size after a read pass measures data blocks both arms share."
+   "because": "Reader open grows with key count, though no longer in proportion to it, and what remains is the block table rather than the key index. The index is 89 bytes per key in a mapped section readers share -- it was 131 heap-resident and duplicated per process, then 57, then 74.8 in the previous full record -- and the number decomposes exactly on this shape: 16.8 B of hash slots (a power of two at twice the keys), 12 B of directory (8 B a key plus the half-again room `index_inserts` reserves; 4 B before that became the default), and 60 B of records, a 16-byte key's 40-byte record under the flat index's half-again slack, of which format v5's count field is the 4 B that took a record from 36 to 40. So v5 costs 6 B a key here, 7%, and `index_inserts` 8; both are recorded rather than netted."
   },
   {
    "experiment": "f7-index",
@@ -332,7 +332,7 @@
    "experiment": "f11-flatindex",
    "id": "F11.2",
    "expect": "holds",
-   "because": "67 bytes per key of mapped section against 186 resident for the decoded index. Measured against the section rather than the resident set, because a mapped index is demand-faulted and resident size measures what has been touched rather than what is needed -- three successive versions of this measurement got it wrong before that was understood. Pinned to full: the arms only separate at scale -- at 50k keys the open difference is 61x rather than 2537x and the read difference is inside noise. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
+   "because": "Decoded 226 B/key resident against a mapped section of 99 B/key at 5M keys (the previous record: 186 against 67). The section is exactly what the flat index's plan says it is: 26.8 B of hash slots (2^24 slots for 5M keys, the power-of-two rounding at its worst), 12 B of directory with `index_inserts` room, 60 B of records under the half-again slack -- 98.8 predicted, 98.9 measured, with format v5's count field 6 B of it. Measured against the section rather than against resident size because a read pass faults in block and cache pages common to both arms and dilutes the difference: on that measure it reads 168 B/key against 226.",
    "profile": "full",
    "arch": "x86_64"
   },
@@ -999,21 +999,21 @@
    "id": "EXT.22",
    "profile": "full",
    "expect": "fails",
-   "because": "Loads 283,841 ops/s against lmdb's 584,194 -- 0.486x, p=0.0022 -- up from 0.335x, and the whole of the move is the seal and the merge writing through SegmentWriter with the cursor merge finding keys (F49.1, F49.6), because nothing on the commit path changed. The adapter drains at sync, so sealing 116 MB into segments and partitioning what it sealed both land inside the timed window; that is the design's trade in one line -- EXT.23's read lead is paid for here -- and EXT.25 prices the half of it that is a policy choice. lmdb's own load moved from 812k to 584k between the previous run and this one (host state; its rel_iqr 7.7%), so the ratio is the number and the absolutes are not. Earlier readings on this axis (a 0.9x tie, then 0.48x) were taken against stores that had not written all their data and do not count."
+   "because": "Loads 281,682 ops/s against lmdb's 727,334 -- 0.387x, p=0.0022 -- with the transactions axis matched for the first time: next commits atomic batches with rollback, lmdb commits transactions, and the comparison carries no residual on that axis, so this is a measurement rather than a bound. The ratio moved from 0.486x in the previous run because lmdb's load moved 584k to 727k between the runs (rel_iqr 11%) while next's stayed within 1% (283,841 to 281,682); read the pair, not either alone. The adapter drains at sync, so sealing 116 MB into segments and partitioning what it sealed both land inside the timed window; that is the design's trade in one line -- EXT.23's read lead is paid for here -- and EXT.25 prices the half of it that is a policy choice. Before the bulk writer and the cursor merge this axis read 0.335x."
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.23",
    "profile": "full",
    "expect": "holds",
-   "because": "Held in five consecutive full runs at the shipping configuration -- 1.419x, 1.441x, 1.580x, 1.644x and 1.603x, each p<=0.0022 (the fourth on a restarted container where lmdb's own rate fell 25%, the fifth after the bulk segment writer: 1,349,310 reads/s against lmdb's 841,833). Report the range, not the best: the honest summary is 'about 1.4-1.6x, and the axis is won'. Two things had to be true at once and neither was configuration-hunting. Every key is sealed on both sides now (the adapter drains before reading, where earlier next arms served a large share of their keys from a resident hash memtable -- a different thing from the engine they were measured against), and the store is left ROUTED (a flush partitions what it sealed, so a read touches exactly one segment instead of paying a Bloom check on each of several overlapping ones). The engine now reads at or above what f44 measures for the same data in a single segment, which is its ceiling for this shape: segmentation costs nothing here, and further gains need fewer cache misses per lookup rather than better arrangement. P-B, refuted twice at 8+ segments, holds at the operating point the design is for -- and the condition is part of the claim, because f44 has the same data at 0.77x when spread over eight segments."
+   "because": "Held in six consecutive full runs at the shipping configuration -- 1.419x, 1.441x, 1.580x, 1.644x, 1.603x and 1.441x, each p<=0.0022 -- the sixth with the transactions axis matched and the format at v5, 1,421,910 reads/s against lmdb's 986,476. Report the range, not the best: the honest summary is 'about 1.4-1.6x, and the axis is won'. Two things had to be true at once and neither was configuration-hunting. Every key is sealed on both sides (the adapter drains before reading, where earlier next arms served a large share of their keys from a resident hash memtable -- a different thing from the engine they were measured against), and the store is left ROUTED (a flush partitions what it sealed, so a read touches exactly one segment instead of paying a Bloom check on each of several overlapping ones). The engine reads at or above what f44 measures for the same data in a single segment, which is its ceiling for this shape: segmentation costs nothing here, and further gains need fewer cache misses per lookup rather than better arrangement. P-B, refuted twice at 8+ segments, holds at the operating point the design is for -- and the condition is part of the claim, because f44 has the same data at 0.77x when spread over eight segments."
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.24",
    "profile": "full",
    "expect": "fails",
-   "because": "A TIE, twice, and the arc is the point: 0.040x when this claim was written, 0.137x after the merged-cursor rewrite, 0.495x after seals wrote in key order, 0.769x after the single-source path came back, 1.054x (p=0.90) last run, and now 28,170,655 entries/s against lmdb's 28,231,337 -- 0.998x, no difference at p=0.7983, on a quiet host this time (rel_iqr 8.6% and 2.2%). Recorded as FAILING because the gate is Greater and a tie is not a win; the title says 'no slower', which a tie satisfies, and that mismatch is mine to fix rather than to argue around. What closed the gap last was resolving a block once per run of keys instead of once per key -- f45 priced that indirection at 60.1ns of a 90.8ns scan, and removing it took the scan to 53.6ns, within 14% of a keys-inline layout that would have cost 16% more space and a second read path."
+   "because": "A TIE, three runs running, and the arc is the point: 0.040x when this claim was written, 0.137x after the merged-cursor rewrite, 0.495x after seals wrote in key order, 0.769x after the single-source path came back, then 1.054x, 0.998x, and now 31,232,263 entries/s against lmdb's 31,242,421 -- 1.000x, no difference at p=0.70, with the transactions axis matched. Recorded as FAILING because the gate is Greater and a tie is not a win; the title says 'no slower', which a tie satisfies, and that mismatch is mine to fix rather than to argue around. What closed the gap last was resolving a block once per run of keys instead of once per key -- f45 priced that indirection at 60.1ns of a 90.8ns scan, and removing it took the scan to 53.6ns, within 14% of a keys-inline layout that would have cost 16% more space and a second read path."
   },
   {
    "experiment": "f43-compact",
@@ -1090,14 +1090,14 @@
    "id": "EXT.25",
    "profile": "full",
    "expect": "holds",
-   "because": "Leaving partitioning to background compaction ingests 1.491x faster than doing it at flush: 423,118 ops/s against 283,841, p=0.0022. It was 1.985x before the bulk writer and the cursor merge made the partitioning pass cheaper; the gap between the two policies is exactly what those two changes took out of it. Same engine, same guarantees, one policy bit apart and interleaved in one run, so nothing needs matching and there is no residual to bound -- which is the point of measuring it this way rather than across two runs, as a first attempt did while lmdb's own load moved 86% between them. Point reads barely notice (1.210M/s against 1.349M, both above lmdb's 0.842M) because a couple of overlapping segments is what the Blooms are for. What it costs is the ordered scan, which EXT.26 gates."
+   "because": "Leaving partitioning to background compaction ingests 1.617x faster than doing it at flush: 455,530 ops/s against 281,682, p=0.0022 (1.985x before the bulk writer and the cursor merge made the partitioning pass cheaper, 1.491x the run before this; the gap between the two policies is what those changes took out of it, and the host moved between runs). Same engine, same guarantees, one policy bit apart and interleaved in one run, so nothing needs matching and there is no residual to bound -- which is the point of measuring it this way rather than across two runs, as a first attempt did while lmdb's own load moved 86% between them. Point reads barely notice (1.343M/s against 1.422M, both above lmdb's 0.986M) because a couple of overlapping segments is what the Blooms are for. What it costs is the ordered scan, which EXT.26 gates."
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.26",
    "profile": "full",
    "expect": "holds",
-   "because": "The other half of EXT.25's trade, gated so it cannot be quoted alone: partitioning at flush scans 1.549x faster than leaving it to compaction -- 28,170,655 entries/s against 18,187,008, p=0.0022 (2.007x the run before; both arms' absolutes moved and the direction did not). A scan over disjoint partitions walks each in turn through one key resolution per key; a scan over overlapping segments runs the k-way merge. Both entries hold, which is the honest shape of a trade: an ingest-heavy writer that reads points wants partitioning off and lets compaction reach it on its own schedule, a store that scans wants it on, and this benchmark is too short to show background compaction closing the gap for the first case."
+   "because": "The other half of EXT.25's trade, gated so it cannot be quoted alone: partitioning at flush scans 1.681x faster than leaving it to compaction -- 31,232,263 entries/s against 18,574,911, p=0.0022 (2.007x and 1.549x in the runs before; the direction has not moved). A scan over disjoint partitions walks each in turn through one key resolution per key; a scan over overlapping segments runs the k-way merge. Both entries hold, which is the honest shape of a trade: an ingest-heavy writer that reads points wants partitioning off and lets compaction reach it on its own schedule, a store that scans wants it on, and this benchmark is too short to show background compaction closing the gap for the first case."
   },
   {
    "experiment": "f46-segwrite",
@@ -1203,6 +1203,69 @@
    "profile": "full",
    "expect": "holds",
    "because": "P49.7 held: 1,218,131/s against 1,234,347, no difference at p=0.79, with three partitions and no level-0 segment on both arms. Same writer, same blocks; only how the merge found its keys differed. This is the control that lets F49.4 blame the writer's layout rather than the merge."
+  },
+  {
+   "experiment": "f50-txn",
+   "id": "F50.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P50.1 held: raw 1,714,240 ops/s against raw+commit 1,696,128, no difference at p=0.52 (the first run of the day read 1,169,454 against 1,183,205, also a tie; the raw floor itself moved 46% between the two runs twenty minutes apart, which is the host and why only the within-run comparison counts). A 17-byte frame per 1,000-record batch is 0.013% of the bytes and rides the same fdatasync. It is what lets replay apply a batch whole or not at all."
+  },
+  {
+   "experiment": "f50-txn",
+   "id": "F50.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P50.4's space half held: 166.3 MB on disk with a tenth of the keys deleted before the drain against 182.1 without, 0.913x, under the 0.92x registered; device bytes 483.1 against 495.8 MB. The merge writes the bottom level, drops the values older than a key's newest tombstone and leaves out a key with nothing live, so the delete gets its bytes back at the first merge that reaches it, and nothing was precomputed to make that so."
+  },
+  {
+   "experiment": "f50-txn",
+   "id": "F50.3",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P50.4's read half held, after its control was fixed: a deleted key reads in 170 ns against 194 for a key that never existed, 0.88x, where the bar was 1.2x. The first version of this control numbered its missing keys past the loaded range, so they all routed to the last partition and its directory stayed warm while the deleted set walked every partition's -- 191 against 148 ns, a refutation of the control rather than of the engine, kept here so it is not rediscovered. Absent keys now sit in range with one byte flipped, and the two misses cost the same because they are the same thing: after the drain the store is partitions only, and a merged-away key is simply not there."
+  },
+  {
+   "experiment": "f50-txn",
+   "id": "F50.4",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P50.5 held with room: present-key reads in the store with deletes run 685 ns against 732 without, 0.936x at p=0.0028 -- faster, because a tenth fewer keys is a smaller index, not because the tombstone pass is free. After the drain every source is a partition and partitions never carry tombstones, so has_tombstones is false and the newest-first pass never runs. What a store pays for deletes on reads is confined to the window between a delete and the merge that reaches it, and F50.3 says a miss in that window costs a miss."
+  },
+  {
+   "experiment": "f50-txn",
+   "id": "F50.5",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P50.6 held: merge phase 0.827s with a tenth deleted against 0.833s without, 0.993x; the merge reads the same inputs and writes a tenth less. Ingest-to-routed 390,426 against 405,709 ops/s, the deletes arm having issued 101 more commits for its 100,000 deletes."
+  },
+  {
+   "experiment": "f51-ioprio",
+   "id": "F51.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P51.1 refuted: commit phase 0.786s with the seal and merge threads at IOPRIO_CLASS_IDLE against 0.809s baseline, no difference at p=0.37; seal 0.362s against 0.366s, merge 0.685s against 0.775s (12% shorter, inside the noise). The idle class changes nothing measurable on this host: either its I/O scheduler does not honour priority classes -- the virtualised block device is the likeliest reason -- or the commit path's barrier is not waiting behind the seal's pages at all. What F49.1 saw, the commit phase rising when the seal got faster, is not undone by asking the block layer for precedence, so on this device it is not a queueing-order effect."
+  },
+  {
+   "experiment": "f51-ioprio",
+   "id": "F51.2",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P51.2 refuted: idle-io 429,500 ops/s against baseline 413,376, 1.039x, no difference at p=0.16. The knob ships off (BackgroundIo::Normal) and stays: a host whose scheduler honours the class -- BFQ, or Apple Silicon's -- may answer differently, and the arm is what makes that a rerun rather than a rewrite."
+  },
+  {
+   "experiment": "f51-ioprio",
+   "id": "F51.3",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P51.3 refuted: fdatasync every 4 MB as the segment writer streams leaves the commit phase at 0.799s against 0.809s, no difference at p=0.71, and the seal at 0.360s against 0.366s; device bytes 498.4 against 495.8 MB and ingest 417,209 against 413,376, both ties. Spreading the flush neither helps nor hurts here; the knob ships at zero."
+  },
+  {
+   "experiment": "f51-ioprio",
+   "id": "F51.4",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P51.4 refuted with the others: both levers together leave the commit phase at 0.806s against 0.786s for the better single one, and ingest at 398,824 against 413,376 (0.965x, no difference at p=0.16). Two inert levers compose to nothing, which is at least consistent. The barrier's growth beside a faster seal remains unexplained on this host and is left as an open item rather than a theory; the segment-size sweep (f52) is the next lever, because it moves the merges off the drain instead of reordering the device's queue."
   }
  ],
  "metrics": [

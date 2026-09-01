@@ -748,3 +748,41 @@ fn a_batch_without_its_commit_frame_is_lost_whole() {
         }
     }
 }
+
+#[test]
+fn idle_io_priority_and_sync_spreading_change_nothing_observable() {
+    // f51's two knobs move where the seal's and merge's bytes go and when;
+    // neither may change what a reader sees, through seals, merges and a
+    // reopen. The idle class may be ignored by the host's scheduler and
+    // the syscall may fail -- both are silent by design, and the store
+    // must be identical either way.
+    use supdb::next::BackgroundIo;
+    let d = dir("ioprio");
+    let opts = NextOptions {
+        seal_bytes: 256 << 10,
+        l0_trigger: 3,
+        background_io: BackgroundIo::Idle,
+        seal_sync_every: 64 << 10,
+        ..NextOptions::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let filler = vec![b'y'; 120];
+    for i in 0..20_000u32 {
+        db.append(format!("k{i:06}").as_bytes(), &filler);
+        db.append(format!("k{i:06}").as_bytes(), &i.to_le_bytes());
+        if i % 250 == 249 {
+            db.commit().unwrap();
+        }
+    }
+    db.flush().unwrap();
+    for i in (0..20_000u32).step_by(997) {
+        let got = read_vec(&db, format!("k{i:06}").as_bytes());
+        assert_eq!(got.len(), 2, "k{i:06}");
+        assert_eq!(got[1], i.to_le_bytes().to_vec());
+    }
+    drop(db);
+    let db = Db::open(&d, opts).unwrap();
+    let mut n = 0usize;
+    db.scan(b"", usize::MAX, |_, _| n += 1).unwrap();
+    assert_eq!(n, 40_000, "every value survives the knobs and a reopen");
+}

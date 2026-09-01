@@ -90,10 +90,12 @@ into one request. The fetcher is a parameter, `(offset, length) ->
 and `s3.mjs` supplies SigV4 on top for S3 itself. Credentials, the bucket
 and which object to open stay with the caller, and are never persisted.
 
-Counts stay free. `countFixed` and `scanCountsFixed` are arithmetic on the
-resident extent lists, so a browser ranks a segment's whole term dictionary
-over ranged HTTP with *zero* fetches after open -- W2.4's 283x carried to
-the network axis, recorded as W4.2.
+Counts stay free, for any schema since format v5: every extent carries its
+record count, so `count` and `scanCounts` are sums over the resident extent
+lists exactly as `countFixed` and `scanCountsFixed` are arithmetic on them,
+and a browser ranks a segment's whole term dictionary over ranged HTTP with
+*zero* fetches after open -- recorded as W4.2 on the network axis, and as
+W2.5 (4.5 ns a key against the fixed form's 5.2) on the CPU axis.
 
 **The premise, and when it expires.** All of this splits the object into
 "index and block table, fetched whole at open" and "data, fetched by plan".
@@ -125,11 +127,13 @@ A *fixed-width* posting list does not need to walk: its count is arithmetic on
 `Ext::len`, checked against `Ext::last`, with no block touched. logshed's
 postings are four-byte line ordinals, so `countFixed` is the call it makes.
 
-The same applies to `scanCounts` versus `scanCountsFixed`, and there the
-factor is 283. The walked form is O(every posting in the range) and the extent
-form is O(extents), so a whole day's term dictionary ranks in about 34
-microseconds. That is the answer to "does the browser need a scan, or should
-the roll precompute the panels": it needs a scan, and precomputing buys
+Before format v5 the same was true of `scanCounts` versus `scanCountsFixed`,
+by a factor of 283: the general form walked every posting in the range. The
+count now lives in the extent record, both forms are O(extents), and the
+general one is the faster of the two (W2.4 records the flip, W2.5 the new
+bound): a whole day's term dictionary ranks in about 9 microseconds whatever
+the value width. That is the answer to "does the browser need a scan, or
+should the roll precompute the panels": it needs a scan, and precomputing buys
 nothing.
 
 `countFixed` and `scanCountsFixed` answer `null` rather than guessing when a

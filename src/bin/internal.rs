@@ -129,6 +129,7 @@ fn main() -> std::io::Result<()> {
             "f48-syncpolicy" => f48_syncpolicy(&args, profile)?,
             "f49-bulkseal" => f49_bulkseal(&args, profile)?,
             "f50-txn" => f50_txn(&args, profile)?,
+            "f51-ioprio" => f51_ioprio(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -6241,6 +6242,30 @@ fn f50_txn(args: &Args, profile: Profile) -> std::io::Result<Record> {
         std::hint::black_box(sink);
         t.elapsed().as_nanos() as f64 / reads as f64
     }
+    fn time_reads_absent(db: &Db, keys: u64, reads: u64, seed: u64) -> f64 {
+        let mut kb = [0u8; 16];
+        let mut x = seed;
+        let mut sink = 0u64;
+        let t = Instant::now();
+        for _ in 0..reads {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            db_key_into(z % keys, &mut kb);
+            // An in-range key with one byte flipped: sorts beside its
+            // neighbours, hashes elsewhere, exists nowhere.
+            kb[15] ^= 0x80;
+            sink += db
+                .read_all(&kb, |v| {
+                    std::hint::black_box(v);
+                })
+                .expect("read");
+        }
+        std::hint::black_box(sink);
+        t.elapsed().as_nanos() as f64 / reads as f64
+    }
     let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
         let mut vrng = Rng::new(0xF50 + 7 + rep as u64);
         let mut kb = [0u8; 16];
@@ -6262,7 +6287,7 @@ fn f50_txn(args: &Args, profile: Profile) -> std::io::Result<Record> {
                 db_key_into(i, &mut kb);
                 db.delete(&kb);
                 n += 1;
-                if n % batch == 0 {
+                if n.is_multiple_of(batch) {
                     db.commit().expect("commit");
                 }
             }
@@ -6272,9 +6297,14 @@ fn f50_txn(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let secs = t.elapsed().as_secs_f64();
         let (c, s, m) = db.phase_ns();
         let io_mb = IoCounters::read_now().since(&io0).write_bytes as f64 / 1_048_576.0;
-        let present = time_reads(&db, keys, reads, 0x51 + rep as u64, |z| if z % 10 == 0 { z + 1 } else { z });
+        let present = time_reads(&db, keys, reads, 0x51 + rep as u64, |z| if z.is_multiple_of(10) { z + 1 } else { z });
         let deleted = time_reads(&db, keys, reads, 0x52 + rep as u64, |z| z - z % 10);
-        let missing = time_reads(&db, keys, reads, 0x53 + rep as u64, |z| keys + z);
+        // Absent keys spread over the whole key space, like the deleted set,
+        // so both misses route across every partition's directory. The first
+        // version numbered them past the loaded range and they all landed in
+        // the last partition, whose directory then stayed warm -- a control
+        // that measured cache footprint, not the tombstone path.
+        let missing = time_reads_absent(&db, keys, reads, 0x53 + rep as u64);
         db.close().expect("close");
         let mut bytes = 0u64;
         for e in std::fs::read_dir(&d).expect("dir") {
@@ -6392,6 +6422,202 @@ fn f50_txn(args: &Args, profile: Profile) -> std::io::Result<Record> {
             rates[1].median(),
             rates[0].median(),
             keys / 10 / batch + 1,
+        ),
+    ));
+    Ok(rec)
+}
+
+fn f51_ioprio(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::next::{BackgroundIo, Db, NextOptions};
+
+    let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+
+    let mut rec = Record::new("f51-ioprio", profile);
+    rec.param("keys", J::u(keys))
+        .param("batch", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .note(
+            "four arms interleaved in one process, fresh store per rep, f49's shape: the f42 \
+             durable load with the drain (seal, join, partition) inside the timed window. \
+             baseline is the shipping configuration; idle-io sets IOPRIO_CLASS_IDLE on the \
+             seal and merge threads; spread-4mb has the segment writer fdatasync every 4 MB as \
+             it streams blocks; both is both. Phases from the engine: commit is the WAL append \
+             and its fdatasync, seal and merge are where the committing thread waits for them",
+        )
+        .note("predictions registered in loadlevers-plan.md before the run");
+
+    let dir = scratch("f51");
+    let payload = Payload::new(value_size, 0.5, 0xF51);
+    let arms: [(&str, BackgroundIo, usize); 4] = [
+        ("baseline", BackgroundIo::Normal, 0),
+        ("idle-io", BackgroundIo::Idle, 0),
+        ("spread-4mb", BackgroundIo::Normal, 4 << 20),
+        ("both", BackgroundIo::Idle, 4 << 20),
+    ];
+    // ci, device MB, disk MB, load-only s, commit s, seal s, merge s
+    type Row = (usize, f64, f64, f64, f64, f64, f64);
+    let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
+    let rates = Trial::new(profile.reps()).run(arms.len(), |ci, rep| {
+        let mut vrng = Rng::new(0xF51 + rep as u64);
+        let mut kb = [0u8; 16];
+        let d = dir.join(format!("f51-{ci}-{rep}"));
+        let _ = std::fs::remove_dir_all(&d);
+        let opts = NextOptions {
+            background_io: arms[ci].1,
+            seal_sync_every: arms[ci].2,
+            ..Default::default()
+        };
+        let mut db = Db::create(&d, opts).expect("create");
+        let io0 = IoCounters::read_now();
+        let t = Instant::now();
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            db.append(&kb, payload.get(&mut vrng));
+            if (i + 1) % batch == 0 {
+                db.commit().expect("commit");
+            }
+        }
+        let load_s = t.elapsed().as_secs_f64();
+        db.flush().expect("flush");
+        let secs = t.elapsed().as_secs_f64();
+        let (c, s, m) = db.phase_ns();
+        let io_mb = IoCounters::read_now().since(&io0).write_bytes as f64 / 1_048_576.0;
+        db.close().expect("close");
+        let mut bytes = 0u64;
+        for e in std::fs::read_dir(&d).expect("dir") {
+            bytes += e.expect("entry").metadata().expect("meta").len();
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        rows.lock().unwrap().push((
+            ci,
+            io_mb,
+            bytes as f64 / 1_048_576.0,
+            load_s,
+            c as f64 / 1e9,
+            s as f64 / 1e9,
+            m as f64 / 1e9,
+        ));
+        keys as f64 / secs
+    });
+    let col = |ci: usize, pick: fn(&Row) -> f64| -> Vec<f64> {
+        rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect()
+    };
+    let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
+        let mut v = col(ci, pick);
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
+    rec.series(
+        "arms",
+        J::arr(
+            arms.iter()
+                .enumerate()
+                .zip(rates.iter())
+                .map(|((ci, (name, _, _)), s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "ops_per_s" => J::fp(s.median(), 1),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4),
+                        "load_s" => J::fp(med(ci, |r| r.3), 3),
+                        "commit_s" => J::fp(med(ci, |r| r.4), 3),
+                        "seal_s" => J::fp(med(ci, |r| r.5), 3),
+                        "merge_s" => J::fp(med(ci, |r| r.6), 3),
+                        "device_write_mb" => J::fp(med(ci, |r| r.1), 1),
+                        "disk_mb" => J::fp(med(ci, |r| r.2), 1)
+                    }
+                })
+                .collect(),
+        ),
+    );
+
+    let commit = |ci: usize| Samples::new(col(ci, |r| r.4));
+    let c_base = commit(0);
+    let c_idle = compare(&c_base, &commit(1), supdb::bench::MIN_EFFECT);
+    rec.compare("commit_s_baseline_vs_idle", c_idle.clone());
+    let c_spread = compare(&c_base, &commit(2), supdb::bench::MIN_EFFECT);
+    rec.compare("commit_s_baseline_vs_spread", c_spread.clone());
+    let c_both = compare(&c_base, &commit(3), supdb::bench::MIN_EFFECT);
+    rec.compare("commit_s_baseline_vs_both", c_both.clone());
+    let ing_idle = compare(&rates[1], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("idle_vs_baseline_ingest", ing_idle.clone());
+    let ing_spread = compare(&rates[2], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("spread_vs_baseline_ingest", ing_spread.clone());
+    let ing_both = compare(&rates[3], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("both_vs_baseline_ingest", ing_both.clone());
+
+    let (cb, sb, mb) = (med(0, |r| r.4), med(0, |r| r.5), med(0, |r| r.6));
+    let within = |ci: usize| med(ci, |r| r.5) <= 1.15 * sb && med(ci, |r| r.6) <= 1.15 * mb;
+    rec.finding(Finding::new(
+        "F51.1",
+        "idle I/O priority on the seal and merge threads takes the commit phase to at most 0.9x the baseline's without lifting seal or merge past 1.15x",
+        med(1, |r| r.4) <= 0.9 * cb && within(1),
+        format!(
+            "commit phase {:.3}s idle against {:.3}s baseline ({}); seal {:.3}s against {:.3}s, \
+             merge {:.3}s against {:.3}s. The seal writes 64 MB while the commit path issues a \
+             barrier per batch on the same device; the idle class asks the block layer to \
+             serve the barrier first. Refuted with the phases unchanged means the host's \
+             scheduler ignores the class",
+            med(1, |r| r.4),
+            cb,
+            c_idle.summary("baseline", "idle-io"),
+            med(1, |r| r.5),
+            sb,
+            med(1, |r| r.6),
+            mb,
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F51.2",
+        "idle I/O priority lifts ingest-to-routed by at least 1.05x",
+        matches!(ing_idle.verdict, supdb::bench::Verdict::Greater) && ing_idle.ratio >= 1.05,
+        format!(
+            "idle-io {:.0} ops/s against baseline {:.0} ({}); device bytes {:.1} against {:.1} \
+             MB. The commit phase is about a third of the window, so this needs the seal and \
+             merge not to slow down in exchange for what the barrier gains",
+            rates[1].median(),
+            rates[0].median(),
+            ing_idle.summary("idle-io", "baseline"),
+            med(1, |r| r.1),
+            med(0, |r| r.1),
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F51.3",
+        "spreading the segment writer's syncs every 4 MB takes the commit phase to at most 0.9x the baseline's without lifting the seal past 1.15x",
+        med(2, |r| r.4) <= 0.9 * cb && med(2, |r| r.5) <= 1.15 * sb,
+        format!(
+            "commit phase {:.3}s spread against {:.3}s baseline ({}); seal {:.3}s against \
+             {:.3}s, merge {:.3}s against {:.3}s; ingest {:.0} against {:.0} ops/s ({}). Dirty \
+             pages leaving in 4 MB slices instead of one 64 MB flush at finish -- or more \
+             barriers from the seal contending with the commit path's, which is the refutation",
+            med(2, |r| r.4),
+            cb,
+            c_spread.summary("baseline", "spread-4mb"),
+            med(2, |r| r.5),
+            sb,
+            med(2, |r| r.6),
+            mb,
+            rates[2].median(),
+            rates[0].median(),
+            ing_spread.summary("spread-4mb", "baseline"),
+        ),
+    ));
+    let best = med(1, |r| r.4).min(med(2, |r| r.4));
+    rec.finding(Finding::new(
+        "F51.4",
+        "the two levers compose: both together reach at least the better of the two on the commit phase",
+        med(3, |r| r.4) <= 1.02 * best,
+        format!(
+            "commit phase {:.3}s with both against {:.3}s for the better single lever ({}); \
+             ingest {:.0} ops/s against baseline {:.0} ({})",
+            med(3, |r| r.4),
+            best,
+            c_both.summary("baseline", "both"),
+            rates[3].median(),
+            rates[0].median(),
+            ing_both.summary("both", "baseline"),
         ),
     ));
     Ok(rec)

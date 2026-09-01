@@ -119,6 +119,13 @@ The matched scorecard against LMDB, `full`:
 | read (`EXT.11`) | 1,172,769/s | 865,587/s | 1.355x, holds -- unstable on this host; 2.42x on Apple Silicon, replicated |
 | scan (`EXT.12`) | 17.4M/s | 18.6M/s | coin toss here (1.16x sig, then 0.93x nd, same night); 1.17x on Apple Silicon, replicated |
 
+The next engine (`src/next.rs`), matched on durability *and* transactions
+since it gained atomic batches and `Txn`: durable load **0.39-0.49x** of LMDB
+across the last two canonical runs (`EXT.22`; 0.63-0.72x with partitioning
+left to compaction, `EXT.25`), point reads **1.42-1.64x** over six runs
+(`EXT.23`), ordered scan a tie three runs running (`EXT.24`). Its story is in
+`docs/next-engine.md`; every number there is under the same gate.
+
 `EXT.9` has moved three times, each for a decomposed reason: 6,735 -> 54,333
 ops/s when `Options::index_inserts` stopped every batch rewriting the whole
 key index; -> ~152,800 when durability points went log-first with a single
