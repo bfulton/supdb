@@ -209,6 +209,14 @@ fn bulk_segment_reads_identically_to_a_store_written_one() {
     let b = open(&dir.join("bulk.sup"));
     assert!(b.blocks() > 0, "the long runs still need blocks, got {}", b.blocks());
     agree(&a, &b, &data);
+    // The writer's other layout -- every run in a block, section built at
+    // the end, the order `Store` writes -- must agree with both as well:
+    // two layouts of one format that answered differently would be the
+    // second-reader failure mode with a second writer.
+    write_bulk_with(&dir.join("blocks.sup"), &data, opts(), 0);
+    let c = open(&dir.join("blocks.sup"));
+    agree(&a, &c, &data);
+    assert!(c.lookup(&data[0].0).expect("present").iter().all(|e| !e.is_inline()));
     // Which runs went inline is decided by their byte length, and an inline
     // run plans no fetch: the extent names no block and the read touches
     // the record alone.

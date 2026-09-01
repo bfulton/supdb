@@ -516,16 +516,15 @@ struct Seg {
 /// prove the checksum recorded is the one the reader checks.
 pub struct SegmentWriter {
     out: std::io::BufWriter<File>,
-    /// File offset the next block lands at. Data starts after the header
+    /// File offset the next write lands at. Data starts after the header
     /// region, which holds the two superblock slots and is written last.
     pos: u64,
     builder: BlockBuilder,
     block_size: usize,
     blocks: Vec<BlockLoc>,
     /// Every key written, concatenated, with each key's span. Flat rather
-    /// than a `Vec<Vec<u8>>` because a segment has a million keys and the
-    /// index build wants them all at once; the extent beside each span is
-    /// the one record `flatindex::encode` reads.
+    /// than a `Vec<Vec<u8>>` because a segment has a million keys; the
+    /// extent beside each span is the one record the index carries.
     key_arena: Vec<u8>,
     spans: Vec<(usize, usize)>,
     exts: Vec<Extents>,
@@ -544,9 +543,42 @@ pub struct SegmentWriter {
     /// block (`Ext::INLINE`); zero keeps every run in blocks.
     inline_max: usize,
     /// The inline runs, concatenated, with each key's span in it (empty for
-    /// a key whose run went to a block).
+    /// a key whose run went to a block). Blocks-first mode only; the
+    /// records-first mode streams each tail out inside its record.
     tails: Vec<u8>,
     tail_spans: Vec<(usize, usize)>,
+    /// Which of the two layouts this segment is being written in. Decided
+    /// at the first key from `inline_max`, because the first bytes differ.
+    mode: Option<Layout>,
+    /// Records-first mode: the records streamed so far, their offsets, and
+    /// each key's hash for the trailer's slots.
+    recs_len: usize,
+    rec_offs: Vec<u32>,
+    hashes: Vec<u64>,
+    rec_buf: Vec<u8>,
+    /// Records-first mode: block bytes held until the section is complete,
+    /// with their table rows (offsets filled in when they are written).
+    pending_blocks: Vec<Vec<u8>>,
+}
+
+/// The two layouts the writer produces. Same format, same readers, one
+/// difference: what streams during the pass.
+///
+/// `BlocksFirst` is what `Store` also writes -- data blocks as they fill,
+/// then the block table and the key section built whole at the end. It is
+/// right when values live in blocks, because the blocks stream and the
+/// kernel writes them back behind the pass.
+///
+/// `RecordsFirst` is for inline runs: the key section comes first in the
+/// file and its records stream as keys arrive, the few block-backed runs
+/// are held and written after it, and the hash slots, directory and fences
+/// go after the records. Without it an inline segment wrote nothing during
+/// the pass and its whole section at `finish`, and f53 measured that as
+/// 0.807x on ingest for the same bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    BlocksFirst,
+    RecordsFirst,
 }
 
 /// One superblock slot, field for field what `store::Super::encode` writes:
@@ -608,19 +640,43 @@ impl SegmentWriter {
             inline_max: 0,
             tails: Vec::new(),
             tail_spans: Vec::new(),
+            mode: None,
+            recs_len: 0,
+            rec_offs: Vec::new(),
+            hashes: Vec::new(),
+            rec_buf: Vec::new(),
+            pending_blocks: Vec::new(),
         })
-    }
-
-    /// Store runs up to `bytes` long inline in the index record. Zero keeps
-    /// every run in a block, which is the layout `Store` writes.
-    pub fn set_inline_max(&mut self, bytes: usize) {
-        self.inline_max = bytes;
     }
 
     /// Spread the writer's syncs: fdatasync every `bytes` of blocks written
     /// instead of once at `finish`. Zero restores the single sync.
     pub fn set_sync_every(&mut self, bytes: usize) {
         self.sync_every = bytes as u64;
+    }
+
+    /// Store runs up to `bytes` long inline in the index record, and write
+    /// the segment records-first so they stream. Zero keeps every run in a
+    /// block and the blocks-first layout `Store` writes. Must be set before
+    /// the first key.
+    pub fn set_inline_max(&mut self, bytes: usize) {
+        self.inline_max = bytes;
+    }
+
+    fn layout(&mut self) -> Result<Layout> {
+        if let Some(m) = self.mode {
+            return Ok(m);
+        }
+        let m = if self.inline_max > 0 { Layout::RecordsFirst } else { Layout::BlocksFirst };
+        if m == Layout::RecordsFirst {
+            // The section header is written last, once the trailer's
+            // offsets are known; its 192 bytes are reserved now so the
+            // records start where `stream_trailer` says they do.
+            self.out.write_all(&[0u8; 192])?;
+            self.pos += 192;
+        }
+        self.mode = Some(m);
+        Ok(m)
     }
 
     /// Start a key. Keys must arrive in strictly increasing order; the
@@ -638,6 +694,7 @@ impl SegmentWriter {
                 return Err(err("segment writer: keys must arrive in strictly increasing order"));
             }
         }
+        self.layout()?;
         let start = self.key_arena.len();
         self.key_arena.extend_from_slice(key);
         self.open_key = Some((start, key.len()));
@@ -672,45 +729,62 @@ impl SegmentWriter {
         if n > u32::MAX as usize {
             return Err(err("segment writer: a key's values exceed 4 GiB in one segment"));
         }
-        // A run that does not fit beside what is staged starts a new block;
-        // a run larger than a whole block takes an empty builder and is a
-        // block by itself, so a key's values stay contiguous -- the same
-        // rule `Store` applies through the same `BlockBuilder`.
         let count = self.records | if tombstone { Ext::TOMBSTONE } else { 0 };
-        if self.inline_max > 0 && n <= self.inline_max {
-            // Into the record's tail: a read of this key never touches a
-            // block. `off` is within this key's tail, and a key has one run
-            // here, so it is zero.
-            let ts = self.tails.len();
-            self.tails.extend_from_slice(&self.run);
-            self.tail_spans.push((ts, n));
-            self.spans.push((start, len));
-            self.exts.push(Extents::One(Ext {
-                block: Ext::INLINE,
-                off: 0,
+        let layout = self.layout()?;
+        let inline = self.inline_max > 0 && n <= self.inline_max;
+        let ext = if inline {
+            // Into the record: a read of this key never touches a block.
+            // `off` is within this key's tail, and a key has one run here.
+            Ext { block: Ext::INLINE, off: 0, len: n as u32, last: self.last as u32, count }
+        } else {
+            // A run that does not fit beside what is staged starts a new
+            // block; a run larger than a whole block takes an empty builder
+            // and is a block by itself, so a key's values stay contiguous --
+            // the same rule `Store` applies through the same `BlockBuilder`.
+            if self.builder.would_overflow(n) {
+                self.flush_block()?;
+            }
+            let off = self.builder.push(&self.run);
+            let ext = Ext {
+                block: self.blocks.len() as u32,
+                off,
                 len: n as u32,
                 last: self.last as u32,
                 count,
-            }));
-            return Ok(());
-        }
-        if self.builder.would_overflow(n) {
-            self.flush_block()?;
-        }
-        let off = self.builder.push(&self.run);
-        let ext = Ext {
-            block: self.blocks.len() as u32,
-            off,
-            len: n as u32,
-            last: self.last as u32,
-            count,
+            };
+            if self.builder.len() >= self.block_size {
+                self.flush_block()?;
+            }
+            ext
         };
-        if self.builder.len() >= self.block_size {
-            self.flush_block()?;
+        match layout {
+            Layout::RecordsFirst => {
+                let key = &self.key_arena[start..start + len];
+                let tail: &[u8] = if inline { &self.run } else { &[] };
+                self.rec_buf.clear();
+                let wrote = flatindex::stream_record(&mut self.rec_buf, key, &[ext], tail)
+                    .ok_or_else(|| err("segment writer: record exceeds the flat index's limits"))?;
+                self.out.write_all(&self.rec_buf)?;
+                self.pos += wrote as u64;
+                self.rec_offs.push(self.recs_len as u32);
+                self.recs_len += wrote;
+                self.hashes.push(flatindex::key_hash(key));
+                if self.recs_len > flatindex::MAX_RECS {
+                    return Err(err("segment writer: key section exceeds the flat index's limits"));
+                }
+            }
+            Layout::BlocksFirst => {
+                if inline {
+                    let ts = self.tails.len();
+                    self.tails.extend_from_slice(&self.run);
+                    self.tail_spans.push((ts, n));
+                } else {
+                    self.tail_spans.push((0, 0));
+                }
+                self.exts.push(Extents::One(ext));
+            }
         }
         self.spans.push((start, len));
-        self.tail_spans.push((0, 0));
-        self.exts.push(Extents::One(ext));
         Ok(())
     }
 
@@ -731,6 +805,12 @@ impl SegmentWriter {
             chunk_crc: false,
             crc,
         });
+        if self.mode == Some(Layout::RecordsFirst) {
+            // Held until the section is complete; `off` is set when it is
+            // written, and nothing reads the row before then.
+            self.pending_blocks.push(bytes);
+            return Ok(());
+        }
         self.out.write_all(&bytes)?;
         self.pos += bytes.len() as u64;
         if self.sync_every > 0 {
@@ -763,17 +843,54 @@ impl SegmentWriter {
         self.spans.len()
     }
 
-    /// Write the block table, the key section and the superblock, and
-    /// fsync. `generation` is what the segment reports as its checkpoint
-    /// identity; a segment is written once, so 1 is the usual answer.
+    /// Write what is left -- the key section or its trailer, the held
+    /// blocks, the block table, the superblock -- and fsync. `generation`
+    /// is what the segment reports as its checkpoint identity; a segment
+    /// is written once, so 1 is the usual answer.
     pub fn finish(mut self, generation: u64) -> Result<()> {
         if self.open_key.is_some() {
             return Err(err("segment writer: finish with a key still open"));
         }
+        let layout = self.layout()?;
         // A segment with no keys is allowed: a partition whose every key was
         // deleted still has to exist, or the fences stop tiling the key
         // space and a later seal would route keys into a neighbour's range.
         self.flush_block()?;
+
+        let (key_off, key_len, header): (u64, usize, Option<Vec<u8>>) = match layout {
+            Layout::RecordsFirst => {
+                let key_off = crate::store::SUPER;
+                let (header, trailer, total) = {
+                    let arena = &self.key_arena;
+                    let spans = &self.spans;
+                    let key_at = |i: usize| -> &[u8] {
+                        let (s, l) = spans[i];
+                        &arena[s..s + l]
+                    };
+                    flatindex::stream_trailer(
+                        self.recs_len,
+                        &self.rec_offs,
+                        &key_at,
+                        &self.hashes,
+                        generation,
+                    )
+                    .ok_or_else(|| err("segment writer: key section exceeds the flat index's limits"))?
+                };
+                self.out.write_all(&trailer)?;
+                self.pos += trailer.len() as u64;
+                debug_assert_eq!(self.pos, key_off + total as u64);
+                // Now the blocks that were held, each row taking its offset
+                // as it lands.
+                let held = std::mem::take(&mut self.pending_blocks);
+                for (i, bytes) in held.into_iter().enumerate() {
+                    self.blocks[i].off = self.pos;
+                    self.out.write_all(&bytes)?;
+                    self.pos += bytes.len() as u64;
+                }
+                (key_off, total, Some(header))
+            }
+            Layout::BlocksFirst => (0, 0, None),
+        };
 
         let rows = vec![[0u32; block::MAX_CHUNK_CRCS]; self.blocks.len()];
         let table = flatindex::encode_blocks(&self.blocks, &rows);
@@ -782,43 +899,52 @@ impl SegmentWriter {
         self.out.write_all(&table)?;
         self.pos += table.len() as u64;
 
-        let (section, reserve) = {
-            let all: Vec<(&[u8], &Extents)> = self
-                .spans
-                .iter()
-                .zip(&self.exts)
-                .map(|(&(s, l), e)| (&self.key_arena[s..s + l], e))
-                .collect();
-            let tails: Vec<&[u8]> = self
-                .tail_spans
-                .iter()
-                .map(|&(s, l)| &self.tails[s..s + l])
-                .collect();
-            // No insert room and no record slack: a segment is never edited
-            // in place, and the half-again the flat index reserves for that
-            // is 20 B a key of file it would never use.
-            flatindex::encode_inline(
-                &all,
-                &tails,
-                generation,
-                None,
-                flatindex::key_hash,
-                0,
-                false,
-                self.parallel_index,
-            )
-            .ok_or_else(|| err("segment writer: key section exceeds the flat index's limits"))?
+        let (key_off, key_len) = if layout == Layout::BlocksFirst {
+            let (section, reserve) = {
+                let all: Vec<(&[u8], &Extents)> = self
+                    .spans
+                    .iter()
+                    .zip(&self.exts)
+                    .map(|(&(s, l), e)| (&self.key_arena[s..s + l], e))
+                    .collect();
+                let tails: Vec<&[u8]> = self
+                    .tail_spans
+                    .iter()
+                    .map(|&(s, l)| &self.tails[s..s + l])
+                    .collect();
+                // No insert room and no record slack: a segment is never
+                // edited in place, and the half-again the flat index
+                // reserves for that is 20 B a key of file it would never use.
+                flatindex::encode_inline(
+                    &all,
+                    &tails,
+                    generation,
+                    None,
+                    flatindex::key_hash,
+                    0,
+                    false,
+                    self.parallel_index,
+                )
+                .ok_or_else(|| err("segment writer: key section exceeds the flat index's limits"))?
+            };
+            self.pad_to(8)?;
+            let key_off = self.pos;
+            self.out.write_all(&section)?;
+            let key_len = reserve.max(section.len());
+            if key_len > section.len() {
+                self.out.write_all(&vec![0u8; key_len - section.len()])?;
+            }
+            self.pos += key_len as u64;
+            (key_off, key_len)
+        } else {
+            (key_off, key_len)
         };
-        self.pad_to(8)?;
-        let key_off = self.pos;
-        self.out.write_all(&section)?;
-        let key_len = reserve.max(section.len());
-        if key_len > section.len() {
-            self.out.write_all(&vec![0u8; key_len - section.len()])?;
-        }
-        self.pos += key_len as u64;
 
         let file = self.out.into_inner().map_err(|e| e.into_error())?;
+        use std::os::unix::fs::FileExt;
+        if let Some(h) = header {
+            file.write_all_at(&h, key_off)?;
+        }
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -845,7 +971,6 @@ impl SegmentWriter {
             generation,
         ];
         let sb = superblock(&fields);
-        use std::os::unix::fs::FileExt;
         file.write_all_at(&sb, 0)?;
         file.write_all_at(&sb, crate::store::SLOT)?;
         file.sync_all()?;

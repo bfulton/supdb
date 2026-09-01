@@ -173,6 +173,146 @@ fn record_len_tail(klen: usize, next: usize, tail: usize) -> usize {
     record_len(klen, next) + align_up(tail, REC_ALIGN)
 }
 
+/// Append one record -- `encode`'s record layout, byte for byte -- to `out`,
+/// for a writer that streams records as keys arrive instead of building the
+/// section at the end. Returns the bytes appended.
+pub fn stream_record(out: &mut Vec<u8>, key: &[u8], exts: &[Ext], tail: &[u8]) -> Option<usize> {
+    if key.len() > u16::MAX as usize || exts.len() > u16::MAX as usize {
+        return None;
+    }
+    let len = record_len_tail(key.len(), exts.len(), tail.len());
+    let base = out.len();
+    out.resize(base + len, 0);
+    let rec = &mut out[base..];
+    rec[0..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+    rec[2..4].copy_from_slice(&(exts.len() as u16).to_le_bytes());
+    rec[4..4 + key.len()].copy_from_slice(key);
+    let mut at = align_up(4 + key.len(), REC_ALIGN);
+    for e in exts {
+        rec[at..at + 4].copy_from_slice(&e.block.to_le_bytes());
+        rec[at + 4..at + 8].copy_from_slice(&e.off.to_le_bytes());
+        rec[at + 8..at + 12].copy_from_slice(&e.len.to_le_bytes());
+        rec[at + 12..at + 16].copy_from_slice(&e.last.to_le_bytes());
+        rec[at + 16..at + 20].copy_from_slice(&e.count.to_le_bytes());
+        at += EXT_BYTES;
+    }
+    rec[at..at + tail.len()].copy_from_slice(tail);
+    Some(len)
+}
+
+/// The section header and the trailer for a records-first section: the
+/// records were streamed starting at `HEADER`, `recs_len` bytes of them, and
+/// the trailer -- fences, directory, hash slots, each aligned -- follows
+/// them. `key_at(i)` returns the i-th key (for the fence samples) and
+/// `hashes[i]` its hash. Returns (header, trailer, section total).
+///
+/// The layout is one `FlatIndex::parse` accepts because every region is
+/// addressed by offset; it differs from `encode`'s only in order, and
+/// `tests/segwriter.rs` holds the two to the same answers on every read.
+pub fn stream_trailer<'a>(
+    recs_len: usize,
+    rec_offs: &[u32],
+    key_at: &dyn Fn(usize) -> &'a [u8],
+    hashes: &[u64],
+    generation: u64,
+) -> Option<(Vec<u8>, Vec<u8>, usize)> {
+    let n = rec_offs.len();
+    if hashes.len() != n || recs_len > MAX_RECS {
+        return None;
+    }
+    let recs_off = HEADER;
+    let mut cap = 1usize;
+    while cap < n * 2 {
+        cap = cap.checked_mul(2)?;
+    }
+    cap = cap.max(16);
+    let mask = cap - 1;
+
+    let mut t: Vec<u8> = Vec::new();
+    let mut at = recs_off + recs_len; // absolute section offset of t's end
+    fn pad_to(t: &mut Vec<u8>, at: &mut usize, align: usize) {
+        let want = align_up(*at, align);
+        t.resize(t.len() + (want - *at), 0);
+        *at = want;
+    }
+    // Fences.
+    pad_to(&mut t, &mut at, 4);
+    let stride = fence_stride(n);
+    let fence_n = n.div_ceil(stride);
+    let fence_offs_off = at;
+    if fence_n > 0 {
+        let offs_len = (fence_n + 1) * 4;
+        let mut blob: Vec<u8> = Vec::new();
+        let mut offs: Vec<u8> = Vec::with_capacity(offs_len);
+        for i in 0..fence_n {
+            offs.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+            blob.extend_from_slice(key_at(i * stride));
+        }
+        offs.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+        t.extend_from_slice(&offs);
+        t.extend_from_slice(&blob);
+        at += offs_len + blob.len();
+    }
+    // Directory.
+    pad_to(&mut t, &mut at, 4);
+    let dir_off = at;
+    for o in rec_offs {
+        t.extend_from_slice(&o.to_le_bytes());
+    }
+    at += n * 4;
+    // Hash slots: 8-aligned, `encode`'s probe and tag, byte for byte.
+    pad_to(&mut t, &mut at, 8);
+    let hash_off = at;
+    let hash_start = t.len();
+    t.resize(hash_start + cap * SLOT, 0);
+    for (i, &h) in hashes.iter().enumerate() {
+        let tag = ((h >> 56) | 1) & 0xff;
+        let packed = (tag << 56) | rec_offs[i] as u64;
+        let mut s = (h as usize) & mask;
+        loop {
+            let a = hash_start + s * SLOT;
+            if t[a..a + 8] == [0u8; 8] {
+                t[a..a + 8].copy_from_slice(&packed.to_le_bytes());
+                break;
+            }
+            s = (s + 1) & mask;
+        }
+    }
+    at += cap * SLOT;
+    let total = at;
+
+    let mut h = vec![0u8; HEADER];
+    h[0..4].copy_from_slice(&MAGIC.to_ne_bytes());
+    h[4..8].copy_from_slice(&VERSION.to_le_bytes());
+    for (i, v) in [
+        generation,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        0u64,
+        n as u64,
+        cap as u64,
+        hash_off as u64,
+        dir_off as u64,
+        recs_off as u64,
+        recs_len as u64,
+        recs_len as u64,
+        recs_len as u64,
+        fence_offs_off as u64,
+        fence_n as u64,
+        stride as u64,
+        0u64,
+        0u64,
+    ]
+    .iter()
+    .enumerate()
+    {
+        h[8 + i * 8..16 + i * 8].copy_from_slice(&v.to_le_bytes());
+    }
+    Some((h, t, total))
+}
+
 /// Measure the section before writing it, so the whole thing can be built into
 /// one allocation of the right size rather than grown.
 /// `insert_slack` is how many keys beyond the current set the directory should
@@ -681,12 +821,26 @@ impl FlatIndex {
         };
         let dir_end = dir_region_end;
         let recs_end = recs_off.checked_add(recs_cap)?;
-        if hash_off < HEADER
-            || hash_end > dir_off
-            || dir_end > recs_off
-            || recs_end > sec.len()
-            || nkeys > hash_cap
-        {
+        // Regions are addressed by offset, so their order in the section is
+        // free: `encode` lays out hash, directory, fences, records, and the
+        // segment writer streams records first and puts the rest after them.
+        // What is enforced is that every region sits inside the section past
+        // the header and that no two overlap.
+        let regions = [(hash_off, hash_end), (dir_off, dir_end), (recs_off, recs_end)];
+        for (a, b) in regions {
+            if a < HEADER || b > sec.len() || a > b {
+                return None;
+            }
+        }
+        for i in 0..regions.len() {
+            for j in (i + 1)..regions.len() {
+                let ((a0, a1), (b0, b1)) = (regions[i], regions[j]);
+                if a0 < b1 && b0 < a1 && a0 != a1 && b0 != b1 {
+                    return None;
+                }
+            }
+        }
+        if nkeys > hash_cap {
             return None;
         }
 
@@ -702,7 +856,7 @@ impl FlatIndex {
                 return None;
             }
             let offs_end = fence_offs_off.checked_add(fence_n.checked_add(1)?.checked_mul(4)?)?;
-            if fence_offs_off < dir_end || offs_end > recs_off {
+            if fence_offs_off < HEADER || offs_end > sec.len() {
                 return None;
             }
             let offs = sec.get(fence_offs_off..offs_end)?;
@@ -710,8 +864,14 @@ impl FlatIndex {
             // after the offsets.
             let blob_len = rd_u32(offs, fence_n * 4)? as usize;
             let blob_end = offs_end.checked_add(blob_len)?;
-            if blob_end > recs_off {
+            if blob_end > sec.len() {
                 return None;
+            }
+            // The fence region may not overlap the others either.
+            for (a, b) in [(hash_off, hash_end), (dir_off, dir_end), (recs_off, recs_end)] {
+                if fence_offs_off < b && a < blob_end && a != b && fence_offs_off != blob_end {
+                    return None;
+                }
             }
             Some((
                 (fence_offs_off, offs_end),
