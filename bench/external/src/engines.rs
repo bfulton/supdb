@@ -336,10 +336,23 @@ impl Engine for Supdb {
 pub struct Next {
     db: Option<supdb::next::Db>,
     path: PathBuf,
+    /// False for the ingest-first arm: a flush stops partitioning what it
+    /// sealed and leaves that to background compaction. Both arms exist so
+    /// the trade is measured in ONE interleaved run rather than compared
+    /// across two, which is the whole reason this suite interleaves.
+    partition: bool,
 }
 
 impl Next {
     pub fn create(path: &Path) -> Res<Next> {
+        Next::with_policy(path, true)
+    }
+
+    pub fn create_ingest(path: &Path) -> Res<Next> {
+        Next::with_policy(path, false)
+    }
+
+    fn with_policy(path: &Path, partition: bool) -> Res<Next> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         // Checksums off in the segments, because LMDB has none and the axis
         // is equalizable -- the same call `supdb-durable` makes, and the
@@ -360,17 +373,21 @@ impl Next {
             // the flush stops partitioning what it sealed and leaves that
             // to background compaction. Both arms are measured rather than
             // argued about.
-            partition_on_flush: std::env::var_os("SUPDB_NO_FLUSH_PARTITION").is_none(),
+            partition_on_flush: partition,
             ..Default::default()
         };
         let db = supdb::next::Db::create(path, opts).map_err(|e| e.to_string())?;
-        Ok(Next { db: Some(db), path: path.to_path_buf() })
+        Ok(Next { db: Some(db), path: path.to_path_buf(), partition })
     }
 }
 
 impl Engine for Next {
     fn name(&self) -> &'static str {
-        "next"
+        if self.partition {
+            "next"
+        } else {
+            "next-ingest"
+        }
     }
     fn features(&self) -> Features {
         Features {

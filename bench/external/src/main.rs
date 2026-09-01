@@ -78,6 +78,9 @@ fn build(root: &std::path::Path, which: &[&str], buffer_mb: usize) -> Vec<Box<dy
         let e: Result<Box<dyn Engine>, String> = match *name {
             "supdb" => Supdb::create(&dir, buffer_mb).map(|e| Box::new(e) as Box<dyn Engine>),
             "next" => Next::create(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
+            "next-ingest" => {
+                Next::create_ingest(&dir).map(|e| Box::new(e) as Box<dyn Engine>)
+            }
             "supdb-durable" => {
                 Supdb::create_durable(&dir, buffer_mb).map(|e| Box::new(e) as Box<dyn Engine>)
             }
@@ -787,6 +790,29 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         "lmdb",
         &read,
         "reads/s",
+        false,
+    );
+    // The read-for-write trade, measured in one run rather than across
+    // two: same engine, same guarantees, one policy bit apart, so nothing
+    // needs matching and there is no residual to bound.
+    ordering_of(
+        &mut rec,
+        "EXT.25",
+        "Leaving partitioning to background compaction ingests faster than doing it at flush",
+        "next-ingest",
+        "next",
+        &load,
+        "ops/s",
+        true,
+    );
+    ordering_of(
+        &mut rec,
+        "EXT.26",
+        "and it costs the ordered scan",
+        "next",
+        "next-ingest",
+        &scan,
+        "entries/s",
         false,
     );
     ordering_of(
