@@ -116,7 +116,7 @@ The matched scorecard against LMDB, `full`:
 |---|---|---|---|
 | load, both durable (`EXT.9`) | 199,485/s | 572,416/s | **0.348x**, failing |
 | load, neither (`EXT.10`) | 628,814/s | 652,367/s | no difference here; 0.85x on Apple Silicon, replicated |
-| read (`EXT.11`) | 1,172,769/s | 865,587/s | 1.355x, holds -- unstable on this host; 2.42x on Apple Silicon, replicated |
+| read (`EXT.11`) | 1,106,133/s | 1,060,077/s | 1.043x, a tie in the latest run and recorded as failing (1.196x, 1.092x, 1.043x across the runs since format v5); 2.42x on Apple Silicon, replicated |
 | scan (`EXT.12`) | 17.4M/s | 18.6M/s | coin toss here (1.16x sig, then 0.93x nd, same night); 1.17x on Apple Silicon, replicated |
 
 The next engine (`src/next.rs`), matched on durability *and* transactions
