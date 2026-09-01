@@ -209,18 +209,10 @@ fn fence_lo(min_key: &[u8]) -> Vec<u8> {
     min_key[..min_key.len().min(FENCE_MAX)].to_vec()
 }
 
-/// `None` means unbounded above: every prefix byte was 0xff, so no
-/// representable bound is greater.
-fn fence_hi(max_key: &[u8]) -> Option<Vec<u8>> {
-    let mut b = max_key[..max_key.len().min(FENCE_MAX)].to_vec();
-    while let Some(last) = b.pop() {
-        if last != 0xff {
-            b.push(last + 1);
-            return Some(b);
-        }
-    }
-    None
-}
+/// A half-open key range `[lo, hi)`, `None` above meaning unbounded. The
+/// live partitions tile the key space with these, and every merge output
+/// is named by one.
+type Fence = (Vec<u8>, Option<Vec<u8>>);
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -319,6 +311,32 @@ impl Seg {
     fn open(dir: &Path, name: &str) -> Result<Seg> {
         let blob = Blob::open(MmapBytes::open(&dir.join(name))?)
             .map_err(|e| err(&format!("segment {name}: {e}")))?;
+        // `pcs-` is a range-ALIGNED L0 piece: a seal split at the live
+        // partition boundaries, so it carries a fence like a partition and
+        // overlaps only the pieces of its own range. That alignment is what
+        // makes a merge O(range) instead of O(store).
+        if let Some(rest) = name.strip_prefix("pcs-").and_then(|r| r.strip_suffix(".sup")) {
+            let f: Vec<&str> = rest.split('-').collect();
+            if f.len() != 4 {
+                return Err(err("aligned piece name is malformed"));
+            }
+            let lo = unhex(f[2]).ok_or_else(|| err("segment fence is malformed"))?;
+            let hi = if f[3].is_empty() {
+                None
+            } else {
+                Some(unhex(f[3]).ok_or_else(|| err("segment fence is malformed"))?)
+            };
+            let mut bloom = BlockedBloom::with_capacity(blob.keys());
+            Seg::for_each_key(&blob, |k| bloom.insert(k))?;
+            return Ok(Seg {
+                blob,
+                name: name.to_string(),
+                level: 0,
+                lo,
+                hi,
+                bloom: Some(bloom),
+            });
+        }
         if let Some(rest) = name.strip_prefix("par-").and_then(|r| r.strip_suffix(".sup")) {
             // par-<id>-<endseq>-<lo hex>-<hi hex>: fences route this one,
             // so nothing is walked at open. The unbounded high fence is the
@@ -611,8 +629,16 @@ fn compact_job(
     first_id: u64,
     end_seq: u64,
     parts: usize,
+    // `Some` names the exact output fences: one segment per fence, keys
+    // assigned by it. That is how boundaries stay STABLE once they exist
+    // -- a merge that re-derived them would misalign every piece sealed
+    // under the old ones, forcing another full merge, and that loop is
+    // what kept device bytes at the full-rewrite level. `None` is the
+    // first partitioning only, which has no boundaries to preserve.
+    fences: Option<Vec<Fence>>,
     opts: Options,
 ) -> Result<Vec<String>> {
+    let _ = &parts;
     let mut blobs = Vec::with_capacity(inputs.len());
     for name in &inputs {
         blobs.push(
@@ -629,19 +655,76 @@ fn compact_job(
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    let parts = parts.max(1).min(keys.len());
+    let parts = match &fences {
+        Some(f) => f.len().max(1),
+        None => parts.max(1).min(keys.len()),
+    };
     let per = keys.len().div_ceil(parts);
 
-    let mut out = Vec::with_capacity(parts);
-    for (pi, chunk) in keys.chunks(per).enumerate() {
+    // The partition set must TILE the key space: every key routes to
+    // exactly one partition, with no gap between one partition's high
+    // fence and the next one's low fence. Deriving each fence separately
+    // from its own chunk does not do that -- `fence_hi(last of chunk i)`
+    // and `fence_lo(first of chunk i+1)` are different values, and a key
+    // landing between them is sealed into a range whose fence then denies
+    // it on the read path. Silent value loss, found at 1M keys by an
+    // experiment's own assertion after the contract tests (whose stores
+    // are too small to make a gap) passed clean.
+    //
+    // So a boundary is ONE value, shared by the partitions on either side,
+    // and the keys are sliced BY the boundaries rather than the boundaries
+    // derived from the slices.
+    let mut bounds: Vec<Vec<u8>> = Vec::new();
+    if fences.is_none() {
+        for i in 1..parts {
+            let b = fence_lo(&keys[(i * per).min(keys.len() - 1)]);
+            if bounds.last().is_none_or(|p| p != &b) {
+                bounds.push(b);
+            }
+        }
+    }
+    // Slice by whichever boundaries govern: the given fences when the
+    // caller has them, the derived ones when it does not.
+    let mut slices: Vec<(usize, usize)> = Vec::new();
+    match &fences {
+        Some(fs) => {
+            for (lo, hi) in fs {
+                let from = keys.partition_point(|k| k.as_slice() < lo.as_slice());
+                let to = match hi {
+                    Some(h) => keys.partition_point(|k| k.as_slice() < h.as_slice()),
+                    None => keys.len(),
+                };
+                slices.push((from, to.max(from)));
+            }
+        }
+        None => {
+            let mut at = 0usize;
+            for b in &bounds {
+                let end = keys.partition_point(|k| k.as_slice() < b.as_slice());
+                if end > at {
+                    slices.push((at, end));
+                    at = end;
+                }
+            }
+            slices.push((at, keys.len()));
+        }
+    }
+
+    let mut out = Vec::with_capacity(slices.len());
+    for (pi, &(from, to)) in slices.iter().enumerate() {
+        let chunk = &keys[from..to];
+        if chunk.is_empty() {
+            continue;
+        }
         let id = first_id + pi as u64;
-        let lo = fence_lo(&chunk[0]);
-        // The high fence is open-ended for the last partition so that a key
-        // beyond every key seen here still routes somewhere.
-        let hi = if pi + 1 == keys.len().div_ceil(per) {
-            None
-        } else {
-            fence_hi(chunk.last().expect("chunk is non-empty"))
+        let (lo, hi) = match &fences {
+            Some(fs) => fs[pi].clone(),
+            // Unbounded at both ends of the set, and every interior fence
+            // is the boundary shared with the neighbour.
+            None => (
+                if pi == 0 { Vec::new() } else { bounds[pi - 1].clone() },
+                if pi + 1 == slices.len() { None } else { Some(bounds[pi].clone()) },
+            ),
         };
         let name = format!(
             "par-{id:08}-{end_seq:016}-{}-{}.sup",
@@ -654,6 +737,15 @@ fn compact_job(
             let store = Store::create(&tmp, opts.clone())
                 .map_err(|e| err(&format!("compact create: {e}")))?;
             for key in chunk {
+                // Insurance against the class of bug that produced this
+                // line: a merge told to write a fence must contain what it
+                // writes, or the read path will deny it and no test will
+                // say so.
+                if key.as_slice() < lo.as_slice()
+                    || hi.as_ref().is_some_and(|h| key.as_slice() >= h.as_slice())
+                {
+                    return Err(err("compaction would write a key outside its fence"));
+                }
                 for b in &blobs {
                     b.read_all(key, |v| {
                         // `Store::append` cannot fail for a value already in
@@ -711,7 +803,7 @@ pub struct Db {
     /// than every segment and older than `mem`) while a thread writes it
     /// out; `join_seal` collects the finished segment.
     frozen: Option<std::sync::Arc<MemTable>>,
-    sealing: Option<std::thread::JoinHandle<Result<String>>>,
+    sealing: Option<std::thread::JoinHandle<Result<Vec<String>>>>,
     /// Sorted keys of the unsealed sources (memtable + frozen), built lazily
     /// by `scan` and reused until a write or a seal changes what is
     /// unsealed. Without this, every scan walked the whole memtable: the
@@ -742,7 +834,10 @@ impl Db {
     /// their first two fields, so one parser serves the manifest, the
     /// orphan sweep and the replay bound.
     fn name_field(name: &str, i: usize) -> Option<u64> {
-        let rest = name.strip_prefix("seg-").or_else(|| name.strip_prefix("par-"))?;
+        let rest = name
+            .strip_prefix("seg-")
+            .or_else(|| name.strip_prefix("par-"))
+            .or_else(|| name.strip_prefix("pcs-"))?;
         rest.strip_suffix(".sup")?.split('-').nth(i)?.parse().ok()
     }
 
@@ -796,7 +891,11 @@ impl Db {
         let mut on_disk: Vec<String> = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let name = entry?.file_name().to_string_lossy().into_owned();
-            if (name.starts_with("seg-") || name.starts_with("par-")) && name.ends_with(".sup") {
+            if (name.starts_with("seg-")
+                || name.starts_with("par-")
+                || name.starts_with("pcs-"))
+                && name.ends_with(".sup")
+            {
                 on_disk.push(name);
             }
         }
@@ -825,12 +924,8 @@ impl Db {
         for name in &live {
             segs.push(Seg::open(dir, name)?);
         }
-        // Partitions first in KEY order (the binary search in `read_all`
-        // depends on it), then L0 oldest to newest by name.
         segs.sort_by(|a, b| {
-            b.level
-                .cmp(&a.level)
-                .then_with(|| if a.level > 0 { a.lo.cmp(&b.lo) } else { a.name.cmp(&b.name) })
+            b.level.cmp(&a.level).then_with(|| a.lo.cmp(&b.lo)).then_with(|| a.name.cmp(&b.name))
         });
         let seg_ids: Vec<(u64, u64)> = live
             .iter()
@@ -927,8 +1022,19 @@ impl Db {
         );
         self.wal_id += 1;
         self.wal.seq = old_wal.seq;
-        let seg_id = self.next_seg;
-        self.next_seg += 1;
+        // The live partition fences, if any. A seal splits the memtable at
+        // them and writes one piece per range, so every piece overlaps only
+        // its own range and a later merge touches one partition instead of
+        // the whole store. Before the first partitioning there are none and
+        // the seal writes a single full-range segment.
+        let fences: Vec<Fence> = self
+            .segs
+            .iter()
+            .filter(|s| s.level > 0)
+            .map(|s| (s.lo.clone(), s.hi.clone()))
+            .collect();
+        let first_id = self.next_seg;
+        self.next_seg += fences.len().max(1) as u64;
         let dir = self.dir.clone();
         let opts = Db::segment_opts(&self.opts);
         let end_seq = old_wal.seq;
@@ -937,36 +1043,68 @@ impl Db {
         let mem = frozen.clone();
         self.frozen = Some(frozen);
         self.sealing = Some(std::thread::spawn(move || {
-            let tmp = dir.join(format!("seal-{seg_id:08}.tmp"));
-            let _ = std::fs::remove_file(&tmp);
-            {
-                let store = Store::create(&tmp, opts)
-                    .map_err(|e| err(&format!("seal create: {e}")))?;
-                // In KEY order, not hash order. A segment written in the
-                // memtable's iteration order scatters each key's values
-                // across blocks by hash, so an ordered scan walks the file
-                // randomly; written sorted, a scan walks it forwards. This
-                // is W1.3's finding in the new engine -- how the roll
-                // writes decides what the read costs -- and the sort is
-                // affordable because a seal is off the commit path.
-                let mut order: Vec<&MemEntry> =
-                    mem.entries.iter().filter(|e| e.hash != 0).collect();
-                order.sort_unstable_by_key(|e| MemTable::key_of(&mem.keys, e));
-                for e in order {
-                    let key = MemTable::key_of(&mem.keys, e);
-                    for off in mem.chain(e) {
-                        store
-                            .append(key, mem.value_at(off))
-                            .map_err(|e| err(&format!("seal append: {e}")))?;
+            // In KEY order, not hash order. A segment written in the
+            // memtable's iteration order scatters each key's values across
+            // blocks by hash, so an ordered scan walks the file randomly;
+            // written sorted, a scan walks it forwards. This is W1.3's
+            // finding in the new engine -- how the roll writes decides what
+            // the read costs -- and the sort is affordable because a seal is
+            // off the commit path. The same sort is what makes splitting at
+            // the fences a matter of slicing.
+            let mut order: Vec<&MemEntry> =
+                mem.entries.iter().filter(|e| e.hash != 0).collect();
+            order.sort_unstable_by_key(|e| MemTable::key_of(&mem.keys, e));
+
+            let ranges: Vec<Fence> = if fences.is_empty() {
+                vec![(Vec::new(), None)]
+            } else {
+                fences
+            };
+            let mut names = Vec::new();
+            let mut at = 0usize;
+            for (ri, (lo, hi)) in ranges.iter().enumerate() {
+                let start = at;
+                while at < order.len() {
+                    let k = MemTable::key_of(&mem.keys, order[at]);
+                    if hi.as_ref().is_some_and(|h| k >= h.as_slice()) {
+                        break;
                     }
+                    at += 1;
                 }
-                store.checkpoint().map_err(|e| err(&format!("seal checkpoint: {e}")))?;
-                store.close().map_err(|e| err(&format!("seal close: {e}")))?;
+                if at == start {
+                    continue;
+                }
+                let id = first_id + ri as u64;
+                let tmp = dir.join(format!("seal-{id:08}.tmp"));
+                let _ = std::fs::remove_file(&tmp);
+                {
+                    let store = Store::create(&tmp, opts.clone())
+                        .map_err(|e| err(&format!("seal create: {e}")))?;
+                    for e in &order[start..at] {
+                        let key = MemTable::key_of(&mem.keys, e);
+                        for off in mem.chain(e) {
+                            store
+                                .append(key, mem.value_at(off))
+                                .map_err(|e| err(&format!("seal append: {e}")))?;
+                        }
+                    }
+                    store.checkpoint().map_err(|e| err(&format!("seal checkpoint: {e}")))?;
+                    store.close().map_err(|e| err(&format!("seal close: {e}")))?;
+                }
+                let name = if ranges.len() == 1 && lo.is_empty() && hi.is_none() {
+                    Db::seg_name(id, end_seq)
+                } else {
+                    format!(
+                        "pcs-{id:08}-{end_seq:016}-{}-{}.sup",
+                        hex(lo),
+                        hi.as_deref().map(hex).unwrap_or_default()
+                    )
+                };
+                std::fs::rename(&tmp, dir.join(&name))?;
+                names.push(name);
             }
-            let name = Db::seg_name(seg_id, end_seq);
-            std::fs::rename(&tmp, dir.join(&name))?;
             File::open(&dir)?.sync_all()?;
-            Ok(name)
+            Ok(names)
         }));
         Ok(())
     }
@@ -991,16 +1129,92 @@ impl Db {
         let Some(handle) = self.sealing.take() else {
             return Ok(());
         };
-        let name = handle.join().map_err(|_| err("seal thread panicked"))??;
-        self.covered_seq = self.covered_seq.max(Db::name_end_seq(&name).unwrap_or(0));
-        self.segs.push(Seg::open(&self.dir, &name)?);
+        let names = handle.join().map_err(|_| err("seal thread panicked"))??;
+        for name in &names {
+            self.covered_seq = self.covered_seq.max(Db::name_end_seq(name).unwrap_or(0));
+            self.segs.push(Seg::open(&self.dir, name)?);
+        }
+        self.sort_segs();
         self.frozen = None;
         self.publish()?;
         for old in std::mem::take(&mut self.retiring_wals) {
             let _ = std::fs::remove_file(old);
         }
-        if self.opts.compact && self.l0_len() >= self.opts.l0_trigger {
-            self.start_compact()?;
+        if self.opts.compact {
+            self.maybe_compact()?;
+        }
+        Ok(())
+    }
+
+    /// Partitions first in key order, then L0 by (range, age). `read_all`
+    /// binary-searches the first group and walks a contiguous run of the
+    /// second, so both depend on this order.
+    fn sort_segs(&mut self) {
+        self.segs.sort_by(|a, b| {
+            b.level
+                .cmp(&a.level)
+                .then_with(|| a.lo.cmp(&b.lo))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+    }
+
+    /// A merge is due when any one range has accumulated `l0_trigger`
+    /// aligned pieces -- or, before the first partitioning, when that many
+    /// full-range segments have piled up.
+    fn maybe_compact(&mut self) -> Result<()> {
+        let parts: Vec<Fence> = self
+            .segs
+            .iter()
+            .filter(|s| s.level > 0)
+            .map(|s| (s.lo.clone(), s.hi.clone()))
+            .collect();
+        if parts.is_empty() {
+            if self.l0_len() >= self.opts.l0_trigger {
+                return self.start_compact(None);
+            }
+            return Ok(());
+        }
+        // A seal that finished DURING the initial partitioning wrote a
+        // full-range segment against the fences that existed when it
+        // started, so it now spans several partitions. Folding it into one
+        // range would write keys outside that range's fence and the read
+        // path would then deny them -- silent loss, which is exactly how
+        // this was found. Anything not aligned to a live range forces a
+        // full re-partitioning instead.
+        if let Some(wide) = self
+            .segs
+            .iter()
+            .find(|s| s.level == 0 && !parts.iter().any(|f| (s.lo.clone(), s.hi.clone()) == *f))
+        {
+            // It spans several ranges: merge it into every partition it
+            // overlaps, each output keeping its own existing fence. The
+            // boundaries do not move, so nothing else becomes misaligned.
+            let (wlo, whi) = (wide.lo.clone(), wide.hi.clone());
+            let touched: Vec<Fence> = parts
+                .into_iter()
+                .filter(|(lo, hi)| {
+                    let below = hi.as_ref().is_some_and(|h| &wlo >= h);
+                    let above = whi.as_ref().is_some_and(|h| h <= lo);
+                    !below && !above
+                })
+                .collect();
+            return self.start_compact(Some(touched));
+        }
+        let worst = parts
+            .into_iter()
+            .map(|f| {
+                let n = self
+                    .segs
+                    .iter()
+                    .filter(|s| s.level == 0 && s.lo == f.0 && s.hi == f.1)
+                    .count();
+                (n, f)
+            })
+            .max_by_key(|(n, _)| *n);
+        if let Some((n, fence)) = worst {
+            if n >= self.opts.l0_trigger {
+                return self.start_compact(Some(vec![fence]));
+            }
         }
         Ok(())
     }
@@ -1019,27 +1233,53 @@ impl Db {
     /// disjoint set. Inputs stay live until `join_compact` publishes the
     /// outputs, so a reader during the merge sees the old set and a crash
     /// during it leaves the old set.
-    fn start_compact(&mut self) -> Result<()> {
+    /// `fence: None` is the initial partitioning -- everything live, split
+    /// into partitions by size. `Some(range)` is the incremental merge: one
+    /// partition and the pieces aligned to it, rewritten as one partition
+    /// with the same fence. The second reads and writes O(range) where the
+    /// first is O(store), which is what F43.4 and F44.1 both convicted.
+    fn start_compact(&mut self, fences: Option<Vec<Fence>>) -> Result<()> {
         if let Some((_, h)) = &self.compacting {
             if !h.is_finished() {
-                // A merge is still running. The tail grows past its bound
-                // until it lands, which costs reads a few extra Bloom
-                // checks -- cheaper than blocking a commit behind a merge,
-                // and the reason P4.4 can hold at all.
+                // A merge is still running. Deferring rather than blocking
+                // keeps it off the commit path; the range it would have
+                // merged waits for the next seal.
                 return Ok(());
             }
             self.join_compact()?;
         }
-        let inputs: Vec<String> = self.live_names();
+        let inputs: Vec<String> = match &fences {
+            None => self.live_names(),
+            Some(fs) => self
+                .segs
+                .iter()
+                .filter(|s| {
+                    // Everything the output fences will cover: the
+                    // partitions being rewritten, and any level-0 segment
+                    // whose own range overlaps one of them.
+                    fs.iter().any(|(lo, hi)| {
+                        let below = hi.as_ref().is_some_and(|h| &s.lo >= h);
+                        let above = s.hi.as_ref().is_some_and(|h| h <= lo);
+                        !below && !above
+                    })
+                })
+                .map(|s| s.name.clone())
+                .collect(),
+        };
         if inputs.is_empty() {
             return Ok(());
         }
-        let bytes: u64 = inputs
-            .iter()
-            .filter_map(|n| std::fs::metadata(self.dir.join(n)).ok())
-            .map(|m| m.len())
-            .sum();
-        let parts = (bytes as usize).div_ceil(self.opts.seal_bytes.max(1)).max(1);
+        let parts = match &fences {
+            Some(f) => f.len(),
+            None => {
+                let bytes: u64 = inputs
+                    .iter()
+                    .filter_map(|n| std::fs::metadata(self.dir.join(n)).ok())
+                    .map(|m| m.len())
+                    .sum();
+                (bytes as usize).div_ceil(self.opts.seal_bytes.max(1)).max(1)
+            }
+        };
         let end_seq = self.covered_seq;
         let first_id = self.next_seg;
         self.next_seg += parts as u64;
@@ -1047,7 +1287,7 @@ impl Db {
         let opts = Db::segment_opts(&self.opts);
         let job_inputs = inputs.clone();
         let handle = std::thread::spawn(move || {
-            compact_job(dir, job_inputs, first_id, end_seq, parts, opts)
+            compact_job(dir, job_inputs, first_id, end_seq, parts, fences, opts)
         });
         self.compacting = Some((inputs, handle));
         Ok(())
@@ -1073,12 +1313,8 @@ impl Db {
         // Partitions first (older, disjoint), then whatever L0 arrived
         // while the merge ran, oldest to newest.
         merged.extend(kept);
-        merged.sort_by(|a, b| {
-            b.level
-                .cmp(&a.level)
-                .then_with(|| if a.level > 0 { a.lo.cmp(&b.lo) } else { a.name.cmp(&b.name) })
-        });
         self.segs = merged;
+        self.sort_segs();
         self.publish()?;
         for name in &inputs {
             let _ = std::fs::remove_file(self.dir.join(name));
@@ -1112,9 +1348,18 @@ impl Db {
                     .map_err(|e| err(&format!("segment read: {e}")))?;
             }
         }
-        // The L0 tail overlaps arbitrarily and is bounded by `l0_trigger`,
-        // so every one of them is asked -- through its Bloom.
-        for seg in &self.segs[np..] {
+        // L0 is sorted by (range, age) and aligned pieces share a range's
+        // fence exactly, so the pieces that can hold this key are one
+        // contiguous run -- found by the same binary search, walked oldest
+        // first, and each one still gated by its Bloom. Full-range segments
+        // from before the first partitioning sort at the front with an
+        // empty low fence, so they are simply the first part of that run.
+        let l0 = &self.segs[np..];
+        let from = l0.partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+        for seg in &l0[from..] {
+            if seg.lo.as_slice() > key {
+                break;
+            }
             if !seg.may_hold(key) {
                 continue;
             }

@@ -354,3 +354,49 @@ fn a_crash_before_the_manifest_lands_keeps_the_pre_merge_store() {
         );
     }
 }
+
+#[test]
+fn every_key_survives_partitioning_and_range_merges_at_scale() {
+    // The contract tests above use stores too small to make a partition
+    // boundary interesting. This one loads enough to force the initial
+    // partitioning AND several per-range merges, then demands every key
+    // back. A fence that does not tile the key space loses keys silently
+    // here and nowhere smaller.
+    let d = dir("scale");
+    let mut db = Db::create(
+        &d,
+        NextOptions { seal_bytes: 512 << 10, l0_trigger: 3, ..NextOptions::default() },
+    )
+    .unwrap();
+    let n = 60_000u32;
+    let filler = vec![b'x'; 100];
+    for i in 0..n {
+        let key = format!("k{i:08}").into_bytes();
+        let mut val = i.to_le_bytes().to_vec();
+        val.extend_from_slice(&filler);
+        db.append(&key, &val);
+        if i % 1000 == 999 {
+            db.commit().unwrap();
+        }
+    }
+    db.flush().unwrap();
+    let (par, l0) = db.levels();
+    assert!(par > 1, "expected several partitions, got {par} with {l0} in the tail");
+
+    let mut missing = Vec::new();
+    for i in 0..n {
+        let key = format!("k{i:08}").into_bytes();
+        let mut want = i.to_le_bytes().to_vec();
+        want.extend_from_slice(&filler);
+        let got = read_vec(&db, &key);
+        if got != vec![want] {
+            missing.push((i, got.len()));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "{} keys wrong, first ten {:?} ({par} partitions, {l0} tail)",
+        missing.len(),
+        &missing[..missing.len().min(10)]
+    );
+}
