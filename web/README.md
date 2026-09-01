@@ -97,6 +97,11 @@ and a browser ranks a segment's whole term dictionary over ranged HTTP with
 *zero* fetches after open -- recorded as W4.2 on the network axis, and as
 W2.5 (4.5 ns a key against the fixed form's 5.2) on the CPU axis.
 
+Reads of small keys are free too, for a segment the next engine wrote: a run
+of values up to 256 bytes lives inside its index record (`Ext::INLINE`), so
+`readAll` on such a key is answered from the resident index and `ranges_for`
+plans nothing. Only runs longer than that reach the data by plan.
+
 **The premise, and when it expires.** All of this splits the object into
 "index and block table, fetched whole at open" and "data, fetched by plan".
 That split costs approximately nothing today because logshed's key

@@ -210,6 +210,24 @@ holds), so a day's whole term dictionary ranks in about 9 µs for any schema
 and nothing has to be precomputed at roll time. A file written before v5 is
 refused by its magic rather than misread.
 
+**A small run lives in its index record, and a read of it touches no block.**
+Since the inline extension of v5, the segment writer stores a run of values
+up to `NextOptions::inline_bytes` (256 by default) inside the record itself,
+after the extents; its extent names `Ext::INLINE` instead of a block. A point
+read then costs the hash slot and the record -- two cache misses fewer than
+the block table row and the block at a million keys, which f53 measured
+(F53.1) as the largest read gain in the project -- and `ranges_for` plans no
+fetch for it, so a browser reading a small key over ranged HTTP fetches
+nothing after open. The prices are on the sequential walks, where wider
+records mean more bytes per key (F53.3, F53.4), and they are recorded beside
+the gain. To let those records stream, the writer lays the key section out
+records-first -- header, records, then fences, directory and hash slots --
+which `FlatIndex::parse` accepts because every region is named by offset;
+`Store` still writes the original order and never inlines, `Blob` reads both,
+and `store::Reader` does not serve inline runs (a next-engine segment is read
+through `Blob`). A v5 reader from before the extension errors on the block id
+rather than answering wrongly, so the magic did not move.
+
 `count_fixed` claims a count only when two independent quantities agree: the
 run is a whole number of strides, *and* `Ext::last` — the offset of the final
 record, stored so that reading the newest value is O(1) — is exactly
