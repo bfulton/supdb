@@ -1127,6 +1127,27 @@
    "profile": "full",
    "expect": "fails",
    "because": "Registered as the alternative if independent streams serialised at the device, and refuted the other way: four threads sharing one file under a group commit reach 2,145,551 records/s against 2,738,027 for four independent streams, 0.784x at p=0.0022. One barrier amortised over four batches did not beat four barriers, because the appends behind a mutex cost more than the barriers saved -- the device has SOME concurrency (1.61x) and independence uses it where the lock throws it away. If group commit is ever built it wants a lock-free append region, not a mutex around the file."
+  },
+  {
+   "experiment": "f48-syncpolicy",
+   "id": "F48.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P48.1 held. Four arms interleaved on the f42 load shape (1M keys, 1,000-record batches, 100-byte values), differing only in SyncPolicy: sync every commit 695,711 ops/s, every fourth 971,187, every sixteenth 1,137,039, every sixty-fourth 1,235,921. every-16 against always is 1.634x at p=0.0022, and the commit phase it moves goes from 0.84s to 0.28s of the window while device bytes stay put (130.8 MB against 127.1 -- the WAL is written on every commit in every arm; the policy moves only the barrier). f47 fixed this device at about 2,700 barriers a second however they are issued; riding sixteen batches on each is what buys the headroom that no arrangement of writers could (F47.1). every-64 lands past f39's raw commit floor of 1,191,125, which is consistent with the barrier having been the floor's largest term."
+  },
+  {
+   "experiment": "f48-syncpolicy",
+   "id": "F48.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P48.2 held: every-64 runs 1.087x of every-16, under the 1.15x registered as 'gains little'. Once the barrier rides sixteen batches its share of the commit path is small and what remains is the memtable append and the WAL framing, which no sync policy touches. A large gain here would have meant the barrier was a bigger share than f42's phase split measured."
+  },
+  {
+   "experiment": "f48-syncpolicy",
+   "id": "F48.3",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P48.3 held, and it is the contract that makes F48.1 sellable: 23 commits under EveryN(16), the WAL torn inside the unsynced tail, reopened -- every record behind the last barrier present, the torn frame served zero values, nothing duplicated. Bounded loss means the tail is lost whole and never in part, and it is measured beside the speed rather than assumed."
   }
  ],
  "metrics": [

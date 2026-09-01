@@ -177,8 +177,14 @@ interleaved where the harness allows:
   1.6x under a spend-complexity-for-time priority, and its registered bar
   is now **1.6x, not 2.5x**. Where ingest headroom actually lives on a
   barrier-bound device is fewer barriers per record: larger batches, or a
-  bounded-loss sync policy (the old engine's `Sync::EveryN`, which the new
-  engine does not yet offer).
+  bounded-loss sync policy. **Built and measured (f48):** `SyncPolicy::EveryN`
+  syncs every Nth commit and writes the WAL on every one. Every-16 ingests
+  **1.634x** every-batch (F48.1, p=0.0022, commit phase 0.84s to 0.28s,
+  device bytes unchanged), every-64 adds only 1.087x over that (F48.2), and
+  a torn unsynced tail is lost whole and never in part (F48.3). That is the
+  same 1.6x sharding would buy, for a policy bit instead of N writers; the
+  two attack different terms (barriers per record, barriers per second), so
+  whether they compose is the next thing to measure rather than assume.
 - **P-E, crash semantics:** a store killed before any seal opens from the
   WAL alone (C3.4 flips), and history survives reopen (segments do not
   forget).
