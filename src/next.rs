@@ -293,6 +293,58 @@ struct Seg {
     lo: Vec<u8>,
     hi: Option<Vec<u8>>,
     bloom: Option<BlockedBloom>,
+    /// Values per key, in rank order -- the sidecar `counts_path` writes.
+    ///
+    /// f28 measured counting a variable-width key's values at 1,983ns
+    /// against 93ns to resolve it and stop, because the only general way to
+    /// count length-prefixed records is to walk them. `count_fixed` escapes
+    /// that only when every value is the same width, which a posting list
+    /// guarantees and an arbitrary caller does not. Four bytes a key, in a
+    /// file beside the segment rather than inside it, buys the general
+    /// case: no change to the store format, nothing for the browser reader
+    /// to learn, and a segment without the sidecar simply falls back to the
+    /// walk.
+    counts: Option<Vec<u32>>,
+}
+
+/// Where a segment's per-rank counts live: the segment's own name with the
+/// suffix replaced, so the manifest names one file and the sidecar follows
+/// it -- and an orphan sweep that removes a segment removes this too.
+fn counts_path(dir: &Path, seg_name: &str) -> PathBuf {
+    dir.join(format!("{}.counts", seg_name.trim_end_matches(".sup")))
+}
+
+/// Write counts in rank order. Called by whoever wrote the segment, which
+/// is the only place the counts are known without walking the file again.
+fn write_counts(dir: &Path, seg_name: &str, counts: &[u32]) -> Result<()> {
+    let mut out = Vec::with_capacity(counts.len() * 4);
+    for c in counts {
+        out.extend_from_slice(&c.to_le_bytes());
+    }
+    let path = counts_path(dir, seg_name);
+    let tmp = path.with_extension("counts.tmp");
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(&out)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+fn read_counts(dir: &Path, seg_name: &str, keys: usize) -> Option<Vec<u32>> {
+    let raw = std::fs::read(counts_path(dir, seg_name)).ok()?;
+    // A sidecar that does not match the segment it names is ignored rather
+    // than trusted: it is an optimisation, and a wrong count is worse than
+    // a slow one.
+    if raw.len() != keys * 4 {
+        return None;
+    }
+    Some(
+        raw.chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
+            .collect(),
+    )
 }
 
 impl Seg {
@@ -333,6 +385,7 @@ impl Seg {
             };
             let mut bloom = BlockedBloom::with_capacity(blob.keys());
             Seg::for_each_key(&blob, |k| bloom.insert(k))?;
+            let counts = read_counts(dir, name, blob.keys());
             return Ok(Seg {
                 blob,
                 name: name.to_string(),
@@ -340,6 +393,7 @@ impl Seg {
                 lo,
                 hi,
                 bloom: Some(bloom),
+                counts,
             });
         }
         if let Some(rest) = name.strip_prefix("par-").and_then(|r| r.strip_suffix(".sup")) {
@@ -356,7 +410,16 @@ impl Seg {
             } else {
                 Some(unhex(f[3]).ok_or_else(|| err("segment fence is malformed"))?)
             };
-            return Ok(Seg { blob, name: name.to_string(), level: 1, lo, hi, bloom: None });
+            let counts = read_counts(dir, name, blob.keys());
+            return Ok(Seg {
+                blob,
+                name: name.to_string(),
+                level: 1,
+                lo,
+                hi,
+                bloom: None,
+                counts,
+            });
         }
         // L0: build the Bloom by walking the segment's keys. That walk is
         // O(keys) and it is affordable for exactly one reason -- L0 is
@@ -364,6 +427,7 @@ impl Seg {
         // this cost is bounded where the level below it is not.
         let mut bloom = BlockedBloom::with_capacity(blob.keys());
         Seg::for_each_key(&blob, |k| bloom.insert(k))?;
+        let counts = read_counts(dir, name, blob.keys());
         Ok(Seg {
             blob,
             name: name.to_string(),
@@ -371,6 +435,7 @@ impl Seg {
             lo: Vec::new(),
             hi: None,
             bloom: Some(bloom),
+            counts,
         })
     }
 
@@ -788,6 +853,7 @@ fn compact_run(
         );
         let tmp = dir.join(format!("compact-{id:08}.tmp"));
         let _ = std::fs::remove_file(&tmp);
+        let mut counts: Vec<u32> = Vec::with_capacity(chunk.len());
         {
             let store = Store::create(&tmp, opts.clone())
                 .map_err(|e| err(&format!("compact create: {e}")))?;
@@ -801,19 +867,23 @@ fn compact_run(
                 {
                     return Err(err("compaction would write a key outside its fence"));
                 }
+                let mut n = 0u32;
                 for b in &blobs {
-                    b.read_all(key, |v| {
-                        // `Store::append` cannot fail for a value already in
-                        // a segment, and the callback cannot return.
-                        let _ = store.append(key, v);
-                    })
-                    .map_err(|e| err(&format!("compact read: {e}")))?;
+                    n += b
+                        .read_all(key, |v| {
+                            // `Store::append` cannot fail for a value already
+                            // in a segment, and the callback cannot return.
+                            let _ = store.append(key, v);
+                        })
+                        .map_err(|e| err(&format!("compact read: {e}")))? as u32;
                 }
+                counts.push(n);
             }
             store.checkpoint().map_err(|e| err(&format!("compact checkpoint: {e}")))?;
             store.close().map_err(|e| err(&format!("compact close: {e}")))?;
         }
         std::fs::rename(&tmp, dir.join(&name))?;
+        write_counts(&dir, &name, &counts)?;
         out.push(name);
     }
     File::open(&dir)?.sync_all()?;
@@ -973,6 +1043,7 @@ impl Db {
         for name in &on_disk {
             if !live.contains(name) {
                 let _ = std::fs::remove_file(dir.join(name));
+                let _ = std::fs::remove_file(counts_path(dir, name));
             }
         }
         let mut segs = Vec::with_capacity(live.len());
@@ -1132,6 +1203,7 @@ impl Db {
                 let id = first_id + ri as u64;
                 let tmp = dir.join(format!("seal-{id:08}.tmp"));
                 let _ = std::fs::remove_file(&tmp);
+                let mut counts: Vec<u32> = Vec::with_capacity(at - start);
                 {
                     let store = Store::create(&tmp, opts.clone())
                         .map_err(|e| err(&format!("seal create: {e}")))?;
@@ -1142,6 +1214,10 @@ impl Db {
                                 .append(key, mem.value_at(off))
                                 .map_err(|e| err(&format!("seal append: {e}")))?;
                         }
+                        // Keys are written in key order, so this vector is
+                        // in rank order by construction -- the same fact
+                        // the sorted seal already relies on.
+                        counts.push(e.count as u32);
                     }
                     store.checkpoint().map_err(|e| err(&format!("seal checkpoint: {e}")))?;
                     store.close().map_err(|e| err(&format!("seal close: {e}")))?;
@@ -1156,6 +1232,7 @@ impl Db {
                     )
                 };
                 std::fs::rename(&tmp, dir.join(&name))?;
+                write_counts(&dir, &name, &counts)?;
                 names.push(name);
             }
             File::open(&dir)?.sync_all()?;
@@ -1422,6 +1499,7 @@ impl Db {
         self.publish()?;
         for name in &inputs {
             let _ = std::fs::remove_file(self.dir.join(name));
+            let _ = std::fs::remove_file(counts_path(&self.dir, name));
         }
         Ok(())
     }
@@ -1625,6 +1703,52 @@ impl Db {
             seen += 1;
         }
         Ok(seen)
+    }
+
+    /// How many values a key holds, without decoding any of them.
+    ///
+    /// f28 is the reason this exists and the reason it is not free: an
+    /// `Ext` is block, offset, length and the offset of the last record,
+    /// and none of those is a count, so counting a variable-width key's
+    /// values means walking their length prefixes -- 1,983ns against 93 to
+    /// resolve the key and stop. `count_fixed` escapes that only when every
+    /// value has the same width. Segments therefore carry a per-rank count
+    /// beside them, written by whoever wrote the segment, and this is a
+    /// seek plus an array read with no block touched. A segment missing its
+    /// sidecar falls back to the walk, so the answer is always right and
+    /// only sometimes fast.
+    pub fn count(&self, key: &[u8]) -> Result<u64> {
+        let mut n = 0u64;
+        for seg in &self.segs {
+            if !seg.may_hold(key) {
+                continue;
+            }
+            match &seg.counts {
+                Some(counts) => {
+                    let rank = seg.blob.seek(key);
+                    if seg.blob.key_at(rank) == Some(key) {
+                        n += u64::from(counts[rank]);
+                    }
+                }
+                None => {
+                    n += seg
+                        .blob
+                        .count(key)
+                        .map_err(|e| err(&format!("segment count: {e}")))?;
+                }
+            }
+        }
+        if let Some(fr) = &self.frozen {
+            if let Some(e) = fr.get(key) {
+                n += e.count;
+            }
+        }
+        if !self.mem.is_empty() {
+            if let Some(e) = self.mem.get(key) {
+                n += e.count;
+            }
+        }
+        Ok(n)
     }
 
     pub fn segments(&self) -> usize {

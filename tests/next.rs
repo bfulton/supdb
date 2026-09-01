@@ -419,3 +419,78 @@ fn every_key_survives_partitioning_and_range_merges_at_scale() {
         &missing[..missing.len().min(10)]
     );
 }
+
+#[test]
+fn count_is_exact_for_variable_width_values_through_seals_and_merges() {
+    // The case `count_fixed` cannot serve: every key holds a different
+    // number of values and every value is a different length, so the only
+    // other way to answer is to walk the length prefixes.
+    let d = dir("counts");
+    let mut db = Db::create(&d, small_opts(2)).unwrap();
+    let mut model: HashMap<Vec<u8>, u64> = HashMap::new();
+    for round in 0u32..8 {
+        for k in 0u32..120 {
+            let key = format!("k{k:04}").into_bytes();
+            // A varying number of values per key per round, each of a
+            // varying length.
+            for j in 0..(k % 5) + 1 {
+                let val = vec![b'v'; ((k + j + round) % 37 + 1) as usize];
+                db.append(&key, &val);
+                *model.entry(key.clone()).or_default() += 1;
+            }
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    let (par, l0) = db.levels();
+    assert!(par + l0 > 1, "expected several segments, got {par}+{l0}");
+
+    for (key, want) in &model {
+        assert_eq!(db.count(key).unwrap(), *want, "key {}", String::from_utf8_lossy(key));
+        // And it agrees with actually reading them, which is the only
+        // definition of correct that matters.
+        assert_eq!(read_vec(&db, key).len() as u64, *want);
+    }
+    drop(db);
+
+    let db = Db::open(&d, small_opts(2)).unwrap();
+    for (key, want) in &model {
+        assert_eq!(db.count(key).unwrap(), *want, "after reopen: {}", String::from_utf8_lossy(key));
+    }
+}
+
+#[test]
+fn a_missing_or_wrong_counts_sidecar_falls_back_rather_than_lying() {
+    let d = dir("countsidecar");
+    let mut db = Db::create(&d, small_opts(2)).unwrap();
+    for k in 0u32..50 {
+        for _ in 0..(k % 4) + 1 {
+            db.append(format!("k{k:04}").as_bytes(), b"value-of-some-length");
+        }
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    drop(db);
+
+    // Truncate every sidecar: a file that does not match the segment it
+    // names must be ignored, not trusted.
+    let mut damaged = 0;
+    for e in std::fs::read_dir(&d).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().is_some_and(|x| x == "counts") {
+            std::fs::write(&p, b"junk").unwrap();
+            damaged += 1;
+        }
+    }
+    assert!(damaged > 0, "no sidecar was written, so nothing was tested");
+
+    let db = Db::open(&d, small_opts(2)).unwrap();
+    for k in 0u32..50 {
+        let key = format!("k{k:04}").into_bytes();
+        assert_eq!(
+            db.count(&key).unwrap(),
+            ((k % 4) + 1) as u64,
+            "a damaged sidecar must fall back to the walk"
+        );
+    }
+}
