@@ -903,6 +903,12 @@ pub struct Db {
     /// holds.
     segs: Vec<Seg>,
     next_seg: u64,
+    /// Nanoseconds spent in each phase of a load, accumulated so an
+    /// experiment can attribute the durable-load cost instead of inferring
+    /// it. `commit` is the WAL append and its fdatasync -- the only work on
+    /// the commit path; `seal` is writing a memtable out as a segment;
+    /// `merge` is compaction, counted where the caller waits for it.
+    phase_ns: [u64; 3],
     /// WAL files whose records no segment has been *named* as covering
     /// yet. One rule governs every one of them: a WAL may be deleted only
     /// after the manifest names a segment that covers its records. The
@@ -998,6 +1004,7 @@ impl Db {
             frozen: None,
             sealing: None,
             compacting: None,
+            phase_ns: [0; 3],
             retiring_wals: Vec::new(),
             covered_seq: 0,
             scan_keys: std::cell::RefCell::new(None),
@@ -1100,6 +1107,7 @@ impl Db {
             frozen: None,
             sealing: None,
             compacting: None,
+            phase_ns: [0; 3],
             retiring_wals: retiring,
             covered_seq: sealed,
             scan_keys: std::cell::RefCell::new(None),
@@ -1118,7 +1126,9 @@ impl Db {
     /// crossed the seal threshold, seal after the commit -- after, so the
     /// batch's durability never waits on a segment write.
     pub fn commit(&mut self) -> Result<()> {
+        let t = std::time::Instant::now();
         self.wal.commit()?;
+        self.phase_ns[0] += t.elapsed().as_nanos() as u64;
         if self.sealing.as_ref().is_some_and(|h| h.is_finished()) {
             self.join_seal()?;
         }
@@ -1273,6 +1283,7 @@ impl Db {
         let Some(handle) = self.sealing.take() else {
             return Ok(());
         };
+        let t = std::time::Instant::now();
         let names = handle.join().map_err(|_| err("seal thread panicked"))??;
         for name in &names {
             self.covered_seq = self.covered_seq.max(Db::name_end_seq(name).unwrap_or(0));
@@ -1284,6 +1295,7 @@ impl Db {
         for old in std::mem::take(&mut self.retiring_wals) {
             let _ = std::fs::remove_file(old);
         }
+        self.phase_ns[1] += t.elapsed().as_nanos() as u64;
         if self.opts.compact {
             self.maybe_compact()?;
         }
@@ -1480,6 +1492,7 @@ impl Db {
         let Some((inputs, handle)) = self.compacting.take() else {
             return Ok(());
         };
+        let t = std::time::Instant::now();
         let outputs = handle.join().map_err(|_| err("compaction thread panicked"))??;
         let mut kept: Vec<Seg> = Vec::new();
         for seg in self.segs.drain(..) {
@@ -1501,6 +1514,7 @@ impl Db {
             let _ = std::fs::remove_file(self.dir.join(name));
             let _ = std::fs::remove_file(counts_path(&self.dir, name));
         }
+        self.phase_ns[2] += t.elapsed().as_nanos() as u64;
         Ok(())
     }
 
@@ -1749,6 +1763,12 @@ impl Db {
             }
         }
         Ok(n)
+    }
+
+    /// Nanoseconds in (commit, seal, merge). Only the first is on the
+    /// commit path; the other two are counted where a caller waits.
+    pub fn phase_ns(&self) -> (u64, u64, u64) {
+        (self.phase_ns[0], self.phase_ns[1], self.phase_ns[2])
     }
 
     pub fn segments(&self) -> usize {

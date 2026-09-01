@@ -6551,6 +6551,11 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let arm_names = ["next", "next-lazyseal", "supdb"];
     type Row = (usize, f64, f64);
     let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
+    // Where a durable load's time actually goes, taken from the engine
+    // rather than inferred: the commit path (WAL append + fdatasync), the
+    // seal, and the merges a caller waits for.
+    let phases: std::sync::Mutex<Vec<Vec<(u64, u64, u64)>>> =
+        std::sync::Mutex::new(vec![Vec::new(); 3]);
     let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
         let mut vrng = Rng::new(0xF42 + rep as u64);
         let mut kb = [0u8; 16];
@@ -6573,6 +6578,8 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
                 }
             }
             let secs = t.elapsed().as_secs_f64();
+            let (c, s, m) = db.phase_ns();
+            phases.lock().unwrap()[ci].push((c, s, m));
             db.close().expect("close");
             let mut bytes = 0u64;
             for e in std::fs::read_dir(&d).expect("dir") {
@@ -6603,6 +6610,23 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
         keys as f64 / secs
     });
 
+    let ph = |ci: usize, which: usize| -> f64 {
+        let all = phases.lock().unwrap();
+        let mut v: Vec<f64> = all[ci]
+            .iter()
+            .map(|t| match which {
+                0 => t.0,
+                1 => t.1,
+                _ => t.2,
+            } as f64
+                / 1e9)
+            .collect();
+        if v.is_empty() {
+            return 0.0;
+        }
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
     let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
         let all = rows.lock().unwrap();
         let mut v: Vec<f64> = all.iter().filter(|r| r.0 == ci).map(pick).collect();
@@ -6622,7 +6646,10 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
                         "ops_per_s" => J::fp(s.median(), 1),
                         "rel_iqr" => J::fp(s.rel_iqr(), 4),
                         "device_write_mb" => J::fp(med(ci, |r| r.1), 1),
-                        "disk_mb" => J::fp(med(ci, |r| r.2), 1)
+                        "disk_mb" => J::fp(med(ci, |r| r.2), 1),
+                        "commit_s" => J::fp(ph(ci, 0), 3),
+                        "seal_s" => J::fp(ph(ci, 1), 3),
+                        "merge_s" => J::fp(ph(ci, 2), 3)
                     }
                 })
                 .collect(),
