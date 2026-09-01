@@ -123,8 +123,18 @@ interleaved where the harness allows:
   what it costs the ordered scan (2.007x). The rest is the seal writing
   each segment through `Store`'s general put path — hash table, freelist,
   arena, per-key bookkeeping — for input that is already sorted,
-  immutable and written once. **A purpose-built segment writer is the
-  largest remaining item on ingest.**
+  immutable and written once. **That writer was priced and declined**:
+  f46 puts its FLOOR at 2.04–2.06x the general path (F46.1, replicated),
+  below the 3x registered as the price of a second writer in the format
+  layer — and the floor omits the block table, checksums and superblock,
+  so a real one lands under 2x. The index build is only 19% of it
+  (F46.2), and a checkpoint pays that call anyway. So the put path is not
+  carrying much fat, and the cheap policy win (EXT.25, 1.985x for one
+  bit) had already taken more than the expensive rewrite would.
+
+  What is left on ingest after that is the partitioning pass itself,
+  which EXT.25 makes optional, and the merge's own write amplification —
+  not the seal.
 - **P-B, the read lead survives: HELD, with its condition stated.** The
   test was "EXT.11's shape with live segment counts under the compaction
   policy stays ≥ 1.2x on x86". At the shipping configuration it reads

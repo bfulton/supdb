@@ -1092,6 +1092,20 @@
    "profile": "full",
    "expect": "holds",
    "because": "The other half of EXT.25's trade, gated so it cannot be quoted alone: partitioning at flush scans 2.007x faster than leaving it to compaction -- 31,739,387 entries/s against 15,814,149, p=0.0022. A scan over disjoint partitions walks each in turn through one key resolution per key; a scan over overlapping segments runs the k-way merge. Both entries hold, which is the honest shape of a trade: an ingest-heavy writer that reads points wants partitioning off and lets compaction reach it on its own schedule, a store that scans wants it on, and this benchmark is too short to show background compaction closing the gap for the first case."
+  },
+  {
+   "experiment": "f46-segwrite",
+   "id": "F46.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "DECLINED ON MEASUREMENT, which is what the bar was registered for. A purpose-built segment writer's FLOOR runs 2.06x the general put path (1,660,878 keys/s against 805,911), replicated at 2.04x on a quieter run (1,956,817 against 960,301, p=0.0022) -- below the 3x that segwrite-plan.md set as the price of a second writer in the format layer. And the floor flatters it: it writes values and one index section and nothing else, no block table, no checksums, no superblock, so a real writer lands BELOW 2x. Against that, EXT.25 recovered 1.985x on the same axis by flipping one policy bit, for free and with no new code in the format. This is the second format change this project has priced and declined in a session (f45 was the first), and both declines came from measuring the ceiling before building toward it."
+  },
+  {
+   "experiment": "f46-segwrite",
+   "id": "F46.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Building the key index is 19.0% of the floor -- `flatindex::encode` over 1M keys takes 0.097s of 0.511s -- so the index is not what makes a seal expensive and a bespoke writer could not have escaped it anyway, since a checkpoint pays exactly the same call. What the general path spends the other way is per-key bookkeeping for a store that will never be updated: a hash table probe, a shard, a dirty set and a freelist, all of which exist to support mutation that a sealed segment does not have. That the total is still only 2x says the put path is not carrying much fat, which is the more useful thing to know."
   }
  ],
  "metrics": [
