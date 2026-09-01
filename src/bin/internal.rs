@@ -128,6 +128,7 @@ fn main() -> std::io::Result<()> {
             "f47-parwal" => f47_parwal(&args, profile)?,
             "f48-syncpolicy" => f48_syncpolicy(&args, profile)?,
             "f49-bulkseal" => f49_bulkseal(&args, profile)?,
+            "f50-txn" => f50_txn(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -6107,6 +6108,292 @@ fn f49_bulkseal(args: &Args, profile: Profile) -> std::io::Result<Record> {
         ),
     ));
 
+    Ok(rec)
+}
+
+fn f50_txn(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use std::io::Write as _;
+    use supdb::next::{Db, NextOptions};
+
+    let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+    let reads = args.num("--reads", profile.pick(20_000, 50_000, 200_000)) as u64;
+
+    let mut rec = Record::new("f50-txn", profile);
+    rec.param("keys", J::u(keys))
+        .param("batch", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .param("reads", J::u(reads))
+        .note(
+            "two experiments in one record, each with its arms interleaved. (1) the raw WAL \
+             shape f39 measured -- write_all + fdatasync of a framed batch -- with and without \
+             the 17-byte commit frame that closes each batch and makes it atomic under replay. \
+             (2) the f42 load shape with the drain inside the window, with and without a tenth \
+             of the keys deleted before the drain; reads after the drain over keys present in \
+             both arms, the deleted tenth (present in the first arm, deleted in the second), and \
+             keys never written. Device bytes over the window, disk bytes after close",
+        )
+        .note("predictions P50.1 and P50.4-P50.6 registered in txn-plan.md before the run");
+
+    let dir = scratch("f50");
+    let payload = Payload::new(value_size, 0.5, 0xF50);
+
+    // ---- (1) the commit frame, on the raw shape
+    let raw_names = ["raw", "raw+commit"];
+    let raw = Trial::new(profile.reps()).run(raw_names.len(), |ci, rep| {
+        let file = dir.join(format!("w{ci}-{rep}.dat"));
+        let _ = std::fs::remove_file(&file);
+        let mut vrng = Rng::new(0xF50 + rep as u64);
+        let mut kb = [0u8; 16];
+        let mut f = std::fs::File::create(&file).expect("create wal");
+        let mut buf: Vec<u8> = Vec::with_capacity((batch as usize) * (value_size + 32));
+        let mut seq = 0u64;
+        let t = Instant::now();
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            let v = payload.get(&mut vrng);
+            // The engine's frame shape: len, crc, seq, kind, klen, key, value.
+            let body_at = buf.len() + 8;
+            buf.extend_from_slice(&[0u8; 8]);
+            buf.extend_from_slice(&seq.to_le_bytes());
+            buf.push(0);
+            buf.push(kb.len() as u8);
+            buf.extend_from_slice(&kb);
+            buf.extend_from_slice(v);
+            let len = (buf.len() - body_at) as u32;
+            buf[body_at - 8..body_at - 4].copy_from_slice(&len.to_le_bytes());
+            seq += 1;
+            if (i + 1) % batch == 0 {
+                if ci == 1 {
+                    buf.extend_from_slice(&[0u8; 8]);
+                    buf.extend_from_slice(&seq.to_le_bytes());
+                    buf.push(2);
+                    let at = buf.len() - 17;
+                    buf[at..at + 4].copy_from_slice(&9u32.to_le_bytes());
+                    seq += 1;
+                }
+                f.write_all(&buf).expect("append");
+                f.sync_data().expect("fdatasync");
+                buf.clear();
+            }
+        }
+        let secs = t.elapsed().as_secs_f64();
+        let _ = std::fs::remove_file(&file);
+        keys as f64 / secs
+    });
+    rec.series(
+        "raw",
+        J::arr(
+            raw_names
+                .iter()
+                .zip(raw.iter())
+                .map(|(name, s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "ops_per_s" => J::fp(s.median(), 1),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4)
+                    }
+                })
+                .collect(),
+        ),
+    );
+    let marker = compare(&raw[1], &raw[0], supdb::bench::MIN_EFFECT);
+    rec.compare("commit_frame_vs_none", marker.clone());
+    rec.finding(Finding::new(
+        "F50.1",
+        "closing every batch with a commit frame costs nothing measurable on the raw WAL shape",
+        matches!(marker.verdict, supdb::bench::Verdict::NoDifference),
+        format!(
+            "raw {:.0} ops/s against raw+commit {:.0} ({}). A 17-byte frame per {batch}-record \
+             batch is {:.3}% of the bytes and rides the same fdatasync; it is what lets replay \
+             apply a batch whole or not at all",
+            raw[0].median(),
+            raw[1].median(),
+            marker.summary("raw+commit", "raw"),
+            100.0 * 17.0 / (batch as f64 * (value_size as f64 + 34.0)),
+        ),
+    ));
+
+    // ---- (2) deletes, on the engine
+    let arm_names = ["no-deletes", "deletes-10pct"];
+    // ci, device MB, disk MB, commit s, seal s, merge s, present ns, deleted-set ns, missing ns
+    type Row = (usize, f64, f64, f64, f64, f64, f64, f64, f64);
+    let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
+    fn time_reads(db: &Db, keys: u64, reads: u64, seed: u64, pick: impl Fn(u64) -> u64) -> f64 {
+        let mut kb = [0u8; 16];
+        let mut x = seed;
+        let mut sink = 0u64;
+        let t = Instant::now();
+        for _ in 0..reads {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            db_key_into(pick(z % keys), &mut kb);
+            sink += db
+                .read_all(&kb, |v| {
+                    std::hint::black_box(v);
+                })
+                .expect("read");
+        }
+        std::hint::black_box(sink);
+        t.elapsed().as_nanos() as f64 / reads as f64
+    }
+    let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
+        let mut vrng = Rng::new(0xF50 + 7 + rep as u64);
+        let mut kb = [0u8; 16];
+        let d = dir.join(format!("db{ci}-{rep}"));
+        let _ = std::fs::remove_dir_all(&d);
+        let mut db = Db::create(&d, NextOptions::default()).expect("create");
+        let io0 = IoCounters::read_now();
+        let t = Instant::now();
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            db.append(&kb, payload.get(&mut vrng));
+            if (i + 1) % batch == 0 {
+                db.commit().expect("commit");
+            }
+        }
+        if ci == 1 {
+            let mut n = 0u64;
+            for i in (0..keys).step_by(10) {
+                db_key_into(i, &mut kb);
+                db.delete(&kb);
+                n += 1;
+                if n % batch == 0 {
+                    db.commit().expect("commit");
+                }
+            }
+            db.commit().expect("commit");
+        }
+        db.flush().expect("flush");
+        let secs = t.elapsed().as_secs_f64();
+        let (c, s, m) = db.phase_ns();
+        let io_mb = IoCounters::read_now().since(&io0).write_bytes as f64 / 1_048_576.0;
+        let present = time_reads(&db, keys, reads, 0x51 + rep as u64, |z| if z % 10 == 0 { z + 1 } else { z });
+        let deleted = time_reads(&db, keys, reads, 0x52 + rep as u64, |z| z - z % 10);
+        let missing = time_reads(&db, keys, reads, 0x53 + rep as u64, |z| keys + z);
+        db.close().expect("close");
+        let mut bytes = 0u64;
+        for e in std::fs::read_dir(&d).expect("dir") {
+            bytes += e.expect("entry").metadata().expect("meta").len();
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        rows.lock().unwrap().push((
+            ci,
+            io_mb,
+            bytes as f64 / 1_048_576.0,
+            c as f64 / 1e9,
+            s as f64 / 1e9,
+            m as f64 / 1e9,
+            present,
+            deleted,
+            missing,
+        ));
+        keys as f64 / secs
+    });
+    let col = |ci: usize, pick: fn(&Row) -> f64| -> Vec<f64> {
+        rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect()
+    };
+    let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
+        let mut v = col(ci, pick);
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
+    rec.series(
+        "arms",
+        J::arr(
+            arm_names
+                .iter()
+                .enumerate()
+                .zip(rates.iter())
+                .map(|((ci, name), s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "ops_per_s" => J::fp(s.median(), 1),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4),
+                        "commit_s" => J::fp(med(ci, |r| r.3), 3),
+                        "seal_s" => J::fp(med(ci, |r| r.4), 3),
+                        "merge_s" => J::fp(med(ci, |r| r.5), 3),
+                        "device_write_mb" => J::fp(med(ci, |r| r.1), 1),
+                        "disk_mb" => J::fp(med(ci, |r| r.2), 1),
+                        "present_read_ns" => J::fp(med(ci, |r| r.6), 1),
+                        "deleted_set_read_ns" => J::fp(med(ci, |r| r.7), 1),
+                        "missing_read_ns" => J::fp(med(ci, |r| r.8), 1)
+                    }
+                })
+                .collect(),
+        ),
+    );
+
+    let disk_ratio = med(1, |r| r.2) / med(0, |r| r.2);
+    rec.finding(Finding::new(
+        "F50.2",
+        "deleting a tenth of the keys before the drain leaves at most 0.92x the disk",
+        disk_ratio <= 0.92,
+        format!(
+            "{:.1} MB on disk with a tenth deleted against {:.1} without ({:.3}x); device bytes \
+             {:.1} against {:.1} MB. The merge writes the bottom level, so a deleted key's \
+             values are dropped and the key is left out; this is the delete getting its bytes \
+             back, measured rather than assumed",
+            med(1, |r| r.2),
+            med(0, |r| r.2),
+            disk_ratio,
+            med(1, |r| r.1),
+            med(0, |r| r.1),
+        ),
+    ));
+    let del_ns = med(1, |r| r.7);
+    let miss_ns = med(1, |r| r.8);
+    rec.finding(Finding::new(
+        "F50.3",
+        "reading a deleted key costs at most 1.2x reading a key that never existed",
+        del_ns <= 1.2 * miss_ns,
+        format!(
+            "{del_ns:.0} ns per read of a deleted key against {miss_ns:.0} for a missing one, \
+             in the store with deletes; the same key set reads in {:.0} ns where it was never \
+             deleted. After the drain the store is partitions only and a merged-away key is \
+             simply absent, so a deleted key should cost exactly a miss",
+            med(0, |r| r.7),
+        ),
+    ));
+    let pres_nd = Samples::new(col(0, |r| r.6));
+    let pres_d = Samples::new(col(1, |r| r.6));
+    let pres = compare(&pres_d, &pres_nd, supdb::bench::MIN_EFFECT);
+    rec.compare("present_read_ns_deletes_vs_none", pres.clone());
+    rec.finding(Finding::new(
+        "F50.4",
+        "present-key reads in a store that has had deletes are within 1.15x of reads in one that has not",
+        pres_d.median() <= 1.15 * pres_nd.median(),
+        format!(
+            "{:.0} ns per present-key read after deletes against {:.0} without ({}). Once any \
+             source holds a tombstone every read pays a newest-first pass to find where live \
+             values start; after the drain the sources are partitions, which never carry \
+             tombstones, so the pass should cost a flag test per source and nothing else",
+            pres_d.median(),
+            pres_nd.median(),
+            pres.summary("deletes", "no-deletes"),
+        ),
+    ));
+    let merge_ratio = med(1, |r| r.5) / med(0, |r| r.5).max(1e-9);
+    rec.finding(Finding::new(
+        "F50.5",
+        "a tenth of the keys deleted costs the merge phase nothing measurable",
+        merge_ratio <= 1.1,
+        format!(
+            "merge phase {:.3}s with a tenth deleted against {:.3}s without ({:.3}x); the merge \
+             reads the same inputs and writes a tenth less. Ingest-to-routed {:.0} against \
+             {:.0} ops/s, the first arm having done {} more commits for its deletes",
+            med(1, |r| r.5),
+            med(0, |r| r.5),
+            merge_ratio,
+            rates[1].median(),
+            rates[0].median(),
+            keys / 10 / batch + 1,
+        ),
+    ));
     Ok(rec)
 }
 

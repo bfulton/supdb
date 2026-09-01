@@ -56,6 +56,7 @@ is not a measurement.
 | `src/` | the engine, vendored from the design artifact **verbatim** |
 | `src/bench/` | the measurement substrate — stats, histogram, plotting, env capture |
 | `src/bytes.rs`, `src/blob.rs` | the read path over any byte source; compiles for wasm |
+| `src/next.rs` | the next engine: WAL with atomic batches, memtable, sealed segments, partitioned compaction, deletes, `Txn` -- `docs/next-engine.md` |
 | `src/bin/internal.rs` | falsification suite (f1–f7) |
 | `src/bin/correctness.rs` | damaged files, model oracle, crash injection (c1–c3) |
 | `src/bin/logshed.rs` | day-index shape, size budget, browser-test fixture |

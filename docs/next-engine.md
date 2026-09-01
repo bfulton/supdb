@@ -92,6 +92,27 @@ checkpoint.
   says, and compaction costs 42% of the durable load. **The incremental
   merge is the design's largest outstanding debt**, named independently by
   F43.4 and F44.1.
+- **Delete** = a tombstone. In the memtable it is a chain chunk with a
+  marker length and the key's live count resets at it; the seal writes the
+  values after the newest tombstone and sets the flag bit format v5
+  reserved beside the extent's count; a level-0 piece records at open
+  whether any of its extents carries the flag. Reads, counts and scans find
+  the newest source holding a tombstone for the key and start there -- a
+  pass only a store with tombstones in it pays, and one that costs a second
+  probe on the sources that hold the key. Every merge writes the bottom
+  level, so a tombstone never survives one: values older than it are
+  dropped, a key with nothing live is left out, and its bytes come back at
+  the next merge that reaches it. f50 measures what that costs and what it
+  returns (txn-plan.md).
+- **Commit is a batch, and a batch is atomic.** WAL frames carry a kind --
+  put, delete, commit -- and replay applies the frames between commit
+  frames whole or not at all; a partial batch used to replay as whole,
+  which the first test written against the contract found. `Txn` stages
+  puts and deletes and commits them as one batch behind one barrier, reads
+  through it see its own staged writes, and drop is abort with nothing to
+  undo. The engine is single-writer and a read borrows it, so no read
+  observes a batch half-applied. That is the external suite's transactions
+  axis, which LMDB held over every Supdb arm until now.
 - **Write scaling** = one active memtable+WAL per shard or per writer;
   segments make the shared-appender mutex (F6.1) unnecessary rather than
   cheaper.
@@ -206,9 +227,13 @@ interleaved where the harness allows:
   same 1.6x sharding would buy, for a policy bit instead of N writers; the
   two attack different terms (barriers per record, barriers per second), so
   whether they compose is the next thing to measure rather than assume.
-- **P-E, crash semantics:** a store killed before any seal opens from the
-  WAL alone (C3.4 flips), and history survives reopen (segments do not
-  forget).
+- **P-E, crash semantics: HELD, and sharpened.** A store killed before any
+  seal opens from the WAL alone, history survives reopen (segments do not
+  forget), and -- since the commit frame -- a batch is lost whole or kept
+  whole: `tests/next.rs` cuts the WAL inside a batch's commit frame, at
+  it, and inside its last record, and the batch is gone in every case and
+  stays gone after the next commit, because `open` truncates the WAL to
+  its last commit frame before appending behind it.
 
 ## Open, and deliberately so
 
@@ -243,8 +268,10 @@ interleaved where the harness allows:
 
 ## What this does not promise
 
-Transactions, MVCC beyond segment-set snapshots, or beating LMDB out-of-core.
-The guarantee set stays what `Features` can equalize, so every comparison the
-external suite makes remains matched — the durable-commit axis finally
-becomes equalizable in both directions, which is worth more to the
-comparisons than any single number in this file.
+Multi-reader snapshots (MVCC beyond the single-writer borrow), or beating
+LMDB out-of-core. Transactions it does promise now -- atomic batches,
+rollback, read-your-writes -- and deletes that reclaim their bytes. The
+guarantee set stays what `Features` can equalize, so every comparison the
+external suite makes remains matched: the durable-commit axis is
+equalizable in both directions, and the transactions axis no longer leaves
+a residual on the next engine's side.

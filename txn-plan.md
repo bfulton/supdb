@@ -110,3 +110,27 @@ cost: I/O priority for the seal and merge threads (`ioprio_set`, idle
 class) so the barrier wins the device; `SyncPolicy::EveryN` for callers
 who accept bounded loss (F48.1, 1.63x); then the memtable append path,
 which is the floor once the barrier is amortised (F48.2).
+
+## Amendment, registered before f50 runs
+
+Built and under test: the commit frame, deletes, `Txn`, and the adapter's
+transactions axis. One cost the design above did not price: once any
+source in a store holds a tombstone, every read pays a newest-first pass
+over the sources that hold its key (a second probe on hits) to find where
+live values start, and a store nothing was deleted from skips it. So f50
+carries two load arms, interleaved, on the f42 shape with the drain inside
+the window: `no-deletes`, and `deletes-10pct` (a tenth of the keys deleted
+before the drain). Reads run after the drain over three key sets: keys
+present in both arms, keys deleted in the second arm, and keys never
+written.
+
+- **P50.5 — present-key reads in a store with tombstones are within 1.15x
+  of reads in a store without.** The pass costs a flag test per source and
+  a second probe only on sources that hold the key; after a drain the
+  store is partitions only, and partitions never carry tombstones, so the
+  extra pass should be near free there. Refuted means the tombstone check
+  reaches into the read path even when nothing it guards is present, and
+  it needs a cheaper gate.
+- **P50.6 — a delete costs the merge nothing measurable:** the
+  `deletes-10pct` arm's merge phase is within 1.1x of the `no-deletes`
+  arm's. It reads the same inputs and writes a tenth less.
