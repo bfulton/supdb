@@ -356,6 +356,11 @@ impl Next {
             // harder, and all it measured was the engine at a shape it
             // should not be run in.
             seal_bytes: 64 << 20,
+            // SUPDB_NO_FLUSH_PARTITION trades the read lead for ingest:
+            // the flush stops partitioning what it sealed and leaves that
+            // to background compaction. Both arms are measured rather than
+            // argued about.
+            partition_on_flush: std::env::var_os("SUPDB_NO_FLUSH_PARTITION").is_none(),
             ..Default::default()
         };
         let db = supdb::next::Db::create(path, opts).map_err(|e| e.to_string())?;

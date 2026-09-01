@@ -85,6 +85,16 @@ pub struct NextOptions {
     /// The measurement instrument: false keeps every segment in the
     /// unrouted L0 fan, which is milestone 3's behaviour exactly.
     pub compact: bool,
+    /// Whether `flush` partitions what it sealed before returning.
+    ///
+    /// This is a read-for-write trade and it is a large one. Partitioning
+    /// makes every later read touch exactly one segment instead of paying
+    /// a Bloom check on each of several overlapping ones -- worth roughly
+    /// 1.4x on EXT.23 -- but it is a second full pass over everything just
+    /// sealed, inside whatever window the caller is timing. A writer that
+    /// is keeping up with ingest and reads later wants it off, and the
+    /// background compaction will get there on its own schedule.
+    pub partition_on_flush: bool,
 }
 
 impl Default for NextOptions {
@@ -94,6 +104,7 @@ impl Default for NextOptions {
             segment: Options::default(),
             l0_trigger: 4,
             compact: true,
+            partition_on_flush: true,
         }
     }
 }
@@ -1270,7 +1281,10 @@ impl Db {
         // Partitioning them costs one merge now and makes every later read
         // touch exactly one segment, which is the arrangement the read
         // lead was measured in.
-        if self.opts.compact && self.segs.iter().any(|s| s.level == 0) {
+        if self.opts.compact
+            && self.opts.partition_on_flush
+            && self.segs.iter().any(|s| s.level == 0)
+        {
             self.start_compact(None)?;
             self.join_compact()?;
         }
