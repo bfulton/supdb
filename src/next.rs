@@ -159,6 +159,11 @@ pub struct NextOptions {
     /// streams blocks, so its dirty pages leave in slices rather than in
     /// one flush at the end. Zero syncs at the end only (f51).
     pub seal_sync_every: usize,
+    /// Runs of values up to this many bytes are stored inline in the index
+    /// record rather than in a block, so a point read of such a key touches
+    /// the hash slot and the record and nothing else. Zero disables; f53
+    /// prices it (inline-plan.md).
+    pub inline_bytes: usize,
     /// Target bytes per partition: how many partitions the first
     /// partitioning cuts, and how many keys one holds before a merge splits
     /// it. `None` uses `seal_bytes`, which is how f52 found that smaller
@@ -184,6 +189,7 @@ impl Default for NextOptions {
             cursor_merge: true,
             background_io: BackgroundIo::Normal,
             seal_sync_every: 0,
+            inline_bytes: 256,
             partition_bytes: Some(64 << 20),
         }
     }
@@ -534,6 +540,13 @@ pub struct SegmentWriter {
     /// fdatasync every this many block bytes; zero for the end only.
     sync_every: u64,
     since_sync: u64,
+    /// Runs up to this many bytes go into the record's tail instead of a
+    /// block (`Ext::INLINE`); zero keeps every run in blocks.
+    inline_max: usize,
+    /// The inline runs, concatenated, with each key's span in it (empty for
+    /// a key whose run went to a block).
+    tails: Vec<u8>,
+    tail_spans: Vec<(usize, usize)>,
 }
 
 /// One superblock slot, field for field what `store::Super::encode` writes:
@@ -592,7 +605,16 @@ impl SegmentWriter {
             parallel_index: opts.parallel_index,
             sync_every: 0,
             since_sync: 0,
+            inline_max: 0,
+            tails: Vec::new(),
+            tail_spans: Vec::new(),
         })
+    }
+
+    /// Store runs up to `bytes` long inline in the index record. Zero keeps
+    /// every run in a block, which is the layout `Store` writes.
+    pub fn set_inline_max(&mut self, bytes: usize) {
+        self.inline_max = bytes;
     }
 
     /// Spread the writer's syncs: fdatasync every `bytes` of blocks written
@@ -654,6 +676,24 @@ impl SegmentWriter {
         // a run larger than a whole block takes an empty builder and is a
         // block by itself, so a key's values stay contiguous -- the same
         // rule `Store` applies through the same `BlockBuilder`.
+        let count = self.records | if tombstone { Ext::TOMBSTONE } else { 0 };
+        if self.inline_max > 0 && n <= self.inline_max {
+            // Into the record's tail: a read of this key never touches a
+            // block. `off` is within this key's tail, and a key has one run
+            // here, so it is zero.
+            let ts = self.tails.len();
+            self.tails.extend_from_slice(&self.run);
+            self.tail_spans.push((ts, n));
+            self.spans.push((start, len));
+            self.exts.push(Extents::One(Ext {
+                block: Ext::INLINE,
+                off: 0,
+                len: n as u32,
+                last: self.last as u32,
+                count,
+            }));
+            return Ok(());
+        }
         if self.builder.would_overflow(n) {
             self.flush_block()?;
         }
@@ -663,12 +703,13 @@ impl SegmentWriter {
             off,
             len: n as u32,
             last: self.last as u32,
-            count: self.records | if tombstone { Ext::TOMBSTONE } else { 0 },
+            count,
         };
         if self.builder.len() >= self.block_size {
             self.flush_block()?;
         }
         self.spans.push((start, len));
+        self.tail_spans.push((0, 0));
         self.exts.push(Extents::One(ext));
         Ok(())
     }
@@ -748,12 +789,22 @@ impl SegmentWriter {
                 .zip(&self.exts)
                 .map(|(&(s, l), e)| (&self.key_arena[s..s + l], e))
                 .collect();
-            flatindex::encode(
+            let tails: Vec<&[u8]> = self
+                .tail_spans
+                .iter()
+                .map(|&(s, l)| &self.tails[s..s + l])
+                .collect();
+            // No insert room and no record slack: a segment is never edited
+            // in place, and the half-again the flat index reserves for that
+            // is 20 B a key of file it would never use.
+            flatindex::encode_inline(
                 &all,
+                &tails,
                 generation,
                 None,
                 flatindex::key_hash,
                 0,
+                false,
                 self.parallel_index,
             )
             .ok_or_else(|| err("segment writer: key section exceeds the flat index's limits"))?
@@ -816,10 +867,17 @@ enum PieceWriter {
 }
 
 impl PieceWriter {
-    fn create(path: &Path, opts: &Options, bulk: bool, sync_every: usize) -> Result<PieceWriter> {
+    fn create(
+        path: &Path,
+        opts: &Options,
+        bulk: bool,
+        sync_every: usize,
+        inline_max: usize,
+    ) -> Result<PieceWriter> {
         if bulk {
             let mut w = SegmentWriter::create(path, opts)?;
             w.set_sync_every(sync_every);
+            w.set_inline_max(inline_max);
             Ok(PieceWriter::Bulk(Box::new(w)))
         } else {
             Ok(PieceWriter::General {
@@ -1334,6 +1392,7 @@ struct MergePlan {
     cursors: bool,
     background_io: BackgroundIo,
     sync_every: usize,
+    inline_max: usize,
 }
 
 fn compact_job(plan: MergePlan) -> Result<Vec<String>> {
@@ -1456,6 +1515,7 @@ struct Emitter<'a> {
     opts: &'a Options,
     bulk: bool,
     sync_every: usize,
+    inline_max: usize,
     pieces: Vec<Piece>,
     pi: usize,
     r: usize,
@@ -1489,7 +1549,7 @@ impl Emitter<'_> {
         if self.r == from {
             let _ = std::fs::remove_file(&tmp);
             self.w = Some(
-                PieceWriter::create(&tmp, self.opts, self.bulk, self.sync_every)
+                PieceWriter::create(&tmp, self.opts, self.bulk, self.sync_every, self.inline_max)
                     .map_err(|e| err(&format!("compact create: {e}")))?,
             );
         }
@@ -1552,6 +1612,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         cursors,
         background_io,
         sync_every,
+        inline_max,
     } = plan;
     if background_io == BackgroundIo::Idle {
         idle_io_priority();
@@ -1687,6 +1748,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         opts: &opts,
         bulk,
         sync_every,
+        inline_max,
         pieces,
         pi: 0,
         r: 0,
@@ -1726,17 +1788,17 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     } else {
         for r in 0..keys.len() {
             let k = keys.get(r);
-            let mut found: Vec<(usize, &[Ext])> = Vec::with_capacity(blobs.len());
+            let mut found: Vec<(usize, &[Ext], &[u8])> = Vec::with_capacity(blobs.len());
             let mut start = 0usize;
             let mut live = 0u64;
             for (i, b) in blobs.iter().enumerate() {
-                if let Some(exts) = b.lookup(k) {
+                if let Some((exts, tail)) = b.lookup_full(k) {
                     if exts.iter().any(|e| e.is_tombstone()) {
                         start = found.len();
                         live = 0;
                     }
                     live += exts.iter().map(|e| u64::from(e.records())).sum::<u64>();
-                    found.push((i, exts));
+                    found.push((i, exts, tail));
                 }
             }
             if live == 0 {
@@ -1744,9 +1806,9 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
                 continue;
             }
             em.key(k, |w| {
-                for &(i, exts) in &found[start..] {
+                for &(i, exts, tail) in &found[start..] {
                     blobs[i]
-                        .read_exts(exts, |v| w.value(v))
+                        .read_exts(exts, tail, |v| w.value(v))
                         .map_err(|e| err(&format!("compact read: {e}")))?;
                 }
                 Ok(())
@@ -2101,6 +2163,7 @@ impl Db {
         let bulk = self.opts.bulk_writer;
         let background_io = self.opts.background_io;
         let sync_every = self.opts.seal_sync_every;
+        let inline_max = self.opts.inline_bytes;
         let end_seq = old_wal.seq;
         self.retiring_wals.push(old_wal.path.clone());
         drop(old_wal);
@@ -2145,7 +2208,7 @@ impl Db {
                 let tmp = dir.join(format!("seal-{id:08}.tmp"));
                 let _ = std::fs::remove_file(&tmp);
                 {
-                    let mut w = PieceWriter::create(&tmp, &opts, bulk, sync_every)
+                    let mut w = PieceWriter::create(&tmp, &opts, bulk, sync_every, inline_max)
                         .map_err(|e| err(&format!("seal create: {e}")))?;
                     for e in &order[start..at] {
                         let key = MemTable::key_of(&mem.keys, e);
@@ -2406,6 +2469,7 @@ impl Db {
         let cursors = self.opts.cursor_merge;
         let background_io = self.opts.background_io;
         let sync_every = self.opts.seal_sync_every;
+        let inline_max = self.opts.inline_bytes;
         let job_inputs = inputs.clone();
         let handle = std::thread::spawn(move || {
             compact_job(MergePlan {
@@ -2421,6 +2485,7 @@ impl Db {
                 cursors,
                 background_io,
                 sync_every,
+                inline_max,
             })
         });
         self.compacting = Some((inputs, handle));

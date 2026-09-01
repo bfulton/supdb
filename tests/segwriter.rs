@@ -114,8 +114,17 @@ fn write_store(path: &Path, data: &[(Vec<u8>, Vec<Vec<u8>>)], o: Options) {
     store.close().expect("close");
 }
 
+/// Runs up to this many bytes go inline in the index record; the fixture's
+/// 9,000-byte values stay in blocks, so one store exercises both paths.
+const INLINE: usize = 256;
+
 fn write_bulk(path: &Path, data: &[(Vec<u8>, Vec<Vec<u8>>)], o: Options) {
+    write_bulk_with(path, data, o, INLINE)
+}
+
+fn write_bulk_with(path: &Path, data: &[(Vec<u8>, Vec<Vec<u8>>)], o: Options, inline: usize) {
     let mut w = SegmentWriter::create(path, &o).expect("create");
+    w.set_inline_max(inline);
     for (k, vals) in data {
         w.begin(k).expect("begin");
         for v in vals {
@@ -198,12 +207,40 @@ fn bulk_segment_reads_identically_to_a_store_written_one() {
     write_bulk(&dir.join("bulk.sup"), &data, opts());
     let a = open(&dir.join("store.sup"));
     let b = open(&dir.join("bulk.sup"));
-    assert!(
-        b.blocks() > 20,
-        "the data should span many blocks, got {}",
-        b.blocks()
-    );
+    assert!(b.blocks() > 0, "the long runs still need blocks, got {}", b.blocks());
     agree(&a, &b, &data);
+    // Which runs went inline is decided by their byte length, and an inline
+    // run plans no fetch: the extent names no block and the read touches
+    // the record alone.
+    let mut inline = 0usize;
+    for (key, vals) in &data {
+        let run: usize = vals.iter().map(|v| v.len() + varint_len(v.len())).sum();
+        let exts = b.lookup(key).expect("present");
+        assert_eq!(exts.len(), 1, "one run per key in a bulk segment");
+        if run <= INLINE {
+            assert!(exts[0].is_inline(), "a {run}-byte run must be inline for {key:?}");
+            assert!(b.ranges_for(key).expect("plan").is_empty(), "an inline run fetches nothing");
+            inline += 1;
+        } else {
+            assert!(!exts[0].is_inline(), "a {run}-byte run must be in a block for {key:?}");
+            assert!(!b.ranges_for(key).expect("plan").is_empty());
+        }
+        assert!(a.lookup(key).expect("present").iter().all(|e| !e.is_inline()), "Store never inlines");
+    }
+    // Both paths well exercised: the fixture's uneven run lengths put a
+    // minority of keys under the threshold and the rest in blocks.
+    assert!(inline > data.len() / 10, "too few inline runs to test: {inline}");
+    assert!(data.len() - inline > data.len() / 10, "too few block runs to test: {inline} inline");
+}
+
+fn varint_len(n: usize) -> usize {
+    let mut n = n as u64;
+    let mut l = 1;
+    while n >= 0x80 {
+        n >>= 7;
+        l += 1;
+    }
+    l
 }
 
 #[test]
@@ -263,7 +300,9 @@ fn the_mapped_reader_opens_a_bulk_segment() {
     let _serial = serial();
     let dir = scratch("reader");
     let data = varlen(1_500, 5);
-    write_bulk(&dir.join("bulk.sup"), &data, opts());
+    // Block-backed only: `store::Reader` is the old engine's reader and does
+    // not serve inline runs -- a next-engine segment is read through `Blob`.
+    write_bulk_with(&dir.join("bulk.sup"), &data, opts(), 0);
     let r = Reader::open(&dir.join("bulk.sup")).expect("Reader::open");
     for (key, vals) in &data {
         let mut got = Vec::new();
@@ -279,7 +318,10 @@ fn the_checksum_recorded_is_the_one_the_reader_checks() {
     let dir = scratch("crc");
     let data = varlen(200, 9);
     let path = dir.join("bulk.sup");
-    write_bulk(&path, &data, opts());
+    // Block-backed, because the byte this test flips is in the first block
+    // and the first key's 50-byte value would otherwise be inline in the
+    // index record, where the block checksum does not reach.
+    write_bulk_with(&path, &data, opts(), 0);
     // Intact first.
     let b = open(&path);
     assert_eq!(b.read_all(b"\x00first", |_| {}).expect("intact"), 1);

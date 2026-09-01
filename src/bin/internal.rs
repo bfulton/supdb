@@ -131,6 +131,7 @@ fn main() -> std::io::Result<()> {
             "f50-txn" => f50_txn(&args, profile)?,
             "f51-ioprio" => f51_ioprio(&args, profile)?,
             "f52-segsize" => f52_segsize(&args, profile)?,
+            "f53-inline" => f53_inline(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -6903,6 +6904,242 @@ fn f52_segsize(args: &Args, profile: Profile) -> std::io::Result<Record> {
             rd32p.summary("32mb-p64", "64mb"),
             med(a32, |r| r.7),
             rd32.summary("32mb", "64mb"),
+        ),
+    ));
+    Ok(rec)
+}
+
+fn f53_inline(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::bytes::MmapBytes;
+    use supdb::next::{Db, NextOptions};
+    use supdb::Blob;
+
+    let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+    let reads = args.num("--reads", profile.pick(20_000, 50_000, 200_000)) as u64;
+
+    let mut rec = Record::new("f53-inline", profile);
+    rec.param("keys", J::u(keys))
+        .param("batch", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .param("reads", J::u(reads))
+        .note(
+            "two arms interleaved in one process, fresh store per rep, one option apart: \
+             inline_bytes 0 (every run in a block, the layout Store writes) against 256 (a run \
+             up to 256 bytes lives in its index record and a read of it touches no block). The \
+             EXT.23 shape: 1M keys, 100-byte values, durable batches, the drain inside the load \
+             window, then point reads, one ordered scan of everything, and a dictionary count \
+             (scan_counts) over every partition -- all over the drained, routed store",
+        )
+        .note("predictions registered in inline-plan.md before the run");
+
+    let dir = scratch("f53");
+    let payload = Payload::new(value_size, 0.5, 0xF53);
+    let arms: [(&str, usize); 2] = [("blocks", 0), ("inline", 256)];
+    // ci, device MB, disk MB, commit s, seal s, merge s, reads/s, scan entries/s, count ns/key
+    type Row = (usize, f64, f64, f64, f64, f64, f64, f64, f64);
+    let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
+    let rates = Trial::new(profile.reps()).run(arms.len(), |ci, rep| {
+        let mut vrng = Rng::new(0xF53 + rep as u64);
+        let mut kb = [0u8; 16];
+        let d = dir.join(format!("f53-{ci}-{rep}"));
+        let _ = std::fs::remove_dir_all(&d);
+        let opts = NextOptions { inline_bytes: arms[ci].1, ..Default::default() };
+        let mut db = Db::create(&d, opts).expect("create");
+        let io0 = IoCounters::read_now();
+        let t = Instant::now();
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            db.append(&kb, payload.get(&mut vrng));
+            if (i + 1) % batch == 0 {
+                db.commit().expect("commit");
+            }
+        }
+        db.flush().expect("flush");
+        let secs = t.elapsed().as_secs_f64();
+        let (c, s, m) = db.phase_ns();
+        let io_mb = IoCounters::read_now().since(&io0).write_bytes as f64 / 1_048_576.0;
+
+        // Point reads.
+        let mut x = 0x1A1E_5EED_u64 ^ (rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut sink = 0u64;
+        let tr = Instant::now();
+        for _ in 0..reads {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            db_key_into(z % keys, &mut kb);
+            sink += db
+                .read_all(&kb, |v| {
+                    std::hint::black_box(v);
+                })
+                .expect("read");
+        }
+        let reads_per_s = reads as f64 / tr.elapsed().as_secs_f64();
+        // One ordered scan of everything.
+        let ts = Instant::now();
+        let mut entries = 0u64;
+        db.scan(b"", usize::MAX, |_, v| {
+            std::hint::black_box(v);
+            entries += 1;
+        })
+        .expect("scan");
+        let scan_per_s = entries as f64 / ts.elapsed().as_secs_f64();
+        // The dictionary count, per partition, straight through Blob.
+        let mut parts: Vec<std::path::PathBuf> = std::fs::read_dir(&d)
+            .expect("dir")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("par-")))
+            .collect();
+        parts.sort();
+        let mut counted = 0u64;
+        let tc = Instant::now();
+        for pth in &parts {
+            let blob = Blob::open(MmapBytes::open(pth).expect("map")).expect("open");
+            blob.scan_counts(b"", usize::MAX, |_, n| {
+                sink += n;
+                counted += 1;
+                true
+            })
+            .expect("scan_counts");
+        }
+        let count_ns = tc.elapsed().as_nanos() as f64 / counted.max(1) as f64;
+        std::hint::black_box(sink);
+
+        db.close().expect("close");
+        let mut bytes = 0u64;
+        for e in std::fs::read_dir(&d).expect("dir") {
+            bytes += e.expect("entry").metadata().expect("meta").len();
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        rows.lock().unwrap().push((
+            ci,
+            io_mb,
+            bytes as f64 / 1_048_576.0,
+            c as f64 / 1e9,
+            s as f64 / 1e9,
+            m as f64 / 1e9,
+            reads_per_s,
+            scan_per_s,
+            count_ns,
+        ));
+        keys as f64 / secs
+    });
+    let col = |ci: usize, pick: fn(&Row) -> f64| -> Vec<f64> {
+        rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect()
+    };
+    let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
+        let mut v = col(ci, pick);
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
+    rec.series(
+        "arms",
+        J::arr(
+            arms.iter()
+                .enumerate()
+                .zip(rates.iter())
+                .map(|((ci, (name, _)), s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "ops_per_s" => J::fp(s.median(), 1),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4),
+                        "commit_s" => J::fp(med(ci, |r| r.3), 3),
+                        "seal_s" => J::fp(med(ci, |r| r.4), 3),
+                        "merge_s" => J::fp(med(ci, |r| r.5), 3),
+                        "device_write_mb" => J::fp(med(ci, |r| r.1), 1),
+                        "disk_mb" => J::fp(med(ci, |r| r.2), 1),
+                        "reads_per_s" => J::fp(med(ci, |r| r.6), 1),
+                        "read_ns" => J::fp(1e9 / med(ci, |r| r.6), 1),
+                        "scan_entries_per_s" => J::fp(med(ci, |r| r.7), 1),
+                        "count_ns_per_key" => J::fp(med(ci, |r| r.8), 2)
+                    }
+                })
+                .collect(),
+        ),
+    );
+
+    let rd = compare(&Samples::new(col(1, |r| r.6)), &Samples::new(col(0, |r| r.6)), supdb::bench::MIN_EFFECT);
+    rec.compare("inline_vs_blocks_reads", rd.clone());
+    rec.finding(Finding::new(
+        "F53.1",
+        "point reads over a drained store are at least 1.25x faster with inline runs",
+        matches!(rd.verdict, supdb::bench::Verdict::Greater) && rd.ratio >= 1.25,
+        format!(
+            "inline {:.0} reads/s ({:.0} ns) against blocks {:.0} ({:.0} ns): {}. An inline read \
+             touches the hash slot and the record; a block-backed one goes on to the block table \
+             row and the block, two more misses at a million keys",
+            med(1, |r| r.6),
+            1e9 / med(1, |r| r.6),
+            med(0, |r| r.6),
+            1e9 / med(0, |r| r.6),
+            rd.summary("inline", "blocks"),
+        ),
+    ));
+    let disk_ratio = med(1, |r| r.2) / med(0, |r| r.2);
+    rec.finding(Finding::new(
+        "F53.2",
+        "the store on disk is within 1.05x either way",
+        (0.95..=1.05).contains(&disk_ratio),
+        format!(
+            "{:.1} MB with inline runs against {:.1} with blocks ({:.3}x); device bytes {:.1} \
+             against {:.1} MB. Values move from blocks into records; nothing is duplicated, and \
+             both arms drop the flat index's half-again record slack a segment never uses",
+            med(1, |r| r.2),
+            med(0, |r| r.2),
+            disk_ratio,
+            med(1, |r| r.1),
+            med(0, |r| r.1),
+        ),
+    ));
+    let sc = compare(&Samples::new(col(1, |r| r.7)), &Samples::new(col(0, |r| r.7)), supdb::bench::MIN_EFFECT);
+    rec.compare("inline_vs_blocks_scan", sc.clone());
+    rec.finding(Finding::new(
+        "F53.3",
+        "the ordered scan is no slower with inline runs",
+        !matches!(sc.verdict, supdb::bench::Verdict::Less),
+        format!(
+            "inline {:.0} entries/s against blocks {:.0}: {}. The scan walks records in key \
+             order and an inline run is where the walk already is; a block-backed one resolves \
+             a block per run of keys",
+            med(1, |r| r.7),
+            med(0, |r| r.7),
+            sc.summary("inline", "blocks"),
+        ),
+    ));
+    let count_ratio = med(1, |r| r.8) / med(0, |r| r.8).max(1e-9);
+    rec.finding(Finding::new(
+        "F53.4",
+        "the dictionary count over inline records costs at most 2x the block-backed form's per key",
+        count_ratio <= 2.0,
+        format!(
+            "{:.2} ns/key through scan_counts over inline records against {:.2} over \
+             block-backed ones ({:.3}x). Wider records mean more bytes per key under the walk; \
+             this is the price, registered rather than discovered",
+            med(1, |r| r.8),
+            med(0, |r| r.8),
+            count_ratio,
+        ),
+    ));
+    let ing = compare(&rates[1], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("inline_vs_blocks_ingest", ing.clone());
+    rec.finding(Finding::new(
+        "F53.5",
+        "ingest-to-routed is within 5% either way",
+        (0.95..=1.05).contains(&ing.ratio) || matches!(ing.verdict, supdb::bench::Verdict::NoDifference),
+        format!(
+            "inline {:.0} ops/s against blocks {:.0}: {}. Seal {:.3}s against {:.3}s, merge \
+             {:.3}s against {:.3}s. The writer moves the same bytes to a different section",
+            rates[1].median(),
+            rates[0].median(),
+            ing.summary("inline", "blocks"),
+            med(1, |r| r.4),
+            med(0, |r| r.4),
+            med(1, |r| r.5),
+            med(0, |r| r.5),
         ),
     ));
     Ok(rec)

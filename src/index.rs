@@ -39,6 +39,21 @@ impl Ext {
     /// Set on an extent that supersedes every older value of its key.
     pub const TOMBSTONE: u32 = 1 << 31;
 
+    /// A `block` of this value means the run is INLINE: its bytes sit in the
+    /// index record itself, after the extents, at `off` within that tail.
+    /// A read of such a run never consults the block table or a block --
+    /// two cache misses fewer per lookup at a million keys, which is what
+    /// the read lead needed past the arrangement ceiling (inline-plan.md).
+    /// Only the segment writer produces them; `Store` never does, and a
+    /// reader from before this extension errors on the block id rather
+    /// than answering wrongly.
+    pub const INLINE: u32 = u32::MAX;
+
+    #[inline]
+    pub fn is_inline(&self) -> bool {
+        self.block == Ext::INLINE
+    }
+
     /// Records in the run, without the flag.
     #[inline]
     pub fn records(&self) -> u32 {

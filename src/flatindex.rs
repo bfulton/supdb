@@ -167,11 +167,31 @@ fn record_len(klen: usize, next: usize) -> usize {
     align_up(4 + klen, REC_ALIGN) + next * EXT_BYTES
 }
 
+/// `record_len` plus the record's tail: the bytes of its inline runs, padded
+/// so the next record stays 4-aligned.
+fn record_len_tail(klen: usize, next: usize, tail: usize) -> usize {
+    record_len(klen, next) + align_up(tail, REC_ALIGN)
+}
+
 /// Measure the section before writing it, so the whole thing can be built into
 /// one allocation of the right size rather than grown.
 /// `insert_slack` is how many keys beyond the current set the directory should
 /// have room for. Zero reproduces the single-buffer layout byte for byte.
 pub fn plan(all: &[(&[u8], &crate::index::Extents)], insert_slack: usize) -> Option<Plan> {
+    plan_inline(all, &[], insert_slack, true)
+}
+
+/// `plan`, with a tail of inline-run bytes per key (`tails` is empty or one
+/// entry per key) and a choice about the half-again record slack. The slack
+/// exists so a store whose keys gain extents can publish updates in place;
+/// an immutable segment never will, so its writer turns it off and saves the
+/// bytes.
+pub fn plan_inline(
+    all: &[(&[u8], &crate::index::Extents)],
+    tails: &[&[u8]],
+    insert_slack: usize,
+    record_slack: bool,
+) -> Option<Plan> {
     let mut cap = 1usize;
     while cap < all.len() * 2 {
         cap = cap.checked_mul(2)?;
@@ -192,14 +212,16 @@ pub fn plan(all: &[(&[u8], &crate::index::Extents)], insert_slack: usize) -> Opt
             return None;
         }
         rec_offs.push(at as u32);
-        at = at.checked_add(record_len(k.len(), n))?;
+        let tail = tails.get(rec_offs.len() - 1).map_or(0, |t| t.len());
+        at = at.checked_add(record_len_tail(k.len(), n, tail))?;
     }
     if at > MAX_RECS {
         return None;
     }
     // Half again, so a store whose keys gain extents can publish updates
-    // without rewriting anything.
-    let slack = at * SLACK_NUM / SLACK_DEN;
+    // without rewriting anything -- unless the caller says the section is
+    // never edited in place.
+    let slack = if record_slack { at * SLACK_NUM / SLACK_DEN } else { 0 };
     let recs_cap = at.checked_add(slack)?;
     if recs_cap > MAX_RECS {
         return None;
@@ -263,7 +285,24 @@ pub fn encode(
     insert_slack: usize,
     parallel: bool,
 ) -> Option<(Vec<u8>, usize)> {
-    let p = plan(all, insert_slack)?;
+    encode_inline(all, &[], generation, prev, hash_of, insert_slack, true, parallel)
+}
+
+/// `encode`, with each key's inline runs (`tails`, empty or one per key,
+/// laid down after that key's extents) and the record slack under the
+/// caller's control. See `plan_inline`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_inline(
+    all: &[(&[u8], &crate::index::Extents)],
+    tails: &[&[u8]],
+    generation: u64,
+    prev: Option<(u64, u64, u64, u64, u64)>,
+    hash_of: fn(&[u8]) -> u64,
+    insert_slack: usize,
+    record_slack: bool,
+    parallel: bool,
+) -> Option<(Vec<u8>, usize)> {
+    let p = plan_inline(all, tails, insert_slack, record_slack)?;
     // Only the part with anything in it. The header still describes the full
     // reserved region, so a reader maps the slack and an in-place update
     // writes into it; it simply is not built here and not written.
@@ -352,6 +391,9 @@ pub fn encode(
                 recs[e_at + 12..e_at + 16].copy_from_slice(&e.last.to_le_bytes());
                 recs[e_at + 16..e_at + 20].copy_from_slice(&e.count.to_le_bytes());
                 e_at += EXT_BYTES;
+            }
+            if let Some(tail) = tails.get(i) {
+                recs[e_at..e_at + tail.len()].copy_from_slice(tail);
             }
             let d = (i - from) * 4;
             dir[d..d + 4].copy_from_slice(&p.rec_offs[i].to_le_bytes());
@@ -711,6 +753,17 @@ impl FlatIndex {
     /// The key and extents of the record at `off` within the record region.
     #[inline]
     fn record<'a>(&self, sec: &'a [u8], off: usize) -> Option<(&'a [u8], &'a [Ext])> {
+        self.record_full(sec, off).map(|(k, e, _)| (k, e))
+    }
+
+    /// `record`, plus the record's tail: the bytes of its inline runs, sized
+    /// from the extents that name `Ext::INLINE`. Empty for a record without
+    /// one, which is every record `Store` writes.
+    fn record_full<'a>(
+        &self,
+        sec: &'a [u8],
+        off: usize,
+    ) -> Option<(&'a [u8], &'a [Ext], &'a [u8])> {
         let recs = sec.get(self.recs.0..self.recs.1)?;
         let klen = rd_u16(recs, off)? as usize;
         let n = rd_u16(recs, off + 2)? as usize;
@@ -727,7 +780,18 @@ impl FlatIndex {
             return None;
         }
         let exts = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const Ext, n) };
-        Some((key, exts))
+        let mut tail_len = 0usize;
+        for e in exts {
+            if e.is_inline() {
+                tail_len = tail_len
+                    .checked_add(e.off as usize)?
+                    .max(tail_len)
+                    .max((e.off as usize).checked_add(e.len as usize)?);
+            }
+        }
+        let t_at = e_at + n * EXT_BYTES;
+        let tail = recs.get(t_at..t_at.checked_add(tail_len)?)?;
+        Some((key, exts, tail))
     }
 
     /// Extents for `key`, borrowed from the mapping. No allocation, no decode.
@@ -737,6 +801,16 @@ impl FlatIndex {
         key: &[u8],
         hash_of: fn(&[u8]) -> u64,
     ) -> Option<&'a [Ext]> {
+        self.lookup_full(sec, key, hash_of).map(|(e, _)| e)
+    }
+
+    /// `lookup`, with the record's tail of inline runs.
+    pub fn lookup_full<'a>(
+        &self,
+        sec: &'a [u8],
+        key: &[u8],
+        hash_of: fn(&[u8]) -> u64,
+    ) -> Option<(&'a [Ext], &'a [u8])> {
         let hash = sec.get(self.hash.0..self.hash.1)?;
         let h = hash_of(key);
         let tag = ((h >> 56) | 1) & 0xff;
@@ -751,9 +825,9 @@ impl FlatIndex {
             }
             if packed >> 56 == tag {
                 let off = (packed & 0x00ff_ffff_ffff_ffff) as usize;
-                if let Some((k, exts)) = self.record(sec, off) {
+                if let Some((k, exts, tail)) = self.record_full(sec, off) {
                     if k == key {
-                        return Some(exts);
+                        return Some((exts, tail));
                     }
                 }
             }
@@ -789,12 +863,21 @@ impl FlatIndex {
 
     /// The record at `rank` in key order.    /// The record at `rank` in key order.
     pub fn at<'a>(&self, sec: &'a [u8], rank: usize) -> Option<(&'a [u8], &'a [Ext])> {
+        self.at_full(sec, rank).map(|(k, e, _)| (k, e))
+    }
+
+    /// `at`, with the record's tail of inline runs.
+    pub fn at_full<'a>(
+        &self,
+        sec: &'a [u8],
+        rank: usize,
+    ) -> Option<(&'a [u8], &'a [Ext], &'a [u8])> {
         if rank >= self.nkeys {
             return None;
         }
         let dir = sec.get(self.dir.0..self.dir.1)?;
         let off = rd_u32(dir, rank * 4)? as usize;
-        self.record(sec, off)
+        self.record_full(sec, off)
     }
 
     /// Where a key that is *not* present would claim a hash slot.

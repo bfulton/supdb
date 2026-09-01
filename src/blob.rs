@@ -522,6 +522,18 @@ impl<B: Bytes> Blob<B> {
             .lookup(self.key_sec().ok()?, key, flatindex::key_hash)
     }
 
+    /// `lookup`, with the record's tail: the bytes of any inline runs, which
+    /// `read_exts` needs to serve an extent that names `Ext::INLINE`.
+    pub fn lookup_full(&self, key: &[u8]) -> Option<(&[Ext], &[u8])> {
+        self.idx
+            .lookup_full(self.key_sec().ok()?, key, flatindex::key_hash)
+    }
+
+    /// `exts_at`, with the record's tail of inline runs.
+    pub fn exts_at_full(&self, rank: usize) -> Option<(&[u8], &[Ext], &[u8])> {
+        self.idx.at_full(self.key_sec().ok()?, rank)
+    }
+
     /// Rank of the first key at or after `key`, in key order. R4.4.
     pub fn seek(&self, key: &[u8]) -> usize {
         match self.key_sec() {
@@ -549,12 +561,12 @@ impl<B: Bytes> Blob<B> {
     /// read must not pay, and it is the whole difference between a scan
     /// and a sequence of lookups.
     pub fn values_at<F: FnMut(&[u8])>(&self, rank: usize, mut f: F) -> Result<u64> {
-        let Some((_, exts)) = self.exts_at(rank) else {
+        let Some((_, exts, tail)) = self.exts_at_full(rank) else {
             return Ok(0);
         };
         let mut n = 0u64;
         for e in exts {
-            n += self.with_extent(*e, |run| {
+            n += self.with_run(*e, tail, |run| {
                 let mut p = 0usize;
                 let mut seen = 0u64;
                 while p < run.len() {
@@ -635,6 +647,11 @@ impl<B: Bytes> Blob<B> {
             return Ok(());
         };
         for e in exts {
+            // An inline run is in the index, which is resident after open:
+            // it costs the plan nothing and fetches nothing.
+            if e.is_inline() {
+                continue;
+            }
             let loc = self.loc_of(e.block)?;
             out.push((loc.off, loc.stored as u64));
         }
@@ -738,7 +755,24 @@ impl<B: Bytes> Blob<B> {
     /// whole into scratch. The buffers are taken out of their `Cell`s and put
     /// back, so a callback that re-enters gets a fresh buffer instead of a
     /// panic.
+    /// `with_extent`, for an extent that may be inline: then the run is a
+    /// slice of the record's tail and no block is touched.
+    fn with_run<R>(&self, e: Ext, tail: &[u8], f: impl FnOnce(&[u8]) -> Result<R>) -> Result<R> {
+        if e.is_inline() {
+            let a = e.off as usize;
+            let b = a
+                .checked_add(e.len as usize)
+                .filter(|&b| b <= tail.len())
+                .ok_or_else(|| corrupt("inline run runs past its record"))?;
+            return f(&tail[a..b]);
+        }
+        self.with_extent(e, f)
+    }
+
     fn with_extent<R>(&self, e: Ext, f: impl FnOnce(&[u8]) -> Result<R>) -> Result<R> {
+        if e.is_inline() {
+            return Err(corrupt("inline run read without its record"));
+        }
         let loc = self.loc_of(e.block)?;
         let (a, b) = (e.off as usize, (e.off as usize).saturating_add(e.len as usize));
         let mut raw_buf = self.raw_buf.take();
@@ -785,19 +819,20 @@ impl<B: Bytes> Blob<B> {
     /// this work was written against says "read_all returns a count", and it
     /// does not.
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], f: F) -> Result<u64> {
-        let Some(exts) = self.lookup(key) else {
+        let Some((exts, tail)) = self.lookup_full(key) else {
             return Ok(0);
         };
-        self.read_exts(exts, f)
+        self.read_exts(exts, tail, f)
     }
 
-    /// Every value in `exts`, in order -- the extents a `lookup` or `exts_at`
-    /// returned, handed back so a caller that has already resolved a key and
-    /// looked at its flags does not resolve it again. Returns how many.
-    pub fn read_exts<F: FnMut(&[u8])>(&self, exts: &[Ext], mut f: F) -> Result<u64> {
+    /// Every value in `exts`, in order -- the extents and tail a
+    /// `lookup_full` or `exts_at_full` returned, handed back so a caller that
+    /// has already resolved a key and looked at its flags does not resolve it
+    /// again. Returns how many.
+    pub fn read_exts<F: FnMut(&[u8])>(&self, exts: &[Ext], tail: &[u8], mut f: F) -> Result<u64> {
         let mut n = 0u64;
         for e in exts {
-            n += self.with_extent(*e, |run| {
+            n += self.with_run(*e, tail, |run| {
                 let mut p = 0usize;
                 let mut seen = 0u64;
                 while p < run.len() {
@@ -968,10 +1003,30 @@ impl<B: Bytes> Blob<B> {
         let mut seen = 0usize;
         let mut cached: Option<(u32, &[u8])> = None;
         while seen < limit {
-            let Some((k, exts)) = self.exts_at(rank) else {
+            let Some((k, exts, tail)) = self.exts_at_full(rank) else {
                 break;
             };
             for e in exts {
+                // An inline run is right here in the record the walk is
+                // already on: no block, no cache, no fetch.
+                if e.is_inline() {
+                    self.with_run(*e, tail, |run| {
+                        let mut p = 0usize;
+                        while p < run.len() {
+                            let len = get_uvarint(run, &mut p) as usize;
+                            let end = p
+                                .checked_add(len)
+                                .ok_or_else(|| corrupt("record length overflows"))?;
+                            if end > run.len() {
+                                return Err(corrupt("record runs past the end of its extent"));
+                            }
+                            f(k, &run[p..end]);
+                            p = end;
+                        }
+                        Ok(())
+                    })?;
+                    continue;
+                }
                 // The fast path wants a lending source and a plain block:
                 // anything else falls back, because a decompressed block
                 // lives in a buffer this loop cannot hold across keys.
