@@ -494,3 +494,45 @@ fn a_missing_or_wrong_counts_sidecar_falls_back_rather_than_lying() {
         );
     }
 }
+
+#[test]
+fn every_n_loses_the_unsynced_tail_whole_and_never_in_part() {
+    // SyncPolicy::EveryN's contract: the WAL is written every commit and
+    // synced every nth, so a crash loses at most n batches -- and what it
+    // loses it loses WHOLE. Emulated the only honest way in one process:
+    // tear the file inside the unsynced tail, since a same-process reopen
+    // would otherwise find the page cache still holding what the device
+    // never got.
+    use supdb::next::SyncPolicy;
+    let d = dir("everyn");
+    let opts = NextOptions { sync: SyncPolicy::EveryN(16), ..NextOptions::default() };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    // 16 commits reach a barrier; the next 7 do not.
+    for c in 0u32..23 {
+        db.append(format!("k{c:03}").as_bytes(), &c.to_le_bytes());
+        db.commit().unwrap();
+    }
+    drop(db);
+    let wal = d.join("wal-00000000");
+    let len = std::fs::metadata(&wal).unwrap().len();
+    // Tear a few bytes off the end: the last unsynced frame is torn, the
+    // ones before it are intact-but-unsynced, and the sixteen before those
+    // were behind a barrier.
+    std::fs::OpenOptions::new().write(true).open(&wal).unwrap().set_len(len - 5).unwrap();
+
+    let db = Db::open(&d, opts).unwrap();
+    for c in 0u32..16 {
+        assert_eq!(
+            read_vec(&db, format!("k{c:03}").as_bytes()),
+            vec![c.to_le_bytes().to_vec()],
+            "a synced record must survive"
+        );
+    }
+    // Everything after the tear is gone; everything intact before it is
+    // served (this emulation tore only the last frame), and no record is
+    // ever duplicated or served out of order.
+    assert_eq!(read_vec(&db, b"k022"), Vec::<Vec<u8>>::new(), "the torn frame is the crash point");
+    for c in 16u32..22 {
+        assert_eq!(read_vec(&db, format!("k{c:03}").as_bytes()).len(), 1);
+    }
+}

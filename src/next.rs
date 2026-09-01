@@ -67,8 +67,26 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
     }
 }
 
+/// When a commit reaches the device. The WAL is WRITTEN on every commit
+/// under every policy; this decides only the barrier. `EveryN(n)` bounds
+/// loss at n batches: on a crash, replay stops at the first frame that is
+/// torn or missing and the sequence-gap check refuses anything past a
+/// hole, so an unsynced tail is lost whole and never served in part.
+///
+/// It exists because f47 measured this device serving ~2,700 barriers a
+/// second however they are issued -- sharding cannot scale past 1.6x --
+/// so on a barrier-bound device the lever is fewer barriers per record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncPolicy {
+    /// One fdatasync per commit. Durable per batch, LMDB's boundary.
+    Always,
+    /// One fdatasync per `n` commits, and always at seal, flush and close.
+    EveryN(u32),
+}
+
 #[derive(Clone)]
 pub struct NextOptions {
+    pub sync: SyncPolicy,
     /// Memtable bytes that trigger a seal at the next commit. Sealing is off
     /// the commit path in cost accounting but runs on the committing thread
     /// in milestone 1; the brief's "Segment size" question owns this number.
@@ -100,6 +118,7 @@ pub struct NextOptions {
 impl Default for NextOptions {
     fn default() -> NextOptions {
         NextOptions {
+            sync: SyncPolicy::Always,
             seal_bytes: 64 << 20,
             segment: Options::default(),
             l0_trigger: 4,
@@ -147,13 +166,23 @@ impl Wal {
     /// The durable point: one write, one fdatasync. F39.1 is the budget this
     /// function is held to.
     fn commit(&mut self) -> Result<()> {
+        self.write()?;
+        self.sync()
+    }
+
+    /// The write half: pending frames reach the file, not yet the device.
+    fn write(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
         self.file.write_all(&self.pending)?;
-        self.file.sync_data()?;
         self.pending.clear();
         Ok(())
+    }
+
+    /// The barrier half.
+    fn sync(&mut self) -> Result<()> {
+        self.file.sync_data()
     }
 
     /// Replay a WAL into `apply`, stopping cleanly at a torn tail: a frame
@@ -914,6 +943,8 @@ pub struct Db {
     /// holds.
     segs: Vec<Seg>,
     next_seg: u64,
+    /// Commits written since the last barrier, for `SyncPolicy::EveryN`.
+    unsynced: u32,
     /// Nanoseconds spent in each phase of a load, accumulated so an
     /// experiment can attribute the durable-load cost instead of inferring
     /// it. `commit` is the WAL append and its fdatasync -- the only work on
@@ -1015,6 +1046,7 @@ impl Db {
             frozen: None,
             sealing: None,
             compacting: None,
+            unsynced: 0,
             phase_ns: [0; 3],
             retiring_wals: Vec::new(),
             covered_seq: 0,
@@ -1118,6 +1150,7 @@ impl Db {
             frozen: None,
             sealing: None,
             compacting: None,
+            unsynced: 0,
             phase_ns: [0; 3],
             retiring_wals: retiring,
             covered_seq: sealed,
@@ -1138,7 +1171,16 @@ impl Db {
     /// batch's durability never waits on a segment write.
     pub fn commit(&mut self) -> Result<()> {
         let t = std::time::Instant::now();
-        self.wal.commit()?;
+        self.wal.write()?;
+        self.unsynced += 1;
+        let due = match self.opts.sync {
+            SyncPolicy::Always => true,
+            SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
+        };
+        if due {
+            self.wal.sync()?;
+            self.unsynced = 0;
+        }
         self.phase_ns[0] += t.elapsed().as_nanos() as u64;
         if self.sealing.as_ref().is_some_and(|h| h.is_finished()) {
             self.join_seal()?;
@@ -1157,6 +1199,7 @@ impl Db {
     /// in flight, so a second trigger joins the first (backpressure).
     pub fn seal(&mut self) -> Result<()> {
         self.wal.commit()?;
+        self.unsynced = 0;
         if self.mem.is_empty() {
             return Ok(());
         }
@@ -1271,6 +1314,7 @@ impl Db {
     /// supposed to remove, back through the side door.
     pub fn flush(&mut self) -> Result<()> {
         self.wal.commit()?;
+        self.unsynced = 0;
         self.seal()?;
         self.join_seal()?;
         self.join_compact()?;

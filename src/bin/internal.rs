@@ -126,6 +126,7 @@ fn main() -> std::io::Result<()> {
             "f45-scanfloor" => f45_scanfloor(&args, profile)?,
             "f46-segwrite" => f46_segwrite(&args, profile)?,
             "f47-parwal" => f47_parwal(&args, profile)?,
+            "f48-syncpolicy" => f48_syncpolicy(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -5791,6 +5792,176 @@ fn f38_fanout(args: &Args, profile: Profile) -> std::io::Result<Record> {
         ),
     ));
 
+    Ok(rec)
+}
+
+/// Fewer barriers per record. syncpolicy-plan.md registers the
+/// predictions: f47 showed the device serves ~2,700 barriers a second
+/// however they are issued, so on a barrier-bound device the lever is
+/// how many records ride each one. Four arms of the same engine, the f42
+/// load shape, differing only in `SyncPolicy`, plus the contract check
+/// P48.3 demands -- a torn unsynced tail is lost whole and never served
+/// in part -- run inline so it is a recorded finding and not only a test.
+fn f48_syncpolicy(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::next::{Db, NextOptions, SyncPolicy};
+
+    let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+
+    let mut rec = Record::new("f48-syncpolicy", profile);
+    rec.param("keys", J::u(keys))
+        .param("batch", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .note(
+            "four arms interleaved, fresh store per rep, the f42 load shape; the arms differ only \
+             in SyncPolicy. The WAL is written on every commit in every arm and the policy moves \
+             only the barrier. Device bytes and the commit-phase seconds travel with the \
+             throughput",
+        )
+        .note("predictions registered in syncpolicy-plan.md before the run");
+
+    let dir = scratch("f48");
+    let payload = Payload::new(value_size, 0.5, 0xF48);
+    let arm_names = ["always", "every-4", "every-16", "every-64"];
+    let policies = [
+        SyncPolicy::Always,
+        SyncPolicy::EveryN(4),
+        SyncPolicy::EveryN(16),
+        SyncPolicy::EveryN(64),
+    ];
+    let io_mb: std::sync::Mutex<Vec<Samples>> =
+        std::sync::Mutex::new(vec![Samples::default(); 4]);
+    let commit_s: std::sync::Mutex<Vec<Samples>> =
+        std::sync::Mutex::new(vec![Samples::default(); 4]);
+
+    let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
+        let d = dir.join(format!("a{ci}-{rep}"));
+        let _ = std::fs::remove_dir_all(&d);
+        let opts = NextOptions { sync: policies[ci], ..Default::default() };
+        let mut db = Db::create(&d, opts).expect("create");
+        let mut vrng = Rng::new(0xF48 + rep as u64);
+        let mut kb = [0u8; 16];
+        let io0 = IoCounters::read_now();
+        let t = Instant::now();
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            db.append(&kb, payload.get(&mut vrng));
+            if (i + 1) % batch == 0 {
+                db.commit().expect("commit");
+            }
+        }
+        let secs = t.elapsed().as_secs_f64();
+        let (c, _, _) = db.phase_ns();
+        commit_s.lock().unwrap()[ci].push(c as f64 / 1e9);
+        io_mb.lock().unwrap()[ci]
+            .push(IoCounters::read_now().since(&io0).write_bytes as f64 / 1_048_576.0);
+        db.close().expect("close");
+        let _ = std::fs::remove_dir_all(&d);
+        keys as f64 / secs
+    });
+
+    let take = |m: &std::sync::Mutex<Vec<Samples>>| m.lock().unwrap().clone();
+    let (io_mb, commit_s) = (take(&io_mb), take(&commit_s));
+    rec.series(
+        "arms",
+        J::arr(
+            (0..4)
+                .map(|i| {
+                    jobj! {
+                        "arm" => J::s(arm_names[i]),
+                        "ops_per_s" => J::fp(rates[i].median(), 1),
+                        "rel_iqr" => J::fp(rates[i].rel_iqr(), 4),
+                        "commit_s" => J::fp(commit_s[i].median(), 3),
+                        "device_write_mb" => J::fp(io_mb[i].median(), 1)
+                    }
+                })
+                .collect(),
+        ),
+    );
+
+    let cmp16 = compare(&rates[2], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("every16_vs_always", cmp16.clone());
+    let g16 = rates[2].median() / rates[0].median().max(1e-9);
+    rec.finding(Finding::new(
+        "F48.1",
+        "syncing every sixteenth commit ingests at least 1.6x syncing every commit",
+        g16 >= 1.6 && matches!(cmp16.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "always {:.0} ops/s (commit phase {:.2}s), every-4 {:.0}, every-16 {:.0} ({g16:.2}x, \
+             {}, commit phase {:.2}s), every-64 {:.0}. f47 fixed this device at ~2,700 barriers a \
+             second however issued; this is what riding sixteen batches on each one buys",
+            rates[0].median(),
+            commit_s[0].median(),
+            rates[1].median(),
+            rates[2].median(),
+            cmp16.summary("every-16", "always"),
+            commit_s[2].median(),
+            rates[3].median()
+        ),
+    ));
+    let g64 = rates[3].median() / rates[2].median().max(1e-9);
+    rec.finding(Finding::new(
+        "F48.2",
+        "past every-16 the barrier is amortised and every-64 gains little",
+        g64 < 1.15,
+        format!(
+            "every-64 runs {g64:.3}x of every-16. Once the barrier rides sixteen batches its \
+             share is small and the memtable and framing are what remain; a large gain here \
+             would mean barriers were a bigger share than f42's phase split measured"
+        ),
+    ));
+
+    // P48.3, the contract: tear the unsynced tail and reopen. Emulated by
+    // truncation because a same-process reopen would otherwise find the
+    // page cache holding what the device never received.
+    let d = dir.join("contract");
+    let _ = std::fs::remove_dir_all(&d);
+    let opts = NextOptions { sync: SyncPolicy::EveryN(16), ..Default::default() };
+    let mut db = Db::create(&d, opts.clone()).expect("create");
+    for c in 0u32..23 {
+        db.append(format!("k{c:03}").as_bytes(), &c.to_le_bytes());
+        db.commit().expect("commit");
+    }
+    drop(db);
+    let wal = d.join("wal-00000000");
+    let len = std::fs::metadata(&wal).expect("wal").len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&wal)
+        .expect("open wal")
+        .set_len(len - 5)
+        .expect("tear");
+    let db = Db::open(&d, opts).expect("reopen");
+    let mut synced_ok = true;
+    for c in 0u32..16 {
+        let mut n = 0;
+        db.read_all(format!("k{c:03}").as_bytes(), |_| n += 1).expect("read");
+        synced_ok &= n == 1;
+    }
+    let mut torn = 0;
+    db.read_all(b"k022", |_| torn += 1).expect("read");
+    let mut dup = false;
+    for c in 0u32..23 {
+        let mut n = 0;
+        db.read_all(format!("k{c:03}").as_bytes(), |_| n += 1).expect("read");
+        dup |= n > 1;
+    }
+    rec.finding(Finding::new(
+        "F48.3",
+        "an unsynced tail is lost whole and never served in part",
+        synced_ok && torn == 0 && !dup,
+        format!(
+            "23 commits under EveryN(16), the file torn inside the unsynced tail, reopened: every \
+             record behind the barrier present ({}), the torn frame absent ({} values served for \
+             it), nothing duplicated ({}). This is the contract bounded-loss sells and it is \
+             measured with the speed rather than assumed beside it",
+            synced_ok,
+            torn,
+            !dup
+        ),
+    ));
+    let _ = std::fs::remove_dir_all(&d);
     Ok(rec)
 }
 
