@@ -346,17 +346,16 @@ impl Next {
         // fairness gate refused to rank this arm until it was made here too.
         let opts = supdb::next::NextOptions {
             segment: supdb::Options { checksums: false, ..Default::default() },
-            // 8 MB rather than the 64 MB default, because this suite loads
-            // 116 MB: at the default the store would hold two segments and
-            // half its data in an unsealed arena, which is a property of
-            // the benchmark's size and not of the engine. Eight megabytes
-            // puts ~15 segments under a store this size -- the segments-per-
-            // store ratio a deployment with a 64 MB memtable and a hundred
-            // gigabytes would see -- so the level structure, the routing
-            // and the compaction are all actually exercised. Every seal and
-            // merge it causes happens inside the timed load, as it would in
-            // production.
-            seal_bytes: 8 << 20,
+            // The engine's own default, 64 MB, which is also what a
+            // production LSM uses for a memtable. Over this suite's 116 MB
+            // that is a handful of segments -- and few segments is not an
+            // accident of the benchmark, it is the operating point the
+            // design is FOR: f44 measured the same data reading 1.19x of
+            // LMDB in one segment and 0.77x spread over eight. An 8 MB
+            // threshold was tried here to make the level machinery work
+            // harder, and all it measured was the engine at a shape it
+            // should not be run in.
+            seal_bytes: 64 << 20,
             ..Default::default()
         };
         let db = supdb::next::Db::create(path, opts).map_err(|e| e.to_string())?;
@@ -400,13 +399,14 @@ impl Engine for Next {
     }
     fn sync(&mut self) -> Res<()> {
         if let Some(db) = self.db.as_mut() {
-            // Just the durability contract: the WAL made everything durable
-            // and the read path serves the memtable, so sync() owes nothing
-            // more. An earlier version drained (seal + join) here to dodge a
-            // scan artifact, which charged ~2s of segment writing into the
-            // suite's load window -- the artifact is now fixed where it
-            // lived, in Db::scan's per-call memtable walk.
-            db.commit().map_err(|e| e.to_string())?;
+            // Commit AND drain. The seal cost lands in the load window,
+            // which is honest -- it is work the engine owes -- and it means
+            // the read phase answers from segments on both sides of the
+            // comparison. A next arm that served half its keys out of a
+            // resident hash memtable would be reading a different thing
+            // from the engine it is measured against, and an earlier
+            // version of this file did exactly that.
+            db.flush().map_err(|e| e.to_string())?;
         }
         Ok(())
     }
