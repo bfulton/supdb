@@ -532,14 +532,17 @@ fn a_corrupted_block_byte_fails_the_read_rather_than_under_returning() {
         .read_all(&key, |_| {})
         .expect_err("a checksum mismatch must fail the read, not empty it");
     assert!(err.to_string().contains("checksum"), "unhelpful error: {err}");
+    // The count does not touch the block: since format v5 it is read out of
+    // the extent record, so damage inside the block cannot reach it and it
+    // must still answer rather than fail.
+    assert_eq!(
+        blob.count(&key).expect("a count comes from the index"),
+        want[2].1.len() as u64
+    );
     // The *second* read of the same block is its own regression: the first
     // version of `Blob::verify` marked a chunk verified before comparing its
     // checksum, so one failed read poisoned the bitmap and the next read
     // served the corrupt bytes as already-verified.
-    let err = blob
-        .count(&key)
-        .expect_err("the walked count reads the block and must fail with it");
-    assert!(err.to_string().contains("checksum"), "unhelpful error: {err}");
     let err = blob
         .read_all(&key, |_| {})
         .expect_err("the failure must repeat, not report once and go quiet");

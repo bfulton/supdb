@@ -6543,6 +6543,7 @@ fn f46_segwrite(args: &Args, profile: Profile) -> std::io::Result<Record> {
                     off,
                     len: (out.len() as u32) - off,
                     last: off,
+                    count: 1,
                 }));
             }
             {
@@ -8437,18 +8438,16 @@ fn f28_count(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // costs, `count` is an API convenience and should be described as one.
     rec.finding(Finding::new(
         "W2.1",
-        "counting a key's values by walking their length prefixes is faster than reading them",
+        "counting a key's values is faster than reading them",
         matches!(vs_read.verdict, supdb::bench::stats::Verdict::Greater),
         format!(
-            "{:.0} ns/probe to count against {:.0} to read ({}). Skipping the payload does not \
-             skip the cache lines it lies in, and the walk is a serial dependent chain -- each \
-             record's position is the previous record's length -- so there is nothing to \
-             overlap. In native Rust the callback `read_all` adds inlines to an increment, which \
-             is the rest of the difference. This is the premise R4.3 was written on and it does \
-             not hold: `count` is the correct general answer, not a cheaper one. What it is \
-             still worth is the wasm boundary, where `read_all` frames every value into a buffer \
-             for JavaScript and `count` returns one integer -- that crossing is not measured \
-             here and is not claimed",
+            "{:.0} ns/probe to count against {:.0} to read ({}). Before format v5 the count \
+             walked the run's length prefixes and cost what reading cost (2,493 against 2,516 \
+             ns): skipping a payload does not skip the cache lines it lies in, and the walk is a \
+             serial dependent chain. Since v5 every extent carries its record count and `count` \
+             sums a field over a borrowed slice, touching no block. The wasm boundary, where \
+             `read_all` frames every value for JavaScript and `count` returns one integer, is \
+             not measured here and is not claimed",
             ns(&rates[2]),
             ns(&rates[3]),
             vs_read.summary("count", "read_all")
@@ -8485,22 +8484,33 @@ fn f28_count(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // null result would have flipped between profiles for a reason that says
     // nothing about the engine -- which is the trap `f8-checksums` documents
     // from the other direction.
-    const WORTH_FOUR_BYTES_NS: f64 = 20.0;
-    let saving = ns(&rates[1]) - ns(&rates[0]);
+    // Before format v5 this gated a hypothetical: whether a stored count
+    // would recover enough of the gap between `count_fixed` and `lookup` to
+    // be worth four bytes an extent, and it said no (under 20 ns on the
+    // table, for a schema logshed does not have). The change was then made
+    // for the variable-width case, so the gate now measures what it bought:
+    // the stored count against resolving the key and stopping, which is the
+    // floor any count has. The same 20 ns bar, applied to the realized cost.
+    const WITHIN_OF_LOOKUP_NS: f64 = 20.0;
+    let over = ns(&rates[2]) - ns(&rates[0]);
+    let count_vs_lookup = compare(&rates[0], &rates[2], min);
+    rec.compare("lookup_vs_count", count_vs_lookup.clone());
     rec.finding(Finding::new(
         "W2.3",
-        "storing a per-extent record count would save less than 20 ns per lookup, which is not worth four bytes per extent",
-        saving < WORTH_FOUR_BYTES_NS,
+        "the stored per-extent count answers within 20 ns of resolving the key and stopping",
+        over < WITHIN_OF_LOOKUP_NS,
         format!(
-            "resolving the key and stopping costs {:.0} ns/probe; the O(extents) count costs \
-             {:.0}, so at most {saving:+.1} ns is on the table and most of it is one 64-bit \
-             division ({}). Four bytes per extent is 25% on top of a 16-byte Ext and it is paid \
-             by every store forever, including the ones that never ask for a count. A schema \
-             with variable-width values is where the change would pay, and it is the case \
-             logshed does not have",
+            "resolving the key and stopping costs {:.0} ns/probe; the general count costs {:.0}, \
+             {over:+.1} ns over it ({}); count_fixed, the schema-dependent form, costs {:.0}. \
+             Before v5 this finding priced a stored count at under 20 ns of saving for four \
+             bytes an extent and declined it; the priority changed to spending space for \
+             time, the four bytes are paid by every extent now (25% on a 16-byte record), and \
+             this is what they buy on the axis that mattered: a general count at the cost of a \
+             lookup, for values of any width",
             ns(&rates[0]),
+            ns(&rates[2]),
+            count_vs_lookup.summary("lookup", "count"),
             ns(&rates[1]),
-            fixed_vs_lookup.summary("count_fixed", "lookup")
         ),
     ));
 
@@ -8571,6 +8581,24 @@ fn f28_count(args: &Args, profile: Profile) -> std::io::Result<Record> {
         ),
     ));
 
+    // W2.5 -- what W2.4 protected, restated for a format where the general
+    // form is O(extents) too: the browser can rank a dictionary through
+    // `scan_counts`, the schema-independent call, without touching a block.
+    rec.finding(Finding::new(
+        "W2.5",
+        "the general dictionary count is within 1.5x of the fixed-width one, so a browser ranks a dictionary of any schema without touching a block",
+        scan_cmp.ratio < 1.5,
+        format!(
+            "over {span} keys: {:.1} ns/key through scan_counts against {:.1} through \
+             scan_counts_fixed ({}). Before format v5 the general form paid a block walk per key \
+             and lost by 283x (W2.4); with the count in the extent record both are O(extents), \
+             and a day's whole term dictionary ranks in the same tens of microseconds whatever \
+             the value width",
+            1e9 / scan[0].median(),
+            1e9 / scan[1].median(),
+            scan_cmp.summary("scan_counts_fixed", "scan_counts")
+        ),
+    ));
     let _ = std::fs::remove_file(&file);
     Ok(rec)
 }

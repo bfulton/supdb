@@ -37,7 +37,7 @@ use crate::index::Ext;
 
 /// "SFIX", little-endian.
 const MAGIC: u32 = 0x5849_4653;
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 /// Header size, padded so the hash region starts 8-byte aligned.
 ///
 /// Version 1 was 128 and used every slot but the last. Version 2 adds the
@@ -50,6 +50,8 @@ const HEADER: usize = 192;
 const SLOT: usize = 8;
 /// Records are 4-aligned so an extent array can be borrowed as `&[Ext]`.
 const REC_ALIGN: usize = 4;
+/// Bytes per extent record: five little-endian u32s, `Ext`'s layout.
+const EXT_BYTES: usize = std::mem::size_of::<Ext>();
 
 /// Spare room left at the end of the record region, as a fraction of it.
 ///
@@ -161,8 +163,8 @@ pub struct Plan {
 }
 
 fn record_len(klen: usize, next: usize) -> usize {
-    // u16 klen, u16 extent count, the key, pad to 4, then 16 bytes each.
-    align_up(4 + klen, REC_ALIGN) + next * 16
+    // u16 klen, u16 extent count, the key, pad to 4, then 20 bytes each.
+    align_up(4 + klen, REC_ALIGN) + next * EXT_BYTES
 }
 
 /// Measure the section before writing it, so the whole thing can be built into
@@ -348,7 +350,8 @@ pub fn encode(
                 recs[e_at + 4..e_at + 8].copy_from_slice(&e.off.to_le_bytes());
                 recs[e_at + 8..e_at + 12].copy_from_slice(&e.len.to_le_bytes());
                 recs[e_at + 12..e_at + 16].copy_from_slice(&e.last.to_le_bytes());
-                e_at += 16;
+                recs[e_at + 16..e_at + 20].copy_from_slice(&e.count.to_le_bytes());
+                e_at += EXT_BYTES;
             }
             let d = (i - from) * 4;
             dir[d..d + 4].copy_from_slice(&p.rec_offs[i].to_le_bytes());
@@ -713,7 +716,7 @@ impl FlatIndex {
         let n = rd_u16(recs, off + 2)? as usize;
         let key = recs.get(off + 4..off + 4 + klen)?;
         let e_at = off.checked_add(align_up(4 + klen, REC_ALIGN))?;
-        let bytes = recs.get(e_at..e_at.checked_add(n.checked_mul(16)?)?)?;
+        let bytes = recs.get(e_at..e_at.checked_add(n.checked_mul(EXT_BYTES)?)?)?;
         // Records are laid out 4-aligned within the section and the section is
         // written at an 8-aligned file offset, so this borrow is aligned by
         // construction. Checked anyway, and the check has already earned its
@@ -923,7 +926,8 @@ impl FlatIndex {
             out[at + 4..at + 8].copy_from_slice(&e.off.to_le_bytes());
             out[at + 8..at + 12].copy_from_slice(&e.len.to_le_bytes());
             out[at + 12..at + 16].copy_from_slice(&e.last.to_le_bytes());
-            at += 16;
+            out[at + 16..at + 20].copy_from_slice(&e.count.to_le_bytes());
+            at += EXT_BYTES;
         }
         Some(out)
     }
@@ -943,14 +947,15 @@ impl FlatIndex {
         let mut at = align_up(4 + klen, REC_ALIGN);
         let mut exts = Vec::with_capacity(n);
         for _ in 0..n {
-            let b = rec.get(at..at + 16)?;
+            let b = rec.get(at..at + EXT_BYTES)?;
             exts.push(Ext {
                 block: u32::from_le_bytes(b[0..4].try_into().ok()?),
                 off: u32::from_le_bytes(b[4..8].try_into().ok()?),
                 len: u32::from_le_bytes(b[8..12].try_into().ok()?),
                 last: u32::from_le_bytes(b[12..16].try_into().ok()?),
+                count: u32::from_le_bytes(b[16..20].try_into().ok()?),
             });
-            at += 16;
+            at += EXT_BYTES;
         }
         Some((key, exts))
     }
@@ -1116,6 +1121,7 @@ mod tests {
             off: n * 2,
             len: n * 3,
             last: n * 4,
+            count: n + 1,
         }
     }
 

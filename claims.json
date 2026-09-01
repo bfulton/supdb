@@ -679,26 +679,32 @@
   {
    "experiment": "f28-count",
    "id": "W2.1",
-   "expect": "fails",
-   "because": "R4.3 of the logshed requirements asks for a count 'without decoding the values' on the premise that this is much cheaper than reading them. It is not, and the number says so: 2,492.9 ns/probe to walk the length prefixes against 2,516.3 to read every value, a ratio of 1.009 at p=1.0000. Skipping a payload does not skip the cache lines it sits in, and the walk is a serial dependent chain -- each record's position is the previous record's length -- so there is nothing to overlap; meanwhile the callback `read_all` adds inlines to an increment. `Blob::count` is kept because it is the correct general answer and because across the wasm boundary it returns one integer where `read_all` frames every value into a buffer for JavaScript, but that crossing is not measured and is not claimed. This claim is recorded as failing so that the premise cannot be quietly re-adopted; the useful answer is W2.2."
+   "expect": "holds",
+   "because": "Flipped by format v5. Counting now costs 94 ns/probe against 2,345 to read, 24.8x at p=0.0022, because every extent carries its record count and `count` sums a field over the borrowed extent slice without touching a block. Before v5 the walk cost what reading cost (2,493 against 2,516 ns, 1.009x at p=1.0): skipping a payload does not skip the cache lines it sits in. The premise R4.3 was written on is true now, and it was bought rather than found: four bytes an extent, 25% on a 16-byte record, paid by every store."
   },
   {
    "experiment": "f28-count",
    "id": "W2.2",
-   "expect": "holds",
-   "because": "The count logshed wants is available, and it does not come from a general walk. `Blob::count_fixed` answers in 91.9 ns/probe where `Blob::count` takes 2,492.9 -- 27.1x at p=0.0022 -- because a fixed-width value carries a fixed-width length prefix, so a run of them is exactly n*(width + varint_len(width)) bytes and the count is arithmetic on `Ext::len` with no block touched at all. logshed's postings are four-byte line ordinals, so this is the call it makes. It is arithmetic on a schema, not a property of the format: an `Ext` is block, offset, byte length and the offset of the last record, and none of those is a count, which is why `count` has to step over every value. `count_fixed` checks two independent quantities before it claims a count: that the run is a whole number of strides, and that `Ext::last` -- the offset of the final record, which the format already stores so that reading the newest value is O(1) -- is exactly (n-1)*stride. The first alone is badly insufficient and was: a fixture of variable-length values produced a 17-value run whose bytes divided exactly by a stride of 4, and divisibility answered 23. `Ext::last` rejects it, because 23 records would put the last at 88 where it is at 87. Two quantities agreeing is not a proof either -- a run could be crafted to satisfy both -- so the contract is still that the caller knows its own schema, and `tests/blob.rs` carries the case."
+   "expect": "fails",
+   "because": "Flipped by format v5, and recorded failing so the premise cannot come back the other way: a count that is O(extents) IS available from the extent list now, for any value width, and `count_fixed` -- the schema-dependent form that was 27.1x faster than the walk -- is a statistical tie with the general `count` (95 against 94 ns/probe, no difference at p=0.37). What made the fixed form special was that the extent list did not carry a count; it does now."
   },
   {
    "experiment": "f28-count",
    "id": "W2.3",
    "expect": "holds",
-   "because": "Whether to add a per-extent record count to the format, priced rather than argued. Resolving a key and stopping costs 77.0 ns/probe and the O(extents) count costs 91.9, so at most 14.9 ns is on the table and most of it is one 64-bit division -- a stored count would still have to iterate the extents. Four bytes on a 16-byte Ext is 25%, paid by every store forever including the ones that never ask for a count. So: not worth making, for a posting list. It would be worth making for a schema with variable-width values, which is the case logshed does not have. Stated as a threshold rather than as a null result on purpose: across four full runs of this experiment the pair has come out 11.4, 9.6, 6.7 and 14.9 ns apart, at p=0.0215, 0.0022, 0.0736 and 0.0022 -- three times a real difference and once not -- so a claim resting on 'no difference' would have flipped run to run for a reason that says nothing about the engine. The threshold does not."
+   "because": "Restated with the format change made. Before v5 this gate priced a stored per-extent count at under 20 ns of saving over `count_fixed` and declined it as not worth four bytes an extent for logshed's fixed-width schema; the priority then changed to spending space for time and variable-width counts were wanted, so the bytes were paid. The gate now measures what they bought against the floor any count has, resolving the key and stopping: 94 ns/probe for the general count against 94 for the lookup, +0.7 ns, no difference at p=0.80. A general count costs a lookup."
   },
   {
    "experiment": "f28-count",
    "id": "W2.4",
+   "expect": "fails",
+   "because": "Flipped by format v5: the general dictionary count no longer walks anything, so 'counting from the extent list is at least 10x walking it' has nothing left to beat -- `scan_counts` runs 4.5 ns/key against `scan_counts_fixed`'s 5.2 (0.868x for the fixed form, p=0.0022; the fixed form does a division and a `last` check per extent where the general one reads a field). Before v5 the ratio was 283x (1,226 against 4.3 ns/key). The capability this protected -- a browser ranking a whole dictionary without touching a block -- is now W2.5's, for any schema."
+  },
+  {
+   "experiment": "f28-count",
+   "id": "W2.5",
    "expect": "holds",
-   "because": "Open question 4 of the requirements -- whether a browser needs a dictionary scan at all, or whether the roll should precompute the breakdown panels -- answered with a number. Over 2,000 keys, `scan_counts` costs 1,226.4 ns/key and `scan_counts_fixed` costs 4.3: 283.0x at p=0.0022. They are different orders of growth rather than different constants, because the walked form pays a `count` per key and is therefore O(every posting in the range) -- for a day index, the whole file -- while the extent form is O(extents) and touches no block. So a 7,806-term day dictionary ranks in about 34 microseconds instead of nine milliseconds, the browser can answer top-N itself, and nothing has to be precomputed at roll time. The gap widens with the traffic a day carries rather than with the size of its dictionary, so it gets better where it matters."
+   "because": "The general dictionary count is within 1.5x of the fixed-width one: 4.5 against 5.2 ns/key over 2,000 keys, so a day's term dictionary ranks in about 9 us through the schema-independent call, for values of any width. Before v5 the general form lost by 283x and only the fixed form was usable; W2.4 records that flip."
   },
   {
    "experiment": "w3-bundle",

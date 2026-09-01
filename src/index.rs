@@ -27,6 +27,28 @@ pub struct Ext {
     /// the deep shape, which is why read_last measured 105k/s against
     /// Uppend's 363k. Four bytes buys an O(1) answer.
     pub last: u32,
+    /// How many records the run holds, with the top bit reserved as the
+    /// tombstone flag (`Ext::TOMBSTONE`). Four more bytes per extent buy an
+    /// O(extents) count for variable-width values, which f28 had measured
+    /// at the cost of reading them (W2.1), and the bit is what a delete
+    /// needs to say "nothing older than this extent is live".
+    pub count: u32,
+}
+
+impl Ext {
+    /// Set on an extent that supersedes every older value of its key.
+    pub const TOMBSTONE: u32 = 1 << 31;
+
+    /// Records in the run, without the flag.
+    #[inline]
+    pub fn records(&self) -> u32 {
+        self.count & !Ext::TOMBSTONE
+    }
+
+    #[inline]
+    pub fn is_tombstone(&self) -> bool {
+        self.count & Ext::TOMBSTONE != 0
+    }
 }
 
 /// Extents of a single key. Inline until the key needs more than one.

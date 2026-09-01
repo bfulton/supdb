@@ -478,42 +478,6 @@ fn count_is_exact_for_variable_width_values_through_seals_and_merges() {
 }
 
 #[test]
-fn a_missing_or_wrong_counts_sidecar_falls_back_rather_than_lying() {
-    let d = dir("countsidecar");
-    let mut db = Db::create(&d, small_opts(2)).unwrap();
-    for k in 0u32..50 {
-        for _ in 0..(k % 4) + 1 {
-            db.append(format!("k{k:04}").as_bytes(), b"value-of-some-length");
-        }
-    }
-    db.commit().unwrap();
-    db.flush().unwrap();
-    drop(db);
-
-    // Truncate every sidecar: a file that does not match the segment it
-    // names must be ignored, not trusted.
-    let mut damaged = 0;
-    for e in std::fs::read_dir(&d).unwrap() {
-        let p = e.unwrap().path();
-        if p.extension().is_some_and(|x| x == "counts") {
-            std::fs::write(&p, b"junk").unwrap();
-            damaged += 1;
-        }
-    }
-    assert!(damaged > 0, "no sidecar was written, so nothing was tested");
-
-    let db = Db::open(&d, small_opts(2)).unwrap();
-    for k in 0u32..50 {
-        let key = format!("k{k:04}").into_bytes();
-        assert_eq!(
-            db.count(&key).unwrap(),
-            ((k % 4) + 1) as u64,
-            "a damaged sidecar must fall back to the walk"
-        );
-    }
-}
-
-#[test]
 fn every_n_loses_the_unsynced_tail_whole_and_never_in_part() {
     // SyncPolicy::EveryN's contract: the WAL is written every commit and
     // synced every nth, so a crash loses at most n batches -- and what it

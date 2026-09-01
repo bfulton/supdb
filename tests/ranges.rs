@@ -174,14 +174,15 @@ fn assert_exact(rig: &mut Rig, keys: &[Vec<u8>]) {
             String::from_utf8_lossy(key)
         );
 
-        // The walked count reads the same blocks -- it decodes the length
-        // prefixes in place, and the unit of transfer is the block either way.
+        // The count reads no data at all: since format v5 it is the sum of
+        // the record counts the extent list carries, so it must agree with
+        // the read and touch nothing. (It used to walk the same blocks the
+        // read did, decoding length prefixes in place.)
         let c = rig.blob.count(key).expect("count");
         assert_eq!(c, n);
-        assert_eq!(
-            rig.touched(),
-            plan,
-            "count of {} touched other bytes than its plan named",
+        assert!(
+            rig.touched().is_empty(),
+            "count of {} touched data; the count lives in the index",
             String::from_utf8_lossy(key)
         );
     }

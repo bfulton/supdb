@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 /// Bumped 0003 -> 0004 when redo-log frames grew a kind byte (sealed extents
 /// vs inline values). A 0003 store's log would misparse under this decoder,
 /// so the magic refuses it instead; sections and superblock are unchanged.
-pub(crate) const MAGIC: u64 = 0x5355_5044_4200_0004;
+pub(crate) const MAGIC: u64 = 0x5355_5044_4200_0005;
 
 /// Two superblock slots live in the first sector-pair of the file, and a
 /// checkpoint alternates between them.
@@ -1259,6 +1259,8 @@ struct Pending {
     len: u32,
     /// Offset of the most recently appended record within `buf`.
     last: u32,
+    /// Records in the run, for `Ext::count`.
+    count: u32,
     /// Extents this pending value replaces, to be released when it is sealed
     /// and only if the store is reclaiming.
     supersedes: Vec<Ext>,
@@ -1353,7 +1355,7 @@ struct Shard {
     pending_bytes: usize,
     builder: BlockBuilder,
     /// Extents already placed in the current block, awaiting its id.
-    members: Vec<(u32, u32, u32, u32, bool)>,
+    members: Vec<(u32, u32, u32, u32, u32, bool)>,
     /// Keys whose extents changed since the last checkpoint, by table index.
     ///
     /// Without this a checkpoint has to ask every shard for every key just to
@@ -1965,6 +1967,7 @@ impl Store {
                     p.off = arena.len() as u32;
                 }
                 p.last = p.len;
+                p.count += 1;
                 put_uvarint(arena, value.len() as u64);
                 arena.extend_from_slice(value);
                 p.len = arena.len() as u32 - p.off;
@@ -1972,6 +1975,7 @@ impl Store {
             } else {
                 let before = p.buf.len();
                 p.last = before as u32;
+                p.count += 1;
                 put_uvarint(&mut p.buf, value.len() as u64);
                 p.buf.extend_from_slice(value);
                 *pending_bytes += p.buf.len() - before;
@@ -2061,6 +2065,7 @@ impl Store {
                     off: 0,
                     len,
                     last: p.last,
+                    count: p.count,
                 };
                 {
                     let entry = sh.keys.entry_at(idx);
@@ -2079,7 +2084,7 @@ impl Store {
             }
             let off = sh.builder.push(pbytes);
             sh.members
-                .push((idx, off, pbytes.len() as u32, p.last, p.replaces));
+                .push((idx, off, pbytes.len() as u32, p.last, p.count, p.replaces));
         }
         // Keep the capacity: clearing is what makes the next batch of writes
         // land in already-reserved memory instead of growing again.
@@ -2114,12 +2119,13 @@ impl Store {
         let touched: Vec<u32> = sh
             .members
             .drain(..)
-            .map(|(idx, off, len, last, replaces)| {
+            .map(|(idx, off, len, last, count, replaces)| {
                 let ext = Ext {
                     block: id,
                     off,
                     len,
                     last,
+                    count,
                 };
                 let entry = sh.keys.entry_at(idx);
                 if replaces {
@@ -2219,6 +2225,7 @@ impl Store {
                 p.len = 0;
             }
             p.last = 0;
+            p.count = 1;
             p.replaces = true;
             // A replacement starts a fresh run; whatever the log holds for
             // the old one is superseded by this record when it is logged.
@@ -2396,10 +2403,12 @@ impl Store {
         };
         let mut buf = Vec::new();
         let mut last = 0u32;
+        let mut count = 0u32;
         let mut ap = self.appender.lock().unwrap();
         for e in &exts {
             let bytes = ap.read_extent(*e)?;
             last = (buf.len() as u32) + e.last;
+            count += e.records();
             buf.extend_from_slice(&bytes);
         }
         let len = buf.len() as u32;
@@ -2428,6 +2437,7 @@ impl Store {
             off: 0,
             len,
             last,
+            count,
         };
         let entry = sh.keys.entry_at(idx);
         if from == 0 {
@@ -2496,7 +2506,7 @@ impl Store {
         let last_replace = sh
             .members
             .iter()
-            .rposition(|(i, _, _, _, r)| *i == idx && *r);
+            .rposition(|(i, _, _, _, _, r)| *i == idx && *r);
         let staged_replaces = last_replace.is_some();
 
         let mut n = 0u64;
@@ -2542,7 +2552,7 @@ impl Store {
         }
         if !pending_replaces {
             let from = last_replace.unwrap_or(0);
-            for (pos, (i, off, len, _, _)) in sh.members.iter().enumerate() {
+            for (pos, (i, off, len, _, _, _)) in sh.members.iter().enumerate() {
                 if *i != idx || pos < from {
                     continue;
                 }
@@ -3864,6 +3874,7 @@ fn encode_key_index(
             put_uvarint(&mut out, e.off as u64);
             put_uvarint(&mut out, e.len as u64);
             put_uvarint(&mut out, e.last as u64);
+            put_uvarint(&mut out, e.count as u64);
         }
     }
     out
@@ -5416,6 +5427,7 @@ impl Reader {
                 let o = get_uvarint(&key_idx, &mut p) as u32;
                 let l = get_uvarint(&key_idx, &mut p) as u32;
                 let last = get_uvarint(&key_idx, &mut p) as u32;
+                let count = get_uvarint(&key_idx, &mut p) as u32;
                 // Validate the block id once, here, rather than at each of the
                 // four read paths that index `self.blocks` with it. A damaged
                 // index otherwise names a block that does not exist and every
@@ -5428,6 +5440,7 @@ impl Reader {
                     off: o,
                     len: l,
                     last,
+                    count,
                 });
             }
             entries.push((key, exts));
@@ -6248,6 +6261,7 @@ mod tests {
             off: 0,
             len,
             last: 0,
+            count: 1,
         }
     }
 

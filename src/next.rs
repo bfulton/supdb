@@ -347,18 +347,6 @@ struct Seg {
     lo: Vec<u8>,
     hi: Option<Vec<u8>>,
     bloom: Option<BlockedBloom>,
-    /// Values per key, in rank order -- the sidecar `counts_path` writes.
-    ///
-    /// f28 measured counting a variable-width key's values at 1,983ns
-    /// against 93ns to resolve it and stop, because the only general way to
-    /// count length-prefixed records is to walk them. `count_fixed` escapes
-    /// that only when every value is the same width, which a posting list
-    /// guarantees and an arbitrary caller does not. Four bytes a key, in a
-    /// file beside the segment rather than inside it, buys the general
-    /// case: no change to the store format, nothing for the browser reader
-    /// to learn, and a segment without the sidecar simply falls back to the
-    /// walk.
-    counts: Option<Vec<u32>>,
 }
 
 // ------------------------------------------------------- the segment writer --
@@ -405,6 +393,7 @@ pub struct SegmentWriter {
     open_key: Option<(usize, usize)>,
     run: Vec<u8>,
     last: usize,
+    records: u32,
     parallel_index: bool,
 }
 
@@ -460,6 +449,7 @@ impl SegmentWriter {
             open_key: None,
             run: Vec::new(),
             last: 0,
+            records: 0,
             parallel_index: opts.parallel_index,
         })
     }
@@ -484,6 +474,7 @@ impl SegmentWriter {
         self.open_key = Some((start, key.len()));
         self.run.clear();
         self.last = 0;
+        self.records = 0;
         Ok(())
     }
 
@@ -491,6 +482,7 @@ impl SegmentWriter {
     pub fn value(&mut self, v: &[u8]) {
         debug_assert!(self.open_key.is_some(), "value without begin");
         self.last = self.run.len();
+        self.records += 1;
         crate::index::put_uvarint(&mut self.run, v.len() as u64);
         self.run.extend_from_slice(v);
     }
@@ -518,6 +510,7 @@ impl SegmentWriter {
             off,
             len: n as u32,
             last: self.last as u32,
+            count: self.records,
         };
         if self.builder.len() >= self.block_size {
             self.flush_block()?;
@@ -722,46 +715,6 @@ impl PieceWriter {
     }
 }
 
-/// Where a segment's per-rank counts live: the segment's own name with the
-/// suffix replaced, so the manifest names one file and the sidecar follows
-/// it -- and an orphan sweep that removes a segment removes this too.
-fn counts_path(dir: &Path, seg_name: &str) -> PathBuf {
-    dir.join(format!("{}.counts", seg_name.trim_end_matches(".sup")))
-}
-
-/// Write counts in rank order. Called by whoever wrote the segment, which
-/// is the only place the counts are known without walking the file again.
-fn write_counts(dir: &Path, seg_name: &str, counts: &[u32]) -> Result<()> {
-    let mut out = Vec::with_capacity(counts.len() * 4);
-    for c in counts {
-        out.extend_from_slice(&c.to_le_bytes());
-    }
-    let path = counts_path(dir, seg_name);
-    let tmp = path.with_extension("counts.tmp");
-    {
-        let mut f = File::create(&tmp)?;
-        f.write_all(&out)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
-}
-
-fn read_counts(dir: &Path, seg_name: &str, keys: usize) -> Option<Vec<u32>> {
-    let raw = std::fs::read(counts_path(dir, seg_name)).ok()?;
-    // A sidecar that does not match the segment it names is ignored rather
-    // than trusted: it is an optimisation, and a wrong count is worse than
-    // a slow one.
-    if raw.len() != keys * 4 {
-        return None;
-    }
-    Some(
-        raw.chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
-            .collect(),
-    )
-}
-
 impl Seg {
     /// Cheap ordered key walk: O(extents), no block touched -- the property
     /// `scan_counts_fixed` exists for. The width argument is irrelevant
@@ -800,7 +753,6 @@ impl Seg {
             };
             let mut bloom = BlockedBloom::with_capacity(blob.keys());
             Seg::for_each_key(&blob, |k| bloom.insert(k))?;
-            let counts = read_counts(dir, name, blob.keys());
             return Ok(Seg {
                 blob,
                 name: name.to_string(),
@@ -808,7 +760,6 @@ impl Seg {
                 lo,
                 hi,
                 bloom: Some(bloom),
-                counts,
             });
         }
         if let Some(rest) = name.strip_prefix("par-").and_then(|r| r.strip_suffix(".sup")) {
@@ -825,7 +776,6 @@ impl Seg {
             } else {
                 Some(unhex(f[3]).ok_or_else(|| err("segment fence is malformed"))?)
             };
-            let counts = read_counts(dir, name, blob.keys());
             return Ok(Seg {
                 blob,
                 name: name.to_string(),
@@ -833,7 +783,6 @@ impl Seg {
                 lo,
                 hi,
                 bloom: None,
-                counts,
             });
         }
         // L0: build the Bloom by walking the segment's keys. That walk is
@@ -842,7 +791,6 @@ impl Seg {
         // this cost is bounded where the level below it is not.
         let mut bloom = BlockedBloom::with_capacity(blob.keys());
         Seg::for_each_key(&blob, |k| bloom.insert(k))?;
-        let counts = read_counts(dir, name, blob.keys());
         Ok(Seg {
             blob,
             name: name.to_string(),
@@ -850,7 +798,6 @@ impl Seg {
             lo: Vec::new(),
             hi: None,
             bloom: Some(bloom),
-            counts,
         })
     }
 
@@ -1235,7 +1182,7 @@ struct Piece {
 
 /// Pass two of a merge: keys arrive in rank order and go into the piece
 /// their rank belongs to, with a writer opened at each piece's first rank
-/// and finished, renamed and given its sidecar at its last. The same
+/// and finished and renamed at its last. The same
 /// emitter serves both ways of finding keys, so the arms f49 compares
 /// differ only in that.
 struct Emitter<'a> {
@@ -1246,12 +1193,11 @@ struct Emitter<'a> {
     pi: usize,
     r: usize,
     w: Option<PieceWriter>,
-    counts: Vec<u32>,
     out: Vec<String>,
 }
 
 impl Emitter<'_> {
-    fn key(&mut self, k: &[u8], pull: impl FnOnce(&mut PieceWriter) -> Result<u32>) -> Result<()> {
+    fn key(&mut self, k: &[u8], pull: impl FnOnce(&mut PieceWriter) -> Result<()>) -> Result<()> {
         let p = self
             .pieces
             .get(self.pi)
@@ -1273,19 +1219,16 @@ impl Emitter<'_> {
                 PieceWriter::create(&p.tmp, self.opts, self.bulk)
                     .map_err(|e| err(&format!("compact create: {e}")))?,
             );
-            self.counts.clear();
         }
         let w = self.w.as_mut().ok_or_else(|| err("merge piece not open"))?;
         w.begin(k)?;
-        let n = pull(w)?;
+        pull(w)?;
         w.end()?;
-        self.counts.push(n);
         self.r += 1;
         if self.r == p.to {
             let w = self.w.take().ok_or_else(|| err("merge piece not open"))?;
             w.finish().map_err(|e| err(&format!("compact finish: {e}")))?;
             std::fs::rename(&p.tmp, self.dir.join(&p.name))?;
-            write_counts(self.dir, &p.name, &self.counts)?;
             self.out.push(p.name.clone());
             self.pi += 1;
         }
@@ -1437,33 +1380,28 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         pi: 0,
         r: 0,
         w: None,
-        counts: Vec::new(),
         out: Vec::new(),
     };
     if cursors {
         merge_ranks(&blobs, |k, tied| {
             em.key(k, |w| {
-                let mut n = 0u32;
                 for &(i, rank) in tied {
-                    n += blobs[i]
+                    blobs[i]
                         .values_at(rank, |v| w.value(v))
-                        .map_err(|e| err(&format!("compact read: {e}")))?
-                        as u32;
+                        .map_err(|e| err(&format!("compact read: {e}")))?;
                 }
-                Ok(n)
+                Ok(())
             })
         })?;
     } else {
         for r in 0..keys.len() {
             let k = keys.get(r);
             em.key(k, |w| {
-                let mut n = 0u32;
                 for b in &blobs {
-                    n += b
-                        .read_all(k, |v| w.value(v))
-                        .map_err(|e| err(&format!("compact read: {e}")))? as u32;
+                    b.read_all(k, |v| w.value(v))
+                        .map_err(|e| err(&format!("compact read: {e}")))?;
                 }
-                Ok(n)
+                Ok(())
             })?;
         }
     }
@@ -1635,7 +1573,6 @@ impl Db {
         for name in &on_disk {
             if !live.contains(name) {
                 let _ = std::fs::remove_file(dir.join(name));
-                let _ = std::fs::remove_file(counts_path(dir, name));
             }
         }
         let mut segs = Vec::with_capacity(live.len());
@@ -1810,7 +1747,6 @@ impl Db {
                 let id = first_id + ri as u64;
                 let tmp = dir.join(format!("seal-{id:08}.tmp"));
                 let _ = std::fs::remove_file(&tmp);
-                let mut counts: Vec<u32> = Vec::with_capacity(at - start);
                 {
                     let mut w = PieceWriter::create(&tmp, &opts, bulk)
                         .map_err(|e| err(&format!("seal create: {e}")))?;
@@ -1821,10 +1757,6 @@ impl Db {
                             w.value(mem.value_at(off));
                         }
                         w.end()?;
-                        // Keys are written in key order, so this vector is
-                        // in rank order by construction -- the same fact
-                        // the sorted seal already relies on.
-                        counts.push(e.count as u32);
                     }
                     w.finish().map_err(|e| err(&format!("seal finish: {e}")))?;
                 }
@@ -1838,7 +1770,6 @@ impl Db {
                     )
                 };
                 std::fs::rename(&tmp, dir.join(&name))?;
-                write_counts(&dir, &name, &counts)?;
                 names.push(name);
             }
             File::open(&dir)?.sync_all()?;
@@ -2116,7 +2047,6 @@ impl Db {
         self.publish()?;
         for name in &inputs {
             let _ = std::fs::remove_file(self.dir.join(name));
-            let _ = std::fs::remove_file(counts_path(&self.dir, name));
         }
         self.phase_ns[2] += t.elapsed().as_nanos() as u64;
         Ok(())
@@ -2323,38 +2253,19 @@ impl Db {
         Ok(seen)
     }
 
-    /// How many values a key holds, without decoding any of them.
-    ///
-    /// f28 is the reason this exists and the reason it is not free: an
-    /// `Ext` is block, offset, length and the offset of the last record,
-    /// and none of those is a count, so counting a variable-width key's
-    /// values means walking their length prefixes -- 1,983ns against 93 to
-    /// resolve the key and stop. `count_fixed` escapes that only when every
-    /// value has the same width. Segments therefore carry a per-rank count
-    /// beside them, written by whoever wrote the segment, and this is a
-    /// seek plus an array read with no block touched. A segment missing its
-    /// sidecar falls back to the walk, so the answer is always right and
-    /// only sometimes fast.
+    /// Values of `key` across every source. O(extents) per segment touched:
+    /// each extent carries its record count (`Ext::count`, format v5), so no
+    /// block is read. The memtable keeps a live count per key.
     pub fn count(&self, key: &[u8]) -> Result<u64> {
         let mut n = 0u64;
         for seg in &self.segs {
             if !seg.may_hold(key) {
                 continue;
             }
-            match &seg.counts {
-                Some(counts) => {
-                    let rank = seg.blob.seek(key);
-                    if seg.blob.key_at(rank) == Some(key) {
-                        n += u64::from(counts[rank]);
-                    }
-                }
-                None => {
-                    n += seg
-                        .blob
-                        .count(key)
-                        .map_err(|e| err(&format!("segment count: {e}")))?;
-                }
-            }
+            n += seg
+                .blob
+                .count(key)
+                .map_err(|e| err(&format!("segment count: {e}")))?;
         }
         if let Some(fr) = &self.frozen {
             if let Some(e) = fr.get(key) {

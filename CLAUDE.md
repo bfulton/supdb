@@ -181,25 +181,23 @@ takes the second for every access and copies nothing, which is the axis
 to lose. `Blob::zero_copy()` is asserted in the test, because a native reader
 that started copying would still pass every correctness check.
 
-**A count is not free, and the reason is the format.** `f28-count` runs four
-arms interleaved. Resolving a key and stopping is 77 ns; counting its values by
-walking their length prefixes is 2,493 ns; reading them all is 2,516. Counting
-without decoding is *not* cheaper than reading — W2.1 is recorded as failing so
-that premise cannot come back. An `Ext` is block, offset, byte length and the
-offset of the last record, and none of those is a count. What is 28x faster is
-`count_fixed`: a fixed-width value carries a fixed-width length prefix, so a
-posting list's count is arithmetic on `Ext::len` with no block touched. That is
-a property of the schema, not of the format. Adding a per-extent count to the
-format would recover at most 14.9 ns of the gap between those two, for four
-bytes on a 16-byte `Ext` paid by every store forever, so it was priced and
-declined.
-
-The same difference decides whether a browser can rank a dictionary at all.
-`scan_counts` pays a `count` per key, so it is O(every posting in the range) —
-for a day index, the whole file — and `scan_counts_fixed` is O(extents). Over
-2,000 keys that is 1,226 ns/key against 4.3, a factor of 283, so a day's whole
-term dictionary ranks in about 34 µs and nothing has to be precomputed at roll
-time.
+**A count costs a lookup, and it took a format change to make it so (v5).**
+`f28-count` runs four arms interleaved. Resolving a key and stopping is 94 ns;
+the general `count` is 94; reading every value is 2,345. Before format v5 the
+count walked the run's length prefixes and cost 2,493 ns -- what reading cost
+-- because an `Ext` was block, offset, byte length and the offset of the last
+record, and none of those is a count; skipping a payload does not skip the
+cache lines it sits in. A per-extent count was priced then at under 20 ns of
+saving for four bytes an extent and declined (W2.3's first form). When
+variable-width counts became a requirement it was built instead of a
+companion file: the four bytes are paid by every extent (20-byte records),
+and the top bit of the count is the tombstone flag deletes ride on. W2.1 and
+W2.2 flipped with it and say so. `count_fixed` and `scan_counts_fixed` survive
+and are no longer special: the general `scan_counts` ranks a 2,000-key
+dictionary at 4.5 ns/key against the fixed form's 5.2 (W2.4 fails, W2.5
+holds), so a day's whole term dictionary ranks in about 9 µs for any schema
+and nothing has to be precomputed at roll time. A file written before v5 is
+refused by its magic rather than misread.
 
 `count_fixed` claims a count only when two independent quantities agree: the
 run is a whole number of strides, *and* `Ext::last` — the offset of the final

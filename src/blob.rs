@@ -107,7 +107,7 @@ fn fixed_count(exts: &[Ext], stride: u64) -> Option<u64> {
 /// the constants below are asserted equal to `store.rs`'s at compile time on
 /// every native build, which says *why* in one line instead of six stack
 /// traces.
-const MAGIC: u64 = 0x5355_5044_4200_0004;
+const MAGIC: u64 = 0x5355_5044_4200_0005;
 const SUPER: u64 = 4096;
 const SLOT: u64 = 512;
 const SB_BYTES: usize = 144;
@@ -809,51 +809,18 @@ impl<B: Bytes> Blob<B> {
         Ok(n)
     }
 
-    /// How many values a key holds, without materialising any of them. R4.3.
+    /// How many values a key has. O(extents): every extent carries its
+    /// record count (`Ext::count`), so nothing in a block is touched.
     ///
-    /// **This is O(values), not O(extents), and the format is why.** An `Ext`
-    /// records where a run of values starts, how many bytes it is, and where
-    /// its last record begins -- four `u32`s, none of which is a count. The
-    /// values inside a run are length-prefixed varints laid end to end, so the
-    /// only way to know how many there are is to step over them. There is no
-    /// arithmetic that recovers the count from the extent list, and saying so
-    /// is more useful than shipping something that quietly decodes.
-    ///
-    /// What it *does* avoid is everything after the length prefix: no value
-    /// slice is bounds-checked into existence, nothing is handed to a
-    /// callback, and across the wasm boundary -- which is where logshed calls
-    /// this from -- no crossing happens per value at all. On a plain block it
-    /// touches one byte per record and skips the payload, so it reads about
-    /// one cache line per record's worth of stride rather than all of them.
-    ///
-    /// `f28-count` measures the three arms interleaved: this walk, the
-    /// `read_all` it replaces, and `lookup` alone -- which is the cost an
-    /// O(extents) count *would* have, and therefore the exact value of adding
-    /// a per-extent count to the format. See `claims.json`, W2.
+    /// It was not always so. f28 measured the walk this used to be at
+    /// 2,493 ns against 2,516 to read every value (W2.1): skipping a payload
+    /// does not skip the cache lines it sits in. The count moved into the
+    /// extent record with format v5, for four bytes an extent.
     pub fn count(&self, key: &[u8]) -> Result<u64> {
         let Some(exts) = self.lookup(key) else {
             return Ok(0);
         };
-        let mut n = 0u64;
-        for e in exts {
-            n += self.with_extent(*e, |run| {
-                let mut p = 0usize;
-                let mut seen = 0u64;
-                while p < run.len() {
-                    let len = get_uvarint(run, &mut p) as usize;
-                    let end = p
-                        .checked_add(len)
-                        .ok_or_else(|| corrupt("record length overflows"))?;
-                    if end > run.len() {
-                        return Err(corrupt("record runs past the end of its extent"));
-                    }
-                    seen += 1;
-                    p = end;
-                }
-                Ok(seen)
-            })?;
-        }
-        Ok(n)
+        Ok(exts.iter().map(|e| u64::from(e.records())).sum())
     }
 
     /// Stored bytes under a key: value payload *plus* the varint length
@@ -917,27 +884,9 @@ impl<B: Bytes> Blob<B> {
             let Some((k, exts)) = self.exts_at(rank) else {
                 break;
             };
-            // Counted before the callback so the borrow of the index section
-            // does not have to survive it.
-            let mut n = 0u64;
-            for e in exts {
-                n += self.with_extent(*e, |run| {
-                    let mut p = 0usize;
-                    let mut c = 0u64;
-                    while p < run.len() {
-                        let len = get_uvarint(run, &mut p) as usize;
-                        let end = p
-                            .checked_add(len)
-                            .ok_or_else(|| corrupt("record length overflows"))?;
-                        if end > run.len() {
-                            return Err(corrupt("record runs past the end of its extent"));
-                        }
-                        c += 1;
-                        p = end;
-                    }
-                    Ok(c)
-                })?;
-            }
+            // Read out of the extent records before the callback so the borrow
+            // of the index section does not have to survive it.
+            let n: u64 = exts.iter().map(|e| u64::from(e.records())).sum();
             seen += 1;
             rank += 1;
             if !f(k, n) {
