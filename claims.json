@@ -1106,6 +1106,27 @@
    "profile": "full",
    "expect": "holds",
    "because": "Building the key index is 19.0% of the floor -- `flatindex::encode` over 1M keys takes 0.097s of 0.511s -- so the index is not what makes a seal expensive and a bespoke writer could not have escaped it anyway, since a checkpoint pays exactly the same call. What the general path spends the other way is per-key bookkeeping for a store that will never be updated: a hash table probe, a shard, a dirty set and a freelist, all of which exist to support mutation that a sealed segment does not have. That the total is still only 2x says the put path is not carrying much fat, which is the more useful thing to know."
+  },
+  {
+   "experiment": "f47-parwal",
+   "id": "F47.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P-D refuted at the floor, before a sharded writer was built. Four independent WAL streams -- each its own file, its own 1,000-record batches, its own fdatasync, no engine work at all -- commit 2,738,027 records/s against one stream's 1,696,490: 1.61x, p=0.0022, against the 2.5x bar the brief set for P-D. Two streams reach 1.38x and eight add nothing over four (1.01x), so this device serves about 2,700 barriers a second in aggregate however they are issued, and durable-per-batch ingest cannot scale past ~1.6x one writer here by any arrangement of writers. Sharding is still worth 1.6x to a design that spends complexity for time, but it is not the multiplier the brief hoped for, and the number to register for it is 1.6x, not 2.5x."
+  },
+  {
+   "experiment": "f47-parwal",
+   "id": "F47.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Eight streams run 1.01x of four on a four-core host: the curve is flat past the core count and was already bending at two (1.38x). The barrier saturates before the cores do, so shard count should follow the device's barrier concurrency -- measured, per host -- and not the core count."
+  },
+  {
+   "experiment": "f47-parwal",
+   "id": "F47.3",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Registered as the alternative if independent streams serialised at the device, and refuted the other way: four threads sharing one file under a group commit reach 2,145,551 records/s against 2,738,027 for four independent streams, 0.784x at p=0.0022. One barrier amortised over four batches did not beat four barriers, because the appends behind a mutex cost more than the barriers saved -- the device has SOME concurrency (1.61x) and independence uses it where the lock throws it away. If group commit is ever built it wants a lock-free append region, not a mutex around the file."
   }
  ],
  "metrics": [

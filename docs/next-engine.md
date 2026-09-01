@@ -166,8 +166,19 @@ interleaved where the harness allows:
   window cost independent of key count — the 25x at a 1,000-op window
   (F4.1) becomes a bounded, window-size-only cost. F4.1 flips or the design
   failed at its main job.
-- **P-D, writes scale:** F6.1's sweep shows ≥ 2.5x at 4 writers. Refuted
-  means the sharding is cosmetic.
+- **P-D, writes scale: REFUTED AT THE FLOOR, before the build.** f47 ran
+  raw WAL streams N-wide with no engine work: four independent streams
+  commit **1.61x** one stream (F47.1), eight add nothing over four
+  (F47.2), and a group commit over one file *loses* to independence at
+  0.784x because the mutex costs more than the shared barrier saves
+  (F47.3). This device serves ~2,700 barriers a second however they are
+  issued, so durable-per-batch ingest cannot scale past ~1.6x one writer
+  here by any arrangement of writers. Sharding is still worth building for
+  1.6x under a spend-complexity-for-time priority, and its registered bar
+  is now **1.6x, not 2.5x**. Where ingest headroom actually lives on a
+  barrier-bound device is fewer barriers per record: larger batches, or a
+  bounded-loss sync policy (the old engine's `Sync::EveryN`, which the new
+  engine does not yet offer).
 - **P-E, crash semantics:** a store killed before any seal opens from the
   WAL alone (C3.4 flips), and history survives reopen (segments do not
   forget).
