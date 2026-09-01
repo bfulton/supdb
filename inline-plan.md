@@ -52,3 +52,28 @@ Both arms behind `NextOptions::inline_bytes` (0 disables), one process,
 f53-inline. `tests/segwriter.rs` holds a Store-written store and an
 inline-written one to the same answers on every read, which is the test
 that a second layout cannot answer differently.
+
+## Amendment, registered before the second run
+
+The first full run held P53.1 past its bar -- reads 1.722x faster -- and
+refuted P53.5: ingest 0.807x, seal 0.63s to 0.92s, merge 1.21s to 1.99s,
+same bytes (F53.2). The mechanism is timing, not volume. With runs in
+blocks the writer streams data during the pass and the kernel writes it
+back behind it; with runs inline nothing streams, the whole key section is
+built in memory and written at `finish`, and its fsync flushes 140 B a key
+at once on the critical path.
+
+So the segment writer gets a layout it can stream: the key section first
+in the file, its records written as keys arrive, and the hash directory,
+directory and fences after them -- the flat index header already names
+every region by offset, so no reader changes. The few block-backed runs
+an inline segment still has are buffered and written after the section.
+`inline_bytes: 0` keeps today's blocks-first layout, so the comparison arm
+is unchanged.
+
+- **P53.7 — with the streamed layout, ingest-to-routed with inline runs is
+  within 5% of the block-backed arm's** (`no_difference`, or a ratio in
+  0.95-1.05). Same bytes, now written at the same time.
+- **P53.8 — reads, scan and the dictionary count are unchanged from the
+  first run within noise** (F53.1, F53.3, F53.4 hold again). A layout
+  change that moved a number on the read side would be a bug.
