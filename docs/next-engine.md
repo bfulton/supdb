@@ -105,10 +105,26 @@ checkpoint.
 To be measured by the same experiments that convicted the current engine,
 interleaved where the harness allows:
 
-- **P-A, durable load:** EXT.9's shape lands **≥ 600,000 ops/s** on this
-  host — within 1.7x of the raw+index floor and past LMDB's recorded rate.
-  Below 600k the design has a leak that must be named; below 572k the axis
-  is conceded and the brief's premise was wrong.
+- **P-A, durable load: HELD, and the commit path is now at its floor.**
+  EXT.9's shape reads **955,714 ops/s** (F42.1) against a registered bar
+  of 600,000 — and the lazy-seal arm at 1,029,190 is *past* f39's
+  raw+index floor of 1,014,003, so the append-and-commit half of the
+  engine has no measured headroom left. Phase accounting puts 0.56s of
+  its 1.05s window in the WAL append and its fdatasync, which is the only
+  work a batch waits for.
+
+  What that leaves is not on the commit path at all. Against LMDB in the
+  external suite the durable load reads **0.299x** (EXT.22), because
+  there the seal and the flush's partitioning land *inside* the timed
+  window: roughly 3.5 of 4.5 seconds. That is overhead rather than bytes,
+  and half of it is a policy choice — EXT.25 measures **1.985x more
+  ingest** and 36% fewer device bytes from leaving partitioning to
+  background compaction, for 5% of read throughput, with EXT.26 gating
+  what it costs the ordered scan (2.007x). The rest is the seal writing
+  each segment through `Store`'s general put path — hash table, freelist,
+  arena, per-key bookkeeping — for input that is already sorted,
+  immutable and written once. **A purpose-built segment writer is the
+  largest remaining item on ingest.**
 - **P-B, the read lead survives: HELD, with its condition stated.** The
   test was "EXT.11's shape with live segment counts under the compaction
   policy stays ≥ 1.2x on x86". At the shipping configuration it reads
