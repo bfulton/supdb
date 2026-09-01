@@ -1527,6 +1527,39 @@ impl Db {
         let unsealed = &cache.as_ref().expect("scan snapshot").1;
         let mut mi = unsealed.partition_point(|k| k.as_slice() < from);
 
+        // When nothing overlaps -- no unsealed keys in range, no L0 -- the
+        // partitions ARE the answer in key order, and each one can be
+        // walked by `Blob::scan`, which resolves each key once. The merge
+        // below costs five or six index lookups an entry (a key_at per
+        // cursor to find the minimum, another to emit, and a third inside
+        // `values_at`) where this costs one, and after a routed flush this
+        // is the shape the store is in. An earlier version had this path,
+        // a refactor dropped it, and the scan axis paid for it.
+        if mi >= unsealed.len() && !self.segs.iter().any(|s| s.level == 0) {
+            let mut parts: Vec<&Seg> =
+                self.segs.iter().filter(|s| s.may_reach(from)).collect();
+            parts.sort_by(|a, b| a.lo.cmp(&b.lo));
+            let mut seen = 0usize;
+            let mut cursor: Vec<u8> = from.to_vec();
+            for seg in parts {
+                if seen >= limit {
+                    break;
+                }
+                if seg.lo.as_slice() > cursor.as_slice() {
+                    cursor = seg.lo.clone();
+                }
+                seen += seg
+                    .blob
+                    .scan(&cursor, limit - seen, &mut f)
+                    .map_err(|e| err(&format!("segment scan: {e}")))?;
+                match &seg.hi {
+                    Some(h) => cursor = h.clone(),
+                    None => break,
+                }
+            }
+            return Ok(seen);
+        }
+
         // A k-way merge over rank cursors, allocating nothing per key.
         //
         // The version before this one materialised every candidate key from
