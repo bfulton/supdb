@@ -157,19 +157,49 @@ struct Wal {
     pending: Vec<u8>,
 }
 
+/// The WAL file starts with this, so a file from before frames carried a
+/// kind byte is refused by name rather than replayed as something else.
+const WAL_MAGIC: &[u8; 8] = b"SUPDBWL\x02";
+/// Frame kinds. A batch is the frames between commit frames, and replay
+/// applies a batch only once its commit frame has been read intact.
+const WAL_PUT: u8 = 0;
+const WAL_DEL: u8 = 1;
+const WAL_COMMIT: u8 = 2;
+
 impl Wal {
     fn create(path: &Path) -> Result<Wal> {
-        let file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
+        let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
+        file.write_all(WAL_MAGIC)?;
         Ok(Wal { file, path: path.to_path_buf(), seq: 0, pending: Vec::new() })
     }
 
-    fn append(&mut self, key: &[u8], value: &[u8]) {
+    /// Reopen a WAL for appending at `seq`, after replay has truncated it to
+    /// its last commit frame. A file that does not exist yet gets its header
+    /// so the next replay finds one.
+    fn open_append(path: &Path, seq: u64) -> Result<Wal> {
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        if file.metadata()?.len() == 0 {
+            file.write_all(WAL_MAGIC)?;
+        }
+        Ok(Wal { file, path: path.to_path_buf(), seq, pending: Vec::new() })
+    }
+
+    /// One frame: `len u32 | crc u32 | seq u64 | kind u8 | payload`, where a
+    /// put's payload is `klen uvarint | key | value`, a delete's is the key
+    /// alone and a commit's is empty. `len` covers everything after `crc`;
+    /// `crc` covers the same bytes.
+    fn frame(&mut self, kind: u8, key: &[u8], value: &[u8]) {
         let body_at = self.pending.len() + FRAME_HEADER;
         self.pending.extend_from_slice(&[0u8; FRAME_HEADER]);
         self.pending.extend_from_slice(&self.seq.to_le_bytes());
-        put_uvarint(&mut self.pending, key.len() as u64);
-        self.pending.extend_from_slice(key);
-        self.pending.extend_from_slice(value);
+        self.pending.push(kind);
+        if kind != WAL_COMMIT {
+            put_uvarint(&mut self.pending, key.len() as u64);
+            self.pending.extend_from_slice(key);
+            if kind == WAL_PUT {
+                self.pending.extend_from_slice(value);
+            }
+        }
         let body_len = (self.pending.len() - body_at) as u32;
         let crc = crc32(&self.pending[body_at..]);
         self.pending[body_at - 8..body_at - 4].copy_from_slice(&body_len.to_le_bytes());
@@ -177,14 +207,28 @@ impl Wal {
         self.seq += 1;
     }
 
-    /// The durable point: one write, one fdatasync. F39.1 is the budget this
-    /// function is held to.
+    fn append(&mut self, key: &[u8], value: &[u8]) {
+        self.frame(WAL_PUT, key, value);
+    }
+
+    fn delete(&mut self, key: &[u8]) {
+        self.frame(WAL_DEL, key, &[]);
+    }
+
+    /// Close the batch: a commit frame after its records, so replay applies
+    /// them all or none of them. Nothing pending, nothing to close.
+    fn mark_commit(&mut self) {
+        if !self.pending.is_empty() {
+            self.frame(WAL_COMMIT, &[], &[]);
+        }
+    }
+
     fn commit(&mut self) -> Result<()> {
+        self.mark_commit();
         self.write()?;
         self.sync()
     }
 
-    /// The write half: pending frames reach the file, not yet the device.
     fn write(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
@@ -194,32 +238,52 @@ impl Wal {
         Ok(())
     }
 
-    /// The barrier half.
     fn sync(&mut self) -> Result<()> {
         self.file.sync_data()
     }
 
-    /// Replay a WAL into `apply`, stopping cleanly at a torn tail: a frame
-    /// whose length runs past the buffer or whose CRC fails is the crash
-    /// point, not corruption to report -- everything durable precedes it.
-    /// Records with seq below `from` were sealed and are skipped.
-    fn replay(path: &Path, from: u64, mut apply: impl FnMut(&[u8], &[u8])) -> Result<u64> {
+    /// Replay committed batches: `apply(kind, key, value)` for every record
+    /// of every batch whose commit frame was read intact, in order. Frames
+    /// after the last commit frame are a batch that never committed -- torn,
+    /// or written and never synced -- and are not applied.
+    ///
+    /// Returns the next sequence number and the length of the file up to and
+    /// including the last commit frame. The caller truncates the live WAL to
+    /// that length before appending, because a partial batch left in place
+    /// would sit in front of the next batch's commit frame and be adopted by
+    /// it on the following replay.
+    fn replay(
+        path: &Path,
+        from: u64,
+        mut apply: impl FnMut(u8, &[u8], &[u8]),
+    ) -> Result<(u64, u64)> {
         let mut buf = Vec::new();
         match File::open(path) {
             Ok(mut f) => {
                 f.read_to_end(&mut buf)?;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(from),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((from, 0)),
             Err(e) => return Err(e),
         }
-        let mut p = 0usize;
+        if buf.is_empty() {
+            return Ok((from, 0));
+        }
+        if buf.len() < WAL_MAGIC.len() || &buf[..WAL_MAGIC.len()] != WAL_MAGIC {
+            return Err(err("not a next-engine WAL: the header is missing or from an older format"));
+        }
+        let mut p = WAL_MAGIC.len();
         let mut next_seq = from;
+        let mut committed_seq = from;
+        let mut valid_len = p as u64;
+        // The batch being read: kind, and where its key and value lie in
+        // `buf`, so nothing is copied until the commit frame says to apply.
+        let mut batch: Vec<(u8, usize, usize, usize)> = Vec::new();
         while buf.len() - p >= FRAME_HEADER {
             let len = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()) as usize;
             let crc = u32::from_le_bytes(buf[p + 4..p + 8].try_into().unwrap());
             let body_at = p + FRAME_HEADER;
             let Some(end) = body_at.checked_add(len) else { break };
-            if end > buf.len() || len < 8 {
+            if end > buf.len() || len < 9 {
                 break;
             }
             let body = &buf[body_at..end];
@@ -227,24 +291,44 @@ impl Wal {
                 break;
             }
             let seq = u64::from_le_bytes(body[..8].try_into().unwrap());
-            let mut q = 8usize;
-            let Some(klen) = get_uvarint(body, &mut q) else {
-                return Err(err("wal frame key length is malformed"));
-            };
-            let kend = q
-                .checked_add(klen as usize)
-                .filter(|&e| e <= body.len())
-                .ok_or_else(|| err("wal frame key runs past its frame"))?;
+            let kind = body[8];
             if seq >= from {
                 if seq != next_seq {
                     return Err(err("wal sequence gap: a durable record is missing"));
                 }
-                apply(&body[q..kend], &body[kend..]);
                 next_seq = seq + 1;
+            }
+            match kind {
+                WAL_COMMIT => {
+                    for &(k, ks, ke, ve) in &batch {
+                        apply(k, &buf[ks..ke], &buf[ke..ve]);
+                    }
+                    batch.clear();
+                    committed_seq = next_seq;
+                    valid_len = end as u64;
+                }
+                WAL_PUT | WAL_DEL => {
+                    let mut q = 9usize;
+                    let Some(klen) = get_uvarint(body, &mut q) else {
+                        return Err(err("wal frame key length is malformed"));
+                    };
+                    let kend = q
+                        .checked_add(klen as usize)
+                        .filter(|&e| e <= body.len())
+                        .ok_or_else(|| err("wal frame key runs past its frame"))?;
+                    if kind == WAL_DEL && kend != body.len() {
+                        return Err(err("wal delete frame carries a value"));
+                    }
+                    if seq >= from {
+                        batch.push((kind, body_at + q, body_at + kend, end));
+                    }
+                }
+                _ => return Err(err("wal frame kind is unknown")),
             }
             p = end;
         }
-        Ok(next_seq)
+        // Whatever `batch` still holds never committed: lost whole.
+        Ok((committed_seq, valid_len))
     }
 }
 
@@ -347,6 +431,11 @@ struct Seg {
     lo: Vec<u8>,
     hi: Option<Vec<u8>>,
     bloom: Option<BlockedBloom>,
+    /// Whether any extent here carries the tombstone flag. A read consults
+    /// it before paying the newest-first pass that tombstones require;
+    /// partitions are always false, because a merge writes the bottom level
+    /// and drops them.
+    tombs: bool,
 }
 
 // ------------------------------------------------------- the segment writer --
@@ -489,6 +578,12 @@ impl SegmentWriter {
 
     /// Close the open key: place its run in a block and record the extent.
     pub fn end(&mut self) -> Result<()> {
+        self.end_with(false)
+    }
+
+    /// `end`, with the extent flagged as a tombstone: this run supersedes
+    /// every older value of the key, in every older segment.
+    pub fn end_with(&mut self, tombstone: bool) -> Result<()> {
         let (start, len) = self
             .open_key
             .take()
@@ -510,7 +605,7 @@ impl SegmentWriter {
             off,
             len: n as u32,
             last: self.last as u32,
-            count: self.records,
+            count: self.records | if tombstone { Ext::TOMBSTONE } else { 0 },
         };
         if self.builder.len() >= self.block_size {
             self.flush_block()?;
@@ -568,9 +663,9 @@ impl SegmentWriter {
         if self.open_key.is_some() {
             return Err(err("segment writer: finish with a key still open"));
         }
-        if self.spans.is_empty() {
-            return Err(err("segment writer: a segment needs at least one key"));
-        }
+        // A segment with no keys is allowed: a partition whose every key was
+        // deleted still has to exist, or the fences stop tiling the key
+        // space and a later seal would route keys into a neighbour's range.
         self.flush_block()?;
 
         let rows = vec![[0u32; block::MAX_CHUNK_CRCS]; self.blocks.len()];
@@ -693,13 +788,18 @@ impl PieceWriter {
         }
     }
 
-    fn end(&mut self) -> Result<()> {
+    fn end_with(&mut self, tombstone: bool) -> Result<()> {
         match self {
-            PieceWriter::Bulk(w) => w.end(),
-            PieceWriter::General { failed, .. } => match failed.take() {
-                Some(e) => Err(e),
-                None => Ok(()),
-            },
+            PieceWriter::Bulk(w) => w.end_with(tombstone),
+            PieceWriter::General { failed, .. } => {
+                if tombstone {
+                    return Err(err("the general writer cannot express a delete"));
+                }
+                match failed.take() {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
+            }
         }
     }
 
@@ -751,8 +851,7 @@ impl Seg {
             } else {
                 Some(unhex(f[3]).ok_or_else(|| err("segment fence is malformed"))?)
             };
-            let mut bloom = BlockedBloom::with_capacity(blob.keys());
-            Seg::for_each_key(&blob, |k| bloom.insert(k))?;
+            let (bloom, tombs) = Seg::bloom_and_tombs(&blob)?;
             return Ok(Seg {
                 blob,
                 name: name.to_string(),
@@ -760,6 +859,7 @@ impl Seg {
                 lo,
                 hi,
                 bloom: Some(bloom),
+                tombs,
             });
         }
         if let Some(rest) = name.strip_prefix("par-").and_then(|r| r.strip_suffix(".sup")) {
@@ -783,14 +883,14 @@ impl Seg {
                 lo,
                 hi,
                 bloom: None,
+                tombs: false,
             });
         }
         // L0: build the Bloom by walking the segment's keys. That walk is
         // O(keys) and it is affordable for exactly one reason -- L0 is
         // bounded at `l0_trigger` segments of at most `seal_bytes` each, so
         // this cost is bounded where the level below it is not.
-        let mut bloom = BlockedBloom::with_capacity(blob.keys());
-        Seg::for_each_key(&blob, |k| bloom.insert(k))?;
+        let (bloom, tombs) = Seg::bloom_and_tombs(&blob)?;
         Ok(Seg {
             blob,
             name: name.to_string(),
@@ -798,7 +898,24 @@ impl Seg {
             lo: Vec::new(),
             hi: None,
             bloom: Some(bloom),
+            tombs,
         })
+    }
+
+    /// The Bloom for a level-0 piece and whether any of its extents carries
+    /// the tombstone flag: one walk of the key section for both, which a
+    /// piece pays for the Bloom anyway.
+    fn bloom_and_tombs(blob: &Blob<MmapBytes>) -> Result<(BlockedBloom, bool)> {
+        let mut bloom = BlockedBloom::with_capacity(blob.keys());
+        let mut tombs = false;
+        for rank in 0..blob.keys() {
+            let (k, exts) = blob
+                .exts_at(rank)
+                .ok_or_else(|| err("segment key walk: a rank the index does not have"))?;
+            bloom.insert(k);
+            tombs |= exts.iter().any(|e| e.is_tombstone());
+        }
+        Ok((bloom, tombs))
     }
 
     /// Could this segment hold `key`? A fence answers exactly; a Bloom
@@ -835,7 +952,16 @@ struct MemTable {
     len: usize,
     keys: Vec<u8>,
     vals: Vec<u8>,
+    /// Tombstone chunks pushed so far. Non-zero is what tells a read that
+    /// this memtable can end a key's older values; zero lets it skip the
+    /// check entirely.
+    tombs: usize,
 }
+
+/// A chain chunk whose length prefix is this is a tombstone: it holds no
+/// value, and nothing older than it -- in this chain or in any older
+/// source -- is live.
+const TOMB_LEN: u64 = u64::MAX;
 
 #[derive(Clone, Copy, Default)]
 struct MemEntry {
@@ -868,6 +994,7 @@ impl MemTable {
             len: 0,
             keys: Vec::new(),
             vals: Vec::new(),
+            tombs: 0,
         }
     }
 
@@ -931,15 +1058,84 @@ impl MemTable {
     }
 
     /// Chunk offsets for one entry, oldest first.
-    fn chain(&self, e: &MemEntry) -> Vec<usize> {
+    /// End every value of `key` before this point: a tombstone chunk at the
+    /// head of the chain, and the live count back to zero. A key never seen
+    /// before gets an entry too, because the tombstone has older sources to
+    /// mask even when this memtable holds nothing of its own.
+    fn delete(&mut self, key: &[u8]) {
+        if (self.len + 1) * 2 > self.entries.len() {
+            self.grow();
+        }
+        let hash = mem_hash(key);
+        let mut i = (hash as usize) & self.mask;
+        loop {
+            let e = self.entries[i];
+            if e.hash == 0 {
+                let key_off = self.keys.len() as u32;
+                self.keys.extend_from_slice(key);
+                let head = self.push_tomb(NO_CHUNK);
+                self.entries[i] = MemEntry {
+                    hash,
+                    key_off,
+                    key_len: key.len() as u32,
+                    head: head + 1,
+                    count: 0,
+                };
+                self.len += 1;
+                self.tombs += 1;
+                return;
+            }
+            if e.hash == hash && MemTable::key_of(&self.keys, &e) == key {
+                let head = self.push_tomb(e.head - 1);
+                self.entries[i].head = head + 1;
+                self.entries[i].count = 0;
+                self.tombs += 1;
+                return;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    fn push_tomb(&mut self, prev: u64) -> u64 {
+        let off = self.vals.len() as u64;
+        self.vals.extend_from_slice(&prev.to_le_bytes());
+        put_uvarint(&mut self.vals, TOMB_LEN);
+        off
+    }
+
+    fn is_tomb(&self, at: usize) -> bool {
+        let mut p = at + 8;
+        get_uvarint(&self.vals, &mut p) == Some(TOMB_LEN)
+    }
+
+    /// The key's live values, oldest first, and whether a tombstone ends
+    /// the chain -- in which case everything older, here and in every older
+    /// source, is dead.
+    fn live_chain(&self, e: &MemEntry) -> (Vec<usize>, bool) {
         let mut offs = Vec::with_capacity(e.count as usize);
         let mut at = e.head - 1;
         while at != NO_CHUNK {
+            if self.is_tomb(at as usize) {
+                offs.reverse();
+                return (offs, true);
+            }
             offs.push(at as usize);
             at = u64::from_le_bytes(self.vals[at as usize..at as usize + 8].try_into().unwrap());
         }
         offs.reverse();
-        offs
+        (offs, false)
+    }
+
+    /// Whether a tombstone sits anywhere in the key's chain.
+    fn has_tomb(&self, e: &MemEntry) -> bool {
+        let mut at = e.head - 1;
+        while at != NO_CHUNK {
+            if self.is_tomb(at as usize) {
+                return true;
+            }
+            at = u64::from_le_bytes(self.vals[at as usize..at as usize + 8].try_into().unwrap());
+        }
+        false
     }
 
     fn value_at(&self, off: usize) -> &[u8] {
@@ -1197,7 +1393,10 @@ struct Emitter<'a> {
 }
 
 impl Emitter<'_> {
-    fn key(&mut self, k: &[u8], pull: impl FnOnce(&mut PieceWriter) -> Result<()>) -> Result<()> {
+    /// Validate that the visited rank belongs to the current piece and that
+    /// `k`, if given, lies inside its fence; open the piece's writer at its
+    /// first rank. Returns the piece's last rank.
+    fn enter(&mut self, k: Option<&[u8]>) -> Result<usize> {
         let p = self
             .pieces
             .get(self.pi)
@@ -1210,29 +1409,54 @@ impl Emitter<'_> {
         // Insurance against the class of bug that produced this line: a
         // merge told to write a fence must contain what it writes, or the
         // read path will deny it and no test will say so.
-        if k < p.lo.as_slice() || p.hi.as_ref().is_some_and(|h| k >= h.as_slice()) {
-            return Err(err("compaction would write a key outside its fence"));
+        if let Some(k) = k {
+            if k < p.lo.as_slice() || p.hi.as_ref().is_some_and(|h| k >= h.as_slice()) {
+                return Err(err("compaction would write a key outside its fence"));
+            }
         }
-        if self.r == p.from {
-            let _ = std::fs::remove_file(&p.tmp);
+        let (from, to, tmp) = (p.from, p.to, p.tmp.clone());
+        if self.r == from {
+            let _ = std::fs::remove_file(&tmp);
             self.w = Some(
-                PieceWriter::create(&p.tmp, self.opts, self.bulk)
+                PieceWriter::create(&tmp, self.opts, self.bulk)
                     .map_err(|e| err(&format!("compact create: {e}")))?,
             );
         }
-        let w = self.w.as_mut().ok_or_else(|| err("merge piece not open"))?;
-        w.begin(k)?;
-        pull(w)?;
-        w.end()?;
+        Ok(to)
+    }
+
+    /// Advance past the visited rank; finish, rename and publish the piece
+    /// at its last one.
+    fn leave(&mut self, to: usize) -> Result<()> {
         self.r += 1;
-        if self.r == p.to {
+        if self.r == to {
             let w = self.w.take().ok_or_else(|| err("merge piece not open"))?;
             w.finish().map_err(|e| err(&format!("compact finish: {e}")))?;
+            let p = &self.pieces[self.pi];
             std::fs::rename(&p.tmp, self.dir.join(&p.name))?;
             self.out.push(p.name.clone());
             self.pi += 1;
         }
         Ok(())
+    }
+
+    fn key(&mut self, k: &[u8], pull: impl FnOnce(&mut PieceWriter) -> Result<()>) -> Result<()> {
+        let to = self.enter(Some(k))?;
+        let w = self.w.as_mut().ok_or_else(|| err("merge piece not open"))?;
+        w.begin(k)?;
+        pull(w)?;
+        // Merges write the bottom level, so no output extent carries the
+        // tombstone flag: there is nothing older left for it to mask.
+        w.end_with(false)?;
+        self.leave(to)
+    }
+
+    /// A rank whose key has nothing live. It still belongs to a piece, and
+    /// the piece is still opened and finished around it, so the fence
+    /// tiling survives even a partition whose every key was deleted.
+    fn skip(&mut self) -> Result<()> {
+        let to = self.enter(None)?;
+        self.leave(to)
     }
 
     fn finish(self, total: usize) -> Result<Vec<String>> {
@@ -1382,10 +1606,29 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         w: None,
         out: Vec::new(),
     };
+    // Tombstones end here. Every merge writes the bottom level, so for each
+    // key the inputs older than its newest flagged extent are dropped, the
+    // flag itself is not carried, and a key with nothing live is left out
+    // -- which is how a delete gets its bytes back.
     if cursors {
         merge_ranks(&blobs, |k, tied| {
+            let mut start = 0usize;
+            let mut live = 0u64;
+            for (j, &(i, rank)) in tied.iter().enumerate() {
+                let Some((_, exts)) = blobs[i].exts_at(rank) else {
+                    return Err(err("segment key walk: a rank the index does not have"));
+                };
+                if exts.iter().any(|e| e.is_tombstone()) {
+                    start = j;
+                    live = 0;
+                }
+                live += exts.iter().map(|e| u64::from(e.records())).sum::<u64>();
+            }
+            if live == 0 {
+                return em.skip();
+            }
             em.key(k, |w| {
-                for &(i, rank) in tied {
+                for &(i, rank) in &tied[start..] {
                     blobs[i]
                         .values_at(rank, |v| w.value(v))
                         .map_err(|e| err(&format!("compact read: {e}")))?;
@@ -1396,9 +1639,27 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     } else {
         for r in 0..keys.len() {
             let k = keys.get(r);
+            let mut found: Vec<(usize, &[Ext])> = Vec::with_capacity(blobs.len());
+            let mut start = 0usize;
+            let mut live = 0u64;
+            for (i, b) in blobs.iter().enumerate() {
+                if let Some(exts) = b.lookup(k) {
+                    if exts.iter().any(|e| e.is_tombstone()) {
+                        start = found.len();
+                        live = 0;
+                    }
+                    live += exts.iter().map(|e| u64::from(e.records())).sum::<u64>();
+                    found.push((i, exts));
+                }
+            }
+            if live == 0 {
+                em.skip()?;
+                continue;
+            }
             em.key(k, |w| {
-                for b in &blobs {
-                    b.read_all(k, |v| w.value(v))
+                for &(i, exts) in &found[start..] {
+                    blobs[i]
+                        .read_exts(exts, |v| w.value(v))
                         .map_err(|e| err(&format!("compact read: {e}")))?;
                 }
                 Ok(())
@@ -1598,11 +1859,19 @@ impl Db {
         let mut mem = MemTable::new();
         let mut mem_bytes = 0usize;
         let mut from = sealed;
+        let mut valid_len = 0u64;
         for &id in &wal_ids {
-            from = Wal::replay(&Db::wal_path(dir, id), from, |k, v| {
-                mem.append(k, v);
-                mem_bytes += k.len() + v.len();
+            let (next, valid) = Wal::replay(&Db::wal_path(dir, id), from, |kind, k, v| {
+                if kind == WAL_DEL {
+                    mem.delete(k);
+                    mem_bytes += k.len() + 16;
+                } else {
+                    mem.append(k, v);
+                    mem_bytes += k.len() + v.len();
+                }
             })?;
+            from = next;
+            valid_len = valid;
         }
         // Older WALs are kept, not swept: their records are in the
         // memtable and the memtable is not durable. They retire at the
@@ -1615,12 +1884,22 @@ impl Db {
             .collect();
         let wal_id = wal_ids.last().copied().unwrap_or(0);
         let wal_path = Db::wal_path(dir, wal_id);
-        let file = OpenOptions::new().create(true).append(true).open(&wal_path)?;
+        // A batch that never committed is cut off before anything is
+        // appended behind it: left in place, its records would sit in front
+        // of the next batch's commit frame and be adopted by it.
+        if valid_len > 0 {
+            let f = OpenOptions::new().write(true).open(&wal_path)?;
+            if f.metadata()?.len() > valid_len {
+                f.set_len(valid_len)?;
+                f.sync_data()?;
+            }
+        }
+        let wal = Wal::open_append(&wal_path, from)?;
         let next_seg = seg_ids.iter().map(|&(n, _)| n + 1).max().unwrap_or(0);
         Ok(Db {
             dir: dir.to_path_buf(),
             opts,
-            wal: Wal { file, path: wal_path, seq: from, pending: Vec::new() },
+            wal,
             wal_id,
             mem,
             mem_bytes,
@@ -1645,11 +1924,37 @@ impl Db {
         self.mem_bytes += key.len() + value.len();
     }
 
+    /// End every value of `key` written before this point; later appends
+    /// start fresh. Durable at the next `commit`, exactly like an append,
+    /// and reclaimed by the next merge that reaches the key.
+    pub fn delete(&mut self, key: &[u8]) {
+        self.wal.delete(key);
+        self.mem.delete(key);
+        self.mem_bytes += key.len() + 16;
+    }
+
+    /// Start a transaction: puts and deletes staged until `Txn::commit`
+    /// applies them as one batch. It borrows the store mutably, so no other
+    /// write can interleave with it and no read can observe it half-applied.
+    pub fn begin(&mut self) -> Txn<'_> {
+        Txn { db: self, ops: Vec::new() }
+    }
+
+    /// Whether any source can end a key's older values. False for a store
+    /// nothing was ever deleted from, which lets every read skip the
+    /// newest-first pass tombstones require.
+    fn has_tombstones(&self) -> bool {
+        self.mem.tombs > 0
+            || self.frozen.as_ref().is_some_and(|f| f.tombs > 0)
+            || self.segs.iter().any(|s| s.tombs)
+    }
+
     /// The durability point: WAL append + fdatasync. If the memtable has
     /// crossed the seal threshold, seal after the commit -- after, so the
     /// batch's durability never waits on a segment write.
     pub fn commit(&mut self) -> Result<()> {
         let t = std::time::Instant::now();
+        self.wal.mark_commit();
         self.wal.write()?;
         self.unsynced += 1;
         let due = match self.opts.sync {
@@ -1752,11 +2057,15 @@ impl Db {
                         .map_err(|e| err(&format!("seal create: {e}")))?;
                     for e in &order[start..at] {
                         let key = MemTable::key_of(&mem.keys, e);
+                        // Only what is live after the newest tombstone, and
+                        // the flag if there was one: the segment carries the
+                        // delete forward for the sources older than it.
+                        let (offs, tomb) = mem.live_chain(e);
                         w.begin(key)?;
-                        for off in mem.chain(e) {
+                        for off in offs {
                             w.value(mem.value_at(off));
                         }
-                        w.end()?;
+                        w.end_with(tomb)?;
                     }
                     w.finish().map_err(|e| err(&format!("seal finish: {e}")))?;
                 }
@@ -2061,33 +2370,61 @@ impl Db {
     /// a false negative, so a skipped segment is a segment that provably
     /// holds nothing for this key.
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
-        let mut n = 0u64;
-        // Partitions sort first and are disjoint, so at most one can hold
-        // the key and a binary search finds it: the promise F40/F41 bought
-        // was two comparisons, not one per partition. Checking every fence
-        // linearly would put the partition count back into the read cost,
-        // which is the cost partitioning exists to remove.
         let np = self.segs.partition_point(|s| s.level > 0);
         let at = self.segs[..np]
             .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
-        if let Some(seg) = self.segs[..np].get(at) {
-            if seg.may_hold(key) {
+        let part = self.segs[..np].get(at).filter(|s| s.may_hold(key));
+        let l0 = &self.segs[np..];
+        // Sources oldest to newest: the partition (0), the level-0 pieces
+        // (1..), the frozen memtable, the live one. `start` is the source
+        // live values begin at: 0 unless a newer source holds a tombstone
+        // for this key. Only a store with tombstones in it checks, and the
+        // check is what a delete costs a read -- a second probe on the
+        // sources that hold the key.
+        let (fr_ix, mem_ix) = (1 + l0.len(), 2 + l0.len());
+        let mut start = 0usize;
+        if self.has_tombstones() {
+            if !self.mem.is_empty() {
+                if let Some(e) = self.mem.get(key) {
+                    if self.mem.has_tomb(e) {
+                        start = mem_ix;
+                    }
+                }
+            }
+            if start == 0 {
+                if let Some(fr) = &self.frozen {
+                    if let Some(e) = fr.get(key) {
+                        if fr.has_tomb(e) {
+                            start = fr_ix;
+                        }
+                    }
+                }
+            }
+            if start == 0 {
+                for (i, seg) in l0.iter().enumerate().rev() {
+                    if !seg.tombs || !seg.may_hold(key) {
+                        continue;
+                    }
+                    if let Some(exts) = seg.blob.lookup(key) {
+                        if exts.iter().any(|e| e.is_tombstone()) {
+                            start = 1 + i;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let mut n = 0u64;
+        if start == 0 {
+            if let Some(seg) = part {
                 n += seg
                     .blob
                     .read_all(key, &mut f)
                     .map_err(|e| err(&format!("segment read: {e}")))?;
             }
         }
-        // L0 is walked linearly, not binary-searched. A search on the high
-        // fence needs that fence to be monotone across the run, and one
-        // leftover full-range piece (hi unbounded, sorting first) breaks
-        // that -- the search then returns the start of the run and every
-        // read walks the whole tail, which cost EXT.23 0.846x -> 0.561x
-        // before the level dump showed a perfectly healthy 8 partitions and
-        // 9 pieces. The tail is bounded by policy, and two comparisons
-        // against a fence are cheap enough that bounded is enough.
-        for seg in &self.segs[np..] {
-            if !seg.may_hold(key) {
+        for (i, seg) in l0.iter().enumerate() {
+            if 1 + i < start || !seg.may_hold(key) {
                 continue;
             }
             n += seg
@@ -2095,34 +2432,29 @@ impl Db {
                 .read_all(key, &mut f)
                 .map_err(|e| err(&format!("segment read: {e}")))?;
         }
-        // An empty memtable is still a hash of the key and a probe, and a
-        // reader that has flushed pays it on every lookup for nothing.
-        if let Some(fr) = &self.frozen {
-            if let Some(e) = fr.get(key) {
-                for off in fr.chain(e) {
-                    f(fr.value_at(off));
+        if fr_ix >= start {
+            if let Some(fr) = &self.frozen {
+                if let Some(e) = fr.get(key) {
+                    let (offs, _) = fr.live_chain(e);
+                    n += offs.len() as u64;
+                    for off in offs {
+                        f(fr.value_at(off));
+                    }
                 }
-                n += e.count;
             }
         }
-        if !self.mem.is_empty() {
+        if mem_ix >= start && !self.mem.is_empty() {
             if let Some(e) = self.mem.get(key) {
-                for off in self.mem.chain(e) {
+                let (offs, _) = self.mem.live_chain(e);
+                n += offs.len() as u64;
+                for off in offs {
                     f(self.mem.value_at(off));
                 }
-                n += e.count;
             }
         }
         Ok(n)
     }
 
-    /// Ordered scan from `from`, at most `limit` distinct keys, values in
-    /// append order within each key. Milestone 3's merge is the unrouted fan
-    /// on the scan axis: every segment contributes up to `limit` candidate
-    /// keys via its own index walk, the memtables contribute theirs, and the
-    /// union is sorted and re-read through `read_all`. Range-partitioned
-    /// compaction is what will make this cost one segment instead of all of
-    /// them; until then this is priced as what it is.
     pub fn scan<F: FnMut(&[u8], &[u8])>(
         &self,
         from: &[u8],
@@ -2204,6 +2536,7 @@ impl Db {
             })
             .collect();
 
+        let tombs = self.has_tombstones();
         let mut seen = 0usize;
         while seen < limit {
             // The next key is the smallest any source is holding.
@@ -2225,25 +2558,63 @@ impl Db {
             // Emit in append order -- partitions, then L0 oldest to
             // newest, then the frozen memtable, then the live one -- and
             // advance every cursor that was sitting on this key.
-            for (seg, rank) in cursors.iter_mut() {
-                if seg.blob.key_at(*rank) == Some(key) {
-                    seg.blob
-                        .values_at(*rank, |v| f(key, v))
-                        .map_err(|e| err(&format!("segment scan read: {e}")))?;
-                    *rank += 1;
+            // Sources are ordered oldest to newest -- the cursors, then the
+            // frozen memtable, then the live one -- so the newest source with
+            // a tombstone for this key is a cut, and live values start there.
+            let nc = cursors.len();
+            let in_unsealed = unsealed.get(mi).map(|k| k.as_slice()) == Some(key);
+            let mut start = 0usize;
+            if tombs {
+                if in_unsealed {
+                    if self.mem.get(key).is_some_and(|e| self.mem.has_tomb(e)) {
+                        start = nc + 1;
+                    } else if self
+                        .frozen
+                        .as_ref()
+                        .and_then(|fr| fr.get(key).map(|e| fr.has_tomb(e)))
+                        .unwrap_or(false)
+                    {
+                        start = nc;
+                    }
                 }
-            }
-            if unsealed.get(mi).map(|k| k.as_slice()) == Some(key) {
-                if let Some(fr) = &self.frozen {
-                    if let Some(e) = fr.get(key) {
-                        for off in fr.chain(e) {
-                            f(key, fr.value_at(off));
+                if start == 0 {
+                    for (j, (seg, rank)) in cursors.iter().enumerate().rev() {
+                        if seg.tombs && seg.blob.key_at(*rank) == Some(key) {
+                            if let Some((_, exts)) = seg.blob.exts_at(*rank) {
+                                if exts.iter().any(|e| e.is_tombstone()) {
+                                    start = j;
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
-                if let Some(e) = self.mem.get(key) {
-                    for off in self.mem.chain(e) {
-                        f(key, self.mem.value_at(off));
+            }
+            for (j, (seg, rank)) in cursors.iter_mut().enumerate() {
+                if seg.blob.key_at(*rank) == Some(key) {
+                    if j >= start {
+                        seg.blob
+                            .values_at(*rank, |v| f(key, v))
+                            .map_err(|e| err(&format!("segment scan read: {e}")))?;
+                    }
+                    *rank += 1;
+                }
+            }
+            if in_unsealed {
+                if nc >= start {
+                    if let Some(fr) = &self.frozen {
+                        if let Some(e) = fr.get(key) {
+                            for off in fr.live_chain(e).0 {
+                                f(key, fr.value_at(off));
+                            }
+                        }
+                    }
+                }
+                if nc + 1 >= start {
+                    if let Some(e) = self.mem.get(key) {
+                        for off in self.mem.live_chain(e).0 {
+                            f(key, self.mem.value_at(off));
+                        }
                     }
                 }
                 mi += 1;
@@ -2257,22 +2628,64 @@ impl Db {
     /// each extent carries its record count (`Ext::count`, format v5), so no
     /// block is read. The memtable keeps a live count per key.
     pub fn count(&self, key: &[u8]) -> Result<u64> {
+        let np = self.segs.partition_point(|s| s.level > 0);
+        let at = self.segs[..np]
+            .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+        let part = self.segs[..np].get(at).filter(|s| s.may_hold(key));
+        let l0 = &self.segs[np..];
+        let (fr_ix, mem_ix) = (1 + l0.len(), 2 + l0.len());
+        let mut start = 0usize;
+        if self.has_tombstones() {
+            if !self.mem.is_empty() {
+                if let Some(e) = self.mem.get(key) {
+                    if self.mem.has_tomb(e) {
+                        start = mem_ix;
+                    }
+                }
+            }
+            if start == 0 {
+                if let Some(fr) = &self.frozen {
+                    if let Some(e) = fr.get(key) {
+                        if fr.has_tomb(e) {
+                            start = fr_ix;
+                        }
+                    }
+                }
+            }
+            if start == 0 {
+                for (i, seg) in l0.iter().enumerate().rev() {
+                    if !seg.tombs || !seg.may_hold(key) {
+                        continue;
+                    }
+                    if let Some(exts) = seg.blob.lookup(key) {
+                        if exts.iter().any(|e| e.is_tombstone()) {
+                            start = 1 + i;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         let mut n = 0u64;
-        for seg in &self.segs {
-            if !seg.may_hold(key) {
+        if start == 0 {
+            if let Some(seg) = part {
+                n += seg.blob.count(key).map_err(|e| err(&format!("segment count: {e}")))?;
+            }
+        }
+        for (i, seg) in l0.iter().enumerate() {
+            if 1 + i < start || !seg.may_hold(key) {
                 continue;
             }
-            n += seg
-                .blob
-                .count(key)
-                .map_err(|e| err(&format!("segment count: {e}")))?;
+            n += seg.blob.count(key).map_err(|e| err(&format!("segment count: {e}")))?;
         }
-        if let Some(fr) = &self.frozen {
-            if let Some(e) = fr.get(key) {
-                n += e.count;
+        if fr_ix >= start {
+            if let Some(fr) = &self.frozen {
+                if let Some(e) = fr.get(key) {
+                    n += e.count;
+                }
             }
         }
-        if !self.mem.is_empty() {
+        if mem_ix >= start && !self.mem.is_empty() {
             if let Some(e) = self.mem.get(key) {
                 n += e.count;
             }
@@ -2280,8 +2693,6 @@ impl Db {
         Ok(n)
     }
 
-    /// Nanoseconds in (commit, seal, merge). Only the first is on the
-    /// commit path; the other two are counted where a caller waits.
     pub fn phase_ns(&self) -> (u64, u64, u64) {
         (self.phase_ns[0], self.phase_ns[1], self.phase_ns[2])
     }
@@ -2312,6 +2723,93 @@ impl Db {
 /// thread is not a crash casualty in-process: it would keep mutating the
 /// directory under whoever reopens it. Join it; the WAL it rotated out
 /// still covers everything either way, so crash semantics are unchanged.
+/// A transaction: puts and deletes staged in memory and applied at `commit`
+/// as one WAL batch behind one commit frame and one barrier, so a crash
+/// leaves all of them or none of them (`Wal::replay`). Reads through it see
+/// the store as of `begin` plus its own staged writes, in order. Dropping it
+/// without `commit` is `abort`: nothing has reached the WAL or the memtable,
+/// so there is nothing to undo -- which is what staging buys, for one copy
+/// of each value, against an undo log over a hash table that may have grown
+/// under the transaction.
+///
+/// The plain `append` + `commit` path stays for callers that do not need
+/// rollback; it is atomic too, by the same commit frame.
+pub struct Txn<'a> {
+    db: &'a mut Db,
+    ops: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+}
+
+impl Txn<'_> {
+    pub fn append(&mut self, key: &[u8], value: &[u8]) {
+        self.ops.push((key.to_vec(), Some(value.to_vec())));
+    }
+
+    pub fn delete(&mut self, key: &[u8]) {
+        self.ops.push((key.to_vec(), None));
+    }
+
+    /// Staged operations so far.
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    /// The key's values as this transaction sees them: the store's, then its
+    /// own staged operations applied in order. A key the transaction has not
+    /// touched reads straight through.
+    pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
+        if !self.ops.iter().any(|(k, _)| k.as_slice() == key) {
+            return self.db.read_all(key, f);
+        }
+        let mut vals: Vec<Vec<u8>> = Vec::new();
+        self.db.read_all(key, |v| vals.push(v.to_vec()))?;
+        for (k, v) in &self.ops {
+            if k.as_slice() == key {
+                match v {
+                    Some(v) => vals.push(v.clone()),
+                    None => vals.clear(),
+                }
+            }
+        }
+        for v in &vals {
+            f(v);
+        }
+        Ok(vals.len() as u64)
+    }
+
+    pub fn count(&self, key: &[u8]) -> Result<u64> {
+        let mut n = self.db.count(key)?;
+        for (k, v) in &self.ops {
+            if k.as_slice() == key {
+                match v {
+                    Some(_) => n += 1,
+                    None => n = 0,
+                }
+            }
+        }
+        Ok(n)
+    }
+
+    /// Apply every staged operation and commit them as one batch.
+    pub fn commit(self) -> Result<()> {
+        let Txn { db, ops } = self;
+        for (k, v) in ops {
+            match v {
+                Some(v) => db.append(&k, &v),
+                None => db.delete(&k),
+            }
+        }
+        db.commit()
+    }
+
+    /// Discard every staged operation. Dropping the transaction does the
+    /// same; this is the name for doing it on purpose.
+    pub fn abort(self) {}
+}
+
 impl Drop for Db {
     fn drop(&mut self) {
         if let Some(h) = self.sealing.take() {

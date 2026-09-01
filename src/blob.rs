@@ -535,7 +535,9 @@ impl<B: Bytes> Blob<B> {
         self.idx.at(self.key_sec().ok()?, rank).map(|(k, _)| k)
     }
 
-    fn exts_at(&self, rank: usize) -> Option<(&[u8], &[Ext])> {
+    /// The key and extents at `rank`, borrowed from the mapping: the flags
+    /// on the extents are how `next::Db` sees a tombstone without a probe.
+    pub fn exts_at(&self, rank: usize) -> Option<(&[u8], &[Ext])> {
         self.idx.at(self.key_sec().ok()?, rank)
     }
 
@@ -782,10 +784,17 @@ impl<B: Bytes> Blob<B> {
     /// has been read as a count more than once -- the requirements document
     /// this work was written against says "read_all returns a count", and it
     /// does not.
-    pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
+    pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], f: F) -> Result<u64> {
         let Some(exts) = self.lookup(key) else {
             return Ok(0);
         };
+        self.read_exts(exts, f)
+    }
+
+    /// Every value in `exts`, in order -- the extents a `lookup` or `exts_at`
+    /// returned, handed back so a caller that has already resolved a key and
+    /// looked at its flags does not resolve it again. Returns how many.
+    pub fn read_exts<F: FnMut(&[u8])>(&self, exts: &[Ext], mut f: F) -> Result<u64> {
         let mut n = 0u64;
         for e in exts {
             n += self.with_extent(*e, |run| {

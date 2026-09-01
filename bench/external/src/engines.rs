@@ -392,7 +392,13 @@ impl Engine for Next {
     fn features(&self) -> Features {
         Features {
             durable_commit: true,
-            transactions: false,
+            // A batch is the WAL frames behind one commit frame and replay
+            // applies it whole or not at all; `Txn` stages, commits as one
+            // batch, and aborts by dropping; and the engine is single-writer
+            // with reads that borrow it, so nothing observes a batch
+            // half-applied. That is the axis LMDB held over every Supdb arm
+            // and the residual every matched comparison carried.
+            transactions: true,
             // Equalized off, matching lmdb -- see create().
             checksums: false,
             reopen_for_write: true,

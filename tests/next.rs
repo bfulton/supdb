@@ -88,16 +88,21 @@ fn uncommitted_tail_is_lost_whole_and_committed_state_survives() {
 }
 
 #[test]
-fn a_torn_frame_stops_replay_at_the_crash_point() {
+fn a_torn_tail_loses_its_batch_whole_and_earlier_batches_survive() {
     let d = dir("torn");
     let mut db = Db::create(&d, NextOptions::default()).unwrap();
     db.append(b"a", b"1");
+    db.commit().unwrap();
     db.append(b"b", b"2");
+    db.append(b"c", b"3");
     db.commit().unwrap();
     drop(db);
 
-    // Tear the last frame: chop bytes off the WAL tail, the state a crash
-    // mid-write leaves.
+    // Tear the tail: chop bytes off the WAL, the state a crash mid-write
+    // leaves. The cut lands in the second batch's commit frame, so `b` is an
+    // intact frame -- and it must NOT be served, because its batch never
+    // committed. Before the commit frame existed this test expected the
+    // intact frame back; that was a partial batch replayed as whole.
     let wal = d.join("wal-00000000");
     let len = std::fs::metadata(&wal).unwrap().len();
     let f = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
@@ -105,8 +110,56 @@ fn a_torn_frame_stops_replay_at_the_crash_point() {
     drop(f);
 
     let db = Db::open(&d, NextOptions::default()).unwrap();
-    assert_eq!(read_vec(&db, b"a"), vec![b"1".to_vec()], "intact frame survives");
-    assert_eq!(read_vec(&db, b"b"), Vec::<Vec<u8>>::new(), "torn frame is the crash point");
+    assert_eq!(read_vec(&db, b"a"), vec![b"1".to_vec()], "a committed batch survives");
+    assert_eq!(read_vec(&db, b"b"), Vec::<Vec<u8>>::new(), "the torn batch is gone whole");
+    assert_eq!(read_vec(&db, b"c"), Vec::<Vec<u8>>::new(), "the torn batch is gone whole");
+}
+
+#[test]
+fn a_transaction_is_all_or_nothing_and_sees_its_own_writes() {
+    let d = dir("txn");
+    let mut db = Db::create(&d, NextOptions::default()).unwrap();
+    db.append(b"z", b"old");
+    db.commit().unwrap();
+    {
+        let mut tx = db.begin();
+        tx.append(b"x", b"1");
+        tx.append(b"x", b"2");
+        tx.delete(b"z");
+        tx.append(b"z", b"new");
+        let mut got = Vec::new();
+        tx.read_all(b"x", |v| got.push(v.to_vec())).unwrap();
+        assert_eq!(got, vec![b"1".to_vec(), b"2".to_vec()], "read-your-writes inside");
+        let mut got = Vec::new();
+        tx.read_all(b"z", |v| got.push(v.to_vec())).unwrap();
+        assert_eq!(got, vec![b"new".to_vec()], "a staged delete masks the store's values");
+        assert_eq!(tx.count(b"z").unwrap(), 1);
+        assert_eq!(tx.count(b"x").unwrap(), 2);
+        tx.abort();
+    }
+    assert!(read_vec(&db, b"x").is_empty(), "an aborted transaction leaves nothing");
+    assert_eq!(read_vec(&db, b"z"), vec![b"old".to_vec()]);
+    {
+        let mut tx = db.begin();
+        tx.append(b"x", b"1");
+        tx.append(b"x", b"2");
+        tx.delete(b"z");
+        tx.append(b"z", b"new");
+        tx.commit().unwrap();
+    }
+    assert_eq!(read_vec(&db, b"x"), vec![b"1".to_vec(), b"2".to_vec()]);
+    assert_eq!(read_vec(&db, b"z"), vec![b"new".to_vec()]);
+    {
+        let mut tx = db.begin();
+        tx.append(b"y", b"gone");
+        drop(tx);
+    }
+    assert!(read_vec(&db, b"y").is_empty(), "dropped without commit is abort");
+    drop(db);
+    let db = Db::open(&d, NextOptions::default()).unwrap();
+    assert_eq!(read_vec(&db, b"x"), vec![b"1".to_vec(), b"2".to_vec()], "committed, durably");
+    assert_eq!(read_vec(&db, b"z"), vec![b"new".to_vec()]);
+    assert!(read_vec(&db, b"y").is_empty());
 }
 
 #[test]
@@ -173,7 +226,7 @@ fn oracle(bulk: bool, cursors: bool) {
     let opts = NextOptions { bulk_writer: bulk, cursor_merge: cursors, ..NextOptions::default() };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
-    let mut uncommitted: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut uncommitted: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
     let mut state = 0x5eedu64;
     let mut rng = move || {
         state ^= state << 13;
@@ -183,21 +236,24 @@ fn oracle(bulk: bool, cursors: bool) {
     };
     for step in 0..2_000u32 {
         let key = format!("k{}", rng() % 97).into_bytes();
-        let val = format!("v{step}").into_bytes();
-        db.append(&key, &val);
-        uncommitted.push((key, val));
+        // One op in twenty is a delete, on the bulk writer only: the general
+        // writer is a measurement arm and cannot express one.
+        if bulk && rng() % 20 == 0 {
+            db.delete(&key);
+            uncommitted.push((key, None));
+        } else {
+            let val = format!("v{step}").into_bytes();
+            db.append(&key, &val);
+            uncommitted.push((key, Some(val)));
+        }
         match rng() % 100 {
             0..=9 => {
                 db.commit().unwrap();
-                for (k, v) in uncommitted.drain(..) {
-                    model.entry(k).or_default().push(v);
-                }
+                apply(&mut model, &mut uncommitted);
             }
             10..=12 => {
                 db.commit().unwrap();
-                for (k, v) in uncommitted.drain(..) {
-                    model.entry(k).or_default().push(v);
-                }
+                apply(&mut model, &mut uncommitted);
                 db.seal().unwrap();
             }
             13 => {
@@ -222,11 +278,28 @@ fn oracle(bulk: bool, cursors: bool) {
         }
     }
     db.commit().unwrap();
-    for (k, v) in uncommitted.drain(..) {
-        model.entry(k).or_default().push(v);
-    }
+    apply(&mut model, &mut uncommitted);
     for (k, want) in &model {
         assert_eq!(&read_vec(&db, k), want);
+    }
+    // The scan agrees with the point reads: every live key, every live
+    // value, and no key whose values were all deleted.
+    let mut scanned: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+    db.scan(b"", usize::MAX, |k, v| scanned.entry(k.to_vec()).or_default().push(v.to_vec()))
+        .unwrap();
+    let live: HashMap<Vec<u8>, Vec<Vec<u8>>> =
+        model.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| (k.clone(), v.clone())).collect();
+    assert_eq!(scanned, live, "the scan must agree with the model");
+}
+
+/// Apply a committed batch to the model: an append pushes, a delete clears.
+fn apply(model: &mut HashMap<Vec<u8>, Vec<Vec<u8>>>, batch: &mut Vec<(Vec<u8>, Option<Vec<u8>>)>) {
+    for (k, v) in batch.drain(..) {
+        let e = model.entry(k).or_default();
+        match v {
+            Some(v) => e.push(v),
+            None => e.clear(),
+        }
     }
 }
 
@@ -516,5 +589,162 @@ fn every_n_loses_the_unsynced_tail_whole_and_never_in_part() {
     assert_eq!(read_vec(&db, b"k022"), Vec::<Vec<u8>>::new(), "the torn frame is the crash point");
     for c in 16u32..22 {
         assert_eq!(read_vec(&db, format!("k{c:03}").as_bytes()).len(), 1);
+    }
+}
+
+fn dir_bytes(d: &std::path::Path) -> u64 {
+    std::fs::read_dir(d).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum()
+}
+
+#[test]
+fn a_delete_ends_older_values_and_later_appends_start_fresh() {
+    let d = dir("delete");
+    let mut db = Db::create(&d, NextOptions::default()).unwrap();
+    db.append(b"k", b"v1");
+    db.append(b"k", b"v2");
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.append(b"k", b"v3");
+    db.commit().unwrap();
+    assert_eq!(read_vec(&db, b"k"), vec![b"v1".to_vec(), b"v2".to_vec(), b"v3".to_vec()]);
+    db.delete(b"k");
+    assert_eq!(read_vec(&db, b"k"), Vec::<Vec<u8>>::new(), "a delete ends everything before it, sealed or not");
+    assert_eq!(db.count(b"k").unwrap(), 0);
+    db.append(b"k", b"v4");
+    db.commit().unwrap();
+    assert_eq!(read_vec(&db, b"k"), vec![b"v4".to_vec()]);
+    assert_eq!(db.count(b"k").unwrap(), 1);
+    db.seal().unwrap();
+    assert_eq!(read_vec(&db, b"k"), vec![b"v4".to_vec()], "through a sealed tombstone");
+    drop(db);
+    let mut db = Db::open(&d, NextOptions::default()).unwrap();
+    assert_eq!(read_vec(&db, b"k"), vec![b"v4".to_vec()], "after reopen");
+    db.flush().unwrap();
+    assert_eq!(read_vec(&db, b"k"), vec![b"v4".to_vec()], "after the merge");
+    assert_eq!(db.count(b"k").unwrap(), 1);
+    let mut scanned = Vec::new();
+    db.scan(b"", usize::MAX, |k, v| scanned.push((k.to_vec(), v.to_vec()))).unwrap();
+    assert_eq!(scanned, vec![(b"k".to_vec(), b"v4".to_vec())]);
+    // A delete of a key never written is a tombstone too; it masks nothing.
+    db.delete(b"never");
+    db.commit().unwrap();
+    assert_eq!(read_vec(&db, b"never"), Vec::<Vec<u8>>::new());
+    // A delete with no later append: empty through seal and merge, and the
+    // key leaves the scan once the merge has dropped it.
+    db.delete(b"k");
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert_eq!(read_vec(&db, b"k"), Vec::<Vec<u8>>::new());
+    assert_eq!(db.count(b"k").unwrap(), 0);
+    let mut scanned = Vec::new();
+    db.scan(b"", usize::MAX, |k, v| scanned.push((k.to_vec(), v.to_vec()))).unwrap();
+    assert!(scanned.is_empty(), "a merged-away key does not scan: {scanned:?}");
+}
+
+#[test]
+fn deleted_values_do_not_survive_the_merge() {
+    let d = dir("delete-merge");
+    let opts = NextOptions { seal_bytes: 256 << 10, l0_trigger: 3, ..NextOptions::default() };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let filler = vec![b'x'; 200];
+    for i in 0..4_000u32 {
+        let k = format!("key-{i:06}");
+        db.append(k.as_bytes(), &filler);
+        db.append(k.as_bytes(), &filler);
+        if i % 100 == 99 {
+            db.commit().unwrap();
+        }
+    }
+    db.flush().unwrap();
+    let before = dir_bytes(&d);
+    for i in (0..4_000u32).step_by(2) {
+        db.delete(format!("key-{i:06}").as_bytes());
+        if i % 200 == 198 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    let after = dir_bytes(&d);
+    assert!(
+        (after as f64) <= (before as f64) * 0.7,
+        "the merge must reclaim the deleted half: {before} -> {after} bytes"
+    );
+    for i in 0..4_000u32 {
+        let k = format!("key-{i:06}");
+        let got = read_vec(&db, k.as_bytes());
+        if i % 2 == 0 {
+            assert!(got.is_empty(), "{k} was deleted");
+            assert_eq!(db.count(k.as_bytes()).unwrap(), 0);
+        } else {
+            assert_eq!(got.len(), 2, "{k} must keep both values");
+            assert_eq!(db.count(k.as_bytes()).unwrap(), 2);
+        }
+    }
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    db.scan(b"", usize::MAX, |k, _| {
+        if keys.last().map(|l| l.as_slice()) != Some(k) {
+            keys.push(k.to_vec());
+        }
+    })
+    .unwrap();
+    assert_eq!(keys.len(), 2_000, "only the live half scans");
+    drop(db);
+    let db = Db::open(&d, opts).unwrap();
+    assert!(read_vec(&db, b"key-000000").is_empty());
+    assert_eq!(read_vec(&db, b"key-000001").len(), 2);
+}
+
+#[test]
+fn a_batch_without_its_commit_frame_is_lost_whole() {
+    // A batch is the frames between commit frames. If the crash lands
+    // anywhere inside the second batch -- inside its commit frame, exactly
+    // at it, or inside its last record -- the whole batch is gone, and it
+    // stays gone after the next commit rather than being adopted by it.
+    let d = dir("torn-batch");
+    let mut db = Db::create(&d, NextOptions::default()).unwrap();
+    for i in 0..3u32 {
+        db.append(format!("a{i}").as_bytes(), b"A");
+    }
+    db.commit().unwrap();
+    for i in 0..3u32 {
+        db.append(format!("b{i}").as_bytes(), b"B");
+    }
+    db.commit().unwrap();
+    drop(db);
+    let wal = d.join("wal-00000000");
+    let full = std::fs::read(&wal).unwrap();
+    for cut in [3usize, 17, 17 + 12] {
+        let dd = dir(&format!("torn-batch-{cut}"));
+        for e in std::fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            if e.file_name() != "wal-00000000" {
+                std::fs::copy(e.path(), dd.join(e.file_name())).unwrap();
+            }
+        }
+        std::fs::write(dd.join("wal-00000000"), &full[..full.len() - cut]).unwrap();
+        let mut db = Db::open(&dd, NextOptions::default()).unwrap();
+        for i in 0..3u32 {
+            assert_eq!(
+                read_vec(&db, format!("a{i}").as_bytes()),
+                vec![b"A".to_vec()],
+                "cut {cut}: the committed batch survives"
+            );
+            assert!(
+                read_vec(&db, format!("b{i}").as_bytes()).is_empty(),
+                "cut {cut}: a batch without its commit frame is gone whole"
+            );
+        }
+        db.append(b"c0", b"C");
+        db.commit().unwrap();
+        drop(db);
+        let db = Db::open(&dd, NextOptions::default()).unwrap();
+        assert_eq!(read_vec(&db, b"c0"), vec![b"C".to_vec()]);
+        for i in 0..3u32 {
+            assert!(
+                read_vec(&db, format!("b{i}").as_bytes()).is_empty(),
+                "cut {cut}: still gone after another commit"
+            );
+        }
     }
 }
