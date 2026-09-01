@@ -162,6 +162,10 @@ fn agree(a: &Blob<MmapBytes>, b: &Blob<MmapBytes>, data: &[(Vec<u8>, Vec<Vec<u8>
         assert_eq!(&ga, vals, "store values for {key:?}");
         assert_eq!(gb, ga, "values differ for {key:?}");
         assert_eq!(b.count(key).expect("count"), a.count(key).expect("count"));
+        let mut cat = Vec::new();
+        let nc = b.read_concat(key, &mut cat).expect("read_concat");
+        assert_eq!(nc, vals.len() as u64);
+        assert_eq!(cat, vals.concat(), "read_concat is the values back to back for {key:?}");
         assert_eq!(
             b.stored_bytes(key),
             a.stored_bytes(key),

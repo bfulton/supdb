@@ -808,3 +808,59 @@ fn idle_io_priority_and_sync_spreading_change_nothing_observable() {
     db.scan(b"", usize::MAX, |_, _| n += 1).unwrap();
     assert_eq!(n, 40_000, "every value survives the knobs and a reopen");
 }
+
+#[test]
+fn ordered_pieces_are_promoted_to_partitions_without_a_merge() {
+    // A log's shape: every seal's keys lie above everything sealed before,
+    // so nothing overlaps and nothing needs merging. With promotion each
+    // piece becomes a partition by rename; the merge phase stays near
+    // zero and every key reads back through the fences.
+    let d = dir("promote");
+    let opts = NextOptions {
+        seal_bytes: 256 << 10,
+        l0_trigger: 3,
+        partition_bytes: None,
+        ..NextOptions::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let filler = vec![b'p'; 100];
+    for i in 0..12_000u32 {
+        let k = format!("log-{i:08}");
+        db.append(k.as_bytes(), &filler);
+        db.append(k.as_bytes(), &i.to_le_bytes());
+        if i % 500 == 499 {
+            db.commit().unwrap();
+        }
+    }
+    db.flush().unwrap();
+    let (parts, l0) = db.levels();
+    assert!(parts >= 4, "ordered pieces should have become partitions: {parts} partitions, {l0} pieces");
+    assert_eq!(l0, 0);
+    let (_, _, merge_ns) = db.phase_ns();
+    assert!(merge_ns < 50_000_000, "promotion should not spend a merge's time: {merge_ns} ns");
+    for i in (0..12_000u32).step_by(997) {
+        let got = read_vec(&db, format!("log-{i:08}").as_bytes());
+        assert_eq!(got.len(), 2, "log-{i:08}");
+        assert_eq!(got[1], i.to_le_bytes().to_vec());
+    }
+    let mut n = 0usize;
+    let mut last: Vec<u8> = Vec::new();
+    db.scan(b"", usize::MAX, |k, _| {
+        assert!(k >= last.as_slice(), "scan order");
+        last = k.to_vec();
+        n += 1;
+    })
+    .unwrap();
+    assert_eq!(n, 24_000);
+    drop(db);
+    let db = Db::open(&d, opts).unwrap();
+    assert_eq!(read_vec(&db, b"log-00011999").len(), 2, "after reopen");
+    assert_eq!(read_vec(&db, b"log-00000000").len(), 2);
+    let mut names: Vec<String> = std::fs::read_dir(&d)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sup"))
+        .collect();
+    names.sort();
+    assert!(names.iter().all(|n| n.starts_with("par-")), "every segment is a partition: {names:?}");
+}

@@ -853,6 +853,16 @@ impl<B: Bytes> Blob<B> {
         Ok(n)
     }
 
+    /// Every value of `key`, in append order, appended to `out` back to back
+    /// with no framing between them. Returns how many. One buffer for the
+    /// whole key rather than one view per record, which is what a caller
+    /// holding a common trigram's hundreds of thousands of postings wants
+    /// across a boundary that charges per allocation: fixed-width values come
+    /// back as one array.
+    pub fn read_concat(&self, key: &[u8], out: &mut Vec<u8>) -> Result<u64> {
+        self.read_all(key, |v| out.extend_from_slice(v))
+    }
+
     /// How many values a key has. O(extents): every extent carries its
     /// record count (`Ext::count`), so nothing in a block is touched.
     ///

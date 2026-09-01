@@ -76,6 +76,10 @@ mod store;
 pub mod bytes;
 /// The read path, over any `Bytes` source. Compiles on every target.
 pub mod blob;
+/// The next engine: a WAL, a memtable and threads that seal and merge --
+/// none of which a browser has. Excluded from the wasm build rather than
+/// stubbed, like `store`; `blob` is the read path that carries over.
+#[cfg(not(target_family = "wasm"))]
 pub mod next;
 /// The C ABI the browser calls. Hand-written rather than generated, because
 /// the whole point of R3.3 is the size of what ships.

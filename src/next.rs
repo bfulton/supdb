@@ -159,6 +159,13 @@ pub struct NextOptions {
     /// streams blocks, so its dirty pages leave in slices rather than in
     /// one flush at the end. Zero syncs at the end only (f51).
     pub seal_sync_every: usize,
+    /// Promote pieces instead of merging them when nothing needs merging:
+    /// a range's pieces whose keys all lie above its partition's last key,
+    /// mutually disjoint, become partitions by rename, and the partition's
+    /// fence closes below them. Nothing is rewritten. Ordered ingest -- a
+    /// log -- is all promotion; uniform keys never qualify (f55,
+    /// promote-plan.md).
+    pub promote: bool,
     /// How a flush drains level 0 once partitions exist: merge only the
     /// ranges that hold pieces, under the live fences (`true`), or
     /// re-partition everything from every key (`false`, the original). f54
@@ -197,6 +204,7 @@ impl Default for NextOptions {
             inline_bytes: 256,
             partition_bytes: Some(64 << 20),
             flush_ranges: true,
+            promote: true,
         }
     }
 }
@@ -2406,8 +2414,19 @@ impl Db {
         while self.segs.iter().any(|s| s.level == 0) {
             let plan = if self.opts.flush_ranges { self.merge_due(1) } else { None };
             match plan {
-                Some(fences) if !fences.is_empty() => self.start_compact(Some(fences))?,
-                _ => self.start_compact(None)?,
+                Some(fences) if !fences.is_empty() => {
+                    let fences =
+                        if self.opts.promote { self.promote_ranges(fences)? } else { fences };
+                    if !fences.is_empty() {
+                        self.start_compact(Some(fences))?;
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    if !(self.opts.promote && self.promote_unpartitioned()?) {
+                        self.start_compact(None)?;
+                    }
+                }
             }
             self.join_compact()?;
             rounds += 1;
@@ -2522,13 +2541,192 @@ impl Db {
         match self.merge_due(self.opts.l0_trigger) {
             None => {
                 if self.l0_len() >= self.opts.l0_trigger {
+                    if self.opts.promote && self.promote_unpartitioned()? {
+                        return Ok(());
+                    }
                     return self.start_compact(None);
                 }
                 Ok(())
             }
-            Some(due) if !due.is_empty() => self.start_compact(Some(due)),
+            Some(due) if !due.is_empty() => {
+                let due = if self.opts.promote { self.promote_ranges(due)? } else { due };
+                if due.is_empty() {
+                    return Ok(());
+                }
+                self.start_compact(Some(due))
+            }
             Some(_) => Ok(()),
         }
+    }
+
+    /// Try to promote the aligned pieces of each of `due`'s ranges instead
+    /// of merging them; return the ranges that still need a merge.
+    ///
+    /// A range qualifies when its partition's last key lies below every
+    /// piece's first key and the pieces are disjoint in key order. Then the
+    /// partition keeps its data and its fence closes at the first piece's
+    /// first key, and each piece becomes a partition running to the next
+    /// piece's first key, the last inheriting the range's upper fence. A
+    /// piece and a partition are the same file from the same writer; only
+    /// the name and the level differ, so this is hard links, one manifest
+    /// write, and the old names unlinked -- in that order, so a crash on
+    /// either side of the manifest leaves exactly one complete set for the
+    /// orphan sweep to reconcile.
+    fn promote_ranges(&mut self, due: Vec<Fence>) -> Result<Vec<Fence>> {
+        let mut rest = Vec::new();
+        for f in due {
+            let part = self
+                .segs
+                .iter()
+                .position(|s| s.level > 0 && s.lo == f.0 && s.hi == f.1);
+            let mut pieces: Vec<usize> = self
+                .segs
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.level == 0 && s.lo == f.0 && s.hi == f.1)
+                .map(|(i, _)| i)
+                .collect();
+            let Some(pi) = part else {
+                rest.push(f);
+                continue;
+            };
+            // The partition's last key, or nothing if it is empty.
+            let floor: Option<Vec<u8>> = {
+                let b = &self.segs[pi].blob;
+                if b.keys() == 0 { None } else { b.key_at(b.keys() - 1).map(|k| k.to_vec()) }
+            };
+            match self.promotion_chain(&f, floor, &mut pieces) {
+                Some(bounds) => {
+                    // Piece i takes (bounds[i], bounds[i+1]); the partition
+                    // keeps its low fence and closes at bounds[0].
+                    let mut renames: Vec<(usize, Fence)> = Vec::with_capacity(pieces.len() + 1);
+                    renames.push((pi, (f.0.clone(), Some(bounds[0].clone()))));
+                    for (j, &si) in pieces.iter().enumerate() {
+                        let hi = if j + 1 < pieces.len() { Some(bounds[j + 1].clone()) } else { f.1.clone() };
+                        renames.push((si, (bounds[j].clone(), hi)));
+                    }
+                    self.apply_promotion(renames)?;
+                }
+                None => rest.push(f),
+            }
+        }
+        Ok(rest)
+    }
+
+    /// Before the first partitioning: if the full-range segments are
+    /// disjoint in key order, they become the first partitions as they
+    /// are, tiling the space from the bottom.
+    fn promote_unpartitioned(&mut self) -> Result<bool> {
+        let mut pieces: Vec<usize> = self
+            .segs
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.level == 0)
+            .map(|(i, _)| i)
+            .collect();
+        if pieces.len() < 2 {
+            return Ok(false);
+        }
+        let whole: Fence = (Vec::new(), None);
+        let Some(bounds) = self.promotion_chain(&whole, None, &mut pieces) else {
+            return Ok(false);
+        };
+        let mut renames: Vec<(usize, Fence)> = Vec::with_capacity(pieces.len());
+        for (j, &si) in pieces.iter().enumerate() {
+            let lo = if j == 0 { Vec::new() } else { bounds[j].clone() };
+            let hi = if j + 1 < pieces.len() { Some(bounds[j + 1].clone()) } else { None };
+            renames.push((si, (lo, hi)));
+        }
+        self.apply_promotion(renames)?;
+        Ok(true)
+    }
+
+    /// Order `pieces` by first key and check the chain: every piece's first
+    /// key, taken as a fence, must lie strictly above what came before it
+    /// (the partition's last key, then the previous piece's last key) and
+    /// inside the range. Returns each piece's fence boundary, or `None` when
+    /// something overlaps and a merge is what is needed.
+    fn promotion_chain(
+        &self,
+        range: &Fence,
+        floor: Option<Vec<u8>>,
+        pieces: &mut [usize],
+    ) -> Option<Vec<Vec<u8>>> {
+        if pieces.is_empty() {
+            return None;
+        }
+        let first_of = |si: usize| -> Option<Vec<u8>> {
+            let b = &self.segs[si].blob;
+            if b.keys() == 0 { None } else { b.key_at(0).map(|k| k.to_vec()) }
+        };
+        let last_of = |si: usize| -> Option<Vec<u8>> {
+            let b = &self.segs[si].blob;
+            if b.keys() == 0 { None } else { b.key_at(b.keys() - 1).map(|k| k.to_vec()) }
+        };
+        // An empty piece has nothing to promote; leave it to the merge.
+        if pieces.iter().any(|&si| self.segs[si].blob.keys() == 0) {
+            return None;
+        }
+        pieces.sort_by_key(|&si| first_of(si));
+        let mut bounds = Vec::with_capacity(pieces.len());
+        let mut prev_last: Option<Vec<u8>> = floor;
+        for &si in pieces.iter() {
+            let first = first_of(si)?;
+            let b = fence_lo(&first);
+            // Strictly above everything before it, and inside the range.
+            if let Some(pl) = &prev_last {
+                if *pl >= b {
+                    return None;
+                }
+            }
+            if b < range.0 || range.1.as_ref().is_some_and(|h| &b >= h) {
+                return None;
+            }
+            bounds.push(b);
+            prev_last = last_of(si);
+        }
+        Some(bounds)
+    }
+
+    /// Give each segment its new fence and level by hard link, publish,
+    /// then unlink the old names.
+    fn apply_promotion(&mut self, renames: Vec<(usize, Fence)>) -> Result<()> {
+        let mut old_names = Vec::with_capacity(renames.len());
+        for (si, (lo, hi)) in renames {
+            let old = self.segs[si].name.clone();
+            // Keep the id and covered-sequence fields verbatim; only the
+            // prefix and the fences change.
+            let stem = old.trim_end_matches(".sup");
+            let fields: Vec<&str> = stem.split('-').collect();
+            if fields.len() < 3 {
+                return Err(err("promotion: segment name is malformed"));
+            }
+            let new = format!(
+                "par-{}-{}-{}-{}.sup",
+                fields[1],
+                fields[2],
+                hex(&lo),
+                hi.as_deref().map(hex).unwrap_or_default()
+            );
+            if new == old {
+                continue;
+            }
+            std::fs::hard_link(self.dir.join(&old), self.dir.join(&new))?;
+            let seg = &mut self.segs[si];
+            seg.name = new;
+            seg.lo = lo;
+            seg.hi = hi;
+            seg.level = 1;
+            seg.bloom = None;
+            old_names.push(old);
+        }
+        File::open(&self.dir)?.sync_all()?;
+        self.sort_segs();
+        self.publish()?;
+        for old in old_names {
+            let _ = std::fs::remove_file(self.dir.join(old));
+        }
+        Ok(())
     }
     // The starvation lesson that shaped `merge_due`: EVERY range that is
     // over its bound merges in one job, not just the worst. A per-range

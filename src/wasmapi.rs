@@ -450,6 +450,30 @@ pub unsafe extern "C" fn supdb_lookup(h: u32, kptr: *const u8, klen: u32) -> u32
     })
 }
 
+/// Every value of a key concatenated, with no framing between records.
+///
+/// Layout: `u32 n`, then the values' bytes back to back. Returns the total
+/// framed length, or `u32::MAX` on error. One buffer per key instead of one
+/// view per record: a common trigram has hundreds of thousands of postings,
+/// and `supdb_lookup`'s per-record frames cost the caller an allocation
+/// each. Fixed-width values come back as one array the caller can view
+/// directly. The bytes live at `supdb_out_ptr()` until the next call.
+///
+/// # Safety
+/// `kptr` must point at `klen` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn supdb_read_concat(h: u32, kptr: *const u8, klen: u32) -> u32 {
+    let key = std::slice::from_raw_parts(kptr, klen as usize);
+    with_blob(h, u32::MAX, |b, out| {
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let n = on!(b, read_all, key, |v: &[u8]| {
+            out.extend_from_slice(v);
+        })?;
+        out[0..4].copy_from_slice(&(n as u32).to_le_bytes());
+        Ok(out.len() as u32)
+    })
+}
+
 /// Keys in order from `from`, each with its value count. R4.4.
 ///
 /// Layout: `u32 n`, then `n` records of `u32 klen`, `u32 count_lo`,

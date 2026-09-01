@@ -133,6 +133,7 @@ fn main() -> std::io::Result<()> {
             "f52-segsize" => f52_segsize(&args, profile)?,
             "f53-inline" => f53_inline(&args, profile)?,
             "f54-merge" => f54_merge(&args, profile)?,
+            "f55-promote" => f55_promote(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -7369,6 +7370,236 @@ fn f54_merge(args: &Args, profile: Profile) -> std::io::Result<Record> {
             med(sr, |r| r.7),
             med(sf, |r| r.7),
             rd_s.summary("ranges", "full"),
+        ),
+    ));
+    Ok(rec)
+}
+
+fn f55_promote(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::next::{Db, NextOptions};
+
+    let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+    let reads = args.num("--reads", profile.pick(20_000, 50_000, 200_000)) as u64;
+
+    let mut rec = Record::new("f55-promote", profile);
+    rec.param("keys", J::u(keys))
+        .param("batch", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .param("reads", J::u(reads))
+        .note(
+            "four arms interleaved in one process, fresh store per rep, at 16 MB seals over 64 \
+             MB partitions with the drain inside the window. Two key orders: uniform (a random \
+             permutation of the ids) and sequential (the ids in order, the shape of a log). \
+             Promotion off (every due range merges) and on (pieces whose keys lie above the \
+             partition's last key become partitions by rename). Device and disk bytes, \
+             phases, partitions, and point reads after the drain",
+        )
+        .note("predictions registered in promote-plan.md before the run");
+
+    let dir = scratch("f55");
+    let payload = Payload::new(value_size, 0.5, 0xF55);
+    let arms: [(&str, bool, bool); 4] = [
+        ("uniform/merge", false, false),
+        ("uniform/promote", false, true),
+        ("sequential/merge", true, false),
+        ("sequential/promote", true, true),
+    ];
+    // ci, device MB, disk MB, commit s, seal s, merge s, partitions, read ns
+    type Row = (usize, f64, f64, f64, f64, f64, f64, f64);
+    let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
+    let rates = Trial::new(profile.reps()).run(arms.len(), |ci, rep| {
+        let (_, sequential, promote) = arms[ci];
+        let mut vrng = Rng::new(0xF55 + rep as u64);
+        let mut kb = [0u8; 16];
+        // The id order: identity, or a Fisher-Yates permutation of it.
+        let mut order: Vec<u64> = (0..keys).collect();
+        if !sequential {
+            let mut x = 0xF55_0000_u64 ^ rep as u64;
+            for i in (1..order.len()).rev() {
+                x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = x;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                order.swap(i, (z % (i as u64 + 1)) as usize);
+            }
+        }
+        let d = dir.join(format!("f55-{ci}-{rep}"));
+        let _ = std::fs::remove_dir_all(&d);
+        let opts = NextOptions {
+            seal_bytes: 16 << 20,
+            partition_bytes: Some(64 << 20),
+            promote,
+            ..Default::default()
+        };
+        let mut db = Db::create(&d, opts).expect("create");
+        let io0 = IoCounters::read_now();
+        let t = Instant::now();
+        for (n, &i) in order.iter().enumerate() {
+            db_key_into(i, &mut kb);
+            db.append(&kb, payload.get(&mut vrng));
+            if (n as u64 + 1).is_multiple_of(batch) {
+                db.commit().expect("commit");
+            }
+        }
+        db.flush().expect("flush");
+        let secs = t.elapsed().as_secs_f64();
+        let (c, s, m) = db.phase_ns();
+        let io_mb = IoCounters::read_now().since(&io0).write_bytes as f64 / 1_048_576.0;
+        let (parts, _) = db.levels();
+        let mut x = 0x5E4D_5EED_u64 ^ (rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut sink = 0u64;
+        let tr = Instant::now();
+        for _ in 0..reads {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            db_key_into(z % keys, &mut kb);
+            sink += db
+                .read_all(&kb, |v| {
+                    std::hint::black_box(v);
+                })
+                .expect("read");
+        }
+        let read_ns = tr.elapsed().as_nanos() as f64 / reads as f64;
+        std::hint::black_box(sink);
+        db.close().expect("close");
+        let mut bytes = 0u64;
+        for e in std::fs::read_dir(&d).expect("dir") {
+            bytes += e.expect("entry").metadata().expect("meta").len();
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        rows.lock().unwrap().push((
+            ci,
+            io_mb,
+            bytes as f64 / 1_048_576.0,
+            c as f64 / 1e9,
+            s as f64 / 1e9,
+            m as f64 / 1e9,
+            parts as f64,
+            read_ns,
+        ));
+        keys as f64 / secs
+    });
+    let col = |ci: usize, pick: fn(&Row) -> f64| -> Vec<f64> {
+        rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect()
+    };
+    let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
+        let mut v = col(ci, pick);
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
+    rec.series(
+        "arms",
+        J::arr(
+            arms.iter()
+                .enumerate()
+                .zip(rates.iter())
+                .map(|((ci, (name, _, _)), s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "ops_per_s" => J::fp(s.median(), 1),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4),
+                        "commit_s" => J::fp(med(ci, |r| r.3), 3),
+                        "seal_s" => J::fp(med(ci, |r| r.4), 3),
+                        "merge_s" => J::fp(med(ci, |r| r.5), 3),
+                        "device_write_mb" => J::fp(med(ci, |r| r.1), 1),
+                        "disk_mb" => J::fp(med(ci, |r| r.2), 1),
+                        "partitions" => J::fp(med(ci, |r| r.6), 1),
+                        "read_ns" => J::fp(med(ci, |r| r.7), 1)
+                    }
+                })
+                .collect(),
+        ),
+    );
+    let (um, up, sm, sp) = (0usize, 1usize, 2usize, 3usize);
+    let ing_u = compare(&rates[up], &rates[um], supdb::bench::MIN_EFFECT);
+    rec.compare("uniform_promote_vs_merge_ingest", ing_u.clone());
+    let ing_s = compare(&rates[sp], &rates[sm], supdb::bench::MIN_EFFECT);
+    rec.compare("sequential_promote_vs_merge_ingest", ing_s.clone());
+    let rd_u = compare(&Samples::new(col(up, |r| r.7)), &Samples::new(col(um, |r| r.7)), supdb::bench::MIN_EFFECT);
+    rec.compare("uniform_read_ns_promote_vs_merge", rd_u.clone());
+    let rd_s = compare(&Samples::new(col(sp, |r| r.7)), &Samples::new(col(sm, |r| r.7)), supdb::bench::MIN_EFFECT);
+    rec.compare("sequential_read_ns_promote_vs_merge", rd_s.clone());
+    let dev_u = med(up, |r| r.1) / med(um, |r| r.1);
+    let dev_s = med(sp, |r| r.1) / med(sm, |r| r.1);
+    rec.finding(Finding::new(
+        "F55.1",
+        "with sequential keys promotion cuts device bytes to at most 0.5x the merge's",
+        dev_s <= 0.5,
+        format!(
+            "device bytes {:.1} MB with promotion against {:.1} with the merge ({:.3}x) at 16 MB \\
+             seals; disk {:.1} against {:.1} MB, partitions {:.0} against {:.0}; merge phase \\
+             {:.3}s against {:.3}s. A piece whose keys lie above the partition's last key \\
+             becomes a partition by rename, and the data is written once to the WAL and once \\
+             to its seal",
+            med(sp, |r| r.1),
+            med(sm, |r| r.1),
+            dev_s,
+            med(sp, |r| r.2),
+            med(sm, |r| r.2),
+            med(sp, |r| r.6),
+            med(sm, |r| r.6),
+            med(sp, |r| r.5),
+            med(sm, |r| r.5),
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F55.2",
+        "with sequential keys promotion lifts ingest-to-routed by at least 1.3x",
+        matches!(ing_s.verdict, supdb::bench::Verdict::Greater) && ing_s.ratio >= 1.3,
+        format!(
+            "{:.0} ops/s with promotion against {:.0} with the merge ({}); seal {:.3}s against \\
+             {:.3}s, merge {:.3}s against {:.3}s, commit {:.3}s against {:.3}s",
+            rates[sp].median(),
+            rates[sm].median(),
+            ing_s.summary("promote", "merge"),
+            med(sp, |r| r.4),
+            med(sm, |r| r.4),
+            med(sp, |r| r.5),
+            med(sm, |r| r.5),
+            med(sp, |r| r.3),
+            med(sm, |r| r.3),
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F55.3",
+        "with uniform keys promotion changes nothing: device bytes within 1.05x and ingest a tie",
+        (0.95..=1.05).contains(&dev_u) && matches!(ing_u.verdict, supdb::bench::Verdict::NoDifference),
+        format!(
+            "device bytes {:.1} MB with promotion against {:.1} without ({:.3}x); ingest {:.0} \\
+             against {:.0} ops/s ({}); partitions {:.0} against {:.0}. Every piece of a uniform \\
+             load spans the whole key space, so nothing qualifies",
+            med(up, |r| r.1),
+            med(um, |r| r.1),
+            dev_u,
+            rates[up].median(),
+            rates[um].median(),
+            ing_u.summary("promote", "merge"),
+            med(up, |r| r.6),
+            med(um, |r| r.6),
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F55.4",
+        "reads after the drain do not differ with promotion under either key order",
+        matches!(rd_u.verdict, supdb::bench::Verdict::NoDifference)
+            && matches!(rd_s.verdict, supdb::bench::Verdict::NoDifference),
+        format!(
+            "uniform: {:.0} ns per read with promotion against {:.0} ({}); sequential: {:.0} \\
+             against {:.0} ({}). Promoted pieces are partitions, fence-routed, with no Bloom to \\
+             consult; there are more of them after an ordered load, and the fence search is a \\
+             binary search",
+            med(up, |r| r.7),
+            med(um, |r| r.7),
+            rd_u.summary("promote", "merge"),
+            med(sp, |r| r.7),
+            med(sm, |r| r.7),
+            rd_s.summary("promote", "merge"),
         ),
     ));
     Ok(rec)

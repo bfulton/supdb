@@ -152,6 +152,24 @@ export class SupdbReader {
     return out;
   }
 
+  /// Every value of a key concatenated into one buffer, with the count.
+  ///
+  /// `lookup` frames one view per record, which for a common trigram is
+  /// hundreds of thousands of allocations; this crosses the boundary once
+  /// and copies once. Fixed-width values are then one typed array:
+  /// `new Uint32Array(readConcat(key).bytes.buffer)` for logshed's postings.
+  readConcat(key) {
+    const m = this.mod;
+    const n = m.withKey(key, (p, l) =>
+      this.check(this.exports.supdb_read_concat(this.handle, p, l), 0xffffffff),
+    );
+    if (n === 0) return { count: 0, bytes: new Uint8Array(0) };
+    const base = this.exports.supdb_out_ptr();
+    const count = m.view.getUint32(base, true);
+    // Sliced, not subarrayed, for the same reason as `lookup`.
+    return { count, bytes: m.mem.slice(base + 4, base + n) };
+  }
+
   /// R4.3 -- how many values, without decoding any of them.
   ///
   /// O(values) but not O(bytes): it walks the length prefixes and skips the
