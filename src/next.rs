@@ -623,7 +623,26 @@ fn manifest_read(dir: &Path) -> Result<Option<(u64, Vec<String>)>> {
 /// hands out keys through a callback and not an iterator. It is the one
 /// place this milestone spends memory proportional to the store; a
 /// streaming k-way merge is the fix if it ever matters.
-fn compact_job(
+/// Everything a merge needs to know, gathered so the job takes one
+/// argument instead of eight.
+struct MergePlan {
+    dir: PathBuf,
+    inputs: Vec<String>,
+    first_id: u64,
+    end_seq: u64,
+    parts: usize,
+    fences: Option<Vec<Fence>>,
+    max_keys: usize,
+    opts: Options,
+}
+
+fn compact_job(plan: MergePlan) -> Result<Vec<String>> {
+    let MergePlan { dir, inputs, first_id, end_seq, parts, fences, max_keys, opts } = plan;
+    compact_run(dir, inputs, first_id, end_seq, parts, fences, max_keys, opts)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compact_run(
     dir: PathBuf,
     inputs: Vec<String>,
     first_id: u64,
@@ -636,6 +655,14 @@ fn compact_job(
     // what kept device bytes at the full-rewrite level. `None` is the
     // first partitioning only, which has no boundaries to preserve.
     fences: Option<Vec<Fence>>,
+    // Keys a partition may hold before the merge splits it in two. Stable
+    // boundaries keep pieces aligned, but a boundary set that NEVER grows
+    // leaves partitions growing with the store: at 1M keys the store had
+    // settled into 8 partitions of 14.5MB each, and a bigger partition is
+    // a bigger index section and more misses per probe. A range splits
+    // when it outgrows this, which disturbs only its own pieces and only
+    // until the next seal.
+    max_keys: usize,
     opts: Options,
 ) -> Result<Vec<String>> {
     let _ = &parts;
@@ -659,6 +686,7 @@ fn compact_job(
         Some(f) => f.len().max(1),
         None => parts.max(1).min(keys.len()),
     };
+    let _ = parts;
     let per = keys.len().div_ceil(parts);
 
     // The partition set must TILE the key space: every key routes to
@@ -686,6 +714,7 @@ fn compact_job(
     // Slice by whichever boundaries govern: the given fences when the
     // caller has them, the derived ones when it does not.
     let mut slices: Vec<(usize, usize)> = Vec::new();
+    let mut given: Vec<Fence> = Vec::new();
     match &fences {
         Some(fs) => {
             for (lo, hi) in fs {
@@ -694,7 +723,28 @@ fn compact_job(
                     Some(h) => keys.partition_point(|k| k.as_slice() < h.as_slice()),
                     None => keys.len(),
                 };
-                slices.push((from, to.max(from)));
+                let to = to.max(from);
+                let n = (to - from).div_ceil(max_keys.max(1)).max(1);
+                let per_sub = (to - from).div_ceil(n);
+                for i in 0..n {
+                    let sf = from + i * per_sub;
+                    let st = (sf + per_sub).min(to);
+                    if sf >= st {
+                        continue;
+                    }
+                    // Sub-fences tile the fence they came from: the first
+                    // keeps its low bound, the last its high bound, and the
+                    // joins are single shared values.
+                    let sub_lo =
+                        if i == 0 { lo.clone() } else { fence_lo(&keys[sf]) };
+                    let sub_hi = if st == to {
+                        hi.clone()
+                    } else {
+                        Some(fence_lo(&keys[st]))
+                    };
+                    slices.push((sf, st));
+                    given.push((sub_lo, sub_hi));
+                }
             }
         }
         None => {
@@ -718,7 +768,7 @@ fn compact_job(
         }
         let id = first_id + pi as u64;
         let (lo, hi) = match &fences {
-            Some(fs) => fs[pi].clone(),
+            Some(_) => given[pi].clone(),
             // Unbounded at both ends of the set, and every interior fence
             // is the boundary shared with the neighbour.
             None => (
@@ -1162,6 +1212,14 @@ impl Db {
     /// aligned pieces -- or, before the first partitioning, when that many
     /// full-range segments have piled up.
     fn maybe_compact(&mut self) -> Result<()> {
+        // Collect a finished merge BEFORE deciding. Its outputs are the
+        // partitions the decision depends on, and deciding first meant
+        // deciding against a store that still looked unpartitioned: every
+        // merge then took the full re-partitioning path and the
+        // incremental one never ran once in a whole load.
+        if self.compacting.as_ref().is_some_and(|(_, h)| h.is_finished()) {
+            self.join_compact()?;
+        }
         let parts: Vec<Fence> = self
             .segs
             .iter()
@@ -1200,21 +1258,26 @@ impl Db {
                 .collect();
             return self.start_compact(Some(touched));
         }
-        let worst = parts
+        // EVERY range that is over its bound, in one job -- not just the
+        // worst. A per-range merge has to run once per range where the
+        // whole-store merge ran once, so picking a single range per seal
+        // starves it: with sixteen ranges and one merge in flight, pieces
+        // accumulated faster than they were consumed and a read ended up
+        // walking ten of them. That starvation cost more than the
+        // whole-store rewrite it replaced (EXT.23 0.846x -> 0.561x), which
+        // is the measurement that produced this loop.
+        let due: Vec<Fence> = parts
             .into_iter()
-            .map(|f| {
-                let n = self
-                    .segs
+            .filter(|f| {
+                self.segs
                     .iter()
                     .filter(|s| s.level == 0 && s.lo == f.0 && s.hi == f.1)
-                    .count();
-                (n, f)
+                    .count()
+                    >= self.opts.l0_trigger
             })
-            .max_by_key(|(n, _)| *n);
-        if let Some((n, fence)) = worst {
-            if n >= self.opts.l0_trigger {
-                return self.start_compact(Some(vec![fence]));
-            }
+            .collect();
+        if !due.is_empty() {
+            return self.start_compact(Some(due));
         }
         Ok(())
     }
@@ -1272,22 +1335,46 @@ impl Db {
         let parts = match &fences {
             Some(f) => f.len(),
             None => {
-                let bytes: u64 = inputs
+                let b: u64 = inputs
                     .iter()
                     .filter_map(|n| std::fs::metadata(self.dir.join(n)).ok())
                     .map(|m| m.len())
                     .sum();
-                (bytes as usize).div_ceil(self.opts.seal_bytes.max(1)).max(1)
+                (b as usize).div_ceil(self.opts.seal_bytes.max(1)).max(1)
             }
         };
+        let bytes: u64 = inputs
+            .iter()
+            .filter_map(|n| std::fs::metadata(self.dir.join(n)).ok())
+            .map(|m| m.len())
+            .sum();
+        let live_keys: usize = self
+            .segs
+            .iter()
+            .filter(|s| inputs.contains(&s.name))
+            .map(|s| s.blob.keys())
+            .sum();
+        let per_key = (bytes as f64 / live_keys.max(1) as f64).max(1.0);
+        let max_keys = ((self.opts.seal_bytes as f64 / per_key) as usize).max(1_000);
         let end_seq = self.covered_seq;
         let first_id = self.next_seg;
-        self.next_seg += parts as u64;
+        // A split can turn one fence into several, so ids are reserved
+        // generously; gaps in the sequence cost nothing.
+        self.next_seg += (parts * 4).max(8) as u64;
         let dir = self.dir.clone();
         let opts = Db::segment_opts(&self.opts);
         let job_inputs = inputs.clone();
         let handle = std::thread::spawn(move || {
-            compact_job(dir, job_inputs, first_id, end_seq, parts, fences, opts)
+            compact_job(MergePlan {
+                dir,
+                inputs: job_inputs,
+                first_id,
+                end_seq,
+                parts,
+                fences,
+                max_keys,
+                opts,
+            })
         });
         self.compacting = Some((inputs, handle));
         Ok(())
@@ -1348,18 +1435,15 @@ impl Db {
                     .map_err(|e| err(&format!("segment read: {e}")))?;
             }
         }
-        // L0 is sorted by (range, age) and aligned pieces share a range's
-        // fence exactly, so the pieces that can hold this key are one
-        // contiguous run -- found by the same binary search, walked oldest
-        // first, and each one still gated by its Bloom. Full-range segments
-        // from before the first partitioning sort at the front with an
-        // empty low fence, so they are simply the first part of that run.
-        let l0 = &self.segs[np..];
-        let from = l0.partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
-        for seg in &l0[from..] {
-            if seg.lo.as_slice() > key {
-                break;
-            }
+        // L0 is walked linearly, not binary-searched. A search on the high
+        // fence needs that fence to be monotone across the run, and one
+        // leftover full-range piece (hi unbounded, sorting first) breaks
+        // that -- the search then returns the start of the run and every
+        // read walks the whole tail, which cost EXT.23 0.846x -> 0.561x
+        // before the level dump showed a perfectly healthy 8 partitions and
+        // 9 pieces. The tail is bounded by policy, and two comparisons
+        // against a fence are cheap enough that bounded is enough.
+        for seg in &self.segs[np..] {
             if !seg.may_hold(key) {
                 continue;
             }
