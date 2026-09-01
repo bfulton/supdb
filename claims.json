@@ -614,7 +614,7 @@
    "id": "EXT.11",
    "profile": "full",
    "expect": "holds",
-   "because": "Flipped back to holding, and the flip is the lesson: 1,073,573 reads/s against lmdb's 778,580, 1.379x at p=0.0022, one run after a tie at 1.043x that was recorded as failing with two candidate causes named. This run says the cause was the host: lmdb's read rate fell 27% between the two runs on a degraded state and supdb-buffered's fell 3%, which is the comparator moving under the ratio. The old engine's read lead over lmdb is real and unstable on this host -- 1.196x, 1.092x, 1.043x, 1.379x across four runs -- and the read claim the project carries is the next engine's (EXT.23). Recorded as it measures; a claim that flips with the host is a claim to quote as a range."
+   "because": "Holding, and to be quoted as a range: 993,942 reads/s against lmdb's 787,571, 1.262x at p=0.0022, after 1.379x the run before and a tie at 1.043x the run before that which was recorded as failing. The tie was the host: lmdb's read rate fell 27% between two runs on a degraded state while supdb-buffered's fell 3%, which is the comparator moving under the ratio. The old engine's read lead over lmdb across five runs is 1.196x, 1.092x, 1.043x, 1.379x, 1.262x -- real, and unstable on this host -- and the read claim the project carries is the next engine's (EXT.23)."
   },
   {
    "experiment": "ext-kv",
@@ -999,21 +999,21 @@
    "id": "EXT.22",
    "profile": "full",
    "expect": "fails",
-   "because": "Loads 266,691 ops/s against lmdb's 541,808 -- 0.492x, p=0.0022 -- the first canonical run with inline runs and the records-first segment layout, and a run on a degraded host state: every engine's absolutes fell 35-50% from the run twenty minutes before (lmdb's load 854,921 to 541,808, its reads 1.06M to 779k, every scan halved) with spreads of 15-33%, so the ratio is what this run says and the absolutes are not. The sequence on this axis is 0.335x, 0.486x, 0.387x, 0.452x, 0.492x. The transactions axis is matched, so it is a measurement and not a bound. The adapter drains at sync, so sealing 116 MB into segments and partitioning what it sealed both land inside the timed window; that is the design's trade in one line -- EXT.23's read lead is paid for here."
+   "because": "Loads 265,909 ops/s against lmdb's 523,822 -- 0.508x, p=0.0022 -- the second canonical run with inline runs and the records-first layout, and the second on the same degraded host state (lmdb's load 541,808 the run before, against 854,921 on the state before that). The two runs agree, 0.492x and 0.508x, so the ratio is replicated on this state; the absolutes are the host's. The sequence on this axis is 0.335x, 0.486x, 0.387x, 0.452x, 0.492x, 0.508x. The transactions axis is matched, so it is a measurement and not a bound. The adapter drains at sync, so sealing 116 MB into segments and partitioning what it sealed both land inside the timed window; that is the design's trade in one line -- EXT.23's read lead is paid for here."
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.23",
    "profile": "full",
    "expect": "holds",
-   "because": "Held in eight consecutive full runs at the shipping configuration -- 1.419x, 1.441x, 1.580x, 1.644x, 1.603x, 1.441x, 1.391x and 2.358x, each p<=0.0022. The eighth is the first with inline runs (F53.1) and it is also a degraded host state where every other engine's reads fell 25-30%; next's ROSE from 1,474,116 to 1,836,273 reads/s against lmdb's 778,580, which is what a read that touches two cache lines instead of four does when memory bandwidth is what the host is short of. It clears the 1.5x bar the inline work set (P53.6) and it needs its repeat on a quiet host before the number is quoted; the range across all eight is what to say. Two things had to be true at once and neither was configuration-hunting: every key is sealed on both sides (the adapter drains before reading), and the store is left ROUTED (a flush partitions what it sealed, so a read touches exactly one segment). P-B, refuted twice at 8+ segments, holds at the operating point the design is for."
+   "because": "Held in nine consecutive full runs at the shipping configuration -- 1.419x, 1.441x, 1.580x, 1.644x, 1.603x, 1.441x, 1.391x, 2.358x and 2.494x, each p<=0.0022. The last two are the first with inline runs (F53.1), taken on a host state where every other engine's reads fell about a quarter and next's rose: 1,964,068 reads/s against lmdb's 787,571 this run, 1,836,273 against 778,580 the run before. Two runs agreeing is the minimum for a number here and they agree; the caveat is that no run with inline runs has yet been taken on the faster host state the first seven had, so the range to quote across states is 1.39-2.49x and the bar the inline work set (1.5x, P53.6) is met on both. Two things had to be true at once and neither was configuration-hunting: every key is sealed on both sides (the adapter drains before reading), and the store is left ROUTED (a flush partitions what it sealed, so a read touches exactly one segment). P-B, refuted twice at 8+ segments, holds at the operating point the design is for."
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.24",
    "profile": "full",
    "expect": "fails",
-   "because": "A TIE, five runs running, with the arc behind it: 0.040x when this claim was written, 0.137x, 0.495x, 0.769x, 1.054x, 0.998x, 1.000x, 0.937x, and now 19,149,982 entries/s against lmdb's 16,750,540 -- 1.143x, no difference at p=0.07, on a host state that halved every engine's scan. Recorded as FAILING because the gate is Greater and a tie is not a win; the title says 'no slower', which a tie satisfies, and that mismatch is mine to fix rather than to argue around. Inline runs cost the ordered scan 0.86-0.90x in f53 (F53.3), which is inside the noise this axis carries between runs."
+   "because": "A TIE, six runs running, with the arc behind it: 0.040x when this claim was written, 0.137x, 0.495x, 0.769x, 1.054x, 0.998x, 1.000x, 0.937x, 1.143x, and now 21,973,802 entries/s against lmdb's 19,254,676 -- 1.141x, no difference at p=0.25. Recorded as FAILING because the gate is Greater and a tie is not a win; the title says 'no slower', which a tie satisfies, and that mismatch is mine to fix rather than to argue around. Inline runs cost the ordered scan 0.86-0.90x in f53 (F53.3), inside the noise this axis carries between runs."
   },
   {
    "experiment": "f43-compact",
@@ -1090,14 +1090,14 @@
    "id": "EXT.25",
    "profile": "full",
    "expect": "fails",
-   "because": "Failing since the shipping default moved to 32 MB seals: with those, a 116 MB load reaches four level-0 pieces at its final seal, the background trigger starts the partitioning merge on its own, and the flush waits for it either way -- so the ingest-policy arm is partitioned too, and the two arms drain through the same merge. This run: 249,032 against 266,691 ops/s, a tie at p=0.90 (1.126x, p=0.07, the run before). The trade this claim measured was real at 64 MB seals (1.985x, 1.491x, 1.617x) and is inert at this shape now; the policy bit still decides loads that never reach the trigger. Kept failing rather than deleted so the collapse of the trade is visible."
+   "because": "Failing since the shipping default moved to 32 MB seals: with those, a 116 MB load reaches four level-0 pieces at its final seal, the background trigger starts the partitioning merge on its own, and the flush waits for it either way -- so the ingest-policy arm is partitioned too, and the two arms drain through the same merge. The last three runs are all ties (1.126x at p=0.07, 0.934x at p=0.90, 1.087x at p=0.80). The trade this claim measured was real at 64 MB seals (1.985x, 1.491x, 1.617x) and is inert at this shape now; the policy bit still decides loads that never reach the trigger. Kept failing rather than deleted so the collapse of the trade is visible."
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.26",
    "profile": "full",
    "expect": "fails",
-   "because": "The other half of EXT.25's trade, collapsed with it: 19,149,982 against 19,611,774 entries/s, a tie at p=1.0 (0.986x the run before; 2.007x, 1.549x and 1.681x at 64 MB seals). Under 32 MB seals both arms are partitioned by the time the scan runs, so a scan walks disjoint partitions in both and there is no k-way merge left to be slower. Both entries fail together, which is the shape a trade takes when the knob stops selecting anything at the measured load."
+   "because": "The other half of EXT.25's trade, collapsed with it: 21,973,802 against 19,761,281 entries/s, a tie at p=0.44 (0.986x and 0.976x the runs before; 2.007x, 1.549x and 1.681x at 64 MB seals). Under 32 MB seals both arms are partitioned by the time the scan runs, so a scan walks disjoint partitions in both and there is no k-way merge left to be slower. Both entries fail together, which is the shape a trade takes when the knob stops selecting anything at the measured load."
   },
   {
    "experiment": "f46-segwrite",
@@ -1343,6 +1343,34 @@
    "profile": "full",
    "expect": "holds",
    "because": "Held under its restated gate, after the layout that made it fail was replaced. Run 1 refuted the original 'within 5%' at 0.807x: with runs inline nothing streamed during the writer's pass, the whole key section was built in memory and written at finish, and its fsync flushed 140 B a key at once. The records-first layout streams each record as its key closes and puts the fences, directory and hash slots after them, and runs 2 and 3 read 1.149x and 1.163x FASTER with inline runs (run 3: 333,069 against 286,522 ops/s, p=0.003; seal 0.484s against 0.678s, merge 0.846s against 1.222s). That overshot the 5% band upward, which is a decision rather than a rerun: the gate is now 'no slower', and the arc from 0.807x to 1.16x is the record."
+  },
+  {
+   "experiment": "f54-merge",
+   "id": "F54.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P54.1 held: with uniform keys the range flush leaves device bytes at 0.989x (696.6 against 704.0 MB) and ingest a tie (303,206 against 295,029 ops/s, p=0.20), at 16 MB seals over 64 MB partitions. Every range holds pieces after a uniform load, so selecting the ranges with pieces selects them all, and the only thing the range flush removes is the re-derivation of boundaries the full flush did on every drain. It is safe, and it ships (flush_ranges: true)."
+  },
+  {
+   "experiment": "f54-merge",
+   "id": "F54.2",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P54.2 refuted, and the refutation is the finding: with sequential keys the range flush cuts device bytes to 0.931x (662.6 against 711.4 MB), not the 0.6x registered, and ordered keys write MORE than random ones (711.4 against 704.0 with the full flush). The reason is where a seal of ordered keys lands: in the last partition, whose fence is open above, so every merge round rewrites that partition and re-splits it, and the merge is incremental over ranges in name only. The bytes are in the rounds before the drain, which both arms share. What would make ordered ingest incremental is not selecting ranges but promoting pieces: a piece whose keys all lie above a partition's last key can become a partition by rename, with nothing rewritten (promote-plan.md, f55)."
+  },
+  {
+   "experiment": "f54-merge",
+   "id": "F54.3",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P54.3 refuted with P54.2: sequential ingest-to-routed is 1.045x with the range flush (311,609 against 298,323 ops/s, p=0.10, a tie), the merge phase 0.963s against 1.192s. The drain's merge did shrink; the rounds before it did not, for the reason F54.2 names."
+  },
+  {
+   "experiment": "f54-merge",
+   "id": "F54.4",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P54.4 held: reads after the drain do not differ between the flushes under either key order (uniform 516 against 488 ns, p=0.32; sequential 472 against 475 ns, p=0.96). Both leave a fully routed store; the range flush keeps the boundaries where they were and leaves four partitions where the full flush re-derived three."
   }
  ],
  "metrics": [

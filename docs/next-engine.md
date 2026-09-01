@@ -202,11 +202,12 @@ interleaved where the harness allows:
 - **P-B, the read lead survives: HELD, with its condition stated.** The
   test was "EXT.11's shape with live segment counts under the compaction
   policy stays ≥ 1.2x on x86". At the shipping configuration it reads
-  **1.39-2.36x** across eight consecutive full runs (EXT.23, each
-  p=0.0022), the eighth at 2.358x with inline runs on a degraded host
-  state where every other engine's reads fell and next's rose. Report the
-  range rather than the best, and repeat the eighth on a quiet host before
-  quoting it.
+  **1.39-2.49x** across nine consecutive full runs (EXT.23, each
+  p=0.0022), the last two at 2.358x and 2.494x with inline runs, on a host
+  state where every other engine's reads fell about a quarter and next's
+  rose. Two runs agree, which is the minimum here; no run with inline runs
+  has yet been taken on the faster state the first seven had, so quote the
+  range.
 
   Getting here took two corrections and one refutation worth keeping.
   The refutation: at 8+ segments the same data reads **0.846x** and
@@ -274,6 +275,17 @@ interleaved where the harness allows:
 - ~~Filter choice~~ — **answered by f40/f41**: fences via range-partitioned
   compaction for sealed levels, per-segment Blooms for the overlapping
   tail; global routing structures rejected by measurement twice.
+- **The incremental merge** — measured before it was built, and the
+  measurement changed what it is (f54, merge-plan.md). The range merge
+  already rewrites only ranges holding pieces; the flush now does too
+  (`flush_ranges`, F54.1 says it is safe, F54.4 that reads do not notice).
+  Neither buys bytes: with uniform keys every range holds pieces, and with
+  ordered keys every seal lands in the last partition, which is rewritten
+  and re-split each round -- ordered keys wrote *more* device bytes than
+  random ones at 16 MB seals (F54.2). What makes ordered ingest
+  incremental is promotion, not selection: a piece whose keys all lie
+  above a partition's last key becomes a partition by rename, with
+  nothing rewritten (promote-plan.md, f55).
 - **Partitioned compaction policy** — built and measured (f43). The tail
   bound is a real dial: T8 sends 0.898x of T4's device bytes and scans
   0.910x as fast. What f43 also convicted is the merge itself — it
