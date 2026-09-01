@@ -1057,6 +1057,27 @@
    "profile": "full",
    "expect": "fails",
    "because": "The registered trade was that a tighter tail costs load -- T1 at most 0.77x of T8 -- and it keeps 85.5% instead (426,377 against 498,874, p=0.0014). The prediction assumed the dial worked; F44.1 shows it does not, so the arms differ only in how many merges they attempt and not in the tail they reach. What the load curve does show is the merge's real price: 736,341 ops/s with no compaction at all, ~430,000 with it, and device bytes from 301.9 MB to 500.6. Compaction costs 42% of the durable load here against F43.4's 21.6% at 300k keys, which is the whole-live-set rewrite growing with the store exactly as F43.3 warned it would."
+  },
+  {
+   "experiment": "f45-scanfloor",
+   "id": "F45.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "A linear sweep of the same records with keys inline runs 24,660,212 entries/s against the engine's ordered scan at 11,016,372 -- 2.24x, p=0.0022 -- clearing the 2x bar registered in scanfloor-plan.md as the price of a format change. The space is measured beside it: 118.3 MB inline against the 186.8 MB store, so inline keys are not a size regression here, they are a different shape entirely (the store carries an index and free-list the flat file does not). The first full run of this experiment credited two arms for entries they never visited and had to be thrown away; these numbers count what was walked."
+  },
+  {
+   "experiment": "f45-scanfloor",
+   "id": "F45.2",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Refuted, and it redirects the fix. The registered guess was that key RESOLUTION is the larger half of an ordered scan, since that is what an inline layout removes. Walking the index alone costs 14.5ns an entry against the scan's 90.8 -- 16% -- while reading values without returning keys costs 60.1ns. So the cost is the per-key extent and block-table indirection inside `values_at`, not the key walk. The sweep's 40.6ns beats even that 60.1ns because it chases no pointers at all. Two consequences: an inline-key layout would help for a reason different from the one it was proposed for, and a cheaper intervention exists -- a scan whose keys share one extent could read the run once instead of re-entering the block table per key, which costs no space and no second read path."
+  },
+  {
+   "experiment": "f45-scanfloor",
+   "id": "F45.3",
+   "profile": "full",
+   "expect": "holds",
+   "because": "The sweep runs 24,660,212 entries/s against the 16,979,241 lmdb last recorded on this host (ext-kv, cited as context -- no finding compares across runs), so the ceiling clears the comparator and a format change COULD close EXT.24 rather than merely narrow it. Note what that costs before believing it: the sweep is a bare linear pass with no index, no checksum path, no free list and no multivalue framing, so it is an upper bound on any real implementation and not a promise."
   }
  ],
  "metrics": [
