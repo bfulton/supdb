@@ -297,10 +297,17 @@ fn a_compacted_store_reopens_with_the_same_answers() {
 
 #[test]
 fn a_crash_before_the_manifest_lands_keeps_the_pre_merge_store() {
-    // The window the manifest exists for: partitions written and renamed
-    // into place, then the process dies before the manifest names them.
-    // Those files are unreachable, and open must delete them rather than
-    // read them alongside the inputs they duplicate.
+    // The window the manifest exists for: a merge wrote its outputs and
+    // renamed them into place, then the process died before the manifest
+    // named them. Those files are unreachable and open must sweep them
+    // rather than read them alongside the inputs they duplicate.
+    //
+    // Staged by building the post-merge files in a COPY and moving them
+    // into the pre-merge store, because a merge legitimately deletes its
+    // inputs -- an earlier version of this test restored an old manifest
+    // over a merged store and was really testing whether open survives a
+    // manifest naming deleted files, which is a different question (it
+    // now answers it with a diagnosis rather than an ENOENT).
     let d = dir("mergewin");
     let mut db = Db::create(&d, small_opts(2)).unwrap();
     let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
@@ -314,23 +321,37 @@ fn a_crash_before_the_manifest_lands_keeps_the_pre_merge_store() {
         db.commit().unwrap();
     }
     db.flush().unwrap();
-    let manifest = std::fs::read(d.join("manifest")).unwrap();
+    drop(db);
 
-    // Emulate: keep every file the merge produced, restore the manifest to
-    // the state it had before the merge published.
-    let mut db2 = Db::open(&d, small_opts(2)).unwrap();
+    let pre: Vec<String> = std::fs::read_dir(&d)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sup"))
+        .collect();
+
+    // A copy of the store carries on and merges; its outputs are the
+    // files a crash would have left behind unnamed.
+    let d2 = dir("mergewin2");
+    for name in std::fs::read_dir(&d).unwrap() {
+        let name = name.unwrap().file_name();
+        std::fs::copy(d.join(&name), d2.join(&name)).unwrap();
+    }
+    let mut db2 = Db::open(&d2, small_opts(2)).unwrap();
     for k in 0u32..100 {
         db2.append(format!("k{k:04}").as_bytes(), b"extra");
     }
     db2.commit().unwrap();
     db2.flush().unwrap();
     drop(db2);
-    let before: Vec<String> = std::fs::read_dir(&d)
+    let post: Vec<String> = std::fs::read_dir(&d2)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| n.ends_with(".sup"))
+        .filter(|n| n.ends_with(".sup") && !pre.contains(&n.to_string()))
         .collect();
-    std::fs::write(d.join("manifest"), &manifest).unwrap();
+    assert!(!post.is_empty(), "the copy produced no new segments; the window was not staged");
+    for name in &post {
+        std::fs::copy(d2.join(name), d.join(name)).unwrap();
+    }
 
     let db = Db::open(&d, small_opts(2)).unwrap();
     let after: Vec<String> = std::fs::read_dir(&d)
@@ -338,18 +359,16 @@ fn a_crash_before_the_manifest_lands_keeps_the_pre_merge_store() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .filter(|n| n.ends_with(".sup"))
         .collect();
-    // The window is only exercised if segments the restored manifest does
-    // not name were actually present and actually swept. A test that
-    // reaches no orphan proves nothing about orphans.
-    assert!(
-        after.len() < before.len(),
-        "no orphan was swept: before {before:?}, after {after:?} -- the window was not reached"
+    assert_eq!(
+        after.len(),
+        pre.len(),
+        "every unnamed segment must be swept: kept {after:?} against a manifest naming {pre:?}"
     );
     for (key, want) in &model {
         assert_eq!(
             &read_vec(&db, key),
             want,
-            "the pre-merge manifest must serve the pre-merge store, no duplicates: {}",
+            "the manifest's store, with no trace of the unnamed merge: {}",
             String::from_utf8_lossy(key)
         );
     }

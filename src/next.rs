@@ -309,8 +309,13 @@ impl Seg {
     }
 
     fn open(dir: &Path, name: &str) -> Result<Seg> {
-        let blob = Blob::open(MmapBytes::open(&dir.join(name))?)
-            .map_err(|e| err(&format!("segment {name}: {e}")))?;
+        let src = MmapBytes::open(&dir.join(name)).map_err(|e| {
+            // A manifest naming a segment that is not on disk is a damaged
+            // store, not a missing file, and saying so is the difference
+            // between a diagnosis and an ENOENT.
+            err(&format!("the manifest names segment {name}, which is not in the store: {e}"))
+        })?;
+        let blob = Blob::open(src).map_err(|e| err(&format!("segment {name}: {e}")))?;
         // `pcs-` is a range-ALIGNED L0 piece: a seal split at the live
         // partition boundaries, so it carries a fence like a partition and
         // overlaps only the pieces of its own range. That alignment is what
@@ -1170,7 +1175,19 @@ impl Db {
         self.wal.commit()?;
         self.seal()?;
         self.join_seal()?;
-        self.join_compact()
+        self.join_compact()?;
+        // Leave the store routed. A flush is a caller saying it has
+        // stopped writing, and what it leaves behind otherwise is a set of
+        // OVERLAPPING full-range segments -- each one costing every
+        // subsequent read a Bloom check, because nothing tells them apart.
+        // Partitioning them costs one merge now and makes every later read
+        // touch exactly one segment, which is the arrangement the read
+        // lead was measured in.
+        if self.opts.compact && self.segs.iter().any(|s| s.level == 0) {
+            self.start_compact(None)?;
+            self.join_compact()?;
+        }
+        Ok(())
     }
 
     /// Collect a finished (or in-flight) seal: join the thread, open its
