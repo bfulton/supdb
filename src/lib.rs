@@ -52,7 +52,10 @@ pub mod index;
 /// The flat key index, including the builders a segment writer drives.
 /// Public for the same reason as `index`: a bulk writer for sorted,
 /// write-once input is a legitimate second producer of this format, and
-/// f46 prices one.
+/// f46 prices one. The lint allowance is the only concession to making a
+/// vendored module public -- its `len()` methods predate the exposure and
+/// the module is not reformatted for it.
+#[allow(clippy::len_without_is_empty)]
 pub mod flatindex;
 #[allow(clippy::all, dead_code)]
 pub mod keytable;

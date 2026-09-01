@@ -125,6 +125,7 @@ fn main() -> std::io::Result<()> {
             "f44-tail" => f44_tail(&args, profile)?,
             "f45-scanfloor" => f45_scanfloor(&args, profile)?,
             "f46-segwrite" => f46_segwrite(&args, profile)?,
+            "f47-parwal" => f47_parwal(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -5787,6 +5788,203 @@ fn f38_fanout(args: &Args, profile: Profile) -> std::io::Result<Record> {
             keep16 * 100.0,
             keep4 * 1.355,
             keep16 * 1.355
+        ),
+    ));
+
+    Ok(rec)
+}
+
+/// Does the one-barrier commit scale across writers? parwal-plan.md
+/// registers the predictions. f39's raw-wal arm run N-wide -- each thread
+/// owns a file and commits its own batches -- plus one arm in which four
+/// threads share a file under a group commit: appends interleave and one
+/// fdatasync per round covers everyone. All engine work removed, so this
+/// is the ceiling sharded writers could reach on this device, not a
+/// measurement of any writer.
+fn f47_parwal(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use std::io::Write as _;
+    use std::sync::{Arc, Barrier, Mutex};
+
+    let per_thread = args.num("--keys", profile.pick(20_000, 100_000, 500_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+
+    let mut rec = Record::new("f47-parwal", profile);
+    rec.param("records_per_thread", J::u(per_thread))
+        .param("batch", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .param("cores", J::u(std::thread::available_parallelism().map_or(0, |n| n.get() as u64)))
+        .note(
+            "five arms interleaved: 1, 2, 4 and 8 threads each owning a WAL file and committing \
+             its own framed 1,000-record batches with one fdatasync each (f39's raw-wal arm run \
+             N-wide), and 4 threads sharing one file under a group commit -- appends interleave \
+             behind a mutex and one fdatasync per round covers every thread's batch. Aggregate \
+             durable records per second. No engine work, so this is a ceiling for sharded \
+             writers and not a measurement of any",
+        )
+        .note("predictions registered in parwal-plan.md before the run");
+
+    let dir = scratch("f47");
+    let payload = Arc::new(Payload::new(value_size, 0.5, 0xF47));
+    let arm_names = ["1-stream", "2-streams", "4-streams", "8-streams", "4-group"];
+    let arm_threads = [1usize, 2, 4, 8, 4];
+
+    // One framed batch, built once per thread per rep outside the timer:
+    // the bytes are the same for every arm and framing is not the question.
+    let frame_batch = move |payload: &Payload, seed: u64| -> Vec<u8> {
+        let mut vrng = Rng::new(seed);
+        let mut kb = [0u8; 16];
+        let mut buf = Vec::with_capacity((batch as usize) * (value_size + 24));
+        for i in 0..batch {
+            db_key_into(i, &mut kb);
+            let v = payload.get(&mut vrng);
+            buf.extend_from_slice(&(kb.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&kb);
+            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            buf.extend_from_slice(v);
+        }
+        buf
+    };
+
+    let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
+        let n = arm_threads[ci];
+        let batches = per_thread / batch;
+        let start = Arc::new(Barrier::new(n + 1));
+        let done = Arc::new(Barrier::new(n + 1));
+        let mut handles = Vec::with_capacity(n);
+        if ci == 4 {
+            // Group commit: one file, one writer position, one barrier per
+            // round. Each thread appends its batch under the lock; the
+            // thread that finds itself last in a round issues the fdatasync
+            // that covers all n batches, and everyone waits for it.
+            let file = dir.join(format!("g{rep}.dat"));
+            let _ = std::fs::remove_file(&file);
+            let shared = Arc::new(Mutex::new((
+                std::fs::File::create(&file).expect("create"),
+                0usize, // appends this round
+            )));
+            let round = Arc::new(Barrier::new(n));
+            for t in 0..n {
+                let (start, done, round, shared, payload) = (
+                    start.clone(),
+                    done.clone(),
+                    round.clone(),
+                    shared.clone(),
+                    payload.clone(),
+                );
+                handles.push(std::thread::spawn(move || {
+                    let buf = frame_batch(&payload, 0xF47 + rep as u64 * 64 + t as u64);
+                    start.wait();
+                    for _ in 0..batches {
+                        {
+                            let mut g = shared.lock().expect("lock");
+                            g.0.write_all(&buf).expect("append");
+                            g.1 += 1;
+                        }
+                        // Everyone has appended: exactly one fdatasync.
+                        if round.wait().is_leader() {
+                            let mut g = shared.lock().expect("lock");
+                            g.0.sync_data().expect("fdatasync");
+                            g.1 = 0;
+                        }
+                        round.wait();
+                    }
+                    done.wait();
+                }));
+            }
+        } else {
+            for t in 0..n {
+                let file = dir.join(format!("s{ci}-{rep}-{t}.dat"));
+                let _ = std::fs::remove_file(&file);
+                let (start, done, payload) = (start.clone(), done.clone(), payload.clone());
+                handles.push(std::thread::spawn(move || {
+                    let buf = frame_batch(&payload, 0xF47 + rep as u64 * 64 + t as u64);
+                    let mut f = std::fs::File::create(&file).expect("create");
+                    start.wait();
+                    for _ in 0..batches {
+                        f.write_all(&buf).expect("append");
+                        f.sync_data().expect("fdatasync");
+                    }
+                    done.wait();
+                    let _ = std::fs::remove_file(&file);
+                }));
+            }
+        }
+        start.wait();
+        let t = Instant::now();
+        done.wait();
+        let secs = t.elapsed().as_secs_f64();
+        for h in handles {
+            h.join().expect("thread");
+        }
+        if ci == 4 {
+            let _ = std::fs::remove_file(dir.join(format!("g{rep}.dat")));
+        }
+        (n as u64 * batches * batch) as f64 / secs
+    });
+
+    rec.series(
+        "arms",
+        J::arr(
+            arm_names
+                .iter()
+                .zip(arm_threads.iter())
+                .zip(rates.iter())
+                .map(|((name, n), s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "threads" => J::u(*n as u64),
+                        "records_per_s" => J::fp(s.median(), 1),
+                        "per_stream" => J::fp(s.median() / *n as f64, 1),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4)
+                    }
+                })
+                .collect(),
+        ),
+    );
+
+    let x4 = rates[2].median() / rates[0].median().max(1e-9);
+    let cmp4 = compare(&rates[2], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("4_streams_vs_1", cmp4.clone());
+    rec.finding(Finding::new(
+        "F47.1",
+        "four independent WAL streams commit at least 2.5x one stream",
+        x4 >= 2.5 && matches!(cmp4.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "1 stream {:.0} records/s, 2 streams {:.0}, 4 streams {:.0} ({x4:.2}x, {}), 8 streams \
+             {:.0}. This is P-D's 2.5x bar applied to the floor: below it the barrier serialises \
+             at the device and sharded WALs cannot deliver P-D here",
+            rates[0].median(),
+            rates[1].median(),
+            rates[2].median(),
+            cmp4.summary("4-streams", "1-stream"),
+            rates[3].median()
+        ),
+    ));
+    let x8 = rates[3].median() / rates[2].median().max(1e-9);
+    rec.finding(Finding::new(
+        "F47.2",
+        "scaling is sublinear past four streams",
+        x8 < 1.6,
+        format!(
+            "8 streams run {x8:.2}x of 4. Near-linear here would mean the device has more \
+             barrier concurrency than the design assumed and shard count should follow cores"
+        ),
+    ));
+    let cmpg = compare(&rates[4], &rates[2], supdb::bench::MIN_EFFECT);
+    rec.compare("4_group_vs_4_streams", cmpg.clone());
+    rec.finding(Finding::new(
+        "F47.3",
+        "a group commit over one file beats four independent streams",
+        matches!(cmpg.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "4 threads under one group-committed file {:.0} records/s against 4 independent \
+             streams {:.0} ({}). One barrier amortised over four batches should cost less than \
+             four barriers if the device is the bottleneck; if independence wins, barriers are \
+             cheap in parallel and the lock is what costs",
+            rates[4].median(),
+            rates[2].median(),
+            cmpg.summary("4-group", "4-streams")
         ),
     ));
 
