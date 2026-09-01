@@ -144,11 +144,14 @@ interleaved where the harness allows:
 
   What that leaves is not on the commit path at all. Against LMDB in the
   external suite the durable load read **0.299x** when this was first
-  written and reads **0.39-0.49x** across the last two runs (EXT.22 --
-  LMDB's own load moved 24% between them and next's 1%; the latest is the
-  first with the transactions axis matched, so it is a measurement and
-  not a bound), with **0.63-0.72x** when partitioning is left to
-  compaction (EXT.25); the whole of that move is below. The gap is there
+  written and reads **0.452x** in the latest run, under 32 MB seals over
+  64 MB partitions (EXT.22 -- 0.39-0.49x in the two runs before; the
+  transactions axis is matched, so it is a measurement and not a bound,
+  and this is the first run where the axis moved for the engine's reason:
+  next's load up 37%, LMDB's up 18%). Leaving partitioning to compaction
+  no longer separates the arms at this load (EXT.25, EXT.26, ties: the
+  trigger fires at the fourth 32 MB seal either way). The whole of that
+  move is below. The gap is there
   because the seal and the flush's partitioning land *inside* the timed
   window. That is overhead rather than bytes,
   and half of it is a policy choice -- EXT.25 measures **1.985x more
@@ -199,10 +202,10 @@ interleaved where the harness allows:
 - **P-B, the read lead survives: HELD, with its condition stated.** The
   test was "EXT.11's shape with live segment counts under the compaction
   policy stays ≥ 1.2x on x86". At the shipping configuration it reads
-  **1.42-1.64x** across six consecutive full runs (EXT.23, each
-  p=0.0022), the sixth at 1.441x with the transactions axis matched and
-  the format at v5. Report the range rather than the best: LMDB's own
-  rate moves between runs and so does next's.
+  **1.39-1.64x** across seven consecutive full runs (EXT.23, each
+  p=0.0022), the seventh at 1.391x under the new seal and partition
+  sizes. Report the range rather than the best: LMDB's own rate moves
+  between runs and so does next's.
 
   Getting here took two corrections and one refutation worth keeping.
   The refutation: at 8+ segments the same data reads **0.846x** and
