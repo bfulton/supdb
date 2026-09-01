@@ -109,27 +109,33 @@ interleaved where the harness allows:
   host — within 1.7x of the raw+index floor and past LMDB's recorded rate.
   Below 600k the design has a leak that must be named; below 572k the axis
   is conceded and the brief's premise was wrong.
-- **P-B, the read lead survives: REFUTED.** The test was "EXT.11's shape
-  with live segment counts under the compaction policy stays ≥ 1.2x on
-  x86", and with the levels actually live it reads **0.846x** (EXT.23,
-  p=0.0022). The three runs that had it at 1.4-1.7x all had the structure
-  idle: a 64MB seal threshold over 116MB of data left two segments and
-  half the store in a resident hash memtable. f43 shows routing *paying*
-  at 23 segments (F43.2) but on a 35MB store where an extra probe is a
-  cache hit; at 116MB it does not. So the read lead `flatindex` earns is
-  not currently preserved by the routing built to protect it, and the
-  decomposition of why — segment count, mapping count, tail size, filter
-  false positives — is the open work this refutation names. Replicated at
-  0.850x on a second full run, next's arm moving 1.3% and LMDB's 1.9%.
-  **f44 decomposed the first layer of it.** The tail is not the cause: the
-  read curve is flat across every tail bound (F44.1), because a merge that
-  rewrites the whole live set is slower than the seals feeding it, so the
-  tail settles at 5–6 whatever `l0_trigger` says and the policy knob is
-  disconnected. The cause is segmentation itself as routed today —
-  1,030,151/s against 1,442,938 for the same data in one segment, **71.4%**
-  (F44.2), which is exactly the distance EXT.23 fell. F38.2's "segmentation
-  is free" survives as what it measured: an oracle that paid no fence
-  search, no Bloom, and had no tail.
+- **P-B, the read lead survives: HELD, with its condition stated.** The
+  test was "EXT.11's shape with live segment counts under the compaction
+  policy stays ≥ 1.2x on x86". At the shipping configuration it reads
+  **1.419x, 1.441x and 1.580x** across three consecutive full runs
+  (EXT.23, each p=0.0022). Report the range rather than the best: LMDB's
+  own rate moved 10.5% across them and next's moved 15%.
+
+  Getting here took two corrections and one refutation worth keeping.
+  The refutation: at 8+ segments the same data reads **0.846x** and
+  **0.850x** (replicated), and f44 has it at 0.77x. Segment count is the
+  variable that decides this axis — one segment 1.19x, eight 0.77x — so
+  the claim is conditional by construction and the condition is part of
+  it.
+
+  The corrections were both mine. Three early readings of 1.4–1.7x had
+  the level structure idle *and* served a large share of their keys from
+  a resident hash memtable, which is not the engine LMDB was being
+  measured against; the adapter now drains before reading, so every key
+  is sealed on both sides. And a flush now leaves the store **routed** —
+  it partitions what it sealed — so a read touches exactly one segment
+  rather than paying a Bloom check on each of several overlapping ones.
+
+  The engine now reads at or above what f44 measures for the same data
+  in a single segment, so segmentation costs nothing at this operating
+  point and the read path itself is the ceiling. Past ~1.6x needs fewer
+  cache misses per lookup (inlining small values in the index is the
+  candidate), not better arrangement.
 - **P-C, the durability curve flattens:** the F4-durability sweep shows
   window cost independent of key count — the 25x at a 1,000-op window
   (F4.1) becomes a bounded, window-size-only cost. F4.1 flips or the design
