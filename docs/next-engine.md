@@ -191,11 +191,11 @@ interleaved where the harness allows:
   spreading the segment writer's syncs -- and both are inert on this host
   (F51.1-F51.4, every comparison a tie), so the barrier's growth is not a
   queueing-order effect here and both knobs ship off. The partitioning
-  pass itself stays optional (EXT.25). What is owed next is the
-  segment-size sweep this brief has listed as open since it was written:
-  smaller seals move the merges off the drain and onto the machine's other
-  cores, at a write amplification the sweep will price (f52, registered
-  in segsize-plan.md).
+  pass itself stays optional (EXT.25). The segment-size sweep this brief
+  owed since it was written is done: 32 MB seals over 64 MB partitions
+  ingest 1.129x at the same device bytes and the same reads (F52.5,
+  F52.6), and are the shipping default now; smaller seals buy nothing
+  until the merge is incremental (F52.1, F52.2).
 - **P-B, the read lead survives: HELD, with its condition stated.** The
   test was "EXT.11's shape with live segment counts under the compaction
   policy stays ≥ 1.2x on x86". At the shipping configuration it reads
@@ -279,8 +279,16 @@ interleaved where the harness allows:
   per source. Both are fixed and both arms gained. EXT.24 needs
   re-measuring against LMDB before anyone knows where the ordered axis
   stands.
-- **Segment size** — trades WAL replay length against segment count; needs
-  its own sweep.
+- ~~Segment size~~ — **swept (f52).** 16 and 8 MB seals are ties on ingest
+  at 1.5x the device bytes (F52.1, F52.2, F52.4); 32 MB seals are an
+  interior optimum, 1.129x at identical device bytes (F52.5) -- once the
+  partition size was set apart from the seal size, because the first
+  partitioning had been cutting as many partitions as the live set held
+  seals, and more partitions read slower (F52.3, run 1). 32 MB seals over
+  64 MB partitions is the shipping default and reads no differently from
+  64 MB seals (F52.6). What the sweep priced beyond that is the
+  incremental merge: below 32 MB every extra merge round rewrites the live
+  set, and that is what stands between this engine and smaller seals.
 - **Group commit** — whether concurrent writers share a barrier; matters
   only after P-D.
 - **What EXT.6 becomes** — segments plus a WAL will not beat LMDB on disk;

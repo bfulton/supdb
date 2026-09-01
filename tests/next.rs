@@ -324,7 +324,10 @@ fn the_probe_merge_arm_passes_the_same_oracle() {
 fn small_opts(l0_trigger: usize) -> NextOptions {
     // Small enough that a few hundred records seal and compact, so the
     // level machinery is exercised at test scale rather than described.
-    NextOptions { seal_bytes: 4 << 10, l0_trigger, ..NextOptions::default() }
+    // Partitions follow the seal here (`partition_bytes: None`): these tests
+    // want many small partitions, where the shipping default holds them at
+    // 64 MB whatever the seal size (f52).
+    NextOptions { seal_bytes: 4 << 10, l0_trigger, partition_bytes: None, ..NextOptions::default() }
 }
 
 #[test]
@@ -475,7 +478,12 @@ fn every_key_survives_partitioning_and_range_merges_at_scale() {
     let d = dir("scale");
     let mut db = Db::create(
         &d,
-        NextOptions { seal_bytes: 512 << 10, l0_trigger: 3, ..NextOptions::default() },
+        NextOptions {
+            seal_bytes: 512 << 10,
+            l0_trigger: 3,
+            partition_bytes: None,
+            ..NextOptions::default()
+        },
     )
     .unwrap();
     let n = 60_000u32;

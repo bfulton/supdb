@@ -1266,6 +1266,48 @@
    "profile": "full",
    "expect": "fails",
    "because": "P51.4 refuted with the others: both levers together leave the commit phase at 0.806s against 0.786s for the better single one, and ingest at 398,824 against 413,376 (0.965x, no difference at p=0.16). Two inert levers compose to nothing, which is at least consistent. The barrier's growth beside a faster seal remains unexplained on this host and is left as an open item rather than a theory; the segment-size sweep (f52) is the next lever, because it moves the merges off the drain instead of reordering the device's queue."
+  },
+  {
+   "experiment": "f52-segsize",
+   "id": "F52.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P52.1 refuted in both runs: 16 MB seals are a tie with 64 MB on ingest-to-routed (1.016x at p=0.44 in run 2, 0.959x in run 1). The overlap the plan counted on is real -- the seal phase falls from 0.479s to 0.146s -- but the drain still ends in a merge of the whole live set, and the extra merge rounds smaller seals trigger during the load put more on the merge phase (1.106s against 0.878s) and the commit phase (0.991s against 0.783s) than the overlap took off. What held instead was an interior optimum at 32 MB, which F52.5 records under the partition size that makes it usable."
+  },
+  {
+   "experiment": "f52-segsize",
+   "id": "F52.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P52.2 held: 765.5 MB to the device at 16 MB seals against 495.8 at 64 MB, 1.544x, under the 2.0x registered; 32 MB seals cost nothing extra (498.6) because four 32 MB pieces are never reached inside a 116 MB load and no merge round runs before the drain, and 8 MB costs 781.9. Every merge round rewrites the live set the new pieces touch; this is that amplification measured, and it is the number that says the incremental merge is owed before smaller seals could pay."
+  },
+  {
+   "experiment": "f52-segsize",
+   "id": "F52.3",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P52.3 held in run 2 and was refuted in run 1, and the mechanism is the same both times: the first partitioning was sizing its partitions from the seal size (3, 6, 12 and 25 partitions for 64, 32, 16 and 8 MB), and more partitions read slower -- 1.072x and 1.124x at p<=0.007 in run 1, 1.083x and 1.096x as ties in run 2 (results/f52-segsize.full.run1.json is kept). The premise 'partition count is set by max_keys, not the seal size' was false as built, which is why NextOptions::partition_bytes now exists and F52.6 measures the decoupled shape. Recorded as holding against the current record; the direction is stable and the partition count is the cause."
+  },
+  {
+   "experiment": "f52-segsize",
+   "id": "F52.4",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P52.4 held: 8 MB seals ingest no faster than 16 MB by the gate (1.266x at p=0.70 in run 2, 0.946x in run 1 -- the 8 MB arm carries rel_iqr 27% and 50%, so its medians mean little), at 781.9 MB to the device against 765.5 and with 25 partitions. Below 32 MB the merge amplification and the per-seal fixed costs take back what the overlap gave, and the arm's own variance says the shape is not one to run."
+  },
+  {
+   "experiment": "f52-segsize",
+   "id": "F52.5",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P52.5 held: 32 MB seals over 64 MB partitions ingest 419,334 ops/s against 371,410 for 64 MB seals, 1.129x at p=0.0106, at the same device bytes (498.0 against 495.8 MB) and the same three partitions. Three seals overlap the load where one did (seal phase 0.215s against 0.479s) and no extra merge round is triggered. With the partitions left coupled to the seal (six of them) the same arm reads 1.138x at p=0.055, just short of the gate. This is the shipping configuration now: NextOptions::default() seals at 32 MB and partitions at 64."
+  },
+  {
+   "experiment": "f52-segsize",
+   "id": "F52.6",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P52.6 held: 734 ns per point read after the drain for 32 MB seals over 64 MB partitions against 747 at 64 MB seals, 0.992x, no difference at p=0.64. Same partition count, same reads. The read cost the first run charged to the seal size was the partition count's, and once the two are set apart the ingest gain of F52.5 comes with no read to pay for it."
   }
  ],
  "metrics": [

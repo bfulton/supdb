@@ -171,7 +171,11 @@ impl Default for NextOptions {
     fn default() -> NextOptions {
         NextOptions {
             sync: SyncPolicy::Always,
-            seal_bytes: 64 << 20,
+            // 32 MB seals over 64 MB partitions: f52 measured 1.129x the
+            // ingest of 64 MB seals at identical device bytes and identical
+            // reads (F52.5, F52.6). Smaller still buys nothing and costs
+            // 1.5x the device bytes.
+            seal_bytes: 32 << 20,
             segment: Options::default(),
             l0_trigger: 4,
             compact: true,
@@ -180,7 +184,7 @@ impl Default for NextOptions {
             cursor_merge: true,
             background_io: BackgroundIo::Normal,
             seal_sync_every: 0,
-            partition_bytes: None,
+            partition_bytes: Some(64 << 20),
         }
     }
 }

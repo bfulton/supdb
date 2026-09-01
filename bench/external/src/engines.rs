@@ -359,16 +359,19 @@ impl Next {
         // fairness gate refused to rank this arm until it was made here too.
         let opts = supdb::next::NextOptions {
             segment: supdb::Options { checksums: false, ..Default::default() },
-            // The engine's own default, 64 MB, which is also what a
-            // production LSM uses for a memtable. Over this suite's 116 MB
-            // that is a handful of segments -- and few segments is not an
-            // accident of the benchmark, it is the operating point the
-            // design is FOR: f44 measured the same data reading 1.19x of
-            // LMDB in one segment and 0.77x spread over eight. An 8 MB
-            // threshold was tried here to make the level machinery work
-            // harder, and all it measured was the engine at a shape it
-            // should not be run in.
-            seal_bytes: 64 << 20,
+            // The engine's own defaults: 32 MB seals over 64 MB partitions.
+            // Few partitions is not an accident of the benchmark, it is the
+            // operating point the design is FOR: f44 measured the same data
+            // reading 1.19x of LMDB in one segment and 0.77x spread over
+            // eight, and f52 found that seal size and partition size had to
+            // be set apart -- 32 MB seals ingest 1.129x over 64 MB at the
+            // same device bytes once the partitions stay at 64 MB, where
+            // coupled they multiplied and cost every read. An 8 MB seal was
+            // tried here once to make the level machinery work harder, and
+            // all it measured was the engine at a shape it should not be
+            // run in.
+            seal_bytes: 32 << 20,
+            partition_bytes: Some(64 << 20),
             // SUPDB_NO_FLUSH_PARTITION trades the read lead for ingest:
             // the flush stops partitioning what it sealed and leaves that
             // to background compaction. Both arms are measured rather than
