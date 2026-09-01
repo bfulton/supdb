@@ -130,6 +130,7 @@ fn main() -> std::io::Result<()> {
             "f49-bulkseal" => f49_bulkseal(&args, profile)?,
             "f50-txn" => f50_txn(&args, profile)?,
             "f51-ioprio" => f51_ioprio(&args, profile)?,
+            "f52-segsize" => f52_segsize(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -6618,6 +6619,228 @@ fn f51_ioprio(args: &Args, profile: Profile) -> std::io::Result<Record> {
             rates[3].median(),
             rates[0].median(),
             ing_both.summary("both", "baseline"),
+        ),
+    ));
+    Ok(rec)
+}
+
+fn f52_segsize(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::next::{Db, NextOptions};
+
+    let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+    let reads = args.num("--reads", profile.pick(20_000, 50_000, 200_000)) as u64;
+
+    let mut rec = Record::new("f52-segsize", profile);
+    rec.param("keys", J::u(keys))
+        .param("batch", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .param("reads", J::u(reads))
+        .note(
+            "four arms interleaved in one process, fresh store per rep, one option apart: \
+             seal_bytes 64 MB (shipping), 32, 16 and 8, on f49's shape -- the f42 durable load \
+             with the drain (seal, join, partition) inside the timed window. Smaller seals move \
+             merges off the drain and onto the other cores while the load runs; the price is \
+             every merge round rewriting the live set. Phases from the engine, device bytes over \
+             the window, disk bytes after close, and a point-read sample after the drain",
+        )
+        .note("predictions registered in segsize-plan.md before the run");
+
+    let dir = scratch("f52");
+    let payload = Payload::new(value_size, 0.5, 0xF52);
+    let arms: [(&str, usize); 4] = [("64mb", 64 << 20), ("32mb", 32 << 20), ("16mb", 16 << 20), ("8mb", 8 << 20)];
+    // ci, device MB, disk MB, load-only s, commit s, seal s, merge s, read ns, partitions
+    type Row = (usize, f64, f64, f64, f64, f64, f64, f64, f64);
+    let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
+    let rates = Trial::new(profile.reps()).run(arms.len(), |ci, rep| {
+        let mut vrng = Rng::new(0xF52 + rep as u64);
+        let mut kb = [0u8; 16];
+        let d = dir.join(format!("f52-{ci}-{rep}"));
+        let _ = std::fs::remove_dir_all(&d);
+        let opts = NextOptions { seal_bytes: arms[ci].1, ..Default::default() };
+        let mut db = Db::create(&d, opts).expect("create");
+        let io0 = IoCounters::read_now();
+        let t = Instant::now();
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            db.append(&kb, payload.get(&mut vrng));
+            if (i + 1) % batch == 0 {
+                db.commit().expect("commit");
+            }
+        }
+        let load_s = t.elapsed().as_secs_f64();
+        db.flush().expect("flush");
+        let secs = t.elapsed().as_secs_f64();
+        let (c, s, m) = db.phase_ns();
+        let io_mb = IoCounters::read_now().since(&io0).write_bytes as f64 / 1_048_576.0;
+        let (parts, _l0) = db.levels();
+        // Point reads over the drained store.
+        let mut x = 0x5E6_5EED_u64 ^ (rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut sink = 0u64;
+        let tr = Instant::now();
+        for _ in 0..reads {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            db_key_into(z % keys, &mut kb);
+            sink += db
+                .read_all(&kb, |v| {
+                    std::hint::black_box(v);
+                })
+                .expect("read");
+        }
+        let read_ns = tr.elapsed().as_nanos() as f64 / reads as f64;
+        std::hint::black_box(sink);
+        db.close().expect("close");
+        let mut bytes = 0u64;
+        for e in std::fs::read_dir(&d).expect("dir") {
+            bytes += e.expect("entry").metadata().expect("meta").len();
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        rows.lock().unwrap().push((
+            ci,
+            io_mb,
+            bytes as f64 / 1_048_576.0,
+            load_s,
+            c as f64 / 1e9,
+            s as f64 / 1e9,
+            m as f64 / 1e9,
+            read_ns,
+            parts as f64,
+        ));
+        keys as f64 / secs
+    });
+    let col = |ci: usize, pick: fn(&Row) -> f64| -> Vec<f64> {
+        rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect()
+    };
+    let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
+        let mut v = col(ci, pick);
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
+    rec.series(
+        "arms",
+        J::arr(
+            arms.iter()
+                .enumerate()
+                .zip(rates.iter())
+                .map(|((ci, (name, _)), s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "ops_per_s" => J::fp(s.median(), 1),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4),
+                        "load_s" => J::fp(med(ci, |r| r.3), 3),
+                        "commit_s" => J::fp(med(ci, |r| r.4), 3),
+                        "seal_s" => J::fp(med(ci, |r| r.5), 3),
+                        "merge_s" => J::fp(med(ci, |r| r.6), 3),
+                        "device_write_mb" => J::fp(med(ci, |r| r.1), 1),
+                        "disk_mb" => J::fp(med(ci, |r| r.2), 1),
+                        "read_ns" => J::fp(med(ci, |r| r.7), 1),
+                        "partitions" => J::fp(med(ci, |r| r.8), 1)
+                    }
+                })
+                .collect(),
+        ),
+    );
+
+    let i16 = compare(&rates[2], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("16mb_vs_64mb_ingest", i16.clone());
+    let i32 = compare(&rates[1], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("32mb_vs_64mb_ingest", i32.clone());
+    let i8 = compare(&rates[3], &rates[2], supdb::bench::MIN_EFFECT);
+    rec.compare("8mb_vs_16mb_ingest", i8.clone());
+    let r16 = Samples::new(col(2, |r| r.7));
+    let r64 = Samples::new(col(0, |r| r.7));
+    let r8 = Samples::new(col(3, |r| r.7));
+    let rd16 = compare(&r16, &r64, supdb::bench::MIN_EFFECT);
+    rec.compare("read_ns_16mb_vs_64mb", rd16.clone());
+    let rd8 = compare(&r8, &r64, supdb::bench::MIN_EFFECT);
+    rec.compare("read_ns_8mb_vs_64mb", rd8.clone());
+
+    rec.finding(Finding::new(
+        "F52.1",
+        "16 MB seals lift ingest-to-routed by at least 1.2x over 64 MB",
+        matches!(i16.verdict, supdb::bench::Verdict::Greater) && i16.ratio >= 1.2,
+        format!(
+            "16 MB {:.0} ops/s against 64 MB {:.0} ({}); 32 MB {:.0} ({}). Phases at 16 against \
+             64 MB: commit {:.3}s/{:.3}s, seal {:.3}s/{:.3}s, merge {:.3}s/{:.3}s; the loop alone \
+             {:.3}s/{:.3}s. Smaller seals move the merges off the drain and onto the other cores \
+             while the load runs",
+            rates[2].median(),
+            rates[0].median(),
+            i16.summary("16mb", "64mb"),
+            rates[1].median(),
+            i32.summary("32mb", "64mb"),
+            med(2, |r| r.4),
+            med(0, |r| r.4),
+            med(2, |r| r.5),
+            med(0, |r| r.5),
+            med(2, |r| r.6),
+            med(0, |r| r.6),
+            med(2, |r| r.3),
+            med(0, |r| r.3),
+        ),
+    ));
+    let dev_ratio = med(2, |r| r.1) / med(0, |r| r.1);
+    rec.finding(Finding::new(
+        "F52.2",
+        "at 16 MB seals, device bytes are at most 2.0x the 64 MB arm's",
+        dev_ratio <= 2.0,
+        format!(
+            "device bytes {:.1} MB at 16 MB seals against {:.1} at 64 MB ({:.3}x); 32 MB {:.1}, \
+             8 MB {:.1}. Disk after the drain {:.1}/{:.1}/{:.1}/{:.1} MB for 64/32/16/8, \
+             partitions {:.0}/{:.0}/{:.0}/{:.0}. Every merge round rewrites the live set the \
+             new pieces touch; this is that amplification, measured",
+            med(2, |r| r.1),
+            med(0, |r| r.1),
+            dev_ratio,
+            med(1, |r| r.1),
+            med(3, |r| r.1),
+            med(0, |r| r.2),
+            med(1, |r| r.2),
+            med(2, |r| r.2),
+            med(3, |r| r.2),
+            med(0, |r| r.8),
+            med(1, |r| r.8),
+            med(2, |r| r.8),
+            med(3, |r| r.8),
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F52.3",
+        "reads after the drain do not differ across seal sizes",
+        matches!(rd16.verdict, supdb::bench::Verdict::NoDifference)
+            && matches!(rd8.verdict, supdb::bench::Verdict::NoDifference),
+        format!(
+            "{:.0} ns per point read at 64 MB, {:.0} at 32, {:.0} at 16 ({}), {:.0} at 8 ({}). \
+             After the drain every arm is partitions only and the partition count is set by \
+             max_keys, not the seal size",
+            med(0, |r| r.7),
+            med(1, |r| r.7),
+            med(2, |r| r.7),
+            rd16.summary("16mb", "64mb"),
+            med(3, |r| r.7),
+            rd8.summary("8mb", "64mb"),
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F52.4",
+        "the sweep has an interior optimum: 8 MB seals ingest no faster than 16 MB",
+        !matches!(i8.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "8 MB {:.0} ops/s against 16 MB {:.0} ({}); device bytes {:.1} against {:.1} MB, \
+             merge phase {:.3}s against {:.3}s. Below some size the merge amplification and \
+             the per-seal fixed costs take back what the overlap gave",
+            rates[3].median(),
+            rates[2].median(),
+            i8.summary("8mb", "16mb"),
+            med(3, |r| r.1),
+            med(2, |r| r.1),
+            med(3, |r| r.6),
+            med(2, |r| r.6),
         ),
     ));
     Ok(rec)
