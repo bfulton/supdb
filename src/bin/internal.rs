@@ -7128,11 +7128,13 @@ fn f53_inline(args: &Args, profile: Profile) -> std::io::Result<Record> {
     rec.compare("inline_vs_blocks_ingest", ing.clone());
     rec.finding(Finding::new(
         "F53.5",
-        "ingest-to-routed is within 5% either way",
-        (0.95..=1.05).contains(&ing.ratio) || matches!(ing.verdict, supdb::bench::Verdict::NoDifference),
+        "ingest-to-routed with inline runs is no slower than with block-backed runs",
+        !matches!(ing.verdict, supdb::bench::Verdict::Less),
         format!(
             "inline {:.0} ops/s against blocks {:.0}: {}. Seal {:.3}s against {:.3}s, merge \
-             {:.3}s against {:.3}s. The writer moves the same bytes to a different section",
+             {:.3}s against {:.3}s. The bytes are the same either way; with the records-first \
+             layout they stream during the pass instead of being built in memory and written \
+             at finish, which is what made the first layout 0.807x",
             rates[1].median(),
             rates[0].median(),
             ing.summary("inline", "blocks"),
