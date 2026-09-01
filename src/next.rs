@@ -30,9 +30,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Result, Write};
 use std::path::{Path, PathBuf};
 
-use crate::block::crc32;
+use crate::block::{self, crc32, BlockBuilder, BlockLoc};
 use crate::bytes::MmapBytes;
-use crate::{Blob, Options, Store};
+use crate::flatindex;
+use crate::index::{Ext, Extents};
+use crate::{Blob, Options};
 
 fn err(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
@@ -113,6 +115,12 @@ pub struct NextOptions {
     /// is keeping up with ingest and reads later wants it off, and the
     /// background compaction will get there on its own schedule.
     pub partition_on_flush: bool,
+    /// Write segments with `SegmentWriter` (the default) or through the
+    /// general `Store` path it replaced. The general path is kept as the
+    /// comparison arm because the rule for pricing an engine change is both
+    /// arms interleaved in one process -- f49 does that -- and a number
+    /// against an old run would mostly have been the machine.
+    pub bulk_writer: bool,
 }
 
 impl Default for NextOptions {
@@ -124,6 +132,7 @@ impl Default for NextOptions {
             l0_trigger: 4,
             compact: true,
             partition_on_flush: true,
+            bulk_writer: true,
         }
     }
 }
@@ -345,6 +354,367 @@ struct Seg {
     /// to learn, and a segment without the sidecar simply falls back to the
     /// walk.
     counts: Option<Vec<u32>>,
+}
+
+// ------------------------------------------------------- the segment writer --
+
+/// Writes an immutable segment in one forward pass, for input that arrives
+/// sorted by key with each key's values together.
+///
+/// `Store` is a general writer: a hash table to find keys again, a freelist
+/// to place blocks, a pending arena, a reuse log, and a checkpoint that
+/// publishes all of it. A seal and a merge need none of that -- their keys
+/// come sorted, each key's values come once and together, and nothing is
+/// ever read back or appended to -- and f46 priced the general path at
+/// 2.04x the floor for exactly that input (F46.1). This is the writer that
+/// floor described: values are packed into blocks in the order they arrive,
+/// each key gets one extent, and the end of the pass writes the block table,
+/// the key section and both superblock slots. It emits the format `Store`
+/// writes and `Blob` reads, and `tests/segwriter.rs` holds the two writers
+/// to agreement on every read, `store::Reader` included.
+///
+/// A second writer of a format is a liability of the same kind as a second
+/// reader: its failure mode is a file that opens and answers differently.
+/// So the superblock is not re-derived here but copied field for field from
+/// `store::Super::encode`, the record encoding is `index::put_uvarint`
+/// because that is the reader's inverse, and the test corrupts a block to
+/// prove the checksum recorded is the one the reader checks.
+pub struct SegmentWriter {
+    out: std::io::BufWriter<File>,
+    /// File offset the next block lands at. Data starts after the header
+    /// region, which holds the two superblock slots and is written last.
+    pos: u64,
+    builder: BlockBuilder,
+    block_size: usize,
+    blocks: Vec<BlockLoc>,
+    /// Every key written, concatenated, with each key's span. Flat rather
+    /// than a `Vec<Vec<u8>>` because a segment has a million keys and the
+    /// index build wants them all at once; the extent beside each span is
+    /// the one record `flatindex::encode` reads.
+    key_arena: Vec<u8>,
+    spans: Vec<(usize, usize)>,
+    exts: Vec<Extents>,
+    /// The key currently open, its run of length-prefixed records, and the
+    /// offset of the newest record's prefix inside the run -- what
+    /// `Ext::last` carries so that reading the newest value is O(1).
+    open_key: Option<(usize, usize)>,
+    run: Vec<u8>,
+    last: usize,
+    parallel_index: bool,
+}
+
+/// One superblock slot, field for field what `store::Super::encode` writes:
+/// sixteen little-endian u64 fields, the magic in native order as the
+/// byte-order mark, and the FNV-1a of the fields and the magic.
+fn superblock(fields: &[u64; 16]) -> [u8; crate::store::SUPER_BYTES] {
+    let mut out = [0u8; crate::store::SUPER_BYTES];
+    for (i, v) in fields.iter().enumerate() {
+        out[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    out[128..136].copy_from_slice(&crate::store::MAGIC.to_ne_bytes());
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for v in fields.iter().chain(std::iter::once(&crate::store::MAGIC)) {
+        for b in v.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+    out[136..144].copy_from_slice(&h.to_le_bytes());
+    out
+}
+
+impl SegmentWriter {
+    /// Open `path` for a fresh segment. `opts` supplies the block size, the
+    /// checksum switch and whether the index build may use threads; the
+    /// rest of `Options` describes machinery this writer does not have.
+    pub fn create(path: &Path, opts: &Options) -> Result<SegmentWriter> {
+        // The checksum switch is process-wide and `Store::create` sets it
+        // from the same option; a writer that recorded none while readers
+        // expected them would fail every block it wrote.
+        block::CHECKSUMS.store(opts.checksums, std::sync::atomic::Ordering::Relaxed);
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+        // The header region stays zero until `finish`, so a segment that
+        // was never finished is a file no reader accepts rather than a
+        // segment with some of its keys.
+        out.write_all(&[0u8; crate::store::SUPER as usize])?;
+        let block_size = opts.block_size.max(1);
+        Ok(SegmentWriter {
+            out,
+            pos: crate::store::SUPER,
+            builder: BlockBuilder::new(block_size),
+            block_size,
+            blocks: Vec::new(),
+            key_arena: Vec::new(),
+            spans: Vec::new(),
+            exts: Vec::new(),
+            open_key: None,
+            run: Vec::new(),
+            last: 0,
+            parallel_index: opts.parallel_index,
+        })
+    }
+
+    /// Start a key. Keys must arrive in strictly increasing order; the
+    /// writer refuses anything else rather than build an index whose
+    /// directory disagrees with its records.
+    pub fn begin(&mut self, key: &[u8]) -> Result<()> {
+        if self.open_key.is_some() {
+            return Err(err("segment writer: begin while a key is open"));
+        }
+        if key.len() > u16::MAX as usize {
+            return Err(err("segment writer: key longer than 65,535 bytes"));
+        }
+        if let Some(&(s, l)) = self.spans.last() {
+            if key <= &self.key_arena[s..s + l] {
+                return Err(err("segment writer: keys must arrive in strictly increasing order"));
+            }
+        }
+        let start = self.key_arena.len();
+        self.key_arena.extend_from_slice(key);
+        self.open_key = Some((start, key.len()));
+        self.run.clear();
+        self.last = 0;
+        Ok(())
+    }
+
+    /// One value of the open key, in append order.
+    pub fn value(&mut self, v: &[u8]) {
+        debug_assert!(self.open_key.is_some(), "value without begin");
+        self.last = self.run.len();
+        crate::index::put_uvarint(&mut self.run, v.len() as u64);
+        self.run.extend_from_slice(v);
+    }
+
+    /// Close the open key: place its run in a block and record the extent.
+    pub fn end(&mut self) -> Result<()> {
+        let (start, len) = self
+            .open_key
+            .take()
+            .ok_or_else(|| err("segment writer: end without begin"))?;
+        let n = self.run.len();
+        if n > u32::MAX as usize {
+            return Err(err("segment writer: a key's values exceed 4 GiB in one segment"));
+        }
+        // A run that does not fit beside what is staged starts a new block;
+        // a run larger than a whole block takes an empty builder and is a
+        // block by itself, so a key's values stay contiguous -- the same
+        // rule `Store` applies through the same `BlockBuilder`.
+        if self.builder.would_overflow(n) {
+            self.flush_block()?;
+        }
+        let off = self.builder.push(&self.run);
+        let ext = Ext {
+            block: self.blocks.len() as u32,
+            off,
+            len: n as u32,
+            last: self.last as u32,
+        };
+        if self.builder.len() >= self.block_size {
+            self.flush_block()?;
+        }
+        self.spans.push((start, len));
+        self.exts.push(Extents::One(ext));
+        Ok(())
+    }
+
+    fn flush_block(&mut self) -> Result<()> {
+        if self.builder.is_empty() {
+            return Ok(());
+        }
+        let bytes = self.builder.take();
+        let len = bytes.len() as u32;
+        let crc = if block::checksums_on() { crc32(&bytes) } else { 0 };
+        self.blocks.push(BlockLoc {
+            off: self.pos,
+            stored: len,
+            uncompressed: len,
+            cap: len,
+            chunked: false,
+            solo: false,
+            chunk_crc: false,
+            crc,
+        });
+        self.out.write_all(&bytes)?;
+        self.pos += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Sections are aligned in the FILE, not just within themselves: the
+    /// index hands back `&[Ext]` borrowed from the mapping at its absolute
+    /// address, and `store::write_section_raw` carries the story of the
+    /// lookups that returned nothing when that was forgotten.
+    fn pad_to(&mut self, align: u64) -> Result<()> {
+        let rem = self.pos % align;
+        if rem != 0 {
+            let pad = (align - rem) as usize;
+            self.out.write_all(&vec![0u8; pad])?;
+            self.pos += pad as u64;
+        }
+        Ok(())
+    }
+
+    /// Keys written so far.
+    pub fn keys(&self) -> usize {
+        self.spans.len()
+    }
+
+    /// Write the block table, the key section and the superblock, and
+    /// fsync. `generation` is what the segment reports as its checkpoint
+    /// identity; a segment is written once, so 1 is the usual answer.
+    pub fn finish(mut self, generation: u64) -> Result<()> {
+        if self.open_key.is_some() {
+            return Err(err("segment writer: finish with a key still open"));
+        }
+        if self.spans.is_empty() {
+            return Err(err("segment writer: a segment needs at least one key"));
+        }
+        self.flush_block()?;
+
+        let rows = vec![[0u32; block::MAX_CHUNK_CRCS]; self.blocks.len()];
+        let table = flatindex::encode_blocks(&self.blocks, &rows);
+        self.pad_to(8)?;
+        let blk_off = self.pos;
+        self.out.write_all(&table)?;
+        self.pos += table.len() as u64;
+
+        let (section, reserve) = {
+            let all: Vec<(&[u8], &Extents)> = self
+                .spans
+                .iter()
+                .zip(&self.exts)
+                .map(|(&(s, l), e)| (&self.key_arena[s..s + l], e))
+                .collect();
+            flatindex::encode(
+                &all,
+                generation,
+                None,
+                flatindex::key_hash,
+                0,
+                self.parallel_index,
+            )
+            .ok_or_else(|| err("segment writer: key section exceeds the flat index's limits"))?
+        };
+        self.pad_to(8)?;
+        let key_off = self.pos;
+        self.out.write_all(&section)?;
+        let key_len = reserve.max(section.len());
+        if key_len > section.len() {
+            self.out.write_all(&vec![0u8; key_len - section.len()])?;
+        }
+        self.pos += key_len as u64;
+
+        let file = self.out.into_inner().map_err(|e| e.into_error())?;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // generation, history_from, timestamp, key section (off, stored,
+        // uncompressed), block table (same three), reuse log (none),
+        // high_water, redo log (none), index_gen.
+        let fields: [u64; 16] = [
+            generation,
+            generation,
+            ts,
+            key_off,
+            key_len as u64,
+            key_len as u64,
+            blk_off,
+            table.len() as u64,
+            table.len() as u64,
+            0,
+            0,
+            0,
+            self.pos,
+            0,
+            0,
+            generation,
+        ];
+        let sb = superblock(&fields);
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(&sb, 0)?;
+        file.write_all_at(&sb, crate::store::SLOT)?;
+        file.sync_all()?;
+        Ok(())
+    }
+}
+
+/// The two ways a piece gets written. `Bulk` is the shipping path; `General`
+/// is the `Store` path it replaced, kept behind `NextOptions::bulk_writer` as
+/// the comparison arm f49 interleaves against it. Both see the same calls in
+/// the same order, so the only thing that differs is the writer.
+enum PieceWriter {
+    Bulk(Box<SegmentWriter>),
+    General {
+        store: Box<crate::Store>,
+        key: Vec<u8>,
+        failed: Option<std::io::Error>,
+    },
+}
+
+impl PieceWriter {
+    fn create(path: &Path, opts: &Options, bulk: bool) -> Result<PieceWriter> {
+        if bulk {
+            Ok(PieceWriter::Bulk(Box::new(SegmentWriter::create(path, opts)?)))
+        } else {
+            Ok(PieceWriter::General {
+                store: Box::new(crate::Store::create(path, opts.clone())?),
+                key: Vec::new(),
+                failed: None,
+            })
+        }
+    }
+
+    fn begin(&mut self, k: &[u8]) -> Result<()> {
+        match self {
+            PieceWriter::Bulk(w) => w.begin(k),
+            PieceWriter::General { key, .. } => {
+                key.clear();
+                key.extend_from_slice(k);
+                Ok(())
+            }
+        }
+    }
+
+    /// Infallible at the call so it can sit inside a read callback; the
+    /// general path parks a failure and `end` reports it.
+    fn value(&mut self, v: &[u8]) {
+        match self {
+            PieceWriter::Bulk(w) => w.value(v),
+            PieceWriter::General { store, key, failed } => {
+                if failed.is_none() {
+                    if let Err(e) = store.append(key, v) {
+                        *failed = Some(e);
+                    }
+                }
+            }
+        }
+    }
+
+    fn end(&mut self) -> Result<()> {
+        match self {
+            PieceWriter::Bulk(w) => w.end(),
+            PieceWriter::General { failed, .. } => match failed.take() {
+                Some(e) => Err(e),
+                None => Ok(()),
+            },
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        match self {
+            PieceWriter::Bulk(w) => (*w).finish(1),
+            PieceWriter::General { store, .. } => {
+                store.checkpoint()?;
+                store.close()?;
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Where a segment's per-rank counts live: the segment's own name with the
@@ -744,11 +1114,12 @@ struct MergePlan {
     fences: Option<Vec<Fence>>,
     max_keys: usize,
     opts: Options,
+    bulk: bool,
 }
 
 fn compact_job(plan: MergePlan) -> Result<Vec<String>> {
-    let MergePlan { dir, inputs, first_id, end_seq, parts, fences, max_keys, opts } = plan;
-    compact_run(dir, inputs, first_id, end_seq, parts, fences, max_keys, opts)
+    let MergePlan { dir, inputs, first_id, end_seq, parts, fences, max_keys, opts, bulk } = plan;
+    compact_run(dir, inputs, first_id, end_seq, parts, fences, max_keys, opts, bulk)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -774,6 +1145,7 @@ fn compact_run(
     // until the next seal.
     max_keys: usize,
     opts: Options,
+    bulk: bool,
 ) -> Result<Vec<String>> {
     let _ = &parts;
     let mut blobs = Vec::with_capacity(inputs.len());
@@ -895,7 +1267,7 @@ fn compact_run(
         let _ = std::fs::remove_file(&tmp);
         let mut counts: Vec<u32> = Vec::with_capacity(chunk.len());
         {
-            let store = Store::create(&tmp, opts.clone())
+            let mut w = PieceWriter::create(&tmp, &opts, bulk)
                 .map_err(|e| err(&format!("compact create: {e}")))?;
             for key in chunk {
                 // Insurance against the class of bug that produced this
@@ -907,20 +1279,17 @@ fn compact_run(
                 {
                     return Err(err("compaction would write a key outside its fence"));
                 }
+                w.begin(key)?;
                 let mut n = 0u32;
                 for b in &blobs {
                     n += b
-                        .read_all(key, |v| {
-                            // `Store::append` cannot fail for a value already
-                            // in a segment, and the callback cannot return.
-                            let _ = store.append(key, v);
-                        })
+                        .read_all(key, |v| w.value(v))
                         .map_err(|e| err(&format!("compact read: {e}")))? as u32;
                 }
+                w.end()?;
                 counts.push(n);
             }
-            store.checkpoint().map_err(|e| err(&format!("compact checkpoint: {e}")))?;
-            store.close().map_err(|e| err(&format!("compact close: {e}")))?;
+            w.finish().map_err(|e| err(&format!("compact finish: {e}")))?;
         }
         std::fs::rename(&tmp, dir.join(&name))?;
         write_counts(&dir, &name, &counts)?;
@@ -1227,6 +1596,7 @@ impl Db {
         self.next_seg += fences.len().max(1) as u64;
         let dir = self.dir.clone();
         let opts = Db::segment_opts(&self.opts);
+        let bulk = self.opts.bulk_writer;
         let end_seq = old_wal.seq;
         self.retiring_wals.push(old_wal.path.clone());
         drop(old_wal);
@@ -1269,22 +1639,21 @@ impl Db {
                 let _ = std::fs::remove_file(&tmp);
                 let mut counts: Vec<u32> = Vec::with_capacity(at - start);
                 {
-                    let store = Store::create(&tmp, opts.clone())
+                    let mut w = PieceWriter::create(&tmp, &opts, bulk)
                         .map_err(|e| err(&format!("seal create: {e}")))?;
                     for e in &order[start..at] {
                         let key = MemTable::key_of(&mem.keys, e);
+                        w.begin(key)?;
                         for off in mem.chain(e) {
-                            store
-                                .append(key, mem.value_at(off))
-                                .map_err(|e| err(&format!("seal append: {e}")))?;
+                            w.value(mem.value_at(off));
                         }
+                        w.end()?;
                         // Keys are written in key order, so this vector is
                         // in rank order by construction -- the same fact
                         // the sorted seal already relies on.
                         counts.push(e.count as u32);
                     }
-                    store.checkpoint().map_err(|e| err(&format!("seal checkpoint: {e}")))?;
-                    store.close().map_err(|e| err(&format!("seal close: {e}")))?;
+                    w.finish().map_err(|e| err(&format!("seal finish: {e}")))?;
                 }
                 let name = if ranges.len() == 1 && lo.is_empty() && hi.is_none() {
                     Db::seg_name(id, end_seq)
@@ -1527,6 +1896,7 @@ impl Db {
         self.next_seg += (parts * 4).max(8) as u64;
         let dir = self.dir.clone();
         let opts = Db::segment_opts(&self.opts);
+        let bulk = self.opts.bulk_writer;
         let job_inputs = inputs.clone();
         let handle = std::thread::spawn(move || {
             compact_job(MergePlan {
@@ -1538,6 +1908,7 @@ impl Db {
                 fences,
                 max_keys,
                 opts,
+                bulk,
             })
         });
         self.compacting = Some((inputs, handle));

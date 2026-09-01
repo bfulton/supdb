@@ -164,14 +164,14 @@ fn reopen_after_seal_serves_both_old_and_new_writes() {
     );
 }
 
-#[test]
-fn model_oracle_over_random_ops_and_crashes() {
+fn oracle(bulk: bool) {
     // The c2-oracle discipline at milestone-1 scale: random appends,
     // commits, seals, and crash-reopens, checked against a HashMap after
     // every reopen. Uncommitted writes are trimmed from the model at a
     // crash, which is the durability contract.
-    let d = dir("oracle");
-    let mut db = Db::create(&d, NextOptions::default()).unwrap();
+    let d = dir(if bulk { "oracle" } else { "oracle-general" });
+    let opts = NextOptions { bulk_writer: bulk, ..NextOptions::default() };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
     let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
     let mut uncommitted: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut state = 0x5eedu64;
@@ -203,7 +203,7 @@ fn model_oracle_over_random_ops_and_crashes() {
             13 => {
                 drop(db); // crash: uncommitted appends vanish
                 uncommitted.clear();
-                db = match Db::open(&d, NextOptions::default()) {
+                db = match Db::open(&d, opts.clone()) {
                     Ok(db) => db,
                     Err(e) => {
                         let mut files: Vec<String> = std::fs::read_dir(&d)
@@ -228,6 +228,18 @@ fn model_oracle_over_random_ops_and_crashes() {
     for (k, want) in &model {
         assert_eq!(&read_vec(&db, k), want);
     }
+}
+
+#[test]
+fn model_oracle_over_random_ops_and_crashes() {
+    oracle(true)
+}
+
+/// The general `Store` writer stays behind `bulk_writer` as f49's comparison
+/// arm, and a path only one arm exercises is a path nothing tests.
+#[test]
+fn the_general_writer_arm_passes_the_same_oracle() {
+    oracle(false)
 }
 
 fn small_opts(l0_trigger: usize) -> NextOptions {

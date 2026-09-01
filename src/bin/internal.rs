@@ -127,6 +127,7 @@ fn main() -> std::io::Result<()> {
             "f46-segwrite" => f46_segwrite(&args, profile)?,
             "f47-parwal" => f47_parwal(&args, profile)?,
             "f48-syncpolicy" => f48_syncpolicy(&args, profile)?,
+            "f49-bulkseal" => f49_bulkseal(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -5802,6 +5803,221 @@ fn f38_fanout(args: &Args, profile: Profile) -> std::io::Result<Record> {
 /// load shape, differing only in `SyncPolicy`, plus the contract check
 /// P48.3 demands -- a torn unsynced tail is lost whole and never served
 /// in part -- run inline so it is a recorded finding and not only a test.
+fn f49_bulkseal(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::next::{Db, NextOptions};
+
+    let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+    let reads = args.num("--reads", profile.pick(20_000, 50_000, 200_000)) as u64;
+
+    let mut rec = Record::new("f49-bulkseal", profile);
+    rec.param("keys", J::u(keys))
+        .param("batch", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .param("reads", J::u(reads))
+        .note(
+            "two arms interleaved in one process, fresh store per rep, the f42 load shape \
+             (durable per batch, partitioning on). The arms differ only in \
+             NextOptions::bulk_writer: general writes every piece through \
+             Store::create/append/checkpoint/close, bulk through SegmentWriter. The timed \
+             window is the load PLUS the drain (flush: seal, join, partition), the shape the \
+             external suite times, because on the loop alone the seal overlaps the commits \
+             and most of its cost is hidden (F42.3). load_s is the loop by itself. Device \
+             bytes from /proc/self/io over the window; disk bytes are the store's files after \
+             close; the read sample runs after the drain, so every key is sealed and routed \
+             in both arms",
+        )
+        .note("predictions registered in bulkseal-plan.md before the run");
+
+    let dir = scratch("f49");
+    let payload = Payload::new(value_size, 0.5, 0xF49);
+    let arm_names = ["general", "bulk"];
+    // ci, device MB, disk MB, load-only s, commit s, seal s, merge s, reads/s
+    type Row = (usize, f64, f64, f64, f64, f64, f64, f64);
+    let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
+    let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
+        let mut vrng = Rng::new(0xF49 + rep as u64);
+        let mut kb = [0u8; 16];
+        let d = dir.join(format!("f49-{ci}-{rep}"));
+        let _ = std::fs::remove_dir_all(&d);
+        let opts = NextOptions { bulk_writer: ci == 1, ..Default::default() };
+        let mut db = Db::create(&d, opts).expect("create");
+        let io0 = IoCounters::read_now();
+        let t = Instant::now();
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            db.append(&kb, payload.get(&mut vrng));
+            if (i + 1) % batch == 0 {
+                db.commit().expect("commit");
+            }
+        }
+        let load_s = t.elapsed().as_secs_f64();
+        db.flush().expect("flush");
+        let secs = t.elapsed().as_secs_f64();
+        let (c, s, m) = db.phase_ns();
+        let io_mb = IoCounters::read_now().since(&io0).write_bytes as f64 / 1_048_576.0;
+
+        // Random point reads over the drained store, both arms routed.
+        let mut x = 0x9EAD_5EED_u64 ^ (rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut sink = 0u64;
+        let tr = Instant::now();
+        for _ in 0..reads {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            db_key_into(z % keys, &mut kb);
+            sink += db
+                .read_all(&kb, |v| {
+                    std::hint::black_box(v);
+                })
+                .expect("read");
+        }
+        let reads_per_s = reads as f64 / tr.elapsed().as_secs_f64();
+        std::hint::black_box(sink);
+
+        db.close().expect("close");
+        let mut bytes = 0u64;
+        for e in std::fs::read_dir(&d).expect("dir") {
+            bytes += e.expect("entry").metadata().expect("meta").len();
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        rows.lock().unwrap().push((
+            ci,
+            io_mb,
+            bytes as f64 / 1_048_576.0,
+            load_s,
+            c as f64 / 1e9,
+            s as f64 / 1e9,
+            m as f64 / 1e9,
+            reads_per_s,
+        ));
+        keys as f64 / secs
+    });
+
+    let col = |ci: usize, pick: fn(&Row) -> f64| -> Vec<f64> {
+        rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect()
+    };
+    let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
+        let mut v = col(ci, pick);
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
+    rec.series(
+        "arms",
+        J::arr(
+            arm_names
+                .iter()
+                .enumerate()
+                .zip(rates.iter())
+                .map(|((ci, name), s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "ops_per_s" => J::fp(s.median(), 1),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4),
+                        "load_s" => J::fp(med(ci, |r| r.3), 3),
+                        "commit_s" => J::fp(med(ci, |r| r.4), 3),
+                        "seal_s" => J::fp(med(ci, |r| r.5), 3),
+                        "merge_s" => J::fp(med(ci, |r| r.6), 3),
+                        "device_write_mb" => J::fp(med(ci, |r| r.1), 1),
+                        "disk_mb" => J::fp(med(ci, |r| r.2), 1),
+                        "reads_per_s" => J::fp(med(ci, |r| r.7), 1)
+                    }
+                })
+                .collect(),
+        ),
+    );
+
+    let ingest = compare(&rates[1], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("bulk_vs_general_ingest", ingest.clone());
+    rec.finding(Finding::new(
+        "F49.1",
+        "the bulk segment writer ingests at least 1.25x the general writer, seal and partitioning inside the window",
+        matches!(ingest.verdict, supdb::bench::Verdict::Greater) && ingest.ratio >= 1.25,
+        format!(
+            "bulk {:.0} ops/s against general {:.0} ({}) on {keys} keys in {batch}-record durable \
+             batches with the drain inside the window. Loop alone: {:.3}s against {:.3}s; commit \
+             phase {:.3}s against {:.3}s, seal {:.3}s against {:.3}s, merge {:.3}s against {:.3}s. \
+             f46 priced the writer's floor at 2.04x the general path on the seal alone (F46.1); \
+             this is the built writer, with the block table, checksums and superblock it \
+             omitted, on the load the engine is judged by",
+            rates[1].median(),
+            rates[0].median(),
+            ingest.summary("bulk", "general"),
+            med(1, |r| r.3),
+            med(0, |r| r.3),
+            med(1, |r| r.4),
+            med(0, |r| r.4),
+            med(1, |r| r.5),
+            med(0, |r| r.5),
+            med(1, |r| r.6),
+            med(0, |r| r.6),
+        ),
+    ));
+
+    let seal_g = Samples::new(col(0, |r| r.5));
+    let seal_b = Samples::new(col(1, |r| r.5));
+    let seal = compare(&seal_g, &seal_b, supdb::bench::MIN_EFFECT);
+    rec.compare("general_vs_bulk_seal_s", seal.clone());
+    rec.finding(Finding::new(
+        "F49.2",
+        "the seal phase is at least 1.8x faster with the bulk writer",
+        matches!(seal.verdict, supdb::bench::Verdict::Greater) && seal.ratio >= 1.8,
+        format!(
+            "seal phase {:.3}s general against {:.3}s bulk ({}), as the engine accounts it. The \
+             memtable sort and the chain walk are the same in both arms; what differs is \
+             Store's hash table, freelist, pending arena and checkpoint against one forward \
+             pass. Merge phase, which writes through the same two writers: {:.3}s against {:.3}s",
+            seal_g.median(),
+            seal_b.median(),
+            seal.summary("general", "bulk"),
+            med(0, |r| r.6),
+            med(1, |r| r.6),
+        ),
+    ));
+
+    let disk_ratio = med(1, |r| r.2) / med(0, |r| r.2);
+    rec.finding(Finding::new(
+        "F49.3",
+        "bulk segments take at most 0.9x the disk of general ones",
+        disk_ratio <= 0.9,
+        format!(
+            "{:.1} MB on disk with the bulk writer against {:.1} with the general one ({:.3}x) \
+             for {:.1} MB of records; device bytes {:.1} against {:.1} MB. A bulk segment has \
+             no freelist rounding, no reuse log, no redo-log arena and no index slack. Space \
+             is immune to drift, so this ratio is a plain median ratio",
+            med(1, |r| r.2),
+            med(0, |r| r.2),
+            disk_ratio,
+            keys as f64 * (value_size as f64 + 16.0) / 1_048_576.0,
+            med(1, |r| r.1),
+            med(0, |r| r.1),
+        ),
+    ));
+
+    let rd_g = Samples::new(col(0, |r| r.7));
+    let rd_b = Samples::new(col(1, |r| r.7));
+    let rd = compare(&rd_b, &rd_g, supdb::bench::MIN_EFFECT);
+    rec.compare("bulk_vs_general_reads", rd.clone());
+    rec.finding(Finding::new(
+        "F49.4",
+        "reads over the loaded store do not differ between the writers",
+        matches!(rd.verdict, supdb::bench::Verdict::NoDifference),
+        format!(
+            "{reads} random point reads after the drain: bulk {:.0}/s against general {:.0}/s \
+             ({}). Same format, same Blob, same routing; a difference either way would mean \
+             the writers pack blocks differently enough to matter",
+            rd_b.median(),
+            rd_g.median(),
+            rd.summary("bulk", "general"),
+        ),
+    ));
+
+    Ok(rec)
+}
+
 fn f48_syncpolicy(args: &Args, profile: Profile) -> std::io::Result<Record> {
     use supdb::next::{Db, NextOptions, SyncPolicy};
 
