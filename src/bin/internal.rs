@@ -123,6 +123,7 @@ fn main() -> std::io::Result<()> {
             "f42-next" => f42_next(&args, profile)?,
             "f43-compact" => f43_compact(&args, profile)?,
             "f44-tail" => f44_tail(&args, profile)?,
+            "f45-scanfloor" => f45_scanfloor(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -5788,6 +5789,253 @@ fn f38_fanout(args: &Args, profile: Profile) -> std::io::Result<Record> {
         ),
     ));
 
+    Ok(rec)
+}
+
+/// Pricing the inline-key format change before building it. The
+/// predictions are in scanfloor-plan.md; the question is how much of an
+/// ordered scan is key RESOLUTION -- which an inline layout removes --
+/// against value reading, which it does not.
+fn f45_scanfloor(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use std::io::Write as _;
+    use supdb::bytes::MmapBytes;
+    use supdb::next::{Db, NextOptions};
+
+    use supdb::Blob;
+
+    let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let scans = args.num("--scans", profile.pick(500, 3_000, 10_000)) as u64;
+    let scan_len = args.num("--scan-len", 100);
+
+    let mut rec = Record::new("f45-scanfloor", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .param("scans", J::u(scans))
+        .param("scan_len", J::u(scan_len as u64))
+        .note(
+            "one store, five arms interleaved, every arm answering the same ranges: the engine's \
+             ordered scan, an index walk with no values, a value read with no keys, and a linear \
+             sweep of a synthetic file holding klen|key|vlen|value in key order -- the ceiling an \
+             inline-key layout could reach",
+        )
+        .note(
+            "the sweep's start offset is precomputed and not timed: a real implementation finds it \
+             with one index lookup amortised over the whole range, and timing a lookup per entry \
+             would price the thing the change exists to remove",
+        )
+        .note("predictions registered in scanfloor-plan.md before the run");
+
+    let dir = scratch("f45");
+    let payload = Payload::new(value_size, 0.5, 0xF45);
+
+    // One store, built once: every arm reads the same bytes.
+    let d = dir.join("store");
+    let _ = std::fs::remove_dir_all(&d);
+    let mut db = Db::create(&d, NextOptions::default()).expect("create");
+    let mut vrng = Rng::new(0xF45);
+    let mut kb = [0u8; 16];
+    for i in 0..keys {
+        db_key_into(i, &mut kb);
+        db.append(&kb, payload.get(&mut vrng));
+        if (i + 1) % 1_000 == 0 {
+            db.commit().expect("commit");
+        }
+    }
+    db.flush().expect("flush");
+
+    // The same records again, keys inline, in key order. `db_key_into` is
+    // monotone in i, so appending in i order IS key order.
+    let flat_path = dir.join("inline.dat");
+    let mut offsets: Vec<u64> = Vec::with_capacity(keys as usize);
+    {
+        let mut vrng = Rng::new(0xF45);
+        let mut out: Vec<u8> = Vec::with_capacity((keys as usize) * (value_size + 24));
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            let v = payload.get(&mut vrng);
+            offsets.push(out.len() as u64);
+            out.extend_from_slice(&(kb.len() as u32).to_le_bytes());
+            out.extend_from_slice(&kb);
+            out.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            out.extend_from_slice(v);
+        }
+        let mut f = std::fs::File::create(&flat_path).expect("create flat");
+        f.write_all(&out).expect("write flat");
+        f.sync_all().expect("sync flat");
+    }
+    // Read it into memory rather than mapping: the arm is measuring a
+    // linear sweep, and a Vec is the least interesting thing that can hold
+    // the bytes -- no mapping behaviour to explain away either direction.
+    let flat_bytes = std::fs::read(&flat_path).expect("read flat");
+
+    // The segment the engine will actually walk, for the two arms that
+    // want `Blob` directly rather than through `Db`.
+    let seg_name = std::fs::read_dir(&d)
+        .expect("dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.ends_with(".sup"))
+        .expect("a sealed segment");
+    let blob = Blob::open(MmapBytes::open(&d.join(&seg_name)).expect("map seg")).expect("blob");
+    rec.param("segments_in_store", J::u(db.segments() as u64));
+
+    let arm_names = ["scan", "index-walk", "values", "inline-sweep"];
+    let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
+        let mut g = KeyGen::new(
+            KeyDist::Uniform,
+            keys.saturating_sub(scan_len as u64).max(1),
+            0x45 + rep as u64,
+        );
+        let mut kb = [0u8; 16];
+        let t = Instant::now();
+        let mut sink = 0u64;
+        for _ in 0..scans {
+            let start = g.next();
+            db_key_into(start, &mut kb);
+            match ci {
+                0 => {
+                    db.scan(&kb, scan_len, |_k, v| {
+                        sink += v.len() as u64;
+                    })
+                    .expect("scan");
+                }
+                1 => {
+                    // What the index alone costs: a key per rank, no value.
+                    let mut rank = blob.seek(&kb);
+                    for _ in 0..scan_len {
+                        match blob.key_at(rank) {
+                            Some(k) => sink += k.len() as u64,
+                            None => break,
+                        }
+                        rank += 1;
+                    }
+                }
+                2 => {
+                    // Resolution plus the block read, no key returned.
+                    let mut rank = blob.seek(&kb);
+                    for _ in 0..scan_len {
+                        let n = blob
+                            .values_at(rank, |v| sink += v.len() as u64)
+                            .expect("values_at");
+                        if n == 0 {
+                            break;
+                        }
+                        rank += 1;
+                    }
+                }
+                _ => {
+                    // The ceiling: one linear pass, nothing resolved.
+                    let mut p = offsets[start as usize] as usize;
+                    for _ in 0..scan_len {
+                        if p + 4 > flat_bytes.len() {
+                            break;
+                        }
+                        let kl = u32::from_le_bytes(
+                            flat_bytes[p..p + 4].try_into().expect("klen"),
+                        ) as usize;
+                        p += 4;
+                        sink += flat_bytes[p..p + kl].len() as u64;
+                        p += kl;
+                        let vl = u32::from_le_bytes(
+                            flat_bytes[p..p + 4].try_into().expect("vlen"),
+                        ) as usize;
+                        p += 4;
+                        sink += flat_bytes[p..p + vl].len() as u64;
+                        p += vl;
+                    }
+                }
+            }
+        }
+        std::hint::black_box(sink);
+        (scans as f64 * scan_len as f64) / t.elapsed().as_secs_f64()
+    });
+
+    rec.series(
+        "arms",
+        J::arr(
+            arm_names
+                .iter()
+                .zip(rates.iter())
+                .map(|(name, s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "entries_per_s" => J::fp(s.median(), 1),
+                        "ns_per_entry" => J::fp(1e9 / s.median(), 1),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4)
+                    }
+                })
+                .collect(),
+        ),
+    );
+    rec.series(
+        "bytes",
+        jobj! {
+            "store_mb" => J::fp(
+                std::fs::read_dir(&d)
+                    .expect("dir")
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+                    .sum::<u64>() as f64
+                    / 1_048_576.0,
+                1
+            ),
+            "inline_mb" => J::fp(
+                std::fs::metadata(&flat_path).expect("meta").len() as f64 / 1_048_576.0,
+                1
+            )
+        },
+    );
+
+    let cmp_sweep = compare(&rates[3], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("inline_sweep_vs_scan", cmp_sweep.clone());
+    let gain = rates[3].median() / rates[0].median().max(1e-9);
+    rec.finding(Finding::new(
+        "F45.1",
+        "an inline-key layout would at least double the ordered scan",
+        gain >= 2.0 && matches!(cmp_sweep.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "a linear sweep of the same records with keys inline runs {:.0} entries/s against the \
+             engine's scan at {:.0} -- {gain:.2}x ({}). scanfloor-plan.md registered 2x as the bar \
+             worth a format change and 1.3x as the floor below which it should not be built",
+            rates[3].median(),
+            rates[0].median(),
+            cmp_sweep.summary("inline-sweep", "scan")
+        ),
+    ));
+
+    let ns = |s: &Samples| 1e9 / s.median();
+    let share = ns(&rates[1]) / ns(&rates[0]);
+    rec.finding(Finding::new(
+        "F45.2",
+        "key resolution is the larger half of an ordered scan's cost",
+        share >= 0.40,
+        format!(
+            "walking the index alone costs {:.1}ns an entry against the full scan's {:.1} -- \
+             {:.1}% of it -- and reading values without returning keys costs {:.1}ns. If the \
+             index share is small the cost is in value bytes, which an inline layout does not \
+             avoid, and the premise behind the change is wrong",
+            ns(&rates[1]),
+            ns(&rates[0]),
+            share * 100.0,
+            ns(&rates[2])
+        ),
+    ));
+
+    // EXT.24's comparator on this host, cited rather than re-run.
+    rec.finding(Finding::new(
+        "F45.3",
+        "the sweep clears the LMDB scan rate this host last recorded",
+        rates[3].median() >= 16_979_241.0,
+        format!(
+            "the sweep runs {:.0} entries/s against the 16,979,241 lmdb last recorded here \
+             (ext-kv, cited as context -- no finding compares across runs). A ceiling below the \
+             comparator would mean this format change cannot close EXT.24 whatever it costs",
+            rates[3].median()
+        ),
+    ));
+
+    let _ = db.close();
     Ok(rec)
 }
 
