@@ -1469,6 +1469,8 @@ impl Db {
                 .read_all(key, &mut f)
                 .map_err(|e| err(&format!("segment read: {e}")))?;
         }
+        // An empty memtable is still a hash of the key and a probe, and a
+        // reader that has flushed pays it on every lookup for nothing.
         if let Some(fr) = &self.frozen {
             if let Some(e) = fr.get(key) {
                 for off in fr.chain(e) {
@@ -1477,11 +1479,13 @@ impl Db {
                 n += e.count;
             }
         }
-        if let Some(e) = self.mem.get(key) {
-            for off in self.mem.chain(e) {
-                f(self.mem.value_at(off));
+        if !self.mem.is_empty() {
+            if let Some(e) = self.mem.get(key) {
+                for off in self.mem.chain(e) {
+                    f(self.mem.value_at(off));
+                }
+                n += e.count;
             }
-            n += e.count;
         }
         Ok(n)
     }
