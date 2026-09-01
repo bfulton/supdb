@@ -283,9 +283,14 @@ interleaved where the harness allows:
   ordered keys every seal lands in the last partition, which is rewritten
   and re-split each round -- ordered keys wrote *more* device bytes than
   random ones at 16 MB seals (F54.2). What makes ordered ingest
-  incremental is promotion, not selection: a piece whose keys all lie
-  above a partition's last key becomes a partition by rename, with
-  nothing rewritten (promote-plan.md, f55).
+  incremental is promotion, not selection, and it is built: a piece whose
+  keys all lie above a partition's last key becomes a partition by rename
+  -- hard links, one manifest write, the old names unlinked -- with nothing
+  rewritten. f55: on a log's key order at 16 MB seals, device bytes
+  **0.453x**, ingest-to-routed **1.688x** (561,195 against 332,397 ops/s)
+  with the merge phase at zero, reads unchanged; on uniform keys nothing
+  qualifies and nothing changes (F55.1-F55.4, all held). The canonical
+  run's shape is uniform, so EXT.22 does not move; a log does.
 - **Partitioned compaction policy** — built and measured (f43). The tail
   bound is a real dial: T8 sends 0.898x of T4's device bytes and scans
   0.910x as fast. What f43 also convicted is the merge itself — it

@@ -1371,6 +1371,34 @@
    "profile": "full",
    "expect": "holds",
    "because": "P54.4 held: reads after the drain do not differ between the flushes under either key order (uniform 516 against 488 ns, p=0.32; sequential 472 against 475 ns, p=0.96). Both leave a fully routed store; the range flush keeps the boundaries where they were and leaves four partitions where the full flush re-derived three."
+  },
+  {
+   "experiment": "f55-promote",
+   "id": "F55.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P55.1 held past its bar: with sequential keys at 16 MB seals, promotion takes device bytes to 300.1 MB against 662.6 with the merge, 0.453x, with the merge phase at 0.000s against 0.943s and seven partitions where the merge left four. A piece whose keys lie above the partition's last key becomes a partition by rename -- hard links, one manifest write, the old names unlinked -- so the data is written once to the WAL and once to its seal, and nothing is rewritten. This is what the incremental merge turned out to be: not selecting ranges (F54.2), but not merging at all when nothing overlaps."
+  },
+  {
+   "experiment": "f55-promote",
+   "id": "F55.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P55.2 held past its bar: sequential ingest-to-routed is 561,195 ops/s with promotion against 332,397 with the merge, 1.688x at p=0.0022; seal 0.209s against 0.266s, merge 0.000s against 0.943s, commit 0.932s against 1.188s. A log's shape now routes itself as it is written, and the drain has nothing to do but publish."
+  },
+  {
+   "experiment": "f55-promote",
+   "id": "F55.3",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P55.3 held: with uniform keys device bytes are 696.6 MB either way (1.000x), ingest 326,560 against 321,830 ops/s (a tie at p=0.52), four partitions either way. Every piece of a uniform load spans the whole key space, so nothing qualifies and nothing changes -- which is the guarantee that promotion cannot cost the shape the canonical run measures."
+  },
+  {
+   "experiment": "f55-promote",
+   "id": "F55.4",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P55.4 held: reads after the drain do not differ with promotion under either key order (uniform 462 against 535 ns, p=0.08; sequential 471 against 453 ns, p=0.56). Promoted pieces are partitions, fence-routed with no Bloom to consult; an ordered load leaves more of them (seven against four) and the fence search is a binary search, which the tie says costs nothing measurable."
   }
  ],
  "metrics": [

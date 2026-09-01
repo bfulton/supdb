@@ -152,10 +152,13 @@ async function main() {
     () => damaged.lookup(expected.corrupt.key),
     "checksum",
   );
-  await throws(
-    "the walked count of the damaged key fails too",
-    () => damaged.count(expected.corrupt.key),
-    "checksum",
+  // The count no longer walks the block: since format v5 it is read out of
+  // the extent record, so damage inside the block cannot reach it and it
+  // must still answer rather than fail.
+  eq(
+    "the count of the damaged key answers from the index",
+    damaged.count(expected.corrupt.key) > 0,
+    true,
   );
   // Repeated, because the first version of Blob::verify marked a chunk
   // verified before comparing it: the error fired once and the next read
