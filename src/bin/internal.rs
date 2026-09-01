@@ -124,6 +124,7 @@ fn main() -> std::io::Result<()> {
             "f43-compact" => f43_compact(&args, profile)?,
             "f44-tail" => f44_tail(&args, profile)?,
             "f45-scanfloor" => f45_scanfloor(&args, profile)?,
+            "f46-segwrite" => f46_segwrite(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -5790,6 +5791,181 @@ fn f38_fanout(args: &Args, profile: Profile) -> std::io::Result<Record> {
     ));
 
     Ok(rec)
+}
+
+/// Pricing a purpose-built segment writer before building one. The
+/// predictions are in segwrite-plan.md. Two arms over the same sorted
+/// input: what a seal does today, and the floor a bespoke writer could
+/// reach -- the value bytes laid down sequentially plus one
+/// `flatindex::encode`, with no block table, checksums or superblock, so
+/// a real writer lands above it.
+fn f46_segwrite(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use std::io::Write as _;
+    use supdb::flatindex;
+    use supdb::index::{Ext, Extents};
+
+    let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+
+    let mut rec = Record::new("f46-segwrite", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .note(
+            "two arms interleaved over the same sorted input, one value a key -- the shape a \
+             seal has after its sort. store-writer is what a seal does today; bulk-parts is the \
+             floor a purpose-built writer could reach and NOT an implementation of one: it omits \
+             the block table, the checksums and the superblock, so a real writer lands above it",
+        )
+        .note("predictions registered in segwrite-plan.md before the run");
+
+    let dir = scratch("f46");
+    let payload = Payload::new(value_size, 0.5, 0xF46);
+    // The input both arms consume, materialised once and outside the timer:
+    // sorted keys with one value each, which is what a memtable hands a
+    // seal after `sort_unstable_by_key`.
+    let mut kbuf: Vec<[u8; 16]> = Vec::with_capacity(keys as usize);
+    let mut vals: Vec<Vec<u8>> = Vec::with_capacity(keys as usize);
+    {
+        let mut vrng = Rng::new(0xF46);
+        let mut kb = [0u8; 16];
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            kbuf.push(kb);
+            vals.push(payload.get(&mut vrng).to_vec());
+        }
+    }
+
+    let arm_names = ["store-writer", "bulk-parts"];
+    let index_ns: std::sync::Mutex<Vec<Samples>> =
+        std::sync::Mutex::new(vec![Samples::default(); 2]);
+    let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
+        let t = Instant::now();
+        if ci == 0 {
+            let file = dir.join(format!("s{rep}.dat"));
+            let _ = std::fs::remove_file(&file);
+            let store = Store::create(&file, default_opts(64)).expect("create");
+            for (k, v) in kbuf.iter().zip(vals.iter()) {
+                store.append(k, v).expect("append");
+            }
+            store.checkpoint().expect("checkpoint");
+            store.close().expect("close");
+            let _ = std::fs::remove_file(&file);
+        } else {
+            // Values, in key order, straight down. A real writer frames
+            // them into blocks; the framing is a varint a value and is not
+            // what this arm is trying to price.
+            let file = dir.join(format!("b{rep}.dat"));
+            let mut out: Vec<u8> = Vec::with_capacity(vals.len() * (value_size + 4));
+            let mut exts: Vec<Extents> = Vec::with_capacity(kbuf.len());
+            for v in vals.iter() {
+                let off = out.len() as u32;
+                put_uvarint_bench(&mut out, v.len() as u64);
+                out.extend_from_slice(v);
+                exts.push(Extents::One(Ext {
+                    block: 0,
+                    off,
+                    len: (out.len() as u32) - off,
+                    last: off,
+                }));
+            }
+            {
+                let mut f = std::fs::File::create(&file).expect("create");
+                f.write_all(&out).expect("write");
+                f.sync_all().expect("sync");
+            }
+            // The half a bespoke writer cannot skip: a checkpoint builds
+            // this section too, so if it dominates there is little to win.
+            let ti = Instant::now();
+            let all: Vec<(&[u8], &Extents)> = kbuf
+                .iter()
+                .map(|k| k.as_slice())
+                .zip(exts.iter())
+                .collect();
+            let sec = flatindex::encode(&all, 1, None, flatindex::key_hash, 0, false)
+                .expect("encode");
+            index_ns.lock().unwrap()[ci].push(ti.elapsed().as_nanos() as f64);
+            std::hint::black_box(sec.0.len());
+            let _ = std::fs::remove_file(&file);
+        }
+        keys as f64 / t.elapsed().as_secs_f64()
+    });
+
+    let idx = index_ns.lock().unwrap()[1].clone();
+    rec.series(
+        "arms",
+        J::arr(
+            arm_names
+                .iter()
+                .zip(rates.iter())
+                .map(|(name, s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "keys_per_s" => J::fp(s.median(), 1),
+                        "s_per_million" => J::fp(1e6 / s.median(), 3),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4)
+                    }
+                })
+                .collect(),
+        ),
+    );
+    let idx_s = idx.median() / 1e9;
+    let bulk_s = 1e6 / rates[1].median();
+    rec.series(
+        "bulk_split",
+        jobj! {
+            "index_encode_s" => J::fp(idx_s, 3),
+            "index_share" => J::fp(idx_s / bulk_s.max(1e-9), 3)
+        },
+    );
+
+    let cmp = compare(&rates[1], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("bulk_vs_store_writer", cmp.clone());
+    let gain = rates[1].median() / rates[0].median().max(1e-9);
+    rec.finding(Finding::new(
+        "F46.1",
+        "a purpose-built segment writer's floor is at least 3x the general put path",
+        gain >= 3.0 && matches!(cmp.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "the floor writes {:.0} keys/s against the store writer's {:.0} -- {gain:.2}x ({}), \
+             {:.2}s a million against {:.2}s. segwrite-plan.md registered 3x as the bar worth a \
+             second writer in the format layer and 5x as clearly worth it. The floor omits the \
+             block table, the checksums and the superblock, so a real writer lands above it",
+            rates[1].median(),
+            rates[0].median(),
+            cmp.summary("bulk-parts", "store-writer"),
+            1e6 / rates[1].median(),
+            1e6 / rates[0].median()
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F46.2",
+        "building the index is the smaller half of what a bespoke writer must do",
+        idx_s / bulk_s < 0.5,
+        format!(
+            "`flatindex::encode` over {keys} keys takes {:.3}s of the floor's {:.3}s, {:.1}%. A \
+             checkpoint already pays this and no writer can skip it, so if it dominated there \
+             would be little left to win",
+            idx_s,
+            bulk_s,
+            100.0 * idx_s / bulk_s.max(1e-9)
+        ),
+    ));
+
+    Ok(rec)
+}
+
+/// A varint, for an experiment that is imitating the writer rather than
+/// calling it.
+fn put_uvarint_bench(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(b);
+            break;
+        }
+        out.push(b | 0x80);
+    }
 }
 
 /// Pricing the inline-key format change before building it. The

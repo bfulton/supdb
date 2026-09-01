@@ -40,13 +40,20 @@ mod block;
 #[allow(clippy::all, dead_code)]
 mod freelist;
 #[allow(clippy::all, dead_code)]
-mod index;
+/// The extent types the index is built from. Public because the next
+/// engine writes segments and a writer needs to name what it is writing;
+/// the format is otherwise reached through `Store` and `Blob`.
+pub mod index;
 // Not vendored -- written here, so it holds to -D warnings like the harness.
 // On wasm its writer half (`plan`, `encode`, the slack and fence arithmetic)
 // has no caller, because there is no writer there. Allowed on that target
 // only, so the native build keeps telling the truth about dead code.
 #[cfg_attr(target_family = "wasm", allow(dead_code))]
-mod flatindex;
+/// The flat key index, including the builders a segment writer drives.
+/// Public for the same reason as `index`: a bulk writer for sorted,
+/// write-once input is a legitimate second producer of this format, and
+/// f46 prices one.
+pub mod flatindex;
 #[allow(clippy::all, dead_code)]
 pub mod keytable;
 // The reader table is shared with a *writer*, and there is no writer on wasm.
