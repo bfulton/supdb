@@ -6649,7 +6649,15 @@ fn f52_segsize(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let dir = scratch("f52");
     let payload = Payload::new(value_size, 0.5, 0xF52);
-    let arms: [(&str, usize); 4] = [("64mb", 64 << 20), ("32mb", 32 << 20), ("16mb", 16 << 20), ("8mb", 8 << 20)];
+    // seal bytes, and the partition size (None: coupled to the seal, the
+    // shipping behaviour when this was first run).
+    let arms: [(&str, usize, Option<usize>); 5] = [
+        ("64mb", 64 << 20, None),
+        ("32mb", 32 << 20, None),
+        ("32mb-p64", 32 << 20, Some(64 << 20)),
+        ("16mb", 16 << 20, None),
+        ("8mb", 8 << 20, None),
+    ];
     // ci, device MB, disk MB, load-only s, commit s, seal s, merge s, read ns, partitions
     type Row = (usize, f64, f64, f64, f64, f64, f64, f64, f64);
     let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
@@ -6658,7 +6666,11 @@ fn f52_segsize(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let mut kb = [0u8; 16];
         let d = dir.join(format!("f52-{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
-        let opts = NextOptions { seal_bytes: arms[ci].1, ..Default::default() };
+        let opts = NextOptions {
+            seal_bytes: arms[ci].1,
+            partition_bytes: arms[ci].2,
+            ..Default::default()
+        };
         let mut db = Db::create(&d, opts).expect("create");
         let io0 = IoCounters::read_now();
         let t = Instant::now();
@@ -6727,7 +6739,7 @@ fn f52_segsize(args: &Args, profile: Profile) -> std::io::Result<Record> {
             arms.iter()
                 .enumerate()
                 .zip(rates.iter())
-                .map(|((ci, (name, _)), s)| {
+                .map(|((ci, (name, _, _)), s)| {
                     jobj! {
                         "arm" => J::s(*name),
                         "ops_per_s" => J::fp(s.median(), 1),
@@ -6746,15 +6758,24 @@ fn f52_segsize(args: &Args, profile: Profile) -> std::io::Result<Record> {
         ),
     );
 
-    let i16 = compare(&rates[2], &rates[0], supdb::bench::MIN_EFFECT);
+    let (a64, a32, a32p, a16, a8) = (0usize, 1usize, 2usize, 3usize, 4usize);
+    let i16 = compare(&rates[a16], &rates[a64], supdb::bench::MIN_EFFECT);
     rec.compare("16mb_vs_64mb_ingest", i16.clone());
-    let i32 = compare(&rates[1], &rates[0], supdb::bench::MIN_EFFECT);
+    let i32 = compare(&rates[a32], &rates[a64], supdb::bench::MIN_EFFECT);
     rec.compare("32mb_vs_64mb_ingest", i32.clone());
-    let i8 = compare(&rates[3], &rates[2], supdb::bench::MIN_EFFECT);
+    let i32p = compare(&rates[a32p], &rates[a64], supdb::bench::MIN_EFFECT);
+    rec.compare("32mb_p64_vs_64mb_ingest", i32p.clone());
+    let i8 = compare(&rates[a8], &rates[a16], supdb::bench::MIN_EFFECT);
     rec.compare("8mb_vs_16mb_ingest", i8.clone());
-    let r16 = Samples::new(col(2, |r| r.7));
-    let r64 = Samples::new(col(0, |r| r.7));
-    let r8 = Samples::new(col(3, |r| r.7));
+    let r64 = Samples::new(col(a64, |r| r.7));
+    let r32 = Samples::new(col(a32, |r| r.7));
+    let r32p = Samples::new(col(a32p, |r| r.7));
+    let r16 = Samples::new(col(a16, |r| r.7));
+    let r8 = Samples::new(col(a8, |r| r.7));
+    let rd32 = compare(&r32, &r64, supdb::bench::MIN_EFFECT);
+    rec.compare("read_ns_32mb_vs_64mb", rd32.clone());
+    let rd32p = compare(&r32p, &r64, supdb::bench::MIN_EFFECT);
+    rec.compare("read_ns_32mb_p64_vs_64mb", rd32p.clone());
     let rd16 = compare(&r16, &r64, supdb::bench::MIN_EFFECT);
     rec.compare("read_ns_16mb_vs_64mb", rd16.clone());
     let rd8 = compare(&r8, &r64, supdb::bench::MIN_EFFECT);
@@ -6769,22 +6790,22 @@ fn f52_segsize(args: &Args, profile: Profile) -> std::io::Result<Record> {
              64 MB: commit {:.3}s/{:.3}s, seal {:.3}s/{:.3}s, merge {:.3}s/{:.3}s; the loop alone \
              {:.3}s/{:.3}s. Smaller seals move the merges off the drain and onto the other cores \
              while the load runs",
-            rates[2].median(),
-            rates[0].median(),
+            rates[a16].median(),
+            rates[a64].median(),
             i16.summary("16mb", "64mb"),
-            rates[1].median(),
+            rates[a32].median(),
             i32.summary("32mb", "64mb"),
-            med(2, |r| r.4),
-            med(0, |r| r.4),
-            med(2, |r| r.5),
-            med(0, |r| r.5),
-            med(2, |r| r.6),
-            med(0, |r| r.6),
-            med(2, |r| r.3),
-            med(0, |r| r.3),
+            med(a16, |r| r.4),
+            med(a64, |r| r.4),
+            med(a16, |r| r.5),
+            med(a64, |r| r.5),
+            med(a16, |r| r.6),
+            med(a64, |r| r.6),
+            med(a16, |r| r.3),
+            med(a64, |r| r.3),
         ),
     ));
-    let dev_ratio = med(2, |r| r.1) / med(0, |r| r.1);
+    let dev_ratio = med(a16, |r| r.1) / med(a64, |r| r.1);
     rec.finding(Finding::new(
         "F52.2",
         "at 16 MB seals, device bytes are at most 2.0x the 64 MB arm's",
@@ -6794,19 +6815,19 @@ fn f52_segsize(args: &Args, profile: Profile) -> std::io::Result<Record> {
              8 MB {:.1}. Disk after the drain {:.1}/{:.1}/{:.1}/{:.1} MB for 64/32/16/8, \
              partitions {:.0}/{:.0}/{:.0}/{:.0}. Every merge round rewrites the live set the \
              new pieces touch; this is that amplification, measured",
-            med(2, |r| r.1),
-            med(0, |r| r.1),
+            med(a16, |r| r.1),
+            med(a64, |r| r.1),
             dev_ratio,
-            med(1, |r| r.1),
-            med(3, |r| r.1),
-            med(0, |r| r.2),
-            med(1, |r| r.2),
-            med(2, |r| r.2),
-            med(3, |r| r.2),
-            med(0, |r| r.8),
-            med(1, |r| r.8),
-            med(2, |r| r.8),
-            med(3, |r| r.8),
+            med(a32, |r| r.1),
+            med(a8, |r| r.1),
+            med(a64, |r| r.2),
+            med(a32, |r| r.2),
+            med(a16, |r| r.2),
+            med(a8, |r| r.2),
+            med(a64, |r| r.8),
+            med(a32, |r| r.8),
+            med(a16, |r| r.8),
+            med(a8, |r| r.8),
         ),
     ));
     rec.finding(Finding::new(
@@ -6818,11 +6839,11 @@ fn f52_segsize(args: &Args, profile: Profile) -> std::io::Result<Record> {
             "{:.0} ns per point read at 64 MB, {:.0} at 32, {:.0} at 16 ({}), {:.0} at 8 ({}). \
              After the drain every arm is partitions only and the partition count is set by \
              max_keys, not the seal size",
-            med(0, |r| r.7),
-            med(1, |r| r.7),
-            med(2, |r| r.7),
+            med(a64, |r| r.7),
+            med(a32, |r| r.7),
+            med(a16, |r| r.7),
             rd16.summary("16mb", "64mb"),
-            med(3, |r| r.7),
+            med(a8, |r| r.7),
             rd8.summary("8mb", "64mb"),
         ),
     ));
@@ -6834,13 +6855,54 @@ fn f52_segsize(args: &Args, profile: Profile) -> std::io::Result<Record> {
             "8 MB {:.0} ops/s against 16 MB {:.0} ({}); device bytes {:.1} against {:.1} MB, \
              merge phase {:.3}s against {:.3}s. Below some size the merge amplification and \
              the per-seal fixed costs take back what the overlap gave",
-            rates[3].median(),
-            rates[2].median(),
+            rates[a8].median(),
+            rates[a16].median(),
             i8.summary("8mb", "16mb"),
-            med(3, |r| r.1),
-            med(2, |r| r.1),
-            med(3, |r| r.6),
-            med(2, |r| r.6),
+            med(a8, |r| r.1),
+            med(a16, |r| r.1),
+            med(a8, |r| r.6),
+            med(a16, |r| r.6),
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F52.5",
+        "32 MB seals over 64 MB partitions ingest at least 1.10x the 64 MB arm",
+        matches!(i32p.verdict, supdb::bench::Verdict::Greater) && i32p.ratio >= 1.10,
+        format!(
+            "32mb-p64 {:.0} ops/s against 64 MB {:.0} ({}); 32 MB with coupled partitions {:.0} \
+             ({}). Phases 32mb-p64 against 64 MB: commit {:.3}s/{:.3}s, seal {:.3}s/{:.3}s, merge \
+             {:.3}s/{:.3}s; device bytes {:.1} against {:.1} MB; partitions {:.0} against {:.0}. \
+             Three seals overlap the load where one did, and no extra merge round is triggered",
+            rates[a32p].median(),
+            rates[a64].median(),
+            i32p.summary("32mb-p64", "64mb"),
+            rates[a32].median(),
+            i32.summary("32mb", "64mb"),
+            med(a32p, |r| r.4),
+            med(a64, |r| r.4),
+            med(a32p, |r| r.5),
+            med(a64, |r| r.5),
+            med(a32p, |r| r.6),
+            med(a64, |r| r.6),
+            med(a32p, |r| r.1),
+            med(a64, |r| r.1),
+            med(a32p, |r| r.8),
+            med(a64, |r| r.8),
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F52.6",
+        "32 MB seals over 64 MB partitions read no slower than 64 MB seals after the drain",
+        matches!(rd32p.verdict, supdb::bench::Verdict::NoDifference),
+        format!(
+            "{:.0} ns per point read for 32mb-p64 against {:.0} at 64 MB ({}); 32 MB with coupled \
+             partitions {:.0} ({}). Same partition count, same reads; the read cost the first \
+             run charged to the seal size was the partition count's",
+            med(a32p, |r| r.7),
+            med(a64, |r| r.7),
+            rd32p.summary("32mb-p64", "64mb"),
+            med(a32, |r| r.7),
+            rd32.summary("32mb", "64mb"),
         ),
     ));
     Ok(rec)

@@ -41,3 +41,22 @@ engine code changes: the arms are one option apart.
 The shipping `seal_bytes`, and whether the incremental merge is the next
 build (if P52.2 refutes high, it is) or the sweep alone buys the ingest
 back (if P52.1 holds at a tolerable P52.2).
+
+## Amendment, registered before the second run
+
+The first run refuted P52.1 and P52.3 together and for one reason: the
+first partitioning sized its partitions from the seal size (3, 6, 12 and
+24 partitions for 64, 32, 16 and 8 MB), and more partitions read slower
+after the drain (7% at 16 MB, 12% at 8). What held instead was an interior
+optimum at 32 MB: 1.142x ingest at identical device bytes, because three
+seals overlap the load and no extra merge round is triggered. So the
+partition size is decoupled from the seal size (`NextOptions::partition_bytes`,
+`None` keeps today's coupling) and f52 gains a fifth arm, 32 MB seals with
+64 MB partitions.
+
+- **P52.5 — 32 MB seals with 64 MB partitions ingest at least 1.10x the
+  64 MB arm** (Greater at the 5% floor), keeping what the first run found.
+- **P52.6 — and read no slower than it after the drain** (`no_difference`),
+  because they leave the same three partitions behind. If both hold, the
+  shipping configuration becomes 32 MB seals over 64 MB partitions and the
+  canonical run is taken again under it.

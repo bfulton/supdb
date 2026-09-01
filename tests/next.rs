@@ -763,6 +763,7 @@ fn idle_io_priority_and_sync_spreading_change_nothing_observable() {
         l0_trigger: 3,
         background_io: BackgroundIo::Idle,
         seal_sync_every: 64 << 10,
+        partition_bytes: Some(512 << 10),
         ..NextOptions::default()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();

@@ -159,6 +159,12 @@ pub struct NextOptions {
     /// streams blocks, so its dirty pages leave in slices rather than in
     /// one flush at the end. Zero syncs at the end only (f51).
     pub seal_sync_every: usize,
+    /// Target bytes per partition: how many partitions the first
+    /// partitioning cuts, and how many keys one holds before a merge splits
+    /// it. `None` uses `seal_bytes`, which is how f52 found that smaller
+    /// seals were also making more partitions and paying for them on every
+    /// read; `Some` decouples the two.
+    pub partition_bytes: Option<usize>,
 }
 
 impl Default for NextOptions {
@@ -174,6 +180,7 @@ impl Default for NextOptions {
             cursor_merge: true,
             background_io: BackgroundIo::Normal,
             seal_sync_every: 0,
+            partition_bytes: None,
         }
     }
 }
@@ -2359,6 +2366,7 @@ impl Db {
         if inputs.is_empty() {
             return Ok(());
         }
+        let pb = self.opts.partition_bytes.unwrap_or(self.opts.seal_bytes).max(1);
         let parts = match &fences {
             Some(f) => f.len(),
             None => {
@@ -2367,7 +2375,7 @@ impl Db {
                     .filter_map(|n| std::fs::metadata(self.dir.join(n)).ok())
                     .map(|m| m.len())
                     .sum();
-                (b as usize).div_ceil(self.opts.seal_bytes.max(1)).max(1)
+                (b as usize).div_ceil(pb).max(1)
             }
         };
         let bytes: u64 = inputs
@@ -2382,7 +2390,7 @@ impl Db {
             .map(|s| s.blob.keys())
             .sum();
         let per_key = (bytes as f64 / live_keys.max(1) as f64).max(1.0);
-        let max_keys = ((self.opts.seal_bytes as f64 / per_key) as usize).max(1_000);
+        let max_keys = ((pb as f64 / per_key) as usize).max(1_000);
         let end_seq = self.covered_seq;
         let first_id = self.next_seg;
         // A split can turn one fence into several, so ids are reserved
