@@ -603,6 +603,122 @@ impl Engine for Redb {
     }
 }
 
+// ---------------------------------------------------------------- rocksdb --
+
+/// RocksDB through rust-rocksdb.
+///
+/// The engine the next engine is shaped like -- a write-ahead log, a
+/// memtable, sorted immutable files and compaction -- and so the comparator
+/// that separates "the next engine is fast" from "an LSM is fast". Two
+/// arms, as for LMDB: `rocksdb` syncs the WAL on every batch, matching the
+/// next engine's `Sync::Always` and LMDB's default; `rocksdb-nosync` writes
+/// the WAL and lets the OS get to it, matching `lmdb-nosync` and
+/// `supdb-buffered`.
+///
+/// Options are RocksDB's defaults except that compression is off, because
+/// every other engine here stores values as written (block compression is
+/// off in supdb since f12 priced it) and a comparison of compressed bytes
+/// against plain ones would be a comparison of codecs, and that reads do
+/// not verify block checksums, because the matched arms of every other
+/// engine here verify none and the fairness gate refuses to rank a pair
+/// that differs on that axis. RocksDB still *computes* a CRC-32C per block
+/// when it writes one; that residual leans against RocksDB on the load,
+/// by one hardware CRC per 4 KB block, and is named here rather than
+/// equalized because the table format does not offer a switch this
+/// binding exposes.
+pub struct Rocks {
+    db: rocksdb::DB,
+    path: PathBuf,
+    sync: bool,
+    read: rocksdb::ReadOptions,
+}
+
+impl Rocks {
+    pub fn create(path: &Path, sync: bool) -> Res<Rocks> {
+        std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
+        let mut o = rocksdb::Options::default();
+        o.create_if_missing(true);
+        o.set_compression_type(rocksdb::DBCompressionType::None);
+        let db = rocksdb::DB::open(&o, path).map_err(|e| e.to_string())?;
+        let mut read = rocksdb::ReadOptions::default();
+        read.set_verify_checksums(false);
+        Ok(Rocks { db, path: path.to_path_buf(), sync, read })
+    }
+}
+
+impl Engine for Rocks {
+    fn name(&self) -> &'static str {
+        if self.sync {
+            "rocksdb"
+        } else {
+            "rocksdb-nosync"
+        }
+    }
+    fn features(&self) -> Features {
+        Features {
+            durable_commit: self.sync,
+            // A WriteBatch is applied whole or not at all and is readable by
+            // this handle the moment `write` returns: the same atomic-batch,
+            // read-your-writes contract the next engine's `Txn` and LMDB's
+            // write transaction give the suite. Reader isolation beyond that
+            // is RocksDB's snapshot, which no workload here needs.
+            transactions: true,
+            checksums: false,
+            reopen_for_write: true,
+            read_your_writes: true,
+            ordered_scan: true,
+        }
+    }
+    fn write_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
+        let mut b = rocksdb::WriteBatch::default();
+        for &(k, v) in items {
+            b.put(k, v);
+        }
+        let mut wo = rocksdb::WriteOptions::default();
+        wo.set_sync(self.sync);
+        self.db.write_opt(b, &wo).map_err(|e| e.to_string())
+    }
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        // Pinned: the value is borrowed from the block cache, not copied out,
+        // which is the cheapest read RocksDB offers and the fair one against
+        // engines that hand back a borrow.
+        Ok(self
+            .db
+            .get_pinned_opt(key, &self.read)
+            .map_err(|e| e.to_string())?
+            .map(|v| v.len())
+            .unwrap_or(0))
+    }
+    fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
+        // By value, and `ReadOptions` does not clone: one per scan, which is
+        // one small allocation against a walk of `n` entries.
+        let mut ro = rocksdb::ReadOptions::default();
+        ro.set_verify_checksums(false);
+        let mut it = self.db.raw_iterator_opt(ro);
+        it.seek(from);
+        let mut bytes = 0usize;
+        let mut seen = 0usize;
+        while it.valid() && seen < n {
+            bytes += it.value().map(|v| v.len()).unwrap_or(0);
+            seen += 1;
+            it.next();
+        }
+        it.status().map_err(|e| e.to_string())?;
+        Ok(bytes)
+    }
+    fn sync(&mut self) -> Res<()> {
+        // Everything written reaches the device: the WAL is fsynced, which
+        // is what the nosync arm has been deferring. The memtable stays a
+        // memtable; RocksDB reads it, so nothing more is needed for
+        // "readable", and flushing it would charge this arm a compaction
+        // the others do not pay at this point.
+        self.db.flush_wal(true).map_err(|e| e.to_string())
+    }
+    fn size_bytes(&self) -> u64 {
+        dir_size(&self.path)
+    }
+}
+
 // ------------------------------------------------------------------- lmdb --
 
 /// LMDB through heed.

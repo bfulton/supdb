@@ -26,6 +26,16 @@ heed = "0.20"
 # so both LMDB adapters measure byte-identical C code.
 lmdb-master-sys = "0.2"
 sled = "0.34"
+# The log-structured engine the next engine is shaped like, and the one the
+# shuffled-arrival win over LMDB (EXT.27) had to be measured against before
+# it meant anything: an LSM beating a B-tree under per-batch fsync is what
+# every LSM does. Built without compression libraries, since every other
+# arm here stores its values uncompressed and the adapter turns compression
+# off explicitly.
+# Building it runs bindgen, which needs libclang: on a host where clang-sys
+# does not find one, point LIBCLANG_PATH at a directory holding a file named
+# libclang.so (a symlink to the versioned library is enough).
+rocksdb = { version = "0.23", default-features = false }
 
 [[bin]]
 name = "external"

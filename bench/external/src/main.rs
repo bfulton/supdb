@@ -25,7 +25,7 @@
 
 mod engines;
 
-use engines::{Batch, Engine, Features, Lmdb, LmdbDup, Redb, Sled, Supdb, Next};
+use engines::{Batch, Engine, Features, Lmdb, LmdbDup, Next, Redb, Rocks, Sled, Supdb};
 use std::path::PathBuf;
 use std::time::Instant;
 use supdb::bench::{
@@ -91,6 +91,10 @@ fn build(root: &std::path::Path, which: &[&str], buffer_mb: usize) -> Vec<Box<dy
             "redb" => Redb::create(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
             "lmdb" => Lmdb::create(&dir, 8).map(|e| Box::new(e) as Box<dyn Engine>),
             "sled" => Sled::create(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
+            "rocksdb" => Rocks::create(&dir, true).map(|e| Box::new(e) as Box<dyn Engine>),
+            "rocksdb-nosync" => {
+                Rocks::create(&dir, false).map(|e| Box::new(e) as Box<dyn Engine>)
+            }
             other => Err(format!("unknown engine {other}")),
         };
         match e {
@@ -263,7 +267,7 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
     // How much each engine cares about arrival order, which is the property
     // rather than the ranking. Same engine, same guarantees, same key set --
     // so nothing needs matching and there is no residual to bound.
-    for name in ["supdb-buffered", "lmdb-nosync", "supdb", "lmdb", "next"] {
+    for name in ["supdb-buffered", "lmdb-nosync", "supdb", "lmdb", "next", "rocksdb"] {
         let (Some(a), Some(b)) = (idx(name, false), idx(name, true)) else {
             continue;
         };
@@ -339,6 +343,46 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
                             load[ns].median(),
                             load[ls].median(),
                             cmp.summary("next", "lmdb")
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    // And against RocksDB, which an arrival order should not move much: the
+    // comparison EXT.27 needed before it could mean more than "an LSM beats
+    // a B-tree under per-batch fsync".
+    if let (Some(ns), Some(rs)) = (idx("next", true), idx("rocksdb", true)) {
+        if !load[ns].is_empty() && !load[rs].is_empty() {
+            if let (Some(fa), Some(fb)) = (feats[ns], feats[rs]) {
+                let gap = fa.unmatched(&fb, true);
+                if !gap.is_empty() {
+                    rec.finding(Finding::not_exercised(
+                        "EXT.31",
+                        "the next engine, syncing per batch, loads a shuffled key set at least as \
+                         fast as RocksDB",
+                        format!("not an ordering: the arms differ on {}", gap.join(", ")),
+                    ));
+                } else {
+                    let cmp = compare(&load[ns], &load[rs], supdb::bench::MIN_EFFECT);
+                    rec.compare("EXT.31_shuffled", cmp.clone());
+                    let seq = idx("next", false).zip(idx("rocksdb", false));
+                    let seq_ratio = seq
+                        .map(|(a, b)| load[a].median() / load[b].median().max(1e-9))
+                        .unwrap_or(f64::NAN);
+                    rec.finding(Finding::new(
+                        "EXT.31",
+                        "the next engine, syncing per batch, loads a shuffled key set at least as \
+                         fast as RocksDB",
+                        !matches!(cmp.verdict, Verdict::Less),
+                        format!(
+                            "shuffled, {:.0} ops/s against {:.0} ({}). Sequential, in the same \
+                             run, is {seq_ratio:.3}x. Both sync the WAL per batch and both apply \
+                             a batch whole; an LSM against an LSM, so the arrival order should \
+                             move neither much",
+                            load[ns].median(),
+                            load[rs].median(),
+                            cmp.summary("next", "rocksdb")
                         ),
                     ));
                 }
@@ -859,6 +903,41 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         "The next engine scans no slower than LMDB",
         "next",
         "lmdb",
+        &scan,
+        "entries/s",
+        false,
+    );
+    // The same three axes against RocksDB, the engine the next engine is
+    // shaped like: both sync the WAL per batch, both apply a batch whole,
+    // neither verifies a checksum on read (Features::unmatched decides the
+    // rest). This is the pair that says whether the next engine is fast or
+    // an LSM is; the LMDB pair cannot.
+    ordering_of(
+        &mut rec,
+        "EXT.28",
+        "The next engine loads faster than RocksDB when both sync the WAL per batch",
+        "next",
+        "rocksdb",
+        &load,
+        "ops/s",
+        true,
+    );
+    ordering_of(
+        &mut rec,
+        "EXT.29",
+        "The next engine reads faster than RocksDB",
+        "next",
+        "rocksdb",
+        &read,
+        "reads/s",
+        false,
+    );
+    ordering_of(
+        &mut rec,
+        "EXT.30",
+        "The next engine scans no slower than RocksDB",
+        "next",
+        "rocksdb",
         &scan,
         "entries/s",
         false,
