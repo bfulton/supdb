@@ -144,6 +144,15 @@ and loads at a tie (0.99x, 0.96x, both no difference) because under
 F_FULLFSYNC the barrier count is the floor for both engines
 (`results/apple-silicon/`, fifth campaign).
 
+Where the durable load's instructions go is measured, not guessed
+(`docs/profiling.md`, f58): 1,359 an appended record, of which the
+engine is 677 -- the WAL frame 227 with a 92-instruction CRC, the
+memtable probe about 180 and nearly every cache miss -- and the harness
+640, because the external suite's `write_batch` takes owned vectors and
+allocates two per record for every engine alike. Compute is the third
+slice of the x86 durable load after the barrier and the seal wait; the
+cheapest moves are a borrowed batch in the harness and a per-batch CRC.
+
 Under shuffled arrival the same matched pair inverts. `EXT.27`
 (`ext-loadshape`, full) has the next engine at 284,938 ops/s against
 LMDB's 48,041, **5.93x**, because a durable commit of a thousand random

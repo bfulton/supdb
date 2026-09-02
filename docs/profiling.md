@@ -300,3 +300,39 @@ bench/profile.sh            # cachegrind miss counts across the index layouts
 ./target/release/indexlab trace --keys 10000000   # distinct lines and pages per lookup
 valgrind --tool=dhat ./target/release/indexlab probe --layout heap-hash --keys 200000
 ```
+
+
+## The next engine's commit path, subtracted (f58)
+
+The same method on `src/next.rs`, for the append-and-commit path below the
+first seal -- 100,000 records of 100 bytes in 1,000-record batches,
+`Sync::Always`, no flush -- registered in `profile-plan.md`:
+
+```sh
+valgrind --tool=cachegrind --cache-sim=yes \
+  --D1=32768,8,64 --LL=8388608,16,64 --cachegrind-out-file=cg.out \
+  ./target/release/external loadprof --engines next --keys 100000 --skip-sync
+# and once with --keys 0; subtract. callgrind with --inclusive=yes and
+# --tree=caller for who calls what.
+```
+
+| per appended record | instructions | D1 misses | LL misses |
+|---|---|---|---|
+| everything, subtracted | 1,359 | 22.5 | 7.9 |
+| the engine (`write_batch` inclusive) | 677 | ~5 rd | ~1.5 rd |
+| of which `Wal::frame` | 227 | | |
+| of which the CRC inside it | 92 | | |
+| of which the memtable probe and entry | ~180 | 3.6 rd | 1.5 rd |
+| of which `MemTable::push_chunk` | 74 | | |
+| the harness: two allocations, their frees and copies, the payload | ~640 | most of the writes | |
+
+Two things this says. The engine's compute is a WAL frame and a hash
+probe, in that order, and the probe is where the misses are; nothing in
+it grows or rehashes at a cost worth seeing. And the driver spends as
+much as the engine: `write_batch(&[(Vec<u8>, Vec<u8>)])` allocates and
+frees two vectors per record (glibc's `free` memsets each chunk it takes
+back -- 200,055 calls, 16.7M instructions), which every adapter pays
+alike and which therefore sits inside every load ratio in `results/`.
+A borrowed batch would move every engine's absolute number up and
+change no comparison's honesty; it is the cheapest fidelity gain left in
+the external suite.
