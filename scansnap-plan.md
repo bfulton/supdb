@@ -96,6 +96,10 @@ build, the frozen table, and then a merge that is 1.7x routed and a
 memtable range that is 2.3x. The k-way merge was never the lever; the
 snapshot was, and it is paid once per commit rather than per scan.
 
-Not measured here: EXT.39, whose adapter (`next-nodrain`) also scans
-behind `sync`, and so pays the build once per repetition over whatever
-the memtable holds; the next canonical drain run will say what remains.
+EXT.39, whose adapter (`next-nodrain`) also scans behind `sync` and so
+pays the build once per repetition, went from 0.68x, 0.44x and 0.45x of
+tuned RocksDB to **1.29x** on the first canonical run after this change
+and 1.08x on the replication: the undrained arm scans 5.98M and 4.70M
+entries/s where it scanned 2.3-2.9M, and the claim flipped to holds. What
+separates it from the drained 23.6M now is the frozen table and the
+memtable's range, not the build.

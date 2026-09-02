@@ -178,8 +178,10 @@ both ways (drain-plan.md; `next-nodrain`, `rocksdb-tuned-drain`): with
 neither draining the durable ordered load is a **tie** (0.904x, `EXT.37`)
 and the shuffled load **2.37x** (`EXT.41`), with both draining 0.815x
 (`EXT.36`); point reads lead 4.7x undrained and 7.1x drained (`EXT.38`,
-`EXT.40`); and the ordered scan of an undrained store is 8.6x slower than
-of a routed one (2.9M against 24.7M entries/s, `EXT.39`). That was read as
+`EXT.40`); and the ordered scan of an undrained store was 8.6x slower than
+of a routed one (2.9M against 24.7M entries/s, `EXT.39`, then failing at
+0.68x of tuned RocksDB; now 5.98M and 1.29x, holding, with 1.08x on the
+replication -- the rest of this paragraph is why). That was read as
 the k-way merge over unrouted sources, and f63 says it was not: scans that
 start inside a segment cost 53 ns an entry under the merge against 31
 routed (F63.4, 1.7x), and entries served from the memtable's range 124
