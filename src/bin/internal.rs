@@ -2705,6 +2705,10 @@ fn f23_madvise(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // rather than only on a machine with more RAM than this one has. The cap
     // is sized under the store the profile builds.
     let cap_mb = args.num("--cap-mb", profile.pick(16, 128, 512)) as u64;
+    // The cap is this experiment's, not the run's: the guard puts the process
+    // back when the function returns. Without it every later experiment ran
+    // under a 16MB ceiling and `internal all` was killed at the next one.
+    let _cap = supdb::bench::env::cap_guard();
     let capped = cap_mb > 0 && supdb::bench::env::cap_memory(cap_mb << 20);
     let ratio = if capped {
         file_bytes as f64 / ((cap_mb << 20) as f64)
@@ -2905,6 +2909,8 @@ fn f24_autoreadahead(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let mut worst = f64::INFINITY;
     let mut crossover: Option<f64> = None;
 
+    // As f23: the sweep's caps are lifted when this function returns.
+    let _cap = supdb::bench::env::cap_guard();
     for r in ratios {
         let cap = ((file_bytes as f64 / r) as u64).max(CAP_FLOOR);
         // What the cap actually achieved, which is what the row reports. The

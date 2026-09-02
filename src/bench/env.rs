@@ -608,6 +608,51 @@ pub fn cap_memory(bytes: u64) -> bool {
     .is_ok()
 }
 
+/// Lift the cap this process set, and leave the cgroup it set it on.
+///
+/// A cap is a property of the *process*, not of the experiment that asked for
+/// it: `cap_memory` writes this pid into the cgroup and it stays there. Every
+/// experiment that runs afterwards inherits the limit, and the first one to
+/// allocate past it is killed by the OOM killer. That is not hypothetical --
+/// `internal all` died at f24 on every host with a writable v1 memory
+/// controller, because f23 capped at 16MB and nothing put it back. On a host
+/// without one the cap silently fails and the suite runs to the end, which is
+/// why the committed results exist and the bug stayed invisible.
+///
+/// Idempotent, and false when there was nothing to lift.
+pub fn uncap_memory() -> bool {
+    let root = "/sys/fs/cgroup/memory";
+    let dir = format!("{root}/supdb-{}", std::process::id());
+    if !std::path::Path::new(&dir).is_dir() {
+        return false;
+    }
+    // The limit first: if moving the process out fails, the cap is still
+    // gone, which is the half that matters.
+    let lifted = fs::write(format!("{dir}/memory.limit_in_bytes"), "-1").is_ok();
+    let _ = fs::write(format!("{root}/cgroup.procs"), std::process::id().to_string());
+    // Only removable once empty, so this fails harmlessly if the move did.
+    let _ = fs::remove_dir(&dir);
+    lifted
+}
+
+/// Lifts whatever cap this process set, when it is dropped.
+///
+/// Hold one for the length of an experiment that caps memory, so the cap
+/// belongs to the experiment rather than to the rest of the run -- including
+/// when the experiment returns early or panics.
+pub struct CapGuard;
+
+impl Drop for CapGuard {
+    fn drop(&mut self) {
+        uncap_memory();
+    }
+}
+
+/// A `CapGuard`. Bind it before capping: `let _cap = env::cap_guard();`
+pub fn cap_guard() -> CapGuard {
+    CapGuard
+}
+
 /// The cap actually in force, if any.
 pub fn memory_cap() -> Option<u64> {
     let dir = format!("/sys/fs/cgroup/memory/supdb-{}", std::process::id());

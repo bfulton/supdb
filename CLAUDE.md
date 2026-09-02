@@ -549,6 +549,21 @@ changes no file already written: identical bytes on a little-endian machine,
 and swapped on any other, so the magic check itself does the refusing. Both
 open paths name it rather than reporting damage.
 
+Also fixed, in the harness rather than the engine, and it had been hiding the
+rest of the suite: `env::cap_memory` writes a cgroup limit and puts the process
+inside it, and nothing ever lifted it. A cap is a property of the process, not
+of the experiment that asked for one, so f23-madvise's 16 MB ceiling stayed in
+force for everything after it and the next experiment to allocate past it was
+killed by the OOM killer. `internal all` died at f24 on any host with a
+writable v1 memory controller -- 17 experiments of 33 -- and on a host without
+one `cap_memory` silently fails, the experiments record `not_exercised`, and
+the suite runs to the end. That is why the committed results exist and why the
+truncation was invisible for as long as it was: the bug only bites where the
+cap actually works. `env::cap_guard()` now lifts the cap when the experiment
+returns, including on a panic, and `internal all --profile ci` completes.
+Nothing about a recorded measurement changes; what changes is how many of them
+a run produces.
+
 That last one needs a reopen to show: a fresh store takes the full-rewrite path
 until an index section exists with a matching key count, and every scan test
 here built its store in one session, so the in-place path was never under test
