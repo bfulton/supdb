@@ -25,7 +25,7 @@
 
 mod engines;
 
-use engines::{Engine, Features, Lmdb, LmdbDup, Redb, Sled, Supdb, Next};
+use engines::{Batch, Engine, Features, Lmdb, LmdbDup, Redb, Sled, Supdb, Next};
 use std::path::PathBuf;
 use std::time::Instant;
 use supdb::bench::{
@@ -209,18 +209,17 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
             }
             let mut vrng = Rng::new(0xE4);
             let mut kb = [0u8; 16];
-            let mut buf: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch);
+            let mut buf = Batch::with_capacity(batch, payload.value_size());
             let t = Instant::now();
             for i in &order {
                 db_key_into(*i, &mut kb);
-                buf.push((kb.to_vec(), payload.get(&mut vrng).to_vec()));
+                buf.push(&kb, payload.get(&mut vrng));
                 if buf.len() == batch {
-                    e.write_batch(&buf).expect("write");
-                    buf.clear();
+                    buf.flush(e.as_mut()).expect("write");
                 }
             }
             if !buf.is_empty() {
-                e.write_batch(&buf).expect("write");
+                buf.flush(e.as_mut()).expect("write");
             }
             e.sync().expect("sync");
             let secs = t.elapsed().as_secs_f64();
@@ -414,18 +413,17 @@ fn load_profile(args: &Args, which: &[&str]) -> std::io::Result<()> {
     let payload = Payload::new(value_size, 0.5, 0xE1);
     let mut vrng = Rng::new(0xE1);
     let mut kb = [0u8; 16];
-    let mut buf: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch);
+    let mut buf = Batch::with_capacity(batch, payload.value_size());
     let t = Instant::now();
     for i in 0..n {
         db_key_into(i, &mut kb);
-        buf.push((kb.to_vec(), payload.get(&mut vrng).to_vec()));
+        buf.push(&kb, payload.get(&mut vrng));
         if buf.len() == batch {
-            e.write_batch(&buf).expect("write");
-            buf.clear();
+            buf.flush(e.as_mut()).expect("write");
         }
     }
     if !buf.is_empty() {
-        e.write_batch(&buf).expect("write");
+        buf.flush(e.as_mut()).expect("write");
     }
     // Split the two halves. cachegrind put a third of this workload's
     // last-level misses in `checkpoint_inner`, `seal_shard` and the memcpy
@@ -545,18 +543,17 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
             let rss0 = supdb::bench::env::rss_bytes();
             let io0 = supdb::bench::IoCounters::read_now();
             let t = Instant::now();
-            let mut buf: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch);
+            let mut buf = Batch::with_capacity(batch, payload.value_size());
             let mut kb = [0u8; 16];
             for i in 0..n {
                 db_key_into(i, &mut kb);
-                buf.push((kb.to_vec(), payload.get(&mut vrng).to_vec()));
+                buf.push(&kb, payload.get(&mut vrng));
                 if buf.len() == batch {
-                    e.write_batch(&buf).expect("write");
-                    buf.clear();
+                    buf.flush(e.as_mut()).expect("write");
                 }
             }
             if !buf.is_empty() {
-                e.write_batch(&buf).expect("write");
+                buf.flush(e.as_mut()).expect("write");
             }
             e.sync().expect("sync");
             let load_s = t.elapsed().as_secs_f64();
@@ -1066,17 +1063,16 @@ fn suite_readdecomp(
                 let payload = Payload::new(*vs, 0.5, 0xD3);
                 let mut vrng = Rng::new(0xD3);
                 let mut kb = [0u8; 16];
-                let mut buf: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch);
+                let mut buf = Batch::with_capacity(batch, payload.value_size());
                 for i in 0..*n {
                     db_key_into(i, &mut kb);
-                    buf.push((kb.to_vec(), payload.get(&mut vrng).to_vec()));
+                    buf.push(&kb, payload.get(&mut vrng));
                     if buf.len() == batch {
-                        e.write_batch(&buf).expect("load");
-                        buf.clear();
+                        buf.flush(e.as_mut()).expect("load");
                     }
                 }
                 if !buf.is_empty() {
-                    e.write_batch(&buf).expect("load");
+                    buf.flush(e.as_mut()).expect("load");
                 }
                 e.sync().expect("sync");
                 store_rows.push(jobj! {
@@ -1559,17 +1555,16 @@ fn suite_sweep(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result
         };
         let mut vrng = Rng::new(0xE3);
         let mut kb = [0u8; 16];
-        let mut buf: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch);
+        let mut buf = Batch::with_capacity(batch, payload.value_size());
         for i in 0..n {
             db_key_into(i, &mut kb);
-            buf.push((kb.to_vec(), payload.get(&mut vrng).to_vec()));
+            buf.push(&kb, payload.get(&mut vrng));
             if buf.len() == batch {
-                e.write_batch(&buf).expect("load");
-                buf.clear();
+                buf.flush(e.as_mut()).expect("load");
             }
         }
         if !buf.is_empty() {
-            e.write_batch(&buf).expect("load");
+            buf.flush(e.as_mut()).expect("load");
         }
         e.sync().expect("sync");
         engines.push(e);
@@ -1829,17 +1824,16 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
             let mut kb = [0u8; 16];
 
             // Load phase.
-            let mut buf = Vec::with_capacity(batch);
+            let mut buf = Batch::with_capacity(batch, payload.value_size());
             for i in 0..n {
                 db_key_into(i, &mut kb);
-                buf.push((kb.to_vec(), payload.get(&mut vrng).to_vec()));
+                buf.push(&kb, payload.get(&mut vrng));
                 if buf.len() == batch {
-                    e.write_batch(&buf).expect("load");
-                    buf.clear();
+                    buf.flush(e.as_mut()).expect("load");
                 }
             }
             if !buf.is_empty() {
-                e.write_batch(&buf).expect("load");
+                buf.flush(e.as_mut()).expect("load");
             }
             e.sync().expect("sync");
 
@@ -1847,7 +1841,7 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
             let mut g = KeyGen::new(*dist, n, 0x9C5B);
             let mut pick = Rng::new(0x5EED);
             let mut h = Hist::new();
-            let mut wbuf: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(batch);
+            let mut wbuf = Batch::with_capacity(batch, payload.value_size());
             let t = Instant::now();
             for _ in 0..ops {
                 let roll = (pick.next() % 100) as u32;
@@ -1856,25 +1850,23 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
                 if roll < *pread {
                     let _ = e.get(&kb).expect("read");
                 } else if roll < pread + pupd {
-                    wbuf.push((kb.to_vec(), payload.get(&mut vrng).to_vec()));
+                    wbuf.push(&kb, payload.get(&mut vrng));
                     if wbuf.len() >= batch {
-                        e.write_batch(&wbuf).expect("update");
-                        wbuf.clear();
+                        wbuf.flush(e.as_mut()).expect("update");
                     }
                 } else if roll < pread + pupd + pscan {
                     let _ = e.range(&kb, 50).expect("scan");
                 } else if *prmw > 0 {
                     let _ = e.get(&kb).expect("rmw read");
-                    wbuf.push((kb.to_vec(), payload.get(&mut vrng).to_vec()));
+                    wbuf.push(&kb, payload.get(&mut vrng));
                     if wbuf.len() >= batch {
-                        e.write_batch(&wbuf).expect("rmw write");
-                        wbuf.clear();
+                        wbuf.flush(e.as_mut()).expect("rmw write");
                     }
                 }
                 h.record(t1.elapsed().as_nanos() as u64);
             }
             if !wbuf.is_empty() {
-                e.write_batch(&wbuf).expect("tail");
+                wbuf.flush(e.as_mut()).expect("tail");
             }
             let secs = t.elapsed().as_secs_f64();
 

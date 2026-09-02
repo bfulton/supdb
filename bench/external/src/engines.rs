@@ -125,11 +125,75 @@ impl Features {
 
 pub type Res<T> = Result<T, String>;
 
+/// A batch assembled without an allocation per record: keys and values
+/// copied once into two arenas that are reused across batches, and the
+/// borrowed pairs built at the flush. What it replaces -- a `Vec` of owned
+/// pairs -- allocated and freed two vectors per record, and cachegrind put
+/// that at 640 instructions a record, a term every engine paid identically
+/// and that therefore sat inside every load ratio in `results/` (f58).
+pub struct Batch {
+    keys: Vec<u8>,
+    vals: Vec<u8>,
+    ends: Vec<(u32, u32)>,
+}
+
+impl Batch {
+    pub fn with_capacity(records: usize, value_size: usize) -> Batch {
+        Batch {
+            keys: Vec::with_capacity(records * 16),
+            vals: Vec::with_capacity(records * value_size),
+            ends: Vec::with_capacity(records),
+        }
+    }
+
+    pub fn push(&mut self, key: &[u8], value: &[u8]) {
+        self.keys.extend_from_slice(key);
+        self.vals.extend_from_slice(value);
+        self.ends.push((self.keys.len() as u32, self.vals.len() as u32));
+    }
+
+    pub fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// Hand the batch to the engine and empty it, keeping the arenas. A
+    /// no-op when empty. One vector of slice pairs per flush -- one
+    /// allocation per batch, against two per record before.
+    pub fn flush(&mut self, e: &mut dyn Engine) -> Res<()> {
+        if self.ends.is_empty() {
+            return Ok(());
+        }
+        let mut pairs: Vec<(&[u8], &[u8])> = Vec::with_capacity(self.ends.len());
+        let (mut ks, mut vs) = (0usize, 0usize);
+        for &(ke, ve) in &self.ends {
+            pairs.push((&self.keys[ks..ke as usize], &self.vals[vs..ve as usize]));
+            ks = ke as usize;
+            vs = ve as usize;
+        }
+        e.write_batch(&pairs)?;
+        self.keys.clear();
+        self.vals.clear();
+        self.ends.clear();
+        Ok(())
+    }
+}
+
 pub trait Engine {
     fn name(&self) -> &'static str;
     fn features(&self) -> Features;
     /// Write a batch and make it visible to this engine's own read path.
-    fn write_batch(&mut self, items: &[(Vec<u8>, Vec<u8>)]) -> Res<()>;
+    ///
+    /// Borrowed, not owned: the first form took `&[(Vec<u8>, Vec<u8>)]`,
+    /// and f58 found the two allocations, two copies and two frees that
+    /// cost per record to be 640 instructions -- as much as the next
+    /// engine's whole commit path -- paid alike by every adapter and so
+    /// folded into every load ratio the suite reports. `Batch` builds one
+    /// without allocating per record.
+    fn write_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()>;
     /// Bytes returned for the key; 0 for a miss.
     fn get(&mut self, key: &[u8]) -> Res<usize>;
     /// Bytes visited scanning `n` entries from `from`.
@@ -278,9 +342,9 @@ impl Engine for Supdb {
             ordered_scan: true,
         }
     }
-    fn write_batch(&mut self, items: &[(Vec<u8>, Vec<u8>)]) -> Res<()> {
+    fn write_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
         let s = self.store.as_ref().ok_or("store closed")?;
-        for (k, v) in items {
+        for &(k, v) in items {
             s.put(k, v).map_err(|e| e.to_string())?;
         }
         if self.durable {
@@ -409,9 +473,9 @@ impl Engine for Next {
             ordered_scan: true,
         }
     }
-    fn write_batch(&mut self, items: &[(Vec<u8>, Vec<u8>)]) -> Res<()> {
+    fn write_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
         let db = self.db.as_mut().ok_or("db closed")?;
-        for (k, v) in items {
+        for &(k, v) in items {
             db.append(k, v);
         }
         db.commit().map_err(|e| e.to_string())
@@ -502,14 +566,13 @@ impl Engine for Redb {
             ordered_scan: true,
         }
     }
-    fn write_batch(&mut self, items: &[(Vec<u8>, Vec<u8>)]) -> Res<()> {
+    fn write_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
         self.txn = None;
         let w = self.db.begin_write().map_err(|e| e.to_string())?;
         {
             let mut t = w.open_table(T).map_err(|e| e.to_string())?;
-            for (k, v) in items {
-                t.insert(k.as_slice(), v.as_slice())
-                    .map_err(|e| e.to_string())?;
+            for &(k, v) in items {
+                t.insert(k, v).map_err(|e| e.to_string())?;
             }
         }
         w.commit().map_err(|e| e.to_string())
@@ -639,12 +702,12 @@ impl Engine for Lmdb {
             ordered_scan: true,
         }
     }
-    fn write_batch(&mut self, items: &[(Vec<u8>, Vec<u8>)]) -> Res<()> {
+    fn write_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
         // A held read transaction pins the version it was opened at, so it has
         // to go before a write, exactly as Supdb's adapter drops its Reader.
         self.txn = None;
         let mut w = self.env.write_txn().map_err(|e| e.to_string())?;
-        for (k, v) in items {
+        for &(k, v) in items {
             self.db.put(&mut w, k, v).map_err(|e| e.to_string())?;
         }
         w.commit().map_err(|e| e.to_string())
@@ -714,10 +777,10 @@ impl Engine for Sled {
             ordered_scan: true,
         }
     }
-    fn write_batch(&mut self, items: &[(Vec<u8>, Vec<u8>)]) -> Res<()> {
+    fn write_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
         let mut b = sled::Batch::default();
-        for (k, v) in items {
-            b.insert(k.as_slice(), v.as_slice());
+        for &(k, v) in items {
+            b.insert(k, v);
         }
         self.db.apply_batch(b).map_err(|e| e.to_string())
     }
