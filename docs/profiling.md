@@ -333,6 +333,8 @@ much as the engine: `write_batch(&[(Vec<u8>, Vec<u8>)])` allocates and
 frees two vectors per record (glibc's `free` memsets each chunk it takes
 back -- 200,055 calls, 16.7M instructions), which every adapter pays
 alike and which therefore sits inside every load ratio in `results/`.
-A borrowed batch would move every engine's absolute number up and
-change no comparison's honesty; it is the cheapest fidelity gain left in
-the external suite.
+A borrowed batch moves every engine's absolute number up and changes no
+comparison's honesty, so the harness now builds one (`engines::Batch`):
+measured again the same way, 1,037 instructions and 19.0 D1 misses a
+record, the engine's 677 unchanged, and what is left of the harness is
+the payload generator and one copy of each key and value.

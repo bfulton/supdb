@@ -65,3 +65,10 @@ which moves every engine's number and none of the comparisons' honesty
 -- and a per-batch CRC in place of the per-frame one, 92 instructions a
 record for the same torn-batch semantics, since replay drops a batch at
 the first frame that fails either way.
+
+## After the borrowed batch
+
+The harness change measured the same way: **1,037 instructions and 19.0
+D1 misses a record**, from 1,359 and 22.5, with the engine's 677 exactly
+where it was. What remains of the harness is the payload generator and
+one copy of each key and value into the batch arenas.
