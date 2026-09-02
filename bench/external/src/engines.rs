@@ -643,6 +643,7 @@ impl Engine for Redb {
 /// by one hardware CRC per 4 KB block, and is named here rather than
 /// equalized because the table format does not offer a switch this
 /// binding exposes.
+#[cfg(feature = "rocksdb")]
 pub struct Rocks {
     db: rocksdb::DB,
     path: PathBuf,
@@ -655,6 +656,7 @@ pub struct Rocks {
     read: rocksdb::ReadOptions,
 }
 
+#[cfg(feature = "rocksdb")]
 impl Rocks {
     pub fn create(path: &Path, sync: bool) -> Res<Rocks> {
         Rocks::with(path, sync, false, false)
@@ -711,6 +713,7 @@ impl Rocks {
     }
 }
 
+#[cfg(feature = "rocksdb")]
 impl Engine for Rocks {
     fn name(&self) -> &'static str {
         match (self.sync, self.tuned, self.drain) {

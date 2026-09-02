@@ -137,6 +137,7 @@ fn main() -> std::io::Result<()> {
             "f56-tailbound" => f56_tailbound(&args, profile)?,
             "f57-walreuse" => f57_walreuse(&args, profile)?,
             "f60-sealwait" => f60_sealwait(&args, profile)?,
+            "f61-scanmerge" => f61_scanmerge(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -10712,6 +10713,189 @@ fn f60_sealwait(args: &Args, profile: Profile) -> std::io::Result<Record> {
             rates[un].median(),
             med(un, |r| r.4),
             med(un, |r| r.6)
+        ),
+    ));
+    Ok(rec)
+}
+
+fn f61_scanmerge(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::next::{Db, NextOptions};
+
+    let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+    let scans = args.num("--scans", profile.pick(50, 200, 400)) as u64;
+    let scan_len = args.num("--scan-len", 1_000) as usize;
+
+    let mut rec = Record::new("f61-scanmerge", profile);
+    rec.param("keys", J::u(keys))
+        .param("batch", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .param("scans", J::u(scans))
+        .param("scan_len", J::u(scan_len as u64))
+        .note(
+            "four arms interleaved, the same ordered load each rep, the store left in four \
+             shapes: routed (flush); routed plus a thousand keys in the memtable; four level-0 \
+             segments and no memtable (seal, no partitioning); undrained (three segments and \
+             the memtable). Then ordered scans from random starts; entries per second",
+        )
+        .note("predictions registered in scanmerge-plan.md before the run");
+
+    let dir = scratch("f61");
+    let payload = Payload::new(value_size, 0.5, 0xF61);
+    let arms: [(&str, u8); 4] = [
+        ("routed", 0),
+        ("routed+memtable", 1),
+        ("four-l0", 2),
+        ("undrained", 3),
+    ];
+    // ci, partitions, l0 segments, unsealed keys
+    type Row = (usize, f64, f64, f64);
+    let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
+    let rates = Trial::new(profile.reps()).run(arms.len(), |ci, rep| {
+        let (_, shape) = arms[ci];
+        let mut vrng = Rng::new(0xF61 + rep as u64);
+        let mut kb = [0u8; 16];
+        let d = dir.join(format!("f61-{ci}-{rep}"));
+        let _ = std::fs::remove_dir_all(&d);
+        // Small seals so every shape has several level-0 segments at the
+        // ci size too; the merge's cost is per source, not per byte.
+        // Three seals and half a seal left in the memtable: the undrained
+        // shape EXT.39 measured, at the ci size too, since the merge's cost
+        // is per source and not per byte. The four-segment arm turns
+        // compaction off so its seals stay unrouted once joined.
+        let seal = ((keys * (value_size as u64 + 16)) * 2 / 7).max(1 << 20) as usize;
+        let opts = NextOptions {
+            seal_bytes: seal,
+            partition_bytes: Some(seal * 2),
+            compact: shape != 2,
+            ..Default::default()
+        };
+        let mut db = Db::create(&d, opts).expect("create");
+        let load = if shape == 1 { keys - 1000 } else { keys };
+        for i in 0..load {
+            db_key_into(i, &mut kb);
+            db.append(&kb, payload.get(&mut vrng));
+            if (i + 1).is_multiple_of(batch) {
+                db.commit().expect("commit");
+            }
+        }
+        match shape {
+            0 => db.flush().expect("flush"),
+            1 => {
+                db.flush().expect("flush");
+                for i in load..keys {
+                    db_key_into(i, &mut kb);
+                    db.append(&kb, payload.get(&mut vrng));
+                }
+                db.commit().expect("commit");
+            }
+            2 => {
+                // Seal the tail and wait, with compaction off: four level-0
+                // segments, no memtable, nothing routed.
+                db.seal().expect("seal");
+                db.settle().expect("settle");
+            }
+            _ => db.sync().expect("sync"),
+        }
+        let (parts, l0) = db.levels();
+        let unsealed = if shape == 1 { 1000.0 } else if shape == 3 { -1.0 } else { 0.0 };
+        rows.lock().unwrap().push((ci, parts as f64, l0 as f64, unsealed));
+
+        let mut x = 0x5CA4_u64 ^ (rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut entries = 0u64;
+        let mut sink = 0u64;
+        let t = Instant::now();
+        for _ in 0..scans {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            db_key_into(z % keys, &mut kb);
+            let n = db
+                .scan(&kb, scan_len, |_k, v| {
+                    entries += 1;
+                    sink = sink.wrapping_add(v.len() as u64);
+                })
+                .expect("scan");
+            std::hint::black_box(n);
+        }
+        let secs = t.elapsed().as_secs_f64();
+        std::hint::black_box(sink);
+        db.close().expect("close");
+        let _ = std::fs::remove_dir_all(&d);
+        entries as f64 / secs
+    });
+    let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
+        let mut v: Vec<f64> = rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect();
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
+    rec.series(
+        "arms",
+        J::arr(
+            arms.iter()
+                .enumerate()
+                .zip(rates.iter())
+                .map(|((ci, (name, _)), s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "entries_per_s" => J::fp(s.median(), 1),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4),
+                        "partitions" => J::fp(med(ci, |r| r.1), 1),
+                        "l0_segments" => J::fp(med(ci, |r| r.2), 1),
+                        "unsealed_keys" => J::s(match med(ci, |r| r.3) as i64 {
+                            0 => "none",
+                            1000 => "a thousand",
+                            _ => "half a seal",
+                        })
+                    }
+                })
+                .collect(),
+        ),
+    );
+    let (r, rm, l4, un) = (0usize, 1usize, 2usize, 3usize);
+    let c_rm = compare(&rates[r], &rates[rm], supdb::bench::MIN_EFFECT);
+    rec.compare("routed_vs_routed_plus_memtable", c_rm.clone());
+    let c_l4 = compare(&rates[un], &rates[l4], supdb::bench::MIN_EFFECT);
+    rec.compare("undrained_vs_four_l0", c_l4.clone());
+    let c_un = compare(&rates[r], &rates[un], supdb::bench::MIN_EFFECT);
+    rec.compare("routed_vs_undrained", c_un.clone());
+    rec.finding(Finding::new(
+        "F61.1",
+        "a thousand keys in the memtable cost the routed scan at least 3x",
+        matches!(c_rm.verdict, supdb::bench::Verdict::Greater) && c_rm.ratio >= 3.0,
+        format!(
+            "{:.0} entries/s routed against {:.0} with a thousand unsealed keys ({}); the fast \
+             path over partitions is lost for every entry once any unsealed key lies past the \
+             scan's start",
+            rates[r].median(),
+            rates[rm].median(),
+            c_rm.summary("routed", "routed+memtable")
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F61.2",
+        "four level-0 segments without a memtable scan within 1.5x of the undrained shape",
+        (1.0 / 1.5..=1.5).contains(&c_l4.ratio),
+        format!(
+            "{:.0} entries/s undrained (three segments and the memtable) against {:.0} with four \
+             segments and no memtable ({}); the level-0 count is the cost",
+            rates[un].median(),
+            rates[l4].median(),
+            c_l4.summary("undrained", "four-l0")
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F61.3",
+        "the undrained shape scans at least 5x slower than routed",
+        matches!(c_un.verdict, supdb::bench::Verdict::Greater) && c_un.ratio >= 5.0,
+        format!(
+            "{:.0} entries/s routed against {:.0} undrained ({}), EXT.39's 8.6x inside one process",
+            rates[r].median(),
+            rates[un].median(),
+            c_un.summary("routed", "undrained")
         ),
     ));
     Ok(rec)

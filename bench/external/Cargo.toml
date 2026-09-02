@@ -35,7 +35,15 @@ sled = "0.34"
 # Building it runs bindgen, which needs libclang: on a host where clang-sys
 # does not find one, point LIBCLANG_PATH at a directory holding a file named
 # libclang.so (a symlink to the versioned library is enough).
-rocksdb = { version = "0.23", default-features = false }
+# Optional, and off by default: librocksdb is a ten-minute C++ build, which
+# the hosted CI does not need (every RocksDB claim is pinned to `full`) and
+# which localmost's 600-second job kill cannot hold on the Mac. Local full
+# runs pass `--features rocksdb`; without it the rocksdb arms are refused by
+# name at `build()`.
+rocksdb = { version = "0.23", default-features = false, optional = true }
+
+[features]
+rocksdb = ["dep:rocksdb"]
 
 [[bin]]
 name = "external"

@@ -25,7 +25,9 @@
 
 mod engines;
 
-use engines::{Batch, Engine, Features, Lmdb, LmdbDup, Next, Redb, Rocks, Sled, Supdb};
+use engines::{Batch, Engine, Features, Lmdb, LmdbDup, Next, Redb, Sled, Supdb};
+#[cfg(feature = "rocksdb")]
+use engines::Rocks;
 use std::path::PathBuf;
 use std::time::Instant;
 use supdb::bench::{
@@ -91,14 +93,23 @@ fn build(root: &std::path::Path, which: &[&str], buffer_mb: usize) -> Vec<Box<dy
             "redb" => Redb::create(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
             "lmdb" => Lmdb::create(&dir, 8).map(|e| Box::new(e) as Box<dyn Engine>),
             "sled" => Sled::create(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
+            #[cfg(feature = "rocksdb")]
             "rocksdb" => Rocks::create(&dir, true).map(|e| Box::new(e) as Box<dyn Engine>),
+            #[cfg(feature = "rocksdb")]
             "rocksdb-nosync" => {
                 Rocks::create(&dir, false).map(|e| Box::new(e) as Box<dyn Engine>)
             }
+            #[cfg(feature = "rocksdb")]
             "rocksdb-tuned" => Rocks::create_tuned(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
+            #[cfg(feature = "rocksdb")]
             "rocksdb-tuned-drain" => {
                 Rocks::create_tuned_drain(&dir).map(|e| Box::new(e) as Box<dyn Engine>)
             }
+            #[cfg(not(feature = "rocksdb"))]
+            "rocksdb" | "rocksdb-nosync" | "rocksdb-tuned" | "rocksdb-tuned-drain" => Err(
+                "built without the rocksdb feature: cargo build -p supdb-external --features rocksdb"
+                    .to_string(),
+            ),
             "next-nodrain" => Next::create_nodrain(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
             other => Err(format!("unknown engine {other}")),
         };
@@ -1975,6 +1986,9 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
     let ops = args.num("--ops", profile.pick(20_000, 200_000, 1_000_000)) as u64;
     let value_size = args.num("--value-size", 100);
     let batch = args.num("--batch", 100);
+    // Fewer repetitions than the kv suite: each is a fresh load of `n`
+    // records per engine per workload, and the gate wants at least three.
+    let reps = args.num("--reps", profile.pick(2, 3, 5));
 
     // (name, read %, update %, scan %, rmw %, distribution)
     let workloads: &[(&str, u32, u32, u32, u32, KeyDist)] = &[
@@ -1991,23 +2005,43 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
         .param("operation_count", J::u(ops))
         .param("value_size", J::u(value_size as u64))
         .param("batch", J::u(batch as u64))
+        .param("reps", J::u(reps as u64))
         .note("YCSB core workloads A-F; Zipfian theta 0.99 as in the original")
         .note(
-            "read this against the feature table, not on its own: LMDB commits durably on \
-             every batch, and Supdb buffers and publishes without an fsync. That is what \
-             durable_commit=false in its Features means and it is why it scores 3/6 against \
-             LMDB's 5/6. f13-sync prices the difference at 31x on this shape, so the mixed \
-             workloads are a comparison of an engine that promises power-loss durability \
-             against one that does not",
+            "engines interleaved round-robin over reps within each workload, a fresh load per \
+             rep, medians reported and every pair gated on stats::compare. It ran each engine \
+             once until it did not; the matched pairs below are the ones that rank",
+        )
+        .note(
+            "read the unmatched rows against the feature table: LMDB commits durably on every \
+             batch where Supdb buffers and publishes without an fsync, so the mixed workloads \
+             across those two compare an engine that promises power-loss durability against \
+             one that does not. The next and RocksDB arms commit durably per batch",
         );
 
     let payload = Payload::new(value_size, 0.5, 0xE2);
     let mut rows = Vec::new();
+    // Per workload, per engine: the samples the pairs are gated on.
+    let mut per_workload: Vec<Vec<Samples>> = Vec::new();
+    let mut feats: Vec<Option<Features>> = vec![None; which.len()];
 
     for (wname, pread, pupd, pscan, prmw, dist) in workloads {
         let root = scratch(&format!("ycsb-{wname}"));
-        for e in build(&root, which, 256).iter_mut() {
-            let name = e.name().to_string();
+        let hists: std::sync::Mutex<Vec<Option<(Hist, f64)>>> =
+            std::sync::Mutex::new(vec![None; which.len()]);
+        let featc: std::sync::Mutex<Vec<Option<Features>>> =
+            std::sync::Mutex::new(vec![None; which.len()]);
+        // The engine's own name for the row, as every other suite records it.
+        let names: std::sync::Mutex<Vec<&'static str>> =
+            std::sync::Mutex::new(vec![""; which.len()]);
+        let rates = Trial::new(reps).run(which.len(), |ci, rep| {
+            let dir = root.join(format!("{}-{rep}", which[ci]));
+            let _ = std::fs::remove_dir_all(&dir);
+            let Some(mut e) = build(&dir, &[which[ci]], 256).into_iter().next() else {
+                return f64::NAN;
+            };
+            featc.lock().unwrap()[ci] = Some(e.features());
+            names.lock().unwrap()[ci] = e.name();
             let mut vrng = Rng::new(0xE2);
             let mut kb = [0u8; 16];
 
@@ -2057,60 +2091,108 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
                 wbuf.flush(e.as_mut()).expect("tail");
             }
             let secs = t.elapsed().as_secs_f64();
-
+            let size_mb = e.size_bytes() as f64 / 1048576.0;
+            drop(e);
+            let _ = std::fs::remove_dir_all(&dir);
+            hists.lock().unwrap()[ci] = Some((h, size_mb));
+            ops as f64 / secs
+        });
+        let hists = hists.into_inner().unwrap();
+        let featc = featc.into_inner().unwrap();
+        let names = names.into_inner().unwrap();
+        for (ci, name) in names.iter().enumerate() {
+            let Some((h, size_mb)) = &hists[ci] else { continue };
+            if feats[ci].is_none() {
+                feats[ci] = featc[ci];
+            }
             rows.push(jobj! {
                 "workload" => J::s(*wname),
-                "engine" => J::s(&name),
+                "engine" => J::s(*name),
                 "distribution" => J::s(dist.as_str()),
-                "ops_per_s" => J::fp(ops as f64 / secs, 1),
+                "ops_per_s" => J::fp(rates[ci].median(), 1),
+                "rel_iqr" => J::fp(rates[ci].rel_iqr(), 4),
                 "latency" => h.to_json(),
-                "size_mb" => J::fp(e.size_bytes() as f64 / 1048576.0, 2),
-                "feature_score" => J::u(e.features().score() as u64),
+                "size_mb" => J::fp(*size_mb, 2),
+                "feature_score" => J::u(featc[ci].map(|f| f.score() as u64).unwrap_or(0)),
             });
             println!(
-                "  {wname:22} {name:6} {:>10.0} ops/s  p99 {:>8.3} ms",
-                ops as f64 / secs,
+                "  {wname:22} {name:14} {:>10.0} ops/s  p99 {:>8.3} ms",
+                rates[ci].median(),
                 h.percentile(99.0) as f64 / 1e6
             );
         }
+        per_workload.push(rates);
     }
     rec.series("workloads", J::arr(rows.clone()));
 
-    // The finding this suite exists to surface. A mixed read/write workload is
+    // The finding this suite existed for. A mixed read/write workload is
     // the shape no benchmark in the design document contains, and Supdb's
     // snapshot read model used to have to checkpoint and rebuild a reader to
     // serve one. `Store::read_all` removed that, so the ratio this reports is
     // now the cost of the write itself rather than the cost of publishing it.
-    let mixed: Vec<f64> = rows
-        .iter()
-        .filter(|r| {
-            r.path("engine").and_then(|v| v.as_str()) == Some("supdb")
-                && r.path("workload")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|w| w.starts_with('A'))
-        })
-        .filter_map(|r| r.num("ops_per_s"))
-        .collect();
-    let readonly: Vec<f64> = rows
-        .iter()
-        .filter(|r| {
-            r.path("engine").and_then(|v| v.as_str()) == Some("supdb")
-                && r.path("workload")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|w| w.starts_with('C'))
-        })
-        .filter_map(|r| r.num("ops_per_s"))
-        .collect();
-    if let (Some(a), Some(c)) = (mixed.first(), readonly.first()) {
+    let idx = |name: &str| which.iter().position(|w| *w == name);
+    let wl = |prefix: char| workloads.iter().position(|w| w.0.starts_with(prefix));
+    if let (Some(si), Some(a), Some(c)) = (idx("supdb"), wl('A'), wl('C')) {
+        let (a, c) = (per_workload[a][si].median(), per_workload[c][si].median());
+        if a.is_finite() && c.is_finite() {
+            rec.finding(Finding::new(
+                "EXT.3",
+                "Supdb sustains a mixed read/write workload within 10x of a read-only one",
+                c / a.max(1e-9) < 10.0,
+                format!(
+                    "YCSB-A (50/50) {a:.0} ops/s against YCSB-C (100% read) {c:.0} ops/s -> \
+                     {:.1}x. A read after a write is served from the writer's own state; when \
+                     this ratio was 13.5x it needed a checkpoint and a fresh Reader, both O(key \
+                     count)",
+                    c / a.max(1e-9)
+                ),
+            ));
+        }
+    }
+
+    // The matched pairs: the next engine, undrained after its load as
+    // RocksDB is, against RocksDB tuned as deployed. Both commit durably
+    // per batch, both apply a batch whole, neither verifies checksums on
+    // read; `Features::unmatched` refuses the ordering if that ever stops
+    // being so. One claim per workload that has a distinct shape.
+    let pairs: [(&str, char, &str); 4] = [
+        ("EXT.42", 'A', "an update-heavy mix (YCSB-A)"),
+        ("EXT.43", 'C', "a read-only Zipfian workload (YCSB-C)"),
+        ("EXT.44", 'E', "short scans with inserts (YCSB-E)"),
+        ("EXT.45", 'F', "read-modify-write (YCSB-F)"),
+    ];
+    for (id, w, what) in pairs {
+        let title = format!("the next engine sustains {what} at least as fast as tuned RocksDB");
+        let (Some(wi), Some(ni), Some(ri)) = (wl(w), idx("next-nodrain"), idx("rocksdb-tuned"))
+        else {
+            continue;
+        };
+        let (a, b) = (&per_workload[wi][ni], &per_workload[wi][ri]);
+        if a.is_empty() || b.is_empty() || !a.median().is_finite() || !b.median().is_finite() {
+            continue;
+        }
+        let (Some(fa), Some(fb)) = (feats[ni], feats[ri]) else { continue };
+        let gap = fa.unmatched(&fb, true);
+        if !gap.is_empty() {
+            rec.finding(Finding::not_exercised(
+                id,
+                &title,
+                format!("not an ordering: the arms differ on {}", gap.join(", ")),
+            ));
+            continue;
+        }
+        let cmp = compare(a, b, supdb::bench::MIN_EFFECT);
+        rec.compare(&format!("{id}_next-nodrain_vs_rocksdb-tuned"), cmp.clone());
         rec.finding(Finding::new(
-            "EXT.3",
-            "Supdb sustains a mixed read/write workload within 10x of a read-only one",
-            c / a.max(1e-9) < 10.0,
+            id,
+            &title,
+            !matches!(cmp.verdict, Verdict::Less),
             format!(
-                "YCSB-A (50/50) {a:.0} ops/s against YCSB-C (100% read) {c:.0} ops/s -> {:.1}x. \
-                 A read after a write is served from the writer's own state; when this \
-                 ratio was 13.5x it needed a checkpoint and a fresh Reader, both O(key count)",
-                c / a.max(1e-9)
+                "{:.0} ops/s against {:.0} ({}), {ops} operations over {n} records in \
+                 {batch}-record batches, each batch durable",
+                a.median(),
+                b.median(),
+                cmp.summary("next-nodrain", "rocksdb-tuned")
             ),
         ));
     }

@@ -2614,6 +2614,15 @@ impl Db {
         Ok(())
     }
 
+    /// Wait for whatever seal and merge are in flight, starting nothing new
+    /// (a joined seal may still trigger a merge when compaction is on and
+    /// the level-0 count says so). For an experiment that wants a store in a
+    /// known shape before it measures.
+    pub fn settle(&mut self) -> Result<()> {
+        self.join_seal()?;
+        self.join_compact()
+    }
+
     /// Make everything written durable and seal nothing: the WAL's pending
     /// frames written and fsynced, the memtable left where it is. What a
     /// caller wants when it has stopped writing for now and will read the
