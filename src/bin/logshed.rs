@@ -63,6 +63,9 @@ const FIELDS: &[(&str, usize)] = &[
 /// posting would save at most two bytes against a one-byte prefix that is
 /// paid either way.
 const POSTING_BYTES: usize = 4;
+/// 0xFF then a UTF-8 continuation byte: sorts after every text key and is
+/// not valid UTF-8, which is what the byte-key regression needs.
+const BINARY_KEY: &[u8] = &[0xff, 0xbf, 0x61];
 
 fn term(field: &str, i: usize, out: &mut Vec<u8>) {
     out.clear();
@@ -189,6 +192,12 @@ fn build_day(path: &Path, lines: u64, seed: u64, order: Order) -> std::io::Resul
             }
         }
     }
+    // One key that is bytes and not text -- a trigram cut through a
+    // multibyte character is the shape -- so the browser suite has a key
+    // whose `TextDecoder` rendering is not the key. It sorts last, so the
+    // dictionary scans the fixture asserts by text are unmoved.
+    store.append(BINARY_KEY, &[0u8; POSTING_BYTES])?;
+    postings += 1;
     store.checkpoint()?;
     let stats = store.close()?;
     let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -615,6 +624,9 @@ fn fixture(dir: &Path, lines: u64) -> std::io::Result<()> {
     if let Some(k) = blob.key_at(blob.keys().saturating_sub(1)) {
         probes.push(k.to_vec());
     }
+    // The byte key is probed by its own test, through `keyBytes`; the text
+    // probes here would look it up by a rendering that is not the key.
+    probes.retain(|k| k.as_slice() != BINARY_KEY);
 
     let mut lookups = Vec::new();
     let mut counts = Vec::new();
@@ -790,6 +802,10 @@ fn fixture(dir: &Path, lines: u64) -> std::io::Result<()> {
             "from" => J::s(from),
             "limit" => J::u(12),
             "rows" => J::arr(rows),
+        },
+        "binary_key" => jobj! {
+            "bytes" => J::arr(BINARY_KEY.iter().map(|b| J::u(*b as u64)).collect()),
+            "count" => J::u(blob.count(BINARY_KEY)?),
         },
         "corrupt" => jobj! {
             "key" => J::s(String::from_utf8_lossy(&corrupt.0).into_owned()),

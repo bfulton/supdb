@@ -75,6 +75,8 @@ function fnv32(values) {
   return { count: n, hash: h >>> 0 };
 }
 
+const plain = (rows) => rows.map(({ key, count }) => ({ key, count }));
+
 const ops = {
   open,
   keys: () => reader.keys,
@@ -86,9 +88,13 @@ const ops = {
   count: ({ key }) => reader.count(key),
   countFixed: ({ key, width }) => reader.countFixed(key, width),
   storedBytes: ({ key }) => reader.storedBytes(key),
-  scanCounts: ({ from, limit }) => reader.scanCounts(from, limit),
+  // Rows cross the worker boundary as text and count: `keyBytes` is the
+  // key and is what a caller passes back to a lookup (web/test/node.mjs
+  // proves the text form of a byte key does not), but the browser suite
+  // compares rows against the native fixture's text rows.
+  scanCounts: ({ from, limit }) => plain(reader.scanCounts(from, limit)),
   scanCountsFixed: ({ from, limit, width }) =>
-    reader.scanCountsFixed(from, limit, width),
+    plain(reader.scanCountsFixed(from, limit, width)),
   // R6.2: the plan, and the plan-then-fetch that makes reads miss-proof.
   planRanges: ({ keys }) => reader.planRanges(keys),
   ensure: async ({ keys }) => {
@@ -96,7 +102,7 @@ const ops = {
     return true;
   },
   // R6.3: the dictionary by range, for the sparse source.
-  dictCounts: ({ lo, hi }) => reader.dictCounts(lo, hi ?? null),
+  dictCounts: ({ lo, hi }) => plain(reader.dictCounts(lo, hi ?? null)),
   ensureDict: async ({ lo, hi }) => {
     await reader.ensureDict(lo, hi ?? null);
     return true;

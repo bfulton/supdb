@@ -289,8 +289,17 @@ export class SupdbReader {
       // this is the one sentinel in the file that never had the i32 problem,
       // because it is read out of the frame rather than returned by a call.
       const missing = lo === 0xffffffff && hi === 0xffffffff;
+      // `keyBytes` is the key. `key` is a rendering of it for display:
+      // supdb keys are byte strings, and a key that is not valid UTF-8 --
+      // a trigram cut through a multibyte character is the common case --
+      // decodes with U+FFFD in it, so the text cannot be looked up. logshed
+      // found this by round-tripping every key of a dictionary; pass
+      // `keyBytes` to `lookup`, `count` and the rest, never `key`.
+      // Sliced, not subarrayed: the wasm memory can grow under a view.
+      const keyBytes = m.mem.slice(at, at + klen);
       out[i] = {
-        key: m.dec.decode(m.mem.subarray(at, at + klen)),
+        key: m.dec.decode(keyBytes),
+        keyBytes,
         count: missing ? null : hi * 0x100000000 + lo,
       };
       at += klen;
@@ -535,8 +544,11 @@ export class SparseReader {
       const lo32 = dv.getUint32(at + 4, true);
       const hi32 = dv.getUint32(at + 8, true);
       at += 12;
+      // As in `scanFrame`: `keyBytes` is the key, `key` is for display.
+      const keyBytes = m.mem.slice(at, at + klen);
       out[i] = {
-        key: m.dec.decode(m.mem.subarray(at, at + klen)),
+        key: m.dec.decode(keyBytes),
+        keyBytes,
         count: hi32 * 0x100000000 + lo32,
       };
       at += klen;

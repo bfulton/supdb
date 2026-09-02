@@ -108,6 +108,24 @@ async function main() {
     eq(`storedBytes ${c.key}`, reader.storedBytes(c.key), c.stored_bytes);
   }
 
+  // Keys are bytes. A walk hands back `keyBytes`, which looks up, and
+  // `key`, a text rendering that for a key that is not UTF-8 does not:
+  // logshed's equivalence test found `scanCounts` returning names that
+  // could not be looked up, because the only thing returned was the text.
+  {
+    const bk = new Uint8Array(expected.binary_key.bytes);
+    const rows = reader.scanCounts(bk, 1);
+    eq("the byte key is the last key of the dictionary", rows.length, 1);
+    eq("scanCounts returns the key's bytes", Array.from(rows[0].keyBytes), Array.from(bk));
+    eq("and its count", rows[0].count, expected.binary_key.count);
+    eq("the bytes look up", reader.count(rows[0].keyBytes), expected.binary_key.count);
+    eq(
+      "the text rendering of a byte key does not look up, which is why keyBytes exists",
+      reader.count(rows[0].key),
+      0,
+    );
+  }
+
   // A closed reader's handle is not a handle, and every arm of the ABI must
   // say so: the u32 sentinel (keys, lookup) and the u64 sentinel (count,
   // storedBytes) each had their own dead comparison.
