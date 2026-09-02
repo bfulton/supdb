@@ -127,8 +127,9 @@ The matched scorecard against LMDB, `full`:
 | scan (`EXT.12`) | 17.4M/s | 18.6M/s | coin toss here (1.16x sig, then 0.93x nd, same night); 1.17x on Apple Silicon, replicated |
 
 The next engine (`src/next.rs`), matched on durability *and* transactions
-since it gained atomic batches and `Txn`: durable load **0.694x** of LMDB
-in the latest canonical run (`EXT.22`; 0.49-0.51x the two runs before --
+since it gained atomic batches and `Txn`: durable load **0.825x** of LMDB
+in the latest canonical run, the first with the borrowed batch in the
+harness (`EXT.22`; 0.694x the run before, 0.49-0.51x the two before that --
 the move is piece promotion, because the canonical load's keys ascend and
 now route by rename with no merge; a uniformly random order sits near
 0.42x, F55.3), point reads **2.2-2.5x** over the three runs with inline
@@ -155,7 +156,8 @@ cheapest moves are a borrowed batch in the harness and a per-batch CRC.
 
 Under shuffled arrival the same matched pair inverts. `EXT.27`
 (`ext-loadshape`, full) has the next engine at 284,938 ops/s against
-LMDB's 48,041, **5.93x**, because a durable commit of a thousand random
+LMDB's 48,041, **5.93x** (6.64x replicated with the borrowed batch),
+because a durable commit of a thousand random
 keys dirties about as many B-tree leaf pages and the fsync writes them
 all; the next engine's own ordered arm in that run is 0.653x, so the
 canonical load's ascending keys are the one arrival order that flatters
