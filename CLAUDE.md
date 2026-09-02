@@ -132,6 +132,15 @@ partitioning to compaction no longer separates the arms at this load
 seal either way). Its story is in `docs/next-engine.md`; every number there
 is under the same gate.
 
+Under shuffled arrival the same matched pair inverts. `EXT.27`
+(`ext-loadshape`, full) has the next engine at 284,938 ops/s against
+LMDB's 48,041, **5.93x**, because a durable commit of a thousand random
+keys dirties about as many B-tree leaf pages and the fsync writes them
+all; the next engine's own ordered arm in that run is 0.653x, so the
+canonical load's ascending keys are the one arrival order that flatters
+the B-tree. Quote the two together. The plan for that run predicted the
+opposite (shape-plan.md), which is why it is written down.
+
 `EXT.9` has moved three times, each for a decomposed reason: 6,735 -> 54,333
 ops/s when `Options::index_inserts` stopped every batch rewriting the whole
 key index; -> ~152,800 when durability points went log-first with a single

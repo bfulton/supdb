@@ -272,6 +272,21 @@ interleaved where the harness allows:
   stays gone after the next commit, because `open` truncates the WAL to
   its last commit frame before appending behind it.
 
+### Arrival order: EXT.27
+
+Every durable-load number above comes from `ext-kv`, whose keys ascend,
+and f55 made that shape special. `ext-loadshape` loads the same million
+keys both ways, interleaved, with LMDB beside each arm. Ordered, the pair
+reads 0.653x, bracketing EXT.22. Shuffled, it reads **5.931x** (284,938
+against 48,041 ops/s, p=0.0022): LMDB's durable ingest falls 13.7x when
+the keys stop arriving in order, because each per-batch fsync then
+writes about a thousand dirtied leaf pages, while the next engine's falls
+1.51x, the cost of merging what promotion cannot route. shape-plan.md
+predicted the opposite ordering -- it priced the next engine's merge and
+not the B-tree's page writeback -- and the refutation is recorded there.
+The two numbers are one finding: which engine wins the matched durable
+load depends on the arrival order, by a factor of nine.
+
 ### Crash injection: c4
 
 The promises above were held by one-shot tests that tore a file by hand.

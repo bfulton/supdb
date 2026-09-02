@@ -805,14 +805,21 @@
    "id": "EXT.13",
    "profile": "full",
    "expect": "holds",
-   "because": "Supdb loads a shuffled key set at 683,781 ops/s against lmdb-nosync's 245,565 -- 2.785x at p=0.0022 -- where the same run has it at 0.305x on the same keys arriving in order. A swing of 9x on arrival order alone, with the engines, the guarantees and the key set identical. EXT.10 measured only the ordered arm, and the suite has been reading it as a statement about loads. Both arms are real: ordered arrival is a common shape and Supdb is 3.3x behind on it. What changes is that the comparison now says which shape it is about. lmdb-nosync is still transactional, so read this as a bound."
+   "because": "Supdb loads a shuffled key set at 584,090 ops/s against lmdb-nosync's 192,245 -- 3.038x at p=0.0022 -- where the same run has it at 0.199x on the same keys arriving in order (314,576 against 1,577,594). The run before read 2.785x shuffled and 0.305x ordered. A swing of 15x on arrival order alone, with the engines, the guarantees and the key set identical. EXT.10 measured only the ordered arm, and the suite has been reading it as a statement about loads. Both arms are real: ordered arrival is a common shape and Supdb is 5x behind on it. What changes is that the comparison now says which shape it is about. lmdb-nosync is still transactional, so read this as a bound."
   },
   {
    "experiment": "ext-loadshape",
    "id": "EXT.14",
    "profile": "full",
    "expect": "holds",
-   "because": "Supdb loads at 605,369/s in order and 683,781 shuffled -- a factor of 0.89, so marginally *faster* out of order. LMDB goes 1,987,572 to 245,565, a factor of 8.10, and 813,207 to 58,507 when durable, a factor of 13.9. That is the architectural difference rather than a ranking: a B-tree taking keys in order fills pages left to right and splits almost never, and the same tree taking them shuffled splits constantly, while an append-structured store writes where the cursor already is either way. It is the property Supdb should have and the first measurement here that shows it, and it is worth more than either ordering, because a store whose ingest rate does not depend on what the keys look like is one you can size capacity for."
+   "because": "Supdb loads at 314,576/s in order and 584,090 shuffled -- a factor of 0.54, so faster out of order (0.89 in the run before). LMDB goes 1,577,594 to 192,245, a factor of 8.21, and 658,292 to 48,041 when durable, a factor of 13.7 (8.10 and 13.9 the run before). The next engine sits between them: 429,659 to 284,938, a factor of 1.51 -- it sorts at seal and merges what it cannot promote, so it keeps some of the B-tree's preference for order and none of its collapse. That is the architectural difference rather than a ranking: a B-tree taking keys in order fills pages left to right and splits almost never, and the same tree taking them shuffled splits constantly, while an append-structured store writes where the cursor already is either way. It is the property Supdb should have and the first measurement here that shows it, and it is worth more than either ordering, because a store whose ingest rate does not depend on what the keys look like is one you can size capacity for."
+  },
+  {
+   "experiment": "ext-loadshape",
+   "id": "EXT.27",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Shuffled, the next engine loads 284,938 ops/s against lmdb's 48,041 -- 5.931x at p=0.0022 -- with both committing per batch and both transactional, so nothing leans. shape-plan.md registered the opposite: P27.1 put this arm at 0.35x to 0.55x, reasoning from the next engine's own cost of merging what promotion cannot route. That half was right -- its ordered arm in the same run is 429,659, 0.653x of lmdb and bracketing EXT.22's 0.694x from the other suite, and its swing is 1.508x (P27.2, P27.3 held). What the plan missed is lmdb's swing: 658,292 to 48,041, 13.7x, because a durable commit of 1,000 random keys dirties about as many leaf pages and the fsync writes them all, where 1,000 ascending keys dirty a handful. The canonical load's ascending keys are the one arrival order that flatters the B-tree; on the other, the matched durable load is not close. Quote this with EXT.22, never instead of it."
   },
   {
    "experiment": "f31-loadphases",

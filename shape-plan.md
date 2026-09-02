@@ -28,3 +28,15 @@ If P27.1 is refuted upward -- shuffled at or above 0.6x -- then merge
 cost is not where the ingest goes under random keys and the next lever is
 not the merge. If the swing is under 1.3x, promotion is not what makes
 the ordered arm fast and F55.3 was misread.
+
+## Outcome (full, one run, `results/ext-loadshape.full.json`)
+
+P27.1 refuted, upward and by an order of magnitude: shuffled, `next` loads
+284,938 ops/s against `lmdb`'s 48,041, **5.931x** (p=0.0022). P27.2 held
+at the edge (swing 1.508x); P27.3 held (ordered pair 0.653x). The miss was
+LMDB's swing, predicted under 1.3x and measured 13.7x: a durable commit of
+a thousand random keys dirties about as many leaf pages and fsyncs them
+all. The plan's own rule applies -- the merge is not where the ingest goes
+*relative to LMDB* under random keys -- but the merge is still where the
+next engine's own 0.66x against its ordered arm goes, and that is the
+lever that remains. Recorded as `EXT.27`, holding.
