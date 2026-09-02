@@ -189,6 +189,14 @@ pub struct NextOptions {
     /// through the journal; an overwrite does not, and LMDB's commit is an
     /// overwrite. f57 prices it (walreuse-plan.md).
     pub recycle_wal: bool,
+    /// The ordered scan's merge over unrouted sources. `true` is the merge
+    /// f61 priced and f62 replaced: one cursor over the disjoint partitions
+    /// in order rather than one per partition, each cursor's key resolved
+    /// once per emitted key, and the unsealed snapshot carrying each key's
+    /// memtable entry so the emit is a chain walk over a reused buffer
+    /// instead of two hash probes and an allocation. `false` is the merge
+    /// before it, kept as the comparison arm (scanmerge-plan.md).
+    pub scan_merge: bool,
 }
 
 impl Default for NextOptions {
@@ -213,6 +221,7 @@ impl Default for NextOptions {
             flush_ranges: true,
             promote: true,
             recycle_wal: false,
+            scan_merge: true,
         }
     }
 }
@@ -1546,6 +1555,24 @@ impl MemTable {
         (offs, false)
     }
 
+    /// `live_chain` into a caller's buffer, oldest first, allocating nothing
+    /// after the buffer has grown once; returns whether a tombstone cut it.
+    fn live_offs_into(&self, e: &MemEntry, out: &mut Vec<usize>) -> bool {
+        out.clear();
+        let mut at = e.head - 1;
+        let mut tomb = false;
+        while at != NO_CHUNK {
+            if self.is_tomb(at as usize) {
+                tomb = true;
+                break;
+            }
+            out.push(at as usize);
+            at = u64::from_le_bytes(self.vals[at as usize..at as usize + 8].try_into().unwrap());
+        }
+        out.reverse();
+        tomb
+    }
+
     /// Whether a tombstone sits anywhere in the key's chain.
     fn has_tomb(&self, e: &MemEntry) -> bool {
         let mut at = e.head - 1;
@@ -2196,7 +2223,16 @@ pub struct Db {
     /// unsealed. Without this, every scan walked the whole memtable: the
     /// ext-kv scan phase spent 15 minutes a rep in that walk, twice -- once
     /// through the live table and once through the frozen one.
-    scan_keys: std::cell::RefCell<Option<(u64, Vec<Vec<u8>>)>>,
+    scan_keys: std::cell::RefCell<Option<(u64, Vec<SnapKey>)>>,
+}
+
+/// One key of the unsealed snapshot a scan merges: the key, and where it
+/// sits in the live and the frozen memtable (`u32::MAX` for absent), so
+/// emitting it is an indexed chain walk and not a hash probe per table.
+struct SnapKey {
+    key: Vec<u8>,
+    mem: u32,
+    frozen: u32,
 }
 
 impl Db {
@@ -2440,6 +2476,18 @@ impl Db {
         self.wal.append(key, value);
         self.mem.append(key, value);
         self.mem_bytes += key.len() + value.len();
+    }
+
+    /// Replace a key's values with one new value: a delete and an append in
+    /// the same batch, so a read after the commit sees the new value alone
+    /// and a crash sees both or neither. This is the update the external
+    /// suite's YCSB phase means, and what `Store::put` and every
+    /// single-value engine there do; `append` is the other verb, and using
+    /// it for an update piled every Zipfian rewrite onto its key until each
+    /// read walked the pile (ycsb-plan.md).
+    pub fn put(&mut self, key: &[u8], value: &[u8]) {
+        self.delete(key);
+        self.append(key, value);
     }
 
     /// End every value of `key` written before this point; later appends
@@ -3261,24 +3309,40 @@ impl Db {
             let mut cache = self.scan_keys.borrow_mut();
             let stale = cache.as_ref().is_none_or(|(g, _)| *g != gen);
             if stale {
-                let mut all: Vec<Vec<u8>> = Vec::with_capacity(self.mem.len);
-                let mut take = |mem: &MemTable| {
-                    for e in mem.entries.iter().filter(|e| e.hash != 0) {
-                        all.push(MemTable::key_of(&mem.keys, e).to_vec());
+                let mut all: Vec<SnapKey> = Vec::with_capacity(self.mem.len);
+                let mut take = |mem: &MemTable, live: bool| {
+                    for (i, e) in mem.entries.iter().enumerate().filter(|(_, e)| e.hash != 0) {
+                        all.push(SnapKey {
+                            key: MemTable::key_of(&mem.keys, e).to_vec(),
+                            mem: if live { i as u32 } else { u32::MAX },
+                            frozen: if live { u32::MAX } else { i as u32 },
+                        });
                     }
                 };
                 if let Some(fr) = &self.frozen {
-                    take(fr);
+                    take(fr, false);
                 }
-                take(&self.mem);
-                all.sort_unstable();
-                all.dedup();
+                take(&self.mem, true);
+                all.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+                // A key in both tables becomes one entry carrying both.
+                all.dedup_by(|later, first| {
+                    if later.key != first.key {
+                        return false;
+                    }
+                    if later.mem != u32::MAX {
+                        first.mem = later.mem;
+                    }
+                    if later.frozen != u32::MAX {
+                        first.frozen = later.frozen;
+                    }
+                    true
+                });
                 *cache = Some((gen, all));
             }
         }
         let cache = self.scan_keys.borrow();
         let unsealed = &cache.as_ref().expect("scan snapshot").1;
-        let mut mi = unsealed.partition_point(|k| k.as_slice() < from);
+        let mut mi = unsealed.partition_point(|k| k.key.as_slice() < from);
 
         // When nothing overlaps -- no unsealed keys in range, no L0 -- the
         // partitions ARE the answer in key order, and each one can be
@@ -3313,6 +3377,10 @@ impl Db {
             return Ok(seen);
         }
 
+        if self.opts.scan_merge {
+            return self.scan_merged(from, limit, mi, unsealed, f);
+        }
+
         // A k-way merge over rank cursors, allocating nothing per key.
         //
         // The version before this one materialised every candidate key from
@@ -3344,8 +3412,8 @@ impl Db {
                 }
             }
             if let Some(k) = unsealed.get(mi) {
-                if next.is_none_or(|n| k.as_slice() < n) {
-                    next = Some(k.as_slice());
+                if next.is_none_or(|n| k.key.as_slice() < n) {
+                    next = Some(k.key.as_slice());
                 }
             }
             let Some(key) = next else { break };
@@ -3357,7 +3425,7 @@ impl Db {
             // frozen memtable, then the live one -- so the newest source with
             // a tombstone for this key is a cut, and live values start there.
             let nc = cursors.len();
-            let in_unsealed = unsealed.get(mi).map(|k| k.as_slice()) == Some(key);
+            let in_unsealed = unsealed.get(mi).map(|k| k.key.as_slice()) == Some(key);
             let mut start = 0usize;
             if tombs {
                 if in_unsealed {
@@ -3410,6 +3478,155 @@ impl Db {
                         for off in self.mem.live_chain(e).0 {
                             f(key, self.mem.value_at(off));
                         }
+                    }
+                }
+                mi += 1;
+            }
+            seen += 1;
+        }
+        Ok(seen)
+    }
+
+    /// The merge over unrouted sources, f62's arm: one cursor walking the
+    /// disjoint partitions in order, one cursor per level-0 segment, and the
+    /// unsealed snapshot with each key's entries in hand. Every cursor's key
+    /// is resolved once per emitted key. Sources are ordered oldest to
+    /// newest -- the partition, level 0 oldest first, the frozen memtable,
+    /// the live one -- and a tombstone in the newest source that holds the
+    /// key cuts everything older, as in `read_all`.
+    fn scan_merged<F: FnMut(&[u8], &[u8])>(
+        &self,
+        from: &[u8],
+        limit: usize,
+        mut mi: usize,
+        unsealed: &[SnapKey],
+        mut f: F,
+    ) -> Result<usize> {
+        let np = self.segs.partition_point(|s| s.level > 0);
+        let parts = &self.segs[..np];
+        // The partition cursor: the first partition whose fence can reach
+        // `from`, then each following one from its first key.
+        let mut pi = parts.partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= from));
+        let mut prank = 0usize;
+        let mut pkey: Option<&[u8]> = None;
+        while pi < np {
+            let s = &parts[pi];
+            let start = if s.lo.as_slice() > from { s.lo.as_slice() } else { from };
+            prank = s.blob.seek(start);
+            pkey = s.blob.key_at(prank);
+            if pkey.is_some() {
+                break;
+            }
+            pi += 1;
+        }
+        struct Cur<'a> {
+            seg: &'a Seg,
+            rank: usize,
+            key: Option<&'a [u8]>,
+        }
+        let mut l0: Vec<Cur> = self.segs[np..]
+            .iter()
+            .filter(|s| s.may_reach(from))
+            .map(|s| {
+                let start = if s.lo.as_slice() > from { s.lo.as_slice() } else { from };
+                let rank = s.blob.seek(start);
+                Cur { seg: s, rank, key: s.blob.key_at(rank) }
+            })
+            .collect();
+        let nc = l0.len();
+        let tombs = self.has_tombstones();
+        let mut scratch: Vec<usize> = Vec::new();
+        let mut seen = 0usize;
+        while seen < limit {
+            let mut next: Option<&[u8]> = pkey;
+            for c in &l0 {
+                if let Some(k) = c.key {
+                    if next.is_none_or(|n| k < n) {
+                        next = Some(k);
+                    }
+                }
+            }
+            let snap = unsealed.get(mi);
+            if let Some(sk) = snap {
+                if next.is_none_or(|n| sk.key.as_slice() < n) {
+                    next = Some(sk.key.as_slice());
+                }
+            }
+            let Some(key) = next else { break };
+            let in_unsealed = snap.is_some_and(|sk| sk.key.as_slice() == key);
+
+            // Source indices: partition 0, level 0 at 1..=nc, frozen nc+1,
+            // live nc+2. `start` is the oldest source whose values are live.
+            let mut start = 0usize;
+            if tombs {
+                if let Some(sk) = snap.filter(|_| in_unsealed) {
+                    if sk.mem != u32::MAX && self.mem.has_tomb(&self.mem.entries[sk.mem as usize]) {
+                        start = nc + 2;
+                    } else if sk.frozen != u32::MAX
+                        && self
+                            .frozen
+                            .as_ref()
+                            .is_some_and(|fr| fr.has_tomb(&fr.entries[sk.frozen as usize]))
+                    {
+                        start = nc + 1;
+                    }
+                }
+                if start == 0 {
+                    for (j, c) in l0.iter().enumerate().rev() {
+                        if c.seg.tombs && c.key == Some(key) {
+                            if let Some((_, exts)) = c.seg.blob.exts_at(c.rank) {
+                                if exts.iter().any(|e| e.is_tombstone()) {
+                                    start = j + 1;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if pkey == Some(key) {
+                if start == 0 {
+                    parts[pi]
+                        .blob
+                        .values_at(prank, |v| f(key, v))
+                        .map_err(|e| err(&format!("segment scan read: {e}")))?;
+                }
+                prank += 1;
+                pkey = parts[pi].blob.key_at(prank);
+                while pkey.is_none() && pi + 1 < np {
+                    pi += 1;
+                    prank = 0;
+                    pkey = parts[pi].blob.key_at(0);
+                }
+            }
+            for (j, c) in l0.iter_mut().enumerate() {
+                if c.key == Some(key) {
+                    if j + 1 >= start {
+                        c.seg
+                            .blob
+                            .values_at(c.rank, |v| f(key, v))
+                            .map_err(|e| err(&format!("segment scan read: {e}")))?;
+                    }
+                    c.rank += 1;
+                    c.key = c.seg.blob.key_at(c.rank);
+                }
+            }
+            if let Some(sk) = snap.filter(|_| in_unsealed) {
+                if sk.frozen != u32::MAX && nc + 1 >= start {
+                    if let Some(fr) = &self.frozen {
+                        let e = &fr.entries[sk.frozen as usize];
+                        fr.live_offs_into(e, &mut scratch);
+                        for &off in &scratch {
+                            f(key, fr.value_at(off));
+                        }
+                    }
+                }
+                if sk.mem != u32::MAX && nc + 2 >= start {
+                    let e = &self.mem.entries[sk.mem as usize];
+                    self.mem.live_offs_into(e, &mut scratch);
+                    for &off in &scratch {
+                        f(key, self.mem.value_at(off));
                     }
                 }
                 mi += 1;

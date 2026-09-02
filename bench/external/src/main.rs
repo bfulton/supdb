@@ -2074,7 +2074,7 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
                 } else if roll < pread + pupd {
                     wbuf.push(&kb, payload.get(&mut vrng));
                     if wbuf.len() >= batch {
-                        wbuf.flush(e.as_mut()).expect("update");
+                        wbuf.flush_updates(e.as_mut()).expect("update");
                     }
                 } else if roll < pread + pupd + pscan {
                     let _ = e.range(&kb, 50).expect("scan");
@@ -2082,13 +2082,13 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
                     let _ = e.get(&kb).expect("rmw read");
                     wbuf.push(&kb, payload.get(&mut vrng));
                     if wbuf.len() >= batch {
-                        wbuf.flush(e.as_mut()).expect("rmw write");
+                        wbuf.flush_updates(e.as_mut()).expect("rmw write");
                     }
                 }
                 h.record(t1.elapsed().as_nanos() as u64);
             }
             if !wbuf.is_empty() {
-                wbuf.flush(e.as_mut()).expect("tail");
+                wbuf.flush_updates(e.as_mut()).expect("tail");
             }
             let secs = t.elapsed().as_secs_f64();
             let size_mb = e.size_bytes() as f64 / 1048576.0;

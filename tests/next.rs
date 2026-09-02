@@ -1067,3 +1067,26 @@ fn a_flipped_byte_anywhere_in_a_batch_loses_that_batch_and_the_ones_after() {
         }
     }
 }
+
+#[test]
+fn put_replaces_and_append_accumulates() {
+    // The two write verbs. YCSB's update is a put; the load is appends; the
+    // external harness confused them once and every Zipfian rewrite piled
+    // onto its key until reads walked the pile.
+    let d = dir("put");
+    let mut db = Db::create(&d, NextOptions::default()).unwrap();
+    db.append(b"k", b"1");
+    db.append(b"k", b"2");
+    db.commit().unwrap();
+    assert_eq!(read_vec(&db, b"k"), vec![b"1".to_vec(), b"2".to_vec()]);
+    db.put(b"k", b"3");
+    db.commit().unwrap();
+    assert_eq!(read_vec(&db, b"k"), vec![b"3".to_vec()], "a put replaces");
+    assert_eq!(db.count(b"k").unwrap(), 1);
+    db.append(b"k", b"4");
+    db.commit().unwrap();
+    assert_eq!(read_vec(&db, b"k"), vec![b"3".to_vec(), b"4".to_vec()], "appends after a put accumulate again");
+    drop(db);
+    let db = Db::open(&d, NextOptions::default()).unwrap();
+    assert_eq!(read_vec(&db, b"k"), vec![b"3".to_vec(), b"4".to_vec()], "and the WAL replays the same");
+}

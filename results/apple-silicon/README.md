@@ -186,3 +186,13 @@ x86 (0.90x in the latest run after six ties), separates cleanly at 1.2x --
 the same architecture-conditional shape as the second reader's 2.4x, and
 the same explanation until decomposed otherwise: the probe executes less
 than the descent and the wide core shows it.
+
+**Run 3** (`ext-kv-next-pair.run3.json`, head a235aa9, loadavg 4.7 before):
+the pair unchanged -- load a tie (0.992x, no difference), reads **3.311x**,
+scan **1.253x** -- and `next-nodrain` beside it, the arm whose `sync` seals
+nothing: reads 2,195,485/s (0.61x of the drained arm, 2.0x LMDB) and scan
+15.4M entries/s, 0.24x of the routed store and 0.30x of LMDB. The undrained
+scan costs the same fraction here as on x86 (EXT.39), which is what f61
+and f62 are about. RocksDB is not in this pair: librocksdb is a
+ten-minute C++ build and localmost kills a job at 600 seconds, so the
+RocksDB arms sit behind a cargo feature the Mac job does not enable.

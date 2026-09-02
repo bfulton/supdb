@@ -180,6 +180,26 @@ impl Batch {
         self.ends.clear();
         Ok(())
     }
+
+    /// As `flush`, through `Engine::update_batch`: the keys may exist and
+    /// the values replace.
+    pub fn flush_updates(&mut self, e: &mut dyn Engine) -> Res<()> {
+        if self.ends.is_empty() {
+            return Ok(());
+        }
+        let mut pairs: Vec<(&[u8], &[u8])> = Vec::with_capacity(self.ends.len());
+        let (mut ks, mut vs) = (0usize, 0usize);
+        for &(ke, ve) in &self.ends {
+            pairs.push((&self.keys[ks..ke as usize], &self.vals[vs..ve as usize]));
+            ks = ke as usize;
+            vs = ve as usize;
+        }
+        e.update_batch(&pairs)?;
+        self.keys.clear();
+        self.vals.clear();
+        self.ends.clear();
+        Ok(())
+    }
 }
 
 pub trait Engine {
@@ -194,6 +214,14 @@ pub trait Engine {
     /// folded into every load ratio the suite reports. `Batch` builds one
     /// without allocating per record.
     fn write_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()>;
+    /// Write a batch whose keys may already exist, with the value replacing
+    /// what was there: YCSB's update. The same as `write_batch` for every
+    /// single-value engine, and for `Store`, whose `put` replaces; the next
+    /// engine's `write_batch` appends, which is its load verb, and an update
+    /// through it accumulated values on hot keys until reads walked them.
+    fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
+        self.write_batch(items)
+    }
     /// Bytes returned for the key; 0 for a miss.
     fn get(&mut self, key: &[u8]) -> Res<usize>;
     /// Bytes visited scanning `n` entries from `from`.
@@ -489,6 +517,13 @@ impl Engine for Next {
         let db = self.db.as_mut().ok_or("db closed")?;
         for &(k, v) in items {
             db.append(k, v);
+        }
+        db.commit().map_err(|e| e.to_string())
+    }
+    fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
+        let db = self.db.as_mut().ok_or("db closed")?;
+        for &(k, v) in items {
+            db.put(k, v);
         }
         db.commit().map_err(|e| e.to_string())
     }

@@ -1660,6 +1660,27 @@
    "profile": "full",
    "expect": "holds",
    "because": "At 16 KiB pages every field's two plans come to at most 0.59 of the field's share of the index plus four pages -- a boundary at each end of each plan, the slack W5.2 taught -- and 0.98 of the two-page bound W5.2 failed at 64 KiB (P5.6)."
+  },
+  {
+   "experiment": "f61-scanmerge",
+   "id": "F61.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "A thousand keys in the memtable cost the routed scan 3.41x: 32.4M entries/s routed against 9.5M with the thousand unsealed (p=0.0022), P61.1's mechanism -- the fast path over partitions is all or nothing, and one unsealed key past the scan's start sends every entry to the k-way merge, with a cursor open on every partition at once."
+  },
+  {
+   "experiment": "f61-scanmerge",
+   "id": "F61.2",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P61.2 refuted, and by the sign that matters: four level-0 segments and no memtable scan at 9.5M entries/s, the undrained shape at 1.7M -- 0.178x -- so the level-0 count is not the cost, the unsealed source is. Its sorted-key snapshot of a frozen and a live memtable is hundreds of thousands of keys, and each emitted key from it pays a hash probe into each table and a chain walk that allocates a vector of offsets to reverse the backward chain. That is the lever scanmerge-plan.md said the run would name, and it named a different one than expected."
+  },
+  {
+   "experiment": "f61-scanmerge",
+   "id": "F61.3",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Undrained against routed 19.1x (1.7M against 32.4M entries/s) inside one process, where EXT.39 had read 8.6x across arms; the difference is the seal still in flight at the moment of the scan, whose frozen memtable joins the live one in the unsealed source (P61.3)."
   }
  ],
  "metrics": [
