@@ -19,7 +19,7 @@ let reader = null;
 let handle = null;
 let cache = null;
 
-async function open({ wasmUrl, indexUrl, name, source, budgetBytes, pageSize }) {
+async function open({ wasmUrl, indexUrl, name, source, budgetBytes, pageSize, probeBytes, directory }) {
   const wasmBytes = await (await fetch(wasmUrl)).arrayBuffer();
   if (source === "memory") {
     const bytes = new Uint8Array(await (await fetch(indexUrl)).arrayBuffer());
@@ -51,7 +51,10 @@ async function open({ wasmUrl, indexUrl, name, source, budgetBytes, pageSize }) 
       budgetBytes,
       ...(pageSize ? { pageSize } : {}),
     });
-    reader = await openSparse(wasmBytes, cache);
+    reader = await openSparse(wasmBytes, cache, {
+      ...(probeBytes ? { probe: probeBytes } : {}),
+      ...(directory ? { directory: true } : {}),
+    });
     return {
       source: "sparse",
       keys: reader.keys,

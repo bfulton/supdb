@@ -733,6 +733,12 @@ pub struct SegmentWriter {
     /// Runs up to this many bytes go into the record's tail instead of a
     /// block (`Ext::INLINE`); zero keeps every run in blocks.
     inline_max: usize,
+    /// Bytes left free after the superblock page, into which `finish` puts
+    /// the block table and a copy of the fence when they fit, so a host
+    /// whose first probe covers the reserve opens in one round trip
+    /// (waves-plan.md, R7.1). Zero for none; laid down at the first key.
+    head_reserve: usize,
+    reserve_off: u64,
     /// The inline runs, concatenated, with each key's span in it (empty for
     /// a key whose run went to a block). Blocks-first mode only; the
     /// records-first mode streams each tail out inside its record.
@@ -834,6 +840,8 @@ impl SegmentWriter {
             sync_every: 0,
             since_sync: 0,
             inline_max: 0,
+            head_reserve: 0,
+            reserve_off: 0,
             tails: Vec::new(),
             tail_spans: Vec::new(),
             mode: None,
@@ -859,11 +867,36 @@ impl SegmentWriter {
         self.inline_max = bytes;
     }
 
+    /// Leave `bytes` free after the superblock page for the block table and
+    /// a copy of the fence, so a sparse open whose first probe is that
+    /// generous needs no second round trip. Must be set before the first
+    /// key. Costs `bytes` of file whether or not they fill.
+    pub fn set_head_reserve(&mut self, bytes: usize) {
+        self.head_reserve = bytes;
+    }
+
+    /// Where the key section starts: after the superblock page and the
+    /// head reserve, if any.
+    fn key_start(&self) -> u64 {
+        crate::store::SUPER + if self.reserve_off != 0 { self.head_reserve as u64 } else { 0 }
+    }
+
     fn layout(&mut self) -> Result<Layout> {
         if let Some(m) = self.mode {
             return Ok(m);
         }
         let m = if self.inline_max > 0 { Layout::RecordsFirst } else { Layout::BlocksFirst };
+        if self.head_reserve > 0 && self.reserve_off == 0 {
+            self.reserve_off = self.pos;
+            let mut left = self.head_reserve;
+            let zeros = [0u8; 4096];
+            while left > 0 {
+                let n = left.min(zeros.len());
+                self.out.write_all(&zeros[..n])?;
+                left -= n;
+            }
+            self.pos += self.head_reserve as u64;
+        }
         if m == Layout::RecordsFirst {
             // The section header is written last, once the trailer's
             // offsets are known; its 192 bytes are reserved now so the
@@ -1064,7 +1097,7 @@ impl SegmentWriter {
 
         let (key_off, key_len, header): (u64, usize, Option<Vec<u8>>) = match layout {
             Layout::RecordsFirst => {
-                let key_off = crate::store::SUPER;
+                let key_off = self.key_start();
                 let (header, trailer, total) = {
                     let arena = &self.key_arena;
                     let spans = &self.spans;
@@ -1130,12 +1163,21 @@ impl SegmentWriter {
 
         let rows = vec![[0u32; block::MAX_CHUNK_CRCS]; self.blocks.len()];
         let table = flatindex::encode_blocks(&self.blocks, &rows);
-        self.pad_to(8)?;
-        let blk_off = self.pos;
-        self.out.write_all(&table)?;
-        self.pos += table.len() as u64;
+        // The table goes into the head reserve when there is one and it
+        // fits with room for the fence copy; else at the end, as before.
+        let table_in_reserve =
+            self.reserve_off != 0 && table.len() + 8 <= self.head_reserve;
+        let blk_off = if table_in_reserve {
+            self.reserve_off
+        } else {
+            self.pad_to(8)?;
+            let at = self.pos;
+            self.out.write_all(&table)?;
+            self.pos += table.len() as u64;
+            at
+        };
 
-        let (key_off, key_len) = if layout == Layout::BlocksFirst {
+        let (key_off, key_len, header_bytes) = if layout == Layout::BlocksFirst {
             let (section, reserve) = {
                 let all: Vec<(&[u8], &Extents)> = self
                     .spans
@@ -1179,16 +1221,77 @@ impl SegmentWriter {
                 self.out.write_all(&vec![0u8; key_len - section.len()])?;
             }
             self.pos += key_len as u64;
-            (key_off, key_len)
+            let mut hb = [0u8; flatindex::HEADER_BYTES];
+            hb.copy_from_slice(&section[..flatindex::HEADER_BYTES]);
+            (key_off, key_len, hb)
         } else {
-            (key_off, key_len)
+            let mut hb = [0u8; flatindex::HEADER_BYTES];
+            hb.copy_from_slice(header.as_deref().expect("records-first header"));
+            (key_off, key_len, hb)
         };
 
         let file = self.out.into_inner().map_err(|e| e.into_error())?;
         use std::os::unix::fs::FileExt;
-        if let Some(h) = header {
-            file.write_all_at(&h, key_off)?;
+        if let Some(h) = &header {
+            file.write_all_at(h, key_off)?;
         }
+
+        // The superblock extension: the header copy and every offset a
+        // sparse open needs, so it plans itself from the first probe; and
+        // the reserve's contents -- table, then the fence copy when it fits.
+        let hdr = flatindex::Header::parse(&header_bytes)
+            .ok_or_else(|| err("segment writer: the header it wrote does not parse"))?;
+        let (foff, flen) = flatindex::fence_span(&hdr, key_len);
+        let row_len = if hdr.crc_off != 0 {
+            flatindex::checksum_row_len(hdr.crc_off, hdr.piece_shift, key_off)
+        } else {
+            0
+        };
+        let mut fence_copy = None;
+        let mut row_copy = None;
+        let mut dir_copy = None;
+        if table_in_reserve {
+            file.write_all_at(&table, self.reserve_off)?;
+            let end = self.reserve_off + self.head_reserve as u64;
+            let mut at = (self.reserve_off + table.len() as u64).div_ceil(8) * 8;
+            // The checksum row first -- verification needs it before the
+            // fence -- then the fence, each when it fits.
+            if row_len > 0 && at + row_len as u64 <= end {
+                let mut row = vec![0u8; row_len];
+                file.read_exact_at(&mut row, key_off + hdr.crc_off as u64)?;
+                file.write_all_at(&row, at)?;
+                row_copy = Some(at);
+                at = (at + row_len as u64).div_ceil(8) * 8;
+            }
+            if flen > 0 && at + flen as u64 <= end {
+                let mut fence = vec![0u8; flen];
+                file.read_exact_at(&mut fence, key_off + foff as u64)?;
+                file.write_all_at(&fence, at)?;
+                fence_copy = Some((at, flen as u64, block::crc32(&fence)));
+                at = (at + flen as u64).div_ceil(8) * 8;
+            }
+            // And the directory, so a directory-resident open is one wave
+            // too when the reserve is sized for it.
+            let dlen = hdr.nkeys * 4;
+            if dlen > 0 && at + dlen as u64 <= end {
+                let mut d = vec![0u8; dlen];
+                file.read_exact_at(&mut d, key_off + hdr.dir_off as u64)?;
+                file.write_all_at(&d, at)?;
+                dir_copy = Some((at, block::crc32(&d)));
+            }
+        }
+        let ext = crate::blob::SuperExt {
+            fence: (key_off + foff as u64, flen as u64),
+            dir: (key_off + hdr.dir_off as u64, hdr.nkeys as u64 * 4),
+            hash: (key_off + hdr.hash_off as u64, hdr.hash_cap as u64 * 8),
+            row: (key_off + hdr.crc_off as u64, row_len as u64),
+            table_copy: if table_in_reserve { Some((blk_off, table.len() as u64)) } else { None },
+            fence_copy,
+            row_copy,
+            dir_copy,
+            header: header_bytes,
+        };
+
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1215,8 +1318,12 @@ impl SegmentWriter {
             generation,
         ];
         let sb = superblock(&fields);
-        file.write_all_at(&sb, 0)?;
-        file.write_all_at(&sb, crate::store::SLOT)?;
+        let mut page = vec![0u8; crate::store::SUPER as usize];
+        page[..sb.len()].copy_from_slice(&sb);
+        page[crate::store::SLOT as usize..crate::store::SLOT as usize + sb.len()].copy_from_slice(&sb);
+        let x = crate::blob::encode_super_ext(&ext, generation);
+        page[1024..1024 + x.len()].copy_from_slice(&x);
+        file.write_all_at(&page, 0)?;
         file.sync_all()?;
         Ok(())
     }

@@ -595,7 +595,13 @@ export class SparseReader {
 /// probe, then the index header and block table, then the fence the header
 /// names -- three small round trips -- and every dictionary range after
 /// that is planned and fetched on demand.
-export async function openSparse(wasm, cache) {
+/// `opts.probe`: bytes to fetch before the first plan, at least the
+/// superblock page; a segment written with a head reserve holding its
+/// block table and fence opens in one round trip when the probe covers it
+/// (R7.1). `opts.directory`: fetch the directory whole at open, so a
+/// lookup after open is one round trip -- the records -- instead of two
+/// (R7.2).
+export async function openSparse(wasm, cache, opts = {}) {
   let mem = null;
   const host = {
     supdb_host_len: () => cache.length,
@@ -616,17 +622,20 @@ export async function openSparse(wasm, cache) {
   const mod = new Module(instance, "sparse");
   const e = instance.exports;
 
-  const probe = e.supdb_open_probe();
+  const flags = opts.directory ? 1 : 0;
+  const probe = Math.max(e.supdb_open_probe(), opts.probe | 0);
   await cache.ensure([[0, probe]]);
   for (const phase of [1, 2]) {
-    const framed = e.supdb_open_sparse_plan(phase) >>> 0;
+    const framed = e.supdb_open_sparse_plan_opts(phase, flags) >>> 0;
     if (framed === 0xffffffff) {
       const why = cache.lastReadError ? ` (${cache.lastReadError})` : "";
       throw new Error(mod.lastError() + why);
     }
-    await cache.ensure(mod.ranges());
+    // An empty plan costs no round trip; the cache skips it.
+    const ranges = mod.ranges();
+    if (ranges.length) await cache.ensure(ranges);
   }
-  const h = e.supdb_open_host_sparse() >>> 0;
+  const h = e.supdb_open_host_sparse_opts(flags) >>> 0;
   if (h === 0xffffffff) {
     const why = cache.lastReadError ? ` (${cache.lastReadError})` : "";
     throw new Error(mod.lastError() + why);

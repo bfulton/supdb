@@ -205,6 +205,27 @@ pub fn verify_pieces(
     Ok(())
 }
 
+/// Where the fence lies in a section of `sec_len` bytes: from its offset
+/// array to the start of whichever region comes next, or the section end.
+/// `(0, 0)` for a section without a fence. Both writers put the fence
+/// directly before another region, so the slack is alignment at most.
+pub fn fence_span(h: &Header, sec_len: usize) -> (usize, usize) {
+    if h.fence_n == 0 {
+        return (0, 0);
+    }
+    let start = h.fence_offs_off;
+    if start < HEADER || start > sec_len {
+        return (0, 0);
+    }
+    let end = [h.hash_off, h.dir_base, h.recs_off, h.crc_off, sec_len]
+        .into_iter()
+        .filter(|&x| x > start)
+        .min()
+        .unwrap_or(sec_len)
+        .min(sec_len);
+    (start, end - start)
+}
+
 /// Piece `i`'s expected checksum out of a row.
 pub fn piece_crc(row: &[u8], i: usize) -> Option<u32> {
     rd_u32(row, i * 4)

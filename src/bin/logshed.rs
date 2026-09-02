@@ -139,6 +139,72 @@ struct Built {
 }
 
 /// Build one day's index and report what it cost.
+/// The day's postings as (field, value, line) words, sorted, so every term's
+/// postings are together and in line order within a term: the shape the
+/// roll writes when it groups by term first.
+fn sorted_pairs(lines: u64, seed: u64) -> Vec<u64> {
+    let mut rng = Rng::new(seed);
+    let mut pairs: Vec<u64> = Vec::with_capacity((lines as usize) * FIELDS.len());
+    for line in 0..lines {
+        for (f, (_, card)) in FIELDS.iter().enumerate() {
+            let i = zipf(&mut rng, *card);
+            pairs.push(((f as u64) << 56) | ((i as u64) << 32) | line);
+        }
+    }
+    pairs.sort_unstable();
+    pairs
+}
+
+/// The same day written by `SegmentWriter`: term order, runs up to
+/// `inline` bytes stored in the index record, an optional head reserve.
+/// What the roll would write if it used the segment writer (R7.3), and the
+/// shape w6 measures beside the store's.
+fn build_day_segment(
+    path: &Path,
+    lines: u64,
+    seed: u64,
+    inline: usize,
+    head_reserve: usize,
+) -> std::io::Result<u64> {
+    let _ = std::fs::remove_file(path);
+    let opts = Options { redo_log: false, shards: 1, ..Options::default() };
+    let mut w = supdb::next::SegmentWriter::create(path, &opts)?;
+    w.set_inline_max(inline);
+    if head_reserve > 0 {
+        w.set_head_reserve(head_reserve);
+    }
+    // The segment writer wants keys in byte order, which is not field-index
+    // order: group the sorted pairs by term, name each term, and sort the
+    // terms as bytes. Lines stay in order within a term.
+    let pairs = sorted_pairs(lines, seed);
+    let mut terms: Vec<(Vec<u8>, Vec<u32>)> = Vec::new();
+    let mut key = Vec::with_capacity(32);
+    let mut cur = u64::MAX;
+    for p in &pairs {
+        let head = p >> 32;
+        if head != cur {
+            cur = head;
+            term(FIELDS[(head >> 24) as usize].0, (head & 0xff_ffff) as usize, &mut key);
+            terms.push((key.clone(), Vec::new()));
+        }
+        terms.last_mut().unwrap().1.push(*p as u32);
+    }
+    terms.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    for (k, lines) in &terms {
+        w.begin(k)?;
+        for line in lines {
+            let ord = line.to_le_bytes();
+            w.value(&ord[..POSTING_BYTES]);
+        }
+        w.end()?;
+    }
+    w.begin(BINARY_KEY)?;
+    w.value(&[0u8; POSTING_BYTES]);
+    w.end()?;
+    w.finish(1)?;
+    Ok(std::fs::metadata(path)?.len())
+}
+
 fn build_day(path: &Path, lines: u64, seed: u64, order: Order) -> std::io::Result<Built> {
     let _ = std::fs::remove_file(path);
     let opts = Options {
@@ -1527,6 +1593,19 @@ fn main() -> std::io::Result<()> {
                 .unwrap_or(12_000);
             segment_fixture(&dir, events)
         }
+        "waves" => {
+            let profile =
+                Profile::parse(arg("--profile").as_deref().unwrap_or("ci")).unwrap_or(Profile::Ci);
+            let out = PathBuf::from(arg("--out").unwrap_or_else(|| "results".into()));
+            let rec = waves(profile)?;
+            rec.print_summary();
+            rec.write(&out)?;
+            if rec.all_findings_hold() {
+                Ok(())
+            } else {
+                std::process::exit(1)
+            }
+        }
         "dict" => {
             let profile =
                 Profile::parse(arg("--profile").as_deref().unwrap_or("ci")).unwrap_or(Profile::Ci);
@@ -1599,4 +1678,372 @@ fn main() -> std::io::Result<()> {
             std::process::exit(2)
         }
     }
+}
+
+// ----------------------------------------------------------------- waves --
+
+/// A byte source that models the browser's cache: bytes arrive only through
+/// `ensure`, in whole pages, and an `ensure` that brings in any page not yet
+/// resident is one dependent round trip -- a wave. Reads outside what was
+/// ensured fail, as they would in the browser. Waves and bytes are counted,
+/// so a finding here is structural rather than timed.
+struct Host {
+    data: Vec<u8>,
+    page: u64,
+    resident: std::cell::RefCell<std::collections::BTreeSet<u64>>,
+    waves: std::cell::Cell<u64>,
+    bytes: std::cell::Cell<u64>,
+}
+
+impl Host {
+    fn new(data: Vec<u8>, page: u64) -> Host {
+        Host {
+            data,
+            page,
+            resident: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+            waves: std::cell::Cell::new(0),
+            bytes: std::cell::Cell::new(0),
+        }
+    }
+    fn ensure(&self, ranges: &[(u64, u64)]) {
+        let len = self.data.len() as u64;
+        let mut new = 0u64;
+        for &(off, n) in ranges {
+            if n == 0 || off >= len {
+                continue;
+            }
+            let last = (off + n - 1).min(len - 1);
+            for p in (off / self.page)..=(last / self.page) {
+                if self.resident.borrow_mut().insert(p) {
+                    new += self.page.min(len - p * self.page);
+                }
+            }
+        }
+        if new > 0 {
+            self.waves.set(self.waves.get() + 1);
+            self.bytes.set(self.bytes.get() + new);
+        }
+    }
+    fn mark(&self) -> (u64, u64) {
+        (self.waves.get(), self.bytes.get())
+    }
+}
+
+impl supdb::Bytes for Host {
+    fn len(&self) -> u64 {
+        self.data.len() as u64
+    }
+    fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
+        let end = off + dst.len() as u64;
+        if end > self.data.len() as u64 {
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short"));
+        }
+        if dst.is_empty() {
+            return Ok(());
+        }
+        let res = self.resident.borrow();
+        for p in (off / self.page)..=((end - 1) / self.page) {
+            if !res.contains(&p) {
+                return Err(std::io::Error::other(format!(
+                    "read of {}+{} outside what was ensured (page {p})",
+                    off,
+                    dst.len()
+                )));
+            }
+        }
+        dst.copy_from_slice(&self.data[off as usize..end as usize]);
+        Ok(())
+    }
+}
+
+/// One cold search through the modelled host: open, then the dictionary
+/// lookup for one key, then its postings. Waves and bytes per step.
+struct Search {
+    open_waves: u64,
+    open_bytes: u64,
+    lookup_waves: u64,
+    lookup_bytes: u64,
+    postings_waves: u64,
+    postings_bytes: u64,
+    postings: u64,
+}
+
+fn cold_search(
+    data: &[u8],
+    page: u64,
+    probe: u64,
+    directory: bool,
+    key: &[u8],
+    next: &[u8],
+) -> std::io::Result<Search> {
+    use supdb::blob::{sparse_fence_ranges_via_opts, sparse_open_ranges_via_opts};
+    use supdb::{BlobOptions, SparseBlob};
+    let host = Host::new(data.to_vec(), page);
+    host.ensure(&[(0, probe)]);
+    let p1 = sparse_open_ranges_via_opts(&host, directory)?;
+    host.ensure(&p1);
+    let p2 = sparse_fence_ranges_via_opts(&host, directory)?;
+    host.ensure(&p2);
+    let sparse = SparseBlob::open_with(
+        host,
+        BlobOptions { resident_directory: directory, ..Default::default() },
+    )?;
+    let (ow, ob) = sparse.source().mark();
+
+    let d = sparse.dictionary_plan(key, Some(next));
+    sparse.source().ensure(&d);
+    let r = sparse.dictionary_plan_records(key, Some(next))?;
+    sparse.source().ensure(&r);
+    let mut found: Option<(Vec<supdb::index::Ext>, Vec<u8>)> = None;
+    sparse.dictionary_walk(key, Some(next), |k, exts, tail| {
+        if k == key {
+            found = Some((exts.to_vec(), tail.to_vec()));
+        }
+        false
+    })?;
+    let (lw, lb) = sparse.source().mark();
+    let (exts, tail) = found.ok_or_else(|| std::io::Error::other("probe key missing"))?;
+
+    let pr = sparse.ranges_for_exts(&exts)?;
+    sparse.source().ensure(&pr);
+    let mut postings = 0u64;
+    sparse.read_exts(&exts, &tail, |_| postings += 1)?;
+    let (pw, pb) = sparse.source().mark();
+    Ok(Search {
+        open_waves: ow,
+        open_bytes: ob,
+        lookup_waves: lw - ow,
+        lookup_bytes: lb - ob,
+        postings_waves: pw - lw,
+        postings_bytes: pb - lb,
+        postings,
+    })
+}
+
+/// w6: dependent round trips on a cold open and search, on the day fixture
+/// written three ways -- by `Store`, by `SegmentWriter`, and by
+/// `SegmentWriter` with a 128 KiB head reserve -- with and without the
+/// directory resident, through a host that fetches 16 KiB pages. R7 of
+/// logshed's requirements; predictions in waves-plan.md.
+fn waves(profile: Profile) -> std::io::Result<Record> {
+    let day_lines: u64 = profile.pick(20_000, 100_000, 250_000);
+    let page: u64 = 16 << 10;
+    let reserve: usize = 128 << 10;
+    let mut rec = Record::new("w6-waves", profile);
+    rec.param("day_lines", J::u(day_lines));
+    rec.param("page_bytes", J::u(page));
+    rec.param("head_reserve_bytes", J::u(reserve as u64));
+    rec.param("inline_bytes", J::u(256));
+    rec.note(
+        "a wave is one ensure that brings in a page not yet resident, through a host that \
+         serves only ensured pages; bytes are page-rounded. Cold means a fresh host per \
+         search. The rare key is the dictionary's smallest posting list, the common key its \
+         largest",
+    );
+    rec.note("predictions registered in waves-plan.md before the run");
+
+    let dir = std::env::temp_dir().join(format!("supdb-w6-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let store_path = dir.join("store.supdb");
+    let seg_path = dir.join("segment.supdb");
+    let res_path = dir.join("reserve.supdb");
+    let built = build_day(&store_path, day_lines, 0x5109_5ed0, Order::Term)?;
+    let seg_bytes = build_day_segment(&seg_path, day_lines, 0x5109_5ed0, 256, 0)?;
+    let res_bytes = build_day_segment(&res_path, day_lines, 0x5109_5ed0, 256, reserve)?;
+
+    // The probe keys, out of the whole reader over the store: the rarest
+    // term with at least one posting and the commonest.
+    let (rare, common, rare_n, common_n) = {
+        let b = Blob::open(MmapBytes::open(&store_path)?)?;
+        let mut best: Option<(Vec<u8>, u64)> = None;
+        let mut top: Option<(Vec<u8>, u64)> = None;
+        for r in 0..b.keys() {
+            let Some(k) = b.key_at(r) else { continue };
+            if k == BINARY_KEY {
+                continue;
+            }
+            let n = b.count(k)?;
+            if n >= 1 && best.as_ref().is_none_or(|(_, m)| n < *m) {
+                best = Some((k.to_vec(), n));
+            }
+            if top.as_ref().is_none_or(|(_, m)| n > *m) {
+                top = Some((k.to_vec(), n));
+            }
+        }
+        let (rk, rn) = best.expect("a rare key");
+        let (ck, cn) = top.expect("a common key");
+        (rk, ck, rn, cn)
+    };
+    let bump = |k: &[u8]| {
+        let mut n = k.to_vec();
+        n.push(0);
+        n
+    };
+    rec.param("rare_key", J::s(String::from_utf8_lossy(&rare).to_string()));
+    rec.param("rare_postings", J::u(rare_n));
+    rec.param("common_key", J::s(String::from_utf8_lossy(&common).to_string()));
+    rec.param("common_postings", J::u(common_n));
+
+    let shapes: [(&str, &Path, u64); 4] = [
+        ("store", &store_path, page),
+        ("segment", &seg_path, page),
+        ("segment+reserve", &res_path, page),
+        ("segment+reserve, generous probe", &res_path, 4096 + reserve as u64),
+    ];
+    let mut rows = Vec::new();
+    let mut table: std::collections::HashMap<(String, bool, &'static str), Search> =
+        std::collections::HashMap::new();
+    for (name, path, probe) in shapes {
+        let data = std::fs::read(path)?;
+        for directory in [false, true] {
+            for (which, key) in [("rare", &rare), ("common", &common)] {
+                let s = cold_search(&data, page, probe, directory, key, &bump(key))?;
+                rows.push(jobj! {
+                    "shape" => J::s(name),
+                    "directory_resident" => J::s(if directory { "yes" } else { "no" }),
+                    "key" => J::s(which),
+                    "open_waves" => J::u(s.open_waves),
+                    "open_bytes" => J::u(s.open_bytes),
+                    "lookup_waves" => J::u(s.lookup_waves),
+                    "lookup_bytes" => J::u(s.lookup_bytes),
+                    "postings_waves" => J::u(s.postings_waves),
+                    "postings_bytes" => J::u(s.postings_bytes),
+                    "postings" => J::u(s.postings),
+                    "total_waves" => J::u(s.open_waves + s.lookup_waves + s.postings_waves),
+                    "total_bytes" => J::u(s.open_bytes + s.lookup_bytes + s.postings_bytes)
+                });
+                table.insert((name.to_string(), directory, which), s);
+            }
+        }
+    }
+    rec.series("searches", J::arr(rows));
+    rec.series(
+        "files",
+        jobj! {
+            "store_bytes" => J::u(built.file_bytes),
+            "segment_bytes" => J::u(seg_bytes),
+            "segment_reserve_bytes" => J::u(res_bytes),
+            "keys" => J::u(built.keys),
+            "postings" => J::u(built.postings)
+        },
+    );
+    fn lookup<'a>(
+        table: &'a std::collections::HashMap<(String, bool, &'static str), Search>,
+        shape: &str,
+        directory: bool,
+        which: &'static str,
+    ) -> &'a Search {
+        table.get(&(shape.to_string(), directory, which)).expect("measured")
+    }
+    let get = |shape: &str, directory: bool, which: &'static str| lookup(&table, shape, directory, which);
+
+    let st = get("store", false, "common");
+    let sg = get("segment", false, "common");
+    let rs = get("segment+reserve, generous probe", false, "common");
+    rec.finding(Finding::new(
+        "W6.1",
+        "a segment's sparse open is two waves from a page-sized probe, where the store's is three",
+        sg.open_waves == 2 && st.open_waves == 3,
+        format!(
+            "store {} waves ({} bytes), segment {} waves ({} bytes): the superblock extension \
+             lets the first plan name the fence, the block table and the checksum row",
+            st.open_waves, st.open_bytes, sg.open_waves, sg.open_bytes
+        ),
+    ));
+    rec.finding(Finding::new(
+        "W6.2",
+        "with a head reserve and a probe that covers it, the sparse open is one wave",
+        rs.open_waves == 1,
+        format!(
+            "{} wave, {} bytes, probe {} bytes: the block table and a copy of the fence sit in \
+             the reserve after the superblock page; the same file from a page-sized probe opens in \
+             {} waves",
+            rs.open_waves,
+            rs.open_bytes,
+            4096 + reserve,
+            get("segment+reserve", false, "common").open_waves
+        ),
+    ));
+    // At most one: the records, and none at all when their page came in
+    // with the open. Without the directory the rare key -- whose directory
+    // slice shares no page with the open's fences -- costs two.
+    let at_most_one = ["store", "segment", "segment+reserve", "segment+reserve, generous probe"]
+        .iter()
+        .all(|s| get(s, true, "common").lookup_waves <= 1 && get(s, true, "rare").lookup_waves <= 1);
+    let two = get("store", false, "rare").lookup_waves;
+    rec.finding(Finding::new(
+        "W6.3",
+        "with the directory resident a lookup after open is at most one wave on every shape",
+        at_most_one && two == 2,
+        format!(
+            "at most one wave -- the records -- on all four shapes, rare and common key (store: \
+             rare {}, common {}), against {} for the rare key without; the open grows by the \
+             directory: store {} bytes with it against {} without",
+            get("store", true, "rare").lookup_waves,
+            get("store", true, "common").lookup_waves,
+            two,
+            get("store", true, "common").open_bytes,
+            get("store", false, "common").open_bytes
+        ),
+    ));
+    let best = get("segment+reserve, generous probe", true, "common");
+    let total = best.open_waves + best.lookup_waves + best.postings_waves;
+    rec.finding(Finding::new(
+        "W6.4",
+        "a cold search for a common key is three waves at most: open, records, postings",
+        total <= 3,
+        format!(
+            "{} waves ({} + {} + {}), {} bytes, for a key with {} postings; the store shape with \
+             nothing resident and a page probe takes {}",
+            total,
+            best.open_waves,
+            best.lookup_waves,
+            best.postings_waves,
+            best.open_bytes + best.lookup_bytes + best.postings_bytes,
+            best.postings,
+            {
+                let s = get("store", false, "common");
+                s.open_waves + s.lookup_waves + s.postings_waves
+            }
+        ),
+    ));
+    let sr = get("store", false, "rare");
+    rec.finding(Finding::new(
+        "W6.5",
+        "a rare key's postings wave reads at most two chunks from the store's block",
+        sr.postings_waves == 1 && sr.postings_bytes <= 2 * page,
+        format!(
+            "{} postings in {} wave of {} bytes (page-rounded) for the store shape; the read is \
+             the 4 KiB chunks the run spans, not the block it shares",
+            sr.postings, sr.postings_waves, sr.postings_bytes
+        ),
+    ));
+    let gr = get("segment", false, "rare");
+    rec.finding(Finding::new(
+        "W6.6",
+        "a segment answers a rare key at the dictionary: no postings wave, no postings bytes",
+        gr.postings_waves == 0 && gr.postings_bytes == 0 && gr.postings == rare_n,
+        format!(
+            "{} postings read from the record itself, {} waves and {} bytes after the lookup; \
+             the run is inline because it is under 256 bytes",
+            gr.postings, gr.postings_waves, gr.postings_bytes
+        ),
+    ));
+    let extra = res_bytes as f64 / seg_bytes as f64 - 1.0;
+    rec.finding(Finding::new(
+        "W6.7",
+        "the head reserve costs under 2% of the segment file at the fixture's size",
+        extra < 0.02,
+        format!(
+            "{} bytes with the reserve against {} without ({:+.2}%), a {} byte reserve holding the \
+             block table and a fence copy; the store shape is {} bytes",
+            res_bytes,
+            seg_bytes,
+            extra * 100.0,
+            reserve,
+            built.file_bytes
+        ),
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(rec)
 }

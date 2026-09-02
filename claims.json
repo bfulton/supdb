@@ -1760,6 +1760,55 @@
    "because": "39,332 bytes of row for a 161,129,244-byte index, 0.0244%: four bytes per 16 KiB piece, as P64.5 said."
   },
   {
+   "experiment": "w6-waves",
+   "id": "W6.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "A segment's sparse open is two waves from a 16 KiB probe -- 64,296 bytes -- where the store's is three (114,648): the superblock page carries a segment's extension, a copy of the key header and the offsets of the fence, directory, hash region and checksum row, so the first plan names the fence, the block table and the row and the second plan is empty. A store writes no extension and opens as before. P7.1's first half, on the 250k-line day fixture (7,807 keys, 1.75M postings)."
+  },
+  {
+   "experiment": "w6-waves",
+   "id": "W6.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "With a 128 KiB head reserve holding the block table, the checksum row, a copy of the fence and a copy of the directory, and a probe of 4096 plus the reserve, the sparse open is one wave of 147,456 bytes; the same file from a page-sized probe opens in two. P7.1's second half. The probe is the host's choice (openSparse's `probe`); the reserve is the writer's (SegmentWriter::set_head_reserve), off by default."
+  },
+  {
+   "experiment": "w6-waves",
+   "id": "W6.3",
+   "profile": "full",
+   "expect": "holds",
+   "because": "With the directory resident a lookup after open is at most one wave -- the records -- on all four shapes and both keys, and none at all when the records' page came in with the open; without it the rare key costs two (directory slice, then records). The open grows by the directory: 147,416 bytes against 114,648 on the store shape, 31 KB of directory for 7,807 keys at four bytes a key. P7.2. On logshed's real day the directory is 0.37 MiB."
+  },
+  {
+   "experiment": "w6-waves",
+   "id": "W6.4",
+   "profile": "full",
+   "expect": "holds",
+   "because": "A cold search for the commonest key (88,581 postings) on the segment with a reserve, a generous probe and the directory resident is two waves -- open, then postings, the records' page having arrived with the open -- and at most three by construction: open, records, postings. The store shape from a page probe with nothing resident takes five, and six for the rare key. P7.2's search count, from the seven logshed measured."
+  },
+  {
+   "experiment": "w6-waves",
+   "id": "W6.5",
+   "profile": "full",
+   "expect": "holds",
+   "because": "The rare key's postings wave reads 32,768 bytes page-rounded on the store shape -- the two 4 KiB chunks its 12-posting run spans, rounded to 16 KiB pages -- where it read the whole block before: a plan and a read are now the chunks an extent spans when the block is plain and carries per-chunk checksums (R7.3), and W4.1 holds on the chunk plan as it did on the block plan. logshed's 'Shuttle', two hits, read 920 KiB."
+  },
+  {
+   "experiment": "w6-waves",
+   "id": "W6.6",
+   "profile": "full",
+   "expect": "holds",
+   "because": "The segment answers the rare key at the dictionary: 12 postings read out of the index record itself, zero postings waves and zero bytes after the lookup, because SegmentWriter stores a run under 256 bytes inline (since v5's inline extension) and Store does not. P7.4. The recommendation to the roll is to write through SegmentWriter -- it already sorts by term -- rather than to teach the store's in-place index to inline."
+  },
+  {
+   "experiment": "w6-waves",
+   "id": "W6.7",
+   "profile": "full",
+   "expect": "holds",
+   "because": "The reserve costs 1.63% of the segment file at the fixture's size: 7,608,372 bytes against 7,486,248, for a 131,072-byte reserve holding the table, the row, the fence copy and the directory copy. P7.6. At ci, on a 1 MB file, the same reserve is 12.7%, which is why it is the writer's choice and off by default; the store shape of the same day is 7,913,432 bytes, so the segment with its reserve is still the smaller file."
+  },
+  {
    "experiment": "ext-ycsb",
    "id": "EXT.42",
    "profile": "full",

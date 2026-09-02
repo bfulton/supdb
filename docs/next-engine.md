@@ -133,6 +133,13 @@ checkpoint.
   1.15-1.19x (EXT.17), the day index from 5.02 MB to 4.05
   (fixedrun-plan.md). The canonical load's 100-byte values are uniform, so
   every run there is now fixed as well; its numbers were last taken on v5.
+- **A segment opens sparsely in one round trip (waves-plan.md).** The
+  superblock page's spare 3 KiB carries an extension -- header copy and
+  every region's offset -- so a sparse open plans itself from the first
+  probe; a head reserve (`set_head_reserve`) holds the block table, the
+  checksum row, and copies of the fence and directory so a generous probe
+  opens in one wave; data reads fetch the chunks a run spans, not the
+  block. w6 counts the waves: a cold search is open, records, postings.
 - **A segment's key index is checksummed (indexsum-plan.md).** The key
   section ends in a row of CRC32C words, one per 16 KiB object page it
   touches, named by two spare header words; `Blob::open` verifies every

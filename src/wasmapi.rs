@@ -598,10 +598,19 @@ pub unsafe extern "C" fn supdb_scan_counts_fixed(
 /// framed length, or `u32::MAX` on error.
 #[no_mangle]
 pub extern "C" fn supdb_open_sparse_plan(phase: u32) -> u32 {
+    supdb_open_sparse_plan_opts(phase, 0)
+}
+
+/// `supdb_open_sparse_plan` with options: bit 0 of `flags` asks for the
+/// directory to be fetched whole at open (`BlobOptions::resident_directory`,
+/// R7.2), so every later lookup plans its records with no dependent read.
+#[no_mangle]
+pub extern "C" fn supdb_open_sparse_plan_opts(phase: u32, flags: u32) -> u32 {
     let src = HostBytes::new();
+    let directory = flags & 1 != 0;
     let r = match phase {
-        1 => crate::blob::sparse_open_ranges_via(&src),
-        2 => crate::blob::sparse_fence_ranges_via(&src),
+        1 => crate::blob::sparse_open_ranges_via_opts(&src, directory),
+        2 => crate::blob::sparse_fence_ranges_via_opts(&src, directory),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "supdb_open_sparse_plan: phase is 1 or 2",
@@ -624,6 +633,14 @@ pub extern "C" fn supdb_open_sparse_plan(phase: u32) -> u32 {
 /// resident. Returns a handle, or `u32::MAX`.
 #[no_mangle]
 pub extern "C" fn supdb_open_host_sparse() -> u32 {
+    supdb_open_host_sparse_opts(0)
+}
+
+/// `supdb_open_host_sparse` with the same `flags` as
+/// `supdb_open_sparse_plan_opts`; both plans, made with the same flags, must
+/// be resident.
+#[no_mangle]
+pub extern "C" fn supdb_open_host_sparse_opts(flags: u32) -> u32 {
     let src = HostBytes::new();
     if src.len() >= MAX_OBJECT {
         return fail(
@@ -634,7 +651,8 @@ pub extern "C" fn supdb_open_host_sparse() -> u32 {
             u32::MAX,
         );
     }
-    match SparseBlob::open(src) {
+    let opts = crate::blob::BlobOptions { resident_directory: flags & 1 != 0, ..Default::default() };
+    match SparseBlob::open_with(src, opts) {
         Ok(b) => put(AnyBlob::Sparse(b)),
         Err(e) => fail(e.to_string(), u32::MAX),
     }

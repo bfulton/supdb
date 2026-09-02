@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use supdb::bytes::MmapBytes;
 use supdb::next::SegmentWriter;
-use supdb::{Blob, Options, Reader, Store};
+use supdb::{Blob, Options, Reader, SparseBlob, Store};
 
 /// `block::CHECKSUMS` is process-wide -- `Store::create` and the writer both
 /// set it from `Options::checksums` -- and the test harness runs tests
@@ -512,8 +512,109 @@ fn every_flip_in_the_key_section_fails_the_open() {
     let mut bytes = clean.clone();
     bytes[key_off + key_len / 2] ^= 0x40;
     std::fs::write(&path, &bytes).unwrap();
-    let opts = supdb::BlobOptions { verify_checksums: true, verify_index: false };
+    let opts = supdb::BlobOptions { verify_checksums: true, verify_index: false, ..Default::default() };
     assert!(Blob::open_with(MmapBytes::open(&path).unwrap(), opts).is_ok());
     std::fs::write(&path, &clean).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A segment's superblock page carries an extension -- a copy of the key
+/// header and every offset a sparse open needs -- and, with a head reserve,
+/// the block table and a copy of the fence right after the page. A source
+/// that serves only the first probe then opens the sparse reader with no
+/// second round trip, and it agrees with the whole reader (waves-plan.md,
+/// P7.1).
+#[test]
+fn a_head_reserve_opens_the_sparse_reader_from_the_probe_alone() {
+    use std::cell::RefCell;
+    struct Ensured {
+        data: Vec<u8>,
+        allowed: RefCell<Vec<(u64, u64)>>,
+    }
+    impl supdb::Bytes for Ensured {
+        fn len(&self) -> u64 {
+            self.data.len() as u64
+        }
+        fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
+            let end = off + dst.len() as u64;
+            let ok = self.allowed.borrow().iter().any(|&(a, l)| a <= off && end <= a + l);
+            if !ok {
+                return Err(std::io::Error::other(format!("read outside the probe: {off}+{}", dst.len())));
+            }
+            dst.copy_from_slice(&self.data[off as usize..end as usize]);
+            Ok(())
+        }
+    }
+    let _g = serial();
+    let dir = scratch("segwriter-reserve");
+    let path = dir.join("seg.sup");
+    let data = fixed(1200, 4, 0x7E5);
+    let reserve = 128 << 10;
+    {
+        let mut w = SegmentWriter::create(&path, &opts()).expect("create");
+        w.set_inline_max(INLINE);
+        w.set_head_reserve(reserve);
+        for (k, vals) in &data {
+            w.begin(k).expect("begin");
+            for v in vals {
+                w.value(v);
+            }
+            w.end().expect("end");
+        }
+        w.finish(1).expect("finish");
+    }
+    let whole = open(&path);
+    assert!(whole.index_checksummed());
+    let bytes = std::fs::read(&path).unwrap();
+
+    // The first plan, made from the page alone, lies inside the probe.
+    let probe = 4096 + reserve as u64;
+    let head = bytes[..4096].to_vec();
+    let p1 = supdb::blob::open_sparse_ranges(&head, bytes.len() as u64).unwrap();
+    for &(o, l) in &p1 {
+        assert!(o + l <= probe, "plan {o}+{l} reaches past the {probe}-byte probe");
+    }
+    let src = Ensured { data: bytes.clone(), allowed: RefCell::new(vec![(0, probe)]) };
+    let sparse = SparseBlob::open(src).expect("open from the probe alone");
+    assert!(sparse.opened_from_extension());
+    assert_eq!(sparse.keys(), data.len());
+    assert!(sparse.has_fence());
+
+    // And the dictionary agrees with the whole reader once its plans are
+    // ensured, through the same source.
+    let lo = data[300].0.clone();
+    let hi = data[340].0.clone();
+    let d = sparse.dictionary_plan(&lo, Some(&hi));
+    sparse.source().allowed.borrow_mut().extend(d.iter().copied());
+    let r = sparse.dictionary_plan_records(&lo, Some(&hi)).expect("records plan");
+    sparse.source().allowed.borrow_mut().extend(r.iter().copied());
+    let mut got = Vec::new();
+    sparse
+        .dictionary_counts(&lo, Some(&hi), |k, n| {
+            got.push((k.to_vec(), n));
+            true
+        })
+        .expect("walk");
+    let mut want = Vec::new();
+    whole.scan_counts(&lo, 40, |k, n| {
+        want.push((k.to_vec(), n));
+        true
+    })
+    .expect("scan counts");
+    assert_eq!(got, want);
+
+    // Without a reserve the extension still plans the open in one dependent
+    // read after the probe: the second plan is empty.
+    let path2 = dir.join("seg2.sup");
+    write_bulk(&path2, &data, opts());
+    let bytes2 = std::fs::read(&path2).unwrap();
+    let head2 = bytes2[..4096].to_vec();
+    let p1 = supdb::blob::open_sparse_ranges(&head2, bytes2.len() as u64).unwrap();
+    let hdr_off = { let b = open(&path2); b.index_offset() as usize };
+    let p2 = supdb::blob::open_sparse_fence_ranges(&head2, bytes2.len() as u64, &bytes2[hdr_off..hdr_off + 192]).unwrap();
+    assert!(p2.is_empty(), "with an extension the second plan is empty: {p2:?}");
+    let src = Ensured { data: bytes2, allowed: RefCell::new(p1) };
+    let sparse = SparseBlob::open(src).expect("open over the first plan");
+    assert!(sparse.opened_from_extension());
     let _ = std::fs::remove_dir_all(&dir);
 }

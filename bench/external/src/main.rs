@@ -2511,6 +2511,7 @@ fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
         supdb::BlobOptions {
             verify_checksums: false,
             verify_index: false,
+            ..Default::default()
         },
     )
     .expect("blob open");

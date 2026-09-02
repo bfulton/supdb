@@ -11404,7 +11404,7 @@ fn f64_indexsum(args: &Args, profile: Profile) -> std::io::Result<Record> {
     type Row = (usize, f64, f64);
     let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
     let rates = Trial::new(profile.reps()).run(arms.len(), |ci, rep| {
-        let opts = BlobOptions { verify_checksums: true, verify_index: ci == 0 };
+        let opts = BlobOptions { verify_checksums: true, verify_index: ci == 0, ..Default::default() };
         let mut open_ms: Vec<f64> = Vec::with_capacity(opens as usize);
         let mut blob = None;
         for _ in 0..opens {

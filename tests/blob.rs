@@ -538,13 +538,22 @@ fn a_corrupted_block_byte_fails_the_read_rather_than_under_returning() {
     let e = exts[0];
     let ranges = blob.ranges_for(&key).expect("plan");
     assert_eq!(ranges.len(), 1);
-    let at = (ranges[0].0 + e.off as u64 + e.len as u64 / 2) as usize;
+    // The plan is the 4 KiB chunks the run spans (R7.3), starting at a chunk
+    // boundary at or before the run, so the run begins `e.off % 4096` into
+    // it. Flip its second byte: inside the run, inside the first chunk.
+    let at = (ranges[0].0 + e.off as u64 % 4096 + 1) as usize;
     // A key that lives in a different block: verification granularity is the
-    // block, so a neighbour in the same one would rightly fail too.
+    // chunk, and a neighbour sharing this one's chunk would rightly fail too.
+    let overlaps = |p: &[(u64, u64)]| {
+        p.iter().any(|&(o, l)| ranges.iter().any(|&(ro, rl)| o < ro + rl && ro < o + l))
+    };
     let (other, other_vals) = want
         .iter()
-        .find(|(k, _)| blob.ranges_for(k).unwrap() != ranges)
-        .expect("the fixture spans more than one block")
+        .find(|(k, _)| {
+            let p = blob.ranges_for(k).unwrap();
+            !p.is_empty() && !overlaps(&p)
+        })
+        .expect("the fixture spans more than one chunk")
         .clone();
     drop(blob);
 

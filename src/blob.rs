@@ -122,6 +122,116 @@ const SLOT: u64 = 512;
 const SB_BYTES: usize = 144;
 const SB_FIELDS: usize = 16;
 
+/// The superblock page's extension: what a write-once segment adds after
+/// the two slots so a sparse open can plan itself from the probe alone
+/// (waves-plan.md, R7.1). Sixteen words -- magic, generation, then the
+/// absolute offset and length of the fence, the directory, the hash region
+/// and the checksum row, a copy of the block table and a copy of the fence
+/// when the writer placed them in a head reserve, and the fence copy's
+/// CRC -- then a copy of the key section's 192-byte header, then the FNV of
+/// all of it. A store writes none of this; the page is zero there and the
+/// magic says so.
+const SX_OFF: usize = 1024;
+const SX_MAGIC: u64 = 0x5355_5044_4253_5831;
+const SX_WORDS: usize = 20;
+/// Bytes of the extension: the words, the header copy, the checksum.
+pub const SX_BYTES: usize = SX_WORDS * 8 + flatindex::HEADER_BYTES + 8;
+
+/// A decoded superblock extension. Offsets are absolute.
+#[derive(Clone, Copy, Debug)]
+pub struct SuperExt {
+    pub fence: (u64, u64),
+    pub dir: (u64, u64),
+    pub hash: (u64, u64),
+    pub row: (u64, u64),
+    /// The block table, when it lives in the head reserve.
+    pub table_copy: Option<(u64, u64)>,
+    /// A copy of the fence in the head reserve, with its CRC32C.
+    pub fence_copy: Option<(u64, u64, u32)>,
+    /// A copy of the checksum row in the head reserve (its length is
+    /// `row.1`), so verification needs nothing from the section's end.
+    pub row_copy: Option<u64>,
+    /// A copy of the directory in the head reserve (length `dir.1`), with
+    /// its CRC32C, so a directory-resident open needs nothing from the
+    /// section either (R7.2).
+    pub dir_copy: Option<(u64, u32)>,
+    pub header: [u8; flatindex::HEADER_BYTES],
+}
+
+fn fnv64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
+}
+
+/// Encode an extension for a segment of generation `generation`.
+pub fn encode_super_ext(x: &SuperExt, generation: u64) -> Vec<u8> {
+    let (tco, tcl) = x.table_copy.unwrap_or((0, 0));
+    let (fco, fcl, fcc) = x.fence_copy.unwrap_or((0, 0, 0));
+    let words: [u64; SX_WORDS] = [
+        SX_MAGIC,
+        generation,
+        x.fence.0,
+        x.fence.1,
+        x.dir.0,
+        x.dir.1,
+        x.hash.0,
+        x.hash.1,
+        x.row.0,
+        x.row.1,
+        tco,
+        tcl,
+        fco,
+        fcl,
+        fcc as u64,
+        x.row_copy.unwrap_or(0),
+        x.dir_copy.map_or(0, |d| d.0),
+        x.dir_copy.map_or(0, |d| d.1 as u64),
+        0,
+        0,
+    ];
+    let mut out = Vec::with_capacity(SX_BYTES);
+    for w in words {
+        out.extend_from_slice(&w.to_le_bytes());
+    }
+    out.extend_from_slice(&x.header);
+    let h = fnv64(&out);
+    out.extend_from_slice(&h.to_le_bytes());
+    out
+}
+
+/// The extension out of the superblock page, when the page holds one for
+/// this generation. `page` is the first `SUPER` bytes of the object; a
+/// shorter buffer, a zero page, a wrong generation or a checksum that does
+/// not match all read as "none", which is the store's case.
+pub fn decode_super_ext(page: &[u8], generation: u64) -> Option<SuperExt> {
+    let buf = page.get(SX_OFF..SX_OFF + SX_BYTES)?;
+    let w = |i: usize| u64::from_le_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap());
+    if w(0) != SX_MAGIC || w(1) != generation {
+        return None;
+    }
+    let body = &buf[..SX_BYTES - 8];
+    if fnv64(body) != u64::from_le_bytes(buf[SX_BYTES - 8..].try_into().unwrap()) {
+        return None;
+    }
+    let mut header = [0u8; flatindex::HEADER_BYTES];
+    header.copy_from_slice(&buf[SX_WORDS * 8..SX_WORDS * 8 + flatindex::HEADER_BYTES]);
+    Some(SuperExt {
+        fence: (w(2), w(3)),
+        dir: (w(4), w(5)),
+        hash: (w(6), w(7)),
+        row: (w(8), w(9)),
+        table_copy: if w(11) > 0 { Some((w(10), w(11))) } else { None },
+        fence_copy: if w(13) > 0 { Some((w(12), w(13), w(14) as u32)) } else { None },
+        row_copy: if w(15) > 0 { Some(w(15)) } else { None },
+        dir_copy: if w(16) > 0 { Some((w(16), w(17) as u32)) } else { None },
+        header,
+    })
+}
+
 // The write path is not compiled for wasm, so this can only be checked where
 // it is -- which is every build that could have changed it.
 #[cfg(not(target_family = "wasm"))]
@@ -271,7 +381,10 @@ fn log_probe_range(sb: &Super) -> Option<(u64, u64)> {
 /// byte it will read can be named. `open_ranges` turns those bytes into the
 /// rest of the plan.
 pub fn open_probe() -> u64 {
-    SLOT + SB_BYTES as u64
+    // The whole superblock page: the two slots, and after them the
+    // extension a segment writes so a sparse open can plan itself from
+    // this one read (R7.1). A store's page is zero past the slots.
+    SUPER
 }
 
 /// The byte ranges `Blob::open` will read, from the first `open_probe()`
@@ -395,7 +508,9 @@ fn open_head<B: Bytes>(src: &B) -> Result<Super> {
     if src.len() < SUPER {
         return Err(corrupt("file too short to hold a superblock"));
     }
-    let mut head = [0u8; (SLOT as usize) + SB_BYTES];
+    // The whole page, as `open_ranges` plans it: the two slots and the
+    // extension a segment may have written after them.
+    let mut head = vec![0u8; open_probe() as usize];
     src.read_at(0, &mut head)?;
     // Everything `open` checks about the header lives in `pick_super`,
     // shared with `open_ranges` so the plan and the open cannot drift.
@@ -430,6 +545,11 @@ pub struct BlobOptions {
     /// every piece at a resident open, each piece as it is first used in a
     /// sparse reader. On by default for the same reason.
     pub verify_index: bool,
+    /// Sparse reader only: fetch the whole directory in the open wave and
+    /// answer every directory slice from memory, so a lookup after open is
+    /// one dependent read -- the records -- instead of two. Costs the
+    /// directory (four bytes a key) at open; off by default (R7.2).
+    pub resident_directory: bool,
 }
 
 impl Default for BlobOptions {
@@ -437,6 +557,7 @@ impl Default for BlobOptions {
         BlobOptions {
             verify_checksums: true,
             verify_index: true,
+            resident_directory: false,
         }
     }
 }
@@ -460,6 +581,10 @@ struct SparseIndex {
     /// piece already verified by this reader.
     crcs: Vec<u8>,
     verified: RefCell<Vec<u64>>,
+    /// The directory, when `resident_directory` fetched it at open.
+    dir: Option<Vec<u32>>,
+    /// Whether the open planned itself from the superblock extension.
+    from_ext: bool,
 }
 
 pub struct Blob<B: Bytes> {
@@ -748,7 +873,8 @@ impl<B: Bytes> Blob<B> {
                 continue;
             }
             let loc = self.loc_of(e.block)?;
-            out.push((loc.off, loc.stored as u64));
+            let (a, b) = chunk_span(&loc, e);
+            out.push((loc.off + a as u64, (b - a) as u64));
         }
         Ok(())
     }
@@ -804,11 +930,25 @@ impl<B: Bytes> Blob<B> {
     /// Whole-block verification is the fallback, never skipping: a block with
     /// no per-chunk checksums, a table too short to hold the row, or a range
     /// outside the block all fall back to hashing the block.
-    fn verify(&self, id: u32, loc: BlockLoc, raw: &[u8], lo: usize, hi: usize) -> Result<()> {
+    fn verify(
+        &self,
+        id: u32,
+        loc: BlockLoc,
+        raw: &[u8],
+        base: usize,
+        lo: usize,
+        hi: usize,
+    ) -> Result<()> {
+        // `raw` holds the block's bytes from `base` on: the whole block when
+        // `base` is zero and `raw` is `stored` long, else the chunks a
+        // partial read fetched (R7.3). `lo..hi` are block offsets.
         if !self.opts.verify_checksums || !block::checksums_on() {
             return Ok(());
         }
         let whole = |this: &Self| -> Result<()> {
+            if base != 0 || raw.len() != loc.stored as usize {
+                return Err(corrupt("a partial block read needs per-chunk checksums"));
+            }
             if this.is_verified(id, 0) {
                 return Ok(());
             }
@@ -818,7 +958,7 @@ impl<B: Bytes> Blob<B> {
             this.set_verified(id, 0);
             Ok(())
         };
-        if !loc.chunk_crc || hi > raw.len() || lo >= hi {
+        if !loc.chunk_crc || hi > base + raw.len() || lo < base || lo >= hi {
             return whole(self);
         }
         let sec = match self.blk_sec() {
@@ -827,14 +967,14 @@ impl<B: Bytes> Blob<B> {
         };
         for j in (lo / block::CHUNK)..=((hi - 1) / block::CHUNK) {
             let a = j * block::CHUNK;
-            let b = ((j + 1) * block::CHUNK).min(raw.len());
-            let (Some(want), true) = (self.blocks.chunk_crc(sec, id as usize, j), a < b) else {
+            let b = ((j + 1) * block::CHUNK).min(base + raw.len());
+            let (Some(want), true) = (self.blocks.chunk_crc(sec, id as usize, j), a < b && a >= base) else {
                 return whole(self);
             };
             if self.is_verified(id, j) {
                 continue;
             }
-            if block::crc32(&raw[a..b]) != want {
+            if block::crc32(&raw[a - base..b - base]) != want {
                 return Err(corrupt("block checksum mismatch"));
             }
             self.set_verified(id, j);
@@ -870,15 +1010,19 @@ impl<B: Bytes> Blob<B> {
         }
         let loc = self.loc_of(e.block)?;
         let (a, b) = (e.off as usize, (e.off as usize).saturating_add(e.len as usize));
+        // What is fetched: the chunks the run spans when the block is plain
+        // and carries per-chunk checksums, else the block (R7.3). The plan
+        // in `plan_exts` names the same bytes, which is what keeps W4.1.
+        let (c0, c1) = chunk_span(&loc, &e);
         let mut raw_buf = self.raw_buf.take();
         let out = (|| -> Result<R> {
-            let raw = take(&self.src, loc.off, loc.stored as usize, &mut raw_buf)?;
+            let raw = take(&self.src, loc.off + c0 as u64, c1 - c0, &mut raw_buf)?;
             if loc.is_plain() {
-                if b > raw.len() {
+                if a < c0 || b > c0 + raw.len() {
                     return Err(corrupt("extent runs past its block"));
                 }
-                self.verify(e.block, loc, raw, a, b)?;
-                return f(&raw[a..b]);
+                self.verify(e.block, loc, raw, c0, a, b)?;
+                return f(&raw[a - c0..b - c0]);
             }
             let un = loc.uncompressed as usize;
             if b > un {
@@ -892,7 +1036,7 @@ impl<B: Bytes> Blob<B> {
                 if loc.chunked {
                     block::read_chunked_range(raw, un, a, b, &mut dec[..un])?;
                 } else {
-                    self.verify(e.block, loc, raw, 0, raw.len())?;
+                    self.verify(e.block, loc, raw, 0, 0, raw.len())?;
                     block::decompress_into(raw, &mut dec, un)?;
                 }
                 f(&dec[a..b])
@@ -1059,7 +1203,7 @@ impl<B: Bytes> Blob<B> {
         if b > raw.len() {
             return Err(corrupt("extent runs past its block"));
         }
-        self.verify(e.block, loc, raw, a, b)?;
+        self.verify(e.block, loc, raw, 0, a, b)?;
         Ok(Some(&raw[a..b]))
     }
 
@@ -1236,7 +1380,7 @@ impl<B: Bytes> Blob<B> {
                         Ok(loc) if loc.is_plain() => {
                             match self.src.slice_at(loc.off, loc.stored as usize) {
                                 Some(bytes) => {
-                                    self.verify(e.block, loc, bytes, 0, bytes.len())?;
+                                    self.verify(e.block, loc, bytes, 0, 0, bytes.len())?;
                                     cached = Some((e.block, bytes));
                                     Some(bytes)
                                 }
@@ -1313,12 +1457,50 @@ mod tests {
 /// follows in a second plan (`open_sparse_fence_ranges`) once the header is
 /// resident, because the header is what says where the fence is.
 pub fn open_sparse_ranges(head: &[u8], object_len: u64) -> Result<Vec<(u64, u64)>> {
+    open_sparse_ranges_opts(head, object_len, false)
+}
+
+/// `open_sparse_ranges`, with the directory included when `directory` is
+/// set (`BlobOptions::resident_directory`). When the superblock page
+/// carries a segment's extension, this one plan names everything the open
+/// needs -- fence, block table, checksum row, and the directory if asked --
+/// and the second plan is empty: two waves, or one when a host's first
+/// probe already covered a head reserve holding the table and the fence.
+pub fn open_sparse_ranges_opts(
+    head: &[u8],
+    object_len: u64,
+    directory: bool,
+) -> Result<Vec<(u64, u64)>> {
     let sb = pick_super(head, object_len)?;
-    let mut v = vec![
-        (0, open_probe()),
-        (sb.key_off, (flatindex::HEADER_BYTES as u64).min(sb.key_stored)),
-        (sb.blk_off, sb.blk_stored),
-    ];
+    let mut v = vec![(0, open_probe())];
+    match decode_super_ext(head, sb.generation) {
+        Some(x) => {
+            let hdr = flatindex::Header::parse(&x.header)
+                .ok_or_else(|| corrupt("the superblock extension's header copy does not parse"))?;
+            v.push(x.table_copy.unwrap_or((sb.blk_off, sb.blk_stored)));
+            match x.fence_copy {
+                Some((o, l, _)) => v.push((o, l)),
+                None => v.push(x.fence),
+            }
+            if hdr.crc_off != 0 {
+                v.push(match x.row_copy {
+                    Some(o) => (o, x.row.1),
+                    None => x.row,
+                });
+            }
+            if directory {
+                v.push(match x.dir_copy {
+                    Some((o, _)) => (o, x.dir.1),
+                    None => x.dir,
+                });
+            }
+            round_to_pieces(&mut v, sb.key_off, &hdr);
+        }
+        None => {
+            v.push((sb.key_off, (flatindex::HEADER_BYTES as u64).min(sb.key_stored)));
+            v.push((sb.blk_off, sb.blk_stored));
+        }
+    }
     if let Some(r) = log_probe_range(&sb) {
         v.push(r);
     }
@@ -1334,12 +1516,30 @@ pub fn open_sparse_fence_ranges(
     object_len: u64,
     index_header: &[u8],
 ) -> Result<Vec<(u64, u64)>> {
+    open_sparse_fence_ranges_opts(head, object_len, index_header, false)
+}
+
+/// `open_sparse_fence_ranges`, with the directory when asked. Empty when
+/// the superblock page carries an extension, since the first plan then
+/// named everything.
+pub fn open_sparse_fence_ranges_opts(
+    head: &[u8],
+    object_len: u64,
+    index_header: &[u8],
+    directory: bool,
+) -> Result<Vec<(u64, u64)>> {
     let sb = pick_super(head, object_len)?;
+    if decode_super_ext(head, sb.generation).is_some() {
+        return Ok(Vec::new());
+    }
     let hdr = flatindex::Header::parse(index_header).ok_or_else(|| {
         corrupt("the key index header is not the flat format this reader understands")
     })?;
     let (off, len) = fence_region(&hdr, sb.key_stored as usize)?;
     let mut v = vec![(sb.key_off + off as u64, len as u64)];
+    if directory {
+        v.push((sb.key_off + hdr.dir_off as u64, hdr.nkeys as u64 * 4));
+    }
     if hdr.crc_off != 0 {
         // A checksummed index: the row itself, exactly; the header's own
         // piece, so the header is verified before any word of it is trusted
@@ -1380,41 +1580,61 @@ fn round_to_pieces(v: &mut [(u64, u64)], sec_off: u64, hdr: &flatindex::Header) 
 /// length is in the array's last word, which is not resident yet, so the
 /// region is bounded by layout instead. Both writers put the fence directly
 /// before another region, so the slack is alignment padding at most.
-fn fence_region(h: &flatindex::Header, sec_len: usize) -> Result<(usize, usize)> {
-    if h.fence_n == 0 {
-        return Ok((0, 0));
+/// The stored bytes a read of `e` fetches from its block: the 4 KiB chunks
+/// the run spans when the block is plain and carries per-chunk checksums,
+/// else the whole block -- compressed and unchunked blocks are verified and
+/// decoded whole. Block-relative `(start, end)`.
+fn chunk_span(loc: &BlockLoc, e: &Ext) -> (usize, usize) {
+    let stored = loc.stored as usize;
+    if !loc.is_plain() || !loc.chunk_crc {
+        return (0, stored);
     }
-    let start = h.fence_offs_off;
-    if start < flatindex::HEADER_BYTES || start > sec_len {
+    let a = (e.off as usize / block::CHUNK) * block::CHUNK;
+    let b = (e.off as usize)
+        .saturating_add(e.len as usize)
+        .div_ceil(block::CHUNK)
+        .saturating_mul(block::CHUNK);
+    (a.min(stored), b.min(stored).max(a.min(stored)))
+}
+
+fn fence_region(h: &flatindex::Header, sec_len: usize) -> Result<(usize, usize)> {
+    if h.fence_n != 0 && (h.fence_offs_off < flatindex::HEADER_BYTES || h.fence_offs_off > sec_len) {
         return Err(corrupt("the key index names a fence outside its section"));
     }
-    let end = [h.hash_off, h.dir_base, h.recs_off, sec_len]
-        .into_iter()
-        .filter(|&x| x > start)
-        .min()
-        .unwrap_or(sec_len)
-        .min(sec_len);
-    Ok((start, end - start))
+    Ok(flatindex::fence_span(h, sec_len))
 }
 
 /// `open_sparse_ranges`, reading the superblock through the source. For a
 /// host whose bytes are reached only by offset -- the wasm module -- so the
 /// two open plans need no bytes carried across the boundary.
 pub fn sparse_open_ranges_via<B: Bytes>(src: &B) -> Result<Vec<(u64, u64)>> {
-    let mut head = vec![0u8; open_probe() as usize];
+    sparse_open_ranges_via_opts(src, false)
+}
+
+pub fn sparse_open_ranges_via_opts<B: Bytes>(src: &B, directory: bool) -> Result<Vec<(u64, u64)>> {
+    let mut head = vec![0u8; (open_probe()).min(src.len()) as usize];
     src.read_at(0, &mut head)?;
-    open_sparse_ranges(&head, src.len())
+    open_sparse_ranges_opts(&head, src.len(), directory)
 }
 
 /// `open_sparse_fence_ranges`, reading the superblock and the index header
 /// through the source; the first plan must be resident.
 pub fn sparse_fence_ranges_via<B: Bytes>(src: &B) -> Result<Vec<(u64, u64)>> {
-    let mut head = vec![0u8; open_probe() as usize];
+    sparse_fence_ranges_via_opts(src, false)
+}
+
+pub fn sparse_fence_ranges_via_opts<B: Bytes>(src: &B, directory: bool) -> Result<Vec<(u64, u64)>> {
+    let mut head = vec![0u8; (open_probe()).min(src.len()) as usize];
     src.read_at(0, &mut head)?;
     let sb = pick_super(&head, src.len())?;
+    if decode_super_ext(&head, sb.generation).is_some() {
+        // The first plan named everything; the section header is not
+        // resident and is not needed.
+        return Ok(Vec::new());
+    }
     let mut hb = vec![0u8; (flatindex::HEADER_BYTES as u64).min(sb.key_stored) as usize];
     src.read_at(sb.key_off, &mut hb)?;
-    open_sparse_fence_ranges(&head, src.len(), &hb)
+    open_sparse_fence_ranges_opts(&head, src.len(), &hb, directory)
 }
 
 /// A reader over an object whose key index it will not fetch whole.
@@ -1450,8 +1670,20 @@ impl<B: Bytes> SparseBlob<B> {
         if sec_len < flatindex::HEADER_BYTES {
             return Err(corrupt("the key index is shorter than its header"));
         }
-        let mut hb = vec![0u8; flatindex::HEADER_BYTES];
-        src.read_at(sb.key_off, &mut hb)?;
+        // The superblock page whole: a segment's extension, when present,
+        // carries the section header and every offset the open needs, so
+        // nothing below reads the section's own header (R7.1).
+        let mut page = vec![0u8; (SUPER.min(src.len())) as usize];
+        src.read_at(0, &mut page)?;
+        let ext = decode_super_ext(&page, sb.generation);
+        let hb: Vec<u8> = match &ext {
+            Some(x) => x.header.to_vec(),
+            None => {
+                let mut hb = vec![0u8; flatindex::HEADER_BYTES];
+                src.read_at(sb.key_off, &mut hb)?;
+                hb
+            }
+        };
         let hdr = flatindex::Header::parse(&hb).ok_or_else(|| {
             corrupt(
                 "the key index is not the flat format this reader understands (an older varint \
@@ -1470,8 +1702,21 @@ impl<B: Bytes> SparseBlob<B> {
             return Err(corrupt("the key index header names a region outside its section"));
         }
         let (foff, flen) = fence_region(&hdr, sec_len)?;
+        // The fence: from the head reserve's copy when the writer left one,
+        // checked against the CRC the extension carries; else from the
+        // section, verified through its pieces below.
         let mut fence = vec![0u8; flen];
-        if flen > 0 {
+        let mut fence_from_section = flen > 0;
+        if let Some((o, l, crc)) = ext.and_then(|x| x.fence_copy) {
+            if l as usize == flen && flen > 0 {
+                src.read_at(o, &mut fence)?;
+                if block::crc32(&fence) != crc {
+                    return Err(corrupt("the fence copy in the head reserve does not match its checksum"));
+                }
+                fence_from_section = false;
+            }
+        }
+        if fence_from_section {
             src.read_at(sb.key_off + foff as u64, &mut fence)?;
         }
         let mut crcs = Vec::new();
@@ -1481,13 +1726,38 @@ impl<B: Bytes> SparseBlob<B> {
                 return Err(corrupt("the key index names a checksum row outside its section"));
             }
             crcs = vec![0u8; n];
-            src.read_at(sb.key_off + hdr.crc_off as u64, &mut crcs)?;
+            let row_at = ext
+                .and_then(|x| x.row_copy)
+                .unwrap_or(sb.key_off + hdr.crc_off as u64);
+            src.read_at(row_at, &mut crcs)?;
         }
-        let blk = Sec::read(&src, sb.blk_off, sb.blk_stored as usize)?;
+        let (toff, tlen) = ext
+            .and_then(|x| x.table_copy)
+            .unwrap_or((sb.blk_off, sb.blk_stored));
+        let blk = Sec::read(&src, toff, tlen as usize)?;
         let blocks = MappedBlocks::parse(blk.get(&src)?)
             .ok_or_else(|| corrupt("the block table is not readable"))?;
         let verified = vec![0u64; (blocks.len() * block::MAX_CHUNK_CRCS).div_ceil(64)];
         let pieces = if crcs.is_empty() { 0 } else { crcs.len() / 4 };
+        // The directory whole, when asked: four bytes a key, and every
+        // later lookup plans its records with no dependent read (R7.2).
+        let mut dir_from_section = opts.resident_directory;
+        let dir = if opts.resident_directory {
+            let mut raw = vec![0u8; hdr.nkeys * 4];
+            match ext.and_then(|x| x.dir_copy) {
+                Some((o, crc)) => {
+                    src.read_at(o, &mut raw)?;
+                    if block::crc32(&raw) != crc {
+                        return Err(corrupt("the directory copy in the head reserve does not match its checksum"));
+                    }
+                    dir_from_section = false;
+                }
+                None => src.read_at(sb.key_off + hdr.dir_off as u64, &mut raw)?,
+            }
+            Some(raw.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+        } else {
+            None
+        };
         let sp = SparseBlob {
             blob: Blob {
                 src,
@@ -1499,6 +1769,8 @@ impl<B: Bytes> SparseBlob<B> {
                     fence,
                     crcs,
                     verified: RefCell::new(vec![0u64; pieces.div_ceil(64)]),
+                    dir,
+                    from_ext: ext.is_some(),
                 }),
                 blk,
                 blocks,
@@ -1509,10 +1781,17 @@ impl<B: Bytes> SparseBlob<B> {
                 dec_buf: Cell::new(Vec::new()),
             },
         };
-        // The header's piece and the fence's, before either is trusted.
-        sp.verify_span(0, flatindex::HEADER_BYTES)?;
-        if flen > 0 {
+        // What was read out of the section is verified before it is trusted:
+        // the header's piece unless the extension supplied the header, the
+        // fence's pieces unless the copy did, the directory's if resident.
+        if ext.is_none() {
+            sp.verify_span(0, flatindex::HEADER_BYTES)?;
+        }
+        if fence_from_section {
             sp.verify_span(foff, flen)?;
+        }
+        if dir_from_section {
+            sp.verify_span(hdr.dir_off, hdr.nkeys * 4)?;
         }
         Ok(sp)
     }
@@ -1608,6 +1887,9 @@ impl<B: Bytes> SparseBlob<B> {
     pub fn dictionary_plan(&self, lo: &[u8], hi: Option<&[u8]>) -> Vec<(u64, u64)> {
         let s = self.sp();
         let (r0, r1) = self.rank_window(lo, hi);
+        if s.dir.is_some() {
+            return Vec::new();
+        }
         let entries = r1 - r0 + usize::from(r1 < s.hdr.nkeys);
         let mut v = vec![(s.off + s.hdr.dir_off as u64 + r0 as u64 * 4, entries as u64 * 4)];
         round_to_pieces(&mut v, s.off, &s.hdr);
@@ -1615,9 +1897,24 @@ impl<B: Bytes> SparseBlob<B> {
         v
     }
 
+    /// Whether the directory was fetched at open (`resident_directory`), so
+    /// phase one of every range plan is empty.
+    pub fn directory_resident(&self) -> bool {
+        self.sp().dir.is_some()
+    }
+
+    /// Whether the open planned itself from the superblock extension a
+    /// segment writes, rather than from the section's own header.
+    pub fn opened_from_extension(&self) -> bool {
+        self.sp().from_ext
+    }
+
     fn dir_slice(&self, r0: usize, r1: usize) -> Result<Vec<u32>> {
         let s = self.sp();
         let entries = r1 - r0 + usize::from(r1 < s.hdr.nkeys);
+        if let Some(d) = &s.dir {
+            return Ok(d[r0..r0 + entries].to_vec());
+        }
         let mut raw = vec![0u8; entries * 4];
         self.verify_span(s.hdr.dir_off + r0 * 4, entries * 4)?;
         self.blob.src.read_at(s.off + s.hdr.dir_off as u64 + r0 as u64 * 4, &mut raw)?;

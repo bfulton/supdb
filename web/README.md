@@ -180,6 +180,26 @@ the value width. That is the answer to "does the browser need a scan, or
 should the roll precompute the panels": it needs a scan, and precomputing buys
 nothing.
 
+## Round trips (R7)
+
+`openSparse(wasm, cache, { probe, directory })`. A segment's superblock
+page carries an extension -- a copy of the key header and the offsets of
+the fence, directory, hash region and checksum row -- so the open's first
+plan names everything it needs and the second plan is empty: two round
+trips from a page-sized probe, where a store's open is three. A segment
+written with a head reserve (`SegmentWriter::set_head_reserve`) keeps its
+block table, checksum row, a copy of the fence and a copy of the directory
+right after the superblock page; pass `probe: 4096 + reserve` and the open
+is one round trip. `directory: true` fetches the directory whole in the
+open wave, so every dictionary plan's first phase is empty and a lookup
+after open is one round trip, the records. A data read then fetches the 4
+KiB chunks a run spans, not its block. Cold, a search is open, records,
+postings; `w6-waves` records the counts on the day fixture, and
+`waves-plan.md` the reasoning. Small runs -- under 256 bytes -- are inline
+in a segment's index record and cost no postings round trip at all; a
+`Store`-written index never inlines, which is the case for writing the
+roll through `SegmentWriter`.
+
 A segment's key index carries a checksum row -- one CRC32C per 16 KiB
 piece, after the hash region. The whole reader verifies every piece at
 open. A piece is the section's intersection with one 16 KiB page of the

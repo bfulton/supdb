@@ -331,6 +331,36 @@ and `store::Reader` does not serve inline runs (a next-engine segment is read
 through `Blob`). A v5 reader from before the extension errors on the block id
 rather than answering wrongly, so the magic did not move.
 
+**A cold sparse open is one or two round trips, and a cold search three
+(R7, waves-plan.md).** logshed measured seven dependent round trips for a
+first page of search results over a cold cache on a real day, five of
+them the store's before a posting byte moved. Three things removed them,
+each measured by `w6-waves` through a host that models the browser's
+cache -- an `ensure` that brings in a page is one wave, and a finding is a
+count, not a timing. A write-once segment writes an **extension into the
+spare part of the superblock page** (a copy of the key header and the
+offsets of fence, directory, hash and checksum row), so the sparse open's
+first plan names everything and its second is empty: two waves from a
+page-sized probe against the store's three (W6.1). With
+`SegmentWriter::set_head_reserve` the writer leaves a reserve after the
+page and fills it at finish with the block table, the row, a copy of the
+fence and a copy of the directory when they fit, and a host whose first
+probe covers the reserve (`openSparse(wasm, cache, {probe})`) opens in one
+wave (W6.2), at 1.63% of the file for 128 KiB on the fixture (W6.7).
+`BlobOptions::resident_directory` fetches the directory in the open wave,
+so a lookup after open is at most the records' wave (W6.3) and a cold
+search is open, records, postings -- two on the fixture, three by
+construction, from six (W6.4). And a **data read fetches the 4 KiB chunks
+an extent spans**, not its block, when the block is plain and carries
+per-chunk checksums: the rare key's postings wave is two chunks where
+logshed's two-hit word read 920 KiB (W6.5); W4.1's exactness holds on the
+chunk plan as it did on the block plan. The third ask, small values inline
+in the record, was already the segment writer's (`inline_max`, 256 bytes
+since v5's inline extension) and never the store's: a segment answers the
+rare key at the dictionary with no postings wave (W6.6), and the
+recommendation to the roll is to write through `SegmentWriter`, which
+`logshed build`'s day already sorts for.
+
 **A segment's key index is checksummed, and a flipped bit in it fails the
 open.** Every block was checksummed and verified once per reader (f8); the
 key index was not, and v6 made that a quiet misread rather than a theory:
