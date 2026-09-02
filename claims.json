@@ -1133,8 +1133,8 @@
    "experiment": "ext-kv",
    "id": "EXT.26",
    "profile": "full",
-   "expect": "fails",
-   "because": "The other half of EXT.25's trade, collapsed with it: 21,973,802 against 19,761,281 entries/s, a tie at p=0.44 (0.986x and 0.976x the runs before; 2.007x, 1.549x and 1.681x at 64 MB seals). Under 32 MB seals both arms are partitioned by the time the scan runs, so a scan walks disjoint partitions in both and there is no k-way merge left to be slower. Both entries fail together, which is the shape a trade takes when the knob stops selecting anything at the measured load."
+   "expect": "holds",
+   "because": "The other half of EXT.25's trade, collapsed with it: 21,973,802 against 19,761,281 entries/s, a tie at p=0.44 (0.986x and 0.976x the runs before; 2.007x, 1.549x and 1.681x at 64 MB seals). Under 32 MB seals both arms are partitioned by the time the scan runs, so a scan walks disjoint partitions in both and there is no k-way merge left to be slower. Both entries fail together, which is the shape a trade takes when the knob stops selecting anything at the measured load. Then a tie four canonical runs in a row (1.034x, 0.937x, 1.053x, 0.926x, all no difference) and 1.107x at p=0.01 in the latest, which is what the recorded file holds and what this expectation now says -- read it as EXT.25's twin: one policy bit that does about the same work either way at 1M keys and 32 MB seals, on the gate, flipping with the host. If the next run reads a tie again it flips back with this history attached rather than being re-argued."
   },
   {
    "experiment": "f46-segwrite",

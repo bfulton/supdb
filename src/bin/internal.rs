@@ -10725,7 +10725,7 @@ fn f61_scanmerge(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let batch = args.num("--batch", 1_000) as u64;
     let value_size = args.num("--value-size", 100);
     let scans = args.num("--scans", profile.pick(50, 200, 400)) as u64;
-    let scan_len = args.num("--scan-len", 1_000) as usize;
+    let scan_len = args.num("--scan-len", 1_000);
 
     let mut rec = Record::new("f61-scanmerge", profile);
     rec.param("keys", J::u(keys))
