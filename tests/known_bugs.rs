@@ -797,11 +797,22 @@ fn per_chunk_checksums_still_catch_damaged_payload() {
         s.close().unwrap();
     }
     let clean = std::fs::read(&path).unwrap();
+    // The payload: after the superblock page and before the key index and
+    // block table, which sit at the end. This used to step to the end of the
+    // file, and the index happened to fail loudly under damage while every
+    // run carried length prefixes; with format v6 a flipped bit in an
+    // extent's count word can re-encode its run, and the index has no
+    // checksum to say so. That is a different finding from the one this
+    // test pins and is tracked on its own; the payload's chunk checksums are
+    // what is under test here.
+    let (index_bytes, table_bytes) = {
+        let b = supdb::Blob::open(supdb::MmapBytes::open(&path).unwrap()).unwrap();
+        (b.index_bytes(), b.block_table_bytes())
+    };
+    let data_end = clean.len() - index_bytes - table_bytes - 4096;
     let mut caught = 0usize;
     let mut served = 0usize;
-    // Step across the data region; the first page is the superblock and the
-    // index sections sit at the end, so this walks payload.
-    for at in (4096..clean.len()).step_by(1021) {
+    for at in (4096..data_end).step_by(1021) {
         let mut bytes = clean.clone();
         bytes[at] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();

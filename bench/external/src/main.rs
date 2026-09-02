@@ -2574,6 +2574,8 @@ fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
             );
             let got = naive_merge(&blob, &dict[ai], &dict[bi], &mut bufa, &mut bufb);
             assert_eq!(got, want, "supdb intersection {ai}x{bi}");
+            let kernel = nock.intersect_fixed(&dict[ai], &dict[bi], WIDTH).expect("kernel");
+            assert_eq!(kernel, want, "supdb in-place intersection {ai}x{bi}");
             let got = ldb
                 .intersect_fixed(&dict[ai], &dict[bi], WIDTH)
                 .expect("intersect");
@@ -2694,10 +2696,11 @@ fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
                     let ka = &dict[r.below(a_keys as u64) as usize];
                     let kb = &dict[a_keys + r.below((dict_len - a_keys) as u64) as usize];
                     matches += match ei {
-                        0 | 1 => {
-                            let b = if ei == 0 { &blob } else { &nock };
-                            naive_merge(b, ka, kb, &mut bufa, &mut bufb)
-                        }
+                        // The checksums-on arm keeps the naive merge -- decode
+                        // both lists, then walk -- as the comparison; the
+                        // matched arm uses the in-place kernel over fixed runs.
+                        0 => naive_merge(&blob, ka, kb, &mut bufa, &mut bufb),
+                        1 => nock.intersect_fixed(ka, kb, WIDTH).expect("intersect"),
                         _ => ldb.intersect_fixed(ka, kb, WIDTH).expect("intersect"),
                     };
                 }

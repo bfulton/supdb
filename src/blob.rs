@@ -30,7 +30,7 @@
 use crate::block::{self, BlockLoc};
 use crate::bytes::{short, take, Bytes};
 use crate::flatindex::{self, FlatIndex, MappedBlocks};
-use crate::index::{get_uvarint, Ext};
+use crate::index::Ext;
 use std::cell::{Cell, RefCell};
 use std::io::{Error, ErrorKind, Result};
 
@@ -69,12 +69,21 @@ fn varint_len(mut v: u64) -> u64 {
 /// contract remains that the caller knows its own schema. It is the
 /// difference between a check that catches an honest mistake and one that
 /// does not.
-fn fixed_count(exts: &[Ext], stride: u64) -> Option<u64> {
+fn fixed_count(exts: &[Ext], stride: u64, width: u64) -> Option<u64> {
     if stride == 0 {
         return None;
     }
     let mut total = 0u64;
     for e in exts {
+        // A fixed run says its width outright (format v6): exact when it is
+        // the width asked about, and a definite no when it is not.
+        if e.is_fixed() {
+            if e.fixed_width()? as u64 != width {
+                return None;
+            }
+            total += u64::from(e.records());
+            continue;
+        }
         let len = e.len as u64;
         if len == 0 || !len.is_multiple_of(stride) {
             return None;
@@ -107,7 +116,7 @@ fn fixed_count(exts: &[Ext], stride: u64) -> Option<u64> {
 /// the constants below are asserted equal to `store.rs`'s at compile time on
 /// every native build, which says *why* in one line instead of six stack
 /// traces.
-const MAGIC: u64 = 0x5355_5044_4200_0005;
+const MAGIC: u64 = 0x5355_5044_4200_0006;
 const SUPER: u64 = 4096;
 const SLOT: u64 = 512;
 const SB_BYTES: usize = 144;
@@ -608,21 +617,7 @@ impl<B: Bytes> Blob<B> {
         let mut n = 0u64;
         for e in exts {
             n += self.with_run(*e, tail, |run| {
-                let mut p = 0usize;
-                let mut seen = 0u64;
-                while p < run.len() {
-                    let len = get_uvarint(run, &mut p) as usize;
-                    let end = p
-                        .checked_add(len)
-                        .ok_or_else(|| corrupt("record length overflows"))?;
-                    if end > run.len() {
-                        return Err(corrupt("record runs past the end of its extent"));
-                    }
-                    f(&run[p..end]);
-                    seen += 1;
-                    p = end;
-                }
-                Ok(seen)
+                crate::index::each_value(run, e, &mut |v| f(v)).map_err(corrupt)
             })?;
         }
         Ok(n)
@@ -888,21 +883,7 @@ impl<B: Bytes> Blob<B> {
         let mut n = 0u64;
         for e in exts {
             n += self.with_run(*e, tail, |run| {
-                let mut p = 0usize;
-                let mut seen = 0u64;
-                while p < run.len() {
-                    let len = get_uvarint(run, &mut p) as usize;
-                    let end = p
-                        .checked_add(len)
-                        .ok_or_else(|| corrupt("record length overflows"))?;
-                    if end > run.len() {
-                        return Err(corrupt("record runs past the end of its extent"));
-                    }
-                    f(&run[p..end]);
-                    seen += 1;
-                    p = end;
-                }
-                Ok(seen)
+                crate::index::each_value(run, e, &mut |v| f(v)).map_err(corrupt)
             })?;
         }
         Ok(n)
@@ -916,6 +897,115 @@ impl<B: Bytes> Blob<B> {
     /// back as one array.
     pub fn read_concat(&self, key: &[u8], out: &mut Vec<u8>) -> Result<u64> {
         self.read_all(key, |v| out.extend_from_slice(v))
+    }
+
+    /// How many values two keys' ascending fixed-width runs have in common:
+    /// a two-pointer walk over the runs where they lie, comparing `width`
+    /// bytes at a time and copying nothing. The kernel EXT.17 said was
+    /// missing. Each key's extents must be fixed runs of `width` in
+    /// ascending value order (postings are) and the source must lend its
+    /// bytes; anything else falls back to decoding both lists, so the
+    /// answer is right either way and only the speed differs.
+    pub fn intersect_fixed(&self, a: &[u8], b: &[u8], width: usize) -> Result<u64> {
+        let (Some((ea, ta)), Some((eb, tb))) = (self.lookup_full(a), self.lookup_full(b)) else {
+            return Ok(0);
+        };
+        let (ra, rb) = match (width, self.fixed_runs(ea, ta, width)?, self.fixed_runs(eb, tb, width)?) {
+            (w, Some(ra), Some(rb)) if w > 0 => (ra, rb),
+            _ => {
+                let (mut va, mut vb) = (Vec::new(), Vec::new());
+                self.read_exts(ea, ta, |v| va.push(v.to_vec()))?;
+                self.read_exts(eb, tb, |v| vb.push(v.to_vec()))?;
+                let (mut i, mut j, mut n) = (0, 0, 0u64);
+                while i < va.len() && j < vb.len() {
+                    match va[i].cmp(&vb[j]) {
+                        std::cmp::Ordering::Equal => {
+                            n += 1;
+                            i += 1;
+                            j += 1;
+                        }
+                        std::cmp::Ordering::Less => i += 1,
+                        std::cmp::Ordering::Greater => j += 1,
+                    }
+                }
+                return Ok(n);
+            }
+        };
+        // Two cursors, each a (run index, byte offset) over its key's runs.
+        let (mut ai, mut ao, mut bi, mut bo) = (0usize, 0usize, 0usize, 0usize);
+        let mut n = 0u64;
+        loop {
+            while ai < ra.len() && ao >= ra[ai].len() {
+                ai += 1;
+                ao = 0;
+            }
+            while bi < rb.len() && bo >= rb[bi].len() {
+                bi += 1;
+                bo = 0;
+            }
+            if ai >= ra.len() || bi >= rb.len() {
+                break;
+            }
+            match ra[ai][ao..ao + width].cmp(&rb[bi][bo..bo + width]) {
+                std::cmp::Ordering::Equal => {
+                    n += 1;
+                    ao += width;
+                    bo += width;
+                }
+                std::cmp::Ordering::Less => ao += width,
+                std::cmp::Ordering::Greater => bo += width,
+            }
+        }
+        Ok(n)
+    }
+
+    /// Every run of a key as a lent slice, when every extent is a fixed run
+    /// of `width` and the source lends; `None` otherwise.
+    fn fixed_runs<'a>(
+        &'a self,
+        exts: &[Ext],
+        tail: &'a [u8],
+        width: usize,
+    ) -> Result<Option<Vec<&'a [u8]>>> {
+        let mut v = Vec::with_capacity(exts.len());
+        for e in exts {
+            if e.fixed_width() != Some(width) {
+                return Ok(None);
+            }
+            match self.run_slice(e, tail)? {
+                Some(r) => v.push(r),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(v))
+    }
+
+    /// A run's bytes where they lie, for a source that lends: the record's
+    /// tail for an inline run, a verified slice of a plain block otherwise.
+    /// `None` when the block is compressed or the source cannot lend, and
+    /// the caller must read through `with_run` instead.
+    fn run_slice<'a>(&'a self, e: &Ext, tail: &'a [u8]) -> Result<Option<&'a [u8]>> {
+        if e.is_inline() {
+            let a = e.off as usize;
+            let b = a
+                .checked_add(e.len as usize)
+                .filter(|&b| b <= tail.len())
+                .ok_or_else(|| corrupt("inline run runs past its record"))?;
+            return Ok(Some(&tail[a..b]));
+        }
+        let loc = self.loc_of(e.block)?;
+        if !loc.is_plain() {
+            return Ok(None);
+        }
+        let Some(raw) = self.src.slice_at(loc.off, loc.stored as usize) else {
+            return Ok(None);
+        };
+        let (a, b) = (e.off as usize, (e.off as usize).saturating_add(e.len as usize));
+        if b > raw.len() {
+            return Err(corrupt("extent runs past its block"));
+        }
+        self.verify(e.block, loc, raw, a, b)?;
+        Ok(Some(&raw[a..b]))
     }
 
     /// How many values a key has. O(extents): every extent carries its
@@ -933,7 +1023,9 @@ impl<B: Bytes> Blob<B> {
     }
 
     /// Stored bytes under a key: value payload *plus* the varint length
-    /// prefix in front of each value.
+    /// prefix in front of each value of a prefixed run. A fixed run
+    /// (format v6, every value one width) has no prefixes, so for it this is
+    /// the payload alone.
     ///
     /// This one is genuinely O(extents) -- `Ext::len` is the byte length of
     /// the run, so the sum touches no block at all, not even to fault a page
@@ -971,7 +1063,7 @@ impl<B: Bytes> Blob<B> {
     pub fn count_fixed(&self, key: &[u8], width: u32) -> Option<u64> {
         let stride = width as u64 + varint_len(width as u64);
         match self.lookup(key) {
-            Some(exts) => fixed_count(exts, stride),
+            Some(exts) => fixed_count(exts, stride, width as u64),
             // A key that is not there holds no values, which is a count.
             None => Some(0),
         }
@@ -1034,7 +1126,7 @@ impl<B: Bytes> Blob<B> {
             let Some((k, exts)) = self.exts_at(rank) else {
                 break;
             };
-            let n = fixed_count(exts, stride);
+            let n = fixed_count(exts, stride, width as u64);
             seen += 1;
             rank += 1;
             if !f(k, n) {
@@ -1076,19 +1168,7 @@ impl<B: Bytes> Blob<B> {
                 // already on: no block, no cache, no fetch.
                 if e.is_inline() {
                     self.with_run(*e, tail, |run| {
-                        let mut p = 0usize;
-                        while p < run.len() {
-                            let len = get_uvarint(run, &mut p) as usize;
-                            let end = p
-                                .checked_add(len)
-                                .ok_or_else(|| corrupt("record length overflows"))?;
-                            if end > run.len() {
-                                return Err(corrupt("record runs past the end of its extent"));
-                            }
-                            f(k, &run[p..end]);
-                            p = end;
-                        }
-                        Ok(())
+                        crate::index::each_value(run, e, &mut |v| f(k, v)).map_err(corrupt)
                     })?;
                     continue;
                 }
@@ -1121,36 +1201,11 @@ impl<B: Bytes> Blob<B> {
                             return Err(corrupt("extent runs past its block"));
                         }
                         let run = &bytes[a..b];
-                        let mut p = 0usize;
-                        while p < run.len() {
-                            let len = get_uvarint(run, &mut p) as usize;
-                            let end = p
-                                .checked_add(len)
-                                .ok_or_else(|| corrupt("record length overflows"))?;
-                            if end > run.len() {
-                                return Err(corrupt("record runs past the end of its extent"));
-                            }
-                            f(k, &run[p..end]);
-                            p = end;
-                        }
+                        crate::index::each_value(run, e, &mut |v| f(k, v)).map_err(corrupt)?;
                     }
                     None => {
                         self.with_extent(*e, |run| {
-                            let mut p = 0usize;
-                            while p < run.len() {
-                                let len = get_uvarint(run, &mut p) as usize;
-                                let end = p
-                                    .checked_add(len)
-                                    .ok_or_else(|| corrupt("record length overflows"))?;
-                                if end > run.len() {
-                                    return Err(corrupt(
-                                        "record runs past the end of its extent",
-                                    ));
-                                }
-                                f(k, &run[p..end]);
-                                p = end;
-                            }
-                            Ok(())
+                            crate::index::each_value(run, e, &mut |v| f(k, v)).map_err(corrupt)
                         })?;
                     }
                 }

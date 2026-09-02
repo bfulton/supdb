@@ -57,6 +57,19 @@ fn build(path: &Path, keys: usize, opts: Options) -> Vec<(Vec<u8>, Vec<Vec<u8>>)
 /// Every value of every key, read through `Blob`, compared against what was
 /// written and against what `Reader` says.
 fn agrees_with_reader<B: Bytes>(blob: &Blob<B>, path: &Path, want: &[(Vec<u8>, Vec<Vec<u8>>)]) {
+    agrees_with_reader_opts(blob, path, want, true)
+}
+
+/// `check_stored` is for fixtures sealed in one run per key, where the
+/// stored bytes follow from the values alone; a key sealed in several runs
+/// may hold a fixed run beside a prefixed one and its stored bytes depend
+/// on how the store cut them.
+fn agrees_with_reader_opts<B: Bytes>(
+    blob: &Blob<B>,
+    path: &Path,
+    want: &[(Vec<u8>, Vec<Vec<u8>>)],
+    check_stored: bool,
+) {
     let r = Reader::open(path).expect("reader open");
     assert_eq!(blob.keys(), r.keys(), "key count");
     assert_eq!(blob.version(), r.version(), "checkpoint identity");
@@ -80,10 +93,21 @@ fn agrees_with_reader<B: Bytes>(blob: &Blob<B>, path: &Path, want: &[(Vec<u8>, V
             "count of {}",
             String::from_utf8_lossy(key)
         );
-        // O(extents), on the quantity the format does record: payload plus a
-        // one-byte varint prefix per value, since every value here is short.
-        let stored: u64 = vals.iter().map(|v| v.len() as u64 + 1).sum();
-        assert_eq!(blob.stored_bytes(key), stored, "stored bytes");
+        // O(extents), on the quantity the format does record. Since format
+        // v6 that depends on the run's encoding: values that all share one
+        // width are stored back to back with no prefixes (Ext::FIXED), so
+        // the stored bytes are the payload alone; a mixed run pays a
+        // one-byte varint prefix per value, every value here being short.
+        let uniform = !vals.is_empty()
+            && !vals[0].is_empty()
+            && vals.iter().all(|v| v.len() == vals[0].len());
+        let stored: u64 = vals
+            .iter()
+            .map(|v| v.len() as u64 + if uniform { 0 } else { 1 })
+            .sum();
+        if check_stored {
+            assert_eq!(blob.stored_bytes(key), stored, "stored bytes of {}", String::from_utf8_lossy(key));
+        }
     }
 
     // A key that is not there is zero, not an error and not a panic.
@@ -570,4 +594,59 @@ fn a_truncated_object_is_refused_at_open() {
         err.to_string().contains("truncated") || err.kind() == std::io::ErrorKind::InvalidData,
         "unhelpful error: {err}"
     );
+}
+
+#[test]
+fn the_store_seals_uniform_runs_fixed_and_both_readers_agree() {
+    // Format v6 through the original store: a key whose pending values all
+    // share a width is sealed without prefixes and flagged; a mixed key is
+    // not; a later append of another width to the fixed key is read back in
+    // order whether or not consolidation has merged the two runs; and the
+    // two readers agree on every key throughout.
+    let path = scratch("fixed-store");
+    let store = Store::create(&path, Options::default()).expect("create");
+    let mut want: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+    let mut a = Vec::new();
+    for i in 0u32..2000 {
+        let v = i.to_be_bytes().to_vec();
+        store.append(b"fixed", &v).unwrap();
+        a.push(v);
+    }
+    want.push((b"fixed".to_vec(), a));
+    let mut b = Vec::new();
+    for i in 0u32..300 {
+        let v = format!("{i}").into_bytes();
+        store.append(b"mixed", &v).unwrap();
+        b.push(v);
+    }
+    want.push((b"mixed".to_vec(), b));
+    store.checkpoint().unwrap();
+    store.close().unwrap();
+
+    let blob = Blob::open(MmapBytes::open(&path).unwrap()).unwrap();
+    let ef = blob.lookup(b"fixed").unwrap();
+    assert!(ef.iter().all(|e| e.is_fixed()), "a uniform run is sealed fixed: {ef:?}");
+    assert_eq!(ef.iter().map(|e| e.len as u64).sum::<u64>(), 8000, "no prefixes");
+    assert_eq!(blob.count_fixed(b"fixed", 4), Some(2000));
+    assert_eq!(blob.stored_bytes(b"fixed"), 8000);
+    let em = blob.lookup(b"mixed").unwrap();
+    assert!(em.iter().all(|e| !e.is_fixed()));
+    agrees_with_reader(&blob, &path, &want);
+    drop(blob);
+
+    // Reopen, append a wider value: the key is no longer uniform.
+    let store = Store::open(&path, Options::default()).expect("open");
+    store.append(b"fixed", b"wider").unwrap();
+    want[0].1.push(b"wider".to_vec());
+    store.checkpoint().unwrap();
+    store.close().unwrap();
+    let blob = Blob::open(MmapBytes::open(&path).unwrap()).unwrap();
+    assert_eq!(blob.count(b"fixed").unwrap(), 2001);
+    assert_eq!(blob.count_fixed(b"fixed", 4), None, "the run is not all fours any more");
+    // Two fixed runs (8,000 + 5 bytes) if the store kept them apart, one
+    // prefixed run (2,001 prefixes more) if it consolidated them; either is
+    // right and both readers must agree on the values.
+    let stored = blob.stored_bytes(b"fixed");
+    assert!(stored == 8005 || stored == 10006, "stored bytes {stored}");
+    agrees_with_reader_opts(&blob, &path, &want, false);
 }

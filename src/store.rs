@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 /// Bumped 0003 -> 0004 when redo-log frames grew a kind byte (sealed extents
 /// vs inline values). A 0003 store's log would misparse under this decoder,
 /// so the magic refuses it instead; sections and superblock are unchanged.
-pub(crate) const MAGIC: u64 = 0x5355_5044_4200_0005;
+pub(crate) const MAGIC: u64 = 0x5355_5044_4200_0006;
 
 /// Two superblock slots live in the first sector-pair of the file, and a
 /// checkpoint alternates between them.
@@ -1354,6 +1354,9 @@ struct Shard {
     arena: Vec<u8>,
     pending_bytes: usize,
     builder: BlockBuilder,
+    /// A pending run stripped of its prefixes when every value shares one
+    /// width (format v6, `Ext::FIXED`); reused across keys at seal.
+    fixbuf: Vec<u8>,
     /// Extents already placed in the current block, awaiting its id.
     members: Vec<(u32, u32, u32, u32, u32, bool)>,
     /// Keys whose extents changed since the last checkpoint, by table index.
@@ -1587,6 +1590,7 @@ impl Store {
                     keys: KeyTable::new(),
                     pending_bytes: 0,
                     builder: BlockBuilder::new(opts.block_size),
+                    fixbuf: Vec::new(),
                     arena: Vec::new(),
                     members: Vec::new(),
                     dirty: Vec::new(),
@@ -1863,6 +1867,7 @@ impl Store {
                     keys: KeyTable::new(),
                     pending_bytes: 0,
                     builder: BlockBuilder::new(opts.block_size),
+                    fixbuf: Vec::new(),
                     arena: Vec::new(),
                     members: Vec::new(),
                     dirty: Vec::new(),
@@ -2008,6 +2013,7 @@ impl Store {
         // end; an error path loses the buffered bytes, which is already true
         // of `batch` and `pending_bytes` above.
         let arena = std::mem::take(&mut sh.arena);
+        let mut fixbuf = std::mem::take(&mut sh.fixbuf);
         // sorted by the keys the indices point at, with no key copied
         sh.keys.sort_by_key(&mut batch);
 
@@ -2044,7 +2050,19 @@ impl Store {
                     ap.release(e.block)?;
                 }
             }
-            let pbytes = p.bytes(&arena);
+            // Format v6: a run whose values all share one width is sealed
+            // without its prefixes and flagged fixed; a mixed run keeps
+            // them. The pending run was buffered prefixed, so the decision is
+            // one pass over it here, where the whole run is in hand.
+            let pending_bytes = p.bytes(&arena);
+            let (pbytes, count, last): (&[u8], u32, u32) =
+                match crate::index::uniform_width(pending_bytes) {
+                    Some(w) if p.count < Ext::FIXED => {
+                        let n = crate::index::strip_prefixes(pending_bytes, &mut fixbuf);
+                        (fixbuf.as_slice(), n | Ext::FIXED, (n - 1) * w as u32)
+                    }
+                    _ => (pending_bytes, p.count, p.last),
+                };
             if pbytes.len() >= self.opts.solo_threshold {
                 // big enough to compress on its own; giving it a private block
                 // means a read of this key decompresses only this key
@@ -2064,8 +2082,8 @@ impl Store {
                     block: id,
                     off: 0,
                     len,
-                    last: p.last,
-                    count: p.count,
+                    last,
+                    count,
                 };
                 {
                     let entry = sh.keys.entry_at(idx);
@@ -2083,13 +2101,13 @@ impl Store {
                 self.flush_builder(sh)?;
             }
             let off = sh.builder.push(pbytes);
-            sh.members
-                .push((idx, off, pbytes.len() as u32, p.last, p.count, p.replaces));
+            sh.members.push((idx, off, pbytes.len() as u32, last, count, p.replaces));
         }
         // Keep the capacity: clearing is what makes the next batch of writes
         // land in already-reserved memory instead of growing again.
         sh.arena = arena;
         sh.arena.clear();
+        sh.fixbuf = fixbuf;
         Ok(())
     }
 
@@ -2401,16 +2419,23 @@ impl Store {
                 None => return Ok(()),
             }
         };
-        let mut buf = Vec::new();
-        let mut last = 0u32;
-        let mut count = 0u32;
+        // Re-encoded from the values rather than concatenated: the inputs may
+        // mix fixed and prefixed runs (format v6), and the merged run is
+        // fixed exactly when every value across them shares one width.
+        let mut raw = Vec::new();
+        let mut lens: Vec<u32> = Vec::new();
         let mut ap = self.appender.lock().unwrap();
         for e in &exts {
             let bytes = ap.read_extent(*e)?;
-            last = (buf.len() as u32) + e.last;
-            count += e.records();
-            buf.extend_from_slice(&bytes);
+            crate::index::each_value(&bytes, e, &mut |v| {
+                lens.push(v.len() as u32);
+                raw.extend_from_slice(v);
+            })
+            .map_err(corrupt)?;
         }
+        let mut buf = Vec::new();
+        let (last, flag) = crate::index::encode_run(&raw, &lens, &mut buf);
+        let count = lens.len() as u32 | flag;
         let len = buf.len() as u32;
         let id = ap.write_block(
             &buf,
@@ -2510,20 +2535,11 @@ impl Store {
         let staged_replaces = last_replace.is_some();
 
         let mut n = 0u64;
-        let mut emit_count = |bytes: &[u8], f: &mut F| -> Result<()> {
-            let mut p = 0usize;
-            while p < bytes.len() {
-                let len = get_uvarint(bytes, &mut p) as usize;
-                let end = p
-                    .checked_add(len)
-                    .ok_or_else(|| corrupt("record length overflows"))?;
-                let Some(rec) = bytes.get(p..end) else {
-                    return Err(corrupt("record runs past the end of its extent"));
-                };
-                f(rec);
-                n += 1;
-                p = end;
-            }
+        // `e` says how the bytes are encoded (format v6): a sealed or staged
+        // extent carries its flag, a pending run is always prefixed.
+        let mut emit_count = |bytes: &[u8], e: Option<Ext>, f: &mut F| -> Result<()> {
+            let ext = e.unwrap_or(Ext { block: 0, off: 0, len: bytes.len() as u32, last: 0, count: 0 });
+            n += crate::index::each_value(bytes, &ext, &mut |v| f(v)).map_err(corrupt)?;
             Ok(())
         };
 
@@ -2547,12 +2563,12 @@ impl Store {
                 // `off` again reads from the wrong place, which is how this
                 // first reported "extent runs past its block".
                 let bytes = ap.extent_bytes(*e, &mut scratch, self.opts.verify_reads)?;
-                emit_count(bytes, &mut f)?;
+                emit_count(bytes, Some(*e), &mut f)?;
             }
         }
         if !pending_replaces {
             let from = last_replace.unwrap_or(0);
-            for (pos, (i, off, len, _, _, _)) in sh.members.iter().enumerate() {
+            for (pos, (i, off, len, last, count, _)) in sh.members.iter().enumerate() {
                 if *i != idx || pos < from {
                     continue;
                 }
@@ -2562,10 +2578,11 @@ impl Store {
                     .staged()
                     .get(a..b)
                     .ok_or_else(|| corrupt("staged extent runs past the builder"))?;
-                emit_count(slice, &mut f)?;
+                let staged = Ext { block: 0, off: *off, len: *len, last: *last, count: *count };
+                emit_count(slice, Some(staged), &mut f)?;
             }
         }
-        emit_count(pending_buf, &mut f)?;
+        emit_count(pending_buf, None, &mut f)?;
         Ok(n)
     }
 
@@ -2672,19 +2689,7 @@ impl Store {
             };
             for e in exts {
                 let bytes = ap.extent_bytes(*e, &mut scratch, self.opts.verify_reads)?;
-                let mut p = 0usize;
-                while p < bytes.len() {
-                    let len = get_uvarint(bytes, &mut p) as usize;
-                    let end = p
-                        .checked_add(len)
-                        .ok_or_else(|| corrupt("record length overflows"))?;
-                    let Some(rec) = bytes.get(p..end) else {
-                        return Err(corrupt("record runs past the end of its extent"));
-                    };
-                    f(key, rec);
-                    n += 1;
-                    p = end;
-                }
+                n += crate::index::each_value(bytes, e, &mut |v| f(key, v)).map_err(corrupt)?;
             }
         }
         Ok(n)
@@ -4497,21 +4502,18 @@ fn corrupt(what: &str) -> std::io::Error {
 /// used to slice `extent[p..p + n]` on a length read straight out of the
 /// buffer, so a damaged extent panicked the calling process instead of
 /// returning an error.
-fn emit<F: FnMut(&[u8])>(extent: &[u8], f: &mut F) -> Result<u64> {
-    let mut p = 0usize;
+fn emit<F: FnMut(&[u8])>(extent: &[u8], e: Option<&Ext>, f: &mut F) -> Result<u64> {
+    // Through the one decoder every reader shares (format v6 made two
+    // encodings of a run, and this is where they would have drifted). A
+    // log's inline run has no extent and is always prefixed.
+    let prefixed = Ext { block: 0, off: 0, len: extent.len() as u32, last: 0, count: 0 };
+    let ext = e.unwrap_or(&prefixed);
     let mut total = 0u64;
-    while p < extent.len() {
-        let n = get_uvarint(extent, &mut p) as usize;
-        let end = p
-            .checked_add(n)
-            .ok_or_else(|| corrupt("record length overflows"))?;
-        if end > extent.len() {
-            return Err(corrupt("record runs past the end of its extent"));
-        }
-        f(&extent[p..end]);
-        total += n as u64;
-        p = end;
-    }
+    crate::index::each_value(extent, ext, &mut |v| {
+        total += v.len() as u64;
+        f(v);
+    })
+    .map_err(corrupt)?;
     Ok(total)
 }
 
@@ -5607,13 +5609,13 @@ impl Reader {
         // (value bytes) as the sealed path.
         let inline = self.overlay_inline(key);
         if let Some((buf, true)) = inline {
-            return emit(buf, &mut f);
+            return emit(buf, None, &mut f);
         }
         let Some(exts) = self.lookup(key) else {
             // Nothing sealed, but the log may still hold an appended run for
             // a key that has never been written to a block.
             return match inline {
-                Some((buf, _)) => emit(buf, &mut f),
+                Some((buf, _)) => emit(buf, None, &mut f),
                 None => Ok(0),
             };
         };
@@ -5644,7 +5646,7 @@ impl Reader {
                     return Err(corrupt("extent runs past its block"));
                 }
                 self.verify_range(e.block, loc, raw, a, b)?;
-                total += emit(&raw[a..b], &mut f)?;
+                total += emit(&raw[a..b], Some(e), &mut f)?;
             } else if loc.chunked || loc.solo {
                 if std::env::var_os("SUPDB_DEBUG").is_some() && loc.stored as usize > raw.len() {
                     eprintln!(
@@ -5687,7 +5689,7 @@ impl Reader {
                     if b > un {
                         return Err(corrupt("extent runs past its block"));
                     }
-                    emit(&buf[a..b], &mut f)
+                    emit(&buf[a..b], Some(e), &mut f)
                 })?;
             } else {
                 let b = self.block(e.block)?;
@@ -5696,11 +5698,11 @@ impl Reader {
                 if z > sl.len() {
                     return Err(corrupt("extent runs past its block"));
                 }
-                total += emit(&sl[a..z], &mut f)?;
+                total += emit(&sl[a..z], Some(e), &mut f)?;
             }
         }
         if let Some((buf, _)) = inline {
-            total += emit(buf, &mut f)?;
+            total += emit(buf, None, &mut f)?;
         }
         Ok(total)
     }
@@ -6173,21 +6175,7 @@ impl Reader {
                     }
                     &buf[e.off as usize..(e.off + e.len) as usize]
                 };
-                let mut p = 0usize;
-                while p < extent.len() {
-                    let len = get_uvarint(extent, &mut p) as usize;
-                    let end = p
-                        .checked_add(len)
-                        .ok_or_else(|| corrupt("record length overflows"))?;
-                    // `get` is the bounds check, so the explicit one it used to
-                    // do first was the same test run twice per record.
-                    let Some(rec) = extent.get(p..end) else {
-                        return Err(corrupt("record runs past the end of its extent"));
-                    };
-                    f(key, rec);
-                    n += 1;
-                    p = end;
-                }
+                n += crate::index::each_value(extent, e, &mut |v| f(key, v)).map_err(corrupt)?;
             }
             // An appended run the log carries comes after the sealed values,
             // in the order it was written.

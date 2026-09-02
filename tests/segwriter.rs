@@ -226,7 +226,13 @@ fn bulk_segment_reads_identically_to_a_store_written_one() {
     // the record alone.
     let mut inline = 0usize;
     for (key, vals) in &data {
-        let run: usize = vals.iter().map(|v| v.len() + varint_len(v.len())).sum();
+        // The run's stored size decides: format v6 stores a uniform-width
+        // run without prefixes, a mixed one with a varint prefix per value.
+        let uniform = !vals.is_empty() && vals.iter().all(|v| v.len() == vals[0].len() && !v.is_empty());
+        let run: usize = vals
+            .iter()
+            .map(|v| v.len() + if uniform { 0 } else { varint_len(v.len()) })
+            .sum();
         let exts = b.lookup(key).expect("present");
         assert_eq!(exts.len(), 1, "one run per key in a bulk segment");
         if run <= INLINE {
@@ -378,4 +384,93 @@ fn keys_out_of_order_are_refused() {
         0,
         "a key closed with no values has none"
     );
+}
+
+#[test]
+fn a_run_of_one_width_is_stored_without_prefixes_and_reads_the_same() {
+    // Format v6: a run whose values share a width carries Ext::FIXED and no
+    // per-value length prefix; a mixed run keeps the prefixes. Both must
+    // read identically through every path, and the fixed one must be
+    // smaller by exactly the prefixes.
+    let _g = serial();
+    let dir = std::env::temp_dir().join("supdb-segwriter-fixed");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("seg.sup");
+    let o = opts();
+    let mut w = SegmentWriter::create(&path, &o).expect("create");
+    w.set_inline_max(0);
+    // 1,000 four-byte values: fixed.
+    w.begin(b"fixed").unwrap();
+    for i in 0u32..1000 {
+        w.value(&i.to_be_bytes());
+    }
+    w.end().unwrap();
+    // Mixed widths: prefixed.
+    w.begin(b"mixed").unwrap();
+    for i in 0u32..1000 {
+        w.value(format!("{i}").as_bytes());
+    }
+    w.end().unwrap();
+    // One value: fixed too (a single width).
+    w.begin(b"one").unwrap();
+    w.value(b"solo");
+    w.end().unwrap();
+    w.finish(1).unwrap();
+
+    let blob = Blob::open(MmapBytes::open(&path).unwrap()).unwrap();
+    let ef = blob.lookup(b"fixed").unwrap();
+    assert_eq!(ef.len(), 1);
+    assert!(ef[0].is_fixed(), "a uniform run must be flagged fixed");
+    assert_eq!(ef[0].fixed_width(), Some(4));
+    assert_eq!(ef[0].len, 4000, "no prefixes: 1,000 x 4 bytes");
+    assert_eq!(ef[0].records(), 1000);
+    assert_eq!(ef[0].last, 3996);
+    let em = blob.lookup(b"mixed").unwrap();
+    assert!(!em[0].is_fixed(), "a mixed run stays prefixed");
+    let eo = blob.lookup(b"one").unwrap();
+    assert!(eo[0].is_fixed());
+
+    let mut got = Vec::new();
+    blob.read_all(b"fixed", |v| got.push(v.to_vec())).unwrap();
+    assert_eq!(got.len(), 1000);
+    for (i, v) in got.iter().enumerate() {
+        assert_eq!(v.as_slice(), (i as u32).to_be_bytes());
+    }
+    let mut got = Vec::new();
+    blob.read_all(b"mixed", |v| got.push(v.to_vec())).unwrap();
+    assert_eq!(got.len(), 1000);
+    assert_eq!(got[999], b"999".to_vec());
+    // Counts: exact from the flag, and a wrong width is refused outright.
+    assert_eq!(blob.count(b"fixed").unwrap(), 1000);
+    assert_eq!(blob.count_fixed(b"fixed", 4), Some(1000));
+    assert_eq!(blob.count_fixed(b"fixed", 2), None, "a fixed run of 4 is not a run of 2");
+    assert_eq!(blob.count_fixed(b"one", 4), Some(1));
+    // The scan agrees.
+    let mut pairs = 0usize;
+    blob.scan(b"", usize::MAX, |_, _| pairs += 1).unwrap();
+    assert_eq!(pairs, 2001);
+    // read_concat of a fixed run is the bytes back to back.
+    let mut out = Vec::new();
+    assert_eq!(blob.read_concat(b"fixed", &mut out).unwrap(), 1000);
+    assert_eq!(out.len(), 4000);
+    assert_eq!(&out[..8], &[0, 0, 0, 0, 0, 0, 0, 1]);
+    // And the in-place intersection over fixed runs matches the naive one.
+    let mut w2 = SegmentWriter::create(&dir.join("seg2.sup"), &o).expect("create");
+    w2.set_inline_max(0);
+    w2.begin(b"a").unwrap();
+    for i in (0u32..3000).step_by(3) {
+        w2.value(&i.to_be_bytes());
+    }
+    w2.end().unwrap();
+    w2.begin(b"b").unwrap();
+    for i in (0u32..3000).step_by(5) {
+        w2.value(&i.to_be_bytes());
+    }
+    w2.end().unwrap();
+    w2.finish(1).unwrap();
+    let b2 = Blob::open(MmapBytes::open(&dir.join("seg2.sup")).unwrap()).unwrap();
+    let common = (0u32..3000).filter(|i| i % 15 == 0).count() as u64;
+    assert_eq!(b2.intersect_fixed(b"a", b"b", 4).unwrap(), common);
+    assert_eq!(b2.intersect_fixed(b"a", b"missing", 4).unwrap(), 0);
 }

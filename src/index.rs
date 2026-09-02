@@ -39,6 +39,33 @@ impl Ext {
     /// Set on an extent that supersedes every older value of its key.
     pub const TOMBSTONE: u32 = 1 << 31;
 
+    /// Bit 30 of `count`: the run's values all share one width and are
+    /// stored back to back with no length prefixes. The width is
+    /// `len / records()`, so nothing else is stored, and `last` is
+    /// `(records - 1) * width` as for any run. Format v6; a reader from
+    /// before it refuses the file by its magic rather than parsing a fixed
+    /// run as prefixed (fixedrun-plan.md).
+    pub const FIXED: u32 = 1 << 30;
+
+    #[inline]
+    pub fn is_fixed(&self) -> bool {
+        self.count & Ext::FIXED != 0
+    }
+
+    /// The width of a fixed run's values; `None` for a prefixed run or an
+    /// empty or inconsistent one.
+    #[inline]
+    pub fn fixed_width(&self) -> Option<usize> {
+        if !self.is_fixed() {
+            return None;
+        }
+        let n = self.records() as usize;
+        if n == 0 || !(self.len as usize).is_multiple_of(n) {
+            return None;
+        }
+        Some(self.len as usize / n)
+    }
+
     /// A `block` of this value means the run is INLINE: its bytes sit in the
     /// index record itself, after the extents, at `off` within that tail.
     /// A read of such a run never consults the block table or a block --
@@ -57,7 +84,7 @@ impl Ext {
     /// Records in the run, without the flag.
     #[inline]
     pub fn records(&self) -> u32 {
-        self.count & !Ext::TOMBSTONE
+        self.count & !(Ext::TOMBSTONE | Ext::FIXED)
     }
 
     #[inline]
@@ -155,3 +182,94 @@ pub fn get_uvarint(buf: &[u8], pos: &mut usize) -> u64 {
 // degenerated into linear probing. A faster hash is only faster if it still
 // spreads the keys it is given, and structured keys are the common case for a
 // store rather than the exception.
+
+/// Hand each value of a run to `f`, in order, and return how many. A fixed
+/// run is `records` slices of one width; a prefixed run is `[varint len]
+/// [bytes]` repeated. The one decoder every reader shares, so the two
+/// encodings cannot drift apart between them. `Err` names the damage.
+pub fn each_value(run: &[u8], e: &Ext, f: &mut dyn FnMut(&[u8])) -> Result<u64, &'static str> {
+    if e.is_fixed() {
+        let Some(w) = e.fixed_width() else {
+            return Err("fixed run's length is not a multiple of its count");
+        };
+        if run.len() != e.len as usize || w == 0 {
+            return Err("fixed run does not match its extent");
+        }
+        let mut n = 0u64;
+        for v in run.chunks_exact(w) {
+            f(v);
+            n += 1;
+        }
+        return Ok(n);
+    }
+    let mut p = 0usize;
+    let mut n = 0u64;
+    while p < run.len() {
+        let len = get_uvarint(run, &mut p) as usize;
+        let end = p.checked_add(len).ok_or("record length overflows")?;
+        if end > run.len() {
+            return Err("record runs past the end of its extent");
+        }
+        f(&run[p..end]);
+        n += 1;
+        p = end;
+    }
+    Ok(n)
+}
+
+/// Encode a run from its values: fixed when every value has the same
+/// non-zero width, prefixed otherwise. Returns the bytes, the offset of the
+/// last value within them, and the count word's flag (`Ext::FIXED` or 0).
+pub fn encode_run(values: &[u8], lens: &[u32], out: &mut Vec<u8>) -> (u32, u32) {
+    out.clear();
+    let n = lens.len();
+    let fixed = n > 0 && lens[0] > 0 && lens.iter().all(|&l| l == lens[0]);
+    if fixed {
+        out.extend_from_slice(values);
+        return (((n as u32) - 1) * lens[0], Ext::FIXED);
+    }
+    let mut at = 0usize;
+    let mut last = 0u32;
+    for &l in lens {
+        last = out.len() as u32;
+        put_uvarint(out, l as u64);
+        out.extend_from_slice(&values[at..at + l as usize]);
+        at += l as usize;
+    }
+    (last, 0)
+}
+
+/// The width a prefixed run's values share, if they all share one and it
+/// is not zero; `None` for a mixed or empty run. For a writer deciding how
+/// to seal a run it holds already prefixed.
+pub fn uniform_width(prefixed: &[u8]) -> Option<usize> {
+    let mut p = 0usize;
+    let mut w: Option<usize> = None;
+    while p < prefixed.len() {
+        let len = get_uvarint(prefixed, &mut p) as usize;
+        if len == 0 || p.checked_add(len)? > prefixed.len() {
+            return None;
+        }
+        match w {
+            None => w = Some(len),
+            Some(x) if x != len => return None,
+            _ => {}
+        }
+        p += len;
+    }
+    w
+}
+
+/// Strip the prefixes off a run `uniform_width` accepted, into `out`.
+pub fn strip_prefixes(prefixed: &[u8], out: &mut Vec<u8>) -> u32 {
+    out.clear();
+    let mut p = 0usize;
+    let mut n = 0u32;
+    while p < prefixed.len() {
+        let len = get_uvarint(prefixed, &mut p) as usize;
+        out.extend_from_slice(&prefixed[p..p + len]);
+        p += len;
+        n += 1;
+    }
+    n
+}

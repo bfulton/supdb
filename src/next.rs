@@ -711,6 +711,10 @@ pub struct SegmentWriter {
     /// `Ext::last` carries so that reading the newest value is O(1).
     open_key: Option<(usize, usize)>,
     run: Vec<u8>,
+    /// The open key's values as they arrive, and their lengths; encoded
+    /// into `run` at `end`.
+    raw: Vec<u8>,
+    lens: Vec<u32>,
     last: usize,
     records: u32,
     parallel_index: bool,
@@ -810,6 +814,8 @@ impl SegmentWriter {
             exts: Vec::new(),
             open_key: None,
             run: Vec::new(),
+            raw: Vec::new(),
+            lens: Vec::new(),
             last: 0,
             records: 0,
             parallel_index: opts.parallel_index,
@@ -885,10 +891,12 @@ impl SegmentWriter {
     /// One value of the open key, in append order.
     pub fn value(&mut self, v: &[u8]) {
         debug_assert!(self.open_key.is_some(), "value without begin");
-        self.last = self.run.len();
+        // Raw bytes and a length: the encoding is chosen at `end`, when the
+        // whole run is in hand and it is known whether every value shares
+        // one width (fixed, no prefixes) or not (prefixed).
         self.records += 1;
-        crate::index::put_uvarint(&mut self.run, v.len() as u64);
-        self.run.extend_from_slice(v);
+        self.lens.push(v.len() as u32);
+        self.raw.extend_from_slice(v);
     }
 
     /// Close the open key: place its run in a block and record the extent.
@@ -903,11 +911,18 @@ impl SegmentWriter {
             .open_key
             .take()
             .ok_or_else(|| err("segment writer: end without begin"))?;
+        let (last, flag) = crate::index::encode_run(&self.raw, &self.lens, &mut self.run);
+        self.last = last as usize;
+        self.raw.clear();
+        self.lens.clear();
         let n = self.run.len();
         if n > u32::MAX as usize {
             return Err(err("segment writer: a key's values exceed 4 GiB in one segment"));
         }
-        let count = self.records | if tombstone { Ext::TOMBSTONE } else { 0 };
+        if self.records >= Ext::FIXED {
+            return Err(err("segment writer: a key's values exceed the extent's count"));
+        }
+        let count = self.records | flag | if tombstone { Ext::TOMBSTONE } else { 0 };
         let layout = self.layout()?;
         let inline = self.inline_max > 0 && n <= self.inline_max;
         let ext = if inline {
