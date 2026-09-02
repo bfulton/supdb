@@ -1798,8 +1798,11 @@ impl<B: Bytes> SparseBlob<B> {
                 None => src.read_at(sb.key_off + hdr.dir_off as u64, &mut raw)?,
             }
             Some(
-                raw.chunks_exact(4)
-                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                raw.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(u32::from_le_bytes)
                     .collect(),
             )
         } else {
@@ -1973,8 +1976,11 @@ impl<B: Bytes> SparseBlob<B> {
             .src
             .read_at(s.off + s.hdr.dir_off as u64 + r0 as u64 * 4, &mut raw)?;
         Ok(raw
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(u32::from_le_bytes)
             .collect())
     }
 

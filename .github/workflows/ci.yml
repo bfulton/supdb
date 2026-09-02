@@ -57,7 +57,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Cross toolchain
         run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu qemu-user-static
+      # The linker and the emulator belong to this job, not to the
+      # repository: `.cargo/config.toml` set them for the aarch64 target,
+      # which is also the *host* target on the native ARM runner, so that
+      # leg tried to run its own tests through a qemu it does not have.
       - name: Build and test under emulation
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64-static -L /usr/aarch64-linux-gnu
         run: cargo test --release --target aarch64-unknown-linux-gnu --lib
 
   falsify:

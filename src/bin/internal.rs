@@ -1178,17 +1178,25 @@ fn f1_outofcore(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let warm_rps = reads as f64 / warm.1;
     let cold_rps = reads as f64 / cold.1;
-    rec.finding(Finding::new(
-        "F1.1",
-        "a cold measurement can prove it was cold",
-        dropped,
-        if dropped {
-            "page cache dropped between phases".into()
-        } else {
-            "drop_caches failed; every 'cold' number in this run is warm and must not be cited"
-                .to_string()
-        },
-    ));
+    rec.finding(if dropped {
+        Finding::new(
+            "F1.1",
+            "a cold measurement can prove it was cold",
+            true,
+            "page cache dropped between phases".to_string(),
+        )
+    } else {
+        // Rule 3: a precondition that was not met is `not_exercised`, never a
+        // pass or a fail. Dropping the page cache needs root, which a hosted
+        // CI runner does not have, and a claim that fails there is measuring
+        // the runner rather than the engine.
+        Finding::not_exercised(
+            "F1.1",
+            "a cold measurement can prove it was cold",
+            "drop_caches failed (it needs root); every 'cold' number in this run is warm and \
+             must not be cited",
+        )
+    });
     // The comparison that means something: the out-of-core dataset against a
     // resident one of the same shape. Warm-against-cold inside the large
     // dataset cannot answer this, because when the file exceeds memory the
@@ -2908,6 +2916,10 @@ fn f24_autoreadahead(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let mut auto_ok = true;
     let mut worst = f64::INFINITY;
     let mut crossover: Option<f64> = None;
+    // Every pass in this sweep is meant to be a cold read; if the page cache
+    // could not be dropped, none of them was and the sweep has measured
+    // nothing about readahead.
+    let mut cold = true;
 
     // As f23: the sweep's caps are lifted when this function returns.
     let _cap = supdb::bench::env::cap_guard();
@@ -2921,8 +2933,11 @@ fn f24_autoreadahead(args: &Args, profile: Profile) -> std::io::Result<Record> {
             continue;
         }
         let chosen = std::sync::Mutex::new(Readahead::Default);
+        let cold_ok = std::sync::atomic::AtomicBool::new(true);
         let arms = Trial::new(profile.reps()).run(3, |ci, rep| {
-            supdb::bench::env::drop_caches();
+            if !supdb::bench::env::drop_caches() {
+                cold_ok.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
             let rd = Reader::open_with(
                 &file,
                 supdb::ReadOptions {
@@ -2947,6 +2962,7 @@ fn f24_autoreadahead(args: &Args, profile: Profile) -> std::io::Result<Record> {
             let w = Wait::read_now().since(&w0);
             reads as f64 / (w.wall_ns as f64 / 1e9)
         });
+        cold &= cold_ok.load(std::sync::atomic::Ordering::Relaxed);
 
         let (auto, deflt, rand) = (arms[0].median(), arms[1].median(), arms[2].median());
         let best = deflt.max(rand);
@@ -2990,6 +3006,23 @@ fn f24_autoreadahead(args: &Args, profile: Profile) -> std::io::Result<Record> {
     }
     rec.series("sweep", J::arr(rows));
 
+    // Every arm of this sweep is a cold read, so without drop_caches the
+    // experiment measures nothing about readahead (rule 3).
+    if !cold {
+        rec.finding(Finding::not_exercised(
+            "F24.1",
+            "Auto picks the faster advice wherever the two differ",
+            "drop_caches failed (it needs root), so no pass in this sweep was cold and the \
+             advices had nothing to differ about",
+        ));
+        rec.finding(Finding::not_exercised(
+            "F24.2",
+            "readahead stops paying somewhere below a file-to-memory ratio of 1",
+            "drop_caches failed (it needs root), so no pass in this sweep was cold",
+        ));
+        let _ = std::fs::remove_file(&file);
+        return Ok(rec);
+    }
     rec.finding(Finding::new(
         "F24.1",
         "Auto picks the faster advice wherever the two differ",

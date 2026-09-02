@@ -13,6 +13,14 @@ and CI fails in **both** directions:
 - a limitation that gets worse turns the build red;
 - a limitation that gets **fixed** also turns the build red.
 
+One exception, and only one: a claim may name a capability of the *host*
+its experiment needs (`"needs": "drop_caches"`), and where the run reports
+it could not reach that condition the claim is skipped rather than failed.
+Dropping the page cache wants root, which a hosted CI runner does not have,
+and failing there would report a fact about the machine as a fact about the
+engine. Rule 3 makes such a finding `not_exercised`; `needs` is the other
+half of it.
+
 The second is not a mistake. Either the engine improved and the claim is stale,
 or the experiment stopped testing anything. Both need a person to decide which.
 So when you fix something, update `claims.json` in the same change — that edit

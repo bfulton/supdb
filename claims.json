@@ -103,7 +103,8 @@
    "experiment": "f1-outofcore",
    "id": "F1.1",
    "expect": "holds",
-   "because": "A cold measurement must be able to prove it was cold. The design document confesses that its earlier cold-read numbers were served from pages the JVM had pinned across drop_caches, invalidating all of them."
+   "because": "A cold measurement must be able to prove it was cold. The design document confesses that its earlier cold-read numbers were served from pages the JVM had pinned across drop_caches, invalidating all of them.",
+   "needs": "drop_caches"
   },
   {
    "experiment": "f1-outofcore",
@@ -596,28 +597,32 @@
    "id": "F24.1",
    "profile": "full",
    "expect": "holds",
-   "because": "`Readahead::Auto` picks the faster advice at every swept ratio where the two differ by more than the noise floor. At 1M keys the default is 3.2-3.4x ahead from a ratio of 0.05 up to 1.00, and behind by 1.7x at 1.25, 6.5x at 1.50 and 28x at 3.00; Auto tracks the switch. The threshold took three attempts and the experiment caught both wrong ones. 0.5 looked conservative and advised Random across the whole 0.5-1.0 band where the default is three times faster. 1.0 sat exactly on the common case -- a cgroup rounds its limit down to a page multiple, so a store sized to its memory comes out a couple of kilobytes over and takes the wrong branch, which the sweep duly caught at ratio 1.00. 1.1 clears it."
+   "because": "`Readahead::Auto` picks the faster advice at every swept ratio where the two differ by more than the noise floor. At 1M keys the default is 3.2-3.4x ahead from a ratio of 0.05 up to 1.00, and behind by 1.7x at 1.25, 6.5x at 1.50 and 28x at 3.00; Auto tracks the switch. The threshold took three attempts and the experiment caught both wrong ones. 0.5 looked conservative and advised Random across the whole 0.5-1.0 band where the default is three times faster. 1.0 sat exactly on the common case -- a cgroup rounds its limit down to a page multiple, so a store sized to its memory comes out a couple of kilobytes over and takes the wrong branch, which the sweep duly caught at ratio 1.00. 1.1 clears it.",
+   "needs": "drop_caches"
   },
   {
    "experiment": "f24-autoreadahead",
    "id": "F24.1",
    "profile": "ci",
    "expect": "fails",
-   "because": "The same threshold mispicks on a smaller store, and this entry exists so that is on the record rather than hidden by a profile that is never cited. At 556MB the crossover is around 0.75 rather than 1.25, so `Auto` keeps the default advice at 0.75 and 1.00 where Random is 8-16% ahead. The crossover moves with store size because what actually decides it is access density -- how much of the store a workload touches -- and a single constant over the file-to-memory ratio cannot express that. The constant is tuned where it costs the most: mispicking at ci is worth 16%, picking right at full is worth 3.3x."
+   "because": "The same threshold mispicks on a smaller store, and this entry exists so that is on the record rather than hidden by a profile that is never cited. At 556MB the crossover is around 0.75 rather than 1.25, so `Auto` keeps the default advice at 0.75 and 1.00 where Random is 8-16% ahead. The crossover moves with store size because what actually decides it is access density -- how much of the store a workload touches -- and a single constant over the file-to-memory ratio cannot express that. The constant is tuned where it costs the most: mispicking at ci is worth 16%, picking right at full is worth 3.3x.",
+   "needs": "drop_caches"
   },
   {
    "experiment": "f24-autoreadahead",
    "id": "F24.2",
    "profile": "full",
    "expect": "fails",
-   "because": "My statement was that readahead stops paying somewhere below a file-to-memory ratio of 1. It does not: at 1M keys MADV_RANDOM first overtakes the default at 1.25. Readahead keeps paying right up to and past the point where the store no longer fits, because the pages it fetches speculatively are still being used before they are evicted. Recorded as failing rather than reworded, because it is the sentence that produced two wrong thresholds."
+   "because": "My statement was that readahead stops paying somewhere below a file-to-memory ratio of 1. It does not: at 1M keys MADV_RANDOM first overtakes the default at 1.25. Readahead keeps paying right up to and past the point where the store no longer fits, because the pages it fetches speculatively are still being used before they are evicted. Recorded as failing rather than reworded, because it is the sentence that produced two wrong thresholds.",
+   "needs": "drop_caches"
   },
   {
    "experiment": "f24-autoreadahead",
    "id": "F24.2",
    "profile": "ci",
    "expect": "holds",
-   "because": "At 556MB the crossover is 0.75, below 1 -- so the same claim holds here and fails at full. That disagreement is the finding: the crossover is not a constant of the engine, it moves with store size, and any single threshold is a compromise across scales rather than a law. Pinned to both profiles deliberately so the pair cannot be read as one answer."
+   "because": "At 556MB the crossover is 0.75, below 1 -- so the same claim holds here and fails at full. That disagreement is the finding: the crossover is not a constant of the engine, it moves with store size, and any single threshold is a compromise across scales rather than a law. Pinned to both profiles deliberately so the pair cannot be read as one answer.",
+   "needs": "drop_caches"
   },
   {
    "experiment": "c1-decoders",

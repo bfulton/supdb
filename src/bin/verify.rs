@@ -65,7 +65,7 @@ fn main() -> std::io::Result<()> {
     println!("\n{} claim(s) checked", out.checked);
     if !out.skipped.is_empty() {
         println!(
-            "{} skipped (no result file at this profile):",
+            "{} skipped (no result file at this profile, or a precondition the host cannot meet):",
             out.skipped.len()
         );
         for s in &out.skipped {
@@ -157,6 +157,19 @@ fn check_findings(claims: &J, results: &Path, profile: &str, out: &mut Outcome) 
         let got_status = Status::from_str(got);
 
         if got_status == Some(Status::NotExercised) && want_status != Some(Status::NotExercised) {
+            // A claim may name a capability of the *host* that its experiment
+            // needs -- `drop_caches` wants root, which a hosted CI runner does
+            // not have. Where the run says it could not reach the condition,
+            // the claim is skipped rather than failed: failing it would report
+            // a fact about the machine as a fact about the engine, and the
+            // gate would be red everywhere the capability is missing. Rule 3
+            // makes the finding `not_exercised`; this is the other half.
+            if let Some(needs) = c.path("needs").and_then(|v| v.as_str()) {
+                out.checked -= 1;
+                out.skipped
+                    .push(format!("{label} (needs {needs} on this host)"));
+                continue;
+            }
             out.failures.push(format!(
                 "{label}: claim expects '{want}' but the run did not exercise it -- {detail}"
             ));
