@@ -144,14 +144,15 @@ interleaved where the harness allows:
 
   What that leaves is not on the commit path at all. Against LMDB in the
   external suite the durable load read **0.299x** when this was first
-  written and reads **0.452x** in the latest run, under 32 MB seals over
-  64 MB partitions (EXT.22 -- 0.39-0.49x in the two runs before; the
-  transactions axis is matched, so it is a measurement and not a bound,
-  and this is the first run where the axis moved for the engine's reason:
-  next's load up 37%, LMDB's up 18%). Leaving partitioning to compaction
-  no longer separates the arms at this load (EXT.25, EXT.26, ties: the
-  trigger fires at the fourth 32 MB seal either way). The whole of that
-  move is below. The gap is there
+  written and reads **0.694x** in the latest run (EXT.22; 0.49-0.51x the
+  two runs before). The last step is piece promotion (F55): the canonical
+  load's keys ascend, so every seal's keys lie above the last partition's
+  and the drain routes by rename with no merge -- say so when quoting it,
+  because a uniformly random key order does not qualify and sits near
+  0.42x (F55.3). The transactions axis is matched, so it is a measurement
+  and not a bound. Leaving partitioning to compaction no longer separates
+  the arms at this load (EXT.25, EXT.26, ties). The whole of that move is
+  below. The gap on random keys is there
   because the seal and the flush's partitioning land *inside* the timed
   window. That is overhead rather than bytes,
   and half of it is a policy choice -- EXT.25 measures **1.985x more
@@ -202,12 +203,13 @@ interleaved where the harness allows:
 - **P-B, the read lead survives: HELD, with its condition stated.** The
   test was "EXT.11's shape with live segment counts under the compaction
   policy stays ≥ 1.2x on x86". At the shipping configuration it reads
-  **1.39-2.49x** across nine consecutive full runs (EXT.23, each
-  p=0.0022), the last two at 2.358x and 2.494x with inline runs, on a host
-  state where every other engine's reads fell about a quarter and next's
-  rose. Two runs agree, which is the minimum here; no run with inline runs
-  has yet been taken on the faster state the first seven had, so quote the
-  range.
+  **2.2-2.5x** across the three full runs with inline runs and 1.4-1.6x
+  across the seven before (EXT.23, ten consecutive holds, each p=0.0022);
+  the tenth, at 2.208x, is on a recovered host state, which is the
+  measurement the two before it owed. f56 then re-priced the alternative
+  to routing under inline runs and refuted it: four Bloom-routed pieces
+  read at 0.79x of four fence-routed partitions, seven at 0.69x, and the
+  ordered scan at a quarter (F56.1-F56.4). Routing at rest stays.
 
   Getting here took two corrections and one refutation worth keeping.
   The refutation: at 8+ segments the same data reads **0.846x** and

@@ -614,7 +614,7 @@
    "id": "EXT.11",
    "profile": "full",
    "expect": "holds",
-   "because": "Holding, and to be quoted as a range: 993,942 reads/s against lmdb's 787,571, 1.262x at p=0.0022, after 1.379x the run before and a tie at 1.043x the run before that which was recorded as failing. The tie was the host: lmdb's read rate fell 27% between two runs on a degraded state while supdb-buffered's fell 3%, which is the comparator moving under the ratio. The old engine's read lead over lmdb across five runs is 1.196x, 1.092x, 1.043x, 1.379x, 1.262x -- real, and unstable on this host -- and the read claim the project carries is the next engine's (EXT.23)."
+   "because": "Holding, quoted as a range: 1,325,496 reads/s against lmdb's 917,928, 1.444x at p=0.0022, on the recovered host state -- after 1.262x and 1.379x on the degraded one and a tie at 1.043x before that. The old engine's read lead over lmdb across six runs is 1.196x, 1.092x, 1.043x, 1.379x, 1.262x, 1.444x: real, and it moves with the host. The read claim the project carries is the next engine's (EXT.23)."
   },
   {
    "experiment": "ext-kv",
@@ -999,21 +999,21 @@
    "id": "EXT.22",
    "profile": "full",
    "expect": "fails",
-   "because": "Loads 265,909 ops/s against lmdb's 523,822 -- 0.508x, p=0.0022 -- the second canonical run with inline runs and the records-first layout, and the second on the same degraded host state (lmdb's load 541,808 the run before, against 854,921 on the state before that). The two runs agree, 0.492x and 0.508x, so the ratio is replicated on this state; the absolutes are the host's. The sequence on this axis is 0.335x, 0.486x, 0.387x, 0.452x, 0.492x, 0.508x. The transactions axis is matched, so it is a measurement and not a bound. The adapter drains at sync, so sealing 116 MB into segments and partitioning what it sealed both land inside the timed window; that is the design's trade in one line -- EXT.23's read lead is paid for here."
+   "because": "Loads 524,210 ops/s against lmdb's 755,420 -- 0.694x, p=0.0022 -- on a host state that recovered (lmdb's load back from 524k to 755k), and the first canonical run since piece promotion (F55). Two things moved it from 0.49-0.51x: the host, which explains lmdb; and promotion, which explains next -- the canonical load's keys ascend (the key encoder is a decimal counter), so every seal's keys lie above the last partition's and the drain routes by rename with no merge, which is why next's absolute nearly doubled (265,909 to 524,210) while lmdb's rose 44%. Say that plainly when quoting it: a uniformly random key order does not qualify for promotion and ingests at about 320,000 ops/s on this host (F55.3), roughly 0.42x. Both engines see the same order and lmdb's B-tree likes ascending keys too, so the comparison is matched; it is the shape that is favourable. The sequence on this axis is 0.335x, 0.486x, 0.387x, 0.452x, 0.492x, 0.508x, 0.694x."
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.23",
    "profile": "full",
    "expect": "holds",
-   "because": "Held in nine consecutive full runs at the shipping configuration -- 1.419x, 1.441x, 1.580x, 1.644x, 1.603x, 1.441x, 1.391x, 2.358x and 2.494x, each p<=0.0022. The last two are the first with inline runs (F53.1), taken on a host state where every other engine's reads fell about a quarter and next's rose: 1,964,068 reads/s against lmdb's 787,571 this run, 1,836,273 against 778,580 the run before. Two runs agreeing is the minimum for a number here and they agree; the caveat is that no run with inline runs has yet been taken on the faster host state the first seven had, so the range to quote across states is 1.39-2.49x and the bar the inline work set (1.5x, P53.6) is met on both. Two things had to be true at once and neither was configuration-hunting: every key is sealed on both sides (the adapter drains before reading), and the store is left ROUTED (a flush partitions what it sealed, so a read touches exactly one segment). P-B, refuted twice at 8+ segments, holds at the operating point the design is for."
+   "because": "Held in ten consecutive full runs at the shipping configuration -- 1.419x, 1.441x, 1.580x, 1.644x, 1.603x, 1.441x, 1.391x, 2.358x, 2.494x and 2.208x, each p<=0.0022. The last three are the runs with inline runs (F53.1); the tenth is on a host state that recovered (lmdb's reads back from 788k to 918k), which is the measurement the previous two owed: 2,027,077 reads/s against lmdb's 917,928, rel_iqr 1.5% and 3.4%. The bar the inline work set (1.5x, P53.6) is met on both host states, and the range to quote is 2.2-2.5x with inline runs, 1.4-1.6x without. Two things had to be true at once and neither was configuration-hunting: every key is sealed on both sides (the adapter drains before reading), and the store is left ROUTED -- by promotion on this key order, by the merge on any other -- so a read touches exactly one segment; f56 priced the alternative at 0.79x for four Bloom-routed pieces and 0.69x for seven. P-B holds at the operating point the design is for."
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.24",
    "profile": "full",
    "expect": "fails",
-   "because": "A TIE, six runs running, with the arc behind it: 0.040x when this claim was written, 0.137x, 0.495x, 0.769x, 1.054x, 0.998x, 1.000x, 0.937x, 1.143x, and now 21,973,802 entries/s against lmdb's 19,254,676 -- 1.141x, no difference at p=0.25. Recorded as FAILING because the gate is Greater and a tie is not a win; the title says 'no slower', which a tie satisfies, and that mismatch is mine to fix rather than to argue around. Inline runs cost the ordered scan 0.86-0.90x in f53 (F53.3), inside the noise this axis carries between runs."
+   "because": "The first LESS after six ties: 25,477,832 entries/s against lmdb's 28,347,572, 0.899x at p=0.007, on the run where promotion first routed the canonical load. The arc: 0.040x when this claim was written, 0.137x, 0.495x, 0.769x, 1.054x, 0.998x, 1.000x, 0.937x, 1.143x, 1.141x, 0.899x. Two candidates, neither isolated: inline runs cost the ordered scan 0.86-0.90x in f53 (F53.3), and a promoted store walks four 32 MB partitions where the merge left three. Recorded as failing either way; the title says 'no slower' and this run says slower."
   },
   {
    "experiment": "f43-compact",
@@ -1399,6 +1399,34 @@
    "profile": "full",
    "expect": "holds",
    "because": "P55.4 held: reads after the drain do not differ with promotion under either key order (uniform 462 against 535 ns, p=0.08; sequential 471 against 453 ns, p=0.56). Promoted pieces are partitions, fence-routed with no Bloom to consult; an ordered load leaves more of them (seven against four) and the fence search is a binary search, which the tie says costs nothing measurable."
+  },
+  {
+   "experiment": "f56-tailbound",
+   "id": "F56.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P56.1 refuted, and cleanly: point reads over seven live pieces cost 608 ns against 414 routed, 0.686x at p=0.0009; four pieces 0.787x, fourteen 0.516x. Inline runs did not change the price of fan-out. The comparison also turned out sharper than the plan meant it to be: the canonical load's keys ascend, so promotion (F55) had already routed the baseline by rename with no merge at all, and what f56 measured is Bloom-routed pieces against fence-routed partitions at equal counts -- four against four, seven against four. Fences win at every count. Routing at rest stays, and the tail bound stays where f43 put it."
+  },
+  {
+   "experiment": "f56-tailbound",
+   "id": "F56.2",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P56.2 refuted: ingest-to-drain at about eight pieces is 1.154x the routed arm's (753,308 against 652,881 ops/s, p=0.005), not the 1.3x registered, and at four pieces a tie (1.053x, p=0.44). The merge the plan expected to remove was already gone from the baseline -- promotion routes an ascending load without one -- so the only thing left to gain was the seal overlap of smaller pieces, which F52 had already priced. Device bytes are 300 MB in every arm."
+  },
+  {
+   "experiment": "f56-tailbound",
+   "id": "F56.3",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P56.3 refuted: at four live pieces reads cost 532 ns against 414 routed, 0.787x at p=0.0009, where 'within 5%' was registered. Four Bloom checks and their false positives against one fence binary search, with the same four files underneath; the fence is what the read lead is made of."
+  },
+  {
+   "experiment": "f56-tailbound",
+   "id": "F56.4",
+   "profile": "full",
+   "expect": "holds",
+   "because": "P56.4 held, with room: the ordered scan over seven pieces runs at 0.247x of the routed rate (8.9M against 35.8M entries/s), 0.376x at four and 0.123x at fourteen. A single-partition walk becomes a k-way merge over pieces. Stated beside F56.1 as the second reason routing stays."
   }
  ],
  "metrics": [
