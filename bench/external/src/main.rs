@@ -264,7 +264,7 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
     // How much each engine cares about arrival order, which is the property
     // rather than the ranking. Same engine, same guarantees, same key set --
     // so nothing needs matching and there is no residual to bound.
-    for name in ["supdb-buffered", "lmdb-nosync", "supdb", "lmdb"] {
+    for name in ["supdb-buffered", "lmdb-nosync", "supdb", "lmdb", "next"] {
         let (Some(a), Some(b)) = (idx(name, false), idx(name, true)) else {
             continue;
         };
@@ -303,6 +303,47 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
                     load[lb].median()
                 ),
             ));
+        }
+    }
+    // The next engine against LMDB, matched on durability and transactions:
+    // the same pair as EXT.22, whose canonical load arrives in order and is
+    // mostly piece promotion (F55.3). Shuffled arrival is the shape promotion
+    // cannot help, and this is where it is recorded rather than inferred.
+    if let (Some(ns), Some(ls)) = (idx("next", true), idx("lmdb", true)) {
+        if !load[ns].is_empty() && !load[ls].is_empty() {
+            if let (Some(fa), Some(fb)) = (feats[ns], feats[ls]) {
+                let gap = fa.unmatched(&fb, true);
+                if !gap.is_empty() {
+                    rec.finding(Finding::not_exercised(
+                        "EXT.27",
+                        "the next engine, durable per batch, loads a shuffled key set at least as \
+                         fast as LMDB",
+                        format!("not an ordering: the arms differ on {}", gap.join(", ")),
+                    ));
+                } else {
+                    let cmp = compare(&load[ns], &load[ls], supdb::bench::MIN_EFFECT);
+                    rec.compare("EXT.27_shuffled", cmp.clone());
+                    let seq = idx("next", false).zip(idx("lmdb", false));
+                    let seq_ratio = seq
+                        .map(|(a, b)| load[a].median() / load[b].median().max(1e-9))
+                        .unwrap_or(f64::NAN);
+                    rec.finding(Finding::new(
+                        "EXT.27",
+                        "the next engine, durable per batch, loads a shuffled key set at least as \
+                         fast as LMDB",
+                        !matches!(cmp.verdict, Verdict::Less),
+                        format!(
+                            "shuffled, {:.0} ops/s against {:.0} ({}). Sequential, in the same \
+                             run, is {seq_ratio:.3}x -- EXT.22's shape, where the seals are \
+                             promoted by rename. Both commit per batch and both are \
+                             transactional, so nothing leans",
+                            load[ns].median(),
+                            load[ls].median(),
+                            cmp.summary("next", "lmdb")
+                        ),
+                    ));
+                }
+            }
         }
     }
     if let (Some(ss), Some(sl)) = (
