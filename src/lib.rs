@@ -86,7 +86,7 @@ pub mod next;
 #[cfg(target_family = "wasm")]
 pub mod wasmapi;
 
-pub use blob::{Blob, BlobOptions};
+pub use blob::{Blob, BlobOptions, SparseBlob};
 pub use bytes::{Bytes, SliceBytes, VecBytes};
 #[cfg(not(target_family = "wasm"))]
 pub use bytes::MmapBytes;

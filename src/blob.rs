@@ -353,6 +353,53 @@ impl Sec {
     }
 }
 
+
+/// Everything `Blob::open` and `SparseBlob::open` check before either reads
+/// a section: the byte order this reader can address, the superblock, and
+/// the redo-log emptiness probe. One function so the two opens cannot
+/// drift on what a valid object is.
+fn open_head<B: Bytes>(src: &B) -> Result<Super> {
+    // The zero-copy read path reinterprets an extent array as `&[Ext]`,
+    // which is native-endian, while every scalar in the file is written
+    // little-endian. On a big-endian target those disagree and the reader
+    // would misread a valid file rather than refuse it. Refused here
+    // instead. Every browser is little-endian and so is every machine in
+    // `results/`, so nothing is given up by saying so out loud.
+    if cfg!(target_endian = "big") {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "supdb's index is little-endian on the wire and native-endian where it is \
+             addressed in place; those agree only on a little-endian machine, so this file \
+             is refused here rather than misread",
+        ));
+    }
+    if src.len() < SUPER {
+        return Err(corrupt("file too short to hold a superblock"));
+    }
+    let mut head = [0u8; (SLOT as usize) + SB_BYTES];
+    src.read_at(0, &mut head)?;
+    // Everything `open` checks about the header lives in `pick_super`,
+    // shared with `open_ranges` so the plan and the open cannot drift.
+    let sb = pick_super(&head, src.len())?;
+    // The log-emptiness probe: this reader does not replay the redo log,
+    // which is only sound when there is nothing to replay. See
+    // `Super::log_off`. Four bytes, because replay itself stops at the
+    // first zero length-word -- the arena describes its own extent.
+    if let Some((off, _)) = log_probe_range(&sb) {
+        let mut word = [0u8; 4];
+        src.read_at(off, &mut word)?;
+        if word != [0u8; 4] {
+            return Err(Error::new(
+                ErrorKind::Unsupported,
+                "this store's redo log holds records newer than its index, and this reader \
+                 does not replay a log. It reads sealed objects; seal the store with a full \
+                 checkpoint (a rolled day index already is) before reading it here",
+            ));
+        }
+    }
+    Ok(sb)
+}
+
 /// How much to check on the way out.
 #[derive(Clone, Copy, Debug)]
 pub struct BlobOptions {
@@ -370,11 +417,27 @@ impl Default for BlobOptions {
     }
 }
 
+/// The key index as this reader holds it: the whole section, or -- for a
+/// reader over an object it will not fetch whole -- its header and fence
+/// alone, with every other region reached by offset through the source.
+enum Index {
+    Flat { key: Sec, idx: FlatIndex },
+    Sparse(SparseIndex),
+}
+
+/// What `SparseBlob` keeps of the key index: where the section is, its
+/// header, and a copy of the fence. Kilobytes, for an index of any size.
+struct SparseIndex {
+    off: u64,
+    len: usize,
+    hdr: flatindex::Header,
+    fence: Vec<u8>,
+}
+
 pub struct Blob<B: Bytes> {
     src: B,
-    key: Sec,
+    index: Index,
     blk: Sec,
-    idx: FlatIndex,
     blocks: MappedBlocks,
     generation: u64,
     timestamp: u64,
@@ -399,44 +462,7 @@ impl<B: Bytes> Blob<B> {
     }
 
     pub fn open_with(src: B, opts: BlobOptions) -> Result<Blob<B>> {
-        // The zero-copy read path reinterprets an extent array as `&[Ext]`,
-        // which is native-endian, while every scalar in the file is written
-        // little-endian. On a big-endian target those disagree and the reader
-        // would misread a valid file rather than refuse it. Refused here
-        // instead. Every browser is little-endian and so is every machine in
-        // `results/`, so nothing is given up by saying so out loud.
-        if cfg!(target_endian = "big") {
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                "supdb's index is little-endian on the wire and native-endian where it is \
-                 addressed in place; those agree only on a little-endian machine, so this file \
-                 is refused here rather than misread",
-            ));
-        }
-        if src.len() < SUPER {
-            return Err(corrupt("file too short to hold a superblock"));
-        }
-        let mut head = [0u8; (SLOT as usize) + SB_BYTES];
-        src.read_at(0, &mut head)?;
-        // Everything `open` checks about the header lives in `pick_super`,
-        // shared with `open_ranges` so the plan and the open cannot drift.
-        let sb = pick_super(&head, src.len())?;
-        // The log-emptiness probe: this reader does not replay the redo log,
-        // which is only sound when there is nothing to replay. See
-        // `Super::log_off`. Four bytes, because replay itself stops at the
-        // first zero length-word -- the arena describes its own extent.
-        if let Some((off, _)) = log_probe_range(&sb) {
-            let mut word = [0u8; 4];
-            src.read_at(off, &mut word)?;
-            if word != [0u8; 4] {
-                return Err(Error::new(
-                    ErrorKind::Unsupported,
-                    "this store's redo log holds records newer than its index, and this reader \
-                     does not replay a log. It reads sealed objects; seal the store with a full \
-                     checkpoint (a rolled day index already is) before reading it here",
-                ));
-            }
-        }
+        let sb = open_head(&src)?;
         let key = Sec::read(&src, sb.key_off, sb.key_stored as usize)?;
         let blk = Sec::read(&src, sb.blk_off, sb.blk_stored as usize)?;
         let idx = FlatIndex::parse(key.get(&src)?).ok_or_else(|| {
@@ -450,8 +476,6 @@ impl<B: Bytes> Blob<B> {
         let verified = vec![0u64; (blocks.len() * block::MAX_CHUNK_CRCS).div_ceil(64)];
         Ok(Blob {
             src,
-            key,
-            blk,
             // The generation of the index *section*, not of the superblock.
             // They are not always the same number -- a publish can move the
             // superblock on without writing a new index -- and `Reader`
@@ -459,7 +483,8 @@ impl<B: Bytes> Blob<B> {
             // actually looking at. `tests/blob.rs` caught this by requiring
             // the two readers to agree, which is what it is for.
             generation: idx.generation,
-            idx,
+            index: Index::Flat { key, idx },
+            blk,
             blocks,
             timestamp: sb.timestamp,
             opts,
@@ -469,16 +494,33 @@ impl<B: Bytes> Blob<B> {
         })
     }
 
+    /// The whole key index and its parsed form, or `None` for a sparse
+    /// reader, which never reaches these paths from outside because
+    /// `SparseBlob` does not expose them.
+    fn flat(&self) -> Option<(&[u8], &FlatIndex)> {
+        match &self.index {
+            Index::Flat { key, idx } => Some((key.get(&self.src).ok()?, idx)),
+            Index::Sparse(_) => None,
+        }
+    }
+
+
     // ------------------------------------------------------------ diagnostics --
 
     /// Number of distinct keys. R4.5.
     pub fn keys(&self) -> usize {
-        self.idx.len()
+        match &self.index {
+            Index::Flat { idx, .. } => idx.len(),
+            Index::Sparse(s) => s.hdr.nkeys,
+        }
     }
 
     /// Bytes of key index this reader addresses. R4.5.
     pub fn index_bytes(&self) -> usize {
-        self.key.len()
+        match &self.index {
+            Index::Flat { key, .. } => key.len(),
+            Index::Sparse(s) => s.len,
+        }
     }
 
     /// Bytes of block table this reader addresses.
@@ -501,14 +543,10 @@ impl<B: Bytes> Blob<B> {
     /// rotting: a native reader that started copying its index would still
     /// pass every correctness test.
     pub fn zero_copy(&self) -> bool {
-        matches!(self.key, Sec::Lent { .. })
+        matches!(&self.index, Index::Flat { key: Sec::Lent { .. }, .. })
     }
 
     // ------------------------------------------------------------ lookup --
-
-    fn key_sec(&self) -> Result<&[u8]> {
-        self.key.get(&self.src)
-    }
 
     fn blk_sec(&self) -> Result<&[u8]> {
         self.blk.get(&self.src)
@@ -518,39 +556,42 @@ impl<B: Bytes> Blob<B> {
     /// decode -- this is the borrow `flatindex` exists to make possible, and
     /// it survives the byte-source abstraction on any source that can lend.
     pub fn lookup(&self, key: &[u8]) -> Option<&[Ext]> {
-        self.idx
-            .lookup(self.key_sec().ok()?, key, flatindex::key_hash)
+        let (sec, idx) = self.flat()?;
+        idx.lookup(sec, key, flatindex::key_hash)
     }
 
     /// `lookup`, with the record's tail: the bytes of any inline runs, which
     /// `read_exts` needs to serve an extent that names `Ext::INLINE`.
     pub fn lookup_full(&self, key: &[u8]) -> Option<(&[Ext], &[u8])> {
-        self.idx
-            .lookup_full(self.key_sec().ok()?, key, flatindex::key_hash)
+        let (sec, idx) = self.flat()?;
+        idx.lookup_full(sec, key, flatindex::key_hash)
     }
 
     /// `exts_at`, with the record's tail of inline runs.
     pub fn exts_at_full(&self, rank: usize) -> Option<(&[u8], &[Ext], &[u8])> {
-        self.idx.at_full(self.key_sec().ok()?, rank)
+        let (sec, idx) = self.flat()?;
+        idx.at_full(sec, rank)
     }
 
     /// Rank of the first key at or after `key`, in key order. R4.4.
     pub fn seek(&self, key: &[u8]) -> usize {
-        match self.key_sec() {
-            Ok(sec) => self.idx.seek_with(sec, key, true),
-            Err(_) => self.idx.len(),
+        match self.flat() {
+            Some((sec, idx)) => idx.seek_with(sec, key, true),
+            None => self.keys(),
         }
     }
 
     /// The key at `rank` in key order.
     pub fn key_at(&self, rank: usize) -> Option<&[u8]> {
-        self.idx.at(self.key_sec().ok()?, rank).map(|(k, _)| k)
+        let (sec, idx) = self.flat()?;
+        idx.at(sec, rank).map(|(k, _)| k)
     }
 
     /// The key and extents at `rank`, borrowed from the mapping: the flags
     /// on the extents are how `next::Db` sees a tombstone without a probe.
     pub fn exts_at(&self, rank: usize) -> Option<(&[u8], &[Ext])> {
-        self.idx.at(self.key_sec().ok()?, rank)
+        let (sec, idx) = self.flat()?;
+        idx.at(sec, rank)
     }
 
     /// Every value at `rank`, in append order: reads blocks, resolves
@@ -646,6 +687,20 @@ impl<B: Bytes> Blob<B> {
         let Some(exts) = self.lookup(key) else {
             return Ok(());
         };
+        self.plan_exts(exts, out)
+    }
+
+    /// The data ranges these extents reach: every block a non-inline one
+    /// names, as the whole stored block. For a caller that already holds a
+    /// key's extents -- a dictionary range walk -- and wants its values next.
+    pub fn ranges_for_exts(&self, exts: &[Ext]) -> Result<Vec<(u64, u64)>> {
+        let mut v = Vec::new();
+        self.plan_exts(exts, &mut v)?;
+        merge_ranges(&mut v);
+        Ok(v)
+    }
+
+    fn plan_exts(&self, exts: &[Ext], out: &mut Vec<(u64, u64)>) -> Result<()> {
         for e in exts {
             // An inline run is in the index, which is resident after open:
             // it costs the plan nothing and fetches nothing.
@@ -1138,5 +1193,330 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(e.kind(), ErrorKind::InvalidData);
+    }
+}
+
+// ------------------------------------------------------------ sparse index --
+
+/// The byte ranges `SparseBlob::open` reads first: the superblock probe, the
+/// key index *header*, the block table and the redo-log word. The fence
+/// follows in a second plan (`open_sparse_fence_ranges`) once the header is
+/// resident, because the header is what says where the fence is.
+pub fn open_sparse_ranges(head: &[u8], object_len: u64) -> Result<Vec<(u64, u64)>> {
+    let sb = pick_super(head, object_len)?;
+    let mut v = vec![
+        (0, open_probe()),
+        (sb.key_off, (flatindex::HEADER_BYTES as u64).min(sb.key_stored)),
+        (sb.blk_off, sb.blk_stored),
+    ];
+    if let Some(r) = log_probe_range(&sb) {
+        v.push(r);
+    }
+    merge_ranges(&mut v);
+    Ok(v)
+}
+
+/// The second open plan: the fence region. `index_header` is the first
+/// `flatindex::HEADER_BYTES` of the key index section, resident after the
+/// first plan. Empty for an index without a fence.
+pub fn open_sparse_fence_ranges(
+    head: &[u8],
+    object_len: u64,
+    index_header: &[u8],
+) -> Result<Vec<(u64, u64)>> {
+    let sb = pick_super(head, object_len)?;
+    let hdr = flatindex::Header::parse(index_header).ok_or_else(|| {
+        corrupt("the key index header is not the flat format this reader understands")
+    })?;
+    let (off, len) = fence_region(&hdr, sb.key_stored as usize)?;
+    let mut v = vec![(sb.key_off + off as u64, len as u64)];
+    merge_ranges(&mut v);
+    Ok(v)
+}
+
+/// Where the fence lies in the section: from its offset array to the start
+/// of whichever region comes next, or the section end. The blob's exact
+/// length is in the array's last word, which is not resident yet, so the
+/// region is bounded by layout instead. Both writers put the fence directly
+/// before another region, so the slack is alignment padding at most.
+fn fence_region(h: &flatindex::Header, sec_len: usize) -> Result<(usize, usize)> {
+    if h.fence_n == 0 {
+        return Ok((0, 0));
+    }
+    let start = h.fence_offs_off;
+    if start < flatindex::HEADER_BYTES || start > sec_len {
+        return Err(corrupt("the key index names a fence outside its section"));
+    }
+    let end = [h.hash_off, h.dir_base, h.recs_off, sec_len]
+        .into_iter()
+        .filter(|&x| x > start)
+        .min()
+        .unwrap_or(sec_len)
+        .min(sec_len);
+    Ok((start, end - start))
+}
+
+/// A reader over an object whose key index it will not fetch whole.
+///
+/// `Blob` copies the key index and block table at open and answers every
+/// question from them. That is the right shape while a dictionary is small
+/// and the wrong one the day it is not: a trigram index's dictionary grows
+/// with the data, and "index fetched whole at open" becomes the download the
+/// design exists to avoid. This reader keeps the section's header and its
+/// fence -- kilobytes, for an index of any size -- and reaches the directory
+/// and the records by offset through the source, so a *range* of the
+/// dictionary costs the bytes of that range: a directory slice, then the
+/// records it names. Everything is a plan first, as with `Blob::ranges_for`,
+/// so a caching source fetches exactly what the walk will read and the walk
+/// itself cannot miss.
+///
+/// It does no point lookups: those go through the hash, which is itself a
+/// region to plan, and nothing needs it yet. A key's values are reachable
+/// from a walk -- the extents come with the record, `ranges_for_exts` plans
+/// their blocks and `read_exts` reads them; an inline run needs no plan.
+pub struct SparseBlob<B: Bytes> {
+    blob: Blob<B>,
+}
+
+impl<B: Bytes> SparseBlob<B> {
+    pub fn open(src: B) -> Result<SparseBlob<B>> {
+        SparseBlob::open_with(src, BlobOptions::default())
+    }
+
+    pub fn open_with(src: B, opts: BlobOptions) -> Result<SparseBlob<B>> {
+        let sb = open_head(&src)?;
+        let sec_len = sb.key_stored as usize;
+        if sec_len < flatindex::HEADER_BYTES {
+            return Err(corrupt("the key index is shorter than its header"));
+        }
+        let mut hb = vec![0u8; flatindex::HEADER_BYTES];
+        src.read_at(sb.key_off, &mut hb)?;
+        let hdr = flatindex::Header::parse(&hb).ok_or_else(|| {
+            corrupt(
+                "the key index is not the flat format this reader understands (an older varint \
+                 index, or damage in its header)",
+            )
+        })?;
+        // Every region a walk will address, checked against the section now,
+        // so a damaged offset fails the open rather than a read.
+        let fits = |a: usize, len: usize| {
+            a >= flatindex::HEADER_BYTES && a.checked_add(len).is_some_and(|e| e <= sec_len)
+        };
+        if !fits(hdr.hash_off, hdr.hash_cap.saturating_mul(8))
+            || !fits(hdr.dir_off, hdr.nkeys.saturating_mul(4))
+            || !fits(hdr.recs_off, hdr.bump)
+        {
+            return Err(corrupt("the key index header names a region outside its section"));
+        }
+        let (foff, flen) = fence_region(&hdr, sec_len)?;
+        let mut fence = vec![0u8; flen];
+        if flen > 0 {
+            src.read_at(sb.key_off + foff as u64, &mut fence)?;
+        }
+        let blk = Sec::read(&src, sb.blk_off, sb.blk_stored as usize)?;
+        let blocks = MappedBlocks::parse(blk.get(&src)?)
+            .ok_or_else(|| corrupt("the block table is not readable"))?;
+        let verified = vec![0u64; (blocks.len() * block::MAX_CHUNK_CRCS).div_ceil(64)];
+        Ok(SparseBlob {
+            blob: Blob {
+                src,
+                generation: hdr.generation,
+                index: Index::Sparse(SparseIndex { off: sb.key_off, len: sec_len, hdr, fence }),
+                blk,
+                blocks,
+                timestamp: sb.timestamp,
+                opts,
+                verified: RefCell::new(verified),
+                raw_buf: Cell::new(Vec::new()),
+                dec_buf: Cell::new(Vec::new()),
+            },
+        })
+    }
+
+    fn sp(&self) -> &SparseIndex {
+        match &self.blob.index {
+            Index::Sparse(s) => s,
+            Index::Flat { .. } => unreachable!("a SparseBlob holds a sparse index"),
+        }
+    }
+
+    pub fn keys(&self) -> usize {
+        self.blob.keys()
+    }
+
+    /// The byte source, for a caller that has to ensure a plan against it
+    /// before a walk -- the shape `cache.mjs` has in the browser.
+    pub fn source(&self) -> &B {
+        &self.blob.src
+    }
+
+    pub fn index_bytes(&self) -> usize {
+        self.blob.index_bytes()
+    }
+
+    pub fn version(&self) -> (u64, u64) {
+        self.blob.version()
+    }
+
+    /// Whether the section carries a fence. Without one every range plan
+    /// spans the whole dictionary -- correct, and not cheap.
+    pub fn has_fence(&self) -> bool {
+        let s = self.sp();
+        flatindex::FenceView::parse(&s.fence, &s.hdr).is_some()
+    }
+
+    /// The ranks a range's keys can occupy, at fence granularity: `[r0, r1)`
+    /// holds every key in `lo..hi` and at most one stride more at each end.
+    fn rank_window(&self, lo: &[u8], hi: Option<&[u8]>) -> (usize, usize) {
+        let s = self.sp();
+        let n = s.hdr.nkeys;
+        let Some(fv) = flatindex::FenceView::parse(&s.fence, &s.hdr) else {
+            return (0, n);
+        };
+        let r0 = fv.window(lo, n).0;
+        let r1 = match hi {
+            Some(h) => fv.window(h, n).1.min(n),
+            None => n,
+        };
+        (r0, r1.max(r0))
+    }
+
+    /// Phase one of a range plan: the directory slice for `lo..hi` (`None`
+    /// above means to the end of the dictionary). Absolute, merged, and it
+    /// reads nothing to produce.
+    pub fn dictionary_plan(&self, lo: &[u8], hi: Option<&[u8]>) -> Vec<(u64, u64)> {
+        let s = self.sp();
+        let (r0, r1) = self.rank_window(lo, hi);
+        let entries = r1 - r0 + usize::from(r1 < s.hdr.nkeys);
+        let mut v = vec![(s.off + s.hdr.dir_off as u64 + r0 as u64 * 4, entries as u64 * 4)];
+        merge_ranges(&mut v);
+        v
+    }
+
+    fn dir_slice(&self, r0: usize, r1: usize) -> Result<Vec<u32>> {
+        let s = self.sp();
+        let entries = r1 - r0 + usize::from(r1 < s.hdr.nkeys);
+        let mut raw = vec![0u8; entries * 4];
+        self.blob.src.read_at(s.off + s.hdr.dir_off as u64 + r0 as u64 * 4, &mut raw)?;
+        Ok(raw.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+    }
+
+    /// The record bytes ranks `[r0, r1)` occupy, from their directory
+    /// entries: absolute start, length, and the record-relative base.
+    fn record_span(&self, r0: usize, r1: usize, d: &[u32]) -> Result<(u64, usize, usize)> {
+        let s = self.sp();
+        let h = &s.hdr;
+        let recs_abs = s.off + h.recs_off as u64;
+        if r1 == r0 {
+            return Ok((recs_abs, 0, 0));
+        }
+        let m = r1 - r0;
+        let monotone = d.windows(2).all(|w| w[0] < w[1]);
+        let (start, end) = if monotone {
+            (d[0] as usize, if r1 < h.nkeys { d[m] as usize } else { h.recs_len })
+        } else {
+            // An index updated in place after these keys were written holds
+            // records out of key order, in the slack. The span is then the
+            // lowest record named through the content end: wide, and still
+            // exact about what the walk reads. A write-once segment and a
+            // rewritten index never take this arm.
+            (d[..m].iter().copied().min().unwrap_or(0) as usize, h.bump)
+        };
+        if end < start || end > h.bump {
+            return Err(corrupt("the directory names records outside the record region"));
+        }
+        Ok((recs_abs + start as u64, end - start, start))
+    }
+
+    /// Phase two: the record bytes for `lo..hi`. Needs phase one's bytes
+    /// resident, and reads exactly them. Absolute, merged.
+    pub fn dictionary_plan_records(
+        &self,
+        lo: &[u8],
+        hi: Option<&[u8]>,
+    ) -> Result<Vec<(u64, u64)>> {
+        let (r0, r1) = self.rank_window(lo, hi);
+        let d = self.dir_slice(r0, r1)?;
+        let (abs, len, _) = self.record_span(r0, r1, &d)?;
+        let mut v = vec![(abs, len as u64)];
+        merge_ranges(&mut v);
+        Ok(v)
+    }
+
+    /// Every key in `lo..hi` in key order, with its extents and inline tail,
+    /// reading exactly the two plans. `f` returns false to stop. Returns how
+    /// many keys it handed out.
+    pub fn dictionary_walk<F: FnMut(&[u8], &[Ext], &[u8]) -> bool>(
+        &self,
+        lo: &[u8],
+        hi: Option<&[u8]>,
+        mut f: F,
+    ) -> Result<usize> {
+        let (r0, r1) = self.rank_window(lo, hi);
+        let d = self.dir_slice(r0, r1)?;
+        let (abs, len, base) = self.record_span(r0, r1, &d)?;
+        // The records: lent when the source can, else copied into an aligned
+        // buffer, because extents are borrowed in place and want 4-byte
+        // alignment, which a byte vector does not promise.
+        let mut words: Vec<u64> = Vec::new();
+        let buf: &[u8] = match self.blob.src.slice_at(abs, len) {
+            Some(sl) => sl,
+            None => {
+                words.resize(len.div_ceil(8), 0);
+                // SAFETY: `words` owns at least `len` initialised bytes and
+                // is not touched again while `bytes` lives.
+                let bytes =
+                    unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, len) };
+                self.blob.src.read_at(abs, bytes)?;
+                bytes
+            }
+        };
+        let mut out = 0usize;
+        let mut prev: Option<&[u8]> = None;
+        for r in r0..r1 {
+            let off = (d[r - r0] as usize)
+                .checked_sub(base)
+                .ok_or_else(|| corrupt("a directory entry points below the planned span"))?;
+            let (key, exts, tail, _) = flatindex::parse_record(buf, off)
+                .ok_or_else(|| corrupt("a dictionary record does not decode"))?;
+            if prev.is_some_and(|p| p >= key) {
+                return Err(corrupt("the dictionary is out of key order"));
+            }
+            prev = Some(key);
+            if key < lo {
+                continue;
+            }
+            if hi.is_some_and(|h| key >= h) {
+                break;
+            }
+            out += 1;
+            if !f(key, exts, tail) {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// `dictionary_walk` reduced to what a ranking wants: each key and its
+    /// record count, summed from the extents. No block is touched.
+    pub fn dictionary_counts<F: FnMut(&[u8], u64) -> bool>(
+        &self,
+        lo: &[u8],
+        hi: Option<&[u8]>,
+        mut f: F,
+    ) -> Result<usize> {
+        self.dictionary_walk(lo, hi, |k, exts, _| {
+            let n: u64 = exts.iter().map(|e| u64::from(e.records())).sum();
+            f(k, n)
+        })
+    }
+
+    /// The data ranges a key's extents reach; `read_exts` then reads them.
+    pub fn ranges_for_exts(&self, exts: &[Ext]) -> Result<Vec<(u64, u64)>> {
+        self.blob.ranges_for_exts(exts)
+    }
+
+    pub fn read_exts<F: FnMut(&[u8])>(&self, exts: &[Ext], tail: &[u8], f: F) -> Result<u64> {
+        self.blob.read_exts(exts, tail, f)
     }
 }

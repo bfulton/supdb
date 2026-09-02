@@ -102,6 +102,178 @@ fn fence_stride(n: usize) -> usize {
 /// back to the heap index rather than silently truncating.
 pub const MAX_RECS: usize = u32::MAX as usize;
 
+/// Bytes of the section header. A reader that holds only the header and the
+/// fence -- `blob::SparseBlob`, over an object it will not fetch whole --
+/// needs to know how many to ask for before it has parsed anything.
+pub const HEADER_BYTES: usize = HEADER;
+
+/// The section header, decoded on its own.
+///
+/// `FlatIndex::parse` decodes the same words and then checks every region
+/// against the section it holds; this is the half that can be done with the
+/// header alone, for a reader whose section is not resident and who will
+/// fetch the regions it needs by offset. Every offset is relative to the
+/// section start and is checked by the caller against the section length.
+#[derive(Clone, Copy, Debug)]
+pub struct Header {
+    pub generation: u64,
+    pub nkeys: usize,
+    pub hash_off: usize,
+    pub hash_cap: usize,
+    /// The *live* directory: the buffer `dir_state` publishes when there are
+    /// two, else the only one.
+    pub dir_off: usize,
+    /// Where the directory region begins, live buffer or not.
+    pub dir_base: usize,
+    pub dir_cap: usize,
+    pub recs_off: usize,
+    pub recs_len: usize,
+    /// Content end of the record region: past `recs_len` when in-place
+    /// updates have written records into the slack.
+    pub bump: usize,
+    pub fence_offs_off: usize,
+    pub fence_n: usize,
+    pub fence_stride: usize,
+}
+
+impl Header {
+    pub fn parse(sec: &[u8]) -> Option<Header> {
+        if !is_flat(sec) {
+            return None;
+        }
+        let nkeys = rd_u64(sec, 56)? as usize;
+        let hash_cap = rd_u64(sec, 64)? as usize;
+        let dir_base = rd_u64(sec, 80)? as usize;
+        let recs_len = rd_u64(sec, 96)? as usize;
+        let recs_cap = rd_u64(sec, 104)?.max(recs_len as u64) as usize;
+        let dir_cap = rd_u64(sec, 144)? as usize;
+        let dir_state = rd_u64(sec, 152)?;
+        if hash_cap == 0 || !hash_cap.is_power_of_two() {
+            return None;
+        }
+        let (dir_off, nkeys) = if dir_cap == 0 {
+            (dir_base, nkeys)
+        } else {
+            let live_off = (dir_state >> 32) as usize;
+            let live_n = (dir_state & 0xffff_ffff) as usize;
+            let second = dir_base.checked_add(dir_cap.checked_mul(4)?)?;
+            if (live_off != dir_base && live_off != second) || live_n > dir_cap {
+                return None;
+            }
+            (live_off, live_n)
+        };
+        if nkeys > hash_cap {
+            return None;
+        }
+        Some(Header {
+            generation: rd_u64(sec, 8)?,
+            nkeys,
+            hash_off: rd_u64(sec, 72)? as usize,
+            hash_cap,
+            dir_off,
+            dir_base,
+            dir_cap,
+            recs_off: rd_u64(sec, 88)? as usize,
+            recs_len,
+            bump: rd_u64(sec, 112)?.clamp(recs_len as u64, recs_cap as u64) as usize,
+            fence_offs_off: rd_u64(sec, 120)? as usize,
+            fence_n: rd_u64(sec, 128)? as usize,
+            fence_stride: rd_u64(sec, 136)? as usize,
+        })
+    }
+}
+
+/// One record out of any buffer: its key, extents, inline tail, and the
+/// bytes it spans -- `record_full`'s decode, for a caller holding a copied
+/// range of the record region rather than the mapped section. `off` is
+/// relative to `buf`, and the extents are borrowed in place, so `buf` must
+/// be 4-aligned where the record's extents fall (a buffer of `u32`s viewed
+/// as bytes is; a `Vec<u8>` is not promised to be).
+pub type ParsedRecord<'a> = (&'a [u8], &'a [Ext], &'a [u8], usize);
+
+pub fn parse_record(buf: &[u8], off: usize) -> Option<ParsedRecord<'_>> {
+    let klen = rd_u16(buf, off)? as usize;
+    let n = rd_u16(buf, off + 2)? as usize;
+    let key = buf.get(off + 4..off + 4 + klen)?;
+    let e_at = off.checked_add(align_up(4 + klen, REC_ALIGN))?;
+    let bytes = buf.get(e_at..e_at.checked_add(n.checked_mul(EXT_BYTES)?)?)?;
+    if !(bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<Ext>()) {
+        return None;
+    }
+    let exts = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const Ext, n) };
+    let mut tail_len = 0usize;
+    for e in exts {
+        if e.is_inline() {
+            tail_len = tail_len.max((e.off as usize).checked_add(e.len as usize)?);
+        }
+    }
+    let t_at = e_at + n * EXT_BYTES;
+    let tail = buf.get(t_at..t_at.checked_add(tail_len)?)?;
+    let len = align_up(t_at + tail_len - off, REC_ALIGN);
+    Some((key, exts, tail, len))
+}
+
+/// The fence, held on its own: `fence_n + 1` offsets and the key blob they
+/// index, copied out of a section that is otherwise not resident.
+pub struct FenceView<'a> {
+    offs: &'a [u8],
+    blob: &'a [u8],
+    n: usize,
+    stride: usize,
+}
+
+impl<'a> FenceView<'a> {
+    /// `region` is the bytes from `fence_offs_off` on; the blob follows the
+    /// offsets directly and the last offset is its length. `None` if the
+    /// region does not hold what the header says, in which case the caller
+    /// has no fence and no cheap seek -- which is a fact about the file to
+    /// report, not to guess around.
+    pub fn parse(region: &'a [u8], h: &Header) -> Option<FenceView<'a>> {
+        if h.fence_n == 0 || h.fence_stride == 0 || h.fence_n > h.nkeys {
+            return None;
+        }
+        if h.fence_n != h.nkeys.div_ceil(h.fence_stride) {
+            return None;
+        }
+        let offs_len = h.fence_n.checked_add(1)?.checked_mul(4)?;
+        let offs = region.get(..offs_len)?;
+        let blob_len = rd_u32(offs, h.fence_n * 4)? as usize;
+        let blob = region.get(offs_len..offs_len.checked_add(blob_len)?)?;
+        Some(FenceView { offs, blob, n: h.fence_n, stride: h.fence_stride })
+    }
+
+    /// Bytes the fence region spans: offsets plus blob.
+    pub fn region_len(&self) -> usize {
+        self.offs.len() + self.blob.len()
+    }
+
+    fn key(&self, i: usize) -> Option<&'a [u8]> {
+        let a = rd_u32(self.offs, i * 4)? as usize;
+        let b = rd_u32(self.offs, (i + 1) * 4)? as usize;
+        if a > b {
+            return None;
+        }
+        self.blob.get(a..b)
+    }
+
+    /// The ranks a key can lie at: `[start, end]`, one stride wide, the same
+    /// window `FlatIndex::seek_with` narrows with. The rank of the first key
+    /// not less than `key` is at least `start` and at most `end`.
+    pub fn window(&self, key: &[u8], nkeys: usize) -> (usize, usize) {
+        let (mut lo, mut hi) = (0usize, self.n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match self.key(mid).map(|k| k.cmp(key)) {
+                Some(std::cmp::Ordering::Less) => lo = mid + 1,
+                _ => hi = mid,
+            }
+        }
+        let start = lo.saturating_sub(1) * self.stride;
+        let end = (lo * self.stride).min(nkeys).max(start);
+        (start, end)
+    }
+}
+
 #[inline]
 fn align_up(n: usize, to: usize) -> usize {
     (n + to - 1) & !(to - 1)
@@ -924,34 +1096,15 @@ impl FlatIndex {
         sec: &'a [u8],
         off: usize,
     ) -> Option<(&'a [u8], &'a [Ext], &'a [u8])> {
-        let recs = sec.get(self.recs.0..self.recs.1)?;
-        let klen = rd_u16(recs, off)? as usize;
-        let n = rd_u16(recs, off + 2)? as usize;
-        let key = recs.get(off + 4..off + 4 + klen)?;
-        let e_at = off.checked_add(align_up(4 + klen, REC_ALIGN))?;
-        let bytes = recs.get(e_at..e_at.checked_add(n.checked_mul(EXT_BYTES)?)?)?;
         // Records are laid out 4-aligned within the section and the section is
-        // written at an 8-aligned file offset, so this borrow is aligned by
-        // construction. Checked anyway, and the check has already earned its
-        // keep: before `write_section_raw` aligned the section, records were
-        // aligned relative to the section and not absolutely, and this is what
-        // turned undefined behaviour into a miss.
-        if !(bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<Ext>()) {
-            return None;
-        }
-        let exts = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const Ext, n) };
-        let mut tail_len = 0usize;
-        for e in exts {
-            if e.is_inline() {
-                tail_len = tail_len
-                    .checked_add(e.off as usize)?
-                    .max(tail_len)
-                    .max((e.off as usize).checked_add(e.len as usize)?);
-            }
-        }
-        let t_at = e_at + n * EXT_BYTES;
-        let tail = recs.get(t_at..t_at.checked_add(tail_len)?)?;
-        Some((key, exts, tail))
+        // written at an 8-aligned file offset, so the extent borrow inside
+        // `parse_record` is aligned by construction. It checks anyway, and the
+        // check has already earned its keep: before `write_section_raw`
+        // aligned the section, records were aligned relative to the section
+        // and not absolutely, and this is what turned undefined behaviour
+        // into a miss.
+        let recs = sec.get(self.recs.0..self.recs.1)?;
+        parse_record(recs, off).map(|(k, e, t, _)| (k, e, t))
     }
 
     /// Extents for `key`, borrowed from the mapping. No allocation, no decode.
