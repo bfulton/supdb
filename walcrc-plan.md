@@ -41,3 +41,19 @@ An ingest change either way at the gate says the CRC was not where the
 time went, which f58's instruction count already suggests; the
 instruction saving is the claim, and the wall-clock is expected to be a
 tie recorded as such.
+
+## Outcome (cachegrind, subtracted, 100,000 records)
+
+**968 instructions an appended record, from 1,037: 69 fewer**, the
+engine's share 677 to about 608. P59.1 asked for 80 and is refuted by
+eleven: the hardware CRC hashes the same bytes either way and what a
+per-frame CRC cost was a call, a setup and a finish per record, which is
+what went. D1 misses 21.1 against 19.0 a record, because the commit
+frame's CRC re-reads the batch's 100 KB from L2 where the per-frame CRC
+hashed each frame while it was still in L1; last-level misses unchanged
+at 7.8. P59.3 held (c4: 120/120, 84 with a seal in flight, 67 with a
+merge, 17 tears landing on stale frames) and P59.4 held (the flip test,
+every byte of a three-batch WAL). No wall-clock claim is made, as for
+the put probe: the arms are two builds, not two arms of one process, and
+20 ns of compute against 2 L1 misses is a tie by construction. Kept for
+the invariant -- one CRC, one batch, one check -- not for speed.

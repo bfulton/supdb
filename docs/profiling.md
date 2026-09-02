@@ -338,3 +338,9 @@ comparison's honesty, so the harness now builds one (`engines::Batch`):
 measured again the same way, 1,037 instructions and 19.0 D1 misses a
 record, the engine's 677 unchanged, and what is left of the harness is
 the payload generator and one copy of each key and value.
+
+And the WAL's CRC per frame became a CRC per batch (f59, walcrc-plan.md):
+968 instructions a record, 69 fewer, at 2.1 more D1 misses because the
+commit frame hashes 100 KB out of L2 that the per-frame CRC hashed out of
+L1; last-level misses unchanged. Kept for the invariant, with no
+wall-clock claim.

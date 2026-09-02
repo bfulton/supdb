@@ -1009,3 +1009,61 @@ fn recycling_survives_crashes_and_leaves_no_spare_after_close() {
         assert_eq!(&read_vec(&db, k), want);
     }
 }
+
+
+#[test]
+fn a_flipped_byte_anywhere_in_a_batch_loses_that_batch_and_the_ones_after() {
+    // The CRC is per batch (f59). The contract it must keep is the one a
+    // CRC per frame gave: damage anywhere inside a batch -- a record
+    // frame's header, its key, its value, the commit frame -- loses that
+    // batch and every batch after it, and nothing before it. Every byte
+    // offset of a three-batch WAL is flipped in turn.
+    let d = dir("flip");
+    let mut db = Db::create(&d, NextOptions::default()).unwrap();
+    let mut ends = Vec::new();
+    for b in 0u32..3 {
+        for i in 0..4u32 {
+            db.append(format!("b{b}k{i}").as_bytes(), format!("v{b}{i}").as_bytes());
+        }
+        if b == 1 {
+            db.delete(b"b0k0");
+        }
+        db.commit().unwrap();
+        ends.push(db.wal_durable().2 as usize);
+    }
+    drop(db);
+    let wal = d.join("wal-00000000");
+    let full = std::fs::read(&wal).unwrap();
+    assert_eq!(full.len(), *ends.last().unwrap());
+    for off in 8..full.len() {
+        let dd = dir(&format!("flip-{off}"));
+        for e in std::fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            if e.file_name() != "wal-00000000" {
+                std::fs::copy(e.path(), dd.join(e.file_name())).unwrap();
+            }
+        }
+        let mut damaged = full.clone();
+        damaged[off] ^= 0x5a;
+        std::fs::write(dd.join("wal-00000000"), &damaged).unwrap();
+        // The batch that holds this byte, and so the number that survive.
+        let survive = ends.iter().position(|&e| off < e).unwrap();
+        let db = match Db::open(&dd, NextOptions::default()) {
+            Ok(db) => db,
+            Err(e) => panic!("offset {off}: open refused the store: {e}"),
+        };
+        for b in 0u32..3 {
+            for i in 0..4u32 {
+                let key = format!("b{b}k{i}");
+                let got = read_vec(&db, key.as_bytes());
+                let deleted = b == 0 && i == 0 && survive >= 2;
+                let want: Vec<Vec<u8>> = if (b as usize) < survive && !deleted {
+                    vec![format!("v{b}{i}").into_bytes()]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(got, want, "offset {off} (batch {survive} damaged): key {key}");
+            }
+        }
+    }
+}

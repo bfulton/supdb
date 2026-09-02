@@ -152,7 +152,9 @@ memtable probe about 180 and nearly every cache miss -- and the harness
 640, because the external suite's `write_batch` takes owned vectors and
 allocates two per record for every engine alike. Compute is the third
 slice of the x86 durable load after the barrier and the seal wait; the
-cheapest moves are a borrowed batch in the harness and a per-batch CRC.
+cheapest moves were a borrowed batch in the harness (done: 1,037 a
+record) and a per-batch CRC (done: 968, at two more L1 misses, no
+wall-clock claim, kept for the one-CRC-one-batch invariant).
 
 Under shuffled arrival the same matched pair inverts. `EXT.27`
 (`ext-loadshape`, full) has the next engine at 284,938 ops/s against

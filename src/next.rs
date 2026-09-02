@@ -243,9 +243,10 @@ struct Wal {
 }
 
 /// The WAL file starts with this, so a file from before frames carried a
-/// kind byte, or before CRCs were seeded by file id, is refused by name
-/// rather than replayed as something else.
-const WAL_MAGIC: &[u8; 8] = b"SUPDBWL\x03";
+/// kind byte, before CRCs were seeded by file id, or before the CRC moved
+/// from the frame to the batch, is refused by name rather than replayed as
+/// something else.
+const WAL_MAGIC: &[u8; 8] = b"SUPDBWL\x04";
 
 /// The per-file CRC seed. Any mix that separates neighbouring ids will do;
 /// this is splitmix64's finalizer.
@@ -348,14 +349,28 @@ impl Wal {
 
     /// One frame: `len u32 | crc u32 | seq u64 | kind u8 | payload`, where a
     /// put's payload is `klen uvarint | key | value`, a delete's is the key
-    /// alone and a commit's is empty. `len` covers everything after `crc`;
-    /// `crc` covers the same bytes.
+    /// alone and a commit's is the batch CRC. `len` covers everything after
+    /// `crc`.
+    ///
+    /// The CRC is per batch, not per frame (f59). A record frame's `crc`
+    /// word is zero; the commit frame carries, as its payload, the CRC of
+    /// every byte of the batch's record frames, and its own `crc` word
+    /// covers its body as before. Replay applies a batch only at a commit
+    /// frame whose both CRCs verify, so a damaged byte anywhere in a batch
+    /// loses that batch and the ones after it -- exactly what a CRC per
+    /// frame bought, at one CRC setup and finish per batch instead of per
+    /// record: 92 of the 677 instructions a record cost (f58).
     fn frame(&mut self, kind: u8, key: &[u8], value: &[u8]) {
+        // `pending` holds exactly this batch's record frames: `write`
+        // empties it at every commit.
+        let batch_crc = if kind == WAL_COMMIT { crc32(&self.pending) ^ self.seed } else { 0 };
         let body_at = self.pending.len() + FRAME_HEADER;
         self.pending.extend_from_slice(&[0u8; FRAME_HEADER]);
         self.pending.extend_from_slice(&self.seq.to_le_bytes());
         self.pending.push(kind);
-        if kind != WAL_COMMIT {
+        if kind == WAL_COMMIT {
+            self.pending.extend_from_slice(&batch_crc.to_le_bytes());
+        } else {
             put_uvarint(&mut self.pending, key.len() as u64);
             self.pending.extend_from_slice(key);
             if kind == WAL_PUT {
@@ -363,7 +378,7 @@ impl Wal {
             }
         }
         let body_len = (self.pending.len() - body_at) as u32;
-        let crc = crc32(&self.pending[body_at..]) ^ self.seed;
+        let crc = if kind == WAL_COMMIT { crc32(&self.pending[body_at..]) ^ self.seed } else { 0 };
         self.pending[body_at - 8..body_at - 4].copy_from_slice(&body_len.to_le_bytes());
         self.pending[body_at - 4..body_at].copy_from_slice(&crc.to_le_bytes());
         self.seq += 1;
@@ -452,9 +467,11 @@ impl Wal {
         let mut next_seq = from;
         let mut committed_seq = from;
         let mut valid_len = p as u64;
-        // The batch being read: kind, and where its key and value lie in
-        // `buf`, so nothing is copied until the commit frame says to apply.
-        let mut batch: Vec<(u8, usize, usize, usize)> = Vec::new();
+        // The batch being read: kind, sequence, and where its key and value
+        // lie in `buf`, so nothing is copied and nothing is checked until
+        // the commit frame says the whole batch is intact.
+        let mut batch: Vec<(u8, u64, usize, usize, usize)> = Vec::new();
+        let mut batch_start = p;
         while buf.len() - p >= FRAME_HEADER {
             let len = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()) as usize;
             let crc = u32::from_le_bytes(buf[p + 4..p + 8].try_into().unwrap());
@@ -464,43 +481,71 @@ impl Wal {
                 break;
             }
             let body = &buf[body_at..end];
-            if crc32(body) ^ seed != crc {
-                break;
-            }
             let seq = u64::from_le_bytes(body[..8].try_into().unwrap());
             let kind = body[8];
-            if seq >= from {
-                if seq != next_seq {
-                    return Err(err("wal sequence gap: a durable record is missing"));
-                }
-                next_seq = seq + 1;
-            }
             match kind {
                 WAL_COMMIT => {
-                    for &(k, ks, ke, ve) in &batch {
-                        apply(k, &buf[ks..ke], &buf[ke..ve]);
+                    // The commit frame's own CRC, then the batch's. Either
+                    // failing means the batch never made it whole, and the
+                    // walk ends here -- what a torn tail always meant.
+                    if crc32(body) ^ seed != crc || body.len() != 13 {
+                        break;
+                    }
+                    let want = u32::from_le_bytes(body[9..13].try_into().unwrap());
+                    if crc32(&buf[batch_start..p]) ^ seed != want {
+                        break;
+                    }
+                    // Intact. Now the sequence has to be continuous, which is
+                    // a statement about durability rather than damage: a gap
+                    // in a verified batch is a record the writer lost, and
+                    // that is an error, not a torn tail.
+                    for &(_, s, _, _, _) in &batch {
+                        if s >= from {
+                            if s != next_seq {
+                                return Err(err("wal sequence gap: a durable record is missing"));
+                            }
+                            next_seq = s + 1;
+                        }
+                    }
+                    if seq >= from {
+                        if seq != next_seq {
+                            return Err(err("wal sequence gap: a durable record is missing"));
+                        }
+                        next_seq = seq + 1;
+                    }
+                    for &(k, s, ks, ke, ve) in &batch {
+                        if s >= from {
+                            apply(k, &buf[ks..ke], &buf[ke..ve]);
+                        }
                     }
                     batch.clear();
                     committed_seq = next_seq;
                     valid_len = end as u64;
+                    batch_start = end;
                 }
                 WAL_PUT | WAL_DEL => {
+                    // A record frame is checked by its batch, so anything
+                    // malformed here is a batch that will not verify: end the
+                    // walk rather than report damage the commit frame would
+                    // have caught. Its `crc` word is zero by construction.
+                    if crc != 0 {
+                        break;
+                    }
                     let mut q = 9usize;
                     let Some(klen) = get_uvarint(body, &mut q) else {
-                        return Err(err("wal frame key length is malformed"));
+                        break;
                     };
-                    let kend = q
-                        .checked_add(klen as usize)
-                        .filter(|&e| e <= body.len())
-                        .ok_or_else(|| err("wal frame key runs past its frame"))?;
+                    let Some(kend) =
+                        q.checked_add(klen as usize).filter(|&e| e <= body.len())
+                    else {
+                        break;
+                    };
                     if kind == WAL_DEL && kend != body.len() {
-                        return Err(err("wal delete frame carries a value"));
+                        break;
                     }
-                    if seq >= from {
-                        batch.push((kind, body_at + q, body_at + kend, end));
-                    }
+                    batch.push((kind, seq, body_at + q, body_at + kend, end));
                 }
-                _ => return Err(err("wal frame kind is unknown")),
+                _ => break,
             }
             p = end;
         }
