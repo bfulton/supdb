@@ -46,3 +46,27 @@ does what it was built to do and the page size is the unit that matters
 at the dictionary sizes logshed has today; the page size is `cache.mjs`'s
 to tune, and a 16 KiB page for the index region would take the sparse
 open under 5% of this fixture's whole open.
+
+## The 16 KiB page — registered before its run
+
+W5.1 and W5.2 failed by page geometry: the sparse open is four regions and
+a range is two plans in two regions, and at 64 KiB each boundary costs a
+page. `cache.mjs` already takes a page size; the sparse reader's cache
+now opens at 16 KiB, and `w5-dict` runs a second pass at that page beside
+the 64 KiB one.
+
+- **P5.5 -- at 16 KiB pages the sparse open is under 10% of the whole
+  open at 64 KiB.** Four to five small pages, 64-80 KB, against 869 KB.
+- **P5.6 -- at 16 KiB pages a field's range is within its share of the
+  index plus four pages**, the slack W5.2 taught: a boundary at each end
+  of each of the two plans.
+
+## Outcome of the 16 KiB page (full)
+
+P5.5 held: 70,960 bytes, 8.8% of the whole open at 64 KiB (218,416 at
+64 KiB pages). P5.6 held: the worst field at 0.59 of its share plus four
+pages, and 0.98 of the two-page bound that failed at 64 KiB. The browser's
+sparse reader opens its cache at 16 KiB now; the fixture computes its
+expected fetches at that page and the browser suite holds them exactly.
+W5.1 and W5.2 keep their 64 KiB record as failing, since that is what
+was predicted and refuted.

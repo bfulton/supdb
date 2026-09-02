@@ -94,3 +94,17 @@ The host read every engine 10-15% lower than the previous run, which is
 why only within-run ratios are quoted. The read and scan numbers may now
 be quoted as "against RocksDB", tuned or shipped; the load stays with
 RocksDB at about two thirds either way.
+
+## The tuned arm's write side — registered before its run
+
+`rocksdb-tuned` gains the write-side settings RocksDB's tuning guide gives
+a bulk load: 128 MB write buffers, four of them, merged two at a time,
+level 0 allowed eight files before a compaction. The read side is
+unchanged. Predictions: the durable ordered load moves in RocksDB's favour
+by a tenth or less (fewer flushes, larger ones; the per-batch fsync is
+unchanged), so **EXT.32 reads 0.62x to 0.75x** and **EXT.36 0.75x to
+0.9x**; the reads and scans do not move at the gate (**EXT.33, EXT.34,
+EXT.38, EXT.40 within 15% of their last values**); the shuffled load
+moves toward RocksDB by the same tenth (**EXT.35 0.9x to 1.15x, EXT.41
+1.9x to 2.4x**). This run is also the replicate the drain claims
+needed, so every EXT.28-41 figure gets a second reading.

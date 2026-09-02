@@ -664,10 +664,10 @@ impl Rocks {
     /// claim can name it: a 256 MB LRU block cache (the canonical data is
     /// 110 MB, so every block a read wants is in memory after the first
     /// touch, as it is for the mapped engines), a 10-bit Bloom filter per
-    /// SST with index and filter blocks cached, and four background
-    /// threads. Write buffers and level sizes stay at their defaults, since
-    /// the point is what RocksDB's read path costs when it is not starved of
-    /// cache, not a tuning contest.
+    /// SST with index and filter blocks cached, four background threads,
+    /// and the write side set as RocksDB's tuning guide sets it for a bulk
+    /// load (see `with`). Not a tuning contest: one stated configuration a
+    /// reader can recognise as a deployment.
     pub fn create_tuned(path: &Path) -> Res<Rocks> {
         Rocks::with(path, true, true, false)
     }
@@ -693,6 +693,16 @@ impl Rocks {
             o.set_block_based_table_factory(&bbo);
             o.increase_parallelism(4);
             o.set_max_background_jobs(4);
+            // The write side, tuned for the load the suite runs and stated
+            // here so EXT.32 and EXT.36 read as "against RocksDB tuned for
+            // the load" too: 128 MB write buffers, four of them, merged two
+            // at a time, and level 0 allowed eight files before a
+            // compaction -- the shape RocksDB's own tuning guide gives a
+            // bulk load, against its 64 MB / two / four defaults.
+            o.set_write_buffer_size(128 << 20);
+            o.set_max_write_buffer_number(4);
+            o.set_min_write_buffer_number_to_merge(2);
+            o.set_level_zero_file_num_compaction_trigger(8);
         }
         let db = rocksdb::DB::open(&o, path).map_err(|e| e.to_string())?;
         let mut read = rocksdb::ReadOptions::default();

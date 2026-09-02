@@ -1498,14 +1498,14 @@
    "id": "W5.1",
    "profile": "full",
    "expect": "fails",
-   "because": "P5.1 refuted by page geometry, not by bytes. The sparse open reads 23,808 bytes -- superblock probe, index header, block table, fence -- which is 3.5% of a 686,456-byte index; but cache.mjs fetches 64 KiB pages and those four regions land on four pages, 279,856 bytes against the whole open's 869,680 (32.2%). The ratio is a function of the index size, since the sparse open is four pages whatever the dictionary holds: it crosses 5% at about 5.6 MB of index, which is the shape this reader exists for and not the shape the fixture has. Both open plans named exactly what the open read."
+   "because": "P5.1 refuted by page geometry, not by bytes. The sparse open reads 23,904 bytes -- superblock probe, index header, block table, fence -- which is 3.5% of a 686,506-byte index; but at cache.mjs's 64 KiB page those four regions land on four pages, 218,416 bytes against the whole open's 808,240 (27.0%). The ratio is a function of the index size, since the sparse open is four pages whatever the dictionary holds. At 16 KiB pages the same open is 70,960 bytes, 8.8% of the whole open (W5.5), and that is the page the browser's sparse reader now uses; the 5% prediction stands refuted at 64 KiB and this claim keeps that record."
   },
   {
    "experiment": "w5-dict",
    "id": "W5.2",
    "profile": "full",
    "expect": "fails",
-   "because": "P5.2 refuted the same way. Un-paged, a field's two plans are well under its share of the index (country: 9,860 bytes for 210 keys against an 18,467-byte share; path: 221,004 for 5,000 keys against 439,698), because the records are smaller than the 88 bytes a key costs with its hash slot and directory entry. Page-rounded, the directory slice and the record span are two ranges in two regions and each can straddle a page boundary at both ends, so the slack is four pages and not the two the plan allowed; country came to 196,608 bytes, 1.31 of the two-page bound. At ci the same schema read 0.99, which is the luck of where the boundaries fell."
+   "because": "P5.2 refuted the same way. Un-paged, a field's two plans are well under its share of the index (country: 9,860 bytes for 210 keys against an 18,467-byte share), because the records are smaller than the 88 bytes a key costs with its hash slot and directory entry. Page-rounded at 64 KiB, the directory slice and the record span are two ranges in two regions and each can straddle a page boundary at both ends, so the slack is four pages and not the two the plan allowed; the worst field came to 1.31 of the two-page bound. At 16 KiB pages with the four-page slack it is 0.59 (W5.6)."
   },
   {
    "experiment": "w5-dict",
@@ -1646,6 +1646,20 @@
    "profile": "full",
    "expect": "holds",
    "because": "Neither drained, shuffled: next-nodrain 500,832 ops/s against tuned RocksDB's 211,650, 2.366x at p=0.0022; P41 said 1.1x to 1.4x and was refuted upward, because under shuffled keys the drain is not one seal's promotion but the flush's partitioning merges, and without it the next engine's shuffled ingest is 0.98x of its ordered ingest (512,997; swing 1.024x, no difference) where the drained arm's is 0.73x. Read with EXT.39: the same undrained store scans 8.6x slower until something routes it. RocksDB's swing 2.92x in this run. The drain matched both ways (drain-plan.md): next-nodrain's sync fsyncs the WAL and seals nothing, so its tail is read out of the memtable and three unrouted segments; rocksdb-tuned-drain's sync flushes its memtable and compacts every level into one."
+  },
+  {
+   "experiment": "w5-dict",
+   "id": "W5.5",
+   "profile": "full",
+   "expect": "holds",
+   "because": "At 16 KiB pages the sparse open is 70,960 bytes (23,904 un-paged) against the whole open's 808,240 at the browser's 64 KiB page, 8.8%, where the same open at 64 KiB pages was 218,416 (P5.5). cache.mjs takes a page size and the sparse reader's cache now opens at 16 KiB: the index is where its bytes go, its data reads still come one block at a time, and ensure coalesces adjacent pages into one request, so the smaller page costs requests nothing."
+  },
+  {
+   "experiment": "w5-dict",
+   "id": "W5.6",
+   "profile": "full",
+   "expect": "holds",
+   "because": "At 16 KiB pages every field's two plans come to at most 0.59 of the field's share of the index plus four pages -- a boundary at each end of each plan, the slack W5.2 taught -- and 0.98 of the two-page bound W5.2 failed at 64 KiB (P5.6)."
   }
  ],
  "metrics": [

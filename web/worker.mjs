@@ -19,7 +19,7 @@ let reader = null;
 let handle = null;
 let cache = null;
 
-async function open({ wasmUrl, indexUrl, name, source, budgetBytes }) {
+async function open({ wasmUrl, indexUrl, name, source, budgetBytes, pageSize }) {
   const wasmBytes = await (await fetch(wasmUrl)).arrayBuffer();
   if (source === "memory") {
     const bytes = new Uint8Array(await (await fetch(indexUrl)).arrayBuffer());
@@ -42,10 +42,14 @@ async function open({ wasmUrl, indexUrl, name, source, budgetBytes }) {
   }
   if (source === "sparse") {
     // R6.3: the index itself by range. Same cache, a different open.
+    // A smaller page than the point-read cache's: the index is where the
+    // sparse reader's bytes go, and w5-dict found the 64 KiB page rather
+    // than the bytes to be its cost at logshed's dictionary sizes.
     cache = await CachedBytes.open({
       name,
       fetcher: httpRangeFetcher(indexUrl),
       budgetBytes,
+      ...(pageSize ? { pageSize } : {}),
     });
     reader = await openSparse(wasmBytes, cache);
     return {

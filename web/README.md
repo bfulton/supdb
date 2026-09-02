@@ -148,9 +148,12 @@ matters: the sparse open is 23,808 bytes but four pages, 279,856 against
 the whole open's 869,680 for a 686 KB index (W5.1, recorded as failing
 its 5% prediction; it crosses 5% near 5.6 MB of index), and a 210-key
 field's two plans are 9,860 bytes but three pages (W5.2). Ranking a field
-from the sparse reader costs 10 ns a key (W5.4). The page size is
-`cache.mjs`'s to tune, and the index region is where a smaller page would
-pay.
+from the sparse reader costs 10 ns a key (W5.4). So the sparse reader's
+cache opens at 16 KiB pages (`openSparse` through the worker passes
+`pageSize`): the open is then 70,960 bytes, 8.8% of the whole open, and
+a field's range sits at 0.59 of its share plus four pages (W5.5, W5.6);
+`ensure` coalesces adjacent pages into one request, so a block read costs
+the same number of requests at either page.
 
 ## What a lookup costs
 

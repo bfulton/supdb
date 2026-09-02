@@ -264,7 +264,9 @@ and through a source that serves only what was ensured. It exists for the
 day a dictionary is too large to fetch whole; `w5-dict` prices it on the
 day index and found the 64 KiB cache page, not the bytes, to be the unit
 that matters at today's sizes (W5.1 and W5.2 recorded as failing their
-byte predictions by page geometry; W5.3 exactness and W5.4 speed hold).
+byte predictions by page geometry; W5.3 exactness and W5.4 speed hold;
+at 16 KiB pages, which the browser's sparse reader now uses, the open is
+8.8% of the whole open and a field's range 0.59 of its bound, W5.5, W5.6).
 It is a third read path, and carries the second's liability: its failure
 mode is a quiet different answer, which is why every range is checked
 against `scan_counts` rather than against itself.

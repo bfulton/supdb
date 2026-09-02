@@ -152,6 +152,7 @@ async function sparseSource() {
     name: `day-sparse-${Date.now()}`,
     source: "sparse",
     budgetBytes: sp.cache_budget_bytes,
+    pageSize: sp.page_size,
   });
   check("sparse: keys", opened.keys, expected.keys);
   check("sparse: open fetched exactly its plans", opened.openFetchedBytes, sp.open_fetch_bytes);
