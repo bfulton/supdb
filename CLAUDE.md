@@ -361,6 +361,26 @@ rare key at the dictionary with no postings wave (W6.6), and the
 recommendation to the roll is to write through `SegmentWriter`, which
 `logshed build`'s day already sorts for.
 
+**A segment writer can compress its blocks, and the encoding decides
+whether that is worth anything (R7.4).** `SegmentWriter::set_compress`
+takes the path `Store::write_block` always had: chunked above the chunk
+size so a point read decompresses one chunk, verbatim when compression
+does not pay, and a verbatim block now carries per-chunk checksums so
+`chunk_span` plans by chunk rather than whole. On logshed's day it saves
+**19.9%** of the file, against the 25% predicted (`W6.8`, recorded as
+failing). Two things that measurement found. The same day stored as
+absolute ordinals compresses **0.0%**, byte for byte identical, because
+LZ4 matches repeated sequences and a rising counter has none -- so both
+arms of the comparison store deltas, and logshed's 2x is a property of
+their encoding rather than of the flag. And 19.9% is far under the 2x LZ4
+gets on the blocks themselves, because inline runs put every run under
+256 bytes in the key section, which is not compressed; on a Zipf
+dictionary that is most of the terms, so inlining and compression pull
+against each other. What is still whole-block is a *compressed* block
+read by range: `with_extent` hands `read_chunked_range` the whole buffer,
+and fetching the chunk directory and then the chunks an extent spans is
+what would let a browser raise its block size (segcompress-plan.md).
+
 **A segment's key index is checksummed, and a flipped bit in it fails the
 open.** Every block was checksummed and verified once per reader (f8); the
 key index was not, and v6 made that a quiet misread rather than a theory:

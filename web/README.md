@@ -200,6 +200,13 @@ in a segment's index record and cost no postings round trip at all; a
 `Store`-written index never inlines, which is the case for writing the
 roll through `SegmentWriter`.
 
+A segment's blocks can be compressed (`SegmentWriter::set_compress`),
+chunked so a point read decompresses one chunk. It is worth 19.9% on
+logshed's day when postings are stored as deltas and nothing at all when
+they are stored as absolute ordinals, because LZ4 needs repeated bytes.
+Runs under 256 bytes are inline in the key section and are never
+compressed, so inlining and compression trade against each other.
+
 A segment's key index carries a checksum row -- one CRC32C per 16 KiB
 piece, after the hash region. The whole reader verifies every piece at
 open. A piece is the section's intersection with one 16 KiB page of the

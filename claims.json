@@ -1809,6 +1809,13 @@
    "because": "The reserve costs 1.63% of the segment file at the fixture's size: 7,608,372 bytes against 7,486,248, for a 131,072-byte reserve holding the table, the row, the fence copy and the directory copy. P7.6. At ci, on a 1 MB file, the same reserve is 12.7%, which is why it is the writer's choice and off by default; the store shape of the same day is 7,913,432 bytes, so the segment with its reserve is still the smaller file."
   },
   {
+   "experiment": "w6-waves",
+   "id": "W6.8",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Compressing a segment's blocks saves 19.9% of the file -- 6,092,168 bytes against 7,608,372 -- against P4.1's 25%, so the prediction is refuted and the feature is kept: `SegmentWriter::set_compress` takes the path `Store::write_block` has always taken, chunked above the chunk size so a point read decompresses one chunk, verbatim when compression does not pay. Both arms store postings as deltas, so compression is the only difference between them. At ci, on a 1.15 MB day, it is 8.8%: the fixed costs and the key section are a larger share of a smaller file. Two things this measured that the ask did not predict. The same day stored as absolute ordinals compresses by 0.0% -- byte for byte identical -- because LZ4 matches repeated byte sequences and a rising counter has none, so the encoding, not the flag, decides whether compression is worth anything; logshed's 2x is a property of their deltas. And 19.9% is well under the 2x LZ4 gets on the block bytes themselves, because inline runs put every run under 256 bytes into the key section, which is not compressed: on a Zipf dictionary that is most of the terms. The 30% logshed attributed to moving off `Store` is therefore not all compression, and the remainder is worth finding before more is spent here. The open is unchanged at one wave and the common key still reads its 88,581 postings (P4.2 held)."
+  },
+  {
    "experiment": "ext-ycsb",
    "id": "EXT.42",
    "profile": "full",

@@ -165,6 +165,12 @@ fn build_day_segment(
     seed: u64,
     inline: usize,
     head_reserve: usize,
+    compress: bool,
+    // `deltas`: store each posting as its distance from the previous one for
+    // the term, which is what logshed writes. Absolute ordinals do not
+    // compress -- LZ4 needs repeated byte sequences and a rising counter has
+    // none -- so measuring compression against them measures nothing.
+    deltas: bool,
 ) -> std::io::Result<u64> {
     let _ = std::fs::remove_file(path);
     let opts = Options {
@@ -174,6 +180,7 @@ fn build_day_segment(
     };
     let mut w = supdb::next::SegmentWriter::create(path, &opts)?;
     w.set_inline_max(inline);
+    w.set_compress(compress);
     if head_reserve > 0 {
         w.set_head_reserve(head_reserve);
     }
@@ -200,8 +207,15 @@ fn build_day_segment(
     terms.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     for (k, lines) in &terms {
         w.begin(k)?;
+        let mut prev = 0u32;
         for line in lines {
-            let ord = line.to_le_bytes();
+            let v = if deltas {
+                line.wrapping_sub(prev)
+            } else {
+                *line
+            };
+            prev = *line;
+            let ord = v.to_le_bytes();
             w.value(&ord[..POSTING_BYTES]);
         }
         w.end()?;
@@ -1893,8 +1907,36 @@ fn waves(profile: Profile) -> std::io::Result<Record> {
     let seg_path = dir.join("segment.supdb");
     let res_path = dir.join("reserve.supdb");
     let built = build_day(&store_path, day_lines, 0x5109_5ed0, Order::Term)?;
-    let seg_bytes = build_day_segment(&seg_path, day_lines, 0x5109_5ed0, 256, 0)?;
-    let res_bytes = build_day_segment(&res_path, day_lines, 0x5109_5ed0, 256, reserve)?;
+    let seg_bytes = build_day_segment(&seg_path, day_lines, 0x5109_5ed0, 256, 0, false, false)?;
+    let res_bytes = build_day_segment(
+        &res_path,
+        day_lines,
+        0x5109_5ed0,
+        256,
+        reserve,
+        false,
+        false,
+    )?;
+    // R7.4: the same segment with its blocks compressed. Inline runs live in
+    // the key section and are untouched, so this is the block bytes alone.
+    // Both arms of the size comparison store deltas, so compression is the
+    // only difference between them; the ordinal pair above is what the wave
+    // shapes use and what the other findings are measured on.
+    let dz_path = dir.join("delta.supdb");
+    let dzc_path = dir.join("delta-compressed.supdb");
+    let dz_bytes = build_day_segment(&dz_path, day_lines, 0x5109_5ed0, 256, reserve, false, true)?;
+    let zip_bytes = build_day_segment(&dzc_path, day_lines, 0x5109_5ed0, 256, reserve, true, true)?;
+    // The same day's ordinals compressed, to show what encoding is worth.
+    let ord_zip_path = dir.join("ordinal-compressed.supdb");
+    let ord_zip_bytes = build_day_segment(
+        &ord_zip_path,
+        day_lines,
+        0x5109_5ed0,
+        256,
+        reserve,
+        true,
+        false,
+    )?;
 
     // The probe keys, out of the whole reader over the store: the rarest
     // term with at least one posting and the commonest.
@@ -1932,13 +1974,18 @@ fn waves(profile: Profile) -> std::io::Result<Record> {
     );
     rec.param("common_postings", J::u(common_n));
 
-    let shapes: [(&str, &Path, u64); 4] = [
+    let shapes: [(&str, &Path, u64); 5] = [
         ("store", &store_path, page),
         ("segment", &seg_path, page),
         ("segment+reserve", &res_path, page),
         (
             "segment+reserve, generous probe",
             &res_path,
+            4096 + reserve as u64,
+        ),
+        (
+            "segment+reserve+compress, generous probe",
+            &dzc_path,
             4096 + reserve as u64,
         ),
     ];
@@ -1975,6 +2022,9 @@ fn waves(profile: Profile) -> std::io::Result<Record> {
             "store_bytes" => J::u(built.file_bytes),
             "segment_bytes" => J::u(seg_bytes),
             "segment_reserve_bytes" => J::u(res_bytes),
+            "segment_delta_bytes" => J::u(dz_bytes),
+            "segment_delta_compressed_bytes" => J::u(zip_bytes),
+            "segment_ordinal_compressed_bytes" => J::u(ord_zip_bytes),
             "keys" => J::u(built.keys),
             "postings" => J::u(built.postings)
         },
@@ -2102,6 +2152,29 @@ fn waves(profile: Profile) -> std::io::Result<Record> {
             extra * 100.0,
             reserve,
             built.file_bytes
+        ),
+    ));
+    let zip = get("segment+reserve+compress, generous probe", true, "common");
+    let saved = 1.0 - zip_bytes as f64 / dz_bytes as f64;
+    let ord_saved = 1.0 - ord_zip_bytes as f64 / res_bytes as f64;
+    rec.finding(Finding::new(
+        "W6.8",
+        "compressing a segment's blocks saves at least a quarter of it, and takes nothing from the open",
+        saved >= 0.25 && zip.open_waves <= 1,
+        format!(
+            "{} bytes compressed against {} uncompressed ({:.1}% smaller), both arms storing \
+             postings as deltas so compression is the only difference; the open is still {} wave \
+             and the common key still reads {} postings. The same day stored as absolute ordinals \
+             saves {:.1}%, which is the finding under the finding: LZ4 needs repeated bytes and a \
+             rising counter has none, so the encoding decides whether compression is worth \
+             anything. Inline runs are in the key section and untouched either way \
+             (segcompress-plan.md, P4.1 and P4.2)",
+            zip_bytes,
+            dz_bytes,
+            saved * 100.0,
+            zip.open_waves,
+            zip.postings,
+            ord_saved * 100.0
         ),
     ));
     let _ = std::fs::remove_dir_all(&dir);

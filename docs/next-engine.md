@@ -133,6 +133,13 @@ checkpoint.
   1.15-1.19x (EXT.17), the day index from 5.02 MB to 4.05
   (fixedrun-plan.md). The canonical load's 100-byte values are uniform, so
   every run there is now fixed as well; its numbers were last taken on v5.
+- **A segment's blocks can be compressed (segcompress-plan.md).**
+  `set_compress` mirrors `Store::write_block`: chunked above the chunk
+  size, verbatim when it does not pay, and a verbatim block carries
+  per-chunk checksums so a run read plans chunks. 19.9% of logshed's day
+  (W6.8, under its 25% prediction). Postings stored as absolute ordinals
+  compress by nothing at all, which is a fact about LZ4 and counters
+  rather than about the writer.
 - **A segment opens sparsely in one round trip (waves-plan.md).** The
   superblock page's spare 3 KiB carries an extension -- header copy and
   every region's offset -- so a sparse open plans itself from the first

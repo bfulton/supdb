@@ -756,6 +756,17 @@ pub struct SegmentWriter {
     /// Runs up to this many bytes go into the record's tail instead of a
     /// block (`Ext::INLINE`); zero keeps every run in blocks.
     inline_max: usize,
+    /// LZ4 the blocks, as `Store` does when `Options::compress` is set. A
+    /// block above the chunk size is compressed chunk by chunk with its own
+    /// directory, so a point read decompresses one chunk rather than the
+    /// block; one that does not shrink is written verbatim. Inline runs live
+    /// in the key section and are untouched either way
+    /// (segcompress-plan.md, R7.4).
+    compress: bool,
+    /// Per-chunk checksums for the blocks written verbatim, one row per
+    /// block in the block table. Without them a run read fetches the whole
+    /// block, which is what `blob::chunk_span` plans by.
+    chunk_rows: Vec<[u32; block::MAX_CHUNK_CRCS]>,
     /// Bytes left free after the superblock page, into which `finish` puts
     /// the block table and a copy of the fence when they fit, so a host
     /// whose first probe covers the reserve opens in one round trip
@@ -863,6 +874,8 @@ impl SegmentWriter {
             sync_every: 0,
             since_sync: 0,
             inline_max: 0,
+            compress: false,
+            chunk_rows: Vec::new(),
             head_reserve: 0,
             reserve_off: 0,
             tails: Vec::new(),
@@ -888,6 +901,15 @@ impl SegmentWriter {
     /// the first key.
     pub fn set_inline_max(&mut self, bytes: usize) {
         self.inline_max = bytes;
+    }
+
+    /// Compress the blocks. Off by default, because a segment written by the
+    /// next engine's seal is read back by its own merge and the seal path
+    /// has never paid for compression; a segment written as an index to be
+    /// downloaded is the other case, and logshed's day index is 30% smaller
+    /// with it on. Must be set before the first key.
+    pub fn set_compress(&mut self, on: bool) {
+        self.compress = on;
     }
 
     /// Leave `bytes` free after the superblock page for the block table and
@@ -1076,8 +1098,36 @@ impl SegmentWriter {
         if self.builder.is_empty() {
             return Ok(());
         }
-        let bytes = self.builder.take();
+        let payload = self.builder.take();
+        // The same three cases `Store::write_block` has: chunked when the
+        // payload is worth chunking and the result is smaller, compressed
+        // whole when it is not chunkable, verbatim when compression does not
+        // pay. A chunked block carries its own per-chunk checksums in its
+        // directory; a verbatim one gets a row beside it in the block table,
+        // which is what lets a reader fetch the chunks an extent spans
+        // instead of the block (segcompress-plan.md).
+        let uncompressed = payload.len() as u32;
+        let chunked = self.compress && payload.len() > block::CHUNK;
+        let stored: Option<Vec<u8>> = if chunked {
+            let c = block::write_chunked_sz(&payload, block::CHUNK);
+            if c.len() < payload.len() {
+                Some(c)
+            } else {
+                None
+            }
+        } else if self.compress {
+            block::compress(&payload)
+        } else {
+            None
+        };
+        let chunked = chunked && stored.is_some();
+        let bytes = stored.unwrap_or(payload);
         let len = bytes.len() as u32;
+        let row = if block::checksums_on() && len == uncompressed {
+            block::chunk_crcs(&bytes)
+        } else {
+            None
+        };
         let crc = if block::checksums_on() {
             crc32(&bytes)
         } else {
@@ -1086,13 +1136,15 @@ impl SegmentWriter {
         self.blocks.push(BlockLoc {
             off: self.pos,
             stored: len,
-            uncompressed: len,
+            uncompressed,
             cap: len,
-            chunked: false,
+            chunked,
             solo: false,
-            chunk_crc: false,
+            chunk_crc: row.is_some(),
             crc,
         });
+        self.chunk_rows
+            .push(row.unwrap_or([0u32; block::MAX_CHUNK_CRCS]));
         if self.mode == Some(Layout::RecordsFirst) {
             // Held until the section is complete; `off` is set when it is
             // written, and nothing reads the row before then.
@@ -1216,8 +1268,7 @@ impl SegmentWriter {
             Layout::BlocksFirst => (0, 0, None),
         };
 
-        let rows = vec![[0u32; block::MAX_CHUNK_CRCS]; self.blocks.len()];
-        let table = flatindex::encode_blocks(&self.blocks, &rows);
+        let table = flatindex::encode_blocks(&self.blocks, &self.chunk_rows);
         // The table goes into the head reserve when there is one and it
         // fits with room for the fence copy; else at the end, as before.
         let table_in_reserve = self.reserve_off != 0 && table.len() + 8 <= self.head_reserve;

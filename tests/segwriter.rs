@@ -706,3 +706,102 @@ fn a_head_reserve_opens_the_sparse_reader_from_the_probe_alone() {
     assert!(sparse.opened_from_extension());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Values with structure, so compression has something to find: four-byte
+/// posting *deltas*, which is what logshed stores and what LZ4 halves --
+/// small numbers, so three bytes in four are zero and the matches are long.
+/// Absolute ordinals do not compress, which the first version of this test
+/// discovered by shrinking nothing.
+fn postings(keys: usize, seed: u64) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+    let mut r = seed;
+    let mut out: Vec<(Vec<u8>, Vec<Vec<u8>>)> = (0..keys)
+        .map(|i| {
+            let n = match splitmix(&mut r) % 20 {
+                0 => 4_000,
+                1..=3 => 1,
+                _ => 1 + (splitmix(&mut r) % 60) as usize,
+            };
+            let vals = (0..n)
+                .map(|_| (1 + (splitmix(&mut r) % 250) as u32).to_le_bytes().to_vec())
+                .collect();
+            (format!("term={i:08}").into_bytes(), vals)
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// A compressed segment answers exactly what an uncompressed one does, on
+/// every key, and its inline runs are untouched because they live in the key
+/// section rather than in a block (segcompress-plan.md, P4.2).
+#[test]
+fn a_compressed_segment_agrees_with_an_uncompressed_one() {
+    let _g = serial();
+    let dir = scratch("segwriter-compress");
+    let data = postings(900, 0xC0FFEE);
+    // 64 KiB blocks, so a block passes `block::CHUNK` and takes the chunked
+    // path rather than being compressed whole.
+    let o = Options {
+        block_size: 64 << 10,
+        checksums: true,
+        ..Options::default()
+    };
+    let plain = dir.join("plain.sup");
+    let packed = dir.join("packed.sup");
+    for (path, compress) in [(&plain, false), (&packed, true)] {
+        let mut w = SegmentWriter::create(path, &o).expect("create");
+        w.set_inline_max(INLINE);
+        w.set_compress(compress);
+        for (k, vals) in &data {
+            w.begin(k).expect("begin");
+            for v in vals {
+                w.value(v);
+            }
+            w.end().expect("end");
+        }
+        w.finish(1).expect("finish");
+    }
+    let a = open(&plain);
+    let b = open(&packed);
+    agree(&a, &b, &data);
+
+    // The compression is real, and it did not come out of the key section:
+    // the index is the same size and the file is smaller.
+    let (sa, sb) = (
+        std::fs::metadata(&plain).unwrap().len(),
+        std::fs::metadata(&packed).unwrap().len(),
+    );
+    assert_eq!(
+        a.index_bytes(),
+        b.index_bytes(),
+        "the key section is untouched"
+    );
+    assert!(sb < sa, "compressed {sb} against plain {sa}");
+
+    // An uncompressed segment's blocks now carry per-chunk checksums, so a
+    // run read plans the chunks it spans rather than the block; a compressed
+    // one carries them inside its own chunk directory instead.
+    let key = data
+        .iter()
+        .find(|(k, _)| {
+            a.lookup(k)
+                .is_some_and(|e| e.iter().any(|x| !x.is_inline()))
+        })
+        .expect("a key whose run went to a block")
+        .0
+        .clone();
+    let plan = a.ranges_for(&key).expect("plan");
+    let whole: u64 = a
+        .lookup(&key)
+        .unwrap()
+        .iter()
+        .filter(|e| !e.is_inline())
+        .map(|_| o.block_size as u64)
+        .sum();
+    let planned: u64 = plan.iter().map(|r| r.1).sum();
+    assert!(
+        planned <= whole,
+        "chunk plan {planned} against block plan {whole}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
