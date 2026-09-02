@@ -1547,21 +1547,21 @@
    "id": "EXT.31",
    "profile": "full",
    "expect": "holds",
-   "because": "Shuffled, 265,727 ops/s against RocksDB's 224,767, 1.182x at p=0.0049 -- inside P31's 0.9x to 1.3x, and the number EXT.27's 6.0x over LMDB needed beside it: against an LSM the next engine's shuffled ingest is a narrow win, not a rout. RocksDB's own swing is 2.14x (480,074 ordered to 224,767 shuffled), more than the next engine's 1.37x, because a skiplist memtable and an L0 that overlaps pay for disorder too. Sequential, in the same run, 0.757x. Replicated as a tie: 1.075x, no difference at p=0.13 -- 'at least as fast' holds, 'faster' would not; RocksDB's own swing 2.30x in that run."
+   "because": "Shuffled, 265,727 ops/s against RocksDB's 224,767, 1.182x at p=0.0049 -- inside P31's 0.9x to 1.3x, and the number EXT.27's 6.0x over LMDB needed beside it: against an LSM the next engine's shuffled ingest is a narrow win, not a rout. RocksDB's own swing is 2.14x (480,074 ordered to 224,767 shuffled), more than the next engine's 1.37x, because a skiplist memtable and an L0 that overlaps pay for disorder too. Sequential, in the same run, 0.757x. Replicated as a tie: 1.075x, no difference at p=0.13 -- 'at least as fast' holds, 'faster' would not; RocksDB's own swing 2.30x in that run. Third run: 1.240x at p=0.01."
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.32",
    "profile": "full",
    "expect": "fails",
-   "because": "424,299 ops/s against tuned RocksDB's 616,965, 0.688x at p=0.0033 -- the plan's 0.7x to 0.9x missed by two hundredths; the shipped arm read 649,742 in the same run, so the tuning cost RocksDB's load about 5% (the filter per key) and the next engine trails either by the same third. rocksdb-tuned is a 256 MB LRU block cache (the data is 110 MB), a 10-bit Bloom filter with index and filter blocks cached, and four background threads; compression off and read-side checksum verification off as for the shipped arm, so the pair is matched."
+   "because": "424,299 ops/s against tuned RocksDB's 616,965, 0.688x at p=0.0033 -- the plan's 0.7x to 0.9x missed by two hundredths; the shipped arm read 649,742 in the same run, so the tuning cost RocksDB's load about 5% (the filter per key) and the next engine trails either by the same third. rocksdb-tuned is a 256 MB LRU block cache (the data is 110 MB), a 10-bit Bloom filter with index and filter blocks cached, and four background threads; compression off and read-side checksum verification off as for the shipped arm, so the pair is matched. Second run: 483,413 against 660,311, 0.732x."
   },
   {
    "experiment": "ext-kv",
    "id": "EXT.33",
    "profile": "full",
    "expect": "holds",
-   "because": "1,500,377 reads/s against tuned RocksDB's 232,697, 6.448x at p=0.0022. P33 said 1.5x to 2.5x on the theory that the shipped arm's 8 MB cache was most of the 7.6x, and the tuning refuted it: a block cache the data fits in and a Bloom filter moved RocksDB's read from 195,729 to 232,697, 1.19x, at 1M keys where the ci smoke had shown 2.6x at 20,000. What remains is the LSM read path itself after a load -- a memtable probe, a filter or index per L0 file, a block from cache and a restart-interval decode -- against a fence, a hash slot and a record in a mapping. Whether RocksDB's post-load L0 shape (its sync fsyncs the WAL and leaves the memtable and level 0 as they are) is part of that number is not decomposed here; it is the same shape a deployment reads at after ingest. rocksdb-tuned is a 256 MB LRU block cache (the data is 110 MB), a 10-bit Bloom filter with index and filter blocks cached, and four background threads; compression off and read-side checksum verification off as for the shipped arm, so the pair is matched."
+   "because": "1,500,377 reads/s against tuned RocksDB's 232,697, 6.448x at p=0.0022. P33 said 1.5x to 2.5x on the theory that the shipped arm's 8 MB cache was most of the 7.6x, and the tuning refuted it: a block cache the data fits in and a Bloom filter moved RocksDB's read from 195,729 to 232,697, 1.19x, at 1M keys where the ci smoke had shown 2.6x at 20,000. What remains is the LSM read path itself after a load -- a memtable probe, a filter or index per L0 file, a block from cache and a restart-interval decode -- against a fence, a hash slot and a record in a mapping. Whether RocksDB's post-load L0 shape (its sync fsyncs the WAL and leaves the memtable and level 0 as they are) is part of that number is not decomposed here; it is the same shape a deployment reads at after ingest. rocksdb-tuned is a 256 MB LRU block cache (the data is 110 MB), a 10-bit Bloom filter with index and filter blocks cached, and four background threads; compression off and read-side checksum verification off as for the shipped arm, so the pair is matched. Second run: 1,723,911 against 230,490, 7.48x."
   },
   {
    "experiment": "ext-kv",
@@ -1575,7 +1575,7 @@
    "id": "EXT.35",
    "profile": "full",
    "expect": "holds",
-   "because": "Shuffled, next against tuned RocksDB 1.026x, no difference at p=0.25 -- 'at least as fast' holds as a tie, inside P35's 0.9x to 1.3x; the shipped arm read 1.075x, also a tie, in the same run. RocksDB's swing with four background threads is 2.73x, larger than shipped (2.30x) and than the next engine's 1.40x: under disorder the LSM that compacts harder pays for it inside the load window. rocksdb-tuned is a 256 MB LRU block cache (the data is 110 MB), a 10-bit Bloom filter with index and filter blocks cached, and four background threads; compression off and read-side checksum verification off as for the shipped arm, so the pair is matched."
+   "because": "Shuffled, next against tuned RocksDB 1.026x, no difference at p=0.25 -- 'at least as fast' holds as a tie, inside P35's 0.9x to 1.3x; the shipped arm read 1.075x, also a tie, in the same run. RocksDB's swing with four background threads is 2.73x, larger than shipped (2.30x) and than the next engine's 1.40x: under disorder the LSM that compacts harder pays for it inside the load window. rocksdb-tuned is a 256 MB LRU block cache (the data is 110 MB), a 10-bit Bloom filter with index and filter blocks cached, and four background threads; compression off and read-side checksum verification off as for the shipped arm, so the pair is matched. Second run: 1.206x, no difference at p=0.055."
   },
   {
    "experiment": "f60-sealwait",
@@ -1604,6 +1604,48 @@
    "profile": "full",
    "expect": "holds",
    "because": "Zero blocked joins under uniform keys as well; the merge phase (1.044 s of a 3.506 s window) runs on its own thread and is booked separately, and the drain is 0.306 s (P60.4). The seal wait is the drain, on either key order."
+  },
+  {
+   "experiment": "ext-kv",
+   "id": "EXT.36",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Both drained: 483,413 ops/s against 593,130, 0.815x at p=0.0033. P36 said 0.85x to 1.15x and missed low: charging RocksDB a flush and a full compaction of 110 MB cost it 10% (660,311 undrained in the same run) where the next engine's own drain costs it 19% (597,044 undrained), because partitioning its last seal under ordered keys is promotion and cheap while RocksDB's compaction is a rewrite. With the layout work matched the next engine still trails an LSM on durable ordered ingest by a fifth. The drain matched both ways (drain-plan.md): next-nodrain's sync fsyncs the WAL and seals nothing, so its tail is read out of the memtable and three unrouted segments; rocksdb-tuned-drain's sync flushes its memtable and compacts every level into one."
+  },
+  {
+   "experiment": "ext-kv",
+   "id": "EXT.37",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Neither drained: 597,044 ops/s against 660,311, 0.904x and no difference at p=0.055 -- a tie at the gate, recorded as failing because the statement says faster. P37 said 0.72x to 0.85x and was refuted upward: removing the drain moved the next engine from 0.688x (EXT.32) to 0.904x, so most of what separated the two on this axis was the adapter's sync, not the commit path. What remains is within the noise of one run. The drain matched both ways (drain-plan.md): next-nodrain's sync fsyncs the WAL and seals nothing, so its tail is read out of the memtable and three unrouted segments; rocksdb-tuned-drain's sync flushes its memtable and compacts every level into one."
+  },
+  {
+   "experiment": "ext-kv",
+   "id": "EXT.38",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Neither drained, reads: 1,080,539 against 230,490, 4.688x at p=0.0022, inside P38's 3x to 5x. The next engine's read with an unsealed tail probes the memtable and Bloom-checks three unrouted segments before the partitions, and costs 1.6x what it costs after a drain (1,723,911); RocksDB's read costs the same either way. The drain matched both ways (drain-plan.md): next-nodrain's sync fsyncs the WAL and seals nothing, so its tail is read out of the memtable and three unrouted segments; rocksdb-tuned-drain's sync flushes its memtable and compacts every level into one."
+  },
+  {
+   "experiment": "ext-kv",
+   "id": "EXT.39",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Neither drained, scan: 2.89M entries/s against 4.26M, 0.678x and no difference at p=0.20; P39 said 2x to 4x and was refuted by an order of magnitude against the drained arm's 24.7M. With three unrouted segments and a memtable in the way, the ordered scan leaves the partitions-only fast path and takes the k-way merge over rank cursors with the memtable's sorted keys as one more source -- 8.6x slower than the routed walk. This is the read-side price of not draining, and it is the scan path's, not the format's: the lever is the merge over unrouted sources, which f45 last touched. The drain matched both ways (drain-plan.md): next-nodrain's sync fsyncs the WAL and seals nothing, so its tail is read out of the memtable and three unrouted segments; rocksdb-tuned-drain's sync flushes its memtable and compacts every level into one."
+  },
+  {
+   "experiment": "ext-kv",
+   "id": "EXT.40",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Both drained, reads: 1,723,911 against 241,215, 7.147x at p=0.0022, just above P40's 4x to 7x: a compacted RocksDB reads 5% faster than its post-load shape (230,490), so level 0 was not what made its read slow. The drain matched both ways (drain-plan.md): next-nodrain's sync fsyncs the WAL and seals nothing, so its tail is read out of the memtable and three unrouted segments; rocksdb-tuned-drain's sync flushes its memtable and compacts every level into one."
+  },
+  {
+   "experiment": "ext-loadshape",
+   "id": "EXT.41",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Neither drained, shuffled: next-nodrain 500,832 ops/s against tuned RocksDB's 211,650, 2.366x at p=0.0022; P41 said 1.1x to 1.4x and was refuted upward, because under shuffled keys the drain is not one seal's promotion but the flush's partitioning merges, and without it the next engine's shuffled ingest is 0.98x of its ordered ingest (512,997; swing 1.024x, no difference) where the drained arm's is 0.73x. Read with EXT.39: the same undrained store scans 8.6x slower until something routes it. RocksDB's swing 2.92x in this run. The drain matched both ways (drain-plan.md): next-nodrain's sync fsyncs the WAL and seals nothing, so its tail is read out of the memtable and three unrouted segments; rocksdb-tuned-drain's sync flushes its memtable and compacts every level into one."
   }
  ],
  "metrics": [

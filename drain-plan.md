@@ -40,3 +40,29 @@ the niche claim; P36 under 0.85x says compaction is cheaper than
 partitioning at this size. P38 under 3x says the memtable and the
 unrouted tail cost more on the read path than the fence and the record
 save, and the drain was buying the read lead rather than reflecting it.
+
+## Outcome (full, `results/ext-kv.full.json`, `results/ext-loadshape.full.json`)
+
+- P36 missed low: both drained, load **0.815x** (483,413 against
+  593,130). A full compaction costs RocksDB 10%; the drain costs the next
+  engine 19% under ordered keys.
+- P37 refuted upward: neither drained, load **0.904x, a tie** (597,044
+  against 660,311, p=0.055). The drain was most of the gap on this axis.
+- P38 held: neither drained, reads **4.69x** (1,080,539 against 230,490);
+  the unsealed tail costs the next engine's read 1.6x.
+- P39 refuted by an order of magnitude: neither drained, scan **0.68x, a
+  tie** (2.89M against 4.26M) where the drained store scans 24.7M. The
+  k-way merge over three unrouted segments and the memtable is 8.6x
+  slower than the routed walk. This is the lever the run found.
+- P40 held: both drained, reads **7.15x** (1,723,911 against 241,215); a
+  compacted RocksDB reads 5% faster than its post-load shape.
+- P41 refuted upward: neither drained, shuffled **2.37x** (500,832
+  against 211,650), and the next engine's own order swing vanishes
+  (1.024x): under shuffled keys the drain was the flush's merges.
+
+What the six say together: the durable load against an LSM is a tie
+when neither does layout work in the window and 0.82x when both do; the
+point-read lead is 4.7x to 7.1x whichever way it is matched; the ordered
+scan's lead exists only over a routed store, and an unrouted one scans
+8.6x slower than a routed one -- the unrouted scan path is the next
+lever, and it is a read-path change, not a format one.

@@ -308,8 +308,15 @@ either key order zero joins found the seal thread still running,
 publishing the manifest is 2% of the phase, and 74% is the final drain:
 the adapter's `sync` seals the last memtable and partitions it inside the
 load window, 0.263 s of 2.301, where RocksDB's `sync` is an fsync of its
-WAL. No engine lever; a benchmark-shape decision, both arms of which
-should run (sealwait-plan.md).
+WAL. No engine lever there; both benchmark shapes now run (drain-plan.md).
+Neither draining, the durable ordered load against tuned RocksDB is a
+tie (0.904x, EXT.37) and the shuffled load 2.37x (EXT.41), the next
+engine's own arrival-order swing gone; both draining, 0.815x (EXT.36).
+Point reads lead 4.7x undrained and 7.1x drained (EXT.38, EXT.40). The
+ordered scan is where not draining costs: 2.9M entries/s over three
+unrouted segments and a memtable against 24.7M routed (EXT.39, 0.68x of
+RocksDB and a tie) -- the k-way merge over unrouted sources is the next
+read-path lever.
 
 ### Arrival order: EXT.27
 

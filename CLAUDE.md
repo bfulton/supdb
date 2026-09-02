@@ -173,8 +173,14 @@ The seal wait in the durable load is the drain, not backpressure: f60
 found zero joins that blocked on an unfinished seal under either key
 order and the manifest at 2% of the seal phase; 74% is the last memtable
 being sealed and partitioned because the adapter's `sync` drains, which
-RocksDB's `sync` (an fsync of its WAL) does not. That is 11% of the load
-window and a benchmark-shape decision still open (sealwait-plan.md).
+RocksDB's `sync` (an fsync of its WAL) does not. So the drain is matched
+both ways (drain-plan.md; `next-nodrain`, `rocksdb-tuned-drain`): with
+neither draining the durable ordered load is a **tie** (0.904x, `EXT.37`)
+and the shuffled load **2.37x** (`EXT.41`), with both draining 0.815x
+(`EXT.36`); point reads lead 4.7x undrained and 7.1x drained (`EXT.38`,
+`EXT.40`); and the ordered scan of an undrained store is 8.6x slower than
+of a routed one (2.9M against 24.7M entries/s, `EXT.39`), which is the
+k-way merge over unrouted sources and the next lever on the read path.
 
 Under shuffled arrival the same matched pair inverts. `EXT.27`
 (`ext-loadshape`, full) has the next engine at 284,938 ops/s against
