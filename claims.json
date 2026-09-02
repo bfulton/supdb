@@ -1492,6 +1492,34 @@
    "profile": "full",
    "expect": "holds",
    "because": "Reads after the drain: 513 ns recycled against 514 uniform, 499 against 510 sequential, both no difference. Nothing on the read path knows what a WAL file looked like."
+  },
+  {
+   "experiment": "w5-dict",
+   "id": "W5.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P5.1 refuted by page geometry, not by bytes. The sparse open reads 23,808 bytes -- superblock probe, index header, block table, fence -- which is 3.5% of a 686,456-byte index; but cache.mjs fetches 64 KiB pages and those four regions land on four pages, 279,856 bytes against the whole open's 869,680 (32.2%). The ratio is a function of the index size, since the sparse open is four pages whatever the dictionary holds: it crosses 5% at about 5.6 MB of index, which is the shape this reader exists for and not the shape the fixture has. Both open plans named exactly what the open read."
+  },
+  {
+   "experiment": "w5-dict",
+   "id": "W5.2",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P5.2 refuted the same way. Un-paged, a field's two plans are well under its share of the index (country: 9,860 bytes for 210 keys against an 18,467-byte share; path: 221,004 for 5,000 keys against 439,698), because the records are smaller than the 88 bytes a key costs with its hash slot and directory entry. Page-rounded, the directory slice and the record span are two ranges in two regions and each can straddle a page boundary at both ends, so the slack is four pages and not the two the plan allowed; country came to 196,608 bytes, 1.31 of the two-page bound. At ci the same schema read 0.99, which is the luck of where the boundaries fell."
+  },
+  {
+   "experiment": "w5-dict",
+   "id": "W5.3",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Nine ranges -- every field of the schema, ten keys from the middle, the tail -- on the 250,000-line day index: phase one read nothing, phase two read exactly the directory slice, the walk read exactly both plans, and every row matched scan_counts over the whole index (P5.3). This is the property the browser test then asserts over ranged HTTP."
+  },
+  {
+   "experiment": "w5-dict",
+   "id": "W5.4",
+   "profile": "full",
+   "expect": "holds",
+   "because": "10 ns a key ranking `country` (210 keys) from a sparse reader over a mapping, median of seven, against a bound of 100 microseconds (P5.4). The walk decodes records out of the lent span; the fence seek is the constant and the decode is the per-key cost, and neither is where a range's time goes -- the fetch is."
   }
  ],
  "metrics": [

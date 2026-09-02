@@ -896,6 +896,206 @@ fn bundle(profile: Profile, wasm: u64, wasm_gz: u64, floor: u64, floor_gz: u64) 
     rec
 }
 
+// ------------------------------------------------------------------ dict --
+
+/// R6.3, measured on the shape it is for: the day index's wide dictionary,
+/// read by range through `SparseBlob` against the whole-index open the
+/// browser did before. Byte counts, page-rounded the way `cache.mjs`
+/// fetches, plus one timing with a bound rather than a comparison.
+/// Registered in dict-plan.md.
+fn dict(profile: Profile) -> std::io::Result<Record> {
+    use supdb::blob::{open_ranges, sparse_fence_ranges_via, sparse_open_ranges_via};
+    use supdb::SparseBlob;
+    const PAGE: u64 = 64 << 10;
+
+    let mut rec = Record::new("w5-dict", profile);
+    let dir = std::env::temp_dir().join("supdb-logshed-dict");
+    std::fs::create_dir_all(&dir)?;
+    let day_lines: u64 = profile.pick(20_000, 100_000, 250_000);
+    rec.param("day_lines", J::u(day_lines));
+    rec.param("page_bytes", J::u(PAGE));
+    rec.note("predictions registered in dict-plan.md before the run");
+
+    let path = dir.join("day.supdb");
+    let built = build_day(&path, day_lines, 0x5109_5ed0, Order::Term)?;
+    let file_bytes = built.file_bytes;
+    let data = std::fs::read(&path)?;
+
+    // The two opens, over recording sources, merged and page-rounded.
+    let whole_log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let whole = Blob::open(Recording { data: data.clone(), log: whole_log.clone() })?;
+    let whole_open = merge_ranges(&whole_log.borrow());
+    let whole_open_paged = paged_bytes(&whole_open, file_bytes, PAGE);
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sparse = SparseBlob::open(Recording { data: data.clone(), log: log.clone() })?;
+    let sparse_open = merge_ranges(&log.borrow());
+    let sparse_open_paged = paged_bytes(&sparse_open, file_bytes, PAGE);
+    // And the plans name exactly what the sparse open read.
+    let head = data[..supdb::blob::open_probe() as usize].to_vec();
+    let mmap = MmapBytes::open(&path)?;
+    let mut planned = sparse_open_ranges_via(&mmap)?;
+    planned.extend(sparse_fence_ranges_via(&mmap)?);
+    let open_exact = merge_ranges(&planned) == sparse_open;
+    let _ = open_ranges(&head, file_bytes)?;
+
+    let keys = whole.keys() as u64;
+    let index_bytes = whole.index_bytes() as u64;
+    let bytes_per_key = index_bytes as f64 / keys.max(1) as f64;
+    let mut mark = log.borrow().len();
+    let mut touched = |log: &std::rc::Rc<std::cell::RefCell<Vec<(u64, u64)>>>| {
+        let l = log.borrow();
+        let out = merge_ranges(&l[mark..]);
+        mark = l.len();
+        out
+    };
+
+    let mut rows = Vec::new();
+    let mut all_exact = open_exact;
+    let mut all_proportional = true;
+    let mut worst_over = 0.0f64;
+    let mut ranges: Vec<(String, Vec<u8>, Option<Vec<u8>>)> = FIELDS
+        .iter()
+        .map(|(f, _)| (f.to_string(), format!("{f}=").into_bytes(), Some(format!("{f}>").into_bytes())))
+        .collect();
+    // Two partial ranges: ten keys out of the middle, and the tail.
+    let key = |r: usize| whole.key_at(r.min(whole.keys() - 1)).map(|k| k.to_vec()).unwrap_or_default();
+    ranges.push(("ten-keys".into(), key(keys as usize / 2), Some(key(keys as usize / 2 + 10))));
+    ranges.push(("tail".into(), key(keys as usize - 8), None));
+    for (name, lo, hi) in &ranges {
+        let hi_ref = hi.as_deref();
+        touched(&log);
+        let p1 = sparse.dictionary_plan(lo, hi_ref);
+        let p2 = sparse.dictionary_plan_records(lo, hi_ref)?;
+        let after_plans = touched(&log);
+        let mut got = 0u64;
+        let mut walked: Vec<(Vec<u8>, u64)> = Vec::new();
+        sparse.dictionary_counts(lo, hi_ref, |k, c| {
+            got += 1;
+            walked.push((k.to_vec(), c));
+            true
+        })?;
+        let read = touched(&log);
+        let both: Vec<(u64, u64)> = p1.iter().chain(p2.iter()).copied().collect();
+        let exact = after_plans == merge_ranges(&p1) && read == merge_ranges(&both);
+        // Against the whole reader, as tests/dict.rs does.
+        let mut want: Vec<(Vec<u8>, u64)> = Vec::new();
+        whole.scan_counts(lo, usize::MAX, |k, c| {
+            if hi_ref.is_some_and(|h| k >= h) {
+                return false;
+            }
+            want.push((k.to_vec(), c));
+            true
+        })?;
+        let agrees = walked == want;
+        all_exact &= exact && agrees;
+        let plan_paged = paged_bytes(&both, file_bytes, PAGE);
+        let plan_bytes = range_bytes(&merge_ranges(&both));
+        let share = got as f64 * bytes_per_key;
+        let bound = share + 2.0 * PAGE as f64;
+        let proportional = (plan_paged as f64) <= bound;
+        if name != "ten-keys" && name != "tail" {
+            all_proportional &= proportional;
+            worst_over = worst_over.max(plan_paged as f64 / bound);
+        }
+        rows.push(jobj! {
+            "range" => J::s(name.as_str()),
+            "keys" => J::u(got),
+            "plan_bytes" => J::u(plan_bytes),
+            "plan_paged_bytes" => J::u(plan_paged),
+            "keys_share_of_index_bytes" => J::fp(share, 0),
+            "exact" => J::Bool(exact),
+            "agrees_with_whole_reader" => J::Bool(agrees),
+        });
+    }
+
+    // Ranking one field from the sparse reader over a mapping: the walk
+    // decodes records out of the lent span. A bound, not a comparison, so
+    // the median of a few repetitions is what is recorded.
+    let lending = SparseBlob::open(MmapBytes::open(&path)?)?;
+    let (f, _) = FIELDS[3];
+    let (flo, fhi) = (format!("{f}=").into_bytes(), format!("{f}>").into_bytes());
+    let mut per_key = Vec::new();
+    let mut field_keys = 0u64;
+    for _ in 0..7 {
+        let t = std::time::Instant::now();
+        let mut n = 0u64;
+        let mut sink = 0u64;
+        lending.dictionary_counts(&flo, Some(&fhi), |_, c| {
+            n += 1;
+            sink = sink.wrapping_add(c);
+            true
+        })?;
+        std::hint::black_box(sink);
+        field_keys = n;
+        per_key.push(t.elapsed().as_nanos() as f64 / n.max(1) as f64);
+    }
+    per_key.sort_by(|a, b| a.total_cmp(b));
+    let ns_per_key = per_key[per_key.len() / 2];
+
+    rec.series("open", jobj! {
+        "keys" => J::u(keys),
+        "index_bytes" => J::u(index_bytes),
+        "file_bytes" => J::u(file_bytes),
+        "whole_open_paged_bytes" => J::u(whole_open_paged),
+        "sparse_open_paged_bytes" => J::u(sparse_open_paged),
+        "sparse_open_bytes" => J::u(range_bytes(&sparse_open)),
+        "sparse_over_whole" => J::fp(sparse_open_paged as f64 / whole_open_paged.max(1) as f64, 4),
+        "plans_exact" => J::Bool(open_exact),
+    });
+    rec.series("ranges", J::arr(rows));
+    rec.series("rank_one_field", jobj! {
+        "field" => J::s(f),
+        "keys" => J::u(field_keys),
+        "ns_per_key_median" => J::fp(ns_per_key, 1),
+    });
+
+    let ratio = sparse_open_paged as f64 / whole_open_paged.max(1) as f64;
+    rec.finding(Finding::new(
+        "W5.1",
+        "the sparse open fetches under 5% of what the whole-index open fetches, page-rounded",
+        ratio < 0.05 && open_exact,
+        format!(
+            "{sparse_open_paged} bytes against {whole_open_paged} ({:.1}%) for a {keys}-key, \
+             {index_bytes}-byte index in a {file_bytes}-byte file; the two open plans named \
+             exactly what the open read: {open_exact}",
+            ratio * 100.0
+        ),
+    ));
+    rec.finding(Finding::new(
+        "W5.2",
+        "one field's range costs at most its share of the index plus two pages",
+        all_proportional,
+        format!(
+            "every field's two plans, page-rounded, came in under keys x {bytes_per_key:.1} bytes \
+             plus two 64 KiB pages; the worst was {:.2} of that bound. The slack is the fence \
+             stride at each end, rounded to a page",
+            worst_over
+        ),
+    ));
+    rec.finding(Finding::new(
+        "W5.3",
+        "every range's walk reads exactly its two plans and agrees with the whole reader",
+        all_exact,
+        format!(
+            "{} ranges: each field of the schema, ten keys from the middle and the tail; the \
+             directory slice was read by the second plan alone, the walk read both plans and \
+             nothing else, and every row matched scan_counts over the whole index",
+            ranges.len()
+        ),
+    ));
+    rec.finding(Finding::new(
+        "W5.4",
+        "ranking a field from the sparse reader costs under 100 microseconds a key",
+        ns_per_key < 100_000.0,
+        format!(
+            "{ns_per_key:.0} ns a key over {field_keys} keys of `{f}`, median of seven, records \
+             decoded out of the lent span; the whole-index scan_counts is a few nanoseconds a \
+             key (W2.5) and the difference is the seek and the decode, bounded by the range"
+        ),
+    ));
+    Ok(rec)
+}
+
 // ---------------------------------------------------------------- ranges --
 
 /// A byte source that cannot lend and remembers every read, so a plan can be
@@ -1205,6 +1405,19 @@ fn main() -> std::io::Result<()> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(12_000);
             segment_fixture(&dir, events)
+        }
+        "dict" => {
+            let profile =
+                Profile::parse(arg("--profile").as_deref().unwrap_or("ci")).unwrap_or(Profile::Ci);
+            let out = PathBuf::from(arg("--out").unwrap_or_else(|| "results".into()));
+            let rec = dict(profile)?;
+            rec.print_summary();
+            rec.write(&out)?;
+            if rec.all_findings_hold() {
+                Ok(())
+            } else {
+                std::process::exit(1)
+            }
         }
         "ranges" => {
             let profile =

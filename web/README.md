@@ -116,10 +116,41 @@ fetches a few pages and everything after is sparse (`w4-ranges` prices the
 open at under 20 KB of a 31 MB object). It stops being cheap the day the
 keys are unbounded: a trigram or free-text index has a dictionary that grows
 with the data, and would need the *index* planned and fetched sparsely too.
-Do not index free text over this source without revisiting that. The ranges
-ABI is deliberately absolute-offset with no assumption that the caller holds
-the rest of the file, so that day changes `cache.mjs` and the open sequence
-in JS -- not the ABI and not the reader.
+That day has a reader now (R6.3, below); it arrived as a second open and a
+handful of range calls, and the point-read reader above is unchanged.
+
+## Reading the dictionary by range (R6.3)
+
+`openSparse(wasm, cache)` never fetches the key index whole. It keeps the
+section's 192-byte header and its fence -- the sampled keys `seek` already
+binary-searches, kilobytes for an index of any size -- and reaches the
+directory and the records by plan, exactly as data is reached by plan
+above. The open is three small round trips (`supdb_open_sparse_plan(1)`:
+superblock probe, index header, block table; `(2)`: the fence the header
+locates; then `supdb_open_host_sparse`). A range of the dictionary is two
+more: `supdb_dict_plan(lo, hi, 1)` names the directory slice for the
+fence-bounded ranks, `(2)` names the record bytes those entries point at
+-- one contiguous span, because both writers lay records out in key order
+-- and `supdb_dict_counts(lo, hi)` walks it. `SparseReader.ensureDict`
+does the two awaits; `dictCounts` then runs synchronously and cannot miss.
+Values follow the same shape: the walk hands out each key's extents,
+`dictRanges`/`ensureDictValues` plan and fetch the blocks behind them, and
+`dictReadConcat(key)` reads one key's values through them. A sparse
+reader refuses the point-read calls by name; a whole reader refuses the
+range calls. Neither answers empty for a question it cannot see.
+
+The plans are exact, on the recorded reads (`tests/dict.rs` natively over
+135 ranges per index shape, `w5-dict` on the day index, and the browser
+suite over ranged HTTP: three ranges fetch exactly the pages their plans
+name that nothing before made resident). What `w5-dict` also says is that
+at logshed's current dictionary sizes the 64 KiB page is the unit that
+matters: the sparse open is 23,808 bytes but four pages, 279,856 against
+the whole open's 869,680 for a 686 KB index (W5.1, recorded as failing
+its 5% prediction; it crosses 5% near 5.6 MB of index), and a 210-key
+field's two plans are 9,860 bytes but three pages (W5.2). Ranking a field
+from the sparse reader costs 10 ns a key (W5.4). The page size is
+`cache.mjs`'s to tune, and the index region is where a smaller page would
+pay.
 
 ## What a lookup costs
 

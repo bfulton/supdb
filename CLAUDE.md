@@ -216,6 +216,20 @@ takes the second for every access and copies nothing, which is the axis
 to lose. `Blob::zero_copy()` is asserted in the test, because a native reader
 that started copying would still pass every correctness check.
 
+**The dictionary can be read by range without holding the index (R6.3).**
+`blob::SparseBlob` keeps the key section's header and fence and plans a
+range as a directory slice and then the record span it names; the walk
+reads exactly those two plans, and `tests/dict.rs` holds it to the whole
+reader's answer over 135 ranges per index shape, on a recording source,
+and through a source that serves only what was ensured. It exists for the
+day a dictionary is too large to fetch whole; `w5-dict` prices it on the
+day index and found the 64 KiB cache page, not the bytes, to be the unit
+that matters at today's sizes (W5.1 and W5.2 recorded as failing their
+byte predictions by page geometry; W5.3 exactness and W5.4 speed hold).
+It is a third read path, and carries the second's liability: its failure
+mode is a quiet different answer, which is why every range is checked
+against `scan_counts` rather than against itself.
+
 **A count costs a lookup, and it took a format change to make it so (v5).**
 `f28-count` runs four arms interleaved. Resolving a key and stopping is 94 ns;
 the general `count` is 94; reading every value is 2,345. Before format v5 the
