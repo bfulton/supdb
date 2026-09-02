@@ -677,6 +677,106 @@ fn fixture(dir: &Path, lines: u64) -> std::io::Result<()> {
         true
     })?;
 
+    // R6.3 -- the dictionary by range. The browser opens this same file
+    // sparse; what it must fetch and what it must answer are computed here
+    // by the native SparseBlob, page-rounded the way cache.mjs fetches.
+    const PAGE: u64 = 64 << 10;
+    let sparse = {
+        use supdb::blob::{open_ranges, sparse_fence_ranges_via, sparse_open_ranges_via};
+        use supdb::SparseBlob;
+        let file_bytes = built.file_bytes;
+        let src = MmapBytes::open(&path)?;
+        let head = std::fs::read(&path)?[..supdb::blob::open_probe() as usize].to_vec();
+        let mut open_plan = sparse_open_ranges_via(&src)?;
+        open_plan.extend(sparse_fence_ranges_via(&src)?);
+        let open_fetch = paged_bytes(&open_plan, file_bytes, PAGE);
+        let whole_fetch = paged_bytes(&open_ranges(&head, file_bytes)?, file_bytes, PAGE);
+        // The cache fetches pages once, so what a range costs is the pages
+        // it needs that nothing before it made resident: the open first,
+        // then each range in the order the browser test runs them.
+        let mut resident: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        let mut new_bytes = |ranges: &[(u64, u64)]| -> u64 {
+            let mut added = 0u64;
+            for &(off, len) in ranges {
+                if len == 0 {
+                    continue;
+                }
+                let last = (off + len - 1).min(file_bytes.saturating_sub(1));
+                for pg in off / PAGE..=last / PAGE {
+                    if resident.insert(pg) {
+                        added += PAGE.min(file_bytes - pg * PAGE);
+                    }
+                }
+            }
+            added
+        };
+        assert_eq!(new_bytes(&open_plan), open_fetch);
+        let sp = SparseBlob::open(src)?;
+        let n = blob.keys();
+        let key = |r: usize| blob.key_at(r.min(n - 1)).map(|k| k.to_vec()).unwrap_or_default();
+        let field = FIELDS[1].0;
+        let ranges: Vec<(Vec<u8>, Option<Vec<u8>>)> = vec![
+            (format!("{field}=").into_bytes(), Some(format!("{field}>").into_bytes())),
+            (key(64), Some(key(74))),
+            (key(n.saturating_sub(5)), None),
+        ];
+        let mut out = Vec::new();
+        for (lo, hi) in &ranges {
+            let hi_ref = hi.as_deref();
+            let mut rows = Vec::new();
+            let mut walked: Vec<(Vec<u8>, u64)> = Vec::new();
+            sp.dictionary_counts(lo, hi_ref, |k, c| {
+                rows.push(jobj! {
+                    "key" => J::s(String::from_utf8_lossy(k).into_owned()),
+                    "count" => J::u(c),
+                });
+                walked.push((k.to_vec(), c));
+                true
+            })?;
+            // The fixture's own check: the range agrees with the whole reader.
+            let mut whole: Vec<(Vec<u8>, u64)> = Vec::new();
+            blob.scan_counts(lo, usize::MAX, |k, c| {
+                if hi_ref.is_some_and(|h| k >= h) {
+                    return false;
+                }
+                whole.push((k.to_vec(), c));
+                true
+            })?;
+            assert_eq!(walked, whole, "the sparse range disagrees with the whole reader");
+            let mut plan = sp.dictionary_plan(lo, hi_ref);
+            plan.extend(sp.dictionary_plan_records(lo, hi_ref)?);
+            out.push(jobj! {
+                "lo" => J::s(String::from_utf8_lossy(lo).into_owned()),
+                "hi" => match hi {
+                    Some(h) => J::s(String::from_utf8_lossy(h).into_owned()),
+                    None => J::Null,
+                },
+                "rows" => J::arr(rows),
+                "plan_fetch_bytes" => J::u(new_bytes(&plan)),
+            });
+        }
+        // One key's values through the range path, hashed as the segment
+        // fixture hashes them.
+        let (vlo, vhi) = (key(64), key(74));
+        let vkey = key(66);
+        let mut hash = 0x811c_9dc5u32;
+        let count = blob.read_all(&vkey, |v| hash = fnv32(hash, v))?;
+        jobj! {
+            "page_size" => J::u(PAGE),
+            "cache_budget_bytes" => J::u(8 << 20),
+            "open_fetch_bytes" => J::u(open_fetch),
+            "whole_open_fetch_bytes" => J::u(whole_fetch),
+            "ranges" => J::arr(out),
+            "value" => jobj! {
+                "lo" => J::s(String::from_utf8_lossy(&vlo).into_owned()),
+                "hi" => J::s(String::from_utf8_lossy(&vhi).into_owned()),
+                "key" => J::s(String::from_utf8_lossy(&vkey).into_owned()),
+                "count" => J::u(count),
+                "hash" => J::u(hash as u64),
+            },
+        }
+    };
+
     let doc = jobj! {
         "lines" => J::u(lines),
         "file_bytes" => J::u(built.file_bytes),
@@ -685,6 +785,7 @@ fn fixture(dir: &Path, lines: u64) -> std::io::Result<()> {
         "posting_bytes" => J::u(POSTING_BYTES as u64),
         "lookups" => J::arr(lookups),
         "counts" => J::arr(counts),
+        "sparse" => sparse,
         "scan" => jobj! {
             "from" => J::s(from),
             "limit" => J::u(12),
@@ -736,7 +837,11 @@ fn bundle(profile: Profile, wasm: u64, wasm_gz: u64, floor: u64, floor_gz: u64) 
     //     removes. Budgeting under that would be budgeting against Rust.
     const BUDGET_GZ: u64 = 64 << 10;
     // What supdb itself may add above the floor.
-    const MARGINAL_BUDGET_GZ: u64 = 32 << 10;
+    // 32 KB while the reader had one read path; 40 KB since R6.3 added a
+    // second -- the dictionary by range: two open plans, two range plans, a
+    // walk and the values behind it, 5,934 gzipped bytes measured. W3.1 is
+    // the budget the user pays and it did not move.
+    const MARGINAL_BUDGET_GZ: u64 = 40 << 10;
 
     let mut rec = Record::new("w3-bundle", profile);
     let marginal = wasm.saturating_sub(floor);
@@ -780,11 +885,12 @@ fn bundle(profile: Profile, wasm: u64, wasm_gz: u64, floor: u64, floor_gz: u64) 
     ));
     rec.finding(Finding::new(
         "W3.3",
-        "supdb's own contribution to the bundle is under 32 KB gzipped",
+        "supdb's own contribution to the bundle is under 40 KB gzipped",
         marginal_gz <= MARGINAL_BUDGET_GZ,
         format!(
-            "{marginal_gz} bytes gzipped above the floor, against {MARGINAL_BUDGET_GZ}. This is \
-             the number that moves when the reader grows; W3.1 is the one the user pays"
+            "{marginal_gz} bytes gzipped above the floor, against {MARGINAL_BUDGET_GZ} (32 KB \
+             until the range-readable dictionary added a second read path). This is the number \
+             that moves when the reader grows; W3.1 is the one the user pays"
         ),
     ));
     rec

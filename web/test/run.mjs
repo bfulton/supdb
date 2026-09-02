@@ -129,6 +129,7 @@ async function main() {
   }
 
   await cachedSource();
+  await sparseSource();
 }
 
 // R6: a reader over ranged HTTP with a cache smaller than the file. The
@@ -137,6 +138,77 @@ async function main() {
 // counts fetch nothing at all. The fixture is segment-shaped on purpose:
 // ~100 keys of index over megabytes of data, which is where sparseness
 // pays, rather than a wide dictionary that would flatter the index side.
+// R6.3: the day index -- the wide dictionary -- opened without ever fetching
+// its key index whole. The open is three small plans, a range of the
+// dictionary is two more, and the expected rows and byte counts come from
+// the native SparseBlob over the same file.
+async function sparseSource() {
+  const expected = await (await fetch("./out/expected.json")).json();
+  const sp = expected.sparse;
+  const worker = new Worker("../worker.mjs", { type: "module" });
+  const opened = await rpc(worker, "open", {
+    wasmUrl: new URL("../supdb.wasm", location.href).href,
+    indexUrl: new URL("./out/day.supdb", location.href).href,
+    name: `day-sparse-${Date.now()}`,
+    source: "sparse",
+    budgetBytes: sp.cache_budget_bytes,
+  });
+  check("sparse: keys", opened.keys, expected.keys);
+  check("sparse: open fetched exactly its plans", opened.openFetchedBytes, sp.open_fetch_bytes);
+  assert(
+    "sparse: the open fetches less than a whole open would",
+    opened.openFetchedBytes < sp.whole_open_fetch_bytes,
+    `${opened.openFetchedBytes} against ${sp.whole_open_fetch_bytes}`,
+  );
+
+  // A walk before its ensure must throw, not answer from nothing.
+  let threw = null;
+  try {
+    await rpc(worker, "dictCounts", { lo: sp.ranges[0].lo, hi: sp.ranges[0].hi });
+  } catch (e) {
+    threw = String(e);
+  }
+  assert(
+    "sparse: a range walk before its ensure throws rather than answers",
+    threw !== null && /not resident|refused/.test(threw),
+    threw ?? "no error",
+  );
+
+  const afterOpen = await rpc(worker, "cacheStats");
+  for (const r of sp.ranges) {
+    const before = (await rpc(worker, "cacheStats")).fetchedBytes;
+    await rpc(worker, "ensureDict", { lo: r.lo, hi: r.hi });
+    const fetched = (await rpc(worker, "cacheStats")).fetchedBytes - before;
+    check(`sparse: dictCounts [${r.lo}, ${r.hi ?? "end"})`, await rpc(worker, "dictCounts", { lo: r.lo, hi: r.hi }), r.rows);
+    check(`sparse: [${r.lo}, ${r.hi ?? "end"}) fetched exactly its plans`, fetched, r.plan_fetch_bytes);
+  }
+  const afterRanges = await rpc(worker, "cacheStats");
+  assert(
+    "sparse: every range together fetched less than the key index",
+    afterRanges.fetchedBytes - afterOpen.fetchedBytes < expected.index_bytes,
+    `${afterRanges.fetchedBytes - afterOpen.fetchedBytes} of a ${expected.index_bytes}-byte index`,
+  );
+
+  // Values through the range: the blocks are planned from the extents the
+  // walk hands out, and the bytes match the native reader's.
+  await rpc(worker, "ensureDictValues", { lo: sp.value.lo, hi: sp.value.hi });
+  check(
+    `sparse: dictReadConcat ${sp.value.key}`,
+    await rpc(worker, "dictReadHash", { key: sp.value.key }),
+    { count: sp.value.count, hash: sp.value.hash },
+  );
+  // The whole point, in one number: the sparse open and every dictionary
+  // range together cost less than the whole-index open did by itself.
+  assert(
+    "sparse: the open and every range together fetched less than a whole open",
+    afterRanges.fetchedBytes < sp.whole_open_fetch_bytes,
+    `${afterRanges.fetchedBytes} against ${sp.whole_open_fetch_bytes}`,
+  );
+
+  await rpc(worker, "close");
+  worker.terminate();
+}
+
 async function cachedSource() {
   const seg = await (await fetch("./out/expected-segment.json")).json();
   const worker = new Worker("../worker.mjs", { type: "module" });

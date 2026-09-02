@@ -12,7 +12,7 @@
 // ranges (R6.2), the ensure awaits fetching them, and the read itself is
 // synchronous as ever. The await lives here, never inside wasm.
 
-import { openSyncHandle, openMemory, openCached, fetchIntoOpfs } from "./supdb.mjs";
+import { openSyncHandle, openMemory, openCached, openSparse, fetchIntoOpfs } from "./supdb.mjs";
 import { CachedBytes, httpRangeFetcher } from "./cache.mjs";
 
 let reader = null;
@@ -35,6 +35,21 @@ async function open({ wasmUrl, indexUrl, name, source, budgetBytes }) {
     reader = await openCached(wasmBytes, cache);
     return {
       source: "cached",
+      keys: reader.keys,
+      length: cache.length,
+      openFetchedBytes: cache.stats.fetchedBytes,
+    };
+  }
+  if (source === "sparse") {
+    // R6.3: the index itself by range. Same cache, a different open.
+    cache = await CachedBytes.open({
+      name,
+      fetcher: httpRangeFetcher(indexUrl),
+      budgetBytes,
+    });
+    reader = await openSparse(wasmBytes, cache);
+    return {
+      source: "sparse",
       keys: reader.keys,
       length: cache.length,
       openFetchedBytes: cache.stats.fetchedBytes,
@@ -79,6 +94,20 @@ const ops = {
   ensure: async ({ keys }) => {
     await reader.ensure(keys);
     return true;
+  },
+  // R6.3: the dictionary by range, for the sparse source.
+  dictCounts: ({ lo, hi }) => reader.dictCounts(lo, hi ?? null),
+  ensureDict: async ({ lo, hi }) => {
+    await reader.ensureDict(lo, hi ?? null);
+    return true;
+  },
+  ensureDictValues: async ({ lo, hi }) => {
+    await reader.ensureDictValues(lo, hi ?? null);
+    return true;
+  },
+  dictReadHash: ({ key }) => {
+    const r = reader.dictReadConcat(key);
+    return { count: r.count, hash: fnv32([r.bytes]).hash };
   },
   cacheStats: () =>
     cache && {

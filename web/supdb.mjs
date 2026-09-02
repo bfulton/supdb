@@ -455,3 +455,169 @@ export async function fetchIntoOpfs(url, name) {
   handle.flush();
   return handle;
 }
+
+
+/// R6.3 -- the dictionary read by range, for an index too large to fetch
+/// whole. The reader holds the key section's header and fence (kilobytes)
+/// and reaches the directory and the records by plan; nothing else changes
+/// about the synchronous shape. Point reads are not on it: they would need
+/// the hash slots planned too, and nothing needs that yet.
+export class SparseReader {
+  constructor(mod, handle, cache) {
+    this.mod = mod;
+    this.handle = handle;
+    this.cache = cache;
+  }
+
+  get exports() {
+    return this.mod.instance.exports;
+  }
+
+  check(v, sentinel) {
+    const u = typeof v === "bigint" ? v : v >>> 0;
+    if (u === sentinel) throw new Error(this.mod.lastError());
+    return u;
+  }
+
+  get keys() {
+    return this.check(this.exports.supdb_keys(this.handle), 0xffffffff);
+  }
+
+  get indexBytes() {
+    return this.check(this.exports.supdb_index_bytes(this.handle), 0xffffffff);
+  }
+
+  get generation() {
+    return this.check(this.exports.supdb_generation(this.handle), 0xffffffff);
+  }
+
+  // Two keys in wasm memory at once. `hi === null` is "no upper bound",
+  // carried as a length of 0xffffffff.
+  withRange(lo, hi, f) {
+    const m = this.mod;
+    return m.withKey(lo, (lp, ll) => {
+      if (hi === null || hi === undefined) return f(lp, ll, 0, 0xffffffff);
+      return m.withKey(hi, (hp, hl) => f(lp, ll, hp, hl));
+    });
+  }
+
+  /// The plan for a range of the dictionary: phase 1 the directory slice,
+  /// phase 2 the records it names (phase 1 must be resident first).
+  /// Absolute, merged file ranges.
+  dictPlan(lo, hi, phase) {
+    this.withRange(lo, hi, (lp, ll, hp, hl) =>
+      this.check(this.exports.supdb_dict_plan(this.handle, lp, ll, hp, hl, phase), 0xffffffff),
+    );
+    return this.mod.ranges();
+  }
+
+  /// Fetch what a range needs, in its two phases. After this resolves,
+  /// `dictCounts` for the range runs synchronously with no miss.
+  async ensureDict(lo, hi) {
+    await this.cache.ensure(this.dictPlan(lo, hi, 1));
+    await this.cache.ensure(this.dictPlan(lo, hi, 2));
+  }
+
+  /// Every key in `[lo, hi)` with its count, in key order. `hi === null`
+  /// runs to the end of the dictionary.
+  dictCounts(lo, hi) {
+    const m = this.mod;
+    this.withRange(lo, hi, (lp, ll, hp, hl) =>
+      this.check(this.exports.supdb_dict_counts(this.handle, lp, ll, hp, hl), 0xffffffff),
+    );
+    const base = this.exports.supdb_out_ptr();
+    const dv = m.view;
+    const count = dv.getUint32(base, true);
+    const out = new Array(count);
+    let at = base + 4;
+    for (let i = 0; i < count; i++) {
+      const klen = dv.getUint32(at, true);
+      const lo32 = dv.getUint32(at + 4, true);
+      const hi32 = dv.getUint32(at + 8, true);
+      at += 12;
+      out[i] = {
+        key: m.dec.decode(m.mem.subarray(at, at + klen)),
+        count: hi32 * 0x100000000 + lo32,
+      };
+      at += klen;
+    }
+    return out;
+  }
+
+  /// The data ranges the values of every key in the range reach.
+  dictRanges(lo, hi) {
+    this.withRange(lo, hi, (lp, ll, hp, hl) =>
+      this.check(this.exports.supdb_dict_ranges(this.handle, lp, ll, hp, hl), 0xffffffff),
+    );
+    return this.mod.ranges();
+  }
+
+  /// `ensureDict`, then the blocks behind the range's values, so
+  /// `dictReadConcat` on any key in it cannot miss.
+  async ensureDictValues(lo, hi) {
+    await this.ensureDict(lo, hi);
+    await this.cache.ensure(this.dictRanges(lo, hi));
+  }
+
+  /// One key's values back to back with the count, as `readConcat`.
+  dictReadConcat(key) {
+    const m = this.mod;
+    const n = m.withKey(key, (p, l) =>
+      this.check(this.exports.supdb_dict_read_concat(this.handle, p, l), 0xffffffff),
+    );
+    if (n === 0) return { count: 0, bytes: new Uint8Array(0) };
+    const base = this.exports.supdb_out_ptr();
+    const count = m.view.getUint32(base, true);
+    return { count, bytes: m.mem.slice(base + 4, base + n) };
+  }
+
+  close() {
+    if (this.handle !== NO_HANDLE) {
+      this.exports.supdb_close(this.handle);
+      this.handle = NO_HANDLE;
+    }
+  }
+}
+
+/// Open a reader that never fetches the key index whole: the superblock
+/// probe, then the index header and block table, then the fence the header
+/// names -- three small round trips -- and every dictionary range after
+/// that is planned and fetched on demand.
+export async function openSparse(wasm, cache) {
+  let mem = null;
+  const host = {
+    supdb_host_len: () => cache.length,
+    supdb_host_read: (off, ptr, len) => {
+      try {
+        const tmp = new Uint8Array(len);
+        cache.readInto(off, tmp);
+        new Uint8Array(mem.buffer).set(tmp, ptr);
+        return 0;
+      } catch (e) {
+        cache.lastReadError = e;
+        return 1;
+      }
+    },
+  };
+  const instance = await instantiate(wasm, host);
+  mem = instance.exports.memory;
+  const mod = new Module(instance, "sparse");
+  const e = instance.exports;
+
+  const probe = e.supdb_open_probe();
+  await cache.ensure([[0, probe]]);
+  for (const phase of [1, 2]) {
+    const framed = e.supdb_open_sparse_plan(phase) >>> 0;
+    if (framed === 0xffffffff) {
+      const why = cache.lastReadError ? ` (${cache.lastReadError})` : "";
+      throw new Error(mod.lastError() + why);
+    }
+    await cache.ensure(mod.ranges());
+  }
+  const h = e.supdb_open_host_sparse() >>> 0;
+  if (h === 0xffffffff) {
+    const why = cache.lastReadError ? ` (${cache.lastReadError})` : "";
+    throw new Error(mod.lastError() + why);
+  }
+  return new SparseReader(mod, h, cache);
+}

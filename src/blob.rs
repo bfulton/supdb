@@ -1256,6 +1256,26 @@ fn fence_region(h: &flatindex::Header, sec_len: usize) -> Result<(usize, usize)>
     Ok((start, end - start))
 }
 
+/// `open_sparse_ranges`, reading the superblock through the source. For a
+/// host whose bytes are reached only by offset -- the wasm module -- so the
+/// two open plans need no bytes carried across the boundary.
+pub fn sparse_open_ranges_via<B: Bytes>(src: &B) -> Result<Vec<(u64, u64)>> {
+    let mut head = vec![0u8; open_probe() as usize];
+    src.read_at(0, &mut head)?;
+    open_sparse_ranges(&head, src.len())
+}
+
+/// `open_sparse_fence_ranges`, reading the superblock and the index header
+/// through the source; the first plan must be resident.
+pub fn sparse_fence_ranges_via<B: Bytes>(src: &B) -> Result<Vec<(u64, u64)>> {
+    let mut head = vec![0u8; open_probe() as usize];
+    src.read_at(0, &mut head)?;
+    let sb = pick_super(&head, src.len())?;
+    let mut hb = vec![0u8; (flatindex::HEADER_BYTES as u64).min(sb.key_stored) as usize];
+    src.read_at(sb.key_off, &mut hb)?;
+    open_sparse_fence_ranges(&head, src.len(), &hb)
+}
+
 /// A reader over an object whose key index it will not fetch whole.
 ///
 /// `Blob` copies the key index and block table at open and answers every

@@ -28,7 +28,7 @@
 //! will hand it, and keeping it out of BigInt keeps the JS glue plain. An
 //! object at or over the limit is refused at open rather than wrapped.
 
-use crate::blob::Blob;
+use crate::blob::{Blob, SparseBlob};
 use crate::bytes::{short, Bytes, VecBytes};
 use std::cell::RefCell;
 use std::io::Result;
@@ -89,6 +89,19 @@ impl Bytes for HostBytes {
 enum AnyBlob {
     Mem(Blob<VecBytes>),
     Host(Blob<HostBytes>),
+    /// A reader that holds the index header and fence only and reads the
+    /// dictionary by range (R6.3). Point reads are not on it, on purpose.
+    Sparse(SparseBlob<HostBytes>),
+}
+
+fn sparse_only(what: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "{what}: this reader was opened sparse and holds no hash slots; read the \
+             dictionary by range (supdb_dict_*), or open it whole"
+        ),
+    )
 }
 
 /// Everything the module holds between calls.
@@ -313,8 +326,35 @@ macro_rules! on {
         match $b {
             AnyBlob::Mem(x) => x.$m($($a),*),
             AnyBlob::Host(x) => x.$m($($a),*),
+            AnyBlob::Sparse(_) => return Err(sparse_only(stringify!($m))),
         }
     };
+}
+
+/// The methods every reader kind answers.
+macro_rules! any {
+    ($b:expr, $m:ident $(, $a:expr)*) => {
+        match $b {
+            AnyBlob::Mem(x) => x.$m($($a),*),
+            AnyBlob::Host(x) => x.$m($($a),*),
+            AnyBlob::Sparse(x) => x.$m($($a),*),
+        }
+    };
+}
+
+/// The sparse reader alone, bound once for a call that uses it inside a
+/// callback, where an early return cannot carry an error.
+fn as_sparse<'a>(b: &'a AnyBlob, what: &str) -> Result<&'a SparseBlob<HostBytes>> {
+    match b {
+        AnyBlob::Sparse(x) => Ok(x),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "{what}: this reader holds its whole index; the dictionary range calls are for \
+                 a reader opened with supdb_open_host_sparse"
+            ),
+        )),
+    }
 }
 
 /// The data ranges a read of these keys will touch. R6.2.
@@ -370,19 +410,19 @@ pub unsafe extern "C" fn supdb_ranges(h: u32, ptr: *const u8, len: u32) -> u32 {
 /// Number of distinct keys. R4.5.
 #[no_mangle]
 pub extern "C" fn supdb_keys(h: u32) -> u32 {
-    with_blob(h, u32::MAX, |b, _| Ok(on!(b, keys) as u32))
+    with_blob(h, u32::MAX, |b, _| Ok(any!(b, keys) as u32))
 }
 
 /// Bytes of key index. R4.5.
 #[no_mangle]
 pub extern "C" fn supdb_index_bytes(h: u32) -> u32 {
-    with_blob(h, u32::MAX, |b, _| Ok(on!(b, index_bytes) as u32))
+    with_blob(h, u32::MAX, |b, _| Ok(any!(b, index_bytes) as u32))
 }
 
 /// Checkpoint generation this reader opened.
 #[no_mangle]
 pub extern "C" fn supdb_generation(h: u32) -> u32 {
-    with_blob(h, u32::MAX, |b, _| Ok(on!(b, version).0 as u32))
+    with_blob(h, u32::MAX, |b, _| Ok(any!(b, version).0 as u32))
 }
 
 /// Values under a key, without decoding them. R4.3.
@@ -540,6 +580,224 @@ pub unsafe extern "C" fn supdb_scan_counts_fixed(
                 true
             }
         )?;
+        out[0..4].copy_from_slice(&(n as u32).to_le_bytes());
+        Ok(out.len() as u32)
+    })
+}
+
+// ------------------------------------------------------- sparse dictionary --
+//
+// R6.3: the key index fetched by range, for a dictionary too large to fetch
+// whole. Open is two plans, a range is two plans, and every plan is exactly
+// what the read after it touches (`tests/dict.rs`). The ranges come out
+// framed like `supdb_open_plan`; the counts like `supdb_scan_counts`.
+
+/// The open plan for a sparse reader over the host's bytes. `phase` 1 names
+/// the superblock probe, the index header, the block table and the log
+/// word; `phase` 2, once those are resident, names the fence. Returns the
+/// framed length, or `u32::MAX` on error.
+#[no_mangle]
+pub extern "C" fn supdb_open_sparse_plan(phase: u32) -> u32 {
+    let src = HostBytes::new();
+    let r = match phase {
+        1 => crate::blob::sparse_open_ranges_via(&src),
+        2 => crate::blob::sparse_fence_ranges_via(&src),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "supdb_open_sparse_plan: phase is 1 or 2",
+        )),
+    };
+    match r {
+        Ok(ranges) => STATE.with(|s| {
+            let mut st = s.borrow_mut();
+            st.err.clear();
+            let mut out = std::mem::take(&mut st.out);
+            let n = frame_ranges(&ranges, &mut out);
+            st.out = out;
+            n
+        }),
+        Err(e) => fail(e.to_string(), u32::MAX),
+    }
+}
+
+/// Open a sparse reader over the host's bytes; both open plans must be
+/// resident. Returns a handle, or `u32::MAX`.
+#[no_mangle]
+pub extern "C" fn supdb_open_host_sparse() -> u32 {
+    let src = HostBytes::new();
+    if src.len() >= MAX_OBJECT {
+        return fail(
+            format!(
+                "this ABI addresses objects below {MAX_OBJECT} bytes and the host offered {}",
+                src.len()
+            ),
+            u32::MAX,
+        );
+    }
+    match SparseBlob::open(src) {
+        Ok(b) => put(AnyBlob::Sparse(b)),
+        Err(e) => fail(e.to_string(), u32::MAX),
+    }
+}
+
+/// A key range as the dictionary calls take it: `lo` inclusive, `hi`
+/// exclusive, and `hlen == u32::MAX` for no upper bound at all.
+unsafe fn range_args<'a>(
+    lptr: *const u8,
+    llen: u32,
+    hptr: *const u8,
+    hlen: u32,
+) -> (&'a [u8], Option<&'a [u8]>) {
+    let lo = std::slice::from_raw_parts(lptr, llen as usize);
+    let hi = if hlen == u32::MAX {
+        None
+    } else {
+        Some(std::slice::from_raw_parts(hptr, hlen as usize))
+    };
+    (lo, hi)
+}
+
+/// The plan for a dictionary range: `phase` 1 is the directory slice
+/// (reads nothing), `phase` 2 the records it names (reads the slice, which
+/// must be resident). Framed ranges, or `u32::MAX`.
+///
+/// # Safety
+/// `lptr` must point at `llen` readable bytes, and `hptr` at `hlen` unless
+/// `hlen` is `u32::MAX`.
+#[no_mangle]
+pub unsafe extern "C" fn supdb_dict_plan(
+    h: u32,
+    lptr: *const u8,
+    llen: u32,
+    hptr: *const u8,
+    hlen: u32,
+    phase: u32,
+) -> u32 {
+    let (lo, hi) = range_args(lptr, llen, hptr, hlen);
+    with_blob(h, u32::MAX, |b, out| {
+        let sb = as_sparse(b, "supdb_dict_plan")?;
+        let ranges = match phase {
+            1 => sb.dictionary_plan(lo, hi),
+            2 => sb.dictionary_plan_records(lo, hi)?,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "supdb_dict_plan: phase is 1 or 2",
+                ))
+            }
+        };
+        Ok(frame_ranges(&ranges, out))
+    })
+}
+
+/// Every key in the range with its count, framed like `supdb_scan_counts`.
+/// Both range plans must be resident.
+///
+/// # Safety
+/// As `supdb_dict_plan`.
+#[no_mangle]
+pub unsafe extern "C" fn supdb_dict_counts(
+    h: u32,
+    lptr: *const u8,
+    llen: u32,
+    hptr: *const u8,
+    hlen: u32,
+) -> u32 {
+    let (lo, hi) = range_args(lptr, llen, hptr, hlen);
+    with_blob(h, u32::MAX, |b, out| {
+        let sb = as_sparse(b, "supdb_dict_counts")?;
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let n = sb.dictionary_counts(lo, hi, |k: &[u8], c: u64| {
+            out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(c as u32).to_le_bytes());
+            out.extend_from_slice(&((c >> 32) as u32).to_le_bytes());
+            out.extend_from_slice(k);
+            true
+        })?;
+        out[0..4].copy_from_slice(&(n as u32).to_le_bytes());
+        Ok(out.len() as u32)
+    })
+}
+
+/// The data ranges the values of every key in the range reach -- the
+/// blocks behind their non-inline runs, merged -- so a caller can ensure
+/// them before `supdb_dict_read_concat`. Both range plans must be resident.
+///
+/// # Safety
+/// As `supdb_dict_plan`.
+#[no_mangle]
+pub unsafe extern "C" fn supdb_dict_ranges(
+    h: u32,
+    lptr: *const u8,
+    llen: u32,
+    hptr: *const u8,
+    hlen: u32,
+) -> u32 {
+    let (lo, hi) = range_args(lptr, llen, hptr, hlen);
+    with_blob(h, u32::MAX, |b, out| {
+        let sb = as_sparse(b, "supdb_dict_ranges")?;
+        let mut all: Vec<(u64, u64)> = Vec::new();
+        let mut failed: Option<std::io::Error> = None;
+        sb.dictionary_walk(lo, hi, |_, exts, _| {
+            match sb.ranges_for_exts(exts) {
+                Ok(r) => all.extend(r),
+                Err(e) => {
+                    failed = Some(e);
+                    return false;
+                }
+            }
+            true
+        })?;
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        all.sort_unstable();
+        // Merge the overlapping and the adjacent, as every plan is.
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (off, len) in all {
+            match merged.last_mut() {
+                Some(last) if off <= last.0 + last.1 => {
+                    let end = (off + len).max(last.0 + last.1);
+                    last.1 = end - last.0;
+                }
+                _ => merged.push((off, len)),
+            }
+        }
+        Ok(frame_ranges(&merged, out))
+    })
+}
+
+/// One key's values back to back, framed like `supdb_read_concat`, found by
+/// walking the one-key range `[key, key+1)`. Its range plans and, for a
+/// block-backed run, its data ranges must be resident.
+///
+/// # Safety
+/// `kptr` must point at `klen` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn supdb_dict_read_concat(h: u32, kptr: *const u8, klen: u32) -> u32 {
+    let key = std::slice::from_raw_parts(kptr, klen as usize);
+    with_blob(h, u32::MAX, |b, out| {
+        let sb = as_sparse(b, "supdb_dict_read_concat")?;
+        let mut hi = key.to_vec();
+        hi.push(0);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let mut n = 0u64;
+        let mut failed: Option<std::io::Error> = None;
+        sb.dictionary_walk(key, Some(hi.as_slice()), |k, exts, tail| {
+            if k != key {
+                return true;
+            }
+            if let Err(e) = sb.read_exts(exts, tail, |v: &[u8]| {
+                n += 1;
+                out.extend_from_slice(v);
+            }) {
+                failed = Some(e);
+            }
+            false
+        })?;
+        if let Some(e) = failed {
+            return Err(e);
+        }
         out[0..4].copy_from_slice(&(n as u32).to_le_bytes());
         Ok(out.len() as u32)
     })
