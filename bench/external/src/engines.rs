@@ -405,18 +405,30 @@ pub struct Next {
     /// the trade is measured in ONE interleaved run rather than compared
     /// across two, which is the whole reason this suite interleaves.
     partition: bool,
+    /// Whether `sync` drains -- seals the last memtable and partitions what
+    /// it sealed inside the load window -- or only makes the WAL durable and
+    /// leaves the tail in memory, as RocksDB's `sync` does. f60 found the
+    /// drain to be 11% of the canonical window and the whole of the seal
+    /// phase, so both shapes are arms (drain-plan.md).
+    drain: bool,
 }
 
 impl Next {
     pub fn create(path: &Path) -> Res<Next> {
-        Next::with_policy(path, true)
+        Next::with_policy(path, true, true)
     }
 
     pub fn create_ingest(path: &Path) -> Res<Next> {
-        Next::with_policy(path, false)
+        Next::with_policy(path, false, true)
     }
 
-    fn with_policy(path: &Path, partition: bool) -> Res<Next> {
+    /// `sync` fsyncs and seals nothing; reads then answer from the
+    /// memtable, the unrouted tail and the partitions together.
+    pub fn create_nodrain(path: &Path) -> Res<Next> {
+        Next::with_policy(path, true, false)
+    }
+
+    fn with_policy(path: &Path, partition: bool, drain: bool) -> Res<Next> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         // Checksums off in the segments, because LMDB has none and the axis
         // is equalizable -- the same call `supdb-durable` makes, and the
@@ -444,16 +456,16 @@ impl Next {
             ..Default::default()
         };
         let db = supdb::next::Db::create(path, opts).map_err(|e| e.to_string())?;
-        Ok(Next { db: Some(db), path: path.to_path_buf(), partition })
+        Ok(Next { db: Some(db), path: path.to_path_buf(), partition, drain })
     }
 }
 
 impl Engine for Next {
     fn name(&self) -> &'static str {
-        if self.partition {
-            "next"
-        } else {
-            "next-ingest"
+        match (self.partition, self.drain) {
+            (true, true) => "next",
+            (false, _) => "next-ingest",
+            (true, false) => "next-nodrain",
         }
     }
     fn features(&self) -> Features {
@@ -494,14 +506,19 @@ impl Engine for Next {
     }
     fn sync(&mut self) -> Res<()> {
         if let Some(db) = self.db.as_mut() {
-            // Commit AND drain. The seal cost lands in the load window,
-            // which is honest -- it is work the engine owes -- and it means
-            // the read phase answers from segments on both sides of the
-            // comparison. A next arm that served half its keys out of a
-            // resident hash memtable would be reading a different thing
-            // from the engine it is measured against, and an earlier
-            // version of this file did exactly that.
-            db.flush().map_err(|e| e.to_string())?;
+            // The default drains: commit AND seal AND partition, so the seal
+            // cost lands in the load window and the read phase answers from
+            // routed segments. That was chosen so a next arm would not read
+            // half its keys out of a resident memtable while LMDB read a
+            // tree -- but RocksDB's sync is an fsync of its WAL and its
+            // reads go through its memtable and level 0, so against it the
+            // drain is a residual the next engine pays alone. `next-nodrain`
+            // is the arm matched to that; both are measured.
+            if self.drain {
+                db.flush().map_err(|e| e.to_string())?;
+            } else {
+                db.sync().map_err(|e| e.to_string())?;
+            }
         }
         Ok(())
     }
@@ -631,12 +648,16 @@ pub struct Rocks {
     path: PathBuf,
     sync: bool,
     tuned: bool,
+    /// Whether `sync` flushes the memtable and compacts everything, so the
+    /// load window carries the same drain the next engine's default does
+    /// and the reads run against a fully compacted tree.
+    drain: bool,
     read: rocksdb::ReadOptions,
 }
 
 impl Rocks {
     pub fn create(path: &Path, sync: bool) -> Res<Rocks> {
-        Rocks::with(path, sync, false)
+        Rocks::with(path, sync, false, false)
     }
 
     /// The deployed shape rather than the shipped one, stated in full so the
@@ -648,10 +669,17 @@ impl Rocks {
     /// the point is what RocksDB's read path costs when it is not starved of
     /// cache, not a tuning contest.
     pub fn create_tuned(path: &Path) -> Res<Rocks> {
-        Rocks::with(path, true, true)
+        Rocks::with(path, true, true, false)
     }
 
-    fn with(path: &Path, sync: bool, tuned: bool) -> Res<Rocks> {
+    /// Tuned, and drained at `sync`: memtable flushed, every level
+    /// compacted into one, inside the window -- the next engine's default
+    /// shape, charged to RocksDB.
+    pub fn create_tuned_drain(path: &Path) -> Res<Rocks> {
+        Rocks::with(path, true, true, true)
+    }
+
+    fn with(path: &Path, sync: bool, tuned: bool, drain: bool) -> Res<Rocks> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         let mut o = rocksdb::Options::default();
         o.create_if_missing(true);
@@ -669,16 +697,17 @@ impl Rocks {
         let db = rocksdb::DB::open(&o, path).map_err(|e| e.to_string())?;
         let mut read = rocksdb::ReadOptions::default();
         read.set_verify_checksums(false);
-        Ok(Rocks { db, path: path.to_path_buf(), sync, tuned, read })
+        Ok(Rocks { db, path: path.to_path_buf(), sync, tuned, drain, read })
     }
 }
 
 impl Engine for Rocks {
     fn name(&self) -> &'static str {
-        match (self.sync, self.tuned) {
-            (_, true) => "rocksdb-tuned",
-            (true, false) => "rocksdb",
-            (false, false) => "rocksdb-nosync",
+        match (self.sync, self.tuned, self.drain) {
+            (_, true, true) => "rocksdb-tuned-drain",
+            (_, true, false) => "rocksdb-tuned",
+            (true, false, _) => "rocksdb",
+            (false, false, _) => "rocksdb-nosync",
         }
     }
     fn features(&self) -> Features {
@@ -739,6 +768,11 @@ impl Engine for Rocks {
         // memtable; RocksDB reads it, so nothing more is needed for
         // "readable", and flushing it would charge this arm a compaction
         // the others do not pay at this point.
+        if self.drain {
+            self.db.flush().map_err(|e| e.to_string())?;
+            self.db.compact_range::<&[u8], &[u8]>(None, None);
+            return Ok(());
+        }
         self.db.flush_wal(true).map_err(|e| e.to_string())
     }
     fn size_bytes(&self) -> u64 {

@@ -96,6 +96,10 @@ fn build(root: &std::path::Path, which: &[&str], buffer_mb: usize) -> Vec<Box<dy
                 Rocks::create(&dir, false).map(|e| Box::new(e) as Box<dyn Engine>)
             }
             "rocksdb-tuned" => Rocks::create_tuned(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
+            "rocksdb-tuned-drain" => {
+                Rocks::create_tuned_drain(&dir).map(|e| Box::new(e) as Box<dyn Engine>)
+            }
+            "next-nodrain" => Next::create_nodrain(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
             other => Err(format!("unknown engine {other}")),
         };
         match e {
@@ -268,7 +272,16 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
     // How much each engine cares about arrival order, which is the property
     // rather than the ranking. Same engine, same guarantees, same key set --
     // so nothing needs matching and there is no residual to bound.
-    for name in ["supdb-buffered", "lmdb-nosync", "supdb", "lmdb", "next", "rocksdb", "rocksdb-tuned"] {
+    for name in [
+        "supdb-buffered",
+        "lmdb-nosync",
+        "supdb",
+        "lmdb",
+        "next",
+        "next-nodrain",
+        "rocksdb",
+        "rocksdb-tuned",
+    ] {
         let (Some(a), Some(b)) = (idx(name, false), idx(name, true)) else {
             continue;
         };
@@ -353,8 +366,12 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
     // And against RocksDB, which an arrival order should not move much: the
     // comparison EXT.27 needed before it could mean more than "an LSM beats
     // a B-tree under per-batch fsync".
-    for (id, rocks) in [("EXT.31", "rocksdb"), ("EXT.35", "rocksdb-tuned")] {
-        let (Some(ns), Some(rs)) = (idx("next", true), idx(rocks, true)) else {
+    for (id, mine, rocks) in [
+        ("EXT.31", "next", "rocksdb"),
+        ("EXT.35", "next", "rocksdb-tuned"),
+        ("EXT.41", "next-nodrain", "rocksdb-tuned"),
+    ] {
+        let (Some(ns), Some(rs)) = (idx(mine, true), idx(rocks, true)) else {
             continue;
         };
         if !load[ns].is_empty() && !load[rs].is_empty() {
@@ -370,7 +387,7 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
                 } else {
                     let cmp = compare(&load[ns], &load[rs], supdb::bench::MIN_EFFECT);
                     rec.compare(&format!("{id}_shuffled"), cmp.clone());
-                    let seq = idx("next", false).zip(idx(rocks, false));
+                    let seq = idx(mine, false).zip(idx(rocks, false));
                     let seq_ratio = seq
                         .map(|(a, b)| load[a].median() / load[b].median().max(1e-9))
                         .unwrap_or(f64::NAN);
@@ -386,7 +403,7 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
                              move neither much",
                             load[ns].median(),
                             load[rs].median(),
-                            cmp.summary("next", rocks)
+                            cmp.summary(mine, rocks)
                         ),
                     ));
                 }
@@ -977,6 +994,61 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         "rocksdb-tuned",
         &scan,
         "entries/s",
+        false,
+    );
+    // The drain matched both ways (f60, drain-plan.md). Default `next`
+    // seals and partitions inside its load window; RocksDB's sync is an
+    // fsync. So: both drained -- RocksDB flushed and compacted at sync --
+    // and neither drained -- next's sync an fsync, its tail read out of the
+    // memtable and the unrouted level as RocksDB's is.
+    ordering_of(
+        &mut rec,
+        "EXT.36",
+        "The next engine loads faster than tuned RocksDB when both drain at sync",
+        "next",
+        "rocksdb-tuned-drain",
+        &load,
+        "ops/s",
+        true,
+    );
+    ordering_of(
+        &mut rec,
+        "EXT.37",
+        "The next engine loads faster than tuned RocksDB when neither drains at sync",
+        "next-nodrain",
+        "rocksdb-tuned",
+        &load,
+        "ops/s",
+        true,
+    );
+    ordering_of(
+        &mut rec,
+        "EXT.38",
+        "The next engine reads faster than tuned RocksDB when neither drained",
+        "next-nodrain",
+        "rocksdb-tuned",
+        &read,
+        "reads/s",
+        false,
+    );
+    ordering_of(
+        &mut rec,
+        "EXT.39",
+        "The next engine scans no slower than tuned RocksDB when neither drained",
+        "next-nodrain",
+        "rocksdb-tuned",
+        &scan,
+        "entries/s",
+        false,
+    );
+    ordering_of(
+        &mut rec,
+        "EXT.40",
+        "The next engine reads faster than tuned RocksDB when both drained",
+        "next",
+        "rocksdb-tuned-drain",
+        &read,
+        "reads/s",
         false,
     );
     // Durability does not touch a read or a scan, so these need only the

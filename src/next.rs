@@ -2614,6 +2614,17 @@ impl Db {
         Ok(())
     }
 
+    /// Make everything written durable and seal nothing: the WAL's pending
+    /// frames written and fsynced, the memtable left where it is. What a
+    /// caller wants when it has stopped writing for now and will read the
+    /// tail out of memory; `flush` is the other answer, and f60 priced the
+    /// difference at 11% of a canonical load window (sealwait-plan.md).
+    pub fn sync(&mut self) -> Result<()> {
+        self.wal.commit()?;
+        self.unsynced = 0;
+        Ok(())
+    }
+
     /// Commit, seal, and wait for the segment: the full drain, for a caller
     /// entering a read-heavy phase. `seal` alone leaves the frozen memtable
     /// readable until an eventual join, which is right for a writer that
