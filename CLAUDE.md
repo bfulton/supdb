@@ -182,6 +182,15 @@ and the shuffled load **2.37x** (`EXT.41`), with both draining 0.815x
 of a routed one (2.9M against 24.7M entries/s, `EXT.39`), which is the
 k-way merge over unrouted sources and the next lever on the read path.
 
+On YCSB, matched and undrained (`EXT.42`-`EXT.45`, five repetitions):
+update-heavy A **1.74x**, read-only C **2.45x**, short-scan E **1.28x**,
+read-modify-write F **2.20x** against tuned RocksDB, every update a
+replacing `put` in a durable 100-record batch. The first run of that
+suite read 0.14x on A because the adapter's `write_batch` appends, which
+is the load verb and not an update; the row is not recorded and the
+lesson is in ycsb-plan.md. On E the undrained arm trails its own drained
+shape 4.3x and LMDB 9x: the unrouted scan, once more.
+
 Under shuffled arrival the same matched pair inverts. `EXT.27`
 (`ext-loadshape`, full) has the next engine at 284,938 ops/s against
 LMDB's 48,041, **5.93x** (6.64x replicated with the borrowed batch),

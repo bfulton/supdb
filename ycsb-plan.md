@@ -29,3 +29,24 @@ durably, one million records and operations at `full`.
 P44 above 1x says the merge is not what a fifty-entry scan pays; P43
 under 3x says the read lead needs the drained shape after all, which
 EXT.38 said it does not.
+
+## Outcome (full, `results/ext-ycsb.full.json`, five repetitions)
+
+First run: the next adapter's `write_batch` appends, and YCSB's updates
+through it piled every Zipfian rewrite onto its key until each read
+walked the pile -- 21,678 ops/s on A. Not recorded. `Db::put` replaces
+and the harness's `update_batch` goes through it; the run below is with
+that.
+
+| pair, next-nodrain against rocksdb-tuned | ratio | predicted |
+|---|---|---|
+| A update-heavy | **1.74x** | a tie |
+| C read-only | **2.45x** | 3-6x |
+| E short scans | **1.28x** | RocksDB or a tie |
+| F read-modify-write | **2.20x** | 0.9-1.3x |
+
+All four hold, three refuted upward and one downward. Two things beside
+them: the drained arm beats the undrained one on every workload (A
+305k, C 2.47M, E 132k, F 272k), and on E the undrained arm is 4.3x
+behind its own drained shape and 9x behind LMDB -- the unrouted scan,
+again, on fifty-entry ranges. EXT.3 stays holding (1.5x).

@@ -1709,6 +1709,34 @@
    "profile": "full",
    "expect": "fails",
    "because": "Routed against undrained with the new merge: 16.1x, where P62.4 asked for 4x and f61 read 19.1x. The undrained scan is the open lever it was; the merge rewrite was worth 1.4x of it."
+  },
+  {
+   "experiment": "ext-ycsb",
+   "id": "EXT.42",
+   "profile": "full",
+   "expect": "holds",
+   "because": "YCSB-A, 50/50 update-heavy Zipfian: 249,843 ops/s against tuned RocksDB's 143,376, 1.743x at p=0.012. P42 predicted a tie and was refuted upward: half the operations are 100-record durable batches at one fsync each on either side, and the other half are reads at the next engine's advantage, which is where the margin comes from. The drained arm reads 304,847 on the same workload; LMDB, durable per batch, 68,314, since a batch of a hundred Zipfian updates dirties about as many leaf pages. next-nodrain against rocksdb-tuned, both durable per 100-record batch, both undrained after their load, five repetitions interleaved with a fresh load each; the next engine's updates go through Db::put (a delete and an append in one batch), since its append verb piled Zipfian rewrites onto hot keys in the first run and is not what an update means."
+  },
+  {
+   "experiment": "ext-ycsb",
+   "id": "EXT.43",
+   "profile": "full",
+   "expect": "holds",
+   "because": "YCSB-C, read-only Zipfian: 1,403,537 ops/s against 572,564, 2.451x at p=0.012; P43 said 3x to 6x and was refuted downward. The Zipfian skew keeps RocksDB's block cache and memtable hot on the head of the distribution, which is where the point-read gap is narrowest; the drained arm reads 2,474,159 on the same workload (4.3x). next-nodrain against rocksdb-tuned, both durable per 100-record batch, both undrained after their load, five repetitions interleaved with a fresh load each; the next engine's updates go through Db::put (a delete and an append in one batch), since its append verb piled Zipfian rewrites onto hot keys in the first run and is not what an update means."
+  },
+  {
+   "experiment": "ext-ycsb",
+   "id": "EXT.44",
+   "profile": "full",
+   "expect": "holds",
+   "because": "YCSB-E, 95% short scans of fifty entries with 5% inserts: 30,710 ops/s against 23,930, 1.283x at p=0.012. P44 said RocksDB or a tie and was refuted upward, but only just, and the row beside it is the finding: the drained arm scans at 131,668 on the same workload and LMDB at 284,547. The undrained scan -- a seek and the k-way merge for every fifty-entry range -- is the same lever EXT.39 and f61/f62 name, and here it costs the next engine 4.3x against itself. next-nodrain against rocksdb-tuned, both durable per 100-record batch, both undrained after their load, five repetitions interleaved with a fresh load each; the next engine's updates go through Db::put (a delete and an append in one batch), since its append verb piled Zipfian rewrites onto hot keys in the first run and is not what an update means."
+  },
+  {
+   "experiment": "ext-ycsb",
+   "id": "EXT.45",
+   "profile": "full",
+   "expect": "holds",
+   "because": "YCSB-F, read-modify-write: 216,510 ops/s against 98,421, 2.200x at p=0.012 (rel_iqr 5%/34%); P45 said 0.9x to 1.3x and was refuted upward. Each operation is a read and a write in a durable batch; the read half decides it. The drained arm reads 271,944, LMDB 67,415. next-nodrain against rocksdb-tuned, both durable per 100-record batch, both undrained after their load, five repetitions interleaved with a fresh load each; the next engine's updates go through Db::put (a delete and an append in one batch), since its append verb piled Zipfian rewrites onto hot keys in the first run and is not what an update means."
   }
  ],
  "metrics": [
