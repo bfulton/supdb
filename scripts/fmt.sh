@@ -23,7 +23,18 @@ cd "$(dirname "$0")/.."
 VENDORED="src/block.rs src/freelist.rs src/index.rs src/flatindex.rs src/keytable.rs src/readers.rs src/store.rs"
 
 if [ "${1:-}" = "--check" ]; then
-  out=$(cargo fmt --all -- --check 2>&1 || true)
+  # Two different nonzero exits hide behind one status: "formatting differs",
+  # which prints `Diff in` lines and is the thing being filtered, and "could
+  # not run" -- no toolchain, a parse error, a rustfmt crash -- which prints
+  # none. Swallowing both with `|| true` made the second a silent pass, which
+  # is a gate that reports green for never having run.
+  out=$(cargo fmt --all -- --check 2>&1) && status=0 || status=$?
+  if [ "$status" -ne 0 ] && ! printf '%s\n' "$out" | grep -q "^Diff in "; then
+    printf '%s\n' "$out"
+    echo
+    echo "cargo fmt exited $status without reporting a diff: it did not run"
+    exit "$status"
+  fi
   rest=$(printf '%s\n' "$out" | awk -v vendored="$VENDORED" '
     BEGIN { n = split(vendored, v, " ") }
     /^Diff in / {
