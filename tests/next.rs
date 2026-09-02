@@ -864,3 +864,49 @@ fn ordered_pieces_are_promoted_to_partitions_without_a_merge() {
     names.sort();
     assert!(names.iter().all(|n| n.starts_with("par-")), "every segment is a partition: {names:?}");
 }
+
+#[test]
+fn a_wal_header_torn_by_power_loss_opens_and_is_rewritten() {
+    // A seal rotates to a fresh WAL whose eight-byte header has been
+    // written and not synced -- nothing in it has, until the first commit
+    // into it. A power loss there leaves a prefix of the header, and the
+    // store must open on its segments alone, then write a whole header
+    // before appending. c4-crash tears exactly this in a third of its
+    // trials; this is the one-shot version.
+    let d = dir("torn-header");
+    let opts = NextOptions { seal_bytes: 1 << 10, ..NextOptions::default() };
+    let newest_wal = |d: &std::path::Path| -> std::path::PathBuf {
+        let mut wals: Vec<std::path::PathBuf> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("wal-"))
+            .collect();
+        wals.sort();
+        wals.last().unwrap().clone()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    for i in 0u32..64 {
+        db.append(format!("k{i:03}").as_bytes(), &[7u8; 64]);
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    drop(db);
+    for (round, cut) in [0u64, 1, 3, 7].into_iter().enumerate() {
+        let live = newest_wal(&d);
+        assert_eq!(std::fs::metadata(&live).unwrap().len(), 8, "a rotated WAL holds only its header");
+        std::fs::OpenOptions::new().write(true).open(&live).unwrap().set_len(cut).unwrap();
+        let mut db = Db::open(&d, opts.clone()).unwrap();
+        for i in 0u32..64 {
+            assert_eq!(read_vec(&db, format!("k{i:03}").as_bytes()), vec![vec![7u8; 64]]);
+        }
+        let key = format!("after{round}");
+        db.append(key.as_bytes(), b"x");
+        db.commit().unwrap();
+        drop(db);
+        let mut db = Db::open(&d, opts.clone()).unwrap();
+        assert_eq!(read_vec(&db, key.as_bytes()), vec![b"x".to_vec()], "cut {cut}: the header was rewritten whole");
+        // Seal so the next round starts from a header-only live WAL again.
+        db.flush().unwrap();
+        drop(db);
+    }
+}

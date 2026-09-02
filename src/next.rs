@@ -222,6 +222,12 @@ struct Wal {
     seq: u64,
     /// Buffered frames since the last commit.
     pending: Vec<u8>,
+    /// Bytes handed to the file so far, and how many of them were behind a
+    /// barrier at the last `sync`. The difference is exactly what a power
+    /// loss may take, and `Db::wal_durable` reports it so a crash
+    /// experiment can take it (c4-crash).
+    written: u64,
+    synced: u64,
 }
 
 /// The WAL file starts with this, so a file from before frames carried a
@@ -237,7 +243,14 @@ impl Wal {
     fn create(path: &Path) -> Result<Wal> {
         let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
         file.write_all(WAL_MAGIC)?;
-        Ok(Wal { file, path: path.to_path_buf(), seq: 0, pending: Vec::new() })
+        Ok(Wal {
+            file,
+            path: path.to_path_buf(),
+            seq: 0,
+            pending: Vec::new(),
+            written: WAL_MAGIC.len() as u64,
+            synced: 0,
+        })
     }
 
     /// Reopen a WAL for appending at `seq`, after replay has truncated it to
@@ -245,10 +258,16 @@ impl Wal {
     /// so the next replay finds one.
     fn open_append(path: &Path, seq: u64) -> Result<Wal> {
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        if file.metadata()?.len() == 0 {
+        let mut written = file.metadata()?.len();
+        if written == 0 {
             file.write_all(WAL_MAGIC)?;
+            written = WAL_MAGIC.len() as u64;
         }
-        Ok(Wal { file, path: path.to_path_buf(), seq, pending: Vec::new() })
+        // What replay kept was read back from the device, so it counts as
+        // synced; a header written just now does not until the first
+        // barrier.
+        let synced = if written == WAL_MAGIC.len() as u64 { 0 } else { written };
+        Ok(Wal { file, path: path.to_path_buf(), seq, pending: Vec::new(), written, synced })
     }
 
     /// One frame: `len u32 | crc u32 | seq u64 | kind u8 | payload`, where a
@@ -301,12 +320,15 @@ impl Wal {
             return Ok(());
         }
         self.file.write_all(&self.pending)?;
+        self.written += self.pending.len() as u64;
         self.pending.clear();
         Ok(())
     }
 
     fn sync(&mut self) -> Result<()> {
-        self.file.sync_data()
+        self.file.sync_data()?;
+        self.synced = self.written;
+        Ok(())
     }
 
     /// Replay committed batches: `apply(kind, key, value)` for every record
@@ -335,7 +357,17 @@ impl Wal {
         if buf.is_empty() {
             return Ok((from, 0));
         }
-        if buf.len() < WAL_MAGIC.len() || &buf[..WAL_MAGIC.len()] != WAL_MAGIC {
+        // A file shorter than the header but a prefix of it is a header a
+        // power loss tore before its first barrier -- a WAL with nothing in
+        // it, not a foreign one. The caller truncates it and the header is
+        // rewritten.
+        if buf.len() < WAL_MAGIC.len() {
+            if WAL_MAGIC.starts_with(&buf) {
+                return Ok((from, 0));
+            }
+            return Err(err("not a next-engine WAL: the header is missing or from an older format"));
+        }
+        if &buf[..WAL_MAGIC.len()] != WAL_MAGIC {
             return Err(err("not a next-engine WAL: the header is missing or from an older format"));
         }
         let mut p = WAL_MAGIC.len();
@@ -2175,9 +2207,9 @@ impl Db {
         // A batch that never committed is cut off before anything is
         // appended behind it: left in place, its records would sit in front
         // of the next batch's commit frame and be adopted by it.
-        if valid_len > 0 {
-            let f = OpenOptions::new().write(true).open(&wal_path)?;
-            if f.metadata()?.len() > valid_len {
+        if let Ok(md) = std::fs::metadata(&wal_path) {
+            if md.len() > valid_len {
+                let f = OpenOptions::new().write(true).open(&wal_path)?;
                 f.set_len(valid_len)?;
                 f.sync_data()?;
             }
@@ -2282,6 +2314,11 @@ impl Db {
             &mut self.wal,
             Wal::create(&Db::wal_path(&self.dir, self.wal_id + 1))?,
         );
+        // The new file's directory entry is made durable now, not at the
+        // end of the seal: commits into it are acknowledged from here on,
+        // and an fdatasync of the file does not promise the entry that
+        // names it. One directory barrier per seal, off the per-commit path.
+        File::open(&self.dir)?.sync_all()?;
         self.wal_id += 1;
         self.wal.seq = old_wal.seq;
         // The live partition fences, if any. A seal splits the memtable at
@@ -3222,6 +3259,21 @@ impl Db {
     /// touch" is the whole question.
     pub fn levels(&self) -> (usize, usize) {
         (self.segs.len() - self.l0_len(), self.l0_len())
+    }
+
+    /// Whether a seal and a merge are running right now. A crash experiment
+    /// records the state it died in with these (c4-crash).
+    pub fn in_flight(&self) -> (bool, bool) {
+        (self.sealing.is_some(), self.compacting.is_some())
+    }
+
+    /// The live WAL: its path, the bytes of it behind a barrier, and the
+    /// bytes written to it. Everything between the two is what a power loss
+    /// may take; `c4-crash` takes a random amount of it, because a process
+    /// kill alone leaves the page cache intact and cannot tell `EveryN` from
+    /// `Always`.
+    pub fn wal_durable(&self) -> (PathBuf, u64, u64) {
+        (self.wal.path.clone(), self.wal.synced, self.wal.written)
     }
 
     /// Commit what is pending, seal the rest. Close is a convenience, not a

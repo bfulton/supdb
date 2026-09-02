@@ -272,6 +272,41 @@ interleaved where the harness allows:
   stays gone after the next commit, because `open` truncates the WAL to
   its last commit frame before appending behind it.
 
+### Crash injection: c4
+
+The promises above were held by one-shot tests that tore a file by hand.
+`c4-crash` (crash-plan.md) kills the process instead: a child commits
+batches of self-describing puts, deletes and transactions under 48 KB
+seals, so that seals, promotions, merges and manifest swaps are all in
+flight, and aborts -- at a fixed operation, or at the first one that finds
+a seal or a merge running, so the windows are reached on purpose rather
+than by thread timing. Then the parent does the one thing a process kill
+cannot: it tears the live WAL's unsynced tail to a random length. A kill
+alone leaves the page cache intact, and `EveryN` would have looked
+exactly like `Always`. The parent regenerates the child's stream from
+its seed and asks which prefix of the commit order the reopened store
+equals.
+
+At `full`, 120 crashes: 82 with a seal in flight, 72 with a merge, 72 with
+partitions, 76 with bytes torn. Every directory opened (C4.1); under
+`Always` no acknowledged batch was lost (C4.2, the statement EXT.22's
+durable load rests on); every recovered state was an exact prefix, with
+`count` and `scan` agreeing (C4.3); nothing was invented (C4.4); under
+`EveryN(8)` the most lost was six batches against a bound of seven
+(C4.5). The suite's own falsifier is `--tear-synced`, which lets the tear
+reach below the synced mark: C4.2 then fails in three trials of four,
+which is how the parent is known to be able to see a lost batch.
+
+It found one thing before it held. A seal rotates to a fresh WAL whose
+eight-byte header is written and not synced until the first commit into
+it, and replay refused a WAL shorter than its magic -- so a power loss in
+that window left a store that would not open. A prefix of the magic is
+now an empty WAL, `open` truncates and rewrites it, and the seal fsyncs
+the directory as soon as the new WAL exists, since commits into it are
+acknowledged from then on and an fdatasync of a file does not promise
+the entry that names it. One directory barrier per seal, off the
+per-commit path.
+
 ## Open, and deliberately so
 
 - ~~Filter choice~~ — **answered by f40/f41**: fences via range-partitioned

@@ -194,6 +194,36 @@
    "because": "A store killed before its first checkpoint does not open at all -- there is no superblock to find. Everything written lives in per-shard memory buffers and buffer_bytes defaults to 512MB, so the window in which a crash loses everything is not small."
   },
   {
+   "experiment": "c4-crash",
+   "id": "C4.1",
+   "expect": "holds",
+   "because": "The next engine opens after a crash at any point. 120/120 directories opened at full: 82 crashes had a seal in flight, 72 a merge, 72 landed with partitions, 41 tore the header of a freshly rotated WAL. The manifest is the swap point, the orphan sweep removes what it does not name, and replay stops at the last intact commit frame. The header case needed a fix before it held: replay refused a WAL shorter than its magic, and a rotated WAL's header is unsynced until its first commit; a prefix of the magic is now an empty WAL and open rewrites it (crash-plan.md P4.1)."
+  },
+  {
+   "experiment": "c4-crash",
+   "id": "C4.2",
+   "expect": "holds",
+   "because": "Under Sync::Always every acknowledged commit survives: 60/60 crashes reopened at or past the last acknowledged batch, with the live WAL's unsynced tail torn to a random length first. This is the statement EXT.22's durable load rests on. The self-check is `--tear-synced`: let the tear reach below the synced mark and 3/4 trials lose an acknowledged batch, so the parent can see one (P4.2)."
+  },
+  {
+   "experiment": "c4-crash",
+   "id": "C4.3",
+   "expect": "holds",
+   "because": "What survives is an exact prefix of the commit order: the parent regenerates the child's stream from its seed and every one of 120 recovered states, deletes and transactions included, equalled the state after some whole number of batches; count agreed with read_all on every key and scan with both (P4.3)."
+  },
+  {
+   "experiment": "c4-crash",
+   "id": "C4.4",
+   "expect": "holds",
+   "because": "Recovery invents nothing: every value read back across 120 crashes was byte for byte the one its sequence number wrote (P4.4)."
+  },
+  {
+   "experiment": "c4-crash",
+   "id": "C4.5",
+   "expect": "holds",
+   "because": "Under Sync::EveryN(8) a crash loses at most seven acknowledged batches and only from the tail: 60/60 within the bound, the most lost 6, with up to 48,248 bytes torn from the unsynced tail. A process kill alone could not have tested this -- the page cache outlives the process -- which is why the parent tears the tail itself (P4.5)."
+  },
+  {
    "experiment": "ext-kv",
    "id": "EXT.2",
    "profile": "full",
