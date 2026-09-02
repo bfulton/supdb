@@ -56,3 +56,24 @@ Both halves carry one caveat: RocksDB's defaults (an 8 MB block cache,
 no Bloom filter, 64 MB write buffer) are not how it is deployed, and a
 tuned arm is the next thing to run before either number is quoted as
 "against RocksDB" rather than "against RocksDB as shipped".
+
+## The tuned arm — registered before its run
+
+`rocksdb-tuned`: a 256 MB LRU block cache (the data is 110 MB), a 10-bit
+Bloom filter with index and filter blocks cached, four background
+threads; everything else as shipped, compression off, no read-side
+checksum verification. The same three axes and the shuffled load, as
+EXT.32-35.
+
+- **P33 -- reads: the next engine 1.5x to 2.5x.** With every block in
+  cache a RocksDB point read is a memtable probe, a filter, a cache hit
+  and a restart-interval decode, about a microsecond; the next engine's
+  is a fence, a slot and a record. The 7.6x against the defaults was
+  mostly the cache misses.
+- **P34 -- scan: the next engine 1.2x to 2x.** The iterator's merge
+  across levels remains; the block parses come from cache.
+- **P32 -- durable ordered load: 0.7x to 0.9x**, as against the
+  defaults. The write path does not see the cache; the filter costs a
+  little per key, the parallelism helps compaction keep up.
+- **P35 -- shuffled load: 0.9x to 1.3x**, as EXT.31; four background
+  threads may move RocksDB up a notch.

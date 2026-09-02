@@ -630,28 +630,55 @@ pub struct Rocks {
     db: rocksdb::DB,
     path: PathBuf,
     sync: bool,
+    tuned: bool,
     read: rocksdb::ReadOptions,
 }
 
 impl Rocks {
     pub fn create(path: &Path, sync: bool) -> Res<Rocks> {
+        Rocks::with(path, sync, false)
+    }
+
+    /// The deployed shape rather than the shipped one, stated in full so the
+    /// claim can name it: a 256 MB LRU block cache (the canonical data is
+    /// 110 MB, so every block a read wants is in memory after the first
+    /// touch, as it is for the mapped engines), a 10-bit Bloom filter per
+    /// SST with index and filter blocks cached, and four background
+    /// threads. Write buffers and level sizes stay at their defaults, since
+    /// the point is what RocksDB's read path costs when it is not starved of
+    /// cache, not a tuning contest.
+    pub fn create_tuned(path: &Path) -> Res<Rocks> {
+        Rocks::with(path, true, true)
+    }
+
+    fn with(path: &Path, sync: bool, tuned: bool) -> Res<Rocks> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         let mut o = rocksdb::Options::default();
         o.create_if_missing(true);
         o.set_compression_type(rocksdb::DBCompressionType::None);
+        if tuned {
+            let mut bbo = rocksdb::BlockBasedOptions::default();
+            let cache = rocksdb::Cache::new_lru_cache(256 << 20);
+            bbo.set_block_cache(&cache);
+            bbo.set_bloom_filter(10.0, false);
+            bbo.set_cache_index_and_filter_blocks(true);
+            o.set_block_based_table_factory(&bbo);
+            o.increase_parallelism(4);
+            o.set_max_background_jobs(4);
+        }
         let db = rocksdb::DB::open(&o, path).map_err(|e| e.to_string())?;
         let mut read = rocksdb::ReadOptions::default();
         read.set_verify_checksums(false);
-        Ok(Rocks { db, path: path.to_path_buf(), sync, read })
+        Ok(Rocks { db, path: path.to_path_buf(), sync, tuned, read })
     }
 }
 
 impl Engine for Rocks {
     fn name(&self) -> &'static str {
-        if self.sync {
-            "rocksdb"
-        } else {
-            "rocksdb-nosync"
+        match (self.sync, self.tuned) {
+            (_, true) => "rocksdb-tuned",
+            (true, false) => "rocksdb",
+            (false, false) => "rocksdb-nosync",
         }
     }
     fn features(&self) -> Features {

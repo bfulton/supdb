@@ -2114,6 +2114,22 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Where the commit thread's seal time goes. `phase_ns().1` is the sum of
+/// everything `join_seal` does; this says how much of it was waiting for a
+/// seal thread that had not finished when the next seal came due
+/// (`join_wait_ns`, over `blocked_joins` such joins), how much was the
+/// final drain a `flush` performs (`drain_wait_ns`), and how much was
+/// publishing the manifest with its two barriers (`publish_ns`). `joins`
+/// counts seals joined.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SealWaits {
+    pub join_wait_ns: u64,
+    pub drain_wait_ns: u64,
+    pub publish_ns: u64,
+    pub blocked_joins: u64,
+    pub joins: u64,
+}
+
 pub struct Db {
     dir: PathBuf,
     opts: NextOptions,
@@ -2135,6 +2151,15 @@ pub struct Db {
     /// the commit path; `seal` is writing a memtable out as a segment;
     /// `merge` is compaction, counted where the caller waits for it.
     phase_ns: [u64; 3],
+    /// The seal phase decomposed: how long the commit thread blocked on a
+    /// seal still running mid-load, how long the final drain took, how long
+    /// publishing (the manifest and its barriers) took, and how often a
+    /// join found the seal unfinished. f60 asks which of these the 14% of
+    /// the durable load in `phase_ns[1]` is (sealwait-plan.md).
+    seal_wait: SealWaits,
+    /// Set by `flush` while it waits for the last seal, so that wait is
+    /// booked as the drain and not as backpressure.
+    draining: bool,
     /// WAL files whose records no segment has been *named* as covering
     /// yet. One rule governs every one of them: a WAL may be deleted only
     /// after the manifest names a segment that covers its records. The
@@ -2271,6 +2296,8 @@ impl Db {
             spare_wals,
             covered_seq: 0,
             scan_keys: std::cell::RefCell::new(None),
+            seal_wait: SealWaits::default(),
+            draining: false,
         })
     }
 
@@ -2402,6 +2429,8 @@ impl Db {
             spare_wals,
             covered_seq: sealed,
             scan_keys: std::cell::RefCell::new(None),
+            seal_wait: SealWaits::default(),
+            draining: false,
         })
     }
 
@@ -2595,8 +2624,10 @@ impl Db {
     pub fn flush(&mut self) -> Result<()> {
         self.wal.commit()?;
         self.unsynced = 0;
-        self.seal()?;
-        self.join_seal()?;
+        self.draining = true;
+        let sealed = self.seal().and_then(|_| self.join_seal());
+        self.draining = false;
+        sealed?;
         self.join_compact()?;
         // Leave the store routed. A flush is a caller saying it has
         // stopped writing, and what it leaves behind otherwise is a set of
@@ -2696,14 +2727,25 @@ impl Db {
             return Ok(());
         };
         let t = std::time::Instant::now();
+        let blocked = !handle.is_finished();
         let names = handle.join().map_err(|_| err("seal thread panicked"))??;
+        let waited = t.elapsed().as_nanos() as u64;
+        self.seal_wait.joins += 1;
+        if self.draining {
+            self.seal_wait.drain_wait_ns += waited;
+        } else if blocked {
+            self.seal_wait.join_wait_ns += waited;
+            self.seal_wait.blocked_joins += 1;
+        }
         for name in &names {
             self.covered_seq = self.covered_seq.max(Db::name_end_seq(name).unwrap_or(0));
             self.segs.push(Seg::open(&self.dir, name)?);
         }
         self.sort_segs();
         self.frozen = None;
+        let tp = std::time::Instant::now();
         self.publish()?;
+        self.seal_wait.publish_ns += tp.elapsed().as_nanos() as u64;
         for old in std::mem::take(&mut self.retiring_wals) {
             if self.opts.recycle_wal && self.spare_wals.is_empty() {
                 let id = old
@@ -3428,6 +3470,11 @@ impl Db {
 
     pub fn phase_ns(&self) -> (u64, u64, u64) {
         (self.phase_ns[0], self.phase_ns[1], self.phase_ns[2])
+    }
+
+    /// The seal phase decomposed; see `SealWaits`.
+    pub fn seal_waits(&self) -> SealWaits {
+        self.seal_wait
     }
 
     pub fn segments(&self) -> usize {

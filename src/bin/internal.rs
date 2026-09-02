@@ -136,6 +136,7 @@ fn main() -> std::io::Result<()> {
             "f55-promote" => f55_promote(&args, profile)?,
             "f56-tailbound" => f56_tailbound(&args, profile)?,
             "f57-walreuse" => f57_walreuse(&args, profile)?,
+            "f60-sealwait" => f60_sealwait(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -10543,6 +10544,174 @@ fn f57_walreuse(args: &Args, profile: Profile) -> std::io::Result<Record> {
             med(sr, |r| r.6),
             med(sf, |r| r.6),
             rd_s.summary("recycle", "fresh"),
+        ),
+    ));
+    Ok(rec)
+}
+
+fn f60_sealwait(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::next::{Db, NextOptions};
+
+    let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+
+    let mut rec = Record::new("f60-sealwait", profile);
+    rec.param("keys", J::u(keys))
+        .param("batch", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .note(
+            "two arms interleaved, fresh store per rep, the engine's defaults, durable per \
+             batch, with the drain inside the window as the canonical load has it. The seal \
+             phase of the commit thread decomposed: blocked joins mid-load (a seal due while the \
+             previous one still runs), the final drain, and publishing the manifest",
+        )
+        .note("predictions registered in sealwait-plan.md before the run");
+
+    let dir = scratch("f60");
+    let payload = Payload::new(value_size, 0.5, 0xF60);
+    let arms: [(&str, bool); 2] = [("sequential", true), ("uniform", false)];
+    // ci, secs, commit s, seal s, merge s, join-wait s, drain s, publish s, blocked, joins
+    type Row = (usize, f64, f64, f64, f64, f64, f64, f64, f64, f64);
+    let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
+    let rates = Trial::new(profile.reps()).run(arms.len(), |ci, rep| {
+        let (_, sequential) = arms[ci];
+        let mut vrng = Rng::new(0xF60 + rep as u64);
+        let mut kb = [0u8; 16];
+        let mut order: Vec<u64> = (0..keys).collect();
+        if !sequential {
+            let mut x = 0xF60_0000_u64 ^ rep as u64;
+            for i in (1..order.len()).rev() {
+                x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = x;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                order.swap(i, (z % (i as u64 + 1)) as usize);
+            }
+        }
+        let d = dir.join(format!("f60-{ci}-{rep}"));
+        let _ = std::fs::remove_dir_all(&d);
+        let t = Instant::now();
+        let mut db = Db::create(&d, NextOptions::default()).expect("create");
+        for (n, &i) in order.iter().enumerate() {
+            db_key_into(i, &mut kb);
+            db.append(&kb, payload.get(&mut vrng));
+            if (n as u64 + 1).is_multiple_of(batch) {
+                db.commit().expect("commit");
+            }
+        }
+        db.flush().expect("flush");
+        let secs = t.elapsed().as_secs_f64();
+        let (c, s, m) = db.phase_ns();
+        let w = db.seal_waits();
+        db.close().expect("close");
+        let _ = std::fs::remove_dir_all(&d);
+        rows.lock().unwrap().push((
+            ci,
+            secs,
+            c as f64 / 1e9,
+            s as f64 / 1e9,
+            m as f64 / 1e9,
+            w.join_wait_ns as f64 / 1e9,
+            w.drain_wait_ns as f64 / 1e9,
+            w.publish_ns as f64 / 1e9,
+            w.blocked_joins as f64,
+            w.joins as f64,
+        ));
+        keys as f64 / secs
+    });
+    let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
+        let mut v: Vec<f64> = rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect();
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
+    rec.series(
+        "arms",
+        J::arr(
+            arms.iter()
+                .enumerate()
+                .zip(rates.iter())
+                .map(|((ci, (name, _)), s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "ops_per_s" => J::fp(s.median(), 1),
+                        "window_s" => J::fp(med(ci, |r| r.1), 3),
+                        "commit_s" => J::fp(med(ci, |r| r.2), 3),
+                        "seal_s" => J::fp(med(ci, |r| r.3), 3),
+                        "merge_s" => J::fp(med(ci, |r| r.4), 3),
+                        "seal_join_wait_s" => J::fp(med(ci, |r| r.5), 3),
+                        "seal_drain_s" => J::fp(med(ci, |r| r.6), 3),
+                        "seal_publish_s" => J::fp(med(ci, |r| r.7), 3),
+                        "blocked_joins" => J::fp(med(ci, |r| r.8), 1),
+                        "seals" => J::fp(med(ci, |r| r.9), 1)
+                    }
+                })
+                .collect(),
+        ),
+    );
+    let (sq, un) = (0usize, 1usize);
+    let drain_share = med(sq, |r| r.6) / med(sq, |r| r.3).max(1e-9);
+    let mid_share_sq = med(sq, |r| r.5) / med(sq, |r| r.1).max(1e-9);
+    let mid_share_un = med(un, |r| r.5) / med(un, |r| r.1).max(1e-9);
+    let pub_share = (med(sq, |r| r.7) / med(sq, |r| r.3).max(1e-9))
+        .max(med(un, |r| r.7) / med(un, |r| r.3).max(1e-9));
+    rec.finding(Finding::new(
+        "F60.1",
+        "under sequential keys at least 60% of the seal phase is the final drain",
+        drain_share >= 0.6,
+        format!(
+            "drain {:.3}s of a {:.3}s seal phase ({:.0}%) in a {:.3}s window; {:.0} seals, {:.0} \
+             of them joined before they had finished",
+            med(sq, |r| r.6),
+            med(sq, |r| r.3),
+            drain_share * 100.0,
+            med(sq, |r| r.1),
+            med(sq, |r| r.9),
+            med(sq, |r| r.8)
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F60.2",
+        "under sequential keys the commit thread blocks on an unfinished seal for under 3% of the window",
+        mid_share_sq <= 0.03,
+        format!(
+            "{:.3}s blocked over {:.0} joins that found the seal still running, {:.1}% of a \
+             {:.3}s window at {:.0} ops/s",
+            med(sq, |r| r.5),
+            med(sq, |r| r.8),
+            mid_share_sq * 100.0,
+            med(sq, |r| r.1),
+            rates[sq].median()
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F60.3",
+        "publishing the manifest is under 15% of the seal phase under either key order",
+        pub_share <= 0.15,
+        format!(
+            "publish {:.3}s of {:.3}s sequential, {:.3}s of {:.3}s uniform; the manifest is a \
+             write, an fsync and a directory fsync per seal",
+            med(sq, |r| r.7),
+            med(sq, |r| r.3),
+            med(un, |r| r.7),
+            med(un, |r| r.3)
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F60.4",
+        "under uniform keys the commit thread blocks on an unfinished seal for under 5% of the window",
+        mid_share_un <= 0.05,
+        format!(
+            "{:.3}s blocked over {:.0} joins, {:.1}% of a {:.3}s window at {:.0} ops/s; merge \
+             phase {:.3}s beside it, drain {:.3}s",
+            med(un, |r| r.5),
+            med(un, |r| r.8),
+            mid_share_un * 100.0,
+            med(un, |r| r.1),
+            rates[un].median(),
+            med(un, |r| r.4),
+            med(un, |r| r.6)
         ),
     ));
     Ok(rec)
