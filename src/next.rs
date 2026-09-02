@@ -27,7 +27,7 @@
 //! whose sealed prefix is skipped by sequence number.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Result, Write};
+use std::io::{Read, Result, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::block::{self, crc32, BlockBuilder, BlockLoc};
@@ -182,6 +182,13 @@ pub struct NextOptions {
     /// seals were also making more partitions and paying for them on every
     /// read; `Some` decouples the two.
     pub partition_bytes: Option<usize>,
+    /// Recycle retired WAL files instead of creating fresh ones, and
+    /// pre-write the first to the seal size, so every block a commit's
+    /// fdatasync touches is already allocated and written. On ext4 an
+    /// fdatasync of an append that grows the file commits an inode change
+    /// through the journal; an overwrite does not, and LMDB's commit is an
+    /// overwrite. f57 prices it (walreuse-plan.md).
+    pub recycle_wal: bool,
 }
 
 impl Default for NextOptions {
@@ -205,6 +212,7 @@ impl Default for NextOptions {
             partition_bytes: Some(64 << 20),
             flush_ranges: true,
             promote: true,
+            recycle_wal: false,
         }
     }
 }
@@ -228,11 +236,25 @@ struct Wal {
     /// experiment can take it (c4-crash).
     written: u64,
     synced: u64,
+    /// Mixed from the file's id and xored into every frame's CRC, so a
+    /// frame left in a recycled file by its previous life -- written under
+    /// another id -- fails its check and replay stops at the true tail.
+    seed: u32,
 }
 
 /// The WAL file starts with this, so a file from before frames carried a
-/// kind byte is refused by name rather than replayed as something else.
-const WAL_MAGIC: &[u8; 8] = b"SUPDBWL\x02";
+/// kind byte, or before CRCs were seeded by file id, is refused by name
+/// rather than replayed as something else.
+const WAL_MAGIC: &[u8; 8] = b"SUPDBWL\x03";
+
+/// The per-file CRC seed. Any mix that separates neighbouring ids will do;
+/// this is splitmix64's finalizer.
+fn wal_seed(id: u64) -> u32 {
+    let mut z = id.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (z ^ (z >> 31)) as u32
+}
 /// Frame kinds. A batch is the frames between commit frames, and replay
 /// applies a batch only once its commit frame has been read intact.
 const WAL_PUT: u8 = 0;
@@ -240,7 +262,7 @@ const WAL_DEL: u8 = 1;
 const WAL_COMMIT: u8 = 2;
 
 impl Wal {
-    fn create(path: &Path) -> Result<Wal> {
+    fn create(path: &Path, id: u64) -> Result<Wal> {
         let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
         file.write_all(WAL_MAGIC)?;
         Ok(Wal {
@@ -250,13 +272,53 @@ impl Wal {
             pending: Vec::new(),
             written: WAL_MAGIC.len() as u64,
             synced: 0,
+            seed: wal_seed(id),
+        })
+    }
+
+    /// Write zeros out to `bytes` so the blocks behind the coming appends
+    /// are allocated and written before any commit needs them, then put
+    /// the cursor back behind the header. Zeros read as a frame of length
+    /// zero, which replay refuses, so a crash before the first commit
+    /// leaves an empty WAL and not a strange one.
+    fn prefill(&mut self, bytes: u64) -> Result<()> {
+        let zeros = vec![0u8; 1 << 20];
+        let mut at = self.written;
+        while at < bytes {
+            let n = zeros.len().min((bytes - at) as usize);
+            self.file.write_all(&zeros[..n])?;
+            at += n as u64;
+        }
+        self.file.sync_all()?;
+        self.file.seek(SeekFrom::Start(self.written))?;
+        Ok(())
+    }
+
+    /// Take a retired file as the new WAL: rename it into place and write a
+    /// fresh header over its old one. Everything after the header is the
+    /// previous life's frames, written under another id, and is overwritten
+    /// as this life appends; replay stops at the first frame whose CRC does
+    /// not verify under this id.
+    fn recycle(spare: &Path, path: &Path, id: u64) -> Result<Wal> {
+        std::fs::rename(spare, path)?;
+        let mut file = OpenOptions::new().write(true).open(path)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(WAL_MAGIC)?;
+        Ok(Wal {
+            file,
+            path: path.to_path_buf(),
+            seq: 0,
+            pending: Vec::new(),
+            written: WAL_MAGIC.len() as u64,
+            synced: 0,
+            seed: wal_seed(id),
         })
     }
 
     /// Reopen a WAL for appending at `seq`, after replay has truncated it to
     /// its last commit frame. A file that does not exist yet gets its header
     /// so the next replay finds one.
-    fn open_append(path: &Path, seq: u64) -> Result<Wal> {
+    fn open_append(path: &Path, id: u64, seq: u64) -> Result<Wal> {
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         let mut written = file.metadata()?.len();
         if written == 0 {
@@ -267,7 +329,15 @@ impl Wal {
         // synced; a header written just now does not until the first
         // barrier.
         let synced = if written == WAL_MAGIC.len() as u64 { 0 } else { written };
-        Ok(Wal { file, path: path.to_path_buf(), seq, pending: Vec::new(), written, synced })
+        Ok(Wal {
+            file,
+            path: path.to_path_buf(),
+            seq,
+            pending: Vec::new(),
+            written,
+            synced,
+            seed: wal_seed(id),
+        })
     }
 
     /// One frame: `len u32 | crc u32 | seq u64 | kind u8 | payload`, where a
@@ -287,7 +357,7 @@ impl Wal {
             }
         }
         let body_len = (self.pending.len() - body_at) as u32;
-        let crc = crc32(&self.pending[body_at..]);
+        let crc = crc32(&self.pending[body_at..]) ^ self.seed;
         self.pending[body_at - 8..body_at - 4].copy_from_slice(&body_len.to_le_bytes());
         self.pending[body_at - 4..body_at].copy_from_slice(&crc.to_le_bytes());
         self.seq += 1;
@@ -343,9 +413,11 @@ impl Wal {
     /// it on the following replay.
     fn replay(
         path: &Path,
+        id: u64,
         from: u64,
         mut apply: impl FnMut(u8, &[u8], &[u8]),
     ) -> Result<(u64, u64)> {
+        let seed = wal_seed(id);
         let mut buf = Vec::new();
         match File::open(path) {
             Ok(mut f) => {
@@ -386,7 +458,7 @@ impl Wal {
                 break;
             }
             let body = &buf[body_at..end];
-            if crc32(body) != crc {
+            if crc32(body) ^ seed != crc {
                 break;
             }
             let seq = u64::from_le_bytes(body[..8].try_into().unwrap());
@@ -2022,6 +2094,11 @@ pub struct Db {
     /// the same mistake: treating "the data is somewhere" as "the data is
     /// durable somewhere a reopen can find".
     retiring_wals: Vec<PathBuf>,
+    /// Retired WAL files kept for the next rotation (`recycle_wal`), under
+    /// `spare-` names so `open` never replays them. One is enough: a
+    /// retiring WAL is released at `join_seal`, and a seal joins the one
+    /// before it before rotating.
+    spare_wals: Vec<PathBuf>,
     /// The WAL sequence every live segment covers between them. Kept as a
     /// monotone field rather than derived from segment names: a compaction
     /// renames the whole live set, and deriving the bound from the names it
@@ -2053,6 +2130,25 @@ impl Db {
     /// in id order; sequence numbers are continuous across the boundary.
     fn wal_path(dir: &Path, id: u64) -> PathBuf {
         dir.join(format!("wal-{id:08}"))
+    }
+
+    fn spare_path(dir: &Path, id: u64) -> PathBuf {
+        dir.join(format!("spare-{id:08}"))
+    }
+
+    /// The new live WAL for a rotation: a recycled retiree when the pool
+    /// has one, else a fresh file.
+    fn next_wal(&mut self, id: u64) -> Result<Wal> {
+        let path = Db::wal_path(&self.dir, id);
+        if self.opts.recycle_wal {
+            if let Some(spare) = self.spare_wals.pop() {
+                return Wal::recycle(&spare, &path, id);
+            }
+            let mut wal = Wal::create(&path, id)?;
+            wal.prefill(self.opts.seal_bytes as u64)?;
+            return Ok(wal);
+        }
+        Wal::create(&path, id)
     }
 
     /// The end-of-covered-sequence rides the file name so the rename that
@@ -2094,7 +2190,18 @@ impl Db {
 
     pub fn create(dir: &Path, opts: NextOptions) -> Result<Db> {
         std::fs::create_dir_all(dir)?;
-        let wal = Wal::create(&Db::wal_path(dir, 0))?;
+        let mut wal = Wal::create(&Db::wal_path(dir, 0), 0)?;
+        let mut spare_wals = Vec::new();
+        if opts.recycle_wal {
+            // The live file and one spare, both written through, so the
+            // first rotation recycles too and no rotation ever pays the
+            // pre-write on the commit path.
+            wal.prefill(opts.seal_bytes as u64)?;
+            let spare = Db::spare_path(dir, 0);
+            Wal::create(&spare, 0)?.prefill(opts.seal_bytes as u64)?;
+            spare_wals.push(spare);
+            File::open(dir)?.sync_all()?;
+        }
         Ok(Db {
             dir: dir.to_path_buf(),
             opts,
@@ -2110,6 +2217,7 @@ impl Db {
             unsynced: 0,
             phase_ns: [0; 3],
             retiring_wals: Vec::new(),
+            spare_wals,
             covered_seq: 0,
             scan_keys: std::cell::RefCell::new(None),
         })
@@ -2168,11 +2276,20 @@ impl Db {
             .filter_map(|n| Some((Db::name_id(n)?, Db::name_end_seq(n)?)))
             .collect();
         let mut wal_ids: Vec<u64> = Vec::new();
+        let mut spare_wals: Vec<PathBuf> = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let name = entry?.file_name();
             let name = name.to_string_lossy();
             if let Some(id) = name.strip_prefix("wal-") {
                 wal_ids.push(id.parse().map_err(|_| err("wal file name is malformed"))?);
+            } else if name.starts_with("spare-") {
+                // A retired WAL kept for recycling. It holds nothing a
+                // segment does not, so it is either the pool or garbage.
+                if opts.recycle_wal && spare_wals.is_empty() {
+                    spare_wals.push(dir.join(name.as_ref()));
+                } else {
+                    let _ = std::fs::remove_file(dir.join(name.as_ref()));
+                }
             }
         }
         wal_ids.sort_unstable();
@@ -2181,7 +2298,7 @@ impl Db {
         let mut from = sealed;
         let mut valid_len = 0u64;
         for &id in &wal_ids {
-            let (next, valid) = Wal::replay(&Db::wal_path(dir, id), from, |kind, k, v| {
+            let (next, valid) = Wal::replay(&Db::wal_path(dir, id), id, from, |kind, k, v| {
                 if kind == WAL_DEL {
                     mem.delete(k);
                     mem_bytes += k.len() + 16;
@@ -2214,7 +2331,7 @@ impl Db {
                 f.sync_data()?;
             }
         }
-        let wal = Wal::open_append(&wal_path, from)?;
+        let wal = Wal::open_append(&wal_path, wal_id, from)?;
         let next_seg = seg_ids.iter().map(|&(n, _)| n + 1).max().unwrap_or(0);
         Ok(Db {
             dir: dir.to_path_buf(),
@@ -2231,6 +2348,7 @@ impl Db {
             unsynced: 0,
             phase_ns: [0; 3],
             retiring_wals: retiring,
+            spare_wals,
             covered_seq: sealed,
             scan_keys: std::cell::RefCell::new(None),
         })
@@ -2310,10 +2428,8 @@ impl Db {
         self.join_seal()?;
         let frozen = std::sync::Arc::new(std::mem::replace(&mut self.mem, MemTable::new()));
         self.mem_bytes = 0;
-        let old_wal = std::mem::replace(
-            &mut self.wal,
-            Wal::create(&Db::wal_path(&self.dir, self.wal_id + 1))?,
-        );
+        let new_wal = self.next_wal(self.wal_id + 1)?;
+        let old_wal = std::mem::replace(&mut self.wal, new_wal);
         // The new file's directory entry is made durable now, not at the
         // end of the seal: commits into it are acknowledged from here on,
         // and an fdatasync of the file does not promise the entry that
@@ -2538,6 +2654,19 @@ impl Db {
         self.frozen = None;
         self.publish()?;
         for old in std::mem::take(&mut self.retiring_wals) {
+            if self.opts.recycle_wal && self.spare_wals.is_empty() {
+                let id = old
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_prefix("wal-"))
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let spare = Db::spare_path(&self.dir, id);
+                if std::fs::rename(&old, &spare).is_ok() {
+                    self.spare_wals.push(spare);
+                    continue;
+                }
+            }
             let _ = std::fs::remove_file(old);
         }
         self.phase_ns[1] += t.elapsed().as_nanos() as u64;
@@ -3283,7 +3412,12 @@ impl Db {
     }
 
     fn close_inner(&mut self) -> Result<()> {
-        self.flush()
+        self.flush()?;
+        // Nothing will rotate into a spare again.
+        for spare in std::mem::take(&mut self.spare_wals) {
+            let _ = std::fs::remove_file(spare);
+        }
+        Ok(())
     }
 }
 

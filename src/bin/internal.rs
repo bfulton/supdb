@@ -135,6 +135,7 @@ fn main() -> std::io::Result<()> {
             "f54-merge" => f54_merge(&args, profile)?,
             "f55-promote" => f55_promote(&args, profile)?,
             "f56-tailbound" => f56_tailbound(&args, profile)?,
+            "f57-walreuse" => f57_walreuse(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -10328,5 +10329,221 @@ fn f28_count(args: &Args, profile: Profile) -> std::io::Result<Record> {
         ),
     ));
     let _ = std::fs::remove_file(&file);
+    Ok(rec)
+}
+
+fn f57_walreuse(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::next::{Db, NextOptions};
+
+    let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+    let reads = args.num("--reads", profile.pick(20_000, 50_000, 200_000)) as u64;
+
+    let mut rec = Record::new("f57-walreuse", profile);
+    rec.param("keys", J::u(keys))
+        .param("batch", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .param("reads", J::u(reads))
+        .note(
+            "four arms interleaved in one process, fresh store per rep, defaults otherwise (32 \
+             MB seals, 64 MB partitions, Sync::Always, one commit per batch) with the drain \
+             inside the window. Two key orders, uniform and sequential; WAL files fresh per \
+             rotation, or recycled from a pre-written pool so every commit's fdatasync is an \
+             overwrite. Device and disk bytes, phases, and point reads after the drain",
+        )
+        .note("predictions registered in walreuse-plan.md before the run");
+
+    let dir = scratch("f57");
+    let payload = Payload::new(value_size, 0.5, 0xF57);
+    let arms: [(&str, bool, bool); 4] = [
+        ("uniform/fresh", false, false),
+        ("uniform/recycle", false, true),
+        ("sequential/fresh", true, false),
+        ("sequential/recycle", true, true),
+    ];
+    // ci, device MB, disk MB, commit s, seal s, merge s, read ns
+    type Row = (usize, f64, f64, f64, f64, f64, f64);
+    let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
+    let rates = Trial::new(profile.reps()).run(arms.len(), |ci, rep| {
+        let (_, sequential, recycle) = arms[ci];
+        let mut vrng = Rng::new(0xF57 + rep as u64);
+        let mut kb = [0u8; 16];
+        let mut order: Vec<u64> = (0..keys).collect();
+        if !sequential {
+            let mut x = 0xF57_0000_u64 ^ rep as u64;
+            for i in (1..order.len()).rev() {
+                x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = x;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                order.swap(i, (z % (i as u64 + 1)) as usize);
+            }
+        }
+        let d = dir.join(format!("f57-{ci}-{rep}"));
+        let _ = std::fs::remove_dir_all(&d);
+        let opts = NextOptions { recycle_wal: recycle, ..Default::default() };
+        let io0 = IoCounters::read_now();
+        let t = Instant::now();
+        let mut db = Db::create(&d, opts).expect("create");
+        for (n, &i) in order.iter().enumerate() {
+            db_key_into(i, &mut kb);
+            db.append(&kb, payload.get(&mut vrng));
+            if (n as u64 + 1).is_multiple_of(batch) {
+                db.commit().expect("commit");
+            }
+        }
+        db.flush().expect("flush");
+        let secs = t.elapsed().as_secs_f64();
+        let (c, s, m) = db.phase_ns();
+        let io_mb = IoCounters::read_now().since(&io0).write_bytes as f64 / 1_048_576.0;
+        let mut x = 0x5E4D_5EED_u64 ^ (rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut sink = 0u64;
+        let tr = Instant::now();
+        for _ in 0..reads {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            db_key_into(z % keys, &mut kb);
+            sink += db
+                .read_all(&kb, |v| {
+                    std::hint::black_box(v);
+                })
+                .expect("read");
+        }
+        let read_ns = tr.elapsed().as_nanos() as f64 / reads as f64;
+        std::hint::black_box(sink);
+        db.close().expect("close");
+        let mut bytes = 0u64;
+        for e in std::fs::read_dir(&d).expect("dir") {
+            bytes += e.expect("entry").metadata().expect("meta").len();
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        rows.lock().unwrap().push((
+            ci,
+            io_mb,
+            bytes as f64 / 1_048_576.0,
+            c as f64 / 1e9,
+            s as f64 / 1e9,
+            m as f64 / 1e9,
+            read_ns,
+        ));
+        keys as f64 / secs
+    });
+    let col = |ci: usize, pick: fn(&Row) -> f64| -> Vec<f64> {
+        rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect()
+    };
+    let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
+        let mut v = col(ci, pick);
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
+    rec.series(
+        "arms",
+        J::arr(
+            arms.iter()
+                .enumerate()
+                .zip(rates.iter())
+                .map(|((ci, (name, _, _)), s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "ops_per_s" => J::fp(s.median(), 1),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4),
+                        "commit_s" => J::fp(med(ci, |r| r.3), 3),
+                        "seal_s" => J::fp(med(ci, |r| r.4), 3),
+                        "merge_s" => J::fp(med(ci, |r| r.5), 3),
+                        "device_write_mb" => J::fp(med(ci, |r| r.1), 1),
+                        "disk_mb" => J::fp(med(ci, |r| r.2), 1),
+                        "read_ns" => J::fp(med(ci, |r| r.6), 1)
+                    }
+                })
+                .collect(),
+        ),
+    );
+    let (uf, ur, sf, sr) = (0usize, 1usize, 2usize, 3usize);
+    let ing_s = compare(&rates[sr], &rates[sf], supdb::bench::MIN_EFFECT);
+    rec.compare("sequential_recycle_vs_fresh_ingest", ing_s.clone());
+    let ing_u = compare(&rates[ur], &rates[uf], supdb::bench::MIN_EFFECT);
+    rec.compare("uniform_recycle_vs_fresh_ingest", ing_u.clone());
+    let rd_u = compare(&Samples::new(col(ur, |r| r.6)), &Samples::new(col(uf, |r| r.6)), supdb::bench::MIN_EFFECT);
+    rec.compare("uniform_read_ns_recycle_vs_fresh", rd_u.clone());
+    let rd_s = compare(&Samples::new(col(sr, |r| r.6)), &Samples::new(col(sf, |r| r.6)), supdb::bench::MIN_EFFECT);
+    rec.compare("sequential_read_ns_recycle_vs_fresh", rd_s.clone());
+    let dev_u = med(ur, |r| r.1) / med(uf, |r| r.1);
+    let dev_s = med(sr, |r| r.1) / med(sf, |r| r.1);
+    rec.finding(Finding::new(
+        "F57.1",
+        "with sequential keys recycling WAL files lifts durable ingest by at least 1.10x",
+        matches!(ing_s.verdict, supdb::bench::Verdict::Greater) && ing_s.ratio >= 1.10,
+        format!(
+            "{:.0} ops/s recycled against {:.0} fresh ({}); commit phase {:.3}s against {:.3}s, \
+             seal {:.3}s against {:.3}s, merge {:.3}s against {:.3}s. Every commit's fdatasync \
+             lands in blocks already allocated and written, so no inode change rides the barrier",
+            rates[sr].median(),
+            rates[sf].median(),
+            ing_s.summary("recycle", "fresh"),
+            med(sr, |r| r.3),
+            med(sf, |r| r.3),
+            med(sr, |r| r.4),
+            med(sf, |r| r.4),
+            med(sr, |r| r.5),
+            med(sf, |r| r.5),
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F57.2",
+        "recycling costs at most 1.05x the device bytes under either key order",
+        dev_u <= 1.05 && dev_s <= 1.05,
+        format!(
+            "device bytes: uniform {:.1} MB recycled against {:.1} fresh ({:.3}x), sequential \
+             {:.1} against {:.1} ({:.3}x); disk after close: uniform {:.1} against {:.1} MB, \
+             sequential {:.1} against {:.1}. The pool pre-writes two files of seal size once",
+            med(ur, |r| r.1),
+            med(uf, |r| r.1),
+            dev_u,
+            med(sr, |r| r.1),
+            med(sf, |r| r.1),
+            dev_s,
+            med(ur, |r| r.2),
+            med(uf, |r| r.2),
+            med(sr, |r| r.2),
+            med(sf, |r| r.2),
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F57.3",
+        "with uniform keys recycling lifts durable ingest by at least 1.10x",
+        matches!(ing_u.verdict, supdb::bench::Verdict::Greater) && ing_u.ratio >= 1.10,
+        format!(
+            "{:.0} ops/s recycled against {:.0} fresh ({}); commit phase {:.3}s against {:.3}s, \
+             merge {:.3}s against {:.3}s",
+            rates[ur].median(),
+            rates[uf].median(),
+            ing_u.summary("recycle", "fresh"),
+            med(ur, |r| r.3),
+            med(uf, |r| r.3),
+            med(ur, |r| r.5),
+            med(uf, |r| r.5),
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F57.4",
+        "reads after the drain do not differ with recycling under either key order",
+        matches!(rd_u.verdict, supdb::bench::Verdict::NoDifference)
+            && matches!(rd_s.verdict, supdb::bench::Verdict::NoDifference),
+        format!(
+            "uniform: {:.0} ns per read recycled against {:.0} ({}); sequential: {:.0} against \
+             {:.0} ({}). Nothing on the read path knows what a WAL file looked like",
+            med(ur, |r| r.6),
+            med(uf, |r| r.6),
+            rd_u.summary("recycle", "fresh"),
+            med(sr, |r| r.6),
+            med(sf, |r| r.6),
+            rd_s.summary("recycle", "fresh"),
+        ),
+    ));
     Ok(rec)
 }

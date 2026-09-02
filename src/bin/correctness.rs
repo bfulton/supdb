@@ -1133,12 +1133,13 @@ fn c4_value(seq: u64, key: u64, len: usize, out: &mut Vec<u8>) {
 /// Seals a few hundred operations wide, two of them per merge, partitions
 /// twice a seal: every background job the engine has is in flight during a
 /// run of a few thousand operations.
-fn c4_opts(sync: SyncPolicy) -> NextOptions {
+fn c4_opts(sync: SyncPolicy, recycle: bool) -> NextOptions {
     NextOptions {
         sync,
         seal_bytes: 48 << 10,
         partition_bytes: Some(96 << 10),
         l0_trigger: 2,
+        recycle_wal: recycle,
         ..NextOptions::default()
     }
 }
@@ -1170,9 +1171,10 @@ fn c4_child(args: &Args) -> std::io::Result<()> {
     // purpose rather than by thread timing; `--cap` bounds the wait.
     let mode = args.get("--mode").unwrap_or("fixed").to_string();
     let cap = args.num("--cap", (abort_after + batch) as usize) as u64;
+    let recycle = args.get("--recycle").is_some();
 
     let ops = c4_ops(seed, keys, cap + batch);
-    let mut db = Db::create(&dir, c4_opts(c4_sync(&arm)))?;
+    let mut db = Db::create(&dir, c4_opts(c4_sync(&arm), recycle))?;
     let mut out = std::io::stdout();
     let mut kb = [0u8; 16];
     let mut val = Vec::new();
@@ -1337,6 +1339,7 @@ fn c4_crash(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let (mut seal_in_flight, mut merge_in_flight, mut with_partitions) = (0u64, 0u64, 0u64);
     let (mut torn_trials, mut max_torn, mut child_errors, mut late_trials) = (0u64, 0u64, 0u64, 0u64);
     let mut torn_headers = 0u64;
+    let (mut recycled_trials, mut torn_into_stale) = (0u64, 0u64);
     let mut coverage_first = String::new();
     let batches = [4u64, 16, 64, 256];
     let modes = ["fixed", "seal", "merge"];
@@ -1350,6 +1353,9 @@ fn c4_crash(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let abort_after = 1 + rng.below(max_ops);
         let cap = abort_after + max_ops;
         let late = rng.next().is_multiple_of(2) && mode == "fixed";
+        // Half the trials recycle WAL files, so a torn tail can land in
+        // front of a previous life's frames (walreuse-plan.md P57.5).
+        let recycle = (t / 2) % 2 == 1;
         let dir = root.join(format!("t{t}"));
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -1373,6 +1379,9 @@ fn c4_crash(args: &Args, profile: Profile) -> std::io::Result<Record> {
             .arg(cap.to_string());
         if late {
             cmd.arg("--late").arg("1");
+        }
+        if recycle {
+            cmd.arg("--recycle").arg("1");
         }
         let st = cmd.output()?;
         let stdout = String::from_utf8_lossy(&st.stdout);
@@ -1415,6 +1424,7 @@ fn c4_crash(args: &Args, profile: Profile) -> std::io::Result<Record> {
         merge_in_flight += u64::from(compact);
         with_partitions += u64::from(parts > 0);
         late_trials += u64::from(late);
+        recycled_trials += u64::from(recycle);
         if coverage_first.is_empty() && seal && compact {
             coverage_first = format!("trial {t}: died with both a seal and a merge in flight");
         }
@@ -1430,17 +1440,42 @@ fn c4_crash(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let synced = synced.saturating_sub(tear_synced);
         if hi > synced {
             let cut = synced + rng.below(hi - synced + 1);
-            if cut < on_disk {
-                std::fs::OpenOptions::new().write(true).open(&wal)?.set_len(cut)?;
+            if cut < hi {
                 torn_trials += 1;
-                max_torn = max_torn.max(on_disk - cut);
+                max_torn = max_torn.max(hi - cut);
                 torn_headers += u64::from(cut < 8);
+                if on_disk > written {
+                    // A recycled or pre-written file: the device keeps
+                    // whatever those blocks held before -- the previous
+                    // life's frames, or zeros -- and its header, which is
+                    // the same eight bytes. Emulate it by pulling stale
+                    // bytes from further along the file down over the
+                    // lost span past the header; the header itself is
+                    // left as it is, because the old one was identical.
+                    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+                    let lo = cut.max(8);
+                    if hi > lo {
+                        let mut f =
+                            std::fs::OpenOptions::new().read(true).write(true).open(&wal)?;
+                        let span = (hi - lo) as usize;
+                        let mut stale = vec![0u8; span];
+                        f.seek(SeekFrom::Start(written + (lo - cut)))?;
+                        let got = f.read(&mut stale)?;
+                        stale.truncate(got);
+                        stale.resize(span, 0);
+                        f.seek(SeekFrom::Start(lo))?;
+                        f.write_all(&stale)?;
+                        torn_into_stale += 1;
+                    }
+                } else {
+                    std::fs::OpenOptions::new().write(true).open(&wal)?.set_len(cut)?;
+                }
             }
         }
 
         let arm = &mut arms[arm_ix];
         arm.crashes += 1;
-        let opts = c4_opts(c4_sync(arm_name));
+        let opts = c4_opts(c4_sync(arm_name), recycle);
         let db = match Db::open(&dir, opts) {
             Ok(db) => db,
             Err(e) => {
@@ -1590,6 +1625,8 @@ fn c4_crash(args: &Args, profile: Profile) -> std::io::Result<Record> {
         "after_commit_before_ack" => J::u(late_trials),
         "trials_with_a_torn_wal_tail" => J::u(torn_trials),
         "trials_with_a_torn_wal_header" => J::u(torn_headers),
+        "trials_with_recycled_wals" => J::u(recycled_trials),
+        "tears_landing_on_stale_frames" => J::u(torn_into_stale),
         "most_bytes_torn" => J::u(max_torn),
         "note" => J::s(&coverage_first),
     });

@@ -910,3 +910,102 @@ fn a_wal_header_torn_by_power_loss_opens_and_is_rewritten() {
         drop(db);
     }
 }
+
+#[test]
+fn a_recycled_wal_never_adopts_a_frame_from_its_previous_life() {
+    // With `recycle_wal`, a rotation renames a retired WAL into place and
+    // writes over its old frames. If the new life commits less than the
+    // old one did, the old life's frames sit past the new tail -- intact,
+    // CRC-correct under the old id -- and replay must stop at the new tail
+    // rather than read them. Their keys are already in a segment, so
+    // adopting one would show as a duplicated value.
+    let d = dir("recycle-stale");
+    let opts = NextOptions {
+        recycle_wal: true,
+        seal_bytes: 64 << 10,
+        ..NextOptions::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    // Life 1 of wal-00000000: about 3 seals' worth, so the file is long.
+    for i in 0u32..3000 {
+        db.append(format!("k{i:05}").as_bytes(), &[1u8; 64]);
+        if i % 50 == 49 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    let (live, _, _) = db.wal_durable();
+    // After the flush the live WAL is a recycled file with a long stale
+    // tail behind an eight-byte header.
+    assert!(
+        std::fs::metadata(&live).unwrap().len() > 8,
+        "the live WAL should be a recycled file with old frames behind the header"
+    );
+    // Life 2: two small batches, then a crash.
+    db.append(b"new-a", b"A");
+    db.commit().unwrap();
+    db.append(b"new-b", b"B");
+    db.commit().unwrap();
+    drop(db);
+
+    let db = Db::open(&d, opts.clone()).unwrap();
+    assert_eq!(read_vec(&db, b"new-a"), vec![b"A".to_vec()]);
+    assert_eq!(read_vec(&db, b"new-b"), vec![b"B".to_vec()]);
+    for i in 0u32..3000 {
+        let got = read_vec(&db, format!("k{i:05}").as_bytes());
+        assert_eq!(got.len(), 1, "k{i:05} came back {} times: a stale frame was adopted", got.len());
+    }
+    drop(db);
+    // And again after another commit and reopen: the truncation at open
+    // must have cut the stale tail so nothing behind the new frames is
+    // ever read.
+    let mut db = Db::open(&d, opts.clone()).unwrap();
+    db.append(b"new-c", b"C");
+    db.commit().unwrap();
+    drop(db);
+    let db = Db::open(&d, opts).unwrap();
+    assert_eq!(read_vec(&db, b"new-c"), vec![b"C".to_vec()]);
+    for i in (0u32..3000).step_by(97) {
+        assert_eq!(read_vec(&db, format!("k{i:05}").as_bytes()).len(), 1);
+    }
+}
+
+#[test]
+fn recycling_survives_crashes_and_leaves_no_spare_after_close() {
+    let d = dir("recycle-crash");
+    let opts = NextOptions {
+        recycle_wal: true,
+        seal_bytes: 32 << 10,
+        l0_trigger: 2,
+        ..NextOptions::default()
+    };
+    let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    for round in 0u32..12 {
+        for i in 0u32..400 {
+            let k = format!("k{:04}", (i * 7 + round) % 500).into_bytes();
+            let v = format!("r{round}i{i}").into_bytes();
+            db.append(&k, &v);
+            model.entry(k).or_default().push(v);
+        }
+        db.commit().unwrap();
+        if round % 4 == 3 {
+            drop(db); // crash
+            db = Db::open(&d, opts.clone()).unwrap();
+            for (k, want) in &model {
+                assert_eq!(&read_vec(&db, k), want, "after the crash in round {round}");
+            }
+        }
+    }
+    db.close().unwrap();
+    let spares = std::fs::read_dir(&d)
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("spare-"))
+        .count();
+    assert_eq!(spares, 0, "close leaves no spare behind");
+    let db = Db::open(&d, opts).unwrap();
+    for (k, want) in &model {
+        assert_eq!(&read_vec(&db, k), want);
+    }
+}
