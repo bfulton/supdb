@@ -39,3 +39,20 @@ and merge cost more than an LSM's flush and compaction at this size, and
 the seal wait is the place to look. RocksDB within 1.5x on reads says
 the read lead against LMDB was mostly the B-tree descent, not the
 flatindex probe.
+
+## Outcome (full, `results/ext-kv.full.json`, `results/ext-loadshape.full.json`)
+
+- P28 refuted: durable ordered load **0.778x** (503,806 against 647,423,
+  p=0.0033). RocksDB writes fewer device bytes (209.9 MB against 299.6)
+  and a smaller file (109.8 against 167.8); P32 held.
+- P29 refuted upward: reads **7.62x** (1,696,165 against 222,518).
+- P30 refuted upward: scan **5.95x** (23.9M against 4.0M entries/s).
+- P31 held: shuffled load **1.18x** (265,727 against 224,767, p=0.0049);
+  RocksDB's own swing 2.14x against the next engine's 1.37x.
+
+The write side of the niche goes to RocksDB at its defaults; the read
+side stays with the next engine by a margin the LMDB pair never showed.
+Both halves carry one caveat: RocksDB's defaults (an 8 MB block cache,
+no Bloom filter, 64 MB write buffer) are not how it is deployed, and a
+tuned arm is the next thing to run before either number is quoted as
+"against RocksDB" rather than "against RocksDB as shipped".

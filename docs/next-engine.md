@@ -284,6 +284,19 @@ The read lead is larger there than on x86 and the scan axis, a coin toss
 on x86, separates cleanly, which is the shape the second reader's
 campaigns had already found.
 
+### Against RocksDB: EXT.28-31
+
+The comparator that separates "the next engine is fast" from "an LSM is
+fast", matched on durability, atomic batches and checksums, at its
+defaults with compression off (rocks-plan.md). Durable ordered load
+**0.778x** (p=0.0033) and RocksDB writes fewer device bytes and a smaller
+file, so the write side goes to it; point reads **7.62x** and ordered
+scan **5.95x** stay with the next engine by margins the LMDB pair never
+showed; shuffled durable load **1.18x**, the number EXT.27's 6x over LMDB
+needed beside it. The plan predicted a tie on the load and 2-3x on reads
+and was wrong both ways. RocksDB's 8 MB block cache and absent filter are
+its shipped defaults; a tuned arm is the open item.
+
 ### Arrival order: EXT.27
 
 Every durable-load number above comes from `ext-kv`, whose keys ascend,

@@ -1520,6 +1520,34 @@
    "profile": "full",
    "expect": "holds",
    "because": "10 ns a key ranking `country` (210 keys) from a sparse reader over a mapping, median of seven, against a bound of 100 microseconds (P5.4). The walk decodes records out of the lent span; the fence seek is the constant and the decode is the per-key cost, and neither is where a range's time goes -- the fetch is."
+  },
+  {
+   "experiment": "ext-kv",
+   "id": "EXT.28",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P28 predicted a tie to 1.2x and was refuted: 503,806 ops/s against RocksDB's 647,423 with both syncing the WAL per batch, 0.778x at p=0.0033 (rel_iqr 24%/6%). Same shape, one fsync per batch on either side, and the LSM that has had fifteen years of work on its write path is ahead by the same margin LMDB is (0.835x in the same run). Device bytes 299.6 MB against 209.9 (amplification 2.71 against 1.90), file 167.8 MB against 109.8: RocksDB writes less and keeps less. The residual named in the adapter -- RocksDB computes a CRC per block it writes -- leans against RocksDB, so the gap is at least this. RocksDB runs at its defaults with compression off and read-side checksum verification off (Features matches the pair on durability, atomic batches and checksums): an 8 MB block cache and no Bloom filter, so its reads go through the page cache with a block parse each; a tuned arm -- a block cache the size of the data, a filter -- is the open item, and until it runs this ranks the next engine against RocksDB as shipped, not as deployed."
+  },
+  {
+   "experiment": "ext-kv",
+   "id": "EXT.29",
+   "profile": "full",
+   "expect": "holds",
+   "because": "1,696,165 reads/s against 222,518, 7.623x at p=0.0022; P29 said 2x to 3x and was refuted upward. The next engine's read is a fence, a hash slot and a record, mapped; RocksDB's at its defaults is a memtable probe, a block-cache miss, a page-cache read, a block-index search and a restart-interval decode. RocksDB runs at its defaults with compression off and read-side checksum verification off (Features matches the pair on durability, atomic batches and checksums): an 8 MB block cache and no Bloom filter, so its reads go through the page cache with a block parse each; a tuned arm -- a block cache the size of the data, a filter -- is the open item, and until it runs this ranks the next engine against RocksDB as shipped, not as deployed."
+  },
+  {
+   "experiment": "ext-kv",
+   "id": "EXT.30",
+   "profile": "full",
+   "expect": "holds",
+   "because": "23.9M entries/s against 4.0M, 5.945x at p=0.0022; P30 said a tie. The rank cursors walk a mapped record region; RocksDB's iterator merges levels through the same 8 MB block cache. RocksDB runs at its defaults with compression off and read-side checksum verification off (Features matches the pair on durability, atomic batches and checksums): an 8 MB block cache and no Bloom filter, so its reads go through the page cache with a block parse each; a tuned arm -- a block cache the size of the data, a filter -- is the open item, and until it runs this ranks the next engine against RocksDB as shipped, not as deployed."
+  },
+  {
+   "experiment": "ext-loadshape",
+   "id": "EXT.31",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Shuffled, 265,727 ops/s against RocksDB's 224,767, 1.182x at p=0.0049 -- inside P31's 0.9x to 1.3x, and the number EXT.27's 6.0x over LMDB needed beside it: against an LSM the next engine's shuffled ingest is a narrow win, not a rout. RocksDB's own swing is 2.14x (480,074 ordered to 224,767 shuffled), more than the next engine's 1.37x, because a skiplist memtable and an L0 that overlaps pay for disorder too. Sequential, in the same run, 0.757x."
   }
  ],
  "metrics": [

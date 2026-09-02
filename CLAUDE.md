@@ -156,6 +156,16 @@ cheapest moves were a borrowed batch in the harness (done: 1,037 a
 record) and a per-batch CRC (done: 968, at two more L1 misses, no
 wall-clock claim, kept for the one-CRC-one-batch invariant).
 
+Against RocksDB, the engine it is shaped like (`rocksdb`, `rocksdb-nosync`
+in the external suite; defaults with compression and read-side checksum
+verification off, so the pair is matched): durable ordered load **0.778x**
+(`EXT.28`, failing), point reads **7.62x** (`EXT.29`), ordered scan
+**5.95x** (`EXT.30`), shuffled durable load **1.18x** (`EXT.31`); RocksDB
+keeps the smallest file, 109.8 MB against 167.8. Read the reads with the
+caveat in the claim: RocksDB's 8 MB default block cache and no filter is
+the shipped configuration, not a deployed one, and a tuned arm is the
+open item before any of these is quoted as "against RocksDB".
+
 Under shuffled arrival the same matched pair inverts. `EXT.27`
 (`ext-loadshape`, full) has the next engine at 284,938 ops/s against
 LMDB's 48,041, **5.93x** (6.64x replicated with the borrowed batch),
