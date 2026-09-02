@@ -25,9 +25,9 @@
 
 mod engines;
 
-use engines::{Batch, Engine, Features, Lmdb, LmdbDup, Next, Redb, Sled, Supdb};
 #[cfg(feature = "rocksdb")]
 use engines::Rocks;
+use engines::{Batch, Engine, Features, Lmdb, LmdbDup, Next, Redb, Sled, Supdb};
 use std::path::PathBuf;
 use std::time::Instant;
 use supdb::bench::{
@@ -255,7 +255,11 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
         format!(
             "{}-{}",
             which[ei / 2],
-            if ei.is_multiple_of(2) { "seq" } else { "shuffled" }
+            if ei.is_multiple_of(2) {
+                "seq"
+            } else {
+                "shuffled"
+            }
         )
     };
     let mut rows = Vec::new();
@@ -421,10 +425,7 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
             }
         }
     }
-    if let (Some(ss), Some(sl)) = (
-        idx("supdb-buffered", true),
-        idx("lmdb-nosync", true),
-    ) {
+    if let (Some(ss), Some(sl)) = (idx("supdb-buffered", true), idx("lmdb-nosync", true)) {
         if !load[ss].is_empty() && !load[sl].is_empty() {
             let (Some(fa), Some(fb)) = (feats[ss], feats[sl]) else {
                 return Ok(rec);
@@ -2101,7 +2102,9 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
         let featc = featc.into_inner().unwrap();
         let names = names.into_inner().unwrap();
         for (ci, name) in names.iter().enumerate() {
-            let Some((h, size_mb)) = &hists[ci] else { continue };
+            let Some((h, size_mb)) = &hists[ci] else {
+                continue;
+            };
             if feats[ci].is_none() {
                 feats[ci] = featc[ci];
             }
@@ -2171,7 +2174,9 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
         if a.is_empty() || b.is_empty() || !a.median().is_finite() || !b.median().is_finite() {
             continue;
         }
-        let (Some(fa), Some(fb)) = (feats[ni], feats[ri]) else { continue };
+        let (Some(fa), Some(fb)) = (feats[ni], feats[ri]) else {
+            continue;
+        };
         let gap = fa.unmatched(&fb, true);
         if !gap.is_empty() {
             rec.finding(Finding::not_exercised(
@@ -2579,7 +2584,9 @@ fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
             );
             let got = naive_merge(&blob, &dict[ai], &dict[bi], &mut bufa, &mut bufb);
             assert_eq!(got, want, "supdb intersection {ai}x{bi}");
-            let kernel = nock.intersect_fixed(&dict[ai], &dict[bi], WIDTH).expect("kernel");
+            let kernel = nock
+                .intersect_fixed(&dict[ai], &dict[bi], WIDTH)
+                .expect("kernel");
             assert_eq!(kernel, want, "supdb in-place intersection {ai}x{bi}");
             let got = ldb
                 .intersect_fixed(&dict[ai], &dict[bi], WIDTH)

@@ -282,7 +282,11 @@ const WAL_COMMIT: u8 = 2;
 
 impl Wal {
     fn create(path: &Path, id: u64) -> Result<Wal> {
-        let mut file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
         file.write_all(WAL_MAGIC)?;
         Ok(Wal {
             file,
@@ -353,7 +357,11 @@ impl Wal {
         // What replay kept was read back from the device, so it counts as
         // synced; a header written just now does not until the first
         // barrier.
-        let synced = if written == WAL_MAGIC.len() as u64 { 0 } else { written };
+        let synced = if written == WAL_MAGIC.len() as u64 {
+            0
+        } else {
+            written
+        };
         Ok(Wal {
             file,
             path: path.to_path_buf(),
@@ -381,7 +389,11 @@ impl Wal {
     fn frame(&mut self, kind: u8, key: &[u8], value: &[u8]) {
         // `pending` holds exactly this batch's record frames: `write`
         // empties it at every commit.
-        let batch_crc = if kind == WAL_COMMIT { crc32(&self.pending) ^ self.seed } else { 0 };
+        let batch_crc = if kind == WAL_COMMIT {
+            crc32(&self.pending) ^ self.seed
+        } else {
+            0
+        };
         let body_at = self.pending.len() + FRAME_HEADER;
         self.pending.extend_from_slice(&[0u8; FRAME_HEADER]);
         self.pending.extend_from_slice(&self.seq.to_le_bytes());
@@ -396,7 +408,11 @@ impl Wal {
             }
         }
         let body_len = (self.pending.len() - body_at) as u32;
-        let crc = if kind == WAL_COMMIT { crc32(&self.pending[body_at..]) ^ self.seed } else { 0 };
+        let crc = if kind == WAL_COMMIT {
+            crc32(&self.pending[body_at..]) ^ self.seed
+        } else {
+            0
+        };
         self.pending[body_at - 8..body_at - 4].copy_from_slice(&body_len.to_le_bytes());
         self.pending[body_at - 4..body_at].copy_from_slice(&crc.to_le_bytes());
         self.seq += 1;
@@ -476,10 +492,14 @@ impl Wal {
             if WAL_MAGIC.starts_with(&buf) {
                 return Ok((from, 0));
             }
-            return Err(err("not a next-engine WAL: the header is missing or from an older format"));
+            return Err(err(
+                "not a next-engine WAL: the header is missing or from an older format",
+            ));
         }
         if &buf[..WAL_MAGIC.len()] != WAL_MAGIC {
-            return Err(err("not a next-engine WAL: the header is missing or from an older format"));
+            return Err(err(
+                "not a next-engine WAL: the header is missing or from an older format",
+            ));
         }
         let mut p = WAL_MAGIC.len();
         let mut next_seq = from;
@@ -494,7 +514,9 @@ impl Wal {
             let len = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap()) as usize;
             let crc = u32::from_le_bytes(buf[p + 4..p + 8].try_into().unwrap());
             let body_at = p + FRAME_HEADER;
-            let Some(end) = body_at.checked_add(len) else { break };
+            let Some(end) = body_at.checked_add(len) else {
+                break;
+            };
             if end > buf.len() || len < 9 {
                 break;
             }
@@ -553,8 +575,7 @@ impl Wal {
                     let Some(klen) = get_uvarint(body, &mut q) else {
                         break;
                     };
-                    let Some(kend) =
-                        q.checked_add(klen as usize).filter(|&e| e <= body.len())
+                    let Some(kend) = q.checked_add(klen as usize).filter(|&e| e <= body.len())
                     else {
                         break;
                     };
@@ -616,7 +637,9 @@ pub(crate) struct BlockedBloom {
 
 impl BlockedBloom {
     fn with_capacity(n: usize) -> BlockedBloom {
-        BlockedBloom { blocks: vec![[0u64; 8]; (n * 10).div_ceil(512).max(1)] }
+        BlockedBloom {
+            blocks: vec![[0u64; 8]; (n * 10).div_ceil(512).max(1)],
+        }
     }
 
     fn hash(key: &[u8]) -> u64 {
@@ -878,14 +901,23 @@ impl SegmentWriter {
     /// Where the key section starts: after the superblock page and the
     /// head reserve, if any.
     fn key_start(&self) -> u64 {
-        crate::store::SUPER + if self.reserve_off != 0 { self.head_reserve as u64 } else { 0 }
+        crate::store::SUPER
+            + if self.reserve_off != 0 {
+                self.head_reserve as u64
+            } else {
+                0
+            }
     }
 
     fn layout(&mut self) -> Result<Layout> {
         if let Some(m) = self.mode {
             return Ok(m);
         }
-        let m = if self.inline_max > 0 { Layout::RecordsFirst } else { Layout::BlocksFirst };
+        let m = if self.inline_max > 0 {
+            Layout::RecordsFirst
+        } else {
+            Layout::BlocksFirst
+        };
         if self.head_reserve > 0 && self.reserve_off == 0 {
             self.reserve_off = self.pos;
             let mut left = self.head_reserve;
@@ -920,7 +952,9 @@ impl SegmentWriter {
         }
         if let Some(&(s, l)) = self.spans.last() {
             if key <= &self.key_arena[s..s + l] {
-                return Err(err("segment writer: keys must arrive in strictly increasing order"));
+                return Err(err(
+                    "segment writer: keys must arrive in strictly increasing order",
+                ));
             }
         }
         self.layout()?;
@@ -962,10 +996,14 @@ impl SegmentWriter {
         self.lens.clear();
         let n = self.run.len();
         if n > u32::MAX as usize {
-            return Err(err("segment writer: a key's values exceed 4 GiB in one segment"));
+            return Err(err(
+                "segment writer: a key's values exceed 4 GiB in one segment",
+            ));
         }
         if self.records >= Ext::FIXED {
-            return Err(err("segment writer: a key's values exceed the extent's count"));
+            return Err(err(
+                "segment writer: a key's values exceed the extent's count",
+            ));
         }
         let count = self.records | flag | if tombstone { Ext::TOMBSTONE } else { 0 };
         let layout = self.layout()?;
@@ -973,7 +1011,13 @@ impl SegmentWriter {
         let ext = if inline {
             // Into the record: a read of this key never touches a block.
             // `off` is within this key's tail, and a key has one run here.
-            Ext { block: Ext::INLINE, off: 0, len: n as u32, last: self.last as u32, count }
+            Ext {
+                block: Ext::INLINE,
+                off: 0,
+                len: n as u32,
+                last: self.last as u32,
+                count,
+            }
         } else {
             // A run that does not fit beside what is staged starts a new
             // block; a run larger than a whole block takes an empty builder
@@ -1008,7 +1052,9 @@ impl SegmentWriter {
                 self.recs_len += wrote;
                 self.hashes.push(flatindex::key_hash(key));
                 if self.recs_len > flatindex::MAX_RECS {
-                    return Err(err("segment writer: key section exceeds the flat index's limits"));
+                    return Err(err(
+                        "segment writer: key section exceeds the flat index's limits",
+                    ));
                 }
             }
             Layout::BlocksFirst => {
@@ -1032,7 +1078,11 @@ impl SegmentWriter {
         }
         let bytes = self.builder.take();
         let len = bytes.len() as u32;
-        let crc = if block::checksums_on() { crc32(&bytes) } else { 0 };
+        let crc = if block::checksums_on() {
+            crc32(&bytes)
+        } else {
+            0
+        };
         self.blocks.push(BlockLoc {
             off: self.pos,
             stored: len,
@@ -1112,7 +1162,9 @@ impl SegmentWriter {
                         &self.hashes,
                         generation,
                     )
-                    .ok_or_else(|| err("segment writer: key section exceeds the flat index's limits"))?
+                    .ok_or_else(|| {
+                        err("segment writer: key section exceeds the flat index's limits")
+                    })?
                 };
                 self.out.write_all(&trailer)?;
                 self.pos += trailer.len() as u64;
@@ -1139,7 +1191,10 @@ impl SegmentWriter {
                             buf[..from_header].copy_from_slice(&header[at..at + from_header]);
                         }
                         if n > from_header {
-                            file.read_exact_at(&mut buf[from_header..n], key_off + (at + from_header) as u64)?;
+                            file.read_exact_at(
+                                &mut buf[from_header..n],
+                                key_off + (at + from_header) as u64,
+                            )?;
                         }
                         row.extend_from_slice(&block::crc32(&buf[..n]).to_le_bytes());
                     }
@@ -1165,8 +1220,7 @@ impl SegmentWriter {
         let table = flatindex::encode_blocks(&self.blocks, &rows);
         // The table goes into the head reserve when there is one and it
         // fits with room for the fence copy; else at the end, as before.
-        let table_in_reserve =
-            self.reserve_off != 0 && table.len() + 8 <= self.head_reserve;
+        let table_in_reserve = self.reserve_off != 0 && table.len() + 8 <= self.head_reserve;
         let blk_off = if table_in_reserve {
             self.reserve_off
         } else {
@@ -1285,7 +1339,11 @@ impl SegmentWriter {
             dir: (key_off + hdr.dir_off as u64, hdr.nkeys as u64 * 4),
             hash: (key_off + hdr.hash_off as u64, hdr.hash_cap as u64 * 8),
             row: (key_off + hdr.crc_off as u64, row_len as u64),
-            table_copy: if table_in_reserve { Some((blk_off, table.len() as u64)) } else { None },
+            table_copy: if table_in_reserve {
+                Some((blk_off, table.len() as u64))
+            } else {
+                None
+            },
             fence_copy,
             row_copy,
             dir_copy,
@@ -1320,7 +1378,8 @@ impl SegmentWriter {
         let sb = superblock(&fields);
         let mut page = vec![0u8; crate::store::SUPER as usize];
         page[..sb.len()].copy_from_slice(&sb);
-        page[crate::store::SLOT as usize..crate::store::SLOT as usize + sb.len()].copy_from_slice(&sb);
+        page[crate::store::SLOT as usize..crate::store::SLOT as usize + sb.len()]
+            .copy_from_slice(&sb);
         let x = crate::blob::encode_super_ext(&ext, generation);
         page[1024..1024 + x.len()].copy_from_slice(&x);
         file.write_all_at(&page, 0)?;
@@ -1435,14 +1494,19 @@ impl Seg {
             // A manifest naming a segment that is not on disk is a damaged
             // store, not a missing file, and saying so is the difference
             // between a diagnosis and an ENOENT.
-            err(&format!("the manifest names segment {name}, which is not in the store: {e}"))
+            err(&format!(
+                "the manifest names segment {name}, which is not in the store: {e}"
+            ))
         })?;
         let blob = Blob::open(src).map_err(|e| err(&format!("segment {name}: {e}")))?;
         // `pcs-` is a range-ALIGNED L0 piece: a seal split at the live
         // partition boundaries, so it carries a fence like a partition and
         // overlaps only the pieces of its own range. That alignment is what
         // makes a merge O(range) instead of O(store).
-        if let Some(rest) = name.strip_prefix("pcs-").and_then(|r| r.strip_suffix(".sup")) {
+        if let Some(rest) = name
+            .strip_prefix("pcs-")
+            .and_then(|r| r.strip_suffix(".sup"))
+        {
             let f: Vec<&str> = rest.split('-').collect();
             if f.len() != 4 {
                 return Err(err("aligned piece name is malformed"));
@@ -1464,7 +1528,10 @@ impl Seg {
                 tombs,
             });
         }
-        if let Some(rest) = name.strip_prefix("par-").and_then(|r| r.strip_suffix(".sup")) {
+        if let Some(rest) = name
+            .strip_prefix("par-")
+            .and_then(|r| r.strip_suffix(".sup"))
+        {
             // par-<id>-<endseq>-<lo hex>-<hi hex>: fences route this one,
             // so nothing is walked at open. The unbounded high fence is the
             // empty string.
@@ -1838,7 +1905,9 @@ fn manifest_read(dir: &Path) -> Result<Option<(u64, Vec<String>)>> {
     }
     let len = u32::from_le_bytes(buf[9..13].try_into().unwrap()) as usize;
     let crc = u32::from_le_bytes(buf[13..17].try_into().unwrap());
-    let body = buf.get(17..17 + len).ok_or_else(|| err("manifest is truncated"))?;
+    let body = buf
+        .get(17..17 + len)
+        .ok_or_else(|| err("manifest is truncated"))?;
     if crc32(body) != crc {
         return Err(err("manifest failed its checksum"));
     }
@@ -1848,10 +1917,15 @@ fn manifest_read(dir: &Path) -> Result<Option<(u64, Vec<String>)>> {
     let mut p = 12usize;
     for _ in 0..n {
         let l = u16::from_le_bytes(
-            body.get(p..p + 2).ok_or_else(|| err("manifest is truncated"))?.try_into().unwrap(),
+            body.get(p..p + 2)
+                .ok_or_else(|| err("manifest is truncated"))?
+                .try_into()
+                .unwrap(),
         ) as usize;
         p += 2;
-        let raw = body.get(p..p + l).ok_or_else(|| err("manifest is truncated"))?;
+        let raw = body
+            .get(p..p + l)
+            .ok_or_else(|| err("manifest is truncated"))?;
         names.push(String::from_utf8(raw.to_vec()).map_err(|_| err("manifest name is not utf8"))?);
         p += l;
     }
@@ -1903,7 +1977,10 @@ struct KeyList {
 
 impl KeyList {
     fn new() -> KeyList {
-        KeyList { bytes: Vec::new(), offs: vec![0] }
+        KeyList {
+            bytes: Vec::new(),
+            offs: vec![0],
+        }
     }
 
     fn push(&mut self, k: &[u8]) {
@@ -2056,7 +2133,8 @@ impl Emitter<'_> {
         self.r += 1;
         if self.r == to {
             let w = self.w.take().ok_or_else(|| err("merge piece not open"))?;
-            w.finish().map_err(|e| err(&format!("compact finish: {e}")))?;
+            w.finish()
+                .map_err(|e| err(&format!("compact finish: {e}")))?;
             let p = &self.pieces[self.pi];
             std::fs::rename(&p.tmp, self.dir.join(&p.name))?;
             self.out.push(p.name.clone());
@@ -2192,8 +2270,16 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
                     // Sub-fences tile the fence they came from: the first
                     // keeps its low bound, the last its high bound, and the
                     // joins are single shared values.
-                    let sub_lo = if i == 0 { lo.clone() } else { fence_lo(keys.get(sf)) };
-                    let sub_hi = if st == to { hi.clone() } else { Some(fence_lo(keys.get(st))) };
+                    let sub_lo = if i == 0 {
+                        lo.clone()
+                    } else {
+                        fence_lo(keys.get(sf))
+                    };
+                    let sub_hi = if st == to {
+                        hi.clone()
+                    } else {
+                        Some(fence_lo(keys.get(st)))
+                    };
                     slices.push((sf, st));
                     given.push((sub_lo, sub_hi));
                 }
@@ -2223,8 +2309,16 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
             // Unbounded at both ends of the set, and every interior fence
             // is the boundary shared with the neighbour.
             None => (
-                if pi == 0 { Vec::new() } else { bounds[pi - 1].clone() },
-                if pi + 1 == slices.len() { None } else { Some(bounds[pi].clone()) },
+                if pi == 0 {
+                    Vec::new()
+                } else {
+                    bounds[pi - 1].clone()
+                },
+                if pi + 1 == slices.len() {
+                    None
+                } else {
+                    Some(bounds[pi].clone())
+                },
             ),
         };
         let name = format!(
@@ -2233,7 +2327,14 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
             hi.as_deref().map(hex).unwrap_or_default()
         );
         let tmp = dir.join(format!("compact-{id:08}.tmp"));
-        pieces.push(Piece { from, to, lo, hi, name, tmp });
+        pieces.push(Piece {
+            from,
+            to,
+            lo,
+            hi,
+            name,
+            tmp,
+        });
     }
 
     // Pass two: values, in rank order, into one piece per slice.
@@ -2426,11 +2527,14 @@ impl Snapshot {
         self.ents.len()
     }
     fn get(&self, i: usize) -> Option<(&[u8], &SnapKey)> {
-        self.ents.get(i).map(|e| (&self.keys[e.off as usize..(e.off + e.len) as usize], e))
+        self.ents
+            .get(i)
+            .map(|e| (&self.keys[e.off as usize..(e.off + e.len) as usize], e))
     }
     /// First index whose key is not below `from`.
     fn seek(&self, from: &[u8]) -> usize {
-        self.ents.partition_point(|e| &self.keys[e.off as usize..(e.off + e.len) as usize] < from)
+        self.ents
+            .partition_point(|e| &self.keys[e.off as usize..(e.off + e.len) as usize] < from)
     }
     /// Merge a run of entries sorted by key into `ents`, folding a key
     /// present in both tables into one entry carrying both indices.
@@ -2485,7 +2589,10 @@ fn key_prefix(k: &[u8]) -> (u64, u64) {
     let mut b = [0u8; 16];
     let n = k.len().min(16);
     b[..n].copy_from_slice(&k[..n]);
-    (u64::from_be_bytes(b[..8].try_into().unwrap()), u64::from_be_bytes(b[8..].try_into().unwrap()))
+    (
+        u64::from_be_bytes(b[..8].try_into().unwrap()),
+        u64::from_be_bytes(b[8..].try_into().unwrap()),
+    )
 }
 
 impl Db {
@@ -2550,7 +2657,11 @@ impl Db {
     }
 
     fn segment_opts(opts: &NextOptions) -> Options {
-        Options { redo_log: false, shards: 1, ..opts.segment.clone() }
+        Options {
+            redo_log: false,
+            shards: 1,
+            ..opts.segment.clone()
+        }
     }
 
     pub fn create(dir: &Path, opts: NextOptions) -> Result<Db> {
@@ -2602,9 +2713,7 @@ impl Db {
         let mut on_disk: Vec<String> = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let name = entry?.file_name().to_string_lossy().into_owned();
-            if (name.starts_with("seg-")
-                || name.starts_with("par-")
-                || name.starts_with("pcs-"))
+            if (name.starts_with("seg-") || name.starts_with("par-") || name.starts_with("pcs-"))
                 && name.ends_with(".sup")
             {
                 on_disk.push(name);
@@ -2613,13 +2722,13 @@ impl Db {
         let (sealed, live) = match manifest_read(dir)? {
             Some((covered, names)) => (covered, names),
             None => {
-                let mut names: Vec<String> =
-                    on_disk.iter().filter(|n| n.starts_with("seg-")).cloned().collect();
+                let mut names: Vec<String> = on_disk
+                    .iter()
+                    .filter(|n| n.starts_with("seg-"))
+                    .cloned()
+                    .collect();
                 names.sort_unstable();
-                let covered = names
-                    .last()
-                    .and_then(|n| Db::name_end_seq(n))
-                    .unwrap_or(0);
+                let covered = names.last().and_then(|n| Db::name_end_seq(n)).unwrap_or(0);
                 (covered, names)
             }
         };
@@ -2636,7 +2745,10 @@ impl Db {
             segs.push(Seg::open(dir, name)?);
         }
         segs.sort_by(|a, b| {
-            b.level.cmp(&a.level).then_with(|| a.lo.cmp(&b.lo)).then_with(|| a.name.cmp(&b.name))
+            b.level
+                .cmp(&a.level)
+                .then_with(|| a.lo.cmp(&b.lo))
+                .then_with(|| a.name.cmp(&b.name))
         });
         let seg_ids: Vec<(u64, u64)> = live
             .iter()
@@ -2756,7 +2868,10 @@ impl Db {
     /// applies them as one batch. It borrows the store mutably, so no other
     /// write can interleave with it and no read can observe it half-applied.
     pub fn begin(&mut self) -> Txn<'_> {
-        Txn { db: self, ops: Vec::new() }
+        Txn {
+            db: self,
+            ops: Vec::new(),
+        }
     }
 
     /// Whether any source can end a key's older values. False for a store
@@ -2854,8 +2969,7 @@ impl Db {
             // the read costs -- and the sort is affordable because a seal is
             // off the commit path. The same sort is what makes splitting at
             // the fences a matter of slicing.
-            let mut order: Vec<&MemEntry> =
-                mem.entries.iter().filter(|e| e.hash != 0).collect();
+            let mut order: Vec<&MemEntry> = mem.entries.iter().filter(|e| e.hash != 0).collect();
             order.sort_unstable_by_key(|e| MemTable::key_of(&mem.keys, e));
 
             let ranges: Vec<Fence> = if fences.is_empty() {
@@ -2968,11 +3082,18 @@ impl Db {
         // partitioning, everything is re-partitioned from every key.
         let mut rounds = 0usize;
         while self.segs.iter().any(|s| s.level == 0) {
-            let plan = if self.opts.flush_ranges { self.merge_due(1) } else { None };
+            let plan = if self.opts.flush_ranges {
+                self.merge_due(1)
+            } else {
+                None
+            };
             match plan {
                 Some(fences) if !fences.is_empty() => {
-                    let fences =
-                        if self.opts.promote { self.promote_ranges(fences)? } else { fences };
+                    let fences = if self.opts.promote {
+                        self.promote_ranges(fences)?
+                    } else {
+                        fences
+                    };
                     if !fences.is_empty() {
                         self.start_compact(Some(fences))?;
                     }
@@ -3111,7 +3232,11 @@ impl Db {
         // deciding against a store that still looked unpartitioned: every
         // merge then took the full re-partitioning path and the
         // incremental one never ran once in a whole load.
-        if self.compacting.as_ref().is_some_and(|(_, h)| h.is_finished()) {
+        if self
+            .compacting
+            .as_ref()
+            .is_some_and(|(_, h)| h.is_finished())
+        {
             self.join_compact()?;
         }
         // One selection rule for both schedulers, so they cannot drift: a
@@ -3129,7 +3254,11 @@ impl Db {
                 Ok(())
             }
             Some(due) if !due.is_empty() => {
-                let due = if self.opts.promote { self.promote_ranges(due)? } else { due };
+                let due = if self.opts.promote {
+                    self.promote_ranges(due)?
+                } else {
+                    due
+                };
                 if due.is_empty() {
                     return Ok(());
                 }
@@ -3173,7 +3302,11 @@ impl Db {
             // The partition's last key, or nothing if it is empty.
             let floor: Option<Vec<u8>> = {
                 let b = &self.segs[pi].blob;
-                if b.keys() == 0 { None } else { b.key_at(b.keys() - 1).map(|k| k.to_vec()) }
+                if b.keys() == 0 {
+                    None
+                } else {
+                    b.key_at(b.keys() - 1).map(|k| k.to_vec())
+                }
             };
             match self.promotion_chain(&f, floor, &mut pieces) {
                 Some(bounds) => {
@@ -3182,7 +3315,11 @@ impl Db {
                     let mut renames: Vec<(usize, Fence)> = Vec::with_capacity(pieces.len() + 1);
                     renames.push((pi, (f.0.clone(), Some(bounds[0].clone()))));
                     for (j, &si) in pieces.iter().enumerate() {
-                        let hi = if j + 1 < pieces.len() { Some(bounds[j + 1].clone()) } else { f.1.clone() };
+                        let hi = if j + 1 < pieces.len() {
+                            Some(bounds[j + 1].clone())
+                        } else {
+                            f.1.clone()
+                        };
                         renames.push((si, (bounds[j].clone(), hi)));
                     }
                     self.apply_promotion(renames)?;
@@ -3213,8 +3350,16 @@ impl Db {
         };
         let mut renames: Vec<(usize, Fence)> = Vec::with_capacity(pieces.len());
         for (j, &si) in pieces.iter().enumerate() {
-            let lo = if j == 0 { Vec::new() } else { bounds[j].clone() };
-            let hi = if j + 1 < pieces.len() { Some(bounds[j + 1].clone()) } else { None };
+            let lo = if j == 0 {
+                Vec::new()
+            } else {
+                bounds[j].clone()
+            };
+            let hi = if j + 1 < pieces.len() {
+                Some(bounds[j + 1].clone())
+            } else {
+                None
+            };
             renames.push((si, (lo, hi)));
         }
         self.apply_promotion(renames)?;
@@ -3237,11 +3382,19 @@ impl Db {
         }
         let first_of = |si: usize| -> Option<Vec<u8>> {
             let b = &self.segs[si].blob;
-            if b.keys() == 0 { None } else { b.key_at(0).map(|k| k.to_vec()) }
+            if b.keys() == 0 {
+                None
+            } else {
+                b.key_at(0).map(|k| k.to_vec())
+            }
         };
         let last_of = |si: usize| -> Option<Vec<u8>> {
             let b = &self.segs[si].blob;
-            if b.keys() == 0 { None } else { b.key_at(b.keys() - 1).map(|k| k.to_vec()) }
+            if b.keys() == 0 {
+                None
+            } else {
+                b.key_at(b.keys() - 1).map(|k| k.to_vec())
+            }
         };
         // An empty piece has nothing to promote; leave it to the merge.
         if pieces.iter().any(|&si| self.segs[si].blob.keys() == 0) {
@@ -3367,7 +3520,11 @@ impl Db {
         if inputs.is_empty() {
             return Ok(());
         }
-        let pb = self.opts.partition_bytes.unwrap_or(self.opts.seal_bytes).max(1);
+        let pb = self
+            .opts
+            .partition_bytes
+            .unwrap_or(self.opts.seal_bytes)
+            .max(1);
         let parts = match &fences {
             Some(f) => f.len(),
             None => {
@@ -3433,7 +3590,9 @@ impl Db {
             return Ok(());
         };
         let t = std::time::Instant::now();
-        let outputs = handle.join().map_err(|_| err("compaction thread panicked"))??;
+        let outputs = handle
+            .join()
+            .map_err(|_| err("compaction thread panicked"))??;
         let mut kept: Vec<Seg> = Vec::new();
         for seg in self.segs.drain(..) {
             if !inputs.contains(&seg.name) {
@@ -3467,8 +3626,8 @@ impl Db {
     /// holds nothing for this key.
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
         let np = self.segs.partition_point(|s| s.level > 0);
-        let at = self.segs[..np]
-            .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+        let at =
+            self.segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
         let part = self.segs[..np].get(at).filter(|s| s.may_hold(key));
         let l0 = &self.segs[np..];
         // Sources oldest to newest: the partition (0), the level-0 pieces
@@ -3557,7 +3716,9 @@ impl Db {
     fn build_snapshot(&self) -> Snapshot {
         let n = self.mem.len + self.frozen.as_ref().map_or(0, |f| f.len);
         let mut snap = Snapshot {
-            keys: Vec::with_capacity(self.mem.keys.len() + self.frozen.as_ref().map_or(0, |f| f.keys.len())),
+            keys: Vec::with_capacity(
+                self.mem.keys.len() + self.frozen.as_ref().map_or(0, |f| f.keys.len()),
+            ),
             ents: Vec::with_capacity(n),
         };
         if self.opts.scan_snapshot_arena {
@@ -3641,7 +3802,12 @@ impl Db {
             for o in all {
                 let off = snap.keys.len() as u32;
                 snap.keys.extend_from_slice(&o.key);
-                snap.push_sorted(SnapKey { off, len: o.key.len() as u32, mem: o.mem, frozen: o.frozen });
+                snap.push_sorted(SnapKey {
+                    off,
+                    len: o.key.len() as u32,
+                    mem: o.mem,
+                    frozen: o.frozen,
+                });
             }
         }
         snap
@@ -3674,8 +3840,7 @@ impl Db {
         // is the shape the store is in. An earlier version had this path,
         // a refactor dropped it, and the scan axis paid for it.
         if mi >= unsealed.len() && !self.segs.iter().any(|s| s.level == 0) {
-            let mut parts: Vec<&Seg> =
-                self.segs.iter().filter(|s| s.may_reach(from)).collect();
+            let mut parts: Vec<&Seg> = self.segs.iter().filter(|s| s.may_reach(from)).collect();
             parts.sort_by(|a, b| a.lo.cmp(&b.lo));
             let mut seen = 0usize;
             let mut cursor: Vec<u8> = from.to_vec();
@@ -3715,7 +3880,11 @@ impl Db {
             .iter()
             .filter(|s| s.may_reach(from))
             .map(|s| {
-                let start = if s.lo.as_slice() > from { s.lo.as_slice() } else { from };
+                let start = if s.lo.as_slice() > from {
+                    s.lo.as_slice()
+                } else {
+                    from
+                };
                 (s, s.blob.seek(start))
             })
             .collect();
@@ -3832,7 +4001,11 @@ impl Db {
         let mut pkey: Option<&[u8]> = None;
         while pi < np {
             let s = &parts[pi];
-            let start = if s.lo.as_slice() > from { s.lo.as_slice() } else { from };
+            let start = if s.lo.as_slice() > from {
+                s.lo.as_slice()
+            } else {
+                from
+            };
             prank = s.blob.seek(start);
             pkey = s.blob.key_at(prank);
             if pkey.is_some() {
@@ -3849,9 +4022,17 @@ impl Db {
             .iter()
             .filter(|s| s.may_reach(from))
             .map(|s| {
-                let start = if s.lo.as_slice() > from { s.lo.as_slice() } else { from };
+                let start = if s.lo.as_slice() > from {
+                    s.lo.as_slice()
+                } else {
+                    from
+                };
                 let rank = s.blob.seek(start);
-                Cur { seg: s, rank, key: s.blob.key_at(rank) }
+                Cur {
+                    seg: s,
+                    rank,
+                    key: s.blob.key_at(rank),
+                }
             })
             .collect();
         let nc = l0.len();
@@ -3963,8 +4144,8 @@ impl Db {
     /// block is read. The memtable keeps a live count per key.
     pub fn count(&self, key: &[u8]) -> Result<u64> {
         let np = self.segs.partition_point(|s| s.level > 0);
-        let at = self.segs[..np]
-            .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+        let at =
+            self.segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
         let part = self.segs[..np].get(at).filter(|s| s.may_hold(key));
         let l0 = &self.segs[np..];
         let (fr_ix, mem_ix) = (1 + l0.len(), 2 + l0.len());
@@ -4003,14 +4184,20 @@ impl Db {
         let mut n = 0u64;
         if start == 0 {
             if let Some(seg) = part {
-                n += seg.blob.count(key).map_err(|e| err(&format!("segment count: {e}")))?;
+                n += seg
+                    .blob
+                    .count(key)
+                    .map_err(|e| err(&format!("segment count: {e}")))?;
             }
         }
         for (i, seg) in l0.iter().enumerate() {
             if 1 + i < start || !seg.may_hold(key) {
                 continue;
             }
-            n += seg.blob.count(key).map_err(|e| err(&format!("segment count: {e}")))?;
+            n += seg
+                .blob
+                .count(key)
+                .map_err(|e| err(&format!("segment count: {e}")))?;
         }
         if fr_ix >= start {
             if let Some(fr) = &self.frozen {

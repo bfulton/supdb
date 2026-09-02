@@ -36,7 +36,10 @@ impl Bytes for Recording {
         self.log.borrow_mut().push((off, dst.len() as u64));
         let end = off as usize + dst.len();
         if end > self.data.len() {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "short",
+            ));
         }
         dst.copy_from_slice(&self.data[off as usize..end]);
         Ok(())
@@ -62,7 +65,9 @@ impl Bytes for Ensured {
     }
     fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
         let end = off + dst.len() as u64;
-        let ok = merged(&self.allowed.borrow()).iter().any(|&(a, l)| a <= off && end <= a + l);
+        let ok = merged(&self.allowed.borrow())
+            .iter()
+            .any(|&(a, l)| a <= off && end <= a + l);
         if !ok {
             return Err(std::io::Error::other(format!(
                 "cache miss: {} bytes at {off} were not ensured",
@@ -118,7 +123,9 @@ fn keys_and_values(n: usize) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
                 5 => 300,
                 _ => 5,
             };
-            let vals = (0..count).map(|j| format!("{fi}:{i}:{j}").into_bytes()).collect();
+            let vals = (0..count)
+                .map(|j| format!("{fi}:{i}:{j}").into_bytes())
+                .collect();
             all.push((key, vals));
         }
     }
@@ -138,7 +145,11 @@ fn build_store(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)]) {
 }
 
 fn build_segment(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)]) {
-    let opts = Options { redo_log: false, shards: 1, ..Options::default() };
+    let opts = Options {
+        redo_log: false,
+        shards: 1,
+        ..Options::default()
+    };
     let mut w = SegmentWriter::create(path, &opts).expect("create");
     w.set_inline_max(256);
     for (k, vals) in all {
@@ -180,12 +191,20 @@ fn ranges_to_try(all: &[(Vec<u8>, Vec<Vec<u8>>)]) -> Vec<(Vec<u8>, Option<Vec<u8
     ];
     let mut x = 0xD1C7_u64;
     for _ in 0..120 {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let a = (x >> 33) as usize % all.len();
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let b = (x >> 33) as usize % all.len();
         let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-        let hi_key = if x & 1 == 0 { Some(key(hi)) } else { Some(bump(&key(hi))) };
+        let hi_key = if x & 1 == 0 {
+            Some(key(hi))
+        } else {
+            Some(bump(&key(hi)))
+        };
         v.push((key(lo), if x & 2 == 0 { hi_key } else { None }));
     }
     v
@@ -209,9 +228,15 @@ fn check_shape(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)], shape: &str) {
     let whole = Blob::open(MmapBytes::open(path).unwrap()).expect("whole open");
     let lending = SparseBlob::open(MmapBytes::open(path).unwrap()).expect("sparse open, lending");
     let log = Rc::new(RefCell::new(Vec::new()));
-    let sparse = SparseBlob::open(Recording { data: std::fs::read(path).unwrap(), log: log.clone() })
-        .expect("sparse open, copying");
-    assert!(sparse.has_fence(), "{shape}: the fixture must carry a fence or the plans are trivial");
+    let sparse = SparseBlob::open(Recording {
+        data: std::fs::read(path).unwrap(),
+        log: log.clone(),
+    })
+    .expect("sparse open, copying");
+    assert!(
+        sparse.has_fence(),
+        "{shape}: the fixture must carry a fence or the plans are trivial"
+    );
     assert_eq!(sparse.keys(), whole.keys());
     assert_eq!(sparse.version(), whole.version());
     let mut mark = log.borrow().len();
@@ -238,10 +263,18 @@ fn check_shape(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)], shape: &str) {
         // piece is touched, and less once its checksum has been verified.
         touched();
         let p1 = sparse.dictionary_plan(&lo, hi);
-        assert!(touched().is_empty(), "{label}: planning the directory slice read bytes");
-        let p2 = sparse.dictionary_plan_records(&lo, hi).expect("plan records");
+        assert!(
+            touched().is_empty(),
+            "{label}: planning the directory slice read bytes"
+        );
+        let p2 = sparse
+            .dictionary_plan_records(&lo, hi)
+            .expect("plan records");
         let t2 = touched();
-        assert!(within(&t2, &p1), "{label}: phase two must read within phase one: {t2:?} vs {p1:?}");
+        assert!(
+            within(&t2, &p1),
+            "{label}: phase two must read within phase one: {t2:?} vs {p1:?}"
+        );
         let mut got = Vec::new();
         sparse
             .dictionary_counts(&lo, hi, |k, n| {
@@ -251,8 +284,14 @@ fn check_shape(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)], shape: &str) {
             .expect("walk");
         let both: Vec<(u64, u64)> = p1.iter().chain(p2.iter()).copied().collect();
         let tw = touched();
-        assert!(within(&tw, &both), "{label}: the walk must read within its two plans: {tw:?} vs {both:?}");
-        assert_eq!(got, want, "{label}: the sparse walk disagrees with the whole reader");
+        assert!(
+            within(&tw, &both),
+            "{label}: the walk must read within its two plans: {tw:?} vs {both:?}"
+        );
+        assert_eq!(
+            got, want,
+            "{label}: the sparse walk disagrees with the whole reader"
+        );
 
         // The lending source answers the same, through the zero-copy arm.
         let mut lent = Vec::new();
@@ -289,10 +328,17 @@ fn check_shape(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)], shape: &str) {
                     seen < 3
                 })
                 .unwrap();
-            assert_eq!((n, seen), (3, 3), "{label}: returning false must stop the walk");
+            assert_eq!(
+                (n, seen),
+                (3, 3),
+                "{label}: returning false must stop the walk"
+            );
         }
     }
-    assert!(nonempty > 20 && partial > 20, "{shape}: the range set is too thin to mean anything");
+    assert!(
+        nonempty > 20 && partial > 20,
+        "{shape}: the range set is too thin to mean anything"
+    );
 
     // Values, through the extents a walk hands out: inline runs need no
     // plan, block-backed ones plan their blocks and read exactly them.
@@ -305,9 +351,16 @@ fn check_shape(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)], shape: &str) {
             let exts = exts.to_vec();
             let tail = tail.to_vec();
             let mut vals = Vec::new();
-            sparse.read_exts(&exts, &tail, |v| vals.push(v.to_vec())).expect("read exts");
+            sparse
+                .read_exts(&exts, &tail, |v| vals.push(v.to_vec()))
+                .expect("read exts");
             let want = &all.iter().find(|(wk, _)| *wk == key).expect("known key").1;
-            assert_eq!(&vals, want, "{shape}: values of {}", String::from_utf8_lossy(&key));
+            assert_eq!(
+                &vals,
+                want,
+                "{shape}: values of {}",
+                String::from_utf8_lossy(&key)
+            );
             let _ = plan;
             checked += 1;
             checked < 60
@@ -331,7 +384,10 @@ fn sparse_ranges_agree_with_the_whole_reader_and_read_exactly_their_plans() {
 fn the_sparse_open_reads_header_fence_and_block_table_only() {
     let all = keys_and_values(2000);
     for (shape, build) in [
-        ("store", build_store as fn(&Path, &[(Vec<u8>, Vec<Vec<u8>>)])),
+        (
+            "store",
+            build_store as fn(&Path, &[(Vec<u8>, Vec<Vec<u8>>)]),
+        ),
         ("segment", build_segment),
     ] {
         let path = scratch(&format!("open-{shape}"));
@@ -340,11 +396,19 @@ fn the_sparse_open_reads_header_fence_and_block_table_only() {
         let object_len = data.len() as u64;
 
         let whole_log = Rc::new(RefCell::new(Vec::new()));
-        let whole = Blob::open(Recording { data: data.clone(), log: whole_log.clone() }).unwrap();
+        let whole = Blob::open(Recording {
+            data: data.clone(),
+            log: whole_log.clone(),
+        })
+        .unwrap();
         let whole_bytes: u64 = merged(&whole_log.borrow()).iter().map(|r| r.1).sum();
 
         let log = Rc::new(RefCell::new(Vec::new()));
-        let sparse = SparseBlob::open(Recording { data: data.clone(), log: log.clone() }).unwrap();
+        let sparse = SparseBlob::open(Recording {
+            data: data.clone(),
+            log: log.clone(),
+        })
+        .unwrap();
         let read = merged(&log.borrow());
         let sparse_bytes: u64 = read.iter().map(|r| r.1).sum();
 
@@ -353,7 +417,9 @@ fn the_sparse_open_reads_header_fence_and_block_table_only() {
         let p1 = open_sparse_ranges(head, object_len).unwrap();
         let hdr_range = p1
             .iter()
-            .find(|r| r.0 != 0 && r.1 as usize >= supdb::flatindex::HEADER_BYTES && r.0 < object_len)
+            .find(|r| {
+                r.0 != 0 && r.1 as usize >= supdb::flatindex::HEADER_BYTES && r.0 < object_len
+            })
             .copied();
         // The index header is the first HEADER_BYTES of the key section; the
         // plan lists it merged with whatever it touches, so find it through
@@ -362,13 +428,22 @@ fn the_sparse_open_reads_header_fence_and_block_table_only() {
             // A whole reader's index section starts where its first non-probe
             // read after the superblock did.
             let l = whole_log.borrow();
-            l.iter().map(|r| r.0).filter(|&o| o >= open_probe()).min().unwrap()
+            l.iter()
+                .map(|r| r.0)
+                .filter(|&o| o >= open_probe())
+                .min()
+                .unwrap()
         };
         let _ = hdr_range;
-        let index_header = &data[key_off as usize..key_off as usize + supdb::flatindex::HEADER_BYTES];
+        let index_header =
+            &data[key_off as usize..key_off as usize + supdb::flatindex::HEADER_BYTES];
         let p2 = open_sparse_fence_ranges(head, object_len, index_header).unwrap();
         let plan: Vec<(u64, u64)> = p1.iter().chain(p2.iter()).copied().collect();
-        assert_eq!(read, merged(&plan), "{shape}: the sparse open must read exactly its two plans");
+        assert_eq!(
+            read,
+            merged(&plan),
+            "{shape}: the sparse open must read exactly its two plans"
+        );
         assert!(
             sparse_bytes * 4 < whole_bytes,
             "{shape}: sparse open read {sparse_bytes} bytes against the whole reader's {whole_bytes}"
@@ -389,7 +464,10 @@ fn a_source_that_serves_only_what_was_ensured_is_enough() {
     let object_len = data.len() as u64;
     let whole = Blob::open(MmapBytes::open(&path).unwrap()).unwrap();
 
-    let src = Ensured { data: data.clone(), allowed: RefCell::new(Vec::new()) };
+    let src = Ensured {
+        data: data.clone(),
+        allowed: RefCell::new(Vec::new()),
+    };
     src.ensure(&[(0, open_probe())]);
     let head = data[..open_probe() as usize].to_vec();
     let p1 = open_sparse_ranges(&head, object_len).unwrap();
@@ -424,7 +502,8 @@ fn a_source_that_serves_only_what_was_ensured_is_enough() {
                 .0
         })
     };
-    let index_header = data[key_off as usize..key_off as usize + supdb::flatindex::HEADER_BYTES].to_vec();
+    let index_header =
+        data[key_off as usize..key_off as usize + supdb::flatindex::HEADER_BYTES].to_vec();
     let p2 = open_sparse_fence_ranges(&head, object_len, &index_header).unwrap();
     src.ensure(&p2);
     let sparse = SparseBlob::open(src).expect("open over ensured ranges only");
@@ -444,7 +523,9 @@ fn a_source_that_serves_only_what_was_ensured_is_enough() {
         // Phase one, then phase two, then the walk.
         let d = sparse.dictionary_plan(&lo, hi);
         sparse.source().ensure(&d);
-        let r = sparse.dictionary_plan_records(&lo, hi).expect("plan records after phase one");
+        let r = sparse
+            .dictionary_plan_records(&lo, hi)
+            .expect("plan records after phase one");
         sparse.source().ensure(&r);
         let mut got = Vec::new();
         sparse
@@ -462,7 +543,9 @@ fn a_source_that_serves_only_what_was_ensured_is_enough() {
                 if e.iter().any(|x| !x.is_inline()) || first.is_none() {
                     first = Some((k.to_vec(), e.to_vec(), t.to_vec()));
                 }
-                !first.as_ref().is_some_and(|(_, e, _)| e.iter().any(|x| !x.is_inline()))
+                !first
+                    .as_ref()
+                    .is_some_and(|(_, e, _)| e.iter().any(|x| !x.is_inline()))
             })
             .unwrap();
         if let Some((k, exts, tail)) = first {
@@ -485,7 +568,9 @@ fn a_source_that_serves_only_what_was_ensured_is_enough() {
                 sparse.source().ensure(&plan);
             }
             let mut vals = Vec::new();
-            sparse.read_exts(&exts, &tail, |v| vals.push(v.to_vec())).expect("values after ensure");
+            sparse
+                .read_exts(&exts, &tail, |v| vals.push(v.to_vec()))
+                .expect("values after ensure");
             let want = &all.iter().find(|(wk, _)| *wk == k).unwrap().1;
             assert_eq!(&vals, want);
         }
@@ -498,7 +583,10 @@ fn a_source_that_serves_only_what_was_ensured_is_enough() {
 #[test]
 fn a_resident_directory_plans_no_first_phase_and_agrees() {
     let all = keys_and_values(700);
-    for (shape, path) in [("store", scratch("resident-store")), ("segment", scratch("resident-seg"))] {
+    for (shape, path) in [
+        ("store", scratch("resident-store")),
+        ("segment", scratch("resident-seg")),
+    ] {
         if shape == "store" {
             build_store(&path, &all);
         } else {
@@ -508,16 +596,23 @@ fn a_resident_directory_plans_no_first_phase_and_agrees() {
         let object_len = data.len() as u64;
         let whole = Blob::open(MmapBytes::open(&path).unwrap()).unwrap();
         let head = data[..open_probe() as usize].to_vec();
-        let src = Ensured { data: data.clone(), allowed: RefCell::new(vec![(0, open_probe())]) };
+        let src = Ensured {
+            data: data.clone(),
+            allowed: RefCell::new(vec![(0, open_probe())]),
+        };
         let p1 = supdb::blob::open_sparse_ranges_opts(&head, object_len, true).unwrap();
         src.ensure(&p1);
         // Phase two needs the section header for a store, which the first
         // plan named; for a segment the extension carried it.
         let key_off = whole.index_offset() as usize;
         let index_header = data[key_off..key_off + supdb::flatindex::HEADER_BYTES].to_vec();
-        let p2 = supdb::blob::open_sparse_fence_ranges_opts(&head, object_len, &index_header, true).unwrap();
+        let p2 = supdb::blob::open_sparse_fence_ranges_opts(&head, object_len, &index_header, true)
+            .unwrap();
         src.ensure(&p2);
-        let opts = supdb::BlobOptions { resident_directory: true, ..Default::default() };
+        let opts = supdb::BlobOptions {
+            resident_directory: true,
+            ..Default::default()
+        };
         let sparse = SparseBlob::open_with(src, opts).expect("open with the directory resident");
         assert!(sparse.directory_resident(), "{shape}");
         assert_eq!(sparse.keys(), whole.keys(), "{shape}");
@@ -525,8 +620,13 @@ fn a_resident_directory_plans_no_first_phase_and_agrees() {
         for (lo, hi) in ranges_to_try(&all) {
             let hi = hi.as_deref();
             let d = sparse.dictionary_plan(&lo, hi);
-            assert!(d.is_empty(), "{shape}: a resident directory plans no slice: {d:?}");
-            let r = sparse.dictionary_plan_records(&lo, hi).expect("records plan with no phase one");
+            assert!(
+                d.is_empty(),
+                "{shape}: a resident directory plans no slice: {d:?}"
+            );
+            let r = sparse
+                .dictionary_plan_records(&lo, hi)
+                .expect("records plan with no phase one");
             sparse.source().ensure(&r);
             let mut got = Vec::new();
             sparse
@@ -535,7 +635,13 @@ fn a_resident_directory_plans_no_first_phase_and_agrees() {
                     true
                 })
                 .expect("walk");
-            assert_eq!(got, expected(&whole, &lo, hi), "{shape}: [{:?}, {:?})", String::from_utf8_lossy(&lo), hi.map(String::from_utf8_lossy));
+            assert_eq!(
+                got,
+                expected(&whole, &lo, hi),
+                "{shape}: [{:?}, {:?})",
+                String::from_utf8_lossy(&lo),
+                hi.map(String::from_utf8_lossy)
+            );
             checked += 1;
         }
         assert!(checked > 100, "{shape}: {checked} ranges");

@@ -106,7 +106,12 @@ fn agrees_with_reader_opts<B: Bytes>(
             .map(|v| v.len() as u64 + if uniform { 0 } else { 1 })
             .sum();
         if check_stored {
-            assert_eq!(blob.stored_bytes(key), stored, "stored bytes of {}", String::from_utf8_lossy(key));
+            assert_eq!(
+                blob.stored_bytes(key),
+                stored,
+                "stored bytes of {}",
+                String::from_utf8_lossy(key)
+            );
         }
     }
 
@@ -545,7 +550,8 @@ fn a_corrupted_block_byte_fails_the_read_rather_than_under_returning() {
     // A key that lives in a different block: verification granularity is the
     // chunk, and a neighbour sharing this one's chunk would rightly fail too.
     let overlaps = |p: &[(u64, u64)]| {
-        p.iter().any(|&(o, l)| ranges.iter().any(|&(ro, rl)| o < ro + rl && ro < o + l))
+        p.iter()
+            .any(|&(o, l)| ranges.iter().any(|&(ro, rl)| o < ro + rl && ro < o + l))
     };
     let (other, other_vals) = want
         .iter()
@@ -564,7 +570,10 @@ fn a_corrupted_block_byte_fails_the_read_rather_than_under_returning() {
     let err = blob
         .read_all(&key, |_| {})
         .expect_err("a checksum mismatch must fail the read, not empty it");
-    assert!(err.to_string().contains("checksum"), "unhelpful error: {err}");
+    assert!(
+        err.to_string().contains("checksum"),
+        "unhelpful error: {err}"
+    );
     // The count does not touch the block: since format v5 it is read out of
     // the extent record, so damage inside the block cannot reach it and it
     // must still answer rather than fail.
@@ -579,7 +588,10 @@ fn a_corrupted_block_byte_fails_the_read_rather_than_under_returning() {
     let err = blob
         .read_all(&key, |_| {})
         .expect_err("the failure must repeat, not report once and go quiet");
-    assert!(err.to_string().contains("checksum"), "unhelpful error: {err}");
+    assert!(
+        err.to_string().contains("checksum"),
+        "unhelpful error: {err}"
+    );
 
     // A key in another block still answers: the damage is one block's, not
     // the file's.
@@ -634,8 +646,15 @@ fn the_store_seals_uniform_runs_fixed_and_both_readers_agree() {
 
     let blob = Blob::open(MmapBytes::open(&path).unwrap()).unwrap();
     let ef = blob.lookup(b"fixed").unwrap();
-    assert!(ef.iter().all(|e| e.is_fixed()), "a uniform run is sealed fixed: {ef:?}");
-    assert_eq!(ef.iter().map(|e| e.len as u64).sum::<u64>(), 8000, "no prefixes");
+    assert!(
+        ef.iter().all(|e| e.is_fixed()),
+        "a uniform run is sealed fixed: {ef:?}"
+    );
+    assert_eq!(
+        ef.iter().map(|e| e.len as u64).sum::<u64>(),
+        8000,
+        "no prefixes"
+    );
     assert_eq!(blob.count_fixed(b"fixed", 4), Some(2000));
     assert_eq!(blob.stored_bytes(b"fixed"), 8000);
     let em = blob.lookup(b"mixed").unwrap();
@@ -651,7 +670,11 @@ fn the_store_seals_uniform_runs_fixed_and_both_readers_agree() {
     store.close().unwrap();
     let blob = Blob::open(MmapBytes::open(&path).unwrap()).unwrap();
     assert_eq!(blob.count(b"fixed").unwrap(), 2001);
-    assert_eq!(blob.count_fixed(b"fixed", 4), None, "the run is not all fours any more");
+    assert_eq!(
+        blob.count_fixed(b"fixed", 4),
+        None,
+        "the run is not all fours any more"
+    );
     // Two fixed runs (8,000 + 5 bytes) if the store kept them apart, one
     // prefixed run (2,001 prefixes more) if it consolidated them; either is
     // right and both readers must agree on the values.

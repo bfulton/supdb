@@ -224,10 +224,22 @@ pub fn decode_super_ext(page: &[u8], generation: u64) -> Option<SuperExt> {
         dir: (w(4), w(5)),
         hash: (w(6), w(7)),
         row: (w(8), w(9)),
-        table_copy: if w(11) > 0 { Some((w(10), w(11))) } else { None },
-        fence_copy: if w(13) > 0 { Some((w(12), w(13), w(14) as u32)) } else { None },
+        table_copy: if w(11) > 0 {
+            Some((w(10), w(11)))
+        } else {
+            None
+        },
+        fence_copy: if w(13) > 0 {
+            Some((w(12), w(13), w(14) as u32))
+        } else {
+            None
+        },
         row_copy: if w(15) > 0 { Some(w(15)) } else { None },
-        dir_copy: if w(16) > 0 { Some((w(16), w(17) as u32)) } else { None },
+        dir_copy: if w(16) > 0 {
+            Some((w(16), w(17) as u32))
+        } else {
+            None
+        },
         header,
     })
 }
@@ -485,7 +497,6 @@ impl Sec {
     }
 }
 
-
 /// Everything `Blob::open` and `SparseBlob::open` check before either reads
 /// a section: the byte order this reader can address, the superblock, and
 /// the redo-log emptiness probe. One function so the two opens cannot
@@ -630,7 +641,9 @@ impl<B: Bytes> Blob<B> {
             if let Err(p) =
                 flatindex::verify_pieces(key.get(&src)?, idx.crc_off, idx.piece_shift, sb.key_off)
             {
-                return Err(corrupt(&format!("key index checksum mismatch in piece {p}")));
+                return Err(corrupt(&format!(
+                    "key index checksum mismatch in piece {p}"
+                )));
             }
         }
         let blocks = MappedBlocks::parse(blk.get(&src)?)
@@ -665,7 +678,6 @@ impl<B: Bytes> Blob<B> {
             Index::Sparse(_) => None,
         }
     }
-
 
     // ------------------------------------------------------------ diagnostics --
 
@@ -722,7 +734,13 @@ impl<B: Bytes> Blob<B> {
     /// rotting: a native reader that started copying its index would still
     /// pass every correctness test.
     pub fn zero_copy(&self) -> bool {
-        matches!(&self.index, Index::Flat { key: Sec::Lent { .. }, .. })
+        matches!(
+            &self.index,
+            Index::Flat {
+                key: Sec::Lent { .. },
+                ..
+            }
+        )
     }
 
     // ------------------------------------------------------------ lookup --
@@ -968,7 +986,10 @@ impl<B: Bytes> Blob<B> {
         for j in (lo / block::CHUNK)..=((hi - 1) / block::CHUNK) {
             let a = j * block::CHUNK;
             let b = ((j + 1) * block::CHUNK).min(base + raw.len());
-            let (Some(want), true) = (self.blocks.chunk_crc(sec, id as usize, j), a < b && a >= base) else {
+            let (Some(want), true) = (
+                self.blocks.chunk_crc(sec, id as usize, j),
+                a < b && a >= base,
+            ) else {
                 return whole(self);
             };
             if self.is_verified(id, j) {
@@ -1009,7 +1030,10 @@ impl<B: Bytes> Blob<B> {
             return Err(corrupt("inline run read without its record"));
         }
         let loc = self.loc_of(e.block)?;
-        let (a, b) = (e.off as usize, (e.off as usize).saturating_add(e.len as usize));
+        let (a, b) = (
+            e.off as usize,
+            (e.off as usize).saturating_add(e.len as usize),
+        );
         // What is fetched: the chunks the run spans when the block is plain
         // and carries per-chunk checksums, else the block (R7.3). The plan
         // in `plan_exts` names the same bytes, which is what keeps W4.1.
@@ -1099,7 +1123,11 @@ impl<B: Bytes> Blob<B> {
         let (Some((ea, ta)), Some((eb, tb))) = (self.lookup_full(a), self.lookup_full(b)) else {
             return Ok(0);
         };
-        let (ra, rb) = match (width, self.fixed_runs(ea, ta, width)?, self.fixed_runs(eb, tb, width)?) {
+        let (ra, rb) = match (
+            width,
+            self.fixed_runs(ea, ta, width)?,
+            self.fixed_runs(eb, tb, width)?,
+        ) {
             (w, Some(ra), Some(rb)) if w > 0 => (ra, rb),
             _ => {
                 let (mut va, mut vb) = (Vec::new(), Vec::new());
@@ -1199,7 +1227,10 @@ impl<B: Bytes> Blob<B> {
         let Some(raw) = self.src.slice_at(loc.off, loc.stored as usize) else {
             return Ok(None);
         };
-        let (a, b) = (e.off as usize, (e.off as usize).saturating_add(e.len as usize));
+        let (a, b) = (
+            e.off as usize,
+            (e.off as usize).saturating_add(e.len as usize),
+        );
         if b > raw.len() {
             return Err(corrupt("extent runs past its block"));
         }
@@ -1497,7 +1528,10 @@ pub fn open_sparse_ranges_opts(
             round_to_pieces(&mut v, sb.key_off, &hdr);
         }
         None => {
-            v.push((sb.key_off, (flatindex::HEADER_BYTES as u64).min(sb.key_stored)));
+            v.push((
+                sb.key_off,
+                (flatindex::HEADER_BYTES as u64).min(sb.key_stored),
+            ));
             v.push((sb.blk_off, sb.blk_stored));
         }
     }
@@ -1598,7 +1632,8 @@ fn chunk_span(loc: &BlockLoc, e: &Ext) -> (usize, usize) {
 }
 
 fn fence_region(h: &flatindex::Header, sec_len: usize) -> Result<(usize, usize)> {
-    if h.fence_n != 0 && (h.fence_offs_off < flatindex::HEADER_BYTES || h.fence_offs_off > sec_len) {
+    if h.fence_n != 0 && (h.fence_offs_off < flatindex::HEADER_BYTES || h.fence_offs_off > sec_len)
+    {
         return Err(corrupt("the key index names a fence outside its section"));
     }
     Ok(flatindex::fence_span(h, sec_len))
@@ -1699,7 +1734,9 @@ impl<B: Bytes> SparseBlob<B> {
             || !fits(hdr.dir_off, hdr.nkeys.saturating_mul(4))
             || !fits(hdr.recs_off, hdr.bump)
         {
-            return Err(corrupt("the key index header names a region outside its section"));
+            return Err(corrupt(
+                "the key index header names a region outside its section",
+            ));
         }
         let (foff, flen) = fence_region(&hdr, sec_len)?;
         // The fence: from the head reserve's copy when the writer left one,
@@ -1711,7 +1748,9 @@ impl<B: Bytes> SparseBlob<B> {
             if l as usize == flen && flen > 0 {
                 src.read_at(o, &mut fence)?;
                 if block::crc32(&fence) != crc {
-                    return Err(corrupt("the fence copy in the head reserve does not match its checksum"));
+                    return Err(corrupt(
+                        "the fence copy in the head reserve does not match its checksum",
+                    ));
                 }
                 fence_from_section = false;
             }
@@ -1723,7 +1762,9 @@ impl<B: Bytes> SparseBlob<B> {
         if hdr.crc_off != 0 && opts.verify_index {
             let n = flatindex::checksum_row_len(hdr.crc_off, hdr.piece_shift, sb.key_off);
             if hdr.crc_off.checked_add(n).is_none_or(|e| e > sec_len) {
-                return Err(corrupt("the key index names a checksum row outside its section"));
+                return Err(corrupt(
+                    "the key index names a checksum row outside its section",
+                ));
             }
             crcs = vec![0u8; n];
             let row_at = ext
@@ -1748,13 +1789,19 @@ impl<B: Bytes> SparseBlob<B> {
                 Some((o, crc)) => {
                     src.read_at(o, &mut raw)?;
                     if block::crc32(&raw) != crc {
-                        return Err(corrupt("the directory copy in the head reserve does not match its checksum"));
+                        return Err(corrupt(
+                            "the directory copy in the head reserve does not match its checksum",
+                        ));
                     }
                     dir_from_section = false;
                 }
                 None => src.read_at(sb.key_off + hdr.dir_off as u64, &mut raw)?,
             }
-            Some(raw.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+            Some(
+                raw.chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .collect(),
+            )
         } else {
             None
         };
@@ -1826,7 +1873,9 @@ impl<B: Bytes> SparseBlob<B> {
             let want = flatindex::piece_crc(&s.crcs, p)
                 .ok_or_else(|| corrupt("the key index checksum row is short"))?;
             if block::crc32(&buf) != want {
-                return Err(corrupt(&format!("key index checksum mismatch in piece {p}")));
+                return Err(corrupt(&format!(
+                    "key index checksum mismatch in piece {p}"
+                )));
             }
             s.verified.borrow_mut()[p / 64] |= 1u64 << (p % 64);
         }
@@ -1891,7 +1940,10 @@ impl<B: Bytes> SparseBlob<B> {
             return Vec::new();
         }
         let entries = r1 - r0 + usize::from(r1 < s.hdr.nkeys);
-        let mut v = vec![(s.off + s.hdr.dir_off as u64 + r0 as u64 * 4, entries as u64 * 4)];
+        let mut v = vec![(
+            s.off + s.hdr.dir_off as u64 + r0 as u64 * 4,
+            entries as u64 * 4,
+        )];
         round_to_pieces(&mut v, s.off, &s.hdr);
         merge_ranges(&mut v);
         v
@@ -1917,8 +1969,13 @@ impl<B: Bytes> SparseBlob<B> {
         }
         let mut raw = vec![0u8; entries * 4];
         self.verify_span(s.hdr.dir_off + r0 * 4, entries * 4)?;
-        self.blob.src.read_at(s.off + s.hdr.dir_off as u64 + r0 as u64 * 4, &mut raw)?;
-        Ok(raw.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
+        self.blob
+            .src
+            .read_at(s.off + s.hdr.dir_off as u64 + r0 as u64 * 4, &mut raw)?;
+        Ok(raw
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect())
     }
 
     /// The record bytes ranks `[r0, r1)` occupy, from their directory
@@ -1933,7 +1990,14 @@ impl<B: Bytes> SparseBlob<B> {
         let m = r1 - r0;
         let monotone = d.windows(2).all(|w| w[0] < w[1]);
         let (start, end) = if monotone {
-            (d[0] as usize, if r1 < h.nkeys { d[m] as usize } else { h.recs_len })
+            (
+                d[0] as usize,
+                if r1 < h.nkeys {
+                    d[m] as usize
+                } else {
+                    h.recs_len
+                },
+            )
         } else {
             // An index updated in place after these keys were written holds
             // records out of key order, in the slack. The span is then the
@@ -1943,18 +2007,16 @@ impl<B: Bytes> SparseBlob<B> {
             (d[..m].iter().copied().min().unwrap_or(0) as usize, h.bump)
         };
         if end < start || end > h.bump {
-            return Err(corrupt("the directory names records outside the record region"));
+            return Err(corrupt(
+                "the directory names records outside the record region",
+            ));
         }
         Ok((recs_abs + start as u64, end - start, start))
     }
 
     /// Phase two: the record bytes for `lo..hi`. Needs phase one's bytes
     /// resident, and reads exactly them. Absolute, merged.
-    pub fn dictionary_plan_records(
-        &self,
-        lo: &[u8],
-        hi: Option<&[u8]>,
-    ) -> Result<Vec<(u64, u64)>> {
+    pub fn dictionary_plan_records(&self, lo: &[u8], hi: Option<&[u8]>) -> Result<Vec<(u64, u64)>> {
         let (r0, r1) = self.rank_window(lo, hi);
         let d = self.dir_slice(r0, r1)?;
         let (abs, len, _) = self.record_span(r0, r1, &d)?;

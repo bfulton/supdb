@@ -41,8 +41,10 @@ jobs:
         run: cargo test --release --workspace
       - name: Clippy
         run: cargo clippy --release --workspace -- -D warnings
+      # Not `cargo fmt --all`: the vendored engine modules are exempt, and
+      # the script names which and why (scripts/fmt.sh).
       - name: Format
-        run: cargo fmt --all -- --check
+        run: sh scripts/fmt.sh --check
 
   cross-arm:
     # Proves the ARM paths build and pass before any ARM hardware is involved.

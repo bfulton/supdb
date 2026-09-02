@@ -55,7 +55,9 @@ fn unsealed_values_survive_the_ack_point_crash() {
     store.checkpoint().unwrap();
     let sb = snapshot_sb(&path);
     for i in 0..50u32 {
-        store.put(format!("k{i:03}").as_bytes(), &[7u8; 64]).unwrap();
+        store
+            .put(format!("k{i:03}").as_bytes(), &[7u8; 64])
+            .unwrap();
     }
     store.checkpoint().unwrap(); // the ack
     std::mem::forget(store); // crash, not close
@@ -159,7 +161,10 @@ fn sealed_and_pending_in_one_point_both_survive() {
     let big = read_vec(&s, b"big");
     assert_eq!(big.len(), 100);
     for (i, v) in big.iter().enumerate() {
-        assert!(v.starts_with(format!("v{i:04}-").as_bytes()), "order lost at {i}");
+        assert!(
+            v.starts_with(format!("v{i:04}-").as_bytes()),
+            "order lost at {i}"
+        );
     }
     assert_eq!(read_vec(&s, b"tail"), vec![b"small".to_vec()]);
 }
@@ -198,12 +203,16 @@ fn a_fresh_reader_serves_logged_values() {
     store.append(b"b", b"three").unwrap();
     store.checkpoint().unwrap();
     let r = Reader::open_with(&path, ReadOptions::default()).unwrap();
-    assert_eq!(reader_vec(&r, b"a"), vec![b"one".to_vec(), b"twoo".to_vec()]);
+    assert_eq!(
+        reader_vec(&r, b"a"),
+        vec![b"one".to_vec(), b"twoo".to_vec()]
+    );
     assert_eq!(r.keys(), 2);
     assert_eq!(r.read_first(b"a").unwrap(), 3);
     assert_eq!(r.read_last(b"a").unwrap(), 4);
     let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    r.scan(None, usize::MAX, |k, v| got.push((k.to_vec(), v.to_vec()))).unwrap();
+    r.scan(None, usize::MAX, |k, v| got.push((k.to_vec(), v.to_vec())))
+        .unwrap();
     assert_eq!(
         got,
         vec![
@@ -242,11 +251,19 @@ fn a_relogged_sealed_record_keeps_the_live_tail() {
     crash_to(&path, &sb);
     let s = Store::open(&path, o).unwrap();
     let got = read_vec(&s, b"k");
-    assert_eq!(got.len(), 40, "the re-logged Sealed record dropped the live tail");
+    assert_eq!(
+        got.len(),
+        40,
+        "the re-logged Sealed record dropped the live tail"
+    );
     for (i, v) in got.iter().enumerate() {
         assert_eq!(v, format!("v{i:03}").as_bytes(), "order lost at {i}");
     }
     drop(s);
     let r = Reader::open_with(&path, ReadOptions::default()).unwrap();
-    assert_eq!(reader_vec(&r, b"k").len(), 40, "fresh reader dropped the tail");
+    assert_eq!(
+        reader_vec(&r, b"k").len(),
+        40,
+        "fresh reader dropped the tail"
+    );
 }

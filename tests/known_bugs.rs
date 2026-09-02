@@ -1195,7 +1195,8 @@ fn the_pending_arena_changes_no_answer() {
         }
         // Replacements abandon a run mid-arena; deletes drop one entirely.
         for k in (0..25u32).step_by(3) {
-            s.put(format!("key-{k:04}").as_bytes(), b"replaced").unwrap();
+            s.put(format!("key-{k:04}").as_bytes(), b"replaced")
+                .unwrap();
         }
         for k in (0..25u32).step_by(7) {
             s.delete(format!("key-{k:04}").as_bytes()).unwrap();
@@ -1614,7 +1615,8 @@ fn sorting_the_index_in_parallel_changes_no_order() {
         }
         s.checkpoint().unwrap();
         let mut order = Vec::with_capacity(n as usize);
-        s.scan(None, usize::MAX, |k, _| order.push(k.to_vec())).unwrap();
+        s.scan(None, usize::MAX, |k, _| order.push(k.to_vec()))
+            .unwrap();
         s.close().unwrap();
         assert_eq!(order.len(), n as usize, "parallel={parallel}: lost keys");
         let mut sorted = order.clone();
@@ -1692,7 +1694,11 @@ fn a_reader_replays_the_log_in_order() {
     s.close().unwrap();
 
     let r = Reader::open(&path).unwrap();
-    assert_eq!(r.keys(), model.len(), "keys() must count the log's insertions");
+    assert_eq!(
+        r.keys(),
+        model.len(),
+        "keys() must count the log's insertions"
+    );
     // Every key, by point lookup.
     for (k, v) in &model {
         let mut got = Vec::new();
@@ -1701,8 +1707,10 @@ fn a_reader_replays_the_log_in_order() {
     }
     // And in order, which is where a mis-spliced rank shows up.
     let mut walked: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    r.scan(None, usize::MAX, |k, v| walked.push((k.to_vec(), v.to_vec())))
-        .unwrap();
+    r.scan(None, usize::MAX, |k, v| {
+        walked.push((k.to_vec(), v.to_vec()))
+    })
+    .unwrap();
     let want: Vec<(Vec<u8>, Vec<u8>)> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     assert_eq!(walked, want, "the merged scan is not the model");
     // A seek lands on the merged rank, including onto an inserted key.
@@ -1768,7 +1776,14 @@ fn a_tiny_store_takes_the_smallest_size_class() {
     let s = Store::open(&path, opts()).unwrap();
     let mut got = Vec::new();
     s.read_all(b"term", |v| got.push(v.to_vec())).unwrap();
-    assert_eq!(got, vec![b"aaaaaaaa".to_vec(), b"bbbbbbbb".to_vec(), b"cccccccc".to_vec()]);
+    assert_eq!(
+        got,
+        vec![
+            b"aaaaaaaa".to_vec(),
+            b"bbbbbbbb".to_vec(),
+            b"cccccccc".to_vec()
+        ]
+    );
     s.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1869,10 +1884,7 @@ fn replay_never_applies_a_record_over_newer_index_state() {
 #[test]
 fn a_logged_checkpoint_survives_losing_its_superblock() {
     for log_values in [false, true] {
-        let dir = std::env::temp_dir().join(format!(
-            "sbhole-{log_values}-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("sbhole-{log_values}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("s.supdb");
         let o = Options {

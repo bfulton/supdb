@@ -27,8 +27,8 @@
 
 use std::path::{Path, PathBuf};
 use supdb::bench::{Finding, Profile, Record, Rng, J};
-use supdb::jobj;
 use supdb::bytes::MmapBytes;
+use supdb::jobj;
 use supdb::{Blob, Options, Reader, Store};
 
 // ---------------------------------------------------------------- the model --
@@ -167,7 +167,11 @@ fn build_day_segment(
     head_reserve: usize,
 ) -> std::io::Result<u64> {
     let _ = std::fs::remove_file(path);
-    let opts = Options { redo_log: false, shards: 1, ..Options::default() };
+    let opts = Options {
+        redo_log: false,
+        shards: 1,
+        ..Options::default()
+    };
     let mut w = supdb::next::SegmentWriter::create(path, &opts)?;
     w.set_inline_max(inline);
     if head_reserve > 0 {
@@ -184,7 +188,11 @@ fn build_day_segment(
         let head = p >> 32;
         if head != cur {
             cur = head;
-            term(FIELDS[(head >> 24) as usize].0, (head & 0xff_ffff) as usize, &mut key);
+            term(
+                FIELDS[(head >> 24) as usize].0,
+                (head & 0xff_ffff) as usize,
+                &mut key,
+            );
             terms.push((key.clone(), Vec::new()));
         }
         terms.last_mut().unwrap().1.push(*p as u32);
@@ -511,10 +519,12 @@ fn budget(profile: Profile) -> std::io::Result<Record> {
     rec.param("fields", J::u(FIELDS.len() as u64));
     rec.param(
         "field_cardinality",
-        J::O(FIELDS
-            .iter()
-            .map(|(f, c)| ((*f).to_string(), J::u(*c as u64)))
-            .collect()),
+        J::O(
+            FIELDS
+                .iter()
+                .map(|(f, c)| ((*f).to_string(), J::u(*c as u64)))
+                .collect(),
+        ),
     );
 
     let row = |lines: u64, b: &Built| -> J {
@@ -741,9 +751,7 @@ fn fixture(dir: &Path, lines: u64) -> std::io::Result<()> {
             })?;
             Some((k.clone(), at, intact.clone()))
         })
-        .ok_or_else(|| {
-            std::io::Error::other("no probe key suits the corruption regression")
-        })?;
+        .ok_or_else(|| std::io::Error::other("no probe key suits the corruption regression"))?;
 
     let from = FIELDS[3].0;
     let mut rows = Vec::new();
@@ -796,10 +804,17 @@ fn fixture(dir: &Path, lines: u64) -> std::io::Result<()> {
         assert_eq!(new_bytes(&open_plan), open_fetch);
         let sp = SparseBlob::open(src)?;
         let n = blob.keys();
-        let key = |r: usize| blob.key_at(r.min(n - 1)).map(|k| k.to_vec()).unwrap_or_default();
+        let key = |r: usize| {
+            blob.key_at(r.min(n - 1))
+                .map(|k| k.to_vec())
+                .unwrap_or_default()
+        };
         let field = FIELDS[1].0;
         let ranges: Vec<(Vec<u8>, Option<Vec<u8>>)> = vec![
-            (format!("{field}=").into_bytes(), Some(format!("{field}>").into_bytes())),
+            (
+                format!("{field}=").into_bytes(),
+                Some(format!("{field}>").into_bytes()),
+            ),
             (key(64), Some(key(74))),
             (key(n.saturating_sub(5)), None),
         ];
@@ -825,7 +840,10 @@ fn fixture(dir: &Path, lines: u64) -> std::io::Result<()> {
                 whole.push((k.to_vec(), c));
                 true
             })?;
-            assert_eq!(walked, whole, "the sparse range disagrees with the whole reader");
+            assert_eq!(
+                walked, whole,
+                "the sparse range disagrees with the whole reader"
+            );
             let mut plan = sp.dictionary_plan(lo, hi_ref);
             plan.extend(sp.dictionary_plan_records(lo, hi_ref)?);
             out.push(jobj! {
@@ -1015,7 +1033,10 @@ fn dict(profile: Profile) -> std::io::Result<Record> {
     // The whole open's bytes, recorded once (they do not depend on the
     // page), page-rounded per pass below.
     let whole_log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let _ = Blob::open(Recording { data: data.clone(), log: whole_log.clone() })?;
+    let _ = Blob::open(Recording {
+        data: data.clone(),
+        log: whole_log.clone(),
+    })?;
     let whole_open = merge_ranges(&whole_log.borrow());
 
     // One pass per page size: the browser's 64 KiB, and the 16 KiB that
@@ -1037,7 +1058,10 @@ fn dict(profile: Profile) -> std::io::Result<Record> {
     let mut passes: Vec<Pass> = Vec::new();
     for page in [64u64 << 10, 16 << 10] {
         let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let sparse = SparseBlob::open(Recording { data: data.clone(), log: log.clone() })?;
+        let sparse = SparseBlob::open(Recording {
+            data: data.clone(),
+            log: log.clone(),
+        })?;
         let sparse_open = merge_ranges(&log.borrow());
         let head = data[..supdb::blob::open_probe() as usize].to_vec();
         let mmap = MmapBytes::open(&path)?;
@@ -1053,15 +1077,26 @@ fn dict(profile: Profile) -> std::io::Result<Record> {
             out
         };
         let key = |r: usize| {
-            whole.key_at(r.min(whole.keys() - 1)).map(|k| k.to_vec()).unwrap_or_default()
+            whole
+                .key_at(r.min(whole.keys() - 1))
+                .map(|k| k.to_vec())
+                .unwrap_or_default()
         };
         let mut ranges: Vec<(String, Vec<u8>, Option<Vec<u8>>)> = FIELDS
             .iter()
             .map(|(f, _)| {
-                (f.to_string(), format!("{f}=").into_bytes(), Some(format!("{f}>").into_bytes()))
+                (
+                    f.to_string(),
+                    format!("{f}=").into_bytes(),
+                    Some(format!("{f}>").into_bytes()),
+                )
             })
             .collect();
-        ranges.push(("ten-keys".into(), key(keys as usize / 2), Some(key(keys as usize / 2 + 10))));
+        ranges.push((
+            "ten-keys".into(),
+            key(keys as usize / 2),
+            Some(key(keys as usize / 2 + 10)),
+        ));
         ranges.push(("tail".into(), key(keys as usize - 8), None));
         let mut pass = Pass {
             page,
@@ -1167,11 +1202,14 @@ fn dict(profile: Profile) -> std::io::Result<Record> {
         });
         rec.series(&format!("ranges{suffix}"), J::arr(p.rows.clone()));
     }
-    rec.series("rank_one_field", jobj! {
-        "field" => J::s(f),
-        "keys" => J::u(field_keys),
-        "ns_per_key_median" => J::fp(ns_per_key, 1),
-    });
+    rec.series(
+        "rank_one_field",
+        jobj! {
+            "field" => J::s(f),
+            "keys" => J::u(field_keys),
+            "ns_per_key_median" => J::fp(ns_per_key, 1),
+        },
+    );
 
     let ratio = big.sparse_paged as f64 / big.whole_paged.max(1) as f64;
     rec.finding(Finding::new(
@@ -1242,8 +1280,7 @@ fn dict(profile: Profile) -> std::io::Result<Record> {
             "every field's two plans against keys x {bytes_per_key:.1} bytes plus four 16 KiB \
              pages -- a boundary at each end of each plan -- the worst was {:.2} of that bound \
              ({:.2} of the two-page bound)",
-            small.worst_4,
-            small.worst_2
+            small.worst_4, small.worst_2
         ),
     ));
     Ok(rec)
@@ -1583,7 +1620,9 @@ fn main() -> std::io::Result<()> {
         }
         "fixture" => {
             let dir = PathBuf::from(arg("--dir").unwrap_or_else(|| "web/test/out".into()));
-            let lines: u64 = arg("--lines").and_then(|v| v.parse().ok()).unwrap_or(20_000);
+            let lines: u64 = arg("--lines")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20_000);
             fixture(&dir, lines)
         }
         "segment" => {
@@ -1653,8 +1692,8 @@ fn main() -> std::io::Result<()> {
             }
         }
         "budget" => {
-            let profile = Profile::parse(arg("--profile").as_deref().unwrap_or("ci"))
-                .unwrap_or(Profile::Ci);
+            let profile =
+                Profile::parse(arg("--profile").as_deref().unwrap_or("ci")).unwrap_or(Profile::Ci);
             let out = PathBuf::from(arg("--out").unwrap_or_else(|| "results".into()));
             let rec = budget(profile)?;
             rec.print_summary();
@@ -1736,7 +1775,10 @@ impl supdb::Bytes for Host {
     fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
         let end = off + dst.len() as u64;
         if end > self.data.len() as u64 {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "short",
+            ));
         }
         if dst.is_empty() {
             return Ok(());
@@ -1786,7 +1828,10 @@ fn cold_search(
     host.ensure(&p2);
     let sparse = SparseBlob::open_with(
         host,
-        BlobOptions { resident_directory: directory, ..Default::default() },
+        BlobOptions {
+            resident_directory: directory,
+            ..Default::default()
+        },
     )?;
     let (ow, ob) = sparse.source().mark();
 
@@ -1881,14 +1926,21 @@ fn waves(profile: Profile) -> std::io::Result<Record> {
     };
     rec.param("rare_key", J::s(String::from_utf8_lossy(&rare).to_string()));
     rec.param("rare_postings", J::u(rare_n));
-    rec.param("common_key", J::s(String::from_utf8_lossy(&common).to_string()));
+    rec.param(
+        "common_key",
+        J::s(String::from_utf8_lossy(&common).to_string()),
+    );
     rec.param("common_postings", J::u(common_n));
 
     let shapes: [(&str, &Path, u64); 4] = [
         ("store", &store_path, page),
         ("segment", &seg_path, page),
         ("segment+reserve", &res_path, page),
-        ("segment+reserve, generous probe", &res_path, 4096 + reserve as u64),
+        (
+            "segment+reserve, generous probe",
+            &res_path,
+            4096 + reserve as u64,
+        ),
     ];
     let mut rows = Vec::new();
     let mut table: std::collections::HashMap<(String, bool, &'static str), Search> =
@@ -1933,9 +1985,12 @@ fn waves(profile: Profile) -> std::io::Result<Record> {
         directory: bool,
         which: &'static str,
     ) -> &'a Search {
-        table.get(&(shape.to_string(), directory, which)).expect("measured")
+        table
+            .get(&(shape.to_string(), directory, which))
+            .expect("measured")
     }
-    let get = |shape: &str, directory: bool, which: &'static str| lookup(&table, shape, directory, which);
+    let get =
+        |shape: &str, directory: bool, which: &'static str| lookup(&table, shape, directory, which);
 
     let st = get("store", false, "common");
     let sg = get("segment", false, "common");
@@ -1967,9 +2022,14 @@ fn waves(profile: Profile) -> std::io::Result<Record> {
     // At most one: the records, and none at all when their page came in
     // with the open. Without the directory the rare key -- whose directory
     // slice shares no page with the open's fences -- costs two.
-    let at_most_one = ["store", "segment", "segment+reserve", "segment+reserve, generous probe"]
-        .iter()
-        .all(|s| get(s, true, "common").lookup_waves <= 1 && get(s, true, "rare").lookup_waves <= 1);
+    let at_most_one = [
+        "store",
+        "segment",
+        "segment+reserve",
+        "segment+reserve, generous probe",
+    ]
+    .iter()
+    .all(|s| get(s, true, "common").lookup_waves <= 1 && get(s, true, "rare").lookup_waves <= 1);
     let two = get("store", false, "rare").lookup_waves;
     rec.finding(Finding::new(
         "W6.3",

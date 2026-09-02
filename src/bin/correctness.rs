@@ -1108,9 +1108,15 @@ fn c4_ops(seed: u64, keys: u64, n: u64) -> Vec<C4Op> {
         } else if (r >> 40).is_multiple_of(20) {
             // One in twenty is too big to inline, so block-backed runs are
             // in the file beside inline ones.
-            ops.push(C4Op::Put { key, len: 300 + ((r >> 44) % 700) as usize });
+            ops.push(C4Op::Put {
+                key,
+                len: 300 + ((r >> 44) % 700) as usize,
+            });
         } else {
-            ops.push(C4Op::Put { key, len: 24 + ((r >> 44) % 73) as usize });
+            ops.push(C4Op::Put {
+                key,
+                len: 24 + ((r >> 44) % 73) as usize,
+            });
         }
     }
     ops
@@ -1337,7 +1343,8 @@ fn c4_crash(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let mut rng = Rng::new(0xC4C4);
     let mut arms = [C4Arm::new("always"), C4Arm::new("every_n")];
     let (mut seal_in_flight, mut merge_in_flight, mut with_partitions) = (0u64, 0u64, 0u64);
-    let (mut torn_trials, mut max_torn, mut child_errors, mut late_trials) = (0u64, 0u64, 0u64, 0u64);
+    let (mut torn_trials, mut max_torn, mut child_errors, mut late_trials) =
+        (0u64, 0u64, 0u64, 0u64);
     let mut torn_headers = 0u64;
     let (mut recycled_trials, mut torn_into_stale) = (0u64, 0u64);
     let mut coverage_first = String::new();
@@ -1455,8 +1462,10 @@ fn c4_crash(args: &Args, profile: Profile) -> std::io::Result<Record> {
                     use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
                     let lo = cut.max(8);
                     if hi > lo {
-                        let mut f =
-                            std::fs::OpenOptions::new().read(true).write(true).open(&wal)?;
+                        let mut f = std::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(&wal)?;
                         let span = (hi - lo) as usize;
                         let mut stale = vec![0u8; span];
                         f.seek(SeekFrom::Start(written + (lo - cut)))?;
@@ -1468,7 +1477,10 @@ fn c4_crash(args: &Args, profile: Profile) -> std::io::Result<Record> {
                         torn_into_stale += 1;
                     }
                 } else {
-                    std::fs::OpenOptions::new().write(true).open(&wal)?.set_len(cut)?;
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&wal)?
+                        .set_len(cut)?;
                 }
             }
         }
@@ -1504,7 +1516,11 @@ fn c4_crash(args: &Args, profile: Profile) -> std::io::Result<Record> {
             let mut seqs = Vec::new();
             db.read_all(&kb, |v| {
                 let mut ok = v.len() >= 24;
-                let seq = if ok { u64::from_be_bytes(v[..8].try_into().unwrap()) } else { 0 };
+                let seq = if ok {
+                    u64::from_be_bytes(v[..8].try_into().unwrap())
+                } else {
+                    0
+                };
                 if ok {
                     ok = match ops.get(seq as usize) {
                         Some(C4Op::Put { key, len }) => {
@@ -1541,13 +1557,19 @@ fn c4_crash(args: &Args, profile: Profile) -> std::io::Result<Record> {
         arm.count_disagreed += u64::from(count_bad > 0);
         arm.scan_disagreed += u64::from(scan_bad);
         if bad > 0 {
-            arm.note(format!("trial {t} ({arm_name}): {bad} values were not what the stream wrote"));
+            arm.note(format!(
+                "trial {t} ({arm_name}): {bad} values were not what the stream wrote"
+            ));
         }
         if count_bad > 0 {
-            arm.note(format!("trial {t} ({arm_name}): count disagreed with read_all on {count_bad} keys"));
+            arm.note(format!(
+                "trial {t} ({arm_name}): count disagreed with read_all on {count_bad} keys"
+            ));
         }
         if scan_bad {
-            arm.note(format!("trial {t} ({arm_name}): scan disagreed with read_all"));
+            arm.note(format!(
+                "trial {t} ({arm_name}): scan disagreed with read_all"
+            ));
         }
 
         // Which prefix of the commit order is this? Replay the stream
@@ -1616,20 +1638,23 @@ fn c4_crash(args: &Args, profile: Profile) -> std::io::Result<Record> {
     }
 
     let crashes: u64 = arms.iter().map(|a| a.crashes).sum();
-    rec.series("coverage", jobj! {
-        "crashes" => J::u(crashes),
-        "child_errors" => J::u(child_errors),
-        "with_a_seal_in_flight" => J::u(seal_in_flight),
-        "with_a_merge_in_flight" => J::u(merge_in_flight),
-        "with_partitions" => J::u(with_partitions),
-        "after_commit_before_ack" => J::u(late_trials),
-        "trials_with_a_torn_wal_tail" => J::u(torn_trials),
-        "trials_with_a_torn_wal_header" => J::u(torn_headers),
-        "trials_with_recycled_wals" => J::u(recycled_trials),
-        "tears_landing_on_stale_frames" => J::u(torn_into_stale),
-        "most_bytes_torn" => J::u(max_torn),
-        "note" => J::s(&coverage_first),
-    });
+    rec.series(
+        "coverage",
+        jobj! {
+            "crashes" => J::u(crashes),
+            "child_errors" => J::u(child_errors),
+            "with_a_seal_in_flight" => J::u(seal_in_flight),
+            "with_a_merge_in_flight" => J::u(merge_in_flight),
+            "with_partitions" => J::u(with_partitions),
+            "after_commit_before_ack" => J::u(late_trials),
+            "trials_with_a_torn_wal_tail" => J::u(torn_trials),
+            "trials_with_a_torn_wal_header" => J::u(torn_headers),
+            "trials_with_recycled_wals" => J::u(recycled_trials),
+            "tears_landing_on_stale_frames" => J::u(torn_into_stale),
+            "most_bytes_torn" => J::u(max_torn),
+            "note" => J::s(&coverage_first),
+        },
+    );
     for a in &arms {
         rec.series(a.name, a.json());
     }
@@ -1642,7 +1667,10 @@ fn c4_crash(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let count_bad: u64 = arms.iter().map(|a| a.count_disagreed).sum();
     let scan_bad: u64 = arms.iter().map(|a| a.scan_disagreed).sum();
     let first = |pick: &dyn Fn(&C4Arm) -> bool| -> String {
-        arms.iter().find(|a| pick(a)).map(|a| a.first.clone()).unwrap_or_default()
+        arms.iter()
+            .find(|a| pick(a))
+            .map(|a| a.first.clone())
+            .unwrap_or_default()
     };
 
     if seal_in_flight == 0 || merge_in_flight == 0 {

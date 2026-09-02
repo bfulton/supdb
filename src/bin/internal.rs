@@ -3779,7 +3779,9 @@ fn f36_commit(args: &Args, profile: Profile) -> std::io::Result<Record> {
         // the same run rather than being medians of different ones.
         let mut sorted: Vec<&&Row> = mine.iter().collect();
         sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
-        let Some(mid) = sorted.get(sorted.len() / 2) else { continue };
+        let Some(mid) = sorted.get(sorted.len() / 2) else {
+            continue;
+        };
         let (_, io_mb, led, _) = ***mid;
         let ledger_mb = mb(led.total());
         let residual = io_mb - ledger_mb;
@@ -3866,11 +3868,14 @@ fn f35_indexauto(args: &Args, profile: Profile) -> std::io::Result<Record> {
     };
 
     let mut rec = Record::new("f35-indexauto", profile);
-    rec.param("key_counts", J::arr(sizes.iter().map(|n| J::u(*n)).collect()))
-        .param("reads", J::u(reads))
-        .param("value_size", J::u(value_size as u64))
-        .note("layouts interleaved within each key count; the sweep is over key count")
-        .note("reads are on a fresh Reader, which is the side the flat layout is for");
+    rec.param(
+        "key_counts",
+        J::arr(sizes.iter().map(|n| J::u(*n)).collect()),
+    )
+    .param("reads", J::u(reads))
+    .param("value_size", J::u(value_size as u64))
+    .note("layouts interleaved within each key count; the sweep is over key count")
+    .note("reads are on a fresh Reader, which is the side the flat layout is for");
 
     let dir = scratch("f35");
     let payload = Payload::new(value_size, 0.5, 0xF35);
@@ -3950,7 +3955,11 @@ fn f35_indexauto(args: &Args, profile: Profile) -> std::io::Result<Record> {
             ov.median(),
             sf.median(),
             sv.median(),
-            if flat_wins_reads { "flat wins reads" } else { "-" }
+            if flat_wins_reads {
+                "flat wins reads"
+            } else {
+                "-"
+            }
         );
         open_ratios.push(ov.median() / of.median().max(1e-9));
         rows.push(jobj! {
@@ -4016,9 +4025,11 @@ fn f34_parallelindex(args: &Args, profile: Profile) -> std::io::Result<Record> {
         .param("value_size", J::u(value_size as u64))
         .param(
             "threads",
-            J::u(std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(1) as u64),
+            J::u(
+                std::thread::available_parallelism()
+                    .map(|p| p.get())
+                    .unwrap_or(1) as u64,
+            ),
         )
         .note("both arms interleaved; the only difference is Options::parallel_index");
 
@@ -4479,11 +4490,9 @@ fn f30_insertindex(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let secs = t.elapsed().as_secs_f64();
         let wrote = IoCounters::read_now().since(&io0).write_bytes;
         let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
-        io.lock().unwrap().push((
-            ci,
-            wrote as f64 / 1_048_576.0,
-            size as f64 / 1_048_576.0,
-        ));
+        io.lock()
+            .unwrap()
+            .push((ci, wrote as f64 / 1_048_576.0, size as f64 / 1_048_576.0));
         let _ = store.close();
         let _ = std::fs::remove_file(&file);
         add as f64 / secs
@@ -4491,12 +4500,7 @@ fn f30_insertindex(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let pick = |which: usize, f: fn(&(usize, f64, f64)) -> f64| -> Samples {
         let all = io.lock().unwrap();
-        Samples::new(
-            all.iter()
-                .filter(|(c, _, _)| *c == which)
-                .map(f)
-                .collect(),
-        )
+        Samples::new(all.iter().filter(|(c, _, _)| *c == which).map(f).collect())
     };
     let wrote: Vec<Samples> = (0..2).map(|c| pick(c, |x| x.1)).collect();
     let size: Vec<Samples> = (0..2).map(|c| pick(c, |x| x.2)).collect();
@@ -5103,9 +5107,7 @@ fn f27_ckptshape(args: &Args, profile: Profile) -> std::io::Result<Record> {
         }
         let secs = t.elapsed().as_secs_f64();
         let wrote = IoCounters::read_now().since(&io0).write_bytes;
-        io.lock()
-            .unwrap()
-            .push((ci, wrote as f64 / 1_048_576.0));
+        io.lock().unwrap().push((ci, wrote as f64 / 1_048_576.0));
         let _ = store.close();
         let _ = std::fs::remove_file(&file);
         ops as f64 / secs
@@ -5188,7 +5190,10 @@ fn f26_buffer(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let mut rec = Record::new("f26-buffer", profile);
     rec.param("keys", J::u(keys))
         .param("value_size", J::u(value_size as u64))
-        .param("buffer_mb", J::arr(mb.iter().map(|m| J::u(*m as u64)).collect()))
+        .param(
+            "buffer_mb",
+            J::arr(mb.iter().map(|m| J::u(*m as u64)).collect()),
+        )
         .note("buffer sizes interleaved in one process; seal_on_put is on for every arm")
         .note(
             "the dataset is about 105MB at the full profile, so the 256MB arm is the one that \
@@ -5313,7 +5318,9 @@ fn f25_arena(args: &Args, profile: Profile) -> std::io::Result<Record> {
     rec.param("keys", J::u(keys))
         .param("value_size", J::u(value_size as u64))
         .param("values_per_key", J::u(depth))
-        .note("both arms interleaved in one process; the only difference is Options::pending_arena");
+        .note(
+            "both arms interleaved in one process; the only difference is Options::pending_arena",
+        );
 
     let dir = scratch("f25");
     let payload = Payload::new(value_size, 0.5, 0xF25);
@@ -5351,9 +5358,7 @@ fn f25_arena(args: &Args, profile: Profile) -> std::io::Result<Record> {
         store.flush().expect("flush");
         let secs = t.elapsed().as_secs_f64();
         let grew = supdb::bench::env::rss_bytes().saturating_sub(rss0);
-        rss.lock()
-            .unwrap()
-            .push((ci, grew as f64 / 1_048_576.0));
+        rss.lock().unwrap().push((ci, grew as f64 / 1_048_576.0));
         let _ = store.close();
         let _ = std::fs::remove_file(&file);
         keys as f64 / secs
@@ -5678,7 +5683,13 @@ fn f38_fanout(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // (build index, oracle?) per arm. k1 runs the fan policy over one
     // segment, which is byte-for-byte today's single-store read.
     let arm_names = ["k1", "fan4", "oracle4", "fan16", "oracle16"];
-    let arm_cfg = [(0usize, false), (1, false), (1, true), (2, false), (2, true)];
+    let arm_cfg = [
+        (0usize, false),
+        (1, false),
+        (1, true),
+        (2, false),
+        (2, true),
+    ];
     let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
         let (cfg, oracle) = arm_cfg[ci];
         let segs = &builds[cfg];
@@ -5695,7 +5706,9 @@ fn f38_fanout(args: &Args, profile: Profile) -> std::io::Result<Record> {
                 std::hint::black_box(v);
             };
             if oracle {
-                n += segs[(i % k) as usize].read_all(&kb, each).expect("read_all");
+                n += segs[(i % k) as usize]
+                    .read_all(&kb, each)
+                    .expect("read_all");
             } else {
                 for seg in segs.iter() {
                     n += seg.read_all(&kb, each).expect("read_all");
@@ -5932,7 +5945,12 @@ fn f49_bulkseal(args: &Args, profile: Profile) -> std::io::Result<Record> {
     });
 
     let col = |ci: usize, pick: fn(&Row) -> f64| -> Vec<f64> {
-        rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect()
+        rows.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.0 == ci)
+            .map(pick)
+            .collect()
     };
     let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
         let mut v = col(ci, pick);
@@ -6314,7 +6332,13 @@ fn f50_txn(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let secs = t.elapsed().as_secs_f64();
         let (c, s, m) = db.phase_ns();
         let io_mb = IoCounters::read_now().since(&io0).write_bytes as f64 / 1_048_576.0;
-        let present = time_reads(&db, keys, reads, 0x51 + rep as u64, |z| if z.is_multiple_of(10) { z + 1 } else { z });
+        let present = time_reads(&db, keys, reads, 0x51 + rep as u64, |z| {
+            if z.is_multiple_of(10) {
+                z + 1
+            } else {
+                z
+            }
+        });
         let deleted = time_reads(&db, keys, reads, 0x52 + rep as u64, |z| z - z % 10);
         // Absent keys spread over the whole key space, like the deleted set,
         // so both misses route across every partition's directory. The first
@@ -6342,7 +6366,12 @@ fn f50_txn(args: &Args, profile: Profile) -> std::io::Result<Record> {
         keys as f64 / secs
     });
     let col = |ci: usize, pick: fn(&Row) -> f64| -> Vec<f64> {
-        rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect()
+        rows.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.0 == ci)
+            .map(pick)
+            .collect()
     };
     let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
         let mut v = col(ci, pick);
@@ -6519,7 +6548,12 @@ fn f51_ioprio(args: &Args, profile: Profile) -> std::io::Result<Record> {
         keys as f64 / secs
     });
     let col = |ci: usize, pick: fn(&Row) -> f64| -> Vec<f64> {
-        rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect()
+        rows.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.0 == ci)
+            .map(pick)
+            .collect()
     };
     let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
         let mut v = col(ci, pick);
@@ -6742,7 +6776,12 @@ fn f52_segsize(args: &Args, profile: Profile) -> std::io::Result<Record> {
         keys as f64 / secs
     });
     let col = |ci: usize, pick: fn(&Row) -> f64| -> Vec<f64> {
-        rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect()
+        rows.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.0 == ci)
+            .map(pick)
+            .collect()
     };
     let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
         let mut v = col(ci, pick);
@@ -6960,7 +6999,10 @@ fn f53_inline(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let mut kb = [0u8; 16];
         let d = dir.join(format!("f53-{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
-        let opts = NextOptions { inline_bytes: arms[ci].1, ..Default::default() };
+        let opts = NextOptions {
+            inline_bytes: arms[ci].1,
+            ..Default::default()
+        };
         let mut db = Db::create(&d, opts).expect("create");
         let io0 = IoCounters::read_now();
         let t = Instant::now();
@@ -7007,7 +7049,10 @@ fn f53_inline(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let mut parts: Vec<std::path::PathBuf> = std::fs::read_dir(&d)
             .expect("dir")
             .map(|e| e.expect("entry").path())
-            .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("par-")))
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("par-"))
+            })
             .collect();
         parts.sort();
         let mut counted = 0u64;
@@ -7044,7 +7089,12 @@ fn f53_inline(args: &Args, profile: Profile) -> std::io::Result<Record> {
         keys as f64 / secs
     });
     let col = |ci: usize, pick: fn(&Row) -> f64| -> Vec<f64> {
-        rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect()
+        rows.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.0 == ci)
+            .map(pick)
+            .collect()
     };
     let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
         let mut v = col(ci, pick);
@@ -7077,7 +7127,11 @@ fn f53_inline(args: &Args, profile: Profile) -> std::io::Result<Record> {
         ),
     );
 
-    let rd = compare(&Samples::new(col(1, |r| r.6)), &Samples::new(col(0, |r| r.6)), supdb::bench::MIN_EFFECT);
+    let rd = compare(
+        &Samples::new(col(1, |r| r.6)),
+        &Samples::new(col(0, |r| r.6)),
+        supdb::bench::MIN_EFFECT,
+    );
     rec.compare("inline_vs_blocks_reads", rd.clone());
     rec.finding(Finding::new(
         "F53.1",
@@ -7110,7 +7164,11 @@ fn f53_inline(args: &Args, profile: Profile) -> std::io::Result<Record> {
             med(0, |r| r.1),
         ),
     ));
-    let sc = compare(&Samples::new(col(1, |r| r.7)), &Samples::new(col(0, |r| r.7)), supdb::bench::MIN_EFFECT);
+    let sc = compare(
+        &Samples::new(col(1, |r| r.7)),
+        &Samples::new(col(0, |r| r.7)),
+        supdb::bench::MIN_EFFECT,
+    );
     rec.compare("inline_vs_blocks_scan", sc.clone());
     rec.finding(Finding::new(
         "F53.3",
@@ -7274,7 +7332,12 @@ fn f54_merge(args: &Args, profile: Profile) -> std::io::Result<Record> {
         keys as f64 / secs
     });
     let col = |ci: usize, pick: fn(&Row) -> f64| -> Vec<f64> {
-        rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect()
+        rows.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.0 == ci)
+            .map(pick)
+            .collect()
     };
     let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
         let mut v = col(ci, pick);
@@ -7309,9 +7372,17 @@ fn f54_merge(args: &Args, profile: Profile) -> std::io::Result<Record> {
     rec.compare("uniform_ranges_vs_full_ingest", ing_u.clone());
     let ing_s = compare(&rates[sr], &rates[sf], supdb::bench::MIN_EFFECT);
     rec.compare("sequential_ranges_vs_full_ingest", ing_s.clone());
-    let rd_u = compare(&Samples::new(col(ur, |r| r.7)), &Samples::new(col(uf, |r| r.7)), supdb::bench::MIN_EFFECT);
+    let rd_u = compare(
+        &Samples::new(col(ur, |r| r.7)),
+        &Samples::new(col(uf, |r| r.7)),
+        supdb::bench::MIN_EFFECT,
+    );
     rec.compare("uniform_read_ns_ranges_vs_full", rd_u.clone());
-    let rd_s = compare(&Samples::new(col(sr, |r| r.7)), &Samples::new(col(sf, |r| r.7)), supdb::bench::MIN_EFFECT);
+    let rd_s = compare(
+        &Samples::new(col(sr, |r| r.7)),
+        &Samples::new(col(sf, |r| r.7)),
+        supdb::bench::MIN_EFFECT,
+    );
     rec.compare("sequential_read_ns_ranges_vs_full", rd_s.clone());
     let dev_u = med(ur, |r| r.1) / med(uf, |r| r.1);
     let dev_s = med(sr, |r| r.1) / med(sf, |r| r.1);
@@ -7499,7 +7570,12 @@ fn f55_promote(args: &Args, profile: Profile) -> std::io::Result<Record> {
         keys as f64 / secs
     });
     let col = |ci: usize, pick: fn(&Row) -> f64| -> Vec<f64> {
-        rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect()
+        rows.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.0 == ci)
+            .map(pick)
+            .collect()
     };
     let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
         let mut v = col(ci, pick);
@@ -7534,9 +7610,17 @@ fn f55_promote(args: &Args, profile: Profile) -> std::io::Result<Record> {
     rec.compare("uniform_promote_vs_merge_ingest", ing_u.clone());
     let ing_s = compare(&rates[sp], &rates[sm], supdb::bench::MIN_EFFECT);
     rec.compare("sequential_promote_vs_merge_ingest", ing_s.clone());
-    let rd_u = compare(&Samples::new(col(up, |r| r.7)), &Samples::new(col(um, |r| r.7)), supdb::bench::MIN_EFFECT);
+    let rd_u = compare(
+        &Samples::new(col(up, |r| r.7)),
+        &Samples::new(col(um, |r| r.7)),
+        supdb::bench::MIN_EFFECT,
+    );
     rec.compare("uniform_read_ns_promote_vs_merge", rd_u.clone());
-    let rd_s = compare(&Samples::new(col(sp, |r| r.7)), &Samples::new(col(sm, |r| r.7)), supdb::bench::MIN_EFFECT);
+    let rd_s = compare(
+        &Samples::new(col(sp, |r| r.7)),
+        &Samples::new(col(sm, |r| r.7)),
+        supdb::bench::MIN_EFFECT,
+    );
     rec.compare("sequential_read_ns_promote_vs_merge", rd_s.clone());
     let dev_u = med(up, |r| r.1) / med(um, |r| r.1);
     let dev_s = med(sp, |r| r.1) / med(sm, |r| r.1);
@@ -7582,7 +7666,8 @@ fn f55_promote(args: &Args, profile: Profile) -> std::io::Result<Record> {
     rec.finding(Finding::new(
         "F55.3",
         "with uniform keys promotion changes nothing: device bytes within 1.05x and ingest a tie",
-        (0.95..=1.05).contains(&dev_u) && matches!(ing_u.verdict, supdb::bench::Verdict::NoDifference),
+        (0.95..=1.05).contains(&dev_u)
+            && matches!(ing_u.verdict, supdb::bench::Verdict::NoDifference),
         format!(
             "device bytes {:.1} MB with promotion against {:.1} without ({:.3}x); ingest {:.0} \\
              against {:.0} ops/s ({}); partitions {:.0} against {:.0}. Every piece of a uniform \\
@@ -7726,7 +7811,12 @@ fn f56_tailbound(args: &Args, profile: Profile) -> std::io::Result<Record> {
         keys as f64 / secs
     });
     let col = |ci: usize, pick: fn(&Row) -> f64| -> Vec<f64> {
-        rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect()
+        rows.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.0 == ci)
+            .map(pick)
+            .collect()
     };
     let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
         let mut v = col(ci, pick);
@@ -7822,7 +7912,11 @@ fn f56_tailbound(args: &Args, profile: Profile) -> std::io::Result<Record> {
     rec.finding(Finding::new(
         "F56.3",
         "at about four live pieces, point reads are within 5% of the routed store's",
-        rd4.ratio >= 0.95 || matches!(rd4.verdict, supdb::bench::Verdict::NoDifference | supdb::bench::Verdict::Greater),
+        rd4.ratio >= 0.95
+            || matches!(
+                rd4.verdict,
+                supdb::bench::Verdict::NoDifference | supdb::bench::Verdict::Greater
+            ),
         format!(
             "{:.0} ns per read over {:.0} live pieces against {:.0} ns routed ({}). Each piece \
              beyond the first costs a Bloom check and, on a false positive, a two-miss probe",
@@ -7878,15 +7972,17 @@ fn f48_syncpolicy(args: &Args, profile: Profile) -> std::io::Result<Record> {
         SyncPolicy::EveryN(16),
         SyncPolicy::EveryN(64),
     ];
-    let io_mb: std::sync::Mutex<Vec<Samples>> =
-        std::sync::Mutex::new(vec![Samples::default(); 4]);
+    let io_mb: std::sync::Mutex<Vec<Samples>> = std::sync::Mutex::new(vec![Samples::default(); 4]);
     let commit_s: std::sync::Mutex<Vec<Samples>> =
         std::sync::Mutex::new(vec![Samples::default(); 4]);
 
     let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
         let d = dir.join(format!("a{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
-        let opts = NextOptions { sync: policies[ci], ..Default::default() };
+        let opts = NextOptions {
+            sync: policies[ci],
+            ..Default::default()
+        };
         let mut db = Db::create(&d, opts).expect("create");
         let mut vrng = Rng::new(0xF48 + rep as u64);
         let mut kb = [0u8; 16];
@@ -7965,7 +8061,10 @@ fn f48_syncpolicy(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // page cache holding what the device never received.
     let d = dir.join("contract");
     let _ = std::fs::remove_dir_all(&d);
-    let opts = NextOptions { sync: SyncPolicy::EveryN(16), ..Default::default() };
+    let opts = NextOptions {
+        sync: SyncPolicy::EveryN(16),
+        ..Default::default()
+    };
     let mut db = Db::create(&d, opts.clone()).expect("create");
     for c in 0u32..23 {
         db.append(format!("k{c:03}").as_bytes(), &c.to_le_bytes());
@@ -7984,7 +8083,8 @@ fn f48_syncpolicy(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let mut synced_ok = true;
     for c in 0u32..16 {
         let mut n = 0;
-        db.read_all(format!("k{c:03}").as_bytes(), |_| n += 1).expect("read");
+        db.read_all(format!("k{c:03}").as_bytes(), |_| n += 1)
+            .expect("read");
         synced_ok &= n == 1;
     }
     let mut torn = 0;
@@ -7992,7 +8092,8 @@ fn f48_syncpolicy(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let mut dup = false;
     for c in 0u32..23 {
         let mut n = 0;
-        db.read_all(format!("k{c:03}").as_bytes(), |_| n += 1).expect("read");
+        db.read_all(format!("k{c:03}").as_bytes(), |_| n += 1)
+            .expect("read");
         dup |= n > 1;
     }
     rec.finding(Finding::new(
@@ -8004,9 +8105,7 @@ fn f48_syncpolicy(args: &Args, profile: Profile) -> std::io::Result<Record> {
              record behind the barrier present ({}), the torn frame absent ({} values served for \
              it), nothing duplicated ({}). This is the contract bounded-loss sells and it is \
              measured with the speed rather than assumed beside it",
-            synced_ok,
-            torn,
-            !dup
+            synced_ok, torn, !dup
         ),
     ));
     let _ = std::fs::remove_dir_all(&d);
@@ -8032,7 +8131,10 @@ fn f47_parwal(args: &Args, profile: Profile) -> std::io::Result<Record> {
     rec.param("records_per_thread", J::u(per_thread))
         .param("batch", J::u(batch))
         .param("value_size", J::u(value_size as u64))
-        .param("cores", J::u(std::thread::available_parallelism().map_or(0, |n| n.get() as u64)))
+        .param(
+            "cores",
+            J::u(std::thread::available_parallelism().map_or(0, |n| n.get() as u64)),
+        )
         .note(
             "five arms interleaved: 1, 2, 4 and 8 threads each owning a WAL file and committing \
              its own framed 1,000-record batches with one fdatasync each (f39's raw-wal arm run \
@@ -8294,13 +8396,10 @@ fn f46_segwrite(args: &Args, profile: Profile) -> std::io::Result<Record> {
             // The half a bespoke writer cannot skip: a checkpoint builds
             // this section too, so if it dominates there is little to win.
             let ti = Instant::now();
-            let all: Vec<(&[u8], &Extents)> = kbuf
-                .iter()
-                .map(|k| k.as_slice())
-                .zip(exts.iter())
-                .collect();
-            let sec = flatindex::encode(&all, 1, None, flatindex::key_hash, 0, false)
-                .expect("encode");
+            let all: Vec<(&[u8], &Extents)> =
+                kbuf.iter().map(|k| k.as_slice()).zip(exts.iter()).collect();
+            let sec =
+                flatindex::encode(&all, 1, None, flatindex::key_hash, 0, false).expect("encode");
             index_ns.lock().unwrap()[ci].push(ti.elapsed().as_nanos() as f64);
             std::hint::black_box(sec.0.len());
             let _ = std::fs::remove_file(&file);
@@ -8536,15 +8635,13 @@ fn f45_scanfloor(args: &Args, profile: Profile) -> std::io::Result<Record> {
                         if p + 4 > flat_bytes.len() {
                             break;
                         }
-                        let kl = u32::from_le_bytes(
-                            flat_bytes[p..p + 4].try_into().expect("klen"),
-                        ) as usize;
+                        let kl = u32::from_le_bytes(flat_bytes[p..p + 4].try_into().expect("klen"))
+                            as usize;
                         p += 4;
                         sink += flat_bytes[p..p + kl].len() as u64;
                         p += kl;
-                        let vl = u32::from_le_bytes(
-                            flat_bytes[p..p + 4].try_into().expect("vlen"),
-                        ) as usize;
+                        let vl = u32::from_le_bytes(flat_bytes[p..p + 4].try_into().expect("vlen"))
+                            as usize;
                         p += 4;
                         sink += flat_bytes[p..p + vl].len() as u64;
                         p += vl;
@@ -8692,14 +8789,10 @@ fn f44_tail(args: &Args, profile: Profile) -> std::io::Result<Record> {
         (true, true, 1),
     ];
     let ne = arm_names.len();
-    let loads: std::sync::Mutex<Vec<Samples>> =
-        std::sync::Mutex::new(vec![Samples::default(); ne]);
-    let io_mb: std::sync::Mutex<Vec<Samples>> =
-        std::sync::Mutex::new(vec![Samples::default(); ne]);
-    let par_n: std::sync::Mutex<Vec<Samples>> =
-        std::sync::Mutex::new(vec![Samples::default(); ne]);
-    let l0_n: std::sync::Mutex<Vec<Samples>> =
-        std::sync::Mutex::new(vec![Samples::default(); ne]);
+    let loads: std::sync::Mutex<Vec<Samples>> = std::sync::Mutex::new(vec![Samples::default(); ne]);
+    let io_mb: std::sync::Mutex<Vec<Samples>> = std::sync::Mutex::new(vec![Samples::default(); ne]);
+    let par_n: std::sync::Mutex<Vec<Samples>> = std::sync::Mutex::new(vec![Samples::default(); ne]);
+    let l0_n: std::sync::Mutex<Vec<Samples>> = std::sync::Mutex::new(vec![Samples::default(); ne]);
 
     let rates = Trial::new(profile.reps()).run(ne, |ci, rep| {
         let (seals, compact, trigger) = arm_cfg[ci];
@@ -8737,10 +8830,11 @@ fn f44_tail(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let mut got = 0u64;
         for _ in 0..probes {
             db_key_into(g.next(), &mut kb);
-            got += db.read_all(&kb, |v| {
-                std::hint::black_box(v);
-            })
-            .expect("read");
+            got += db
+                .read_all(&kb, |v| {
+                    std::hint::black_box(v);
+                })
+                .expect("read");
         }
         assert_eq!(got, probes, "every key holds exactly one value");
         let rate = probes as f64 / t.elapsed().as_secs_f64();
@@ -8894,21 +8988,17 @@ fn f43_compact(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let arm_names = ["no-compact", "compact-T4", "compact-T8"];
     let arm_cfg = [(false, 0usize), (true, 4), (true, 8)];
     let ne = arm_names.len();
-    let reads: std::sync::Mutex<Vec<Samples>> =
-        std::sync::Mutex::new(vec![Samples::default(); ne]);
+    let reads: std::sync::Mutex<Vec<Samples>> = std::sync::Mutex::new(vec![Samples::default(); ne]);
     let scan_rate: std::sync::Mutex<Vec<Samples>> =
         std::sync::Mutex::new(vec![Samples::default(); ne]);
-    let io_mb: std::sync::Mutex<Vec<Samples>> =
-        std::sync::Mutex::new(vec![Samples::default(); ne]);
+    let io_mb: std::sync::Mutex<Vec<Samples>> = std::sync::Mutex::new(vec![Samples::default(); ne]);
     let disk_mb: std::sync::Mutex<Vec<Samples>> =
         std::sync::Mutex::new(vec![Samples::default(); ne]);
-    let segs: std::sync::Mutex<Vec<Samples>> =
-        std::sync::Mutex::new(vec![Samples::default(); ne]);
+    let segs: std::sync::Mutex<Vec<Samples>> = std::sync::Mutex::new(vec![Samples::default(); ne]);
     // The tail on its own, because "how many segments" and "how many
     // UNROUTED segments" are different questions and only the second one
     // is bounded by policy.
-    let tail: std::sync::Mutex<Vec<Samples>> =
-        std::sync::Mutex::new(vec![Samples::default(); ne]);
+    let tail: std::sync::Mutex<Vec<Samples>> = std::sync::Mutex::new(vec![Samples::default(); ne]);
 
     let rates = Trial::new(profile.reps()).run(ne, |ci, rep| {
         let (compact, trigger) = arm_cfg[ci];
@@ -8945,17 +9035,22 @@ fn f43_compact(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let mut got = 0u64;
         for _ in 0..probes {
             db_key_into(g.next(), &mut kb);
-            got += db.read_all(&kb, |v| {
-                std::hint::black_box(v);
-            })
-            .expect("read");
+            got += db
+                .read_all(&kb, |v| {
+                    std::hint::black_box(v);
+                })
+                .expect("read");
         }
         assert_eq!(got, probes, "every key holds exactly one value");
         reads.lock().unwrap()[ci].push(probes as f64 / t.elapsed().as_secs_f64());
 
         // Ordered scans: the axis EXT.24 records failing, and the one
         // partitioning is supposed to recover.
-        let mut g2 = KeyGen::new(KeyDist::Uniform, keys.saturating_sub(scan_len as u64).max(1), 43);
+        let mut g2 = KeyGen::new(
+            KeyDist::Uniform,
+            keys.saturating_sub(scan_len as u64).max(1),
+            43,
+        );
         let t = Instant::now();
         let mut entries = 0u64;
         for _ in 0..scans {
@@ -9158,7 +9253,10 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
             let d = dir.join(format!("next-{ci}-{rep}"));
             let _ = std::fs::remove_dir_all(&d);
             let opts = if ci == 1 {
-                NextOptions { seal_bytes: usize::MAX, ..Default::default() }
+                NextOptions {
+                    seal_bytes: usize::MAX,
+                    ..Default::default()
+                }
             } else {
                 NextOptions::default()
             };
@@ -9291,8 +9389,7 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
         "F42.3",
         "sealing on the committing thread is the larger share of the gap to the floor",
         matches!(cmp_seal.verdict, supdb::bench::Verdict::Greater)
-            && (rates[1].median() - rates[0].median())
-                >= (1_014_003.0 - rates[1].median()),
+            && (rates[1].median() - rates[0].median()) >= (1_014_003.0 - rates[1].median()),
         format!(
             "next-lazyseal {:.0} ops/s against next {:.0} ({}): sealing inside the timed \
              window costs {:.0} ops/s, and the residual from lazyseal to f39's raw+index \
@@ -9359,7 +9456,9 @@ fn f41_segroute(args: &Args, profile: Profile) -> std::io::Result<Record> {
     impl BlockedBloom {
         fn build(n: usize) -> BlockedBloom {
             let blocks = (n * 10).div_ceil(512).max(1);
-            BlockedBloom { blocks: vec![[0u64; 8]; blocks] }
+            BlockedBloom {
+                blocks: vec![[0u64; 8]; blocks],
+            }
         }
         fn slots(&self, kb: &[u8; 16]) -> (usize, [(usize, u64); 4]) {
             let h = mix(kb, 0x40);
@@ -9401,7 +9500,10 @@ fn f41_segroute(args: &Args, profile: Profile) -> std::io::Result<Record> {
     impl SegTable {
         fn build(n: usize) -> SegTable {
             let buckets = ((n * 2).div_ceil(16)).next_power_of_two().max(2);
-            SegTable { buckets: vec![[0u32; 16]; buckets], mask: buckets - 1 }
+            SegTable {
+                buckets: vec![[0u32; 16]; buckets],
+                mask: buckets - 1,
+            }
         }
         #[inline]
         fn slot(kb: &[u8; 16]) -> (u64, u32) {
@@ -9527,7 +9629,9 @@ fn f41_segroute(args: &Args, profile: Profile) -> std::io::Result<Record> {
                     }
                 }
                 _ => {
-                    n += segs[(i % k) as usize].read_all(&kb, each).expect("read_all");
+                    n += segs[(i % k) as usize]
+                        .read_all(&kb, each)
+                        .expect("read_all");
                 }
             }
             sink += n;
@@ -9651,7 +9755,9 @@ fn f40_filter(args: &Args, profile: Profile) -> std::io::Result<Record> {
         fn build(n: usize) -> BlockedBloom {
             // ~10 bits/key rounded up to whole 512-bit blocks.
             let blocks = (n * 10).div_ceil(512).max(1);
-            BlockedBloom { blocks: vec![[0u64; 8]; blocks] }
+            BlockedBloom {
+                blocks: vec![[0u64; 8]; blocks],
+            }
         }
         fn slots(&self, kb: &[u8; 16]) -> (usize, [(usize, u64); 4]) {
             let h = mix(kb, 0x40);
@@ -9777,7 +9883,9 @@ fn f40_filter(args: &Args, profile: Profile) -> std::io::Result<Record> {
                     n += segs[s].read_all(&kb, each).expect("read_all");
                 }
                 _ => {
-                    n += segs[(i % k) as usize].read_all(&kb, each).expect("read_all");
+                    n += segs[(i % k) as usize]
+                        .read_all(&kb, each)
+                        .expect("read_all");
                 }
             }
             sink += n;
@@ -10394,7 +10502,10 @@ fn f57_walreuse(args: &Args, profile: Profile) -> std::io::Result<Record> {
         }
         let d = dir.join(format!("f57-{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
-        let opts = NextOptions { recycle_wal: recycle, ..Default::default() };
+        let opts = NextOptions {
+            recycle_wal: recycle,
+            ..Default::default()
+        };
         let io0 = IoCounters::read_now();
         let t = Instant::now();
         let mut db = Db::create(&d, opts).expect("create");
@@ -10445,7 +10556,12 @@ fn f57_walreuse(args: &Args, profile: Profile) -> std::io::Result<Record> {
         keys as f64 / secs
     });
     let col = |ci: usize, pick: fn(&Row) -> f64| -> Vec<f64> {
-        rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect()
+        rows.lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.0 == ci)
+            .map(pick)
+            .collect()
     };
     let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
         let mut v = col(ci, pick);
@@ -10479,9 +10595,17 @@ fn f57_walreuse(args: &Args, profile: Profile) -> std::io::Result<Record> {
     rec.compare("sequential_recycle_vs_fresh_ingest", ing_s.clone());
     let ing_u = compare(&rates[ur], &rates[uf], supdb::bench::MIN_EFFECT);
     rec.compare("uniform_recycle_vs_fresh_ingest", ing_u.clone());
-    let rd_u = compare(&Samples::new(col(ur, |r| r.6)), &Samples::new(col(uf, |r| r.6)), supdb::bench::MIN_EFFECT);
+    let rd_u = compare(
+        &Samples::new(col(ur, |r| r.6)),
+        &Samples::new(col(uf, |r| r.6)),
+        supdb::bench::MIN_EFFECT,
+    );
     rec.compare("uniform_read_ns_recycle_vs_fresh", rd_u.clone());
-    let rd_s = compare(&Samples::new(col(sr, |r| r.6)), &Samples::new(col(sf, |r| r.6)), supdb::bench::MIN_EFFECT);
+    let rd_s = compare(
+        &Samples::new(col(sr, |r| r.6)),
+        &Samples::new(col(sf, |r| r.6)),
+        supdb::bench::MIN_EFFECT,
+    );
     rec.compare("sequential_read_ns_recycle_vs_fresh", rd_s.clone());
     let dev_u = med(ur, |r| r.1) / med(uf, |r| r.1);
     let dev_s = med(sr, |r| r.1) / med(sf, |r| r.1);
@@ -10632,7 +10756,13 @@ fn f60_sealwait(args: &Args, profile: Profile) -> std::io::Result<Record> {
         keys as f64 / secs
     });
     let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
-        let mut v: Vec<f64> = rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect();
+        let mut v: Vec<f64> = rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.0 == ci)
+            .map(pick)
+            .collect();
         v.sort_by(|a, b| a.total_cmp(b));
         v[v.len() / 2]
     };
@@ -10808,8 +10938,16 @@ fn f61_scanmerge(args: &Args, profile: Profile) -> std::io::Result<Record> {
             _ => db.sync().expect("sync"),
         }
         let (parts, l0) = db.levels();
-        let unsealed = if shape == 1 { 1000.0 } else if shape == 3 { -1.0 } else { 0.0 };
-        rows.lock().unwrap().push((ci, parts as f64, l0 as f64, unsealed));
+        let unsealed = if shape == 1 {
+            1000.0
+        } else if shape == 3 {
+            -1.0
+        } else {
+            0.0
+        };
+        rows.lock()
+            .unwrap()
+            .push((ci, parts as f64, l0 as f64, unsealed));
 
         let mut x = 0x5CA4_u64 ^ (rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let mut entries = 0u64;
@@ -10837,7 +10975,13 @@ fn f61_scanmerge(args: &Args, profile: Profile) -> std::io::Result<Record> {
         entries as f64 / secs
     });
     let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
-        let mut v: Vec<f64> = rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect();
+        let mut v: Vec<f64> = rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.0 == ci)
+            .map(pick)
+            .collect();
         v.sort_by(|a, b| a.total_cmp(b));
         v[v.len() / 2]
     };
@@ -10995,8 +11139,16 @@ fn f62_scanmerge2(args: &Args, profile: Profile) -> std::io::Result<Record> {
             _ => db.sync().expect("sync"),
         }
         let (parts, l0) = db.levels();
-        let unsealed = if shape == 1 { 1000.0 } else if shape == 3 { -1.0 } else { 0.0 };
-        rows.lock().unwrap().push((ci, parts as f64, l0 as f64, unsealed));
+        let unsealed = if shape == 1 {
+            1000.0
+        } else if shape == 3 {
+            -1.0
+        } else {
+            0.0
+        };
+        rows.lock()
+            .unwrap()
+            .push((ci, parts as f64, l0 as f64, unsealed));
 
         let mut x = 0x5CA4_u64 ^ (rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let mut entries = 0u64;
@@ -11024,7 +11176,13 @@ fn f62_scanmerge2(args: &Args, profile: Profile) -> std::io::Result<Record> {
         entries as f64 / secs
     });
     let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
-        let mut v: Vec<f64> = rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect();
+        let mut v: Vec<f64> = rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.0 == ci)
+            .map(pick)
+            .collect();
         v.sort_by(|a, b| a.total_cmp(b));
         v[v.len() / 2]
     };
@@ -11199,7 +11357,9 @@ fn f63_scansnap(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let mut one = |db: &Db| {
             db_key_into(0, &mut kb);
             let t = Instant::now();
-            let n = db.scan(&kb, 1, |_k, v| sink = sink.wrapping_add(v.len() as u64)).expect("scan");
+            let n = db
+                .scan(&kb, 1, |_k, v| sink = sink.wrapping_add(v.len() as u64))
+                .expect("scan");
             std::hint::black_box(n);
             t.elapsed().as_secs_f64()
         };
@@ -11229,13 +11389,20 @@ fn f63_scansnap(args: &Args, profile: Profile) -> std::io::Result<Record> {
         };
         let sealed_hi = (load - unsealed).saturating_sub(scan_len as u64);
         let (se, st) = sweep(&db, 0, sealed_hi, 0x5E6);
-        let (me, mt) = sweep(&db, load - unsealed, load.saturating_sub(scan_len as u64), 0x3E3);
+        let (me, mt) = sweep(
+            &db,
+            load - unsealed,
+            load.saturating_sub(scan_len as u64),
+            0x3E3,
+        );
         let (ue, ut) = sweep(&db, 0, load, 0x0F62);
         std::hint::black_box(sink);
         db.close().expect("close");
         let _ = std::fs::remove_dir_all(&d);
         let per = |e: u64, t: f64| if e > 0 { t * 1e9 / e as f64 } else { f64::NAN };
-        rows.lock().unwrap().push((ci, build_s * 1e3, per(se, st), per(me, mt), unsealed as f64));
+        rows.lock()
+            .unwrap()
+            .push((ci, build_s * 1e3, per(se, st), per(me, mt), unsealed as f64));
         ue as f64 / (ut + build_s)
     });
     let col = |ci: usize, pick: fn(&Row) -> f64| -> Samples {
@@ -11379,7 +11546,11 @@ fn f64_indexsum(args: &Args, profile: Profile) -> std::io::Result<Record> {
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("seg.sup");
     {
-        let opts = Options { redo_log: false, shards: 1, ..Options::default() };
+        let opts = Options {
+            redo_log: false,
+            shards: 1,
+            ..Options::default()
+        };
         let mut w = SegmentWriter::create(&path, &opts).expect("create");
         w.set_inline_max(256);
         let payload = Payload::new(value_size, 0.5, 0xF64);
@@ -11410,7 +11581,11 @@ fn f64_indexsum(args: &Args, profile: Profile) -> std::io::Result<Record> {
     type Row = (usize, f64, f64);
     let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
     let rates = Trial::new(profile.reps()).run(arms.len(), |ci, rep| {
-        let opts = BlobOptions { verify_checksums: true, verify_index: ci == 0, ..Default::default() };
+        let opts = BlobOptions {
+            verify_checksums: true,
+            verify_index: ci == 0,
+            ..Default::default()
+        };
         let mut open_ms: Vec<f64> = Vec::with_capacity(opens as usize);
         let mut blob = None;
         for _ in 0..opens {
@@ -11428,16 +11603,27 @@ fn f64_indexsum(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let t = Instant::now();
         for _ in 0..reads {
             db_key_into(r.below(keys), &mut kb);
-            let n = blob.read_all(&kb, |v| sink = sink.wrapping_add(v.len() as u64)).expect("read");
+            let n = blob
+                .read_all(&kb, |v| sink = sink.wrapping_add(v.len() as u64))
+                .expect("read");
             std::hint::black_box(n);
         }
         let secs = t.elapsed().as_secs_f64();
         std::hint::black_box(sink);
-        rows.lock().unwrap().push((ci, open_med, secs * 1e9 / reads as f64));
+        rows.lock()
+            .unwrap()
+            .push((ci, open_med, secs * 1e9 / reads as f64));
         reads as f64 / secs
     });
     let col = |ci: usize, pick: fn(&Row) -> f64| -> Samples {
-        Samples::new(rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect())
+        Samples::new(
+            rows.lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.0 == ci)
+                .map(pick)
+                .collect(),
+        )
     };
     let opens_s: Vec<Samples> = (0..2).map(|ci| col(ci, |r| r.1)).collect();
     let nsr: Vec<Samples> = (0..2).map(|ci| col(ci, |r| r.2)).collect();

@@ -39,7 +39,12 @@ fn values_come_back_in_append_order_across_seals() {
     }
     assert_eq!(db.segments(), 3);
     for (key, want) in &model {
-        assert_eq!(&read_vec(&db, key), want, "key {}", String::from_utf8_lossy(key));
+        assert_eq!(
+            &read_vec(&db, key),
+            want,
+            "key {}",
+            String::from_utf8_lossy(key)
+        );
     }
     db.close().unwrap();
 }
@@ -49,7 +54,11 @@ fn reads_see_uncommitted_and_unsealed_state() {
     let d = dir("ryw");
     let mut db = Db::create(&d, NextOptions::default()).unwrap();
     db.append(b"k", b"one");
-    assert_eq!(read_vec(&db, b"k"), vec![b"one".to_vec()], "pre-commit read");
+    assert_eq!(
+        read_vec(&db, b"k"),
+        vec![b"one".to_vec()],
+        "pre-commit read"
+    );
     db.commit().unwrap();
     db.append(b"k", b"two");
     assert_eq!(read_vec(&db, b"k"), vec![b"one".to_vec(), b"two".to_vec()]);
@@ -69,7 +78,10 @@ fn killed_before_first_seal_opens_from_the_wal_alone() {
     let db = Db::open(&d, NextOptions::default()).unwrap();
     assert_eq!(db.segments(), 0, "nothing was sealed");
     for i in 0u32..500 {
-        assert_eq!(read_vec(&db, format!("k{i}").as_bytes()), vec![i.to_le_bytes().to_vec()]);
+        assert_eq!(
+            read_vec(&db, format!("k{i}").as_bytes()),
+            vec![i.to_le_bytes().to_vec()]
+        );
     }
 }
 
@@ -110,9 +122,21 @@ fn a_torn_tail_loses_its_batch_whole_and_earlier_batches_survive() {
     drop(f);
 
     let db = Db::open(&d, NextOptions::default()).unwrap();
-    assert_eq!(read_vec(&db, b"a"), vec![b"1".to_vec()], "a committed batch survives");
-    assert_eq!(read_vec(&db, b"b"), Vec::<Vec<u8>>::new(), "the torn batch is gone whole");
-    assert_eq!(read_vec(&db, b"c"), Vec::<Vec<u8>>::new(), "the torn batch is gone whole");
+    assert_eq!(
+        read_vec(&db, b"a"),
+        vec![b"1".to_vec()],
+        "a committed batch survives"
+    );
+    assert_eq!(
+        read_vec(&db, b"b"),
+        Vec::<Vec<u8>>::new(),
+        "the torn batch is gone whole"
+    );
+    assert_eq!(
+        read_vec(&db, b"c"),
+        Vec::<Vec<u8>>::new(),
+        "the torn batch is gone whole"
+    );
 }
 
 #[test]
@@ -129,15 +153,26 @@ fn a_transaction_is_all_or_nothing_and_sees_its_own_writes() {
         tx.append(b"z", b"new");
         let mut got = Vec::new();
         tx.read_all(b"x", |v| got.push(v.to_vec())).unwrap();
-        assert_eq!(got, vec![b"1".to_vec(), b"2".to_vec()], "read-your-writes inside");
+        assert_eq!(
+            got,
+            vec![b"1".to_vec(), b"2".to_vec()],
+            "read-your-writes inside"
+        );
         let mut got = Vec::new();
         tx.read_all(b"z", |v| got.push(v.to_vec())).unwrap();
-        assert_eq!(got, vec![b"new".to_vec()], "a staged delete masks the store's values");
+        assert_eq!(
+            got,
+            vec![b"new".to_vec()],
+            "a staged delete masks the store's values"
+        );
         assert_eq!(tx.count(b"z").unwrap(), 1);
         assert_eq!(tx.count(b"x").unwrap(), 2);
         tx.abort();
     }
-    assert!(read_vec(&db, b"x").is_empty(), "an aborted transaction leaves nothing");
+    assert!(
+        read_vec(&db, b"x").is_empty(),
+        "an aborted transaction leaves nothing"
+    );
     assert_eq!(read_vec(&db, b"z"), vec![b"old".to_vec()]);
     {
         let mut tx = db.begin();
@@ -154,10 +189,17 @@ fn a_transaction_is_all_or_nothing_and_sees_its_own_writes() {
         tx.append(b"y", b"gone");
         drop(tx);
     }
-    assert!(read_vec(&db, b"y").is_empty(), "dropped without commit is abort");
+    assert!(
+        read_vec(&db, b"y").is_empty(),
+        "dropped without commit is abort"
+    );
     drop(db);
     let db = Db::open(&d, NextOptions::default()).unwrap();
-    assert_eq!(read_vec(&db, b"x"), vec![b"1".to_vec(), b"2".to_vec()], "committed, durably");
+    assert_eq!(
+        read_vec(&db, b"x"),
+        vec![b"1".to_vec(), b"2".to_vec()],
+        "committed, durably"
+    );
     assert_eq!(read_vec(&db, b"z"), vec![b"new".to_vec()]);
     assert!(read_vec(&db, b"y").is_empty());
 }
@@ -185,7 +227,11 @@ fn crash_between_rename_and_wal_reset_does_not_duplicate() {
     let db = Db::open(&d, NextOptions::default()).unwrap();
     assert_eq!(db.segments(), 1);
     let got = read_vec(&db, b"dup-window");
-    assert_eq!(got.len(), 40, "sealed records must not replay into duplicates");
+    assert_eq!(
+        got.len(),
+        40,
+        "sealed records must not replay into duplicates"
+    );
     for (i, v) in got.iter().enumerate() {
         assert_eq!(v, &(i as u32).to_le_bytes().to_vec());
     }
@@ -203,7 +249,10 @@ fn reopen_after_seal_serves_both_old_and_new_writes() {
     drop(db); // crash with one segment and one live WAL record
 
     let mut db = Db::open(&d, NextOptions::default()).unwrap();
-    assert_eq!(read_vec(&db, b"k"), vec![b"sealed".to_vec(), b"walled".to_vec()]);
+    assert_eq!(
+        read_vec(&db, b"k"),
+        vec![b"sealed".to_vec(), b"walled".to_vec()]
+    );
     db.append(b"k", b"after");
     db.commit().unwrap();
     db.seal().unwrap();
@@ -222,8 +271,16 @@ fn oracle(bulk: bool, cursors: bool) {
     // commits, seals, and crash-reopens, checked against a HashMap after
     // every reopen. Uncommitted writes are trimmed from the model at a
     // crash, which is the durability contract.
-    let d = dir(&format!("oracle-{}-{}", if bulk { "bulk" } else { "general" }, if cursors { "cursors" } else { "probes" }));
-    let opts = NextOptions { bulk_writer: bulk, cursor_merge: cursors, ..NextOptions::default() };
+    let d = dir(&format!(
+        "oracle-{}-{}",
+        if bulk { "bulk" } else { "general" },
+        if cursors { "cursors" } else { "probes" }
+    ));
+    let opts = NextOptions {
+        bulk_writer: bulk,
+        cursor_merge: cursors,
+        ..NextOptions::default()
+    };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
     let mut uncommitted: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
@@ -285,10 +342,15 @@ fn oracle(bulk: bool, cursors: bool) {
     // The scan agrees with the point reads: every live key, every live
     // value, and no key whose values were all deleted.
     let mut scanned: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
-    db.scan(b"", usize::MAX, |k, v| scanned.entry(k.to_vec()).or_default().push(v.to_vec()))
-        .unwrap();
-    let live: HashMap<Vec<u8>, Vec<Vec<u8>>> =
-        model.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| (k.clone(), v.clone())).collect();
+    db.scan(b"", usize::MAX, |k, v| {
+        scanned.entry(k.to_vec()).or_default().push(v.to_vec())
+    })
+    .unwrap();
+    let live: HashMap<Vec<u8>, Vec<Vec<u8>>> = model
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     assert_eq!(scanned, live, "the scan must agree with the model");
 }
 
@@ -327,7 +389,12 @@ fn small_opts(l0_trigger: usize) -> NextOptions {
     // Partitions follow the seal here (`partition_bytes: None`): these tests
     // want many small partitions, where the shipping default holds them at
     // 64 MB whatever the seal size (f52).
-    NextOptions { seal_bytes: 4 << 10, l0_trigger, partition_bytes: None, ..NextOptions::default() }
+    NextOptions {
+        seal_bytes: 4 << 10,
+        l0_trigger,
+        partition_bytes: None,
+        ..NextOptions::default()
+    }
 }
 
 #[test]
@@ -346,10 +413,18 @@ fn compaction_partitions_the_key_space_and_keeps_every_value() {
     }
     db.flush().unwrap();
     let (partitioned, l0) = db.levels();
-    assert!(partitioned > 1, "the merge should have split the key space, got {partitioned}");
+    assert!(
+        partitioned > 1,
+        "the merge should have split the key space, got {partitioned}"
+    );
     assert!(l0 <= 3, "the tail stays bounded by l0_trigger, got {l0}");
     for (key, want) in &model {
-        assert_eq!(&read_vec(&db, key), want, "key {}", String::from_utf8_lossy(key));
+        assert_eq!(
+            &read_vec(&db, key),
+            want,
+            "key {}",
+            String::from_utf8_lossy(key)
+        );
     }
     // Ordered scan over a compacted store: keys ascending, no duplicates.
     let mut seen: Vec<Vec<u8>> = Vec::new();
@@ -385,7 +460,12 @@ fn a_compacted_store_reopens_with_the_same_answers() {
 
     let db = Db::open(&d, small_opts(2)).unwrap();
     for (key, want) in &model {
-        assert_eq!(&read_vec(&db, key), want, "after reopen: {}", String::from_utf8_lossy(key));
+        assert_eq!(
+            &read_vec(&db, key),
+            want,
+            "after reopen: {}",
+            String::from_utf8_lossy(key)
+        );
     }
 }
 
@@ -442,7 +522,10 @@ fn a_crash_before_the_manifest_lands_keeps_the_pre_merge_store() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .filter(|n| n.ends_with(".sup") && !pre.contains(&n.to_string()))
         .collect();
-    assert!(!post.is_empty(), "the copy produced no new segments; the window was not staged");
+    assert!(
+        !post.is_empty(),
+        "the copy produced no new segments; the window was not staged"
+    );
     for name in &post {
         std::fs::copy(d2.join(name), d.join(name)).unwrap();
     }
@@ -487,7 +570,11 @@ fn scale(flush_ranges: bool) {
     // partitioning AND several per-range merges, then demands every key
     // back. A fence that does not tile the key space loses keys silently
     // here and nowhere smaller.
-    let d = dir(if flush_ranges { "scale" } else { "scale-fullflush" });
+    let d = dir(if flush_ranges {
+        "scale"
+    } else {
+        "scale-fullflush"
+    });
     let mut db = Db::create(
         &d,
         NextOptions {
@@ -512,7 +599,10 @@ fn scale(flush_ranges: bool) {
     }
     db.flush().unwrap();
     let (par, l0) = db.levels();
-    assert!(par > 1, "expected several partitions, got {par} with {l0} in the tail");
+    assert!(
+        par > 1,
+        "expected several partitions, got {par} with {l0} in the tail"
+    );
 
     let mut missing = Vec::new();
     for i in 0..n {
@@ -558,7 +648,12 @@ fn count_is_exact_for_variable_width_values_through_seals_and_merges() {
     assert!(par + l0 > 1, "expected several segments, got {par}+{l0}");
 
     for (key, want) in &model {
-        assert_eq!(db.count(key).unwrap(), *want, "key {}", String::from_utf8_lossy(key));
+        assert_eq!(
+            db.count(key).unwrap(),
+            *want,
+            "key {}",
+            String::from_utf8_lossy(key)
+        );
         // And it agrees with actually reading them, which is the only
         // definition of correct that matters.
         assert_eq!(read_vec(&db, key).len() as u64, *want);
@@ -567,7 +662,12 @@ fn count_is_exact_for_variable_width_values_through_seals_and_merges() {
 
     let db = Db::open(&d, small_opts(2)).unwrap();
     for (key, want) in &model {
-        assert_eq!(db.count(key).unwrap(), *want, "after reopen: {}", String::from_utf8_lossy(key));
+        assert_eq!(
+            db.count(key).unwrap(),
+            *want,
+            "after reopen: {}",
+            String::from_utf8_lossy(key)
+        );
     }
 }
 
@@ -581,7 +681,10 @@ fn every_n_loses_the_unsynced_tail_whole_and_never_in_part() {
     // never got.
     use supdb::next::SyncPolicy;
     let d = dir("everyn");
-    let opts = NextOptions { sync: SyncPolicy::EveryN(16), ..NextOptions::default() };
+    let opts = NextOptions {
+        sync: SyncPolicy::EveryN(16),
+        ..NextOptions::default()
+    };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     // 16 commits reach a barrier; the next 7 do not.
     for c in 0u32..23 {
@@ -594,7 +697,12 @@ fn every_n_loses_the_unsynced_tail_whole_and_never_in_part() {
     // Tear a few bytes off the end: the last unsynced frame is torn, the
     // ones before it are intact-but-unsynced, and the sixteen before those
     // were behind a barrier.
-    std::fs::OpenOptions::new().write(true).open(&wal).unwrap().set_len(len - 5).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&wal)
+        .unwrap()
+        .set_len(len - 5)
+        .unwrap();
 
     let db = Db::open(&d, opts).unwrap();
     for c in 0u32..16 {
@@ -607,14 +715,21 @@ fn every_n_loses_the_unsynced_tail_whole_and_never_in_part() {
     // Everything after the tear is gone; everything intact before it is
     // served (this emulation tore only the last frame), and no record is
     // ever duplicated or served out of order.
-    assert_eq!(read_vec(&db, b"k022"), Vec::<Vec<u8>>::new(), "the torn frame is the crash point");
+    assert_eq!(
+        read_vec(&db, b"k022"),
+        Vec::<Vec<u8>>::new(),
+        "the torn frame is the crash point"
+    );
     for c in 16u32..22 {
         assert_eq!(read_vec(&db, format!("k{c:03}").as_bytes()).len(), 1);
     }
 }
 
 fn dir_bytes(d: &std::path::Path) -> u64 {
-    std::fs::read_dir(d).unwrap().map(|e| e.unwrap().metadata().unwrap().len()).sum()
+    std::fs::read_dir(d)
+        .unwrap()
+        .map(|e| e.unwrap().metadata().unwrap().len())
+        .sum()
 }
 
 #[test]
@@ -627,16 +742,27 @@ fn a_delete_ends_older_values_and_later_appends_start_fresh() {
     db.seal().unwrap();
     db.append(b"k", b"v3");
     db.commit().unwrap();
-    assert_eq!(read_vec(&db, b"k"), vec![b"v1".to_vec(), b"v2".to_vec(), b"v3".to_vec()]);
+    assert_eq!(
+        read_vec(&db, b"k"),
+        vec![b"v1".to_vec(), b"v2".to_vec(), b"v3".to_vec()]
+    );
     db.delete(b"k");
-    assert_eq!(read_vec(&db, b"k"), Vec::<Vec<u8>>::new(), "a delete ends everything before it, sealed or not");
+    assert_eq!(
+        read_vec(&db, b"k"),
+        Vec::<Vec<u8>>::new(),
+        "a delete ends everything before it, sealed or not"
+    );
     assert_eq!(db.count(b"k").unwrap(), 0);
     db.append(b"k", b"v4");
     db.commit().unwrap();
     assert_eq!(read_vec(&db, b"k"), vec![b"v4".to_vec()]);
     assert_eq!(db.count(b"k").unwrap(), 1);
     db.seal().unwrap();
-    assert_eq!(read_vec(&db, b"k"), vec![b"v4".to_vec()], "through a sealed tombstone");
+    assert_eq!(
+        read_vec(&db, b"k"),
+        vec![b"v4".to_vec()],
+        "through a sealed tombstone"
+    );
     drop(db);
     let mut db = Db::open(&d, NextOptions::default()).unwrap();
     assert_eq!(read_vec(&db, b"k"), vec![b"v4".to_vec()], "after reopen");
@@ -644,7 +770,10 @@ fn a_delete_ends_older_values_and_later_appends_start_fresh() {
     assert_eq!(read_vec(&db, b"k"), vec![b"v4".to_vec()], "after the merge");
     assert_eq!(db.count(b"k").unwrap(), 1);
     let mut scanned = Vec::new();
-    db.scan(b"", usize::MAX, |k, v| scanned.push((k.to_vec(), v.to_vec()))).unwrap();
+    db.scan(b"", usize::MAX, |k, v| {
+        scanned.push((k.to_vec(), v.to_vec()))
+    })
+    .unwrap();
     assert_eq!(scanned, vec![(b"k".to_vec(), b"v4".to_vec())]);
     // A delete of a key never written is a tombstone too; it masks nothing.
     db.delete(b"never");
@@ -658,14 +787,24 @@ fn a_delete_ends_older_values_and_later_appends_start_fresh() {
     assert_eq!(read_vec(&db, b"k"), Vec::<Vec<u8>>::new());
     assert_eq!(db.count(b"k").unwrap(), 0);
     let mut scanned = Vec::new();
-    db.scan(b"", usize::MAX, |k, v| scanned.push((k.to_vec(), v.to_vec()))).unwrap();
-    assert!(scanned.is_empty(), "a merged-away key does not scan: {scanned:?}");
+    db.scan(b"", usize::MAX, |k, v| {
+        scanned.push((k.to_vec(), v.to_vec()))
+    })
+    .unwrap();
+    assert!(
+        scanned.is_empty(),
+        "a merged-away key does not scan: {scanned:?}"
+    );
 }
 
 #[test]
 fn deleted_values_do_not_survive_the_merge() {
     let d = dir("delete-merge");
-    let opts = NextOptions { seal_bytes: 256 << 10, l0_trigger: 3, ..NextOptions::default() };
+    let opts = NextOptions {
+        seal_bytes: 256 << 10,
+        l0_trigger: 3,
+        ..NextOptions::default()
+    };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     let filler = vec![b'x'; 200];
     for i in 0..4_000u32 {
@@ -834,10 +973,16 @@ fn ordered_pieces_are_promoted_to_partitions_without_a_merge() {
     }
     db.flush().unwrap();
     let (parts, l0) = db.levels();
-    assert!(parts >= 4, "ordered pieces should have become partitions: {parts} partitions, {l0} pieces");
+    assert!(
+        parts >= 4,
+        "ordered pieces should have become partitions: {parts} partitions, {l0} pieces"
+    );
     assert_eq!(l0, 0);
     let (_, _, merge_ns) = db.phase_ns();
-    assert!(merge_ns < 50_000_000, "promotion should not spend a merge's time: {merge_ns} ns");
+    assert!(
+        merge_ns < 50_000_000,
+        "promotion should not spend a merge's time: {merge_ns} ns"
+    );
     for i in (0..12_000u32).step_by(997) {
         let got = read_vec(&db, format!("log-{i:08}").as_bytes());
         assert_eq!(got.len(), 2, "log-{i:08}");
@@ -862,7 +1007,10 @@ fn ordered_pieces_are_promoted_to_partitions_without_a_merge() {
         .filter(|n| n.ends_with(".sup"))
         .collect();
     names.sort();
-    assert!(names.iter().all(|n| n.starts_with("par-")), "every segment is a partition: {names:?}");
+    assert!(
+        names.iter().all(|n| n.starts_with("par-")),
+        "every segment is a partition: {names:?}"
+    );
 }
 
 #[test]
@@ -874,7 +1022,10 @@ fn a_wal_header_torn_by_power_loss_opens_and_is_rewritten() {
     // before appending. c4-crash tears exactly this in a third of its
     // trials; this is the one-shot version.
     let d = dir("torn-header");
-    let opts = NextOptions { seal_bytes: 1 << 10, ..NextOptions::default() };
+    let opts = NextOptions {
+        seal_bytes: 1 << 10,
+        ..NextOptions::default()
+    };
     let newest_wal = |d: &std::path::Path| -> std::path::PathBuf {
         let mut wals: Vec<std::path::PathBuf> = std::fs::read_dir(d)
             .unwrap()
@@ -893,18 +1044,34 @@ fn a_wal_header_torn_by_power_loss_opens_and_is_rewritten() {
     drop(db);
     for (round, cut) in [0u64, 1, 3, 7].into_iter().enumerate() {
         let live = newest_wal(&d);
-        assert_eq!(std::fs::metadata(&live).unwrap().len(), 8, "a rotated WAL holds only its header");
-        std::fs::OpenOptions::new().write(true).open(&live).unwrap().set_len(cut).unwrap();
+        assert_eq!(
+            std::fs::metadata(&live).unwrap().len(),
+            8,
+            "a rotated WAL holds only its header"
+        );
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&live)
+            .unwrap()
+            .set_len(cut)
+            .unwrap();
         let mut db = Db::open(&d, opts.clone()).unwrap();
         for i in 0u32..64 {
-            assert_eq!(read_vec(&db, format!("k{i:03}").as_bytes()), vec![vec![7u8; 64]]);
+            assert_eq!(
+                read_vec(&db, format!("k{i:03}").as_bytes()),
+                vec![vec![7u8; 64]]
+            );
         }
         let key = format!("after{round}");
         db.append(key.as_bytes(), b"x");
         db.commit().unwrap();
         drop(db);
         let mut db = Db::open(&d, opts.clone()).unwrap();
-        assert_eq!(read_vec(&db, key.as_bytes()), vec![b"x".to_vec()], "cut {cut}: the header was rewritten whole");
+        assert_eq!(
+            read_vec(&db, key.as_bytes()),
+            vec![b"x".to_vec()],
+            "cut {cut}: the header was rewritten whole"
+        );
         // Seal so the next round starts from a header-only live WAL again.
         db.flush().unwrap();
         drop(db);
@@ -954,7 +1121,12 @@ fn a_recycled_wal_never_adopts_a_frame_from_its_previous_life() {
     assert_eq!(read_vec(&db, b"new-b"), vec![b"B".to_vec()]);
     for i in 0u32..3000 {
         let got = read_vec(&db, format!("k{i:05}").as_bytes());
-        assert_eq!(got.len(), 1, "k{i:05} came back {} times: a stale frame was adopted", got.len());
+        assert_eq!(
+            got.len(),
+            1,
+            "k{i:05} came back {} times: a stale frame was adopted",
+            got.len()
+        );
     }
     drop(db);
     // And again after another commit and reopen: the truncation at open
@@ -1001,7 +1173,13 @@ fn recycling_survives_crashes_and_leaves_no_spare_after_close() {
     db.close().unwrap();
     let spares = std::fs::read_dir(&d)
         .unwrap()
-        .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("spare-"))
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("spare-")
+        })
         .count();
     assert_eq!(spares, 0, "close leaves no spare behind");
     let db = Db::open(&d, opts).unwrap();
@@ -1009,7 +1187,6 @@ fn recycling_survives_crashes_and_leaves_no_spare_after_close() {
         assert_eq!(&read_vec(&db, k), want);
     }
 }
-
 
 #[test]
 fn a_flipped_byte_anywhere_in_a_batch_loses_that_batch_and_the_ones_after() {
@@ -1023,7 +1200,10 @@ fn a_flipped_byte_anywhere_in_a_batch_loses_that_batch_and_the_ones_after() {
     let mut ends = Vec::new();
     for b in 0u32..3 {
         for i in 0..4u32 {
-            db.append(format!("b{b}k{i}").as_bytes(), format!("v{b}{i}").as_bytes());
+            db.append(
+                format!("b{b}k{i}").as_bytes(),
+                format!("v{b}{i}").as_bytes(),
+            );
         }
         if b == 1 {
             db.delete(b"b0k0");
@@ -1062,7 +1242,10 @@ fn a_flipped_byte_anywhere_in_a_batch_loses_that_batch_and_the_ones_after() {
                 } else {
                     Vec::new()
                 };
-                assert_eq!(got, want, "offset {off} (batch {survive} damaged): key {key}");
+                assert_eq!(
+                    got, want,
+                    "offset {off} (batch {survive} damaged): key {key}"
+                );
             }
         }
     }
@@ -1085,8 +1268,16 @@ fn put_replaces_and_append_accumulates() {
     assert_eq!(db.count(b"k").unwrap(), 1);
     db.append(b"k", b"4");
     db.commit().unwrap();
-    assert_eq!(read_vec(&db, b"k"), vec![b"3".to_vec(), b"4".to_vec()], "appends after a put accumulate again");
+    assert_eq!(
+        read_vec(&db, b"k"),
+        vec![b"3".to_vec(), b"4".to_vec()],
+        "appends after a put accumulate again"
+    );
     drop(db);
     let db = Db::open(&d, NextOptions::default()).unwrap();
-    assert_eq!(read_vec(&db, b"k"), vec![b"3".to_vec(), b"4".to_vec()], "and the WAL replays the same");
+    assert_eq!(
+        read_vec(&db, b"k"),
+        vec![b"3".to_vec(), b"4".to_vec()],
+        "and the WAL replays the same"
+    );
 }

@@ -523,12 +523,7 @@ pub unsafe extern "C" fn supdb_read_concat(h: u32, kptr: *const u8, klen: u32) -
 /// # Safety
 /// `fptr` must point at `flen` readable bytes.
 #[no_mangle]
-pub unsafe extern "C" fn supdb_scan_counts(
-    h: u32,
-    fptr: *const u8,
-    flen: u32,
-    limit: u32,
-) -> u32 {
+pub unsafe extern "C" fn supdb_scan_counts(h: u32, fptr: *const u8, flen: u32, limit: u32) -> u32 {
     let from = std::slice::from_raw_parts(fptr, flen as usize);
     with_blob(h, u32::MAX, |b, out| {
         out.extend_from_slice(&0u32.to_le_bytes());
@@ -651,7 +646,10 @@ pub extern "C" fn supdb_open_host_sparse_opts(flags: u32) -> u32 {
             u32::MAX,
         );
     }
-    let opts = crate::blob::BlobOptions { resident_directory: flags & 1 != 0, ..Default::default() };
+    let opts = crate::blob::BlobOptions {
+        resident_directory: flags & 1 != 0,
+        ..Default::default()
+    };
     match SparseBlob::open_with(src, opts) {
         Ok(b) => put(AnyBlob::Sparse(b)),
         Err(e) => fail(e.to_string(), u32::MAX),

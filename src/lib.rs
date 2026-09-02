@@ -72,10 +72,10 @@ mod readers;
 #[allow(clippy::all, dead_code)]
 mod store;
 
-/// Where a reader's bytes come from. The seam the wasm build needed.
-pub mod bytes;
 /// The read path, over any `Bytes` source. Compiles on every target.
 pub mod blob;
+/// Where a reader's bytes come from. The seam the wasm build needed.
+pub mod bytes;
 /// The next engine: a WAL, a memtable and threads that seal and merge --
 /// none of which a browser has. Excluded from the wasm build rather than
 /// stubbed, like `store`; `blob` is the read path that carries over.
@@ -87,9 +87,9 @@ pub mod next;
 pub mod wasmapi;
 
 pub use blob::{Blob, BlobOptions, SparseBlob};
-pub use bytes::{Bytes, SliceBytes, VecBytes};
 #[cfg(not(target_family = "wasm"))]
 pub use bytes::MmapBytes;
+pub use bytes::{Bytes, SliceBytes, VecBytes};
 #[cfg(not(target_family = "wasm"))]
 pub use store::{
     take_phases, take_write_ledger, Options, Phases, ReadOptions, Readahead, Reader, Reclaim,

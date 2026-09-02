@@ -149,7 +149,8 @@ impl Batch {
     pub fn push(&mut self, key: &[u8], value: &[u8]) {
         self.keys.extend_from_slice(key);
         self.vals.extend_from_slice(value);
-        self.ends.push((self.keys.len() as u32, self.vals.len() as u32));
+        self.ends
+            .push((self.keys.len() as u32, self.vals.len() as u32));
     }
 
     pub fn len(&self) -> usize {
@@ -462,7 +463,10 @@ impl Next {
         // is equalizable -- the same call `supdb-durable` makes, and the
         // fairness gate refused to rank this arm until it was made here too.
         let opts = supdb::next::NextOptions {
-            segment: supdb::Options { checksums: false, ..Default::default() },
+            segment: supdb::Options {
+                checksums: false,
+                ..Default::default()
+            },
             // The engine's own defaults: 32 MB seals over 64 MB partitions.
             // Few partitions is not an accident of the benchmark, it is the
             // operating point the design is FOR: f44 measured the same data
@@ -484,7 +488,12 @@ impl Next {
             ..Default::default()
         };
         let db = supdb::next::Db::create(path, opts).map_err(|e| e.to_string())?;
-        Ok(Next { db: Some(db), path: path.to_path_buf(), partition, drain })
+        Ok(Next {
+            db: Some(db),
+            path: path.to_path_buf(),
+            partition,
+            drain,
+        })
     }
 }
 
@@ -530,13 +539,15 @@ impl Engine for Next {
     fn get(&mut self, key: &[u8]) -> Res<usize> {
         let db = self.db.as_ref().ok_or("db closed")?;
         let mut n = 0usize;
-        db.read_all(key, |v| n += v.len()).map_err(|e| e.to_string())?;
+        db.read_all(key, |v| n += v.len())
+            .map_err(|e| e.to_string())?;
         Ok(n)
     }
     fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
         let db = self.db.as_ref().ok_or("db closed")?;
         let mut bytes = 0usize;
-        db.scan(from, n, |_k, v| bytes += v.len()).map_err(|e| e.to_string())?;
+        db.scan(from, n, |_k, v| bytes += v.len())
+            .map_err(|e| e.to_string())?;
         Ok(bytes)
     }
     fn sync(&mut self) -> Res<()> {
@@ -744,7 +755,14 @@ impl Rocks {
         let db = rocksdb::DB::open(&o, path).map_err(|e| e.to_string())?;
         let mut read = rocksdb::ReadOptions::default();
         read.set_verify_checksums(false);
-        Ok(Rocks { db, path: path.to_path_buf(), sync, tuned, drain, read })
+        Ok(Rocks {
+            db,
+            path: path.to_path_buf(),
+            sync,
+            tuned,
+            drain,
+            read,
+        })
     }
 }
 

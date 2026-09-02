@@ -629,7 +629,10 @@ pub fn uncap_memory() -> bool {
     // The limit first: if moving the process out fails, the cap is still
     // gone, which is the half that matters.
     let lifted = fs::write(format!("{dir}/memory.limit_in_bytes"), "-1").is_ok();
-    let _ = fs::write(format!("{root}/cgroup.procs"), std::process::id().to_string());
+    let _ = fs::write(
+        format!("{root}/cgroup.procs"),
+        std::process::id().to_string(),
+    );
     // Only removable once empty, so this fails harmlessly if the move did.
     let _ = fs::remove_dir(&dir);
     lifted

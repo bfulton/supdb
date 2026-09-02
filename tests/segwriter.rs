@@ -165,7 +165,11 @@ fn agree(a: &Blob<MmapBytes>, b: &Blob<MmapBytes>, data: &[(Vec<u8>, Vec<Vec<u8>
         let mut cat = Vec::new();
         let nc = b.read_concat(key, &mut cat).expect("read_concat");
         assert_eq!(nc, vals.len() as u64);
-        assert_eq!(cat, vals.concat(), "read_concat is the values back to back for {key:?}");
+        assert_eq!(
+            cat,
+            vals.concat(),
+            "read_concat is the values back to back for {key:?}"
+        );
         assert_eq!(
             b.stored_bytes(key),
             a.stored_bytes(key),
@@ -211,7 +215,11 @@ fn bulk_segment_reads_identically_to_a_store_written_one() {
     write_bulk(&dir.join("bulk.sup"), &data, opts());
     let a = open(&dir.join("store.sup"));
     let b = open(&dir.join("bulk.sup"));
-    assert!(b.blocks() > 0, "the long runs still need blocks, got {}", b.blocks());
+    assert!(
+        b.blocks() > 0,
+        "the long runs still need blocks, got {}",
+        b.blocks()
+    );
     agree(&a, &b, &data);
     // The writer's other layout -- every run in a block, section built at
     // the end, the order `Store` writes -- must agree with both as well:
@@ -220,7 +228,11 @@ fn bulk_segment_reads_identically_to_a_store_written_one() {
     write_bulk_with(&dir.join("blocks.sup"), &data, opts(), 0);
     let c = open(&dir.join("blocks.sup"));
     agree(&a, &c, &data);
-    assert!(c.lookup(&data[0].0).expect("present").iter().all(|e| !e.is_inline()));
+    assert!(c
+        .lookup(&data[0].0)
+        .expect("present")
+        .iter()
+        .all(|e| !e.is_inline()));
     // Which runs went inline is decided by their byte length, and an inline
     // run plans no fetch: the extent names no block and the read touches
     // the record alone.
@@ -228,7 +240,10 @@ fn bulk_segment_reads_identically_to_a_store_written_one() {
     for (key, vals) in &data {
         // The run's stored size decides: format v6 stores a uniform-width
         // run without prefixes, a mixed one with a varint prefix per value.
-        let uniform = !vals.is_empty() && vals.iter().all(|v| v.len() == vals[0].len() && !v.is_empty());
+        let uniform = !vals.is_empty()
+            && vals
+                .iter()
+                .all(|v| v.len() == vals[0].len() && !v.is_empty());
         let run: usize = vals
             .iter()
             .map(|v| v.len() + if uniform { 0 } else { varint_len(v.len()) })
@@ -236,19 +251,40 @@ fn bulk_segment_reads_identically_to_a_store_written_one() {
         let exts = b.lookup(key).expect("present");
         assert_eq!(exts.len(), 1, "one run per key in a bulk segment");
         if run <= INLINE {
-            assert!(exts[0].is_inline(), "a {run}-byte run must be inline for {key:?}");
-            assert!(b.ranges_for(key).expect("plan").is_empty(), "an inline run fetches nothing");
+            assert!(
+                exts[0].is_inline(),
+                "a {run}-byte run must be inline for {key:?}"
+            );
+            assert!(
+                b.ranges_for(key).expect("plan").is_empty(),
+                "an inline run fetches nothing"
+            );
             inline += 1;
         } else {
-            assert!(!exts[0].is_inline(), "a {run}-byte run must be in a block for {key:?}");
+            assert!(
+                !exts[0].is_inline(),
+                "a {run}-byte run must be in a block for {key:?}"
+            );
             assert!(!b.ranges_for(key).expect("plan").is_empty());
         }
-        assert!(a.lookup(key).expect("present").iter().all(|e| !e.is_inline()), "Store never inlines");
+        assert!(
+            a.lookup(key)
+                .expect("present")
+                .iter()
+                .all(|e| !e.is_inline()),
+            "Store never inlines"
+        );
     }
     // Both paths well exercised: the fixture's uneven run lengths put a
     // minority of keys under the threshold and the rest in blocks.
-    assert!(inline > data.len() / 10, "too few inline runs to test: {inline}");
-    assert!(data.len() - inline > data.len() / 10, "too few block runs to test: {inline} inline");
+    assert!(
+        inline > data.len() / 10,
+        "too few inline runs to test: {inline}"
+    );
+    assert!(
+        data.len() - inline > data.len() / 10,
+        "too few block runs to test: {inline} inline"
+    );
 }
 
 fn varint_len(n: usize) -> usize {
@@ -444,7 +480,11 @@ fn a_run_of_one_width_is_stored_without_prefixes_and_reads_the_same() {
     // Counts: exact from the flag, and a wrong width is refused outright.
     assert_eq!(blob.count(b"fixed").unwrap(), 1000);
     assert_eq!(blob.count_fixed(b"fixed", 4), Some(1000));
-    assert_eq!(blob.count_fixed(b"fixed", 2), None, "a fixed run of 4 is not a run of 2");
+    assert_eq!(
+        blob.count_fixed(b"fixed", 2),
+        None,
+        "a fixed run of 4 is not a run of 2"
+    );
     assert_eq!(blob.count_fixed(b"one", 4), Some(1));
     // The scan agrees.
     let mut pairs = 0usize;
@@ -490,10 +530,16 @@ fn every_flip_in_the_key_section_fails_the_open() {
     let clean = std::fs::read(&path).unwrap();
     let (key_off, key_len) = {
         let b = open(&path);
-        assert!(b.index_checksummed(), "a segment's index carries a checksum row");
+        assert!(
+            b.index_checksummed(),
+            "a segment's index carries a checksum row"
+        );
         (b.index_offset() as usize, b.index_bytes())
     };
-    assert!(key_len > 4096, "the fixture's index spans several pieces: {key_len}");
+    assert!(
+        key_len > 4096,
+        "the fixture's index spans several pieces: {key_len}"
+    );
     let mut tried = 0usize;
     for at in (key_off..key_off + key_len).step_by(7) {
         let mut bytes = clean.clone();
@@ -512,7 +558,11 @@ fn every_flip_in_the_key_section_fails_the_open() {
     let mut bytes = clean.clone();
     bytes[key_off + key_len / 2] ^= 0x40;
     std::fs::write(&path, &bytes).unwrap();
-    let opts = supdb::BlobOptions { verify_checksums: true, verify_index: false, ..Default::default() };
+    let opts = supdb::BlobOptions {
+        verify_checksums: true,
+        verify_index: false,
+        ..Default::default()
+    };
     assert!(Blob::open_with(MmapBytes::open(&path).unwrap(), opts).is_ok());
     std::fs::write(&path, &clean).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
@@ -537,9 +587,16 @@ fn a_head_reserve_opens_the_sparse_reader_from_the_probe_alone() {
         }
         fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
             let end = off + dst.len() as u64;
-            let ok = self.allowed.borrow().iter().any(|&(a, l)| a <= off && end <= a + l);
+            let ok = self
+                .allowed
+                .borrow()
+                .iter()
+                .any(|&(a, l)| a <= off && end <= a + l);
             if !ok {
-                return Err(std::io::Error::other(format!("read outside the probe: {off}+{}", dst.len())));
+                return Err(std::io::Error::other(format!(
+                    "read outside the probe: {off}+{}",
+                    dst.len()
+                )));
             }
             dst.copy_from_slice(&self.data[off as usize..end as usize]);
             Ok(())
@@ -572,9 +629,15 @@ fn a_head_reserve_opens_the_sparse_reader_from_the_probe_alone() {
     let head = bytes[..4096].to_vec();
     let p1 = supdb::blob::open_sparse_ranges(&head, bytes.len() as u64).unwrap();
     for &(o, l) in &p1 {
-        assert!(o + l <= probe, "plan {o}+{l} reaches past the {probe}-byte probe");
+        assert!(
+            o + l <= probe,
+            "plan {o}+{l} reaches past the {probe}-byte probe"
+        );
     }
-    let src = Ensured { data: bytes.clone(), allowed: RefCell::new(vec![(0, probe)]) };
+    let src = Ensured {
+        data: bytes.clone(),
+        allowed: RefCell::new(vec![(0, probe)]),
+    };
     let sparse = SparseBlob::open(src).expect("open from the probe alone");
     assert!(sparse.opened_from_extension());
     assert_eq!(sparse.keys(), data.len());
@@ -585,9 +648,19 @@ fn a_head_reserve_opens_the_sparse_reader_from_the_probe_alone() {
     let lo = data[300].0.clone();
     let hi = data[340].0.clone();
     let d = sparse.dictionary_plan(&lo, Some(&hi));
-    sparse.source().allowed.borrow_mut().extend(d.iter().copied());
-    let r = sparse.dictionary_plan_records(&lo, Some(&hi)).expect("records plan");
-    sparse.source().allowed.borrow_mut().extend(r.iter().copied());
+    sparse
+        .source()
+        .allowed
+        .borrow_mut()
+        .extend(d.iter().copied());
+    let r = sparse
+        .dictionary_plan_records(&lo, Some(&hi))
+        .expect("records plan");
+    sparse
+        .source()
+        .allowed
+        .borrow_mut()
+        .extend(r.iter().copied());
     let mut got = Vec::new();
     sparse
         .dictionary_counts(&lo, Some(&hi), |k, n| {
@@ -596,11 +669,12 @@ fn a_head_reserve_opens_the_sparse_reader_from_the_probe_alone() {
         })
         .expect("walk");
     let mut want = Vec::new();
-    whole.scan_counts(&lo, 40, |k, n| {
-        want.push((k.to_vec(), n));
-        true
-    })
-    .expect("scan counts");
+    whole
+        .scan_counts(&lo, 40, |k, n| {
+            want.push((k.to_vec(), n));
+            true
+        })
+        .expect("scan counts");
     assert_eq!(got, want);
 
     // Without a reserve the extension still plans the open in one dependent
@@ -610,10 +684,24 @@ fn a_head_reserve_opens_the_sparse_reader_from_the_probe_alone() {
     let bytes2 = std::fs::read(&path2).unwrap();
     let head2 = bytes2[..4096].to_vec();
     let p1 = supdb::blob::open_sparse_ranges(&head2, bytes2.len() as u64).unwrap();
-    let hdr_off = { let b = open(&path2); b.index_offset() as usize };
-    let p2 = supdb::blob::open_sparse_fence_ranges(&head2, bytes2.len() as u64, &bytes2[hdr_off..hdr_off + 192]).unwrap();
-    assert!(p2.is_empty(), "with an extension the second plan is empty: {p2:?}");
-    let src = Ensured { data: bytes2, allowed: RefCell::new(p1) };
+    let hdr_off = {
+        let b = open(&path2);
+        b.index_offset() as usize
+    };
+    let p2 = supdb::blob::open_sparse_fence_ranges(
+        &head2,
+        bytes2.len() as u64,
+        &bytes2[hdr_off..hdr_off + 192],
+    )
+    .unwrap();
+    assert!(
+        p2.is_empty(),
+        "with an extension the second plan is empty: {p2:?}"
+    );
+    let src = Ensured {
+        data: bytes2,
+        allowed: RefCell::new(p1),
+    };
     let sparse = SparseBlob::open(src).expect("open over the first plan");
     assert!(sparse.opened_from_extension());
     let _ = std::fs::remove_dir_all(&dir);
