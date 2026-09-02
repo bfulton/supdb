@@ -281,8 +281,14 @@ impl Wal {
     /// the cursor back behind the header. Zeros read as a frame of length
     /// zero, which replay refuses, so a crash before the first commit
     /// leaves an empty WAL and not a strange one.
+    ///
+    /// In page-sized writes, and that is load-bearing: the page cache
+    /// sizes a folio by the write that creates it, and a byte dirtied in
+    /// a 1 MB folio writes back the whole megabyte. Pre-written in 1 MB
+    /// pieces, every later 100 KB commit cost 11x its bytes at the device;
+    /// in 4 KB pieces, 1.04x (f57's first run, and walreuse-plan.md).
     fn prefill(&mut self, bytes: u64) -> Result<()> {
-        let zeros = vec![0u8; 1 << 20];
+        let zeros = vec![0u8; 4096];
         let mut at = self.written;
         while at < bytes {
             let n = zeros.len().min((bytes - at) as usize);
