@@ -43,3 +43,31 @@ An ingest gain under 1.05x says the fdatasync's journal cost is not on
 the commit path at this batch size -- the drive's flush dominates and the
 microbenchmark's difference was the page cache's. A c4 failure says the
 seed is not enough and a stale frame can be adopted.
+
+## Outcome (full, two runs)
+
+**Run 1** (pre-write in 1 MB pieces): ingest a tie both ways (1.019x,
+1.004x, no difference), commit phase 0.966 -> 0.734 s sequential and
+0.968 -> 0.729 uniform -- P57.1's mechanism -- and device bytes **2.18x
+and 1.76x**, P57.2 refuted by a factor the pre-write could not explain.
+The microbenchmark found it: an overwrite into a file pre-written in 1 MB
+pieces costs 11.2x its bytes at the device, into one pre-written in 4 KB
+pieces 1.04x, and 100 KB overwrites over frames written 100 KB at a time
+(the recycled shape itself) 1.04x. The page cache sizes a folio by the
+write that creates it, and a byte dirtied inside a 1 MB folio writes the
+megabyte back. Kernel 6.18, ext4.
+
+**Run 2** (pre-write in 4 KB pieces, the recorded one): device bytes
++64.0 MB in each arm, exactly the two pre-written files; commit phase
+0.960 -> 0.782 s sequential (19%) and 0.910 -> 0.858 uniform (6%);
+ingest still a tie (0.984x, 0.954x). P57.1 and P57.3 refuted at the gate,
+P57.2 refuted by the pre-write alone, P57.4 held, P57.5 held (c4: 120/120
+with the flag on in half the trials and 15 tears landing on stale frames).
+
+The flag stays off. The commit-phase saving is real and would survive on
+a store that outlives one seal cycle, where the pre-write is paid once;
+in a fresh 1M-key load it is paid back. What the decomposition also says
+is where the durable load now goes: the commit phase is ~45% of the
+window, waiting on seals ~14%, and the rest is the caller's thread
+building frames and memtable entries -- the next lever is compute, not
+the barrier.

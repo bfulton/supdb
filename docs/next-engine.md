@@ -384,6 +384,17 @@ per-commit path.
   64 MB seals (F52.6). What the sweep priced beyond that is the
   incremental merge: below 32 MB every extra merge round rewrites the live
   set, and that is what stands between this engine and smaller seals.
+- **Recycling WAL files** — built and measured (f57, walreuse-plan.md),
+  not the default. An fdatasync into blocks already allocated and written
+  carries no inode change through the journal, and the commit phase falls
+  19% on ordered keys and 6% on uniform with retired WALs renamed back
+  into place; but the pool's one-time pre-write pays that back inside a
+  1M-key load and the ingest reads a tie both ways (F57.1, F57.3), so a
+  tie it stays until a longer-lived shape is measured. The run also found
+  a measurement trap worth more than the flag: pre-writing in 1 MB pieces
+  left 1 MB page-cache folios, and every 100 KB commit wrote a megabyte
+  back — 2.2x the device bytes, 11.2x in isolation. A folio is sized by
+  the write that creates it; pre-write in pages.
 - **Group commit** — whether concurrent writers share a barrier; matters
   only after P-D.
 - **What EXT.6 becomes** — segments plus a WAL will not beat LMDB on disk;

@@ -86,6 +86,13 @@ them **interleaved in one process**, as `f8-checksums` does for
 `Options::checksums`. Space is the exception — file size is immune to drift and
 can be compared across runs.
 
+Device bytes have a trap of their own: the page cache sizes a folio by the
+write that creates it, and a byte dirtied inside a 1 MB folio writes the
+whole megabyte back. f57 pre-wrote a WAL in 1 MB pieces and every 100 KB
+commit after that cost 11x its bytes at the device; in 4 KB pieces, 1.04x.
+When device bytes move and the design says they should not, ask what size
+the writes that first created those pages were.
+
 And use `--profile full`. The same checksum cost measured at `dev` came out
 "+3.0%, not significant"; at `full`, with the variance tight enough to resolve
 it, it is +8.5% and unambiguous. An underpowered measurement is not a free

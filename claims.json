@@ -1464,6 +1464,34 @@
    "profile": "full",
    "expect": "holds",
    "because": "P56.4 held, with room: the ordered scan over seven pieces runs at 0.247x of the routed rate (8.9M against 35.8M entries/s), 0.376x at four and 0.123x at fourteen. A single-partition walk becomes a k-way merge over pieces. Stated beside F56.1 as the second reason routing stays."
+  },
+  {
+   "experiment": "f57-walreuse",
+   "id": "F57.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "P57.1 refuted at the gate: 576,209 ops/s with recycled WAL files against 585,434 fresh under sequential keys, no difference at p=0.31. The mechanism is real and measured: the commit phase fell from 0.960 s to 0.782 s (19%), because an fdatasync into blocks already allocated and written carries no inode change through the journal. What ate it inside a 1M-key window is the one-time pre-write of the live file and its spare (64 MB, about 0.1 s) and a seal phase 0.09 s longer. On a store that outlives one seal cycle the pre-write amortizes to nothing and the commit saving remains, but this suite measures a fresh load and a tie is not a win, so the flag stays off. The first run of this experiment read the same tie with the device bytes at 1.76-2.18x, and found something else: zeros pre-written in 1 MB pieces leave 1 MB page-cache folios, and a 100 KB commit that dirties one byte of a folio writes the whole megabyte back -- 11.2x the bytes in a microbenchmark, 1.04x once the same file is pre-written in 4 KB pieces. The pre-write is page-sized now and the second run is the one recorded."
+  },
+  {
+   "experiment": "f57-walreuse",
+   "id": "F57.2",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Device bytes 1.138x with recycling under uniform keys (529.3 MB against 465.3) and 1.214x under sequential (363.6 against 299.6): 64.0 MB more in each case, which is exactly the two pre-written files of seal size. The bound was 1.05x and the pre-write alone is outside it in a 1M-key load; nothing else is amplified. The first run read 1.762x and 2.184x, the folio effect described under F57.1, since fixed."
+  },
+  {
+   "experiment": "f57-walreuse",
+   "id": "F57.3",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Uniform keys: 400,260 ops/s recycled against 419,638 fresh, no difference at p=0.52. The commit phase fell less here (0.910 s to 0.858, 6%) than under sequential keys, because the merge runs beside the commits under uniform arrival and its writes share the device with every barrier; the saving is a smaller fraction of a batch that was already waiting on them."
+  },
+  {
+   "experiment": "f57-walreuse",
+   "id": "F57.4",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Reads after the drain: 513 ns recycled against 514 uniform, 499 against 510 sequential, both no difference. Nothing on the read path knows what a WAL file looked like."
   }
  ],
  "metrics": [
