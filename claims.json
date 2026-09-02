@@ -1089,8 +1089,8 @@
    "experiment": "ext-kv",
    "id": "EXT.25",
    "profile": "full",
-   "expect": "fails",
-   "because": "Failing since the shipping default moved to 32 MB seals: with those, a 116 MB load reaches four level-0 pieces at its final seal, the background trigger starts the partitioning merge on its own, and the flush waits for it either way -- so the ingest-policy arm is partitioned too, and the two arms drain through the same merge. The last three runs are all ties (1.126x at p=0.07, 0.934x at p=0.90, 1.087x at p=0.80). The trade this claim measured was real at 64 MB seals (1.985x, 1.491x, 1.617x) and is inert at this shape now; the policy bit still decides loads that never reach the trigger. Kept failing rather than deleted so the collapse of the trade is visible."
+   "expect": "holds",
+   "because": "Back to holding, marginally, and quoted with its spread: next-ingest 648,903 ops/s against next 524,210, 1.238x at p=0.03, with rel_iqr 17.8% on the routed arm -- one run, on the first canonical run since piece promotion. The three runs before were ties (1.126x, 0.934x, 1.087x) because at 32 MB seals the background trigger partitioned both arms through the same merge. Promotion changed what the two arms do: on this ascending key order both route by rename, and what still separates them is the flush waiting for that promotion round and its manifest against returning after the seal. The trade this claim first measured (1.985x, 1.491x, 1.617x at 64 MB seals) is not what it measures now; if the next run ties again it goes back to failing, and the flip-flop is itself the record: a knob whose effect sits inside the run-to-run noise is not a knob to advertise."
   },
   {
    "experiment": "ext-kv",
