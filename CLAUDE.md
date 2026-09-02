@@ -161,10 +161,20 @@ in the external suite; defaults with compression and read-side checksum
 verification off, so the pair is matched): durable ordered load **0.778x**
 (`EXT.28`, failing), point reads **7.62x** (`EXT.29`), ordered scan
 **5.95x** (`EXT.30`), shuffled durable load **1.18x** (`EXT.31`); RocksDB
-keeps the smallest file, 109.8 MB against 167.8. Read the reads with the
-caveat in the claim: RocksDB's 8 MB default block cache and no filter is
-the shipped configuration, not a deployed one, and a tuned arm is the
-open item before any of these is quoted as "against RocksDB".
+keeps the smallest file, 109.8 MB against 167.8. Tuned as deployed
+(`rocksdb-tuned`: a 256 MB block cache the data fits in, a Bloom filter,
+four background threads) the pair reads **6.45x** and scans **4.70x**
+(`EXT.33`, `EXT.34`), because the tuning moved RocksDB's read only from
+195,729 to 232,697 a second at 1M keys; the load stays at 0.688x
+(`EXT.32`) and the shuffled load a tie (`EXT.35`). So the reads may be
+quoted against RocksDB either way, and the load goes to RocksDB either way.
+
+The seal wait in the durable load is the drain, not backpressure: f60
+found zero joins that blocked on an unfinished seal under either key
+order and the manifest at 2% of the seal phase; 74% is the last memtable
+being sealed and partitioned because the adapter's `sync` drains, which
+RocksDB's `sync` (an fsync of its WAL) does not. That is 11% of the load
+window and a benchmark-shape decision still open (sealwait-plan.md).
 
 Under shuffled arrival the same matched pair inverts. `EXT.27`
 (`ext-loadshape`, full) has the next engine at 284,938 ops/s against

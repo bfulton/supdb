@@ -77,3 +77,20 @@ EXT.32-35.
   little per key, the parallelism helps compaction keep up.
 - **P35 -- shuffled load: 0.9x to 1.3x**, as EXT.31; four background
   threads may move RocksDB up a notch.
+
+## Outcome of the tuned arm (full)
+
+- P32 missed by two hundredths: load **0.688x** (424,299 against
+  616,965); the shipped arm 649,742 in the same run, so the filter costs
+  RocksDB about 5% on the load.
+- P33 refuted upward: reads **6.45x** (1,500,377 against 232,697). The
+  tuning took RocksDB from 195,729 to 232,697 -- 1.19x -- at 1M keys,
+  where the ci smoke at 20,000 keys had shown 2.6x. The 8 MB cache was
+  not most of the difference; the read path is.
+- P34 refuted upward: scan **4.70x** (20.0M against 4.3M).
+- P35 held: shuffled **1.026x**, a tie, as the shipped arm's 1.075x.
+
+The host read every engine 10-15% lower than the previous run, which is
+why only within-run ratios are quoted. The read and scan numbers may now
+be quoted as "against RocksDB", tuned or shipped; the load stays with
+RocksDB at about two thirds either way.

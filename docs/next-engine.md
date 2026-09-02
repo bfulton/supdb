@@ -295,7 +295,21 @@ scan **5.95x** stay with the next engine by margins the LMDB pair never
 showed; shuffled durable load **1.18x**, the number EXT.27's 6x over LMDB
 needed beside it. The plan predicted a tie on the load and 2-3x on reads
 and was wrong both ways. RocksDB's 8 MB block cache and absent filter are
-its shipped defaults; a tuned arm is the open item.
+its shipped defaults; tuned as deployed (`rocksdb-tuned`, a 256 MB block
+cache, a Bloom filter, four background threads) its read moved 1.19x and
+its scan 1.09x at 1M keys, so the pair reads **6.45x** and scans
+**4.70x** either way (EXT.33, EXT.34); the load stays at 0.688x
+(EXT.32), the shuffled load a tie (EXT.35).
+
+### The seal wait: f60
+
+`Db::seal_waits` splits the seal phase the commit thread pays. Under
+either key order zero joins found the seal thread still running,
+publishing the manifest is 2% of the phase, and 74% is the final drain:
+the adapter's `sync` seals the last memtable and partitions it inside the
+load window, 0.263 s of 2.301, where RocksDB's `sync` is an fsync of its
+WAL. No engine lever; a benchmark-shape decision, both arms of which
+should run (sealwait-plan.md).
 
 ### Arrival order: EXT.27
 

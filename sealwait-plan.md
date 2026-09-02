@@ -33,3 +33,19 @@ barriers belong off the commit thread. A drain share above 60% says the
 number to fix is the benchmark's, and EXT.22 should be read knowing that
 LMDB's last batch is durable when its commit returns and the next
 engine's last seal is charged to the same window.
+
+## Outcome (full, `results/f60-sealwait.full.json`)
+
+All four held, and more sharply than predicted: **zero blocked joins**
+under either key order, publish 8 ms (2%), and the drain 74% of the seal
+phase -- 0.263 s of a 2.301 s window under sequential keys, 0.306 s under
+uniform. There is no engine lever here: the seal thread keeps up, the
+manifest is cheap, and the seal phase is the last memtable being written
+and partitioned because the adapter's `sync` drains. RocksDB's `sync`
+fsyncs its WAL and leaves its memtable and level 0 where they are, so 11%
+of the next engine's load window is work its comparator defers. The
+decision that follows is about the benchmark's shape, not the engine:
+either the next engine's sync stops draining (and the reads after it are
+measured against a store with an unsealed tail, as RocksDB's are), or
+RocksDB's sync flushes and compacts (charging it the same drain). Both
+arms should run; neither has yet.
