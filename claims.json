@@ -1631,7 +1631,7 @@
    "id": "EXT.39",
    "profile": "full",
    "expect": "fails",
-   "because": "Neither drained, scan: 2.89M entries/s against 4.26M, 0.678x and no difference at p=0.20; P39 said 2x to 4x and was refuted by an order of magnitude against the drained arm's 24.7M. With three unrouted segments and a memtable in the way, the ordered scan leaves the partitions-only fast path and takes the k-way merge over rank cursors with the memtable's sorted keys as one more source -- 8.6x slower than the routed walk. This is the read-side price of not draining, and it is the scan path's, not the format's: the lever is the merge over unrouted sources, which f45 last touched. The drain matched both ways (drain-plan.md): next-nodrain's sync fsyncs the WAL and seals nothing, so its tail is read out of the memtable and three unrouted segments; rocksdb-tuned-drain's sync flushes its memtable and compacts every level into one. Two runs with the tuned write side (128 MB write buffers, four of them, level 0 at eight files; results/ext-kv.full.run1-tuned-write.json and the canonical file): 0.435x and 0.454x (2.31M and 2.37M against 5.31M and 5.22M entries/s), both at the gate now that RocksDB's scan rose with the write buffers: an undrained store scans a tenth as fast as a routed one, three runs in a row."
+   "because": "Neither drained, scan: 2.89M entries/s against 4.26M, 0.678x and no difference at p=0.20; P39 said 2x to 4x and was refuted by an order of magnitude against the drained arm's 24.7M. With three unrouted segments and a memtable in the way, the ordered scan leaves the partitions-only fast path and takes the k-way merge over rank cursors with the memtable's sorted keys as one more source -- 8.6x slower than the routed walk. This is the read-side price of not draining, and it is the scan path's, not the format's. It was read as the k-way merge over unrouted sources; f63 decomposed it and the merge is 1.7x of routed (F63.4) -- the cost was the sorted snapshot of the unsealed keys, built on the first scan after a commit at 300 ns a key over a memtable that, behind sync, still had a frozen twin (F63.1, F63.2), plus a memtable range at 2.3x (F63.3). The build is 5.8x cheaper since; the number here is from before it and stands until the next canonical drain run. The drain matched both ways (drain-plan.md): next-nodrain's sync fsyncs the WAL and seals nothing, so its tail is read out of the memtable and three unrouted segments; rocksdb-tuned-drain's sync flushes its memtable and compacts every level into one. Two runs with the tuned write side (128 MB write buffers, four of them, level 0 at eight files; results/ext-kv.full.run1-tuned-write.json and the canonical file): 0.435x and 0.454x (2.31M and 2.37M against 5.31M and 5.22M entries/s), both at the gate now that RocksDB's scan rose with the write buffers: an undrained store scans a tenth as fast as a routed one, three runs in a row."
   },
   {
    "experiment": "ext-kv",
@@ -1686,29 +1686,57 @@
    "experiment": "f62-scanmerge2",
    "id": "F62.1",
    "profile": "full",
-   "expect": "fails",
-   "because": "The new merge scans a routed store with a thousand unsealed keys at 1.778x the old (18.1M against 10.2M entries/s, p=0.0022): real, and short of the 2x P62.1 asked for. One partition cursor instead of four, keys resolved once, and the memtable entry carried by the snapshot are worth that much on this shape; what remains against the 33.2M routed walk is the merge loop itself against Blob::scan's straight walk."
+   "expect": "holds",
+   "because": "FLIPPED to holds by the snapshot build, not by the merge: 2.133x (20.5M against 9.6M entries/s, p=0.0022) in the re-run after f63, where the first run read 1.778x (18.1M against 10.2M). Both arms here build the same sorted snapshot of the thousand unsealed keys on their first scan; that build got 5.8x cheaper (F63.1) and was a shared cost that diluted the merge's ratio, so removing it moved the ratio without touching either merge. The old figure is kept in results history. P62.1 asked for 2x of the merge alone and the first run said no; the honest reading is that the merge is worth 1.8x and the snapshot the rest."
   },
   {
    "experiment": "f62-scanmerge2",
    "id": "F62.2",
    "profile": "full",
    "expect": "fails",
-   "because": "The undrained store scans at 1.387x the old merge (2.06M against 1.48M entries/s), against P62.2's 3x; four level-0 segments without a memtable at 1.616x (15.5M against 9.6M). The rewrite took out the probes and the allocation and the undrained shape barely moved, so those were not its cost: f61's F61.2 mis-attributed it. What the undrained shape pays per entry -- 485 ns against 30 routed -- is not yet decomposed and is the next thing to profile rather than guess at; the new merge stays the default because it is faster on every shape and never slower."
+   "because": "The undrained store scans at 1.890x the old merge (5.35M against 2.83M entries/s) in the re-run after f63, from 1.387x (2.06M against 1.48M) before it; four level-0 segments without a memtable 1.792x (18.2M against 10.1M), from 1.616x. Still short of P62.2's 3x, and the first run's prose -- 485 ns an entry, not yet decomposed -- is answered by f63: this arm's measurement was the sorted snapshot of 428,000 unsealed keys built on its first scan (a 286,000-key frozen table beside the live one, because sync joins no seal and the third was still being written) amortized over 400 scans, then a memtable range at 2.3x and a merge at 1.7x of routed (F63.2-F63.4). The build is 5.8-9.8x cheaper now and both arms pay it, which is why both moved and the ratio only somewhat. The new merge stays the default because it is faster on every shape and never slower."
   },
   {
    "experiment": "f62-scanmerge2",
    "id": "F62.3",
    "profile": "full",
    "expect": "holds",
-   "because": "Routed: 33.2M against 34.4M entries/s, no difference at p=0.37. The fast path over partitions is untouched (P62.3)."
+   "because": "Routed: 32.7M against 34.3M entries/s, no difference at p=0.37 (33.2M against 34.4M in the first run). The fast path over partitions is untouched (P62.3), by the merge and by the snapshot build."
   },
   {
    "experiment": "f62-scanmerge2",
    "id": "F62.4",
    "profile": "full",
    "expect": "fails",
-   "because": "Routed against undrained with the new merge: 16.1x, where P62.4 asked for 4x and f61 read 19.1x. The undrained scan is the open lever it was; the merge rewrite was worth 1.4x of it."
+   "because": "Routed against undrained with the new merge: 6.11x in the re-run after f63, where the first run read 16.1x and f61 19.1x; P62.4 asked for 4x. The 10x that moved was the snapshot build (F63.1); what is left is the shape this arm builds -- sync, no settle, so a frozen 286,000-key table and an in-flight seal beside the 142,000-key live one -- plus the memtable range's 2.3x and the merge's 1.7x. f63 measures the same store settled and reads 3.1x (10.5M against 32.5M) with the build inside, which is inside P62.4's bound; this arm keeps its shape so the number stays comparable to its history, and stays recorded as failing."
+  },
+  {
+   "experiment": "f63-scansnap",
+   "id": "F63.1",
+   "profile": "full",
+   "expect": "holds",
+   "because": "The arena snapshot build is 5.81x faster than the per-key build at 142,000 unsealed keys (10.0 ms against 58.3, p=0.0009) and 9.81x at 428,571 (32.1 against 314.5), interleaved in one process behind NextOptions::scan_snapshot_arena. P63.1 asked for 3x and its first form did not reach it: keys in one arena and a 24-byte sort record took the probe's 428k-key build from about 140 ms to 89, and the plan's refutation clause named the cause -- the hash table walked in slot order visits its key bytes in random order, one miss a key. The build now records (key offset, length, slot) without touching a key, radix-sorts the triples in two 16-bit passes, copies the arena sequentially, and only then sorts by a 16-byte prefix. The sort was 2.5 ms of the 55; the walk was the rest."
+  },
+  {
+   "experiment": "f63-scansnap",
+   "id": "F63.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "f62's undrained measurement -- the snapshot build plus 400 uniform scans of 1,000 entries -- moves 2.277x with the build alone: 10.5M entries/s against 4.6M (p=0.0022). The build was 58.3 ms of the old arm's 86.7; the scans are the other 29. Both arms here call settle, so no seal is in flight; f62's own undrained arm did not (sync seals nothing and joins nothing), and at the moment its scans began the third seal was still being written and a 286,000-key frozen table sat beside the 142,000-key live one, which is why its 2.06M is half of the old arm here and its rel_iqr was 20% against every other arm's 5%. Db::unsealed_keys() now exists so an experiment can check the shape it thinks it built."
+  },
+  {
+   "experiment": "f63-scansnap",
+   "id": "F63.3",
+   "profile": "full",
+   "expect": "holds",
+   "because": "With a warm snapshot an entry served from the memtable's key range costs 124.2 ns against 53.2 inside a segment, 2.33x (p=0.0009), undrained shape at 1M keys. P63.3 predicted 3-5x from a probe that read 240 ns against a 428k-key table with a frozen twin beside it; settled, and with the snapshot's keys in arena order, it is 2.3x. The remaining cost is the memtable's: an entry slot in hash order, a chain walk and a value fetch per key, against a segment's contiguous records. Recorded as the price of scanning a hash table in key order; the change that would move it is sealing sooner, not a faster walk."
+  },
+  {
+   "experiment": "f63-scansnap",
+   "id": "F63.4",
+   "profile": "full",
+   "expect": "holds",
+   "because": "For scans that start inside a segment, the merge over unrouted sources costs 53.2 ns an entry against 31.4 routed, 1.69x (p=0.0009; P63.4 allowed 2.5x). That is key_at per cursor per entry and one values_at, and it is the whole cost of the k-way merge -- which f61, f62 and EXT.39's prose all named as the 16x lever. It was not: f62's 16.1x decomposes as one snapshot build over 428,000 keys amortized over 400 scans, a frozen table beside the live one, a memtable range at 2.3x, and then this 1.7x. The snapshot is paid once per commit, not per scan, and after f63 it is 10 ms at 142k keys."
   },
   {
    "experiment": "ext-ycsb",

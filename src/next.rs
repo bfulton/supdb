@@ -197,6 +197,14 @@ pub struct NextOptions {
     /// instead of two hash probes and an allocation. `false` is the merge
     /// before it, kept as the comparison arm (scanmerge-plan.md).
     pub scan_merge: bool,
+    /// How the ordered scan builds its sorted snapshot of the unsealed keys.
+    /// `true` keeps the keys in one arena and sorts 24-byte records (a
+    /// 16-byte key prefix and an index), touching the arena only on a shared
+    /// prefix; `false` is the build before it -- a `Vec<u8>` per key, sorted
+    /// through two heap pointers per compare -- kept as the comparison arm.
+    /// The build runs on the first scan after a commit and cost 300 ns a key
+    /// (scansnap-plan.md).
+    pub scan_snapshot_arena: bool,
 }
 
 impl Default for NextOptions {
@@ -222,6 +230,7 @@ impl Default for NextOptions {
             promote: true,
             recycle_wal: false,
             scan_merge: true,
+            scan_snapshot_arena: true,
         }
     }
 }
@@ -2238,16 +2247,96 @@ pub struct Db {
     /// unsealed. Without this, every scan walked the whole memtable: the
     /// ext-kv scan phase spent 15 minutes a rep in that walk, twice -- once
     /// through the live table and once through the frozen one.
-    scan_keys: std::cell::RefCell<Option<(u64, Vec<SnapKey>)>>,
+    scan_keys: std::cell::RefCell<Option<(u64, Snapshot)>>,
 }
 
-/// One key of the unsealed snapshot a scan merges: the key, and where it
-/// sits in the live and the frozen memtable (`u32::MAX` for absent), so
-/// emitting it is an indexed chain walk and not a hash probe per table.
+/// One key of the unsealed snapshot a scan merges: where the key sits in
+/// the snapshot's arena, and where it sits in the live and the frozen
+/// memtable (`u32::MAX` for absent), so emitting it is an indexed chain
+/// walk and not a hash probe per table.
+#[derive(Clone, Copy)]
 struct SnapKey {
-    key: Vec<u8>,
+    off: u32,
+    len: u32,
     mem: u32,
     frozen: u32,
+}
+
+/// The sorted keys of the unsealed sources, built lazily by `Db::scan` and
+/// kept until the next commit or seal. Keys live in one arena rather than
+/// one allocation each, which is what makes the build a sort of small
+/// records instead of a pointer chase (scansnap-plan.md).
+#[derive(Default)]
+struct Snapshot {
+    keys: Vec<u8>,
+    ents: Vec<SnapKey>,
+}
+
+impl Snapshot {
+    fn len(&self) -> usize {
+        self.ents.len()
+    }
+    fn get(&self, i: usize) -> Option<(&[u8], &SnapKey)> {
+        self.ents.get(i).map(|e| (&self.keys[e.off as usize..(e.off + e.len) as usize], e))
+    }
+    /// First index whose key is not below `from`.
+    fn seek(&self, from: &[u8]) -> usize {
+        self.ents.partition_point(|e| &self.keys[e.off as usize..(e.off + e.len) as usize] < from)
+    }
+    /// Merge a run of entries sorted by key into `ents`, folding a key
+    /// present in both tables into one entry carrying both indices.
+    fn push_sorted(&mut self, e: SnapKey) {
+        if let Some(last) = self.ents.last_mut() {
+            let same = self.keys[last.off as usize..(last.off + last.len) as usize]
+                == self.keys[e.off as usize..(e.off + e.len) as usize];
+            if same {
+                if e.mem != u32::MAX {
+                    last.mem = e.mem;
+                }
+                if e.frozen != u32::MAX {
+                    last.frozen = e.frozen;
+                }
+                return;
+            }
+        }
+        self.ents.push(e);
+    }
+}
+
+/// LSD radix sort of `(key, a, b)` triples by the key, two 16-bit passes.
+/// Stable, O(n), and what puts a hash table's entries back into the order
+/// their keys were appended so the copy that follows is sequential.
+fn radix_by_first(v: &mut Vec<(u32, u32, u32)>, scratch: &mut Vec<(u32, u32, u32)>) {
+    scratch.clear();
+    scratch.resize(v.len(), (0, 0, 0));
+    for shift in [0u32, 16] {
+        let mut counts = vec![0usize; 1 << 16];
+        for &(k, _, _) in v.iter() {
+            counts[((k >> shift) & 0xFFFF) as usize] += 1;
+        }
+        let mut sum = 0usize;
+        for c in counts.iter_mut() {
+            let n = *c;
+            *c = sum;
+            sum += n;
+        }
+        for &t in v.iter() {
+            let b = ((t.0 >> shift) & 0xFFFF) as usize;
+            scratch[counts[b]] = t;
+            counts[b] += 1;
+        }
+        std::mem::swap(v, scratch);
+    }
+}
+
+/// The first sixteen bytes of a key as two big-endian words, zero-padded,
+/// so that comparing the words compares the keys wherever they differ
+/// inside that prefix.
+fn key_prefix(k: &[u8]) -> (u64, u64) {
+    let mut b = [0u8; 16];
+    let n = k.len().min(16);
+    b[..n].copy_from_slice(&k[..n]);
+    (u64::from_be_bytes(b[..8].try_into().unwrap()), u64::from_be_bytes(b[8..].try_into().unwrap()))
 }
 
 impl Db {
@@ -3313,6 +3402,102 @@ impl Db {
         Ok(n)
     }
 
+    /// The sorted snapshot of every unsealed key (frozen table first, then
+    /// live), one entry per key. Two builds behind `scan_snapshot_arena`;
+    /// both walk the hash tables once and both end in the same `Snapshot`.
+    fn build_snapshot(&self) -> Snapshot {
+        let n = self.mem.len + self.frozen.as_ref().map_or(0, |f| f.len);
+        let mut snap = Snapshot {
+            keys: Vec::with_capacity(self.mem.keys.len() + self.frozen.as_ref().map_or(0, |f| f.keys.len())),
+            ents: Vec::with_capacity(n),
+        };
+        if self.opts.scan_snapshot_arena {
+            // Arena build. The hash table is walked in slot order, which
+            // visits the key bytes in random order -- one cache miss a key,
+            // and at 428k keys that walk, not the sort, was most of the
+            // build. So the walk records (key offset, slot) without touching
+            // a key, a radix pass puts them in arena order, and the copy
+            // into the snapshot's arena is sequential. Then sort (prefix,
+            // prefix, index) records, touching the arena only on a tie.
+            let mut recs: Vec<(u64, u64, u32)> = Vec::with_capacity(n);
+            let mut pending: Vec<SnapKey> = Vec::with_capacity(n);
+            let mut order: Vec<(u32, u32, u32)> = Vec::with_capacity(n);
+            let mut scratch: Vec<(u32, u32, u32)> = Vec::with_capacity(n);
+            let mut take = |mem: &MemTable, live: bool| {
+                // (key offset, key length, slot): the copy below needs no
+                // slot access, since a slot in key order is a random one.
+                order.clear();
+                order.extend(
+                    mem.entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| e.hash != 0)
+                        .map(|(i, e)| (e.key_off, e.key_len, i as u32)),
+                );
+                radix_by_first(&mut order, &mut scratch);
+                for &(off, len, i) in &order {
+                    let k = &mem.keys[off as usize..(off + len) as usize];
+                    let (a, b) = key_prefix(k);
+                    recs.push((a, b, pending.len() as u32));
+                    pending.push(SnapKey {
+                        off: snap.keys.len() as u32,
+                        len: k.len() as u32,
+                        mem: if live { i } else { u32::MAX },
+                        frozen: if live { u32::MAX } else { i },
+                    });
+                    snap.keys.extend_from_slice(k);
+                }
+            };
+            if let Some(fr) = &self.frozen {
+                take(fr, false);
+            }
+            take(&self.mem, true);
+            let keys = &snap.keys;
+            let key_of = |e: &SnapKey| &keys[e.off as usize..(e.off + e.len) as usize];
+            recs.sort_unstable_by(|x, y| {
+                (x.0, x.1).cmp(&(y.0, y.1)).then_with(|| {
+                    key_of(&pending[x.2 as usize])
+                        .cmp(key_of(&pending[y.2 as usize]))
+                        // Frozen entries were pushed first; on a tie the
+                        // live one must come later so the fold sees it.
+                        .then(x.2.cmp(&y.2))
+                })
+            });
+            for r in recs {
+                snap.push_sorted(pending[r.2 as usize]);
+            }
+        } else {
+            // The build before it: one allocation per key, sorted through
+            // the pointers, then copied into the arena the merge expects.
+            struct Old {
+                key: Vec<u8>,
+                mem: u32,
+                frozen: u32,
+            }
+            let mut all: Vec<Old> = Vec::with_capacity(n);
+            let mut take = |mem: &MemTable, live: bool| {
+                for (i, e) in mem.entries.iter().enumerate().filter(|(_, e)| e.hash != 0) {
+                    all.push(Old {
+                        key: MemTable::key_of(&mem.keys, e).to_vec(),
+                        mem: if live { i as u32 } else { u32::MAX },
+                        frozen: if live { u32::MAX } else { i as u32 },
+                    });
+                }
+            };
+            if let Some(fr) = &self.frozen {
+                take(fr, false);
+            }
+            take(&self.mem, true);
+            all.sort_by(|a, b| a.key.cmp(&b.key));
+            for o in all {
+                let off = snap.keys.len() as u32;
+                snap.keys.extend_from_slice(&o.key);
+                snap.push_sorted(SnapKey { off, len: o.key.len() as u32, mem: o.mem, frozen: o.frozen });
+            }
+        }
+        snap
+    }
+
     pub fn scan<F: FnMut(&[u8], &[u8])>(
         &self,
         from: &[u8],
@@ -3324,40 +3509,12 @@ impl Db {
             let mut cache = self.scan_keys.borrow_mut();
             let stale = cache.as_ref().is_none_or(|(g, _)| *g != gen);
             if stale {
-                let mut all: Vec<SnapKey> = Vec::with_capacity(self.mem.len);
-                let mut take = |mem: &MemTable, live: bool| {
-                    for (i, e) in mem.entries.iter().enumerate().filter(|(_, e)| e.hash != 0) {
-                        all.push(SnapKey {
-                            key: MemTable::key_of(&mem.keys, e).to_vec(),
-                            mem: if live { i as u32 } else { u32::MAX },
-                            frozen: if live { u32::MAX } else { i as u32 },
-                        });
-                    }
-                };
-                if let Some(fr) = &self.frozen {
-                    take(fr, false);
-                }
-                take(&self.mem, true);
-                all.sort_unstable_by(|a, b| a.key.cmp(&b.key));
-                // A key in both tables becomes one entry carrying both.
-                all.dedup_by(|later, first| {
-                    if later.key != first.key {
-                        return false;
-                    }
-                    if later.mem != u32::MAX {
-                        first.mem = later.mem;
-                    }
-                    if later.frozen != u32::MAX {
-                        first.frozen = later.frozen;
-                    }
-                    true
-                });
-                *cache = Some((gen, all));
+                *cache = Some((gen, self.build_snapshot()));
             }
         }
         let cache = self.scan_keys.borrow();
         let unsealed = &cache.as_ref().expect("scan snapshot").1;
-        let mut mi = unsealed.partition_point(|k| k.key.as_slice() < from);
+        let mut mi = unsealed.seek(from);
 
         // When nothing overlaps -- no unsealed keys in range, no L0 -- the
         // partitions ARE the answer in key order, and each one can be
@@ -3426,9 +3583,9 @@ impl Db {
                     }
                 }
             }
-            if let Some(k) = unsealed.get(mi) {
-                if next.is_none_or(|n| k.key.as_slice() < n) {
-                    next = Some(k.key.as_slice());
+            if let Some((k, _)) = unsealed.get(mi) {
+                if next.is_none_or(|n| k < n) {
+                    next = Some(k);
                 }
             }
             let Some(key) = next else { break };
@@ -3440,7 +3597,7 @@ impl Db {
             // frozen memtable, then the live one -- so the newest source with
             // a tombstone for this key is a cut, and live values start there.
             let nc = cursors.len();
-            let in_unsealed = unsealed.get(mi).map(|k| k.key.as_slice()) == Some(key);
+            let in_unsealed = unsealed.get(mi).map(|(k, _)| k) == Some(key);
             let mut start = 0usize;
             if tombs {
                 if in_unsealed {
@@ -3514,7 +3671,7 @@ impl Db {
         from: &[u8],
         limit: usize,
         mut mi: usize,
-        unsealed: &[SnapKey],
+        unsealed: &Snapshot,
         mut f: F,
     ) -> Result<usize> {
         let np = self.segs.partition_point(|s| s.level > 0);
@@ -3562,13 +3719,14 @@ impl Db {
                 }
             }
             let snap = unsealed.get(mi);
-            if let Some(sk) = snap {
-                if next.is_none_or(|n| sk.key.as_slice() < n) {
-                    next = Some(sk.key.as_slice());
+            if let Some((k, _)) = snap {
+                if next.is_none_or(|n| k < n) {
+                    next = Some(k);
                 }
             }
             let Some(key) = next else { break };
-            let in_unsealed = snap.is_some_and(|sk| sk.key.as_slice() == key);
+            let in_unsealed = snap.is_some_and(|(k, _)| k == key);
+            let snap = snap.map(|(_, sk)| sk);
 
             // Source indices: partition 0, level 0 at 1..=nc, frozen nc+1,
             // live nc+2. `start` is the oldest source whose values are live.
@@ -3727,6 +3885,12 @@ impl Db {
     /// The seal phase decomposed; see `SealWaits`.
     pub fn seal_waits(&self) -> SealWaits {
         self.seal_wait
+    }
+
+    /// Keys held by the unsealed sources: the live memtable and, while a
+    /// seal is in flight, the frozen one. A key in both counts twice.
+    pub fn unsealed_keys(&self) -> usize {
+        self.mem.len + self.frozen.as_ref().map_or(0, |f| f.len)
     }
 
     pub fn segments(&self) -> usize {

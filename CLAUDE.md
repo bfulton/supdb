@@ -179,8 +179,21 @@ neither draining the durable ordered load is a **tie** (0.904x, `EXT.37`)
 and the shuffled load **2.37x** (`EXT.41`), with both draining 0.815x
 (`EXT.36`); point reads lead 4.7x undrained and 7.1x drained (`EXT.38`,
 `EXT.40`); and the ordered scan of an undrained store is 8.6x slower than
-of a routed one (2.9M against 24.7M entries/s, `EXT.39`), which is the
-k-way merge over unrouted sources and the next lever on the read path.
+of a routed one (2.9M against 24.7M entries/s, `EXT.39`). That was read as
+the k-way merge over unrouted sources, and f63 says it was not: scans that
+start inside a segment cost 53 ns an entry under the merge against 31
+routed (F63.4, 1.7x), and entries served from the memtable's range 124
+(F63.3, 2.3x). The 16x that f62 measured was the **sorted snapshot of the
+unsealed keys**, which `Db::scan` builds on the first scan after a commit,
+one `Vec<u8>` per key at 300 ns a key, over a memtable that behind `sync`
+still had its frozen twin beside it -- a 286,000-key seal in flight that
+the experiment never joined. The build now keeps the keys in one arena,
+radix-orders the hash slots by key offset so the copy is sequential, and
+sorts 24-byte prefix records: 10 ms against 58 at 142k unsealed keys, 32
+against 314 at 428k (F63.1), which moves f62's measurement 2.28x on its
+own (F63.2). `Db::unsealed_keys()` exists so an experiment can check the
+shape it built, and `settle` is what joins an in-flight seal; `sync` does
+neither (scansnap-plan.md).
 
 On YCSB, matched and undrained (`EXT.42`-`EXT.45`, five repetitions):
 update-heavy A **1.74x**, read-only C **2.45x**, short-scan E **1.28x**,

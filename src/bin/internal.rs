@@ -139,6 +139,7 @@ fn main() -> std::io::Result<()> {
             "f60-sealwait" => f60_sealwait(&args, profile)?,
             "f61-scanmerge" => f61_scanmerge(&args, profile)?,
             "f62-scanmerge2" => f62_scanmerge2(&args, profile)?,
+            "f63-scansnap" => f63_scansnap(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -11100,6 +11101,238 @@ fn f62_scanmerge2(args: &Args, profile: Profile) -> std::io::Result<Record> {
             rates[1].median(),
             rates[7].median(),
             gap.ratio
+        ),
+    ));
+    Ok(rec)
+}
+
+/// f63: where the unrouted scan's time goes, and the snapshot build behind
+/// `NextOptions::scan_snapshot_arena`. Five arms interleaved: the routed
+/// store as the reference, f62's undrained shape (three level-0 segments
+/// and the rest in the memtable, settled) under both builds, and a
+/// memtable-only store of 3/7 of the keys under both. Each arm reports the
+/// build (first scan after the load minus the second), the steady cost of
+/// an entry for scans that start inside a segment and for scans that start
+/// in the memtable's range, and the end-to-end rate f62 measured -- the
+/// build plus `scans` uniform scans. Predictions in scansnap-plan.md.
+fn f63_scansnap(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::next::{Db, NextOptions};
+
+    // 25k at ci rather than f62's 20k: seals are at least 1 MB, which at
+    // 20k keys is exactly two seals and an empty memtable once settled.
+    let keys = args.num("--keys", profile.pick(25_000, 100_000, 1_000_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+    let scans = args.num("--scans", profile.pick(50, 200, 400)) as u64;
+    let scan_len = args.num("--scan-len", 1_000);
+
+    let mut rec = Record::new("f63-scansnap", profile);
+    rec.param("keys", J::u(keys))
+        .param("batch", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .param("scans", J::u(scans))
+        .param("scan_len", J::u(scan_len as u64))
+        .note(
+            "five arms interleaved in one process: routed (flushed) as the reference; f62's \
+             undrained shape -- three level-0 segments, the rest in the memtable, settled so no \
+             seal is in flight -- under the old and the arena snapshot build; and a memtable-only \
+             store of 3/7 of the keys under both. build_ms is the first scan after the load minus \
+             the second; seg_ns and mem_ns are the steady cost per entry for scans that start \
+             inside a segment and inside the memtable's key range; the arm's rate is f62's \
+             measurement -- the build plus `scans` uniform scans -- so the two can be read together",
+        )
+        .note("predictions registered in scansnap-plan.md before the run");
+
+    let dir = scratch("f63");
+    let payload = Payload::new(value_size, 0.5, 0xF63);
+    let arms: [(&str, u8, bool); 5] = [
+        ("routed", 0, true),
+        ("undrained/old", 1, false),
+        ("undrained/new", 1, true),
+        ("memtable/old", 2, false),
+        ("memtable/new", 2, true),
+    ];
+    // ci, build ms, ns/entry in a segment, ns/entry in the memtable range, unsealed keys
+    type Row = (usize, f64, f64, f64, f64);
+    let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
+    let rates = Trial::new(profile.reps()).run(arms.len(), |ci, rep| {
+        let (_, shape, arena) = arms[ci];
+        let mut vrng = Rng::new(0xF63 + rep as u64);
+        let mut kb = [0u8; 16];
+        let d = dir.join(format!("f63-{ci}-{rep}"));
+        let _ = std::fs::remove_dir_all(&d);
+        let seal = ((keys * (value_size as u64 + 16)) * 2 / 7).max(1 << 20) as usize;
+        let opts = NextOptions {
+            seal_bytes: if shape == 2 { usize::MAX / 2 } else { seal },
+            partition_bytes: Some(seal * 2),
+            scan_snapshot_arena: arena,
+            ..Default::default()
+        };
+        let mut db = Db::create(&d, opts).expect("create");
+        let load = if shape == 2 { keys * 3 / 7 } else { keys };
+        for i in 0..load {
+            db_key_into(i, &mut kb);
+            db.append(&kb, payload.get(&mut vrng));
+            if (i + 1).is_multiple_of(batch) {
+                db.commit().expect("commit");
+            }
+        }
+        db.commit().expect("commit");
+        match shape {
+            0 => db.flush().expect("flush"),
+            _ => {
+                db.sync().expect("sync");
+                db.settle().expect("settle");
+            }
+        }
+        let unsealed = db.unsealed_keys() as u64;
+        let mut sink = 0u64;
+        // The build: the first scan after a commit builds the snapshot, the
+        // second finds it cached; both resolve one key.
+        let mut one = |db: &Db| {
+            db_key_into(0, &mut kb);
+            let t = Instant::now();
+            let n = db.scan(&kb, 1, |_k, v| sink = sink.wrapping_add(v.len() as u64)).expect("scan");
+            std::hint::black_box(n);
+            t.elapsed().as_secs_f64()
+        };
+        let first = one(&db);
+        let second = one(&db);
+        let build_s = (first - second).max(0.0);
+
+        // Steady state by region, then the uniform mix f62 timed.
+        let mut sweep = |db: &Db, lo: u64, hi: u64, seed: u64| -> (u64, f64) {
+            if hi <= lo {
+                return (0, 0.0);
+            }
+            let mut r = Rng::new(seed ^ (rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let mut entries = 0u64;
+            let t = Instant::now();
+            for _ in 0..scans {
+                db_key_into(lo + r.below(hi - lo), &mut kb);
+                let n = db
+                    .scan(&kb, scan_len, |_k, v| {
+                        entries += 1;
+                        sink = sink.wrapping_add(v.len() as u64);
+                    })
+                    .expect("scan");
+                std::hint::black_box(n);
+            }
+            (entries, t.elapsed().as_secs_f64())
+        };
+        let sealed_hi = (load - unsealed).saturating_sub(scan_len as u64);
+        let (se, st) = sweep(&db, 0, sealed_hi, 0x5E6);
+        let (me, mt) = sweep(&db, load - unsealed, load.saturating_sub(scan_len as u64), 0x3E3);
+        let (ue, ut) = sweep(&db, 0, load, 0x0F62);
+        std::hint::black_box(sink);
+        db.close().expect("close");
+        let _ = std::fs::remove_dir_all(&d);
+        let per = |e: u64, t: f64| if e > 0 { t * 1e9 / e as f64 } else { f64::NAN };
+        rows.lock().unwrap().push((ci, build_s * 1e3, per(se, st), per(me, mt), unsealed as f64));
+        ue as f64 / (ut + build_s)
+    });
+    let col = |ci: usize, pick: fn(&Row) -> f64| -> Samples {
+        Samples::new(
+            rows.lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.0 == ci && !pick(r).is_nan())
+                .map(pick)
+                .collect(),
+        )
+    };
+    let med = |s: &Samples| if s.is_empty() { f64::NAN } else { s.median() };
+    let builds: Vec<Samples> = (0..arms.len()).map(|ci| col(ci, |r| r.1)).collect();
+    let segs: Vec<Samples> = (0..arms.len()).map(|ci| col(ci, |r| r.2)).collect();
+    let mems: Vec<Samples> = (0..arms.len()).map(|ci| col(ci, |r| r.3)).collect();
+    rec.series(
+        "arms",
+        J::arr(
+            arms.iter()
+                .enumerate()
+                .zip(rates.iter())
+                .map(|((ci, (name, _, _)), s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "entries_per_s" => J::fp(s.median(), 1),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4),
+                        "build_ms" => J::fp(med(&builds[ci]), 3),
+                        "seg_ns_per_entry" => J::fp(med(&segs[ci]), 1),
+                        "mem_ns_per_entry" => J::fp(med(&mems[ci]), 1),
+                        "unsealed_keys" => J::fp(med(&col(ci, |r| r.4)), 0)
+                    }
+                })
+                .collect(),
+        ),
+    );
+    let c_build_un = compare(&builds[1], &builds[2], supdb::bench::MIN_EFFECT);
+    let c_build_mem = compare(&builds[3], &builds[4], supdb::bench::MIN_EFFECT);
+    let c_e2e = compare(&rates[2], &rates[1], supdb::bench::MIN_EFFECT);
+    let c_region = compare(&mems[2], &segs[2], supdb::bench::MIN_EFFECT);
+    let c_merge = compare(&segs[2], &segs[0], supdb::bench::MIN_EFFECT);
+    rec.compare("build_undrained_old_vs_new", c_build_un.clone());
+    rec.compare("build_memtable_old_vs_new", c_build_mem.clone());
+    rec.compare("undrained_e2e_new_vs_old", c_e2e.clone());
+    rec.compare("undrained_new_mem_ns_vs_seg_ns", c_region.clone());
+    rec.compare("undrained_new_seg_ns_vs_routed_ns", c_merge.clone());
+    let faster = |c: &supdb::bench::Comparison| {
+        matches!(c.verdict, supdb::bench::Verdict::Greater) && c.ratio >= 3.0
+    };
+    rec.finding(Finding::new(
+        "F63.1",
+        "the arena snapshot build is at least 3x faster than the per-key build at both unsealed sizes",
+        faster(&c_build_un) && faster(&c_build_mem),
+        format!(
+            "undrained ({:.0} unsealed keys): {:.1} ms against {:.1} ({}); memtable-only ({:.0} \
+             keys): {:.1} ms against {:.1} ({})",
+            med(&col(2, |r| r.4)),
+            med(&builds[2]),
+            med(&builds[1]),
+            c_build_un.summary("old", "new"),
+            med(&col(4, |r| r.4)),
+            med(&builds[4]),
+            med(&builds[3]),
+            c_build_mem.summary("old", "new")
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F63.2",
+        "with the build alone, f62's undrained measurement moves at least 1.2x",
+        matches!(c_e2e.verdict, supdb::bench::Verdict::Greater) && c_e2e.ratio >= 1.2,
+        format!(
+            "{:.0} entries/s against {:.0} ({}), the build plus {} uniform scans of {} entries; \
+             the build is {:.1} ms of the old arm's {:.1} ms",
+            rates[2].median(),
+            rates[1].median(),
+            c_e2e.summary("new", "old"),
+            scans,
+            scan_len,
+            med(&builds[1]),
+            (scans * scan_len as u64) as f64 / rates[1].median() * 1e3
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F63.3",
+        "with a warm snapshot an entry served from the memtable's range costs within 5x of one served from a segment",
+        c_region.ratio <= 5.0,
+        format!(
+            "{:.1} ns/entry in the memtable's range against {:.1} inside a segment ({:.2}x), \
+             undrained shape, arena build",
+            med(&mems[2]),
+            med(&segs[2]),
+            c_region.ratio
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F63.4",
+        "the merge over unrouted sources costs within 2.5x of the routed scan for scans that start inside a segment",
+        c_merge.ratio <= 2.5,
+        format!(
+            "{:.1} ns/entry under the merge against {:.1} routed ({:.2}x); f62's 16x was the \
+             build and the memtable's range, not the merge",
+            med(&segs[2]),
+            med(&segs[0]),
+            c_merge.ratio
         ),
     ));
     Ok(rec)

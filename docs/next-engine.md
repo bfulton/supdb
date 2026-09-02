@@ -327,8 +327,17 @@ engine's own arrival-order swing gone; both draining, 0.815x (EXT.36).
 Point reads lead 4.7x undrained and 7.1x drained (EXT.38, EXT.40). The
 ordered scan is where not draining costs: 2.9M entries/s over three
 unrouted segments and a memtable against 24.7M routed (EXT.39, 0.68x of
-RocksDB and a tie) -- the k-way merge over unrouted sources is the next
-read-path lever.
+RocksDB and a tie). f63 decomposed that gap and the k-way merge is the
+smallest piece of it -- 1.7x of routed for scans that start in a segment
+(F63.4), 2.3x for entries served from the memtable's range (F63.3); the
+rest was the sorted snapshot of the unsealed keys that the first scan
+after a commit builds, at 300 ns a key over a memtable that still had a
+frozen twin behind `sync`. The build is 5.8-9.8x cheaper now (F63.1: the
+keys in one arena, the slots radix-ordered by key offset so the copy is
+sequential, a 24-byte prefix sort), and f62's measurement moves 2.28x on
+that alone (F63.2). What remains for an undrained scan is the memtable's
+own 2.3x, which sealing sooner would remove and a faster walk would not
+(scansnap-plan.md).
 
 ### Arrival order: EXT.27
 
