@@ -1236,6 +1236,9 @@ fn range_bytes(ranges: &[(u64, u64)]) -> u64 {
 struct Planned {
     probes: usize,
     exact: bool,
+    /// Which checks were not exact, for the record: a plan is a claim and
+    /// the detail should say where it missed.
+    why: Vec<String>,
     open_bytes: u64,
     plan_bytes: u64,
     file_bytes: u64,
@@ -1269,6 +1272,7 @@ fn plan_shape(path: &Path, ranks: &[usize]) -> std::io::Result<Planned> {
         .filter_map(|r| blob.key_at(r).map(|k| k.to_vec()))
         .collect();
     let mut exact = true;
+    let mut why: Vec<String> = Vec::new();
     let mut widest_plan = 0u64;
     for key in &keys {
         let plan = blob.ranges_for(key)?;
@@ -1277,13 +1281,31 @@ fn plan_shape(path: &Path, ranks: &[usize]) -> std::io::Result<Planned> {
         let read = touched(&log);
         blob.count(key)?;
         let counted = touched(&log);
-        exact &= plan == read && plan == counted && !plan.is_empty();
+        // The read touches exactly the plan; the count touches nothing at
+        // all, since format v5 put a record count in every extent. This
+        // check was `plan == counted`, which held only while a count walked
+        // the values, and went quietly false when it stopped needing to.
+        let ok = plan == read && counted.is_empty() && !plan.is_empty();
+        if !ok {
+            why.push(format!(
+                "{}: plan {:?} read {:?} counted {:?}",
+                String::from_utf8_lossy(key),
+                plan,
+                read,
+                counted
+            ));
+        }
+        exact &= ok;
         widest_plan = widest_plan.max(range_bytes(&plan));
     }
     // The absent key: no ranges, no reads.
     let none = blob.ranges_for(b"absent=key")?;
     blob.read_all(b"absent=key", |_| {})?;
-    exact &= none.is_empty() && touched(&log).is_empty();
+    let absent_reads = touched(&log);
+    if !none.is_empty() || !absent_reads.is_empty() {
+        why.push(format!("absent key: plan {none:?} read {absent_reads:?}"));
+    }
+    exact &= none.is_empty() && absent_reads.is_empty();
 
     // One plan for the whole probe set, deduped and merged -- and reading
     // every key touches exactly it.
@@ -1293,11 +1315,16 @@ fn plan_shape(path: &Path, ranks: &[usize]) -> std::io::Result<Planned> {
     for key in &keys {
         blob.read_all(key, |_| {})?;
     }
-    exact &= touched(&log) == many;
+    let many_read = touched(&log);
+    if many_read != many {
+        why.push(format!("probe set: plan {many:?} read {many_read:?}"));
+    }
+    exact &= many_read == many;
 
     Ok(Planned {
         probes: keys.len(),
         exact,
+        why,
         open_bytes,
         plan_bytes: range_bytes(&many),
         file_bytes,
@@ -1360,12 +1387,19 @@ fn ranges(profile: Profile) -> std::io::Result<Record> {
         "the byte ranges `ranges_for` reports for a key are exactly the ranges a subsequent read touches, on both index shapes, through recorded reads",
         day.exact && seg.exact && spans_blocks && disjoint,
         format!(
-            "{} day probes and {} segment probes: every `read_all` and `count` touched \
-             exactly its plan, an absent key planned and read nothing, and the shared plan \
-             for each probe set equals the union of its reads ({} and {} disjoint ranges; \
+            "{} day probes and {} segment probes: every `read_all` and `count` must touch \
+             exactly its plan, an absent key plan and read nothing, and the shared plan \
+             for each probe set equal the union of its reads ({} and {} disjoint ranges; \
              widest single plan {} bytes, so runs span blocks). The granularity is the \
-             stored block, because that is what the read path fetches per extent",
-            day.probes, seg.probes, day.disjoint_ranges, seg.disjoint_ranges, seg.widest_plan
+             stored block, because that is what the read path fetches per extent. Misses: \
+             day {}; segment {}",
+            day.probes,
+            seg.probes,
+            day.disjoint_ranges,
+            seg.disjoint_ranges,
+            seg.widest_plan,
+            if day.why.is_empty() { "none".to_string() } else { day.why.join("; ") },
+            if seg.why.is_empty() { "none".to_string() } else { seg.why.join("; ") }
         ),
     ));
 

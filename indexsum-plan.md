@@ -70,3 +70,52 @@ hot path in a way the block one did not -- then verify at open for
 sections under a size and keep the bitmap for larger ones. A flip that
 survives says a read path reaches the section without naming its
 offsets, which is a code path to find, not a parameter to tune.
+
+## Amendment (before the run, after reading the readers)
+
+Two things changed between the plan and the code, both recorded here
+before anything was measured.
+
+- **The resident reader verifies the whole row at open, not piece by
+  piece on touch.** The per-touch design needed `FlatIndex` to name the
+  offsets each probe reads, through every lookup, seek and record access,
+  and a miss -- a key that is not there -- has no record to verify, so a
+  corrupted key byte that turned a hit into a miss would have passed
+  silently. Verifying every piece once at open closes that: a section a
+  reader holds whole costs one CRC32C pass (57 MB per million keys, a few
+  milliseconds on hardware CRC) and nothing per read after. P64.2 and
+  P64.3 become trivially true and P64.1 gains "at the open" -- every flip
+  fails `Blob::open`, not a later read. The open cost is what f64 prices.
+  The sparse reader keeps the per-piece design because it never holds the
+  section: its plans round out to pieces, and a piece is verified the
+  first time a plan's bytes are used.
+- **No magic bump.** The two header words were spare and zero in every
+  file already written, and a reader from before the row never reads
+  them, so a v6 reader opens a v7 segment (unverified, as it always did)
+  and a v7 reader opens a v6 file (no row, unverified, and says so through
+  `index_checksummed`). Nothing is misparsed in either direction, which is
+  the only reason a magic ever moves here.
+- **A piece shift no writer produces refuses the section.** The first
+  thing the reproducer found was a flip in the shift word: 14 became 78,
+  the words no longer described a row, and the reader fell back to "no
+  row" and opened clean. A row named with an impossible shift is now
+  damage, not absence.
+
+## Outcome (f64-indexsum, full; `tests/segwriter.rs`; `results/f64-indexsum.full.json`)
+
+- **P64.1 held.** Every seventh byte of a segment's key section flipped,
+  1,000-odd flips, and each fails `Blob::open`; the first run found the
+  one that did not -- the piece-shift word, 14 flipped to 78, read as "no
+  row" -- and that is now damage rather than absence.
+- **The open cost refuted its prediction: 26.1 ms per million keys, not
+  under 10 (F64.1, fails).** The plan priced a 57 MB index; the segment's
+  is 161 MB, because inline runs put the values in the records, so the
+  CRC pass runs over the data. 6.2 GB/s, hardware CRC32C. Recorded as the
+  price; `verify_index` turns it off for a reader that would rather not
+  pay it.
+- **P64.2 held**: 420.8 against 417.6 ns a read, no difference (F64.2).
+- **P64.5 held**: 0.0244% (F64.3).
+- **P64.6**: the sparse reader's plans round to pieces and its answers do
+  not change -- `tests/dict.rs` holds every range within its plan and
+  equal to the whole reader; the byte counts are in the re-run w4 and w5
+  records.

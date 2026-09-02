@@ -332,7 +332,7 @@ fn merge_ranges(v: &mut Vec<(u64, u64)>) {
 /// since it has already downloaded the whole object.
 enum Sec {
     Lent { off: u64, len: usize },
-    Owned(Vec<u8>),
+    Owned(Vec<u8>, u64),
 }
 
 impl Sec {
@@ -342,7 +342,7 @@ impl Sec {
         }
         let mut v = vec![0u8; len];
         src.read_at(off, &mut v)?;
-        Ok(Sec::Owned(v))
+        Ok(Sec::Owned(v, off))
     }
 
     fn get<'a, B: Bytes>(&'a self, src: &'a B) -> Result<&'a [u8]> {
@@ -350,14 +350,24 @@ impl Sec {
             Sec::Lent { off, len } => src
                 .slice_at(*off, *len)
                 .ok_or_else(|| short(*off, *len, src.len())),
-            Sec::Owned(v) => Ok(v),
+            Sec::Owned(v, _) => Ok(v),
+        }
+    }
+
+    fn off(&self) -> u64 {
+        match self {
+            Sec::Lent { off, .. } => *off,
+            Sec::Owned(v, off) => {
+                let _ = v;
+                *off
+            }
         }
     }
 
     fn len(&self) -> usize {
         match self {
             Sec::Lent { len, .. } => *len,
-            Sec::Owned(v) => v.len(),
+            Sec::Owned(v, _) => v.len(),
         }
     }
 }
@@ -416,12 +426,17 @@ pub struct BlobOptions {
     /// browser reading an object off a CDN has more reason to check than a
     /// process reading its own disk, not less.
     pub verify_checksums: bool,
+    /// Verify the key index's checksum row when the section carries one:
+    /// every piece at a resident open, each piece as it is first used in a
+    /// sparse reader. On by default for the same reason.
+    pub verify_index: bool,
 }
 
 impl Default for BlobOptions {
     fn default() -> Self {
         BlobOptions {
             verify_checksums: true,
+            verify_index: true,
         }
     }
 }
@@ -441,6 +456,10 @@ struct SparseIndex {
     len: usize,
     hdr: flatindex::Header,
     fence: Vec<u8>,
+    /// The checksum row, empty for a section without one, and one bit per
+    /// piece already verified by this reader.
+    crcs: Vec<u8>,
+    verified: RefCell<Vec<u64>>,
 }
 
 pub struct Blob<B: Bytes> {
@@ -480,6 +499,15 @@ impl<B: Bytes> Blob<B> {
                  index, or damage in its header)",
             )
         })?;
+        // The whole section is resident, so the whole row is checked here,
+        // once, and no read path pays anything after (indexsum-plan.md).
+        if idx.crc_off != 0 && opts.verify_index {
+            if let Err(p) =
+                flatindex::verify_pieces(key.get(&src)?, idx.crc_off, idx.piece_shift, sb.key_off)
+            {
+                return Err(corrupt(&format!("key index checksum mismatch in piece {p}")));
+            }
+        }
         let blocks = MappedBlocks::parse(blk.get(&src)?)
             .ok_or_else(|| corrupt("the block table is not readable"))?;
         let verified = vec![0u64; (blocks.len() * block::MAX_CHUNK_CRCS).div_ceil(64)];
@@ -515,6 +543,23 @@ impl<B: Bytes> Blob<B> {
 
 
     // ------------------------------------------------------------ diagnostics --
+
+    /// Whether the key index carries a checksum row (segments do; a store's
+    /// in-place-editable index does not).
+    pub fn index_checksummed(&self) -> bool {
+        match &self.index {
+            Index::Flat { idx, .. } => idx.crc_off != 0,
+            Index::Sparse(s) => !s.crcs.is_empty(),
+        }
+    }
+
+    /// Where the key index section starts in the object.
+    pub fn index_offset(&self) -> u64 {
+        match &self.index {
+            Index::Flat { key, .. } => key.off(),
+            Index::Sparse(s) => s.off,
+        }
+    }
 
     /// Number of distinct keys. R4.5.
     pub fn keys(&self) -> usize {
@@ -1295,8 +1340,39 @@ pub fn open_sparse_fence_ranges(
     })?;
     let (off, len) = fence_region(&hdr, sb.key_stored as usize)?;
     let mut v = vec![(sb.key_off + off as u64, len as u64)];
+    if hdr.crc_off != 0 {
+        // A checksummed index: the row itself, exactly; the header's own
+        // piece, so the header is verified before any word of it is trusted
+        // past this point; and the fence rounded out to the pieces that
+        // verify it.
+        let row = flatindex::checksum_row_len(hdr.crc_off, hdr.piece_shift, sb.key_off);
+        v.push((sb.key_off + hdr.crc_off as u64, row as u64));
+        v.push((sb.key_off, flatindex::HEADER_BYTES as u64));
+        round_to_pieces(&mut v, sb.key_off, &hdr);
+    }
     merge_ranges(&mut v);
     Ok(v)
+}
+
+/// Widen every range that lies in the checksummed content of the section
+/// to whole pieces -- object pages, clamped to the section -- so what a
+/// plan fetches is what its verification reads, and no more than a
+/// page-fetching host was going to fetch anyway.
+fn round_to_pieces(v: &mut [(u64, u64)], sec_off: u64, hdr: &flatindex::Header) {
+    if hdr.crc_off == 0 {
+        return;
+    }
+    let piece = 1u64 << hdr.piece_shift;
+    let end = sec_off + hdr.crc_off as u64;
+    for r in v.iter_mut() {
+        let (a, b) = (r.0, r.0 + r.1);
+        if a < sec_off || a >= end || r.1 == 0 {
+            continue;
+        }
+        let a2 = (a / piece * piece).max(sec_off);
+        let b2 = (b.div_ceil(piece) * piece).min(end);
+        *r = (a2, b2 - a2);
+    }
 }
 
 /// Where the fence lies in the section: from its offset array to the start
@@ -1398,15 +1474,32 @@ impl<B: Bytes> SparseBlob<B> {
         if flen > 0 {
             src.read_at(sb.key_off + foff as u64, &mut fence)?;
         }
+        let mut crcs = Vec::new();
+        if hdr.crc_off != 0 && opts.verify_index {
+            let n = flatindex::checksum_row_len(hdr.crc_off, hdr.piece_shift, sb.key_off);
+            if hdr.crc_off.checked_add(n).is_none_or(|e| e > sec_len) {
+                return Err(corrupt("the key index names a checksum row outside its section"));
+            }
+            crcs = vec![0u8; n];
+            src.read_at(sb.key_off + hdr.crc_off as u64, &mut crcs)?;
+        }
         let blk = Sec::read(&src, sb.blk_off, sb.blk_stored as usize)?;
         let blocks = MappedBlocks::parse(blk.get(&src)?)
             .ok_or_else(|| corrupt("the block table is not readable"))?;
         let verified = vec![0u64; (blocks.len() * block::MAX_CHUNK_CRCS).div_ceil(64)];
-        Ok(SparseBlob {
+        let pieces = if crcs.is_empty() { 0 } else { crcs.len() / 4 };
+        let sp = SparseBlob {
             blob: Blob {
                 src,
                 generation: hdr.generation,
-                index: Index::Sparse(SparseIndex { off: sb.key_off, len: sec_len, hdr, fence }),
+                index: Index::Sparse(SparseIndex {
+                    off: sb.key_off,
+                    len: sec_len,
+                    hdr,
+                    fence,
+                    crcs,
+                    verified: RefCell::new(vec![0u64; pieces.div_ceil(64)]),
+                }),
                 blk,
                 blocks,
                 timestamp: sb.timestamp,
@@ -1415,7 +1508,50 @@ impl<B: Bytes> SparseBlob<B> {
                 raw_buf: Cell::new(Vec::new()),
                 dec_buf: Cell::new(Vec::new()),
             },
-        })
+        };
+        // The header's piece and the fence's, before either is trusted.
+        sp.verify_span(0, flatindex::HEADER_BYTES)?;
+        if flen > 0 {
+            sp.verify_span(foff, flen)?;
+        }
+        Ok(sp)
+    }
+
+    /// Verify the pieces covering `[rel, rel + len)` of the section that this
+    /// reader has not verified yet, reading each whole piece through the
+    /// source -- which holds it, because every plan is rounded to pieces.
+    fn verify_span(&self, rel: usize, len: usize) -> Result<()> {
+        let s = self.sp();
+        if s.crcs.is_empty() || len == 0 || rel >= s.hdr.crc_off {
+            return Ok(());
+        }
+        // Pieces are object pages: piece p of this section is page
+        // (first_page + p) intersected with the section's content.
+        let piece = 1u64 << s.hdr.piece_shift;
+        let first_page = s.off / piece;
+        let end = s.off + s.hdr.crc_off as u64;
+        let a = s.off + rel as u64;
+        let b = (a + len as u64).min(end);
+        let p0 = (a / piece - first_page) as usize;
+        let p1 = (b.div_ceil(piece) - first_page) as usize;
+        let mut buf: Vec<u8> = Vec::new();
+        for p in p0..p1 {
+            if s.verified.borrow()[p / 64] & (1u64 << (p % 64)) != 0 {
+                continue;
+            }
+            let start = ((first_page + p as u64) * piece).max(s.off);
+            let stop = ((first_page + p as u64 + 1) * piece).min(end);
+            let n = (stop - start) as usize;
+            buf.resize(n, 0);
+            self.blob.src.read_at(start, &mut buf)?;
+            let want = flatindex::piece_crc(&s.crcs, p)
+                .ok_or_else(|| corrupt("the key index checksum row is short"))?;
+            if block::crc32(&buf) != want {
+                return Err(corrupt(&format!("key index checksum mismatch in piece {p}")));
+            }
+            s.verified.borrow_mut()[p / 64] |= 1u64 << (p % 64);
+        }
+        Ok(())
     }
 
     fn sp(&self) -> &SparseIndex {
@@ -1474,6 +1610,7 @@ impl<B: Bytes> SparseBlob<B> {
         let (r0, r1) = self.rank_window(lo, hi);
         let entries = r1 - r0 + usize::from(r1 < s.hdr.nkeys);
         let mut v = vec![(s.off + s.hdr.dir_off as u64 + r0 as u64 * 4, entries as u64 * 4)];
+        round_to_pieces(&mut v, s.off, &s.hdr);
         merge_ranges(&mut v);
         v
     }
@@ -1482,6 +1619,7 @@ impl<B: Bytes> SparseBlob<B> {
         let s = self.sp();
         let entries = r1 - r0 + usize::from(r1 < s.hdr.nkeys);
         let mut raw = vec![0u8; entries * 4];
+        self.verify_span(s.hdr.dir_off + r0 * 4, entries * 4)?;
         self.blob.src.read_at(s.off + s.hdr.dir_off as u64 + r0 as u64 * 4, &mut raw)?;
         Ok(raw.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect())
     }
@@ -1524,6 +1662,7 @@ impl<B: Bytes> SparseBlob<B> {
         let d = self.dir_slice(r0, r1)?;
         let (abs, len, _) = self.record_span(r0, r1, &d)?;
         let mut v = vec![(abs, len as u64)];
+        round_to_pieces(&mut v, self.sp().off, &self.sp().hdr);
         merge_ranges(&mut v);
         Ok(v)
     }
@@ -1540,6 +1679,7 @@ impl<B: Bytes> SparseBlob<B> {
         let (r0, r1) = self.rank_window(lo, hi);
         let d = self.dir_slice(r0, r1)?;
         let (abs, len, base) = self.record_span(r0, r1, &d)?;
+        self.verify_span((abs - self.sp().off) as usize, len)?;
         // The records: lent when the source can, else copied into an aligned
         // buffer, because extents are borrowed in place and want 4-byte
         // alignment, which a byte vector does not promise.

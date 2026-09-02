@@ -140,6 +140,7 @@ fn main() -> std::io::Result<()> {
             "f61-scanmerge" => f61_scanmerge(&args, profile)?,
             "f62-scanmerge2" => f62_scanmerge2(&args, profile)?,
             "f63-scansnap" => f63_scansnap(&args, profile)?,
+            "f64-indexsum" => f64_indexsum(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -11335,5 +11336,175 @@ fn f63_scansnap(args: &Args, profile: Profile) -> std::io::Result<Record> {
             c_merge.ratio
         ),
     ));
+    Ok(rec)
+}
+
+/// f64: what verifying the key index's checksum row costs. One segment of
+/// `keys` keys written once; two arms interleaved -- `verify_index` on and
+/// off -- each opening it `opens` times per repetition and then reading
+/// `reads` random keys, so the open cost and the read cost are priced in
+/// the same process. The row's size against the section is arithmetic on
+/// the file. Predictions in indexsum-plan.md.
+fn f64_indexsum(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::next::SegmentWriter;
+    use supdb::{Blob, BlobOptions, MmapBytes};
+
+    let keys = args.num("--keys", profile.pick(20_000, 200_000, 1_000_000)) as u64;
+    let value_size = args.num("--value-size", 100);
+    let opens = args.num("--opens", profile.pick(5, 10, 20)) as u64;
+    let reads = args.num("--reads", profile.pick(5_000, 50_000, 200_000)) as u64;
+
+    let mut rec = Record::new("f64-indexsum", profile);
+    rec.param("keys", J::u(keys))
+        .param("value_size", J::u(value_size as u64))
+        .param("opens", J::u(opens))
+        .param("reads", J::u(reads))
+        .note(
+            "one segment written by SegmentWriter (inline runs, 100-byte values), opened `opens` \
+             times per repetition with the key index's checksum row verified and not, then `reads` \
+             uniform point reads through each; arms interleaved. open_ms is the median open; \
+             ns_per_read the steady read. Space is arithmetic on the section: the row is four \
+             bytes per 16 KiB piece",
+        )
+        .note("predictions registered in indexsum-plan.md before the run");
+
+    let dir = scratch("f64");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("seg.sup");
+    {
+        let opts = Options { redo_log: false, shards: 1, ..Options::default() };
+        let mut w = SegmentWriter::create(&path, &opts).expect("create");
+        w.set_inline_max(256);
+        let payload = Payload::new(value_size, 0.5, 0xF64);
+        let mut vrng = Rng::new(0xF64);
+        let mut kb = [0u8; 16];
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            w.begin(&kb).expect("begin");
+            w.value(payload.get(&mut vrng));
+            w.end().expect("end");
+        }
+        w.finish(1).expect("finish");
+    }
+    let (index_bytes, checksummed) = {
+        let b = Blob::open(MmapBytes::open(&path).expect("map")).expect("open");
+        (b.index_bytes(), b.index_checksummed())
+    };
+    let row_bytes = {
+        let b = Blob::open(MmapBytes::open(&path).expect("map")).expect("open");
+        let base = b.index_offset();
+        let content = index_bytes
+            - supdb::flatindex::checksum_row_len(index_bytes, supdb::flatindex::PIECE_SHIFT, base);
+        supdb::flatindex::checksum_row_len(content, supdb::flatindex::PIECE_SHIFT, base)
+    };
+
+    let arms = ["verify", "noverify"];
+    // ci, open ms, ns per read
+    type Row = (usize, f64, f64);
+    let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
+    let rates = Trial::new(profile.reps()).run(arms.len(), |ci, rep| {
+        let opts = BlobOptions { verify_checksums: true, verify_index: ci == 0 };
+        let mut open_ms: Vec<f64> = Vec::with_capacity(opens as usize);
+        let mut blob = None;
+        for _ in 0..opens {
+            let t = Instant::now();
+            let b = Blob::open_with(MmapBytes::open(&path).expect("map"), opts).expect("open");
+            open_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            blob = Some(b);
+        }
+        let blob = blob.expect("opened");
+        open_ms.sort_by(|a, b| a.total_cmp(b));
+        let open_med = open_ms[open_ms.len() / 2];
+        let mut r = Rng::new(0xF64 ^ (rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut kb = [0u8; 16];
+        let mut sink = 0u64;
+        let t = Instant::now();
+        for _ in 0..reads {
+            db_key_into(r.below(keys), &mut kb);
+            let n = blob.read_all(&kb, |v| sink = sink.wrapping_add(v.len() as u64)).expect("read");
+            std::hint::black_box(n);
+        }
+        let secs = t.elapsed().as_secs_f64();
+        std::hint::black_box(sink);
+        rows.lock().unwrap().push((ci, open_med, secs * 1e9 / reads as f64));
+        reads as f64 / secs
+    });
+    let col = |ci: usize, pick: fn(&Row) -> f64| -> Samples {
+        Samples::new(rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect())
+    };
+    let opens_s: Vec<Samples> = (0..2).map(|ci| col(ci, |r| r.1)).collect();
+    let nsr: Vec<Samples> = (0..2).map(|ci| col(ci, |r| r.2)).collect();
+    rec.series(
+        "arms",
+        J::arr(
+            arms.iter()
+                .enumerate()
+                .map(|(ci, name)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "open_ms" => J::fp(opens_s[ci].median(), 3),
+                        "open_rel_iqr" => J::fp(opens_s[ci].rel_iqr(), 4),
+                        "reads_per_s" => J::fp(rates[ci].median(), 1),
+                        "ns_per_read" => J::fp(nsr[ci].median(), 1)
+                    }
+                })
+                .collect(),
+        ),
+    );
+    rec.series(
+        "space",
+        jobj! {
+            "index_bytes" => J::u(index_bytes as u64),
+            "row_bytes" => J::u(row_bytes as u64),
+            "row_share" => J::fp(row_bytes as f64 / index_bytes as f64, 6),
+            "checksummed" => J::s(if checksummed { "yes" } else { "no" })
+        },
+    );
+    let c_open = compare(&opens_s[0], &opens_s[1], supdb::bench::MIN_EFFECT);
+    let c_read = compare(&rates[0], &rates[1], supdb::bench::MIN_EFFECT);
+    rec.compare("open_verify_vs_noverify", c_open.clone());
+    rec.compare("reads_verify_vs_noverify", c_read.clone());
+    let extra_ms = opens_s[0].median() - opens_s[1].median();
+    let per_million = extra_ms * 1e6 / keys as f64;
+    rec.finding(Finding::new(
+        "F64.1",
+        "verifying the key index at open costs under 10 ms per million keys",
+        checksummed && per_million < 10.0,
+        format!(
+            "{:.3} ms to open with the row verified against {:.3} without, at {} keys: {:.2} ms per \
+             million keys ({}); the index is {} bytes and its row {}",
+            opens_s[0].median(),
+            opens_s[1].median(),
+            keys,
+            per_million,
+            c_open.summary("verify", "noverify"),
+            index_bytes,
+            row_bytes
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F64.2",
+        "point reads through a verified index cost the same as through an unverified one",
+        matches!(c_read.verdict, supdb::bench::Verdict::NoDifference),
+        format!(
+            "{:.1} ns/read verified against {:.1} unverified ({})",
+            nsr[0].median(),
+            nsr[1].median(),
+            c_read.summary("verify", "noverify")
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F64.3",
+        "the checksum row is under 0.03% of the key index",
+        checksummed && (row_bytes as f64) < index_bytes as f64 * 0.0003,
+        format!(
+            "{} bytes of row for {} bytes of index ({:.4}%)",
+            row_bytes,
+            index_bytes,
+            row_bytes as f64 * 100.0 / index_bytes as f64
+        ),
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
     Ok(rec)
 }

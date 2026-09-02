@@ -180,6 +180,19 @@ the value width. That is the answer to "does the browser need a scan, or
 should the roll precompute the panels": it needs a scan, and precomputing buys
 nothing.
 
+A segment's key index carries a checksum row -- one CRC32C per 16 KiB
+piece, after the hash region. The whole reader verifies every piece at
+open. A piece is the section's intersection with one 16 KiB page of the
+object -- the same pages `cache.mjs` fetches -- so the sparse reader, which
+fetches the row in its second open plan and rounds every dictionary plan
+out to pieces, verifies exactly the pages the host fetched and never asks
+for more than a page-fetching host was going to fetch anyway. A piece is
+verified the first time a plan's bytes are used, so a damaged directory
+entry or record is an error rather than a different answer even over a
+partial fetch. A walk over a piece already verified reads less than it planned;
+`tests/dict.rs` holds reads within plans rather than equal to them. A store
+written by `Store` (not a segment) has no row and is read as before.
+
 `countFixed` and `scanCountsFixed` answer `null` rather than guessing when a
 key's values are not all the width you named. Since format v6 a run whose
 values share one width is stored without length prefixes and its extent says

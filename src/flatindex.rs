@@ -97,6 +97,119 @@ fn fence_stride(n: usize) -> usize {
     want.next_power_of_two()
 }
 
+/// The key section's checksum row: one CRC32C per piece of the section,
+/// appended after the last region and named by two header words -- the
+/// row's offset (zero when there is no row) and the piece shift. A piece is
+/// the section's intersection with one 16 KiB page of the OBJECT, not a
+/// 16 KiB span of the section: the sparse reader's host fetches whole object
+/// pages, so verification then reads exactly the pages the host fetched and
+/// never a byte more. The first piece is therefore short by the section's
+/// offset within its page, which every caller passes as `base` (the
+/// section's object offset modulo the piece). A section the store may edit in place
+/// carries no row: a record is published there with one aligned store into
+/// a mapping readers hold, and a piece checksum cannot be kept consistent
+/// with that lock-free. Segments are write-once and always carry one
+/// (indexsum-plan.md).
+pub const PIECE_SHIFT: u32 = 14;
+const W_CRC_OFF: usize = 160;
+const W_PIECE_SHIFT: usize = 168;
+
+/// Number of pieces of a section `len` bytes long starting `base` bytes
+/// into an object page.
+pub fn piece_count(len: usize, shift: u32, base: u64) -> usize {
+    let piece = 1u64 << shift;
+    ((base % piece) as usize + len).div_ceil(piece as usize)
+}
+
+/// Bytes of the row for a section of `len` bytes starting `base` bytes into
+/// an object page.
+pub fn checksum_row_len(len: usize, shift: u32, base: u64) -> usize {
+    piece_count(len, shift, base) * 4
+}
+
+/// The pieces of a section: `(start, end)` offsets within it, in order.
+pub fn pieces(len: usize, shift: u32, base: u64) -> impl Iterator<Item = (usize, usize)> {
+    let piece = 1usize << shift;
+    let first = piece - (base % piece as u64) as usize;
+    let mut at = 0usize;
+    std::iter::from_fn(move || {
+        if at >= len {
+            return None;
+        }
+        let end = if at == 0 { first.min(len) } else { (at + piece).min(len) };
+        let r = (at, end);
+        at = end;
+        Some(r)
+    })
+}
+
+/// The row for `sec`, which is the whole section without its row, whose
+/// object offset is `base` modulo the piece.
+pub fn checksum_row(sec: &[u8], shift: u32, base: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(checksum_row_len(sec.len(), shift, base));
+    for (a, b) in pieces(sec.len(), shift, base) {
+        out.extend_from_slice(&crate::block::crc32(&sec[a..b]).to_le_bytes());
+    }
+    out
+}
+
+/// Name a row in the header words of a section `len` bytes long.
+pub fn set_checksum_words(header: &mut [u8], len: usize) {
+    header[W_CRC_OFF..W_CRC_OFF + 8].copy_from_slice(&(len as u64).to_le_bytes());
+    header[W_PIECE_SHIFT..W_PIECE_SHIFT + 8].copy_from_slice(&u64::from(PIECE_SHIFT).to_le_bytes());
+}
+
+/// A complete section with its row named and appended; `base` is the
+/// object offset the section will be written at.
+pub fn with_checksums(mut sec: Vec<u8>, base: u64) -> Vec<u8> {
+    let len = sec.len();
+    set_checksum_words(&mut sec, len);
+    let row = checksum_row(&sec, PIECE_SHIFT, base);
+    sec.extend_from_slice(&row);
+    sec
+}
+
+/// The checksum words of a section: `Ok(Some((crc_off, shift)))` for a
+/// section naming a row, `Ok(None)` for one without, and `Err` for a row
+/// named with a piece shift no writer produces -- a damaged word, which
+/// must refuse the section rather than read it unverified (a flip of that
+/// one byte was the first thing the reproducer found).
+fn checksum_words(sec: &[u8]) -> std::result::Result<Option<(usize, u32)>, ()> {
+    let crc_off = rd_u64(sec, W_CRC_OFF).ok_or(())? as usize;
+    if crc_off == 0 {
+        return Ok(None);
+    }
+    let shift = rd_u64(sec, W_PIECE_SHIFT).ok_or(())?;
+    if !(10..=24).contains(&shift) {
+        return Err(());
+    }
+    Ok(Some((crc_off, shift as u32)))
+}
+
+/// Verify every piece of a resident section against its row. `Err(piece)`
+/// names the first mismatch; `Err(usize::MAX)` a row the section cannot
+/// hold. `base` is the section's object offset.
+pub fn verify_pieces(
+    sec: &[u8],
+    crc_off: usize,
+    shift: u32,
+    base: u64,
+) -> std::result::Result<(), usize> {
+    let n = checksum_row_len(crc_off, shift, base);
+    let row = sec.get(crc_off..crc_off.checked_add(n).ok_or(usize::MAX)?).ok_or(usize::MAX)?;
+    for (i, (a, b)) in pieces(crc_off, shift, base).enumerate() {
+        if crate::block::crc32(&sec[a..b]) != piece_crc(row, i).ok_or(usize::MAX)? {
+            return Err(i);
+        }
+    }
+    Ok(())
+}
+
+/// Piece `i`'s expected checksum out of a row.
+pub fn piece_crc(row: &[u8], i: usize) -> Option<u32> {
+    rd_u32(row, i * 4)
+}
+
 /// Offsets are 32-bit, so the record region is bounded. At the ~40 bytes per
 /// key this format uses that is about 100M keys, past which the caller falls
 /// back to the heap index rather than silently truncating.
@@ -134,6 +247,10 @@ pub struct Header {
     pub fence_offs_off: usize,
     pub fence_n: usize,
     pub fence_stride: usize,
+    /// Where the checksum row starts, which is also the length of the
+    /// content it covers; zero for a section without one.
+    pub crc_off: usize,
+    pub piece_shift: u32,
 }
 
 impl Header {
@@ -179,6 +296,8 @@ impl Header {
             fence_offs_off: rd_u64(sec, 120)? as usize,
             fence_n: rd_u64(sec, 128)? as usize,
             fence_stride: rd_u64(sec, 136)? as usize,
+            crc_off: checksum_words(sec).ok()?.map_or(0, |w| w.0),
+            piece_shift: checksum_words(sec).ok()?.map_or(0, |w| w.1),
         })
     }
 }
@@ -901,6 +1020,10 @@ pub struct FlatIndex {
     fence_stride: usize,
     pub generation: u64,
     pub prev: Option<(u64, u64, u64, u64, u64)>,
+    /// The checksum row, when the section carries one: its offset (the
+    /// covered length) and piece shift. `Blob::open` verifies it.
+    pub crc_off: usize,
+    pub piece_shift: u32,
 }
 
 /// The hash the flat index is built with.
@@ -1053,6 +1176,20 @@ impl FlatIndex {
             ))
         })()
         .unwrap_or(((0, 0), (0, 0), 0, 0));
+        // A row that does not fit is a damaged header word, not a missing
+        // row; refuse rather than read unverified.
+        // The row's exact length depends on the section's object offset,
+        // which the section does not know; the reader checks that when it
+        // verifies. Here: the row starts inside the section, past the header.
+        let (crc_off, piece_shift) = match checksum_words(sec).ok()? {
+            Some((off, shift)) => {
+                if off < HEADER || off > sec.len() {
+                    return None;
+                }
+                (off, shift)
+            }
+            None => (0, 0),
+        };
         Some(FlatIndex {
             hash: (hash_off, hash_end),
             dir: (dir_off, dir_end),
@@ -1070,6 +1207,8 @@ impl FlatIndex {
             fence_n,
             fence_stride,
             generation,
+            crc_off,
+            piece_shift,
             prev: if prev_off > 0 {
                 Some((prev_gen, prev_ts, prev_off, prev_stored, prev_unc))
             } else {

@@ -133,6 +133,15 @@ checkpoint.
   1.15-1.19x (EXT.17), the day index from 5.02 MB to 4.05
   (fixedrun-plan.md). The canonical load's 100-byte values are uniform, so
   every run there is now fixed as well; its numbers were last taken on v5.
+- **A segment's key index is checksummed (indexsum-plan.md).** The key
+  section ends in a row of CRC32C words, one per 16 KiB object page it
+  touches, named by two spare header words; `Blob::open` verifies every
+  piece once -- 26 ms for a million-key segment, because with inline runs
+  the index is the data (F64.1, recorded as over its prediction) -- and no
+  read pays after (F64.2). The sparse reader rounds its plans to the same
+  pages and verifies each on first use. A store's in-place-editable index
+  carries no row. `tests/segwriter.rs` flips every seventh byte of a
+  segment's key section and requires the open to fail.
 - **Write scaling** = one active memtable+WAL per shard or per writer;
   segments make the shared-appender mutex (F6.1) unnecessary rather than
   cheaper.

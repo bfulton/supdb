@@ -474,3 +474,46 @@ fn a_run_of_one_width_is_stored_without_prefixes_and_reads_the_same() {
     assert_eq!(b2.intersect_fixed(b"a", b"b", 4).unwrap(), common);
     assert_eq!(b2.intersect_fixed(b"a", b"missing", 4).unwrap(), 0);
 }
+
+/// Every byte of a segment's key index is covered by its checksum row, so a
+/// flip anywhere in the section fails the open rather than changing an
+/// answer. Format v6 made this the difference between an error and a quiet
+/// misread: a flipped FIXED bit re-decodes a run under the other encoding
+/// (indexsum-plan.md, P64.1).
+#[test]
+fn every_flip_in_the_key_section_fails_the_open() {
+    let _g = serial();
+    let dir = scratch("segwriter-indexsum");
+    let path = dir.join("seg.sup");
+    let data = fixed(1500, 4, 0x1D5);
+    write_bulk(&path, &data, opts());
+    let clean = std::fs::read(&path).unwrap();
+    let (key_off, key_len) = {
+        let b = open(&path);
+        assert!(b.index_checksummed(), "a segment's index carries a checksum row");
+        (b.index_offset() as usize, b.index_bytes())
+    };
+    assert!(key_len > 4096, "the fixture's index spans several pieces: {key_len}");
+    let mut tried = 0usize;
+    for at in (key_off..key_off + key_len).step_by(7) {
+        let mut bytes = clean.clone();
+        bytes[at] ^= 0x40;
+        std::fs::write(&path, &bytes).unwrap();
+        tried += 1;
+        assert!(
+            Blob::open(MmapBytes::open(&path).unwrap()).is_err(),
+            "a flip at section offset {} opened cleanly",
+            at - key_off
+        );
+    }
+    assert!(tried > 500);
+    // And with verification off the same file opens, which is the arm f64
+    // prices the check against.
+    let mut bytes = clean.clone();
+    bytes[key_off + key_len / 2] ^= 0x40;
+    std::fs::write(&path, &bytes).unwrap();
+    let opts = supdb::BlobOptions { verify_checksums: true, verify_index: false };
+    assert!(Blob::open_with(MmapBytes::open(&path).unwrap(), opts).is_ok());
+    std::fs::write(&path, &clean).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -801,7 +801,10 @@ impl SegmentWriter {
         // from the same option; a writer that recorded none while readers
         // expected them would fail every block it wrote.
         block::CHECKSUMS.store(opts.checksums, std::sync::atomic::Ordering::Relaxed);
+        // Read as well as write: `finish` reads the streamed records back to
+        // compute the key section's checksum row.
         let file = OpenOptions::new()
+            .read(true)
             .create(true)
             .write(true)
             .truncate(true)
@@ -1081,6 +1084,37 @@ impl SegmentWriter {
                 self.out.write_all(&trailer)?;
                 self.pos += trailer.len() as u64;
                 debug_assert_eq!(self.pos, key_off + total as u64);
+                // The checksum row: named in the header, computed over the
+                // header as it will be written plus the records already on
+                // disk, one piece at a time, and appended after the trailer.
+                let mut header = header;
+                flatindex::set_checksum_words(&mut header, total);
+                self.out.flush()?;
+                let row = {
+                    use std::os::unix::fs::FileExt;
+                    let file = self.out.get_ref();
+                    let mut buf = vec![0u8; 1usize << flatindex::PIECE_SHIFT];
+                    let mut row = Vec::with_capacity(flatindex::checksum_row_len(
+                        total,
+                        flatindex::PIECE_SHIFT,
+                        key_off,
+                    ));
+                    for (at, end) in flatindex::pieces(total, flatindex::PIECE_SHIFT, key_off) {
+                        let n = end - at;
+                        let from_header = header.len().saturating_sub(at).min(n);
+                        if from_header > 0 {
+                            buf[..from_header].copy_from_slice(&header[at..at + from_header]);
+                        }
+                        if n > from_header {
+                            file.read_exact_at(&mut buf[from_header..n], key_off + (at + from_header) as u64)?;
+                        }
+                        row.extend_from_slice(&block::crc32(&buf[..n]).to_le_bytes());
+                    }
+                    row
+                };
+                self.out.write_all(&row)?;
+                self.pos += row.len() as u64;
+                let total = total + row.len();
                 // Now the blocks that were held, each row taking its offset
                 // as it lands.
                 let held = std::mem::take(&mut self.pending_blocks);
@@ -1129,8 +1163,16 @@ impl SegmentWriter {
                 )
                 .ok_or_else(|| err("segment writer: key section exceeds the flat index's limits"))?
             };
+            // A segment reserves no slack, so the section is complete and
+            // takes its checksum row here, over pieces laid on the object's
+            // pages from where the section will start.
             self.pad_to(8)?;
             let key_off = self.pos;
+            let section = if reserve <= section.len() {
+                flatindex::with_checksums(section, key_off)
+            } else {
+                section
+            };
             self.out.write_all(&section)?;
             let key_len = reserve.max(section.len());
             if key_len > section.len() {

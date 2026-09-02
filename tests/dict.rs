@@ -74,6 +74,17 @@ impl Bytes for Ensured {
     }
 }
 
+/// Every byte of `reads` lies inside `plan` (both merged). A checksummed
+/// index verifies each 16 KiB piece once per reader, so a walk reads
+/// exactly its plans the first time it touches a piece and less after; the
+/// contract a range-fetching host relies on is that it never reads more.
+fn within(reads: &[(u64, u64)], plan: &[(u64, u64)]) -> bool {
+    let plan = merged(plan);
+    merged(reads)
+        .iter()
+        .all(|&(a, n)| plan.iter().any(|&(pa, pn)| pa <= a && a + n <= pa + pn))
+}
+
 fn merged(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
     let mut v: Vec<(u64, u64)> = ranges.iter().copied().filter(|r| r.1 > 0).collect();
     v.sort_unstable();
@@ -222,13 +233,15 @@ fn check_shape(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)], shape: &str) {
             hi.map(String::from_utf8_lossy)
         );
 
-        // The plans: phase one reads nothing, phase two reads exactly phase
-        // one, and the walk reads exactly both.
+        // The plans: phase one reads nothing, phase two reads within phase
+        // one, and the walk reads within both -- exactly, the first time a
+        // piece is touched, and less once its checksum has been verified.
         touched();
         let p1 = sparse.dictionary_plan(&lo, hi);
         assert!(touched().is_empty(), "{label}: planning the directory slice read bytes");
         let p2 = sparse.dictionary_plan_records(&lo, hi).expect("plan records");
-        assert_eq!(touched(), merged(&p1), "{label}: phase two must read exactly phase one");
+        let t2 = touched();
+        assert!(within(&t2, &p1), "{label}: phase two must read within phase one: {t2:?} vs {p1:?}");
         let mut got = Vec::new();
         sparse
             .dictionary_counts(&lo, hi, |k, n| {
@@ -237,7 +250,8 @@ fn check_shape(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)], shape: &str) {
             })
             .expect("walk");
         let both: Vec<(u64, u64)> = p1.iter().chain(p2.iter()).copied().collect();
-        assert_eq!(touched(), merged(&both), "{label}: the walk must read exactly its two plans");
+        let tw = touched();
+        assert!(within(&tw, &both), "{label}: the walk must read within its two plans: {tw:?} vs {both:?}");
         assert_eq!(got, want, "{label}: the sparse walk disagrees with the whole reader");
 
         // The lending source answers the same, through the zero-copy arm.

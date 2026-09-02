@@ -329,6 +329,25 @@ and `store::Reader` does not serve inline runs (a next-engine segment is read
 through `Blob`). A v5 reader from before the extension errors on the block id
 rather than answering wrongly, so the magic did not move.
 
+**A segment's key index is checksummed, and a flipped bit in it fails the
+open.** Every block was checksummed and verified once per reader (f8); the
+key index was not, and v6 made that a quiet misread rather than a theory:
+a flipped `FIXED` bit re-decodes a run under the other encoding with no
+error, and a flipped offset or count always could. A segment's key section
+now ends in a row of CRC32C words, one per 16 KiB piece, named by two
+header words that were spare; `Blob::open` verifies every piece once and
+no read pays anything after, and `SparseBlob` rounds its plans to pieces
+and verifies each the first time it uses it. A store's in-place-editable
+index carries no row -- a record is published there with one aligned
+store into a mapping readers hold, and a piece checksum cannot follow that
+lock-free -- and `index_checksummed()` says which kind a reader has.
+`tests/segwriter.rs` flips every seventh byte of a segment's key section
+and requires each to fail the open; its first run found a flip of the
+piece-shift word that made the row look absent and opened clean, which is
+why a row named with an impossible shift is now damage rather than
+absence. The magic did not move: the words are zero in every older file
+and unread by every older reader (indexsum-plan.md).
+
 **A run of one width is stored without prefixes, and reading it is a
 memcpy (v6).** The segment writer, and the store when it seals a key's
 pending bytes or consolidates its extents, check whether every value in the

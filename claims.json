@@ -650,8 +650,8 @@
    "experiment": "ext-kv",
    "id": "EXT.12",
    "profile": "full",
-   "expect": "fails",
-   "because": "Back inside the noise, hours after clearing the gate: tonight's two canonical runs read 1.155x at p=0.0298 and then 0.934x at p=0.31, and the axis's x86 history is 1.046x (nd), 1.155x (sig), 0.934x (nd) -- a coin toss on this host, recorded as fails because the statement is 'scans faster' and the latest record cannot show it. The evidence that is not a coin toss is Apple Silicon: 1.174x and 1.178x with rel_iqr under 1.3%, replicated. When the two architectures disagree this cleanly on stability, quote the one that replicates and say which host a number came from."
+   "expect": "holds",
+   "because": "FLIPPED to holds by format v6, one canonical run in: supdb-buffered scans a fresh store at 29.6M entries/s against lmdb's 23.7M, 1.246x at p=0.0049. The x86 history of this axis is a coin toss -- 1.046x (nd), 1.155x (sig), 0.934x (nd), 0.9x (nd), 0.868x (sig, the run before this one) -- and the comparator did not move here (24.4M to 23.7M); Supdb's own arm did, from 21.2M to 29.6M, and the one change to the store's scan path between the runs is that its 100-byte values are uniform and so are now written as fixed runs with no length prefixes to decode (fixedrun-plan.md). Apple Silicon had 1.174x and 1.178x with rel_iqr under 1.3% before v6, replicated. Recorded as holds because the latest record shows it and a mechanism is on the books; the next canonical run replicates or flips it back, and either way this history stays."
   },
   {
    "experiment": "f25-arena",
@@ -758,7 +758,7 @@
    "experiment": "w4-ranges",
    "id": "W4.1",
    "expect": "holds",
-   "because": "R6.2's whole design rests on this: a lookup consults only resident sections, so the byte ranges a read will touch are known before any data byte moves, and JavaScript can fetch them asynchronously while the read stays synchronous -- no Asyncify, no JSPI, no fault-and-retry. That only works if the plan is *exact*, so it is measured rather than argued: a recording byte source logs every (offset, length) the reader pulls, and at full, 7 day-index probes and 7 segment probes each read exactly what `ranges_for` named -- for `read_all` and for the walked `count`, with an absent key planning and reading nothing, and `ranges_for_many` equal to the union of its keys' reads. The granularity that makes it true is the stored block, not the extent: `with_extent` fetches whole blocks (verification and decompression want the enclosing bytes), so a plan at extent granularity would under-report, which is the first trap the test was built around. `tests/ranges.rs` holds the same property on every push, including through compressed blocks and for `open_ranges` against the open's own reads."
+   "because": "R6.2's whole design rests on this: a lookup consults only resident sections, so the byte ranges a read will touch are known before any data byte moves, and JavaScript can fetch them asynchronously while the read stays synchronous -- no Asyncify, no JSPI, no fault-and-retry. That only works if the plan is *exact*, so it is measured rather than argued: a recording byte source logs every (offset, length) the reader pulls, and at full, 7 day-index probes and 7 segment probes each read exactly what `ranges_for` named for `read_all`, `count` read nothing at all, an absent key planned and read nothing, and `ranges_for_many` equals the union of its keys' reads. The count clause is the corrected one: the check was `plan == counted`, which held while a count walked the values and went quietly false when format v5 put a record count in every extent and `count` stopped touching a block -- an improvement the probe read as a miss, and the record did not notice because it was last taken on August 30 and every run since was of other experiments. Re-run in the checksum-row change (indexsum-plan.md), which is when the probe learned to say which clause missed. The granularity is the stored block, because that is what the read path fetches per extent."
   },
   {
    "experiment": "w4-ranges",
@@ -1133,8 +1133,8 @@
    "experiment": "ext-kv",
    "id": "EXT.26",
    "profile": "full",
-   "expect": "holds",
-   "because": "The other half of EXT.25's trade, collapsed with it: 21,973,802 against 19,761,281 entries/s, a tie at p=0.44 (0.986x and 0.976x the runs before; 2.007x, 1.549x and 1.681x at 64 MB seals). Under 32 MB seals both arms are partitioned by the time the scan runs, so a scan walks disjoint partitions in both and there is no k-way merge left to be slower. Both entries fail together, which is the shape a trade takes when the knob stops selecting anything at the measured load. Then a tie four canonical runs in a row (1.034x, 0.937x, 1.053x, 0.926x, all no difference) and 1.107x at p=0.01 in the latest, which is what the recorded file holds and what this expectation now says -- read it as EXT.25's twin: one policy bit that does about the same work either way at 1M keys and 32 MB seals, on the gate, flipping with the host. If the next run reads a tie again it flips back with this history attached rather than being re-argued."
+   "expect": "fails",
+   "because": "Back to a tie, as this entry said it would if the next run read one: 23.55M against 24.53M entries/s, no difference at p=1.0 (0.960x), after 1.107x at p=0.01 in the run before. The x86 history is now 0.986x, 0.976x, 1.034x, 0.937x, 1.053x, 0.926x, 1.107x (sig), 0.960x -- one significant reading in eight, on a policy bit that does about the same work either way at 1M keys and 32 MB seals: under 32 MB seals both arms are partitioned by the time the scan runs, so a scan walks disjoint partitions in both and there is no k-way merge left to be slower. Read it as EXT.25's twin and quote the two together; the 64 MB seals where the knob selected something (2.007x, 1.549x, 1.681x) are in f52's record."
   },
   {
    "experiment": "f46-segwrite",
@@ -1630,8 +1630,8 @@
    "experiment": "ext-kv",
    "id": "EXT.39",
    "profile": "full",
-   "expect": "fails",
-   "because": "Neither drained, scan: 2.89M entries/s against 4.26M, 0.678x and no difference at p=0.20; P39 said 2x to 4x and was refuted by an order of magnitude against the drained arm's 24.7M. With three unrouted segments and a memtable in the way, the ordered scan leaves the partitions-only fast path and takes the k-way merge over rank cursors with the memtable's sorted keys as one more source -- 8.6x slower than the routed walk. This is the read-side price of not draining, and it is the scan path's, not the format's. It was read as the k-way merge over unrouted sources; f63 decomposed it and the merge is 1.7x of routed (F63.4) -- the cost was the sorted snapshot of the unsealed keys, built on the first scan after a commit at 300 ns a key over a memtable that, behind sync, still had a frozen twin (F63.1, F63.2), plus a memtable range at 2.3x (F63.3). The build is 5.8x cheaper since; the number here is from before it and stands until the next canonical drain run. The drain matched both ways (drain-plan.md): next-nodrain's sync fsyncs the WAL and seals nothing, so its tail is read out of the memtable and three unrouted segments; rocksdb-tuned-drain's sync flushes its memtable and compacts every level into one. Two runs with the tuned write side (128 MB write buffers, four of them, level 0 at eight files; results/ext-kv.full.run1-tuned-write.json and the canonical file): 0.435x and 0.454x (2.31M and 2.37M against 5.31M and 5.22M entries/s), both at the gate now that RocksDB's scan rose with the write buffers: an undrained store scans a tenth as fast as a routed one, three runs in a row."
+   "expect": "holds",
+   "because": "FLIPPED to holds by the snapshot build (f63): neither drained, next-nodrain scans 5.98M entries/s against rocksdb-tuned's 4.62M, 1.293x at p=0.0022, in the first canonical run after the arena build shipped. Before it: 2.89M against 4.26M (0.678x, no difference), then 2.31M against 5.31M (0.435x) and 2.37M against 5.22M (0.454x) in the two drain-replication runs -- so the arm itself moved 2.5x while its comparator did not. P39 had said 2x to 4x and was refuted by an order of magnitude against the drained arm's 24.7M; the reason was read as the k-way merge over three unrouted segments and a memtable, and f63 decomposed it: the merge is 1.7x of routed (F63.4), the memtable's range 2.3x (F63.3), and the rest was the sorted snapshot of the unsealed keys that the first scan after a commit built at 300 ns a key over a memtable that, behind sync, still had its frozen twin (F63.1, F63.2). That build is 5.8-9.8x cheaper now and this adapter still pays it once per repetition, behind sync, which is why the undrained scan is 5.98M and not the drained 23.6M: the remaining 4x is the frozen table and the memtable range, and sealing sooner is the lever, not the merge. One run since the change; the pair replicates on the next canonical run and this entry says so."
   },
   {
    "experiment": "ext-kv",
@@ -1651,8 +1651,8 @@
    "experiment": "w5-dict",
    "id": "W5.5",
    "profile": "full",
-   "expect": "holds",
-   "because": "At 16 KiB pages the sparse open is 70,960 bytes (23,904 un-paged) against the whole open's 808,240 at the browser's 64 KiB page, 8.8%, where the same open at 64 KiB pages was 218,416 (P5.5). cache.mjs takes a page size and the sparse reader's cache now opens at 16 KiB: the index is where its bytes go, its data reads still come one block at a time, and ensure coalesces adjacent pages into one request, so the smaller page costs requests nothing."
+   "expect": "fails",
+   "because": "At 16 KiB pages the sparse open is 114,648 bytes (21,120 un-paged) against the whole open's 901,080 at the browser's 64 KiB page, 12.7%, over P5.5's 10%; it was 70,960 against 808,240 (8.8%) on the fixture before format v6 and the checksum row. Two things moved it, both geometry: the day file is a different file now (7.91 MB against 9.72, its runs fixed-width), so the section boundaries fall on different pages; and a checksummed index's sparse open fetches the row, which sits at the end of the section on a page nothing else in the open touches -- one 16 KiB page more, by design, since the row is what lets every later range be verified against exactly the pages the host fetched. The un-paged bytes fell (23,904 to 21,120); the paged count is what the bound is about, and at ci the same open is 7.5% and holds. Recorded as failing by the same page geometry W5.1 and W5.2 fail by; the fix that would move it is placing the row beside the fence, which the streaming writer cannot do before it knows the section's length."
   },
   {
    "experiment": "w5-dict",
@@ -1737,6 +1737,27 @@
    "profile": "full",
    "expect": "holds",
    "because": "For scans that start inside a segment, the merge over unrouted sources costs 53.2 ns an entry against 31.4 routed, 1.69x (p=0.0009; P63.4 allowed 2.5x). That is key_at per cursor per entry and one values_at, and it is the whole cost of the k-way merge -- which f61, f62 and EXT.39's prose all named as the 16x lever. It was not: f62's 16.1x decomposes as one snapshot build over 428,000 keys amortized over 400 scans, a frozen table beside the live one, a memtable range at 2.3x, and then this 1.7x. The snapshot is paid once per commit, not per scan, and after f63 it is 10 ms at 142k keys."
+  },
+  {
+   "experiment": "f64-indexsum",
+   "id": "F64.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Verifying the row at open costs 26.1 ms for a million-key segment (26.094 ms against 0.010 unverified, p=0.0009), against P64's 10. The prediction priced a 57 MB index and the segment's is 161 MB: since the inline extension of v5 a run up to 256 bytes lives in its index record, so at 100-byte values the key section IS the data and the CRC pass runs over all of it at about 6.2 GB/s. The reads pay nothing after (F64.2) and the row is 0.024% of the section (F64.3); the price is per open, per segment, and it is recorded rather than tuned away. The alternative the plan started with -- verify each piece on first touch -- was dropped because a miss has no record to verify and a corrupted key byte that turns a hit into a miss would pass silently; the open-time pass is the one that closes that. Stays behind BlobOptions::verify_index for the reader that would rather not pay it."
+  },
+  {
+   "experiment": "f64-indexsum",
+   "id": "F64.2",
+   "profile": "full",
+   "expect": "holds",
+   "because": "420.8 ns a point read through a verified index against 417.6 through an unverified one, no difference (ratio 1.000, p=0.90), 200,000 uniform reads over a million keys, arms interleaved. P64.2 held for the plain reason the amendment gave: after the open, no read path touches the row."
+  },
+  {
+   "experiment": "f64-indexsum",
+   "id": "F64.3",
+   "profile": "full",
+   "expect": "holds",
+   "because": "39,332 bytes of row for a 161,129,244-byte index, 0.0244%: four bytes per 16 KiB piece, as P64.5 said."
   },
   {
    "experiment": "ext-ycsb",

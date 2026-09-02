@@ -2510,6 +2510,7 @@ fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
         supdb::MmapBytes::open(&nock_path).expect("map"),
         supdb::BlobOptions {
             verify_checksums: false,
+            verify_index: false,
         },
     )
     .expect("blob open");
