@@ -121,6 +121,18 @@ checkpoint.
   Format v5's count field, which the tombstone bit rides on, costs 6 B a
   key -- decomposed to the byte in F7.2 and F11.2, beside the 8 B a key
   `index_inserts` had already added.
+- **A run of one width is written without prefixes (format v6).** The
+  segment writer decides at `end`: if every value in the run has the same
+  length the values go back to back and the extent carries `Ext::FIXED`
+  beside the tombstone bit, the width being `len / records`; a mixed run
+  keeps the varint form, and the merge re-encodes from values so the flag
+  is a property of the run it describes. A read of a fixed run is a copy
+  of its bytes, and `Blob::intersect_fixed` walks two keys' runs in place.
+  Priced in `ext-analytics`: the full-list read from 0.307x of LMDB's
+  DUPFIXED to parity or better (EXT.18), the intersection from 0.769x to
+  1.15-1.19x (EXT.17), the day index from 5.02 MB to 4.05
+  (fixedrun-plan.md). The canonical load's 100-byte values are uniform, so
+  every run there is now fixed as well; its numbers were last taken on v5.
 - **Write scaling** = one active memtable+WAL per shard or per writer;
   segments make the shared-appender mutex (F6.1) unnecessary rather than
   cheaper.

@@ -181,8 +181,15 @@ should the roll precompute the panels": it needs a scan, and precomputing buys
 nothing.
 
 `countFixed` and `scanCountsFixed` answer `null` rather than guessing when a
-key's values are not all the width you named. That is a check, not a proof --
-the contract is that you know your own schema.
+key's values are not all the width you named. Since format v6 a run whose
+values share one width is stored without length prefixes and its extent says
+so, and for such a run the count is exact: the flag records the width, so the
+answer is `len / width` and nothing is assumed. For a run written with mixed
+widths the old two-quantity check still applies, and that is a check, not a
+proof -- the contract is that you know your own schema. Reading a fixed run
+is a copy of its bytes rather than a decode, which is where `ext-analytics`
+took the full-list read from 0.31x of LMDB's DUPFIXED to parity (EXT.18) and
+the intersection to 1.15x (EXT.17).
 
 ## Size
 

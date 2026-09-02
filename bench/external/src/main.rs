@@ -2296,11 +2296,11 @@ fn decode_postings(blob: &supdb::Blob<supdb::MmapBytes>, key: &[u8], out: &mut V
     .expect("read_all");
 }
 
-/// q4's Supdb arm, and deliberately the naive one: decode both lists in
-/// full, then count matches with a two-pointer walk. The shipped read paths
-/// expose no streaming merge -- building that kernel is rank 5's work, not
-/// this suite's -- so this is what an application could write today, and the
-/// finding says so rather than dressing it up.
+/// q4's comparison arm, and deliberately the naive one: decode both lists in
+/// full, then count matches with a two-pointer walk. It is what an application
+/// wrote before `Blob::intersect_fixed` existed, and it stays in the checksums-on
+/// arm so the kernel is priced against it in the same process rather than
+/// against a memory.
 fn naive_merge(
     blob: &supdb::Blob<supdb::MmapBytes>,
     ka: &[u8],
@@ -2413,9 +2413,12 @@ fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
              same question",
         )
         .note(
-            "q4's supdb arm is the NAIVE merge -- read_all both lists into reused buffers, then \
-             a two-pointer count -- because the shipped read paths expose no streaming merge. \
-             The finding prices that missing kernel; rank 5 owns building it",
+            "q4's matched arm (supdb-nocksum) is Blob::intersect_fixed, a two-pointer walk over \
+             the two keys' fixed runs in place; the checksums-on arm keeps the naive merge -- \
+             read_all both lists into reused buffers, then a two-pointer count -- so the kernel \
+             is priced against the application-side merge in the same process. Values are \
+             4-byte postings, so every run is written fixed-width (format v6) and neither \
+             arm decodes a length prefix",
         );
 
     // ---- one day's postings, generated once, identical for every engine ----
@@ -2898,8 +2901,9 @@ fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
              uniform probes, identical probe sequences, the rate counted in postings visited. \
              This is the baseline that keeps q1 and q2 honest, and the shape DUPFIXED is \
              genuinely built for: 4-byte postings packed end to end, a page per GET_MULTIPLE \
-             call, no per-value work at all. Supdb pays a varint length prefix per posting -- a \
-             5-byte stride for 4-byte data -- and the serial dependent walk W2.1 documents. \
+             call, no per-value work at all. Since format v6 a run of one width is stored the \
+             same way -- no length prefix, a 4-byte stride -- and the read is a memcpy-shaped \
+             walk over the extent rather than the serial dependent decode W2.1 documented. \
              Claimed as parity, not a lead: holds on Greater or NoDifference{residual}",
             ns(&rates[7]),
             ns(&rates[8]),
@@ -2916,14 +2920,14 @@ fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
         format!(
             "supdb-nocksum intersects at {:.1} us/pair against lmdb-dup's {:.1} ({}), each pair \
              one key from each field, both engines walking the same ascending lists. Supdb's \
-             arm is the NAIVE merge -- read_all both lists into reused buffers, then a \
-             two-pointer count -- because the shipped read paths expose no streaming merge: \
-             every posting is varint-decoded and copied before the merge sees it. LMDB merges \
-             in place across GET_MULTIPLE pages and copies nothing. This entry prices the \
-             missing kernel, and rank 5's merge is the thing that has to move it{residual}",
+             matched arm is Blob::intersect_fixed: a two-pointer walk over both keys' fixed \
+             runs in place, comparing 4-byte values as big-endian integers, copying nothing. \
+             LMDB merges in place across GET_MULTIPLE pages. The checksums-on arm keeps the \
+             naive decode-both merge at {:.1} us/pair as the price of doing it application-side{residual}",
             ns(&rates[10]) / 1e3,
             ns(&rates[11]) / 1e3,
-            c.summary("supdb-nocksum", "lmdb-dup")
+            c.summary("supdb-nocksum", "lmdb-dup"),
+            ns(&rates[9]) / 1e3
         ),
     ));
 

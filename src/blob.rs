@@ -931,29 +931,39 @@ impl<B: Bytes> Blob<B> {
                 return Ok(n);
             }
         };
-        // Two cursors, each a (run index, byte offset) over its key's runs.
-        let (mut ai, mut ao, mut bi, mut bo) = (0usize, 0usize, 0usize, 0usize);
+        // Each key's runs as one stream of `width`-byte values, and a
+        // two-pointer walk over the two streams. `chunks_exact` carries no
+        // per-step bounds check, which a byte-offset cursor did, and on the
+        // Zipf head's lists that check was the whole difference between this
+        // and a merge over decoded integers.
+        let mut ia = ra.iter().flat_map(|r| r.chunks_exact(width)).peekable();
+        let mut ib = rb.iter().flat_map(|r| r.chunks_exact(width)).peekable();
         let mut n = 0u64;
-        loop {
-            while ai < ra.len() && ao >= ra[ai].len() {
-                ai += 1;
-                ao = 0;
+        // Four- and eight-byte values compare as big-endian integers, which
+        // orders exactly as the bytes do and costs one instruction where a
+        // slice comparison costs a call.
+        let cmp = |x: &[u8], y: &[u8]| -> std::cmp::Ordering {
+            match width {
+                4 => u32::from_be_bytes(x.try_into().unwrap())
+                    .cmp(&u32::from_be_bytes(y.try_into().unwrap())),
+                8 => u64::from_be_bytes(x.try_into().unwrap())
+                    .cmp(&u64::from_be_bytes(y.try_into().unwrap())),
+                _ => x.cmp(y),
             }
-            while bi < rb.len() && bo >= rb[bi].len() {
-                bi += 1;
-                bo = 0;
-            }
-            if ai >= ra.len() || bi >= rb.len() {
-                break;
-            }
-            match ra[ai][ao..ao + width].cmp(&rb[bi][bo..bo + width]) {
+        };
+        while let (Some(x), Some(y)) = (ia.peek(), ib.peek()) {
+            match cmp(x, y) {
                 std::cmp::Ordering::Equal => {
                     n += 1;
-                    ao += width;
-                    bo += width;
+                    ia.next();
+                    ib.next();
                 }
-                std::cmp::Ordering::Less => ao += width,
-                std::cmp::Ordering::Greater => bo += width,
+                std::cmp::Ordering::Less => {
+                    ia.next();
+                }
+                std::cmp::Ordering::Greater => {
+                    ib.next();
+                }
             }
         }
         Ok(n)

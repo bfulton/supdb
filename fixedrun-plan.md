@@ -54,3 +54,50 @@ verification, not the decode, were the cost; that would send the next
 look at `with_extent`. A loss on the intersection with the kernel in
 place says LMDB's page-at-a-time merge has an edge the two-pointer walk
 does not, and the walk should batch.
+
+## Outcome (recorded after the run)
+
+Five `ext-analytics` runs at `full` on the v6 code, the last one installed
+in `results/ext-analytics.full.json`.
+
+- **P18 held in its first half and not its second.** Reading a full
+  posting list went from 0.307x of LMDB's DUPFIXED to 1.201x, 1.192x,
+  1.248x (no difference), 1.150x and 1.200x (no difference, p=0.0553):
+  parity or better in all five runs, a significant lead in three. EXT.18
+  is claimed as parity and flips to `holds`. It did not pass 2x on long
+  lists and the reason is in the design, not the run: GET_MULTIPLE is
+  also a memcpy-shaped walk over a page of packed 4-byte values, so once
+  the prefix is gone the two engines run the same inner loop, and the
+  uniform probes over a 255-median dictionary are decided by the per-key
+  constant. The 1.0 ns/posting either way is memory bandwidth.
+- **P17 held, after its mechanism was refuted once.** The first kernel --
+  a byte-offset cursor per key and a bounds-checked slice compare per
+  step -- measured 9,534 ns/pair at `full`, 0.842x of LMDB and slower than
+  the naive decode-both merge (7,321) in the same process, having been
+  1.54x faster than it at `ci`. That is the "walk should batch" branch of
+  the refutation paragraph, and the batching that mattered was the
+  compiler's: replacing the cursors with `chunks_exact` iterators over
+  each key's runs removed the per-step check and gave an exact tie
+  (8,083 against 8,084 ns); comparing each 4- or 8-byte value as a
+  big-endian integer instead of a slice took it past, to 6,993, 6,700
+  and 7,089 ns against 8,325, 7,905 and 8,175 -- 1.191x, 1.180x, 1.153x,
+  all significant. EXT.17 flips to `holds`. The naive merge is kept in
+  the checksums-on arm so every run prices the kernel against the
+  application-side form: 1.06-1.11x.
+- **P15 and P16 held**: 3.00x and 6.25x, with the run-to-run spread of the
+  LMDB arm (2.92-3.04x, 5.87-6.36x across the five) and no movement
+  attributable to the encoding.
+- **Space held exactly**: 5.02 MB to 4.05, -19.3%, against the predicted
+  fifth. LMDB stays at 7.33.
+- **Every agreement held**: `tests/blob.rs`, `tests/segwriter.rs`,
+  `tests/dict.rs`, the next-engine oracle and the browser fixtures. One
+  test had to move: `tests/known_bugs.rs` flipped every byte of a store
+  and expected each flip to be caught, and a flip of the FIXED bit in an
+  index record is not damage the block checksum can see -- the run
+  re-decodes quietly under the other encoding. The test is bounded to the
+  data region and the hole is filed: the key index section needs its own
+  checksum.
+
+Not measured here: the day-index roll (`w1`, `f28`) and the canonical
+`ext-kv` load, whose 100-byte values are uniform and so now write fixed
+runs too. Both should be re-run before their numbers are next quoted.

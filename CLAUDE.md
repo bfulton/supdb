@@ -316,6 +316,33 @@ and `store::Reader` does not serve inline runs (a next-engine segment is read
 through `Blob`). A v5 reader from before the extension errors on the block id
 rather than answering wrongly, so the magic did not move.
 
+**A run of one width is stored without prefixes, and reading it is a
+memcpy (v6).** The segment writer, and the store when it seals a key's
+pending bytes or consolidates its extents, check whether every value in the
+run has the same length; if so the values go back to back with no varint
+prefixes and the extent carries `Ext::FIXED` (bit 30 of the count word,
+beside the tombstone bit), the width being `len / records`. Mixed runs keep
+the prefixed form and every reader branches on the flag through
+`index::each_value`. The superblock magic moved to v6 so a reader from
+before the flag refuses the file. `ext-analytics` is where it was priced:
+reading a term's whole posting list went from **0.307x** of LMDB's DUPFIXED
+to parity or better in five runs (1.20x, 1.19x, 1.25x nd, 1.15x, 1.20x nd;
+`EXT.18`, now holds), the intersection of two lists from **0.769x** to
+**1.15-1.19x** (`EXT.17`, now holds) with `Blob::intersect_fixed`, a
+two-pointer walk over both keys' runs in place that compares 4- and 8-byte
+values as big-endian integers, and the day index shrank from 5.02 MB to
+4.05 against LMDB's 7.33. The kernel's first form was slower than the naive
+decode-then-merge at `full` (0.842x of LMDB) because of a bounds-checked
+slice compare per step; the record of that is in `fixedrun-plan.md`, and
+the naive merge stays in the checksums-on arm so every run prices the
+kernel against it. Two consequences to know: `stored_bytes` counts payload
+only for a fixed run, since there are no prefixes to count; and a flipped
+FIXED bit in an index record re-decodes the run quietly instead of
+failing, which the block checksum cannot see and the key index section's
+own checksum, not yet built, would. `count_fixed(width)` is exact for a
+fixed run because the flag says what the caller had to assume; for a
+prefixed run it is still the two-quantity check below.
+
 `count_fixed` claims a count only when two independent quantities agree: the
 run is a whole number of strides, *and* `Ext::last` — the offset of the final
 record, stored so that reading the newest value is O(1) — is exactly
