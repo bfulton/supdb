@@ -134,6 +134,7 @@ fn main() -> std::io::Result<()> {
             "f53-inline" => f53_inline(&args, profile)?,
             "f54-merge" => f54_merge(&args, profile)?,
             "f55-promote" => f55_promote(&args, profile)?,
+            "f56-tailbound" => f56_tailbound(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -7600,6 +7601,238 @@ fn f55_promote(args: &Args, profile: Profile) -> std::io::Result<Record> {
             med(sp, |r| r.7),
             med(sm, |r| r.7),
             rd_s.summary("promote", "merge"),
+        ),
+    ));
+    Ok(rec)
+}
+
+fn f56_tailbound(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    use supdb::next::{Db, NextOptions};
+
+    let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
+    let batch = args.num("--batch", 1_000) as u64;
+    let value_size = args.num("--value-size", 100);
+    let reads = args.num("--reads", profile.pick(20_000, 50_000, 200_000)) as u64;
+
+    let mut rec = Record::new("f56-tailbound", profile);
+    rec.param("keys", J::u(keys))
+        .param("batch", J::u(batch))
+        .param("value_size", J::u(value_size as u64))
+        .param("reads", J::u(reads))
+        .note(
+            "four arms interleaved in one process, fresh store per rep, the canonical shape with \
+             the drain inside the window. routed is today's default (32 MB seals, trigger 4, the \
+             flush partitions what it sealed); tail-4, tail-8 and tail-15 leave the store \
+             unrouted with about that many live pieces after the drain (32/16/8 MB seals with a \
+             trigger the load never reaches). Then point reads and one ordered scan over the \
+             drained store, so the price of fan-out is measured with inline runs in place",
+        )
+        .note("predictions registered in tailbound-plan.md before the run");
+
+    let dir = scratch("f56");
+    let payload = Payload::new(value_size, 0.5, 0xF56);
+    // name, seal bytes, trigger, partition at flush
+    let arms: [(&str, usize, usize, bool); 4] = [
+        ("routed", 32 << 20, 4, true),
+        ("tail-4", 32 << 20, 8, false),
+        ("tail-8", 16 << 20, 16, false),
+        ("tail-15", 8 << 20, 32, false),
+    ];
+    // ci, device MB, disk MB, commit s, seal s, merge s, live segments, read ns, scan entries/s
+    type Row = (usize, f64, f64, f64, f64, f64, f64, f64, f64);
+    let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
+    let rates = Trial::new(profile.reps()).run(arms.len(), |ci, rep| {
+        let (_, seal, trigger, partition) = arms[ci];
+        let mut vrng = Rng::new(0xF56 + rep as u64);
+        let mut kb = [0u8; 16];
+        let d = dir.join(format!("f56-{ci}-{rep}"));
+        let _ = std::fs::remove_dir_all(&d);
+        let opts = NextOptions {
+            seal_bytes: seal,
+            l0_trigger: trigger,
+            partition_on_flush: partition,
+            ..Default::default()
+        };
+        let mut db = Db::create(&d, opts).expect("create");
+        let io0 = IoCounters::read_now();
+        let t = Instant::now();
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            db.append(&kb, payload.get(&mut vrng));
+            if (i + 1) % batch == 0 {
+                db.commit().expect("commit");
+            }
+        }
+        db.flush().expect("flush");
+        let secs = t.elapsed().as_secs_f64();
+        let (c, s, m) = db.phase_ns();
+        let io_mb = IoCounters::read_now().since(&io0).write_bytes as f64 / 1_048_576.0;
+        let segs = db.segments() as f64;
+        let mut x = 0x7A11_5EED_u64 ^ (rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut sink = 0u64;
+        let tr = Instant::now();
+        for _ in 0..reads {
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            db_key_into(z % keys, &mut kb);
+            sink += db
+                .read_all(&kb, |v| {
+                    std::hint::black_box(v);
+                })
+                .expect("read");
+        }
+        let read_ns = tr.elapsed().as_nanos() as f64 / reads as f64;
+        let ts = Instant::now();
+        let mut entries = 0u64;
+        db.scan(b"", usize::MAX, |_, v| {
+            std::hint::black_box(v);
+            entries += 1;
+        })
+        .expect("scan");
+        let scan_per_s = entries as f64 / ts.elapsed().as_secs_f64();
+        std::hint::black_box(sink);
+        db.close().expect("close");
+        let mut bytes = 0u64;
+        for e in std::fs::read_dir(&d).expect("dir") {
+            bytes += e.expect("entry").metadata().expect("meta").len();
+        }
+        let _ = std::fs::remove_dir_all(&d);
+        rows.lock().unwrap().push((
+            ci,
+            io_mb,
+            bytes as f64 / 1_048_576.0,
+            c as f64 / 1e9,
+            s as f64 / 1e9,
+            m as f64 / 1e9,
+            segs,
+            read_ns,
+            scan_per_s,
+        ));
+        keys as f64 / secs
+    });
+    let col = |ci: usize, pick: fn(&Row) -> f64| -> Vec<f64> {
+        rows.lock().unwrap().iter().filter(|r| r.0 == ci).map(pick).collect()
+    };
+    let med = |ci: usize, pick: fn(&Row) -> f64| -> f64 {
+        let mut v = col(ci, pick);
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
+    rec.series(
+        "arms",
+        J::arr(
+            arms.iter()
+                .enumerate()
+                .zip(rates.iter())
+                .map(|((ci, (name, _, _, _)), s)| {
+                    jobj! {
+                        "arm" => J::s(*name),
+                        "ops_per_s" => J::fp(s.median(), 1),
+                        "rel_iqr" => J::fp(s.rel_iqr(), 4),
+                        "commit_s" => J::fp(med(ci, |r| r.3), 3),
+                        "seal_s" => J::fp(med(ci, |r| r.4), 3),
+                        "merge_s" => J::fp(med(ci, |r| r.5), 3),
+                        "device_write_mb" => J::fp(med(ci, |r| r.1), 1),
+                        "disk_mb" => J::fp(med(ci, |r| r.2), 1),
+                        "segments" => J::fp(med(ci, |r| r.6), 1),
+                        "read_ns" => J::fp(med(ci, |r| r.7), 1),
+                        "scan_entries_per_s" => J::fp(med(ci, |r| r.8), 1)
+                    }
+                })
+                .collect(),
+        ),
+    );
+    // Read rates per rep, so the gate is the usual comparison.
+    let rd = |ci: usize| Samples::new(col(ci, |r| 1e9 / r.7));
+    let (r0, r1, r2, r3) = (rd(0), rd(1), rd(2), rd(3));
+    let rd8 = compare(&r2, &r0, supdb::bench::MIN_EFFECT);
+    rec.compare("tail8_vs_routed_reads", rd8.clone());
+    let rd4 = compare(&r1, &r0, supdb::bench::MIN_EFFECT);
+    rec.compare("tail4_vs_routed_reads", rd4.clone());
+    let rd15 = compare(&r3, &r0, supdb::bench::MIN_EFFECT);
+    rec.compare("tail15_vs_routed_reads", rd15.clone());
+    let ing8 = compare(&rates[2], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("tail8_vs_routed_ingest", ing8.clone());
+    let ing4 = compare(&rates[1], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("tail4_vs_routed_ingest", ing4.clone());
+    let sc = |ci: usize| Samples::new(col(ci, |r| r.8));
+    let sc8 = compare(&sc(2), &sc(0), supdb::bench::MIN_EFFECT);
+    rec.compare("tail8_vs_routed_scan", sc8.clone());
+
+    rec.finding(Finding::new(
+        "F56.1",
+        "at about eight live pieces, point reads are at least 0.85x the routed store's",
+        rd8.ratio >= 0.85 || matches!(rd8.verdict, supdb::bench::Verdict::NoDifference | supdb::bench::Verdict::Greater),
+        format!(
+            "{:.0} ns per read over {:.0} live pieces against {:.0} ns routed ({}); at {:.0} pieces \
+             {:.0} ns ({}), at {:.0} pieces {:.0} ns ({}). f44 had eight segments at 0.77x before \
+             inline runs, when a probe was four misses ending in a block",
+            med(2, |r| r.7),
+            med(2, |r| r.6),
+            med(0, |r| r.7),
+            rd8.summary("tail-8", "routed"),
+            med(1, |r| r.6),
+            med(1, |r| r.7),
+            rd4.summary("tail-4", "routed"),
+            med(3, |r| r.6),
+            med(3, |r| r.7),
+            rd15.summary("tail-15", "routed"),
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F56.2",
+        "at about eight live pieces, ingest-to-drain is at least 1.3x the routed store's",
+        matches!(ing8.verdict, supdb::bench::Verdict::Greater) && ing8.ratio >= 1.3,
+        format!(
+            "tail-8 {:.0} ops/s against routed {:.0} ({}); tail-4 {:.0} ({}); tail-15 {:.0}. \
+             Phases tail-8 against routed: commit {:.3}s/{:.3}s, seal {:.3}s/{:.3}s, merge \
+             {:.3}s/{:.3}s; device bytes {:.1} against {:.1} MB. The drain's merge is gone and the \
+             seals overlap the load",
+            rates[2].median(),
+            rates[0].median(),
+            ing8.summary("tail-8", "routed"),
+            rates[1].median(),
+            ing4.summary("tail-4", "routed"),
+            rates[3].median(),
+            med(2, |r| r.3),
+            med(0, |r| r.3),
+            med(2, |r| r.4),
+            med(0, |r| r.4),
+            med(2, |r| r.5),
+            med(0, |r| r.5),
+            med(2, |r| r.1),
+            med(0, |r| r.1),
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F56.3",
+        "at about four live pieces, point reads are within 5% of the routed store's",
+        rd4.ratio >= 0.95 || matches!(rd4.verdict, supdb::bench::Verdict::NoDifference | supdb::bench::Verdict::Greater),
+        format!(
+            "{:.0} ns per read over {:.0} live pieces against {:.0} ns routed ({}). Each piece \
+             beyond the first costs a Bloom check and, on a false positive, a two-miss probe",
+            med(1, |r| r.7),
+            med(1, |r| r.6),
+            med(0, |r| r.7),
+            rd4.summary("tail-4", "routed"),
+        ),
+    ));
+    rec.finding(Finding::new(
+        "F56.4",
+        "at about eight live pieces the ordered scan is at most half the routed rate",
+        sc8.ratio <= 0.5,
+        format!(
+            "{:.0} entries/s over {:.0} pieces against {:.0} routed ({:.3}x, {}). A single-partition \
+             walk becomes a k-way merge over pieces; this is the price of leaving routing to \
+             compaction, stated beside the gain",
+            med(2, |r| r.8),
+            med(2, |r| r.6),
+            med(0, |r| r.8),
+            sc8.ratio,
+            sc8.summary("tail-8", "routed"),
         ),
     ));
     Ok(rec)
