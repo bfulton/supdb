@@ -132,6 +132,11 @@ partitioning to compaction no longer separates the arms at this load
 seal either way). Its story is in `docs/next-engine.md`; every number there
 is under the same gate.
 
+On Apple Silicon the same pair reads 3.30x and 3.18x, scans 1.20x twice,
+and loads at a tie (0.99x, 0.96x, both no difference) because under
+F_FULLFSYNC the barrier count is the floor for both engines
+(`results/apple-silicon/`, fifth campaign).
+
 Under shuffled arrival the same matched pair inverts. `EXT.27`
 (`ext-loadshape`, full) has the next engine at 284,938 ops/s against
 LMDB's 48,041, **5.93x**, because a durable commit of a thousand random

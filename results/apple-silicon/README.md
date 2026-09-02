@@ -151,3 +151,38 @@ agreeing on every axis that clears the gate:
 Practical reading: the 2.4x buffered read lead on this host is not an
 artifact of Apple's memory system; it is the flatindex probe being cheaper
 than a B-tree walk, visible wherever the core is wide enough to show it.
+
+## Fifth campaign: the next engine, matched on durability and transactions (replicated)
+
+The canonical pair of `docs/next-engine.md` -- `next` against `lmdb`, both
+committing per batch, both transactional -- taken twice on this host on
+consecutive heads that differ only in bench code (2ec7b5c, 06c7902;
+`ext-kv-next-pair.run{1,2}.json`, environment beside each):
+
+| | run 1 | run 2 | x86 (EXT.22-24, latest) |
+|---|---|---|---|
+| durable load | 0.989x, no difference (160,207 vs 161,989) | 0.963x, no difference (167,906 vs 174,320) | 0.694x, failing |
+| point read | **3.302x** (3,563,607 vs 1,079,302), p=0.0022 | **3.177x** (3,510,681 vs 1,105,122), p=0.0022 | 2.2-2.5x |
+| ordered scan | **1.203x** (63.4M vs 52.7M entries/s), p=0.0022 | **1.196x** (63.8M vs 53.4M), p=0.0022 | 0.90x |
+
+Each arm agrees with its replicate to within 5% on load and 1.5% on reads
+and scans, under loadavg 2.2-4.5 and 2.8-3.1; the comparator moved 7.6% on
+load between the runs, which is the durable axis's usual behaviour here
+and why the load verdict is a tie rather than a number.
+
+**The durable load is a tie under F_FULLFSYNC.** Both engines land near
+160,000-175,000 ops/s because both pay one full barrier per 1,000-op
+batch, and on this platform the barrier is the floor: the same pair Linux
+separates at 0.694x cannot be told apart. This is the fourth campaign's
+statement made on the new engine -- the fsync count, not the bytes behind
+it, sets the durable rate on macOS -- and the next engine sends 307.6 MB
+to the device for LMDB's 199.1 (write amplification 2.78 against 1.80,
+read here from `proc_pid_rusage`, which macOS does report where `/proc`
+does not) without that costing it anything at this barrier rate.
+
+**Reads and scans lead on both platforms and lead more here.** 3.2-3.3x
+on point reads against 2.2-2.5x on x86, and the scan axis, a coin toss on
+x86 (0.90x in the latest run after six ties), separates cleanly at 1.2x --
+the same architecture-conditional shape as the second reader's 2.4x, and
+the same explanation until decomposed otherwise: the probe executes less
+than the descent and the wide core shows it.

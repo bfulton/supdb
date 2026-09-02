@@ -272,6 +272,18 @@ interleaved where the harness allows:
   stays gone after the next commit, because `open` truncates the WAL to
   its last commit frame before appending behind it.
 
+### Apple Silicon, replicated
+
+The canonical pair taken twice via localmost (`results/apple-silicon/`,
+fifth campaign): durable load a tie (0.989x and 0.963x, both no
+difference, both engines at 160,000-175,000 ops/s because one
+F_FULLFSYNC per batch is the floor for either), point reads **3.302x**
+and **3.177x**, ordered scan **1.203x** and **1.196x**, every comparison
+at p=0.0022 with arms agreeing across the pair to within 1.5% on reads.
+The read lead is larger there than on x86 and the scan axis, a coin toss
+on x86, separates cleanly, which is the shape the second reader's
+campaigns had already found.
+
 ### Arrival order: EXT.27
 
 Every durable-load number above comes from `ext-kv`, whose keys ascend,
