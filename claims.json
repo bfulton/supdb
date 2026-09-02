@@ -1681,6 +1681,34 @@
    "profile": "full",
    "expect": "holds",
    "because": "Undrained against routed 19.1x (1.7M against 32.4M entries/s) inside one process, where EXT.39 had read 8.6x across arms; the difference is the seal still in flight at the moment of the scan, whose frozen memtable joins the live one in the unsealed source (P61.3)."
+  },
+  {
+   "experiment": "f62-scanmerge2",
+   "id": "F62.1",
+   "profile": "full",
+   "expect": "fails",
+   "because": "The new merge scans a routed store with a thousand unsealed keys at 1.778x the old (18.1M against 10.2M entries/s, p=0.0022): real, and short of the 2x P62.1 asked for. One partition cursor instead of four, keys resolved once, and the memtable entry carried by the snapshot are worth that much on this shape; what remains against the 33.2M routed walk is the merge loop itself against Blob::scan's straight walk."
+  },
+  {
+   "experiment": "f62-scanmerge2",
+   "id": "F62.2",
+   "profile": "full",
+   "expect": "fails",
+   "because": "The undrained store scans at 1.387x the old merge (2.06M against 1.48M entries/s), against P62.2's 3x; four level-0 segments without a memtable at 1.616x (15.5M against 9.6M). The rewrite took out the probes and the allocation and the undrained shape barely moved, so those were not its cost: f61's F61.2 mis-attributed it. What the undrained shape pays per entry -- 485 ns against 30 routed -- is not yet decomposed and is the next thing to profile rather than guess at; the new merge stays the default because it is faster on every shape and never slower."
+  },
+  {
+   "experiment": "f62-scanmerge2",
+   "id": "F62.3",
+   "profile": "full",
+   "expect": "holds",
+   "because": "Routed: 33.2M against 34.4M entries/s, no difference at p=0.37. The fast path over partitions is untouched (P62.3)."
+  },
+  {
+   "experiment": "f62-scanmerge2",
+   "id": "F62.4",
+   "profile": "full",
+   "expect": "fails",
+   "because": "Routed against undrained with the new merge: 16.1x, where P62.4 asked for 4x and f61 read 19.1x. The undrained scan is the open lever it was; the merge rewrite was worth 1.4x of it."
   }
  ],
  "metrics": [

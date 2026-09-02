@@ -68,3 +68,15 @@ what f61 measured; the routed scan **does not move** (P62.3), since the
 fast path is untouched; and the undrained store comes **within 4x** of
 the routed one (P62.4), from 19x, the rest being the level-0 cursors
 themselves and the snapshot's sort.
+
+## Outcome of f62 (full)
+
+New against old, same process: routed+memtable **1.78x** (P62.1 asked 2x),
+four-l0 **1.62x**, undrained **1.39x** (P62.2 asked 3x), routed a tie
+(P62.3 held), routed over undrained still **16.1x** (P62.4 asked 4x). The
+rewrite is kept as the default -- faster on every unrouted shape, never
+slower -- and it says that F61.2's attribution was wrong: taking the
+hash probes and the allocation out of the unsealed source barely moved
+the undrained shape. Its 485 ns an entry against 30 routed is not yet
+explained, and the next step is cachegrind on the undrained arm rather
+than a fourth guess.
