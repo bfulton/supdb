@@ -697,19 +697,13 @@
    "experiment": "w1-daysize",
    "id": "W1.1",
    "expect": "holds",
-   "because": "36.02 B/line between 50k and 250k lines against 36.13 between 250k and 1M -- 0.3% apart -- over a fixed cost of 632,616 bytes. The postings dominate and there is one per line per indexed field; the key count is bounded by field cardinalities, so it lands in the fixed term. This record was re-taken twice in one day for cause: the freelist class_of underflow (reported by logshed) had been inflating every sub-4KiB placement to 7,680 bytes since the format existed, and then redo_log defaulting on silently added a 4 MB log arena to every CLOSED store's file -- the fixed cost read 4,826,920 until close() learned to drop the arena it can never use. A closing store now trims it directly rather than releasing it into a free list whose coalescing rightly ignores generation-quarantined slots."
+   "because": "28.04 B/line between 50k and 250k lines against 28.03 between 250k and 1M -- 0.0% apart -- over a fixed cost of 478,045 bytes. The postings dominate and there is one per line per indexed field; the key count is bounded by field cardinalities, so it lands in the fixed term. Both figures fell when the roll moved to the segment writer: a run of four-byte ordinals is stored fixed, so it carries no length prefixes, and a run under 256 bytes lives in its index record rather than a block."
   },
   {
    "experiment": "w1-daysize",
    "id": "W1.2",
    "expect": "holds",
-   "because": "36.13 B/line over 632,616 fixed puts the 32 MB budget at 911,192 lines/day; a 10M-line day is 11 objects, each independently under budget and each skippable by a time-ranged query. This is what makes R2.2(a) -- an OPFS synchronous access handle over one downloaded object -- viable, and why the reader in blob.rs stays synchronous. The budget briefly read 795,104 lines while every closed store was shipping a 4 MB arena of reserved zeroes to the browser; see W1.1."
-  },
-  {
-   "experiment": "w1-daysize",
-   "id": "W1.3",
-   "expect": "holds",
-   "because": "At 1M lines, line order writes 740,509,448 bytes where term order writes 40,957,384 -- 18.08x. Line order interleaves every key, so a hot key's run is sealed into many small extents and merge_threshold rewrites the whole run each time it crosses four; F5.1 records that as a latency tail and it shows up here as dead space. Term order seals each run once and merges zero times. The ratio was 22.6x when first measured; in-place index insertion (index_inserts) since made the line-order arm cheaper, which narrowed it without changing the verdict, and the design panel's rank-2 item (geometric deferred consolidation) exists to close most of the rest."
+   "because": "28.03 B/line over 478,045 fixed puts the 32 MB budget at 1,179,916 lines/day; a 10M-line day is 9 objects, each independently under budget and each skippable by a time-ranged query. This is what makes R2.2(a) -- an OPFS synchronous access handle over one downloaded object -- viable, and why the reader in blob.rs stays synchronous."
   },
   {
    "experiment": "f28-count",
