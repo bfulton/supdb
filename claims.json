@@ -15,58 +15,6 @@
  ],
  "findings": [
   {
-   "experiment": "f5-latency",
-   "id": "F5.1",
-   "expect": "fails",
-   "because": "Append latency is long-tailed: inline merge_key holds both the shard lock and the appender lock while it decompresses, concatenates, recompresses and rewrites a key's whole run. The design document reports only throughput means, which cannot show this."
-  },
-  {
-   "experiment": "f5-latency",
-   "id": "F5.2",
-   "expect": "holds",
-   "because": "No single append should stall for more than 50ms. This currently holds at ci profile and is the guard that would catch inline merging getting worse."
-  },
-  {
-   "experiment": "f6-threads",
-   "id": "F6.1",
-   "expect": "fails",
-   "because": "Write throughput does not scale with writer threads. seal_shard takes the single appender mutex inside its per-extent loop and flush_builder takes it twice consecutively, so the write path convoys. Measured at 19% efficiency and negative absolute scaling at 4 threads. Every db_bench comparison in the design document is single-threaded, which is the configuration that hides this."
-  },
-  {
-   "experiment": "f2-open",
-   "id": "F2.1",
-   "expect": "fails",
-   "because": "Open is no longer proportional to key count but is not independent of it either: 0.0ms at 100k keys against 0.6ms at 10M, so 100x the keys cost 20x the open. What remains is the block table, which is still decoded per entry. The key index, which used to dominate this, no longer contributes. Pinned to full: at ci scale the key counts are too small for an open to resolve at all -- F2.1 holds there and fails here, which is a property of the clock rather than of the engine. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
-   "profile": "full",
-   "arch": "x86_64"
-  },
-  {
-   "experiment": "f2-open",
-   "id": "F2.2",
-   "expect": "holds",
-   "because": "FIXED by the mapped key index. Open grew 196x for 100x the keys while the reader decoded the index into Vec<(Vec<u8>, Extents)> and hashed it; it now grows 20x, because opening validates a header and stops. At 10M keys that is 0.6ms against 2406ms. F2.1 still fails -- 20x is sub-linear, not independent -- since the index is still read from a file whose size grows with the key count. Pinned to full: at ci scale the key counts are too small for an open to resolve at all -- F2.1 holds there and fails here, which is a property of the clock rather than of the engine. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
-   "profile": "full",
-   "arch": "x86_64"
-  },
-  {
-   "experiment": "f4-durability",
-   "id": "F4.1",
-   "expect": "fails",
-   "because": "A 1,000-op durability window costs 25x throughput, because checkpoint() rewrites the whole key index rather than what changed."
-  },
-  {
-   "experiment": "f4-durability",
-   "id": "F4.2",
-   "expect": "holds",
-   "because": "FIXED by turning block compression off. A 20,000-op window sustains 199,308 ops/s with about 2MB at risk -- the first usable point this curve has had. checkpoint() still rewrites the whole key index, so the floor grows with key count rather than with what changed, and F4.1 still fails at 38x; what changed is that the write path is now fast enough that the floor sits somewhere usable. Measured at ci, which is not citable for the throughput figure itself -- the claim is that a point exists, and its existence is not a ci artifact."
-  },
-  {
-   "experiment": "f3-multiproc",
-   "id": "F3.1",
-   "expect": "holds",
-   "because": "Every reader process must see a complete, self-consistent checkpoint state. This is the core safety property of the append-only design and must never regress."
-  },
-  {
    "experiment": "f1-outofcore",
    "id": "F1.1",
    "expect": "holds",
@@ -100,24 +48,6 @@
    "profile": "full",
    "expect": "holds",
    "because": "The precondition: the stored file must exceed the memory available to cache it. 23.0GB against 15.7GB, ratio 1.47."
-  },
-  {
-   "experiment": "f7-index",
-   "id": "F7.1",
-   "expect": "fails",
-   "because": "Index size still grows with key count -- 13.5MB at 250k keys, 866MB at 16M -- which no layout change fixes: an index of N keys holds N records. What changed is the constant, 57 B/key against 131, and that the bytes are shared between readers instead of duplicated."
-  },
-  {
-   "experiment": "f7-index",
-   "id": "F7.2",
-   "expect": "fails",
-   "because": "Reader open grows with key count, though no longer in proportion to it, and what remains is the block table rather than the key index. The index is 89 bytes per key in a mapped section readers share -- it was 131 heap-resident and duplicated per process, then 57, then 74.8 in the previous full record -- and the number decomposes exactly on this shape: 16.8 B of hash slots (a power of two at twice the keys), 12 B of directory (8 B a key plus the half-again room `index_inserts` reserves; 4 B before that became the default), and 60 B of records, a 16-byte key's 40-byte record under the flat index's half-again slack, of which format v5's count field is the 4 B that took a record from 36 to 40. So v5 costs 6 B a key here, 7%, and `index_inserts` 8; both are recorded rather than netted."
-  },
-  {
-   "experiment": "f7-index",
-   "id": "F7.3",
-   "expect": "holds",
-   "because": "At 57 B/key one reader fills this machine's 15.7GB at 297M keys and eight readers reach it at 37.1M keys each, against 16.1M each before the index was made shareable. The headroom is understated, since the eight now share one file-backed copy rather than holding eight."
   },
   {
    "experiment": "c1-decoders",
@@ -352,54 +282,6 @@
    "arch": "x86_64"
   },
   {
-   "experiment": "f12-compress",
-   "id": "F12.1",
-   "expect": "holds",
-   "because": "Turning block compression off makes point reads 3.6x faster. The question was whether decompression explains any of LMDB's 2.9x read lead; it explains more than all of it. Pinned to full: at ci scale the store fits in cache and the space saving looks four times larger than it is. Pinned to x86_64.",
-   "profile": "full",
-   "arch": "x86_64"
-  },
-  {
-   "experiment": "f12-compress",
-   "id": "F12.2",
-   "expect": "holds",
-   "because": "And ordered scans 30x faster. A scan walks whole blocks in order, so it pays decompression on every one; this is the largest single effect measured anywhere in this suite. Pinned to full: at ci scale the store fits in cache and the space saving looks four times larger than it is. Pinned to x86_64.",
-   "profile": "full",
-   "arch": "x86_64"
-  },
-  {
-   "experiment": "f12-compress",
-   "id": "F12.3",
-   "expect": "holds",
-   "because": "The space given up is 1.04x -- 3017 MB against 3142 MB. Compression is buying almost nothing here because the payload is half-random by construction; a more compressible payload would save more, but the read and scan costs above do not depend on how well the data compresses. Pinned to full: at ci scale the store fits in cache and the space saving looks four times larger than it is. Pinned to x86_64.",
-   "profile": "full",
-   "arch": "x86_64"
-  },
-  {
-   "experiment": "f12-compress",
-   "id": "F12.4",
-   "expect": "fails",
-   "because": "Compression costs the write path too: 3.8x. It is off by default as of this measurement, so this claim now records what the option costs anyone who turns it back on rather than what the engine does. It stays expected-to-fail because the statement is about the compressor, not the default: paying on writes as well as reads and scans, for four percent of disk, is not a trade. Pinned to full: at ci scale the store fits in cache and the space saving looks four times larger than it is. Pinned to x86_64.",
-   "profile": "full",
-   "arch": "x86_64"
-  },
-  {
-   "experiment": "f13-sync",
-   "id": "F13.1",
-   "expect": "fails",
-   "because": "fsync is the dominant cost of publishing, by a wide margin: 415 ops/s against 12,985 without, 31.3x, on the read-your-writes shape. Every such operation costs a checkpoint because Store has no read method, and a checkpoint syncs twice. This is the whole of the gap on the workloads Supdb is worst at -- YCSB A/B/D/E/F sit at 0.07-0.14x of LMDB while C, which never publishes, sits at 1.73x. Recorded as expected-to-fail because the statement is about where the time goes, and it goes here. Pinned to full and to x86_64. The ratio is a property of this disk as much as of the engine -- a device with a faster flush would show less -- which is exactly why it is recorded as a measurement rather than folded into a design argument.",
-   "profile": "full",
-   "arch": "x86_64"
-  },
-  {
-   "experiment": "f13-sync",
-   "id": "F13.2",
-   "expect": "fails",
-   "because": "And it is worth far more than the largest thing an instruction profile could see. Callgrind put the block table decode at 34% of all instructions; mapping it removed 4.75x of the total instruction count and moved throughput by nothing, because the workload waits on a syscall. This claim exists to keep that lesson attached to a number: an instruction profile answers where the CPU goes, not why a workload is slow. Pinned to full and to x86_64. The ratio is a property of this disk as much as of the engine -- a device with a faster flush would show less -- which is exactly why it is recorded as a measurement rather than folded into a design argument.",
-   "profile": "full",
-   "arch": "x86_64"
-  },
-  {
    "experiment": "f14-blocktable",
    "id": "F14.1",
    "profile": "full",
@@ -414,34 +296,6 @@
    "because": "The mapped block table costs nothing on a point read either: 1,996,309 ops/s against 1,995,093, ratio 0.999 at p=0.90. Kept alongside F14.1 so the two are read together -- the point of the pair is that a structure can be free on one access pattern and not on another, and here it happens to be free on both."
   },
   {
-   "experiment": "f15-scancache",
-   "id": "F15.1",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Holding the current block across a scan's entries is worth 1.201x at 1M keys (17,342,159 against 14,441,442 entries/s, p=0.0022). A scan walks keys in rank order and consecutive keys usually share a block, so resolving one per entry re-reads the block table, re-bounds-checks the mapping and re-tests a checksum bit to learn what the previous entry already established. Finding it also turned up that the block was resolved *twice* per entry, since `check_extent` resolved it and then the read resolved it again; that fix is in both arms, so this figure understates what the work was worth. Worth recording that this is the sort of cost an instruction profile can see and a syscall-blind one cannot -- the exact opposite of the fsync case in f13."
-  },
-  {
-   "experiment": "f16-slack",
-   "id": "F16.1",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Leaving the index slack as a hole is worth 1.077x on a bulk load (1,158,872 against 1,075,715 ops/s, p=0.0325) and 10.2% fewer bytes to the device (F16.2). It took 21 repetitions to say that. At the default seven it read 1.158x at p=0.0553 and then 1.132x at p=0.0409 on consecutive runs -- a verdict flipping without the engine changing, because the effect is around 10% and the repetition-to-repetition IQR is 17-19%. An underpowered measurement is not a cheap one, it is one that could not see, and the fix was more samples rather than a softer claim."
-  },
-  {
-   "experiment": "f16-slack",
-   "id": "F16.2",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Both arms produce a 176,681,680-byte file, and send 157,949,952 against 175,951,872 bytes to the device -- 18MB, 10.2% fewer, for the same store. The flat index reserves half its record region again as slack so an in-place checkpoint has somewhere to put a lengthened record; nothing reads that region until an update writes into it, and an unwritten hole reads back as the same zeroes. This is exactly the pair CLAUDE.md means by measuring write amplification from /proc/self/io rather than inferring it from file size: file size cannot see a hole, and here the two answers differ by 18MB."
-  },
-  {
-   "experiment": "f17-gather",
-   "id": "F17.1",
-   "profile": "full",
-   "expect": "fails",
-   "because": "Borrowing the keys instead of copying them does not measurably speed up a bulk load: 1,181,333 ops/s against 1,147,204, ratio 1.030 at p=0.2502. The change is kept -- it allocates nothing where it used to allocate once per key, a million 16-byte mallocs at this scale -- but it is not a speedup and this entry says so. What sent me looking was a phase split showing the checkpoint as 820ms of a 1,443ms load while writing 57MB, where the flush had just written 101MB in 226ms; after the change a rerun showed 440ms. That 1.9x was drift. Two single runs on this machine differ by more than the change did, which is the whole reason arms go behind a runtime flag and run interleaved -- and I wrote the flag *because* I did not trust the number, which is the only reason this is recorded correctly."
-  },
-  {
    "experiment": "f18-fence",
    "id": "F18.1",
    "profile": "full",
@@ -454,20 +308,6 @@
    "profile": "full",
    "expect": "holds",
    "because": "On the workload the fence was built for -- 50-entry scans, the shape YCSB-E runs -- it is worth 1.092x: 15,909,949 against 14,570,849 entries/s, p=0.0022 with IQRs of 2.0% and 1.4%. This is the finding that decides whether the fence earns a format version, since a seek that got faster without moving a scan would not. 9% is real, repeated and far less than predicted; it is kept because it is positive and measured, not because it was expected."
-  },
-  {
-   "experiment": "f19-coldscan",
-   "id": "F19.1",
-   "profile": "full",
-   "expect": "fails",
-   "because": "Verifying block checksums costs 0.715x on a cold scan -- 39,251,416 entries/s against 54,902,165 unverified, p=0.0022 with IQRs of 4.5% and 4.6%. f8-checksums measured this cost at 'read -1.0%, no difference' and that measurement was not wrong, it was on the wrong workload: a reader checks each block once and records it, so a point-read workload reads every block many times and amortises the check away. A scan over a fresh reader touches each block for the first time and pays for all of them. The amplification is the point -- a 64KiB block is checksummed in full to hand back a 100-byte value."
-  },
-  {
-   "experiment": "f19-coldscan",
-   "id": "F19.2",
-   "profile": "full",
-   "expect": "fails",
-   "because": "A scan's first pass costs 1.65x its steady state with verification on, and 1.09x with it off, so the cold penalty is the checksum and almost nothing else. The cold pass took 0 major faults and spent 0.0% of its wall time off CPU, which rules out page faults and I/O: this is CPU spent on CRC32C. That resolves the disagreement between ext-sweep, which discards a warmup and finds Supdb faster than LMDB at every scan length from 100 up, and ext-kv, which measures the first pass and finds it slower at exactly 100. Both are right about what they measure, and the difference between them is a guarantee LMDB does not offer -- Features::checksums is false for it."
   },
   {
    "experiment": "f20-chunkcrc",
@@ -497,119 +337,10 @@
    "because": "FIXED. The writer's read path now verifies what the reader's verifies: 0/8 damaged trials read through `Store::read_all` returned wrong bytes, where every one of them did before. `Store::read_all` was added so a writer could read its own writes without a checkpoint -- it took the mixed YCSB workloads from 0.07x of LMDB to 18x -- and went from the mapping to the caller with no checksum in between, so the same store answered with two guarantees depending on the handle. C1.2 said 'a read returns the bytes that were written, or an error' and every trial behind it opened a `Reader`; its statement now names the reader and this asks the same question of the other path. RocksDB verifies every block it loads by default, which is the bar being matched here. f21-writerverify prices it at 1.135x on a cold read pass and 0.956x warm, and `Options::verify_reads` is the knob for a caller who wants LMDB's trade instead -- LMDB has no checksums at all."
   },
   {
-   "experiment": "f21-writerverify",
-   "id": "F21.1",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Verifying the writer's own reads costs 1.135x on a cold pass -- 1,417,715 ops/s against 1,608,870, p=0.0022 with IQRs of 0.9% and 3.8%. That is the price of the guarantee RocksDB charges by default and LMDB does not offer, on the path YCSB A through F read through. It was paid: A is 14.96x of LMDB with verification on where it was 17.69x with it off, C is 1.19x where it was 1.29x, and every ordering held."
-  },
-  {
-   "experiment": "f21-writerverify",
-   "id": "F21.2",
-   "profile": "full",
-   "expect": "holds",
-   "because": "A warm read pays 0.956x for verification -- almost nothing. A chunk is checked once and remembered, so the cost belongs to the first touch of a block rather than to the read path, which is exactly why f8-checksums measured warm point reads and found the whole thing free. Two experiments, the same mechanism, opposite-looking answers, and neither is wrong."
-  },
-  {
-   "experiment": "f22-storescan",
-   "id": "F22.1",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Scanning through the writer is worth 1.593x against opening a `Reader` for it: 35,123,371 entries/s against 22,043,018, p=0.0022 with IQRs of 2.6% and 6.1%. The shape is the kv suite's -- read through `Store::read_all`, then scan -- and the reader loses because it duplicates a mapping the writer already has and starts a verified bitset the writer has already filled, so it re-verifies a store this process just wrote. At ci there is no difference, because a cache-resident store has nothing to warm. This needed an arm: between two suite runs an hour apart both engines' scan throughput roughly doubled, so no cross-run number could have shown it."
-  },
-  {
-   "experiment": "f23-madvise",
-   "id": "F23.0",
-   "profile": "full",
-   "expect": "holds",
-   "because": "The precondition, and the reason this experiment exists in this shape: 1,414,698,744 bytes of store against a 512MB cap, ratio 2.64. f1-outofcore reaches the same condition by building 23GB on a machine with more RAM than this one has, which is why F1.2 is not_exercised at every profile below full and unrunnable here at all -- 15GB of RAM and 20GB of free disk cannot produce it. Out-of-core is a ratio, not a size, and a memory cgroup makes the ratio a parameter of the experiment instead of a property of the host. Page cache is charged to the cgroup that faults it in, so capping the cgroup caps the cache."
-  },
-  {
-   "experiment": "f23-madvise",
-   "id": "F23.1",
-   "profile": "full",
-   "expect": "fails",
-   "because": "The default readahead amplifies an out-of-core random read by 86,977x: 8,697,724 device bytes to return a 100-byte value, against 14,149 with MADV_RANDOM. Passing no advice means MADV_NORMAL, so every miss faults in a cluster of pages on the assumption that a read is the start of a sequential run. For a random point read that is wrong twice -- it fetches a window to return a hundred bytes, and the pages it fetched speculatively evict pages something was still using, so they are fetched again. Measured from /proc/self/io with the page cache dropped before each pass, so these are bytes the device was asked for rather than bytes inferred from file size."
-  },
-  {
-   "experiment": "f23-madvise",
-   "id": "F23.2",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Telling the kernel a random read is random is worth 25.2x out of core: 5,143 reads/s against 204, p=0.0022. The 204 is the point -- F1.2 records 370 reads/s out-of-core against 338,681 resident and blames an engine with no madvise anywhere, and this reproduces that collapse at a sixteenth of the scale and then removes most of it with one syscall. It is regime-dependent and the opposite way round when the store fits: resident and uncapped, MADV_RANDOM is about 15x *slower*, because readahead is a working prefetcher when the pages it fetches survive. That is why `Readahead` is a knob and why the default is unchanged; an adaptive `Auto` is the obvious follow-up and has not been measured, so it does not exist yet."
-  },
-  {
-   "experiment": "f24-autoreadahead",
-   "id": "F24.1",
-   "profile": "full",
-   "expect": "holds",
-   "because": "`Readahead::Auto` picks the faster advice at every swept ratio where the two differ by more than the noise floor. At 1M keys the default is 3.2-3.4x ahead from a ratio of 0.05 up to 1.00, and behind by 1.7x at 1.25, 6.5x at 1.50 and 28x at 3.00; Auto tracks the switch. The threshold took three attempts and the experiment caught both wrong ones. 0.5 looked conservative and advised Random across the whole 0.5-1.0 band where the default is three times faster. 1.0 sat exactly on the common case -- a cgroup rounds its limit down to a page multiple, so a store sized to its memory comes out a couple of kilobytes over and takes the wrong branch, which the sweep duly caught at ratio 1.00. 1.1 clears it.",
-   "needs": "drop_caches and a v1 memory cgroup"
-  },
-  {
-   "experiment": "f24-autoreadahead",
-   "id": "F24.1",
-   "profile": "ci",
-   "expect": "fails",
-   "because": "The same threshold mispicks on a smaller store, and this entry exists so that is on the record rather than hidden by a profile that is never cited. At 556MB the crossover is around 0.75 rather than 1.25, so `Auto` keeps the default advice at 0.75 and 1.00 where Random is 8-16% ahead. The crossover moves with store size because what actually decides it is access density -- how much of the store a workload touches -- and a single constant over the file-to-memory ratio cannot express that. The constant is tuned where it costs the most: mispicking at ci is worth 16%, picking right at full is worth 3.3x.",
-   "needs": "drop_caches and a v1 memory cgroup"
-  },
-  {
-   "experiment": "f24-autoreadahead",
-   "id": "F24.2",
-   "profile": "full",
-   "expect": "fails",
-   "because": "My statement was that readahead stops paying somewhere below a file-to-memory ratio of 1. It does not: at 1M keys MADV_RANDOM first overtakes the default at 1.25. Readahead keeps paying right up to and past the point where the store no longer fits, because the pages it fetches speculatively are still being used before they are evicted. Recorded as failing rather than reworded, because it is the sentence that produced two wrong thresholds.",
-   "needs": "drop_caches and a v1 memory cgroup"
-  },
-  {
-   "experiment": "f24-autoreadahead",
-   "id": "F24.2",
-   "profile": "ci",
-   "expect": "holds",
-   "because": "At 556MB the crossover is 0.75, below 1 -- so the same claim holds here and fails at full. That disagreement is the finding: the crossover is not a constant of the engine, it moves with store size, and any single threshold is a compromise across scales rather than a law. Pinned to both profiles deliberately so the pair cannot be read as one answer.",
-   "needs": "drop_caches and a v1 memory cgroup"
-  },
-  {
    "experiment": "c1-decoders",
    "id": "C1.4",
    "expect": "holds",
    "because": "A damaged store is refused by `Store::open` or read correctly, never opened onto: 0/24 damaged files were accepted and then disagreed with what was written, and 2 were refused outright. This matters more than an ordinary read path because reopening rebuilds the block table, the key tables and every reference count from the file, and then *writes on top of* whatever it believed. Building it found a live defect: `Appender::read_extent` indexed `self.blocks[e.block]` unchecked and took the process down on a damaged index. `Reader` has had `loc_of` for exactly that since a damaged file panicked through `scan`; the writer's copy had never been asked, because nothing could reopen a store to ask it. That is the shape of this whole entry: the limitation prevented the test of the limitation."
-  },
-  {
-   "experiment": "f25-arena",
-   "id": "F25.1",
-   "profile": "full",
-   "expect": "fails",
-   "because": "NOT ESTABLISHED, across five full runs: 1.187x (p=0.0215), 1.050x, 1.021x, 1.007x and 1.035x, no difference in four of the five. The first is the one I wrote a claim from, and a marginal p from a single run is exactly the EXT.1 failure mode this repository already documents. The arena's bulk-load benefit does not exist at a size this host can resolve. What the arena does do is remove 50,305 live allocations per 50k keys and cut instructions 16% per key -- neither of which shows up as load throughput, which is itself the finding: this load is not instruction-bound."
-  },
-  {
-   "experiment": "f25-arena",
-   "id": "F25.2",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Holds, but marginally, and the margin is falling: across five full runs the ratio has read 1.144x (p=0.0022), 1.117x, 1.079x, 1.028x and 1.083x, clearing the gate in four and missing it in the fifth at p=0.0553 -- a hair the wrong side of it. Read this as about 8% and fragile rather than as a result. It is still the workload where the arena could have lost outright, since an append must keep a key's run contiguous and copies it to the arena tail whenever another key has appended in between. Set against F25.3's 2.2x resident memory, an 8% append-path gain that flips one run in five is a poor trade, and the next thing to try is removing the up-front reservation rather than defending it."
-  },
-  {
-   "experiment": "f25-arena",
-   "id": "F25.3",
-   "profile": "full",
-   "expect": "fails",
-   "because": "The arena's price, now 197.2 MB against 132.7 MB for the same load -- 0.664x at p=0.0100, where it was 0.450x. It reserved each shard's whole `buffer_bytes` share on first use, on the theory that growth memcpys explained the 21% rise in last-level misses the arena caused. They did not: reserving removed every one of those copies and the misses did not move, so the reservation was the answer to a question it was not the answer to, and it cost 2.2x resident memory. It starts at 128KB and grows now, which recovered a third of the memory and changed neither the append gain (1.080x against 1.079x) nor the absent load gain. What remains is `Vec` doubling slack -- capacity up to twice length -- and a chunked arena would remove that too. Recorded as failing because 1.5x resident memory for an 8% append-path gain that flips one run in five (F25.2) is not yet a trade worth defending; it is a cost with a known next step."
-  },
-  {
-   "experiment": "f26-buffer",
-   "id": "F26.1",
-   "profile": "full",
-   "expect": "holds",
-   "because": "1,834,782 ops/s at a 4MB buffer against 1,827,426 at 256MB -- 1.004x at p=0.7015, no difference -- while resident memory falls from 279.9 MB to 173.0, a 38% saving for nothing given up. All four arms (4, 16, 64, 256MB) are statistically tied on throughput, so the choice is free and smaller strictly dominates. The external adapter configures 256MB, which is larger than the 105MB dataset, so Supdb holds all of it -- and that is a straightforward part of why EXT.10 shows 218MB resident against LMDB's 46. This experiment could not have been run at all before `Options::seal_on_put`: `append` sealed when a shard's buffer filled and `put` never checked, so a put-only workload ignored `buffer_bytes` entirely and every arm here would have behaved identically. What is left after the fix is Supdb's key index, which stays resident through a load at roughly 57 bytes per key, and no buffer setting touches that."
-  },
-  {
-   "experiment": "f27-ckptshape",
-   "id": "F27.1",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Updating existing keys under Sync::Always runs 173,446 ops/s; inserting new ones runs 42,079 -- 4.122x at p=0.0022, on identical operation counts, identical checkpoint counts and the same durability policy. So durability is not what EXT.9's 0.010x is made of. Insertion under durability is. `checkpoint_in_place` edits the mapped index through slack instead of rewriting it, and opens with `if nkeys != meta.len() { return Ok(false) }` -- any key added or removed sends the checkpoint down the full-rewrite path, and every batch of a bulk load adds. The margin scales the way an O(key count) rewrite must: 1.067x at 20k keys, 3.282x at 100k, 4.122x at 200k. It is visible in device bytes too, 1,269.6 MB against 984.4 for the same work. This is the measurement that says where to spend: a durable Supdb is not slow, a *growing* durable Supdb is, and the in-place path already exists and is simply declined."
   },
   {
    "experiment": "w1-daysize",
@@ -690,81 +421,11 @@
    "because": "What R6 buys, in bytes, on the shape logshed actually rolls: a segment's dictionary is bounded by field cardinality (~104 keys however much traffic), so at full the open fetches 19,832 bytes of a 31,384,960-byte object -- superblock probe, key index, block table -- and the 7-probe query set plans 2,015,000 more: 6.5% fetched, the rest never leaves object storage. The day shape reads 11.0% of 9,651,504. Both denominators are honest ones: the class_of underflow and the retained 4 MB log arena were fixed before these numbers were taken, which cost the percentages about a point against the inflated files they replaced. The browser test carries the same result end to end in Chromium: a 512 KiB cache over ranged HTTP against a 3,187,648-byte segment file that is 98% data, answers identical to the native reader's, total fetched under the data region alone, and the budget observed to evict. The premise -- index and block table fetched whole at open -- is priced in that 19,832 and expires when key cardinality does: a trigram or free-text index would need the index fetched sparsely too, which changes the JS host only, because every range in the ABI is an absolute file offset."
   },
   {
-   "experiment": "f29-redolog",
-   "id": "F29.1",
-   "profile": "full",
-   "expect": "holds",
-   "because": "FIXED twice over. The extents-only log earned 1.440x against the best non-log arm; now that the log carries values -- a durability point appends unsealed bytes and seals nothing -- it earns 2.977x (p=0.0022): logged 327,603 ops/s at write amplification 3.58x against rewriting at 110,038 and 34.58x, 79 MB to the device against 765. The history of this claim tracked the design's whole arc: 5.112x against naive rewrites, 1.116x once index_inserts made the rewrite arm fast, 1.440x when points went log-first, and 3.022x when the seal left the durability point entirely. F29.2's guarantee is unchanged at 500/500, now covering value records: a fresh reader serves bytes straight from the arena overlay, and tests/valuelog.rs holds the crash-reopen contract -- deltas concatenate, replacements hide sealed state, deletes win over values, and a reopen never re-logs what the arena already holds."
-  },
-  {
-   "experiment": "f29-redolog",
-   "id": "F29.2",
-   "profile": "full",
-   "expect": "holds",
-   "because": "FIXED, and on by default: 500 of 500 keys that a logged checkpoint made durable are visible to a reader opened before the next full rewrite, where it was 0 of 500. A `Reader` replays the log at open and merges it over the published index. The index itself is untouched -- it is mapped, shared between processes and read in place, and none of that survives being edited per reader -- so a record whose key exists replaces its extents and moves nothing, and one whose key is new takes a rank and shifts every published rank at or after it. `keys`, `seek` and `scan` see the merged order, and the fast path that walks the mapped section by rank stands down whenever there is anything to merge. Turning it on then exposed a reclamation bug older than the log: `live_key_off` was maintained only inside the flat branch and only when the index could be adopted for in-place editing, so with the varint layout it stayed None, the pruning loop saw a key section that did not match 'the live one', and released it. That was survivable while every checkpoint rewrote the key section -- the previous one really was superseded -- and the log makes a section outlive its generation. The next block table was then placed on top of the index every reader was using, which surfaced as lz4 failing on a section nobody had written there."
-  },
-  {
-   "experiment": "f30-insertindex",
-   "id": "F30.1",
-   "profile": "full",
-   "expect": "holds",
-   "because": "139,402 ops/s against 29,112 -- 4.788x at p=0.0022 -- for a workload that only inserts, with 1.85x fewer device bytes (509.8 MB against 944.5). It scales the way avoiding an O(key count) rewrite must: 1.582x at 20k keys, 3.254x at 100k, 4.788x at 200k. `checkpoint_in_place` declined every insertion outright, and f27 priced that refusal at 4.122x -- which is what this recovers, to within the noise. The records and the hash always had room for a new key; only the directory did not, because it is a sorted array and growing it shifts everything after. It is double-buffered now, so the spliced copy goes into the buffer nobody is reading and one aligned store of `dir_state` publishes which is live and how many keys it holds -- the same discipline the record path already used, where the bytes go down first and a single store publishes them."
-  },
-  {
-   "experiment": "f30-insertindex",
-   "id": "F30.2",
-   "profile": "full",
-   "expect": "holds",
-   "because": "52.56 MB against 385.21 -- the file is 7.33x SMALLER with room to insert, at p=0.0001, and the prediction was the opposite. Doubling the directory costs about 4 bytes per key on an index that is about 57, and Supdb already loses the size axis to LMDB (EXT.6), so this claim was written expecting to have to defend a size regression. It does not: rewriting the index for every insertion appends a fresh section each time and reclaims them more slowly than they accumulate, which costs far more than the second buffer ever could. The reserved directory is the smaller half of a trade whose larger half nobody had measured."
-  },
-  {
    "experiment": "ext-loadshape",
    "id": "EXT.27",
    "profile": "full",
    "expect": "holds",
    "because": "Shuffled, the next engine loads 284,938 ops/s against lmdb's 48,041 -- 5.931x at p=0.0022 -- with both committing per batch and both transactional, so nothing leans. shape-plan.md registered the opposite: P27.1 put this arm at 0.35x to 0.55x, reasoning from the next engine's own cost of merging what promotion cannot route. That half was right -- its ordered arm in the same run is 429,659, 0.653x of lmdb and bracketing EXT.22's 0.694x from the other suite, and its swing is 1.508x (P27.2, P27.3 held). What the plan missed is lmdb's swing: 658,292 to 48,041, 13.7x, because a durable commit of 1,000 random keys dirties about as many leaf pages and the fsync writes them all, where 1,000 ascending keys dirty a handful. The canonical load's ascending keys are the one arrival order that flatters the B-tree; on the other, the matched durable load is not close. Quote this with EXT.22, never instead of it. Replicated with the borrowed batch: 300,080 against 45,163, 6.644x at p=0.0022; the ordered pair in that run 0.591x. Two more: 4.21x and 6.38x."
-  },
-  {
-   "experiment": "f31-loadphases",
-   "id": "F31.1",
-   "profile": "full",
-   "expect": "fails",
-   "because": "It does not: put 0.434s (42.4%), flush 0.136s (13.3%), checkpoint 0.453s (44.3%) for 1M keys arriving in order. Building the key index is the largest phase of a bulk load, and it costs 3.3x more than the flush that writes 105MB of actual data -- so it is the sort and the encode, not I/O. This is where EXT.13's 3.3x loss on ordered arrival lives. Two earlier readings were wrong about it and are worth keeping: cachegrind reports 62x LMDB's last-level misses per key on this shape, which reads like a scattered write path, and I took it for one -- but the same profile puts 1% of those misses in the hash probe and the rest in `checkpoint_inner`, `seal_shard` and the memcpy inside them. Timed directly, Supdb's put path is within 1.17x of LMDB's; the whole gap is the flush. A miss count says where the misses are, not which phase is slow. This is the same fixed cost that makes Supdb indifferent to arrival order (EXT.14), so it is the price of that property rather than an oversight -- but it is embarrassingly parallel across 64 shards and is done on one thread, which is the obvious thing to try next."
-  },
-  {
-   "experiment": "f31-loadphases",
-   "id": "F31.2",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Inside a 0.468s checkpoint over 1M keys: sort 0.067s, encode 0.086s, crc 0.009s, pwrite 0.015s, fsync 0.186s. Building the index is 33% and making it durable is 40%, and neither is the one thing to remove. That is the finding, because three separate profiles each looked like it was. cachegrind reported 62x LMDB's last-level misses per key on an ordered load, which reads like a scattered write path -- `cg_annotate` puts 1% of them in the hash probe. The phase that looked like a 57MB section write took 4.7x what a bare 57MB write costs on this machine, which is 0.087s measured against a control, and that gap is what finally exposed the `sync_data` sitting inside the phase; the pwrite it appeared to be is 3% of the checkpoint. And f32 refuted preallocation, which had been the explanation for the write being slow, by aiming at disk blocks when the cost was never there. Against LMDB's 0.49s for the same load, Supdb's excess splits roughly evenly between building an index LMDB does not have and flushing the 1.33x bytes that index adds -- one root cause, two costs, and no single phase to delete."
-  },
-  {
-   "experiment": "f33-indexsize",
-   "id": "F33.1",
-   "profile": "full",
-   "expect": "holds",
-   "because": "1,145,201 ops/s with the varint index against 816,259 with the flat one -- 1.403x at p=0.0022 -- with the file at 105.5 MB against 168.6 and the checkpoint at 0.342s against 0.663s, of which fsync is 0.132s against 0.233s. This is f31's flush half tested directly: it said the excess over LMDB splits between building an index LMDB does not have and flushing the bytes that index adds, and removing 37% of those bytes moves the load by 1.4x. The lever is real and it is the only one that hits both halves at once, because the same bytes are what the sort and the encode produce and what the fsync then has to push. Note it is not free and not a recommendation on its own: see F33.2."
-  },
-  {
-   "experiment": "f33-indexsize",
-   "id": "F33.2",
-   "profile": "full",
-   "expect": "fails",
-   "because": "1,884,035 reads/s flat against 1,906,483 varint -- 0.988x at p=0.6365, no difference at 1M keys. F11.3 measures 1.25x for the flat index at 5M keys and both are right: the heap index it replaces costs 186 bytes per key resident, which is 930MB at 5M keys and comfortable at 1M. So the flat index's read advantage arrives with scale, while its costs are paid at every size -- 1.403x on a bulk load (F33.1) and +73.5% on the file (F11.4). Recorded as failing because a layout chosen for reads that does not help reads at the size being measured is a cost with no return there, and the honest conclusion is not that the flat index is wrong but that fixing it at compile time is: this is the same shape as `Readahead::Auto`, which picks by file-to-memory ratio rather than being set once."
-  },
-  {
-   "experiment": "f34-parallelindex",
-   "id": "F34.1",
-   "profile": "full",
-   "expect": "holds",
-   "because": "0.087s against 0.1678s -- 1.930x at p=0.0009 on four cores, for the whole index build. Every part of it is threaded: the sort splits and merges (0.079s to 0.051s); the record loop splits because `rec_offs` is a prefix sum, so a range of keys owns a contiguous range of record bytes and its directory entries are `i*4`, disjoint by construction (0.035s to 0.012s); and the hash claims slots with compare-exchange (0.069s to 0.035s). The hash was two thirds of the encode and the last part done, which is why the first version of this claim measured only 1.253x -- parallelising the visible half of a phase and stopping is how an inch gets left behind. Below 64k keys none of it engages: threads cost more than the work, and small checkpoints are the common case."
-  },
-  {
-   "experiment": "f34-parallelindex",
-   "id": "F34.2",
-   "profile": "full",
-   "expect": "fails",
-   "because": "995,460 ops/s against 957,516 -- 1.040x at p=0.2502, still no difference, with the build now 1.930x faster rather than 1.667x. It saves 0.081s of a 1.0s load, which is 8%, and this host cannot resolve 8% end to end: EXT.1 has moved 0.866x to 1.331x here with no code change at all. Recorded as failing because that is what the gate says, and the useful form of the result is the pair -- gate the phase, where 1.930x at p=0.0009 is unambiguous, and report the load contribution as arithmetic. An 8% saving that cannot be measured end to end on the available machine is still 8%; what it is not is evidence, and the two should not be confused. The Mac runner holds ratios to 1.2-5.0% across runs and could resolve it."
   },
   {
    "experiment": "ext-analytics",
@@ -793,125 +454,6 @@
    "profile": "full",
    "expect": "holds",
    "because": "FIXED by format v6; was recorded failing at 0.307x (3.44 ns/posting against 1.06) while every value carried a varint length prefix -- a 5-byte stride for 4-byte postings and a serial dependent decode. A run whose values share one width is now stored back to back with no prefixes, flagged in its extent (Ext::FIXED, beside the tombstone bit), and reading it is a walk over the extent's bytes: 1.03 ns/posting against lmdb-dup's 1.23 -- 1.200x at p=0.0553, no difference at the gate, and 1.201x, 1.192x, 1.150x significant and 1.248x not on the four full runs beside it. Claimed as parity, so it holds on a tie or a lead, and it has been one or the other in all five runs. P18's first half held (from 0.31x to at least parity); its second -- past 2x on long lists -- did not, because the probes are uniform over a dictionary whose median list is 255 postings and the per-key constant, not the per-posting cost, decides most of them; DUPFIXED's page-at-a-time GET_MULTIPLE is also a memcpy-shaped walk, so on the bulk axis the two encodings are now the same encoding. The size consolation grew: Supdb's file is 4.05 MB, from 5.02, against lmdb-dup's 7.33 for the same million postings -- the prefix was 19% of the file, as predicted. Checksums on or off reads the same 1.0 ns (ratio 1.002), because verification is per block and the block is read once."
-  },
-  {
-   "experiment": "f36-commit",
-   "id": "F36.1",
-   "profile": "full",
-   "expect": "fails",
-   "because": "FIXED, in two steps the three-arm decomposition now prices separately. Log-first points took the residual from 87.4% to 31.3% (fsync stopped flushing a 68 MB mapping's dirty pages); the value-carrying log then removed the seal from the point entirely and took the whole bill down: 79.2 MB reach the device for the log-values arm against 161.4 for log-extents and 765.1 for no-log, residual 19.1%. values_vs_extents reads 1.764x and values_vs_nolog 2.851x at 200k keys (p=0.0022; arms 339,332 / 192,425 / 119,014 ops/s at 79.2 / 157.0 / 765.1 MB); at 1M keys the same arms read 1.814x and 4.819x -- but only after an O(keys) scan per point was replaced by a per-shard queue, and the unfixed 1M run that read 0.718x is kept in results history as the shape of that quadratic. The ledger stays in the experiment so the next regression of this kind is a diff, not a hunt."
-  },
-  {
-   "experiment": "f37-consolidate",
-   "id": "F37.1",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Deferred (geometric suffix) consolidation lifts fragmenting append throughput 3.963x over the inline whole-run merge (137,660 vs 34,734 ops/s, p=0.0022) -- ABOVE the 1.6-3.5x prediction band registered before the run, with the refutation floor at 1.3x. Inline rewrites O(n^2) bytes per key over its life; deferred absorbs an older extent only into a run at least its own size, so a byte is copied O(log n) times. Default ON since this record; the flag remains the measurement instrument."
-  },
-  {
-   "experiment": "f37-consolidate",
-   "id": "F37.2",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Deferred consolidation shortens the append p99.9 3.427x: 501.8us inline to 146.4us deferred, worst single append 202.0ms to 70.1ms. This is F5.1's tail measured against the policy that causes it. Note what deferral does NOT do: the biggest cascade merge is still O(run) -- it bounds how often the big rewrites happen, not how big the biggest one is."
-  },
-  {
-   "experiment": "f37-consolidate",
-   "id": "F37.3",
-   "profile": "full",
-   "expect": "fails",
-   "because": "Recorded as failing ON PURPOSE: deferred consolidation taxes the read-back pass at 0.762x (30.98 vs 40.68 Mvalues/s), because a deferred key holds O(threshold + log n) extents where inline holds at most threshold, and reads pay per extent. This is the price of the 3.96x write-side win and this entry is what keeps it from being forgotten. The default flipped ON with this loss on the books; if a read-heavy deployment finds it unacceptable, the policy needs a list-length cap, and this entry is where that decision lives."
-  },
-  {
-   "experiment": "f37-consolidate",
-   "id": "F37.4",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Inline sends 4,699.7 MB to the block layer where deferred sends 1,286.7, for 113.3 MB of appended records -- 3.652x fewer device bytes (p=0.0014). The O(n^2) rewrite is a device cost before it is a latency cost, which is how W1.3 saw it first on the space axis."
-  },
-  {
-   "experiment": "f37-consolidate",
-   "id": "F37.5",
-   "profile": "full",
-   "expect": "holds",
-   "because": "File after close: deferred 1,287.6 MB against inline 4,699.6 (0.274x, p=0.0004). The same mechanism read through the file: what inline rewrote and left dead, deferred never wrote. Downstream, flipping the default took w1's line-ordered day index from 740.5 MB to 190.0 -- the naive-roll penalty W1.3 prices fell from 22.6x to 5.17x while the claim itself kept holding, since term order still writes less than a third."
-  },
-  {
-   "experiment": "f38-fanout",
-   "id": "F38.1",
-   "profile": "full",
-   "expect": "holds",
-   "because": "The unfiltered fan tax is linear and inside the band registered in fanout-plan.md before the run: 90ns per extra probe at four segments, 92 at sixteen (k1 554ns/read, fan4 689, fan16 1247, both p=0.0022). The ci smoke read 21-27ns and argued the band was too high; full scale restored it, because at 1M keys a failed hash probe misses cache like everything else. A per-segment existence filter earns its place only by adjudicating presence in well under 90ns; that number is now the filter's budget rather than a guess."
-  },
-  {
-   "experiment": "f38-fanout",
-   "id": "F38.2",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Segmentation itself is free: perfectly-routed reads over four and sixteen segments are indistinguishable from the single store (1.068x and 1.120x, p=0.0553, no difference -- leaning positive if anything, the ci run's smaller-index cache effect shrunk into noise at 1M keys). The entire fan-out cost is the probing, none of it the splitting, so the next engine buys write-side segmentation at zero read cost IF routing is solved -- and F38.1 prices what routing must beat."
-  },
-  {
-   "experiment": "f38-fanout",
-   "id": "F38.3",
-   "profile": "full",
-   "expect": "fails",
-   "because": "Registered prediction P3 said the x86 read lead survives an unfiltered four-segment fan; it does not, and this entry records the refutation. fan4 keeps 80.5% of k1 (threshold was 85%), which puts EXT.11's 1.355x lead at 1.09x -- inside that comparison's own noise on this host -- and fan16 keeps 44.4%, lead 0.60x, gone outright. The design consequence is stronger than predicted: routing or filtering is required from k=4 up, not merely at large k. Read with F38.2, the shape is settled -- segments cost nothing, unrouted probes cost everything."
-  },
-  {
-   "experiment": "f39-walfloor",
-   "id": "F39.1",
-   "profile": "full",
-   "expect": "holds",
-   "because": "A raw log-only durable batch -- framed append + fdatasync, no engine -- sustains 1,191,125 ops/s at batch 1000 on this host, 0.84ms per barrier, inside the 600k-2.5M band registered in walfloor-plan.md. That is 2.08x LMDB's recorded durable load (EXT.9, 572,416, context only), so a one-barrier commit has the headroom to win the axis this engine has always lost; whether an engine can stay near its own floor is now the design question, not whether the floor is high enough."
-  },
-  {
-   "experiment": "f39-walfloor",
-   "id": "F39.2",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Adding a hash-map insert per op -- the memtable bookkeeping no engine can skip -- keeps 85.1% of the raw floor (1,014,003 against 1,191,125, p=0.0298). The tax is real but small: the write path's budget is spent at the barrier and the log, not in the map, so the next engine's durable-load promise is registered against the raw+index arm, ~1.0M ops/s on this host."
-  },
-  {
-   "experiment": "f39-walfloor",
-   "id": "F39.3",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Today's engine commits at 203,603 ops/s against the 1,191,125 floor -- 5.85x below, p=0.0022, mid-band of the registered 3-8x. The gap is per-point arena append + section work that a WAL-only design deletes rather than optimizes, and 5.85x is the number the rewrite is claiming to recover. Read with F39.1: the floor clears LMDB by 2.08x and today's engine sits 2.8x below LMDB, so the whole 0.348x deficit on EXT.9 lives between the engine and its own floor, none of it in the hardware."
-  },
-  {
-   "experiment": "f40-filter",
-   "id": "F40.1",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Per-segment blocked Blooms keep 82.1% of the single-store read rate at sixteen segments -- 1.693x over the unfiltered fan (p=0.0022) but only 0.683x of the oracle, inside the 60-85% band registered in filter-plan.md. The mechanism is structural, not tunable: a fixed probe order queries ~8.5 filters per lookup before its first data probe, so per-segment filtering recreates the fan tax at a smaller constant and cannot reach the ceiling at this k."
-  },
-  {
-   "experiment": "f40-filter",
-   "id": "F40.2",
-   "profile": "full",
-   "expect": "fails",
-   "because": "Registered prediction P2 said a global key->segment map recovers 95% of perfect routing; it recovers 61.7% (765ns/read against the oracle's 472, p=0.0022) and loses to the per-segment blooms it was supposed to beat. The refutation clause named the cause in advance: a routing map's real cost is not its lookup arithmetic but its memory misses -- a std hash map at 1M entries pays ~290ns of SipHash and DRAM walk per query. The re-examination it demanded is f41: a routing structure has to answer in one cache miss or it is not a routing structure."
-  },
-  {
-   "experiment": "f40-filter",
-   "id": "F40.3",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Min/max fences prune nothing when segment key-ranges overlap: fence16 within noise of the unfiltered fan (0.918x, p=0.0553, no difference). Round-robin dealing makes every segment's range cover every key and the fence admits every probe. Recorded so the design never assumes fences route without key-partitioned sealing; they are a compaction-policy benefit, not a general router."
-  },
-  {
-   "experiment": "f41-segroute",
-   "id": "F41.1",
-   "profile": "full",
-   "expect": "fails",
-   "because": "Registered prediction P1 said a purpose-built one-line-load fingerprint table routes at 85-100% of the perfect-routing ceiling; it routes at 71.5% (791ns/read against the oracle's 566, p=0.0022, max observed spill 2 buckets). The ~225ns it pays over the oracle is the DRAM miss on an 8.4MB side structure -- the same order as f40's generic hash map once its hashing overhead is stripped. The refutation generalizes: at 1M keys, ANY router consulted per lookup costs a memory miss on a keys-sized structure. The only free routing is information the reader already holds -- which is what fences over key-partitioned segments are, and why compaction policy owns this problem rather than filter engineering."
-  },
-  {
-   "experiment": "f41-segroute",
-   "id": "F41.2",
-   "profile": "full",
-   "expect": "fails",
-   "because": "The fingerprint table does not beat per-segment blooms: 791ns against 806, no difference at p=0.0736, while costing 8.39 B/key against the blooms' 1.25 -- a 6.7x memory price for a tie. Registered as the decision gate and it decided: global routing is not worth its mutability concession at any price measured across f40 and f41. The next engine keeps routing inside immutable per-segment state (blooms for segments with overlapping ranges) and buys the rest with range-partitioned compaction, where the fence F40.3 showed inert on overlapping ranges becomes a two-comparison router that touches no side structure at all."
   },
   {
    "experiment": "f42-next",
@@ -1038,20 +580,6 @@
    "profile": "full",
    "expect": "fails",
    "because": "Back to a tie, as this entry said it would if the next run read one: 23.55M against 24.53M entries/s, no difference at p=1.0 (0.960x), after 1.107x at p=0.01 in the run before. The x86 history is now 0.986x, 0.976x, 1.034x, 0.937x, 1.053x, 0.926x, 1.107x (sig), 0.960x -- one significant reading in eight, on a policy bit that does about the same work either way at 1M keys and 32 MB seals: under 32 MB seals both arms are partitioned by the time the scan runs, so a scan walks disjoint partitions in both and there is no k-way merge left to be slower. Read it as EXT.25's twin and quote the two together; the 64 MB seals where the knob selected something (2.007x, 1.549x, 1.681x) are in f52's record."
-  },
-  {
-   "experiment": "f46-segwrite",
-   "id": "F46.1",
-   "profile": "full",
-   "expect": "fails",
-   "because": "DECLINED ON MEASUREMENT, which is what the bar was registered for. A purpose-built segment writer's FLOOR runs 2.06x the general put path (1,660,878 keys/s against 805,911), replicated at 2.04x on a quieter run (1,956,817 against 960,301, p=0.0022) -- below the 3x that segwrite-plan.md set as the price of a second writer in the format layer. And the floor flatters it: it writes values and one index section and nothing else, no block table, no checksums, no superblock, so a real writer lands BELOW 2x. Against that, EXT.25 recovered 1.985x on the same axis by flipping one policy bit, for free and with no new code in the format. This is the second format change this project has priced and declined in a session (f45 was the first), and both declines came from measuring the ceiling before building toward it."
-  },
-  {
-   "experiment": "f46-segwrite",
-   "id": "F46.2",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Building the key index is 19.0% of the floor -- `flatindex::encode` over 1M keys takes 0.097s of 0.511s -- so the index is not what makes a seal expensive and a bespoke writer could not have escaped it anyway, since a checkpoint pays exactly the same call. What the general path spends the other way is per-key bookkeeping for a store that will never be updated: a hash table probe, a shard, a dirty set and a freelist, all of which exist to support mutation that a sealed segment does not have. That the total is still only 2x says the put path is not carrying much fat, which is the more useful thing to know."
   },
   {
    "experiment": "f47-parwal",
@@ -1749,57 +1277,10 @@
  ],
  "metrics": [
   {
-   "experiment": "f5-latency",
-   "path": "series.throughput.ops_per_s",
-   "min": 100000,
-   "because": "Pinned to ci. At full scale this figure collapses to about 12,500 ops/s because a single checkpoint took 66 seconds; the floor here exists to catch a collapse in the append path itself, not in checkpointing.",
-   "profile": "ci"
-  },
-  {
-   "experiment": "f6-threads",
-   "path": "series.scaling.0.ops_per_s",
-   "min": 200000,
-   "because": "Single-threaded append throughput. The axis the design is built to win, so a regression here is the most serious kind.",
-   "profile": "ci"
-  },
-  {
-   "experiment": "f3-multiproc",
-   "path": "series.readers.read_errors",
-   "max": 0,
-   "because": "Zero read errors across reader processes. Any nonzero value means a reader observed space the writer reused underneath it."
-  },
-  {
-   "experiment": "f3-multiproc",
-   "path": "series.readers.torn_or_inconsistent",
-   "max": 0,
-   "because": "Zero torn or inconsistent states."
-  },
-  {
    "experiment": "ext-kv",
    "path": "series.engines.0.read_hit_rate",
    "min": 0.99,
    "because": "The comparison is only meaningful if the engine actually returns the data. A collapse here would mean the reads being timed are misses."
-  },
-  {
-   "experiment": "f5-latency",
-   "profile": "full",
-   "path": "series.throughput.ops_per_s",
-   "min": 5000,
-   "because": "At full scale end-to-end throughput is about 12,500 ops/s -- two orders of magnitude below the append rate -- because checkpoint() rewrites the whole key index and one took 66 seconds. The floor is set low deliberately: it guards against total collapse while recording that the figure is already dominated by checkpointing."
-  },
-  {
-   "experiment": "f5-latency",
-   "profile": "full",
-   "path": "series.checkpoint_latency.max_ms",
-   "max": 120000,
-   "because": "The worst observed checkpoint is 66.6 seconds at 500k keys. This ceiling is a tripwire, not a target: any growth past two minutes means the O(nkeys) checkpoint has become unusable at this scale."
-  },
-  {
-   "experiment": "f6-threads",
-   "profile": "full",
-   "path": "series.scaling.0.ops_per_s",
-   "min": 500000,
-   "because": "Single-threaded append throughput at full scale, the axis the design is built to win."
   },
   {
    "experiment": "f10-pair-hash-paged-vs-hash-pagedfixed",

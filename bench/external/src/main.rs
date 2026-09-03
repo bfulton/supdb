@@ -1312,10 +1312,8 @@ fn suite_readdecomp(
             }
         }
         _ => {
-            blockers.push(
-                "the pair this decomposition is about (next vs lmdb) was not fielded"
-                    .into(),
-            );
+            blockers
+                .push("the pair this decomposition is about (next vs lmdb) was not fielded".into());
         }
     }
 
