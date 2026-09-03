@@ -12,8 +12,8 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use supdb::blob::{open_probe, open_sparse_fence_ranges, open_sparse_ranges};
-use supdb::next::SegmentWriter;
-use supdb::{Blob, Bytes, MmapBytes, Options, SparseBlob};
+use supdb::SegmentWriter;
+use supdb::{Blob, Bytes, MmapBytes, SegmentOptions, SparseBlob};
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-dicttest-{name}"));
@@ -145,7 +145,7 @@ fn build_segment(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)]) {
 }
 
 fn build_segment_with(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)], inline_max: usize) {
-    let opts = Options::default();
+    let opts = SegmentOptions::default();
     let mut w = SegmentWriter::create(path, &opts).expect("create");
     w.set_inline_max(inline_max);
     for (k, vals) in all {

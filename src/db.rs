@@ -1,12 +1,12 @@
-//! The next engine, milestone 1: a WAL is the only mutable thing.
+//! The engine, milestone 1: a WAL is the only mutable thing.
 //!
-//! `docs/next-engine.md` is the design brief and every load-bearing decision
+//! `docs/engine.md` is the design brief and every load-bearing decision
 //! here cites a measurement. A durable commit is one framed append and one
 //! fdatasync and nothing else, because f39 measured that shape at 1,191,125
 //! ops/s with all engine work removed (F39.1) and today's engine 5.85x below
 //! it on work this design deletes (F39.3). Sealed segments are byte-for-byte
 //! today's store format, written by the existing `Store` writer and read by
-//! `Blob` (`Options { redo_log: false, shards: 1 }` -- the logshed
+//! `Blob` (`SegmentOptions { redo_log: false, shards: 1 }` -- the logshed
 //! configuration), so everything measured about that read path carries over,
 //! browser reader included. There is no checkpoint: sealing is off the
 //! commit path, and a store killed before its first seal opens from the WAL
@@ -115,17 +115,17 @@ fn idle_io_priority() {
 }
 
 #[derive(Clone)]
-pub struct NextOptions {
+pub struct Options {
     pub sync: SyncPolicy,
     /// Memtable bytes that trigger a seal at the next commit. Sealing is off
     /// the commit path in cost accounting but runs on the committing thread
     /// in milestone 1; the brief's "Segment size" question owns this number.
     pub seal_bytes: usize,
-    /// Options for the segment writer. Fixed to `redo_log: false, shards: 1`
+    /// SegmentOptions for the segment writer. Fixed to `redo_log: false, shards: 1`
     /// regardless of what is passed, because a sealed segment is written
     /// once and never reopened for writing -- the logshed finding that a
     /// 4 MiB redo arena in a write-once file is pure waste.
-    pub segment: Options,
+    pub segment: SegmentOptions,
     /// How many overlapping L0 segments to tolerate before a partitioning
     /// merge. The brief's open "partitioned compaction policy" question in
     /// one number; f43 sweeps it.
@@ -201,16 +201,16 @@ pub struct NextOptions {
     pub scan_snapshot_arena: bool,
 }
 
-impl Default for NextOptions {
-    fn default() -> NextOptions {
-        NextOptions {
+impl Default for Options {
+    fn default() -> Options {
+        Options {
             sync: SyncPolicy::Always,
             // 32 MB seals over 64 MB partitions: f52 measured 1.129x the
             // ingest of 64 MB seals at identical device bytes and identical
             // reads (F52.5, F52.6). Smaller still buys nothing and costs
             // 1.5x the device bytes.
             seal_bytes: 32 << 20,
-            segment: Options::default(),
+            segment: SegmentOptions::default(),
             l0_trigger: 4,
             compact: true,
             partition_on_flush: true,
@@ -486,12 +486,12 @@ impl Wal {
                 return Ok((from, 0));
             }
             return Err(err(
-                "not a next-engine WAL: the header is missing or from an older format",
+                "not a supdb WAL: the header is missing or from an older format",
             ));
         }
         if &buf[..WAL_MAGIC.len()] != WAL_MAGIC {
             return Err(err(
-                "not a next-engine WAL: the header is missing or from an older format",
+                "not a supdb WAL: the header is missing or from an older format",
             ));
         }
         let mut p = WAL_MAGIC.len();
@@ -749,7 +749,7 @@ pub struct SegmentWriter {
     /// Runs up to this many bytes go into the record's tail instead of a
     /// block (`Ext::INLINE`); zero keeps every run in blocks.
     inline_max: usize,
-    /// LZ4 the blocks, as `Store` does when `Options::compress` is set. A
+    /// LZ4 the blocks, as `Store` does when `SegmentOptions::compress` is set. A
     /// block above the chunk size is compressed chunk by chunk with its own
     /// directory, so a point read decompresses one chunk rather than the
     /// block; one that does not shrink is written verbatim. Inline runs live
@@ -828,8 +828,8 @@ fn superblock(fields: &[u64; 16]) -> [u8; crate::format::SUPER_BYTES] {
 impl SegmentWriter {
     /// Open `path` for a fresh segment. `opts` supplies the block size, the
     /// checksum switch and whether the index build may use threads; the
-    /// rest of `Options` describes machinery this writer does not have.
-    pub fn create(path: &Path, opts: &Options) -> Result<SegmentWriter> {
+    /// rest of `SegmentOptions` describes machinery this writer does not have.
+    pub fn create(path: &Path, opts: &SegmentOptions) -> Result<SegmentWriter> {
         // The checksum switch is process-wide and `Store::create` sets it
         // from the same option; a writer that recorded none while readers
         // expected them would fail every block it wrote.
@@ -1437,7 +1437,7 @@ impl SegmentWriter {
 /// Three settings, which is what is left of a struct that once carried
 /// twenty-four: the rest described a writer that no longer exists -- its
 /// buffer, its shards, its redo log, its freelist, its checkpoint policy --
-/// and nothing read them. `NextOptions::segment` carries one of these to the
+/// and nothing read them. `Options::segment` carries one of these to the
 /// writer for every piece the engine seals or merges.
 ///
 /// Compression is deliberately not here. It is a property of one file rather
@@ -1446,7 +1446,7 @@ impl SegmentWriter {
 /// nothing, which is how `tests/ranges.rs` came to check the plain path while
 /// claiming to check the compressed one.
 #[derive(Clone, Debug)]
-pub struct Options {
+pub struct SegmentOptions {
     /// Target size of a compression block. Bigger compresses better and costs
     /// more to decompress on a point read; this is the size/read dial.
     pub block_size: usize,
@@ -1467,9 +1467,9 @@ pub struct Options {
     pub parallel_index: bool,
 }
 
-impl Default for Options {
-    fn default() -> Options {
-        Options {
+impl Default for SegmentOptions {
+    fn default() -> SegmentOptions {
+        SegmentOptions {
             block_size: 64 * 1024,
             checksums: true,
             parallel_index: true,
@@ -1489,7 +1489,7 @@ struct PieceWriter(Box<SegmentWriter>);
 impl PieceWriter {
     fn create(
         path: &Path,
-        opts: &Options,
+        opts: &SegmentOptions,
         sync_every: usize,
         inline_max: usize,
     ) -> Result<PieceWriter> {
@@ -1996,7 +1996,7 @@ struct MergePlan {
     parts: usize,
     fences: Option<Vec<Fence>>,
     max_keys: usize,
-    opts: Options,
+    opts: SegmentOptions,
     cursors: bool,
     background_io: BackgroundIo,
     sync_every: usize,
@@ -2123,7 +2123,7 @@ struct Piece {
 /// differ only in that.
 struct Emitter<'a> {
     dir: &'a Path,
-    opts: &'a Options,
+    opts: &'a SegmentOptions,
     sync_every: usize,
     inline_max: usize,
     pieces: Vec<Piece>,
@@ -2470,7 +2470,7 @@ pub struct SealWaits {
 
 pub struct Db {
     dir: PathBuf,
-    opts: NextOptions,
+    opts: Options,
     wal: Wal,
     wal_id: u64,
     mem: MemTable,
@@ -2693,11 +2693,11 @@ impl Db {
         self.segs.iter().map(|s| s.name.clone()).collect()
     }
 
-    fn segment_opts(opts: &NextOptions) -> Options {
+    fn segment_opts(opts: &Options) -> SegmentOptions {
         opts.segment.clone()
     }
 
-    pub fn create(dir: &Path, opts: NextOptions) -> Result<Db> {
+    pub fn create(dir: &Path, opts: Options) -> Result<Db> {
         std::fs::create_dir_all(dir)?;
         let mut wal = Wal::create(&Db::wal_path(dir, 0), 0)?;
         let mut spare_wals = Vec::new();
@@ -2739,7 +2739,7 @@ impl Db {
     /// whatever outlived the last seal, torn tail tolerated. A directory
     /// with no segments and only a WAL is a store killed before its first
     /// seal, and it opens -- the brief's P-E.
-    pub fn open(dir: &Path, opts: NextOptions) -> Result<Db> {
+    pub fn open(dir: &Path, opts: Options) -> Result<Db> {
         // The manifest is the truth when it exists. Without one -- a store
         // killed before its first seal -- the directory is scanned, which
         // is also how a store written before manifests still opens.

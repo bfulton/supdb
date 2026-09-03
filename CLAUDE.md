@@ -103,7 +103,7 @@ is not a measurement.
 
 | path | what |
 |---|---|
-| `src/next.rs` | the engine: WAL with atomic batches, memtable, sealed segments, partitioned compaction, deletes, `Txn`, and the `SegmentWriter` every segment is written by -- `docs/next-engine.md` |
+| `src/db.rs` | the engine: WAL with atomic batches, memtable, sealed segments, partitioned compaction, deletes, `Txn`, and the `SegmentWriter` every segment is written by -- `docs/engine.md` |
 | `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
 | `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index |
 | `src/bytes.rs`, `src/blob.rs` | the read path over any byte source; compiles for wasm |
@@ -180,7 +180,7 @@ runs and 1.4-1.6x over the seven before (`EXT.23`, ten consecutive holds),
 ordered scan 0.90x in the latest run after six ties (`EXT.24`). Leaving
 partitioning to compaction no longer separates the arms at this load
 (`EXT.25`, `EXT.26`: ties, because the trigger fires at the fourth 32 MB
-seal either way). Its story is in `docs/next-engine.md`; every number there
+seal either way). Its story is in `docs/engine.md`; every number there
 is under the same gate.
 
 On Apple Silicon the same pair reads 3.30x and 3.18x, scans 1.20x twice,
@@ -250,11 +250,11 @@ lesson is in ycsb-plan.md. On E the undrained arm trails its own drained
 shape 4.3x and LMDB 9x: the unrouted scan, once more.
 
 Under shuffled arrival the same matched pair inverts. `EXT.27`
-(`ext-loadshape`, full) has the next engine at 284,938 ops/s against
+(`ext-loadshape`, full) has the engine at 284,938 ops/s against
 LMDB's 48,041, **5.93x** (6.64x replicated with the borrowed batch),
 because a durable commit of a thousand random
 keys dirties about as many B-tree leaf pages and the fsync writes them
-all; the next engine's own ordered arm in that run is 0.653x, so the
+all; the engine's own ordered arm in that run is 0.653x, so the
 canonical load's ascending keys are the one arrival order that flatters
 the B-tree. Quote the two together. The plan for that run predicted the
 opposite (shape-plan.md), which is why it is written down.
@@ -351,7 +351,7 @@ refused by its magic rather than misread.
 
 **A small run lives in its index record, and a read of it touches no block.**
 Since the inline extension of v5, the segment writer stores a run of values
-up to `NextOptions::inline_bytes` (256 by default) inside the record itself,
+up to `Options::inline_bytes` (256 by default) inside the record itself,
 after the extents; its extent names `Ext::INLINE` instead of a block. A point
 read then costs the hash slot and the record -- two cache misses fewer than
 the block table row and the block at a million keys, which f53 measured

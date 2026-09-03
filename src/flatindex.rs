@@ -19,10 +19,9 @@
 //! Two things this format pays for deliberately:
 //!
 //!   * **It is stored uncompressed.** A compressed section has to be
-//!     decompressed into a buffer, and a buffer per reader is most of what
-//!     F7.2 is complaining about. The cost is file size, which is Supdb's
-//!     other real advantage, so the arms are behind `Options::flat_index` and
-//!     measured rather than assumed.
+//!     decompressed into a buffer, and a buffer per reader is exactly what a
+//!     mapped index exists to avoid. The cost is file size, and it is paid
+//!     knowingly: a reader shares the mapping and decodes nothing.
 //!   * **It is native-endian.** Extents are read as `&[Ext]` straight out of
 //!     the mapping with no decode step at all, which is the whole point, and
 //!     that means a file written on a little-endian machine is not readable on

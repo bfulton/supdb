@@ -2181,7 +2181,7 @@ fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     // ---- build all three stores from the same stream ----
     //
-    // `Options::checksums` is a process-global set by the writer, so the
+    // `SegmentOptions::checksums` is a process-global set by the writer, so the
     // no-checksum file is built FIRST and the checksummed one second: the
     // global is then still on when the checksummed arm reads, and the nocksum
     // arm opts out per-reader with `BlobOptions::verify_checksums`.
@@ -2197,9 +2197,9 @@ fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
     );
     let root = scratch("analytics");
     let build_segment = |path: &std::path::Path, checksums: bool| {
-        let mut w = supdb::next::SegmentWriter::create(
+        let mut w = supdb::SegmentWriter::create(
             path,
-            &supdb::Options {
+            &supdb::SegmentOptions {
                 checksums,
                 ..Default::default()
             },

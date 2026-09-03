@@ -258,7 +258,7 @@ fn dir_size(p: &Path) -> u64 {
 /// (every segment contributes candidates) until range-partitioned compaction
 /// lands; that cost is the arm's to show, not to hide.
 pub struct Next {
-    db: Option<supdb::next::Db>,
+    db: Option<supdb::Db>,
     path: PathBuf,
     /// False for the ingest-first arm: a flush stops partitioning what it
     /// sealed and leaves that to background compaction. Both arms exist so
@@ -293,8 +293,8 @@ impl Next {
         // Checksums off in the segments, because LMDB has none and the axis
         // is equalizable -- the same call `supdb-durable` makes, and the
         // fairness gate refused to rank this arm until it was made here too.
-        let opts = supdb::next::NextOptions {
-            segment: supdb::Options {
+        let opts = supdb::Options {
+            segment: supdb::SegmentOptions {
                 checksums: false,
                 ..Default::default()
             },
@@ -318,7 +318,7 @@ impl Next {
             partition_on_flush: partition,
             ..Default::default()
         };
-        let db = supdb::next::Db::create(path, opts).map_err(|e| e.to_string())?;
+        let db = supdb::Db::create(path, opts).map_err(|e| e.to_string())?;
         Ok(Next {
             db: Some(db),
             path: path.to_path_buf(),
@@ -509,7 +509,7 @@ impl Engine for Redb {
 /// the WAL and lets the OS get to it, matching `lmdb-nosync` and
 /// `supdb-buffered`.
 ///
-/// Options are RocksDB's defaults except that compression is off, because
+/// SegmentOptions are RocksDB's defaults except that compression is off, because
 /// every other engine here stores values as written (block compression is
 /// off in supdb since f12 priced it) and a comparison of compressed bytes
 /// against plain ones would be a comparison of codecs, and that reads do
@@ -560,7 +560,7 @@ impl Rocks {
 
     fn with(path: &Path, sync: bool, tuned: bool, drain: bool) -> Res<Rocks> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
-        let mut o = rocksdb::Options::default();
+        let mut o = rocksdb::SegmentOptions::default();
         o.create_if_missing(true);
         o.set_compression_type(rocksdb::DBCompressionType::None);
         if tuned {

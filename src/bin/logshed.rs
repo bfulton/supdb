@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use supdb::bench::{Finding, Profile, Record, Rng, J};
 use supdb::bytes::MmapBytes;
 use supdb::jobj;
-use supdb::{Blob, Options};
+use supdb::{Blob, SegmentOptions};
 
 // ---------------------------------------------------------------- the model --
 
@@ -141,7 +141,7 @@ fn build_day_segment(
     deltas: bool,
 ) -> std::io::Result<u64> {
     let _ = std::fs::remove_file(path);
-    let mut w = supdb::next::SegmentWriter::create(path, &Options::default())?;
+    let mut w = supdb::SegmentWriter::create(path, &SegmentOptions::default())?;
     w.set_inline_max(inline);
     w.set_compress(compress);
     if head_reserve > 0 {
@@ -265,7 +265,7 @@ fn seg_value(key: &[u8], ord: u32, out: &mut [u8; SEG_VALUE_BYTES]) {
 /// anyway, since it is what makes the day's file the size it is.
 fn build_segment(path: &Path, events: u64) -> std::io::Result<()> {
     let _ = std::fs::remove_file(path);
-    let mut w = supdb::next::SegmentWriter::create(path, &Options::default())?;
+    let mut w = supdb::SegmentWriter::create(path, &SegmentOptions::default())?;
     let mut key = Vec::with_capacity(32);
     let mut val = [0u8; SEG_VALUE_BYTES];
     let mut terms: Vec<Vec<u8>> = Vec::new();

@@ -6,7 +6,7 @@ benchmark program would have to contain to constitute proof.
 
 > This review was written against the engine vendored from the design
 > artifact, which has since been retired (`retire-plan.md`); the repository now
-> has one engine, `src/next.rs`. Its line-level references are to code no
+> has one engine, `src/db.rs`. Its line-level references are to code no
 > longer in the tree, and a number of the experiments it motivates have gone
 > with that engine. It is kept because it is why the falsification suite exists
 > and why the format is shaped as it is -- read it as the review it was, not as

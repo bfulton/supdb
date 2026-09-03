@@ -310,9 +310,9 @@ valgrind --tool=dhat ./target/release/indexlab probe --layout heap-hash --keys 2
 ```
 
 
-## The next engine's commit path, subtracted (f58)
+## The commit path, subtracted (f58)
 
-The same method on `src/next.rs`, for the append-and-commit path below the
+The same method on `src/db.rs`, for the append-and-commit path below the
 first seal -- 100,000 records of 100 bytes in 1,000-record batches,
 `Sync::Always`, no flush -- registered in `profile-plan.md`:
 

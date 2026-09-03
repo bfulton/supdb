@@ -1,6 +1,6 @@
 # Retiring the original engine
 
-Two engines have been in the tree since `src/next.rs` shipped. `Store` is the
+Two engines have been in the tree since `src/db.rs` shipped. `Store` is the
 vendored one from the design artifact; `Db` is the one every current comparison
 and every browser path is measured on. Keeping both costs more than the second
 engine is worth: it doubles the surface a reader has to hold, and it lets

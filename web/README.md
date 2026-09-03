@@ -102,7 +102,7 @@ the count, one boundary crossing and one copy per key where `lookup` frames
 one view per record; a common trigram has hundreds of thousands of
 postings, and fixed-width ones come back as one typed array.
 
-Reads of small keys are free too, for a segment the next engine wrote: a run
+Reads of small keys are free too, for a segment the engine wrote: a run
 of values up to 256 bytes lives inside its index record (`Ext::INLINE`), so
 `readAll` on such a key is answered from the resident index and `ranges_for`
 plans nothing. Only runs longer than that reach the data by plan.

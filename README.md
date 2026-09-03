@@ -9,7 +9,7 @@ and a benchmark suite whose job is to **try to falsify** the claims made about
 it.
 
 ```
-src/next.rs        the engine -- WAL, memtable, sealed segments, compaction, deletes, Txn
+src/db.rs          the engine -- WAL, memtable, sealed segments, compaction, deletes, Txn
 src/blob.rs        the read path over any byte source; compiles for wasm
 src/flatindex.rs   the flat key index the format is built on
 src/bench/         the measurement substrate  -- repetition, significance, latency, I/O accounting

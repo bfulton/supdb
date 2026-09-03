@@ -2,7 +2,7 @@
 
 The next engine's durable-load number (`EXT.22`, 0.694x of LMDB) is only a
 number if an acknowledged commit is actually on the device when `commit`
-returns. So far that rests on `tests/next.rs`, which emulates one crash at a
+returns. So far that rests on `tests/db.rs`, which emulates one crash at a
 time by tearing a WAL by hand, and on the fact that `commit` calls
 `fdatasync`. Nothing here has killed the process while a seal, a promotion
 and a merge were in flight and asked what the directory then opens to. `c3`

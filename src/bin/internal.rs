@@ -27,7 +27,7 @@ use supdb::bench::{
     Record, Rng, Samples, Trial, J,
 };
 use supdb::jobj;
-use supdb::Options;
+use supdb::SegmentOptions;
 
 // ------------------------------------------------------------------ args --
 
@@ -208,7 +208,7 @@ fn f1_outofcore(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let resident_keys = (resident_mb * 1048576) / value_size.max(1) as u64;
     let resident = {
         let rf = dir.join("resident.dat");
-        let mut w = supdb::next::SegmentWriter::create(&rf, &Options::default())?;
+        let mut w = supdb::SegmentWriter::create(&rf, &SegmentOptions::default())?;
         let mut vrng = Rng::new(0x8F1);
         let mut kb = [0u8; 16];
         for i in 0..resident_keys {
@@ -230,7 +230,7 @@ fn f1_outofcore(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let io0 = IoCounters::read_now();
     {
-        let mut w = supdb::next::SegmentWriter::create(&file, &Options::default())?;
+        let mut w = supdb::SegmentWriter::create(&file, &SegmentOptions::default())?;
         let mut vrng = Rng::new(0xF1);
         let mut kb = [0u8; 16];
         // One value per key, in byte order: `db_key_into` is a zero-padded
@@ -457,7 +457,7 @@ fn f8_checksums(args: &Args, profile: Profile) -> std::io::Result<Record> {
         .param("values_per_key", J::u(depth))
         .param("value_size", J::u(value_size as u64))
         .param("reads", J::u(reads))
-        .note("both arms interleaved in one process; the only difference is Options::checksums");
+        .note("both arms interleaved in one process; the only difference is SegmentOptions::checksums");
 
     let dir = scratch("f8");
     let payload = Payload::new(value_size, 0.5, 0xF8);
@@ -467,11 +467,11 @@ fn f8_checksums(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let trial = Trial::new(profile.reps());
     let write = trial.run(2, |ci, rep| {
         let file = dir.join(format!("w{ci}-{rep}.dat"));
-        let mut w = supdb::next::SegmentWriter::create(
+        let mut w = supdb::SegmentWriter::create(
             &file,
-            &Options {
+            &SegmentOptions {
                 checksums: on[ci],
-                ..Options::default()
+                ..SegmentOptions::default()
             },
         )
         .expect("create");
@@ -499,11 +499,11 @@ fn f8_checksums(args: &Args, profile: Profile) -> std::io::Result<Record> {
     for (ci, want) in on.iter().enumerate() {
         let file = dir.join(format!("r{ci}.dat"));
         {
-            let mut w = supdb::next::SegmentWriter::create(
+            let mut w = supdb::SegmentWriter::create(
                 &file,
-                &Options {
+                &SegmentOptions {
                     checksums: *want,
-                    ..Options::default()
+                    ..SegmentOptions::default()
                 },
             )
             .expect("create");
@@ -617,7 +617,7 @@ fn f8_checksums(args: &Args, profile: Profile) -> std::io::Result<Record> {
 /// P48.3 demands -- a torn unsynced tail is lost whole and never served
 /// in part -- run inline so it is a recorded finding and not only a test.
 fn f49_bulkseal(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    use supdb::next::{Db, NextOptions};
+    use supdb::{Db, Options};
 
     let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
     let batch = args.num("--batch", 1_000) as u64;
@@ -632,7 +632,7 @@ fn f49_bulkseal(args: &Args, profile: Profile) -> std::io::Result<Record> {
         .note(
             "two arms interleaved in one process, fresh store per rep, the f42 load shape \
              (durable per batch, partitioning on). Both write every piece through \
-             SegmentWriter and differ only in NextOptions::cursor_merge: probe-merge finds \
+             SegmentWriter and differ only in Options::cursor_merge: probe-merge finds \
              the keys a merge writes by collect-sort-probe, cursor-merge by a k-way walk of \
              the inputs' rank order (the shipping default). The timed \
              window is the load PLUS the drain (flush: seal, join, partition), the shape the \
@@ -660,7 +660,7 @@ fn f49_bulkseal(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let mut kb = [0u8; 16];
         let d = dir.join(format!("f49-{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
-        let opts = NextOptions {
+        let opts = Options {
             cursor_merge: ci == 1,
             ..Default::default()
         };
@@ -835,7 +835,7 @@ fn f49_bulkseal(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
 fn f50_txn(args: &Args, profile: Profile) -> std::io::Result<Record> {
     use std::io::Write as _;
-    use supdb::next::{Db, NextOptions};
+    use supdb::{Db, Options};
 
     let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
     let batch = args.num("--batch", 1_000) as u64;
@@ -992,7 +992,7 @@ fn f50_txn(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let mut kb = [0u8; 16];
         let d = dir.join(format!("db{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
-        let mut db = Db::create(&d, NextOptions::default()).expect("create");
+        let mut db = Db::create(&d, Options::default()).expect("create");
         let io0 = IoCounters::read_now();
         let t = Instant::now();
         for i in 0..keys {
@@ -1160,7 +1160,7 @@ fn f50_txn(args: &Args, profile: Profile) -> std::io::Result<Record> {
 }
 
 fn f51_ioprio(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    use supdb::next::{BackgroundIo, Db, NextOptions};
+    use supdb::{BackgroundIo, Db, Options};
 
     let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
     let batch = args.num("--batch", 1_000) as u64;
@@ -1196,7 +1196,7 @@ fn f51_ioprio(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let mut kb = [0u8; 16];
         let d = dir.join(format!("f51-{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
-        let opts = NextOptions {
+        let opts = Options {
             background_io: arms[ci].1,
             seal_sync_every: arms[ci].2,
             ..Default::default()
@@ -1361,7 +1361,7 @@ fn f51_ioprio(args: &Args, profile: Profile) -> std::io::Result<Record> {
 }
 
 fn f52_segsize(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    use supdb::next::{Db, NextOptions};
+    use supdb::{Db, Options};
 
     let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
     let batch = args.num("--batch", 1_000) as u64;
@@ -1402,7 +1402,7 @@ fn f52_segsize(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let mut kb = [0u8; 16];
         let d = dir.join(format!("f52-{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
-        let opts = NextOptions {
+        let opts = Options {
             seal_bytes: arms[ci].1,
             partition_bytes: arms[ci].2,
             ..Default::default()
@@ -1651,8 +1651,8 @@ fn f52_segsize(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
 fn f53_inline(args: &Args, profile: Profile) -> std::io::Result<Record> {
     use supdb::bytes::MmapBytes;
-    use supdb::next::{Db, NextOptions};
     use supdb::Blob;
+    use supdb::{Db, Options};
 
     let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
     let batch = args.num("--batch", 1_000) as u64;
@@ -1685,7 +1685,7 @@ fn f53_inline(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let mut kb = [0u8; 16];
         let d = dir.join(format!("f53-{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
-        let opts = NextOptions {
+        let opts = Options {
             inline_bytes: arms[ci].1,
             ..Default::default()
         };
@@ -1907,7 +1907,7 @@ fn f53_inline(args: &Args, profile: Profile) -> std::io::Result<Record> {
 }
 
 fn f54_merge(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    use supdb::next::{Db, NextOptions};
+    use supdb::{Db, Options};
 
     let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
     let batch = args.num("--batch", 1_000) as u64;
@@ -1960,7 +1960,7 @@ fn f54_merge(args: &Args, profile: Profile) -> std::io::Result<Record> {
         }
         let d = dir.join(format!("f54-{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
-        let opts = NextOptions {
+        let opts = Options {
             seal_bytes: 16 << 20,
             partition_bytes: Some(64 << 20),
             flush_ranges: ranges,
@@ -2146,7 +2146,7 @@ fn f54_merge(args: &Args, profile: Profile) -> std::io::Result<Record> {
 }
 
 fn f55_promote(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    use supdb::next::{Db, NextOptions};
+    use supdb::{Db, Options};
 
     let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
     let batch = args.num("--batch", 1_000) as u64;
@@ -2198,7 +2198,7 @@ fn f55_promote(args: &Args, profile: Profile) -> std::io::Result<Record> {
         }
         let d = dir.join(format!("f55-{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
-        let opts = NextOptions {
+        let opts = Options {
             seal_bytes: 16 << 20,
             partition_bytes: Some(64 << 20),
             promote,
@@ -2390,7 +2390,7 @@ fn f55_promote(args: &Args, profile: Profile) -> std::io::Result<Record> {
 }
 
 fn f56_tailbound(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    use supdb::next::{Db, NextOptions};
+    use supdb::{Db, Options};
 
     let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
     let batch = args.num("--batch", 1_000) as u64;
@@ -2430,7 +2430,7 @@ fn f56_tailbound(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let mut kb = [0u8; 16];
         let d = dir.join(format!("f56-{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
-        let opts = NextOptions {
+        let opts = Options {
             seal_bytes: seal,
             l0_trigger: trigger,
             partition_on_flush: partition,
@@ -2631,7 +2631,7 @@ fn f56_tailbound(args: &Args, profile: Profile) -> std::io::Result<Record> {
 }
 
 fn f48_syncpolicy(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    use supdb::next::{Db, NextOptions, SyncPolicy};
+    use supdb::{Db, Options, SyncPolicy};
 
     let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
     let batch = args.num("--batch", 1_000) as u64;
@@ -2665,7 +2665,7 @@ fn f48_syncpolicy(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
         let d = dir.join(format!("a{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
-        let opts = NextOptions {
+        let opts = Options {
             sync: policies[ci],
             ..Default::default()
         };
@@ -2747,7 +2747,7 @@ fn f48_syncpolicy(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // page cache holding what the device never received.
     let d = dir.join("contract");
     let _ = std::fs::remove_dir_all(&d);
-    let opts = NextOptions {
+    let opts = Options {
         sync: SyncPolicy::EveryN(16),
         ..Default::default()
     };
@@ -3005,7 +3005,7 @@ fn f47_parwal(args: &Args, profile: Profile) -> std::io::Result<Record> {
 fn f45_scanfloor(args: &Args, profile: Profile) -> std::io::Result<Record> {
     use std::io::Write as _;
     use supdb::bytes::MmapBytes;
-    use supdb::next::{Db, NextOptions};
+    use supdb::{Db, Options};
 
     use supdb::Blob;
 
@@ -3038,7 +3038,7 @@ fn f45_scanfloor(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // One store, built once: every arm reads the same bytes.
     let d = dir.join("store");
     let _ = std::fs::remove_dir_all(&d);
-    let mut db = Db::create(&d, NextOptions::default()).expect("create");
+    let mut db = Db::create(&d, Options::default()).expect("create");
     let mut vrng = Rng::new(0xF45);
     let mut kb = [0u8; 16];
     for i in 0..keys {
@@ -3263,7 +3263,7 @@ fn f45_scanfloor(args: &Args, profile: Profile) -> std::io::Result<Record> {
 /// against, built in the same process by the same code so the comparison
 /// is not across runs.
 fn f44_tail(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    use supdb::next::{Db, NextOptions};
+    use supdb::{Db, Options};
 
     let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
     let batch = args.num("--batch", 1_000) as u64;
@@ -3307,7 +3307,7 @@ fn f44_tail(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let (seals, compact, trigger) = arm_cfg[ci];
         let d = dir.join(format!("a{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
-        let opts = NextOptions {
+        let opts = Options {
             seal_bytes: if seals { seal_kb << 10 } else { usize::MAX },
             l0_trigger: if trigger == 0 { usize::MAX } else { trigger },
             compact,
@@ -3461,7 +3461,7 @@ fn f44_tail(args: &Args, profile: Profile) -> std::io::Result<Record> {
 /// is gated: load through `Trial`, the rest through `Samples` filled per
 /// rep and compared the same way.
 fn f43_compact(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    use supdb::next::{Db, NextOptions};
+    use supdb::{Db, Options};
 
     let keys = args.num("--keys", profile.pick(20_000, 100_000, 300_000)) as u64;
     let batch = args.num("--batch", 1_000) as u64;
@@ -3513,7 +3513,7 @@ fn f43_compact(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let (compact, trigger) = arm_cfg[ci];
         let d = dir.join(format!("a{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
-        let opts = NextOptions {
+        let opts = Options {
             seal_bytes: seal_kb << 10,
             l0_trigger: if trigger == 0 { usize::MAX } else { trigger },
             compact,
@@ -3713,12 +3713,12 @@ fn f43_compact(args: &Args, profile: Profile) -> std::io::Result<Record> {
 /// key new, 100B values, a durable point every 1,000 ops -- with the next
 /// engine (WAL commit + seal-off-path, src/next.rs) interleaved against
 /// today's engine committing through the value-carrying log. The registered
-/// promise (docs/next-engine.md): >= 600,000 ops/s, within 1.7x of f39's
+/// promise (docs/engine.md): >= 600,000 ops/s, within 1.7x of f39's
 /// raw+index floor and past LMDB's recorded 572,416; below 600k the design
 /// has a leak that must be named. Rule 4: device bytes and on-disk size
 /// travel with the throughput.
 fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    use supdb::next::{Db, NextOptions};
+    use supdb::{Db, Options};
 
     let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
     let batch = args.num("--batch", 1_000) as u64;
@@ -3762,12 +3762,12 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
             let d = dir.join(format!("next-{ci}-{rep}"));
             let _ = std::fs::remove_dir_all(&d);
             let opts = if ci == 1 {
-                NextOptions {
+                Options {
                     seal_bytes: usize::MAX,
                     ..Default::default()
                 }
             } else {
-                NextOptions::default()
+                Options::default()
             };
             let mut db = Db::create(&d, opts).expect("create");
             let t = Instant::now();
@@ -3843,7 +3843,7 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let next_tp = rates[0].median();
     rec.finding(Finding::new(
         "F42.1",
-        "the next engine's durable load clears the brief's registered P-A gate of 600k ops/s",
+        "the engine's durable load clears the brief's registered P-A gate of 600k ops/s",
         next_tp >= 600_000.0,
         format!(
             "next loads {:.0} ops/s durably at batch {batch} ({:.1} MB to the device, {:.1} \
@@ -3935,7 +3935,8 @@ fn f28_count(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // the writer takes. `db_key_into` is a zero-padded decimal, so ascending
     // `i` is ascending key bytes.
     {
-        let mut w = supdb::next::SegmentWriter::create(&file, &Options::default()).expect("create");
+        let mut w =
+            supdb::SegmentWriter::create(&file, &SegmentOptions::default()).expect("create");
         let mut kb = [0u8; 16];
         for i in 0..keys {
             db_key_into(i, &mut kb);
@@ -4180,7 +4181,7 @@ fn f28_count(args: &Args, profile: Profile) -> std::io::Result<Record> {
 }
 
 fn f57_walreuse(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    use supdb::next::{Db, NextOptions};
+    use supdb::{Db, Options};
 
     let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
     let batch = args.num("--batch", 1_000) as u64;
@@ -4230,7 +4231,7 @@ fn f57_walreuse(args: &Args, profile: Profile) -> std::io::Result<Record> {
         }
         let d = dir.join(format!("f57-{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
-        let opts = NextOptions {
+        let opts = Options {
             recycle_wal: recycle,
             ..Default::default()
         };
@@ -4412,7 +4413,7 @@ fn f57_walreuse(args: &Args, profile: Profile) -> std::io::Result<Record> {
 }
 
 fn f60_sealwait(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    use supdb::next::{Db, NextOptions};
+    use supdb::{Db, Options};
 
     let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
     let batch = args.num("--batch", 1_000) as u64;
@@ -4455,7 +4456,7 @@ fn f60_sealwait(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let d = dir.join(format!("f60-{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
         let t = Instant::now();
-        let mut db = Db::create(&d, NextOptions::default()).expect("create");
+        let mut db = Db::create(&d, Options::default()).expect("create");
         for (n, &i) in order.iter().enumerate() {
             db_key_into(i, &mut kb);
             db.append(&kb, payload.get(&mut vrng));
@@ -4586,7 +4587,7 @@ fn f60_sealwait(args: &Args, profile: Profile) -> std::io::Result<Record> {
 }
 
 fn f61_scanmerge(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    use supdb::next::{Db, NextOptions};
+    use supdb::{Db, Options};
 
     let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
     let batch = args.num("--batch", 1_000) as u64;
@@ -4632,7 +4633,7 @@ fn f61_scanmerge(args: &Args, profile: Profile) -> std::io::Result<Record> {
         // is per source and not per byte. The four-segment arm turns
         // compaction off so its seals stay unrouted once joined.
         let seal = ((keys * (value_size as u64 + 16)) * 2 / 7).max(1 << 20) as usize;
-        let opts = NextOptions {
+        let opts = Options {
             seal_bytes: seal,
             partition_bytes: Some(seal * 2),
             compact: shape != 2,
@@ -4783,7 +4784,7 @@ fn f61_scanmerge(args: &Args, profile: Profile) -> std::io::Result<Record> {
 }
 
 fn f62_scanmerge2(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    use supdb::next::{Db, NextOptions};
+    use supdb::{Db, Options};
 
     let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
     let batch = args.num("--batch", 1_000) as u64;
@@ -4832,7 +4833,7 @@ fn f62_scanmerge2(args: &Args, profile: Profile) -> std::io::Result<Record> {
         // is per source and not per byte. The four-segment arm turns
         // compaction off so its seals stay unrouted once joined.
         let seal = ((keys * (value_size as u64 + 16)) * 2 / 7).max(1 << 20) as usize;
-        let opts = NextOptions {
+        let opts = Options {
             seal_bytes: seal,
             partition_bytes: Some(seal * 2),
             compact: shape != 2,
@@ -5000,7 +5001,7 @@ fn f62_scanmerge2(args: &Args, profile: Profile) -> std::io::Result<Record> {
 }
 
 /// f63: where the unrouted scan's time goes, and the snapshot build behind
-/// `NextOptions::scan_snapshot_arena`. Five arms interleaved: the routed
+/// `Options::scan_snapshot_arena`. Five arms interleaved: the routed
 /// store as the reference, f62's undrained shape (three level-0 segments
 /// and the rest in the memtable, settled) under both builds, and a
 /// memtable-only store of 3/7 of the keys under both. Each arm reports the
@@ -5009,7 +5010,7 @@ fn f62_scanmerge2(args: &Args, profile: Profile) -> std::io::Result<Record> {
 /// in the memtable's range, and the end-to-end rate f62 measured -- the
 /// build plus `scans` uniform scans. Predictions in scansnap-plan.md.
 fn f63_scansnap(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    use supdb::next::{Db, NextOptions};
+    use supdb::{Db, Options};
 
     // 25k at ci rather than f62's 20k: seals are at least 1 MB, which at
     // 20k keys is exactly two seals and an empty memtable once settled.
@@ -5055,7 +5056,7 @@ fn f63_scansnap(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let d = dir.join(format!("f63-{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
         let seal = ((keys * (value_size as u64 + 16)) * 2 / 7).max(1 << 20) as usize;
-        let opts = NextOptions {
+        let opts = Options {
             seal_bytes: if shape == 2 { usize::MAX / 2 } else { seal },
             partition_bytes: Some(seal * 2),
             scan_snapshot_arena: arena,
@@ -5247,7 +5248,7 @@ fn f63_scansnap(args: &Args, profile: Profile) -> std::io::Result<Record> {
 /// the same process. The row's size against the section is arithmetic on
 /// the file. Predictions in indexsum-plan.md.
 fn f64_indexsum(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    use supdb::next::SegmentWriter;
+    use supdb::SegmentWriter;
     use supdb::{Blob, BlobOptions, MmapBytes};
 
     let keys = args.num("--keys", profile.pick(20_000, 200_000, 1_000_000)) as u64;
@@ -5274,7 +5275,7 @@ fn f64_indexsum(args: &Args, profile: Profile) -> std::io::Result<Record> {
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("seg.sup");
     {
-        let opts = Options::default();
+        let opts = SegmentOptions::default();
         let mut w = SegmentWriter::create(&path, &opts).expect("create");
         w.set_inline_max(256);
         let payload = Payload::new(value_size, 0.5, 0xF64);

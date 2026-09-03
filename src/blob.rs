@@ -785,7 +785,7 @@ impl<B: Bytes> Blob<B> {
     }
 
     /// The key and extents at `rank`, borrowed from the mapping: the flags
-    /// on the extents are how `next::Db` sees a tombstone without a probe.
+    /// on the extents are how `db::Db` sees a tombstone without a probe.
     pub fn exts_at(&self, rank: usize) -> Option<(&[u8], &[Ext])> {
         let (sec, idx) = self.flat()?;
         idx.at(sec, rank)
@@ -793,7 +793,7 @@ impl<B: Bytes> Blob<B> {
 
     /// Every value at `rank`, in append order: reads blocks, resolves
     /// nothing. With `seek` and the existing `key_at` this completes an
-    /// ordered cursor, which is what `next::Db` merges segments with --
+    /// ordered cursor, which is what `db::Db` merges segments with --
     /// advancing each source's rank instead of re-resolving every key in
     /// every source. A hash probe per key per source is what an ordered
     /// read must not pay, and it is the whole difference between a scan

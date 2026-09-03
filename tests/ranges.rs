@@ -31,8 +31,8 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use supdb::bytes::Bytes;
-use supdb::next::SegmentWriter;
-use supdb::{Blob, Options};
+use supdb::SegmentWriter;
+use supdb::{Blob, SegmentOptions};
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-rangestest-{name}"));
@@ -92,9 +92,9 @@ fn merged(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
 /// probes cover an inline run, a block-backed one, and runs large enough to
 /// take a block to themselves.
 fn build(path: &Path, keys: usize, compress: bool) -> Vec<Vec<u8>> {
-    let mut w = SegmentWriter::create(path, &Options::default()).expect("create");
-    // Compression is the writer's switch, not an `Options` field: a segment
-    // writer takes it through `set_compress`. Setting it on `Options` here
+    let mut w = SegmentWriter::create(path, &SegmentOptions::default()).expect("create");
+    // Compression is the writer's switch, not an `SegmentOptions` field: a segment
+    // writer takes it through `set_compress`. Setting it on `SegmentOptions` here
     // compiled and wrote plain blocks, so the compressed-plan test below was
     // checking the uncompressed path.
     w.set_compress(compress);
@@ -295,7 +295,7 @@ fn a_plan_for_many_keys_is_the_merged_union_and_a_shared_fetch() {
 fn extent_counts_need_no_plan_because_they_read_nothing() {
     let path = scratch("fixedcount");
     // Fixed-width values, so `count_fixed` applies to every key.
-    let mut w = SegmentWriter::create(&path, &Options::default()).expect("create");
+    let mut w = SegmentWriter::create(&path, &SegmentOptions::default()).expect("create");
     for k in 0..80u32 {
         let key = format!("term={k:08}").into_bytes();
         let n = [1u32, 9, 700, 20_000][(k % 4) as usize];
@@ -405,7 +405,7 @@ fn a_file_with_unreplayed_log_records_is_refused_not_misread() {
     // guarantee is the *reader's*, and it has to hold for any file handed to
     // it, including one no writer here would produce.
     let path = scratch("logbytes");
-    let mut w = SegmentWriter::create(&path, &Options::default()).expect("create");
+    let mut w = SegmentWriter::create(&path, &SegmentOptions::default()).expect("create");
     for k in 0..20 {
         let key = format!("term={k:08}").into_bytes();
         w.begin(&key).expect("begin");

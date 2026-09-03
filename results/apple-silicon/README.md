@@ -154,7 +154,7 @@ than a B-tree walk, visible wherever the core is wide enough to show it.
 
 ## Fifth campaign: the next engine, matched on durability and transactions (replicated)
 
-The canonical pair of `docs/next-engine.md` -- `next` against `lmdb`, both
+The canonical pair of `docs/engine.md` -- `next` against `lmdb`, both
 committing per batch, both transactional -- taken twice on this host on
 consecutive heads that differ only in bench code (2ec7b5c, 06c7902;
 `ext-kv-next-pair.run{1,2}.json`, environment beside each):

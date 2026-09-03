@@ -1,4 +1,4 @@
-# The next engine: a design brief written against the measurements
+# The engine: a design brief written against the measurements
 
 Every assertion here cites a recorded result in `results/` or a claim in
 `claims.json`. The brief exists because the current engine's remaining
@@ -303,7 +303,7 @@ interleaved where the harness allows:
 - **P-E, crash semantics: HELD, and sharpened.** A store killed before any
   seal opens from the WAL alone, history survives reopen (segments do not
   forget), and -- since the commit frame -- a batch is lost whole or kept
-  whole: `tests/next.rs` cuts the WAL inside a batch's commit frame, at
+  whole: `tests/db.rs` cuts the WAL inside a batch's commit frame, at
   it, and inside its last record, and the batch is gone in every case and
   stays gone after the next commit, because `open` truncates the WAL to
   its last commit frame before appending behind it.
@@ -322,12 +322,12 @@ campaigns had already found.
 
 ### Against RocksDB: EXT.28-31
 
-The comparator that separates "the next engine is fast" from "an LSM is
+The comparator that separates "the engine is fast" from "an LSM is
 fast", matched on durability, atomic batches and checksums, at its
 defaults with compression off (rocks-plan.md). Durable ordered load
 **0.778x** (p=0.0033) and RocksDB writes fewer device bytes and a smaller
 file, so the write side goes to it; point reads **7.62x** and ordered
-scan **5.95x** stay with the next engine by margins the LMDB pair never
+scan **5.95x** stay with the engine by margins the LMDB pair never
 showed; shuffled durable load **1.18x**, the number EXT.27's 6x over LMDB
 needed beside it. The plan predicted a tie on the load and 2-3x on reads
 and was wrong both ways. RocksDB's 8 MB block cache and absent filter are
@@ -371,9 +371,9 @@ keys both ways, interleaved, with LMDB beside each arm. Ordered, the pair
 reads 0.653x, bracketing EXT.22. Shuffled, it reads **5.931x** (284,938
 against 48,041 ops/s, p=0.0022): LMDB's durable ingest falls 13.7x when
 the keys stop arriving in order, because each per-batch fsync then
-writes about a thousand dirtied leaf pages, while the next engine's falls
+writes about a thousand dirtied leaf pages, while the engine's falls
 1.51x, the cost of merging what promotion cannot route. shape-plan.md
-predicted the opposite ordering -- it priced the next engine's merge and
+predicted the opposite ordering -- it priced the engine's merge and
 not the B-tree's page writeback -- and the refutation is recorded there.
 The two numbers are one finding: which engine wins the matched durable
 load depends on the arrival order, by a factor of nine.
@@ -487,4 +487,4 @@ rollback, read-your-writes -- and deletes that reclaim their bytes. The
 guarantee set stays what `Features` can equalize, so every comparison the
 external suite makes remains matched: the durable-commit axis is
 equalizable in both directions, and the transactions axis no longer leaves
-a residual on the next engine's side.
+a residual on the engine's side.

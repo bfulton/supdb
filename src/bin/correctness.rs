@@ -9,7 +9,7 @@
 //!                reader returns an error or takes the host process down
 //!   c2-oracle    randomized operation sequences against a BTreeMap model
 //!   c3-crash     kill a writer mid-flight and check what survives
-//!   c4-crash     the same for the next engine, with the WAL's unsynced tail
+//!   c4-crash     the same for the engine, with the WAL's unsynced tail
 //!                torn the way a power loss would tear it (crash-plan.md)
 //!
 //! The first is the one the architecture review predicted and never
@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use supdb::bench::{db_key_into, Finding, Profile, Record, Rng, J};
 use supdb::jobj;
-use supdb::next::{Db, NextOptions, SyncPolicy};
-use supdb::Options;
+use supdb::SegmentOptions;
+use supdb::{Db, Options, SyncPolicy};
 
 struct Args(Vec<String>);
 impl Args {
@@ -92,7 +92,7 @@ fn main() -> std::io::Result<()> {
 
 /// Build a small, valid store and return its path.
 fn build_segment(path: &Path, keys: u64, depth: u64, value_size: usize) -> std::io::Result<()> {
-    let mut w = supdb::next::SegmentWriter::create(path, &Options::default())?;
+    let mut w = supdb::SegmentWriter::create(path, &SegmentOptions::default())?;
     let mut kb = [0u8; 16];
     let mut v = vec![0u8; value_size];
     // `db_key_into` is a zero-padded decimal, so ascending `k` is ascending
@@ -488,14 +488,14 @@ fn c4_value(seq: u64, key: u64, len: usize, out: &mut Vec<u8>) {
 /// Seals a few hundred operations wide, two of them per merge, partitions
 /// twice a seal: every background job the engine has is in flight during a
 /// run of a few thousand operations.
-fn c4_opts(sync: SyncPolicy, recycle: bool) -> NextOptions {
-    NextOptions {
+fn c4_opts(sync: SyncPolicy, recycle: bool) -> Options {
+    Options {
         sync,
         seal_bytes: 48 << 10,
         partition_bytes: Some(96 << 10),
         l0_trigger: 2,
         recycle_wal: recycle,
-        ..NextOptions::default()
+        ..Options::default()
     }
 }
 
@@ -1025,7 +1025,7 @@ fn c4_crash(args: &Args, profile: Profile) -> std::io::Result<Record> {
     if seal_in_flight == 0 || merge_in_flight == 0 {
         rec.finding(Finding::not_exercised(
             "C4.1",
-            "the next engine opens after a crash at any point, seals and merges in flight included",
+            "the engine opens after a crash at any point, seals and merges in flight included",
             format!(
                 "{seal_in_flight} crashes landed with a seal in flight and {merge_in_flight} with \
                  a merge; both windows must be reached before opening means anything"
@@ -1034,7 +1034,7 @@ fn c4_crash(args: &Args, profile: Profile) -> std::io::Result<Record> {
     } else {
         rec.finding(Finding::new(
             "C4.1",
-            "the next engine opens after a crash at any point, seals and merges in flight included",
+            "the engine opens after a crash at any point, seals and merges in flight included",
             open_failed == 0 && child_errors == 0,
             format!(
                 "{}/{crashes} directories opened; {open_failed} were refused, {child_errors} \

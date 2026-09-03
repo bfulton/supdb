@@ -69,6 +69,12 @@ pub mod index;
 pub mod blob;
 /// Where a reader's bytes come from. The seam the wasm build needed.
 pub mod bytes;
+/// The engine: a WAL, a memtable and threads that seal and merge -- none of
+/// which a browser has, and all of which want files to write and map.
+/// Excluded from the wasm build rather than stubbed; `blob` is the read path
+/// that carries over.
+#[cfg(not(target_family = "wasm"))]
+pub mod db;
 #[cfg_attr(target_family = "wasm", allow(dead_code))]
 /// The flat key index, including the builders a segment writer drives.
 /// Public for the same reason as `index`: a bulk writer for sorted,
@@ -78,12 +84,6 @@ pub mod bytes;
 /// the module is not reformatted for it.
 #[allow(clippy::len_without_is_empty)]
 pub mod flatindex;
-/// The engine: a WAL, a memtable and threads that seal and merge -- none of
-/// which a browser has, and all of which want files to write and map.
-/// Excluded from the wasm build rather than stubbed; `blob` is the read path
-/// that carries over.
-#[cfg(not(target_family = "wasm"))]
-pub mod next;
 /// The C ABI the browser calls. Hand-written rather than generated, because
 /// the whole point of R3.3 is the size of what ships.
 #[cfg(target_family = "wasm")]
@@ -93,5 +93,10 @@ pub use blob::{Blob, BlobOptions, SparseBlob};
 #[cfg(not(target_family = "wasm"))]
 pub use bytes::MmapBytes;
 pub use bytes::{Bytes, SliceBytes, VecBytes};
+/// The engine's surface, at the crate root: `supdb::Db` rather than
+/// `supdb::db::Db`. `Options` configures the engine and `SegmentOptions` the
+/// segments it writes, which is the way round a caller meets them -- the
+/// names were the other way round while a second engine owned the shorter
+/// one.
 #[cfg(not(target_family = "wasm"))]
-pub use next::Options;
+pub use db::{BackgroundIo, Db, Options, SegmentOptions, SegmentWriter, SyncPolicy, Txn};

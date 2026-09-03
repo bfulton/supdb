@@ -19,8 +19,8 @@
 
 use std::path::{Path, PathBuf};
 use supdb::bytes::{Bytes, MmapBytes, VecBytes};
-use supdb::next::SegmentWriter;
-use supdb::{Blob, Options};
+use supdb::SegmentWriter;
+use supdb::{Blob, SegmentOptions};
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-blobtest-{name}"));
@@ -45,7 +45,7 @@ fn build_with(
     compress: bool,
     inline_max: usize,
 ) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
-    let mut w = SegmentWriter::create(path, &Options::default()).expect("create");
+    let mut w = SegmentWriter::create(path, &SegmentOptions::default()).expect("create");
     w.set_compress(compress);
     w.set_inline_max(inline_max);
     let mut want = Vec::new();
@@ -328,9 +328,9 @@ fn a_fixed_width_schema_counts_without_touching_a_block() {
     let path = scratch("fixed");
     // Small blocks, so the largest run is many times a block: it must still
     // arrive as one extent.
-    let opts = Options {
+    let opts = SegmentOptions {
         block_size: 4096,
-        ..Options::default()
+        ..SegmentOptions::default()
     };
     let mut w = SegmentWriter::create(&path, &opts).expect("create");
     let mut want: Vec<(Vec<u8>, u64)> = Vec::new();
@@ -398,7 +398,7 @@ fn a_count_from_the_extent_list_checks_two_quantities_not_one() {
     let key = b"term=00000016";
     for (name, inline_max) in [("guard-inline", 256), ("guard-block", 0)] {
         let path = scratch(name);
-        let mut w = SegmentWriter::create(&path, &Options::default()).expect("create");
+        let mut w = SegmentWriter::create(&path, &SegmentOptions::default()).expect("create");
         w.set_inline_max(inline_max);
         w.begin(key).expect("begin");
         for i in 0..17 {
@@ -420,7 +420,7 @@ fn a_count_from_the_extent_list_checks_two_quantities_not_one() {
 
     // The same key really is fixed width at its own width, and is answered.
     let path = scratch("guard-ok");
-    let mut w = SegmentWriter::create(&path, &Options::default()).expect("create");
+    let mut w = SegmentWriter::create(&path, &SegmentOptions::default()).expect("create");
     w.begin(key).expect("begin");
     for i in 0..17u32 {
         w.value(&i.to_le_bytes());
@@ -544,7 +544,7 @@ fn the_writer_stores_uniform_runs_without_prefixes() {
     // The reader has to branch on the flag, and a run large enough to spill
     // to a block has to keep the flag across every extent it spans.
     let path = scratch("fixed-runs");
-    let mut w = SegmentWriter::create(&path, &Options::default()).expect("create");
+    let mut w = SegmentWriter::create(&path, &SegmentOptions::default()).expect("create");
     let mut want: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
     let mut a = Vec::new();
     w.begin(b"fixed").expect("begin");

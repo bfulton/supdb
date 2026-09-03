@@ -11,11 +11,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use supdb::bytes::MmapBytes;
-use supdb::next::SegmentWriter;
-use supdb::{Blob, Options, SparseBlob};
+use supdb::SegmentWriter;
+use supdb::{Blob, SegmentOptions, SparseBlob};
 
 /// `block::CHECKSUMS` is process-wide -- every writer here
-/// set it from `Options::checksums` -- and the test harness runs tests
+/// set it from `SegmentOptions::checksums` -- and the test harness runs tests
 /// concurrently, so a checksums-off test flips the switch under a
 /// checksums-on one and every block it reads mismatches. Each test holds
 /// this for its duration.
@@ -94,13 +94,13 @@ fn fixed(keys: usize, width: usize, seed: u64) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
     out
 }
 
-fn opts() -> Options {
-    Options {
+fn opts() -> SegmentOptions {
+    SegmentOptions {
         // Small blocks, so a few thousand keys span many of them and the
         // 9,000-byte values overflow one.
         block_size: 4096,
         checksums: true,
-        ..Options::default()
+        ..SegmentOptions::default()
     }
 }
 
@@ -108,11 +108,16 @@ fn opts() -> Options {
 /// 9,000-byte values stay in blocks, so one store exercises both paths.
 const INLINE: usize = 256;
 
-fn write_bulk(path: &Path, data: &[(Vec<u8>, Vec<Vec<u8>>)], o: Options) {
+fn write_bulk(path: &Path, data: &[(Vec<u8>, Vec<Vec<u8>>)], o: SegmentOptions) {
     write_bulk_with(path, data, o, INLINE)
 }
 
-fn write_bulk_with(path: &Path, data: &[(Vec<u8>, Vec<Vec<u8>>)], o: Options, inline: usize) {
+fn write_bulk_with(
+    path: &Path,
+    data: &[(Vec<u8>, Vec<Vec<u8>>)],
+    o: SegmentOptions,
+    inline: usize,
+) {
     let mut w = SegmentWriter::create(path, &o).expect("create");
     w.set_inline_max(inline);
     for (k, vals) in data {
@@ -294,7 +299,7 @@ fn the_two_segment_layouts_agree_with_checksums_off_too() {
     let _serial = serial();
     let dir = scratch("nocrc");
     let data = varlen(1_000, 11);
-    let o = Options {
+    let o = SegmentOptions {
         checksums: false,
         ..opts()
     };
@@ -716,10 +721,10 @@ fn a_compressed_segment_agrees_with_an_uncompressed_one() {
     let data = postings(900, 0xC0FFEE);
     // 64 KiB blocks, so a block passes `block::CHUNK` and takes the chunked
     // path rather than being compressed whole.
-    let o = Options {
+    let o = SegmentOptions {
         block_size: 64 << 10,
         checksums: true,
-        ..Options::default()
+        ..SegmentOptions::default()
     };
     let plain = dir.join("plain.sup");
     let packed = dir.join("packed.sup");

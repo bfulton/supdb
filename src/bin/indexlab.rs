@@ -2312,7 +2312,7 @@ fn probe_mode(args: &Args) -> std::io::Result<()> {
 /// The probe measures each layout under its own `Trial`, one after another.
 /// That is enough for a table and not enough for a claim: CLAUDE.md requires
 /// two arms of a change to be run interleaved, as `f8-checksums` does for
-/// `Options::checksums`, precisely because sequential blocks let the machine
+/// `SegmentOptions::checksums`, precisely because sequential blocks let the machine
 /// drift between them. The drift within one process over a few seconds is far
 /// smaller than the drift between runs that once moved three unchanged
 /// comparators by +20% to +43% -- but "far smaller" is not "measured", and a
