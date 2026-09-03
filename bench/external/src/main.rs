@@ -27,7 +27,7 @@ mod engines;
 
 #[cfg(feature = "rocksdb")]
 use engines::Rocks;
-use engines::{Batch, Engine, Features, Lmdb, LmdbDup, Next, Redb, Sled, Supdb};
+use engines::{Batch, Engine, Features, Lmdb, LmdbDup, Next, Redb, Sled};
 use std::path::PathBuf;
 use std::time::Instant;
 use supdb::bench::{
@@ -72,22 +72,15 @@ impl Args {
     }
 }
 
-/// Build the field. Supdb first, then the comparators.
-fn build(root: &std::path::Path, which: &[&str], buffer_mb: usize) -> Vec<Box<dyn Engine>> {
+/// Build the field: the engine under test, then the comparators.
+fn build(root: &std::path::Path, which: &[&str]) -> Vec<Box<dyn Engine>> {
     let mut out: Vec<Box<dyn Engine>> = Vec::new();
     for name in which {
         let dir = root.join(name);
         let e: Result<Box<dyn Engine>, String> = match *name {
-            "supdb" => Supdb::create(&dir, buffer_mb).map(|e| Box::new(e) as Box<dyn Engine>),
             "next" => Next::create(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
             "next-ingest" => {
                 Next::create_ingest(&dir).map(|e| Box::new(e) as Box<dyn Engine>)
-            }
-            "supdb-durable" => {
-                Supdb::create_durable(&dir, buffer_mb).map(|e| Box::new(e) as Box<dyn Engine>)
-            }
-            "supdb-buffered" => {
-                Supdb::create_buffered(&dir, buffer_mb).map(|e| Box::new(e) as Box<dyn Engine>)
             }
             "lmdb-nosync" => Lmdb::create_nosync(&dir, 8).map(|e| Box::new(e) as Box<dyn Engine>),
             "redb" => Redb::create(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
@@ -133,7 +126,7 @@ fn main() -> std::io::Result<()> {
     let engines: Vec<&str> = args
         .get("--engines")
         .map(|s| s.split(',').collect())
-        .unwrap_or_else(|| vec!["supdb", "redb", "lmdb", "sled"]);
+        .unwrap_or_else(|| vec!["next", "redb", "lmdb", "sled"]);
 
     let rec = match cmd.as_str() {
         "kv" => suite_kv(&args, profile, &engines)?,
@@ -157,7 +150,7 @@ fn main() -> std::io::Result<()> {
                 "external <kv|ycsb|sweep|readdecomp|analytics|all|loadshape|loadprof> \
                  [--profile ci|dev|full] [--engines supdb,redb,lmdb,sled] \
                  (analytics fields its own arms and ignores --engines; readdecomp \
-                 wants --engines supdb-buffered,lmdb)"
+                 wants --engines next,lmdb)"
             );
             return Ok(());
         }
@@ -213,7 +206,7 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
             .enumerate()
         {
             let root = scratch(&format!("shape-{name}-{}-{rep}", shuffled as u8));
-            let Some(mut e) = build(&root, &[name], 256).into_iter().next() else {
+            let Some(mut e) = build(&root, &[name]).into_iter().next() else {
                 continue;
             };
             feats[ei] = Some(e.features());
@@ -288,9 +281,7 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
     // rather than the ranking. Same engine, same guarantees, same key set --
     // so nothing needs matching and there is no residual to bound.
     for name in [
-        "supdb-buffered",
         "lmdb-nosync",
-        "supdb",
         "lmdb",
         "next",
         "next-nodrain",
@@ -307,35 +298,6 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
             &format!("{name}_seq_vs_shuffled"),
             compare(&load[a], &load[b], supdb::bench::MIN_EFFECT),
         );
-    }
-    if let (Some(sa), Some(sb), Some(la), Some(lb)) = (
-        idx("supdb-buffered", false),
-        idx("supdb-buffered", true),
-        idx("lmdb-nosync", false),
-        idx("lmdb-nosync", true),
-    ) {
-        if !load[sa].is_empty() && !load[lb].is_empty() {
-            let supdb_swing = load[sa].median() / load[sb].median().max(1e-9);
-            let lmdb_swing = load[la].median() / load[lb].median().max(1e-9);
-            rec.finding(Finding::new(
-                "EXT.14",
-                "Supdb's load rate depends less on key arrival order than LMDB's",
-                supdb_swing < lmdb_swing,
-                format!(
-                    "Supdb loads at {:.0}/s in order and {:.0} shuffled, a factor of \
-                     {supdb_swing:.2}; LMDB at {:.0} and {:.0}, a factor of {lmdb_swing:.2}. This \
-                     is the architectural difference rather than a ranking: a B-tree writing keys \
-                     in order fills pages left to right and splits almost never, and the same \
-                     B-tree taking them shuffled splits constantly, while an append-structured \
-                     store writes where the cursor already is either way. Both engines are \
-                     measured on the same permutation of the same keys",
-                    load[sa].median(),
-                    load[sb].median(),
-                    load[la].median(),
-                    load[lb].median()
-                ),
-            ));
-        }
     }
     // The next engine against LMDB, matched on durability and transactions:
     // the same pair as EXT.22, whose canonical load arrives in order and is
@@ -425,42 +387,6 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
             }
         }
     }
-    if let (Some(ss), Some(sl)) = (idx("supdb-buffered", true), idx("lmdb-nosync", true)) {
-        if !load[ss].is_empty() && !load[sl].is_empty() {
-            let (Some(fa), Some(fb)) = (feats[ss], feats[sl]) else {
-                return Ok(rec);
-            };
-            let gap = fa.unmatched(&fb, true);
-            if !gap.is_empty() {
-                rec.finding(Finding::not_exercised(
-                    "EXT.13",
-                    "Supdb loads faster than LMDB when the keys do not arrive in order",
-                    format!("not an ordering: the arms differ on {}", gap.join(", ")),
-                ));
-                return Ok(rec);
-            }
-            let cmp = compare(&load[ss], &load[sl], supdb::bench::MIN_EFFECT);
-            rec.compare("EXT.13_shuffled", cmp.clone());
-            let seq = idx("supdb-buffered", false).zip(idx("lmdb-nosync", false));
-            let seq_ratio = seq
-                .map(|(a, b)| load[a].median() / load[b].median().max(1e-9))
-                .unwrap_or(f64::NAN);
-            rec.finding(Finding::new(
-                "EXT.13",
-                "Supdb loads faster than LMDB when the keys do not arrive in order",
-                matches!(cmp.verdict, Verdict::Greater),
-                format!(
-                    "shuffled, {:.0} ops/s against {:.0} ({}). Sequential, in the same run, is \
-                     {seq_ratio:.3}x -- which is what EXT.10 measures and the only arrival order \
-                     this suite had ever used. Neither commits to the device and neither \
-                     checksums; lmdb-nosync is still transactional, so read this as a bound",
-                    load[ss].median(),
-                    load[sl].median(),
-                    cmp.summary("supdb-buffered", "lmdb-nosync")
-                ),
-            ));
-        }
-    }
     Ok(rec)
 }
 
@@ -481,9 +407,9 @@ fn load_profile(args: &Args, which: &[&str]) -> std::io::Result<()> {
     let n = args.num("--keys", 200_000) as u64;
     let value_size = args.num("--value-size", 100);
     let batch = args.num("--batch", 1_000).max(1);
-    let name = which.first().copied().unwrap_or("supdb-buffered");
+    let name = which.first().copied().unwrap_or("next");
     let root = scratch(&format!("loadprof-{name}"));
-    let Some(mut e) = build(&root, &[name], 256).into_iter().next() else {
+    let Some(mut e) = build(&root, &[name]).into_iter().next() else {
         eprintln!("# no engine {name}");
         return Ok(());
     };
@@ -610,7 +536,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
             // already held the data. A fresh path per rep is what makes each
             // rep an independent run.
             let root = scratch(&format!("kv-{name}-{rep}"));
-            let Some(mut e) = build(&root, &[name], 256).into_iter().next() else {
+            let Some(mut e) = build(&root, &[name]).into_iter().next() else {
                 continue;
             };
             feats[ei] = Some(e.features());
@@ -801,88 +727,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
             ),
         ));
     };
-    let ordering =
-        |rec: &mut Record,
-         id: &str,
-         title: &str,
-         other: &str,
-         s: &[Samples],
-         unit: &str,
-         writes: bool| { ordering_of(rec, id, title, "supdb", other, s, unit, writes) };
 
-    // EXT.1, EXT.4 and EXT.5 are kept, and all three are now `not_exercised`
-    // against LMDB: plain `supdb` checksums and LMDB does not, and on load it
-    // also does not commit durably. Their numbers stay in the record because
-    // they are what the run did. They were never orderings.
-    ordering(
-        &mut rec,
-        "EXT.1",
-        "Supdb loads faster than LMDB, the architecture it is modelled on",
-        "lmdb",
-        &load,
-        "ops/s",
-        true,
-    );
-    ordering(
-        &mut rec,
-        "EXT.2",
-        "Supdb reads faster than redb, the closest non-mmap sibling",
-        "redb",
-        &read,
-        "reads/s",
-        false,
-    );
-    // The design document's headline read comparison, restated as a claim.
-    // Its own figures put Supdb ahead of LMDB on warm reads (330,732/s against
-    // 316,557/s on the wide shape) -- but LMDB was measured through a Java
-    // harness with an adapter the document later found to allocate per value
-    // and open a transaction per lookup. Measured natively, this is the claim.
-    ordering(
-        &mut rec,
-        "EXT.4",
-        "Supdb reads faster than LMDB when both are measured natively",
-        "lmdb",
-        &read,
-        "reads/s",
-        false,
-    );
-    ordering(
-        &mut rec,
-        "EXT.5",
-        "Supdb scans faster than LMDB when both are measured natively",
-        "lmdb",
-        &scan,
-        "entries/s",
-        false,
-    );
-
-    // ---- the matched comparisons -------------------------------------------
-    //
-    // Four claims that actually rank the engines, because on each one the two
-    // arms promise the same thing. The load axis is measured at both levels of
-    // promise rather than at neither: EXT.9 has both committing to the device
-    // per batch, EXT.10 has neither. Whichever guarantee a reader cares about,
-    // one of these is the comparison for it, and EXT.1 is not.
-    ordering_of(
-        &mut rec,
-        "EXT.9",
-        "Supdb loads faster than LMDB when both commit durably per batch",
-        "supdb-durable",
-        "lmdb",
-        &load,
-        "ops/s",
-        true,
-    );
-    ordering_of(
-        &mut rec,
-        "EXT.10",
-        "Supdb loads faster than LMDB when neither commits to the device",
-        "supdb-buffered",
-        "lmdb-nosync",
-        &load,
-        "ops/s",
-        true,
-    );
     // The next engine (supdb::next), measured on the same three axes against
     // the same LMDB in the same process. Its commit is a WAL append plus one
     // fdatasync per batch -- LMDB's own boundary -- so the load comparison is
@@ -1063,44 +908,6 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         "reads/s",
         false,
     );
-    // Durability does not touch a read or a scan, so these need only the
-    // checksum axis matched -- and that one was costing Supdb 8.5% on every
-    // EXT.4 figure ever recorded, in the direction nobody was watching.
-    ordering_of(
-        &mut rec,
-        "EXT.11",
-        "Supdb reads faster than LMDB when neither verifies checksums",
-        "supdb-buffered",
-        "lmdb",
-        &read,
-        "reads/s",
-        false,
-    );
-    ordering_of(
-        &mut rec,
-        "EXT.12",
-        "Supdb scans faster than LMDB when neither verifies checksums",
-        "supdb-buffered",
-        "lmdb",
-        &scan,
-        "entries/s",
-        false,
-    );
-    if let (Some(si), Some(li)) = (idx("supdb"), idx("lmdb")) {
-        if !load[si].is_empty() && !load[li].is_empty() {
-            let (s, l) = (size[si], size[li]);
-            rec.finding(Finding::new(
-                "EXT.6",
-                "Supdb stores the same data in less space than LMDB",
-                s < l,
-                format!(
-                    "supdb {s:.1} MB vs lmdb {l:.1} MB ({:.2}x). Size is the one axis immune to \
-                     drift, so it is the one that needs no repetition to be believed",
-                    l / s.max(1e-9)
-                ),
-            ));
-        }
-    }
     rec.note(
         "feature_score counts durable commit, transactions, checksums, reopen-for-write, \
          read-your-writes and ordered scan. Supdb provides one of six; a throughput comparison \
@@ -1112,12 +919,12 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
 /// Decompose the point-read comparison against LMDB into its candidate
 /// mechanisms.
 ///
-/// The fact this exists to split: EXT.11 (supdb-buffered vs lmdb, uniform
-/// point reads at 1M keys) is a tie on the x86 host -- 1.243x p=0.37 and
-/// 1.179x p=0.13 across two full runs, unable to separate -- and a replicated
-/// 2.42x/2.41x win on Apple Silicon at p=0.0022 with rel_iqr under 1.3%
-/// (`results/apple-silicon/ext-kv-buffered-read.run{1,2}.json`). Nothing on
-/// the books says *why*. The candidate mechanisms:
+/// The fact this exists to split: the point-read comparison against LMDB
+/// moves with the host rather than with the engine -- ties on x86, a
+/// replicated win on Apple Silicon at p=0.0022 with rel_iqr under 1.3%
+/// (`results/apple-silicon/`). Nothing on the books says *why*, and a
+/// comparator that moves with the machine is the one worth decomposing.
+/// The candidate mechanisms:
 ///
 ///   (a) 128-byte cache lines: Supdb's flatindex probe touches ~1 line where
 ///       LMDB's descent touches several per node, so a wider line forgives
@@ -1165,12 +972,12 @@ fn suite_readdecomp(
     engines_arg: &[&str],
 ) -> std::io::Result<Record> {
     // The pair the findings are about. `main` defaults --engines to the
-    // four-engine field, which is not what a decomposition of EXT.11 wants,
+    // four-engine field, which is not what this decomposition wants,
     // so an absent flag means the matched pair rather than the field.
     let which: Vec<&str> = if args.get("--engines").is_some() {
         engines_arg.to_vec()
     } else {
-        vec!["supdb-buffered", "lmdb"]
+        vec!["next", "lmdb"]
     };
     let keys_list = args.list(
         "--keys-list",
@@ -1257,7 +1064,7 @@ fn suite_readdecomp(
         let mut row: Vec<Option<Box<dyn Engine>>> = Vec::with_capacity(ne);
         for (ei, name) in which.iter().enumerate() {
             let root = scratch(&format!("rdec-{name}-{n}-{vs}"));
-            let e = build(&root, &[name], 256).into_iter().next();
+            let e = build(&root, &[name]).into_iter().next();
             let e = e.map(|mut e| {
                 feats[ei] = Some(e.features());
                 let payload = Payload::new(*vs, 0.5, 0xD3);
@@ -1333,7 +1140,7 @@ fn suite_readdecomp(
         .map(|_| (0..ne).map(|_| Hist::new()).collect())
         .collect();
     let mut miss = vec![vec![0u64; ne]; nc];
-    let si = which.iter().position(|w| *w == "supdb-buffered");
+    let si = which.iter().position(|w| *w == "next");
     let li = which.iter().position(|w| *w == "lmdb");
     let mut ratio: Vec<Samples> = (0..nc).map(|_| Samples::default()).collect();
 
@@ -1506,7 +1313,7 @@ fn suite_readdecomp(
         }
         _ => {
             blockers.push(
-                "the pair this decomposition is about (supdb-buffered vs lmdb) was not fielded"
+                "the pair this decomposition is about (next vs lmdb) was not fielded"
                     .into(),
             );
         }
@@ -1608,7 +1415,7 @@ fn suite_readdecomp(
                          accesses, fewer instructions (c as compute, or d). Supdb's index probes \
                          stay scattered across the whole index section even in this cell, so the \
                          residual TLB cost leans against it and a surviving lead is conservative",
-                        hot_cmp.summary("supdb-buffered", "lmdb"),
+                        hot_cmp.summary("next", "lmdb"),
                         ratio[ac].median(),
                         ratio[hc].median(),
                         lead_cmp.summary("lead@hot", "lead@uniform")
@@ -1750,7 +1557,7 @@ fn suite_sweep(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result
     let mut engines: Vec<Box<dyn Engine>> = Vec::new();
     let mut names: Vec<&str> = Vec::new();
     for name in which {
-        let Some(mut e) = build(&root, &[name], 256).into_iter().next() else {
+        let Some(mut e) = build(&root, &[name]).into_iter().next() else {
             continue;
         };
         let mut vrng = Rng::new(0xE3);
@@ -1900,84 +1707,6 @@ fn suite_sweep(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result
     }
     rec.series("sweep", J::arr(rows));
 
-    let idx = |name: &str| names.iter().position(|w| *w == name);
-    if let (Some(s), Some(l)) = (idx("supdb"), idx("lmdb")) {
-        // Lower is better for both quantities, so the comparisons are the
-        // other way round from a throughput one.
-        let walk_cmp = compare(&walk[l], &walk[s], supdb::bench::MIN_EFFECT);
-        let floor_cmp = compare(&floor[l], &floor[s], supdb::bench::MIN_EFFECT);
-        rec.compare("walk_lmdb_vs_supdb", walk_cmp.clone());
-        rec.compare("floor_lmdb_vs_supdb", floor_cmp.clone());
-
-        let unsettled = [s, l]
-            .iter()
-            .filter(|ei| !matches!(settled[**ei].verdict, Verdict::NoDifference))
-            .map(|ei| format!("{} ({})", names[*ei], settled[*ei].summary("below", "top")))
-            .collect::<Vec<_>>();
-        if unsettled.is_empty() {
-            rec.finding(Finding::new(
-                "EXT.7",
-                "Supdb walks a scan with less work per entry than LMDB",
-                matches!(walk_cmp.verdict, Verdict::Greater),
-                format!(
-                    "supdb {:.2} ns/entry against lmdb {:.2} ({}), measured as the difference \
-                     quotient between scans of {} and {} entries rather than fitted. The walk is \
-                     bounded by memory bandwidth rather than by structure, so this is the half of \
-                     a scan where there is little left to win. The fit this replaces put the \
-                     slope at {:.2} against {:.2}, so on this coefficient it was close -- it was \
-                     the intercept the straight line destroyed, not the slope",
-                    walk[s].median(),
-                    walk[l].median(),
-                    walk_cmp.summary("lmdb", "supdb"),
-                    lens[last - 1],
-                    lens[last],
-                    full_fit[s].1,
-                    full_fit[l].1
-                ),
-            ));
-        } else {
-            rec.finding(Finding::not_exercised(
-                "EXT.7",
-                "Supdb walks a scan with less work per entry than LMDB",
-                format!(
-                    "the cost curve has not stopped bending by n={}: the marginal cost over \
-                     {}..{} is still distinguishable from the one over {}..{} for {}. A marginal \
-                     cost taken where the curve is still turning is a property of the sweep's \
-                     range rather than of the engine, so this run declines to report one",
-                    lens[last],
-                    lens[last - 1],
-                    lens[last],
-                    lens[last - 2],
-                    lens[last - 1],
-                    unsettled.join(" and ")
-                ),
-            ));
-        }
-
-        rec.finding(Finding::new(
-            "EXT.8",
-            "Supdb pays no more fixed cost per scan than LMDB",
-            // Lower is better, so this holds when LMDB's floor is the greater
-            // one or the two cannot be told apart. The first version of this
-            // line accepted `Less` as well, which is LMDB winning, and it duly
-            // reported a hold on a run where Supdb was 1.24x worse.
-            matches!(floor_cmp.verdict, Verdict::Greater | Verdict::NoDifference),
-            format!(
-                "supdb {:.0} ns against lmdb {:.0} ({}). This is the observed cost of a \
-                 one-entry scan, not a fitted intercept: what an engine pays before anyone asks \
-                 it for a second entry. For Supdb that is the seek plus resolving the first \
-                 block; for LMDB and redb it was, until this commit, opening a read transaction \
-                 per call. The fitted version of this number read {:.0}ns against {:.0} -- each \
-                 above the one-entry scan it was supposed to bound, which is how a straight line \
-                 through a bent curve reports a floor that no measurement ever touched",
-                floor[s].median(),
-                floor[l].median(),
-                floor_cmp.summary("lmdb", "supdb"),
-                full_fit[s].0,
-                full_fit[l].0
-            ),
-        ));
-    }
     Ok(rec)
 }
 
@@ -2038,7 +1767,7 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
         let rates = Trial::new(reps).run(which.len(), |ci, rep| {
             let dir = root.join(format!("{}-{rep}", which[ci]));
             let _ = std::fs::remove_dir_all(&dir);
-            let Some(mut e) = build(&dir, &[which[ci]], 256).into_iter().next() else {
+            let Some(mut e) = build(&dir, &[which[ci]]).into_iter().next() else {
                 return f64::NAN;
             };
             featc.lock().unwrap()[ci] = Some(e.features());
@@ -2135,23 +1864,6 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
     // now the cost of the write itself rather than the cost of publishing it.
     let idx = |name: &str| which.iter().position(|w| *w == name);
     let wl = |prefix: char| workloads.iter().position(|w| w.0.starts_with(prefix));
-    if let (Some(si), Some(a), Some(c)) = (idx("supdb"), wl('A'), wl('C')) {
-        let (a, c) = (per_workload[a][si].median(), per_workload[c][si].median());
-        if a.is_finite() && c.is_finite() {
-            rec.finding(Finding::new(
-                "EXT.3",
-                "Supdb sustains a mixed read/write workload within 10x of a read-only one",
-                c / a.max(1e-9) < 10.0,
-                format!(
-                    "YCSB-A (50/50) {a:.0} ops/s against YCSB-C (100% read) {c:.0} ops/s -> \
-                     {:.1}x. A read after a write is served from the writer's own state; when \
-                     this ratio was 13.5x it needed a checkpoint and a fresh Reader, both O(key \
-                     count)",
-                    c / a.max(1e-9)
-                ),
-            ));
-        }
-    }
 
     // The matched pairs: the next engine, undrained after its load as
     // RocksDB is, against RocksDB tuned as deployed. Both commit durably
@@ -2366,13 +2078,12 @@ fn intersect_sorted(a: &[u32], b: &[u32]) -> u64 {
 /// per line, appended grouped by term because W1.3 showed the naive roll
 /// costs 22.6x the file. ~2,000 term keys and ~1M postings at `full`.
 ///
-/// Read-only over immutable stores built once and probed repeatedly, so
+/// Read-only over immutable segments built once and probed repeatedly, so
 /// every number is warm, like ext-sweep's -- EXT.12 owns cold -- and
 /// durability does not bind. The checksum axis does: supdb-nocksum is built
-/// without checksums and read without verification, which is the read-side
-/// counterpart of ext-kv's supdb-buffered arm, because LMDB has none to turn
-/// on. Plain supdb (checksums on, the shipping default) is recorded beside
-/// it and gates nothing.
+/// without checksums and read without verification, which is the arm matched
+/// to LMDB, because LMDB has none to turn on. The checksummed arm (the
+/// shipping default) is recorded beside it and gates nothing.
 fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
     const WIDTH: usize = 4;
     let lines = args.num("--lines", profile.pick(20_000, 150_000, 500_000)) as u64;
@@ -2396,17 +2107,17 @@ fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
         .param("reps", J::u(reps as u64))
         .note(
             "one synthetic day in logshed's shape: per line, one 4-byte line-ordinal posting \
-             under a zipf-picked term of each field, appended grouped by term (W1.3). Postings \
+             under a zipf-picked term of each field, written grouped by term, which is the order the segment writer takes. Postings \
              are big-endian here where logshed writes little-endian: Supdb never compares value \
              bytes so it costs Supdb nothing, and it makes LMDB's dup comparator agree with \
              numeric order, so both engines walk ascending lists and the intersection needs no \
              comparator shim",
         )
         .note(
-            "read-only over immutable stores built once and probed repeatedly: every number is \
+            "read-only over immutable segments built once and probed repeatedly: every number is \
              warm, like ext-sweep's, and EXT.12 owns cold. Durability does not bind on a read; \
              the checksum axis does, and supdb-nocksum -- built without checksums, read without \
-             verification, the read-side counterpart of ext-kv's supdb-buffered -- is the \
+             verification -- is the \
              matched arm for every claim, since LMDB has none to turn on. Plain supdb is \
              recorded beside it and gates nothing",
         )
@@ -2472,33 +2183,43 @@ fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     // ---- build all three stores from the same stream ----
     //
-    // `Options::checksums` is a process-global set by `Store::create`, so the
+    // `Options::checksums` is a process-global set by the writer, so the
     // no-checksum file is built FIRST and the checksummed one second: the
     // global is then still on when the checksummed arm reads, and the nocksum
     // arm opts out per-reader with `BlobOptions::verify_checksums`.
+    //
+    // The writer takes keys in byte order. `dict` is built in the order the
+    // packed records sort, which is field index then value index, and both
+    // ascend with the key bytes -- asserted rather than assumed, because a
+    // field added out of name order would otherwise fail deep inside the
+    // writer rather than here.
+    assert!(
+        dict.windows(2).all(|w| w[0] < w[1]),
+        "the dictionary must be in byte order for the segment writer"
+    );
     let root = scratch("analytics");
-    let build_store = |path: &std::path::Path, checksums: bool| {
-        let store = supdb::Store::create(
+    let build_segment = |path: &std::path::Path, checksums: bool| {
+        let mut w = supdb::next::SegmentWriter::create(
             path,
-            supdb::Options {
-                buffer_bytes: 256 << 20,
+            &supdb::Options {
                 checksums,
                 ..Default::default()
             },
         )
         .expect("create");
         for (i, key) in dict.iter().enumerate() {
+            w.begin(key).expect("begin");
             for p in &postings[starts[i]..starts[i + 1]] {
-                store.append(key, &p.to_be_bytes()).expect("append");
+                w.value(&p.to_be_bytes());
             }
+            w.end().expect("end");
         }
-        store.checkpoint().expect("checkpoint");
-        store.close().expect("close");
+        w.finish(1).expect("finish");
     };
     let nock_path = root.join("supdb-nocksum.dat");
-    build_store(&nock_path, false);
+    build_segment(&nock_path, false);
     let ck_path = root.join("supdb.dat");
-    build_store(&ck_path, true);
+    build_segment(&ck_path, true);
 
     let mut ldb = LmdbDup::create(&root.join("lmdb-dup"), 8).expect("lmdb-dup create");
     ldb.begin_load().expect("begin_load");

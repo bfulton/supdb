@@ -67,39 +67,6 @@
    "because": "Every reader process must see a complete, self-consistent checkpoint state. This is the core safety property of the append-only design and must never regress."
   },
   {
-   "experiment": "ext-kv",
-   "id": "EXT.1",
-   "expect": "not_exercised",
-   "because": "WITHDRAWN as an ordering. `supdb` does not commit durably and LMDB does, and `supdb` checksums and LMDB does not; both axes could have been equalized and neither was. The suite recorded 863,005 ops/s against 674,858 and called it a 1.28x win for as long as this claim has existed, with the difference sitting in a features table two lines away. It was never a load result. EXT.9 and EXT.10 are the comparisons, at both levels of promise: matched durable, Supdb loses 91x; matched non-durable, it loses 1.85x. `Features::unmatched` now refuses to rank a pair that differs on an equalizable axis, so this cannot recur by being forgotten.",
-   "profile": "full"
-  },
-  {
-   "experiment": "ext-kv",
-   "id": "EXT.4",
-   "expect": "not_exercised",
-   "because": "WITHDRAWN as an ordering: `supdb` verifies checksums and LMDB has none to verify. This one ran in the direction nobody was watching -- the unmatched figure is 994,780 reads/s against LMDB's 1,093,321, so Supdb was *behind* here while paying a cost its comparator does not. f8 prices verification at +8.5% on writes. Equalized, EXT.11 reads 1.042x at p=0.2013, which is parity. The point of matching is not that it flatters Supdb; it is that unmatched comparisons are not comparisons whichever way they fall.",
-   "profile": "full"
-  },
-  {
-   "experiment": "ext-kv",
-   "id": "EXT.5",
-   "expect": "not_exercised",
-   "because": "WITHDRAWN as an ordering, same reason as EXT.4: the checksum axis was never equalized and a scan verifies. Recorded unmatched at 27,798,545 entries/s against LMDB's 39,940,773. EXT.12 is the matched version and reads 0.785x, so equalizing recovers some of the gap and does not close it. The prose here used to say '0.65x' and point at the ext-sweep decomposition as the stable thing to read instead; both halves were wrong, and the decomposition turned out to be a straight line fitted through a bent curve. See EXT.7 and EXT.8.",
-   "profile": "full"
-  },
-  {
-   "experiment": "ext-kv",
-   "id": "EXT.6",
-   "expect": "fails",
-   "because": "BROKEN by the same change, and deliberately. Supdb stores 4.7MB against LMDB's 2.6MB where it used to be smaller. Uncompressed data plus an uncompressed mapped index cost the space axis outright. That was one of only two axes Supdb led on, and it was traded knowingly for 3.6x on reads, 30x on scans and 3.8x on writes -- see f12. Turning Options::compress back on restores it."
-  },
-  {
-   "experiment": "ext-ycsb",
-   "id": "EXT.3",
-   "expect": "holds",
-   "because": "FIXED by `Store::read_all`. YCSB-A (50/50 read/write) now runs 1,750,629 ops/s against read-only YCSB-C's 2,304,688 -- 0.76x, where it was 13.5x slower. A read no longer needs a checkpoint and a fresh Reader; the writer reads its own sealed, staged and pending state directly, and a sealed extent is served from a mapping rather than by preading its whole 64KiB block. Against LMDB the mixed workloads went from 0.07-0.14x to 20.98x on A and 18.40x on F. This was the last structural thing between Supdb and the workload shape no benchmark in the design document contains."
-  },
-  {
    "experiment": "f1-outofcore",
    "id": "F1.1",
    "expect": "holds",
@@ -223,13 +190,6 @@
    "id": "C4.5",
    "expect": "holds",
    "because": "Under Sync::EveryN(8) a crash loses at most seven acknowledged batches and only from the tail: 60/60 within the bound, the most lost 6, with up to 48,248 bytes torn from the unsynced tail. A process kill alone could not have tested this -- the page cache outlives the process -- which is why the parent tears the tail itself (P4.5)."
-  },
-  {
-   "experiment": "ext-kv",
-   "id": "EXT.2",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Supdb reads 2.878x faster than redb (p=0.0022) over seven interleaved repetitions. LMDB is behind Supdb here too (EXT.4), so this is first place rather than second."
   },
   {
    "experiment": "c2-oracle",
@@ -496,20 +456,6 @@
    "because": "On the workload the fence was built for -- 50-entry scans, the shape YCSB-E runs -- it is worth 1.092x: 15,909,949 against 14,570,849 entries/s, p=0.0022 with IQRs of 2.0% and 1.4%. This is the finding that decides whether the fence earns a format version, since a seek that got faster without moving a scan would not. 9% is real, repeated and far less than predicted; it is kept because it is positive and measured, not because it was expected."
   },
   {
-   "experiment": "ext-sweep",
-   "id": "EXT.7",
-   "profile": "full",
-   "expect": "fails",
-   "because": "WAS 'holds', now measured rather than fitted, and the margin does not survive the change: Supdb walks at 24.41 ns/entry against LMDB's 22.99, ratio 0.942 at p=0.5229. This flip is not the engine getting worse and not the experiment going blind -- it is the experiment starting to measure the quantity it names. The per-entry cost is now the difference quotient between scans of 200 and 400 entries, which is what 'the cost of one more entry' means; it was the slope of a least-squares line fitted over lengths 1..400, across a range where the marginal cost of an entry falls from about 89ns to 15 before settling near 20. On this coefficient the fit was nearly right, and its problem was never arithmetic: it reported p=0.0409 for a margin the direct measurement cannot find at all. Across two runs an hour apart this ratio reads 1.018 and 0.942, crossing parity in both directions, no difference each time. Supdb and LMDB walk a scan at the same speed as far as this host can resolve."
-  },
-  {
-   "experiment": "ext-sweep",
-   "id": "EXT.8",
-   "profile": "full",
-   "expect": "holds",
-   "because": "FIXED, in the sense that the loss was never really measured: Supdb's shortest scan costs 857 ns against LMDB's 924, ratio 1.079 at p=0.6093, no difference. The old value -- 952 ns against 812, 0.853x at p=0.0022, a confident loss -- was the intercept of a straight line fitted over scan lengths 1..400, and that line is refuted by its own data. Its intercept lands ABOVE the measured cost of a one-entry scan for every engine in the suite and in every run since: +330ns for Supdb, +143 for LMDB, +9 for redb here, and +279/+208/+174 an hour earlier. A per-scan constant greater than the cheapest scan ever observed is not a constant, and two engines' versions of it are not a comparison. The floor is now read straight off the n=1 point with no model, and reads 0.947x and 1.079x across two runs -- across parity in both directions, where the fitted version said 0.853x at p=0.0022. With EXT.7 this removes the 'faster walker, larger constant' story entirely: both halves were fit artifacts pointing in opposite directions, and neither axis separates the two engines. full_range_fit is kept in every ext-sweep record so the refuted model stays visible rather than merely deleted, and src/bench/stats.rs carries the curve that refutes it as a test."
-  },
-  {
    "experiment": "f19-coldscan",
    "id": "F19.1",
    "profile": "full",
@@ -629,34 +575,6 @@
    "id": "C1.4",
    "expect": "holds",
    "because": "A damaged store is refused by `Store::open` or read correctly, never opened onto: 0/24 damaged files were accepted and then disagreed with what was written, and 2 were refused outright. This matters more than an ordinary read path because reopening rebuilds the block table, the key tables and every reference count from the file, and then *writes on top of* whatever it believed. Building it found a live defect: `Appender::read_extent` indexed `self.blocks[e.block]` unchecked and took the process down on a damaged index. `Reader` has had `loc_of` for exactly that since a damaged file panicked through `scan`; the writer's copy had never been asked, because nothing could reopen a store to ask it. That is the shape of this whole entry: the limitation prevented the test of the limitation."
-  },
-  {
-   "experiment": "ext-kv",
-   "id": "EXT.9",
-   "profile": "full",
-   "expect": "fails",
-   "because": "Supdb loads at 199,485 ops/s against LMDB's 572,416 when both commit per batch -- 0.348x at p=0.0022 in the canonical record; the same night's other full-suite readings were 0.298x, 0.361x and 0.271x (the comparator moved 1.6% between those pairs while Supdb's own arm moved 26%, so the residual instability is ours and is recorded rather than averaged away). The session arc on this axis: 6,735 ops/s (91x behind, 270x write amplification), 54,333 after in-place index insertion, 152,790 after log-first single-fsync points, ~200,000 now that the log carries the VALUES and a durability point seals nothing -- blocks are written later, full, on the store's own schedule, and the device sees ~834 MB per load against 1,459 before. Each step was predicted by a decomposition before it was built, and the last one was nearly refuted by its own gate: at 1M keys the first value-log walked every key per point looking for unlogged bytes, an O(keys^2) tax that read 0.149x until the per-shard queue removed it (f36 at 1M: 0.718x values-vs-extents unfixed, 1.814x fixed -- both runs kept). Still 3.4x behind, so still failing; what remains is per-batch arena append + fsync + block-table section against LMDB's single page-chain commit, and the macOS barrier ladder now brackets that floor from both sides: 0.426x pre-value-log, 0.490x/0.487x with it, replicated to 0.4% (+19.3% where Linux gained +30.6%, the compression being F_FULLFSYNC's share), leaving a 2.04x residual with both engines paying exactly one barrier per batch. Borrowed batch (551f026): 209,393 against 592,274, 0.354x."
-  },
-  {
-   "experiment": "ext-kv",
-   "id": "EXT.10",
-   "profile": "full",
-   "expect": "fails",
-   "because": "The load axis finally has a host that can read it. On this x86 VM the entry is unmeasurable -- lmdb-nosync, untouched, moved 85% between consecutive runs, and the ratio has read 0.53x to 1.06x with no code change. The Mac runner (results/apple-silicon/ext-kv-buffered-pair.run*.json) measures the pair twice with each engine drifting no more than 1.5% between runs: 0.857x at p=0.0073 and 0.852x at p=0.1599 -- the point estimate stable to 0.6%, one run clearing the gate and one not, which is what a ~15% effect at the edge of resolution looks like. So the sequential arrival deficit is real and it is 14-15%, not the 47% this host's drift suggested. Arrival order still decides the sign: shuffled keys win 1.94x (EXT.13). Architecture caveat: aarch64, 128-byte lines, 16KiB pages; this claim's pinned record stays x86 and stays failing until an x86 host that holds still says otherwise. Borrowed batch: 739,745 against 979,662, 0.755x at p=0.01, lmdb-nosync at rel_iqr 36%."
-  },
-  {
-   "experiment": "ext-kv",
-   "id": "EXT.11",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Holding, quoted as a range: 1,325,496 reads/s against lmdb's 917,928, 1.444x at p=0.0022, on the recovered host state -- after 1.262x and 1.379x on the degraded one and a tie at 1.043x before that. The old engine's read lead over lmdb across six runs is 1.196x, 1.092x, 1.043x, 1.379x, 1.262x, 1.444x: real, and it moves with the host. The read claim the project carries is the next engine's (EXT.23)."
-  },
-  {
-   "experiment": "ext-kv",
-   "id": "EXT.12",
-   "profile": "full",
-   "expect": "holds",
-   "because": "FLIPPED to holds by format v6, one canonical run in: supdb-buffered scans a fresh store at 29.6M entries/s against lmdb's 23.7M, 1.246x at p=0.0049. The x86 history of this axis is a coin toss -- 1.046x (nd), 1.155x (sig), 0.934x (nd), 0.9x (nd), 0.868x (sig, the run before this one) -- and the comparator did not move here (24.4M to 23.7M); Supdb's own arm did, from 21.2M to 29.6M, and the one change to the store's scan path between the runs is that its 100-byte values are uniform and so are now written as fixed runs with no length prefixes to decode (fixedrun-plan.md). Apple Silicon had 1.174x and 1.178x with rel_iqr under 1.3% before v6, replicated. Replicated on the next run: 22.1M against 18.0M, 1.229x at p=0.0298 (results/ext-kv.full.run3-norocksdb.json, a run without the RocksDB arms because the binary had been rebuilt without the feature, kept for this pair). Then 1.442x at p=0.0022 on the run after that (run4-replication) -- three runs on v6, all significant, all in the same direction, after five that were not; recorded as holds with that history. The last two had lmdb's scan arm at 18.0M and 16.5M against 23.7M in the canonical run, so read the size of the lead from the canonical file and the direction from all three."
   },
   {
    "experiment": "f25-arena",
@@ -798,20 +716,6 @@
    "profile": "full",
    "expect": "holds",
    "because": "52.56 MB against 385.21 -- the file is 7.33x SMALLER with room to insert, at p=0.0001, and the prediction was the opposite. Doubling the directory costs about 4 bytes per key on an index that is about 57, and Supdb already loses the size axis to LMDB (EXT.6), so this claim was written expecting to have to defend a size regression. It does not: rewriting the index for every insertion appends a fresh section each time and reclaims them more slowly than they accumulate, which costs far more than the second buffer ever could. The reserved directory is the smaller half of a trade whose larger half nobody had measured."
-  },
-  {
-   "experiment": "ext-loadshape",
-   "id": "EXT.13",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Supdb loads a shuffled key set at 584,090 ops/s against lmdb-nosync's 192,245 -- 3.038x at p=0.0022 -- where the same run has it at 0.199x on the same keys arriving in order (314,576 against 1,577,594). The run before read 2.785x shuffled and 0.305x ordered. A swing of 15x on arrival order alone, with the engines, the guarantees and the key set identical. EXT.10 measured only the ordered arm, and the suite has been reading it as a statement about loads. Both arms are real: ordered arrival is a common shape and Supdb is 5x behind on it. What changes is that the comparison now says which shape it is about. lmdb-nosync is still transactional, so read this as a bound. Borrowed batch: 580,010 against 194,447, 2.983x; ordered 0.140x."
-  },
-  {
-   "experiment": "ext-loadshape",
-   "id": "EXT.14",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Supdb loads at 314,576/s in order and 584,090 shuffled -- a factor of 0.54, so faster out of order (0.89 in the run before). LMDB goes 1,577,594 to 192,245, a factor of 8.21, and 658,292 to 48,041 when durable, a factor of 13.7 (8.10 and 13.9 the run before). The next engine sits between them: 429,659 to 284,938, a factor of 1.51 -- it sorts at seal and merges what it cannot promote, so it keeps some of the B-tree's preference for order and none of its collapse. That is the architectural difference rather than a ranking: a B-tree taking keys in order fills pages left to right and splits almost never, and the same tree taking them shuffled splits constantly, while an append-structured store writes where the cursor already is either way. It is the property Supdb should have and the first measurement here that shows it, and it is worth more than either ordering, because a store whose ingest rate does not depend on what the keys look like is one you can size capacity for. Borrowed batch: supdb 253,607 to 580,010 (0.44), LMDB 1,806,415 to 194,447 (9.29) and 592,166 to 45,163 durable (13.1), next 349,700 to 300,080 (1.17, no difference)."
   },
   {
    "experiment": "ext-loadshape",
@@ -1874,7 +1778,7 @@
    "experiment": "ext-kv",
    "path": "series.engines.0.read_hit_rate",
    "min": 0.99,
-   "because": "The comparison is only meaningful if Supdb actually returns the data. A collapse here would mean the reads being timed are misses."
+   "because": "The comparison is only meaningful if the engine actually returns the data. A collapse here would mean the reads being timed are misses."
   },
   {
    "experiment": "f5-latency",
