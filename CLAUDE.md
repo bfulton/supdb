@@ -26,6 +26,35 @@ or the experiment stopped testing anything. Both need a person to decide which.
 So when you fix something, update `claims.json` in the same change — that edit
 is the record that the fix was intentional.
 
+## Where commentary goes
+
+Two audiences, and they want opposite things. This file, the plan files and a
+claim's `because` are notes to whoever picks the work up next with no memory of
+it: dense, contextual, and worth keeping even when superseded. `README.md`, a PR
+description and the crate docs are read by people who either already have the
+context or do not want it, and for them a recounting of the moves and pivots is
+noise on top of the summary.
+
+So keep the outward-facing ones **factual, current, likely to stay current, and
+simple**. In practice:
+
+- **No counts that move.** Not the number of tests, assertions, claims, commits
+  or files. They are wrong within a day and they never mattered.
+- **No figures that move.** Directions and trades belong there; the numbers
+  belong in `claims.json` and `results/`, where `verify` gates them. Cite the
+  claim id instead and the reader gets a checked figure rather than a snapshot.
+- **No history.** Not what a section used to say, not what the design document
+  called it, not what was tried first. A reader who wants that follows the
+  pointer.
+- **No narrative of the change that produced it.** A cleanup pass that announces
+  itself is the thing it was meant to remove.
+
+The last one is the easiest to get wrong, because the writing feels like
+diligence. It is not: the person who asked for the work already knows, and the
+person who did not is being handed a changelog they did not ask for. Write the
+result as though it had always been that way, and put the reasoning where
+reasoning lives.
+
 ## Before adding a benchmark
 
 Four rules, enforced in `src/bench/` rather than remembered:
