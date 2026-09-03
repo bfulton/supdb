@@ -48,6 +48,19 @@ Four rules, enforced in `src/bench/` rather than remembered:
    `/proc/self/io`, never inferred from file size — they are different
    quantities.
 
+## Running the checks
+
+`sh scripts/check.sh` runs every group -- build, test, lint, browser, claims,
+suites -- and CI calls the same script with the same names, so a green run
+here is a green run there. Use a group name to run one (`sh scripts/check.sh
+browser`). Two things are deliberately outside it: `cross-arm`, which needs a
+cross toolchain and qemu, and `--profile full`, which takes hours and is run
+by hand when a number is going to be cited.
+
+Keep it that way. Every gate this repository has broken has broken the same
+way -- a check that was not running, or was reporting a verdict it had not
+earned -- and a second definition of "the checks" is how that starts.
+
 ## Profiles
 
 `ci` runs in seconds and is **never citable**; it proves the experiments still

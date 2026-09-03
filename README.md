@@ -27,6 +27,16 @@ docs/              the architecture review that produced all of the above
 ## Quick start
 
 ```sh
+sh scripts/check.sh          # everything CI runs: build, test, lint, browser, claims, suites
+sh scripts/check.sh lint     # or one group at a time
+```
+
+CI calls the same script with the same group names, so what passes here is
+what passes there. That is deliberate: the checks used to be written down
+twice, once in a contributor's habits and once in the workflow, and the two
+had drifted far enough that CI never built the wasm module at all.
+
+```sh
 cargo build --release --workspace
 cargo run --release --bin internal -- all --profile dev      # falsification suite
 cargo run --release --bin external -- all --profile dev      # against redb, LMDB, sled

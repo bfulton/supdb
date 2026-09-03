@@ -9,6 +9,13 @@ cachegrind.out.*
 callgrind.out.*
 perf.data*
 
+# What `scripts/check.sh suites` and `claims` write. A local run of the
+# checks must not dirty the tree: results/ and figures/ are the committed
+# measurements, these are the throwaway ones the run produced.
+/results-ci
+/figures-ci
+/figures-ci-committed
+
 # Build artifacts of the browser reader: `web/build.sh` writes the module,
 # `logshed fixture` writes the day index the browser test opens.
 /web/supdb.wasm
