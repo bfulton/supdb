@@ -158,3 +158,50 @@ retired arms. They are accurate records of runs that happened, and no claim
 cites them any more, so they stay until the next canonical `full` run replaces
 them. Taking that run is the right last step of the retirement, not a step in
 the middle of it.
+
+## The canonical run, taken and rejected
+
+`ext-kv --profile full`, ten engines at 1M keys, seven repetitions, on the
+current head with the RocksDB arms built (`results/ext-kv.full.run5-postretire.json`).
+It is recorded and it does not replace the canonical file, because the
+comparators moved more than the engine did.
+
+Run over run, the load rate of the arms this repository does not touch:
+
+| arm | ratio |
+|---|---|
+| lmdb-nosync | 0.516 |
+| rocksdb-tuned-drain | 0.639 |
+| redb | 0.734 |
+| rocksdb-nosync | 0.777 |
+| rocksdb-tuned | 0.861 |
+| rocksdb | 0.903 |
+| lmdb | 0.941 |
+
+A 45-point spread on code nothing here changed. The engine's own arms --
+0.764, 0.779, 0.920 -- sit inside it, so the run says nothing about the load
+axis either way.
+
+`verify` did flag one flip: `EXT.24` recorded `holds` against an expected
+`fails`, the ordered scan reading 1.269x of LMDB where the canonical run has
+0.899x. That is the comparator and not the engine: LMDB's scan fell from
+23.7M to 17.6M entries/s (0.743x) while the engine's fell from 23.6M to 22.4M
+(0.950x). Flipping a claim on it would have recorded a fact about the host as
+a fact about the engine, which is the failure this project exists to avoid.
+The claim stays `fails` until a quiet host says otherwise.
+
+**Prediction 3 held on the axis that could have refuted it.** The retirement
+touched `PieceWriter` and `Options`, both on the read path, and the point read
+came back at **0.994x** of the previous canonical run -- 1,913,379 against
+1,902,515 ops/s -- with the ordered scan at 0.950x. If collapsing the writer
+enum or slimming the options struct had cost anything, the read is where it
+would show, and it did not.
+
+What remains is one canonical `full` campaign -- ext-kv, ext-ycsb,
+ext-loadshape, ext-analytics -- taken on a host that is not also building.
+Two runs is the minimum, as ever.
+
+Building the RocksDB arms needs `LIBCLANG_PATH` pointing at a directory
+holding a file named exactly `libclang.so`; `clang-sys` does not match the
+versioned `libclang-18.so.1` this image ships, and without the arms the run
+silently omits `EXT.28`-`EXT.41`.
