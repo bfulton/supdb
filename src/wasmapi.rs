@@ -36,6 +36,13 @@ use std::io::Result;
 /// The largest object this ABI addresses.
 const MAX_OBJECT: u64 = u32::MAX as u64;
 
+// Named explicitly rather than left to the default. `env` is what the JS side
+// passes (`instantiate` builds `{ env: host }`), and naming it is what makes
+// these wasm *imports* rather than undefined symbols: on rustc 1.98 the bare
+// block stopped linking with "undefined symbol: supdb_host_read". Nothing in
+// CI builds the wasm module, so that break was invisible until a toolchain
+// update surfaced it here.
+#[link(wasm_import_module = "env")]
 extern "C" {
     /// Total bytes of the host's object.
     fn supdb_host_len() -> u32;

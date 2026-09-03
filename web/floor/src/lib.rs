@@ -27,14 +27,31 @@ fn work(n: u32) -> Result<u64> {
     })
 }
 
-/// # Safety
-/// Trivially safe; `extern "C"` for the same ABI shape the real module has.
+/// The same allocation shape `supdb_alloc` has, deliberately down to the
+/// detail that makes it correct: `vec![0u8; n]` allocates exactly `n` where
+/// `with_capacity` may allocate more, and handing the allocator back a
+/// capacity it did not give out is undefined behaviour rather than a leak.
+/// A control that allocates differently from the thing it controls for is
+/// not measuring the same std surface -- and the first version of this file
+/// used `with_capacity` and had no `floor_free` at all, so it linked neither
+/// the exact-size path nor the deallocation one.
 #[no_mangle]
 pub extern "C" fn floor_alloc(len: u32) -> *mut u8 {
-    let mut v = Vec::<u8>::with_capacity(len as usize);
+    let mut v = vec![0u8; len as usize];
     let p = v.as_mut_ptr();
     std::mem::forget(v);
     p
+}
+
+/// Release memory from `floor_alloc`, as `supdb_free` does.
+///
+/// # Safety
+/// `ptr` and `len` must be exactly what `floor_alloc` returned and was given.
+#[no_mangle]
+pub unsafe extern "C" fn floor_free(ptr: *mut u8, len: u32) {
+    if !ptr.is_null() {
+        drop(Vec::from_raw_parts(ptr, 0, len as usize));
+    }
 }
 
 #[no_mangle]

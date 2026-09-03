@@ -2,6 +2,13 @@
 /bench/external/vendor
 *.dat
 
+# Profiler output. `bench/profile.sh` pins --cachegrind-out-file=/dev/null,
+# but a bare `valgrind --tool=cachegrind` drops one of these in the cwd, and
+# one of them reached the repository root and stayed there.
+cachegrind.out.*
+callgrind.out.*
+perf.data*
+
 # Build artifacts of the browser reader: `web/build.sh` writes the module,
 # `logshed fixture` writes the day index the browser test opens.
 /web/supdb.wasm

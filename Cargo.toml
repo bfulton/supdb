@@ -59,24 +59,8 @@ name = "recover"
 path = "src/bin/recover.rs"
 
 [[bin]]
-name = "mvcc"
-path = "src/bin/mvcc.rs"
-
-[[bin]]
-name = "kvbench"
-path = "src/bin/kvbench.rs"
-
-[[bin]]
-name = "concur"
-path = "src/bin/concur.rs"
-
-[[bin]]
 name = "soak"
 path = "src/bin/soak.rs"
-
-[[bin]]
-name = "tablebench"
-path = "src/bin/tablebench.rs"
 
 [[bin]]
 name = "internal"

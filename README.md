@@ -9,11 +9,15 @@ it. The engine came from a design document; the suite came from reviewing that
 document and asking what measurement would prove it wrong.
 
 ```
-src/               engine  (~1,400 lines, two dependencies: memmap2, lz4_flex)
+src/               the original engine, vendored from the design artifact
+src/next.rs        the next engine -- WAL, memtable, sealed segments, compaction, deletes, Txn
+src/blob.rs        the read path over any byte source; compiles for wasm
 src/bench/         the measurement substrate  -- repetition, significance, latency, I/O accounting
 src/bin/internal   the falsification suite    -- Supdb against itself, as it scales
 src/bin/correctness  the correctness suite    -- damaged files, a model oracle, crash injection
+src/bin/logshed    the browser-reader suite   -- day-index shape, round trips, size budget
 bench/external/    the comparison suite       -- Supdb inside other projects' evaluations
+web/               the browser reader, its size budget and its browser test
 results/           committed measurements     -- the source of truth for figures and claims
 figures/           publication-quality SVG    -- generated from results/, never by hand
 claims.json        every statement, with the state it is expected to be in
@@ -33,62 +37,78 @@ cargo run --release --bin figures                            # results/ -> figur
 
 ## What the measurements currently say
 
-Taken on 4 cores / 15 GB at the `ci` and `dev` profiles. **Neither is citable
-evidence** — only `--profile full` is, and these are the honest small-scale
-numbers, not headline ones.
+Every number below is `--profile full`, which is the only profile this project
+treats as citable, and every one of them is read out of `results/` rather than
+remembered. There are two engines here: the original `Store`, and `src/next.rs`,
+which is where the recent work has gone. Comparisons are **matched** — an engine
+is not ranked against another until they promise the same thing about durability,
+transactions and checksums, and `Features::unmatched` refuses the ranking when
+they do not.
 
-**What holds.** Supdb has the fastest bulk load in the field, and the smallest
-file — 1.55× smaller than LMDB on the same data. Every reader process sees a
-complete, self-consistent state under a live writer. Chunk-granular
-decompression inside a packed block is a genuinely good idea and it works.
-Device-level write amplification is **0.96×** — genuinely below one, because
-compression more than pays for the append-only overhead. That is a real result
-and it is the design's strongest number.
+**What holds.** The next engine reads **2.14×** faster than LMDB with both
+committing durably per batch and both transactional (1,913,379 against 895,249
+reads/s, `EXT.23`), and **6.97×** faster than RocksDB tuned as it would be
+deployed (`EXT.33`). Its ordered scan ties LMDB (0.992×, no difference,
+`EXT.24`) and beats tuned RocksDB by **5.10×** (`EXT.34`). On YCSB, matched, it
+leads tuned RocksDB on update-heavy A by 1.74×, read-only C by 2.45×, short-scan
+E by 1.28× and read-modify-write F by 2.20× (`EXT.42`–`EXT.45`).
 
-Crash recovery works: across every trial that crashed *after* a checkpoint, the
-store opened, ~95% of keys survived, and recovery invented nothing — no value
-came back that had not been written. The alternating superblock slots do their
-job. And the store agrees with a `BTreeMap` model over randomized sequences of
-appends, replaces and deletes across every checkpoint.
+Arrival order decides the load, and both halves are recorded: under **shuffled**
+arrival the next engine loads at **5.93×** LMDB (`EXT.27`), because a durable
+commit of a thousand random keys dirties about as many B-tree leaf pages and the
+fsync writes them all. Quote that only alongside the ordered load below.
 
-**What does not.**
+The original `Store` reads **1.52×** LMDB and scans **1.25×** with checksums
+equalized (`EXT.11`, `EXT.12`). Durability has a usable point on its curve since
+block compression went off by default: a 20,000-op window sustains **199,308
+ops/s** with about 2 MB at risk (`F4.2`). Reader open is no longer proportional
+to key count (`F2.2`), and the key index is 89 bytes per key in a mapped section
+every reader process shares rather than 131 bytes duplicated per process
+(`F7.2`).
+
+Correctness is where the suite has earned the most. The store agrees with a
+`BTreeMap` model across randomized appends, replaces and deletes (`C2.1`);
+damaged files error rather than panic or serve wrong bytes (`C1.3`); a segment's
+key index is checksummed per 16 KiB piece, and `tests/segwriter.rs` flips every
+seventh byte of one and requires each flip to fail the open. Crash injection
+against the next engine shows every recovered state is an exact prefix of the
+commit order, and recovery invents nothing (`C4.1`–`C4.5`).
+
+**What does not.** These are recorded as failing on purpose; each is
+load-bearing evidence, and `claims.json` fails the build in both directions so
+none can be quietly forgotten.
 
 | finding | measured |
 |---|---|
-| reader open is independent of key count | **super-linear**: 20× the keys costs 34.7× the open |
-| a short-lived reader process is viable | 100 reads against 200k keys costs 433 µs/read against a 1.4 µs steady state; break-even is 16,384 reads |
-| write throughput scales with threads | 4 threads is **0.86×** of one thread — negative scaling |
-| durability is affordable | a 1,000-op loss window costs **25×** throughput; no usable point on the curve |
-| the mean summarises append cost | p99.9/mean = 61×; one checkpoint stalled **32.8 seconds** |
-| many reader processes are safe | 80 readers past the 64-slot table, held 35 s past the 30 s stale window: **2 read errors** |
-| Supdb reads faster than LMDB | measured natively, LMDB is **2.4× faster** on reads and 4.7× on scans |
-| Supdb sustains a mixed read/write workload | YCSB-A runs **13.5× slower** than read-only YCSB-C |
-| reads survive the dataset outgrowing memory | **916× degradation** — 338,681 reads/s resident vs 370 at 23 GB against 15.7 GB of RAM; p99 9.5 ms |
-| the reader index is affordable | **131 bytes per key**, resident, per process, shared with nobody — to index a 100-byte value |
-| a store killed before its first checkpoint is readable | it is not; nothing reaches disk until a checkpoint, and `buffer_bytes` defaults to 512 MB |
-| the store agrees with a `BTreeMap` model | **yes**, since the fixes — 60k comparisons across all reclaim policies |
-| a damaged file errors rather than panics | **yes**, since the fixes — 0 panics in 3,317 damage trials |
-| a read returns written bytes or an error | **yes**, since checksums — 0 corrupt reads |
+| the next engine loads faster than LMDB, both durable | **0.755×** — 463,695 against 613,821 ops/s (`EXT.22`) |
+| the next engine loads faster than tuned RocksDB | **0.611×** (`EXT.32`); RocksDB also keeps the smaller file |
+| reader open is independent of key count | not independent: 100× the keys costs **20×** the open (`F2.1`) |
+| write throughput scales with threads | 4 threads is **0.93×** of one — the appender mutex (`F6.1`) |
+| a 1,000-op durability window is affordable | **25×** throughput; `checkpoint` rewrites the whole key index (`F4.1`) |
+| the mean summarises append cost | p99.9/mean = **19.2×**; inline `merge_key` holds two locks (`F5.1`) |
+| Supdb stores the same data in less space than LMDB | **187.6 MB against 126.9** (0.68×, `EXT.6`) — traded knowingly for scans |
+| reads survive the dataset outgrowing memory | **916×** degradation, 338,681 reads/s resident against 370 (`F1.2`) |
+| a store killed before its first checkpoint is readable | it is not; nothing reaches disk until a checkpoint (`C3.4`) |
 
-The out-of-core result is the largest single number in the suite, and it is
-the only one measured at `--profile full`, so it is the only citable one.
-Reading through a mmap with no `madvise` anywhere means no readahead control,
-no asynchronous I/O and no influence over eviction — the failure modes Crotty
-et al. (CIDR'22) enumerate — and none of them are visible until the working
-set stops fitting.
+The size result is a deliberate trade, not a regression: turning block
+compression off cost the space axis and bought the scan axis, and both entries
+say so. The ordered-load deficit is the one that is genuinely open — what
+remains is the per-batch append, fsync and section work against LMDB's single
+page-chain commit, and the macOS `F_FULLFSYNC` pair says the floor there is the
+fsync count itself.
 
-The LMDB and YCSB results matter for a different reason: they contradict the
-design document rather than merely extending it. The LMDB comparison reverses once the Java harness is
-removed. The mixed-workload result is structural: `Store` exposes no read
-method, so a read after a write needs a checkpoint and a fresh `Reader`, both
-`O(key count)` — and no benchmark in the original suite mixes reads with
-writes.
+`CLAUDE.md` carries the full scorecard, including which numbers have replicated
+and on which host; `docs/next-engine.md` is the next engine's own account.
 
-## Three defects, found and fixed
+## Defects found and fixed
 
-All three were found by the suites here and none is reachable by any benchmark
-in the original design, because none of those compares the store against an
-independent model or feeds it damaged bytes.
+The three below were the first, and none is reachable by any benchmark in the
+original design, because none of those compares the store against an independent
+model or feeds it damaged bytes. A dozen more have been found since — a delete
+that was never marked dirty, a logged durability point that could be lost whole,
+replay applying records over newer state, a freelist class that underflowed for
+every block of 4 KiB or less. `CLAUDE.md` lists them with the reasoning; the
+reproducers live in `tests/known_bugs.rs`.
 
 **A deleted key came back.** `append` calls `seal_shard` inline once a shard's
 buffer fills, staging the extent in the block builder — but the block has no id
@@ -181,7 +201,18 @@ cannot be quietly forgotten.
 
 ## Status
 
-The engine is a prototype and several gaps are expected of one. Two are large
-enough to name here: a store cannot be reopened for writing (`Store::create`
-always truncates, and there is no `Store::open`), and there are no checksums on
-any data block. `docs/architecture-review.md` is the full account.
+Still a prototype, and the gaps are named rather than implied. The two this
+section used to name are closed: `Store::open` exists, and every block carries a
+checksum — CRC-32C per chunk in the chunk directory, plus a whole-block CRC for
+blocks stored verbatim, which is what the section above measures the cost of.
+
+What is open, in the order it matters: the durable ordered load trails LMDB and
+RocksDB (`EXT.22`, `EXT.32`); `checkpoint` is O(key count) rather than O(what
+changed), which is why the 1,000-op durability window still costs 25×; write
+throughput does not scale with writer threads; and a reopened store declares
+history before the reopen broken, because `Store::open` does not carry the reuse
+log across. Each is a claim in `claims.json` with the state it is expected to be
+in, so none of them can improve or decay without turning the build red.
+
+`docs/architecture-review.md` is the full account, and `docs/next-engine.md` the
+next engine's.
