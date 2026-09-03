@@ -126,8 +126,7 @@ fn sorted_pairs(lines: u64, seed: u64) -> Vec<u64> {
 
 /// The same day written by `SegmentWriter`: term order, runs up to
 /// `inline` bytes stored in the index record, an optional head reserve.
-/// What the roll would write if it used the segment writer (R7.3), and the
-/// shape w6 measures beside the store's.
+/// What the roll writes (R7.3), and the shape w6 measures.
 fn build_day_segment(
     path: &Path,
     lines: u64,
@@ -142,12 +141,7 @@ fn build_day_segment(
     deltas: bool,
 ) -> std::io::Result<u64> {
     let _ = std::fs::remove_file(path);
-    let opts = Options {
-        redo_log: false,
-        shards: 1,
-        ..Options::default()
-    };
-    let mut w = supdb::next::SegmentWriter::create(path, &opts)?;
+    let mut w = supdb::next::SegmentWriter::create(path, &Options::default())?;
     w.set_inline_max(inline);
     w.set_compress(compress);
     if head_reserve > 0 {

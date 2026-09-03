@@ -57,16 +57,18 @@ mod format;
 #[allow(clippy::all, dead_code)]
 mod block;
 #[allow(clippy::all, dead_code)]
-mod freelist;
-#[allow(clippy::all, dead_code)]
-/// The extent types the index is built from. Public because the next
-/// engine writes segments and a writer needs to name what it is writing;
-/// the format is otherwise reached through `Store` and `Blob`.
+/// The extent types the index is built from. Public because a writer needs
+/// to name what it is writing; the format is otherwise reached through
+/// `Blob`.
 pub mod index;
 // Not vendored -- written here, so it holds to -D warnings like the harness.
 // On wasm its writer half (`plan`, `encode`, the slack and fence arithmetic)
 // has no caller, because there is no writer there. Allowed on that target
 // only, so the native build keeps telling the truth about dead code.
+/// The read path, over any `Bytes` source. Compiles on every target.
+pub mod blob;
+/// Where a reader's bytes come from. The seam the wasm build needed.
+pub mod bytes;
 #[cfg_attr(target_family = "wasm", allow(dead_code))]
 /// The flat key index, including the builders a segment writer drives.
 /// Public for the same reason as `index`: a bulk writer for sorted,
@@ -76,28 +78,10 @@ pub mod index;
 /// the module is not reformatted for it.
 #[allow(clippy::len_without_is_empty)]
 pub mod flatindex;
-#[allow(clippy::all, dead_code)]
-pub mod keytable;
-// The reader table is shared with a *writer*, and there is no writer on wasm.
-#[cfg(not(target_family = "wasm"))]
-#[allow(clippy::all, dead_code)]
-mod readers;
-// `store` is the write path and it maps files. Seventeen of the twenty-nine
-// wasm errors were here -- `write_all_at`, `read_exact_at`, `memmap2::Advice`
-// -- and none of them is worth porting, because a browser has no file to write
-// and no file to map. It is excluded rather than ported, and `blob` is the
-// read path that survives the exclusion.
-#[cfg(not(target_family = "wasm"))]
-#[allow(clippy::all, dead_code)]
-mod store;
-
-/// The read path, over any `Bytes` source. Compiles on every target.
-pub mod blob;
-/// Where a reader's bytes come from. The seam the wasm build needed.
-pub mod bytes;
-/// The next engine: a WAL, a memtable and threads that seal and merge --
-/// none of which a browser has. Excluded from the wasm build rather than
-/// stubbed, like `store`; `blob` is the read path that carries over.
+/// The engine: a WAL, a memtable and threads that seal and merge -- none of
+/// which a browser has, and all of which want files to write and map.
+/// Excluded from the wasm build rather than stubbed; `blob` is the read path
+/// that carries over.
 #[cfg(not(target_family = "wasm"))]
 pub mod next;
 /// The C ABI the browser calls. Hand-written rather than generated, because
@@ -110,7 +94,4 @@ pub use blob::{Blob, BlobOptions, SparseBlob};
 pub use bytes::MmapBytes;
 pub use bytes::{Bytes, SliceBytes, VecBytes};
 #[cfg(not(target_family = "wasm"))]
-pub use store::{
-    take_phases, take_write_ledger, Options, Phases, ReadOptions, Readahead, Reader, Reclaim,
-    Stats, Store, Sync, WriteLedger,
-};
+pub use next::Options;

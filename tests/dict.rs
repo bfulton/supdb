@@ -145,11 +145,7 @@ fn build_segment(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)]) {
 }
 
 fn build_segment_with(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)], inline_max: usize) {
-    let opts = Options {
-        redo_log: false,
-        shards: 1,
-        ..Options::default()
-    };
+    let opts = Options::default();
     let mut w = SegmentWriter::create(path, &opts).expect("create");
     w.set_inline_max(inline_max);
     for (k, vals) in all {

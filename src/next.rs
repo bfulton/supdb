@@ -34,7 +34,7 @@ use crate::block::{self, crc32, BlockBuilder, BlockLoc};
 use crate::bytes::MmapBytes;
 use crate::flatindex;
 use crate::index::{Ext, Extents};
-use crate::{Blob, Options};
+use crate::Blob;
 
 fn err(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
@@ -1432,6 +1432,51 @@ impl SegmentWriter {
     }
 }
 
+/// How a segment file is written.
+///
+/// Three settings, which is what is left of a struct that once carried
+/// twenty-four: the rest described a writer that no longer exists -- its
+/// buffer, its shards, its redo log, its freelist, its checkpoint policy --
+/// and nothing read them. `NextOptions::segment` carries one of these to the
+/// writer for every piece the engine seals or merges.
+///
+/// Compression is deliberately not here. It is a property of one file rather
+/// than of the engine's configuration, so `SegmentWriter::set_compress` takes
+/// it; a field on this struct would be read by nothing and would silently do
+/// nothing, which is how `tests/ranges.rs` came to check the plain path while
+/// claiming to check the compressed one.
+#[derive(Clone, Debug)]
+pub struct Options {
+    /// Target size of a compression block. Bigger compresses better and costs
+    /// more to decompress on a point read; this is the size/read dial.
+    pub block_size: usize,
+    /// Compute and verify block checksums.
+    ///
+    /// On by default: without it a bit flip, a torn write or a reused slot
+    /// returns silently wrong data, because LZ4 decodes many corrupted inputs
+    /// into plausible bytes. The knob exists so the cost can be measured
+    /// honestly -- both arms in one process, interleaved -- rather than by
+    /// comparing two runs taken hours apart, which measures the machine as
+    /// much as the code (f8-checksums).
+    pub checksums: bool,
+    /// Sort and encode the key index across threads rather than on one.
+    ///
+    /// On by default. The sort splits and merges, the record loop splits
+    /// because `rec_offs` is a prefix sum, and the hash claims slots with
+    /// compare-exchange.
+    pub parallel_index: bool,
+}
+
+impl Default for Options {
+    fn default() -> Options {
+        Options {
+            block_size: 64 * 1024,
+            checksums: true,
+            parallel_index: true,
+        }
+    }
+}
+
 /// How a piece gets written.
 ///
 /// This was an enum: `SegmentWriter`, or the general `Store` path it
@@ -2649,11 +2694,7 @@ impl Db {
     }
 
     fn segment_opts(opts: &NextOptions) -> Options {
-        Options {
-            redo_log: false,
-            shards: 1,
-            ..opts.segment.clone()
-        }
+        opts.segment.clone()
     }
 
     pub fn create(dir: &Path, opts: NextOptions) -> Result<Db> {

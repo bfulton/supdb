@@ -91,8 +91,13 @@ fn merged(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
 /// A segment with run lengths from one value to tens of thousands, so the
 /// probes cover an inline run, a block-backed one, and runs large enough to
 /// take a block to themselves.
-fn build(path: &Path, keys: usize, opts: Options) -> Vec<Vec<u8>> {
-    let mut w = SegmentWriter::create(path, &opts).expect("create");
+fn build(path: &Path, keys: usize, compress: bool) -> Vec<Vec<u8>> {
+    let mut w = SegmentWriter::create(path, &Options::default()).expect("create");
+    // Compression is the writer's switch, not an `Options` field: a segment
+    // writer takes it through `set_compress`. Setting it on `Options` here
+    // compiled and wrote plain blocks, so the compressed-plan test below was
+    // checking the uncompressed path.
+    w.set_compress(compress);
     let mut names = Vec::new();
     for k in 0..keys {
         let key = format!("term={k:08}").into_bytes();
@@ -211,7 +216,7 @@ fn assert_exact(rig: &mut Rig, keys: &[Vec<u8>]) {
 #[test]
 fn the_plan_is_exactly_what_a_read_touches() {
     let path = scratch("exact");
-    let names = build(&path, 60, Options::default());
+    let names = build(&path, 60, false);
     let mut rig = Rig::open(&path);
 
     let probes: Vec<Vec<u8>> = [0usize, 1, 2, 3, 4, 31, 58, 59]
@@ -243,7 +248,7 @@ fn the_plan_is_exactly_what_a_read_touches() {
 #[test]
 fn a_plan_for_many_keys_is_the_merged_union_and_a_shared_fetch() {
     let path = scratch("many");
-    let names = build(&path, 60, Options::default());
+    let names = build(&path, 60, false);
     let mut rig = Rig::open(&path);
 
     // Scattered keys, deliberately mixed in size. The small keys' runs are
@@ -334,14 +339,20 @@ fn the_plan_is_exact_through_compressed_blocks_too() {
     // the chunked and solo-decompress arms of `with_extent`, whose unit of
     // transfer is the *stored* (compressed) block. The plan must follow.
     let path = scratch("compressed");
-    let names = build(
-        &path,
-        40,
-        Options {
-            compress: true,
-            ..Default::default()
-        },
+    let names = build(&path, 40, true);
+    // The compression has to be real, or this test checks the plain path
+    // while claiming to check the compressed one. Asserted by size against
+    // the same data written plain -- the trap being that a rising counter
+    // has no repeated sequences for LZ4 to match, so a fixture can be
+    // "compressed" and byte-identical.
+    let plain = scratch("compressed-plain");
+    build(&plain, 40, false);
+    let (sz_p, sz_c) = (
+        std::fs::metadata(&plain).unwrap().len(),
+        std::fs::metadata(&path).unwrap().len(),
     );
+    assert!(sz_c < sz_p, "compressed {sz_c} against plain {sz_p}");
+
     let mut rig = Rig::open(&path);
     let probes: Vec<Vec<u8>> = [0usize, 1, 2, 3, 4, 39]
         .iter()
@@ -353,7 +364,7 @@ fn the_plan_is_exact_through_compressed_blocks_too() {
 #[test]
 fn open_ranges_names_exactly_what_open_reads() {
     let path = scratch("openplan");
-    build(&path, 60, Options::default());
+    build(&path, 60, false);
     let data = std::fs::read(&path).unwrap();
 
     let probe = supdb::blob::open_probe() as usize;

@@ -1,13 +1,18 @@
 #!/bin/sh
 # The format gate, minus the modules vendored from the design artifact.
 #
-# `cargo fmt --all` reformats those modules, which CLAUDE.md forbids:
-# `results/baseline/` holds measurements taken against commit 101a4e7 and
-# `docs/profiling.md` cites line numbers in `src/store.rs`. So the repository
+# `cargo fmt --all` reformats those modules, which CLAUDE.md forbids, because
+# `docs/architecture-review.md` cites line numbers in them. So the repository
 # cannot hold to `cargo fmt --all -- --check`, and never did -- that gate
 # failed on the day the engine was vendored and every day after, which meant
 # CI carried a step nobody could make green. This covers everything the
 # project writes itself and names the exemptions.
+#
+# The list is shorter than it was: the store, its readers, its freelist and
+# its key table are gone with the engine. What is left is the format itself,
+# which the shipping engine still reads and writes. Lifting the exemption on
+# those three is a reformat of three files and nothing else -- worth doing on
+# its own rather than inside a change that also moves code.
 #
 #   sh scripts/fmt.sh --check   # what CI runs
 #   sh scripts/fmt.sh           # apply
@@ -20,7 +25,7 @@ set -eu
 cd "$(dirname "$0")/.."
 
 # Exactly the modules declared with the vendored allow in src/lib.rs.
-VENDORED="src/block.rs src/freelist.rs src/index.rs src/flatindex.rs src/keytable.rs src/readers.rs src/store.rs"
+VENDORED="src/block.rs src/index.rs src/flatindex.rs"
 
 if [ "${1:-}" = "--check" ]; then
   # Two different nonzero exits hide behind one status: "formatting differs",

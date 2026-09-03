@@ -27,7 +27,7 @@ use supdb::bench::{
     Record, Rng, Samples, Trial, J,
 };
 use supdb::jobj;
-use supdb::{Options, Reclaim};
+use supdb::Options;
 
 // ------------------------------------------------------------------ args --
 
@@ -58,17 +58,6 @@ fn scratch(name: &str) -> PathBuf {
 
 fn file_len(p: &Path) -> u64 {
     std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
-}
-
-/// Options tuned the way the design document tunes them, so these experiments
-/// measure the engine as it is presented rather than a configuration invented
-/// to make a point.
-fn default_opts(buffer_mb: usize) -> Options {
-    Options {
-        buffer_bytes: buffer_mb << 20,
-        reclaim: Reclaim::AfterReads,
-        ..Default::default()
-    }
 }
 
 // ------------------------------------------------------------------ main --
@@ -219,7 +208,7 @@ fn f1_outofcore(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let resident_keys = (resident_mb * 1048576) / value_size.max(1) as u64;
     let resident = {
         let rf = dir.join("resident.dat");
-        let mut w = supdb::next::SegmentWriter::create(&rf, &default_opts(256))?;
+        let mut w = supdb::next::SegmentWriter::create(&rf, &Options::default())?;
         let mut vrng = Rng::new(0x8F1);
         let mut kb = [0u8; 16];
         for i in 0..resident_keys {
@@ -241,7 +230,7 @@ fn f1_outofcore(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let io0 = IoCounters::read_now();
     {
-        let mut w = supdb::next::SegmentWriter::create(&file, &default_opts(256))?;
+        let mut w = supdb::next::SegmentWriter::create(&file, &Options::default())?;
         let mut vrng = Rng::new(0xF1);
         let mut kb = [0u8; 16];
         // One value per key, in byte order: `db_key_into` is a zero-padded
@@ -482,7 +471,7 @@ fn f8_checksums(args: &Args, profile: Profile) -> std::io::Result<Record> {
             &file,
             &Options {
                 checksums: on[ci],
-                ..default_opts(128)
+                ..Options::default()
             },
         )
         .expect("create");
@@ -514,7 +503,7 @@ fn f8_checksums(args: &Args, profile: Profile) -> std::io::Result<Record> {
                 &file,
                 &Options {
                     checksums: *want,
-                    ..default_opts(128)
+                    ..Options::default()
                 },
             )
             .expect("create");
@@ -5285,11 +5274,7 @@ fn f64_indexsum(args: &Args, profile: Profile) -> std::io::Result<Record> {
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("seg.sup");
     {
-        let opts = Options {
-            redo_log: false,
-            shards: 1,
-            ..Options::default()
-        };
+        let opts = Options::default();
         let mut w = SegmentWriter::create(&path, &opts).expect("create");
         w.set_inline_max(256);
         let payload = Payload::new(value_size, 0.5, 0xF64);
