@@ -1,7 +1,17 @@
 # Supdb
 
-An ingest-optimized embedded key-multivalue store in Rust, and the evidence for
+A read-optimized embedded key-multivalue store in Rust, and the evidence for
 and against it.
+
+Read-optimized is the measurements' word, not the design document's, which
+called it ingest-optimized. The defining decision went the other way: block
+compression is off by default because turning it off made point reads 3.6x
+faster and ordered scans 30x (`F12.1`, `F12.2`), and the space that bought
+was given up outright -- 187.6 MB against LMDB's 126.9 (`EXT.6`, recorded as
+failing). Meanwhile the durable ordered load trails both comparators
+(`EXT.22`, `EXT.32`). It is an LSM-shaped engine that spends space on reads,
+and the one ingest axis it wins is shuffled arrival (`EXT.27`, 5.93x), which
+is worth quoting only next to the ordered load it loses.
 
 This repository holds two things that are meant to stay together: the engine,
 and a benchmark suite whose job is to **try to falsify** the claims made about

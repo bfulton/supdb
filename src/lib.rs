@@ -1,7 +1,21 @@
-//! Supdb -- an ingest-optimized store for append-heavy, deep-key workloads.
+//! Supdb -- a read-optimized store for append-heavy, deep-key workloads.
 //!
-//! The shape here is driven by measurements taken against Uppend, RocksDB,
-//! LMDB and MapDB rather than by taste. Four findings set the design:
+//! The four findings below are the *design document's*, taken against Uppend,
+//! RocksDB, LMDB and MapDB, and they are kept because they explain why the
+//! code is shaped as it is. Two have since been overtaken by this
+//! repository's own measurements, which is why the line above no longer says
+//! ingest-optimized:
+//!
+//! - Finding 1's "nothing here may compromise the ingest path" did not hold:
+//!   the durable ordered load runs at 0.755x of LMDB and 0.611x of tuned
+//!   RocksDB (`EXT.22`, `EXT.32`). What the engine wins is reads, 2.14x and
+//!   6.97x of the same pair (`EXT.23`, `EXT.33`).
+//! - Finding 4's choice between size and warm reads was made, and it was made
+//!   for reads: compression is off by default since `f12-compress` priced it
+//!   at 3.6x on reads and 30x on scans, and the space axis was lost outright
+//!   as a result (`EXT.6`).
+//!
+//! `claims.json` holds both sides. The four as stated:
 //!
 //! 1. Append throughput and flush cost are what an append-only log actually
 //!    wins (2-2.6x and 17-39x respectively), and they survived every
