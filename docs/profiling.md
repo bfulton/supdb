@@ -6,6 +6,14 @@ figure that double-counted a structure, and 180 ns per lookup attributed to
 memory that turned out to be varint decoding. This is what the measurement
 setup should be, what it currently is, and what is missing.
 
+The worked examples between here and "Reproducibility" were taken against the
+original engine, which has since been retired (`retire-plan.md`), so their
+file-and-line references point at code that is no longer in the tree. They are
+kept because each one is a lesson about the method rather than about that
+engine: a miss profile that pointed the wrong way, an allocation pattern that
+mattered more than an allocation count, a profile that had to be thrown away.
+The current engine's commit path is the last section.
+
 ## What each question needs
 
 | question | tool | here? |

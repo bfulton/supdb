@@ -134,8 +134,8 @@ checkpoint.
   (fixedrun-plan.md). The canonical load's 100-byte values are uniform, so
   every run there is now fixed as well; its numbers were last taken on v5.
 - **A segment's blocks can be compressed (segcompress-plan.md).**
-  `set_compress` mirrors `Store::write_block`: chunked above the chunk
-  size, verbatim when it does not pay, and a verbatim block carries
+  `set_compress` takes the path `write_block` always had: chunked above the
+  chunk size, verbatim when it does not pay, and a verbatim block carries
   per-chunk checksums so a run read plans chunks. 19.9% of logshed's day
   (W6.8, under its 25% prediction). Postings stored as absolute ordinals
   compress by nothing at all, which is a fact about LZ4 and counters
@@ -203,11 +203,12 @@ interleaved where the harness allows:
   registered as the price of a second writer in the format layer, and it
   was declined. The standing priority then changed -- complexity is spent
   for time -- and `next::SegmentWriter` now writes every seal and merge
-  output in one forward pass, same format, same `Blob`, `store::Reader`
-  included. f49 ran both writers interleaved in one process on the f42
-  shape with the drain inside the window, three times: the seal phase is
-  **2.5-3.2x** faster (F49.2) and ingest-to-routed **1.28-1.48x** (F49.1,
-  p=0.0022 each run; report the range, the host moved between them). The
+  output in one forward pass, same format, same `Blob`. f49 ran it against
+  the general writer interleaved in one process on the f42 shape with the
+  drain inside the window, three times: the seal phase was **2.5-3.2x**
+  faster and ingest-to-routed **1.28-1.48x**, p=0.0022 each run. Those
+  findings retired with the writer they were measured against; what f49
+  compares now is the two merge strategies. The
   merge's input side -- collect every key, sort, one hash probe per key per
   input -- then went to a k-way walk over rank cursors, worth 1.305x on the
   merge phase and 1.104x on the window (F49.5, F49.6, both *under* their

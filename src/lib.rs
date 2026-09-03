@@ -11,9 +11,9 @@
 //!   RocksDB (`EXT.22`, `EXT.32`). What the engine wins is reads, 2.14x and
 //!   6.97x of the same pair (`EXT.23`, `EXT.33`).
 //! - Finding 4's choice between size and warm reads was made, and it was made
-//!   for reads: compression is off by default since `f12-compress` priced it
-//!   at 3.6x on reads and 30x on scans, and the space axis was lost outright
-//!   as a result (`EXT.6`).
+//!   for reads: blocks are stored uncompressed by default, so a point read
+//!   decompresses nothing and the file is the larger for it. Compression is
+//!   per segment rather than global, and `W6.8` prices it on a real index.
 //!
 //! `claims.json` holds both sides. The four as stated:
 //!
@@ -44,7 +44,7 @@
 #[cfg(not(target_family = "wasm"))]
 pub mod bench;
 
-// The engine modules below are vendored from the design artifact verbatim, so
+// The format modules below are vendored from the design artifact verbatim, so
 // that the architecture review's line-level references stay valid and so a
 // reader can compare what was measured against what was described. Style lints
 // are scoped off here rather than fixed in place; the harness code above and

@@ -9,12 +9,12 @@ and a benchmark suite whose job is to **try to falsify** the claims made about
 it.
 
 ```
-src/               the original engine, vendored from the design artifact
-src/next.rs        the next engine -- WAL, memtable, sealed segments, compaction, deletes, Txn
+src/next.rs        the engine -- WAL, memtable, sealed segments, compaction, deletes, Txn
 src/blob.rs        the read path over any byte source; compiles for wasm
+src/flatindex.rs   the flat key index the format is built on
 src/bench/         the measurement substrate  -- repetition, significance, latency, I/O accounting
 src/bin/internal   the falsification suite    -- Supdb against itself, as it scales
-src/bin/correctness  the correctness suite    -- damaged files, a model oracle, crash injection
+src/bin/correctness  the correctness suite    -- damaged files, crash injection
 src/bin/logshed    the browser-reader suite   -- day-index shape, round trips, size budget
 bench/external/    the comparison suite       -- Supdb inside other projects' evaluations
 web/               the browser reader, its size budget and its browser test
@@ -55,28 +55,27 @@ be deployed (`EXT.23`, `EXT.33`). Ordered scans tie LMDB and lead tuned RocksDB
 (`EXT.24`, `EXT.34`). YCSB A, C, E and F all lead tuned RocksDB
 (`EXT.42`–`EXT.45`).
 
-**Space paid for them.** Block compression is off by default because turning it
-off bought reads and scans outright (`F12.1`, `F12.2`), and the file is larger
-than LMDB's as a result (`EXT.6`, recorded as failing).
+**Space paid for them.** Blocks are stored uncompressed by default, which is
+what a point read that decompresses nothing costs; RocksDB keeps the smaller
+file. Compression is per segment rather than global -- `SegmentWriter` takes
+it -- and on a real day's index it saves about a fifth of the file (`W6.8`).
 
 **Ingest depends on arrival order.** The durable ordered load trails LMDB and
 tuned RocksDB (`EXT.22`, `EXT.32`); under shuffled arrival it leads LMDB
 (`EXT.27`), because a durable commit of scattered keys dirties about as many
 B-tree leaf pages as it has keys. Quote the two together or neither.
 
-**Correctness is where the suite has earned most.** The store agrees with a
-`BTreeMap` model over randomized appends, replaces and deletes (`C2.1`).
-Damaged files error rather than panic or serve wrong bytes (`C1.3`). A
+**Correctness is where the suite has earned most.** The engine agrees with a
+model of itself over randomized appends, deletes and crash-reopens. Damaged
+files error rather than panic or serve wrong bytes (`C1.1`, `C1.2`). A
 segment's key index is checksummed per piece, and every recovered state after
 crash injection is an exact prefix of the commit order (`C4.1`–`C4.5`).
 
 **What is open**, and recorded as failing on purpose: the durable ordered load
-above; `checkpoint` rewrites the whole key index rather than what changed, so a
-small durability window is expensive (`F4.1`); write throughput does not scale
-with writer threads (`F6.1`); reader open is not independent of key count
-(`F2.1`); reads degrade sharply once the dataset outgrows memory (`F1.2`); and a
-reopened store declares history before the reopen broken. Each is a claim with
-an expected state, so none can improve or decay unnoticed.
+above; reads degrade sharply once the dataset outgrows memory (`F1.2`, `F1.4`);
+and the index-layout study found points on the frontier that are both smaller
+and faster than the shipping layout (`F9.7`). Each is a claim with an expected
+state, so none can improve or decay unnoticed.
 
 ## The rules
 
@@ -121,7 +120,7 @@ in:
 | `CLAUDE.md` | the working notes: what broke, what was fixed, what not to repeat |
 | `*-plan.md` | one per experiment: predictions registered before the run, outcome appended after |
 | `docs/` | the architecture review that started it, and the engine's own design notes |
-| `tests/known_bugs.rs` | a reproducer per fixed defect, kept after the fix |
+| `tests/` | the model oracle, the read paths held to each other, the format's damage cases |
 
 ## Status
 

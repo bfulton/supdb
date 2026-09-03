@@ -4,6 +4,15 @@ A critique of the design document and prototype, in three parts: whether each ar
 decision is defensible against the state of practice, what the gaps are, and what a
 benchmark program would have to contain to constitute proof.
 
+> This review was written against the engine vendored from the design
+> artifact, which has since been retired (`retire-plan.md`); the repository now
+> has one engine, `src/next.rs`. Its line-level references are to code no
+> longer in the tree, and a number of the experiments it motivates have gone
+> with that engine. It is kept because it is why the falsification suite exists
+> and why the format is shaped as it is -- read it as the review it was, not as
+> a description of what is here now.
+
+
 Read against the artifact and the ~1,400 lines of engine and ~2,100 lines of harness in it.
 Everything below marked **[code]** was read off the prototype source rather than inferred
 from the prose.

@@ -266,5 +266,4 @@ Every scalar in the file is written little-endian, but the zero-copy read path
 reinterprets an extent array as `&[Ext]`, which is native-endian. Those agree
 only on a little-endian machine. `Blob::open` refuses a big-endian target
 explicitly rather than misreading a valid file there. Every browser is
-little-endian, so this costs nothing -- but it is checked rather than assumed,
-and `store::Reader` has the same latent hazard and does not check it.
+little-endian, so this costs nothing -- but it is checked rather than assumed.

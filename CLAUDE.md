@@ -103,26 +103,27 @@ is not a measurement.
 
 | path | what |
 |---|---|
-| `src/` | the engine, vendored from the design artifact **verbatim** |
-| `src/bench/` | the measurement substrate — stats, histogram, plotting, env capture |
+| `src/next.rs` | the engine: WAL with atomic batches, memtable, sealed segments, partitioned compaction, deletes, `Txn`, and the `SegmentWriter` every segment is written by -- `docs/next-engine.md` |
+| `src/format.rs` | the on-disk format's fixed quantities, owned by no writer |
+| `src/block.rs`, `src/index.rs`, `src/flatindex.rs` | the format itself: blocks, extents, the flat key index |
 | `src/bytes.rs`, `src/blob.rs` | the read path over any byte source; compiles for wasm |
-| `src/next.rs` | the next engine: WAL with atomic batches, memtable, sealed segments, partitioned compaction, deletes, `Txn` -- `docs/next-engine.md` |
-| `src/bin/internal.rs` | falsification suite (f1–f7) |
-| `src/bin/correctness.rs` | damaged files, model oracle, crash injection (c1–c3), crash injection for the next engine with power-loss emulation (c4) |
+| `src/bench/` | the measurement substrate — stats, histogram, plotting, env capture |
+| `src/bin/internal.rs` | falsification suite |
+| `src/bin/correctness.rs` | damaged files (c1), crash injection with power-loss emulation (c4) |
 | `src/bin/logshed.rs` | day-index shape, size budget, browser-test fixture |
-| `bench/external/` | Supdb inside other projects' evaluations (redb, LMDB, sled) |
+| `bench/external/` | Supdb inside other projects' evaluations (redb, LMDB, sled, RocksDB) |
 | `web/` | the browser reader, its size control and its browser test |
 | `results/` | committed measurements — the source of truth |
 | `figures/` | generated from `results/`, never drawn by hand |
 | `docs/architecture-review.md` | why every experiment here exists |
 
-The engine modules carry scoped `#[allow(clippy::all, dead_code)]`. They were
-vendored byte-for-byte from the design artifact and have since been changed
-only to fix specific defects, each described in `claims.json`. **Do not
-reformat them** — the architecture review cites line numbers in commit
-`101a4e7`, and `results/baseline/` holds the measurements taken against that
-revision. Everything in `src/bench/`, `src/bin/` and `bench/external/` holds to
-`-D warnings`.
+There was a second engine until recently: the one vendored from the design
+artifact, with its own writer, reader, freelist and key table. It is gone, and
+`retire-plan.md` records what went with it and why. The three format modules
+still carry a scoped `#[allow(clippy::all, dead_code)]` and are still exempt
+from the format gate, because `docs/architecture-review.md` cites line numbers
+in them; that exemption is now a reformat of three files away from being
+liftable. Everything else holds to `-D warnings`.
 
 ## Measuring a change to the engine
 
@@ -155,29 +156,21 @@ decides whether a pair may be compared at all and `ordering_of` emits
 `not_exercised` when it may not, naming the axes. This is enforced because it
 was not: `engines.rs` carried three fairness rules and only two of them
 equalized, the third merely *recorded* what each engine promises. Durability
-was filed under the third, so `EXT.1` compared a Supdb that never reaches the
-device against an LMDB that fsyncs every batch and called it a 1.28x win, with
-the difference in a table two lines away. The checksum axis was unequalized the
-other way for exactly as long, and cost Supdb its read lead.
+was filed under the third, so an early load ordering compared a Supdb that
+never reaches the device against an LMDB that fsyncs every batch and called it
+a 1.28x win, with the difference in a table two lines away. The checksum axis
+was unequalized the other way for exactly as long, and cost Supdb its read
+lead. Both of those orderings retired with the engine that made them, but the
+rule is the reason `Features::unmatched` exists.
 
 Equalize in **both** directions where the engines allow it, so a reader gets
 the comparison for the guarantee they care about rather than the one that
-flatters: `supdb-durable` and `lmdb` both commit per batch, `supdb-buffered`
-and `lmdb-nosync` neither do. Where an axis cannot be equalized -- LMDB cannot
-stop being transactional -- say which way the residual leans and read the
-result as a bound: a loss is at least that large, a win is not yet a win.
+flatters: `next` and `lmdb` both commit per batch, `next-nodrain` and
+`rocksdb-tuned` neither drain. Where an axis cannot be equalized -- LMDB
+cannot stop being transactional -- say which way the residual leans and read
+the result as a bound: a loss is at least that large, a win is not yet a win.
 
-The matched scorecard against LMDB, `full`:
-
-| | Supdb | LMDB | |
-|---|---|---|---|
-| load, both durable (`EXT.9`) | 199,485/s | 572,416/s | **0.348x**, failing |
-| load, neither (`EXT.10`) | 628,814/s | 652,367/s | no difference here; 0.85x on Apple Silicon, replicated |
-| read (`EXT.11`) | 1,325,496/s | 917,928/s | 1.444x; 1.196x, 1.092x, 1.043x (a tie), 1.379x, 1.262x, 1.444x across six runs -- the comparator moves with the host; 2.42x on Apple Silicon, replicated |
-| scan (`EXT.12`) | 17.4M/s | 18.6M/s | coin toss here (1.16x sig, then 0.93x nd, same night); 1.17x on Apple Silicon, replicated |
-
-The next engine (`src/next.rs`), matched on durability *and* transactions
-since it gained atomic batches and `Txn`: durable load **0.825x** of LMDB
+Against LMDB, matched on durability *and* transactions: durable load **0.825x** of LMDB
 in the latest canonical run, the first with the borrowed batch in the
 harness (`EXT.22`; 0.694x the run before, 0.49-0.51x the two before that --
 the move is piece promotion, because the canonical load's keys ascend and
@@ -266,53 +259,46 @@ canonical load's ascending keys are the one arrival order that flatters
 the B-tree. Quote the two together. The plan for that run predicted the
 opposite (shape-plan.md), which is why it is written down.
 
-`EXT.9` has moved three times, each for a decomposed reason: 6,735 -> 54,333
-ops/s when `Options::index_inserts` stopped every batch rewriting the whole
-key index; -> ~152,800 when durability points went log-first with a single
-fsync (f36's ledger had convicted mmap writeback under the per-batch fsync at
-87.4% of all device bytes); -> ~200,000 when the log started carrying VALUES
-(`Options::log_values`), so a durability point appends unsealed bytes and
-seals nothing -- blocks are written later, full, on the store's own schedule.
-Write amplification went 270x -> 105x -> 13.2x -> ~7x. Still ~3x behind, so
-still recorded as failing; what remains is the per-batch append+fsync+section
-work against LMDB's single page-chain commit, and the macOS F_FULLFSYNC pair
-says the floor there is the fsync count itself. The value-log step was nearly
-refuted by its own gate: the first version scanned every key per point for
-unlogged bytes, an O(keys^2) tax invisible at f36's 200k keys (1.435x ahead)
-and fatal at EXT.9's 1M (0.149x); a per-shard queue of keys with unlogged
-bytes -- `dirty`'s twin -- removed it, and both 1M runs are kept.
+Two lessons from that engine's load numbers are worth keeping, because they
+are about method rather than about the code that is gone.
 
-`EXT.10` cannot currently be read at all. Two consecutive runs gave 1.06x and
-0.60x because `lmdb-nosync`, which nothing here touches, moved 85% between
-them. Supdb's own arm moved 5%. Treat the load axis as unmeasured on this host
-until it is taken somewhere quieter, and note that nothing shipped this session
-should move it: that load never checkpoints per batch, so the log and
-`index_inserts` are both inert there.
+The first is that a fix can be refuted by its own gate. When the redo log
+started carrying values, the first version scanned every key at every
+durability point looking for unlogged bytes -- O(keys) a point, O(keys^2) a
+load. It was invisible at 200k keys, where it measured 1.435x ahead, and
+fatal at 1M, where it measured 0.149x. The suite caught it because the
+canonical run is large; a smaller one would have shipped it.
 
-Two runs is the minimum for a number here, and it is the comparator that tells
-you whether to believe it: the durable arm moved 1.0% between the pair while
-`lmdb-nosync` moved 85%, which is the whole difference between a result and a
-coincidence.
+The second is that the comparator tells you whether to believe a number. Two
+consecutive runs of the same unchanged load gave 1.06x and 0.60x, because the
+LMDB arm that nothing here touches moved 85% between them while Supdb's own
+arm moved 5%. An axis whose comparator moves like that is unmeasured on this
+host, whatever ratio the run prints.
 
-Rule 4 is why two of those numbers are legible at all. The suite reported
-throughput, read latency and file size and neither of the other two the rule
-names, until it did: the durable arm sends **29.9 GB to the block layer for
-116 MB of data**, a write amplification of 270x against LMDB's 2.1x, and
-leaves a 7.35 GB file. `checkpoint` being O(key count) was on the books as a
-time cost and is a device cost of the same origin.
+Two runs is the minimum for a number here.
 
-## The second reader
+Rule 4 is why the worst of that engine's behaviour was ever legible. The suite
+reported throughput, read latency and file size and neither of the other two
+the rule names, until it did -- and then a load that wrote 116 MB of data was
+seen sending 29.9 GB to the block layer, a write amplification of 270x against
+LMDB's 2.1x. A cost that had been on the books as a time cost was a device
+cost of the same origin, and nothing but the rule would have shown it.
 
-There are now two read paths. `store::Reader` maps a file; `blob::Blob<B>`
-reads through a `Bytes` source and so runs where there is no file to map — a
-browser, over an object fetched out of S3. Same format, same `flatindex`, same
-`block` decoder. A second read path is a liability, because its failure mode is
-not a crash but a browser quietly answering a different question from the
-server, so `tests/blob.rs` opens a store written by `store.rs` and requires the
-two to agree on every key, every value, every count and the checkpoint
-identity. It has already caught two: `Blob` reporting the superblock's
-generation where `Reader` reports the index section's, and a `value_bytes` that
-counted the varint length prefixes it claimed to exclude.
+## The reader, and the ways it can quietly disagree
+
+`blob::Blob<B>` reads through a `Bytes` source, so the same code serves a
+mapped file and a browser reading an object out of S3. `Blob<MmapBytes>` is
+the native path and lends its bytes; `Blob` over a source with no memory
+behind it copies. That difference is the liability, because its failure mode
+is not a crash but a browser quietly answering a different question from the
+server, so `tests/blob.rs` writes a segment and requires a lending source and
+a copying one to agree on every key, every value, every count -- and pins
+`Blob::zero_copy()`, because a native reader that started copying would still
+pass every correctness check.
+
+The agreement checks have caught real differences: a reader reporting the
+superblock's generation where another reported the index section's, and a
+`value_bytes` that counted the varint length prefixes it claimed to exclude.
 
 Nothing in that path is asynchronous, and that is the constraint rather than an
 accident. `flatindex::lookup` returns a borrow into the index section and a
@@ -376,9 +362,9 @@ records mean more bytes per key (F53.3, F53.4), and they are recorded beside
 the gain. To let those records stream, the writer lays the key section out
 records-first -- header, records, then fences, directory and hash slots --
 which `FlatIndex::parse` accepts because every region is named by offset;
-`Store` still writes the original order and never inlines, `Blob` reads both,
-and `store::Reader` does not serve inline runs (a next-engine segment is read
-through `Blob`). A v5 reader from before the extension errors on the block id
+The writer emits either layout -- `set_inline_max(0)` gives the original
+order with every run in a block -- and `Blob` reads both, which is what
+`tests/segwriter.rs` holds them to. A v5 reader from before the extension errors on the block id
 rather than answering wrongly, so the magic did not move.
 
 **A cold sparse open is one or two round trips, and a cold search three
@@ -413,7 +399,7 @@ recommendation to the roll is to write through `SegmentWriter`, which
 
 **A segment writer can compress its blocks, and the encoding decides
 whether that is worth anything (R7.4).** `SegmentWriter::set_compress`
-takes the path `Store::write_block` always had: chunked above the chunk
+takes the path `write_block` always had: chunked above the chunk
 size so a point read decompresses one chunk, verbatim when compression
 does not pay, and a verbatim block now carries per-chunk checksums so
 `chunk_span` plans by chunk rather than whole. On logshed's day it saves
@@ -485,216 +471,76 @@ variable-length values divided exactly by a stride of 4 and the first version
 answered 23. Two quantities is still not a proof, so the contract is that the
 caller knows its schema; `tests/blob.rs` carries the case either way.
 
-**How the roll writes decides the file size, by 5.17x (was 22.6x).** Appending
-a day's postings in log-line order wrote 831 MB where grouping them by term
-first writes 36.7 — 44,629 inline merges against zero, which is F5.1's latency
-tail showing up on the space axis. Deferred consolidation
-(`Options::defer_merge`, default on since f37 priced it at 3.963x on
-fragmenting appends for a 0.762x read-back cost) cut the line-ordered day to
-190 MB, so the penalty is 5.17x now — but it still grows with the day, and any
-tool that builds an index here still sorts by key first.
+**A roll sorts by key first, and now it has no choice.** The writer takes keys
+in byte order and nothing else, so the arrival order of a day's log lines
+cannot reach the file: the sort is between them. That closed an axis rather
+than winning it -- the previous engine would accept line-ordered appends and
+charge several times the file for them, which is why `w1-daysize` used to
+carry a line-order arm. What is left is the day's own size, and `W1.1` and
+`W1.2` are where the bytes per line and the download budget live.
 
 ## Known-failing on purpose
 
-Do not "fix" these casually; each is load-bearing evidence and each is
-described in `claims.json`:
-
-- A reopened store declares history before the reopen broken. `Store::open`
-  does not carry the reuse log across, so `history_from` is set to the
-  generation opened and older snapshots are refused rather than served.
-- Reader open grows with key count, though no longer in proportion to it: 20x
-  for 100x the keys, and what remains is the block table rather than the key
-  index. The index is 57 bytes per key in a mapped section readers share; it
-  was 131 bytes per key, heap-resident and duplicated per process.
-- Write throughput barely scales with writer threads.
-- `checkpoint` is O(key count): it rewrites the whole key index rather than
-  what changed. The durability *curve* now has a usable point on it -- a
-  20,000-op window sustains ~199k ops/s with about 2MB at risk -- but that came
-  from making writes faster, not from fixing the floor.
+Roughly a third of the claims in `claims.json` are recorded as `fails`, and
+that is the file working rather than the project failing. Most of them are
+registered predictions that the run refuted -- a plan file said a lever would
+buy something, the measurement said it did not, and the finding stays on the
+books so the idea cannot quietly come back. Do not "fix" one casually: each is
+load-bearing evidence and each carries its reason in its `because`.
 
 If you fix one, the corresponding claim must change from `fails` to `holds` in
-the same commit, and the review in `docs/` should be updated to say so.
+the same commit, and the review in `docs/` should be updated to say so. The
+gate fails in both directions precisely so that flipping one is a decision
+somebody made rather than a thing that happened.
 
-Fixed so far, with reproducers kept in `tests/known_bugs.rs`: delete
-resurrection, the double-free that handed one slot to three blocks, decoder
-panics on damaged input, silently-served corruption (now checksummed), a
-checkpoint that appended three index sections and released none of them, and a
-reader that fed a flat block-table section to the varint decoder and reported
-the misparse as file corruption, and an in-place checkpoint that republished a
-record into its hash slot and not its directory entry -- so `read_all` returned
-the new value and `scan` the previous one, silently, for every key it touched.
+The engine's own standing limitations, as opposed to refuted predictions:
 
-Also fixed: a logged durability point could be lost WHOLE, store refusing to
-open. `checkpoint_to_log` fsynced extent records naming blocks sealed in the
-same batch, but the block-table section mapping those ids to offsets was
-written after the fsync and rode unsynced -- so a crash at the ack point left
-a log naming blocks the recovered table did not have, and `open` refused the
-file with "index names a block the table does not have". Every durable batch
-that sealed a block had this window, from the day the redo log shipped; no
-crash test ever placed a crash between the ack and the section writes. The
-log is now self-describing: a `Blocks` record carries the table extension in
-the same CRC'd, generation-stamped stream, before any extent record that
-needs it, under the same fsync. The reproducer emulates the crash by
-restoring the pre-batch superblock slots -- exactly what rides unsynced
-behind an arena fsync -- and runs both log shapes.
+- Out-of-core reads fall off a cliff. Once the file exceeds the memory that
+  can cache it, throughput drops by about three orders of magnitude and the
+  latency distribution goes bimodal -- every miss is a synchronous page fault
+  (`F1.2`, `F1.4`). This is the mapped read path's shape, not a bug.
+- The durable ordered load is behind LMDB and behind RocksDB (`EXT.22`,
+  `EXT.28`), and shuffled arrival inverts both. Quote the pair, never one.
+- The index layout study found smaller and faster points on the frontier that
+  the shipping layout does not occupy (`F9.3`, `F9.5`, `F9.7`).
 
-Also fixed, before it shipped: the first value-carrying log walked every key
-in every shard at every durability point to find the ones with unlogged
-bytes. O(keys) per point, O(keys^2) per load: invisible at 200k keys, fatal
-at 1M. The fix is `Shard::log_queue`, and its first version had a bug the
-release suite caught the same hour -- a key that seals, re-queues and seals
-again inside one interval was queued twice and logged the SAME delta twice,
-four copies of one value in the reproducer. Dedupe at the gather. The lesson
-is the panel's again: the sharp edges of a log are all in the bookkeeping
-around it, never in the append.
+## What the retired engine taught, that still applies
 
-Also fixed: under `Sync::EveryN` and `Sync::Interval`, every logged point
-fsynced -- log-first had quietly made EveryN mean Always. The log append is
-now unconditional and the fsync obeys the policy, which restores EveryN's
-stated contract (bounded loss, amortized flush) on the log path.
+The original engine is gone (`retire-plan.md`), and with it the reproducers
+for a decade of its defects. The bugs are not worth recounting; the shapes
+they came in are, because they are shapes this engine can take too.
 
-Also fixed: log replay applied records over newer index state. A logged
-checkpoint leaves records in the arena and restores its keys to `dirty`,
-which usually keeps every later checkpoint on the log path too -- the masking
-that hid this. But a delete shrinks a record to a few bytes, so tombstoning
-logged keys let the next checkpoint go in place: index newest, arena older,
-nothing saying which. On crash-reopen, replay resurrected all forty deleted
-keys. Every log record now carries its checkpoint's generation inside the
-CRC'd frame, the superblock carries `index_gen` (last index-updating
-checkpoint), and both replay paths apply a record only if its stamp is newer.
-Found by writing the reproducer for a suspicion the design panel had also
-flagged ("replay ordering across record kinds is the sharp edge") -- the
-first repro came back clean and was inconclusive until a path trace showed
-it never reached the in-place arm, which is its own lesson: a clean result
-proves nothing about a path the test never took.
+**A path only one arm exercises is a path nothing tests.** A delete was never
+marked dirty, and the checkpoint that was asked to carry it dropped it,
+leaving the key readable at its old extents. It was invisible for as long as
+every insertion forced a full rewrite, because a rewrite reads the tombstone
+directly. Turning a flag on is what exposed it -- and the bug was older than
+the flag.
 
-Also fixed: `freelist::class_of` underflowed for every length of 4 KiB or
-less -- which is every block a store of short postings produces. Debug builds
-panicked on the subtraction; release builds wrapped and filed the block into
-the largest sub-class of the smallest octave, so `capacity_for` reserved 7,680
-bytes per tiny placement and every small store silently paid ~1.9x on every
-section it wrote, visible to benchmarks as size rather than as a fault.
-Reported by the logshed session from a three-posting repro whose 65,536-byte
-file the fixed arithmetic reproduces exactly. Found the same day: a closed
-store kept its 4 MB redo-log arena in the file -- close() now drops what
-nothing can ever append to, which took the fixed cost of a day-index segment
-from 4.8 MB back to 618 KB.
+**The sharp edges of a log are in the bookkeeping around it, never in the
+append.** A value-carrying log queued a key twice when it sealed, re-queued
+and sealed again inside one interval, and logged the same delta twice. A
+replay applied records over newer index state because nothing said which was
+newer. A durability point acked before the block table that named its blocks
+was synced, so a crash at exactly that point left a log naming blocks the
+recovered table did not have.
 
-Also fixed: `live_key_off` named the live key section only when the index was
-flat *and* could be adopted for in-place editing. With the varint layout it
-stayed `None`, so the pruning loop compared every historical key section
-against "the live one", found no match, and released the one still in use. It
-was survivable for as long as every checkpoint rewrote the key section, because
-then the previous one really was superseded. The redo log breaks that
-assumption -- a logged checkpoint publishes no key section, so the last one
-outlives its generation -- and the next block table was placed on top of the
-index every reader was using. It presented as lz4 failing to decompress a
-section nobody had written there, which is three layers away from the cause.
+**A clean test result proves nothing about a path the test never took.** The
+first reproducer for the replay-ordering bug came back green and was
+inconclusive until a path trace showed it had never reached the in-place arm.
 
-Also fixed: a delete was never marked dirty. `checkpoint_in_place` and the redo
-log both publish only what `dirty` names, so a tombstone they were asked to
-carry was dropped and the key stayed readable at its old extents. It was
-invisible for as long as any insertion forced a full rewrite -- a rewrite reads
-every key from the shards and sees the tombstone directly -- so turning
-`Options::index_inserts` on is what exposed it. The bug is older than the flag,
-which is the argument against leaving things behind flags: a path only one arm
-exercises is a path nothing tests.
+**Arithmetic that underflows fails quietly and expensively.** A size-class
+calculation underflowed for every block of 4 KiB or less -- which is every
+block a store of short postings produces. Debug builds panicked; release
+builds wrapped and reserved 7,680 bytes for a tiny placement, so every small
+store paid about 1.9x on every section it wrote, visible to benchmarks as
+size rather than as a fault.
 
-Also fixed: `put` probed the key table twice per call -- `get_or_insert` and
-then `index_of` -- immediately below a comment saying it probes once. One
-probe now, 11.3% of the put path's instructions, measured with cachegrind
-because the path is memory bound and the saving is compute: 1,739 to 1,543
-instructions per key, D1 misses unchanged at 26. No wall-clock claim is made
-and none should be.
-
-Also fixed: a store recorded nothing about the byte order that wrote it. Every
-scalar goes to disk little-endian, but the two structures that make this format
-fast are addressed in place regardless -- `flatindex` hands back `&[Ext]`
-borrowed out of the mapping, and a block table's records are reinterpreted
-rather than decoded -- so a file is self-consistent only on the byte order that
-wrote it. A big-endian-written store would have been read, with every extent
-field silently byte-swapped, rather than refused. The three magics are now
-written `to_ne_bytes`, which is a byte-order mark that costs nothing and
-changes no file already written: identical bytes on a little-endian machine,
-and swapped on any other, so the magic check itself does the refusing. Both
-open paths name it rather than reporting damage.
-
-Also fixed, in the harness rather than the engine, and it had been hiding the
-rest of the suite: `env::cap_memory` writes a cgroup limit and puts the process
-inside it, and nothing ever lifted it. A cap is a property of the process, not
-of the experiment that asked for one, so f23-madvise's 16 MB ceiling stayed in
-force for everything after it and the next experiment to allocate past it was
-killed by the OOM killer. `internal all` died at f24 on any host with a
-writable v1 memory controller -- 17 experiments of 33 -- and on a host without
-one `cap_memory` silently fails, the experiments record `not_exercised`, and
-the suite runs to the end. That is why the committed results exist and why the
-truncation was invisible for as long as it was: the bug only bites where the
-cap actually works. `env::cap_guard()` now lifts the cap when the experiment
-returns, including on a panic, and `internal all --profile ci` completes.
-Nothing about a recorded measurement changes; what changes is how many of them
-a run produces.
-
-That last one needs a reopen to show: a fresh store takes the full-rewrite path
-until an index section exists with a matching key count, and every scan test
-here built its store in one session, so the in-place path was never under test
-when a scan was checked. `c2-oracle` does not exercise reopen-then-update
-either, which is why the differential oracle did not catch it. Until it does,
-that shape is covered only by its reproducer.
-
-The largest one is `Store::read_all`. A writer can read its own sealed, staged
-and pending state, so a read after a write no longer needs a checkpoint and a
-fresh `Reader`; a scan refreshes with `publish` rather than `checkpoint`,
-because it needs the writes visible and not durable. `EXT.3` moved from 13.5x
-to 0.76x. It also moved the mixed YCSB workloads against LMDB from 0.07-0.14x
-to 18.9x on A and 18.4x on F -- but do not read those as wins. They are
-unmatched: LMDB commits durably on every batch there and Supdb does not, and
-`ext-ycsb` emits no cross-engine finding, so nothing gated them. EXT.9 prices
-that difference at 91x on a 1000-op batch, and YCSB batches at 100, so a
-matched YCSB-A is not merely slower, it is currently unrunnable at `full` --
-which is itself the finding. YCSB-E is the one still losing even unmatched, at
-0.43x, because publishing rewrites index structure in proportion to the key
-count rather than to what changed.
-
-Two of the four above have moved from `fails` to `holds`. F2.2: reader open is
-sub-linear in key count since the key index became a mapped section
-(`src/flatindex.rs`, `Options::flat_index`). F4.2: a usable durability point
-exists since block compression was turned off by default (`f12-compress`
-prices that at 3.6x on reads, 30x on scans, 3.8x on writes, for 1.04x the
-disk). F2.1 still fails — sub-linear is not independent — and so does F4.1, at
-38x.
-
-The compression change also took the size axis away: `EXT.6` moved from `holds`
-to `fails`, since Supdb stores 168.6MB where LMDB stores 126.9. That was traded
-knowingly, and scans are what it bought — `EXT.5` went from 4.7x slower than
-LMDB to 0.96x of it, which is `no_difference` at p=0.37 rather than a lead.
-Two earlier versions of that sentence were wrong in the same way twice: it
-claimed 1.29x from a `ci` run, which is never citable, and then 0.65x from a
-`full` run whose result file had since been regenerated underneath it. `verify`
-compares the recorded verdict against `expect` and never reads the prose, so a
-number quoted in a `because` can rot for as long as nobody re-derives it. When
-you cite a figure here or in `claims.json`, read it out of `results/` first.
-
-Scan is the one axis where Supdb and LMDB cannot be told apart *warm*, and it
-took a methodology fix to see that. Cold they can: `EXT.12` scans at 0.785x
-with checksums equalized. The two suites measure different things and both are
-right -- `ext-sweep` builds one store per engine and sweeps it repeatedly, so
-it walks a warm structure, while `ext-kv` loads a fresh store per repetition
-and scans it once. Do not average them. `ext-sweep` used to decompose scan cost by fitting
-`a + b*n` over lengths 1..400 and report both coefficients: `EXT.7` had Supdb
-the faster walker and `EXT.8` had it paying the larger constant. The marginal
-cost of an entry falls from about 89ns to 15 over that range before settling
-near 20, and a straight line through it lands its intercept *above* the measured
-cost of a one-entry scan — 952ns of "fixed cost" for a scan observed to finish
-in 692, and the same for LMDB and redb. Both quantities are now measured rather
-than fitted: the floor is the observed n=1 point, the per-entry cost is the
-difference quotient between the top two lengths. Measured that way neither axis
-separates the engines, `EXT.7` moved to `fails` and `EXT.8` to `holds`, and all
-three scan measurements finally agree. A model is a claim about the data and
-belongs under the same gate as everything else; `full_range_fit` stays in every
-`ext-sweep` record so the refuted one is visible rather than deleted.
-
-The external suite repeats and interleaves its engines, like everything in
-`src/bench/`. It did not always: it ran each engine once, and `EXT.1` read
-0.70x, 1.03x, 0.998x, 1.13x and 0.85x across five such runs, flipping between
-holding and failing on margins as small as 0.2%. Seven repetitions settle it at
-0.866x with p=0.0106. If you add an engine or a metric there, it repeats too.
+**A cap is a property of the process, not of the experiment that asked for
+one.** `env::cap_memory` put the process inside a cgroup limit and nothing
+lifted it, so one experiment's 16 MB ceiling stayed in force for everything
+after it and the next allocation past it was killed. Seventeen experiments of
+thirty-three never ran, on any host where the cap actually worked -- and on a
+host where it silently failed, the suite ran to the end and looked fine.
+`env::cap_guard()` is the fix and the lesson is the shape: a check that
+reports a verdict it has not earned.
