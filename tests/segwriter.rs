@@ -152,7 +152,11 @@ fn agree(a: &Blob<MmapBytes>, b: &Blob<MmapBytes>, data: &[(Vec<u8>, Vec<Vec<u8>
         let nb = b
             .read_all(key, |v| gb.push(v.to_vec()))
             .expect("bulk read_all");
-        assert_eq!(na, vals.len() as u64, "block-layout value count for {key:?}");
+        assert_eq!(
+            na,
+            vals.len() as u64,
+            "block-layout value count for {key:?}"
+        );
         assert_eq!(nb, na, "value count differs for {key:?}");
         assert_eq!(&ga, vals, "block-layout values for {key:?}");
         assert_eq!(gb, ga, "values differ for {key:?}");

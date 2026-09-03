@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use supdb::bench::{Finding, Profile, Record, Rng, J};
 use supdb::bytes::MmapBytes;
 use supdb::jobj;
-use supdb::{Blob, Options, Reader, Store};
+use supdb::{Blob, Options};
 
 // ---------------------------------------------------------------- the model --
 
@@ -98,43 +98,12 @@ fn zipf(rng: &mut Rng, n: usize) -> usize {
     i.min(n - 1)
 }
 
-/// How the daily roll feeds the store.
-///
-/// This is open question 2 from the requirements, and it decides more than the
-/// question asks. `Line` is the naive shape -- stream the day and append each
-/// line's terms as they arrive. `Term` is what an index builder does: group
-/// the postings by term first, then append each term's run in one go.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Order {
-    Line,
-    Term,
-}
-
-impl Order {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Order::Line => "line",
-            Order::Term => "term",
-        }
-    }
-    fn parse(s: &str) -> Option<Order> {
-        match s {
-            "line" => Some(Order::Line),
-            "term" => Some(Order::Term),
-            _ => None,
-        }
-    }
-}
-
 struct Built {
     keys: u64,
     postings: u64,
     file_bytes: u64,
     index_bytes: u64,
     blocks: u64,
-    bytes_written: u64,
-    merges: u64,
-    free_bytes: u64,
     payload_bytes: u64,
 }
 
@@ -227,79 +196,27 @@ fn build_day_segment(
     Ok(std::fs::metadata(path)?.len())
 }
 
-fn build_day(path: &Path, lines: u64, seed: u64, order: Order) -> std::io::Result<Built> {
-    let _ = std::fs::remove_file(path);
-    let opts = Options {
-        // The daily roll is one pass with a single checkpoint at the end, so
-        // the buffer wants to be large and the sync policy does not matter
-        // until close.
-        buffer_bytes: 256 << 20,
-        ..Default::default()
-    };
-    let store = Store::create(path, opts)?;
-    let mut rng = Rng::new(seed);
-    let mut key = Vec::with_capacity(32);
-    let mut postings = 0u64;
-    match order {
-        Order::Line => {
-            for line in 0..lines {
-                let ord = (line as u32).to_le_bytes();
-                for (field, card) in FIELDS {
-                    let i = zipf(&mut rng, *card);
-                    term(field, i, &mut key);
-                    store.append(&key, &ord[..POSTING_BYTES])?;
-                    postings += 1;
-                }
-            }
-        }
-        Order::Term => {
-            // (field, value, line) packed into one word so a single sort puts
-            // every term's postings together, and in line order within a term.
-            let mut pairs: Vec<u64> = Vec::with_capacity((lines as usize) * FIELDS.len());
-            for line in 0..lines {
-                for (f, (_, card)) in FIELDS.iter().enumerate() {
-                    let i = zipf(&mut rng, *card);
-                    pairs.push(((f as u64) << 56) | ((i as u64) << 32) | line);
-                }
-            }
-            pairs.sort_unstable();
-            let mut cur = u64::MAX;
-            for p in &pairs {
-                let head = p >> 32;
-                if head != cur {
-                    cur = head;
-                    term(
-                        FIELDS[(head >> 24) as usize].0,
-                        (head & 0xff_ffff) as usize,
-                        &mut key,
-                    );
-                }
-                let ord = (*p as u32).to_le_bytes();
-                store.append(&key, &ord[..POSTING_BYTES])?;
-                postings += 1;
-            }
-        }
-    }
-    // One key that is bytes and not text -- a trigram cut through a
-    // multibyte character is the shape -- so the browser suite has a key
-    // whose `TextDecoder` rendering is not the key. It sorts last, so the
-    // dictionary scans the fixture asserts by text are unmoved.
-    store.append(BINARY_KEY, &[0u8; POSTING_BYTES])?;
-    postings += 1;
-    store.checkpoint()?;
-    let stats = store.close()?;
-    let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let r = Reader::open(path)?;
+/// One day's index, written the way a roll should write it: postings grouped
+/// by term, terms in byte order, through the segment writer.
+///
+/// The writer takes keys in byte order and nothing else, which is the whole
+/// reason a roll sorts first. It also means the arrival order of the lines
+/// cannot change what the file costs -- the sort is between them and the
+/// file -- so the size of a day is a function of the day, not of how it
+/// happened to be read.
+fn build_day(path: &Path, lines: u64, seed: u64) -> std::io::Result<Built> {
+    let file_bytes = build_day_segment(path, lines, seed, INLINE_MAX, 0, false, false)?;
+    let postings = lines * FIELDS.len() as u64 + 1;
+    let blob = Blob::open(MmapBytes::open(path)?)?;
     Ok(Built {
-        keys: stats.keys,
+        keys: blob.keys() as u64,
         postings,
         file_bytes,
-        index_bytes: r.index_bytes() as u64,
-        blocks: stats.blocks,
-        bytes_written: stats.bytes_written,
-        merges: stats.merges,
-        free_bytes: stats.free_bytes,
-        payload_bytes: postings * (POSTING_BYTES as u64 + 1),
+        index_bytes: blob.index_bytes() as u64,
+        blocks: blob.blocks() as u64,
+        // Four-byte ordinals all the same width, so the run is stored fixed
+        // and there are no length prefixes to count (format v6).
+        payload_bytes: postings * POSTING_BYTES as u64,
     })
 }
 
@@ -311,6 +228,10 @@ fn build_day(path: &Path, lines: u64, seed: u64, order: Order) -> std::io::Resul
 /// that makes R6.2's premise -- index and block table resident after open --
 /// cost approximately nothing: the sections are kilobytes over a data region
 /// of megabytes, and sparseness pays where the bytes are, in the data.
+/// Runs up to this many bytes live in their index record rather than a
+/// block, so a browser reading a rare term fetches nothing after the open.
+const INLINE_MAX: usize = 256;
+
 const SEG_FIELDS: &[(&str, usize)] = &[("app", 8), ("level", 6), ("host", 30), ("route", 60)];
 
 /// A segment value is a fixed 64-byte record (ordinal plus payload), so the
@@ -341,28 +262,48 @@ fn seg_value(key: &[u8], ord: u32, out: &mut [u8; SEG_VALUE_BYTES]) {
     }
 }
 
-/// Build a segment-shaped store: every event carries one value per field,
-/// values appended grouped by term (the roll sorts by key first -- W1.3 is
-/// the 22.6x reason), event `e` of field with cardinality `c` landing under
+/// Build a segment: every event carries one value per field, values written
+/// grouped by term, event `e` of a field with cardinality `c` landing under
 /// value `e % c` so run lengths are even and bounded rather than Zipf-headed.
+///
+/// The terms are collected and sorted as bytes before anything is written,
+/// because the writer takes keys in byte order -- which is what a roll does
+/// anyway, since it is what makes the day's file the size it is.
 fn build_segment(path: &Path, events: u64) -> std::io::Result<()> {
     let _ = std::fs::remove_file(path);
-    let store = Store::create(path, Options::default())?;
+    let mut w = supdb::next::SegmentWriter::create(path, &Options::default())?;
     let mut key = Vec::with_capacity(32);
     let mut val = [0u8; SEG_VALUE_BYTES];
+    let mut terms: Vec<Vec<u8>> = Vec::new();
     for (field, card) in SEG_FIELDS {
         for v in 0..*card {
             term(field, v, &mut key);
-            let mut e = v as u64;
-            while e < events {
-                seg_value(&key, e as u32, &mut val);
-                store.append(&key, &val)?;
-                e += *card as u64;
-            }
+            terms.push(key.clone());
         }
     }
-    store.checkpoint()?;
-    store.close()?;
+    terms.sort_unstable();
+    for k in &terms {
+        w.begin(k)?;
+        // Recover the field cardinality this key belongs to, so the event
+        // stride is the one the shape describes.
+        let (card, v) = SEG_FIELDS
+            .iter()
+            .find_map(|(field, card)| {
+                (0..*card).find_map(|v| {
+                    term(field, v, &mut key);
+                    (key == *k).then_some((*card, v))
+                })
+            })
+            .expect("every key came from the schema");
+        let mut e = v as u64;
+        while e < events {
+            seg_value(k, e as u32, &mut val);
+            w.value(&val);
+            e += card as u64;
+        }
+        w.end()?;
+    }
+    w.finish(1)?;
     Ok(())
 }
 
@@ -411,7 +352,13 @@ fn segment_fixture(dir: &Path, events: u64) -> std::io::Result<()> {
     // Small enough that eviction must happen over the probe set (the point
     // of a budget), large enough that any single query's plan fits (its
     // contract). Recorded in the fixture so the test and the cache agree.
-    const CACHE_BUDGET: u64 = 512 << 10;
+    //
+    // It is a fraction of what the probe set fetches rather than a round
+    // number, because a round one stops testing anything the moment the
+    // reader fetches less: at 512 KiB the browser suite went quietly green
+    // when the fixture moved to the segment writer and the whole probe set
+    // came to 465 KiB, evicting nothing.
+    const CACHE_BUDGET: u64 = 256 << 10;
 
     std::fs::create_dir_all(dir)?;
     let path = dir.join("segment.supdb");
@@ -554,34 +501,23 @@ fn budget(profile: Profile) -> std::io::Result<Record> {
             "payload_bytes" => J::u(b.payload_bytes),
             "overhead_over_payload" => J::fp(b.file_bytes as f64 / b.payload_bytes.max(1) as f64, 3),
             "blocks" => J::u(b.blocks),
-            "bytes_written" => J::u(b.bytes_written),
-            "merges" => J::u(b.merges),
-            "free_bytes" => J::u(b.free_bytes),
             "within_budget" => J::Bool(b.file_bytes <= BUDGET_BYTES),
         }
     };
 
     let mut term_rows = Vec::new();
-    let mut line_rows = Vec::new();
     let mut term_bytes: Vec<u64> = Vec::new();
-    let mut line_bytes: Vec<u64> = Vec::new();
-    let mut worst_merges = 0u64;
     for lines in &scales {
         // Not interleaved, and it does not need to be: a file length does not
         // drift with the machine, which is the one exemption CLAUDE.md grants
         // from measuring two arms in a single process.
         let path = dir.join(format!("day-{lines}.supdb"));
-        let t = build_day(&path, *lines, 0x5109_5ed0 ^ lines, Order::Term)?;
+        let t = build_day(&path, *lines, 0x5109_5ed0 ^ lines)?;
         term_rows.push(row(*lines, &t));
         term_bytes.push(t.file_bytes);
-        worst_merges = worst_merges.max(t.merges);
-        let l = build_day(&path, *lines, 0x5109_5ed0 ^ lines, Order::Line)?;
-        line_rows.push(row(*lines, &l));
-        line_bytes.push(l.file_bytes);
         let _ = std::fs::remove_file(&path);
     }
     rec.series("term_order", J::arr(term_rows));
-    rec.series("line_order", J::arr(line_rows));
 
     // Measured, not fitted. `ext-sweep` learned this the expensive way: a
     // straight line through a scan sweep put its intercept above the measured
@@ -665,26 +601,6 @@ fn budget(profile: Profile) -> std::io::Result<Record> {
         ),
     ));
 
-    // W1.3 -- open question 2, and the largest single number in this file.
-    let ratio = if term_bytes[last] > 0 {
-        line_bytes[last] as f64 / term_bytes[last] as f64
-    } else {
-        0.0
-    };
-    rec.finding(Finding::new(
-        "W1.3",
-        "grouping a day's postings by term before appending them costs less than a third of the file that appending them in log-line order does",
-        ratio >= 3.0,
-        format!(
-            "at {} lines, line order writes {} bytes and term order writes {} ({ratio:.2}x). Line \
-             order interleaves every key, so a hot key's run is sealed into many small extents and \
-             merge_threshold then rewrites the whole run each time it crosses four -- the \
-             inline-merge cost F5.1 records as a latency tail, showing up here as dead space. Term \
-             order seals each key's run once and merges {worst_merges} times in the whole sweep",
-            scales[last], line_bytes[last], term_bytes[last]
-        ),
-    ));
-
     Ok(rec)
 }
 
@@ -694,13 +610,13 @@ fn budget(profile: Profile) -> std::io::Result<Record> {
 ///
 /// The answers come from the *native* reader over the same file. So the
 /// browser test is a differential test across the wasm boundary and an OPFS
-/// handle, against a chain that `tests/blob.rs` already pins to
-/// `store::Reader`. A browser test whose expectations were hand-written would
-/// only ever confirm what its author already believed.
+/// handle, against a chain `tests/blob.rs` already pins to what was written.
+/// A browser test whose expectations were hand-written would only ever
+/// confirm what its author already believed.
 fn fixture(dir: &Path, lines: u64) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join("day.supdb");
-    let built = build_day(&path, lines, 0x5109_5ed0, Order::Term)?;
+    let built = build_day(&path, lines, 0x5109_5ed0)?;
     let blob = Blob::open(MmapBytes::open(&path)?)?;
 
     // Keys spread across the dictionary and across run lengths: the head of a
@@ -1036,7 +952,7 @@ fn dict(profile: Profile) -> std::io::Result<Record> {
     rec.note("predictions registered in dict-plan.md before the run");
 
     let path = dir.join("day.supdb");
-    let built = build_day(&path, day_lines, 0x5109_5ed0, Order::Term)?;
+    let built = build_day(&path, day_lines, 0x5109_5ed0)?;
     let file_bytes = built.file_bytes;
     let data = std::fs::read(&path)?;
     let whole = Blob::open(MmapBytes::open(&path)?)?;
@@ -1469,7 +1385,7 @@ fn ranges(profile: Profile) -> std::io::Result<Record> {
     rec.param("segment_events", J::u(seg_events));
 
     let day_path = dir.join("day.supdb");
-    build_day(&day_path, day_lines, 0x5109_5ed0, Order::Term)?;
+    build_day(&day_path, day_lines, 0x5109_5ed0)?;
     let day = plan_shape(&day_path, &[0, 1, 7, 64, 512, 2048, usize::MAX])?;
 
     let seg_path = dir.join("segment.supdb");
@@ -1608,19 +1524,13 @@ fn main() -> std::io::Result<()> {
             let lines: u64 = arg("--lines")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(20_000);
-            let order =
-                Order::parse(arg("--order").as_deref().unwrap_or("term")).unwrap_or(Order::Term);
-            let b = build_day(&path, lines, 0x5109_5ed0, order)?;
+            let b = build_day(&path, lines, 0x5109_5ed0)?;
             println!(
                 "{}",
                 jobj! {
                     "path" => J::s(path.display().to_string()),
-                    "order" => J::s(order.as_str()),
                     "blocks" => J::u(b.blocks),
-                    "merges" => J::u(b.merges),
-                    "free_bytes" => J::u(b.free_bytes),
                     "payload_bytes" => J::u(b.payload_bytes),
-                    "bytes_written" => J::u(b.bytes_written),
                     "lines" => J::u(lines),
                     "keys" => J::u(b.keys),
                     "postings" => J::u(b.postings),
@@ -1720,7 +1630,7 @@ fn main() -> std::io::Result<()> {
         }
         _ => {
             eprintln!(
-                "logshed build   --path P --lines N [--order term|line]\n\
+                "logshed build   --path P --lines N\n\
                  logshed budget  --profile ci|dev|full [--out results]\n\
                  logshed fixture --dir web/test/out [--lines N]\n\
                  logshed segment --dir web/test/out [--events N]\n\
@@ -1906,7 +1816,7 @@ fn waves(profile: Profile) -> std::io::Result<Record> {
     let store_path = dir.join("store.supdb");
     let seg_path = dir.join("segment.supdb");
     let res_path = dir.join("reserve.supdb");
-    let built = build_day(&store_path, day_lines, 0x5109_5ed0, Order::Term)?;
+    let built = build_day(&store_path, day_lines, 0x5109_5ed0)?;
     let seg_bytes = build_day_segment(&seg_path, day_lines, 0x5109_5ed0, 256, 0, false, false)?;
     let res_bytes = build_day_segment(
         &res_path,
