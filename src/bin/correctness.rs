@@ -25,7 +25,7 @@ use std::time::Instant;
 use supdb::bench::{db_key_into, Finding, Profile, Record, Rng, J};
 use supdb::jobj;
 use supdb::next::{Db, NextOptions, SyncPolicy};
-use supdb::{Options, Reader, Reclaim, Store};
+use supdb::Options;
 
 struct Args(Vec<String>);
 impl Args {
@@ -58,8 +58,6 @@ fn main() -> std::io::Result<()> {
     let run = |name: &str| -> std::io::Result<bool> {
         let rec = match name {
             "c1-decoders" => c1_decoders(&args, profile)?,
-            "c2-oracle" => c2_oracle(&args, profile)?,
-            "c3-crash" => c3_crash(&args, profile)?,
             "c4-crash" => c4_crash(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
@@ -72,10 +70,9 @@ fn main() -> std::io::Result<()> {
     };
 
     match cmd.as_str() {
-        "c3-child" => c3_child(&args),
         "c4-child" => c4_child(&args),
         "all" => {
-            for e in ["c1-decoders", "c2-oracle", "c3-crash", "c4-crash"] {
+            for e in ["c1-decoders", "c4-crash"] {
                 run(e)?;
             }
             Ok(())
@@ -94,181 +91,42 @@ fn main() -> std::io::Result<()> {
 }
 
 /// Build a small, valid store and return its path.
-fn build_store(path: &Path, keys: u64, depth: u64, value_size: usize) -> std::io::Result<()> {
-    let store = Store::create(
-        path,
-        Options {
-            buffer_bytes: 4 << 20,
-            reclaim: Reclaim::AfterReads,
-            ..Default::default()
-        },
-    )?;
+fn build_segment(path: &Path, keys: u64, depth: u64, value_size: usize) -> std::io::Result<()> {
+    let mut w = supdb::next::SegmentWriter::create(path, &Options::default())?;
     let mut kb = [0u8; 16];
     let mut v = vec![0u8; value_size];
-    for i in 0..(keys * depth) {
-        let k = i % keys;
+    // `db_key_into` is a zero-padded decimal, so ascending `k` is ascending
+    // key bytes, which is the order the writer takes.
+    for k in 0..keys {
         db_key_into(k, &mut kb);
-        // Self-describing: sequence, key, and a checksum of both, so a reader
-        // can tell a correct value from a corrupted one of the right length.
-        v[..8].copy_from_slice(&i.to_be_bytes());
-        v[8..16].copy_from_slice(&k.to_be_bytes());
-        let tag = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ k;
-        v[16..24].copy_from_slice(&tag.to_be_bytes());
-        for (j, b) in v.iter_mut().enumerate().skip(24) {
-            *b = (j as u64).wrapping_mul(31).wrapping_add(tag) as u8;
+        w.begin(&kb)?;
+        // The same (sequence, key) pairing the interleaved writer produced:
+        // key `k` holds sequences k, k+keys, k+2*keys, and so on. Keeping it
+        // means the fixture's bytes are unchanged, so a damage model that
+        // used to land somewhere still lands there.
+        for d in 0..depth {
+            let i = k + d * keys;
+            // Self-describing: sequence, key, and a checksum of both, so a
+            // reader can tell a correct value from a corrupted one of the
+            // right length.
+            v[..8].copy_from_slice(&i.to_be_bytes());
+            v[8..16].copy_from_slice(&k.to_be_bytes());
+            let tag = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ k;
+            v[16..24].copy_from_slice(&tag.to_be_bytes());
+            for (j, b) in v.iter_mut().enumerate().skip(24) {
+                *b = (j as u64).wrapping_mul(31).wrapping_add(tag) as u8;
+            }
+            w.value(&v);
         }
-        store.append(&kb, &v)?;
+        w.end()?;
     }
-    store.close()?;
+    w.finish(1)?;
     Ok(())
 }
 
 // ------------------------------------------------------- C1: damaged bytes --
 
-/// Reopen deliberately damaged stores and see whether anything wrong is served.
-///
-/// Returns (files opened that then disagreed with what was written, files
-/// refused, files tried).
-fn reopen_damage(
-    dir: &std::path::Path,
-    keys: u64,
-    value_size: usize,
-) -> std::io::Result<(u64, u64, u64)> {
-    let val = vec![b'r'; value_size];
-    let path = dir.join("reopen-src.dat");
-    let _ = std::fs::remove_file(&path);
-    {
-        let s = Store::create(&path, Options::default())?;
-        let mut kb = [0u8; 16];
-        for k in 0..keys {
-            db_key_into(k, &mut kb);
-            s.put(&kb, &val)?;
-        }
-        s.flush()?;
-        s.close()?;
-    }
-    let clean = std::fs::read(&path)?;
-    let (mut wrong, mut refused, mut tried) = (0u64, 0u64, 0u64);
-    let target = dir.join("reopen-damaged.dat");
-    for i in 0..24usize {
-        let at = (clean.len() / 24) * i + 17;
-        if at >= clean.len() {
-            continue;
-        }
-        let mut bytes = clean.clone();
-        bytes[at] ^= 0xff;
-        std::fs::write(&target, &bytes)?;
-        tried += 1;
-        let Ok(s) = Store::open(&target, Options::default()) else {
-            refused += 1;
-            continue;
-        };
-        let mut bad = false;
-        let mut kb = [0u8; 16];
-        for k in 0..keys {
-            db_key_into(k, &mut kb);
-            let mut got = Vec::new();
-            match s.read_all(&kb, |v| got.extend_from_slice(v)) {
-                Ok(0) => {}
-                Ok(_) => {
-                    if got != val {
-                        bad = true;
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-        if bad {
-            wrong += 1;
-        }
-        let _ = s.close();
-    }
-    let _ = std::fs::remove_file(&target);
-    let _ = std::fs::remove_file(&path);
-    Ok((wrong, refused, tried))
-}
-
 // ---------------------------------------------- the other read path --
-/// Damage a live store's file underneath it and read through both paths.
-///
-/// Returns (values the writer served that differed from what was written,
-/// trials the reader rejected, trials run).
-fn writer_path_damage(
-    dir: &std::path::Path,
-    keys: u64,
-    value_size: usize,
-) -> std::io::Result<(u64, u64, u64)> {
-    use std::io::{Seek, Write};
-    let mut served = 0u64;
-    let mut caught = 0u64;
-    let mut trials = 0u64;
-    let val = vec![b'v'; value_size];
-    for t in 0..8u64 {
-        let path = dir.join(format!("writer-{t}.dat"));
-        let _ = std::fs::remove_file(&path);
-        let s = Store::create(
-            &path,
-            Options {
-                checksums: true,
-                ..Options::default()
-            },
-        )?;
-        let mut kb = [0u8; 16];
-        for k in 0..keys {
-            db_key_into(k, &mut kb);
-            s.put(&kb, &val)?;
-        }
-        s.flush()?;
-        s.checkpoint()?;
-
-        let clean = std::fs::read(&path)?;
-        let Some(at) = clean.windows(val.len()).position(|w| w == val.as_slice()) else {
-            continue;
-        };
-        let at = at + 8 + t as usize;
-        if at >= clean.len() {
-            continue;
-        }
-        {
-            let mut f = std::fs::OpenOptions::new().write(true).open(&path)?;
-            f.seek(std::io::SeekFrom::Start(at as u64))?;
-            f.write_all(&[clean[at] ^ 0xff])?;
-            f.sync_all()?;
-        }
-        trials += 1;
-
-        let (mut wrong, mut err) = (false, false);
-        for k in 0..keys {
-            db_key_into(k, &mut kb);
-            match s.read_all(&kb, |v| {
-                if v != val.as_slice() {
-                    wrong = true;
-                }
-            }) {
-                Ok(_) => {}
-                Err(_) => err = true,
-            }
-        }
-        if wrong && !err {
-            served += 1;
-        }
-        if let Ok(r) = Reader::open(&path) {
-            let mut rerr = false;
-            for k in 0..keys {
-                db_key_into(k, &mut kb);
-                if r.read_all(&kb, |_| {}).is_err() {
-                    rerr = true;
-                }
-            }
-            if rerr {
-                caught += 1;
-            }
-        }
-        let _ = s.close();
-        let _ = std::fs::remove_file(&path);
-    }
-    Ok((served, caught, trials))
-}
 
 /// What a reader does with a file that is not quite what it wrote.
 ///
@@ -304,7 +162,7 @@ fn c1_decoders(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let dir = scratch("c1");
     let good = dir.join("good.dat");
-    build_store(&good, keys, depth, value_size)?;
+    build_segment(&good, keys, depth, value_size)?;
     let template = std::fs::read(&good)?;
     let target = dir.join("damaged.dat");
 
@@ -345,8 +203,9 @@ fn c1_decoders(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // whole file mostly hits size-class padding, where a flipped byte is
     // genuinely harmless -- reporting that as "undetected corruption" measures
     // the file's layout, not the engine.
-    let payload_ranges: Vec<(u64, u64)> = Reader::open(&good)
-        .map(|r| r.block_extents())
+    let payload_ranges: Vec<(u64, u64)> = supdb::MmapBytes::open(&good)
+        .and_then(supdb::Blob::open)
+        .map(|b| b.block_extents())
         .unwrap_or_default()
         .into_iter()
         .filter(|(off, len)| *off >= 4096 && *len > 0)
@@ -418,7 +277,9 @@ fn c1_decoders(args: &Args, profile: Profile) -> std::io::Result<Record> {
         std::fs::write(&target, &bytes)?;
 
         let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(u64, u64), String> {
-            let r = Reader::open(&target).map_err(|e| e.to_string())?;
+            let r = supdb::MmapBytes::open(&target)
+                .and_then(supdb::Blob::open)
+                .map_err(|e| e.to_string())?;
             let mut kb = [0u8; 16];
             let (mut vals, mut odd) = (0u64, 0u64);
             for k in 0..keys {
@@ -536,48 +397,6 @@ fn c1_decoders(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // that were mostly layout, not integrity.
     let payload_total: u64 = by_model[4].iter().sum();
     let payload_silent = by_model[4][2];
-    // The same claim, asked of the other read path.
-    //
-    // Every trial above opens a `Reader`. `Store::read_all` exists so a writer
-    // can read its own writes without a checkpoint -- it took the mixed YCSB
-    // workloads from 0.07x of LMDB to 18x -- and it goes from the mapping to
-    // the caller with no checksum in between. So C1.2 was stated about reads
-    // and measured on one of the two ways to do one.
-    //
-    // The scope is real but narrow: `Store::create` truncates and there is no
-    // `Store::open`, so a writer only ever reads blocks it wrote in this
-    // session. What is unprotected is the file changing underneath it, which
-    // is what this measures, through a second handle, because the appender
-    // maps the file shared.
-    let writer = writer_path_damage(&dir, keys.min(2_000), value_size)?;
-    // Reopening is a read of the whole index through a path that then *writes*
-    // to the file, so a damaged store must be refused rather than opened onto.
-    let reopen = reopen_damage(&dir, keys.min(1_000), value_size)?;
-    rec.finding(Finding::new(
-        "C1.4",
-        "a damaged store is refused by Store::open, never opened onto",
-        reopen.0 == 0,
-        format!(
-            "{}/{} damaged files opened for writing and then disagreed with what was written; \
-             {} were refused outright. `Store::open` rebuilds the block table, the key tables and \
-             every reference count from the file, so anything it accepts it then writes on top of",
-            reopen.0, reopen.2, reopen.1
-        ),
-    ));
-    rec.finding(Finding::new(
-        "C1.3",
-        "the writer's own read path checks what the reader's read path checks",
-        writer.0 == 0,
-        format!(
-            "{}/{} damaged reads through Store::read_all returned bytes that differed from what \
-             was written with no error; a Reader over the same file rejected {}. Both paths now \
-             verify, which matters because the feature table scores Supdb a point for checksums \
-             and YCSB A through F route every read through the writer's path. It cost 1.135x on \
-             a cold read pass and 0.956x warm -- see f21-writerverify, and Options::verify_reads \
-             for callers who want LMDB's trade instead",
-            writer.0, writer.2, writer.1
-        ),
-    ));
     rec.finding(Finding::new(
         "C1.2",
         "a reader returns the bytes that were written, or an error -- never wrong data",
@@ -611,477 +430,7 @@ fn c1_decoders(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
 // ------------------------------------------------------------ C2: an oracle --
 
-/// Randomized operation sequences against a model.
-///
-/// The model is a `BTreeMap<Vec<u8>, Vec<Vec<u8>>>` -- the data structure the
-/// API describes. After each checkpoint the store is reopened and every key is
-/// compared against it. A hundred lines that the design document's six
-/// hand-written harnesses do not contain.
-fn c2_oracle(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    // The ci defaults are sized to actually reproduce, not merely to run.
-    // At 500 operations per round a shard's pending buffer never fills, so
-    // seal_shard is not triggered inline and the staged-extent bug cannot
-    // occur -- the suite reported "no divergence" for a defect it had already
-    // proven. Both known bugs surface at 60x2000 in under half a second.
-    let rounds = args.num("--rounds", profile.pick(60, 200, 1_000));
-    let ops_per_round = args.num("--ops", profile.pick(2_000, 2_000, 10_000));
-    let keyspace = args.num("--keyspace", 300) as u64;
-    let seed = args.num("--seed", 0xC2C2) as u64;
-
-    let mut rec = Record::new("c2-oracle", profile);
-    rec.param("rounds", J::u(rounds as u64))
-        .param("ops_per_round", J::u(ops_per_round as u64))
-        .param("keyspace", J::u(keyspace))
-        .param("seed", J::u(seed));
-
-    // Every reclaim policy, because the two defects this found are
-    // policy-dependent and running one policy hides the other: under
-    // AfterReads the write path dies before the comparison can run, and under
-    // Never it survives and diverges.
-    //
-    // Plus one deferred-consolidation arm, under the policy that actually
-    // releases and reuses space mid-run -- a suffix merge releases only the
-    // extents it consumed and repoints the list mid-run, and "a path only one
-    // arm exercises is a path nothing tests" is a lesson this repository has
-    // already paid for once, on a dropped tombstone.
-    let policies: Vec<(&str, Reclaim, bool)> = vec![
-        ("AfterReads", Reclaim::AfterReads, false),
-        ("Never", Reclaim::Never, false),
-        ("OnClose", Reclaim::OnClose, false),
-        ("AfterReads+defer", Reclaim::AfterReads, true),
-    ];
-
-    let mut rows = Vec::new();
-    let mut any_write_error = false;
-    let mut any_divergence = false;
-    let mut worst = String::new();
-
-    for (name, reclaim, defer) in &policies {
-        let r = run_oracle(*reclaim, *defer, rounds, ops_per_round, keyspace, seed)?;
-        if r.write_error.is_some() {
-            any_write_error = true;
-        }
-        if r.mismatches > 0 {
-            any_divergence = true;
-            if worst.is_empty() {
-                worst = format!("{name}: {}", r.first);
-            }
-        }
-        println!(
-            "  {name:11} {:>7} comparisons  {:>6} mismatches  {:>4} read errors  write path: {}",
-            r.checked,
-            r.mismatches,
-            r.read_errors,
-            r.write_error.clone().unwrap_or_else(|| "ok".into())
-        );
-        rows.push(jobj! {
-            "reclaim" => J::s(*name),
-            "defer_merge" => J::Bool(*defer),
-            "keys_compared" => J::u(r.checked),
-            "mismatches" => J::u(r.mismatches),
-            "read_errors" => J::u(r.read_errors),
-            "rounds_completed" => J::u(r.rounds_done),
-            "write_error" => match &r.write_error {
-                Some(e) => J::s(e.as_str()),
-                None => J::Null,
-            },
-            "first_divergence" => J::s(&r.first),
-        });
-    }
-    rec.series("by_reclaim_policy", J::arr(rows));
-
-    rec.finding(Finding::new(
-        "C2.1",
-        "the store agrees with a BTreeMap model across appends, replaces and deletes",
-        !any_divergence,
-        if worst.is_empty() {
-            "no divergence under any reclaim policy".to_string()
-        } else {
-            format!(
-                "{worst}. delete() clears entry.extents but does not cancel an extent already \
-                 staged in the block builder, so flush_builder pushes it back and the deleted \
-                 key returns. Reduced in tests/known_bugs.rs"
-            )
-        },
-    ));
-    rec.finding(Finding::new(
-        "C2.2",
-        "the write path completes without error under every reclaim policy",
-        !any_write_error,
-        if any_write_error {
-            "under AfterReads the writer's own merge path fails to decode a block it wrote: a \
-             freed slot is handed out while a block still holds live references to it, so three \
-             block ids end up describing the same byte range"
-                .to_string()
-        } else {
-            "no write-path errors".to_string()
-        },
-    ));
-    rec.note(format!(
-        "deterministic: rerun with --seed {seed} to reproduce exactly"
-    ));
-    Ok(rec)
-}
-
-struct OracleRun {
-    checked: u64,
-    mismatches: u64,
-    read_errors: u64,
-    rounds_done: u64,
-    write_error: Option<String>,
-    first: String,
-}
-
-/// One pass of the oracle under one reclaim policy.
-///
-/// A write-path error stops the run and is reported rather than propagated:
-/// the point is to characterise the failure, not to abort the experiment that
-/// found it.
-fn run_oracle(
-    reclaim: Reclaim,
-    defer_merge: bool,
-    rounds: usize,
-    ops_per_round: usize,
-    keyspace: u64,
-    seed: u64,
-) -> std::io::Result<OracleRun> {
-    let merge_threshold: usize = std::env::var("SUPDB_MERGE_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(4);
-    use std::collections::BTreeMap;
-
-    let dir = scratch(&format!("c2-{reclaim:?}-{defer_merge}"));
-    let file = dir.join("s.dat");
-    let store = Store::create(
-        &file,
-        Options {
-            buffer_bytes: 1 << 20,
-            reclaim,
-            merge_threshold,
-            defer_merge,
-            ..Default::default()
-        },
-    )?;
-
-    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-    let mut rng = Rng::new(seed);
-    let mut out = OracleRun {
-        checked: 0,
-        mismatches: 0,
-        read_errors: 0,
-        rounds_done: 0,
-        write_error: None,
-        first: String::new(),
-    };
-
-    'rounds: for round in 0..rounds {
-        for _ in 0..ops_per_round {
-            let k = rng.next() % keyspace;
-            let mut kb = [0u8; 16];
-            db_key_into(k, &mut kb);
-            let key = kb.to_vec();
-            let tag = rng.next();
-            let mut val = vec![0u8; 24];
-            val[..8].copy_from_slice(&tag.to_be_bytes());
-            val[8..16].copy_from_slice(&k.to_be_bytes());
-            val[16..24].copy_from_slice(&(round as u64).to_be_bytes());
-
-            let r = match rng.next() % 100 {
-                0..=69 => {
-                    let r = store.append(&key, &val);
-                    if r.is_ok() {
-                        model.entry(key).or_default().push(val);
-                    }
-                    r
-                }
-                70..=89 => {
-                    let r = store.put(&key, &val);
-                    if r.is_ok() {
-                        model.insert(key, vec![val]);
-                    }
-                    r
-                }
-                _ => {
-                    let r = store.delete(&key);
-                    if r.is_ok() {
-                        model.insert(key, Vec::new());
-                    }
-                    r
-                }
-            };
-            if let Err(e) = r {
-                out.write_error = Some(format!("round {round}: {e}"));
-                break 'rounds;
-            }
-        }
-        if let Err(e) = store.checkpoint() {
-            out.write_error = Some(format!("round {round} checkpoint: {e}"));
-            break 'rounds;
-        }
-        out.rounds_done += 1;
-
-        let reader = Reader::open(&file)?;
-        for (key, want) in &model {
-            out.checked += 1;
-            let mut got: Vec<Vec<u8>> = Vec::new();
-            match reader.read_all(key, |v| got.push(v.to_vec())) {
-                Ok(_) => {
-                    if &got != want {
-                        out.mismatches += 1;
-                        if out.first.is_empty() {
-                            out.first = format!(
-                                "round {round}, key {}: model has {} value(s), store returned {}",
-                                String::from_utf8_lossy(key),
-                                want.len(),
-                                got.len()
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    out.read_errors += 1;
-                    if out.first.is_empty() {
-                        out.first = format!("round {round}: read error {e}");
-                    }
-                }
-            }
-        }
-    }
-    let _ = store.close();
-    let _ = std::fs::remove_dir_all(&dir);
-    Ok(out)
-}
-
 // ------------------------------------------------------------- C3: crashes --
-
-/// Kill a writer at many different points and check what survives.
-///
-/// The design document reports one `SIGABRT` at one point, which is an
-/// anecdote. The contract is narrow enough to state precisely: after any crash
-/// the store must open, and it must present a state that is a prefix of what
-/// was written -- some suffix of the writes may be lost, but nothing may be
-/// invented, and no key may hold a value that was never appended.
-fn c3_crash(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    let trials = args.num("--trials", profile.pick(12, 40, 120));
-    let keys = args.num("--keys", 500) as u64;
-    let value_size = args.num("--value-size", 64);
-
-    let mut rec = Record::new("c3-crash", profile);
-    rec.param("trials", J::u(trials as u64))
-        .param("keys", J::u(keys))
-        .param("value_size", J::u(value_size as u64));
-
-    let dir = scratch("c3");
-    let exe = std::env::current_exe().expect("exe");
-    let mut rng = Rng::new(0xC3C3);
-
-    // The child checkpoints every keys/2 operations, so the parent knows
-    // whether any checkpoint completed before the crash. A store killed before
-    // its first checkpoint has nothing on disk to recover -- that is a real
-    // and important limitation, but it is a different statement from "a store
-    // with a completed checkpoint will not open", and merging the two would
-    // hide the second behind the first.
-    let ckpt_every = (keys / 2).max(1);
-    let (mut opened, mut open_failed, mut read_errors, mut invented, mut torn_values) =
-        (0u64, 0u64, 0u64, 0u64, 0u64);
-    let (mut pre_ckpt_crashes, mut pre_ckpt_unopenable) = (0u64, 0u64);
-    let (mut post_ckpt_crashes, mut post_ckpt_unopenable) = (0u64, 0u64);
-    let mut recovered_fraction: Vec<f64> = Vec::new();
-    let mut first = String::new();
-
-    for t in 0..trials {
-        let file = dir.join(format!("c{t}.dat"));
-        // Abort after a random number of operations, so the crash lands in a
-        // different place each time -- mid-append, mid-seal, mid-checkpoint.
-        let abort_after = 1 + (rng.next() % (keys * 6));
-        let st = std::process::Command::new(&exe)
-            .arg("c3-child")
-            .arg("--file")
-            .arg(&file)
-            .arg("--keys")
-            .arg(keys.to_string())
-            .arg("--value-size")
-            .arg(value_size.to_string())
-            .arg("--abort-after")
-            .arg(abort_after.to_string())
-            .output()?;
-        // The child aborts, so a "success" exit means it never crashed.
-        if st.status.success() {
-            continue;
-        }
-
-        let had_checkpoint = abort_after >= ckpt_every;
-        if had_checkpoint {
-            post_ckpt_crashes += 1;
-        } else {
-            pre_ckpt_crashes += 1;
-        }
-        match Reader::open(&file) {
-            Err(_) => {
-                open_failed += 1;
-                if had_checkpoint {
-                    post_ckpt_unopenable += 1;
-                    if first.is_empty() {
-                        first = format!(
-                            "trial {t}: crash at op {abort_after}, past the checkpoint at \
-                             {ckpt_every}, and the store still would not open"
-                        );
-                    }
-                } else {
-                    pre_ckpt_unopenable += 1;
-                }
-            }
-            Ok(r) => {
-                opened += 1;
-                let mut kb = [0u8; 16];
-                let (mut present, mut bad) = (0u64, 0u64);
-                for k in 0..keys {
-                    db_key_into(k, &mut kb);
-                    let mut n = 0u64;
-                    match r.read_all(&kb, |v| {
-                        n += 1;
-                        // Every value written by the child is value_size bytes
-                        // and carries its own key in bytes 8..16. Anything else
-                        // was not written by this writer.
-                        let self_describing = v.len() == value_size
-                            && u64::from_be_bytes(v[8..16].try_into().unwrap()) == k;
-                        if !self_describing {
-                            bad += 1;
-                        }
-                    }) {
-                        Ok(_) => {
-                            if n > 0 {
-                                present += 1;
-                            }
-                        }
-                        Err(_) => read_errors += 1,
-                    }
-                }
-                invented += bad;
-                if bad > 0 {
-                    torn_values += 1;
-                    if first.is_empty() {
-                        first = format!("trial {t}: {bad} values did not match what was written");
-                    }
-                }
-                recovered_fraction.push(present as f64 / keys as f64);
-            }
-        }
-        let _ = std::fs::remove_file(&file);
-    }
-
-    let n = (opened + open_failed).max(1);
-    let mean_recovered = if recovered_fraction.is_empty() {
-        0.0
-    } else {
-        recovered_fraction.iter().sum::<f64>() / recovered_fraction.len() as f64
-    };
-    rec.series("before_first_checkpoint", jobj! {
-        "crashes" => J::u(pre_ckpt_crashes),
-        "unopenable" => J::u(pre_ckpt_unopenable),
-        "note" => J::s("nothing is on disk until the first checkpoint; with buffer_bytes at its \
-                        512MB default a writer can accumulate a great deal before one happens"),
-    })
-    .series("after_a_checkpoint", jobj! {
-        "crashes" => J::u(post_ckpt_crashes),
-        "unopenable" => J::u(post_ckpt_unopenable),
-    })
-    .series("recovery", jobj! {
-        "crashes" => J::u(n),
-        "opened" => J::u(opened),
-        "open_failed" => J::u(open_failed),
-        "read_errors" => J::u(read_errors),
-        "trials_with_bad_values" => J::u(torn_values),
-        "bad_values_total" => J::u(invented),
-        "mean_keys_recovered" => J::fp(mean_recovered, 4),
-        "first" => J::s(&first),
-    });
-
-    rec.finding(if post_ckpt_crashes > 0 {
-        Finding::new(
-            "C3.1",
-            "a store killed after at least one checkpoint always opens",
-            post_ckpt_unopenable == 0,
-            format!(
-                "{}/{post_ckpt_crashes} stores with a completed checkpoint opened; \
-                 {post_ckpt_unopenable} did not. {first}",
-                post_ckpt_crashes - post_ckpt_unopenable
-            ),
-        )
-    } else {
-        Finding::not_exercised(
-            "C3.1",
-            "a store killed after at least one checkpoint always opens",
-            "no trial crashed after a checkpoint",
-        )
-    });
-    rec.finding(Finding::new(
-        "C3.4",
-        "a store killed before its first checkpoint is readable",
-        pre_ckpt_crashes == 0 || pre_ckpt_unopenable == 0,
-        format!(
-            "{pre_ckpt_unopenable}/{pre_ckpt_crashes} stores killed before their first \
-             checkpoint would not open at all. Everything written so far lives in per-shard \
-             memory buffers, and buffer_bytes defaults to 512MB, so this is not a small window"
-        ),
-    ));
-    rec.finding(Finding::new(
-        "C3.2",
-        "recovery invents nothing: every value read back was actually written",
-        invented == 0,
-        format!(
-            "{invented} values across {torn_values} trials did not match what the writer wrote"
-        ),
-    ));
-    rec.finding(Finding::new(
-        "C3.3",
-        "recovery loses only a suffix: at least half the keys survive a mid-run crash",
-        mean_recovered >= 0.5,
-        format!(
-            "mean {:.0}% of keys present after a crash. Everything since the last checkpoint is \
-             buffered in memory, and buffer_bytes defaults to 512MB",
-            mean_recovered * 100.0
-        ),
-    ));
-    Ok(rec)
-}
-
-/// Child for C3: write, then abort abruptly. No unwinding, no destructors.
-fn c3_child(args: &Args) -> std::io::Result<()> {
-    let file = PathBuf::from(args.get("--file").expect("--file"));
-    let keys = args.num("--keys", 100) as u64;
-    let value_size = args.num("--value-size", 64);
-    let abort_after = args.num("--abort-after", 100) as u64;
-
-    let store = Store::create(
-        &file,
-        Options {
-            buffer_bytes: 256 << 10,
-            reclaim: Reclaim::AfterReads,
-            ..Default::default()
-        },
-    )?;
-    let mut kb = [0u8; 16];
-    let mut v = vec![0u8; value_size];
-    for i in 0..(keys * 8) {
-        let k = i % keys;
-        db_key_into(k, &mut kb);
-        v[..8].copy_from_slice(&i.to_be_bytes());
-        v[8..16].copy_from_slice(&k.to_be_bytes());
-        store.append(&kb, &v)?;
-        if i > 0 && i % (keys / 2).max(1) == 0 {
-            store.checkpoint()?;
-        }
-        if i == abort_after {
-            // A real crash: no flush, no close, no destructors.
-            std::io::stdout().flush().ok();
-            std::process::abort();
-        }
-    }
-    store.close()?;
-    Ok(())
-}
 
 // ------------------------------------------------ C4: next engine crashes --
 

@@ -62,36 +62,6 @@
    "because": "FIXED by adding checksums: CRC-32C per chunk in the chunk directory, so a point read verifies only what it decodes, plus a whole-block CRC in the block index for blocks stored verbatim or compressed as a single stream. The statement was also corrected twice: it previously measured how much damage went unnoticed, which at 73% was mostly size-class padding, and then at 7.5% was mostly chunks orphaned inside live blocks. The engine's actual obligation is that a read returns written bytes or an error, and that now holds at 0/3,317."
   },
   {
-   "experiment": "c2-oracle",
-   "id": "C2.1",
-   "expect": "holds",
-   "because": "FIXED. delete() and put() now drop matching entries from Shard::members, so an extent staged in the block builder by an inline seal cannot be pushed back onto a key that was deleted or replaced. Reproducer in tests/known_bugs.rs, no longer ignored."
-  },
-  {
-   "experiment": "c3-crash",
-   "id": "C3.1",
-   "expect": "holds",
-   "because": "A store killed after at least one checkpoint must open. It does, across every trial -- the alternating superblock slots work. This is a genuine strength of the design."
-  },
-  {
-   "experiment": "c3-crash",
-   "id": "C3.2",
-   "expect": "holds",
-   "because": "Recovery must invent nothing: every value read back after a crash was actually written."
-  },
-  {
-   "experiment": "c3-crash",
-   "id": "C3.3",
-   "expect": "holds",
-   "because": "Recovery must lose only a suffix. About 95% of keys survive a mid-run crash."
-  },
-  {
-   "experiment": "c3-crash",
-   "id": "C3.4",
-   "expect": "fails",
-   "because": "A store killed before its first checkpoint does not open at all -- there is no superblock to find. Everything written lives in per-shard memory buffers and buffer_bytes defaults to 512MB, so the window in which a crash loses everything is not small."
-  },
-  {
    "experiment": "c4-crash",
    "id": "C4.1",
    "expect": "holds",
@@ -120,12 +90,6 @@
    "id": "C4.5",
    "expect": "holds",
    "because": "Under Sync::EveryN(8) a crash loses at most seven acknowledged batches and only from the tail: 60/60 within the bound, the most lost 6, with up to 48,248 bytes torn from the unsynced tail. A process kill alone could not have tested this -- the page cache outlives the process -- which is why the parent tears the tail itself (P4.5)."
-  },
-  {
-   "experiment": "c2-oracle",
-   "id": "C2.2",
-   "expect": "holds",
-   "because": "FIXED, by two changes. Appender::release now refuses an unbalanced release instead of absorbing it -- the old saturating guard did not prevent a double free, it guaranteed one, pushing the same slot into the free list twice. And seal_shard now clears entry.extents in the same breath as releasing the superseded blocks, so the index can never name a block whose refcount has already reached zero."
   },
   {
    "experiment": "f8-checksums",
@@ -329,18 +293,6 @@
    "profile": "full",
    "expect": "holds",
    "because": "On a skewed scan workload -- Zipfian keys, which is what YCSB runs and what real access looks like -- chunk verification is worth 1.162x: 55,285,646 entries/s against 47,589,779, p=0.0022. This is the regime where a scan touches part of a block and moves on, so hashing 4KiB instead of 64KiB is a real saving. It took two attempts. The first measured 0.908x -- chunking made it *slower* -- because whole-block verification is checked once per block-resolve and amortised over the ~600 entries in it, while per-chunk was checked per extent: the same trick f15-scancache needed, and holding the last verified chunk across entries is what turned a 0.908x loss into a 1.162x win. YCSB-E moved from 0.48x of LMDB to 0.57x."
-  },
-  {
-   "experiment": "c1-decoders",
-   "id": "C1.3",
-   "expect": "holds",
-   "because": "FIXED. The writer's read path now verifies what the reader's verifies: 0/8 damaged trials read through `Store::read_all` returned wrong bytes, where every one of them did before. `Store::read_all` was added so a writer could read its own writes without a checkpoint -- it took the mixed YCSB workloads from 0.07x of LMDB to 18x -- and went from the mapping to the caller with no checksum in between, so the same store answered with two guarantees depending on the handle. C1.2 said 'a read returns the bytes that were written, or an error' and every trial behind it opened a `Reader`; its statement now names the reader and this asks the same question of the other path. RocksDB verifies every block it loads by default, which is the bar being matched here. f21-writerverify prices it at 1.135x on a cold read pass and 0.956x warm, and `Options::verify_reads` is the knob for a caller who wants LMDB's trade instead -- LMDB has no checksums at all."
-  },
-  {
-   "experiment": "c1-decoders",
-   "id": "C1.4",
-   "expect": "holds",
-   "because": "A damaged store is refused by `Store::open` or read correctly, never opened onto: 0/24 damaged files were accepted and then disagreed with what was written, and 2 were refused outright. This matters more than an ordinary read path because reopening rebuilds the block table, the key tables and every reference count from the file, and then *writes on top of* whatever it believed. Building it found a live defect: `Appender::read_extent` indexed `self.blocks[e.block]` unchecked and took the process down on a damaged index. `Reader` has had `loc_of` for exactly that since a damaged file panicked through `scan`; the writer's copy had never been asked, because nothing could reopen a store to ask it. That is the shape of this whole entry: the limitation prevented the test of the limitation."
   },
   {
    "experiment": "w1-daysize",

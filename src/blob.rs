@@ -916,6 +916,26 @@ impl<B: Bytes> Blob<B> {
             })
     }
 
+    /// Byte ranges holding block payload, as (offset, stored length).
+    ///
+    /// Diagnostic. A corruption experiment that picks byte offsets uniformly
+    /// mostly lands in padding or in an index section, so a "how much damage
+    /// goes unnoticed" figure taken that way says more about the file's
+    /// layout than about the engine's integrity checking. This lets a caller
+    /// aim at bytes that actually carry data. An fsck-style tool would want
+    /// the same thing.
+    ///
+    /// Every block in a segment's table is live: a segment is written once and
+    /// nothing in it is ever superseded, so unlike a store there is no
+    /// orphaned block whose damage would be undetectable and correctly so.
+    pub fn block_extents(&self) -> Vec<(u64, u64)> {
+        (0..self.blocks.len() as u32)
+            .filter_map(|id| self.loc_of(id).ok())
+            .filter(|loc| loc.stored > 0)
+            .map(|loc| (loc.off, loc.stored as u64))
+            .collect()
+    }
+
     /// Has chunk `j` of block `i` already been checksummed by this reader?
     ///
     /// Asking and recording are separate on purpose, and the order is the
