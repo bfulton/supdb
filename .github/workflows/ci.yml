@@ -67,6 +67,43 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64-static -L /usr/aarch64-linux-gnu
         run: cargo test --release --target aarch64-unknown-linux-gnu --lib
 
+  browser:
+    # The browser reader, built and actually run. Nothing else in this
+    # workflow compiles the wasm module, and that gap hid a real break: on
+    # rustc 1.98 the bare `extern` block for the host imports stopped linking
+    # ("undefined symbol: supdb_host_read") and no CI run noticed, because no
+    # CI run had ever built it. A second read path whose failure mode is a
+    # browser quietly answering a different question from the server is the
+    # last one that should go untested.
+    #
+    # `web/test/run.sh` is the whole thing from a clean tree: it builds the
+    # module and the floor control, writes two real indexes plus the answers
+    # the native reader gives for them, runs the Node half (the error paths)
+    # and then opens both indexes in Chromium -- the day index over an OPFS
+    # sync access handle and the segment index over ranged HTTP with a cache
+    # smaller than the file. `web/build.sh` records the bundle size against
+    # its budget and exits non-zero if W3.1-W3.3 stop holding, so this gates
+    # the module's size as well as its behaviour.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Chromium
+        # Resolved out of the global node_modules: `web/test/browser.mjs`
+        # looks there rather than vendoring a node_modules into the repo.
+        run: |
+          npm install -g playwright
+          playwright install --with-deps chromium
+          echo "NODE_PATH=$(npm root -g)" >> "$GITHUB_ENV"
+      - name: Build the reader and run the browser suite
+        run: sh web/test/run.sh
+
   falsify:
     # The falsification suite and the claim gate. Runs at the `ci` profile,
     # which is deliberately too small to be evidence about performance -- it
