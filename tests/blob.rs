@@ -1,37 +1,58 @@
-//! `blob::Blob` against `store::Reader`, on the same file.
+//! `blob::Blob` over a segment, against what was written.
 //!
-//! `Blob` is a second read path. A second read path is a liability unless
-//! something forces it to agree with the first one, because the failure mode
-//! is not a crash -- it is a browser quietly answering a different question
-//! from the server. So every test here opens a store written by `store.rs` and
-//! requires the two readers to return the same keys, the same values in the
-//! same order, and the same counts.
+//! `Blob` is one of three read paths -- itself, `SparseBlob`, and the JS
+//! reader over the same wasm -- and a read path is a liability unless
+//! something forces it to agree, because the failure mode is not a crash but
+//! a browser quietly answering a different question from the server. So every
+//! test here writes a segment through the writer that ships and requires the
+//! reader to return the same keys, the same values in the same order, and the
+//! same counts.
 //!
-//! It also pins the two properties that a correctness test would otherwise let
-//! rot: that the native path stays zero-copy (R2.3), and that a source which
-//! *cannot* lend its bytes answers identically to one that can (R2.1), which
-//! is the only thing standing between this and the browser.
+//! The cross-path check that matters most is here rather than against a
+//! second reader: a source that *cannot* lend its bytes must answer
+//! identically to one that can (R2.1). That is the browser's shape, and it is
+//! the seam where a difference would be the reader's rather than the format's.
+//! `tests/dict.rs` holds `SparseBlob` to this reader over every range.
+//!
+//! It also pins the property a correctness test would otherwise let rot: that
+//! the native path stays zero-copy (R2.3).
 
 use std::path::{Path, PathBuf};
 use supdb::bytes::{Bytes, MmapBytes, VecBytes};
-use supdb::{Blob, Options, Reader, Store};
+use supdb::next::SegmentWriter;
+use supdb::{Blob, Options};
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-blobtest-{name}"));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).expect("scratch dir");
-    d.join("store.supdb")
+    d.join("segment.supdb")
 }
 
-/// A key-multivalue store shaped like a logshed day index: a few thousand
+/// A key-multivalue segment shaped like a logshed day index: a few thousand
 /// keys, wildly uneven run lengths, values grouped by key.
-fn build(path: &Path, keys: usize, opts: Options) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
-    let store = Store::create(path, opts).expect("create");
+///
+/// The run lengths straddle `inline_max`, so the fixture covers a run that
+/// lives in its index record, one that spills to a block, and one large
+/// enough to span several -- the three shapes `with_extent` has to plan for.
+fn build(path: &Path, keys: usize, compress: bool) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+    build_with(path, keys, compress, 256)
+}
+
+fn build_with(
+    path: &Path,
+    keys: usize,
+    compress: bool,
+    inline_max: usize,
+) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+    let mut w = SegmentWriter::create(path, &Options::default()).expect("create");
+    w.set_compress(compress);
+    w.set_inline_max(inline_max);
     let mut want = Vec::new();
+    // Zero-padded, so ascending index order is the byte order the writer
+    // requires.
     for k in 0..keys {
         let key = format!("term={k:08}").into_bytes();
-        // Run lengths spanning one value to a few thousand, so the fixture
-        // covers an inline extent, a spilled extent list and a solo block.
         let n = match k % 7 {
             0 => 1,
             1 => 2,
@@ -42,37 +63,33 @@ fn build(path: &Path, keys: usize, opts: Options) -> Vec<(Vec<u8>, Vec<Vec<u8>>)
             _ => 40,
         };
         let mut vals = Vec::with_capacity(n);
+        w.begin(&key).expect("begin");
         for i in 0..n {
             let v = format!("{k}:{i}").into_bytes();
-            store.append(&key, &v).expect("append");
+            w.value(&v);
             vals.push(v);
         }
+        w.end().expect("end");
         want.push((key, vals));
     }
-    store.checkpoint().expect("checkpoint");
-    store.close().expect("close");
+    w.finish(1).expect("finish");
     want
 }
 
 /// Every value of every key, read through `Blob`, compared against what was
-/// written and against what `Reader` says.
-fn agrees_with_reader<B: Bytes>(blob: &Blob<B>, path: &Path, want: &[(Vec<u8>, Vec<Vec<u8>>)]) {
-    agrees_with_reader_opts(blob, path, want, true)
+/// written.
+fn reads_what_was_written<B: Bytes>(blob: &Blob<B>, want: &[(Vec<u8>, Vec<Vec<u8>>)]) {
+    reads_what_was_written_opts(blob, want, true)
 }
 
-/// `check_stored` is for fixtures sealed in one run per key, where the
-/// stored bytes follow from the values alone; a key sealed in several runs
-/// may hold a fixed run beside a prefixed one and its stored bytes depend
-/// on how the store cut them.
-fn agrees_with_reader_opts<B: Bytes>(
+/// `check_stored` is for fixtures whose stored bytes follow from the values
+/// alone; a key holding a fixed run beside a prefixed one does not.
+fn reads_what_was_written_opts<B: Bytes>(
     blob: &Blob<B>,
-    path: &Path,
     want: &[(Vec<u8>, Vec<Vec<u8>>)],
     check_stored: bool,
 ) {
-    let r = Reader::open(path).expect("reader open");
-    assert_eq!(blob.keys(), r.keys(), "key count");
-    assert_eq!(blob.version(), r.version(), "checkpoint identity");
+    assert_eq!(blob.keys(), want.len(), "key count");
 
     for (key, vals) in want {
         // R4.2 -- the values, in order.
@@ -80,11 +97,6 @@ fn agrees_with_reader_opts<B: Bytes>(
         let n = blob.read_all(key, |v| got.push(v.to_vec())).expect("blob");
         assert_eq!(&got, vals, "values of {}", String::from_utf8_lossy(key));
         assert_eq!(n, vals.len() as u64, "read_all returns the value count");
-
-        let mut from_reader: Vec<Vec<u8>> = Vec::new();
-        r.read_all(key, |v| from_reader.push(v.to_vec()))
-            .expect("reader");
-        assert_eq!(got, from_reader, "the two readers disagree");
 
         // R4.3 -- the count, without materialising anything.
         assert_eq!(
@@ -122,12 +134,12 @@ fn agrees_with_reader_opts<B: Bytes>(
 }
 
 #[test]
-fn blob_and_reader_agree_on_a_real_store() {
+fn blob_reads_back_every_key_of_a_segment() {
     let path = scratch("agree");
-    let want = build(&path, 500, Options::default());
+    let want = build(&path, 500, false);
     let blob = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
     assert!(blob.zero_copy(), "R2.3: the native path must not copy");
-    agrees_with_reader(&blob, &path, &want);
+    reads_what_was_written(&blob, &want);
 }
 
 /// The same file, read through a source with no memory behind it.
@@ -157,38 +169,31 @@ impl Bytes for Copying {
 #[test]
 fn a_source_that_cannot_lend_answers_the_same() {
     let path = scratch("copying");
-    let want = build(&path, 300, Options::default());
+    let want = build(&path, 300, false);
     let raw = std::fs::read(&path).unwrap();
     let blob = Blob::open(Copying(raw)).expect("blob open over a copying source");
     assert!(
         !blob.zero_copy(),
         "this source has nothing to lend, and the test is worthless if it does"
     );
-    agrees_with_reader(&blob, &path, &want);
+    reads_what_was_written(&blob, &want);
 }
 
 #[test]
 fn compressed_blocks_read_the_same_as_plain_ones() {
-    // Compression is off by default since f12; a file written with it on is
-    // still a file this reader may be handed, and it takes the chunked and
-    // solo arms of `with_extent` that the default never reaches.
+    // A compressed segment takes the chunked and solo arms of `with_extent`
+    // that a plain one never reaches, and its inline runs stay uncompressed
+    // in the key section either way (R7.4).
     let path = scratch("compressed");
-    let want = build(
-        &path,
-        200,
-        Options {
-            compress: true,
-            ..Default::default()
-        },
-    );
+    let want = build(&path, 200, true);
     let blob = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
-    agrees_with_reader(&blob, &path, &want);
+    reads_what_was_written(&blob, &want);
 }
 
 #[test]
 fn scanning_walks_the_dictionary_in_key_order_with_counts() {
     let path = scratch("scan");
-    let want = build(&path, 400, Options::default());
+    let want = build(&path, 400, false);
     let blob = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
 
     // R4.4 -- from a prefix, in order, with each key's count.
@@ -271,7 +276,7 @@ fn scanning_walks_the_dictionary_in_key_order_with_counts() {
 #[test]
 fn damaged_objects_do_not_panic_the_caller() {
     let path = scratch("damage");
-    build(&path, 120, Options::default());
+    build(&path, 120, false);
     let clean = std::fs::read(&path).unwrap();
 
     let mut hit = 0;
@@ -306,65 +311,69 @@ fn damaged_objects_do_not_panic_the_caller() {
 ///
 /// A posting list of fixed-width values -- which is what logshed writes, four
 /// bytes of line ordinal -- has a count that falls out of the extent list with
-/// no block touched. This checks the arithmetic against the walk on a store
+/// no block touched. This checks the arithmetic against the walk on a segment
 /// whose keys span one extent and many, and checks that a schema which is
 /// *not* fixed width is refused rather than answered wrongly.
+///
+/// It also pins a property of the writer that the reader's shape depends on:
+/// one `end()` emits one extent, and a run too large for a block takes a
+/// block to itself so its values stay contiguous. Every extent list in a
+/// segment therefore has length one, however long the run -- 20,000 four-byte
+/// postings here against a 4 KiB block. `count_fixed` still sums per extent,
+/// because a key read through `Db` has a run in each segment holding it, and
+/// because a writer that started fragmenting runs would change what a point
+/// read costs; this is where that change would surface.
 #[test]
 fn a_fixed_width_schema_counts_without_touching_a_block() {
     let path = scratch("fixed");
-    let store = Store::create(&path, Options::default()).expect("create");
+    // Small blocks, so the largest run is many times a block: it must still
+    // arrive as one extent.
+    let opts = Options {
+        block_size: 4096,
+        ..Options::default()
+    };
+    let mut w = SegmentWriter::create(&path, &opts).expect("create");
     let mut want: Vec<(Vec<u8>, u64)> = Vec::new();
     for k in 0..400u32 {
         let key = format!("term={k:08}").into_bytes();
-        // Deliberately across the extent boundary: a few thousand four-byte
-        // postings do not fit in one 64 KiB block.
+        // Deliberately across the extent boundary: 20,000 four-byte postings
+        // do not fit one 4 KiB block.
         let n = [1u32, 5, 900, 20_000][(k % 4) as usize];
+        w.begin(&key).expect("begin");
         for i in 0..n {
-            store.append(&key, &i.to_le_bytes()).expect("append");
+            w.value(&i.to_le_bytes());
         }
+        w.end().expect("end");
         want.push((key, n as u64));
     }
     // One key whose values are not all the same width, to prove the guard.
-    store.append(b"mixed", b"aaaa").unwrap();
-    store.append(b"mixed", b"bbbbbbbbbb").unwrap();
-    store.checkpoint().expect("checkpoint");
-    store.close().expect("close");
+    // It sorts after every `term=` key, so the writer's byte order holds.
+    w.begin(b"zmixed").expect("begin");
+    w.value(b"aaaa");
+    w.value(b"bbbbbbbbbb");
+    w.end().expect("end");
+    w.finish(1).expect("finish");
 
     let blob = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
     for (key, n) in &want {
-        assert_eq!(blob.count(key).unwrap(), *n, "walked count");
+        assert_eq!(blob.count(key).unwrap(), *n, "the walk is the authority");
         assert_eq!(
             blob.count_fixed(key, 4),
             Some(*n),
-            "O(extents) count of {}",
+            "count_fixed on {}",
+            String::from_utf8_lossy(key)
+        );
+        assert_eq!(
+            blob.lookup(key).map_or(0, |e| e.len()),
+            1,
+            "one run, one extent, whatever the block size: {}",
             String::from_utf8_lossy(key)
         );
     }
-    // 4 + 1 and 10 + 1 is 15 bytes, which is not a multiple of 5, so the
-    // guard fires. It is a necessary condition, not a sufficient one, and the
-    // doc comment says so.
-    assert_eq!(blob.count(b"mixed").unwrap(), 2);
-    assert_eq!(blob.count_fixed(b"mixed", 4), None);
-
-    // The dictionary scan in its O(extents) form, which is what a breakdown
-    // panel calls. Every fixed-width key must come back with the count the
-    // walk gives, and the one mixed key must come back as None.
-    let mut rows: Vec<(Vec<u8>, Option<u64>)> = Vec::new();
-    blob.scan_counts_fixed(b"", usize::MAX, 4, |k, n| {
-        rows.push((k.to_vec(), n));
-        true
-    })
-    .expect("scan fixed");
-    assert_eq!(rows.len(), want.len() + 1, "every key, plus `mixed`");
-    for (key, n) in &want {
-        let (_, got) = rows.iter().find(|(k, _)| k == key).expect("known key");
-        assert_eq!(*got, Some(*n), "{}", String::from_utf8_lossy(key));
-    }
-    assert_eq!(
-        rows.iter().find(|(k, _)| k == b"mixed").map(|(_, n)| *n),
-        Some(None),
-        "the mixed key must decline rather than guess"
-    );
+    // A run of two different widths declines rather than guesses.
+    assert_eq!(blob.count(b"zmixed").unwrap(), 2);
+    assert_eq!(blob.count_fixed(b"zmixed", 4), None);
+    assert_eq!(blob.count_fixed(b"zmixed", 10), None);
 }
 
 /// The case that made `count_fixed` check `Ext::last` as well as divisibility.
@@ -375,143 +384,51 @@ fn a_fixed_width_schema_counts_without_touching_a_block() {
 /// stores so that reading the newest value is O(1), and for 23 records of
 /// stride 4 it would have to be 88 where it is actually 87. Two independent
 /// quantities have to agree before a count is claimed.
+///
+/// Run against both encodings of the same run. A run this size lives in its
+/// index record by default, and the guard has to hold there as well as in a
+/// block -- an inline extent names `Ext::INLINE` rather than a block id, and
+/// nothing else about the arithmetic changes, which is exactly the kind of
+/// "nothing else changes" worth a test.
 #[test]
 fn a_count_from_the_extent_list_checks_two_quantities_not_one() {
-    let path = scratch("guard");
-    let store = Store::create(&path, Options::default()).expect("create");
-    // "2:0".."2:16" -- three bytes for the first ten, four for the rest, so
-    // 10*(1+3) + 7*(1+4) = 75 bytes, which is not divisible by 4. Pad to the
-    // shape that fooled the old check: the fixture in `build` produces it at
-    // k=2, so reproduce that key exactly.
     // "16:0".."16:16": ten values of four bytes and seven of five, each with
     // a one-byte length prefix, so 10*5 + 7*6 = 92 stored bytes -- exactly
-    // 23 strides of 4. This is key 16 of the fixture `build` writes, and it
-    // is where the old check was found to be wrong.
+    // 23 strides of 4.
     let key = b"term=00000016";
-    for i in 0..17 {
-        store
-            .append(key, format!("16:{i}").as_bytes())
-            .expect("append");
-    }
-    store.checkpoint().expect("checkpoint");
-    store.close().expect("close");
-
-    let blob = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
-    assert_eq!(blob.count(key).unwrap(), 17, "the walk is the authority");
-    // 92 stored bytes over a stride of 4 is 23, and 23 is not 17.
-    assert_eq!(blob.stored_bytes(key) % 4, 0, "the trap needs divisibility");
-    assert_eq!(
-        blob.count_fixed(key, 3),
-        None,
-        "divisibility alone would have answered {}",
-        blob.stored_bytes(key) / 4
-    );
-    // The same key really is fixed width at its own width, and is answered.
-    let path2 = scratch("guard-ok");
-    let store = Store::create(&path2, Options::default()).expect("create");
-    for i in 0..17u32 {
-        store.append(key, &i.to_le_bytes()).expect("append");
-    }
-    store.checkpoint().expect("checkpoint");
-    store.close().expect("close");
-    let blob = Blob::open(MmapBytes::open(&path2).unwrap()).expect("blob open");
-    assert_eq!(blob.count_fixed(key, 4), Some(17));
-}
-
-/// A store consolidated by the deferred policy reads identically through
-/// both paths, and its fragmented runs keep `count_fixed`'s contract.
-///
-/// `Options::defer_merge` leaves a key holding a geometric ladder of extents
-/// where the inline policy leaves one, so this is the store shape with the
-/// most extents per key either reader will ever see. Two things must hold.
-/// First, `Blob` and `Reader` agree on every key, value, order and count --
-/// the standing bar for a second read path. Second, `count_fixed` checks its
-/// two quantities *per extent*, so a fragmented fixed-width run must still
-/// answer exactly, and a fragmented mixed-width run must still decline: a
-/// merge that concatenated fragments but miscomputed the merged extent's
-/// `last` would break the first, and a policy that produced a coincidental
-/// stride-multiple would break the second.
-///
-/// The fragmentation is asserted, not assumed: interleaved appends against a
-/// tiny buffer must leave at least one key spilled across several extents,
-/// or the test has quietly stopped covering the shape it exists for.
-#[test]
-fn a_deferred_consolidated_store_reads_the_same_and_counts_exactly() {
-    let path = scratch("deferred");
-    let store = Store::create(
-        &path,
-        Options {
-            defer_merge: true,
-            buffer_bytes: 1 << 16,
-            ..Default::default()
-        },
-    )
-    .expect("create");
-    // Interleaved fixed-width appends: every key's run is broken by every
-    // other key's, which is the fragmenting shape, and four-byte values are
-    // logshed's posting schema -- the caller count_fixed exists for.
-    let keys = 60u32;
-    let depth = 300u32;
-    for i in 0..depth {
-        for k in 0..keys {
-            let key = format!("term={k:08}").into_bytes();
-            store.append(&key, &i.to_le_bytes()).expect("append");
+    for (name, inline_max) in [("guard-inline", 256), ("guard-block", 0)] {
+        let path = scratch(name);
+        let mut w = SegmentWriter::create(&path, &Options::default()).expect("create");
+        w.set_inline_max(inline_max);
+        w.begin(key).expect("begin");
+        for i in 0..17 {
+            w.value(format!("16:{i}").as_bytes());
         }
-    }
-    // One mixed-width key, fragmented the same way, to prove the guard still
-    // fires on a multi-extent run.
-    for i in 0..40u32 {
-        let v = if i % 3 == 0 {
-            vec![b'x'; 4]
-        } else {
-            vec![b'y'; 10]
-        };
-        store.append(b"mixed", &v).expect("append");
-    }
-    store.checkpoint().expect("checkpoint");
-    let stats = store.close().expect("close");
-    assert!(stats.merges > 0, "nothing merged, so nothing was deferred");
+        w.end().expect("end");
+        w.finish(1).expect("finish");
 
-    let blob = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
-    assert!(blob.zero_copy(), "the native path must not start copying");
-    let r = Reader::open(&path).expect("reader open");
-    assert_eq!(blob.keys(), r.keys(), "key count");
-    assert_eq!(blob.version(), r.version(), "checkpoint identity");
-
-    let mut spilled = 0usize;
-    for k in 0..keys {
-        let key = format!("term={k:08}").into_bytes();
-        let exts = blob.lookup(&key).expect("every key is in the index");
-        spilled += usize::from(exts.len() > 1);
-
-        // Both readers, same values, same order.
-        let mut got: Vec<Vec<u8>> = Vec::new();
-        blob.read_all(&key, |v| got.push(v.to_vec())).expect("blob");
-        let want: Vec<Vec<u8>> = (0..depth).map(|i| i.to_le_bytes().to_vec()).collect();
-        assert_eq!(got, want, "values of {}", String::from_utf8_lossy(&key));
-        let mut from_reader: Vec<Vec<u8>> = Vec::new();
-        r.read_all(&key, |v| from_reader.push(v.to_vec()))
-            .expect("reader");
-        assert_eq!(got, from_reader, "the two readers disagree");
-
-        // The O(extents) count must agree with the walk on every fragment
-        // ladder the policy produced.
-        assert_eq!(blob.count(&key).unwrap(), depth as u64, "walked count");
+        let blob = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
+        assert_eq!(blob.count(key).unwrap(), 17, "the walk is the authority");
+        assert_eq!(blob.stored_bytes(key) % 4, 0, "the trap needs divisibility");
         assert_eq!(
-            blob.count_fixed(&key, 4),
-            Some(depth as u64),
-            "count_fixed on the fragmented run of {}",
-            String::from_utf8_lossy(&key)
+            blob.count_fixed(key, 3),
+            None,
+            "divisibility alone would have answered {} ({name})",
+            blob.stored_bytes(key) / 4
         );
     }
-    assert!(
-        spilled > 0,
-        "no key was left multi-extent, so the fragmented shape was never under test"
-    );
-    // The mixed-width key declines rather than guesses, however it fragmented.
-    assert_eq!(blob.count(b"mixed").unwrap(), 40);
-    assert_eq!(blob.count_fixed(b"mixed", 4), None);
-    assert_eq!(blob.count_fixed(b"mixed", 10), None);
+
+    // The same key really is fixed width at its own width, and is answered.
+    let path = scratch("guard-ok");
+    let mut w = SegmentWriter::create(&path, &Options::default()).expect("create");
+    w.begin(key).expect("begin");
+    for i in 0..17u32 {
+        w.value(&i.to_le_bytes());
+    }
+    w.end().expect("end");
+    w.finish(1).expect("finish");
+    let blob = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
+    assert_eq!(blob.count_fixed(key, 4), Some(17));
 }
 
 /// The under-return the downstream requirements document reported: corrupt a
@@ -528,9 +445,12 @@ fn a_deferred_consolidated_store_reads_the_same_and_counts_exactly() {
 #[test]
 fn a_corrupted_block_byte_fails_the_read_rather_than_under_returning() {
     let path = scratch("corrupt-block");
-    let want = build(&path, 120, Options::default());
-    // k=2 holds 17 values: one extent, so its block range is unambiguous.
-    let key = want[2].0.clone();
+    let want = build(&path, 120, false);
+    // k=4 holds 1,500 values: too many to live in its index record, so the
+    // run is in a block and the damage has somewhere to land. A key whose run
+    // is inline plans no fetch at all (R7.3) and could not be damaged this
+    // way, which is the point of choosing deliberately.
+    let key = want[4].0.clone();
     let clean = std::fs::read(&path).unwrap();
 
     // Find a byte inside the key's own extent -- not merely inside its block,
@@ -579,7 +499,7 @@ fn a_corrupted_block_byte_fails_the_read_rather_than_under_returning() {
     // must still answer rather than fail.
     assert_eq!(
         blob.count(&key).expect("a count comes from the index"),
-        want[2].1.len() as u64
+        want[4].1.len() as u64
     );
     // The *second* read of the same block is its own regression: the first
     // version of `Blob::verify` marked a chunk verified before comparing its
@@ -604,7 +524,7 @@ fn a_corrupted_block_byte_fails_the_read_rather_than_under_returning() {
 #[test]
 fn a_truncated_object_is_refused_at_open() {
     let path = scratch("truncated");
-    build(&path, 50, Options::default());
+    build(&path, 50, false);
     let clean = std::fs::read(&path).unwrap();
     let cut = clean[..clean.len() / 2].to_vec();
     let err = match Blob::open(VecBytes(cut)) {
@@ -618,37 +538,39 @@ fn a_truncated_object_is_refused_at_open() {
 }
 
 #[test]
-fn the_store_seals_uniform_runs_fixed_and_both_readers_agree() {
-    // Format v6 through the original store: a key whose pending values all
-    // share a width is sealed without prefixes and flagged; a mixed key is
-    // not; a later append of another width to the fixed key is read back in
-    // order whether or not consolidation has merged the two runs; and the
-    // two readers agree on every key throughout.
-    let path = scratch("fixed-store");
-    let store = Store::create(&path, Options::default()).expect("create");
+fn the_writer_stores_uniform_runs_without_prefixes() {
+    // Format v6: a run whose values all share a width is stored back to back
+    // with no varint prefixes and flagged `Ext::FIXED`; a mixed run is not.
+    // The reader has to branch on the flag, and a run large enough to spill
+    // to a block has to keep the flag across every extent it spans.
+    let path = scratch("fixed-runs");
+    let mut w = SegmentWriter::create(&path, &Options::default()).expect("create");
     let mut want: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
     let mut a = Vec::new();
+    w.begin(b"fixed").expect("begin");
     for i in 0u32..2000 {
         let v = i.to_be_bytes().to_vec();
-        store.append(b"fixed", &v).unwrap();
+        w.value(&v);
         a.push(v);
     }
+    w.end().expect("end");
     want.push((b"fixed".to_vec(), a));
     let mut b = Vec::new();
+    w.begin(b"mixed").expect("begin");
     for i in 0u32..300 {
         let v = format!("{i}").into_bytes();
-        store.append(b"mixed", &v).unwrap();
+        w.value(&v);
         b.push(v);
     }
+    w.end().expect("end");
     want.push((b"mixed".to_vec(), b));
-    store.checkpoint().unwrap();
-    store.close().unwrap();
+    w.finish(1).expect("finish");
 
     let blob = Blob::open(MmapBytes::open(&path).unwrap()).unwrap();
     let ef = blob.lookup(b"fixed").unwrap();
     assert!(
         ef.iter().all(|e| e.is_fixed()),
-        "a uniform run is sealed fixed: {ef:?}"
+        "a uniform run is stored fixed: {ef:?}"
     );
     assert_eq!(
         ef.iter().map(|e| e.len as u64).sum::<u64>(),
@@ -659,26 +581,10 @@ fn the_store_seals_uniform_runs_fixed_and_both_readers_agree() {
     assert_eq!(blob.stored_bytes(b"fixed"), 8000);
     let em = blob.lookup(b"mixed").unwrap();
     assert!(em.iter().all(|e| !e.is_fixed()));
-    agrees_with_reader(&blob, &path, &want);
-    drop(blob);
-
-    // Reopen, append a wider value: the key is no longer uniform.
-    let store = Store::open(&path, Options::default()).expect("open");
-    store.append(b"fixed", b"wider").unwrap();
-    want[0].1.push(b"wider".to_vec());
-    store.checkpoint().unwrap();
-    store.close().unwrap();
-    let blob = Blob::open(MmapBytes::open(&path).unwrap()).unwrap();
-    assert_eq!(blob.count(b"fixed").unwrap(), 2001);
     assert_eq!(
-        blob.count_fixed(b"fixed", 4),
+        blob.count_fixed(b"mixed", 4),
         None,
-        "the run is not all fours any more"
+        "a mixed run declines rather than guessing"
     );
-    // Two fixed runs (8,000 + 5 bytes) if the store kept them apart, one
-    // prefixed run (2,001 prefixes more) if it consolidated them; either is
-    // right and both readers must agree on the values.
-    let stored = blob.stored_bytes(b"fixed");
-    assert!(stored == 8005 || stored == 10006, "stored bytes {stored}");
-    agrees_with_reader_opts(&blob, &path, &want, false);
+    reads_what_was_written(&blob, &want);
 }

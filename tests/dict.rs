@@ -4,8 +4,8 @@
 //! second reader was -- its failure mode is a range that quietly answers a
 //! different question -- so every range here is checked against the whole
 //! reader's answer, and every plan against the reads that follow it, on both
-//! index shapes (a `Store` checkpoint and a segment the next engine's writer
-//! streams). Then the browser's contract is run literally: a source that
+//! index shapes (a key section built at the end over block-backed runs, and
+//! the records-first one the writer streams). Then the browser's contract is run literally: a source that
 //! serves only what was ensured, and nothing else, is enough.
 
 use std::cell::RefCell;
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use supdb::blob::{open_probe, open_sparse_fence_ranges, open_sparse_ranges};
 use supdb::next::SegmentWriter;
-use supdb::{Blob, Bytes, MmapBytes, Options, SparseBlob, Store};
+use supdb::{Blob, Bytes, MmapBytes, Options, SparseBlob};
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-dicttest-{name}"));
@@ -133,25 +133,25 @@ fn keys_and_values(n: usize) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
     all
 }
 
-fn build_store(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)]) {
-    let store = Store::create(path, Options::default()).expect("create");
-    for (k, vals) in all {
-        for v in vals {
-            store.append(k, v).expect("append");
-        }
-    }
-    store.checkpoint().expect("checkpoint");
-    store.close().expect("close");
+/// The writer's block layout: every run in a block, key section built at the
+/// end. The sparse reader plans differently over it than over the records-
+/// first layout below, so both index shapes are swept.
+fn build_blocks(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)]) {
+    build_segment_with(path, all, 0)
 }
 
 fn build_segment(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)]) {
+    build_segment_with(path, all, 256)
+}
+
+fn build_segment_with(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)], inline_max: usize) {
     let opts = Options {
         redo_log: false,
         shards: 1,
         ..Options::default()
     };
     let mut w = SegmentWriter::create(path, &opts).expect("create");
-    w.set_inline_max(256);
+    w.set_inline_max(inline_max);
     for (k, vals) in all {
         w.begin(k).expect("begin");
         for v in vals {
@@ -372,9 +372,9 @@ fn check_shape(path: &Path, all: &[(Vec<u8>, Vec<Vec<u8>>)], shape: &str) {
 #[test]
 fn sparse_ranges_agree_with_the_whole_reader_and_read_exactly_their_plans() {
     let all = keys_and_values(700);
-    let store = scratch("store");
-    build_store(&store, &all);
-    check_shape(&store, &all, "store");
+    let blocks = scratch("blocks");
+    build_blocks(&blocks, &all);
+    check_shape(&blocks, &all, "blocks");
     let seg = scratch("segment");
     build_segment(&seg, &all);
     check_shape(&seg, &all, "segment");
@@ -385,8 +385,8 @@ fn the_sparse_open_reads_header_fence_and_block_table_only() {
     let all = keys_and_values(2000);
     for (shape, build) in [
         (
-            "store",
-            build_store as fn(&Path, &[(Vec<u8>, Vec<Vec<u8>>)]),
+            "blocks",
+            build_blocks as fn(&Path, &[(Vec<u8>, Vec<Vec<u8>>)]),
         ),
         ("segment", build_segment),
     ] {
@@ -584,11 +584,11 @@ fn a_source_that_serves_only_what_was_ensured_is_enough() {
 fn a_resident_directory_plans_no_first_phase_and_agrees() {
     let all = keys_and_values(700);
     for (shape, path) in [
-        ("store", scratch("resident-store")),
+        ("blocks", scratch("resident-blocks")),
         ("segment", scratch("resident-seg")),
     ] {
-        if shape == "store" {
-            build_store(&path, &all);
+        if shape == "blocks" {
+            build_blocks(&path, &all);
         } else {
             build_segment(&path, &all);
         }

@@ -31,7 +31,8 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use supdb::bytes::Bytes;
-use supdb::{Blob, Options, Store};
+use supdb::next::SegmentWriter;
+use supdb::{Blob, Options};
 
 fn scratch(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-rangestest-{name}"));
@@ -87,11 +88,11 @@ fn merged(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
     out
 }
 
-/// A store with run lengths from one value to tens of thousands, so the
-/// probes cover an inline extent, a spilled extent list, and runs that
-/// span several 64 KiB blocks.
+/// A segment with run lengths from one value to tens of thousands, so the
+/// probes cover an inline run, a block-backed one, and runs large enough to
+/// take a block to themselves.
 fn build(path: &Path, keys: usize, opts: Options) -> Vec<Vec<u8>> {
-    let store = Store::create(path, opts).expect("create");
+    let mut w = SegmentWriter::create(path, &opts).expect("create");
     let mut names = Vec::new();
     for k in 0..keys {
         let key = format!("term={k:08}").into_bytes();
@@ -102,16 +103,35 @@ fn build(path: &Path, keys: usize, opts: Options) -> Vec<Vec<u8>> {
             3 => 40_000,
             _ => 6,
         };
+        w.begin(&key).expect("begin");
         for i in 0..n {
-            store
-                .append(&key, &(i as u32).to_le_bytes())
-                .expect("append");
+            w.value(&(i as u32).to_le_bytes());
         }
+        w.end().expect("end");
         names.push(key);
     }
-    store.checkpoint().expect("checkpoint");
-    store.close().expect("close");
+    w.finish(1).expect("finish");
     names
+}
+
+/// Recompute a superblock slot's checksum after editing its fields: FNV-1a
+/// over the sixteen field words and then the magic, which is what the writer
+/// does. Without it an edited slot fails the open for the wrong reason.
+fn restamp(data: &mut [u8], slot: usize) {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let feed = |v: u64, h: &mut u64| {
+        for b in v.to_le_bytes() {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+    };
+    for i in 0..16 {
+        let v = u64::from_le_bytes(data[slot + i * 8..slot + i * 8 + 8].try_into().unwrap());
+        feed(v, &mut h);
+    }
+    let magic = u64::from_ne_bytes(data[slot + 128..slot + 136].try_into().unwrap());
+    feed(magic, &mut h);
+    data[slot + 136..slot + 144].copy_from_slice(&h.to_le_bytes());
 }
 
 struct Rig {
@@ -270,16 +290,17 @@ fn a_plan_for_many_keys_is_the_merged_union_and_a_shared_fetch() {
 fn extent_counts_need_no_plan_because_they_read_nothing() {
     let path = scratch("fixedcount");
     // Fixed-width values, so `count_fixed` applies to every key.
-    let store = Store::create(&path, Options::default()).expect("create");
+    let mut w = SegmentWriter::create(&path, &Options::default()).expect("create");
     for k in 0..80u32 {
         let key = format!("term={k:08}").into_bytes();
         let n = [1u32, 9, 700, 20_000][(k % 4) as usize];
+        w.begin(&key).expect("begin");
         for i in 0..n {
-            store.append(&key, &i.to_le_bytes()).expect("append");
+            w.value(&i.to_le_bytes());
         }
+        w.end().expect("end");
     }
-    store.checkpoint().expect("checkpoint");
-    store.close().expect("close");
+    w.finish(1).expect("finish");
 
     let mut rig = Rig::open(&path);
     rig.touched();
@@ -360,49 +381,61 @@ fn open_ranges_names_exactly_what_open_reads() {
 }
 
 #[test]
-fn a_store_with_unreplayed_log_records_is_refused_not_misread() {
-    // A cleanly closed store has no redo-log arena at all -- `close` drops
-    // it -- so this probe is about the store that was *never* cleanly
-    // closed: a writer's working file, or what a crash leaves. Such a file's
-    // superblock names an arena (`log_len` is its capacity), and its first
-    // length-word decides everything: zero means replay would find nothing
-    // and the index is complete; nonzero means records newer than the index,
-    // which this reader does not replay and must therefore refuse rather
-    // than serve the previous state, silently. Built by checkpointing
-    // *without* close -- the only writer shape that leaves an arena behind
-    // -- then byte surgery on the word, so the test does not depend on
-    // which shapes the writer currently sends to the log.
+fn a_file_with_unreplayed_log_records_is_refused_not_misread() {
+    // A superblock can name a redo-log arena (`log_len` is its capacity),
+    // and its first length-word decides everything: zero means replay would
+    // find nothing and the index is complete; nonzero means records newer
+    // than the index, which this reader does not replay and must therefore
+    // refuse rather than serve the previous state, silently.
+    //
+    // No writer here leaves an arena behind, so the fixture is made rather
+    // than produced: a segment, an arena appended past its end, and the
+    // superblock's two words pointed at it. That is deliberate -- the
+    // guarantee is the *reader's*, and it has to hold for any file handed to
+    // it, including one no writer here would produce.
     let path = scratch("logbytes");
-    let store = Store::create(&path, Options::default()).expect("create");
+    let mut w = SegmentWriter::create(&path, &Options::default()).expect("create");
     for k in 0..20 {
         let key = format!("term={k:08}").into_bytes();
+        w.begin(&key).expect("begin");
         for i in 0..5u32 {
-            store.append(&key, &i.to_le_bytes()).expect("append");
+            w.value(&i.to_le_bytes());
         }
+        w.end().expect("end");
     }
-    store.checkpoint().expect("checkpoint");
-    // Dropped, not closed: the file stays exactly as the checkpoint
-    // published it, arena and all.
-    drop(store);
+    w.finish(1).expect("finish");
     let mut data = std::fs::read(&path).unwrap();
 
-    // Find the winning superblock's log arena, exactly as the decoder does.
-    let field = |slot: usize, i: usize| -> u64 {
+    // Find the winning superblock, exactly as the decoder does, and give it
+    // an arena at the end of the file.
+    let field = |data: &[u8], slot: usize, i: usize| -> u64 {
         u64::from_le_bytes(data[slot + i * 8..slot + (i + 1) * 8].try_into().unwrap())
     };
-    let slot = if field(0, 0) >= field(512, 0) { 0 } else { 512 };
-    let (log_off, log_len) = (field(slot, 13) as usize, field(slot, 14));
-    assert!(
-        log_len >= 4,
-        "a checkpointed-but-not-closed store carries a log arena; \
-         if this fails, the writer stopped leaving one and this test needs a new fixture"
-    );
+    let slot = if field(&data, 0, 0) >= field(&data, 512, 0) {
+        0
+    } else {
+        512
+    };
+    let log_off = data.len();
+    let log_len = 4096u64;
+    data.resize(log_off + log_len as usize, 0);
+    let put = |data: &mut Vec<u8>, i: usize, v: u64| {
+        data[slot + i * 8..slot + (i + 1) * 8].copy_from_slice(&v.to_le_bytes());
+    };
+    put(&mut data, 13, log_off as u64);
+    put(&mut data, 14, log_len);
+    // The superblock carries its own checksum, so re-stamp the slot or the
+    // open fails for the wrong reason.
+    restamp(&mut data, slot);
 
-    // An unclosed store with an *empty* arena still opens -- the probe reads
-    // the zero word and passes. Asserted before breaking it, so the surgery
-    // below is known to be the only difference between the two opens.
+    // An arena that is *empty* still opens -- the probe reads the zero word
+    // and passes. Asserted before breaking it, so the surgery below is known
+    // to be the only difference between the two opens.
     assert_eq!(&data[log_off..log_off + 4], &[0u8; 4]);
-    assert!(Blob::open(supdb::VecBytes(data.clone())).is_ok());
+    assert!(
+        Blob::open(supdb::VecBytes(data.clone())).is_ok(),
+        "an empty arena is not unreplayed records"
+    );
 
     data[log_off..log_off + 4].copy_from_slice(&64u32.to_le_bytes());
     let err = match Blob::open(supdb::VecBytes(data.clone())) {

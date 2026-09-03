@@ -1,19 +1,20 @@
-//! The bulk segment writer against the general one.
+//! The segment writer's two layouts against each other.
 //!
-//! `next::SegmentWriter` is a second writer of the store format, and a second
-//! writer fails the way a second reader does: not by crashing but by producing
-//! a file that opens and answers differently. So the same data is written
-//! through `Store` and through the writer, and both files are read through
-//! `Blob` -- and the writer's file through `store::Reader` too -- and required
-//! to agree on every key, every value, every count, and the scan order.
+//! `SegmentWriter` emits one format in two shapes: short runs inline in their
+//! index record with the key section laid out records-first, or every run in a
+//! block with the section built at the end. A layout fails the way a second
+//! reader does -- not by crashing but by producing a file that opens and
+//! answers differently -- so the same data is written both ways and the two
+//! files are required to agree on every key, every value, every count, and
+//! the scan order.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use supdb::bytes::MmapBytes;
 use supdb::next::SegmentWriter;
-use supdb::{Blob, Options, Reader, SparseBlob, Store};
+use supdb::{Blob, Options, SparseBlob};
 
-/// `block::CHECKSUMS` is process-wide -- `Store::create` and the writer both
+/// `block::CHECKSUMS` is process-wide -- every writer here
 /// set it from `Options::checksums` -- and the test harness runs tests
 /// concurrently, so a checksums-off test flips the switch under a
 /// checksums-on one and every block it reads mismatches. Each test holds
@@ -103,17 +104,6 @@ fn opts() -> Options {
     }
 }
 
-fn write_store(path: &Path, data: &[(Vec<u8>, Vec<Vec<u8>>)], o: Options) {
-    let store = Store::create(path, o).expect("create");
-    for (k, vals) in data {
-        for v in vals {
-            store.append(k, v).expect("append");
-        }
-    }
-    store.checkpoint().expect("checkpoint");
-    store.close().expect("close");
-}
-
 /// Runs up to this many bytes go inline in the index record; the fixture's
 /// 9,000-byte values stay in blocks, so one store exercises both paths.
 const INLINE: usize = 256;
@@ -141,8 +131,13 @@ fn open(path: &Path) -> Blob<MmapBytes> {
 }
 
 /// Everything a reader can ask, asked of both and compared.
+/// Two layouts of one format, against each other and against what was
+/// written. `a` puts every run in a block and builds its key section at the
+/// end; `b` inlines the short runs and lays the section out records-first.
+/// Two layouts that answered differently would be the second-reader failure
+/// mode arriving through a second writer instead.
 fn agree(a: &Blob<MmapBytes>, b: &Blob<MmapBytes>, data: &[(Vec<u8>, Vec<Vec<u8>>)]) {
-    assert_eq!(a.keys(), data.len(), "store key count");
+    assert_eq!(a.keys(), data.len(), "block-layout key count");
     assert_eq!(b.keys(), data.len(), "bulk key count");
     assert!(
         b.zero_copy(),
@@ -152,14 +147,14 @@ fn agree(a: &Blob<MmapBytes>, b: &Blob<MmapBytes>, data: &[(Vec<u8>, Vec<Vec<u8>
         let mut ga = Vec::new();
         let na = a
             .read_all(key, |v| ga.push(v.to_vec()))
-            .expect("store read_all");
+            .expect("block-layout read_all");
         let mut gb = Vec::new();
         let nb = b
             .read_all(key, |v| gb.push(v.to_vec()))
             .expect("bulk read_all");
-        assert_eq!(na, vals.len() as u64, "store value count for {key:?}");
+        assert_eq!(na, vals.len() as u64, "block-layout value count for {key:?}");
         assert_eq!(nb, na, "value count differs for {key:?}");
-        assert_eq!(&ga, vals, "store values for {key:?}");
+        assert_eq!(&ga, vals, "block-layout values for {key:?}");
         assert_eq!(gb, ga, "values differ for {key:?}");
         assert_eq!(b.count(key).expect("count"), a.count(key).expect("count"));
         let mut cat = Vec::new();
@@ -179,7 +174,7 @@ fn agree(a: &Blob<MmapBytes>, b: &Blob<MmapBytes>, data: &[(Vec<u8>, Vec<Vec<u8>
         assert_eq!(
             a.key_at(rank),
             Some(key.as_slice()),
-            "rank {rank} in the store"
+            "rank {rank} in the block layout"
         );
         assert_eq!(b.seek(key), rank);
         let mut by_rank = Vec::new();
@@ -193,7 +188,7 @@ fn agree(a: &Blob<MmapBytes>, b: &Blob<MmapBytes>, data: &[(Vec<u8>, Vec<Vec<u8>
 
     let mut sa = Vec::new();
     a.scan(b"", usize::MAX, |k, v| sa.push((k.to_vec(), v.to_vec())))
-        .expect("store scan");
+        .expect("block-layout scan");
     let mut sb = Vec::new();
     b.scan(b"", usize::MAX, |k, v| sb.push((k.to_vec(), v.to_vec())))
         .expect("bulk scan");
@@ -201,19 +196,19 @@ fn agree(a: &Blob<MmapBytes>, b: &Blob<MmapBytes>, data: &[(Vec<u8>, Vec<Vec<u8>
         .iter()
         .flat_map(|(k, vals)| vals.iter().map(move |v| (k.clone(), v.clone())))
         .collect();
-    assert_eq!(sa.len(), want.len(), "store scan length");
-    assert_eq!(sa, want, "store scan order");
+    assert_eq!(sa.len(), want.len(), "block-layout scan length");
+    assert_eq!(sa, want, "block-layout scan order");
     assert_eq!(sb, want, "bulk scan order");
 }
 
 #[test]
-fn bulk_segment_reads_identically_to_a_store_written_one() {
+fn the_two_segment_layouts_read_identically() {
     let _serial = serial();
     let dir = scratch("varlen");
     let data = varlen(3_000, 7);
-    write_store(&dir.join("store.sup"), &data, opts());
+    write_bulk_with(&dir.join("blocks.sup"), &data, opts(), 0);
     write_bulk(&dir.join("bulk.sup"), &data, opts());
-    let a = open(&dir.join("store.sup"));
+    let a = open(&dir.join("blocks.sup"));
     let b = open(&dir.join("bulk.sup"));
     assert!(
         b.blocks() > 0,
@@ -221,14 +216,7 @@ fn bulk_segment_reads_identically_to_a_store_written_one() {
         b.blocks()
     );
     agree(&a, &b, &data);
-    // The writer's other layout -- every run in a block, section built at
-    // the end, the order `Store` writes -- must agree with both as well:
-    // two layouts of one format that answered differently would be the
-    // second-reader failure mode with a second writer.
-    write_bulk_with(&dir.join("blocks.sup"), &data, opts(), 0);
-    let c = open(&dir.join("blocks.sup"));
-    agree(&a, &c, &data);
-    assert!(c
+    assert!(a
         .lookup(&data[0].0)
         .expect("present")
         .iter()
@@ -272,7 +260,7 @@ fn bulk_segment_reads_identically_to_a_store_written_one() {
                 .expect("present")
                 .iter()
                 .all(|e| !e.is_inline()),
-            "Store never inlines"
+            "the block layout never inlines"
         );
     }
     // Both paths well exercised: the fixture's uneven run lengths put a
@@ -298,7 +286,7 @@ fn varint_len(n: usize) -> usize {
 }
 
 #[test]
-fn bulk_segment_agrees_with_checksums_off_too() {
+fn the_two_segment_layouts_agree_with_checksums_off_too() {
     let _serial = serial();
     let dir = scratch("nocrc");
     let data = varlen(1_000, 11);
@@ -306,10 +294,10 @@ fn bulk_segment_agrees_with_checksums_off_too() {
         checksums: false,
         ..opts()
     };
-    write_store(&dir.join("store.sup"), &data, o.clone());
+    write_bulk_with(&dir.join("blocks.sup"), &data, o.clone(), 0);
     write_bulk(&dir.join("bulk.sup"), &data, o);
     agree(
-        &open(&dir.join("store.sup")),
+        &open(&dir.join("blocks.sup")),
         &open(&dir.join("bulk.sup")),
         &data,
     );
@@ -320,9 +308,9 @@ fn fixed_width_counts_come_from_the_extent_alone() {
     let _serial = serial();
     let dir = scratch("fixed");
     let data = fixed(2_000, 4, 3);
-    write_store(&dir.join("store.sup"), &data, opts());
+    write_bulk_with(&dir.join("blocks.sup"), &data, opts(), 0);
     write_bulk(&dir.join("bulk.sup"), &data, opts());
-    let a = open(&dir.join("store.sup"));
+    let a = open(&dir.join("blocks.sup"));
     let b = open(&dir.join("bulk.sup"));
     agree(&a, &b, &data);
     for (key, vals) in &data {
@@ -347,23 +335,6 @@ fn fixed_width_counts_come_from_the_extent_alone() {
     })
     .expect("scan_counts_fixed");
     assert_eq!(seen, data.len());
-}
-
-#[test]
-fn the_mapped_reader_opens_a_bulk_segment() {
-    let _serial = serial();
-    let dir = scratch("reader");
-    let data = varlen(1_500, 5);
-    // Block-backed only: `store::Reader` is the old engine's reader and does
-    // not serve inline runs -- a next-engine segment is read through `Blob`.
-    write_bulk_with(&dir.join("bulk.sup"), &data, opts(), 0);
-    let r = Reader::open(&dir.join("bulk.sup")).expect("Reader::open");
-    for (key, vals) in &data {
-        let mut got = Vec::new();
-        r.read_all(key, |v| got.push(v.to_vec()))
-            .expect("reader read_all");
-        assert_eq!(&got, vals, "Reader values for {key:?}");
-    }
 }
 
 #[test]
