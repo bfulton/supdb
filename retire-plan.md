@@ -99,3 +99,56 @@ experiment is a new measurement, and a re-measured claim needs `full`.
    updated. `results/baseline/` goes -- it is the pre-fix baseline of a file
    that no longer exists.
 7. `CLAUDE.md`, `README.md`, `src/lib.rs`, `docs/`: one engine.
+
+## Where it stands
+
+Done, each green and pushed:
+
+1. `src/format.rs`, and the read paths pointed at it.
+2. The read-path tests write segments. Three shapes changed and each is now
+   pinned rather than assumed: an inline run plans no fetch, one `end()` emits
+   one extent, and the store-versus-segment comparisons became the writer's
+   own two layouts.
+3. logshed's roll writes segments. W1.3 retired -- the writer takes keys in
+   byte order, so there is no line-order arm to compare against -- and W1.1
+   and W1.2 were re-taken at `full`: 28.03 B/line over 478,045 fixed against
+   36.13 over 632,616, so the 32 MB budget holds 1,179,916 lines rather than
+   911,192.
+4. The external suite fields one engine. EXT.1-EXT.14 retired with the three
+   `supdb` arms. ext-analytics kept its claims and changed its fixture, since
+   it was always `Blob` against LMDB's DUPFIXED with only the file under it
+   written by the old engine.
+
+Prediction 1 held: the extraction moved no recorded number. Prediction 3 held
+so far: no next-engine result moved.
+
+## What is left, and the one part that costs
+
+The internal suite's thirty-nine `Store` experiments split two ways, and the
+split is the last real decision:
+
+- **Retire** (Store's own machinery, not re-pointable, thirty-three of them):
+  f2-open, f3-multiproc, f4-durability, f5-latency, f6-threads, f7-index,
+  f12-compress, f13-sync, f15-scancache, f16-slack, f17-gather, f19-coldscan,
+  f21-writerverify, f22-storescan, f23-madvise, f24-autoreadahead, f25-arena,
+  f26-buffer, f27-ckptshape, f29-redolog, f30-insertindex, f31-loadphases,
+  f33-indexsize, f34-parallelindex, f35-indexauto, f36-commit,
+  f37-consolidate, f38-fanout, f39-walfloor, f40-filter, f41-segroute,
+  f46-segwrite, and c1-c3 in the correctness suite.
+- **Re-point and re-measure** (the shared format and read path, still live
+  code): f1-outofcore, f8-checksums, f11-flatindex, f14-blocktable, f18-fence,
+  f20-chunkcrc, f28-count. These are findings about code that ships; they were
+  merely measured through the old engine's writer. Each needs a `full` run,
+  which is the hours in this plan.
+
+Then: delete `store.rs`, `readers.rs`, `freelist.rs`, `keytable.rs`,
+`tests/known_bugs.rs`, `tests/valuelog.rs`, `tests/consolidate.rs`, the `soak`,
+`supbench` and `recover` binaries; drop the retired claims; and rewrite
+`CLAUDE.md`, `README.md`, `src/lib.rs` and `docs/` for one engine.
+
+One thing to decide when the canonical numbers are next taken rather than now:
+the committed `results/ext-*.full.json` still record runs that included the
+retired arms. They are accurate records of runs that happened, and no claim
+cites them any more, so they stay until the next canonical `full` run replaces
+them. Taking that run is the right last step of the retirement, not a step in
+the middle of it.
