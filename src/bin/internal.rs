@@ -27,7 +27,7 @@ use supdb::bench::{
     Record, Rng, Samples, Trial, J,
 };
 use supdb::jobj;
-use supdb::{Options, Reader, Reclaim, Store};
+use supdb::{Options, Reclaim};
 
 // ------------------------------------------------------------------ args --
 
@@ -84,10 +84,6 @@ fn main() -> std::io::Result<()> {
         let rec = match name {
             "f1-outofcore" => f1_outofcore(&args, profile)?,
             "f8-checksums" => f8_checksums(&args, profile)?,
-            "f11-flatindex" => f11_flatindex(&args, profile)?,
-            "f14-blocktable" => f14_blocktable(&args, profile)?,
-            "f18-fence" => f18_fence(&args, profile)?,
-            "f20-chunkcrc" => f20_chunkcrc(&args, profile)?,
             "f28-count" => f28_count(&args, profile)?,
             "f42-next" => f42_next(&args, profile)?,
             "f43-compact" => f43_compact(&args, profile)?,
@@ -121,17 +117,9 @@ fn main() -> std::io::Result<()> {
 
     match cmd.as_str() {
         // Child modes, used by experiments that must measure a fresh process.
-        "f11-child" => f11_child(&args),
         "all" => {
             let mut failed = Vec::new();
-            for e in [
-                "f11-flatindex",
-                "f14-blocktable",
-                "f18-fence",
-                "f20-chunkcrc",
-                "f28-count",
-                "f1-outofcore",
-            ] {
+            for e in ["f28-count", "f1-outofcore"] {
                 if !run(e)? {
                     failed.push(e);
                 }
@@ -231,14 +219,16 @@ fn f1_outofcore(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let resident_keys = (resident_mb * 1048576) / value_size.max(1) as u64;
     let resident = {
         let rf = dir.join("resident.dat");
-        let store = Store::create(&rf, default_opts(256))?;
+        let mut w = supdb::next::SegmentWriter::create(&rf, &default_opts(256))?;
         let mut vrng = Rng::new(0x8F1);
         let mut kb = [0u8; 16];
         for i in 0..resident_keys {
             db_key_into(i, &mut kb);
-            store.append(&kb, payload.get(&mut vrng))?;
+            w.begin(&kb)?;
+            w.value(payload.get(&mut vrng));
+            w.end()?;
         }
-        store.close()?;
+        w.finish(1)?;
         // Warm it deliberately, then measure: this is the in-memory ceiling.
         let _ = measure_reads(&rf, resident_keys, reads.min(50_000), dist)?;
         let r = measure_reads(&rf, resident_keys, reads.min(50_000), dist)?;
@@ -251,14 +241,18 @@ fn f1_outofcore(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let io0 = IoCounters::read_now();
     {
-        let store = Store::create(&file, default_opts(256))?;
+        let mut w = supdb::next::SegmentWriter::create(&file, &default_opts(256))?;
         let mut vrng = Rng::new(0xF1);
         let mut kb = [0u8; 16];
+        // One value per key, in byte order: `db_key_into` is a zero-padded
+        // decimal, so ascending `i` ascends the key bytes the writer wants.
         for i in 0..nkeys {
             db_key_into(i, &mut kb);
-            store.append(&kb, payload.get(&mut vrng))?;
+            w.begin(&kb)?;
+            w.value(payload.get(&mut vrng));
+            w.end()?;
         }
-        store.close()?;
+        w.finish(1)?;
     }
     let build_io = IoCounters::read_now().since(&io0);
     let fsz = file_len(&file);
@@ -443,7 +437,7 @@ fn measure_reads(
     reads: u64,
     dist: KeyDist,
 ) -> std::io::Result<(Hist, f64)> {
-    let reader = Reader::open(file)?;
+    let reader = supdb::Blob::open(supdb::MmapBytes::open(file)?)?;
     let mut g = KeyGen::new(dist, nkeys, 0xC01D);
     let mut kb = [0u8; 16];
     let mut h = Hist::new();
@@ -460,811 +454,6 @@ fn measure_reads(
 }
 
 // ------------------------------------------------- F7: index memory scaling --
-
-/// What it costs to make a checkpoint durable rather than merely visible.
-///
-/// Publishing does not need fsync. Readers map the same file, so a write is
-/// visible as soon as it is in the page cache, and a process crash leaves the
-/// file intact regardless. fsync buys *ordering* against power loss: it stops
-/// the superblock landing before the sections it points at.
-///
-/// That matters because every read-your-writes operation costs a checkpoint --
-/// `Store` has no read method -- and a checkpoint syncs twice. The mixed YCSB
-/// workloads sit at 0.07-0.14x of LMDB, and an instruction profile of the same
-/// shape blamed the block table decode at 34%. Removing that decode entirely
-/// moved throughput by nothing, because the workload waits on a syscall rather
-/// than on the CPU. This asks the question the profiler could not.
-///
-/// Both arms in one process, interleaved, as f8 and f12 do.
-/// Does reading the block table out of the mapping cost anything on a scan?
-///
-/// The table was moved into a mapped section so that many readers of one store
-/// share it instead of each decoding a private copy. That change was measured
-/// on point reads, where it was worth nothing either way, and the conclusion
-/// recorded was that the decode had not been the bottleneck. It was never
-/// measured on a scan, which resolves a block for every entry it walks rather
-/// than one per lookup -- and between the run that recorded it and the next
-/// one, external scan throughput fell from 0.82x of LMDB to 0.54x while LMDB
-/// and redb moved less than 3%.
-///
-/// Both arms open the *same file* in the same process and are interleaved, so
-/// the only difference is `ReadOptions::mapped_blocks`.
-fn f14_blocktable(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
-    let value_size = args.num("--value-size", 100);
-    let scan_len = args.num("--scan-len", 50);
-    let scans = args.num("--scans", profile.pick(2_000, 20_000, 60_000)) as u64;
-    let reads = args.num("--reads", profile.pick(50_000, 200_000, 500_000)) as u64;
-
-    let mut rec = Record::new("f14-blocktable", profile);
-    rec.param("keys", J::u(keys))
-        .param("value_size", J::u(value_size as u64))
-        .param("scan_len", J::u(scan_len as u64))
-        .param("scans", J::u(scans))
-        .param("reads", J::u(reads))
-        .note(
-            "one store, two readers over the same file, interleaved; the only difference is \
-             ReadOptions::mapped_blocks",
-        );
-
-    let dir = scratch("f14");
-    let file = dir.join("bt.dat");
-    let payload = Payload::new(value_size, 0.5, 0x14);
-    {
-        let store = Store::create(&file, default_opts(128)).expect("create");
-        let mut vrng = Rng::new(0x14);
-        let mut kb = [0u8; 16];
-        for i in 0..keys {
-            db_key_into(i, &mut kb);
-            store.put(&kb, payload.get(&mut vrng)).expect("put");
-        }
-        store.flush().expect("flush");
-        store.close().expect("close");
-    }
-    let mapped = [true, false];
-
-    // Scans. A scan resolves a block per entry, so if revalidating the mapped
-    // table costs anything this is where it shows.
-    let scan = Trial::new(profile.reps()).run(2, |ci, rep| {
-        let r = Reader::open_with(
-            &file,
-            supdb::ReadOptions {
-                mapped_blocks: mapped[ci],
-                ..Default::default()
-            },
-        )
-        .expect("open");
-        let mut g = KeyGen::new(
-            KeyDist::Uniform,
-            keys.saturating_sub(scan_len as u64).max(1),
-            0x14 + rep as u64,
-        );
-        let mut kb = [0u8; 16];
-        let t = Instant::now();
-        let mut n = 0u64;
-        for _ in 0..scans {
-            db_key_into(g.next(), &mut kb);
-            n += r
-                .scan(Some(&kb), scan_len, |_k, v| {
-                    std::hint::black_box(v);
-                })
-                .expect("scan");
-        }
-        n as f64 / t.elapsed().as_secs_f64()
-    });
-
-    // Point reads, the arm the original change was measured on.
-    let read = Trial::new(profile.reps()).run(2, |ci, rep| {
-        let r = Reader::open_with(
-            &file,
-            supdb::ReadOptions {
-                mapped_blocks: mapped[ci],
-                ..Default::default()
-            },
-        )
-        .expect("open");
-        let mut g = KeyGen::new(KeyDist::Uniform, keys, 0x41 + rep as u64);
-        let mut kb = [0u8; 16];
-        let t = Instant::now();
-        for _ in 0..reads {
-            db_key_into(g.next(), &mut kb);
-            r.read_all(&kb, |v| {
-                std::hint::black_box(v);
-            })
-            .expect("read");
-        }
-        reads as f64 / t.elapsed().as_secs_f64()
-    });
-
-    let scan_cmp = compare(&scan[1], &scan[0], supdb::bench::MIN_EFFECT);
-    let read_cmp = compare(&read[1], &read[0], supdb::bench::MIN_EFFECT);
-    let (sm, so) = (scan[0].median(), scan[1].median());
-    let (rm, ro) = (read[0].median(), read[1].median());
-    rec.compare("scan_owned_vs_mapped", scan_cmp.clone());
-    rec.compare("read_owned_vs_mapped", read_cmp.clone());
-    rec.series(
-        "arms",
-        jobj! {
-            "scan_mapped_entries_per_s" => J::fp(sm, 1),
-            "scan_owned_entries_per_s" => J::fp(so, 1),
-            "read_mapped_ops_per_s" => J::fp(rm, 1),
-            "read_owned_ops_per_s" => J::fp(ro, 1),
-        },
-    );
-
-    rec.finding(Finding::new(
-        "F14.1",
-        "the mapped block table costs nothing on a scan",
-        matches!(
-            scan_cmp.verdict,
-            supdb::bench::stats::Verdict::NoDifference | supdb::bench::stats::Verdict::Underpowered
-        ),
-        format!(
-            "scan {sm:.0} entries/s mapped against {so:.0} owned ({})",
-            scan_cmp.summary("owned", "mapped")
-        ),
-    ));
-    rec.finding(Finding::new(
-        "F14.2",
-        "the mapped block table costs nothing on a point read",
-        matches!(
-            read_cmp.verdict,
-            supdb::bench::stats::Verdict::NoDifference | supdb::bench::stats::Verdict::Underpowered
-        ),
-        format!(
-            "read {rm:.0} ops/s mapped against {ro:.0} owned ({}). This is the arm the change \
-             was originally measured on, and it is kept so the two can be read together: a \
-             structure can be free on one access pattern and not on another",
-            read_cmp.summary("owned", "mapped")
-        ),
-    ));
-    let _ = std::fs::remove_file(&file);
-    Ok(rec)
-}
-
-/// Does a fence make an ordered seek cheaper?
-///
-/// A scan's cost is linear in its length with a large constant: measured at 1M
-/// keys, `1637 + 20.8n` nanoseconds. The per-entry walk is competitive -- at
-/// length 400 it reaches 40M entries/s against LMDB's 47M -- so the whole scan
-/// deficit is that constant, and most of the constant is the seek. A seek
-/// binary-searches the record region, and each probe is two dependent loads at
-/// a scattered offset: the rank directory, then the record.
-///
-/// The fence copies every stride-th key out contiguously so the search can
-/// narrow before it touches a record. What it cannot do anything about is that
-/// the *upper* levels of a binary search over a static array visit the same
-/// few addresses on every search and are already cached; the fence replaces
-/// exactly those, and the expensive lower levels remain. Whether the trade is
-/// positive is the question, and predicting it wrong is why this exists.
-///
-/// Both arms are one process over one file; the fence is in the section either
-/// way and `ReadOptions::seek_fence` decides whether it is consulted.
-fn f18_fence(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
-    let value_size = args.num("--value-size", 100);
-    let seeks = args.num("--seeks", profile.pick(50_000, 200_000, 500_000)) as u64;
-    let scans = args.num("--scans", profile.pick(5_000, 20_000, 40_000)) as u64;
-
-    let mut rec = Record::new("f18-fence", profile);
-    rec.param("keys", J::u(keys))
-        .param("value_size", J::u(value_size as u64))
-        .param("seeks", J::u(seeks))
-        .param("scans", J::u(scans))
-        .note("one file, two readers, interleaved; the only difference is ReadOptions::seek_fence");
-
-    let dir = scratch("f18");
-    let file = dir.join("fence.dat");
-    let payload = Payload::new(value_size, 0.5, 0x18);
-    {
-        let store = Store::create(&file, default_opts(128)).expect("create");
-        let mut vrng = Rng::new(0x18);
-        let mut kb = [0u8; 16];
-        for i in 0..keys {
-            db_key_into(i, &mut kb);
-            store.put(&kb, payload.get(&mut vrng)).expect("put");
-        }
-        store.flush().expect("flush");
-        store.close().expect("close");
-    }
-    let on = [true, false];
-    let reader = |ci: usize| {
-        Reader::open_with(
-            &file,
-            supdb::ReadOptions {
-                seek_fence: on[ci],
-                ..Default::default()
-            },
-        )
-        .expect("open")
-    };
-
-    // The seek alone, which is what the fence changes.
-    let seek = Trial::new(profile.reps()).run(2, |ci, rep| {
-        let r = reader(ci);
-        let mut g = KeyGen::new(KeyDist::Uniform, keys, 0x18 + rep as u64);
-        let mut kb = [0u8; 16];
-        let t = Instant::now();
-        let mut acc = 0usize;
-        for _ in 0..seeks {
-            db_key_into(g.next(), &mut kb);
-            acc += r.seek(&kb);
-        }
-        std::hint::black_box(acc);
-        seeks as f64 / t.elapsed().as_secs_f64()
-    });
-
-    // A 50-entry scan, which is the shape YCSB-E runs and where the seek is
-    // the largest single term.
-    let scan = Trial::new(profile.reps()).run(2, |ci, rep| {
-        let r = reader(ci);
-        let mut g = KeyGen::new(
-            KeyDist::Uniform,
-            keys.saturating_sub(50).max(1),
-            0x81 + rep as u64,
-        );
-        let mut kb = [0u8; 16];
-        let t = Instant::now();
-        let mut n = 0u64;
-        for _ in 0..scans {
-            db_key_into(g.next(), &mut kb);
-            n += r
-                .scan(Some(&kb), 50, |_k, v| {
-                    std::hint::black_box(v);
-                })
-                .expect("scan");
-        }
-        n as f64 / t.elapsed().as_secs_f64()
-    });
-
-    let seek_cmp = compare(&seek[0], &seek[1], supdb::bench::MIN_EFFECT);
-    let scan_cmp = compare(&scan[0], &scan[1], supdb::bench::MIN_EFFECT);
-    let (sf, sn) = (seek[0].median(), seek[1].median());
-    let (cf, cn) = (scan[0].median(), scan[1].median());
-    rec.compare("seek_fenced_vs_plain", seek_cmp.clone());
-    rec.compare("scan_fenced_vs_plain", scan_cmp.clone());
-    rec.series(
-        "arms",
-        jobj! {
-            "seek_fenced_per_s" => J::fp(sf, 1),
-            "seek_plain_per_s" => J::fp(sn, 1),
-            "seek_fenced_ns" => J::fp(1e9 / sf.max(1e-9), 1),
-            "seek_plain_ns" => J::fp(1e9 / sn.max(1e-9), 1),
-            "scan50_fenced_entries_per_s" => J::fp(cf, 1),
-            "scan50_plain_entries_per_s" => J::fp(cn, 1),
-        },
-    );
-    rec.finding(Finding::new(
-        "F18.1",
-        "narrowing a seek with a fence makes it cheaper",
-        matches!(seek_cmp.verdict, supdb::bench::stats::Verdict::Greater),
-        format!(
-            "{:.0}ns fenced against {:.0}ns plain ({})",
-            1e9 / sf.max(1e-9),
-            1e9 / sn.max(1e-9),
-            seek_cmp.summary("fenced", "plain")
-        ),
-    ));
-    rec.finding(Finding::new(
-        "F18.2",
-        "the fence is worth having on the workload it was built for",
-        matches!(scan_cmp.verdict, supdb::bench::stats::Verdict::Greater),
-        format!(
-            "50-entry scans at {cf:.0} entries/s fenced against {cn:.0} plain ({}). This is the \
-             one that decides whether the fence earns a format version; a seek that got faster \
-             without moving a scan would not",
-            scan_cmp.summary("fenced", "plain")
-        ),
-    ));
-    let _ = std::fs::remove_file(&file);
-    Ok(rec)
-}
-
-/// Does verifying a chunk instead of a block make a cold scan cheaper?
-///
-/// f19-coldscan priced whole-block verification at 0.715x on a cold scan and
-/// showed the cold penalty is the checksum and almost nothing else -- zero
-/// major faults, zero time off CPU, pure CRC32C. The amplification is the
-/// reason: a 64KiB block hashed in full to hand back a 100-byte value.
-///
-/// `write_block` already chunks the compressed path for the same shape of
-/// problem, because decompressing 64KiB to reach 960 bytes was 68x read
-/// amplification. Plain blocks now carry per-chunk checksums beside them in
-/// the block table -- beside, because a plain block is sliced straight out of
-/// the mapping and has to stay byte-for-byte what the extent offsets say.
-///
-/// One file, two readers, arms differing only in
-/// `ReadOptions::chunk_verify`. Both verify; one verifies less.
-fn f20_chunkcrc(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    use supdb::bench::env::Wait;
-
-    let keys = args.num("--keys", profile.pick(50_000, 300_000, 1_000_000)) as u64;
-    let value_size = args.num("--value-size", 100);
-    let scan_len = args.num("--scan-len", 100);
-    let scans = args.num("--scans", profile.pick(2_000, 10_000, 20_000)) as u64;
-
-    let mut rec = Record::new("f20-chunkcrc", profile);
-    rec.param("keys", J::u(keys))
-        .param("value_size", J::u(value_size as u64))
-        .param("scan_len", J::u(scan_len as u64))
-        .param("scans", J::u(scans))
-        .note(
-            "one file, two readers, interleaved; the only difference is ReadOptions::chunk_verify",
-        );
-
-    let dir = scratch("f20");
-    let file = dir.join("chunk.dat");
-    let payload = Payload::new(value_size, 0.5, 0x20);
-    {
-        let store = Store::create(
-            &file,
-            Options {
-                checksums: true,
-                ..default_opts(128)
-            },
-        )
-        .expect("create");
-        let mut vrng = Rng::new(0x20);
-        let mut kb = [0u8; 16];
-        for i in 0..keys {
-            db_key_into(i, &mut kb);
-            store.put(&kb, payload.get(&mut vrng)).expect("put");
-        }
-        store.flush().expect("flush");
-        store.close().expect("close");
-    }
-
-    let chunked = [true, false];
-    let warm_out = std::sync::Mutex::new([0f64; 2]);
-    let cold = Trial::new(profile.reps()).run(2, |ci, rep| {
-        let r = Reader::open_with(
-            &file,
-            supdb::ReadOptions {
-                chunk_verify: chunked[ci],
-                ..Default::default()
-            },
-        )
-        .expect("open");
-        let pass = |seed: u64, dist: KeyDist| -> (f64, u64) {
-            let mut g = KeyGen::new(dist, keys.saturating_sub(scan_len as u64).max(1), seed);
-            let mut kb = [0u8; 16];
-            let a = Wait::read_now();
-            let mut n = 0u64;
-            for _ in 0..scans {
-                db_key_into(g.next(), &mut kb);
-                n += r
-                    .scan(Some(&kb), scan_len, |_k, v| {
-                        std::hint::black_box(v);
-                    })
-                    .expect("scan");
-            }
-            let w = Wait::read_now().since(&a);
-            (n as f64 / (w.wall_ns as f64 / 1e9), n)
-        };
-        let (first, _) = pass(0x20 + rep as u64, KeyDist::Uniform);
-        let (second, _) = pass(0x20 + rep as u64, KeyDist::Uniform);
-        warm_out.lock().unwrap()[ci] = second;
-        first
-    });
-
-    // The skewed case, which is the one chunking can help. A uniform sweep
-    // touches every chunk of every block it touches, and verifying all of a
-    // block's chunks is verifying the block -- the same bytes hashed, plus a
-    // bitset test per chunk. Only a workload that touches part of a block and
-    // does not come back pays less.
-    let skewed = Trial::new(profile.reps()).run(2, |ci, rep| {
-        let r = Reader::open_with(
-            &file,
-            supdb::ReadOptions {
-                chunk_verify: chunked[ci],
-                ..Default::default()
-            },
-        )
-        .expect("open");
-        let mut g = KeyGen::new(
-            KeyDist::Zipfian,
-            keys.saturating_sub(scan_len as u64).max(1),
-            0x02 + rep as u64,
-        );
-        let mut kb = [0u8; 16];
-        let t = Instant::now();
-        let mut n = 0u64;
-        for _ in 0..scans {
-            db_key_into(g.next(), &mut kb);
-            n += r
-                .scan(Some(&kb), scan_len, |_k, v| {
-                    std::hint::black_box(v);
-                })
-                .expect("scan");
-        }
-        n as f64 / t.elapsed().as_secs_f64()
-    });
-
-    let cmp = compare(&cold[0], &cold[1], supdb::bench::MIN_EFFECT);
-    let (chunk, whole) = (cold[0].median(), cold[1].median());
-    let warm = *warm_out.lock().unwrap();
-    rec.compare("chunk_vs_whole", cmp.clone());
-    rec.series(
-        "arms",
-        jobj! {
-            "cold_chunk_entries_per_s" => J::fp(chunk, 1),
-            "cold_whole_entries_per_s" => J::fp(whole, 1),
-            "warm_chunk_entries_per_s" => J::fp(warm[0], 1),
-            "warm_whole_entries_per_s" => J::fp(warm[1], 1),
-            "skewed_chunk_entries_per_s" => J::fp(skewed[0].median(), 1),
-            "skewed_whole_entries_per_s" => J::fp(skewed[1].median(), 1),
-        },
-    );
-    let skew_cmp = compare(&skewed[0], &skewed[1], supdb::bench::MIN_EFFECT);
-    rec.compare("skewed_chunk_vs_whole", skew_cmp.clone());
-    rec.finding(Finding::new(
-        "F20.3",
-        "chunk verification pays on a skewed scan workload",
-        matches!(skew_cmp.verdict, supdb::bench::stats::Verdict::Greater),
-        format!(
-            "Zipfian scans at {:.0} entries/s per chunk against {:.0} per block ({}). This is the \
-             regime chunking can help in at all: a uniform sweep reaches every chunk of every \
-             block it touches, and verifying all of a block's chunks is verifying the block",
-            skewed[0].median(),
-            skewed[1].median(),
-            skew_cmp.summary("chunk", "whole")
-        ),
-    ));
-    rec.finding(Finding::new(
-        "F20.1",
-        "verifying a chunk instead of a block makes a cold scan cheaper",
-        matches!(cmp.verdict, supdb::bench::stats::Verdict::Greater),
-        format!(
-            "cold scans at {chunk:.0} entries/s per chunk against {whole:.0} per block ({})",
-            cmp.summary("chunk", "whole")
-        ),
-    ));
-    rec.finding(Finding::new(
-        "F20.2",
-        "the first pass now costs about what the steady state does",
-        warm[0] <= chunk * 1.15,
-        format!(
-            "per chunk: {chunk:.0} entries/s cold against {:.0} warm ({:.2}x). Per block: \
-             {whole:.0} against {:.0} ({:.2}x). f19-coldscan measured the whole-block ratio at \
-             1.65x, and closing it is the point of this change -- a scan that has to warm up is a \
-             scan whose first pass is charged for every block it will ever touch",
-            warm[0],
-            warm[0] / chunk.max(1e-9),
-            warm[1],
-            warm[1] / whole.max(1e-9)
-        ),
-    ));
-    let _ = std::fs::remove_file(&file);
-    Ok(rec)
-}
-
-/// What an index read where it lies buys, and what it costs.
-///
-/// F2.1 and F7.2 both fail for one reason: the reader decodes the key index
-/// into `Vec<(Vec<u8>, Extents)>` and hashes it. That is 131 bytes per key in
-/// every reader process and an open that grows with the key count -- 6.4ms at
-/// 100k keys, 1446ms at 10M. `Options::flat_index` writes a shape a lookup can
-/// use directly instead, so the open validates a header and stops.
-///
-/// The trade is file size: a section used in place cannot be compressed. That
-/// matters more than it sounds, because compactness is one of only two axes
-/// Supdb currently wins on, so the space cost is measured here rather than
-/// waved at.
-///
-/// Both arms run in one process, interleaved, as f8-checksums does. Space is
-/// the exception the project's own rule allows: file size is immune to drift
-/// and is compared directly.
-fn f11_flatindex(args: &Args, profile: Profile) -> std::io::Result<Record> {
-    let nkeys = args.num("--keys", profile.pick(50_000, 500_000, 5_000_000)) as u64;
-    let value_size = args.num("--value-size", 100);
-    let lookups = args.num("--lookups", profile.pick(20_000, 100_000, 500_000)) as u64;
-
-    let mut rec = Record::new("f11-flatindex", profile);
-    rec.param("keys", J::u(nkeys))
-        .param("value_size", J::u(value_size as u64))
-        .param("lookups", J::u(lookups));
-
-    let dir = scratch("f11");
-    let payload = Payload::new(value_size, 0.5, 0xF1);
-    let exe = std::env::current_exe().expect("current exe");
-
-    // One store per arm, identical data.
-    let mut files = Vec::new();
-    let mut per_ckpt: Vec<f64> = Vec::new();
-    let mut minimal: Vec<f64> = Vec::new();
-    for flat in [false, true] {
-        let file = dir.join(if flat { "flat.dat" } else { "heap.dat" });
-        let store = Store::create(
-            &file,
-            Options {
-                buffer_bytes: 256 << 20,
-                reclaim: Reclaim::AfterReads,
-                flat_index: flat,
-                ..Default::default()
-            },
-        )?;
-        let mut vrng = Rng::new(nkeys);
-        let mut kb = [0u8; 16];
-        for i in 0..nkeys {
-            db_key_into(i, &mut kb);
-            store.append(&kb, payload.get(&mut vrng))?;
-        }
-        // What a checkpoint costs in space, which is the part the headline
-        // file size hides: every checkpoint appends a whole index section and
-        // nothing reclaims the last one. The heap arm leaks too -- this is a
-        // pre-existing defect, not one the flat format introduces -- but the
-        // flat section is several times larger, so the leak is several times
-        // more expensive and grows without bound in checkpoint count.
-        // Two different questions, measured separately because conflating
-        // them is what made the first run of this experiment report +217%.
-        //
-        // The minimal file is one checkpoint's worth: that is the intrinsic
-        // price of an uncompressed index and the number the space trade
-        // should be judged on. The steady-state delta is what a long-running
-        // store pays per checkpoint once the free list has come round, which
-        // is a different thing and is now zero.
-        store.checkpoint()?;
-        minimal.push(file_len(&file) as f64);
-        for _ in 0..5 {
-            store.checkpoint()?;
-        }
-        let before = file_len(&file);
-        store.checkpoint()?;
-        per_ckpt.push((file_len(&file) - before) as f64);
-        store.close()?;
-        files.push(file);
-    }
-
-    // Open cost, the two arms round-robined so a frequency excursion lands on
-    // both. Each iteration opens a fresh reader and drops it.
-    let opens = Trial::new(profile.reps()).run(2, |ci, _| {
-        let t = Instant::now();
-        let r = Reader::open(&files[ci]).expect("open");
-        let ms = t.elapsed().as_secs_f64() * 1000.0;
-        std::hint::black_box(r.keys());
-        ms
-    });
-
-    // Before timing anything: the two arms must return the same data. An arm
-    // that silently finds nothing is very fast indeed, and a read benchmark
-    // that does not check would report that as a win. This has already caught
-    // three false greens elsewhere in this suite.
-    {
-        let a = Reader::open(&files[0])?;
-        let b = Reader::open(&files[1])?;
-        assert_eq!(a.keys(), b.keys(), "arms disagree on key count");
-        let mut kb = [0u8; 16];
-        let mut rng = Rng::new(0xC0DE);
-        for _ in 0..1000.min(nkeys) {
-            db_key_into(rng.next() % nkeys, &mut kb);
-            let mut ha = Vec::new();
-            let mut hb = Vec::new();
-            a.read_all(&kb, |v| ha.push(v.to_vec()))?;
-            b.read_all(&kb, |v| hb.push(v.to_vec()))?;
-            assert_eq!(ha, hb, "arms disagree on the values of a key");
-            assert!(!ha.is_empty(), "neither arm found a key that was written");
-        }
-        // Ordered scans too: `seek` and `at` are separate code in each arm.
-        let mut sa = Vec::new();
-        let mut sb = Vec::new();
-        a.scan(None, 500, |k, v| sa.push((k.to_vec(), v.to_vec())))?;
-        b.scan(None, 500, |k, v| sb.push((k.to_vec(), v.to_vec())))?;
-        assert_eq!(sa, sb, "arms disagree on an ordered scan");
-    }
-
-    // Steady-state point reads, same interleaving, readers built once so the
-    // open cost is not folded into the read figure.
-    let readers: Vec<Reader> = files
-        .iter()
-        .map(|f| Reader::open(f).expect("open"))
-        .collect();
-    let hits_seen = std::sync::atomic::AtomicU64::new(0);
-    let reads = Trial::new(profile.reps()).run(2, |ci, _| {
-        let r = &readers[ci];
-        let mut rng = Rng::new(0xF11);
-        let mut kb = [0u8; 16];
-        let t = Instant::now();
-        let mut hits = 0u64;
-        for _ in 0..lookups {
-            db_key_into(rng.next() % nkeys, &mut kb);
-            hits += r
-                .read_all(&kb, |v| {
-                    std::hint::black_box(v);
-                })
-                .expect("read");
-        }
-        hits_seen.fetch_max(hits, std::sync::atomic::Ordering::Relaxed);
-        std::hint::black_box(hits);
-        t.elapsed().as_secs_f64() * 1e9 / lookups as f64
-    });
-    drop(readers);
-
-    // Resident cost, in a child so the allocator's overhead is counted rather
-    // than estimated, and *after* a random lookup pass: a mapped index is
-    // faulted in on demand, so measuring straight after open would credit the
-    // flat arm for laziness rather than for sharing.
-    let mut rss = Vec::new();
-    for f in &files {
-        let o = std::process::Command::new(&exe)
-            .args([
-                "f11-child",
-                "--file",
-                f.to_str().unwrap(),
-                "--keys",
-                &nkeys.to_string(),
-                "--lookups",
-                &lookups.min(200_000).to_string(),
-            ])
-            .output()?;
-        let txt = String::from_utf8_lossy(&o.stdout).to_string();
-        let pick = |k: &str| -> f64 {
-            txt.split(k)
-                .nth(1)
-                .and_then(|s| s.split_whitespace().next())
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0.0)
-        };
-        rss.push((pick("index_rss_bytes="), pick("open_ms=")));
-    }
-
-    let heap_bytes = minimal[0];
-    let flat_bytes = minimal[1];
-    let churn_bytes = [file_len(&files[0]) as f64, file_len(&files[1]) as f64];
-    let index_bytes = {
-        let a = Reader::open(&files[0])?;
-        let b = Reader::open(&files[1])?;
-        // The decoded arm has no section to point at, so its index cost is
-        // the resident figure the child measured; the mapped arm's is exact.
-        [rss[0].0, b.index_bytes() as f64]
-            .map(|v| v.max(0.0))
-            .map(|v| {
-                let _ = &a;
-                v
-            })
-    };
-    let heap_open = opens[0].median();
-    let flat_open = opens[1].median();
-    let heap_read = reads[0].median();
-    let flat_read = reads[1].median();
-    let heap_rss_key = rss[0].0 / nkeys as f64;
-    let flat_rss_key = rss[1].0 / nkeys as f64;
-
-    rec.series(
-        "arms",
-        J::arr(vec![
-            jobj! {
-                "arm" => J::s("heap"),
-                "open_ms" => J::fp(heap_open, 3),
-                "read_ns" => J::fp(heap_read, 1),
-                "index_bytes_per_key" => J::fp(heap_rss_key, 2),
-                "file_bytes_minimal" => J::u(heap_bytes as u64),
-                "file_bytes_after_churn" => J::u(churn_bytes[0] as u64),
-                "index_bytes_per_key_exact" => J::fp(index_bytes[0] / nkeys as f64, 2),
-                "child_open_ms" => J::fp(rss[0].1, 3),
-                "checkpoint_bytes_per_key" => J::fp(per_ckpt[0] / nkeys as f64, 2),
-            },
-            jobj! {
-                "arm" => J::s("flat"),
-                "open_ms" => J::fp(flat_open, 3),
-                "read_ns" => J::fp(flat_read, 1),
-                "index_bytes_per_key" => J::fp(flat_rss_key, 2),
-                "file_bytes_minimal" => J::u(flat_bytes as u64),
-                "file_bytes_after_churn" => J::u(churn_bytes[1] as u64),
-                "index_bytes_per_key_exact" => J::fp(index_bytes[1] / nkeys as f64, 2),
-                "child_open_ms" => J::fp(rss[1].1, 3),
-                "checkpoint_bytes_per_key" => J::fp(per_ckpt[1] / nkeys as f64, 2),
-            },
-        ]),
-    );
-    rec.param(
-        "values_per_lookup",
-        J::fp(
-            hits_seen.load(std::sync::atomic::Ordering::Relaxed) as f64 / lookups as f64,
-            3,
-        ),
-    );
-    rec.compare(
-        "flat_open_vs_heap_open",
-        compare(&opens[0], &opens[1], supdb::bench::MIN_EFFECT),
-    );
-    rec.compare(
-        "flat_read_vs_heap_read",
-        compare(&reads[0], &reads[1], supdb::bench::MIN_EFFECT),
-    );
-
-    rec.finding(Finding::new(
-        "F11.1",
-        "a mapped index opens at least 10x faster than a decoded one",
-        flat_open * 10.0 <= heap_open,
-        format!(
-            "{nkeys} keys: heap {heap_open:.2}ms -> flat {flat_open:.3}ms ({:.0}x)",
-            heap_open / flat_open.max(1e-9)
-        ),
-    ));
-    rec.finding(Finding::new(
-        "F11.2",
-        "a mapped index costs less than half the bytes per key of a decoded one",
-        index_bytes[1] / nkeys as f64 * 2.0 <= heap_rss_key,
-        format!(
-            "decoded {heap_rss_key:.0} B/key resident against a mapped section of {:.0} B/key. \
-             Measured against the section rather than against resident size, because a read \
-             pass faults in block and cache pages common to both arms and dilutes the \
-             difference: on that measure it reads {flat_rss_key:.0} B/key. The mapped arm's \
-             pages are also file-backed, so N readers share one copy where the decoded arm \
-             pays N times",
-            index_bytes[1] / nkeys as f64
-        ),
-    ));
-    rec.finding(Finding::new(
-        "F11.3",
-        "point reads do not get slower",
-        flat_read <= heap_read * 1.05,
-        format!("heap {heap_read:.0} ns -> flat {flat_read:.0} ns"),
-    ));
-    rec.finding(Finding::new(
-        "F11.5",
-        "a checkpoint does not cost more than 16 bytes per key of permanent file growth",
-        per_ckpt[1] / nkeys as f64 <= 16.0,
-        format!(
-            "heap {:.1} B/key per checkpoint, flat {:.1} B/key. Sections are reclaimed once \
-             no reader can reach them, so a long-running store reaches steady state instead \
-             of growing without bound in checkpoint count. Before that fix this was 9.2 and \
-             66.9 B/key respectively, forever -- a pre-existing leak the flat format made \
-             expensive enough to notice ({:.1}x)",
-            per_ckpt[0] / nkeys as f64,
-            per_ckpt[1] / nkeys as f64,
-            per_ckpt[1] / per_ckpt[0].max(1.0)
-        ),
-    ));
-    rec.finding(Finding::new(
-        "F11.4",
-        "the file grows by less than 10% in exchange",
-        flat_bytes <= heap_bytes * 1.10,
-        format!(
-            "at one checkpoint, heap {:.1} MB -> flat {:.1} MB ({:+.1}%). An index read in \
-             place cannot be compressed, and compactness is one of the two axes this engine \
-             wins on. Measured on the minimal file: after six checkpoints the same stores are \
-             {:.1} and {:.1} MB, but that gap is holes left by reclaimed sections rather than \
-             the price of the format",
-            heap_bytes / 1e6,
-            flat_bytes / 1e6,
-            (flat_bytes / heap_bytes - 1.0) * 100.0,
-            churn_bytes[0] / 1e6,
-            churn_bytes[1] / 1e6
-        ),
-    ));
-    Ok(rec)
-}
-
-/// Open, then fault the index in the way a real reader would, then report.
-fn f11_child(args: &Args) -> std::io::Result<()> {
-    let file = PathBuf::from(args.get("--file").expect("--file"));
-    let nkeys = args.num("--keys", 1) as u64;
-    let lookups = args.num("--lookups", 1) as u64;
-    let baseline = env::rss_bytes();
-    let t = Instant::now();
-    let reader = Reader::open(&file)?;
-    let open_ms = t.elapsed().as_secs_f64() * 1000.0;
-    // Touch a realistic working set. A mapped index is demand-faulted, so
-    // resident size straight after open measures how little has been read
-    // rather than how little is needed.
-    let mut rng = Rng::new(0xC11D);
-    let mut kb = [0u8; 16];
-    let mut hits = 0u64;
-    for _ in 0..lookups {
-        db_key_into(rng.next() % nkeys.max(1), &mut kb);
-        hits += reader.read_all(&kb, |v| {
-            std::hint::black_box(v);
-        })?;
-    }
-    std::hint::black_box(hits);
-    println!(
-        "baseline_rss_bytes={baseline} index_rss_bytes={} open_ms={open_ms:.3} keys={}",
-        env::rss_bytes().saturating_sub(baseline),
-        reader.keys()
-    );
-    Ok(())
-}
 
 // ------------------------------------------------- F8: the cost of checksums --
 
@@ -1289,9 +478,9 @@ fn f8_checksums(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let trial = Trial::new(profile.reps());
     let write = trial.run(2, |ci, rep| {
         let file = dir.join(format!("w{ci}-{rep}.dat"));
-        let store = Store::create(
+        let mut w = supdb::next::SegmentWriter::create(
             &file,
-            Options {
+            &Options {
                 checksums: on[ci],
                 ..default_opts(128)
             },
@@ -1300,13 +489,17 @@ fn f8_checksums(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let mut vrng = Rng::new(0xF8 + rep as u64);
         let mut kb = [0u8; 16];
         let t = Instant::now();
-        for i in 0..(keys * depth) {
-            db_key_into(i % keys, &mut kb);
-            store.append(&kb, payload.get(&mut vrng)).expect("append");
+        // Grouped by key, which is the only order the writer takes.
+        for i in 0..keys {
+            db_key_into(i, &mut kb);
+            w.begin(&kb).expect("begin");
+            for _ in 0..depth {
+                w.value(payload.get(&mut vrng));
+            }
+            w.end().expect("end");
         }
-        store.flush().expect("flush");
+        w.finish(1).expect("finish");
         let secs = t.elapsed().as_secs_f64();
-        let _ = store.close();
         let _ = std::fs::remove_file(&file);
         (keys * depth) as f64 / secs
     });
@@ -1317,9 +510,9 @@ fn f8_checksums(args: &Args, profile: Profile) -> std::io::Result<Record> {
     for (ci, want) in on.iter().enumerate() {
         let file = dir.join(format!("r{ci}.dat"));
         {
-            let store = Store::create(
+            let mut w = supdb::next::SegmentWriter::create(
                 &file,
-                Options {
+                &Options {
                     checksums: *want,
                     ..default_opts(128)
                 },
@@ -1327,18 +520,32 @@ fn f8_checksums(args: &Args, profile: Profile) -> std::io::Result<Record> {
             .expect("create");
             let mut vrng = Rng::new(0xF8);
             let mut kb = [0u8; 16];
-            for i in 0..(keys * depth) {
-                db_key_into(i % keys, &mut kb);
-                store.append(&kb, payload.get(&mut vrng)).expect("append");
+            for i in 0..keys {
+                db_key_into(i, &mut kb);
+                w.begin(&kb).expect("begin");
+                for _ in 0..depth {
+                    w.value(payload.get(&mut vrng));
+                }
+                w.end().expect("end");
             }
-            store.close().expect("close");
+            w.finish(1).expect("finish");
         }
         sizes.push(file_len(&file));
         read_samples.push(file);
     }
     let read = Trial::new(profile.reps()).run(2, |ci, _| {
-        // The flag is global, so it is set for the arm being measured.
-        let reader = Reader::open(&read_samples[ci]).expect("open");
+        // Whether this arm verifies is stated per reader rather than left to
+        // the process-wide flag the writer sets, so an interleaved pair
+        // cannot end up measuring whichever arm wrote last.
+        let reader = supdb::Blob::open_with(
+            supdb::MmapBytes::open(&read_samples[ci]).expect("map"),
+            supdb::BlobOptions {
+                verify_checksums: on[ci],
+                verify_index: on[ci],
+                ..Default::default()
+            },
+        )
+        .expect("open");
         let mut g = KeyGen::new(KeyDist::Uniform, keys, 0xF8);
         let mut kb = [0u8; 16];
         let t = Instant::now();
@@ -1435,11 +642,10 @@ fn f49_bulkseal(args: &Args, profile: Profile) -> std::io::Result<Record> {
         .param("reads", J::u(reads))
         .note(
             "two arms interleaved in one process, fresh store per rep, the f42 load shape \
-             (durable per batch, partitioning on). The arms differ only in \
-             NextOptions::bulk_writer and cursor_merge: general writes every piece through \
-             Store::create/append/checkpoint/close and finds merge keys by collect-sort-probe, \
-             bulk writes through SegmentWriter with the same probe merge, bulk-cursors adds \
-             the k-way rank merge (the shipping default). The timed \
+             (durable per batch, partitioning on). Both write every piece through \
+             SegmentWriter and differ only in NextOptions::cursor_merge: probe-merge finds \
+             the keys a merge writes by collect-sort-probe, cursor-merge by a k-way walk of \
+             the inputs' rank order (the shipping default). The timed \
              window is the load PLUS the drain (flush: seal, join, partition), the shape the \
              external suite times, because on the loop alone the seal overlaps the commits \
              and most of its cost is hidden (F42.3). load_s is the loop by itself. Device \
@@ -1451,10 +657,11 @@ fn f49_bulkseal(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let dir = scratch("f49");
     let payload = Payload::new(value_size, 0.5, 0xF49);
-    // general: Store writer, probe merge -- the engine as f44 measured it.
-    // bulk: SegmentWriter, probe merge. bulk-cursors: SegmentWriter and the
-    // k-way rank merge, which is the shipping default.
-    let arm_names = ["general", "bulk", "bulk-cursors"];
+    // Both arms write through SegmentWriter and differ only in how a merge
+    // finds the keys it writes: probe-merge collects, sorts and probes;
+    // cursor-merge walks the inputs' rank order, which is the shipping
+    // default.
+    let arm_names = ["probe-merge", "cursor-merge"];
     // ci, device MB, disk MB, load-only s, commit s, seal s, merge s, reads/s,
     // partitioned segments after the drain, L0 segments after the drain
     type Row = (usize, f64, f64, f64, f64, f64, f64, f64, f64, f64);
@@ -1465,8 +672,7 @@ fn f49_bulkseal(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let d = dir.join(format!("f49-{ci}-{rep}"));
         let _ = std::fs::remove_dir_all(&d);
         let opts = NextOptions {
-            bulk_writer: ci >= 1,
-            cursor_merge: ci == 2,
+            cursor_merge: ci == 1,
             ..Default::default()
         };
         let mut db = Db::create(&d, opts).expect("create");
@@ -1569,100 +775,10 @@ fn f49_bulkseal(args: &Args, profile: Profile) -> std::io::Result<Record> {
         ),
     );
 
-    let ingest = compare(&rates[1], &rates[0], supdb::bench::MIN_EFFECT);
-    rec.compare("bulk_vs_general_ingest", ingest.clone());
-    rec.finding(Finding::new(
-        "F49.1",
-        "the bulk segment writer ingests at least 1.25x the general writer, seal and partitioning inside the window",
-        matches!(ingest.verdict, supdb::bench::Verdict::Greater) && ingest.ratio >= 1.25,
-        format!(
-            "bulk {:.0} ops/s against general {:.0} ({}) on {keys} keys in {batch}-record durable \
-             batches with the drain inside the window. Loop alone: {:.3}s against {:.3}s; commit \
-             phase {:.3}s against {:.3}s, seal {:.3}s against {:.3}s, merge {:.3}s against {:.3}s. \
-             f46 priced the writer's floor at 2.04x the general path on the seal alone (F46.1); \
-             this is the built writer, with the block table, checksums and superblock it \
-             omitted, on the load the engine is judged by",
-            rates[1].median(),
-            rates[0].median(),
-            ingest.summary("bulk", "general"),
-            med(1, |r| r.3),
-            med(0, |r| r.3),
-            med(1, |r| r.4),
-            med(0, |r| r.4),
-            med(1, |r| r.5),
-            med(0, |r| r.5),
-            med(1, |r| r.6),
-            med(0, |r| r.6),
-        ),
-    ));
-
-    let seal_g = Samples::new(col(0, |r| r.5));
-    let seal_b = Samples::new(col(1, |r| r.5));
-    let seal = compare(&seal_g, &seal_b, supdb::bench::MIN_EFFECT);
-    rec.compare("general_vs_bulk_seal_s", seal.clone());
-    rec.finding(Finding::new(
-        "F49.2",
-        "the seal phase is at least 1.8x faster with the bulk writer",
-        matches!(seal.verdict, supdb::bench::Verdict::Greater) && seal.ratio >= 1.8,
-        format!(
-            "seal phase {:.3}s general against {:.3}s bulk ({}), as the engine accounts it. The \
-             memtable sort and the chain walk are the same in both arms; what differs is \
-             Store's hash table, freelist, pending arena and checkpoint against one forward \
-             pass. Merge phase, which writes through the same two writers: {:.3}s against {:.3}s",
-            seal_g.median(),
-            seal_b.median(),
-            seal.summary("general", "bulk"),
-            med(0, |r| r.6),
-            med(1, |r| r.6),
-        ),
-    ));
-
-    let disk_ratio = med(1, |r| r.2) / med(0, |r| r.2);
-    rec.finding(Finding::new(
-        "F49.3",
-        "bulk segments take at most 0.9x the disk of general ones",
-        disk_ratio <= 0.9,
-        format!(
-            "{:.1} MB on disk with the bulk writer against {:.1} with the general one ({:.3}x) \
-             for {:.1} MB of records; device bytes {:.1} against {:.1} MB. A bulk segment has \
-             no freelist rounding, no reuse log, no redo-log arena and no index slack. Space \
-             is immune to drift, so this ratio is a plain median ratio",
-            med(1, |r| r.2),
-            med(0, |r| r.2),
-            disk_ratio,
-            keys as f64 * (value_size as f64 + 16.0) / 1_048_576.0,
-            med(1, |r| r.1),
-            med(0, |r| r.1),
-        ),
-    ));
-
-    let rd_g = Samples::new(col(0, |r| r.7));
-    let rd_b = Samples::new(col(1, |r| r.7));
-    let rd_c = Samples::new(col(2, |r| r.7));
-    let rd = compare(&rd_b, &rd_g, supdb::bench::MIN_EFFECT);
-    rec.compare("bulk_vs_general_reads", rd.clone());
-    rec.finding(Finding::new(
-        "F49.4",
-        "reads over the loaded store do not differ between the writers",
-        matches!(rd.verdict, supdb::bench::Verdict::NoDifference),
-        format!(
-            "{reads} random point reads after the drain: bulk {:.0}/s against general {:.0}/s \
-             ({}). Segments after the drain, partitioned + L0: bulk {:.0}+{:.0} against \
-             general {:.0}+{:.0}. Same format, same Blob, same routing; a difference either \
-             way means the writers lay blocks down differently or the drain leaves a \
-             different layout behind",
-            rd_b.median(),
-            rd_g.median(),
-            rd.summary("bulk", "general"),
-            med(1, |r| r.8),
-            med(1, |r| r.9),
-            med(0, |r| r.8),
-            med(0, |r| r.9),
-        ),
-    ));
-
-    let merge_b = Samples::new(col(1, |r| r.6));
-    let merge_c = Samples::new(col(2, |r| r.6));
+    let rd_b = Samples::new(col(0, |r| r.7));
+    let rd_c = Samples::new(col(1, |r| r.7));
+    let merge_b = Samples::new(col(0, |r| r.6));
+    let merge_c = Samples::new(col(1, |r| r.6));
     let mg = compare(&merge_b, &merge_c, supdb::bench::MIN_EFFECT);
     rec.compare("bulk_vs_cursors_merge_s", mg.clone());
     rec.finding(Finding::new(
@@ -1680,52 +796,48 @@ fn f49_bulkseal(args: &Args, profile: Profile) -> std::io::Result<Record> {
         ),
     ));
 
-    let ing = compare(&rates[2], &rates[1], supdb::bench::MIN_EFFECT);
-    rec.compare("cursors_vs_bulk_ingest", ing.clone());
+    let ing = compare(&rates[1], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("cursors_vs_probes_ingest", ing.clone());
     rec.finding(Finding::new(
         "F49.6",
-        "ingest-to-routed with the cursor merge is at least 1.15x the bulk arm's",
+        "ingest-to-routed with the cursor merge is at least 1.15x the probe arm's",
         matches!(ing.verdict, supdb::bench::Verdict::Greater) && ing.ratio >= 1.15,
         format!(
-            "bulk-cursors {:.0} ops/s against bulk {:.0} ({}); seal {:.3}s against {:.3}s, merge \
-             {:.3}s against {:.3}s, device bytes {:.1} against {:.1} MB, disk {:.1} against \
-             {:.1} MB. Against the general arm's {:.0} ops/s the shipping configuration is \
-             {:.3}x",
-            rates[2].median(),
+            "cursor-merge {:.0} ops/s against probe-merge {:.0} ({}); seal {:.3}s against \
+             {:.3}s, merge {:.3}s against {:.3}s, device bytes {:.1} against {:.1} MB, disk \
+             {:.1} against {:.1} MB",
             rates[1].median(),
-            ing.summary("bulk-cursors", "bulk"),
-            med(2, |r| r.5),
-            med(1, |r| r.5),
-            med(2, |r| r.6),
-            med(1, |r| r.6),
-            med(2, |r| r.1),
-            med(1, |r| r.1),
-            med(2, |r| r.2),
-            med(1, |r| r.2),
             rates[0].median(),
-            rates[2].median() / rates[0].median(),
+            ing.summary("cursor-merge", "probe-merge"),
+            med(1, |r| r.5),
+            med(0, |r| r.5),
+            med(1, |r| r.6),
+            med(0, |r| r.6),
+            med(1, |r| r.1),
+            med(0, |r| r.1),
+            med(1, |r| r.2),
+            med(0, |r| r.2),
         ),
     ));
 
     let rdc = compare(&rd_c, &rd_b, supdb::bench::MIN_EFFECT);
-    rec.compare("cursors_vs_bulk_reads", rdc.clone());
+    rec.compare("cursors_vs_probes_reads", rdc.clone());
     rec.finding(Finding::new(
         "F49.7",
         "reads after the drain do not differ between the probe and cursor merges, same writer",
         matches!(rdc.verdict, supdb::bench::Verdict::NoDifference),
         format!(
-            "bulk-cursors {:.0}/s against bulk {:.0}/s ({}); segments after the drain {:.0}+{:.0} \
-             against {:.0}+{:.0}. Same writer, same blocks; only how the inputs were walked \
-             differs. The control for F49.4: if these tie and the segment counts match, the \
-             read difference against general is the writer's layout or the drain's, not the \
-             merge's",
+            "cursor-merge {:.0}/s against probe-merge {:.0}/s ({}); segments after the drain \
+             {:.0}+{:.0} against {:.0}+{:.0}. Same writer, same blocks; only how the inputs \
+             were walked differs, so a difference here would mean the merge changed what the \
+             segments contain rather than how fast they were built",
             rd_c.median(),
             rd_b.median(),
-            rdc.summary("bulk-cursors", "bulk"),
-            med(2, |r| r.8),
-            med(2, |r| r.9),
+            rdc.summary("cursor-merge", "probe-merge"),
             med(1, |r| r.8),
             med(1, |r| r.9),
+            med(0, |r| r.8),
+            med(0, |r| r.9),
         ),
     ));
 
@@ -2565,7 +1677,7 @@ fn f53_inline(args: &Args, profile: Profile) -> std::io::Result<Record> {
         .param("reads", J::u(reads))
         .note(
             "two arms interleaved in one process, fresh store per rep, one option apart: \
-             inline_bytes 0 (every run in a block, the layout Store writes) against 256 (a run \
+             inline_bytes 0 (every run in a block) against 256 (a run \
              up to 256 bytes lives in its index record and a read of it touches no block). The \
              EXT.23 shape: 1M keys, 100-byte values, durable batches, the drain inside the load \
              window, then point reads, one ordered scan of everything, and a dictionary count \
@@ -4628,11 +3740,11 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
         .param("batch", J::u(batch))
         .param("value_size", J::u(value_size as u64))
         .note(
-            "two arms interleaved in one process, fresh store per rep, the EXT.9 load shape. \
-             next commits by WAL append + fdatasync with seals off the commit path (64MB \
-             memtable); supdb commits by put + checkpoint under the shipped value-carrying \
-             log. Device bytes from /proc/self/io per rep; disk bytes are the store's files \
-             after close",
+            "two arms interleaved in one process, a fresh store per rep, the EXT.9 load \
+             shape. Both commit by WAL append + fdatasync; they differ only in whether a \
+             seal can happen inside the timed window (64MB memtable against one that never \
+             fills). Device bytes from /proc/self/io per rep; disk bytes are the store's \
+             files after close",
         )
         .note(
             "the gate is the brief's registered P-A: >= 600,000 ops/s, past LMDB's recorded \
@@ -4645,7 +3757,7 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // dataset), so next minus next-lazyseal is the cost of sealing on the
     // committing thread -- the milestone-1 shortcut -- and next-lazyseal
     // against f39's raw+index floor is the memtable-and-framing overhead.
-    let arm_names = ["next", "next-lazyseal", "supdb"];
+    let arm_names = ["next", "next-lazyseal"];
     type Row = (usize, f64, f64);
     let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
     // Where a durable load's time actually goes, taken from the engine
@@ -4657,7 +3769,7 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let mut vrng = Rng::new(0xF42 + rep as u64);
         let mut kb = [0u8; 16];
         let io0 = IoCounters::read_now();
-        let (secs, disk_mb) = if ci <= 1 {
+        let (secs, disk_mb) = {
             let d = dir.join(format!("next-{ci}-{rep}"));
             let _ = std::fs::remove_dir_all(&d);
             let opts = if ci == 1 {
@@ -4686,23 +3798,6 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
                 bytes += e.expect("entry").metadata().expect("meta").len();
             }
             let _ = std::fs::remove_dir_all(&d);
-            (secs, bytes as f64 / 1_048_576.0)
-        } else {
-            let file = dir.join(format!("supdb-{rep}.dat"));
-            let _ = std::fs::remove_file(&file);
-            let store = Store::create(&file, default_opts(64)).expect("create");
-            let t = Instant::now();
-            for i in 0..keys {
-                db_key_into(i, &mut kb);
-                store.put(&kb, payload.get(&mut vrng)).expect("put");
-                if (i + 1) % batch == 0 {
-                    store.checkpoint().expect("checkpoint");
-                }
-            }
-            let secs = t.elapsed().as_secs_f64();
-            let _ = store.close();
-            let bytes = std::fs::metadata(&file).expect("meta").len();
-            let _ = std::fs::remove_file(&file);
             (secs, bytes as f64 / 1_048_576.0)
         };
         let io_mb = IoCounters::read_now().since(&io0).write_bytes as f64 / 1_048_576.0;
@@ -4775,24 +3870,6 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let cmp_seal = compare(&rates[1], &rates[0], supdb::bench::MIN_EFFECT);
     rec.compare("lazyseal_vs_next", cmp_seal.clone());
-    let cmp = compare(&rates[0], &rates[2], supdb::bench::MIN_EFFECT);
-    rec.compare("next_vs_supdb", cmp.clone());
-    rec.finding(Finding::new(
-        "F42.2",
-        "the next engine beats today's engine on the axis the redesign exists for",
-        matches!(cmp.verdict, supdb::bench::Verdict::Greater),
-        format!(
-            "next {:.0} ops/s against supdb {:.0} ({}); device bytes {:.1} against {:.1} MB. \
-             F39.3 priced today's engine 5.85x under its own floor on per-point work this \
-             design deletes; this is that deletion, measured",
-            next_tp,
-            rates[2].median(),
-            cmp.summary("next", "supdb"),
-            med(0, |r| r.1),
-            med(2, |r| r.1)
-        ),
-    ));
-
     rec.finding(Finding::new(
         "F42.3",
         "sealing on the committing thread is the larger share of the gap to the floor",
@@ -4865,24 +3942,26 @@ fn f28_count(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let dir = scratch("f28");
     let file = dir.join("count.dat");
-    // Grouped by key, which is how a day index is built -- see w1-daysize
-    // W1.3, where the alternative costs nine times the file.
+    // Grouped by key, which is how a day index is built and the only order
+    // the writer takes. `db_key_into` is a zero-padded decimal, so ascending
+    // `i` is ascending key bytes.
     {
-        let store = Store::create(&file, default_opts(256)).expect("create");
+        let mut w = supdb::next::SegmentWriter::create(&file, &Options::default()).expect("create");
         let mut kb = [0u8; 16];
         for i in 0..keys {
             db_key_into(i, &mut kb);
             // Every sixteenth key is long, so the file carries both the shape
-            // a breakdown panel asks about and the shape it does not.
+            // a breakdown panel asks about and the shape it does not -- and,
+            // since the writer inlines a run under `inline_bytes`, both sides
+            // of that threshold too.
             let n = if i % 16 == 0 { long_run } else { run_len };
+            w.begin(&kb).expect("begin");
             for v in 0..n {
-                store
-                    .append(&kb, &(v as u32).to_le_bytes()[..width])
-                    .expect("append");
+                w.value(&(v as u32).to_le_bytes()[..width]);
             }
+            w.end().expect("end");
         }
-        store.checkpoint().expect("checkpoint");
-        store.close().expect("close");
+        w.finish(1).expect("finish");
     }
 
     let blob = Blob::open(MmapBytes::open(&file).expect("map")).expect("blob open");

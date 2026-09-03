@@ -206,95 +206,6 @@
    "arch": "x86_64"
   },
   {
-   "experiment": "f11-flatindex",
-   "id": "F11.1",
-   "expect": "holds",
-   "because": "The whole point of the format. 5M keys open in 0.29ms against 738ms, 2537x, because a mapped index validates a header instead of decoding every key and hashing the result. This is what moved F2.2 from failing to holding. Pinned to full: the arms only separate at scale -- at 50k keys the open difference is 61x rather than 2537x and the read difference is inside noise. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
-   "profile": "full",
-   "arch": "x86_64"
-  },
-  {
-   "experiment": "f11-flatindex",
-   "id": "F11.2",
-   "expect": "holds",
-   "because": "Decoded 226 B/key resident against a mapped section of 99 B/key at 5M keys (the previous record: 186 against 67). The section is exactly what the flat index's plan says it is: 26.8 B of hash slots (2^24 slots for 5M keys, the power-of-two rounding at its worst), 12 B of directory with `index_inserts` room, 60 B of records under the half-again slack -- 98.8 predicted, 98.9 measured, with format v5's count field 6 B of it. Measured against the section rather than against resident size because a read pass faults in block and cache pages common to both arms and dilutes the difference: on that measure it reads 168 B/key against 226.",
-   "profile": "full",
-   "arch": "x86_64"
-  },
-  {
-   "experiment": "f11-flatindex",
-   "id": "F11.3",
-   "expect": "holds",
-   "because": "Point reads are 1893ns against 2334ns, 1.25x, so the space is not being spent to stand still. Much smaller than the 6.9x the ci profile reported, which was a small-store artifact. Pinned to full: the arms only separate at scale -- at 50k keys the open difference is 61x rather than 2537x and the read difference is inside noise. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
-   "profile": "full",
-   "arch": "x86_64"
-  },
-  {
-   "experiment": "f11-flatindex",
-   "id": "F11.4",
-   "expect": "fails",
-   "because": "The price, and it is accepted deliberately: 394MB becomes 683MB at 5M keys, +73.5%, because a section read in place cannot be compressed. Space is the axis this engine has to spare and open latency is the one it does not. Measured on the minimal file -- one checkpoint -- because the churned file also contains holes left by reclaimed sections, which is a different quantity and was what made the first run of this report +217%. Pinned to full: the arms only separate at scale -- at 50k keys the open difference is 61x rather than 2537x and the read difference is inside noise. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
-   "profile": "full",
-   "arch": "x86_64"
-  },
-  {
-   "experiment": "f11-flatindex",
-   "id": "F11.5",
-   "expect": "holds",
-   "because": "Zero bytes per key of permanent growth per checkpoint, on both arms. It was 9.2 and 66.9 respectively, forever: every checkpoint appended keys, blocks and reuse-log sections and released none of them. A pre-existing leak that the flat format made expensive enough to notice, and the reason this format was not turned on by default until it was fixed. Pinned to full: the arms only separate at scale -- at 50k keys the open difference is 61x rather than 2537x and the read difference is inside noise. Pinned to x86_64: measured on 64-byte lines and 4 KiB pages.",
-   "profile": "full",
-   "arch": "x86_64"
-  },
-  {
-   "experiment": "f14-blocktable",
-   "id": "F14.1",
-   "profile": "full",
-   "expect": "holds",
-   "because": "The mapped block table costs nothing on a scan: 13,717,970 entries/s mapped against 13,748,135 owned, ratio 1.002 at p=0.70. This experiment exists because a scan resolves a block for every entry it walks, and the change that introduced the mapping was measured only on point reads -- one lookup, one resolve. The reasoning was sound and the answer is still no. Recorded so the next person who suspects this structure finds it already asked."
-  },
-  {
-   "experiment": "f14-blocktable",
-   "id": "F14.2",
-   "profile": "full",
-   "expect": "holds",
-   "because": "The mapped block table costs nothing on a point read either: 1,996,309 ops/s against 1,995,093, ratio 0.999 at p=0.90. Kept alongside F14.1 so the two are read together -- the point of the pair is that a structure can be free on one access pattern and not on another, and here it happens to be free on both."
-  },
-  {
-   "experiment": "f18-fence",
-   "id": "F18.1",
-   "profile": "full",
-   "expect": "holds",
-   "because": "Narrowing a seek with the fence is worth 1.066x: 698ns against 744ns, p=0.0073. I predicted eight times that, and said so out loud before measuring. The reasoning was that a seek is twenty probes into a 36MB region and the fence replaces them with fourteen into 300KB. What it misses is that the *upper* levels of a binary search over a static array visit the same few addresses on every search and are therefore already cached -- the fence replaces exactly the probes that were cheap, and the expensive bottom levels remain. Verifying the fence's answer against two records, which is what makes it safe, eats into the rest."
-  },
-  {
-   "experiment": "f18-fence",
-   "id": "F18.2",
-   "profile": "full",
-   "expect": "holds",
-   "because": "On the workload the fence was built for -- 50-entry scans, the shape YCSB-E runs -- it is worth 1.092x: 15,909,949 against 14,570,849 entries/s, p=0.0022 with IQRs of 2.0% and 1.4%. This is the finding that decides whether the fence earns a format version, since a seek that got faster without moving a scan would not. 9% is real, repeated and far less than predicted; it is kept because it is positive and measured, not because it was expected."
-  },
-  {
-   "experiment": "f20-chunkcrc",
-   "id": "F20.1",
-   "profile": "full",
-   "expect": "fails",
-   "because": "Verifying a chunk instead of a block makes no difference to a cold scan that sweeps the store uniformly: 39,663,014 entries/s against 40,341,188, ratio 0.983 at p=0.3067. This is the prediction failing on arithmetic I should have done first. Verifying every chunk of a block *is* verifying the block -- the same bytes hashed -- so chunking cannot save anything on a workload that reaches all of them. It only helps a read that touches part of a block and does not come back. f19-coldscan measured the cold penalty as a CRC over everything the scan reads, and a uniform sweep reads everything."
-  },
-  {
-   "experiment": "f20-chunkcrc",
-   "id": "F20.2",
-   "profile": "full",
-   "expect": "fails",
-   "because": "A uniform cold pass still costs 1.44x its steady state per chunk, against 1.47x per block, because on that workload the two hash the same bytes. F19.2 measured 1.65x for whole blocks and this does not close it. What closes it for a uniform sweep is not a smaller verification unit -- there isn't one -- it is verifying less often or not at all, which is what ReadOptions::verify_checksums is for."
-  },
-  {
-   "experiment": "f20-chunkcrc",
-   "id": "F20.3",
-   "profile": "full",
-   "expect": "holds",
-   "because": "On a skewed scan workload -- Zipfian keys, which is what YCSB runs and what real access looks like -- chunk verification is worth 1.162x: 55,285,646 entries/s against 47,589,779, p=0.0022. This is the regime where a scan touches part of a block and moves on, so hashing 4KiB instead of 64KiB is a real saving. It took two attempts. The first measured 0.908x -- chunking made it *slower* -- because whole-block verification is checked once per block-resolve and amortised over the ~600 entries in it, while per-chunk was checked per extent: the same trick f15-scancache needed, and holding the last verified chunk across entries is what turned a 0.908x loss into a 1.162x win. YCSB-E moved from 0.48x of LMDB to 0.57x."
-  },
-  {
    "experiment": "w1-daysize",
    "id": "W1.1",
    "expect": "holds",
@@ -413,13 +324,6 @@
    "profile": "full",
    "expect": "holds",
    "because": "The promise registered before the engine existed, kept and then improved on: 955,714 ops/s durably at batch 1000 against a registered bar of 600,000, past LMDB's recorded 572,416 (context). The arc, each step named by a decomposition before it was built: 287,763 at milestone 1, 418,239 once the memtable stopped allocating per key, 800,526 once the seal left the committing thread, and 955,714 now. Phase accounting says where the remaining time goes: 0.56s of a 1.05s window is the WAL append and its fdatasync -- the only work a batch waits for -- and the seal and merge land outside it. Device bytes travel with it per rule 4: 472.7 MB for 110.6 MB of records against today's engine at 890.9."
-  },
-  {
-   "experiment": "f42-next",
-   "id": "F42.2",
-   "profile": "full",
-   "expect": "holds",
-   "because": "The new design beats the tuned current engine 3.423x on durable load (955,714 against 279,167, p=0.0022) while sending 1.9x fewer bytes to the device. This read 1.156x at milestone 1 and 1.712x after the arena memtable; the multiple grows as the design sheds the per-point work F39.3 priced."
   },
   {
    "experiment": "f42-next",
@@ -574,34 +478,6 @@
    "profile": "full",
    "expect": "holds",
    "because": "P48.3 held, and it is the contract that makes F48.1 sellable: 23 commits under EveryN(16), the WAL torn inside the unsynced tail, reopened -- every record behind the last barrier present, the torn frame served zero values, nothing duplicated. Bounded loss means the tail is lost whole and never in part, and it is measured beside the speed rather than assumed."
-  },
-  {
-   "experiment": "f49-bulkseal",
-   "id": "F49.1",
-   "profile": "full",
-   "expect": "holds",
-   "because": "P49.1 held in three consecutive full runs: bulk against general ingest-to-routed 1.476x, 1.419x and 1.282x (p=0.0022 each), the third on a host state where the general arm itself ran 15% slower than in the first -- report the range, 1.28-1.48x, and read the ratio rather than the absolutes. Run 3: bulk 259,014 ops/s against general 201,976 on 1M keys in 1,000-record durable batches with the drain inside the window. The loop alone never moved in the writer's favour (run 3: 1.777s against 1.623s, commit phase 1.047s against 0.917s) -- the commit path never touches the writer, and the direction is consistent with a seal that now finishes while commits are still running and contends with their fdatasyncs, which is not decomposed here. What moved is the drain: seal 1.346s to 0.539s and merge 1.960s to 1.606s in run 3. f46 put this writer's floor at 2.04x on the seal alone (F46.1) and it was declined under a 3x bar; under a priority that spends complexity for time it was built, and with the cursor merge behind it (F49.6) the shipping configuration ingests 1.416x the general path in the same run."
-  },
-  {
-   "experiment": "f49-bulkseal",
-   "id": "F49.2",
-   "profile": "full",
-   "expect": "holds",
-   "because": "P49.2 held past its bar in all three runs: the seal phase is 3.236x, 3.065x and 2.501x faster with the bulk writer (run 3: 1.342s against 0.537s, p=0.0009), where f46's floor said 2.04x. The floor measured a seal alone; a seal through Store also pays a checkpoint that publishes an index for a million keys, which F31.1 had at 44% of a bulk load, and the bulk writer builds that index once from an already-sorted list. Merge outputs go through the same two writers and the merge phase moved 1.960s to 1.606s with the probe merge still finding the keys; F49.5 has what the cursor merge took off the rest."
-  },
-  {
-   "experiment": "f49-bulkseal",
-   "id": "F49.3",
-   "profile": "full",
-   "expect": "fails",
-   "because": "P49.3 refuted, identically in three runs because bytes do not drift: 180.2 MB on disk with the bulk writer against 190.6 with the general one, 0.945x, over the 0.9x registered. The general path's slack on this shape was smaller than assumed -- with 64 KiB blocks the freelist rounding is small, the 4 MB redo-log arena is dropped at close, and the key sections are the same encode() output -- so the writer removes about 10 MB, and the rest of the 180 MB is 110.6 MB of records, roughly 57 MB of key index and the block tables and count files, none of which is the writer's to shrink. Device bytes went the other way, 491.0 against 472.7 MB (1.04x), and are recorded rather than explained."
-  },
-  {
-   "experiment": "f49-bulkseal",
-   "id": "F49.4",
-   "profile": "full",
-   "expect": "fails",
-   "because": "P49.4 refuted, in the writer's favour, three times: reads over bulk segments run 1.109x, 1.090x and 1.131x faster than over general ones (run 3: 1,234,347/s against 1,090,971, p=0.0054), where 'no difference' was registered. Both arms drain to the same layout -- three partitions and no level-0 segment, recorded per rep from run 2 on -- so it is not routing; and F49.7's control, probe against cursor merge on the same writer, ties at 0.987x, so it is not the merge. What is left is what the writers lay down: the bulk writer packs each block in one pass in key order and places the block table and key section contiguously after the data, where Store seals out of a pending arena and places its sections through the freelist. Which of those the extra tenth comes from is not isolated. Recorded failing so the assumption that the writers are read-equivalent cannot stand, not as a read win."
   },
   {
    "experiment": "f49-bulkseal",

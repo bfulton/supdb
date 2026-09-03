@@ -143,12 +143,6 @@ pub struct NextOptions {
     /// is keeping up with ingest and reads later wants it off, and the
     /// background compaction will get there on its own schedule.
     pub partition_on_flush: bool,
-    /// Write segments with `SegmentWriter` (the default) or through the
-    /// general `Store` path it replaced. The general path is kept as the
-    /// comparison arm because the rule for pricing an engine change is both
-    /// arms interleaved in one process -- f49 does that -- and a number
-    /// against an old run would mostly have been the machine.
-    pub bulk_writer: bool,
     /// Find the keys a merge writes by a k-way walk of the inputs' rank
     /// order (the default) rather than by collecting, sorting and probing
     /// them. The probe path is kept as f49's comparison arm.
@@ -220,7 +214,6 @@ impl Default for NextOptions {
             l0_trigger: 4,
             compact: true,
             partition_on_flush: true,
-            bulk_writer: true,
             cursor_merge: true,
             background_io: BackgroundIo::Normal,
             seal_sync_every: 0,
@@ -1439,91 +1432,43 @@ impl SegmentWriter {
     }
 }
 
-/// The two ways a piece gets written. `Bulk` is the shipping path; `General`
-/// is the `Store` path it replaced, kept behind `NextOptions::bulk_writer` as
-/// the comparison arm f49 interleaves against it. Both see the same calls in
-/// the same order, so the only thing that differs is the writer.
-enum PieceWriter {
-    Bulk(Box<SegmentWriter>),
-    General {
-        store: Box<crate::Store>,
-        key: Vec<u8>,
-        failed: Option<std::io::Error>,
-    },
-}
+/// How a piece gets written.
+///
+/// This was an enum: `SegmentWriter`, or the general `Store` path it
+/// replaced, kept behind an option so f49 could interleave
+/// the two in one process and price the change honestly. That comparison is
+/// settled and the old path is gone, so what is left is a thin shim that
+/// keeps `flush` and `merge` reading as a sequence of begin/value/end calls.
+struct PieceWriter(Box<SegmentWriter>);
 
 impl PieceWriter {
     fn create(
         path: &Path,
         opts: &Options,
-        bulk: bool,
         sync_every: usize,
         inline_max: usize,
     ) -> Result<PieceWriter> {
-        if bulk {
-            let mut w = SegmentWriter::create(path, opts)?;
-            w.set_sync_every(sync_every);
-            w.set_inline_max(inline_max);
-            Ok(PieceWriter::Bulk(Box::new(w)))
-        } else {
-            Ok(PieceWriter::General {
-                store: Box::new(crate::Store::create(path, opts.clone())?),
-                key: Vec::new(),
-                failed: None,
-            })
-        }
+        let mut w = SegmentWriter::create(path, opts)?;
+        w.set_sync_every(sync_every);
+        w.set_inline_max(inline_max);
+        Ok(PieceWriter(Box::new(w)))
     }
 
     fn begin(&mut self, k: &[u8]) -> Result<()> {
-        match self {
-            PieceWriter::Bulk(w) => w.begin(k),
-            PieceWriter::General { key, .. } => {
-                key.clear();
-                key.extend_from_slice(k);
-                Ok(())
-            }
-        }
+        self.0.begin(k)
     }
 
-    /// Infallible at the call so it can sit inside a read callback; the
-    /// general path parks a failure and `end` reports it.
+    /// Infallible at the call so it can sit inside a read callback.
     fn value(&mut self, v: &[u8]) {
-        match self {
-            PieceWriter::Bulk(w) => w.value(v),
-            PieceWriter::General { store, key, failed } => {
-                if failed.is_none() {
-                    if let Err(e) = store.append(key, v) {
-                        *failed = Some(e);
-                    }
-                }
-            }
-        }
+        self.0.value(v)
     }
 
     fn end_with(&mut self, tombstone: bool) -> Result<()> {
-        match self {
-            PieceWriter::Bulk(w) => w.end_with(tombstone),
-            PieceWriter::General { failed, .. } => {
-                if tombstone {
-                    return Err(err("the general writer cannot express a delete"));
-                }
-                match failed.take() {
-                    Some(e) => Err(e),
-                    None => Ok(()),
-                }
-            }
-        }
+        self.0.end_with(tombstone)
     }
 
     fn finish(self) -> Result<()> {
-        match self {
-            PieceWriter::Bulk(w) => (*w).finish(1),
-            PieceWriter::General { store, .. } => {
-                store.checkpoint()?;
-                store.close()?;
-                Ok(())
-            }
-        }
+        (*self.0).finish(1)
     }
 }
 
@@ -2007,7 +1952,6 @@ struct MergePlan {
     fences: Option<Vec<Fence>>,
     max_keys: usize,
     opts: Options,
-    bulk: bool,
     cursors: bool,
     background_io: BackgroundIo,
     sync_every: usize,
@@ -2135,7 +2079,6 @@ struct Piece {
 struct Emitter<'a> {
     dir: &'a Path,
     opts: &'a Options,
-    bulk: bool,
     sync_every: usize,
     inline_max: usize,
     pieces: Vec<Piece>,
@@ -2171,7 +2114,7 @@ impl Emitter<'_> {
         if self.r == from {
             let _ = std::fs::remove_file(&tmp);
             self.w = Some(
-                PieceWriter::create(&tmp, self.opts, self.bulk, self.sync_every, self.inline_max)
+                PieceWriter::create(&tmp, self.opts, self.sync_every, self.inline_max)
                     .map_err(|e| err(&format!("compact create: {e}")))?,
             );
         }
@@ -2231,7 +2174,6 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         fences,
         max_keys,
         opts,
-        bulk,
         cursors,
         background_io,
         sync_every,
@@ -2392,7 +2334,6 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     let mut em = Emitter {
         dir: &dir,
         opts: &opts,
-        bulk,
         sync_every,
         inline_max,
         pieces,
@@ -2999,7 +2940,6 @@ impl Db {
         self.next_seg += fences.len().max(1) as u64;
         let dir = self.dir.clone();
         let opts = Db::segment_opts(&self.opts);
-        let bulk = self.opts.bulk_writer;
         let background_io = self.opts.background_io;
         let sync_every = self.opts.seal_sync_every;
         let inline_max = self.opts.inline_bytes;
@@ -3046,7 +2986,7 @@ impl Db {
                 let tmp = dir.join(format!("seal-{id:08}.tmp"));
                 let _ = std::fs::remove_file(&tmp);
                 {
-                    let mut w = PieceWriter::create(&tmp, &opts, bulk, sync_every, inline_max)
+                    let mut w = PieceWriter::create(&tmp, &opts, sync_every, inline_max)
                         .map_err(|e| err(&format!("seal create: {e}")))?;
                     for e in &order[start..at] {
                         let key = MemTable::key_of(&mem.keys, e);
@@ -3607,7 +3547,6 @@ impl Db {
         self.next_seg += (parts * 4).max(8) as u64;
         let dir = self.dir.clone();
         let opts = Db::segment_opts(&self.opts);
-        let bulk = self.opts.bulk_writer;
         let cursors = self.opts.cursor_merge;
         let background_io = self.opts.background_io;
         let sync_every = self.opts.seal_sync_every;
@@ -3623,7 +3562,6 @@ impl Db {
                 fences,
                 max_keys,
                 opts,
-                bulk,
                 cursors,
                 background_io,
                 sync_every,

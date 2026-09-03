@@ -266,18 +266,16 @@ fn reopen_after_seal_serves_both_old_and_new_writes() {
     );
 }
 
-fn oracle(bulk: bool, cursors: bool) {
-    // The c2-oracle discipline at milestone-1 scale: random appends,
-    // commits, seals, and crash-reopens, checked against a HashMap after
-    // every reopen. Uncommitted writes are trimmed from the model at a
-    // crash, which is the durability contract.
+fn oracle(cursors: bool) {
+    // The differential model oracle: random appends, commits, seals, and
+    // crash-reopens, checked against a HashMap after every reopen.
+    // Uncommitted writes are trimmed from the model at a crash, which is the
+    // durability contract.
     let d = dir(&format!(
-        "oracle-{}-{}",
-        if bulk { "bulk" } else { "general" },
+        "oracle-{}",
         if cursors { "cursors" } else { "probes" }
     ));
     let opts = NextOptions {
-        bulk_writer: bulk,
         cursor_merge: cursors,
         ..NextOptions::default()
     };
@@ -293,9 +291,8 @@ fn oracle(bulk: bool, cursors: bool) {
     };
     for step in 0..2_000u32 {
         let key = format!("k{}", rng() % 97).into_bytes();
-        // One op in twenty is a delete, on the bulk writer only: the general
-        // writer is a measurement arm and cannot express one.
-        if bulk && rng() % 20 == 0 {
+        // One op in twenty is a delete.
+        if rng() % 20 == 0 {
             db.delete(&key);
             uncommitted.push((key, None));
         } else {
@@ -367,20 +364,14 @@ fn apply(model: &mut HashMap<Vec<u8>, Vec<Vec<u8>>>, batch: &mut Vec<(Vec<u8>, O
 
 #[test]
 fn model_oracle_over_random_ops_and_crashes() {
-    oracle(true, true)
+    oracle(true)
 }
 
-/// The general `Store` writer stays behind `bulk_writer` and the probe merge
-/// behind `cursor_merge`, as f49's comparison arms -- and a path only one arm
-/// exercises is a path nothing tests.
-#[test]
-fn the_general_writer_arm_passes_the_same_oracle() {
-    oracle(false, true)
-}
-
+/// The probe merge stays behind `cursor_merge` as f49's comparison arm -- and
+/// a path only one arm exercises is a path nothing tests.
 #[test]
 fn the_probe_merge_arm_passes_the_same_oracle() {
-    oracle(true, false)
+    oracle(false)
 }
 
 fn small_opts(l0_trigger: usize) -> NextOptions {
