@@ -182,6 +182,16 @@ A 45-point spread on code nothing here changed. The engine's own arms --
 0.764, 0.779, 0.920 -- sit inside it, so the run says nothing about the load
 axis either way.
 
+The captured environment rules out the easy explanation. Both runs report the
+same CPU model, the same four cores, the same 16,075 MB, the same page size
+and the same THP setting; the only field that differs is the kernel build
+(`6.18.44-fc-v22` against `-v24`). So this is not a smaller box -- it is
+another instance of the same nominal one, and instance-level variation alone
+moved an untouched arm by 48%. That is the argument for taking a whole
+campaign on one instance and comparing within it, rather than against a
+number carried over from a previous session. Rule 4's environment capture is
+what makes the distinction available at all.
+
 `verify` did flag one flip: `EXT.24` recorded `holds` against an expected
 `fails`, the ordered scan reading 1.269x of LMDB where the canonical run has
 0.899x. That is the comparator and not the engine: LMDB's scan fell from
