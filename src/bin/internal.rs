@@ -2918,8 +2918,10 @@ fn f24_autoreadahead(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let mut crossover: Option<f64> = None;
     // Every pass in this sweep is meant to be a cold read; if the page cache
     // could not be dropped, none of them was and the sweep has measured
-    // nothing about readahead.
+    // nothing about readahead. The cap is the other precondition: without a
+    // cgroup to cap, every ratio is skipped and the sweep is empty.
     let mut cold = true;
+    let mut swept = 0usize;
 
     // As f23: the sweep's caps are lifted when this function returns.
     let _cap = supdb::bench::env::cap_guard();
@@ -2963,6 +2965,7 @@ fn f24_autoreadahead(args: &Args, profile: Profile) -> std::io::Result<Record> {
             reads as f64 / (w.wall_ns as f64 / 1e9)
         });
         cold &= cold_ok.load(std::sync::atomic::Ordering::Relaxed);
+        swept += 1;
 
         let (auto, deflt, rand) = (arms[0].median(), arms[1].median(), arms[2].median());
         let best = deflt.max(rand);
@@ -3008,17 +3011,24 @@ fn f24_autoreadahead(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     // Every arm of this sweep is a cold read, so without drop_caches the
     // experiment measures nothing about readahead (rule 3).
-    if !cold {
+    if !cold || swept == 0 {
+        // An empty sweep is not a result about readahead: with no ratio
+        // measured, `worst` is still infinity and `crossover` still None, and
+        // reporting either as a finding would be the rig describing itself.
+        let why = if swept == 0 {
+            "no ratio could be swept: capping memory needs a v1 cgroup controller this host              does not have, so the sweep measured nothing"
+        } else {
+            "drop_caches failed (it needs root), so no pass in this sweep was cold and the              advices had nothing to differ about"
+        };
         rec.finding(Finding::not_exercised(
             "F24.1",
             "Auto picks the faster advice wherever the two differ",
-            "drop_caches failed (it needs root), so no pass in this sweep was cold and the \
-             advices had nothing to differ about",
+            why,
         ));
         rec.finding(Finding::not_exercised(
             "F24.2",
             "readahead stops paying somewhere below a file-to-memory ratio of 1",
-            "drop_caches failed (it needs root), so no pass in this sweep was cold",
+            why,
         ));
         let _ = std::fs::remove_file(&file);
         return Ok(rec);
@@ -8636,27 +8646,23 @@ fn f45_scanfloor(args: &Args, profile: Profile) -> std::io::Result<Record> {
                 }
                 1 => {
                     // What the index alone costs: a key per rank, no value.
-                    let mut rank = blob.seek(&kb);
-                    for _ in 0..scan_len {
+                    for rank in (blob.seek(&kb)..).take(scan_len) {
                         match blob.key_at(rank) {
                             Some(k) => sink += k.len() as u64,
                             None => break,
                         }
-                        rank += 1;
                         done += 1;
                     }
                 }
                 2 => {
                     // Resolution plus the block read, no key returned.
-                    let mut rank = blob.seek(&kb);
-                    for _ in 0..scan_len {
+                    for rank in (blob.seek(&kb)..).take(scan_len) {
                         let n = blob
                             .values_at(rank, |v| sink += v.len() as u64)
                             .expect("values_at");
                         if n == 0 {
                             break;
                         }
-                        rank += 1;
                         done += 1;
                     }
                 }

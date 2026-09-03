@@ -2567,8 +2567,8 @@ fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
         .expect("read_all");
         let mut s2 = 0u64;
         ldb.read_postings(key, |page| {
-            for c in page.chunks_exact(WIDTH) {
-                s2 += u32::from_be_bytes(c.try_into().expect("stride")) as u64;
+            for c in page.as_chunks::<WIDTH>().0 {
+                s2 += u32::from_be_bytes(*c) as u64;
             }
         })
         .expect("read_postings");
@@ -2684,11 +2684,8 @@ fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
                         _ => {
                             let bytes = ldb
                                 .read_postings(k, |page| {
-                                    for c in page.chunks_exact(WIDTH) {
-                                        sum = sum.wrapping_add(u32::from_be_bytes(
-                                            c.try_into().expect("stride"),
-                                        )
-                                            as u64);
+                                    for c in page.as_chunks::<WIDTH>().0 {
+                                        sum = sum.wrapping_add(u32::from_be_bytes(*c) as u64);
                                     }
                                 })
                                 .expect("read_postings");
