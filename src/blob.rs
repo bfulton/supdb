@@ -248,13 +248,13 @@ pub fn decode_super_ext(page: &[u8], generation: u64) -> Option<SuperExt> {
 // it is -- which is every build that could have changed it.
 #[cfg(not(target_family = "wasm"))]
 const _: () = {
-    assert!(MAGIC == crate::store::MAGIC, "superblock magic drifted");
+    assert!(MAGIC == crate::format::MAGIC, "superblock magic drifted");
     assert!(
-        SB_BYTES == crate::store::SUPER_BYTES,
+        SB_BYTES == crate::format::SUPER_BYTES,
         "the superblock changed size and blob.rs still slices the old one"
     );
-    assert!(SUPER == crate::store::SUPER);
-    assert!(SLOT == crate::store::SLOT);
+    assert!(SUPER == crate::format::SUPER);
+    assert!(SLOT == crate::format::SLOT);
     // The fields, then the magic, then the checksum.
     assert!(SB_BYTES == SB_FIELDS * 8 + 16, "field count disagrees");
 };

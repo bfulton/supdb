@@ -815,14 +815,14 @@ enum Layout {
 /// One superblock slot, field for field what `store::Super::encode` writes:
 /// sixteen little-endian u64 fields, the magic in native order as the
 /// byte-order mark, and the FNV-1a of the fields and the magic.
-fn superblock(fields: &[u64; 16]) -> [u8; crate::store::SUPER_BYTES] {
-    let mut out = [0u8; crate::store::SUPER_BYTES];
+fn superblock(fields: &[u64; 16]) -> [u8; crate::format::SUPER_BYTES] {
+    let mut out = [0u8; crate::format::SUPER_BYTES];
     for (i, v) in fields.iter().enumerate() {
         out[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
     }
-    out[128..136].copy_from_slice(&crate::store::MAGIC.to_ne_bytes());
+    out[128..136].copy_from_slice(&crate::format::MAGIC.to_ne_bytes());
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for v in fields.iter().chain(std::iter::once(&crate::store::MAGIC)) {
+    for v in fields.iter().chain(std::iter::once(&crate::format::MAGIC)) {
         for b in v.to_le_bytes() {
             h ^= b as u64;
             h = h.wrapping_mul(0x1000_0000_01b3);
@@ -853,11 +853,11 @@ impl SegmentWriter {
         // The header region stays zero until `finish`, so a segment that
         // was never finished is a file no reader accepts rather than a
         // segment with some of its keys.
-        out.write_all(&[0u8; crate::store::SUPER as usize])?;
+        out.write_all(&[0u8; crate::format::SUPER as usize])?;
         let block_size = opts.block_size.max(1);
         Ok(SegmentWriter {
             out,
-            pos: crate::store::SUPER,
+            pos: crate::format::SUPER,
             builder: BlockBuilder::new(block_size),
             block_size,
             blocks: Vec::new(),
@@ -923,7 +923,7 @@ impl SegmentWriter {
     /// Where the key section starts: after the superblock page and the
     /// head reserve, if any.
     fn key_start(&self) -> u64 {
-        crate::store::SUPER
+        crate::format::SUPER
             + if self.reserve_off != 0 {
                 self.head_reserve as u64
             } else {
@@ -1427,9 +1427,9 @@ impl SegmentWriter {
             generation,
         ];
         let sb = superblock(&fields);
-        let mut page = vec![0u8; crate::store::SUPER as usize];
+        let mut page = vec![0u8; crate::format::SUPER as usize];
         page[..sb.len()].copy_from_slice(&sb);
-        page[crate::store::SLOT as usize..crate::store::SLOT as usize + sb.len()]
+        page[crate::format::SLOT as usize..crate::format::SLOT as usize + sb.len()]
             .copy_from_slice(&sb);
         let x = crate::blob::encode_super_ext(&ext, generation);
         page[1024..1024 + x.len()].copy_from_slice(&x);

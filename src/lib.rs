@@ -49,6 +49,11 @@ pub mod bench;
 // reader can compare what was measured against what was described. Style lints
 // are scoped off here rather than fixed in place; the harness code above and
 // in src/bin holds to -D warnings.
+/// The on-disk format's fixed quantities: the superblock magic and geometry.
+/// Not owned by any writer -- two of them exist and three readers parse what
+/// either produced.
+mod format;
+
 #[allow(clippy::all, dead_code)]
 mod block;
 #[allow(clippy::all, dead_code)]

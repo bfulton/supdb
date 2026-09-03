@@ -3,6 +3,7 @@ use crate::flatindex::{self, FlatIndex};
 use crate::freelist::{capacity_for, FreeList};
 use crate::index::{get_uvarint, put_uvarint, Ext, Extents};
 use crate::keytable::KeyTable;
+use crate::format::{MAGIC, SLOT, SUPER, SUPER_BYTES};
 use crate::readers;
 
 use memmap2::{Mmap, MmapMut};
@@ -15,7 +16,7 @@ use std::sync::{Arc, Mutex};
 /// Bumped 0003 -> 0004 when redo-log frames grew a kind byte (sealed extents
 /// vs inline values). A 0003 store's log would misparse under this decoder,
 /// so the magic refuses it instead; sections and superblock are unchanged.
-pub(crate) const MAGIC: u64 = 0x5355_5044_4200_0006;
+
 
 /// Two superblock slots live in the first sector-pair of the file, and a
 /// checkpoint alternates between them.
@@ -26,14 +27,14 @@ pub(crate) const MAGIC: u64 = 0x5355_5044_4200_0006;
 /// that matters -- a torn write can damage at most the slot being written,
 /// and the other still describes a complete, older state. Recovery picks the
 /// valid slot with the higher generation.
-pub(crate) const SUPER: u64 = 4096;
-pub(crate) const SLOT: u64 = 512;
+
+
 /// Encoded size of a superblock: the fields, then the magic, then the
 /// checksum. Named because eight call sites used to slice the literal, and
 /// adding two fields to `Super` left every one of them reading a prefix that
 /// no longer contained the checksum -- a format change that presented itself
 /// as "no valid supdb checkpoint" on a healthy file.
-pub(crate) const SUPER_BYTES: usize = 144;
+
 
 #[derive(Clone, Copy, Default, Debug)]
 struct Super {
@@ -4279,12 +4280,6 @@ pub fn take_phases() -> Phases {
     }
 }
 
-/// Sub-phases of `flatindex::encode`, printed under the same env var.
-pub(crate) fn enc_phase(what: &str, t: std::time::Instant) {
-    if std::env::var_os("SUPDB_CKPT_PHASES").is_some() {
-        eprintln!("      enc:{what} {:.4}s", t.elapsed().as_secs_f64());
-    }
-}
 
 #[inline]
 fn ckpt_phase(what: &str, t: std::time::Instant, extra: Option<usize>) {

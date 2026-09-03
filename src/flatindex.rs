@@ -896,7 +896,7 @@ pub fn encode_inline(
 
     // `store` is cfg'd off the wasm build; the timing hook goes with it.
     #[cfg(not(target_family = "wasm"))]
-    crate::store::enc_phase("recs", _t_enc);
+    crate::format::enc_phase("recs", _t_enc);
     let _t_enc = std::time::Instant::now();
     // The fence: every stride-th key copied out, with one more offset than
     // entries so an entry's key is the span to the next.
@@ -915,7 +915,7 @@ pub fn encode_inline(
 
     // `store` is cfg'd off the wasm build; the timing hook goes with it.
     #[cfg(not(target_family = "wasm"))]
-    crate::store::enc_phase("fence", _t_enc);
+    crate::format::enc_phase("fence", _t_enc);
     let _t_enc = std::time::Instant::now();
     let mask = p.hash_cap - 1;
     // The hash is two thirds of the encode: the probe writes land at random
