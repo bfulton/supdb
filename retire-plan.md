@@ -119,6 +119,11 @@ Done, each green and pushed:
    it was always `Blob` against LMDB's DUPFIXED with only the file under it
    written by the old engine.
 
+5. The thirty-two `Store`-machinery experiments are gone from the internal
+   suite, with their claims, metrics, recorded results and figures. What is
+   left in `internal.rs` is the seven shared-format experiments and the next
+   engine's own.
+
 Prediction 1 held: the extraction moved no recorded number. Prediction 3 held
 so far: no next-engine result moved.
 
@@ -127,19 +132,20 @@ so far: no next-engine result moved.
 The internal suite's thirty-nine `Store` experiments split two ways, and the
 split is the last real decision:
 
-- **Retire** (Store's own machinery, not re-pointable, thirty-three of them):
-  f2-open, f3-multiproc, f4-durability, f5-latency, f6-threads, f7-index,
-  f12-compress, f13-sync, f15-scancache, f16-slack, f17-gather, f19-coldscan,
-  f21-writerverify, f22-storescan, f23-madvise, f24-autoreadahead, f25-arena,
-  f26-buffer, f27-ckptshape, f29-redolog, f30-insertindex, f31-loadphases,
-  f33-indexsize, f34-parallelindex, f35-indexauto, f36-commit,
-  f37-consolidate, f38-fanout, f39-walfloor, f40-filter, f41-segroute,
-  f46-segwrite, and c1-c3 in the correctness suite.
+- **Retire** -- done for the thirty-two in `internal.rs`. Still to go:
+  `c2-oracle` and `c3-crash` in the correctness suite, which are the model
+  oracle and crash injection for the old engine (`c4-crash` is the next
+  engine's). Retiring `c2-oracle` leaves the next engine without a
+  differential model oracle, which is a real gap and should be written down
+  rather than discovered later.
 - **Re-point and re-measure** (the shared format and read path, still live
   code): f1-outofcore, f8-checksums, f11-flatindex, f14-blocktable, f18-fence,
-  f20-chunkcrc, f28-count. These are findings about code that ships; they were
-  merely measured through the old engine's writer. Each needs a `full` run,
-  which is the hours in this plan.
+  f20-chunkcrc, f28-count, and `c1-decoders` in the correctness suite. These
+  are findings about code that ships; they were merely measured through the
+  old engine's writer. Each needs a `full` run, which is the hours in this
+  plan. `c1-decoders` also needs `Blob::block_extents` -- it aims damage at
+  bytes that actually carry payload, and only the old reader can currently
+  say where those are.
 
 Then: delete `store.rs`, `readers.rs`, `freelist.rs`, `keytable.rs`,
 `tests/known_bugs.rs`, `tests/valuelog.rs`, `tests/consolidate.rs`, the `soak`,
