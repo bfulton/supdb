@@ -9,7 +9,7 @@ default-members = [".", "bench/external"]
 
 [package]
 name = "supdb"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 
 # A wasm build gets the reader and nothing else. `cdylib` is what the browser
