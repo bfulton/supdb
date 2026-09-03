@@ -51,18 +51,6 @@ strip = true
 debug = false
 
 [[bin]]
-name = "supbench"
-path = "src/bin/supbench.rs"
-
-[[bin]]
-name = "recover"
-path = "src/bin/recover.rs"
-
-[[bin]]
-name = "soak"
-path = "src/bin/soak.rs"
-
-[[bin]]
 name = "internal"
 path = "src/bin/internal.rs"
 
