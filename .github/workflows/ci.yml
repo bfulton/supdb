@@ -19,15 +19,31 @@ env:
 
 jobs:
   test:
-    # Both architectures. ARM is not here for speed -- these runners are
-    # virtualised and their timings mean nothing -- but for correctness: the
-    # reader table is hand-rolled lock-free code, and x86's total store order
-    # gives correct-looking behaviour for orderings that ARM's weaker model
-    # does not.
+    # Three platforms, none of them here for speed -- these runners are
+    # virtualised and their timings mean nothing.
+    #
+    # ARM is here for correctness: the reader table is hand-rolled lock-free
+    # code, and x86's total store order gives correct-looking behaviour for
+    # orderings that ARM's weaker model does not.
+    #
+    # macOS is here because the tree carries a body of `cfg(target_os =
+    # "macos")` code -- the environment capture's whole non-Linux half, and
+    # the `cfg(target_os = "linux")` guard on the I/O priority path -- that
+    # nothing else compiles. It was written for the Apple Silicon campaigns
+    # and was only ever built when a person ran one by hand, which is the
+    # shape this project keeps finding: a path only one arm exercises is a
+    # path nothing tests. macos-latest is arm64, and a public repository
+    # pays nothing for it.
+    #
+    # It gates building, testing and linting, not measuring. A timing
+    # benchmark cannot gate a pull request: two runs on instances of the
+    # same nominal machine have moved untouched comparator arms by half.
+    # The Apple Silicon numbers are taken deliberately, per campaign, on a
+    # real machine.
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
