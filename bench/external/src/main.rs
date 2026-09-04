@@ -1018,7 +1018,23 @@ fn suite_readdecomp(
     let base_value = args.num("--value-size", 100);
     let reads = args.num("--reads", profile.pick(2_000, 100_000, 500_000)) as u64;
     let batch = args.num("--batch", 1_000).max(1);
-    let reps = args.num("--reps", profile.reps());
+    // Twenty-one at `full`. Seven cannot resolve the depth arm: across six runs
+    // EXT.19 came back holds four times and fails twice on identical code,
+    // because it compares the lead at the top of the key axis against the lead
+    // at the bottom and the 100k cell is the noisiest thing in the record --
+    // 1.62x to 2.54x across those runs against 1.87x to 2.22x at 4M. A finding
+    // whose direction is decided by its noisiest cell adjudicates the host, and
+    // this one names opposite mechanisms in its plan (P1 depth against P2
+    // per-access), so a coin flip there misinforms rather than merely failing to
+    // inform. Twenty-one narrows it without settling it: of four runs at that
+    // count three read greater at p=0.0000 (1.134x, 1.253x and one more) and
+    // one read NO DIFFERENCE at ratio 1.046. Ten runs across both counts stand
+    // at seven greater to three flat, and no run has ever read less -- so the
+    // lead does not shrink with n, and whether it provably grows is a question
+    // this host answers most of the time and not all of it. The claim records
+    // what the committed run measured; the instability is the reason this
+    // comment exists rather than a footnote in a plan.
+    let reps = args.num("--reps", profile.pick(5, 5, 21));
     // The anchor: the key count the hot and value axes pivot on. The middle
     // of the list, which at the defaults is 1M -- the read ordering's own shape.
     let anchor = keys_list[keys_list.len() / 2];

@@ -3753,9 +3753,19 @@ fn f42_load(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
     let batch = args.num("--batch", 1_000) as u64;
     let value_size = args.num("--value-size", 100);
+    // Twenty-one at `full`, not the usual seven, because seven cannot resolve
+    // this arm pair. Across seven independent full runs the lazyseal arm was
+    // ahead in every one -- 1.196x, 1.201x, 1.179x, 1.159x, 1.114x, 1.047x and
+    // 1.035x, a sign test at p=0.008 -- while only one of those runs cleared
+    // `stats::compare` on its own. The effect was real and the measurement
+    // could not see it, which is an underpowered measurement rather than a
+    // free lunch. At twenty-one it resolves: 1.112x at p=0.0003 and 1.146x at
+    // p=0.0001 on two consecutive runs.
+    let reps = args.num("--reps", profile.pick(5, 5, 21));
 
     let mut rec = Record::new("f42-load", profile);
     rec.param("keys", J::u(keys))
+        .param("reps", J::u(reps as u64))
         .param("batch", J::u(batch))
         .param("value_size", J::u(value_size as u64))
         .note(
@@ -3784,7 +3794,7 @@ fn f42_load(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // seal, and the merges a caller waits for.
     let phases: std::sync::Mutex<Vec<Vec<(u64, u64, u64)>>> =
         std::sync::Mutex::new(vec![Vec::new(); 3]);
-    let rates = Trial::new(profile.reps()).run(arm_names.len(), |ci, rep| {
+    let rates = Trial::new(reps).run(arm_names.len(), |ci, rep| {
         let mut vrng = Rng::new(0xF42 + rep as u64);
         let mut kb = [0u8; 16];
         let io0 = IoCounters::read_now();
@@ -3891,20 +3901,33 @@ fn f42_load(args: &Args, profile: Profile) -> std::io::Result<Record> {
     rec.compare("lazyseal_vs_next", cmp_seal.clone());
     rec.finding(Finding::new(
         "F42.3",
-        "sealing on the committing thread is the larger share of the gap to the floor",
-        matches!(cmp_seal.verdict, supdb::bench::Verdict::Greater)
-            && (rates[1].median() - rates[0].median()) >= (1_014_003.0 - rates[1].median()),
+        "sealing on the committing thread costs a resolvable share of the durable load",
+        matches!(cmp_seal.verdict, supdb::bench::Verdict::Greater),
         format!(
             "supdb-lazyseal {:.0} ops/s against supdb {:.0} ({}): sealing inside the timed \
-             window costs {:.0} ops/s, and the residual from lazyseal to f39's raw+index \
-             floor (1,014,003, cited) is {:.0}. Whichever is larger names milestone 2: \
-             seal off-thread, or a cheaper memtable",
+             window costs {:.0} ops/s. Both arms are measured in this process, interleaved, \
+             so this is the half of the question the suite can answer",
             rates[1].median(),
             rates[0].median(),
             cmp_seal.summary("lazyseal", "supdb"),
             rates[1].median() - rates[0].median(),
-            1_014_003.0 - rates[1].median()
         ),
+    ));
+
+    // The other half is not a finding, because half of it comes from another
+    // run. Whether the seal costs more than the remaining distance to f39's
+    // raw+index floor decides what milestone 2 should attack -- seal off-thread
+    // or a cheaper memtable -- but the floor is a constant this suite cites
+    // rather than measures, and the crossover sits inside this host's drift:
+    // three consecutive 21-rep runs put the seal cost at 82,992, 106,865 and
+    // 139,179 against a residual of 187,593, 173,110 and 127,422, flipping
+    // which is larger twice. Gating on it adjudicated the host. It is reported.
+    rec.note(format!(
+        "seal cost {:.0} ops/s against a residual of {:.0} to f39's raw+index floor \
+         (1,014,003, cited from another run and not comparable to this one): the larger \
+         names milestone 2, seal off-thread or a cheaper memtable",
+        rates[1].median() - rates[0].median(),
+        1_014_003.0 - rates[1].median()
     ));
 
     Ok(rec)
