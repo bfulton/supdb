@@ -1198,6 +1198,32 @@
       "expect": "holds",
       "needs": "a writable memory controller to cap the page cache",
       "because": "The case that decides whether this can be a default rather than an option, and the one that refuted the argument for k=2. A workload alternating one point read and one cold scan of 500 has no phase structure for a counter to lock onto; there the default measured 1.515x and 1.497x the better fixed advice, resolvably greater both times. k=2 on the same workload was 33.2% and 30.8% of it, because with no two scans ever consecutive it never reaches its threshold and stays in MADV_RANDOM for a workload that is half ordered scanning. So the hysteresis is the cost and not the protection. k=1 does thrash -- 456 switches a repetition -- and it does not matter: a switch is a madvise at about 1.3 us while being in the wrong mode for one cold scan is milliseconds. k counts calls, and one scan call carries five hundred entries of evidence where a point read carries one, so requiring two consecutive scans demands a thousand entries' proof of what the first call already established."
+    },
+    {
+      "experiment": "f67-dbadvice",
+      "id": "F67.4",
+      "expect": "holds",
+      "because": "The inheritance check, and it asks the kernel rather than the engine. After a scan puts an adaptive store in the kernel's default advice, a seal that took it from 2 to 6 segments left 0 of 6 mappings carrying VM_RAND_READ, read out of /proc/self/smaps. Comparing the store's own record of the mode against itself would prove nothing; the bug worth catching is a segment opened with the option's mode rather than the store's, which leaves every read correct and only the advice stale. Run against that bug deliberately -- passing the option at the seal site -- it reports 4 of 6 and fails, so the check discriminates. No cap needed and no timing, which is why it carries no `needs`."
+    },
+    {
+      "experiment": "f67-dbadvice",
+      "id": "F67.1",
+      "expect": "holds",
+      "needs": "a writable memory controller to cap the page cache",
+      "because": "The policy survives the move from one mapping to a store. f66 measured it over a single Blob; here it runs over a Db of several segments, where a transition costs one madvise each, and it beats both fixed settings: 4.444x and 4.292x over the kernel's default, 6.484x and 6.645x over a fixed MADV_RANDOM, on two full runs of a phased workload against a store eight times its page cache. Both fixed arms lose, and they lose to different phases, which is the same shape F66.2 found and the reason a per-store choice cannot be the right answer."
+    },
+    {
+      "experiment": "f67-dbadvice",
+      "id": "F67.2",
+      "expect": "holds",
+      "needs": "a writable memory controller to cap the page cache",
+      "because": "F66.6 over a store rather than a mapping: alternating one point read and one cold scan, with no phase structure for the policy to find, it is 2.101x and 2.048x the better fixed setting. Gated on stats::compare against whichever of the two fixed arms won, because what a user gives up by taking the default is the better of the settings they could have picked, not the average of them."
+    },
+    {
+      "experiment": "f67-dbadvice",
+      "id": "F67.3",
+      "expect": "holds",
+      "because": "The case f66 could not ask, and the one that decides whether Adaptive is safe as a default. Every f66 arm ran against a file eight times its page cache, because that is where the advice can matter; most stores fit in memory, where the policy can win nothing and can only cost -- a madvise per segment per phase change and a branch per operation. On a warm resident store it measures 97.3% and 99.0% of the kernel's default, no difference on either run. Carries no `needs`: a resident store is resident whether or not the host can cap its page cache, so this one is exercised everywhere."
     }
   ],
   "metrics": [

@@ -268,8 +268,9 @@ fn check_unregistered(claims: &J, results: &Path, profile: &str, out: &mut Outco
             // The name came out of the directory listing a moment ago, so
             // absent here means it went away mid-check.
             Load::Missing => {
-                out.failures
-                    .push(format!("{exp}: {name} was listed and then could not be opened"));
+                out.failures.push(format!(
+                    "{exp}: {name} was listed and then could not be opened"
+                ));
                 continue;
             }
             Load::Broken(why) => {
