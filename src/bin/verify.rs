@@ -255,11 +255,35 @@ fn check_unregistered(claims: &J, results: &Path, profile: &str, out: &mut Outco
             return;
         }
     };
-    let mut files: Vec<String> = dir
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| n.ends_with(&suffix))
-        .collect();
+    // Every entry that cannot be read is a failure, not a skip. This is the
+    // third place in this function where dropping an error would have let the
+    // check pass over a results file and still report success -- after the
+    // directory that would not list and the file that would not parse. An
+    // entry this loop never sees is a finding this direction never checks,
+    // and that is the whole thing it was added to prevent.
+    let mut files: Vec<String> = Vec::new();
+    for entry in dir {
+        let name = match entry {
+            Ok(e) => e.file_name(),
+            Err(e) => {
+                out.failures.push(format!(
+                    "{} could not be walked past an entry, so some result may not have been \
+                     checked for unregistered findings: {e}",
+                    results.display()
+                ));
+                continue;
+            }
+        };
+        match name.into_string() {
+            Ok(n) if n.ends_with(&suffix) => files.push(n),
+            Ok(_) => {}
+            Err(n) => out.failures.push(format!(
+                "{}: a file name that is not UTF-8, so it cannot be matched against an \
+                 experiment: {n:?}",
+                results.display()
+            )),
+        }
+    }
     files.sort();
     for name in files {
         let exp = &name[..name.len() - suffix.len()];

@@ -1419,7 +1419,9 @@ impl<B: Bytes> Blob<B> {
     /// path, which is also the one `tests/blob.rs` checks against
     /// `store.rs`.
     /// Fetch the value bytes a `scan(from, limit, ..)` is about to walk, in
-    /// one pass, before walking them. Returns the bytes asked for.
+    /// one pass, before walking them. Returns the bytes the source reports it
+    /// submitted, which is not always the bytes planned: a source may clamp a
+    /// range to its mapping, or have no mapping and submit nothing.
     ///
     /// This is the one thing the reader knows and the kernel cannot: where
     /// the span ends. Readahead has to infer it and, over a bounded span,
