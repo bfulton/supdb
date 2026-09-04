@@ -1450,8 +1450,16 @@ impl<B: Bytes> Blob<B> {
         merge_ranges(&mut ranges);
         let mut asked = 0u64;
         for (off, len) in ranges {
-            self.src.advise_willneed(off, len as usize);
-            asked += len;
+            // Saturating rather than `as`, and counted after the conversion
+            // rather than before. A range cannot exceed a mapping and a
+            // mapping cannot exceed the address space, so on any target this
+            // reaches there is nothing to truncate -- but a returned count
+            // that says one thing while the syscall was handed another is a
+            // number disagreeing with what happened, which is the kind of
+            // quiet difference this reader has to not have.
+            let span = usize::try_from(len).unwrap_or(usize::MAX);
+            self.src.advise_willneed(off, span);
+            asked += span as u64;
         }
         Ok(asked)
     }
