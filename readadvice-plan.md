@@ -74,3 +74,40 @@ test would catch.
 Q1 through Q4 all holding is the only case in which `Adaptive` becomes the
 default. Q5 in either form ships the enum with `Default` as the default and
 `Adaptive` available, and records here which of the two costs bit.
+
+## Second registration: does the default flip move the numbers this project quotes?
+
+Written after `F67.1`-`F67.4` were registered and before any run of what
+follows. Q1 through Q4 held, which by the rule above is the case in which
+`Adaptive` becomes the default.
+
+One thing that rule did not account for. `Options::default()` is what the
+external suite spreads, so changing it changes the arm behind `EXT.22`-`EXT.45`
+-- every comparison this project quotes against LMDB and RocksDB. A default
+flipped without checking those is a change to the headline numbers made
+sight-unseen.
+
+The wrong way to check is to flip it and re-run the campaign. Two campaigns
+cannot answer this: the three *unchanged* comparators in this suite once moved
++20% to +43% between consecutive runs, and the question here is whether the
+engine moved by a few percent. So `supdb-adaptive` is an **arm**, identical to
+`supdb` but for `read_advice`, and the two run interleaved in one process --
+the same shape as `supdb-ingest` against `supdb` for `EXT.25` and `EXT.26`,
+where the pair differs by one policy bit and needs no matching.
+
+| | outcome | reading |
+|---|---|---|
+| Q6 | `EXT.46` and `EXT.47` hold: the adaptive arm is not resolvably slower than `supdb` on the canonical point read and ordered scan | the default may flip, and the numbers this project quotes stand |
+| Q7 | either fails | the policy costs something at the canonical shape, and `Adaptive` stays opt-in whatever f67 measured |
+
+The canonical dataset is resident, which is exactly where `F67.3` says the
+policy can win nothing and should cost nothing. So Q6 is the prediction, and
+what makes it worth running rather than assuming is that `F67.3` measured a
+store built for f67 rather than the one these numbers come from -- different
+key size, value size, segment count and read mix. A prediction that a
+measurement will agree with another measurement is still a prediction.
+
+`EXT.46` and `EXT.47` are deliberately "no worse than" rather than "better
+than". Out-of-core the policy wins by multiples and `F67.1` records that; here
+there is nothing to win, and a finding that demanded a win would be a finding
+designed to fail.

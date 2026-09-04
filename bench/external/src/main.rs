@@ -104,6 +104,9 @@ fn build(root: &std::path::Path, which: &[&str]) -> Vec<Box<dyn Engine>> {
                     .to_string(),
             ),
             "supdb-nodrain" => Supdb::create_nodrain(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
+            "supdb-adaptive" => {
+                Supdb::create_adaptive(&dir).map(|e| Box::new(e) as Box<dyn Engine>)
+            }
             other => Err(format!("unknown engine {other}")),
         };
         match e {
@@ -804,6 +807,35 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         "Supdb scans no slower than LMDB",
         "supdb",
         "lmdb",
+        &scan,
+        "entries/s",
+        false,
+    );
+    // Whether the read advice that f66 and f67 measured moves the numbers
+    // this project quotes. Same engine, same guarantees, one option apart,
+    // so nothing needs matching -- and interleaved rather than compared
+    // across campaigns, because the unchanged comparators in this suite once
+    // moved +20% to +43% between consecutive runs.
+    //
+    // The canonical dataset is resident, which is where F67.3 says the policy
+    // can win nothing and should cost nothing. These two are the check that
+    // it costs nothing HERE, and they are what a change of default waits on.
+    ordering_of(
+        &mut rec,
+        "EXT.46",
+        "The adaptive read advice does not cost the canonical point read",
+        "supdb-adaptive",
+        "supdb",
+        &read,
+        "reads/s",
+        false,
+    );
+    ordering_of(
+        &mut rec,
+        "EXT.47",
+        "nor the ordered scan",
+        "supdb-adaptive",
+        "supdb",
         &scan,
         "entries/s",
         false,
