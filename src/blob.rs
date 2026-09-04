@@ -733,6 +733,17 @@ impl<B: Bytes> Blob<B> {
     /// Diagnostic, and the thing `tests/blob.rs` asserts to keep R2.3 from
     /// rotting: a native reader that started copying its index would still
     /// pass every correctness test.
+    /// Tell the byte source that this reader's access pattern is random.
+    ///
+    /// `MADV_RANDOM` on a mapped file, and a no-op on every source with no
+    /// mapping behind it. It does not make a fault cheaper; it stops the
+    /// kernel fetching pages around one a point read will never touch, which
+    /// is worth a great deal to a random read out of core and costs an
+    /// ordered scan the readahead it wanted. `f65-madvise` prices both.
+    pub fn advise_random(&self) {
+        self.src.advise_random();
+    }
+
     pub fn zero_copy(&self) -> bool {
         matches!(
             &self.index,

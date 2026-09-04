@@ -94,6 +94,7 @@ fn main() -> std::io::Result<()> {
             "f62-scanmerge2" => f62_scanmerge2(&args, profile)?,
             "f63-scansnap" => f63_scansnap(&args, profile)?,
             "f64-indexsum" => f64_indexsum(&args, profile)?,
+            "f65-madvise" => f65_madvise(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -138,6 +139,7 @@ fn main() -> std::io::Result<()> {
                 "f62-scanmerge2",
                 "f63-scansnap",
                 "f64-indexsum",
+                "f65-madvise",
             ] {
                 if !run(e)? {
                     failed.push(e);
@@ -470,6 +472,245 @@ fn measure_reads(
         h.record(t.elapsed().as_nanos() as u64);
     }
     Ok((h, t0.elapsed().as_secs_f64()))
+}
+
+// ------------------------------- F65: is the out-of-core cliff readahead? --
+
+/// `MADV_RANDOM` against the kernel's default, on both access patterns.
+///
+/// `F1.2` says out-of-core point reads fall three orders of magnitude and
+/// blames readahead thrashing, citing `f23-madvise` -- an experiment that
+/// retired with the old engine and whose results are not in this tree. So the
+/// mechanism is a hypothesis here, not evidence, and `MmapBytes::advise_random`
+/// has been written and called by nothing the whole time.
+///
+/// `MADV_RANDOM` does not make a fault cheaper, it turns readahead off. That
+/// is the entire benefit to a random point read and a straightforward cost to
+/// an ordered scan, and this engine does both -- so four arms, not two.
+/// madvise-plan.md registered the predictions before the first run.
+fn f65_madvise(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    // Big values: what has to outgrow the cap is the file, and at 100 bytes
+    // that needs a key count whose index dominates the measurement instead.
+    let value_size = args.num("--value-size", 4096);
+    let data_mb = args.num("--data-mb", profile.pick(64, 512, 2_048)) as u64;
+    let cap_mb = args.num("--cap-mb", profile.pick(32, 128, 256)) as u64;
+    let reads = args.num("--reads", profile.pick(1_000, 5_000, 20_000)) as u64;
+    let scan_len = args.num("--scan-len", profile.pick(2_000, 20_000, 50_000));
+    let reps = args.num("--reps", profile.reps());
+
+    let mut rec = Record::new("f65-madvise", profile);
+    let nkeys = (data_mb * 1048576) / value_size.max(1) as u64;
+    rec.param("data_mb", J::u(data_mb))
+        .param("cap_mb", J::u(cap_mb))
+        .param("keys", J::u(nkeys))
+        .param("value_size", J::u(value_size as u64))
+        .param("reads", J::u(reads))
+        .param("scan_len", J::u(scan_len as u64))
+        .param("reps", J::u(reps as u64))
+        .note(
+            "four arms interleaved in one process over one file: {random point read, \
+             ordered scan} x {kernel default, MADV_RANDOM}. The advice is applied to the \
+             mapping after open and before the first read, so both arms of a pair differ \
+             in nothing else",
+        );
+
+    let dir = scratch("f65");
+    let file = dir.join("s.dat");
+    // Built before the cap: anonymous memory counts against the same limit,
+    // and a writer that trips it is an OOM kill rather than a measurement.
+    let payload = Payload::new(value_size, 0.1, 0xF65);
+    {
+        let mut w = supdb::SegmentWriter::create(&file, &SegmentOptions::default())?;
+        let mut vrng = Rng::new(0xF65);
+        let mut kb = [0u8; 16];
+        for i in 0..nkeys {
+            db_key_into(i, &mut kb);
+            w.begin(&kb)?;
+            w.value(payload.get(&mut vrng));
+            w.end()?;
+        }
+        w.finish(1)?;
+    }
+    let file_bytes = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+
+    // A cap is a property of the process. Bind the guard before setting one.
+    let _cap = env::cap_guard();
+    let capped = env::cap_memory(cap_mb * 1048576);
+    let over_cap = file_bytes as f64 / (cap_mb * 1048576) as f64;
+    rec.param("file_mb", J::fp(file_bytes as f64 / 1048576.0, 1))
+        .param("file_over_cap", J::fp(over_cap, 2))
+        .param("cap_applied", J::Bool(capped));
+
+    // Rule 3. A run that could not make the reads cold has nothing to say
+    // about cold reads, and must not report a verdict shaped like one.
+    if !capped || over_cap <= 1.0 {
+        let why = if !capped {
+            "no writable v1 memory controller, so the page cache was never capped and every \
+             read here is warm"
+                .to_string()
+        } else {
+            format!(
+                "the file is {over_cap:.2}x the cap, so it fits in the page cache and no read \
+                 faults from storage"
+            )
+        };
+        for (id, st) in [
+            (
+                "F65.1",
+                "MADV_RANDOM makes cold random point reads at least 2x faster",
+            ),
+            (
+                "F65.2",
+                "MADV_RANDOM cuts read amplification on cold random reads by at least 10x",
+            ),
+            ("F65.3", "MADV_RANDOM costs the ordered scan"),
+        ] {
+            rec.finding(Finding::not_exercised(id, st, why.clone()));
+        }
+        rec.finding(Finding::not_exercised(
+            "F65.4",
+            "the file exceeds the memory available to cache it",
+            why,
+        ));
+        return Ok(rec);
+    }
+    rec.finding(Finding::new(
+        "F65.4",
+        "the file exceeds the memory available to cache it",
+        true,
+        format!(
+            "{:.1} MB of file against a {cap_mb} MB cap, {over_cap:.2}x",
+            file_bytes as f64 / 1048576.0
+        ),
+    ));
+
+    // arm 0,1: random reads default/advised. arm 2,3: scan default/advised.
+    let mut hists: Vec<Hist> = (0..4).map(|_| Hist::new()).collect();
+    let mut dev_read: Vec<u64> = vec![0; 4];
+    let mut asked: Vec<u64> = vec![0; 4];
+    let rates = Trial::new(reps).run(4, |ci, rep| {
+        let _ = env::drop_caches();
+        let reader = supdb::Blob::open(supdb::MmapBytes::open(&file).expect("map")).expect("open");
+        if ci == 1 || ci == 3 {
+            reader.advise_random();
+        }
+        let io0 = IoCounters::read_now();
+        let t0 = Instant::now();
+        let mut got = 0u64;
+        if ci < 2 {
+            let mut g = KeyGen::new(KeyDist::Uniform, nkeys, 0xC01D ^ rep as u64);
+            let mut kb = [0u8; 16];
+            for _ in 0..reads {
+                db_key_into(g.next(), &mut kb);
+                let t = Instant::now();
+                reader
+                    .read_all(&kb, |v| {
+                        std::hint::black_box(v);
+                    })
+                    .expect("read");
+                hists[ci].record(t.elapsed().as_nanos() as u64);
+                got += value_size as u64;
+            }
+        } else {
+            let t = Instant::now();
+            let n = reader
+                .scan(&[], scan_len, |_k, v| {
+                    std::hint::black_box(v);
+                })
+                .expect("scan");
+            hists[ci].record(t.elapsed().as_nanos() as u64);
+            got += n as u64 * value_size as u64;
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        let io1 = IoCounters::read_now();
+        dev_read[ci] += io1.read_bytes.saturating_sub(io0.read_bytes);
+        asked[ci] += got;
+        let ops = if ci < 2 {
+            reads as f64
+        } else {
+            scan_len as f64
+        };
+        ops / secs
+    });
+
+    let amp = |i: usize| dev_read[i] as f64 / asked[i].max(1) as f64;
+    // Rule 4: throughput never travels alone.
+    let arms: Vec<J> = ["read-default", "read-random", "scan-default", "scan-random"]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            J::O(vec![
+                ("arm".into(), J::s(*name)),
+                ("ops_per_s".into(), J::fp(rates[i].median(), 0)),
+                ("latency".into(), hists[i].to_json()),
+                (
+                    "device_read_mb_per_rep".into(),
+                    J::fp(dev_read[i] as f64 / 1048576.0 / reps as f64, 2),
+                ),
+                ("read_amplification".into(), J::fp(amp(i), 2)),
+            ])
+        })
+        .collect();
+    rec.series("arms", J::A(arms));
+    rec.param(
+        "peak_rss_mb",
+        J::fp(env::peak_rss_bytes() as f64 / 1048576.0, 1),
+    );
+
+    let cmp_read = compare(&rates[1], &rates[0], supdb::bench::MIN_EFFECT);
+    rec.compare("F65.1_advised_vs_default_reads", cmp_read.clone());
+    rec.finding(Finding::new(
+        "F65.1",
+        "MADV_RANDOM makes cold random point reads at least 2x faster",
+        matches!(cmp_read.verdict, supdb::bench::Verdict::Greater)
+            && rates[1].median() >= 2.0 * rates[0].median(),
+        format!(
+            "advised {:.0} reads/s against the kernel's default {:.0} ({}); p99 {:.3} ms \
+             advised against {:.3} ms, max {:.1} ms against {:.1}",
+            rates[1].median(),
+            rates[0].median(),
+            cmp_read.summary("advised", "default"),
+            hists[1].percentile(99.0) as f64 / 1e6,
+            hists[0].percentile(99.0) as f64 / 1e6,
+            hists[1].max() as f64 / 1e6,
+            hists[0].max() as f64 / 1e6,
+        ),
+    ));
+
+    rec.finding(Finding::new(
+        "F65.2",
+        "MADV_RANDOM cuts read amplification on cold random reads by at least 10x",
+        amp(0) >= 10.0 * amp(1).max(1e-9),
+        format!(
+            "{:.1}x amplification under the default against {:.1}x advised, over {} reads \
+             a rep asking {:.1} MB and fetching {:.1} MB against {:.1} MB. Amplification is \
+             device bytes over payload asked for and does not drift with the host",
+            amp(0),
+            amp(1),
+            reads,
+            asked[0] as f64 / 1048576.0 / reps as f64,
+            dev_read[0] as f64 / 1048576.0 / reps as f64,
+            dev_read[1] as f64 / 1048576.0 / reps as f64,
+        ),
+    ));
+
+    let cmp_scan = compare(&rates[2], &rates[3], supdb::bench::MIN_EFFECT);
+    rec.compare("F65.3_default_vs_advised_scan", cmp_scan.clone());
+    rec.finding(Finding::new(
+        "F65.3",
+        "MADV_RANDOM costs the ordered scan",
+        matches!(cmp_scan.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "scan {:.0} entries/s under the default against {:.0} advised ({}). Turning \
+             readahead off is what helps the random arm; a scan wanted every page it \
+             would have fetched",
+            rates[2].median(),
+            rates[3].median(),
+            cmp_scan.summary("default", "advised"),
+        ),
+    ));
+
+    Ok(rec)
 }
 
 // ------------------------------------------------- F7: index memory scaling --
@@ -3741,7 +3982,7 @@ fn f43_compact(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
 /// The brief's P-A. The canonical durable load's exact shape -- every
 /// key new, 100B values, a durable point every 1,000 ops -- with the next
-/// engine (WAL commit + seal-off-path, src/next.rs) interleaved against
+/// engine (WAL commit + seal-off-path, src/db.rs) interleaved against
 /// today's engine committing through the value-carrying log. The registered
 /// promise (docs/engine.md): >= 600,000 ops/s, within 1.7x of f39's
 /// raw+index floor and past LMDB's recorded 572,416; below 600k the design

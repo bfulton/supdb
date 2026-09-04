@@ -1,4 +1,4 @@
-//! Milestone-1 contract of the next engine: multivalue order across seals, a
+//! The engine's contract: multivalue order across seals, a
 //! model-checked read path, and the crash windows the module doc enumerates.
 //! Every crash here is emulated the way `tests/known_bugs.rs` emulates them:
 //! by constructing the exact on-disk state the window leaves behind, because

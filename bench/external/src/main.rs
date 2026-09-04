@@ -751,7 +751,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         ));
     };
 
-    // Supdb (supdb::next), measured on the same three axes against
+    // Supdb (supdb::Db), measured on the same three axes against
     // the same LMDB in the same process. Its commit is a WAL append plus one
     // fdatasync per batch -- LMDB's own boundary -- so the load comparison is
     // matched the way EXT.22 is, with the same transactional residual.
@@ -876,7 +876,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         "entries/s",
         false,
     );
-    // The drain matched both ways (f60, drain-plan.md). Default `next`
+    // The drain matched both ways (f60, drain-plan.md). Default `supdb`
     // seals and partitions inside its load window; RocksDB's sync is an
     // fsync. So: both drained -- RocksDB flushed and compacted at sync --
     // and neither drained -- next's sync an fsync, its tail read out of the
@@ -1936,7 +1936,7 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
             continue;
         }
         let cmp = compare(a, b, supdb::bench::MIN_EFFECT);
-        rec.compare(&format!("{id}_next-nodrain_vs_rocksdb-tuned"), cmp.clone());
+        rec.compare(&format!("{id}_supdb-nodrain_vs_rocksdb-tuned"), cmp.clone());
         rec.finding(Finding::new(
             id,
             &title,

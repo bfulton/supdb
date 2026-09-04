@@ -33,7 +33,7 @@
    "id": "F1.2",
    "profile": "full",
    "expect": "fails",
-   "because": "Measured at 23.0GB against 15.7GB of RAM: 338,681 reads/s resident against 370 out-of-core, a 916x degradation. The engine reads through a read-only mmap with no madvise anywhere, so it has no readahead control, no asynchronous I/O and no influence over eviction -- the failure modes Crotty et al. (CIDR'22) enumerate. MECHANISM FOUND: f23-madvise reproduces this collapse under a memory cgroup and attributes it to readahead thrashing -- 86,977x read amplification with the default advice against 141x with MADV_RANDOM, and 25.2x on throughput. The engine still has no asynchronous I/O and no influence over eviction, so this remains a failing claim, but 'no madvise anywhere' is now a measured cause rather than a plausible one."
+   "because": "Measured at 23.0GB against 15.7GB of RAM: 338,681 reads/s resident against 370 out-of-core, a 916x degradation. The engine reads through a read-only mmap with no madvise anywhere, so it has no readahead control, no asynchronous I/O and no influence over eviction -- the failure modes Crotty et al. (CIDR'22) enumerate. MECHANISM FOUND, and re-established on this engine: f65-madvise reproduces the collapse under a memory cgroup and attributes it to readahead. Two full runs put cold point reads 75.8x and 78.9x faster under MADV_RANDOM, at 1800x read amplification against 1.0x -- the kernel's default fetched 157 GB off the device to serve 89 MB of asked-for payload. (The figure previously cited here, 86,977x against 141x, came from f23-madvise, which retired with the old engine and left no results in this tree.) It is a trade rather than a fix: the same advice costs the ordered scan 2.3x to 2.5x (F65.3), so it is `Options::advise_random` and defaults off. And it does not lift this claim -- advised out-of-core reads are still about 19x below resident, because readahead is one of the four costs Crotty et al. name and the engine still has no asynchronous I/O and no influence over eviction."
   },
   {
    "experiment": "f1-outofcore",
@@ -1029,6 +1029,35 @@
    "profile": "full",
    "expect": "fails",
    "because": "Verifying the row at open costs 26.1 ms for a million-key segment (26.094 ms against 0.010 unverified, p=0.0009), against P64's 10. The prediction priced a 57 MB index and the segment's is 161 MB: since the inline extension of v5 a run up to 256 bytes lives in its index record, so at 100-byte values the key section IS the data and the CRC pass runs over all of it at about 6.2 GB/s. The reads pay nothing after (F64.2) and the row is 0.024% of the section (F64.3); the price is per open, per segment, and it is recorded rather than tuned away. The alternative the plan started with -- verify each piece on first touch -- was dropped because a miss has no record to verify and a corrupted key byte that turns a hit into a miss would pass silently; the open-time pass is the one that closes that. Stays behind BlobOptions::verify_index for the reader that would rather not pay it."
+  },
+  {
+   "experiment": "f65-madvise",
+   "id": "F65.1",
+   "expect": "holds",
+   "needs": "a writable memory controller to cap the page cache",
+   "because": "The out-of-core cliff is readahead, and this is the size of it: 17,726 and 17,780 cold reads a second advised against 234 and 225 under the kernel's default, 75.8x and 78.9x on two full runs, with p99 latency 0.106 ms against 8.716 and the maximum 7.6 ms against 187.8. MADV_RANDOM does not make a fault cheaper; it stops the kernel fetching the pages around one a point read will never touch. F1.2 blamed readahead on the strength of f23-madvise, which retired with the old engine and left no results in this tree; this reproduces the mechanism on the engine that ships."
+  },
+  {
+   "experiment": "f65-madvise",
+   "id": "F65.2",
+   "expect": "holds",
+   "needs": "a writable memory controller to cap the page cache",
+   "because": "The evidence for F65.1 in the quantity that does not drift with the host, and it is the same to a decimal place across two runs: 1800.4x and 1800.3x amplification under the default against 1.0x advised. Serving 89.3 MB of asked-for payload cost 160,749 MB off the device unadvised and 87.3 MB advised -- readahead fetching 157 GB nobody read. Device bytes come from /proc/self/io, never inferred from file size."
+  },
+  {
+   "experiment": "f65-madvise",
+   "id": "F65.3",
+   "expect": "holds",
+   "profile": "full",
+   "needs": "a writable memory controller to cap the page cache",
+   "because": "The other half of the trade, and the reason the advice cannot go on unconditionally. Turning readahead off costs the ordered scan 2.303x and 2.489x on the same two runs -- 43,311 and 47,950 entries a second under the default against 18,805 and 19,265 advised -- because a scan wanted every page readahead would have fetched. madvise-plan.md registered this as P4 and it landed with P1, which is the least convenient pair: neither setting is right for every workload, so `Options::advise_random` is a per-store choice and defaults off. Pinned to full: at ci the file is 64 MB against a 32 MB cap and the scan is too small to resolve."
+  },
+  {
+   "experiment": "f65-madvise",
+   "id": "F65.4",
+   "expect": "holds",
+   "needs": "a writable memory controller to cap the page cache",
+   "because": "Rule 3's precondition, checked rather than assumed: 2081.3 MB of file against a 256 MB cap, 8.13x. Without both the cap applied and the file over it, every finding here is not_exercised -- a run that could not make its reads cold has nothing to say about cold reads, and the first version of f1-outofcore produced exactly that false green."
   },
   {
    "experiment": "f64-indexsum",

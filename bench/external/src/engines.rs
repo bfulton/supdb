@@ -251,7 +251,7 @@ fn dir_size(p: &Path) -> u64 {
 
 // ------------------------------------------------------------------- next --
 
-/// Supdb (`supdb::next`): a WAL-only commit with sealed segments in
+/// Supdb (`supdb::Db`): a WAL-only commit with sealed segments in
 /// today's store format. Always durable -- a commit is a WAL append plus one
 /// fdatasync, which is LMDB's own boundary, so this arm is guarantee-matched
 /// against `lmdb` the way `supdb-durable` is. Scans pay the unrouted fan
@@ -385,11 +385,11 @@ impl Engine for Supdb {
         if let Some(db) = self.db.as_mut() {
             // The default drains: commit AND seal AND partition, so the seal
             // cost lands in the load window and the read phase answers from
-            // routed segments. That was chosen so a next arm would not read
+            // routed segments. That was chosen so a supdb arm would not read
             // half its keys out of a resident memtable while LMDB read a
             // tree -- but RocksDB's sync is an fsync of its WAL and its
             // reads go through its memtable and level 0, so against it the
-            // drain is a residual the engine pays alone. `next-nodrain`
+            // drain is a residual the engine pays alone. `supdb-nodrain`
             // is the arm matched to that; both are measured.
             if self.drain {
                 db.flush().map_err(|e| e.to_string())?;

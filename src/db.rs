@@ -182,6 +182,21 @@ pub struct Options {
     /// fdatasync of an append that grows the file commits an inode change
     /// through the journal; an overwrite does not, and LMDB's commit is an
     /// overwrite. f57 prices it (walreuse-plan.md).
+    /// Tell the kernel that reads of a segment are random.
+    ///
+    /// `MADV_RANDOM` on every segment mapping the reader opens. Off by
+    /// default, because it is a trade rather than a win and neither side of it
+    /// is small: `f65-madvise` measured cold point reads 75.8x and 78.9x
+    /// faster advised, at 1800x read amplification against 1.0x -- the default
+    /// fetched 157 GB off the device to serve 89 MB anybody asked for -- and
+    /// the ordered scan 2.3x to 2.5x *slower*, because a scan wanted every page
+    /// readahead would have fetched (`F65.1`, `F65.2`, `F65.3`).
+    ///
+    /// So set it for a store whose working set outgrows memory and whose reads
+    /// are points; leave it off for one that scans. It applies to the reader's
+    /// segment mappings only -- compaction streams its inputs and would be the
+    /// wrong side of exactly this trade.
+    pub advise_random: bool,
     pub recycle_wal: bool,
     /// The ordered scan's merge over unrouted sources. `true` is the merge
     /// f61 priced and f62 replaced: one cursor over the disjoint partitions
@@ -222,6 +237,7 @@ impl Default for Options {
             flush_ranges: true,
             promote: true,
             recycle_wal: false,
+            advise_random: false,
             scan_merge: true,
             scan_snapshot_arena: true,
         }
@@ -1530,7 +1546,7 @@ impl Seg {
         Ok(())
     }
 
-    fn open(dir: &Path, name: &str) -> Result<Seg> {
+    fn open(dir: &Path, name: &str, advise_random: bool) -> Result<Seg> {
         let src = MmapBytes::open(&dir.join(name)).map_err(|e| {
             // A manifest naming a segment that is not on disk is a damaged
             // store, not a missing file, and saying so is the difference
@@ -1540,6 +1556,9 @@ impl Seg {
             ))
         })?;
         let blob = Blob::open(src).map_err(|e| err(&format!("segment {name}: {e}")))?;
+        if advise_random {
+            blob.advise_random();
+        }
         // `pcs-` is a range-ALIGNED L0 piece: a seal split at the live
         // partition boundaries, so it carries a fence like a partition and
         // overlaps only the pieces of its own range. That alignment is what
@@ -2775,7 +2794,7 @@ impl Db {
         }
         let mut segs = Vec::with_capacity(live.len());
         for name in &live {
-            segs.push(Seg::open(dir, name)?);
+            segs.push(Seg::open(dir, name, opts.advise_random)?);
         }
         segs.sort_by(|a, b| {
             b.level
@@ -3213,7 +3232,8 @@ impl Db {
         }
         for name in &names {
             self.covered_seq = self.covered_seq.max(Db::name_end_seq(name).unwrap_or(0));
-            self.segs.push(Seg::open(&self.dir, name)?);
+            self.segs
+                .push(Seg::open(&self.dir, name, self.opts.advise_random)?);
         }
         self.sort_segs();
         self.frozen = None;
@@ -3631,7 +3651,7 @@ impl Db {
         }
         let mut merged = Vec::with_capacity(outputs.len());
         for name in &outputs {
-            merged.push(Seg::open(&self.dir, name)?);
+            merged.push(Seg::open(&self.dir, name, self.opts.advise_random)?);
         }
         // Partitions first (older, disjoint), then whatever L0 arrived
         // while the merge ran, oldest to newest.
