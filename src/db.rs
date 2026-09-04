@@ -129,8 +129,14 @@ fn idle_io_priority() {
 /// this is set: `compact` opens them through its own `MmapBytes`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ReadAdvice {
-    /// The kernel's default readahead, for every access.
-    Default,
+    /// The kernel's own readahead, for every access -- `MADV_NORMAL`, and
+    /// what the engine did before there was a choice.
+    ///
+    /// Named for the `madvise` mode rather than called `Default`, because
+    /// `ReadAdvice::default()` is `Adaptive`: a variant of that name would
+    /// read as the type's default while meaning the opposite of it, and
+    /// somebody reaching for one would silently get the other.
+    Normal,
     /// `MADV_RANDOM` for the life of the store. For one whose working set
     /// outgrows memory and whose reads are points.
     Random,

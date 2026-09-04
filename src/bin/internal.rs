@@ -1115,7 +1115,7 @@ fn f67_dbadvice(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     // ---- The timed arms.
     let advices = [
-        supdb::ReadAdvice::Default,
+        supdb::ReadAdvice::Normal,
         supdb::ReadAdvice::Random,
         supdb::ReadAdvice::Adaptive,
     ];
@@ -1123,7 +1123,7 @@ fn f67_dbadvice(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
     let big = dir.join("big");
     let file_bytes: u64 = {
-        let db = f67_store(&big, keys, value_size, supdb::ReadAdvice::Default, seal_mb)?;
+        let db = f67_store(&big, keys, value_size, supdb::ReadAdvice::Normal, seal_mb)?;
         let segs = db.segments();
         rec.param("segments", J::u(segs as u64));
         drop(db);
@@ -1249,7 +1249,7 @@ fn f67_dbadvice(args: &Args, profile: Profile) -> std::io::Result<Record> {
             &small,
             resident_keys,
             value_size,
-            supdb::ReadAdvice::Default,
+            supdb::ReadAdvice::Normal,
             seal_mb,
         )?;
         rec.param("resident_segments", J::u(db.segments() as u64));
@@ -1258,7 +1258,7 @@ fn f67_dbadvice(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let db = supdb::Db::open(
             &small,
             supdb::Options {
-                read_advice: [supdb::ReadAdvice::Default, supdb::ReadAdvice::Adaptive][ci],
+                read_advice: [supdb::ReadAdvice::Normal, supdb::ReadAdvice::Adaptive][ci],
                 seal_bytes: seal_mb * 1_048_576,
                 ..Default::default()
             },

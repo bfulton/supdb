@@ -444,7 +444,7 @@ per-commit path.
   It is a trade rather than a win, because the ordered scan wants exactly
   the pages a point read does not and pays 2.3x to 2.5x for losing them
   (F65.3). `Options::read_advice` carries that trade: `ReadAdvice::Random`
-  takes one side of it for the life of the store, `ReadAdvice::Default`
+  takes one side of it for the life of the store, `ReadAdvice::Normal`
   the other.
   What removes the choice is that a store knows which of the two it is
   doing: `read_all` and `scan` are different calls, so the advice can

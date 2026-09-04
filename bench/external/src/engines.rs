@@ -303,7 +303,7 @@ impl Supdb {
     /// kernel's plain readahead. The pair differs by one option and needs no
     /// matching.
     pub fn create_noadvice(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, true, true, Some(supdb::ReadAdvice::Default))
+        Supdb::with_policy(path, true, true, Some(supdb::ReadAdvice::Normal))
     }
 
     fn with_policy(
