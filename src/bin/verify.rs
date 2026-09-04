@@ -59,7 +59,7 @@ fn main() -> std::io::Result<()> {
         profile
     );
 
-    check_shape(&claims, &results, &mut out);
+    check_shape(&claims, &mut out);
     check_findings(&claims, &results, &profile, &mut out);
     check_metrics(&claims, &results, &profile, &mut out);
     check_unregistered(&claims, &results, &profile, &mut out);
@@ -136,27 +136,21 @@ fn load(results: &Path, experiment: &str, profile: &str) -> Load {
 /// Checking the shape once here means neither direction has to care: a claim
 /// that cannot be read is a failure, said out loud, rather than a claim that
 /// quietly stops being adjudicated.
-fn check_shape(claims: &J, results: &Path, out: &mut Outcome) {
+///
+/// The other half of this is not here, and the reason is worth writing down.
+/// A *misspelt* experiment is as quiet as an empty one -- it reads as an
+/// experiment nobody has run, so the claims side skips it and the results
+/// side never sees the name. The obvious test is whether any result names it,
+/// and that is wrong: `check.sh suites` verifies against a directory holding
+/// only the experiments that run just produced, so every other experiment
+/// looks misspelt. It cost 46 false failures to find that out. The reference
+/// set that would work is the dispatch table in the suite binaries, which
+/// this one is deliberately not linked against, so catching it properly needs
+/// that list exported rather than a directory listing guessed at.
+fn check_shape(claims: &J, out: &mut Outcome) {
     let Some(list) = claims.path("findings") else {
         return;
     };
-    // Every experiment that has a result at any profile. A claim naming one
-    // that has none is the other half of this: an empty field fails loudly
-    // above, but a *misspelt* experiment reads as an experiment nobody has
-    // run yet, so both directions pass it over -- the claims side finds no
-    // result and skips, and the results side never sees the name at all.
-    let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if let Ok(dir) = std::fs::read_dir(results) {
-        for e in dir.flatten() {
-            if let Ok(n) = e.file_name().into_string() {
-                if let Some(stem) = n.strip_suffix(".json") {
-                    if let Some((exp, _profile)) = stem.rsplit_once('.') {
-                        known.insert(exp.to_string());
-                    }
-                }
-            }
-        }
-    }
     for (i, c) in list.items().iter().enumerate() {
         let exp = c.path("experiment").and_then(|v| v.as_str()).unwrap_or("");
         let id = c.path("id").and_then(|v| v.as_str()).unwrap_or("");
@@ -165,14 +159,6 @@ fn check_shape(claims: &J, results: &Path, out: &mut Outcome) {
                 "claims.json findings[{i}]: a claim must name both an experiment and an id, \
                  and this one has experiment {exp:?} and id {id:?} -- a claim that cannot be \
                  read is a claim nothing adjudicates"
-            ));
-            continue;
-        }
-        if !known.is_empty() && !known.contains(exp) {
-            out.failures.push(format!(
-                "{exp}/{id}: no result names the experiment {exp:?} at any profile. Either it \
-                 is misspelt, in which case nothing has been checking this claim, or the \
-                 experiment is gone and the claim went with it"
             ));
         }
     }
