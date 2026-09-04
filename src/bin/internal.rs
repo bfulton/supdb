@@ -95,6 +95,7 @@ fn main() -> std::io::Result<()> {
             "f63-scansnap" => f63_scansnap(&args, profile)?,
             "f64-indexsum" => f64_indexsum(&args, profile)?,
             "f65-madvise" => f65_madvise(&args, profile)?,
+            "f66-adaptive" => f66_adaptive(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -140,6 +141,7 @@ fn main() -> std::io::Result<()> {
                 "f63-scansnap",
                 "f64-indexsum",
                 "f65-madvise",
+                "f66-adaptive",
             ] {
                 if !run(e)? {
                     failed.push(e);
@@ -707,6 +709,470 @@ fn f65_madvise(args: &Args, profile: Profile) -> std::io::Result<Record> {
             rates[2].median(),
             rates[3].median(),
             cmp_scan.summary("default", "advised"),
+        ),
+    ));
+
+    Ok(rec)
+}
+
+// ------------------------------ F66: can the advice follow the workload? --
+
+/// The read advice as a policy rather than a setting.
+///
+/// `Adaptive(k)` starts in RANDOM, leaves it on the first point read, and
+/// enters NORMAL only after k consecutive scans. The asymmetry is the whole
+/// design: f65 measured being wrong in NORMAL at 75.8x and being wrong in
+/// RANDOM at 2.4x, so the exit is instant and the entry is deliberate.
+#[derive(Clone, Copy, PartialEq)]
+enum Advice {
+    Normal,
+    Random,
+    Oracle,
+    Adaptive(usize),
+}
+
+impl Advice {
+    fn label(&self) -> String {
+        match self {
+            Advice::Normal => "normal".into(),
+            Advice::Random => "random".into(),
+            Advice::Oracle => "oracle".into(),
+            Advice::Adaptive(k) => format!("adaptive-{k}"),
+        }
+    }
+}
+
+/// Tracks which mode a mapping is in so a switch is issued only on a change.
+struct Mode<'a> {
+    blob: &'a supdb::Blob<supdb::MmapBytes>,
+    random: bool,
+    switches: u64,
+}
+
+impl<'a> Mode<'a> {
+    fn start(blob: &'a supdb::Blob<supdb::MmapBytes>, random: bool) -> Mode<'a> {
+        if random {
+            blob.advise_random();
+        } else {
+            blob.advise_normal();
+        }
+        Mode {
+            blob,
+            random,
+            switches: 0,
+        }
+    }
+    fn set(&mut self, random: bool) {
+        if random == self.random {
+            return;
+        }
+        if random {
+            self.blob.advise_random();
+        } else {
+            self.blob.advise_normal();
+        }
+        self.random = random;
+        self.switches += 1;
+    }
+}
+
+/// One pass of a phased workload under one policy. Returns ops/s over the
+/// whole pass, so a policy is judged on the workload rather than on the half
+/// of it that suits it.
+#[allow(clippy::too_many_arguments)]
+fn f66_pass(
+    blob: &supdb::Blob<supdb::MmapBytes>,
+    advice: Advice,
+    nkeys: u64,
+    cycles: usize,
+    phase_reads: usize,
+    phase_scans: usize,
+    scan_len: usize,
+    seed: u64,
+    h_read: &mut Hist,
+    h_scan: &mut Hist,
+) -> (f64, u64) {
+    let mut m = Mode::start(blob, !matches!(advice, Advice::Normal));
+    let mut consec_scans = 0usize;
+    let mut g = KeyGen::new(KeyDist::Uniform, nkeys, seed);
+    let mut kb = [0u8; 16];
+    let mut ops = 0u64;
+    let t0 = Instant::now();
+    for _ in 0..cycles {
+        // --- point-read phase ---
+        if advice == Advice::Oracle {
+            m.set(true);
+        }
+        for _ in 0..phase_reads {
+            if let Advice::Adaptive(_) = advice {
+                consec_scans = 0;
+                m.set(true); // the expensive direction: leave NORMAL at once
+            }
+            db_key_into(g.next(), &mut kb);
+            let t = Instant::now();
+            blob.read_all(&kb, |v| {
+                std::hint::black_box(v);
+            })
+            .expect("read");
+            h_read.record(t.elapsed().as_nanos() as u64);
+            ops += 1;
+        }
+        // --- scan phase ---
+        if advice == Advice::Oracle {
+            m.set(false);
+        }
+        for s in 0..phase_scans {
+            if let Advice::Adaptive(k) = advice {
+                consec_scans += 1;
+                if consec_scans >= k {
+                    m.set(false); // the cheap direction: only on sustained evidence
+                }
+            }
+            let mut kb2 = [0u8; 16];
+            db_key_into(
+                (s as u64 * nkeys / phase_scans.max(1) as u64) % nkeys,
+                &mut kb2,
+            );
+            let t = Instant::now();
+            let n = blob
+                .scan(&kb2, scan_len, |_k, v| {
+                    std::hint::black_box(v);
+                })
+                .expect("scan");
+            h_scan.record(t.elapsed().as_nanos() as u64);
+            ops += n as u64;
+        }
+    }
+    (ops as f64 / t0.elapsed().as_secs_f64(), m.switches)
+}
+
+/// Does the advice pay to follow the workload, and at what threshold?
+///
+/// f65 priced the two static settings and found a 30:1 asymmetry. This asks
+/// whether a policy can have both sides, and -- the reason it exists -- whether
+/// one threshold works well enough across phase lengths to be a default.
+/// adaptive-plan.md registered the predictions before the first run.
+fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let value_size = args.num("--value-size", 4096);
+    let data_mb = args.num("--data-mb", profile.pick(64, 512, 2_048)) as u64;
+    let cap_mb = args.num("--cap-mb", profile.pick(32, 128, 256)) as u64;
+    let cycles = args.num("--cycles", profile.pick(2, 3, 4));
+    let phase_reads = args.num("--phase-reads", profile.pick(20, 60, 200));
+    // The scan phase is counted in *calls*, because k counts calls. Three of
+    // them made every k above 3 untestable: the counter could not reach the
+    // threshold inside a phase, so adaptive-4 and up degenerated to fixed
+    // RANDOM and reported its number to four significant figures. The first
+    // ci run of this experiment did exactly that.
+    let phase_scans = args.num("--phase-scans", profile.pick(8, 32, 96));
+    let scan_len = args.num("--scan-len", profile.pick(100, 300, 500));
+    let reps = args.num("--reps", profile.reps());
+
+    let mut rec = Record::new("f66-adaptive", profile);
+    let nkeys = (data_mb * 1048576) / value_size.max(1) as u64;
+    rec.param("data_mb", J::u(data_mb))
+        .param("cap_mb", J::u(cap_mb))
+        .param("keys", J::u(nkeys))
+        .param("cycles", J::u(cycles as u64))
+        .param("phase_reads", J::u(phase_reads as u64))
+        .param("phase_scans", J::u(phase_scans as u64))
+        .param("scan_len", J::u(scan_len as u64))
+        .param("reps", J::u(reps as u64))
+        .note(
+            "one phased workload -- alternating runs of cold point reads and ordered scans -- \
+             driven under every policy, interleaved in one process over one file. The score is \
+             ops/s over the whole pass, so a policy is judged on the workload rather than on \
+             the half of it that suits it",
+        )
+        .note(
+            "`oracle` switches at the true phase boundary and is not a policy anyone could \
+             ship: it is the bound, so adaptive is judged against what is reachable rather \
+             than against whichever static arm flatters it",
+        );
+
+    let dir = scratch("f66");
+    let file = dir.join("s.dat");
+    let payload = Payload::new(value_size, 0.1, 0xF66);
+    {
+        let mut w = supdb::SegmentWriter::create(&file, &SegmentOptions::default())?;
+        let mut vrng = Rng::new(0xF66);
+        let mut kb = [0u8; 16];
+        for i in 0..nkeys {
+            db_key_into(i, &mut kb);
+            w.begin(&kb)?;
+            w.value(payload.get(&mut vrng));
+            w.end()?;
+        }
+        w.finish(1)?;
+    }
+    let file_bytes = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+
+    let _cap = env::cap_guard();
+    let capped = env::cap_memory(cap_mb * 1048576);
+    let over_cap = file_bytes as f64 / (cap_mb * 1048576) as f64;
+    rec.param("file_mb", J::fp(file_bytes as f64 / 1048576.0, 1))
+        .param("file_over_cap", J::fp(over_cap, 2))
+        .param("cap_applied", J::Bool(capped));
+
+    let ks: Vec<usize> = vec![1, 2, 4, 8, 16, 32, 64];
+    let arms: Vec<Advice> = [Advice::Normal, Advice::Random, Advice::Oracle]
+        .into_iter()
+        .chain(ks.iter().map(|k| Advice::Adaptive(*k)))
+        .collect();
+
+    if !capped || over_cap <= 1.0 {
+        let why = if !capped {
+            "no writable v1 memory controller, so the page cache was never capped and no read \
+             here faults from storage -- the advice cannot matter and a verdict would be about \
+             the host"
+                .to_string()
+        } else {
+            format!("the file is {over_cap:.2}x the cap, so it fits in the page cache")
+        };
+        for (id, st) in [
+            ("F66.1", "the adaptive policy comes within 10% of an oracle that knows every phase boundary"),
+            ("F66.2", "the adaptive policy beats a fixed MADV_RANDOM on a phased workload"),
+            ("F66.3", "the adaptive policy costs under 5% against fixed MADV_RANDOM when nothing ever scans"),
+            ("F66.5", "one threshold is within 10% of the best at every phase length"),
+        ] {
+            rec.finding(Finding::not_exercised(id, st, why.clone()));
+        }
+        rec.finding(Finding::not_exercised(
+            "F66.4",
+            "the file exceeds the memory available to cache it",
+            why,
+        ));
+        return Ok(rec);
+    }
+    rec.finding(Finding::new(
+        "F66.4",
+        "the file exceeds the memory available to cache it",
+        true,
+        format!(
+            "{:.1} MB of file against a {cap_mb} MB cap, {over_cap:.2}x",
+            file_bytes as f64 / 1048576.0
+        ),
+    ));
+
+    let mut h_read: Vec<Hist> = (0..arms.len()).map(|_| Hist::new()).collect();
+    let mut h_scan: Vec<Hist> = (0..arms.len()).map(|_| Hist::new()).collect();
+    let mut switches = vec![0u64; arms.len()];
+    let rates = Trial::new(reps).run(arms.len(), |ci, rep| {
+        let _ = env::drop_caches();
+        let blob = supdb::Blob::open(supdb::MmapBytes::open(&file).expect("map")).expect("open");
+        let (ops, sw) = f66_pass(
+            &blob,
+            arms[ci],
+            nkeys,
+            cycles,
+            phase_reads,
+            phase_scans,
+            scan_len,
+            0xADA9 ^ rep as u64,
+            &mut h_read[ci],
+            &mut h_scan[ci],
+        );
+        switches[ci] += sw;
+        ops
+    });
+
+    let series: Vec<J> = arms
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            J::O(vec![
+                ("arm".into(), J::s(a.label())),
+                ("ops_per_s".into(), J::fp(rates[i].median(), 0)),
+                (
+                    "read_p99_ms".into(),
+                    J::fp(h_read[i].percentile(99.0) as f64 / 1e6, 3),
+                ),
+                (
+                    "scan_p50_ms".into(),
+                    J::fp(h_scan[i].percentile(50.0) as f64 / 1e6, 3),
+                ),
+                (
+                    "advice_switches_per_rep".into(),
+                    J::fp(switches[i] as f64 / reps as f64, 1),
+                ),
+            ])
+        })
+        .collect();
+    rec.series("arms", J::A(series));
+    rec.param(
+        "peak_rss_mb",
+        J::fp(env::peak_rss_bytes() as f64 / 1048576.0, 1),
+    );
+
+    let at = |a: Advice| arms.iter().position(|x| *x == a).unwrap();
+    let oracle = at(Advice::Oracle);
+    let random = at(Advice::Random);
+    let normal = at(Advice::Normal);
+    // The best k by median, chosen from the record rather than assumed.
+    let best = ks
+        .iter()
+        .map(|k| at(Advice::Adaptive(*k)))
+        .max_by(|a, b| rates[*a].median().total_cmp(&rates[*b].median()))
+        .unwrap();
+    let best_k = match arms[best] {
+        Advice::Adaptive(k) => k,
+        _ => 0,
+    };
+    rec.param("best_k", J::u(best_k as u64));
+
+    let sweep: String = ks
+        .iter()
+        .map(|k| format!("k={k} {:.0}", rates[at(Advice::Adaptive(*k))].median()))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    rec.finding(Finding::new(
+        "F66.1",
+        "the adaptive policy comes within 10% of an oracle that knows every phase boundary",
+        rates[best].median() >= 0.9 * rates[oracle].median(),
+        format!(
+            "best adaptive k={best_k} at {:.0} ops/s against the oracle's {:.0} ({:.0}% of it). \
+             Sweep: {sweep}. Fixed arms for scale: random {:.0}, normal {:.0}",
+            rates[best].median(),
+            rates[oracle].median(),
+            100.0 * rates[best].median() / rates[oracle].median().max(1.0),
+            rates[random].median(),
+            rates[normal].median(),
+        ),
+    ));
+
+    let cmp = compare(&rates[best], &rates[random], supdb::bench::MIN_EFFECT);
+    rec.compare("F66.2_adaptive_vs_random", cmp.clone());
+    rec.finding(Finding::new(
+        "F66.2",
+        "the adaptive policy beats a fixed MADV_RANDOM on a phased workload",
+        matches!(cmp.verdict, supdb::bench::Verdict::Greater)
+            && rates[best].median() >= 1.5 * rates[random].median(),
+        format!(
+            "adaptive k={best_k} {:.0} ops/s against fixed random {:.0} ({}), over {cycles} \
+             cycles of {phase_reads} point reads and {phase_scans} scans of {scan_len}. \
+             Switches per rep: {:.1} adaptive against {:.1} oracle",
+            rates[best].median(),
+            rates[random].median(),
+            cmp.summary("adaptive", "random"),
+            switches[best] as f64 / reps as f64,
+            switches[oracle] as f64 / reps as f64,
+        ),
+    ));
+
+    // F66.3 -- the safety check. A default has to be harmless on a workload
+    // that never scans, where the policy fires not once and all it can do is
+    // cost something.
+    let safe_arms = [Advice::Random, Advice::Adaptive(best_k)];
+    let mut hr: Vec<Hist> = (0..2).map(|_| Hist::new()).collect();
+    let mut hs: Vec<Hist> = (0..2).map(|_| Hist::new()).collect();
+    let mut sw2 = [0u64; 2];
+    let no_scan = Trial::new(reps).run(2, |ci, rep| {
+        let _ = env::drop_caches();
+        let blob = supdb::Blob::open(supdb::MmapBytes::open(&file).expect("map")).expect("open");
+        let (ops, sw) = f66_pass(
+            &blob,
+            safe_arms[ci],
+            nkeys,
+            cycles,
+            phase_reads,
+            0,
+            scan_len,
+            0x5AFE ^ rep as u64,
+            &mut hr[ci],
+            &mut hs[ci],
+        );
+        sw2[ci] += sw;
+        ops
+    });
+    rec.finding(Finding::new(
+        "F66.3",
+        "the adaptive policy costs under 5% against fixed MADV_RANDOM when nothing ever scans",
+        no_scan[1].median() >= 0.95 * no_scan[0].median(),
+        format!(
+            "adaptive k={best_k} {:.0} ops/s against fixed random {:.0}, {:.1}% of it, over a              workload with no scan in it at all. Switches per rep: {:.1} -- the policy starts              in RANDOM and never has cause to leave, so what this prices is the counter and              nothing else",
+            no_scan[1].median(),
+            no_scan[0].median(),
+            100.0 * no_scan[1].median() / no_scan[0].median().max(1.0),
+            sw2[1] as f64 / reps as f64,
+        ),
+    ));
+
+    // F66.5 -- the question that decides whether this can be a default: is one
+    // threshold good enough everywhere, or does k have to be tuned per store?
+    // Scan-phase length, not read-phase length: k counts scan calls, so the
+    // read phase is not the axis it responds to. These straddle the k sweep,
+    // so the longest phase exercises every threshold and the shortest starves
+    // the largest ones -- which is the case a default has to survive rather
+    // than the one it gets to pick.
+    let lengths: Vec<usize> = vec![
+        (phase_scans / 8).max(2),
+        (phase_scans / 2).max(4),
+        phase_scans,
+    ];
+    let mut cells: Vec<(usize, usize)> = Vec::new(); // (length, k)
+    for l in &lengths {
+        for k in &ks {
+            cells.push((*l, *k));
+        }
+    }
+    let mut hr2: Vec<Hist> = (0..cells.len()).map(|_| Hist::new()).collect();
+    let mut hs2: Vec<Hist> = (0..cells.len()).map(|_| Hist::new()).collect();
+    let mut sw3 = vec![0u64; cells.len()];
+    let sweep_rates = Trial::new(reps.min(3)).run(cells.len(), |ci, rep| {
+        let _ = env::drop_caches();
+        let blob = supdb::Blob::open(supdb::MmapBytes::open(&file).expect("map")).expect("open");
+        let (l, k) = cells[ci];
+        let (ops, sw) = f66_pass(
+            &blob,
+            Advice::Adaptive(k),
+            nkeys,
+            cycles,
+            phase_reads,
+            l,
+            scan_len,
+            0x5EED ^ rep as u64,
+            &mut hr2[ci],
+            &mut hs2[ci],
+        );
+        sw3[ci] += sw;
+        ops
+    });
+    // For each k, its worst showing against the best k at the same length.
+    let mut worst_ratio_for_k: Vec<(usize, f64)> = Vec::new();
+    for k in &ks {
+        let mut worst = f64::INFINITY;
+        for l in &lengths {
+            let best_at_l = ks
+                .iter()
+                .map(|kk| {
+                    let i = cells.iter().position(|c| c == &(*l, *kk)).unwrap();
+                    sweep_rates[i].median()
+                })
+                .fold(0.0f64, f64::max);
+            let i = cells.iter().position(|c| c == &(*l, *k)).unwrap();
+            worst = worst.min(sweep_rates[i].median() / best_at_l.max(1.0));
+        }
+        worst_ratio_for_k.push((*k, worst));
+    }
+    let (robust_k, robust_ratio) = worst_ratio_for_k
+        .iter()
+        .copied()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .unwrap();
+    rec.param("robust_k", J::u(robust_k as u64));
+    let detail: String = worst_ratio_for_k
+        .iter()
+        .map(|(k, r)| format!("k={k} {:.0}%", 100.0 * r))
+        .collect::<Vec<_>>()
+        .join(", ");
+    rec.finding(Finding::new(
+        "F66.5",
+        "one threshold is within 10% of the best at every phase length",
+        robust_ratio >= 0.9,
+        format!(
+            "k={robust_k} is the most robust choice, never below {:.0}% of the best k at its              own phase length over scan phases of {:?} calls. Worst-case share of the best, by              k: {detail}. A default needs one row of this table to be good enough everywhere,              not one row to be best somewhere",
+            100.0 * robust_ratio,
+            lengths,
         ),
     ));
 

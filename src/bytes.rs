@@ -74,6 +74,13 @@ pub trait Bytes {
     /// non-native source -- not an error. There is nothing to tell an OPFS
     /// file handle about page-fault patterns.
     fn advise_random(&self) {}
+
+    /// Undo `advise_random`: back to the kernel's default readahead.
+    ///
+    /// The pair exists so a reader can follow its workload rather than pick a
+    /// side once -- `f66-adaptive` measures whether that is worth doing. A
+    /// no-op wherever `advise_random` is one.
+    fn advise_normal(&self) {}
 }
 
 /// Read `len` bytes at `off`, borrowing when the source allows it.
@@ -188,6 +195,9 @@ impl Bytes for MmapBytes {
     }
     fn advise_random(&self) {
         let _ = self.0.advise(memmap2::Advice::Random);
+    }
+    fn advise_normal(&self) {
+        let _ = self.0.advise(memmap2::Advice::Normal);
     }
 }
 

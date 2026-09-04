@@ -744,6 +744,13 @@ impl<B: Bytes> Blob<B> {
         self.src.advise_random();
     }
 
+    /// Back to the kernel's default readahead. The other half of the pair a
+    /// reader needs if it is going to follow its workload rather than pick a
+    /// side once.
+    pub fn advise_normal(&self) {
+        self.src.advise_normal();
+    }
+
     pub fn zero_copy(&self) -> bool {
         matches!(
             &self.index,
