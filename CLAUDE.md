@@ -172,7 +172,7 @@ rule is the reason `Features::unmatched` exists.
 
 Equalize in **both** directions where the engines allow it, so a reader gets
 the comparison for the guarantee they care about rather than the one that
-flatters: `next` and `lmdb` both commit per batch, `next-nodrain` and
+flatters: `supdb` and `lmdb` both commit per batch, `supdb-nodrain` and
 `rocksdb-tuned` neither drain. Where an axis cannot be equalized -- LMDB
 cannot stop being transactional -- say which way the residual leans and read
 the result as a bound: a loss is at least that large, a win is not yet a win.
@@ -224,7 +224,7 @@ found zero joins that blocked on an unfinished seal under either key
 order and the manifest at 2% of the seal phase; 74% is the last memtable
 being sealed and partitioned because the adapter's `sync` drains, which
 RocksDB's `sync` (an fsync of its WAL) does not. So the drain is matched
-both ways (drain-plan.md; `next-nodrain`, `rocksdb-tuned-drain`): with
+both ways (drain-plan.md; `supdb-nodrain`, `rocksdb-tuned-drain`): with
 neither draining the durable ordered load is a **tie** (0.904x, `EXT.37`)
 and the shuffled load **2.37x** (`EXT.41`), with both draining 0.815x
 (`EXT.36`); point reads lead 4.7x undrained and 7.1x drained (`EXT.38`,

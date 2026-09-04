@@ -897,7 +897,7 @@ impl SegmentWriter {
     }
 
     /// Compress the blocks. Off by default, because a segment written by the
-    /// next engine's seal is read back by its own merge and the seal path
+    /// the seal is read back by its own merge and the seal path
     /// has never paid for compression; a segment written as an index to be
     /// downloaded is the other case, and logshed's day index is 30% smaller
     /// with it on. Must be set before the first key.

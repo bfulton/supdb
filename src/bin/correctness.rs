@@ -432,7 +432,7 @@ fn c1_decoders(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
 // ------------------------------------------------------------- C3: crashes --
 
-// ------------------------------------------------ C4: next engine crashes --
+// ------------------------------------------------ C4: engine crashes --
 
 /// One operation of the child's stream. The stream is a pure function of
 /// the seed, so the parent regenerates it and knows the exact state after

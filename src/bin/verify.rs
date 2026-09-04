@@ -236,10 +236,7 @@ fn check_unregistered(claims: &J, results: &Path, profile: &str, out: &mut Outco
             if id.is_empty() {
                 continue;
             }
-            if !registered
-                .iter()
-                .any(|(e, i)| e == exp && i == id)
-            {
+            if !registered.iter().any(|(e, i)| e == exp && i == id) {
                 let status = f.path("status").and_then(|v| v.as_str()).unwrap_or("");
                 out.failures.push(format!(
                     "{exp}/{id}: the run recorded this finding ('{status}') and no claim registers it"

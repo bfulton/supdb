@@ -345,14 +345,14 @@
    "because": "The value-size arm, and the one whose outcome the plan did not expect. If the lead lives in the lookup, tiny values widen it and large ones compress it toward the bandwidth bound -- a failure in the Greater direction, P5. It fails in the Less direction instead: 1.780x at 8B, 1.628x at 100B, 2.694x at 1024B, the lead growing with value size. That is P6, which the plan wrote down as the outcome that would demand a re-derivation, because a differential scaling with bytes copied out is not the index walk at all. Kept failing and on the books so the re-derivation cannot be quietly skipped."
   },
   {
-   "experiment": "f42-next",
+   "experiment": "f42-load",
    "id": "F42.1",
    "profile": "full",
    "expect": "holds",
    "because": "The promise registered before the engine existed, kept and then improved on: 955,714 ops/s durably at batch 1000 against a registered bar of 600,000, past LMDB's recorded 572,416 (context). The arc, each step named by a decomposition before it was built: 287,763 at milestone 1, 418,239 once the memtable stopped allocating per key, 800,526 once the seal left the committing thread, and 955,714 now. Phase accounting says where the remaining time goes: 0.56s of a 1.05s window is the WAL append and its fdatasync -- the only work a batch waits for -- and the seal and merge land outside it. Device bytes travel with it per rule 4: 472.7 MB for 110.6 MB of records against today's engine at 890.9."
   },
   {
-   "experiment": "f42-next",
+   "experiment": "f42-load",
    "id": "F42.3",
    "profile": "full",
    "expect": "holds",

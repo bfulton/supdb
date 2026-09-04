@@ -202,7 +202,7 @@ interleaved where the harness allows:
   at 2.04-2.06x the general path (F46.1, replicated), under the 3x
   registered as the price of a second writer in the format layer, and it
   was declined. The standing priority then changed -- complexity is spent
-  for time -- and `next::SegmentWriter` now writes every seal and merge
+  for time -- and `supdb::SegmentWriter` now writes every seal and merge
   output in one forward pass, same format, same `Blob`. f49 ran it against
   the general writer interleaved in one process on the f42 shape with the
   drain inside the window, three times: the seal phase was **2.5-3.2x**

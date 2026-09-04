@@ -74,7 +74,7 @@ fn main() -> std::io::Result<()> {
             "f1-outofcore" => f1_outofcore(&args, profile)?,
             "f8-checksums" => f8_checksums(&args, profile)?,
             "f28-count" => f28_count(&args, profile)?,
-            "f42-next" => f42_next(&args, profile)?,
+            "f42-load" => f42_load(&args, profile)?,
             "f43-compact" => f43_compact(&args, profile)?,
             "f44-tail" => f44_tail(&args, profile)?,
             "f45-scanfloor" => f45_scanfloor(&args, profile)?,
@@ -118,7 +118,7 @@ fn main() -> std::io::Result<()> {
                 "f1-outofcore",
                 "f8-checksums",
                 "f28-count",
-                "f42-next",
+                "f42-load",
                 "f43-compact",
                 "f44-tail",
                 "f45-scanfloor",
@@ -3747,14 +3747,14 @@ fn f43_compact(args: &Args, profile: Profile) -> std::io::Result<Record> {
 /// raw+index floor and past LMDB's recorded 572,416; below 600k the design
 /// has a leak that must be named. Rule 4: device bytes and on-disk size
 /// travel with the throughput.
-fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
+fn f42_load(args: &Args, profile: Profile) -> std::io::Result<Record> {
     use supdb::{Db, Options};
 
     let keys = args.num("--keys", profile.pick(20_000, 100_000, 1_000_000)) as u64;
     let batch = args.num("--batch", 1_000) as u64;
     let value_size = args.num("--value-size", 100);
 
-    let mut rec = Record::new("f42-next", profile);
+    let mut rec = Record::new("f42-load", profile);
     rec.param("keys", J::u(keys))
         .param("batch", J::u(batch))
         .param("value_size", J::u(value_size as u64))
@@ -3776,7 +3776,7 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // dataset), so next minus next-lazyseal is the cost of sealing on the
     // committing thread -- the milestone-1 shortcut -- and next-lazyseal
     // against f39's raw+index floor is the memtable-and-framing overhead.
-    let arm_names = ["next", "next-lazyseal"];
+    let arm_names = ["supdb", "supdb-lazyseal"];
     type Row = (usize, f64, f64);
     let rows: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
     // Where a durable load's time actually goes, taken from the engine
@@ -3789,7 +3789,7 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let mut kb = [0u8; 16];
         let io0 = IoCounters::read_now();
         let (secs, disk_mb) = {
-            let d = dir.join(format!("next-{ci}-{rep}"));
+            let d = dir.join(format!("supdb-{ci}-{rep}"));
             let _ = std::fs::remove_dir_all(&d);
             let opts = if ci == 1 {
                 Options {
@@ -3876,7 +3876,7 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
         "the engine's durable load clears the brief's registered P-A gate of 600k ops/s",
         next_tp >= 600_000.0,
         format!(
-            "next loads {:.0} ops/s durably at batch {batch} ({:.1} MB to the device, {:.1} \
+            "supdb loads {:.0} ops/s durably at batch {batch} ({:.1} MB to the device, {:.1} \
              MB on disk for {:.1} MB of records). The promise registered before this engine \
              existed was >= 600,000 -- within 1.7x of f39's raw+index floor and past LMDB's \
              recorded 572,416; a miss is a design leak to name, not a number to accept",
@@ -3895,13 +3895,13 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
         matches!(cmp_seal.verdict, supdb::bench::Verdict::Greater)
             && (rates[1].median() - rates[0].median()) >= (1_014_003.0 - rates[1].median()),
         format!(
-            "next-lazyseal {:.0} ops/s against next {:.0} ({}): sealing inside the timed \
+            "supdb-lazyseal {:.0} ops/s against supdb {:.0} ({}): sealing inside the timed \
              window costs {:.0} ops/s, and the residual from lazyseal to f39's raw+index \
              floor (1,014,003, cited) is {:.0}. Whichever is larger names milestone 2: \
              seal off-thread, or a cheaper memtable",
             rates[1].median(),
             rates[0].median(),
-            cmp_seal.summary("lazyseal", "next"),
+            cmp_seal.summary("lazyseal", "supdb"),
             rates[1].median() - rates[0].median(),
             1_014_003.0 - rates[1].median()
         ),

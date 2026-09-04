@@ -251,13 +251,13 @@ fn dir_size(p: &Path) -> u64 {
 
 // ------------------------------------------------------------------- next --
 
-/// The next engine (`supdb::next`): a WAL-only commit with sealed segments in
+/// Supdb (`supdb::next`): a WAL-only commit with sealed segments in
 /// today's store format. Always durable -- a commit is a WAL append plus one
 /// fdatasync, which is LMDB's own boundary, so this arm is guarantee-matched
 /// against `lmdb` the way `supdb-durable` is. Scans pay the unrouted fan
 /// (every segment contributes candidates) until range-partitioned compaction
 /// lands; that cost is the arm's to show, not to hide.
-pub struct Next {
+pub struct Supdb {
     db: Option<supdb::Db>,
     path: PathBuf,
     /// False for the ingest-first arm: a flush stops partitioning what it
@@ -273,22 +273,22 @@ pub struct Next {
     drain: bool,
 }
 
-impl Next {
-    pub fn create(path: &Path) -> Res<Next> {
-        Next::with_policy(path, true, true)
+impl Supdb {
+    pub fn create(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(path, true, true)
     }
 
-    pub fn create_ingest(path: &Path) -> Res<Next> {
-        Next::with_policy(path, false, true)
+    pub fn create_ingest(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(path, false, true)
     }
 
     /// `sync` fsyncs and seals nothing; reads then answer from the
     /// memtable, the unrouted tail and the partitions together.
-    pub fn create_nodrain(path: &Path) -> Res<Next> {
-        Next::with_policy(path, true, false)
+    pub fn create_nodrain(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(path, true, false)
     }
 
-    fn with_policy(path: &Path, partition: bool, drain: bool) -> Res<Next> {
+    fn with_policy(path: &Path, partition: bool, drain: bool) -> Res<Supdb> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         // Checksums off in the segments, because LMDB has none and the axis
         // is equalizable -- the same call `supdb-durable` makes, and the
@@ -319,7 +319,7 @@ impl Next {
             ..Default::default()
         };
         let db = supdb::Db::create(path, opts).map_err(|e| e.to_string())?;
-        Ok(Next {
+        Ok(Supdb {
             db: Some(db),
             path: path.to_path_buf(),
             partition,
@@ -328,12 +328,12 @@ impl Next {
     }
 }
 
-impl Engine for Next {
+impl Engine for Supdb {
     fn name(&self) -> &'static str {
         match (self.partition, self.drain) {
-            (true, true) => "next",
-            (false, _) => "next-ingest",
-            (true, false) => "next-nodrain",
+            (true, true) => "supdb",
+            (false, _) => "supdb-ingest",
+            (true, false) => "supdb-nodrain",
         }
     }
     fn features(&self) -> Features {
@@ -389,7 +389,7 @@ impl Engine for Next {
             // half its keys out of a resident memtable while LMDB read a
             // tree -- but RocksDB's sync is an fsync of its WAL and its
             // reads go through its memtable and level 0, so against it the
-            // drain is a residual the next engine pays alone. `next-nodrain`
+            // drain is a residual the engine pays alone. `next-nodrain`
             // is the arm matched to that; both are measured.
             if self.drain {
                 db.flush().map_err(|e| e.to_string())?;
@@ -501,11 +501,11 @@ impl Engine for Redb {
 
 /// RocksDB through rust-rocksdb.
 ///
-/// The engine the next engine is shaped like -- a write-ahead log, a
+/// The engine the engine is shaped like -- a write-ahead log, a
 /// memtable, sorted immutable files and compaction -- and so the comparator
-/// that separates "the next engine is fast" from "an LSM is fast". Two
+/// that separates "the engine is fast" from "an LSM is fast". Two
 /// arms, as for LMDB: `rocksdb` syncs the WAL on every batch, matching the
-/// next engine's `Sync::Always` and LMDB's default; `rocksdb-nosync` writes
+/// supdb's `Sync::Always` and LMDB's default; `rocksdb-nosync` writes
 /// the WAL and lets the OS get to it, matching `lmdb-nosync` and
 /// `supdb-buffered`.
 ///
@@ -527,7 +527,7 @@ pub struct Rocks {
     sync: bool,
     tuned: bool,
     /// Whether `sync` flushes the memtable and compacts everything, so the
-    /// load window carries the same drain the next engine's default does
+    /// load window carries the same drain the engine's default does
     /// and the reads run against a fully compacted tree.
     drain: bool,
     read: rocksdb::ReadOptions,
@@ -552,7 +552,7 @@ impl Rocks {
     }
 
     /// Tuned, and drained at `sync`: memtable flushed, every level
-    /// compacted into one, inside the window -- the next engine's default
+    /// compacted into one, inside the window -- the engine's default
     /// shape, charged to RocksDB.
     pub fn create_tuned_drain(path: &Path) -> Res<Rocks> {
         Rocks::with(path, true, true, true)
@@ -612,7 +612,7 @@ impl Engine for Rocks {
             durable_commit: self.sync,
             // A WriteBatch is applied whole or not at all and is readable by
             // this handle the moment `write` returns: the same atomic-batch,
-            // read-your-writes contract the next engine's `Txn` and LMDB's
+            // read-your-writes contract the engine's `Txn` and LMDB's
             // write transaction give the suite. Reader isolation beyond that
             // is RocksDB's snapshot, which no workload here needs.
             transactions: true,
