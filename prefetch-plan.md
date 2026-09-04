@@ -78,3 +78,54 @@ than one per extent, and that is a different experiment.
 S1 is registered because it is the change I would have shipped on the strength
 of the first probe shape, and writing down that it does not work is worth more
 than quietly not doing it.
+
+## Outcome
+
+Two full runs an arm, and for the resident question eight.
+
+**S1 landed: `MADV_SEQUENTIAL` is worth nothing here** (`F68.1`, recorded as
+failing). The rung looked like a 12.5x answer on a whole-file walk and is
+1.01x at the spans a scan walks. It never got an arm, and the reasoning that
+made it not worth one is in the finding so nobody re-runs the flattering
+shape.
+
+**S2 and S3 landed** (`F68.2`, `F68.3`): 1.47-1.56x the shipped adaptive
+advice at 1.18x read amplification against 3.44x -- 793 MB of device traffic
+where the advice needs 2,310 and the kernel's own readahead needs 11,602.
+Faster and cheaper at once, because the engine is told where the span ends.
+
+**S5 did not land, and the reason is worth keeping.** It predicted one
+contiguous `WILLNEED` per scan would fetch the wrong bytes, since a scan
+interleaves index, block table and blocks. That is true of a contiguous span
+and the probe only ever measured one. `prefetch_scan` does not use a span: it
+walks the records the scan will cover and plans through `plan_exts`, the
+planner the browser's ranged reads already needed. The machinery that answers
+"which bytes does this read want" existed for a different reason and was
+exactly what the native path lacked.
+
+**S4 landed and does not carry the conclusion** (`F68.4`). A policy that never
+switches mode does beat one that does, so phase detection is not what wins the
+scan back. That would have retired the switching -- except for the cost.
+
+**The cost is what decides it.** On a warm store that fits in memory the
+planning is pure overhead, and eight full runs put prefetch at 1.038, 0.964,
+0.933, 0.963, 0.922, 0.963, 0.976 and 0.964 of the adaptive advice. Six of
+eight below one. `F68.6` states it as a bound rather than a tie because a tie
+test cannot answer it twice running: at twenty-one repetitions the p-values
+are 0.0000 and 0.0003 while the verdicts differ, since 7.8% clears the gate's
+5% minimum effect and 3.7% does not.
+
+So `ReadAdvice::Prefetch` ships as an option and `ReadAdvice::Adaptive` stays
+the default. That is the same call `MADV_RANDOM` got, for the same reason: a
+large win for a workload shape, chosen by somebody who knows their shape, and
+not imposed on the many stores that fit in memory. `F67.3` asked the same
+question of `Adaptive` and got a tie twice, which is why `Adaptive` is what
+users get.
+
+Two thresholds were restated in this experiment after watching them straddle,
+which is a pattern that deserves naming rather than burying. `F68.2`'s 1.5x
+bar was arbitrary and sat on top of a gate that already enforces an effect
+size. `F68.6` moved from a tie test to a bound, and that one moves the
+conclusion *against* the change -- a policy costing a few percent where most
+stores live does not become the default -- which is the opposite of a bar
+relaxed to get a pass.

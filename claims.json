@@ -1236,6 +1236,48 @@
       "id": "EXT.47",
       "expect": "holds",
       "because": "The same pair on the ordered scan: 1.038x and 0.995x, no difference either time. The scan is the side the advice can hurt -- F65.3 priced a fixed MADV_RANDOM at 2.3-2.5x slower there -- so a policy that switches on the first scan has to be shown not to pay that, and at this shape it does not. Read the two together with EXT.46: neither the point read nor the scan moved when the default changed."
+    },
+    {
+      "experiment": "f68-prefetch",
+      "id": "F68.5",
+      "expect": "holds",
+      "needs": "a writable memory controller to cap the page cache",
+      "because": "Rule 3's precondition: 2081.3 MB of store against a 256 MB cap. Without it the scan arms answer from the page cache and there is nothing to prefetch and nothing to over-fetch."
+    },
+    {
+      "experiment": "f68-prefetch",
+      "id": "F68.1",
+      "expect": "fails",
+      "because": "Registered as S1 in prefetch-plan.md and refuted before an arm was built for it, which is the finding's point. A feasibility probe walking a whole 2 GB file made MADV_SEQUENTIAL look like a 12.5x answer; over 200 bounded spans of 2 MB it is 1.01x, and at 256 KiB spans 1.04x. The readahead ramp that pays over two uninterrupted gigabytes never starts inside a bounded span, and every scan this engine issues is bounded. Both numbers are in its evidence so the next person does not re-run the shape that flatters it. No `needs`: nothing was measured that a cap could gate."
+    },
+    {
+      "experiment": "f68-prefetch",
+      "id": "F68.2",
+      "expect": "holds",
+      "needs": "a writable memory controller to cap the page cache",
+      "because": "The dial that is worth something. Planning a scan's byte ranges and prefetching them runs 1.474x, 1.486x, 1.514x and 1.560x the shipped adaptive advice over four full runs, every one `greater` at p=0.0022. The ranges come from `plan_exts`, the planner the browser's ranged reads already use, which is what makes this work on the real path: a scan's bytes are index, block table and blocks interleaved, and prefetch-plan.md registered a single contiguous span per scan as the likely failure. Gated on `compare` alone -- an earlier 1.5x bar on top of it was arbitrary, thirty times stricter than the 5% MIN_EFFECT the gate already enforces, and flipped the finding on which side of an invented line a median fell."
+    },
+    {
+      "experiment": "f68-prefetch",
+      "id": "F68.3",
+      "expect": "holds",
+      "needs": "a writable memory controller to cap the page cache",
+      "because": "The half that does not drift with the host, and the reason the other half happens: device bytes per byte the reader handed back are 1.18x prefetching against 3.44x for the adaptive advice, 17.26x for the kernel's default and 1.01x for a fixed MADV_RANDOM. In absolute terms 793 MB against 2,310 MB for the same work, and 11.6 GB for the kernel's own readahead. Readahead cannot see where a bounded span ends so it reads past it into data the scan never touches; a planned range asks for what the extents name and nothing else."
+    },
+    {
+      "experiment": "f68-prefetch",
+      "id": "F68.4",
+      "expect": "holds",
+      "needs": "a writable memory controller to cap the page cache",
+      "because": "Prefetch stays in MADV_RANDOM for the life of the store and issues no advice changes at all, and still beats the policy that switches on every phase boundary. So the phase detection is not what wins the scan back -- there is no phase to detect when the caller states the span. It does not follow that the switching can retire: F68.6 is why it does not."
+    },
+    {
+      "experiment": "f68-prefetch",
+      "id": "F68.6",
+      "expect": "holds",
+      "profile": "full",
+      "needs": "a writable memory controller to cap the page cache",
+      "because": "The cost, and the reason Prefetch is an option rather than the default. On a warm store that fits in memory the planning is pure overhead -- the walk that builds each plan reads records the scan is about to read again, and every range it names is already resident -- and eight full runs put it at 1.038, 0.964, 0.933, 0.963, 0.922, 0.963, 0.976 and 0.964. Six of eight below one. Stated as a bound rather than as a tie because a tie test could not answer it twice running: at twenty-one repetitions the p-values are 0.0000 and 0.0003 while the verdicts differ, because 7.8% clears the gate's 5% minimum effect and 3.7% does not. The cost is real, consistent, and a few percent -- which is the shape that kept MADV_RANDOM from being the default, so this ships the same way. F67.3 asked the same question of Adaptive and got a tie, twice, which is why Adaptive is what users get. Pinned to full, and the ci number is the reason rather than an embarrassment: there the resident store is 8 MB walked by twenty scans of a hundred, so the fixed cost of planning is a much larger share of a much smaller amount of work and it measures 0.841x. The bound is a claim about the cost at a scale anybody runs, and ci is not one -- the same reason F65.3 carries a pin."
     }
   ],
   "metrics": [
