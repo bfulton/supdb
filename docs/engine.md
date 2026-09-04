@@ -434,6 +434,28 @@ per-commit path.
   with the merge phase at zero, reads unchanged; on uniform keys nothing
   qualifies and nothing changes (F55.1-F55.4, all held). The canonical
   run's shape is uniform, so EXT.22 does not move; a log does.
+- ~~Readahead out-of-core~~ — **answered by f65/f66**. Once the file
+  outgrows the page cache, the kernel's default readahead is the whole
+  cliff: cold point reads run 75.8x and 78.9x faster under `MADV_RANDOM`,
+  at 1.0x read amplification against 1800x, the default having fetched
+  157 GB off the device to serve 89 MB anybody asked for (F65.1, F65.2).
+  It is a trade rather than a win, because the ordered scan wants exactly
+  the pages a point read does not and pays 2.3x to 2.5x for losing them
+  (F65.3). `Options::advise_random` is that trade as a per-store choice
+  and defaults off.
+  What removes the choice is that a store knows which of the two it is
+  doing: `read_all` and `scan` are different calls, so the advice can
+  follow the workload rather than be picked once. Doing that beats a fixed
+  `MADV_RANDOM` by 7.650x and 7.941x on a phased workload and ties an
+  oracle switching at true phase boundaries (F66.2, F66.1) — and costs
+  nothing on a workload that never scans (F66.3). The threshold is one
+  scan, which is no counter at all, because hysteresis measured as the
+  cost rather than the protection: two consecutive scans as the trigger
+  falls to 33.2% and 30.8% of the better fixed advice on a workload with
+  no phases, where one scan is 1.5x it (F66.6, F66.5). A `madvise` is
+  microseconds and a cold scan in the wrong mode is milliseconds, so the
+  policy is right to act on the first call rather than wait for a second.
+
 - **Partitioned compaction policy** — built and measured (f43). The tail
   bound is a real dial: T8 sends 0.898x of T4's device bytes and scans
   0.910x as fast. What f43 also convicted is the merge itself — it
