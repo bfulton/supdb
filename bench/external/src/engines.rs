@@ -271,38 +271,47 @@ pub struct Supdb {
     /// drain to be 11% of the canonical window and the whole of the seal
     /// phase, so both shapes are arms (drain-plan.md).
     drain: bool,
-    /// `ReadAdvice::Adaptive` rather than the shipped default. It is an arm
-    /// rather than a changed default because that is the only way to price
-    /// it: f67 measured the policy on a store built for it, and what the
-    /// canonical comparison needs to know is whether it moves the numbers
-    /// this project quotes. Two campaigns cannot answer that -- the three
-    /// unchanged comparators once moved +20% to +43% between consecutive
-    /// runs of this suite -- so both arms run interleaved in one process.
-    adaptive: bool,
+    /// A read advice pinned against the engine's own default, or `None` to
+    /// take whatever the default is.
+    ///
+    /// `None` for the canonical arm, deliberately: the numbers this project
+    /// quotes should describe what a user gets, so the arm follows the
+    /// default rather than pinning a setting beside it. The contrast arm
+    /// pins the kernel's plain readahead, and `EXT.46` and `EXT.47` are the
+    /// two run interleaved -- which is the only way to price this, since the
+    /// three unchanged comparators in this suite once moved +20% to +43%
+    /// between consecutive runs.
+    advice: Option<supdb::ReadAdvice>,
 }
 
 impl Supdb {
     pub fn create(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, true, true, false)
+        Supdb::with_policy(path, true, true, None)
     }
 
     pub fn create_ingest(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, false, true, false)
+        Supdb::with_policy(path, false, true, None)
     }
 
     /// `sync` fsyncs and seals nothing; reads then answer from the
     /// memtable, the unrouted tail and the partitions together.
     pub fn create_nodrain(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, true, false, false)
+        Supdb::with_policy(path, true, false, None)
     }
 
-    /// `supdb` in every respect but the read advice, so the pair differs by
-    /// one option and needs no matching.
-    pub fn create_adaptive(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, true, true, true)
+    /// `supdb` in every respect but the read advice, which is pinned to the
+    /// kernel's plain readahead. The pair differs by one option and needs no
+    /// matching.
+    pub fn create_noadvice(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(path, true, true, Some(supdb::ReadAdvice::Default))
     }
 
-    fn with_policy(path: &Path, partition: bool, drain: bool, adaptive: bool) -> Res<Supdb> {
+    fn with_policy(
+        path: &Path,
+        partition: bool,
+        drain: bool,
+        advice: Option<supdb::ReadAdvice>,
+    ) -> Res<Supdb> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         // Checksums off in the segments, because LMDB has none and the axis
         // is equalizable -- the same call `supdb-durable` makes, and the
@@ -330,12 +339,14 @@ impl Supdb {
             // to background compaction. Both arms are measured rather than
             // argued about.
             partition_on_flush: partition,
-            read_advice: if adaptive {
-                supdb::ReadAdvice::Adaptive
-            } else {
-                supdb::ReadAdvice::Default
-            },
             ..Default::default()
+        };
+        let opts = match advice {
+            Some(a) => supdb::Options {
+                read_advice: a,
+                ..opts
+            },
+            None => opts,
         };
         let db = supdb::Db::create(path, opts).map_err(|e| e.to_string())?;
         Ok(Supdb {
@@ -343,15 +354,15 @@ impl Supdb {
             path: path.to_path_buf(),
             partition,
             drain,
-            adaptive,
+            advice,
         })
     }
 }
 
 impl Engine for Supdb {
     fn name(&self) -> &'static str {
-        match (self.partition, self.drain, self.adaptive) {
-            (true, true, true) => "supdb-adaptive",
+        match (self.partition, self.drain, self.advice.is_some()) {
+            (true, true, true) => "supdb-noadvice",
             (true, true, false) => "supdb",
             (false, _, _) => "supdb-ingest",
             (true, false, _) => "supdb-nodrain",

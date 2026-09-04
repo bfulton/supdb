@@ -130,7 +130,6 @@ fn idle_io_priority() {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ReadAdvice {
     /// The kernel's default readahead, for every access.
-    #[default]
     Default,
     /// `MADV_RANDOM` for the life of the store. For one whose working set
     /// outgrows memory and whose reads are points.
@@ -147,6 +146,15 @@ pub enum ReadAdvice {
     /// where switching on the first is 1.5x it (`F66.5`, `F66.6`). A switch
     /// is a `madvise` in microseconds and one cold scan in the wrong mode is
     /// milliseconds, so there is nothing to be gained by waiting.
+    ///
+    /// The default, because it wins where the advice matters and costs
+    /// nothing where it does not. Out-of-core it is 4.3-4.4x the kernel's
+    /// default and 6.5-6.6x a fixed `MADV_RANDOM` over a store of several
+    /// segments (`F67.1`), and 2.0-2.1x the better of the two on a workload
+    /// with no phases (`F67.2`). On a store that fits in memory, where it can
+    /// win nothing and can only cost, it is a tie (`F67.3`) -- as it is on
+    /// the canonical comparison this project quotes (`EXT.46`, `EXT.47`).
+    #[default]
     Adaptive,
 }
 
@@ -233,8 +241,7 @@ pub struct Options {
     /// overwrite. f57 prices it (walreuse-plan.md).
     /// How reads advise the kernel about the segment mappings.
     ///
-    /// See `ReadAdvice`. `Default` unless changed, which is the setting the
-    /// engine has always had.
+    /// See `ReadAdvice`. `Adaptive` unless changed.
     pub read_advice: ReadAdvice,
     pub recycle_wal: bool,
     /// The ordered scan's merge over unrouted sources. `true` is the merge
@@ -276,7 +283,7 @@ impl Default for Options {
             flush_ranges: true,
             promote: true,
             recycle_wal: false,
-            read_advice: ReadAdvice::Default,
+            read_advice: ReadAdvice::default(),
             scan_merge: true,
             scan_snapshot_arena: true,
         }

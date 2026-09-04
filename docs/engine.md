@@ -458,12 +458,14 @@ per-commit path.
   no phases, where one scan is 1.5x it (F66.6, F66.5). A `madvise` is
   microseconds and a cold scan in the wrong mode is milliseconds, so the
   policy is right to act on the first call rather than wait for a second.
-  It is `ReadAdvice::Adaptive`, and it takes no threshold, because a knob
-  whose only good value is known is a knob nobody should have. What f66
-  has not priced is the same policy over a store rather than over one
-  mapping -- a `Db` maps a file per segment, so a switch is one `madvise`
-  each -- which is f67 and `readadvice-plan.md`, and which is what the
-  default waits on.
+  It is `ReadAdvice::Adaptive`, it takes no threshold, because a knob whose
+  only good value is known is a knob nobody should have, and it is the
+  default. f67 is why it can be: over a `Db` of several segments, where a
+  switch costs one `madvise` each, it is 4.3-4.4x the kernel's default and
+  6.5-6.6x a fixed `MADV_RANDOM` (F67.1), and on a store that fits in
+  memory -- where it can win nothing and can only cost -- it is a tie
+  (F67.3). The canonical comparison agrees (EXT.46, EXT.47), which is what
+  a default has to be measured against rather than predicted from.
 
 - **Partitioned compaction policy** — built and measured (f43). The tail
   bound is a real dial: T8 sends 0.898x of T4's device bytes and scans

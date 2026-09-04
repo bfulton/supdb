@@ -104,8 +104,8 @@ fn build(root: &std::path::Path, which: &[&str]) -> Vec<Box<dyn Engine>> {
                     .to_string(),
             ),
             "supdb-nodrain" => Supdb::create_nodrain(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
-            "supdb-adaptive" => {
-                Supdb::create_adaptive(&dir).map(|e| Box::new(e) as Box<dyn Engine>)
+            "supdb-noadvice" => {
+                Supdb::create_noadvice(&dir).map(|e| Box::new(e) as Box<dyn Engine>)
             }
             other => Err(format!("unknown engine {other}")),
         };
@@ -149,12 +149,12 @@ fn main() -> std::io::Result<()> {
     let engines: Vec<&str> = args
         .get("--engines")
         .map(|s| s.split(',').collect())
-        // `supdb-adaptive` is in the default set so every run of this suite
-        // prices the read advice against the arm it would replace. Leaving it
-        // out would mean EXT.46 and EXT.47 were only ever measured when
-        // somebody remembered to ask for them, which is how a gate stops
-        // running.
-        .unwrap_or_else(|| vec!["supdb", "supdb-adaptive", "redb", "lmdb", "sled"]);
+        // `supdb-noadvice` is in the default set so every run of this suite
+        // prices the engine's default read advice against the kernel's plain
+        // readahead. Leaving it out would mean EXT.46 and EXT.47 were only
+        // ever measured when somebody remembered to ask for them, which is
+        // how a gate stops running.
+        .unwrap_or_else(|| vec!["supdb", "supdb-noadvice", "redb", "lmdb", "sled"]);
 
     let rec = match cmd.as_str() {
         "kv" => suite_kv(&args, profile, &engines)?,
@@ -846,9 +846,9 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
     ordering_of(
         &mut rec,
         "EXT.46",
-        "The adaptive read advice does not cost the canonical point read",
-        "supdb-adaptive",
+        "The engine's default read advice does not cost the canonical point read",
         "supdb",
+        "supdb-noadvice",
         &read,
         "reads/s",
         false,
@@ -858,8 +858,8 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &mut rec,
         "EXT.47",
         "nor the ordered scan",
-        "supdb-adaptive",
         "supdb",
+        "supdb-noadvice",
         &scan,
         "entries/s",
         false,
