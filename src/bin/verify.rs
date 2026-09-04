@@ -59,6 +59,7 @@ fn main() -> std::io::Result<()> {
         profile
     );
 
+    check_shape(&claims, &results, &mut out);
     check_findings(&claims, &results, &profile, &mut out);
     check_metrics(&claims, &results, &profile, &mut out);
     check_unregistered(&claims, &results, &profile, &mut out);
@@ -119,6 +120,61 @@ fn load(results: &Path, experiment: &str, profile: &str) -> Load {
     match jparse::parse(&text) {
         Ok(doc) => Load::Ok(Box::new(doc)),
         Err(e) => Load::Broken(format!("{} is not parseable: {e:?}", p.display())),
+    }
+}
+
+/// Every claim must name an experiment and an id.
+///
+/// Both readers below reach for those with `unwrap_or("")`, and an empty one
+/// is not harmless in the same way twice. In the claims-to-results direction
+/// it looks up a result for the experiment `""`, finds nothing, and reports
+/// the claim *skipped* -- so a claim with a typo in its experiment name is
+/// silently never checked, which is the quietest way this file could fail.
+/// In the other direction it registers the pair `("", "")`, which matches no
+/// finding, so a real finding would at least be reported unregistered.
+///
+/// Checking the shape once here means neither direction has to care: a claim
+/// that cannot be read is a failure, said out loud, rather than a claim that
+/// quietly stops being adjudicated.
+fn check_shape(claims: &J, results: &Path, out: &mut Outcome) {
+    let Some(list) = claims.path("findings") else {
+        return;
+    };
+    // Every experiment that has a result at any profile. A claim naming one
+    // that has none is the other half of this: an empty field fails loudly
+    // above, but a *misspelt* experiment reads as an experiment nobody has
+    // run yet, so both directions pass it over -- the claims side finds no
+    // result and skips, and the results side never sees the name at all.
+    let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(dir) = std::fs::read_dir(results) {
+        for e in dir.flatten() {
+            if let Ok(n) = e.file_name().into_string() {
+                if let Some(stem) = n.strip_suffix(".json") {
+                    if let Some((exp, _profile)) = stem.rsplit_once('.') {
+                        known.insert(exp.to_string());
+                    }
+                }
+            }
+        }
+    }
+    for (i, c) in list.items().iter().enumerate() {
+        let exp = c.path("experiment").and_then(|v| v.as_str()).unwrap_or("");
+        let id = c.path("id").and_then(|v| v.as_str()).unwrap_or("");
+        if exp.is_empty() || id.is_empty() {
+            out.failures.push(format!(
+                "claims.json findings[{i}]: a claim must name both an experiment and an id, \
+                 and this one has experiment {exp:?} and id {id:?} -- a claim that cannot be \
+                 read is a claim nothing adjudicates"
+            ));
+            continue;
+        }
+        if !known.is_empty() && !known.contains(exp) {
+            out.failures.push(format!(
+                "{exp}/{id}: no result names the experiment {exp:?} at any profile. Either it \
+                 is misspelt, in which case nothing has been checking this claim, or the \
+                 experiment is gone and the claim went with it"
+            ));
+        }
     }
 }
 
