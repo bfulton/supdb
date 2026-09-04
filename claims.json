@@ -1224,6 +1224,18 @@
       "id": "F67.3",
       "expect": "holds",
       "because": "The case f66 could not ask, and the one that decides whether Adaptive is safe as a default. Every f66 arm ran against a file eight times its page cache, because that is where the advice can matter; most stores fit in memory, where the policy can win nothing and can only cost -- a madvise per segment per phase change and a branch per operation. On a warm resident store it measures 97.3% and 99.0% of the kernel's default, no difference on either run. Carries no `needs`: a resident store is resident whether or not the host can cap its page cache, so this one is exercised everywhere."
+    },
+    {
+      "experiment": "ext-kv",
+      "id": "EXT.46",
+      "expect": "holds",
+      "because": "The check that let the read advice become the default. `supdb` takes the engine's default and `supdb-noadvice` pins the kernel's plain readahead, one option apart and interleaved in one process, so what is measured is the option rather than the machine. Two full runs: 1.007x and 1.002x, no difference either time. This is the case that mattered, because the canonical dataset is resident and there the policy can win nothing and can only cost -- F67.1 and F67.2 are where it wins, out of core. Gated on not being resolvably slower rather than on a win, since a finding that demanded one here would be designed to fail."
+    },
+    {
+      "experiment": "ext-kv",
+      "id": "EXT.47",
+      "expect": "holds",
+      "because": "The same pair on the ordered scan: 1.038x and 0.995x, no difference either time. The scan is the side the advice can hurt -- F65.3 priced a fixed MADV_RANDOM at 2.3-2.5x slower there -- so a policy that switches on the first scan has to be shown not to pay that, and at this shape it does not. Read the two together with EXT.46: neither the point read nor the scan moved when the default changed."
     }
   ],
   "metrics": [
