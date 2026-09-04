@@ -509,7 +509,7 @@ impl Engine for Redb {
 /// the WAL and lets the OS get to it, matching `lmdb-nosync` and
 /// `supdb-buffered`.
 ///
-/// SegmentOptions are RocksDB's defaults except that compression is off, because
+/// Its options are RocksDB's defaults except that compression is off, because
 /// every other engine here stores values as written (block compression is
 /// off in supdb since f12 priced it) and a comparison of compressed bytes
 /// against plain ones would be a comparison of codecs, and that reads do
@@ -560,7 +560,7 @@ impl Rocks {
 
     fn with(path: &Path, sync: bool, tuned: bool, drain: bool) -> Res<Rocks> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
-        let mut o = rocksdb::SegmentOptions::default();
+        let mut o = rocksdb::Options::default();
         o.create_if_missing(true);
         o.set_compression_type(rocksdb::DBCompressionType::None);
         if tuned {
