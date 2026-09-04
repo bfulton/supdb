@@ -28,15 +28,29 @@ set -eu
 cd "$(dirname "$0")/.."
 
 ALL="build test lint browser claims suites"
-GROUPS="${*:-$ALL}"
+# Lowercase because `GROUPS` is a built-in bash variable holding the current
+# user's group ids. Assigning to it does not take, so on any host where
+# /bin/sh is bash -- macOS ships bash 3.2 as /bin/sh -- this loop would have
+# iterated over group ids instead of over check groups. dash, which is
+# /bin/sh on the Linux runners, has no such variable and hid it.
+groups="${*:-$ALL}"
 
 # Where `suites` writes. CI overrides these so it can upload them.
-RESULTS="${CHECK_RESULTS:-results-ci}"
-FIGURES="${CHECK_FIGURES:-figures-ci}"
+#
+# Spelled out rather than `${CHECK_RESULTS:-results-ci}`, because macOS ships
+# bash 3.2 as /bin/sh and it mishandles a default expansion of an *unset*
+# variable under `set -u`: the script died there having printed nothing, on a
+# checkout that passed on both Linux runners. `${VAR+x}` is the portable test
+# for "is it set", and the `if` is not an `&&` because a false `&&` would trip
+# `set -e`.
+RESULTS=results-ci
+FIGURES=figures-ci
+if [ -n "${CHECK_RESULTS+x}" ]; then RESULTS=$CHECK_RESULTS; fi
+if [ -n "${CHECK_FIGURES+x}" ]; then FIGURES=$CHECK_FIGURES; fi
 
 say() { printf '\n=== %s ===\n' "$1"; }
 
-for g in $GROUPS; do
+for g in $groups; do
   case "$g" in
     build)
       say "build"
@@ -83,4 +97,4 @@ for g in $GROUPS; do
   esac
 done
 
-printf '\nall checks passed: %s\n' "$GROUPS"
+printf '\nall checks passed: %s\n' "$groups"

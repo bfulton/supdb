@@ -53,20 +53,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # `scripts/check.sh` is the single definition of what this project
       # checks, so a contributor running it locally runs exactly this.
-      #
-      # DIAGNOSTIC, to be reverted: the first macOS run exited 1 in 38ms with
-      # no output at all -- not the script's first banner, not a shell error --
-      # while the same checkout passed on both Linux runners. The script parses
-      # under dash, posix bash and bash, and is mode 755 clean ASCII, so the
-      # failure is in reaching or starting it rather than in running it. This
-      # names the shell and traces execution so the next run says which.
       - name: Build, test and lint
-        run: |
-          echo "uname: $(uname -a)"
-          echo "sh:    $(command -v sh)"
-          sh --version 2>&1 | head -1 || echo "(sh --version not supported)"
-          ls -l scripts/
-          sh -x scripts/check.sh build test lint
+        run: sh scripts/check.sh build test lint
 
   cross-arm:
     # Proves the ARM paths build and pass before any ARM hardware is involved.
