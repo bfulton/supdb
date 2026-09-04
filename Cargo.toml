@@ -12,6 +12,8 @@ name = "supdb"
 version = "0.1.0"
 edition = "2021"
 description = "A read-optimized embedded key-multivalue store"
+license = "MIT"
+repository = "https://github.com/bfulton/supdb"
 
 # A wasm build gets the reader and nothing else. `cdylib` is what the browser
 # loads; `rlib` is what the bins and tests link.

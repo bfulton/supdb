@@ -125,3 +125,7 @@ in:
 ## Status
 
 A prototype. The open gaps are the ones listed above, each carried as a claim.
+
+## License
+
+MIT. See `LICENSE`.
