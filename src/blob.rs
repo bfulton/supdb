@@ -728,11 +728,6 @@ impl<B: Bytes> Blob<B> {
         (self.generation, self.timestamp)
     }
 
-    /// True when the index section is borrowed rather than copied.
-    ///
-    /// Diagnostic, and the thing `tests/blob.rs` asserts to keep R2.3 from
-    /// rotting: a native reader that started copying its index would still
-    /// pass every correctness test.
     /// Tell the byte source that this reader's access pattern is random.
     ///
     /// `MADV_RANDOM` on a mapped file, and a no-op on every source with no
@@ -751,6 +746,11 @@ impl<B: Bytes> Blob<B> {
         self.src.advise_normal();
     }
 
+    /// True when the index section is borrowed rather than copied.
+    ///
+    /// Diagnostic, and the thing `tests/blob.rs` asserts to keep R2.3 from
+    /// rotting: a native reader that started copying its index would still
+    /// pass every correctness test.
     pub fn zero_copy(&self) -> bool {
         matches!(
             &self.index,
