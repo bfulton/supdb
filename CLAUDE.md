@@ -119,11 +119,18 @@ is not a measurement.
 
 There was a second engine until recently: the one vendored from the design
 artifact, with its own writer, reader, freelist and key table. It is gone, and
-`retire-plan.md` records what went with it and why. The three format modules
-still carry a scoped `#[allow(clippy::all, dead_code)]` and are still exempt
-from the format gate, because `docs/architecture-review.md` cites line numbers
-in them; that exemption is now a reformat of three files away from being
-liftable. Everything else holds to `-D warnings`.
+`retire-plan.md` records what went with it and why. `block` and `index` still
+carry a scoped `#[allow(clippy::all, dead_code)]` -- style not yet paid down,
+rather than code anyone may not touch. Nothing is exempt from the format gate.
+Everything else holds to `-D warnings`.
+
+The exemption those two modules used to have is worth remembering, because it
+was the same shape as every other gate failure here. It was justified in
+`scripts/fmt.sh`, in `src/lib.rs` and in this file by the architecture review
+citing line numbers in the exempt files. The review cites none, and nothing
+had checked. Two of the three files turned out to be rustfmt-clean already, so
+the whole exemption was buying a reformat of one file -- and the reason it
+survived was that its justification read like one nobody needed to verify.
 
 ## Measuring a change to the engine
 
