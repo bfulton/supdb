@@ -809,6 +809,8 @@ fn f66_pass(
     let mut g = KeyGen::new(KeyDist::Uniform, nkeys, seed);
     let mut kb = [0u8; 16];
     let mut ops = 0u64;
+    let mut scan_ix = 0u64;
+    let stride = (nkeys / (cycles * phase_scans).max(1) as u64).max(1);
     let mut asked = 0u64;
     let mut read_secs = 0.0f64;
     let mut scan_secs = 0.0f64;
@@ -842,18 +844,22 @@ fn f66_pass(
             m.set(false);
         }
         let tp = Instant::now();
-        for s in 0..phase_scans {
+        for _ in 0..phase_scans {
             if let Advice::Adaptive(k) = advice {
                 consec_scans += 1;
                 if consec_scans >= k {
                     m.set(false); // the cheap direction: only on sustained evidence
                 }
             }
+            // Spread over the whole pass, not over the phase. Indexing by the
+            // position *within* a phase makes every cycle re-scan the same
+            // regions -- warm after the first -- and collapses to a single
+            // start key when a phase holds one scan, which is the phase-free
+            // workload F66.6 drives. A scan that is always warm cannot tell
+            // one advice from another.
             let mut kb2 = [0u8; 16];
-            db_key_into(
-                (s as u64 * nkeys / phase_scans.max(1) as u64) % nkeys,
-                &mut kb2,
-            );
+            db_key_into(scan_ix * stride % nkeys, &mut kb2);
+            scan_ix += 1;
             let t = Instant::now();
             let mut got = 0u64;
             let n = blob
@@ -897,6 +903,17 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let phase_scans = args.num("--phase-scans", profile.pick(8, 32, 96));
     let scan_len = args.num("--scan-len", profile.pick(100, 300, 500));
     let reps = args.num("--reps", profile.reps());
+    // The k that would ship, declared rather than searched for.
+    //
+    // Taking the argmax of the sweep is taking noise: two full runs of this
+    // experiment chose k=2 and k=1, 3.6% and 3.9% apart in opposite
+    // directions, and every finding downstream then describes whichever
+    // policy won a coin flip. The default is instead the smallest k that
+    // cannot thrash. k=1 re-enters the kernel's default advice on a single
+    // scan, so a workload alternating one read and one scan switches twice
+    // an operation; no k above 1 ever reaches its threshold there. F66.5 and
+    // F66.6 test that choice, they do not make it.
+    let default_k = args.num("--default-k", 2);
 
     let mut rec = Record::new("f66-adaptive", profile);
     let nkeys = (data_mb * 1048576) / value_size.max(1) as u64;
@@ -944,7 +961,11 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
         .param("file_over_cap", J::fp(over_cap, 2))
         .param("cap_applied", J::Bool(capped));
 
-    let ks: Vec<usize> = vec![1, 2, 4, 8, 16, 32, 64];
+    let mut ks: Vec<usize> = vec![1, 2, 4, 8, 16, 32, 64];
+    if !ks.contains(&default_k) {
+        ks.push(default_k);
+        ks.sort_unstable();
+    }
     let arms: Vec<Advice> = [Advice::Normal, Advice::Random, Advice::Oracle]
         .into_iter()
         .chain(ks.iter().map(|k| Advice::Adaptive(*k)))
@@ -962,8 +983,8 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
         for (id, st) in [
             ("F66.1", "the adaptive policy comes within 10% of an oracle that knows every phase boundary"),
             ("F66.2", "the adaptive policy beats a fixed MADV_RANDOM on a phased workload"),
-            ("F66.3", "the adaptive policy costs under 5% against fixed MADV_RANDOM when nothing ever scans"),
-            ("F66.5", "one threshold is within 10% of the best at every phase length"),
+            ("F66.3", "the adaptive policy is not resolvably slower than fixed MADV_RANDOM when nothing ever scans"),
+            ("F66.5", "the declared default threshold is within 10% of the best at every phase length"),
             (
                 "F66.6",
                 "on a workload with no phase structure the adaptive default is not resolvably \
@@ -1062,7 +1083,10 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let oracle = at(Advice::Oracle);
     let random = at(Advice::Random);
     let normal = at(Advice::Normal);
-    // The best k by median, chosen from the record rather than assumed.
+    let dflt = at(Advice::Adaptive(default_k));
+    rec.param("default_k", J::u(default_k as u64));
+    // The argmax is still recorded, as context for whether the declared
+    // default leaves anything on the table -- but nothing is gated on it.
     let best = ks
         .iter()
         .map(|k| at(Advice::Adaptive(*k)))
@@ -1086,45 +1110,47 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // percent above the bound reads as a heuristic beating the oracle that
     // defines it, which is not a thing that can happen -- the arms differ only
     // in when they enter NORMAL, and the oracle enters it first.
-    let cmp_oracle = compare(&rates[best], &rates[oracle], supdb::bench::MIN_EFFECT);
+    let cmp_oracle = compare(&rates[dflt], &rates[oracle], supdb::bench::MIN_EFFECT);
     rec.compare("F66.1_adaptive_vs_oracle", cmp_oracle.clone());
     rec.finding(Finding::new(
         "F66.1",
         "the adaptive policy comes within 10% of an oracle that knows every phase boundary",
-        rates[best].median() >= 0.9 * rates[oracle].median(),
+        rates[dflt].median() >= 0.9 * rates[oracle].median(),
         format!(
-            "best adaptive k={best_k} at {:.0} ops/s against the oracle's {:.0} ({:.0}% of it, \
-             {}). Sweep: {sweep}. Fixed arms for scale: random {:.0}, normal {:.0}",
-            rates[best].median(),
+            "the default k={default_k} at {:.0} ops/s against the oracle's {:.0} ({:.0}% of it, \
+             {}). The best k in the sweep is k={best_k} at {:.0}, which is context and not what \
+             this is gated on. Sweep: {sweep}. Fixed arms for scale: random {:.0}, normal {:.0}",
+            rates[dflt].median(),
             rates[oracle].median(),
-            100.0 * rates[best].median() / rates[oracle].median().max(1.0),
+            100.0 * rates[dflt].median() / rates[oracle].median().max(1.0),
             cmp_oracle.summary("adaptive", "oracle"),
+            rates[best].median(),
             rates[random].median(),
             rates[normal].median(),
         ),
     ));
 
-    let cmp = compare(&rates[best], &rates[random], supdb::bench::MIN_EFFECT);
+    let cmp = compare(&rates[dflt], &rates[random], supdb::bench::MIN_EFFECT);
     rec.compare("F66.2_adaptive_vs_random", cmp.clone());
     rec.finding(Finding::new(
         "F66.2",
         "the adaptive policy beats a fixed MADV_RANDOM on a phased workload",
         matches!(cmp.verdict, supdb::bench::Verdict::Greater)
-            && rates[best].median() >= 1.5 * rates[random].median(),
+            && rates[dflt].median() >= 1.5 * rates[random].median(),
         format!(
-            "adaptive k={best_k} {:.0} ops/s against fixed random {:.0} ({}), over {cycles} \
+            "the default k={default_k} {:.0} ops/s against fixed random {:.0} ({}), over {cycles} \
              cycles of {phase_reads} point reads and {phase_scans} scans of {scan_len}. \
              Switches per rep: {:.1} adaptive against {:.1} oracle. Where the time goes, \
              read phase / scan phase seconds a rep: adaptive {:.2}/{:.2}, random {:.2}/{:.2}, \
              normal {:.2}/{:.2} -- the fixed arms each lose a different phase, which is the \
              whole reason a policy that follows the workload has anything to win",
-            rates[best].median(),
+            rates[dflt].median(),
             rates[random].median(),
             cmp.summary("adaptive", "random"),
-            switches[best] as f64 / reps as f64,
+            switches[dflt] as f64 / reps as f64,
             switches[oracle] as f64 / reps as f64,
-            read_secs[best] / reps as f64,
-            scan_secs[best] / reps as f64,
+            read_secs[dflt] / reps as f64,
+            scan_secs[dflt] / reps as f64,
             read_secs[random] / reps as f64,
             scan_secs[random] / reps as f64,
             read_secs[normal] / reps as f64,
@@ -1135,7 +1161,7 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // F66.3 -- the safety check. A default has to be harmless on a workload
     // that never scans, where the policy fires not once and all it can do is
     // cost something.
-    let safe_arms = [Advice::Random, Advice::Adaptive(best_k)];
+    let safe_arms = [Advice::Random, Advice::Adaptive(default_k)];
     let mut hr: Vec<Hist> = (0..2).map(|_| Hist::new()).collect();
     let mut hs: Vec<Hist> = (0..2).map(|_| Hist::new()).collect();
     let mut sw2 = [0u64; 2];
@@ -1157,15 +1183,27 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
         sw2[ci] += pass.switches;
         pass.ops_per_s
     });
+    // Rule 2 again. The first two full runs put this at 102.0% and 95.3% of
+    // fixed random, straddling a hard 95% cliff that a median ratio cannot
+    // resolve -- the arms are the same policy in the same mode and differ
+    // only by a counter, so the honest question is whether a difference is
+    // there at all, not which side of 5% one run's median landed.
+    let cmp_safe = compare(&no_scan[1], &no_scan[0], supdb::bench::MIN_EFFECT);
+    rec.compare("F66.3_adaptive_vs_random_no_scans", cmp_safe.clone());
     rec.finding(Finding::new(
         "F66.3",
-        "the adaptive policy costs under 5% against fixed MADV_RANDOM when nothing ever scans",
-        no_scan[1].median() >= 0.95 * no_scan[0].median(),
+        "the adaptive policy is not resolvably slower than fixed MADV_RANDOM when nothing \
+         ever scans",
+        !matches!(cmp_safe.verdict, supdb::bench::Verdict::Less),
         format!(
-            "adaptive k={best_k} {:.0} ops/s against fixed random {:.0}, {:.1}% of it, over a              workload with no scan in it at all. Switches per rep: {:.1} -- the policy starts              in RANDOM and never has cause to leave, so what this prices is the counter and              nothing else",
+            "the default k={default_k} {:.0} ops/s against fixed random {:.0}, {:.1}% of it \
+             ({}), over a workload with no scan in it at all. Switches per rep: {:.1} -- the \
+             policy starts in MADV_RANDOM and never has cause to leave, so what this prices is \
+             the counter and nothing else",
             no_scan[1].median(),
             no_scan[0].median(),
             100.0 * no_scan[1].median() / no_scan[0].median().max(1.0),
+            cmp_safe.summary("adaptive", "random"),
             sw2[1] as f64 / reps as f64,
         ),
     ));
@@ -1233,6 +1271,11 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
         .max_by(|a, b| a.1.total_cmp(&b.1))
         .unwrap();
     rec.param("robust_k", J::u(robust_k as u64));
+    let default_ratio = worst_ratio_for_k
+        .iter()
+        .find(|(k, _)| *k == default_k)
+        .map(|(_, r)| *r)
+        .unwrap_or(0.0);
     let detail: String = worst_ratio_for_k
         .iter()
         .map(|(k, r)| format!("k={k} {:.0}%", 100.0 * r))
@@ -1240,12 +1283,17 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
         .join(", ");
     rec.finding(Finding::new(
         "F66.5",
-        "one threshold is within 10% of the best at every phase length",
-        robust_ratio >= 0.9,
+        "the declared default threshold is within 10% of the best at every phase length",
+        default_ratio >= 0.9,
         format!(
-            "k={robust_k} is the most robust choice, never below {:.0}% of the best k at its              own phase length over scan phases of {:?} calls. Worst-case share of the best, by              k: {detail}. A default needs one row of this table to be good enough everywhere,              not one row to be best somewhere",
-            100.0 * robust_ratio,
+            "the default k={default_k} is never below {:.0}% of the best k at its own phase \
+             length, over scan phases of {:?} calls. The most robust row is k={robust_k} at \
+             {:.0}%, which is context: a default needs one row of this table to be good enough \
+             everywhere, not the row that happened to be best on this run. Worst-case share of \
+             the best, by k: {detail}",
+            100.0 * default_ratio,
             lengths,
+            100.0 * robust_ratio,
         ),
     ));
 
@@ -1264,11 +1312,20 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // and perfect alternation is the adversarial case -- which `f66_pass`
     // already expresses, as a phase of one read and a phase of one scan.
     let mix_ops = args.num("--mix-ops", profile.pick(20, 60, 200));
+    // k=1 is here as the thrash demonstration and must stay distinct from the
+    // default, or the run measures one arm twice and the evidence asserts a
+    // contrast nobody tested. That is what happened when the argmax picked
+    // k=1 and this arm was `Adaptive(robust_k)`.
+    let thrash_k = 1;
+    assert!(
+        default_k > thrash_k,
+        "the default must not be the arm that thrashes"
+    );
     let mix_arms = [
         Advice::Normal,
         Advice::Random,
-        Advice::Adaptive(1),
-        Advice::Adaptive(robust_k),
+        Advice::Adaptive(thrash_k),
+        Advice::Adaptive(default_k),
     ];
     let mut hm: Vec<Hist> = (0..4).map(|_| Hist::new()).collect();
     let mut hms: Vec<Hist> = (0..4).map(|_| Hist::new()).collect();
@@ -1313,12 +1370,14 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
         !matches!(cmp_mix.verdict, supdb::bench::Verdict::Less),
         format!(
             "alternating one point read and one scan of {scan_len}, {mix_ops} of each, no phases \
-             at all: normal {:.0} ops/s, random {:.0}, adaptive k=1 {:.0} at {:.1} switches a \
-             rep, adaptive k={robust_k} {:.0} at {:.1}. The default k={robust_k} is {:.1}% of \
-             the better fixed arm ({best_fixed_name}), which is what decides this: {}. \
-             k=1 is the arm that thrashes and the reason the default is not it: with no two \
-             scans ever consecutive, every k above 1 never reaches its threshold and stays in \
-             MADV_RANDOM, which on this workload is the right place to stay",
+             at all: normal {:.0} ops/s, random {:.0}, adaptive k={thrash_k} {:.0} at {:.1} \
+             switches a \
+             rep, the default k={default_k} {:.0} at {:.1}. The default is {:.1}% of the \
+             better fixed arm ({best_fixed_name}), which is what decides this: {}. The two \
+             adaptive arms are the mechanism: k={thrash_k} re-enters the kernel's default on \
+             every single scan and pays a switch for it, while with no two scans ever \
+             consecutive the default never reaches its threshold and stays in MADV_RANDOM -- \
+             which on a workload of cold point reads is the right place to stay",
             mix[0].median(),
             mix[1].median(),
             mix[2].median(),

@@ -126,3 +126,49 @@ agreeing for different reasons.
 
 If they disagree -- if `F66.5`'s most robust k is 1 -- the two are in tension
 and the default is the smallest k that satisfies both, or there is no default.
+
+## Third registration: the default is declared, not searched for
+
+Written after two full runs and before any run of the code described here.
+Those two runs are superseded and are not evidence for what follows.
+
+Three things they exposed, none of which is a result about the engine.
+
+**The argmax was noise.** The two runs chose k=2 and k=1 as the best
+threshold, 3.6% and 3.9% apart in opposite directions, and every finding was
+gated on that choice -- so each run adjudicated a different policy and called
+it the same claim. The default is now **declared**: `k=2`, the smallest
+threshold that cannot thrash, because k=1 re-enters the kernel's default
+advice on a single scan while no k above 1 ever reaches its threshold on a
+workload that never scans twice in a row. `F66.1`, `F66.2`, `F66.3`, `F66.5`
+and `F66.6` all test that declared value. The sweep's argmax is still
+recorded, as context for what the default leaves on the table, and nothing is
+gated on it.
+
+**The scans never moved.** The start key was indexed by position within a
+phase, so every cycle re-scanned the same regions -- warm after the first --
+and collapsed to a single start key whenever a phase held one scan, which is
+the phase-free workload `F66.6` drives. A scan that is always warm cannot
+tell one advice from another, so `F66.6` was measuring nothing. The start now
+walks the whole key space across the pass.
+
+**`F66.3` was a median against a cliff.** Its two runs came in at 102.0% and
+95.3% of fixed random against a hard 95% bar, and the arms differ only by a
+counter. It is now `compare`, like `F66.6`.
+
+`F66.6` also measured one arm twice whenever the argmax was 1, while its
+evidence asserted a contrast between k=1 and the default that no arm had
+tested. The thrash arm is now pinned at k=1 and asserted distinct from the
+default.
+
+| | outcome | reading |
+|---|---|---|
+| P9 | `F66.1`, `F66.2`, `F66.5` hold on the declared k=2 with the scans moving | the structural argument for the default survives a colder workload than the one that produced P1-P4 |
+| P10 | `F66.5` fails: the declared default is more than 10% off the best k at some phase length | k=2's one-scan delay is not free at short phases, and either the default is k=1 with the thrash cost priced, or there is no single default |
+| P11 | `F66.6` fails | a phase-free workload pays for the policy; adaptive ships opt-in whatever the phased arms say |
+
+At `ci` this code gives P10 and P11 both landing, which is expected and is not
+evidence: a `ci` scan phase is 8 calls, so entering the default advice one
+scan late costs an eighth of the phase, against a hundredth at `full`. That
+`ci` and `full` should disagree here is a property of the workload sizes and
+is the reason `ci` is not citable.
