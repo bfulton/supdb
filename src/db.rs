@@ -162,6 +162,16 @@ pub enum ReadAdvice {
     /// the canonical comparison this project quotes (`EXT.46`, `EXT.47`).
     #[default]
     Adaptive,
+    /// Never leave `MADV_RANDOM`, and prefetch the value bytes a scan is
+    /// about to walk before walking them.
+    ///
+    /// The other three tell the kernel what kind of access to expect and let
+    /// it decide what to fetch. This one stops guessing: the reader is handed
+    /// a `limit`, so it knows the span, plans the exact ranges its records
+    /// name and asks for those. There is no phase to detect and no mode to
+    /// switch, which makes it the simplest of the four rather than the most
+    /// elaborate -- `f68-prefetch` is whether it is also the fastest.
+    Prefetch,
 }
 
 impl ReadAdvice {
@@ -173,7 +183,10 @@ impl ReadAdvice {
     /// seventy-fifth of an advised one, against `F65.3`'s 2.4x for a scan
     /// under `MADV_RANDOM`.
     fn starts_random(self) -> bool {
-        matches!(self, ReadAdvice::Random | ReadAdvice::Adaptive)
+        matches!(
+            self,
+            ReadAdvice::Random | ReadAdvice::Adaptive | ReadAdvice::Prefetch
+        )
     }
 }
 
@@ -3973,6 +3986,16 @@ impl Db {
         mut f: F,
     ) -> Result<usize> {
         self.advise(false);
+        // `Prefetch` never changes mode, so `advise` above is a no-op for it.
+        // Instead the segments are told exactly which value bytes this scan
+        // will walk, before it walks them. Errors are dropped: a plan that
+        // cannot be built is a scan that fetches the way it always did, not a
+        // scan that fails.
+        if self.opts.read_advice == ReadAdvice::Prefetch {
+            for seg in &self.segs {
+                let _ = seg.blob.prefetch_scan(from, limit);
+            }
+        }
         let gen = self.wal.seq ^ (self.next_seg << 48) ^ ((self.frozen.is_some() as u64) << 63);
         {
             let mut cache = self.scan_keys.borrow_mut();

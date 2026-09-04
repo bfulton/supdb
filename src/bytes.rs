@@ -75,6 +75,15 @@ pub trait Bytes {
     /// file handle about page-fault patterns.
     fn advise_random(&self) {}
 
+    /// Fetch `len` bytes at `off` in the background, now.
+    ///
+    /// `MADV_WILLNEED` on a mapped file: not a hint about a pattern but an
+    /// explicit asynchronous read of exactly those bytes, which is the one
+    /// thing a reader can tell the kernel that the kernel cannot work out --
+    /// where the span it is about to walk ends. A no-op on any source with no
+    /// mapping behind it.
+    fn advise_willneed(&self, _off: u64, _len: usize) {}
+
     /// Undo `advise_random`: back to the kernel's default readahead.
     ///
     /// The pair exists so a reader can follow its workload rather than pick a
@@ -198,6 +207,16 @@ impl Bytes for MmapBytes {
     }
     fn advise_normal(&self) {
         let _ = self.0.advise(memmap2::Advice::Normal);
+    }
+    fn advise_willneed(&self, off: u64, len: usize) {
+        // Clamped rather than trusted: the offsets come from a plan built out
+        // of a file's own block table, and a damaged one must not hand the
+        // kernel a range past the end of the mapping.
+        let start = (off as usize).min(self.0.len());
+        let span = len.min(self.0.len() - start);
+        if span > 0 {
+            let _ = self.0.advise_range(memmap2::Advice::WillNeed, start, span);
+        }
     }
 }
 

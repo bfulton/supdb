@@ -97,6 +97,7 @@ fn main() -> std::io::Result<()> {
             "f65-madvise" => f65_madvise(&args, profile)?,
             "f66-adaptive" => f66_adaptive(&args, profile)?,
             "f67-dbadvice" => f67_dbadvice(&args, profile)?,
+            "f68-prefetch" => f68_prefetch(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -144,6 +145,7 @@ fn main() -> std::io::Result<()> {
                 "f65-madvise",
                 "f66-adaptive",
                 "f67-dbadvice",
+                "f68-prefetch",
             ] {
                 if !run(e)? {
                     failed.push(e);
@@ -883,6 +885,255 @@ fn f66_pass(
         scan_secs,
         asked,
     }
+}
+
+// ------------------------------------- F68: prefetching what a scan will read --
+
+fn f68_prefetch(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let value_size = args.num("--value-size", 4096);
+    let data_mb = args.num("--data-mb", profile.pick(64, 512, 2_048)) as u64;
+    let cap_mb = args.num("--cap-mb", profile.pick(32, 128, 256)) as u64;
+    let seal_mb = args.num("--seal-mb", profile.pick(8, 32, 64));
+    let scans = args.num("--scans", profile.pick(20, 100, 300));
+    let scan_len = args.num("--scan-len", profile.pick(100, 300, 500));
+    let reads = args.num("--reads", profile.pick(50, 200, 600));
+    let reps = args.num("--reps", profile.reps());
+
+    let mut rec = Record::new("f68-prefetch", profile);
+    let keys = (data_mb * 1048576) / value_size.max(1) as u64;
+    rec.param("data_mb", J::u(data_mb))
+        .param("cap_mb", J::u(cap_mb))
+        .param("keys", J::u(keys))
+        .param("scans", J::u(scans as u64))
+        .param("scan_len", J::u(scan_len as u64))
+        .param("reads", J::u(reads as u64))
+        .param("reps", J::u(reps as u64))
+        .note(
+            "every arm is a shipping ReadAdvice rather than a harness policy, so what is \
+             ranked is what a user can select. The workload is scan-heavy on purpose: this \
+             asks what the scan side is worth, and f66 and f67 already priced the read side",
+        );
+
+    let dir = scratch("f68");
+    let big = dir.join("store");
+    let file_bytes: u64 = {
+        let db = f67_store(&big, keys, value_size, supdb::ReadAdvice::Normal, seal_mb)?;
+        rec.param("segments", J::u(db.segments() as u64));
+        drop(db);
+        let mut b = 0u64;
+        for e in std::fs::read_dir(&big)? {
+            b += e?.metadata()?.len();
+        }
+        b
+    };
+    let _cap = env::cap_guard();
+    let capped = env::cap_memory(cap_mb * 1048576);
+    let over_cap = file_bytes as f64 / (cap_mb * 1048576) as f64;
+    rec.param("store_mb", J::fp(file_bytes as f64 / 1048576.0, 1))
+        .param("store_over_cap", J::fp(over_cap, 2))
+        .param("cap_applied", J::Bool(capped));
+
+    let advices = [
+        supdb::ReadAdvice::Normal,
+        supdb::ReadAdvice::Random,
+        supdb::ReadAdvice::Adaptive,
+        supdb::ReadAdvice::Prefetch,
+    ];
+    let names = ["normal", "random", "adaptive", "prefetch"];
+    let (i_normal, i_adaptive, i_prefetch) = (0usize, 2usize, 3usize);
+
+    if !capped || over_cap <= 1.0 {
+        let why = if !capped {
+            "no writable memory controller, so the page cache was never capped and no scan \
+             here faults from storage -- with everything resident there is nothing to \
+             prefetch and nothing to over-fetch"
+                .to_string()
+        } else {
+            format!("the store is {over_cap:.2}x the cap, so it fits in the page cache")
+        };
+        for (id, st) in [
+            ("F68.1", "MADV_SEQUENTIAL as the scan mode beats the kernel's default at the scan lengths the engine uses"),
+            ("F68.2", "planning a scan's reads and prefetching them beats the shipped adaptive advice"),
+            ("F68.3", "and does it at about 1.0x read amplification, against the kernel's over-fetch"),
+            ("F68.4", "a policy that never switches mode ties or beats one that does"),
+            ("F68.5", "the store exceeds the memory available to cache it"),
+        ] {
+            rec.finding(Finding::not_exercised(id, st, why.clone()));
+        }
+        return Ok(rec);
+    }
+    rec.finding(Finding::new(
+        "F68.5",
+        "the store exceeds the memory available to cache it",
+        true,
+        format!(
+            "{:.1} MB of store against a {cap_mb} MB cap, {over_cap:.2}x",
+            file_bytes as f64 / 1048576.0
+        ),
+    ));
+
+    let mut dev = vec![0u64; advices.len()];
+    let mut asked = vec![0u64; advices.len()];
+    let mut hs: Vec<Hist> = (0..advices.len()).map(|_| Hist::new()).collect();
+    let rates = Trial::new(reps).run(advices.len(), |ci, rep| {
+        let _ = env::drop_caches();
+        let db = supdb::Db::open(
+            &big,
+            supdb::Options {
+                read_advice: advices[ci],
+                seal_bytes: seal_mb * 1_048_576,
+                ..Default::default()
+            },
+        )
+        .expect("open");
+        let mut g = KeyGen::new(KeyDist::Uniform, keys, 0xF68 ^ rep as u64);
+        let mut kb = [0u8; 16];
+        let io0 = IoCounters::read_now();
+        let t0 = Instant::now();
+        let mut ops = 0u64;
+        let mut got = 0u64;
+        // A few point reads so the arm is a workload rather than a scan
+        // benchmark: a policy that helps the scan by hurting the read is not
+        // an improvement, and `adaptive` exists because that trade is real.
+        for _ in 0..reads {
+            db_key_into(g.next(), &mut kb);
+            db.read_all(&kb, |v| {
+                got += v.len() as u64;
+                std::hint::black_box(v);
+            })
+            .expect("read");
+            ops += 1;
+        }
+        let stride = (keys / scans.max(1) as u64).max(1);
+        for i in 0..scans {
+            let mut kb2 = [0u8; 16];
+            db_key_into((i as u64 * stride) % keys, &mut kb2);
+            let t = Instant::now();
+            ops += db
+                .scan(&kb2, scan_len, |_k, v| {
+                    got += v.len() as u64;
+                    std::hint::black_box(v);
+                })
+                .expect("scan") as u64;
+            hs[ci].record(t.elapsed().as_nanos() as u64);
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        dev[ci] += IoCounters::read_now().since(&io0).read_bytes;
+        asked[ci] += got;
+        ops as f64 / secs
+    });
+
+    let amp = |i: usize| dev[i] as f64 / asked[i].max(1) as f64;
+    let series: Vec<J> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            J::O(vec![
+                ("arm".into(), J::s(*n)),
+                ("ops_per_s".into(), J::fp(rates[i].median(), 0)),
+                ("scan_latency".into(), hs[i].to_json()),
+                (
+                    "device_read_mb_per_rep".into(),
+                    J::fp(dev[i] as f64 / 1048576.0 / reps as f64, 2),
+                ),
+                ("read_amplification".into(), J::fp(amp(i), 2)),
+            ])
+        })
+        .collect();
+    rec.series("arms", J::A(series));
+    rec.param(
+        "peak_rss_mb",
+        J::fp(env::peak_rss_bytes() as f64 / 1048576.0, 1),
+    );
+
+    // F68.1 -- the cheap rung. A whole-file probe made MADV_SEQUENTIAL look
+    // like a 12.5x answer; this asks the question at the span an engine scan
+    // actually walks, which is the only shape that decides anything.
+    let cmp_seq = compare(
+        &rates[i_adaptive],
+        &rates[i_normal],
+        supdb::bench::MIN_EFFECT,
+    );
+    rec.compare("F68.1_adaptive_vs_normal", cmp_seq.clone());
+    rec.finding(Finding::new(
+        "F68.1",
+        "MADV_SEQUENTIAL as the scan mode beats the kernel's default at the scan lengths the \
+         engine uses",
+        false,
+        format!(
+            "not measured as an arm, and recorded as failing on the reasoning that made it \
+             not worth one. A probe over a contiguous 2 GB walk put MADV_SEQUENTIAL at 12.5x \
+             the kernel's default; over 200 bounded spans of 2 MB it was 1.01x, and at 256 \
+             KiB 1.04x. The readahead ramp that pays over two uninterrupted gigabytes never \
+             starts inside a bounded span, and every scan this engine issues is bounded. \
+             S1 in prefetch-plan.md registered that before the arms were built. The arms \
+             here price the dial that is worth something instead: adaptive {:.0} ops/s \
+             against the kernel's default {:.0}",
+            rates[i_adaptive].median(),
+            rates[i_normal].median(),
+        ),
+    ));
+
+    let cmp_pf = compare(
+        &rates[i_prefetch],
+        &rates[i_adaptive],
+        supdb::bench::MIN_EFFECT,
+    );
+    rec.compare("F68.2_prefetch_vs_adaptive", cmp_pf.clone());
+    rec.finding(Finding::new(
+        "F68.2",
+        "planning a scan's reads and prefetching them beats the shipped adaptive advice",
+        matches!(cmp_pf.verdict, supdb::bench::Verdict::Greater)
+            && rates[i_prefetch].median() >= 1.5 * rates[i_adaptive].median(),
+        format!(
+            "prefetch {:.0} ops/s against adaptive {:.0} ({}), over {reads} point reads and \
+             {scans} scans of {scan_len} on a {:.1} MB store against a {cap_mb} MB cap. \
+             Fixed arms for scale: the kernel's default {:.0}, MADV_RANDOM {:.0}",
+            rates[i_prefetch].median(),
+            rates[i_adaptive].median(),
+            cmp_pf.summary("prefetch", "adaptive"),
+            file_bytes as f64 / 1048576.0,
+            rates[i_normal].median(),
+            rates[1].median(),
+        ),
+    ));
+
+    rec.finding(Finding::new(
+        "F68.3",
+        "and does it at about 1.0x read amplification, against the kernel's over-fetch",
+        amp(i_prefetch) <= 1.25 && amp(i_prefetch) < amp(i_adaptive),
+        format!(
+            "device bytes per byte the reader handed back, from /proc/self/io: prefetch \
+             {:.2}x, adaptive {:.2}x, the kernel's default {:.2}x, MADV_RANDOM {:.2}x. The \
+             quantity that does not drift with the host, and the one that says why: \
+             readahead cannot see where a bounded span ends, so it reads past it into data \
+             the scan never touches, while a planned range asks for what the extents name \
+             and nothing else",
+            amp(i_prefetch),
+            amp(i_adaptive),
+            amp(i_normal),
+            amp(1),
+        ),
+    ));
+
+    rec.finding(Finding::new(
+        "F68.4",
+        "a policy that never switches mode ties or beats one that does",
+        !matches!(cmp_pf.verdict, supdb::bench::Verdict::Less),
+        format!(
+            "prefetch stays in MADV_RANDOM for the life of the store and issues no advice \
+             changes at all, against adaptive's switch on every phase boundary: {} at {:.0} \
+             against {:.0} ops/s. If this holds the phase detection f66 spent six findings \
+             justifying is not better tuned, it is unnecessary -- there is no phase to detect \
+             when the reader states the span outright",
+            cmp_pf.summary("prefetch", "adaptive"),
+            rates[i_prefetch].median(),
+            rates[i_adaptive].median(),
+        ),
+    ));
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(rec)
 }
 
 // ----------------------------------- F67: the read advice inside the engine --
