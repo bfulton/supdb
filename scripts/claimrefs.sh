@@ -26,8 +26,31 @@ scan() {
     -exec grep "$@" {} + 2>/dev/null
 }
 
+# No `\b`: it is a GNU extension rather than POSIX ERE, and a grep that does
+# not know it matches nothing -- which would leave `cited` empty, skip the
+# loop below and print success. A gate that reports a verdict it has not
+# earned is the shape of every other gate failure in this repository, so the
+# boundaries are done with the portable trick instead: pull in any identifier
+# characters either side of a candidate, then require the whole extraction to
+# be exactly an id. `XF12.3` and `F12.3a` extract whole and are rejected;
+# `F12.3` extracts alone and is kept.
+id_re='(EXT|[FCW][0-9]+)\.[0-9]+'
 ids=$(grep -oE '"id": "[A-Z]+[0-9]*\.[0-9]+"' claims.json | sed 's/.*"id": "//; s/"//')
-cited=$(scan -hoE '\b([FCW][0-9]+|EXT)\.[0-9]+\b' | sort -u || true)
+cited=$(scan -hoE "[A-Za-z0-9_]*${id_re}[A-Za-z0-9_]*" \
+          | grep -xE "$id_re" | sort -u || true)
+
+# And the guard the comment above argues for. Every one of these files cites
+# claims; finding none means the search broke, not that the source went
+# quiet.
+if [ -z "$ids" ]; then
+  echo "no claim ids parsed out of claims.json -- the gate cannot run"
+  exit 1
+fi
+if [ -z "$cited" ]; then
+  echo "no claim ids found cited in src, web, bench or tests -- the gate cannot"
+  echo "have passed, since these files are full of them. Check the extraction."
+  exit 1
+fi
 
 missing=
 for c in $cited; do
@@ -42,7 +65,7 @@ if [ -n "$missing" ]; then
   echo "cited in the source but not registered in claims.json:"
   for m in $missing; do
     echo "  $m"
-    scan -n "\\b$m\\b" | sed 's/^/      /' | cut -c1-120 || true
+    scan -nF "$m" | sed 's/^/      /' | cut -c1-120 || true
   done
   echo
   echo "A citation is only useful while it resolves. Either register the claim,"
