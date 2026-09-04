@@ -95,7 +95,8 @@
    "experiment": "f8-checksums",
    "id": "F8.1",
    "expect": "holds",
-   "because": "Block checksums must cost less than 10% of write throughput. Measured interleaved in one process, not by subtracting two runs -- when that was tried the unchanged comparators in the external suite moved +20% to +43% between runs, so the apparent effect was mostly machine drift."
+   "profile": "full",
+   "because": "Block checksums must cost less than 10% of write throughput. Measured interleaved in one process, not by subtracting two runs -- when that was tried the unchanged comparators in the external suite moved +20% to +43% between runs, so the apparent effect was mostly machine drift. Pinned to `full`: the threshold is 10% and `ci` cannot resolve it -- two ci runs of unchanged code measured +3.0% (no difference) and +14.0% (a difference), so adjudicating it there decides the claim by noise. That is the shape this project already records for dev, where the same cost read +3.0% and not significant against +8.5% and unambiguous at full. The claims group runs verify at both profiles, so this stays gated against the committed full run rather than going unchecked."
   },
   {
    "experiment": "f8-checksums",
@@ -132,6 +133,13 @@
    "because": "A bulk-loaded B+tree is not on the frontier: a plain packed array is both faster and smaller. Loaded here at 100% fill, which flatters it. This is the measured answer to whether copying LMDB's index is worth doing. Pinned to full: these thresholds are calibrated at 10M keys, and at ci scale (100k) every structure fits in cache and the ordering differs. Pinned to x86_64: the thresholds are calibrated for 64-byte cache lines and 4 KiB pages, and Apple Silicon has 128-byte lines and 16 KiB pages.",
    "profile": "full",
    "arch": "x86_64"
+  },
+  {
+   "experiment": "f9-index-layout",
+   "id": "F9.4",
+   "expect": "holds",
+   "profile": "full",
+   "because": "Indexing by key value rather than by comparison is only as good as its assumption about the distribution, so the layout study has to price the distribution it is worst on. Clustered keys cost 1581 ns against 1104 for smooth ones, 1.43x -- a degradation rather than a collapse, and the collapse is what this exists to catch: the radix layer answered nothing at all on decimal keys until the shared prefix was stripped. Registered late; `indexlab` had emitted it since the layout study and no claim named it, which the results-to-claims direction of `verify` now makes impossible."
   },
   {
    "experiment": "f9-index-layout",
@@ -317,6 +325,24 @@
    "profile": "full",
    "expect": "holds",
    "because": "FIXED by format v6; was recorded failing at 0.307x (3.44 ns/posting against 1.06) while every value carried a varint length prefix -- a 5-byte stride for 4-byte postings and a serial dependent decode. A run whose values share one width is now stored back to back with no prefixes, flagged in its extent (Ext::FIXED, beside the tombstone bit), and reading it is a walk over the extent's bytes: 1.03 ns/posting against lmdb-dup's 1.23 -- 1.200x at p=0.0553, no difference at the gate, and 1.201x, 1.192x, 1.150x significant and 1.248x not on the four full runs beside it. Claimed as parity, so it holds on a tie or a lead, and it has been one or the other in all five runs. P18's first half held (from 0.31x to at least parity); its second -- past 2x on long lists -- did not, because the probes are uniform over a dictionary whose median list is 255 postings and the per-key constant, not the per-posting cost, decides most of them; DUPFIXED's page-at-a-time GET_MULTIPLE is also a memcpy-shaped walk, so on the bulk axis the two encodings are now the same encoding. The size consolation grew: Supdb's file is 4.05 MB, from 5.02, against lmdb-dup's 7.33 for the same million postings -- the prefix was 19% of the file, as predicted. Checksums on or off reads the same 1.0 ns (ratio 1.002), because verification is per block and the block is read once."
+  },
+  {
+   "experiment": "ext-readdecomp",
+   "id": "EXT.19",
+   "expect": "fails",
+   "because": "The read-decomposition suite asks which mechanism the point-read lead is made of, and this is the depth arm: a B-tree descent deepens with log n and a hash probe does not, so a lead that grows with key count implicates depth. It does not grow -- 2.146x at 2000 keys, 1.628x at 8000, 1.557x at 32000, so the lead at the top is 0.726x of the lead at the bottom. That is outcome P2 of the plan's registered table: not depth. Recorded as failing because the prediction was that it would grow; the mechanism it points at is per-access or compute."
+  },
+  {
+   "experiment": "ext-readdecomp",
+   "id": "EXT.20",
+   "expect": "holds",
+   "because": "The cache-resident arm, and the one that acquits the memory system. Reading uniformly over the first 64 key ids touches about 11 KB, small enough that misses leave the picture, and the lead survives at 2.329x -- it does not need DRAM misses to exist, so neither cache-line width nor TLB reach is what produces it. Outcome P3: what remains is dependent-access count and instruction count, which this suite cannot split further without counters, and that is the honest stopping point. The residual leans against Supdb here, whose hash probe scatters the hot keys across the whole index section while LMDB's adjacent leaves stay compact, so a surviving lead is conservative."
+  },
+  {
+   "experiment": "ext-readdecomp",
+   "id": "EXT.21",
+   "expect": "fails",
+   "because": "The value-size arm, and the one whose outcome the plan did not expect. If the lead lives in the lookup, tiny values widen it and large ones compress it toward the bandwidth bound -- a failure in the Greater direction, P5. It fails in the Less direction instead: 1.780x at 8B, 1.628x at 100B, 2.694x at 1024B, the lead growing with value size. That is P6, which the plan wrote down as the outcome that would demand a re-derivation, because a differential scaling with bytes copied out is not the index walk at all. Kept failing and on the books so the re-derivation cannot be quietly skipped."
   },
   {
    "experiment": "f42-next",

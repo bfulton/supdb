@@ -16,7 +16,7 @@
 //!   * **Guarantees are matched, not merely recorded.** This rule used to read
 //!     "what each engine promises is recorded, not assumed", and recording is
 //!     not controlling. The features table below said for months that Supdb
-//!     does not commit durably and LMDB does; EXT.1 compared their load
+//!     does not commit durably and LMDB does; an early ordering compared their load
 //!     throughput anyway and reported Supdb 1.33x ahead. Measured with the two
 //!     committing on the same boundary, LMDB is about 19x faster. That is the
 //!     same defect as the first rule -- "committing once per operation is not

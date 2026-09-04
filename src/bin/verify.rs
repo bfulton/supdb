@@ -61,6 +61,7 @@ fn main() -> std::io::Result<()> {
 
     check_findings(&claims, &results, &profile, &mut out);
     check_metrics(&claims, &results, &profile, &mut out);
+    check_unregistered(&claims, &results, &profile, &mut out);
 
     println!("\n{} claim(s) checked", out.checked);
     if !out.skipped.is_empty() {
@@ -186,6 +187,64 @@ fn check_findings(claims: &J, results: &Path, profile: &str, out: &mut Outcome) 
             out.failures.push(format!(
                 "{label}: expected '{want}', recorded '{got}' -- {detail}"
             ));
+        }
+    }
+}
+
+/// The other direction: a finding a run reported that no claim registers.
+///
+/// `check_findings` walks claims and looks for results, which cannot see a
+/// finding nobody claimed -- and an unclaimed finding is the exact thing this
+/// file exists to prevent, a measurement with no recorded expected state. It
+/// hid two different faults at once: findings the suites emit and nobody ever
+/// adjudicated, and findings left in a committed result by an experiment that
+/// has since stopped emitting them, which is a result file describing an
+/// engine that no longer exists.
+///
+/// Registration is what is checked, not adjudication at this profile: a claim
+/// pinned to `full` or to one architecture still registers its finding
+/// everywhere, so pins are ignored here.
+fn check_unregistered(claims: &J, results: &Path, profile: &str, out: &mut Outcome) {
+    let mut registered: Vec<(String, String)> = Vec::new();
+    if let Some(list) = claims.path("findings") {
+        for c in list.items() {
+            let exp = c.path("experiment").and_then(|v| v.as_str()).unwrap_or("");
+            let id = c.path("id").and_then(|v| v.as_str()).unwrap_or("");
+            registered.push((exp.to_string(), id.to_string()));
+        }
+    }
+    let suffix = format!(".{profile}.json");
+    let Ok(dir) = std::fs::read_dir(results) else {
+        return;
+    };
+    let mut files: Vec<String> = dir
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.ends_with(&suffix))
+        .collect();
+    files.sort();
+    for name in files {
+        let exp = &name[..name.len() - suffix.len()];
+        let Ok(text) = std::fs::read_to_string(results.join(&name)) else {
+            continue;
+        };
+        let Ok(doc) = jparse::parse(&text) else {
+            continue;
+        };
+        for f in doc.path("findings").map(|f| f.items()).unwrap_or(&[]) {
+            let id = f.path("id").and_then(|v| v.as_str()).unwrap_or("");
+            if id.is_empty() {
+                continue;
+            }
+            if !registered
+                .iter()
+                .any(|(e, i)| e == exp && i == id)
+            {
+                let status = f.path("status").and_then(|v| v.as_str()).unwrap_or("");
+                out.failures.push(format!(
+                    "{exp}/{id}: the run recorded this finding ('{status}') and no claim registers it"
+                ));
+            }
         }
     }
 }

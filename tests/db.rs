@@ -66,7 +66,7 @@ fn reads_see_uncommitted_and_unsealed_state() {
 
 #[test]
 fn killed_before_first_seal_opens_from_the_wal_alone() {
-    // P-E, the flip of C3.4: no segment exists, only a WAL.
+    // P-E: no segment exists, only a WAL.
     let d = dir("preseal");
     let mut db = Db::create(&d, Options::default()).unwrap();
     for i in 0u32..500 {

@@ -108,7 +108,37 @@ fn main() -> std::io::Result<()> {
         // Child modes, used by experiments that must measure a fresh process.
         "all" => {
             let mut failed = Vec::new();
-            for e in ["f28-count", "f1-outofcore"] {
+            // Every experiment the dispatch above knows. `all` used to name two
+            // of them, so `sh scripts/check.sh suites` -- the group whose whole
+            // job is to prove the experiments still run -- ran two of twenty-three
+            // and `verify` reported the other twenty-one as skipped. At `ci` the
+            // set costs about half a minute, so there was never a budget reason
+            // for the short list.
+            for e in [
+                "f1-outofcore",
+                "f8-checksums",
+                "f28-count",
+                "f42-next",
+                "f43-compact",
+                "f44-tail",
+                "f45-scanfloor",
+                "f47-parwal",
+                "f48-syncpolicy",
+                "f49-bulkseal",
+                "f50-txn",
+                "f51-ioprio",
+                "f52-segsize",
+                "f53-inline",
+                "f54-merge",
+                "f55-promote",
+                "f56-tailbound",
+                "f57-walreuse",
+                "f60-sealwait",
+                "f61-scanmerge",
+                "f62-scanmerge2",
+                "f63-scansnap",
+                "f64-indexsum",
+            ] {
                 if !run(e)? {
                     failed.push(e);
                 }
@@ -3411,7 +3441,7 @@ fn f44_tail(args: &Args, profile: Profile) -> std::io::Result<Record> {
         frac >= 0.90,
         format!(
             "T1 reads {:.0}/s against one-store's {:.0} -- {:.1}% of it ({}), over {:.0} \
-             partitions and {:.0} unrouted segments against a single one. F38.2 measured \
+             partitions and {:.0} unrouted segments against a single one. f38 measured \
              perfectly-routed segmentation as free at this key count, but its oracle paid no \
              fence search, no Bloom and had no tail; this is that measurement with the routing \
              the engine actually has",
@@ -3648,7 +3678,7 @@ fn f43_compact(args: &Args, profile: Profile) -> std::io::Result<Record> {
         format!(
             "compact-T4 reads {:.0}/s against the unrouted fan's {:.0} ({}). The fan probes every \
              segment; the routed arm probes one partition plus a bounded Bloomed tail, which is \
-             the arithmetic F38.1 and F40.1 priced",
+             the arithmetic f38 and f40 priced",
             reads[1].median(),
             reads[0].median(),
             cmp_read.summary("compact-T4", "no-compact")
@@ -3709,7 +3739,7 @@ fn f43_compact(args: &Args, profile: Profile) -> std::io::Result<Record> {
     Ok(rec)
 }
 
-/// The brief's P-A, measured on milestone 1. EXT.9's exact shape -- every
+/// The brief's P-A. The canonical durable load's exact shape -- every
 /// key new, 100B values, a durable point every 1,000 ops -- with the next
 /// engine (WAL commit + seal-off-path, src/next.rs) interleaved against
 /// today's engine committing through the value-carrying log. The registered
@@ -3729,7 +3759,7 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
         .param("batch", J::u(batch))
         .param("value_size", J::u(value_size as u64))
         .note(
-            "two arms interleaved in one process, a fresh store per rep, the EXT.9 load \
+            "two arms interleaved in one process, a fresh store per rep, the canonical durable load \
              shape. Both commit by WAL append + fdatasync; they differ only in whether a \
              seal can happen inside the timed window (64MB memtable against one that never \
              fills). Device bytes from /proc/self/io per rep; disk bytes are the store's \
@@ -3737,7 +3767,7 @@ fn f42_next(args: &Args, profile: Profile) -> std::io::Result<Record> {
         )
         .note(
             "the gate is the brief's registered P-A: >= 600,000 ops/s, past LMDB's recorded \
-             572,416 (EXT.9, cited as context -- no finding compares across runs)",
+             572,416 (cited as context -- no finding compares across runs)",
         );
 
     let dir = scratch("f42");

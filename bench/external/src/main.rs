@@ -162,7 +162,8 @@ fn main() -> std::io::Result<()> {
 
 /// Does the load comparison depend on the order the keys arrive in?
 ///
-/// `EXT.10` has Supdb loading at 0.529x of an LMDB that is not syncing either,
+/// The retired undrained ordering had the engine loading at 0.529x of an LMDB
+/// that is not syncing either,
 /// and it has read 0.542x, 0.623x and 0.529x across three runs, so it is not
 /// drift. An append-structured store losing bulk ingest to a B-tree is the one
 /// result this design should not produce, and one thing about how it is
@@ -398,7 +399,8 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
 /// subtract to remove store creation and the payload generator, exactly as
 /// `docs/profiling.md` does with `indexlab probe --lookups 0`.
 ///
-/// It exists because EXT.10 says Supdb loads at 0.54x of an LMDB that is not
+/// It exists because the retired undrained ordering had the engine loading at
+/// 0.54x of an LMDB that is not
 /// syncing either -- a B-tree beating an append-structured store at bulk
 /// ingest, which is the one thing this design is supposed to win. That is a
 /// defect to find rather than a tradeoff to accept, and no timing harness can
@@ -463,7 +465,7 @@ fn load_profile(args: &Args, which: &[&str]) -> std::io::Result<()> {
 /// Every engine is measured `reps` times and the engines are interleaved, one
 /// round at a time, so a machine that drifts drifts across all of them rather
 /// than into one. It used to run each engine exactly once. That is the habit
-/// this whole module exists to break, and it showed: EXT.1 read 0.70x, 1.03x,
+/// this whole module exists to break, and it showed: one load ordering read 0.70x, 1.03x,
 /// 0.998x, 1.13x and 0.85x across five single runs and flipped between holding
 /// and failing on margins as small as 0.2%. An ordering now has to clear
 /// `stats::compare` -- a Mann-Whitney U test and a minimum effect size --
@@ -654,9 +656,10 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
 
     let idx = |name: &str| which.iter().position(|w| *w == name);
     // `mine` is the left-hand engine. It is a parameter rather than always
-    // "supdb" because EXT.9 compares the durable arm, and an engine comparing
+    // the engine under test because a durable ordering compares the durable arm,
+    // and an engine comparing
     // itself against a comparator on a boundary the comparator does not use is
-    // the thing EXT.9 exists to stop.
+    // the thing this parameter exists to stop.
     // `writes` says whether the metric touches the write path, which decides
     // whether the durability axis has to match for the ordering to mean
     // anything. Everything else that can be equalized must match on every
@@ -731,7 +734,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
     // The next engine (supdb::next), measured on the same three axes against
     // the same LMDB in the same process. Its commit is a WAL append plus one
     // fdatasync per batch -- LMDB's own boundary -- so the load comparison is
-    // matched the way EXT.9 is, with the same transactional residual.
+    // matched the way EXT.22 is, with the same transactional residual.
     ordering_of(
         &mut rec,
         "EXT.22",
@@ -963,7 +966,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
 /// reads it once; this builds each store once and sweeps it warm, the
 /// `ext-sweep` precedent, because rebuilding a 4M-key LMDB store per rep does
 /// not fit any host's budget. Compare shapes *within* this record; do not
-/// average its absolute ratios with EXT.11's, they are different experiments.
+/// average its absolute ratios with the kv suite's read ordering, they are different experiments.
 /// The prediction table -- which outcome convicts which mechanism, written
 /// before the first run -- is `read-decomposition-plan.md` at the repo root.
 fn suite_readdecomp(
@@ -997,7 +1000,7 @@ fn suite_readdecomp(
     let batch = args.num("--batch", 1_000).max(1);
     let reps = args.num("--reps", profile.reps());
     // The anchor: the key count the hot and value axes pivot on. The middle
-    // of the list, which at the defaults is 1M -- EXT.11's own shape.
+    // of the list, which at the defaults is 1M -- the read ordering's own shape.
     let anchor = keys_list[keys_list.len() / 2];
 
     let mut rec = Record::new("ext-readdecomp", profile);
@@ -1514,7 +1517,7 @@ fn suite_readdecomp(
 /// emit -- while the seek is bounded by the number of *dependent* memory
 /// accesses, since probe k+1 cannot issue until probe k returns. Reporting one
 /// blended entries/s figure hides which of the two an engine is losing on, and
-/// this suite has been reporting exactly that: EXT.5 is a single number at one
+/// this suite has been reporting exactly that: the retired scan ordering was a single number at one
 /// scan length.
 ///
 /// Measuring the same scan at many lengths separates them. Cost per scan is
@@ -2073,11 +2076,12 @@ fn intersect_sorted(a: &[u32], b: &[u32]) -> u64 {
 ///
 /// The dataset is one synthetic day in logshed's shape (`src/bin/logshed.rs`):
 /// two fields of zipf-skewed terms, one 4-byte line-ordinal posting per field
-/// per line, appended grouped by term because W1.3 showed the naive roll
+/// per line, appended grouped by term because the retired line-order arm
+/// of w1-daysize showed the naive roll
 /// costs 22.6x the file. ~2,000 term keys and ~1M postings at `full`.
 ///
 /// Read-only over immutable segments built once and probed repeatedly, so
-/// every number is warm, like ext-sweep's -- EXT.12 owns cold -- and
+/// every number is warm, like ext-sweep's -- ext-kv's cold arm owns cold -- and
 /// durability does not bind. The checksum axis does: supdb-nocksum is built
 /// without checksums and read without verification, which is the arm matched
 /// to LMDB, because LMDB has none to turn on. The checksummed arm (the
@@ -2113,7 +2117,7 @@ fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
         )
         .note(
             "read-only over immutable segments built once and probed repeatedly: every number is \
-             warm, like ext-sweep's, and EXT.12 owns cold. Durability does not bind on a read; \
+             warm, like ext-sweep's, and ext-kv's cold arm owns cold. Durability does not bind on a read; \
              the checksum axis does, and supdb-nocksum -- built without checksums, read without \
              verification -- is the \
              matched arm for every claim, since LMDB has none to turn on. Plain supdb is \

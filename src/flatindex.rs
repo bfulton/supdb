@@ -1,12 +1,12 @@
 //! A key index that is read where it lies instead of rebuilt on open.
 //!
-//! The shipped index is decoded into `Vec<(Vec<u8>, Extents)>` and then hashed,
-//! which costs two failing claims at once. `F2.1`: open is not independent of
-//! key count -- 6.4ms at 100k keys, 1446ms at 10M, so 100x the keys costs 225x
-//! the open. `F7.2`: the result is 131 bytes per key, resident in every reader
-//! process, shared with nobody. Both are properties of *rebuilding*, not of
-//! the data: the bytes on disk are already an index, and the decode exists
-//! only because the on-disk shape is not one a lookup can use.
+//! The engine this replaced decoded its index into `Vec<(Vec<u8>, Extents)>`
+//! and then hashed it, which cost two things at once. Open was not independent
+//! of key count -- 6.4ms at 100k keys, 1446ms at 10M, so 100x the keys cost
+//! 225x the open -- and the result was 131 bytes per key, resident in every
+//! reader process, shared with nobody. Both are properties of *rebuilding*,
+//! not of the data: the bytes on disk are already an index, and the decode
+//! existed only because the on-disk shape was not one a lookup can use.
 //!
 //! So write a shape a lookup can use. `indexlab` measured ten candidates for
 //! this and the answer was not the elaborate one: `hash+flatfixed` -- an open

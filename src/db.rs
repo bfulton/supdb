@@ -1,22 +1,22 @@
-//! The engine, milestone 1: a WAL is the only mutable thing.
+//! The engine: a WAL, a memtable, and immutable segments.
 //!
 //! `docs/engine.md` is the design brief and every load-bearing decision
 //! here cites a measurement. A durable commit is one framed append and one
 //! fdatasync and nothing else, because f39 measured that shape at 1,191,125
-//! ops/s with all engine work removed (F39.1) and today's engine 5.85x below
-//! it on work this design deletes (F39.3). Sealed segments are byte-for-byte
-//! today's store format, written by the existing `Store` writer and read by
-//! `Blob` (`SegmentOptions { redo_log: false, shards: 1 }` -- the logshed
-//! configuration), so everything measured about that read path carries over,
-//! browser reader included. There is no checkpoint: sealing is off the
-//! commit path, and a store killed before its first seal opens from the WAL
-//! alone, which is the brief's P-E and the flip of C3.4.
+//! ops/s with all engine work removed, and the engine this replaced ran
+//! 5.85x below it on per-point work this design deletes. Sealed segments are
+//! the format `Blob` reads, so everything measured about that read path
+//! carries over, browser reader included. There is no checkpoint: sealing is
+//! off the commit path, and a store killed before its first seal opens from
+//! the WAL alone, which is the brief's P-E.
 //!
-//! Milestone 1 deliberately leaves out: deletes, scans over segments,
-//! per-segment Blooms and range-partitioned compaction (the routing story
-//! F40/F41 settled -- the read path here queries every source, which is the
-//! unfiltered fan and is priced at 90ns per segment by F38.1), sharded
-//! writers (P-D), and group commit. Each arrives with its own experiment.
+//! A batch commits atomically behind a commit frame and `Txn` builds one.
+//! Deletes are tombstones that the merge collects. Segments are compacted
+//! into key ranges, so a read routes by fence to one partition plus a
+//! bounded L0 tail that a per-segment Bloom filter guards: the unfiltered
+//! fan that queries every source was priced at 90ns a segment by f38, and
+//! f41 refuted every keys-sized global router, which is why the routing is
+//! by range and not by key.
 //!
 //! Crash discipline, in order, so every window is survivable:
 //! commit = WAL append + fdatasync (the batch is durable or its tail frame
@@ -621,8 +621,8 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 
 /// One 64-byte block per query, four probe bits inside it: the structure
 /// f40 measured at 82.1% of a single store when it is the only routing
-/// there is (F40.1). Here it guards only the bounded L0 tail, because
-/// F41.1/F41.2 refuted every keys-sized global router -- the partitioned
+/// there is. Here it guards only the bounded L0 tail, because f41
+/// refuted every keys-sized global router -- the partitioned
 /// levels below are routed by fences that cost two comparisons.
 pub(crate) struct BlockedBloom {
     blocks: Vec<[u64; 8]>,
@@ -704,7 +704,7 @@ struct Seg {
 /// publishes all of it. A seal and a merge need none of that -- their keys
 /// come sorted, each key's values come once and together, and nothing is
 /// ever read back or appended to -- and f46 priced the general path at
-/// 2.04x the floor for exactly that input (F46.1). This is the writer that
+/// 2.04x the floor for exactly that input. This is the writer that
 /// floor described: values are packed into blocks in the order they arrive,
 /// each key gets one extent, and the end of the pass writes the block table,
 /// the key section and both superblock slots. It emits the format `Store`
@@ -2996,8 +2996,8 @@ impl Db {
             // In KEY order, not hash order. A segment written in the
             // memtable's iteration order scatters each key's values across
             // blocks by hash, so an ordered scan walks the file randomly;
-            // written sorted, a scan walks it forwards. This is W1.3's
-            // finding in the new engine -- how the roll writes decides what
+            // written sorted, a scan walks it forwards. This is what the
+            // retired line-order arm of w1-daysize found, in the new engine -- how the roll writes decides what
             // the read costs -- and the sort is affordable because a seal is
             // off the commit path. The same sort is what makes splitting at
             // the fences a matter of slicing.
