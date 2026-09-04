@@ -97,10 +97,29 @@ fn main() -> std::io::Result<()> {
     }
 }
 
-fn load(results: &Path, experiment: &str, profile: &str) -> Option<J> {
+/// A result file that is absent and one that is unreadable are different
+/// facts, and collapsing them is how a gate reports a verdict it has not
+/// earned: an absent file means a claim was not exercised at this profile,
+/// while a corrupt or truncated one means the check could not run. The first
+/// version returned `Option` for both, so a damaged result silently skipped
+/// every claim of its experiment.
+enum Load {
+    Missing,
+    Broken(String),
+    Ok(Box<J>),
+}
+
+fn load(results: &Path, experiment: &str, profile: &str) -> Load {
     let p = results.join(format!("{experiment}.{profile}.json"));
-    let text = std::fs::read_to_string(p).ok()?;
-    jparse::parse(&text).ok()
+    let text = match std::fs::read_to_string(&p) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Load::Missing,
+        Err(e) => return Load::Broken(format!("{} could not be read: {e}", p.display())),
+    };
+    match jparse::parse(&text) {
+        Ok(doc) => Load::Ok(Box::new(doc)),
+        Err(e) => Load::Broken(format!("{} is not parseable: {e:?}", p.display())),
+    }
 }
 
 fn check_findings(claims: &J, results: &Path, profile: &str, out: &mut Outcome) {
@@ -122,9 +141,16 @@ fn check_findings(claims: &J, results: &Path, profile: &str, out: &mut Outcome) 
         }
         let label = format!("{exp}/{id}");
 
-        let Some(doc) = load(results, exp, profile) else {
-            out.skipped.push(label);
-            continue;
+        let doc = match load(results, exp, profile) {
+            Load::Ok(doc) => doc,
+            Load::Missing => {
+                out.skipped.push(label);
+                continue;
+            }
+            Load::Broken(why) => {
+                out.failures.push(format!("{label}: {why}"));
+                continue;
+            }
         };
         // Architecture pins for the same reason profile pins exist. Cache line
         // size and page size differ across targets -- Graviton is 64B/4KiB like
@@ -205,17 +231,29 @@ fn check_findings(claims: &J, results: &Path, profile: &str, out: &mut Outcome) 
 /// pinned to `full` or to one architecture still registers its finding
 /// everywhere, so pins are ignored here.
 fn check_unregistered(claims: &J, results: &Path, profile: &str, out: &mut Outcome) {
-    let mut registered: Vec<(String, String)> = Vec::new();
+    let mut registered: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
     if let Some(list) = claims.path("findings") {
         for c in list.items() {
             let exp = c.path("experiment").and_then(|v| v.as_str()).unwrap_or("");
             let id = c.path("id").and_then(|v| v.as_str()).unwrap_or("");
-            registered.push((exp.to_string(), id.to_string()));
+            registered.insert((exp.to_string(), id.to_string()));
         }
     }
     let suffix = format!(".{profile}.json");
-    let Ok(dir) = std::fs::read_dir(results) else {
-        return;
+    let dir = match std::fs::read_dir(results) {
+        Ok(d) => d,
+        Err(e) => {
+            // Not a silent return. A results directory that cannot be listed
+            // means this direction did not run, and a check that did not run
+            // must not report that it passed.
+            out.failures.push(format!(
+                "{} could not be listed, so no result could be checked for \
+                 unregistered findings: {e}",
+                results.display()
+            ));
+            return;
+        }
     };
     let mut files: Vec<String> = dir
         .filter_map(|e| e.ok())
@@ -225,18 +263,26 @@ fn check_unregistered(claims: &J, results: &Path, profile: &str, out: &mut Outco
     files.sort();
     for name in files {
         let exp = &name[..name.len() - suffix.len()];
-        let Ok(text) = std::fs::read_to_string(results.join(&name)) else {
-            continue;
-        };
-        let Ok(doc) = jparse::parse(&text) else {
-            continue;
+        let doc = match load(results, exp, profile) {
+            Load::Ok(doc) => doc,
+            // The name came out of the directory listing a moment ago, so
+            // absent here means it went away mid-check.
+            Load::Missing => {
+                out.failures
+                    .push(format!("{exp}: {name} was listed and then could not be opened"));
+                continue;
+            }
+            Load::Broken(why) => {
+                out.failures.push(format!("{exp}: {why}"));
+                continue;
+            }
         };
         for f in doc.path("findings").map(|f| f.items()).unwrap_or(&[]) {
             let id = f.path("id").and_then(|v| v.as_str()).unwrap_or("");
             if id.is_empty() {
                 continue;
             }
-            if !registered.iter().any(|(e, i)| e == exp && i == id) {
+            if !registered.contains(&(exp.to_string(), id.to_string())) {
                 let status = f.path("status").and_then(|v| v.as_str()).unwrap_or("");
                 out.failures.push(format!(
                     "{exp}/{id}: the run recorded this finding ('{status}') and no claim registers it"
@@ -263,9 +309,16 @@ fn check_metrics(claims: &J, results: &Path, profile: &str, out: &mut Outcome) {
         }
         let label = format!("{exp}:{path}");
 
-        let Some(doc) = load(results, exp, profile) else {
-            out.skipped.push(label);
-            continue;
+        let doc = match load(results, exp, profile) {
+            Load::Ok(doc) => doc,
+            Load::Missing => {
+                out.skipped.push(label);
+                continue;
+            }
+            Load::Broken(why) => {
+                out.failures.push(format!("{label}: {why}"));
+                continue;
+            }
         };
         if let Some(want_arch) = c.path("arch").and_then(|v| v.as_str()) {
             if doc.path("env.arch").and_then(|v| v.as_str()) != Some(want_arch) {

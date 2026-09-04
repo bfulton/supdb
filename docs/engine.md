@@ -441,8 +441,9 @@ per-commit path.
   157 GB off the device to serve 89 MB anybody asked for (F65.1, F65.2).
   It is a trade rather than a win, because the ordered scan wants exactly
   the pages a point read does not and pays 2.3x to 2.5x for losing them
-  (F65.3). `Options::advise_random` is that trade as a per-store choice
-  and defaults off.
+  (F65.3). `Options::read_advice` carries that trade: `ReadAdvice::Random`
+  takes one side of it for the life of the store, `ReadAdvice::Default`
+  the other.
   What removes the choice is that a store knows which of the two it is
   doing: `read_all` and `scan` are different calls, so the advice can
   follow the workload rather than be picked once. Doing that beats a fixed
@@ -455,6 +456,12 @@ per-commit path.
   no phases, where one scan is 1.5x it (F66.6, F66.5). A `madvise` is
   microseconds and a cold scan in the wrong mode is milliseconds, so the
   policy is right to act on the first call rather than wait for a second.
+  It is `ReadAdvice::Adaptive`, and it takes no threshold, because a knob
+  whose only good value is known is a knob nobody should have. What f66
+  has not priced is the same policy over a store rather than over one
+  mapping -- a `Db` maps a file per segment, so a switch is one `madvise`
+  each -- which is f67 and `readadvice-plan.md`, and which is what the
+  default waits on.
 
 - **Partitioned compaction policy** — built and measured (f43). The tail
   bound is a real dial: T8 sends 0.898x of T4's device bytes and scans
