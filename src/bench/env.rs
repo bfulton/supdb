@@ -271,6 +271,16 @@ pub fn device_write_counter_source() -> &'static str {
 /// callers above turn that into 0 -- exactly what the /proc reads used to
 /// return on this platform -- rather than panicking. A wrong answer from the
 /// kernel loses a column, not a run.
+//
+// `libc` is deprecating its mach bindings in favour of the `mach2` crate, and
+// this module is the only thing that calls them -- which is why the
+// deprecation went unnoticed until macOS joined the test matrix and `-D
+// warnings` turned it into an error. Allowed here rather than depended away:
+// `mach2` would be a whole crate for one symbol, and `task_info` would then
+// take a port from one crate's mach bindings and its flavour constants from
+// another's. If libc removes these rather than deprecating them, that is the
+// moment to take the dependency.
+#[allow(deprecated)]
 #[cfg(target_os = "macos")]
 mod darwin {
     /// `MACH_TASK_BASIC_INFO` for this task, or `None` if the kernel refused.
