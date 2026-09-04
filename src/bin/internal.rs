@@ -96,6 +96,7 @@ fn main() -> std::io::Result<()> {
             "f64-indexsum" => f64_indexsum(&args, profile)?,
             "f65-madvise" => f65_madvise(&args, profile)?,
             "f66-adaptive" => f66_adaptive(&args, profile)?,
+            "f67-dbadvice" => f67_dbadvice(&args, profile)?,
             other => {
                 eprintln!("unknown experiment {other}");
                 std::process::exit(2);
@@ -142,6 +143,7 @@ fn main() -> std::io::Result<()> {
                 "f64-indexsum",
                 "f65-madvise",
                 "f66-adaptive",
+                "f67-dbadvice",
             ] {
                 if !run(e)? {
                     failed.push(e);
@@ -881,6 +883,423 @@ fn f66_pass(
         scan_secs,
         asked,
     }
+}
+
+// ----------------------------------- F67: the read advice inside the engine --
+
+/// Whether the kernel has `VM_RAND_READ` set on each mapping of a file whose
+/// path contains `needle`, read out of `/proc/self/smaps`.
+///
+/// This is the whole point of `F67.4`. The store keeps its own record of the
+/// mode it last asked for, and checking that record against itself proves
+/// nothing -- the bug worth catching is a segment whose mapping never got the
+/// call, which leaves every read correct and only the advice stale. smaps is
+/// the kernel's answer rather than the engine's: `rr` in `VmFlags` is
+/// `VM_RAND_READ`, which `MADV_RANDOM` sets and `MADV_NORMAL` clears.
+///
+/// `None` where the host does not publish `VmFlags`, because a field that is
+/// not there is not evidence either way.
+fn smaps_random(needle: &str) -> Option<Vec<bool>> {
+    let text = std::fs::read_to_string("/proc/self/smaps").ok()?;
+    let mut out = Vec::new();
+    let mut interesting = false;
+    let mut saw_flags = false;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("VmFlags:") {
+            saw_flags = true;
+            if interesting {
+                out.push(rest.split_whitespace().any(|f| f == "rr"));
+                interesting = false;
+            }
+        } else if line.split_whitespace().next().is_some_and(|f| {
+            f.contains('-') && f.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+        }) {
+            // A mapping header, recognised by its leading `start-end` in hex.
+            // Not by the absence of a colon: the device field is `fd:01`, so
+            // every header has one and the first version of this matched no
+            // mapping at all and reported `not_exercised` rather than a
+            // wrong answer, which is the one good thing about it.
+            interesting = line.contains(needle);
+        }
+    }
+    if saw_flags {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Load a store with `keys` keys, sealed small enough to leave several
+/// segments behind. Returns it settled, so no seal is in flight.
+fn f67_store(
+    dir: &std::path::Path,
+    keys: u64,
+    value_size: usize,
+    advice: supdb::ReadAdvice,
+    seal_mb: usize,
+) -> std::io::Result<supdb::Db> {
+    let _ = std::fs::remove_dir_all(dir);
+    let opts = supdb::Options {
+        read_advice: advice,
+        seal_bytes: seal_mb * 1_048_576,
+        ..Default::default()
+    };
+    let mut db = supdb::Db::create(dir, opts)?;
+    let payload = Payload::new(value_size, 0.1, 0xF67);
+    let mut vrng = Rng::new(0xF67);
+    let mut kb = [0u8; 16];
+    for i in 0..keys {
+        db_key_into(i, &mut kb);
+        db.append(&kb, payload.get(&mut vrng));
+        if (i + 1) % 1000 == 0 {
+            db.commit()?;
+        }
+    }
+    db.commit()?;
+    db.settle()?;
+    Ok(db)
+}
+
+/// One pass of a phased or phase-free workload over a `Db`. `phase_scans` of
+/// 1 with `phase_reads` of 1 is the phase-free case, exactly as in f66.
+#[allow(clippy::too_many_arguments)]
+fn f67_pass(
+    db: &supdb::Db,
+    keys: u64,
+    cycles: usize,
+    phase_reads: usize,
+    phase_scans: usize,
+    scan_len: usize,
+    seed: u64,
+) -> f64 {
+    let mut g = KeyGen::new(KeyDist::Uniform, keys, seed);
+    let mut kb = [0u8; 16];
+    let mut ops = 0u64;
+    let mut scan_ix = 0u64;
+    let stride = (keys / (cycles * phase_scans).max(1) as u64).max(1);
+    let t0 = Instant::now();
+    for _ in 0..cycles {
+        for _ in 0..phase_reads {
+            db_key_into(g.next(), &mut kb);
+            db.read_all(&kb, |v| {
+                std::hint::black_box(v);
+            })
+            .expect("read");
+            ops += 1;
+        }
+        for _ in 0..phase_scans {
+            let mut kb2 = [0u8; 16];
+            db_key_into(scan_ix * stride % keys, &mut kb2);
+            scan_ix += 1;
+            ops += db
+                .scan(&kb2, scan_len, |_k, v| {
+                    std::hint::black_box(v);
+                })
+                .expect("scan") as u64;
+        }
+    }
+    ops as f64 / t0.elapsed().as_secs_f64()
+}
+
+fn f67_dbadvice(args: &Args, profile: Profile) -> std::io::Result<Record> {
+    let value_size = args.num("--value-size", 4096);
+    let data_mb = args.num("--data-mb", profile.pick(64, 512, 2_048)) as u64;
+    let cap_mb = args.num("--cap-mb", profile.pick(32, 128, 256)) as u64;
+    let seal_mb = args.num("--seal-mb", profile.pick(8, 32, 64));
+    let cycles = args.num("--cycles", profile.pick(2, 3, 4));
+    let phase_reads = args.num("--phase-reads", profile.pick(20, 60, 200));
+    let phase_scans = args.num("--phase-scans", profile.pick(8, 32, 96));
+    let scan_len = args.num("--scan-len", profile.pick(100, 300, 500));
+    let mix_ops = args.num("--mix-ops", profile.pick(20, 60, 200));
+    // The resident case is deliberately small: it has to fit the cap with
+    // room to spare, because what it prices is the policy costing nothing
+    // where it can win nothing.
+    let resident_mb = args.num("--resident-mb", profile.pick(8, 24, 48)) as u64;
+    let reps = args.num("--reps", profile.reps());
+
+    let mut rec = Record::new("f67-dbadvice", profile);
+    let keys = (data_mb * 1048576) / value_size.max(1) as u64;
+    let resident_keys = (resident_mb * 1048576) / value_size.max(1) as u64;
+    rec.param("data_mb", J::u(data_mb))
+        .param("cap_mb", J::u(cap_mb))
+        .param("resident_mb", J::u(resident_mb))
+        .param("seal_mb", J::u(seal_mb as u64))
+        .param("keys", J::u(keys))
+        .param("reps", J::u(reps as u64))
+        .note(
+            "f66 measured this policy over a single Blob and a single mapping. A Db maps one \
+             file per segment, so a transition is one madvise per live segment rather than \
+             one, and the memtable is not advised at all -- this is the same policy priced \
+             where it actually ships",
+        );
+
+    let dir = scratch("f67");
+
+    // ---- F67.4 first: it needs no cap and no timing, and if the advice does
+    // not reach the mappings there is nothing worth timing.
+    {
+        let d = dir.join("inherit");
+        let mut db = f67_store(
+            &d,
+            resident_keys,
+            value_size,
+            supdb::ReadAdvice::Adaptive,
+            1,
+        )?;
+        let mut kb = [0u8; 16];
+        // A scan puts the store in the kernel's default, then a seal has to
+        // produce a segment already in that mode rather than in the option's.
+        db.scan(&[], 16, |_k, _v| {}).expect("scan");
+        let after_scan = smaps_random(&d.to_string_lossy());
+        let store_says = db.advice_random();
+        let segs_before = db.segments();
+        let payload = Payload::new(value_size, 0.1, 0xF67);
+        let mut vrng = Rng::new(0x67F);
+        for i in resident_keys..resident_keys + resident_keys.max(1) {
+            db_key_into(i, &mut kb);
+            db.append(&kb, payload.get(&mut vrng));
+            if (i + 1) % 500 == 0 {
+                db.commit()?;
+            }
+        }
+        db.commit()?;
+        db.settle()?;
+        let segs_after = db.segments();
+        let after_seal = smaps_random(&d.to_string_lossy());
+        let sealed_more = segs_after > segs_before;
+        match (&after_scan, &after_seal) {
+            (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() && sealed_more => {
+                let all_normal_before = a.iter().all(|r| !r);
+                let all_normal_after = b.iter().all(|r| !r);
+                rec.finding(Finding::new(
+                    "F67.4",
+                    "a segment opened after the store has changed mode is in the store's mode, \
+                     not the option's",
+                    all_normal_before && all_normal_after && !store_says,
+                    format!(
+                        "after a scan the store reports MADV_RANDOM {store_says} and the kernel \
+                         reports VM_RAND_READ on {} of {} segment mappings; after a seal took it \
+                         from {segs_before} to {segs_after} segments, {} of {}. Read from \
+                         /proc/self/smaps rather than from the store's own record, because the \
+                         failure this catches is the two disagreeing -- a segment opened with \
+                         the option's mode instead of the store's leaves every read correct and \
+                         only the advice stale",
+                        a.iter().filter(|r| **r).count(),
+                        a.len(),
+                        b.iter().filter(|r| **r).count(),
+                        b.len(),
+                    ),
+                ));
+            }
+            _ => {
+                let why = if after_scan.is_none() || after_seal.is_none() {
+                    "this host does not publish VmFlags in /proc/self/smaps, so the kernel \
+                     cannot be asked what the advice is"
+                        .to_string()
+                } else if !sealed_more {
+                    format!("the write did not produce a new segment ({segs_before} to {segs_after}), so nothing was opened to inherit a mode")
+                } else {
+                    "no segment mapping was found in /proc/self/smaps".to_string()
+                };
+                rec.finding(Finding::not_exercised(
+                    "F67.4",
+                    "a segment opened after the store has changed mode is in the store's mode, \
+                     not the option's",
+                    why,
+                ));
+            }
+        }
+        db.close()?;
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- The timed arms.
+    let advices = [
+        supdb::ReadAdvice::Default,
+        supdb::ReadAdvice::Random,
+        supdb::ReadAdvice::Adaptive,
+    ];
+    let names = ["default", "random", "adaptive"];
+
+    let big = dir.join("big");
+    let file_bytes: u64 = {
+        let db = f67_store(&big, keys, value_size, supdb::ReadAdvice::Default, seal_mb)?;
+        let segs = db.segments();
+        rec.param("segments", J::u(segs as u64));
+        drop(db);
+        let mut b = 0u64;
+        for e in std::fs::read_dir(&big)? {
+            b += e?.metadata()?.len();
+        }
+        b
+    };
+    let _cap = env::cap_guard();
+    let capped = env::cap_memory(cap_mb * 1048576);
+    let over_cap = file_bytes as f64 / (cap_mb * 1048576) as f64;
+    rec.param("store_mb", J::fp(file_bytes as f64 / 1048576.0, 1))
+        .param("store_over_cap", J::fp(over_cap, 2))
+        .param("cap_applied", J::Bool(capped));
+
+    if !capped || over_cap <= 1.0 {
+        let why = if !capped {
+            "no writable memory controller, so the page cache was never capped and no read \
+             here faults from storage"
+                .to_string()
+        } else {
+            format!("the store is {over_cap:.2}x the cap, so it fits in the page cache")
+        };
+        for (id, st) in [
+            ("F67.1", "over a store with several segments the adaptive advice beats both fixed settings on a phased workload"),
+            ("F67.2", "on a workload with no phases the adaptive advice is not resolvably slower than the better fixed setting"),
+            ("F67.3", "on a store that fits in memory the adaptive advice costs nothing against the kernel's default"),
+        ] {
+            rec.finding(Finding::not_exercised(id, st, why.clone()));
+        }
+        return Ok(rec);
+    }
+
+    let phased = Trial::new(reps).run(3, |ci, rep| {
+        let _ = env::drop_caches();
+        let db = supdb::Db::open(
+            &big,
+            supdb::Options {
+                read_advice: advices[ci],
+                seal_bytes: seal_mb * 1_048_576,
+                ..Default::default()
+            },
+        )
+        .expect("open");
+        f67_pass(
+            &db,
+            keys,
+            cycles,
+            phase_reads,
+            phase_scans,
+            scan_len,
+            0xD00D ^ rep as u64,
+        )
+    });
+    let cmp_def = compare(&phased[2], &phased[0], supdb::bench::MIN_EFFECT);
+    let cmp_rnd = compare(&phased[2], &phased[1], supdb::bench::MIN_EFFECT);
+    rec.compare("F67.1_adaptive_vs_default", cmp_def.clone());
+    rec.compare("F67.1_adaptive_vs_random", cmp_rnd.clone());
+    rec.finding(Finding::new(
+        "F67.1",
+        "over a store with several segments the adaptive advice beats both fixed settings on \
+         a phased workload",
+        matches!(cmp_def.verdict, supdb::bench::Verdict::Greater)
+            && matches!(cmp_rnd.verdict, supdb::bench::Verdict::Greater),
+        format!(
+            "adaptive {:.0} ops/s against the kernel's default {:.0} ({}) and fixed \
+             MADV_RANDOM {:.0} ({}), over {cycles} cycles of {phase_reads} point reads and \
+             {phase_scans} scans of {scan_len} on a store of {:.1} MB in several segments \
+             against a {cap_mb} MB cap",
+            phased[2].median(),
+            phased[0].median(),
+            cmp_def.summary("adaptive", "default"),
+            phased[1].median(),
+            cmp_rnd.summary("adaptive", "random"),
+            file_bytes as f64 / 1048576.0,
+        ),
+    ));
+
+    let mixed = Trial::new(reps).run(3, |ci, rep| {
+        let _ = env::drop_caches();
+        let db = supdb::Db::open(
+            &big,
+            supdb::Options {
+                read_advice: advices[ci],
+                seal_bytes: seal_mb * 1_048_576,
+                ..Default::default()
+            },
+        )
+        .expect("open");
+        f67_pass(&db, keys, mix_ops, 1, 1, scan_len, 0x71C7 ^ rep as u64)
+    });
+    let bf = if mixed[0].median() >= mixed[1].median() {
+        0
+    } else {
+        1
+    };
+    let cmp_mix = compare(&mixed[2], &mixed[bf], supdb::bench::MIN_EFFECT);
+    rec.compare("F67.2_adaptive_vs_best_fixed", cmp_mix.clone());
+    rec.finding(Finding::new(
+        "F67.2",
+        "on a workload with no phases the adaptive advice is not resolvably slower than the \
+         better fixed setting",
+        !matches!(cmp_mix.verdict, supdb::bench::Verdict::Less),
+        format!(
+            "alternating one point read and one scan of {scan_len}, {mix_ops} of each: default \
+             {:.0} ops/s, random {:.0}, adaptive {:.0}. Against the better fixed setting \
+             ({}), {}",
+            mixed[0].median(),
+            mixed[1].median(),
+            mixed[2].median(),
+            names[bf],
+            cmp_mix.summary("adaptive", names[bf]),
+        ),
+    ));
+
+    // ---- F67.3: the case f66 could not ask. A store that fits in memory is
+    // where most stores are; the policy can win nothing there and can only
+    // cost, so this is what decides whether it is safe as a default.
+    let small = dir.join("small");
+    {
+        let db = f67_store(
+            &small,
+            resident_keys,
+            value_size,
+            supdb::ReadAdvice::Default,
+            seal_mb,
+        )?;
+        rec.param("resident_segments", J::u(db.segments() as u64));
+    }
+    let resident = Trial::new(reps).run(2, |ci, rep| {
+        let db = supdb::Db::open(
+            &small,
+            supdb::Options {
+                read_advice: [supdb::ReadAdvice::Default, supdb::ReadAdvice::Adaptive][ci],
+                seal_bytes: seal_mb * 1_048_576,
+                ..Default::default()
+            },
+        )
+        .expect("open");
+        // Warm it deliberately: the question is the policy's cost on a store
+        // already in memory, not the cost of getting it there.
+        let _ = f67_pass(&db, resident_keys, 1, 50, 4, scan_len, 0x0BEE);
+        f67_pass(
+            &db,
+            resident_keys,
+            cycles,
+            phase_reads,
+            phase_scans,
+            scan_len,
+            0x5EA7 ^ rep as u64,
+        )
+    });
+    let cmp_res = compare(&resident[1], &resident[0], supdb::bench::MIN_EFFECT);
+    rec.compare("F67.3_adaptive_vs_default_resident", cmp_res.clone());
+    rec.finding(Finding::new(
+        "F67.3",
+        "on a store that fits in memory the adaptive advice costs nothing against the \
+         kernel's default",
+        !matches!(cmp_res.verdict, supdb::bench::Verdict::Less),
+        format!(
+            "a warm {resident_mb} MB store inside the {cap_mb} MB cap: adaptive {:.0} ops/s \
+             against the kernel's default {:.0}, {:.1}% of it ({}). This is the case f66 could \
+             not ask, because every one of its arms ran against a file eight times its page \
+             cache. Here the advice can win nothing and can only cost -- a madvise per segment \
+             per phase change, and a branch per operation -- so a resolvable loss makes \
+             Adaptive a bad default however well it does out-of-core",
+            resident[1].median(),
+            resident[0].median(),
+            100.0 * resident[1].median() / resident[0].median().max(1.0),
+            cmp_res.summary("adaptive", "default"),
+        ),
+    ));
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(rec)
 }
 
 /// Does the advice pay to follow the workload, and at what threshold?

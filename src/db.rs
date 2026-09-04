@@ -114,6 +114,55 @@ fn idle_io_priority() {
     }
 }
 
+/// How a store advises the kernel about its segment mappings.
+///
+/// Once a store outgrows the page cache the kernel's default readahead is
+/// the whole out-of-core cliff: cold point reads run 75.8x and 78.9x faster
+/// under `MADV_RANDOM`, at 1.0x read amplification against 1800x -- the
+/// default fetched 157 GB off the device to serve 89 MB anybody asked for
+/// (`F65.1`, `F65.2`). It is a trade rather than a win, because an ordered
+/// scan wants exactly the pages a point read does not and pays 2.3x to 2.5x
+/// for losing them (`F65.3`).
+///
+/// A mapping's advice applies to the reader that set it and not to the file,
+/// so a compaction streams its inputs under the kernel's default however
+/// this is set: `compact` opens them through its own `MmapBytes`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ReadAdvice {
+    /// The kernel's default readahead, for every access.
+    #[default]
+    Default,
+    /// `MADV_RANDOM` for the life of the store. For one whose working set
+    /// outgrows memory and whose reads are points.
+    Random,
+    /// Follow the workload: `MADV_RANDOM` while the store is answering point
+    /// reads, the kernel's default while it is scanning, switched on the
+    /// first call of the other kind.
+    ///
+    /// The store does not have to infer which it is doing -- `read_all` and
+    /// `scan` are different calls -- so the phase signal is free and exact.
+    /// There is no threshold to tune: `f66-adaptive` swept one and found that
+    /// waiting for a second consecutive scan before switching falls to 33.2%
+    /// and 30.8% of the better fixed advice on a workload with no phases,
+    /// where switching on the first is 1.5x it (`F66.5`, `F66.6`). A switch
+    /// is a `madvise` in microseconds and one cold scan in the wrong mode is
+    /// milliseconds, so there is nothing to be gained by waiting.
+    Adaptive,
+}
+
+impl ReadAdvice {
+    /// The mode a store's mappings start in.
+    ///
+    /// `Adaptive` starts advised because it leaves that mode on the first
+    /// scan and being wrong in the other direction is the expensive one:
+    /// `F65.1` puts a cold point read under the kernel's default at about a
+    /// seventy-fifth of an advised one, against `F65.3`'s 2.4x for a scan
+    /// under `MADV_RANDOM`.
+    fn starts_random(self) -> bool {
+        matches!(self, ReadAdvice::Random | ReadAdvice::Adaptive)
+    }
+}
+
 #[derive(Clone)]
 pub struct Options {
     pub sync: SyncPolicy,
@@ -182,26 +231,11 @@ pub struct Options {
     /// fdatasync of an append that grows the file commits an inode change
     /// through the journal; an overwrite does not, and LMDB's commit is an
     /// overwrite. f57 prices it (walreuse-plan.md).
-    /// Tell the kernel that reads of a segment are random.
+    /// How reads advise the kernel about the segment mappings.
     ///
-    /// `MADV_RANDOM` on every segment mapping the reader opens. Off by
-    /// default, because it is a trade rather than a win and neither side of it
-    /// is small: `f65-madvise` measured cold point reads 75.8x and 78.9x
-    /// faster advised, at 1800x read amplification against 1.0x -- the default
-    /// fetched 157 GB off the device to serve 89 MB anybody asked for -- and
-    /// the ordered scan 2.3x to 2.5x *slower*, because a scan wanted every page
-    /// readahead would have fetched (`F65.1`, `F65.2`, `F65.3`).
-    ///
-    /// So set it for a store whose working set outgrows memory and whose reads
-    /// are points; leave it off for one that scans.
-    ///
-    /// It applies to the reader's segment mappings only, and that holds even
-    /// for a segment compaction later consumes: `madvise` is a property of a
-    /// mapping rather than of a file, and `compact` opens its inputs through
-    /// its own `MmapBytes`. So a compaction streams under the kernel's default
-    /// readahead however this is set, which is the side of the trade it
-    /// wants.
-    pub advise_random: bool,
+    /// See `ReadAdvice`. `Default` unless changed, which is the setting the
+    /// engine has always had.
+    pub read_advice: ReadAdvice,
     pub recycle_wal: bool,
     /// The ordered scan's merge over unrouted sources. `true` is the merge
     /// f61 priced and f62 replaced: one cursor over the disjoint partitions
@@ -242,7 +276,7 @@ impl Default for Options {
             flush_ranges: true,
             promote: true,
             recycle_wal: false,
-            advise_random: false,
+            read_advice: ReadAdvice::Default,
             scan_merge: true,
             scan_snapshot_arena: true,
         }
@@ -1551,7 +1585,12 @@ impl Seg {
         Ok(())
     }
 
-    fn open(dir: &Path, name: &str, advise_random: bool) -> Result<Seg> {
+    /// `random` is the mode the *store* is in right now, not the option: a
+    /// segment from a seal or a merge has to join the mode its store is
+    /// already in. Passing the option here instead is silent -- reads stay
+    /// correct and only the advice goes stale -- which is why `F67.4` checks
+    /// it rather than trusting it.
+    fn open(dir: &Path, name: &str, random: bool) -> Result<Seg> {
         let src = MmapBytes::open(&dir.join(name)).map_err(|e| {
             // A manifest naming a segment that is not on disk is a damaged
             // store, not a missing file, and saying so is the difference
@@ -1561,7 +1600,7 @@ impl Seg {
             ))
         })?;
         let blob = Blob::open(src).map_err(|e| err(&format!("segment {name}: {e}")))?;
-        if advise_random {
+        if random {
             blob.advise_random();
         }
         // `pcs-` is a range-ALIGNED L0 piece: a seal split at the live
@@ -2504,6 +2543,14 @@ pub struct Db {
     /// preserves it and everything L0 holds is newer than everything L1
     /// holds.
     segs: Vec<Seg>,
+    /// Which mode the segment mappings are in: `true` is `MADV_RANDOM`.
+    ///
+    /// One flag for the whole store rather than one per segment, because the
+    /// phase is a property of what the caller is doing and not of which file
+    /// answers. A `Cell` because `Db` is not `Sync` -- `Blob` holds a
+    /// `RefCell` -- so every reader thread has its own store, its own
+    /// mappings and its own mode, and two threads cannot fight over one flag.
+    advice_random: std::cell::Cell<bool>,
     next_seg: u64,
     /// Commits written since the last barrier, for `SyncPolicy::EveryN`.
     unsynced: u32,
@@ -2722,6 +2769,7 @@ impl Db {
     }
 
     pub fn create(dir: &Path, opts: Options) -> Result<Db> {
+        let starts_random = opts.read_advice.starts_random();
         std::fs::create_dir_all(dir)?;
         let mut wal = Wal::create(&Db::wal_path(dir, 0), 0)?;
         let mut spare_wals = Vec::new();
@@ -2743,6 +2791,7 @@ impl Db {
             mem: MemTable::new(),
             mem_bytes: 0,
             segs: Vec::new(),
+            advice_random: std::cell::Cell::new(starts_random),
             next_seg: 0,
             frozen: None,
             sealing: None,
@@ -2797,9 +2846,11 @@ impl Db {
                 let _ = std::fs::remove_file(dir.join(name));
             }
         }
+        // Where the store starts. `Random` starts advised and never moves;
+        let starts_random = opts.read_advice.starts_random();
         let mut segs = Vec::with_capacity(live.len());
         for name in &live {
-            segs.push(Seg::open(dir, name, opts.advise_random)?);
+            segs.push(Seg::open(dir, name, starts_random)?);
         }
         segs.sort_by(|a, b| {
             b.level
@@ -2877,6 +2928,10 @@ impl Db {
             mem,
             mem_bytes,
             segs,
+            // The same value the segments above were opened with, so the
+            // store's idea of its mode and the mappings' actual mode agree
+            // from the first read rather than from the first transition.
+            advice_random: std::cell::Cell::new(starts_random),
             next_seg,
             frozen: None,
             sealing: None,
@@ -3238,7 +3293,7 @@ impl Db {
         for name in &names {
             self.covered_seq = self.covered_seq.max(Db::name_end_seq(name).unwrap_or(0));
             self.segs
-                .push(Seg::open(&self.dir, name, self.opts.advise_random)?);
+                .push(Seg::open(&self.dir, name, self.advice_random.get())?);
         }
         self.sort_segs();
         self.frozen = None;
@@ -3656,7 +3711,7 @@ impl Db {
         }
         let mut merged = Vec::with_capacity(outputs.len());
         for name in &outputs {
-            merged.push(Seg::open(&self.dir, name, self.opts.advise_random)?);
+            merged.push(Seg::open(&self.dir, name, self.advice_random.get())?);
         }
         // Partitions first (older, disjoint), then whatever L0 arrived
         // while the merge ran, oldest to newest.
@@ -3679,7 +3734,37 @@ impl Db {
     /// segment answers from a Bloom in one cache line. Neither can produce
     /// a false negative, so a skipped segment is a segment that provably
     /// holds nothing for this key.
+    /// Put the segment mappings in `random` if they are not already there.
+    ///
+    /// A no-op unless the mode actually changes, so the steady state costs a
+    /// `Cell` load and a compare. On a change it is one `madvise` per live
+    /// segment -- the cost `F67.1` and `F67.3` exist to price, since f66
+    /// measured this over a single mapping.
+    fn advise(&self, random: bool) {
+        if self.opts.read_advice != ReadAdvice::Adaptive || self.advice_random.get() == random {
+            return;
+        }
+        self.advice_random.set(random);
+        for s in &self.segs {
+            if random {
+                s.blob.advise_random();
+            } else {
+                s.blob.advise_normal();
+            }
+        }
+    }
+
+    /// Which mode the segment mappings are in: `true` is `MADV_RANDOM`.
+    ///
+    /// The store's own record of what it last asked for, which is what
+    /// `F67.4` needs to compare against the mappings themselves -- the
+    /// interesting failure is the two disagreeing.
+    pub fn advice_random(&self) -> bool {
+        self.advice_random.get()
+    }
+
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
+        self.advise(true);
         let np = self.segs.partition_point(|s| s.level > 0);
         let at =
             self.segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
@@ -3874,6 +3959,7 @@ impl Db {
         limit: usize,
         mut f: F,
     ) -> Result<usize> {
+        self.advise(false);
         let gen = self.wal.seq ^ (self.next_seg << 48) ^ ((self.frozen.is_some() as u64) << 63);
         {
             let mut cache = self.scan_keys.borrow_mut();
@@ -4198,6 +4284,9 @@ impl Db {
     /// each extent carries its record count (`Ext::count`, format v5), so no
     /// block is read. The memtable keeps a live count per key.
     pub fn count(&self, key: &[u8]) -> Result<u64> {
+        // A count resolves one key, so it is a point read for advice
+        // purposes even though it returns no bytes (`F28`: 94 ns, a lookup).
+        self.advise(true);
         let np = self.segs.partition_point(|s| s.level > 0);
         let at =
             self.segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
