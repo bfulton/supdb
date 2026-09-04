@@ -193,9 +193,14 @@ pub struct Options {
     /// readahead would have fetched (`F65.1`, `F65.2`, `F65.3`).
     ///
     /// So set it for a store whose working set outgrows memory and whose reads
-    /// are points; leave it off for one that scans. It applies to the reader's
-    /// segment mappings only -- compaction streams its inputs and would be the
-    /// wrong side of exactly this trade.
+    /// are points; leave it off for one that scans.
+    ///
+    /// It applies to the reader's segment mappings only, and that holds even
+    /// for a segment compaction later consumes: `madvise` is a property of a
+    /// mapping rather than of a file, and `compact` opens its inputs through
+    /// its own `MmapBytes`. So a compaction streams under the kernel's default
+    /// readahead however this is set, which is the side of the trade it
+    /// wants.
     pub advise_random: bool,
     pub recycle_wal: bool,
     /// The ordered scan's merge over unrouted sources. `true` is the merge
