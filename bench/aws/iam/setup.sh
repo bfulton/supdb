@@ -44,11 +44,15 @@ check() { # action, expected(allowed|implicitDeny|explicitDeny), context...
   else echo "  FAIL $action -> $got (wanted $want)"; FAILED=1; fi
 }
 FAILED=0
-echo "simulating with admin still attached (so results include it):"
+# Only the denials are meaningful here, and they are meaningful *because*
+# admin is still attached: an explicit Deny beating an administrator Allow is
+# exactly the property being proven. A positive check is worthless in this
+# position -- admin allows it whatever the new policy says -- so the allow is
+# asserted after the detach instead, where only the new policy can grant it.
+echo "simulating with admin still attached (so an explicit deny must still win):"
 check iam:CreateUser explicitDeny            # must be denied even under admin
 check iam:AttachUserPolicy explicitDeny      # no path back to admin
 check s3:CreateBucket explicitDeny           # nothing outside EC2
-check ec2:DescribeInstances allowed
 [ "$FAILED" = 0 ] || { echo "policy did not behave as intended; admin left attached"; exit 1; }
 
 # --- drop admin --------------------------------------------------------------
@@ -61,6 +65,13 @@ done
 echo "remaining policies:"
 aws iam list-attached-user-policies --user-name "$USER_NAME" \
   --query 'AttachedPolicies[].PolicyName' --output text
+
+# Now that admin is gone, an allow can only have come from the bench policy.
+echo
+echo "simulating with only the bench policy attached:"
+check ec2:DescribeInstances allowed
+check ec2:RunInstances allowed
+[ "$FAILED" = 0 ] || { echo "the bench policy does not grant what the runs need"; exit 1; }
 echo
 echo "Service Quotas are still worth setting -- they are the only hard stop."
 echo "A policy limits what can be launched; a quota limits how much."

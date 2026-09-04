@@ -12,9 +12,16 @@
 /// structures that make the format fast are addressed in place regardless:
 /// `flatindex` hands back `&[Ext]` borrowed out of the mapping, and a block
 /// table's records are reinterpreted rather than decoded. So a file is
-/// self-consistent only on the byte order that wrote it. Writing the magic
-/// `to_ne_bytes` makes the magic check itself do the refusing: identical
-/// bytes on a little-endian machine, swapped on any other.
+/// self-consistent only on the byte order that wrote it.
+///
+/// Two things refuse, in different directions, and it is worth naming both
+/// because each looks incomplete alone. The magic goes to disk `to_ne_bytes`
+/// while `Blob` reads it back `from_le_bytes`, and that asymmetry is the
+/// byte-order mark: a file written big-endian reads back byte-swapped on a
+/// little-endian machine and fails the comparison. The other direction never
+/// reaches the comparison, because `Blob::open` refuses a big-endian target
+/// outright -- the index is addressed in place, so a big-endian reader would
+/// misread a valid little-endian file rather than reject it.
 ///
 /// The low bytes are the format version, and a reader from before a version
 /// refuses a file rather than misreading it. 0004 when redo-log frames grew a
