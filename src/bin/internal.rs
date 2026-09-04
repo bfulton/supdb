@@ -780,6 +780,19 @@ impl<'a> Mode<'a> {
 /// whole pass, so a policy is judged on the workload rather than on the half
 /// of it that suits it.
 #[allow(clippy::too_many_arguments)]
+/// What one pass of the phased workload cost. The phase split is here because
+/// an aggregate ops/s says which policy won and not where it won: `normal`
+/// loses its time in the read phase and `random` loses its time in the scan
+/// phase, and a reader who cannot see that cannot check the story.
+struct Pass {
+    ops_per_s: f64,
+    switches: u64,
+    read_secs: f64,
+    scan_secs: f64,
+    asked: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn f66_pass(
     blob: &supdb::Blob<supdb::MmapBytes>,
     advice: Advice,
@@ -791,18 +804,22 @@ fn f66_pass(
     seed: u64,
     h_read: &mut Hist,
     h_scan: &mut Hist,
-) -> (f64, u64) {
+) -> Pass {
     let mut m = Mode::start(blob, !matches!(advice, Advice::Normal));
     let mut consec_scans = 0usize;
     let mut g = KeyGen::new(KeyDist::Uniform, nkeys, seed);
     let mut kb = [0u8; 16];
     let mut ops = 0u64;
+    let mut asked = 0u64;
+    let mut read_secs = 0.0f64;
+    let mut scan_secs = 0.0f64;
     let t0 = Instant::now();
     for _ in 0..cycles {
         // --- point-read phase ---
         if advice == Advice::Oracle {
             m.set(true);
         }
+        let tp = Instant::now();
         for _ in 0..phase_reads {
             if let Advice::Adaptive(_) = advice {
                 consec_scans = 0;
@@ -810,17 +827,22 @@ fn f66_pass(
             }
             db_key_into(g.next(), &mut kb);
             let t = Instant::now();
+            let mut got = 0u64;
             blob.read_all(&kb, |v| {
+                got += v.len() as u64;
                 std::hint::black_box(v);
             })
             .expect("read");
             h_read.record(t.elapsed().as_nanos() as u64);
             ops += 1;
+            asked += got;
         }
+        read_secs += tp.elapsed().as_secs_f64();
         // --- scan phase ---
         if advice == Advice::Oracle {
             m.set(false);
         }
+        let tp = Instant::now();
         for s in 0..phase_scans {
             if let Advice::Adaptive(k) = advice {
                 consec_scans += 1;
@@ -834,16 +856,26 @@ fn f66_pass(
                 &mut kb2,
             );
             let t = Instant::now();
+            let mut got = 0u64;
             let n = blob
                 .scan(&kb2, scan_len, |_k, v| {
+                    got += v.len() as u64;
                     std::hint::black_box(v);
                 })
                 .expect("scan");
             h_scan.record(t.elapsed().as_nanos() as u64);
             ops += n as u64;
+            asked += got;
         }
+        scan_secs += tp.elapsed().as_secs_f64();
     }
-    (ops as f64 / t0.elapsed().as_secs_f64(), m.switches)
+    Pass {
+        ops_per_s: ops as f64 / t0.elapsed().as_secs_f64(),
+        switches: m.switches,
+        read_secs,
+        scan_secs,
+        asked,
+    }
 }
 
 /// Does the advice pay to follow the workload, and at what threshold?
@@ -956,10 +988,15 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let mut h_read: Vec<Hist> = (0..arms.len()).map(|_| Hist::new()).collect();
     let mut h_scan: Vec<Hist> = (0..arms.len()).map(|_| Hist::new()).collect();
     let mut switches = vec![0u64; arms.len()];
+    let mut dev_read = vec![0u64; arms.len()];
+    let mut asked = vec![0u64; arms.len()];
+    let mut read_secs = vec![0.0f64; arms.len()];
+    let mut scan_secs = vec![0.0f64; arms.len()];
     let rates = Trial::new(reps).run(arms.len(), |ci, rep| {
         let _ = env::drop_caches();
         let blob = supdb::Blob::open(supdb::MmapBytes::open(&file).expect("map")).expect("open");
-        let (ops, sw) = f66_pass(
+        let io0 = IoCounters::read_now();
+        let pass = f66_pass(
             &blob,
             arms[ci],
             nkeys,
@@ -971,8 +1008,12 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
             &mut h_read[ci],
             &mut h_scan[ci],
         );
-        switches[ci] += sw;
-        ops
+        dev_read[ci] += IoCounters::read_now().since(&io0).read_bytes;
+        switches[ci] += pass.switches;
+        asked[ci] += pass.asked;
+        read_secs[ci] += pass.read_secs;
+        scan_secs[ci] += pass.scan_secs;
+        pass.ops_per_s
     });
 
     let series: Vec<J> = arms
@@ -982,13 +1023,23 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
             J::O(vec![
                 ("arm".into(), J::s(a.label())),
                 ("ops_per_s".into(), J::fp(rates[i].median(), 0)),
+                ("read_latency".into(), h_read[i].to_json()),
+                ("scan_latency".into(), h_scan[i].to_json()),
                 (
-                    "read_p99_ms".into(),
-                    J::fp(h_read[i].percentile(99.0) as f64 / 1e6, 3),
+                    "read_phase_secs_per_rep".into(),
+                    J::fp(read_secs[i] / reps as f64, 3),
                 ),
                 (
-                    "scan_p50_ms".into(),
-                    J::fp(h_scan[i].percentile(50.0) as f64 / 1e6, 3),
+                    "scan_phase_secs_per_rep".into(),
+                    J::fp(scan_secs[i] / reps as f64, 3),
+                ),
+                (
+                    "device_read_mb_per_rep".into(),
+                    J::fp(dev_read[i] as f64 / 1048576.0 / reps as f64, 2),
+                ),
+                (
+                    "read_amplification".into(),
+                    J::fp(dev_read[i] as f64 / asked[i].max(1) as f64, 2),
                 ),
                 (
                     "advice_switches_per_rep".into(),
@@ -1025,16 +1076,25 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
         .collect::<Vec<_>>()
         .join(", ");
 
+    // Rule 2: the ratio is the threshold this finding states, but whether the
+    // policy and its oracle differ at all is a question for the gate, not for
+    // arithmetic on two medians. Without this a run where adaptive lands a few
+    // percent above the bound reads as a heuristic beating the oracle that
+    // defines it, which is not a thing that can happen -- the arms differ only
+    // in when they enter NORMAL, and the oracle enters it first.
+    let cmp_oracle = compare(&rates[best], &rates[oracle], supdb::bench::MIN_EFFECT);
+    rec.compare("F66.1_adaptive_vs_oracle", cmp_oracle.clone());
     rec.finding(Finding::new(
         "F66.1",
         "the adaptive policy comes within 10% of an oracle that knows every phase boundary",
         rates[best].median() >= 0.9 * rates[oracle].median(),
         format!(
-            "best adaptive k={best_k} at {:.0} ops/s against the oracle's {:.0} ({:.0}% of it). \
-             Sweep: {sweep}. Fixed arms for scale: random {:.0}, normal {:.0}",
+            "best adaptive k={best_k} at {:.0} ops/s against the oracle's {:.0} ({:.0}% of it, \
+             {}). Sweep: {sweep}. Fixed arms for scale: random {:.0}, normal {:.0}",
             rates[best].median(),
             rates[oracle].median(),
             100.0 * rates[best].median() / rates[oracle].median().max(1.0),
+            cmp_oracle.summary("adaptive", "oracle"),
             rates[random].median(),
             rates[normal].median(),
         ),
@@ -1050,12 +1110,21 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
         format!(
             "adaptive k={best_k} {:.0} ops/s against fixed random {:.0} ({}), over {cycles} \
              cycles of {phase_reads} point reads and {phase_scans} scans of {scan_len}. \
-             Switches per rep: {:.1} adaptive against {:.1} oracle",
+             Switches per rep: {:.1} adaptive against {:.1} oracle. Where the time goes, \
+             read phase / scan phase seconds a rep: adaptive {:.2}/{:.2}, random {:.2}/{:.2}, \
+             normal {:.2}/{:.2} -- the fixed arms each lose a different phase, which is the \
+             whole reason a policy that follows the workload has anything to win",
             rates[best].median(),
             rates[random].median(),
             cmp.summary("adaptive", "random"),
             switches[best] as f64 / reps as f64,
             switches[oracle] as f64 / reps as f64,
+            read_secs[best] / reps as f64,
+            scan_secs[best] / reps as f64,
+            read_secs[random] / reps as f64,
+            scan_secs[random] / reps as f64,
+            read_secs[normal] / reps as f64,
+            scan_secs[normal] / reps as f64,
         ),
     ));
 
@@ -1069,7 +1138,7 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let no_scan = Trial::new(reps).run(2, |ci, rep| {
         let _ = env::drop_caches();
         let blob = supdb::Blob::open(supdb::MmapBytes::open(&file).expect("map")).expect("open");
-        let (ops, sw) = f66_pass(
+        let pass = f66_pass(
             &blob,
             safe_arms[ci],
             nkeys,
@@ -1081,8 +1150,8 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
             &mut hr[ci],
             &mut hs[ci],
         );
-        sw2[ci] += sw;
-        ops
+        sw2[ci] += pass.switches;
+        pass.ops_per_s
     });
     rec.finding(Finding::new(
         "F66.3",
@@ -1122,7 +1191,7 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
         let _ = env::drop_caches();
         let blob = supdb::Blob::open(supdb::MmapBytes::open(&file).expect("map")).expect("open");
         let (l, k) = cells[ci];
-        let (ops, sw) = f66_pass(
+        let pass = f66_pass(
             &blob,
             Advice::Adaptive(k),
             nkeys,
@@ -1134,8 +1203,8 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
             &mut hr2[ci],
             &mut hs2[ci],
         );
-        sw3[ci] += sw;
-        ops
+        sw3[ci] += pass.switches;
+        pass.ops_per_s
     });
     // For each k, its worst showing against the best k at the same length.
     let mut worst_ratio_for_k: Vec<(usize, f64)> = Vec::new();
