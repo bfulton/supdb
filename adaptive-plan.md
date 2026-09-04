@@ -172,3 +172,51 @@ evidence: a `ci` scan phase is 8 calls, so entering the default advice one
 scan late costs an eighth of the phase, against a hundredth at `full`. That
 `ci` and `full` should disagree here is a property of the workload sizes and
 is the reason `ci` is not citable.
+
+## Outcome of the declared-default runs, and the fourth registration
+
+Two `full` runs, agreeing on every finding.
+
+`F66.1` **holds**: the default reaches the oracle. 99% and 97% of it, both
+`NO DIFFERENCE`. There is nothing left for a better switching policy to win
+on this actuator, which is the useful half of a tie.
+
+`F66.2` **holds** at **7.227x** and **7.230x** over fixed `MADV_RANDOM`. The
+phase split is the mechanism and is worth quoting: fixed random spends 12.70
+seconds of a repetition in the scan phase against the policy's 1.69, and the
+kernel default spends 3.33 seconds in the read phase against 0.09. Each fixed
+arm loses a different phase; the policy loses neither.
+
+`F66.3` **holds**: no cost when nothing ever scans, and zero switches.
+
+`F66.5` and `F66.6` **failed on k=2**, and P10 and P11 both landed. The
+declared default was 78% and 83% of the best k at some phase length, and
+**33.2%** and **30.8%** of the better fixed advice on a workload with no
+phases. On the same runs k=1 was 100% and **1.5x**.
+
+So the structural argument that set the default at 2 was wrong, and it was
+wrong in its unit. It ran: k=1 re-enters the kernel's default on a single
+scan, so an alternating workload thrashes, and the safe default is the
+smallest k that cannot. The thrash is real -- 456 switches a repetition --
+and it is irrelevant, because a switch is a `madvise` at about 1.3 us and
+being in the wrong mode for one cold scan of 500 entries is milliseconds. **k
+counts calls, and a scan call is not worth a point read.** One scan carries
+five hundred entries of evidence; requiring two consecutive scans demands a
+thousand entries' proof of what the first call already established. That is
+P6's lesson arriving through a different door: the counter's unit is work,
+not calls, and at k=1 the distinction disappears because one call is enough.
+
+P10 named this outcome in advance -- "either the default is k=1 with the
+thrash cost priced, or there is no default" -- so what follows is the
+registered decision procedure rather than a fit to the data.
+
+| | outcome | reading |
+|---|---|---|
+| P12 | all six hold with the default declared at k=1 | the policy is "advise by the verb the caller used", with no hysteresis and no counter, and it may be the default |
+| P13 | `F66.6` still fails at k=1 | no threshold is safe on a phase-free workload and adaptive ships opt-in |
+
+A threshold of 1 is not a tuned constant, which is the part worth noticing.
+It is no counter at all: `MADV_RANDOM` on a point read, the kernel's default
+on a scan, decided by the call the engine is already inside. The hysteresis
+was machinery added against a thrash that pricing shows costs 3% where being
+in the wrong mode costs 3x.

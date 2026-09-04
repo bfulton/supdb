@@ -903,17 +903,29 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let phase_scans = args.num("--phase-scans", profile.pick(8, 32, 96));
     let scan_len = args.num("--scan-len", profile.pick(100, 300, 500));
     let reps = args.num("--reps", profile.reps());
-    // The k that would ship, declared rather than searched for.
+    // The k that would ship, declared rather than searched for. Taking the
+    // argmax of the sweep is taking noise -- two early runs chose k=2 and
+    // k=1, under 4% apart in opposite directions -- so the value is argued
+    // for and then tested.
     //
-    // Taking the argmax of the sweep is taking noise: two full runs of this
-    // experiment chose k=2 and k=1, 3.6% and 3.9% apart in opposite
-    // directions, and every finding downstream then describes whichever
-    // policy won a coin flip. The default is instead the smallest k that
-    // cannot thrash. k=1 re-enters the kernel's default advice on a single
-    // scan, so a workload alternating one read and one scan switches twice
-    // an operation; no k above 1 ever reaches its threshold there. F66.5 and
-    // F66.6 test that choice, they do not make it.
-    let default_k = args.num("--default-k", 2);
+    // It is 1, and the argument that put it at 2 was wrong in its unit. That
+    // argument was: k=1 re-enters the kernel's default advice on a single
+    // scan, so a workload alternating one read and one scan thrashes, and the
+    // smallest safe threshold is the smallest one that cannot. The thrash is
+    // real -- 456 switches a repetition -- and it does not matter, because a
+    // switch is a `madvise` at about 1.3 us while being in the wrong mode for
+    // one cold scan of 500 entries is milliseconds. k counts *calls*, and one
+    // scan call carries five hundred entries of evidence where a point read
+    // carries one, so requiring two consecutive scans demands a thousand
+    // entries' proof of something the first call already established.
+    //
+    // So the hysteresis is the cost, not the protection: k=2 measured 78% and
+    // 83% of the best k at some phase length, and 33.2% and 30.8% of the
+    // better fixed advice on a workload with no phases, while k=1 was 100%
+    // and 1.5x on the same runs. A threshold of 1 is also no counter at all
+    // -- advise by the verb the caller used -- which is what the feasibility
+    // probe said was available for free.
+    let default_k = args.num("--default-k", 1);
 
     let mut rec = Record::new("f66-adaptive", profile);
     let nkeys = (data_mb * 1048576) / value_size.max(1) as u64;
@@ -1312,20 +1324,18 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // and perfect alternation is the adversarial case -- which `f66_pass`
     // already expresses, as a phase of one read and a phase of one scan.
     let mix_ops = args.num("--mix-ops", profile.pick(20, 60, 200));
-    // k=1 is here as the thrash demonstration and must stay distinct from the
-    // default, or the run measures one arm twice and the evidence asserts a
-    // contrast nobody tested. That is what happened when the argmax picked
-    // k=1 and this arm was `Adaptive(robust_k)`.
-    let thrash_k = 1;
-    assert!(
-        default_k > thrash_k,
-        "the default must not be the arm that thrashes"
-    );
+    // The fourth arm is whichever of k=1 and k=2 is not the default, so the
+    // pair always shows what one step of hysteresis costs or buys on a
+    // workload with no phases. It must be distinct from the default or the
+    // run measures one arm twice and the evidence asserts a contrast nobody
+    // tested, which is what happened when both were pinned at 1.
+    let contrast_k = if default_k == 1 { 2 } else { 1 };
+    assert_ne!(contrast_k, default_k);
     let mix_arms = [
         Advice::Normal,
         Advice::Random,
-        Advice::Adaptive(thrash_k),
         Advice::Adaptive(default_k),
+        Advice::Adaptive(contrast_k),
     ];
     let mut hm: Vec<Hist> = (0..4).map(|_| Hist::new()).collect();
     let mut hms: Vec<Hist> = (0..4).map(|_| Hist::new()).collect();
@@ -1361,7 +1371,7 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
     };
     let best_fixed = mix[bf].median();
     let best_fixed_name = ["normal", "random"][bf];
-    let cmp_mix = compare(&mix[3], &mix[bf], supdb::bench::MIN_EFFECT);
+    let cmp_mix = compare(&mix[2], &mix[bf], supdb::bench::MIN_EFFECT);
     rec.compare("F66.6_adaptive_vs_best_fixed_interleaved", cmp_mix.clone());
     rec.finding(Finding::new(
         "F66.6",
@@ -1370,21 +1380,20 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
         !matches!(cmp_mix.verdict, supdb::bench::Verdict::Less),
         format!(
             "alternating one point read and one scan of {scan_len}, {mix_ops} of each, no phases \
-             at all: normal {:.0} ops/s, random {:.0}, adaptive k={thrash_k} {:.0} at {:.1} \
-             switches a \
-             rep, the default k={default_k} {:.0} at {:.1}. The default is {:.1}% of the \
+             at all: normal {:.0} ops/s, random {:.0}, the default k={default_k} {:.0} at \
+             {:.1} switches a rep, k={contrast_k} {:.0} at {:.1}. The default is {:.1}% of the \
              better fixed arm ({best_fixed_name}), which is what decides this: {}. The two \
-             adaptive arms are the mechanism: k={thrash_k} re-enters the kernel's default on \
-             every single scan and pays a switch for it, while with no two scans ever \
-             consecutive the default never reaches its threshold and stays in MADV_RANDOM -- \
-             which on a workload of cold point reads is the right place to stay",
+             adaptive arms are where the cost of hysteresis shows: k=1 switches on every scan \
+             and pays a madvise for each, while k=2 never reaches its threshold here -- no two \
+             scans are ever consecutive -- and so stays in MADV_RANDOM for a workload that is \
+             half ordered scanning",
             mix[0].median(),
             mix[1].median(),
             mix[2].median(),
             swm[2] as f64 / reps as f64,
             mix[3].median(),
             swm[3] as f64 / reps as f64,
-            100.0 * mix[3].median() / best_fixed.max(1.0),
+            100.0 * mix[2].median() / best_fixed.max(1.0),
             cmp_mix.summary("adaptive", best_fixed_name),
         ),
     ));
