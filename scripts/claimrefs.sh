@@ -17,9 +17,17 @@
 set -eu
 cd "$(dirname "$0")/.."
 
+# `find -exec +` rather than `grep -r --include`: this project is measured on
+# Apple Silicon as well as x86, so a check a contributor cannot run on a Mac
+# is a check that runs in one place. `-exec +` also does the right thing with
+# no matching files, where `xargs grep` would read stdin and hang.
+scan() {
+  find src web bench tests \( -name '*.rs' -o -name '*.mjs' \) -type f \
+    -exec grep "$@" {} + 2>/dev/null
+}
+
 ids=$(grep -oE '"id": "[A-Z]+[0-9]*\.[0-9]+"' claims.json | sed 's/.*"id": "//; s/"//')
-cited=$(grep -rhoE '\b([FCW][0-9]+|EXT)\.[0-9]+\b' \
-          src web bench tests --include='*.rs' --include='*.mjs' 2>/dev/null | sort -u)
+cited=$(scan -hoE '\b([FCW][0-9]+|EXT)\.[0-9]+\b' | sort -u || true)
 
 missing=
 for c in $cited; do
@@ -34,8 +42,7 @@ if [ -n "$missing" ]; then
   echo "cited in the source but not registered in claims.json:"
   for m in $missing; do
     echo "  $m"
-    grep -rn "\\b$m\\b" src web bench tests --include='*.rs' --include='*.mjs' 2>/dev/null \
-      | sed 's/^/      /' | cut -c1-120
+    scan -n "\\b$m\\b" | sed 's/^/      /' | cut -c1-120 || true
   done
   echo
   echo "A citation is only useful while it resolves. Either register the claim,"
