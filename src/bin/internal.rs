@@ -1151,84 +1151,89 @@ fn f67_dbadvice(args: &Args, profile: Profile) -> std::io::Result<Record> {
         for (id, st) in [
             ("F67.1", "over a store with several segments the adaptive advice beats both fixed settings on a phased workload"),
             ("F67.2", "on a workload with no phases the adaptive advice is not resolvably slower than the better fixed setting"),
-            ("F67.3", "on a store that fits in memory the adaptive advice costs nothing against the kernel's default"),
         ] {
             rec.finding(Finding::not_exercised(id, st, why.clone()));
         }
-        return Ok(rec);
     }
-
-    let phased = Trial::new(reps).run(3, |ci, rep| {
-        let _ = env::drop_caches();
-        let db = supdb::Db::open(
-            &big,
-            supdb::Options {
-                read_advice: advices[ci],
-                seal_bytes: seal_mb * 1_048_576,
-                ..Default::default()
-            },
-        )
-        .expect("open");
-        f67_pass(
-            &db,
-            keys,
-            cycles,
-            phase_reads,
-            phase_scans,
-            scan_len,
-            0xD00D ^ rep as u64,
-        )
-    });
-    let cmp_def = compare(&phased[2], &phased[0], supdb::bench::MIN_EFFECT);
-    let cmp_rnd = compare(&phased[2], &phased[1], supdb::bench::MIN_EFFECT);
-    rec.compare("F67.1_adaptive_vs_default", cmp_def.clone());
-    rec.compare("F67.1_adaptive_vs_random", cmp_rnd.clone());
-    rec.finding(Finding::new(
-        "F67.1",
-        "over a store with several segments the adaptive advice beats both fixed settings on \
+    // F67.3 is deliberately outside that gate. It asks what the policy costs
+    // on a store that fits in memory, and a store sized to fit is resident
+    // whether or not the host can cap its page cache -- so it is exercised
+    // everywhere, which is what its claim says and what a host without a
+    // memory controller was reporting otherwise. The first version skipped it
+    // with the other two and CI, which has no controller, caught the
+    // disagreement between the code and the claim.
+    if capped && over_cap > 1.0 {
+        let phased = Trial::new(reps).run(3, |ci, rep| {
+            let _ = env::drop_caches();
+            let db = supdb::Db::open(
+                &big,
+                supdb::Options {
+                    read_advice: advices[ci],
+                    seal_bytes: seal_mb * 1_048_576,
+                    ..Default::default()
+                },
+            )
+            .expect("open");
+            f67_pass(
+                &db,
+                keys,
+                cycles,
+                phase_reads,
+                phase_scans,
+                scan_len,
+                0xD00D ^ rep as u64,
+            )
+        });
+        let cmp_def = compare(&phased[2], &phased[0], supdb::bench::MIN_EFFECT);
+        let cmp_rnd = compare(&phased[2], &phased[1], supdb::bench::MIN_EFFECT);
+        rec.compare("F67.1_adaptive_vs_default", cmp_def.clone());
+        rec.compare("F67.1_adaptive_vs_random", cmp_rnd.clone());
+        rec.finding(Finding::new(
+            "F67.1",
+            "over a store with several segments the adaptive advice beats both fixed settings on \
          a phased workload",
-        matches!(cmp_def.verdict, supdb::bench::Verdict::Greater)
-            && matches!(cmp_rnd.verdict, supdb::bench::Verdict::Greater),
-        format!(
-            "adaptive {:.0} ops/s against the kernel's default {:.0} ({}) and fixed \
+            matches!(cmp_def.verdict, supdb::bench::Verdict::Greater)
+                && matches!(cmp_rnd.verdict, supdb::bench::Verdict::Greater),
+            format!(
+                "adaptive {:.0} ops/s against the kernel's default {:.0} ({}) and fixed \
              MADV_RANDOM {:.0} ({}), over {cycles} cycles of {phase_reads} point reads and \
              {phase_scans} scans of {scan_len} on a store of {:.1} MB in several segments \
              against a {cap_mb} MB cap",
-            phased[2].median(),
-            phased[0].median(),
-            cmp_def.summary("adaptive", "default"),
-            phased[1].median(),
-            cmp_rnd.summary("adaptive", "random"),
-            file_bytes as f64 / 1048576.0,
-        ),
-    ));
+                phased[2].median(),
+                phased[0].median(),
+                cmp_def.summary("adaptive", "default"),
+                phased[1].median(),
+                cmp_rnd.summary("adaptive", "random"),
+                file_bytes as f64 / 1048576.0,
+            ),
+        ));
 
-    let mixed = Trial::new(reps).run(3, |ci, rep| {
-        let _ = env::drop_caches();
-        let db = supdb::Db::open(
-            &big,
-            supdb::Options {
-                read_advice: advices[ci],
-                seal_bytes: seal_mb * 1_048_576,
-                ..Default::default()
-            },
-        )
-        .expect("open");
-        f67_pass(&db, keys, mix_ops, 1, 1, scan_len, 0x71C7 ^ rep as u64)
-    });
-    let bf = if mixed[0].median() >= mixed[1].median() {
-        0
-    } else {
-        1
-    };
-    let cmp_mix = compare(&mixed[2], &mixed[bf], supdb::bench::MIN_EFFECT);
-    rec.compare("F67.2_adaptive_vs_best_fixed", cmp_mix.clone());
-    rec.finding(Finding::new(
-        "F67.2",
-        "on a workload with no phases the adaptive advice is not resolvably slower than the \
+        let mixed = Trial::new(reps).run(3, |ci, rep| {
+            let _ = env::drop_caches();
+            let db = supdb::Db::open(
+                &big,
+                supdb::Options {
+                    read_advice: advices[ci],
+                    seal_bytes: seal_mb * 1_048_576,
+                    ..Default::default()
+                },
+            )
+            .expect("open");
+            f67_pass(&db, keys, mix_ops, 1, 1, scan_len, 0x71C7 ^ rep as u64)
+        });
+        let bf = if mixed[0].median() >= mixed[1].median() {
+            0
+        } else {
+            1
+        };
+        let cmp_mix = compare(&mixed[2], &mixed[bf], supdb::bench::MIN_EFFECT);
+        rec.compare("F67.2_adaptive_vs_best_fixed", cmp_mix.clone());
+        rec.finding(Finding::new(
+            "F67.2",
+            "on a workload with no phases the adaptive advice is not resolvably slower than the \
          better fixed setting",
-        !matches!(cmp_mix.verdict, supdb::bench::Verdict::Less),
-        format!(
+            !matches!(cmp_mix.verdict, supdb::bench::Verdict::Less),
+            format!(
             "alternating one point read and one scan of {scan_len}, {mix_ops} of each: default \
              {:.0} ops/s, random {:.0}, adaptive {:.0}. Against the better fixed setting \
              ({}), {}",
@@ -1238,7 +1243,8 @@ fn f67_dbadvice(args: &Args, profile: Profile) -> std::io::Result<Record> {
             names[bf],
             cmp_mix.summary("adaptive", names[bf]),
         ),
-    ));
+        ));
+    }
 
     // ---- F67.3: the case f66 could not ask. A store that fits in memory is
     // where most stores are; the policy can win nothing there and can only
