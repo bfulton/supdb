@@ -1,0 +1,50 @@
+[package]
+name = "supdb-external"
+version = "0.1.0"
+edition = "2021"
+
+# Comparator engines live here, not in the engine crate.
+#
+# Supdb itself holds to two dependencies, and that is a real property worth
+# preserving -- a reviewer can read the whole thing. The external harness is
+# where the field lives, so pulling in redb, LMDB and sled costs the engine
+# nothing.
+#
+# All three are in-process Rust. The design document's cross-language
+# comparison went through a Java harness and carried a JNI caveat it
+# quantified at <=11% of the append gap; measuring through native bindings
+# removes the asterisk rather than bounding it.
+[dependencies]
+supdb = { path = "../.." }
+redb = "2"
+heed = "0.20"
+# The same LMDB heed links, addressed directly. The `LmdbDup` adapter needs
+# cursor operations heed 0.20 does not expose (mdb_cursor_count,
+# MDB_GET_MULTIPLE, MDB_NEXT_NODUP), and heed re-exports neither its cursors
+# nor this crate -- so the analytics suite takes the sys crate itself. It
+# resolves to the one instance already in the lockfile as heed's dependency,
+# so both LMDB adapters measure byte-identical C code.
+lmdb-master-sys = "0.2"
+sled = "0.34"
+# The log-structured engine the next engine is shaped like, and the one the
+# shuffled-arrival win over LMDB (EXT.27) had to be measured against before
+# it meant anything: an LSM beating a B-tree under per-batch fsync is what
+# every LSM does. Built without compression libraries, since every other
+# arm here stores its values uncompressed and the adapter turns compression
+# off explicitly.
+# Building it runs bindgen, which needs libclang: on a host where clang-sys
+# does not find one, point LIBCLANG_PATH at a directory holding a file named
+# libclang.so (a symlink to the versioned library is enough).
+# Optional, and off by default: librocksdb is a ten-minute C++ build, which
+# the hosted CI does not need (every RocksDB claim is pinned to `full`) and
+# which localmost's 600-second job kill cannot hold on the Mac. Local full
+# runs pass `--features rocksdb`; without it the rocksdb arms are refused by
+# name at `build()`.
+rocksdb = { version = "0.23", default-features = false, optional = true }
+
+[features]
+rocksdb = ["dep:rocksdb"]
+
+[[bin]]
+name = "external"
+path = "src/main.rs"

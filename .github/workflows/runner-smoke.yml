@@ -1,0 +1,45 @@
+name: runner-smoke
+
+# The smallest job that can tell us where work actually lands.
+#
+# Earlier attempts hard-coded `runs-on` at a self-hosted label set and sat in
+# `queued` indefinitely -- through three label spellings, with and without a
+# concurrency group, and with @claude added to localmost's job filter. This
+# version uses localmost's own documented integration verbatim instead, so the
+# remaining differences between it and a known-good setup are the repository
+# and the machine, not the workflow.
+#
+# It deliberately keeps the macos-latest fallback. A run that lands on a hosted
+# runner is not wasted here: the job prints which runner claimed it, so falling
+# back tells us the heartbeat was stale at scheduling time -- a different fault
+# from a fresh heartbeat that nothing acts on. That fallback is right for a
+# smoke test and wrong for the sweep, where a hosted runner would produce a
+# number that looks like a measurement and is not.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  check:
+    uses: bfulton/localmost/.github/workflows/check.yaml@main
+
+  smoke:
+    needs: check
+    runs-on: ${{ needs.check.outputs.runner }}
+    timeout-minutes: 5
+    steps:
+      - name: Which runner claimed this
+        run: |
+          echo "resolved runs-on: ${{ needs.check.outputs.runner }}"
+          echo "runner name:      ${RUNNER_NAME:-?}"
+          echo "os/arch:          $(uname -s) $(uname -m)"
+          if [ "$(uname -s)" = "Darwin" ]; then
+            echo "cache line:       $(sysctl -n hw.cachelinesize)"
+            echo "page size:        $(getconf PAGE_SIZE)"
+            echo "cpus:             $(sysctl -n hw.ncpu)"
+            echo "loadavg:          $(sysctl -n vm.loadavg)"
+          fi

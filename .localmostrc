@@ -1,0 +1,69 @@
+# Sandbox policy for localmost self-hosted runners (see bfulton/localmost,
+# src/shared/localmostrc.ts and src/shared/sandbox-profile.ts). Applied per
+# job after one-time approval in the localmost app; a change here re-prompts.
+#
+# STRICT declares everything: the level grants only the working directory,
+# the temp directories, the root node and /dev basics. Every other path a
+# job touches must be listed below, which is the point -- reading this file
+# tells you everything a benchmark job may reach.
+#
+# network -- hosts beyond the runner's own control plane:
+#   codeload.github.com   the runner downloads action packages (actions/
+#                         checkout, Swatinem/rust-cache, upload-artifact) as
+#                         tarballs from here; without it no step even starts
+#   index.crates.io       cargo's sparse registry index -- the host modern
+#                         cargo actually uses
+#   crates.io             registry API
+#   static.crates.io      the crate downloads themselves
+#   static.rust-lang.org  rustup's dist server, for the day a runner is
+#                         missing a toolchain
+#   Nothing else: benchmarks must not talk to the network.
+#
+# filesystem.read -- the macOS baseline first (MACOS_BASELINE_READ_PATHS:
+# deliberately the OS-install subpaths, not their parents; /usr/bin/git and
+# xcrun are shims that execute out of Xcode.app, which is why it is here),
+# then what a Rust build needs:
+#   ~/.rustup             the toolchains and rustup's settings.toml -- its
+#                         absence is exactly how strict mode first failed
+#                         ("could not read settings file")
+#   ~/.cargo              rustup's cargo/rustc proxies in bin/, and the
+#                         registry + git caches the jobs deliberately reuse
+#                         instead of re-downloading per run
+#
+# filesystem.write -- ~/.cargo only: cargo takes .package-cache locks and
+# fills registry caches on fetch, and Swatinem/rust-cache restores into it.
+# ~/.rustup stays read-only: nothing here installs toolchains mid-job, and a
+# job that tries should fail loudly rather than write there silently.
+version: 1
+level: strict
+shared:
+  network:
+    allow:
+      - codeload.github.com
+      - index.crates.io
+      - crates.io
+      - static.crates.io
+      - static.rust-lang.org
+  filesystem:
+    read:
+      - /etc
+      - /var
+      - /tmp
+      - /bin
+      - /sbin
+      - /usr/bin
+      - /usr/lib
+      - /usr/libexec
+      - /usr/sbin
+      - /usr/share
+      - /System
+      - /Library/Developer
+      - /Library/Preferences
+      - /private/etc
+      - /private/var/db
+      - /private/var/select
+      - /Applications/Xcode.app
+      - ~/.rustup
+      - ~/.cargo
+    write:
+      - ~/.cargo

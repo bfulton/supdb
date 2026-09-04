@@ -1,0 +1,313 @@
+name: apple-silicon
+
+# Two questions that cannot be answered from the x86 Linux runners in ci.yml,
+# kept in separate jobs because only one of them needs real hardware.
+#
+#  1. Does `Machine::detect` read the right numbers on macOS? That is a
+#     parsing question, not a timing question, so a GitHub-hosted -- and
+#     therefore virtualised -- Apple Silicon runner answers it perfectly well.
+#     It is also the question that was silently wrong until 38868d2: the
+#     detector read a /sys path that does not exist on macOS and defaulted to
+#     a 64-byte line on a machine whose lines are 128.
+#
+#  2. Is the derived records-per-page still near-optimal at a 128-byte cache
+#     line and a 16 KiB page? On x86-64 the spread across a 32x parameter
+#     range is 7.7%, which is the evidence for a single unified derivation
+#     instead of a per-architecture tuning table. That evidence is currently
+#     one architecture wide. Answering it is a timing question, a shared
+#     virtualised runner cannot answer it, and so this job runs only on a
+#     self-hosted Apple Silicon runner -- for instance one published by
+#     localmost (https://github.com/bfulton/localmost). When no such runner
+#     claims it, the run is cancelled rather than redirected to a hosted
+#     runner, which would produce a number that looks like a measurement and
+#     is not.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'src/bench/machine.rs'
+      - 'src/bin/indexlab.rs'
+      - '.github/workflows/apple-silicon.yml'
+  workflow_dispatch:
+    inputs:
+      keys:
+        # Lower than the 10M the x86 baseline uses, because the whole sweep
+        # must fit inside localmost's 600-second job limit. The sweep compares
+        # candidate records/page values against each other on one machine, so
+        # a smaller scale still answers its question -- but it is not
+        # comparable to the x86 figures unless x86 is re-run at the same
+        # scale. That control was run and is recorded in
+        # docs/index-theory.md under "The 2M x86 baseline".
+        description: 'Keys per sweep point'
+        default: '2000000'
+      lookups:
+        description: 'Lookups per configuration'
+        default: '400000'
+      shape:
+        description: 'Key shape (decimal16, randomhex, clustered)'
+        default: 'decimal16'
+      pickup_timeout_minutes:
+        description: 'Cancel the run if no self-hosted runner claims the sweep within this many minutes'
+        default: '10'
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  detect:
+    # Cheap, and it runs on every change to the detector. `indexlab machine`
+    # exits non-zero when the line size was defaulted rather than read, so a
+    # platform the detector does not understand fails here instead of quietly
+    # producing tuning constants derived from a guess.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: |
+          set -euo pipefail
+          # Offline, because localmost's sandbox allowlists egress: cargo's
+          # reach for the crates.io index comes back "CONNECT tunnel failed,
+          # response 403", exactly as rustup's reach for static.rust-lang.org
+          # did. The runner uses this machine's own CARGO_HOME, so whatever has
+          # been fetched here already is available; nothing needs downloading
+          # to build a tree whose Cargo.lock has not moved.
+          # Two ways through localmost's allowlist, tried in order.
+          #
+          # Offline first: the runner uses this machine's own CARGO_HOME, so a
+          # tree whose Cargo.lock has not moved may need nothing at all.
+          #
+          # Then the git index protocol. Cargo 1.70+ defaults to the sparse
+          # index at index.crates.io, and localmost's allowlist has crates.io
+          # and static.crates.io but not index.crates.io -- which is why the
+          # failure was "download of config.json failed, CONNECT tunnel failed,
+          # response 403". The older git protocol reads the index from
+          # github.com, which is allowlisted, so it goes through.
+          if cargo build --release --offline --locked --bin indexlab; then
+            echo "built from the local cargo cache"
+          elif CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git \
+               cargo build --release --locked --bin indexlab; then
+            echo "built via the git index protocol"
+          else
+            echo "::error::Neither the local cache nor the git index protocol"
+            echo "::error::could build this. Add index.crates.io to localmost's"
+            echo "::error::DEFAULT_ALLOWED_HOSTS, or run 'cargo fetch --locked'"
+            echo "::error::once in a supdb checkout on this Mac."
+            exit 1
+          fi
+
+      - name: What the machine reports about itself
+        run: ./target/release/indexlab machine
+
+      - name: Cross-check the detector against sysctl
+        run: |
+          set -euo pipefail
+          json=$(./target/release/indexlab machine)
+          line=$(printf '%s' "$json" | jq -r '.cache_line')
+          page=$(printf '%s' "$json" | jq -r '.page_size')
+          sys_line=$(sysctl -n hw.cachelinesize)
+          sys_page=$(getconf PAGE_SIZE)
+          echo "detector: line=$line page=$page"
+          echo "sysctl:   line=$sys_line page=$sys_page"
+          test "$line" = "$sys_line"
+          test "$page" = "$sys_page"
+
+      - name: Apple Silicon is 128-byte lines and 16 KiB pages
+        # Guarded on arch rather than assumed: macos-latest is Apple Silicon
+        # today and was Intel not long ago, and the point of the check is the
+        # shape of the machine, not the label on the runner.
+        if: runner.arch == 'ARM64'
+        run: |
+          set -euo pipefail
+          json=$(./target/release/indexlab machine)
+          test "$(printf '%s' "$json" | jq -r '.cache_line')" = "128"
+          test "$(printf '%s' "$json" | jq -r '.page_size')" = "16384"
+          test "$(printf '%s' "$json" | jq -r '.cache_line_detected')" = "true"
+
+      - name: Machine unit tests
+        run: cargo test --release --lib machine
+
+  check:
+    # localmost's own runner-selection workflow. It reads the
+    # LOCALMOST_HEARTBEAT repository variable and resolves to `self-hosted`
+    # when the Mac is live, `macos-latest` otherwise.
+    uses: bfulton/localmost/.github/workflows/check.yaml@main
+
+  pickup-watchdog:
+    # Bounds how long the sweep may sit unclaimed.
+    #
+    # The first version of this gate read a LOCALMOST_HEARTBEAT repository
+    # variable and skipped the sweep when it was stale. It was the wrong
+    # instrument twice over: this repository does not publish that variable,
+    # so the gate blocked the only job it existed to enable, and a heartbeat
+    # is a claim about the Mac rather than an observation of the queue. A
+    # runner can be online, heartbeating, and still never claim the job --
+    # busy, wrong labels, proxy asleep.
+    #
+    # So observe the queue instead. If nothing has claimed the sweep within
+    # the window, cancel the run and say so. A job that hangs for a day
+    # looks identical to a job that is about to start, and neither is a
+    # measurement.
+    needs: [detect, check]
+    if: github.event_name == 'workflow_dispatch' && needs.check.outputs.runner == 'self-hosted'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Wait for a self-hosted runner to claim the sweep
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          WINDOW: ${{ inputs.pickup_timeout_minutes || '10' }}
+        run: |
+          set -uo pipefail
+          deadline=$(( WINDOW * 2 ))   # polls, at 30s each
+          for i in $(seq 1 "$deadline"); do
+            job=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
+              --jq '.jobs[] | select(.name=="sweep") | "\(.status)|\(.runner_name)"' \
+              2>&1 || true)
+            status="${job%%|*}"
+            runner="${job##*|}"
+            echo "poll $i: status='$status' runner='$runner'"
+            case "$status" in
+              queued|"")
+                # Still waiting, or the API did not answer. Keep waiting.
+                ;;
+              *)
+                # Anything else means a runner has it or has had it. This job
+                # is about pickup, and pickup has happened.
+                echo "sweep picked up by ${runner:-?} after $(( i * 30 ))s"
+                exit 0
+                ;;
+            esac
+            sleep 30
+          done
+          echo "::error::sweep was still queued after ${WINDOW}m and no runner took it."
+          echo "::error::Check Settings > Actions > Runners: registrations expire, and a"
+          echo "::error::stale one leaves the localmost app heartbeating with nothing listening."
+          gh api -X POST "repos/$REPO/actions/runs/$RUN_ID/cancel" >/dev/null || true
+          exit 1
+                ;;
+              "")
+                # The job has not been created yet, or the API hiccupped.
+                echo "waiting: sweep job not visible yet"
+                ;;
+              *)
+                echo "waiting: sweep is $status ($(( i * 30 ))s)"
+                ;;
+            esac
+            sleep 30
+          done
+          echo "::error::No self-hosted runner claimed the sweep within ${WINDOW}m."
+          echo "::error::Check that localmost is running and the runners show Idle,"
+          echo "::error::not Offline, under Settings > Actions > Runners."
+          gh api -X POST "repos/$REPO/actions/runs/$RUN_ID/cancel" >/dev/null || true
+          exit 1
+
+  sweep:
+    # The measurement. Manual only: a timing benchmark that fires on every
+    # push to a laptop someone is using is not a measurement, it is a
+    # background process competing with one.
+    needs: [detect, check]
+    # Note what this does NOT do: fall back to macos-latest. localmost's
+    # documented pattern resolves runs-on to a hosted runner when the Mac is
+    # unavailable, which is right for a build and wrong for a timing
+    # benchmark -- a shared virtualised runner would return a number that
+    # looks like a measurement and is not. So the fallback becomes a skip.
+    if: github.event_name == 'workflow_dispatch' && needs.check.outputs.runner == 'self-hosted'
+    runs-on: ${{ needs.check.outputs.runner }}
+    # Nine, not 180. localmost kills a job at exactly 600 seconds -- measured
+    # twice, 12:40:06->12:50:06 and 12:56:12->13:06:12 -- and an externally
+    # killed job uploads no logs at all, so both runs came back as a 404 with
+    # nothing to read. Ending just inside that window means GitHub stops the
+    # job itself and the partial output survives. A truncated measurement you
+    # can read beats a complete one you cannot.
+    timeout-minutes: 9
+    # Never two timing benchmarks at once. Four cores measuring each other is
+    # not a measurement, and this is the one runner in the fleet that is also
+    # somebody's desktop.
+    concurrency:
+      group: timing-benchmark
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      # No `dtolnay/rust-toolchain` here, unlike the hosted jobs. That action
+      # provisions a toolchain on an ephemeral runner; this runner is somebody's
+      # Mac and already has one. Running it anyway made `rustup toolchain
+      # install stable` reach for static.rust-lang.org through localmost's
+      # sandbox proxy, which answered `tunnel error: unsuccessful`, and the job
+      # died two seconds in having been claimed successfully. Use what is
+      # installed, and say so plainly if nothing is.
+      - name: Use the toolchain this machine already has
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null; then
+            echo "::error::No cargo on this runner and this job will not install one:"
+            echo "::error::the sandbox has no route to static.rust-lang.org. Install a"
+            echo "::error::stable toolchain on the Mac itself, once."
+            exit 1
+          fi
+          cargo --version
+          rustc --version
+      # localmost publishes four runner slots and each has its own workspace,
+      # so a job lands on a cold target/ about three times in four. A cold
+      # release build is minutes of the job's budget spent before the
+      # measurement starts, which is how the first sweep spent its entire
+      # allowance compiling. The shared cache is keyed on the lockfile, not on
+      # the slot, so all four warm each other.
+      - uses: Swatinem/rust-cache@v2
+        # Best effort: this reaches GitHub's cache service, and a runner whose
+        # egress is proxied may not get there. A cold build is slower; a failed
+        # cache step would cost the whole measurement.
+        continue-on-error: true
+        with:
+          shared-key: apple-silicon-sweep
+      - name: Build
+        run: cargo build --release --bin indexlab
+
+      - name: Record the machine and what else it was doing
+        # localmost publishes four runner slots on one Mac, and the Mac is
+        # also somebody's desktop. The concurrency group above keeps this
+        # workflow from racing itself, but nothing stops a person opening a
+        # compiler. Load average before and after is the cheapest evidence of
+        # whether the run deserves to be believed, and it travels with the
+        # numbers rather than being reconstructed afterwards.
+        run: |
+          ./target/release/indexlab machine | tee sweep-apple-silicon.txt
+          echo "# loadavg before: $(sysctl -n vm.loadavg)" | tee -a sweep-apple-silicon.txt
+
+      - name: Sweep records-per-page
+        run: |
+          ./target/release/indexlab sweep \
+            --keys    '${{ inputs.keys }}' \
+            --lookups '${{ inputs.lookups }}' \
+            --shape   '${{ inputs.shape }}' \
+            | tee -a sweep-apple-silicon.txt
+          echo "# loadavg after: $(sysctl -n vm.loadavg)" | tee -a sweep-apple-silicon.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweep-apple-silicon
+          path: sweep-apple-silicon.txt
+
+      - name: Summary
+        run: |
+          {
+            echo '## records-per-page sweep, Apple Silicon'
+            echo
+            echo 'Not yet evidence. `results/` is the source of truth and this'
+            echo 'artifact is not in it; a person has to read the run, decide'
+            echo 'the machine was quiet enough to believe, and commit it.'
+            echo
+            echo '```'
+            cat sweep-apple-silicon.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

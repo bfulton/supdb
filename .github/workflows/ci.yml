@@ -1,0 +1,148 @@
+name: ci
+
+# The point of this workflow is not that the code compiles. It is that the
+# claims the repository makes about the engine still match what the engine
+# measurably does. `verify` fails in both directions: a known limitation that
+# quietly gets fixed is as much a reason to stop as one that gets worse,
+# because either the engine changed or the experiment stopped testing anything.
+
+on:
+  # Pull requests and main only. Every branch commit would run three benchmark
+  # suites, and most branch commits are work in progress.
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    # Three platforms, none of them here for speed -- these runners are
+    # virtualised and their timings mean nothing.
+    #
+    # ARM is here for correctness: the reader table is hand-rolled lock-free
+    # code, and x86's total store order gives correct-looking behaviour for
+    # orderings that ARM's weaker model does not.
+    #
+    # macOS is here because the tree carries a body of `cfg(target_os =
+    # "macos")` code -- the environment capture's whole non-Linux half, and
+    # the `cfg(target_os = "linux")` guard on the I/O priority path -- that
+    # nothing else compiles. It was written for the Apple Silicon campaigns
+    # and was only ever built when a person ran one by hand, which is the
+    # shape this project keeps finding: a path only one arm exercises is a
+    # path nothing tests. macos-latest is arm64, and a public repository
+    # pays nothing for it.
+    #
+    # It gates building, testing and linting, not measuring. A timing
+    # benchmark cannot gate a pull request: two runs on instances of the
+    # same nominal machine have moved untouched comparator arms by half.
+    # The Apple Silicon numbers are taken deliberately, per campaign, on a
+    # real machine.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # `scripts/check.sh` is the single definition of what this project
+      # checks, so a contributor running it locally runs exactly this.
+      - name: Build, test and lint
+        run: sh scripts/check.sh build test lint
+
+  cross-arm:
+    # Proves the ARM paths build and pass before any ARM hardware is involved.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Cross toolchain
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-aarch64-linux-gnu qemu-user-static
+      # The linker and the emulator belong to this job, not to the
+      # repository: `.cargo/config.toml` set them for the aarch64 target,
+      # which is also the *host* target on the native ARM runner, so that
+      # leg tried to run its own tests through a qemu it does not have.
+      - name: Build and test under emulation
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64-static -L /usr/aarch64-linux-gnu
+        run: cargo test --release --target aarch64-unknown-linux-gnu --lib
+
+  browser:
+    # The browser reader, built and actually run. Nothing else in this
+    # workflow compiles the wasm module, and that gap hid a real break: on
+    # rustc 1.98 the bare `extern` block for the host imports stopped linking
+    # ("undefined symbol: supdb_host_read") and no CI run noticed, because no
+    # CI run had ever built it. A second read path whose failure mode is a
+    # browser quietly answering a different question from the server is the
+    # last one that should go untested.
+    #
+    # `web/test/run.sh` is the whole thing from a clean tree: it builds the
+    # module and the floor control, writes two real indexes plus the answers
+    # the native reader gives for them, runs the Node half (the error paths)
+    # and then opens both indexes in Chromium -- the day index over an OPFS
+    # sync access handle and the segment index over ranged HTTP with a cache
+    # smaller than the file. `web/build.sh` records the bundle size against
+    # its budget and exits non-zero if W3.1-W3.3 stop holding, so this gates
+    # the module's size as well as its behaviour.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Chromium
+        # Resolved out of the global node_modules: `web/test/browser.mjs`
+        # looks there rather than vendoring a node_modules into the repo.
+        run: |
+          npm install -g playwright
+          playwright install --with-deps chromium
+          echo "NODE_PATH=$(npm root -g)" >> "$GITHUB_ENV"
+      - name: Build the reader and run the browser suite
+        run: sh scripts/check.sh browser
+
+  falsify:
+    # The falsification suite and the claim gate. Runs at the `ci` profile,
+    # which is deliberately too small to be evidence about performance -- it
+    # exists to prove the experiments still run and the findings still say what
+    # claims.json says they say.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Suites, then the claim gate against their fresh results
+        run: sh scripts/check.sh suites
+
+      - name: Publish results and figures
+        uses: actions/upload-artifact@v4
+        with:
+          name: measurements
+          path: |
+            results-ci/
+            figures-ci/
+
+  committed-results-are-current:
+    # Guards against results/ drifting away from the code that produced it.
+    # A committed result whose schema no longer parses, or whose findings no
+    # longer match claims.json, is a stale proof.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify the committed results and redraw from them
+        run: sh scripts/check.sh claims
