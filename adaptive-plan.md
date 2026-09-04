@@ -92,3 +92,37 @@ detector is fooled by that, the fix is to count work rather than calls.
 default, and `F65.3`'s scan penalty stops being something a user has to know
 about. If P5 or P6 lands, adaptive ships opt-in and the default stays where
 f65 put it, with the reason recorded here.
+
+## Second registration: the case a default has to survive
+
+Written after the first full run answered P1 through P4 and before any run of
+`F66.6`. The first run is not evidence for what follows and the code that
+produced it did not contain this arm.
+
+Everything above has phases. A default does not get to assume them. The
+adversarial workload is the one with **no phase structure at all** -- a reader
+that alternates a point read and a scan -- because that is where a counter
+over consecutive scans has nothing to lock onto.
+
+Threads are not the shape of this risk, which is worth writing down because it
+is the first place one looks. `Blob` holds a `RefCell` and is deliberately not
+`Sync`, so a `Db` is not shared across threads: every reader thread maps the
+file itself and advises its own mapping, and two threads cannot fight over one
+flag. What one thread can do is alternate.
+
+| | outcome | reading |
+|---|---|---|
+| P7 | `F66.6` holds: on a perfectly alternating read/scan workload the default k is not resolvably slower than the better fixed advice | the policy degrades to the right fixed arm when there is no phase to find, and may be the default |
+| P8 | `F66.6` fails | a phase-free workload pays for the policy, so adaptive ships opt-in whatever P1-P4 said |
+
+The mechanism P7 rests on is worth stating in advance so that it is a
+prediction rather than a reading: with no two scans ever consecutive, the
+counter never reaches any k above 1, so every such arm stays in `MADV_RANDOM`
+-- which is the right place to be on a workload whose reads are cold. If that
+is right, `k=1` is the only arm that thrashes, and the smallest safe default
+is the smallest k that is not 1. That would make the choice of k a structural
+argument rather than the median of a sweep, and `F66.5` and `F66.6` would be
+agreeing for different reasons.
+
+If they disagree -- if `F66.5`'s most robust k is 1 -- the two are in tension
+and the default is the smallest k that satisfies both, or there is no default.

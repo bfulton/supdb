@@ -776,10 +776,6 @@ impl<'a> Mode<'a> {
     }
 }
 
-/// One pass of a phased workload under one policy. Returns ops/s over the
-/// whole pass, so a policy is judged on the workload rather than on the half
-/// of it that suits it.
-#[allow(clippy::too_many_arguments)]
 /// What one pass of the phased workload cost. The phase split is here because
 /// an aggregate ops/s says which policy won and not where it won: `normal`
 /// loses its time in the read phase and `random` loses its time in the scan
@@ -792,6 +788,9 @@ struct Pass {
     asked: u64,
 }
 
+/// One pass of a phased workload under one policy. The score is ops/s over
+/// the whole pass, so a policy is judged on the workload rather than on the
+/// half of it that suits it.
 #[allow(clippy::too_many_arguments)]
 fn f66_pass(
     blob: &supdb::Blob<supdb::MmapBytes>,
@@ -965,6 +964,11 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
             ("F66.2", "the adaptive policy beats a fixed MADV_RANDOM on a phased workload"),
             ("F66.3", "the adaptive policy costs under 5% against fixed MADV_RANDOM when nothing ever scans"),
             ("F66.5", "one threshold is within 10% of the best at every phase length"),
+            (
+                "F66.6",
+                "on a workload with no phase structure the adaptive default is not resolvably \
+                 slower than the better fixed advice",
+            ),
         ] {
             rec.finding(Finding::not_exercised(id, st, why.clone()));
         }
@@ -1242,6 +1246,87 @@ fn f66_adaptive(args: &Args, profile: Profile) -> std::io::Result<Record> {
             "k={robust_k} is the most robust choice, never below {:.0}% of the best k at its              own phase length over scan phases of {:?} calls. Worst-case share of the best, by              k: {detail}. A default needs one row of this table to be good enough everywhere,              not one row to be best somewhere",
             100.0 * robust_ratio,
             lengths,
+        ),
+    ));
+
+    // F66.6 -- the case that decides whether this can be a default rather
+    // than an option offered to someone who already knows their workload.
+    // Every arm above has phases. A workload with none is where a counter
+    // over consecutive scans thrashes, and a default has to be safe there or
+    // it is a hazard for anyone whose reads and scans are interleaved rather
+    // than batched.
+    //
+    // Threads are not the shape of this risk, which is worth saying because
+    // it is the first place one looks. `Blob` holds a `RefCell` and is
+    // deliberately not `Sync`, so a `Db` is not shared across threads: every
+    // reader thread maps the file itself and advises its own mapping, and two
+    // threads cannot fight over one flag. What one thread can do is alternate,
+    // and perfect alternation is the adversarial case -- which `f66_pass`
+    // already expresses, as a phase of one read and a phase of one scan.
+    let mix_ops = args.num("--mix-ops", profile.pick(20, 60, 200));
+    let mix_arms = [
+        Advice::Normal,
+        Advice::Random,
+        Advice::Adaptive(1),
+        Advice::Adaptive(robust_k),
+    ];
+    let mut hm: Vec<Hist> = (0..4).map(|_| Hist::new()).collect();
+    let mut hms: Vec<Hist> = (0..4).map(|_| Hist::new()).collect();
+    let mut swm = [0u64; 4];
+    let mix = Trial::new(reps).run(4, |ci, rep| {
+        let _ = env::drop_caches();
+        let blob = supdb::Blob::open(supdb::MmapBytes::open(&file).expect("map")).expect("open");
+        let pass = f66_pass(
+            &blob,
+            mix_arms[ci],
+            nkeys,
+            mix_ops,
+            1,
+            1,
+            scan_len,
+            0x71C7 ^ rep as u64,
+            &mut hm[ci],
+            &mut hms[ci],
+        );
+        swm[ci] += pass.switches;
+        pass.ops_per_s
+    });
+    // Against the better of the two fixed arms, because that is what a user
+    // whose workload has no phases could have chosen instead. Rule 2 decides
+    // it: a median ratio is not a difference until `compare` says so, and the
+    // first ci smoke of this finding failed on a 15% gap that `compare` called
+    // noise over twenty operations. The gate is whether the default is
+    // *resolvably* slower, and any amount of that blocks it.
+    let bf = if mix[0].median() >= mix[1].median() {
+        0
+    } else {
+        1
+    };
+    let best_fixed = mix[bf].median();
+    let best_fixed_name = ["normal", "random"][bf];
+    let cmp_mix = compare(&mix[3], &mix[bf], supdb::bench::MIN_EFFECT);
+    rec.compare("F66.6_adaptive_vs_best_fixed_interleaved", cmp_mix.clone());
+    rec.finding(Finding::new(
+        "F66.6",
+        "on a workload with no phase structure the adaptive default is not resolvably slower \
+         than the better fixed advice",
+        !matches!(cmp_mix.verdict, supdb::bench::Verdict::Less),
+        format!(
+            "alternating one point read and one scan of {scan_len}, {mix_ops} of each, no phases \
+             at all: normal {:.0} ops/s, random {:.0}, adaptive k=1 {:.0} at {:.1} switches a \
+             rep, adaptive k={robust_k} {:.0} at {:.1}. The default k={robust_k} is {:.1}% of \
+             the better fixed arm ({best_fixed_name}), which is what decides this: {}. \
+             k=1 is the arm that thrashes and the reason the default is not it: with no two \
+             scans ever consecutive, every k above 1 never reaches its threshold and stays in \
+             MADV_RANDOM, which on this workload is the right place to stay",
+            mix[0].median(),
+            mix[1].median(),
+            mix[2].median(),
+            swm[2] as f64 / reps as f64,
+            mix[3].median(),
+            swm[3] as f64 / reps as f64,
+            100.0 * mix[3].median() / best_fixed.max(1.0),
+            cmp_mix.summary("adaptive", best_fixed_name),
         ),
     ));
 
