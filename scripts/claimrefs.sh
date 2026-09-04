@@ -21,8 +21,19 @@ cd "$(dirname "$0")/.."
 # Apple Silicon as well as x86, so a check a contributor cannot run on a Mac
 # is a check that runs in one place. `-exec +` also does the right thing with
 # no matching files, where `xargs grep` would read stdin and hang.
+# `docs` and `README.md` are in here because prose is where the drift lives.
+# The gate was source-only and the documents had accumulated thirty-nine dead
+# citations, most of them naming claims that retired with the engine they
+# described -- which is the exact fault this script was written for, in the
+# files a reader is most likely to be holding.
+#
+# The plan files are deliberately out. They are working notes, their R-numbers
+# are a different namespace resolving to `*-plan.md`, and a plan that recorded
+# a prediction under an id the run later renamed is a true record of what was
+# predicted rather than a broken pointer.
 scan() {
-  find src web bench tests \( -name '*.rs' -o -name '*.mjs' \) -type f \
+  find src web bench tests docs README.md \
+    \( -name '*.rs' -o -name '*.mjs' -o -name '*.md' \) -type f \
     -exec grep "$@" {} + 2>/dev/null
 }
 
@@ -47,7 +58,7 @@ if [ -z "$ids" ]; then
   exit 1
 fi
 if [ -z "$cited" ]; then
-  echo "no claim ids found cited in src, web, bench or tests -- the gate cannot"
+  echo "no claim ids found cited in src, web, bench, tests or docs -- the gate cannot"
   echo "have passed, since these files are full of them. Check the extraction."
   exit 1
 fi
@@ -62,7 +73,7 @@ for c in $cited; do
 done
 
 if [ -n "$missing" ]; then
-  echo "cited in the source but not registered in claims.json:"
+  echo "cited in the source or docs but not registered in claims.json:"
   for m in $missing; do
     echo "  $m"
     scan -nF "$m" | sed 's/^/      /' | cut -c1-120 || true

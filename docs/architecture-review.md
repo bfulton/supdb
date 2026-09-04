@@ -383,9 +383,10 @@ default. At 5M keys, `--profile full`:
 | index | 186 B/key resident, per process | **57 B/key, file-backed and shared** |
 | file | 394 MB | 683 MB (+73.5%) |
 
-**F2.2 moved from `fails` to `holds`** — reader open is sub-linear in key count. F2.1 still
-fails: 20× for 100× the keys is sub-linear, not independent, and what remains is the *block*
-table, still decoded per entry. F7.1 and F7.2 also still fail, because an index of N keys
+**f2's open-time finding moved from `fails` to `holds`** — reader open is sub-linear in key
+count. Its independence finding still fails: 20× for 100× the keys is sub-linear, not
+independent, and what remains is the *block* table, still decoded per entry. Both of f7's
+index-size findings also still fail, because an index of N keys
 holds N records and 57 B/key is above that claim's 32-byte bar — but the per-process
 multiplier this section objects to is gone. Ten reader processes now share one copy.
 
@@ -410,7 +411,8 @@ Two things found on the way are worth more than the speedup:
 **Resolved by `Store::read_all`.** The writer now reads its own sealed, staged
 and pending state directly, and a sealed extent is served from a mapping rather
 than by preading its whole 64KiB block. Against LMDB, YCSB A went from 0.07x to
-**18.9x** and F from 0.08x to **18.4x**; EXT.3, which asks whether a mixed
+**18.9x** and F from 0.08x to **18.4x**; the suite's mixed-workload ordering, which asks
+whether a mixed
 workload stays within 10x of a read-only one, moved from 13.5x to **0.76x**.
 The separate half — a scan needing a reader — was fixed by refreshing with
 `publish()` rather than `checkpoint()`, since a scan needs the writes to be
@@ -578,7 +580,8 @@ read phase, one scan per engine per invocation. There was no distribution, so
 `stats::compare` could not be applied and was not — the findings were written
 as `supdb > lmdb`.
 
-EXT.1, "Supdb loads faster than LMDB", read 0.70x, 1.03x, 0.998x, 1.13x and
+the external suite's load ordering, "Supdb loads faster than LMDB", read 0.70x, 1.03x,
+0.998x, 1.13x and
 0.85x across five full runs and flipped between holding and failing on margins
 as small as 0.2%. It was measuring the machine. Seven interleaved repetitions
 settle it at **0.866x, p=0.0106** — Supdb is slower on load, and the earlier
@@ -842,7 +845,7 @@ measured points rather than a fitted slope, for the reason `ext-sweep` documents
 It also found the largest number in this repository that is not a defect in the engine.
 Appending a day's postings in log-line order writes 831 MB where grouping them by term first
 writes 36.7: 22.6x, from 44,629 inline merges against zero. That is §2's inline-merge cost
-(F5.1's latency tail) arriving on the space axis, and it means the *caller's* write order is a
+(f5's latency tail) arriving on the space axis, and it means the *caller's* write order is a
 first-class part of this engine's performance envelope and is documented nowhere else.
 
 **24. `f28-count` — pricing a format change instead of arguing about one.** A consumer wanted
