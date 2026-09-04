@@ -149,7 +149,12 @@ fn main() -> std::io::Result<()> {
     let engines: Vec<&str> = args
         .get("--engines")
         .map(|s| s.split(',').collect())
-        .unwrap_or_else(|| vec!["supdb", "redb", "lmdb", "sled"]);
+        // `supdb-adaptive` is in the default set so every run of this suite
+        // prices the read advice against the arm it would replace. Leaving it
+        // out would mean EXT.46 and EXT.47 were only ever measured when
+        // somebody remembered to ask for them, which is how a gate stops
+        // running.
+        .unwrap_or_else(|| vec!["supdb", "supdb-adaptive", "redb", "lmdb", "sled"]);
 
     let rec = match cmd.as_str() {
         "kv" => suite_kv(&args, profile, &engines)?,
@@ -689,6 +694,15 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
     // metric; when it does not, the pair is `not_exercised` rather than
     // ranked. That is the whole of the fix: the features table used to be a
     // note printed beside a number, and it is a precondition now.
+    // What "holds" means for a pair. Most orderings here assert a win, but a
+    // finding that a change costs nothing has to hold on a tie -- gating it on
+    // `Greater` would demand a win where there is nothing to win, which is a
+    // finding designed to fail.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Want {
+        Greater,
+        NotWorse,
+    }
     let ordering_of = |rec: &mut Record,
                        id: &str,
                        title: &str,
@@ -696,7 +710,8 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
                        other: &str,
                        s: &[Samples],
                        unit: &str,
-                       writes: bool| {
+                       writes: bool,
+                       want: Want| {
         let (Some(si), Some(oi)) = (idx(mine), idx(other)) else {
             return;
         };
@@ -724,7 +739,10 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
             return;
         }
         let cmp = compare(&s[si], &s[oi], supdb::bench::MIN_EFFECT);
-        let holds = matches!(cmp.verdict, Verdict::Greater);
+        let holds = match want {
+            Want::Greater => matches!(cmp.verdict, Verdict::Greater),
+            Want::NotWorse => !matches!(cmp.verdict, Verdict::Less),
+        };
         rec.compare(&format!("{id}_{mine}_vs_{other}"), cmp.clone());
         // Transactions are the one axis that cannot be equalized, so say which
         // way the remainder leans instead of pretending it is not there.
@@ -767,6 +785,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &load,
         "ops/s",
         true,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
@@ -777,6 +796,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &read,
         "reads/s",
         false,
+        Want::Greater,
     );
     // The read-for-write trade, measured in one run rather than across
     // two: same engine, same guarantees, one policy bit apart, so nothing
@@ -790,6 +810,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &load,
         "ops/s",
         true,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
@@ -800,6 +821,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &scan,
         "entries/s",
         false,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
@@ -810,6 +832,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &scan,
         "entries/s",
         false,
+        Want::Greater,
     );
     // Whether the read advice that f66 and f67 measured moves the numbers
     // this project quotes. Same engine, same guarantees, one option apart,
@@ -829,6 +852,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &read,
         "reads/s",
         false,
+        Want::NotWorse,
     );
     ordering_of(
         &mut rec,
@@ -839,6 +863,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &scan,
         "entries/s",
         false,
+        Want::NotWorse,
     );
     // The same three axes against RocksDB, the engine the engine is
     // shaped like: both sync the WAL per batch, both apply a batch whole,
@@ -854,6 +879,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &load,
         "ops/s",
         true,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
@@ -864,6 +890,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &read,
         "reads/s",
         false,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
@@ -874,6 +901,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &scan,
         "entries/s",
         false,
+        Want::Greater,
     );
     // And against RocksDB tuned as it is deployed -- a block cache the data
     // fits in, a Bloom filter, four background threads -- which is the pair
@@ -887,6 +915,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &load,
         "ops/s",
         true,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
@@ -897,6 +926,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &read,
         "reads/s",
         false,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
@@ -907,6 +937,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &scan,
         "entries/s",
         false,
+        Want::Greater,
     );
     // The drain matched both ways (f60, drain-plan.md). Default `supdb`
     // seals and partitions inside its load window; RocksDB's sync is an
@@ -922,6 +953,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &load,
         "ops/s",
         true,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
@@ -932,6 +964,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &load,
         "ops/s",
         true,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
@@ -942,6 +975,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &read,
         "reads/s",
         false,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
@@ -952,6 +986,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &scan,
         "entries/s",
         false,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
@@ -962,6 +997,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &read,
         "reads/s",
         false,
+        Want::Greater,
     );
     rec.note(
         "feature_score counts durable commit, transactions, checksums, reopen-for-write, \
