@@ -1166,8 +1166,18 @@ fn f68_prefetch(args: &Args, profile: Profile) -> std::io::Result<Record> {
         rec.param("resident_mb", J::u(resident_mb))
             .param("resident_segments", J::u(db.segments() as u64));
     }
+    // More repetitions than the rest of the experiment, because this is the
+    // one place the effect is small. Four full runs at the default reps read
+    // 1.038, 0.964, 0.933 and 0.963 -- three `no difference` and one `less`,
+    // which is a verdict that flips on the run rather than on the engine. The
+    // answer is to resolve it, not to restate the question: at seven
+    // repetitions a few percent is at the edge of what a Mann-Whitney test
+    // over seven can see, and `stats.rs` says as much where it explains why
+    // seven is the floor.
+    let res_reps = args.num("--resident-reps", profile.pick(5, 7, 21));
+    rec.param("resident_reps", J::u(res_reps as u64));
     let res_arms = [supdb::ReadAdvice::Adaptive, supdb::ReadAdvice::Prefetch];
-    let resident = Trial::new(reps).run(2, |ci, rep| {
+    let resident = Trial::new(res_reps).run(2, |ci, rep| {
         let db = supdb::Db::open(
             &small,
             supdb::Options {

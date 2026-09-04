@@ -1450,16 +1450,15 @@ impl<B: Bytes> Blob<B> {
         merge_ranges(&mut ranges);
         let mut asked = 0u64;
         for (off, len) in ranges {
-            // Saturating rather than `as`, and counted after the conversion
-            // rather than before. A range cannot exceed a mapping and a
-            // mapping cannot exceed the address space, so on any target this
-            // reaches there is nothing to truncate -- but a returned count
-            // that says one thing while the syscall was handed another is a
-            // number disagreeing with what happened, which is the kind of
-            // quiet difference this reader has to not have.
-            let span = usize::try_from(len).unwrap_or(usize::MAX);
-            self.src.advise_willneed(off, span);
-            asked += span as u64;
+            // The count is what the source says it submitted, not what was
+            // asked of it. Saturating the conversion fixed half of that and
+            // left the other half: `MmapBytes` clamps a range to its mapping,
+            // so a plan built from a damaged block table would still have
+            // been counted whole. A returned figure that says one thing while
+            // the syscall was handed another is exactly the quiet difference
+            // this reader exists to not have.
+            let want = usize::try_from(len).unwrap_or(usize::MAX);
+            asked += self.src.advise_willneed(off, want) as u64;
         }
         Ok(asked)
     }

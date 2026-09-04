@@ -865,7 +865,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         false,
         Want::NotWorse,
     );
-    // The same three axes against RocksDB, the engine the engine is
+    // The same three axes against RocksDB, the engine Supdb is
     // shaped like: both sync the WAL per batch, both apply a batch whole,
     // neither verifies a checksum on read (Features::unmatched decides the
     // rest). This is the pair that says whether the engine is fast or

@@ -533,7 +533,7 @@ impl Engine for Redb {
 
 /// RocksDB through rust-rocksdb.
 ///
-/// The engine the engine is shaped like -- a write-ahead log, a
+/// The engine Supdb is shaped like -- a write-ahead log, a
 /// memtable, sorted immutable files and compaction -- and so the comparator
 /// that separates "the engine is fast" from "an LSM is fast". Two
 /// arms, as for LMDB: `rocksdb` syncs the WAL on every batch, matching the
