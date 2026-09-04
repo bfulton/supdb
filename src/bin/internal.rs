@@ -942,6 +942,31 @@ fn f68_prefetch(args: &Args, profile: Profile) -> std::io::Result<Record> {
     let names = ["normal", "random", "adaptive", "prefetch"];
     let (i_normal, i_adaptive, i_prefetch) = (0usize, 2usize, 3usize);
 
+    // F68.1 -- the cheap rung, and the only finding here whose verdict is not
+    // a measurement. It is recorded as failing on the reasoning that made it
+    // not worth an arm, so it is emitted before the page-cache gate and
+    // carries no `needs`: a cap changes nothing about it.
+    //
+    // Putting it inside that gate is a mistake this session has now made
+    // three times, F67.3 and F68.6 the same way, and the shape does not vary:
+    // the finding goes where it is convenient in the code rather than where
+    // its precondition actually is, and every host with a memory controller
+    // agrees with itself, so nothing local ever notices.
+    rec.finding(Finding::new(
+        "F68.1",
+        "MADV_SEQUENTIAL as the scan mode beats the kernel's default at the scan lengths the \
+     engine uses",
+        false,
+        "not measured as an arm, and recorded as failing on the reasoning that made it not \
+     worth one. A probe over a contiguous 2 GB walk put MADV_SEQUENTIAL at 12.5x the \
+     kernel's default; over 200 bounded spans of 2 MB it was 1.01x, and at 256 KiB spans \
+     1.04x. The readahead ramp that pays over two uninterrupted gigabytes never starts \
+     inside a bounded span, and every scan this engine issues is bounded. S1 in \
+     prefetch-plan.md registered that before the arms were built, and both numbers are \
+     here so the shape that flatters the rung does not get re-run"
+            .to_string(),
+    ));
+
     if !capped || over_cap <= 1.0 {
         let why = if !capped {
             "no writable memory controller, so the page cache was never capped and no scan \
@@ -952,11 +977,22 @@ fn f68_prefetch(args: &Args, profile: Profile) -> std::io::Result<Record> {
             format!("the store is {over_cap:.2}x the cap, so it fits in the page cache")
         };
         for (id, st) in [
-            ("F68.1", "MADV_SEQUENTIAL as the scan mode beats the kernel's default at the scan lengths the engine uses"),
-            ("F68.2", "planning a scan's reads and prefetching them beats the shipped adaptive advice"),
-            ("F68.3", "and does it at about 1.0x read amplification, against the kernel's over-fetch"),
-            ("F68.4", "a policy that never switches mode ties or beats one that does"),
-            ("F68.5", "the store exceeds the memory available to cache it"),
+            (
+                "F68.2",
+                "planning a scan's reads and prefetching them beats the shipped adaptive advice",
+            ),
+            (
+                "F68.3",
+                "and does it at about 1.0x read amplification, against the kernel's over-fetch",
+            ),
+            (
+                "F68.4",
+                "a policy that never switches mode ties or beats one that does",
+            ),
+            (
+                "F68.5",
+                "the store exceeds the memory available to cache it",
+            ),
         ] {
             rec.finding(Finding::not_exercised(id, st, why.clone()));
         }
@@ -1051,34 +1087,6 @@ fn f68_prefetch(args: &Args, profile: Profile) -> std::io::Result<Record> {
             "peak_rss_mb",
             J::fp(env::peak_rss_bytes() as f64 / 1048576.0, 1),
         );
-
-        // F68.1 -- the cheap rung. A whole-file probe made MADV_SEQUENTIAL look
-        // like a 12.5x answer; this asks the question at the span an engine scan
-        // actually walks, which is the only shape that decides anything.
-        let cmp_seq = compare(
-            &rates[i_adaptive],
-            &rates[i_normal],
-            supdb::bench::MIN_EFFECT,
-        );
-        rec.compare("F68.1_adaptive_vs_normal", cmp_seq.clone());
-        rec.finding(Finding::new(
-            "F68.1",
-            "MADV_SEQUENTIAL as the scan mode beats the kernel's default at the scan lengths the \
-         engine uses",
-            false,
-            format!(
-                "not measured as an arm, and recorded as failing on the reasoning that made it \
-             not worth one. A probe over a contiguous 2 GB walk put MADV_SEQUENTIAL at 12.5x \
-             the kernel's default; over 200 bounded spans of 2 MB it was 1.01x, and at 256 \
-             KiB 1.04x. The readahead ramp that pays over two uninterrupted gigabytes never \
-             starts inside a bounded span, and every scan this engine issues is bounded. \
-             S1 in prefetch-plan.md registered that before the arms were built. The arms \
-             here price the dial that is worth something instead: adaptive {:.0} ops/s \
-             against the kernel's default {:.0}",
-                rates[i_adaptive].median(),
-                rates[i_normal].median(),
-            ),
-        ));
 
         let cmp_pf = compare(
             &rates[i_prefetch],
