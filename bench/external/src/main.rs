@@ -108,10 +108,30 @@ fn build(root: &std::path::Path, which: &[&str]) -> Vec<Box<dyn Engine>> {
         };
         match e {
             Ok(e) => out.push(e),
-            // A comparator that will not start is recorded, never skipped
-            // silently: an absent engine must not look like an engine that
-            // lost.
-            Err(err) => eprintln!("# SKIPPED {name}: {err}"),
+            // An engine that was named and will not start ends the run.
+            //
+            // This used to warn on stderr and carry on, on the reasoning that
+            // an absent engine must not look like an engine that lost. That is
+            // the right instinct and the wrong mechanism: a warning is only
+            // read by someone watching, and a canonical run is scripted. A
+            // missing arm produces no findings, a claim with no finding is
+            // skipped rather than failed, and the run therefore exits 0 having
+            // measured a fraction of what it was asked for. It happened twice
+            // in one afternoon -- both times a plain `cargo build` had replaced
+            // the binary with one built without `--features rocksdb`, and both
+            // times the result looked like a clean shorter run.
+            //
+            // Nothing names an engine by accident: the default list is written
+            // here and every other name arrives through `--engines`. So this is
+            // a caller error in any profile, and it stops.
+            Err(err) => {
+                eprintln!("cannot build the engine '{name}': {err}");
+                eprintln!(
+                    "every engine named must be measurable; a run missing an arm \
+                     reports fewer findings, not a failure"
+                );
+                std::process::exit(2);
+            }
         }
     }
     out
