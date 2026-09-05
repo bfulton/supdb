@@ -40,9 +40,16 @@ simple**. In practice:
 
 - **No counts that move.** Not the number of tests, assertions, claims, commits
   or files. They are wrong within a day and they never mattered.
-- **No figures that move.** Directions and trades belong there; the numbers
-  belong in `claims.json` and `results/`, where `verify` gates them. Cite the
-  claim id instead and the reader gets a checked figure rather than a snapshot.
+- **No figures that move** -- and the test is the tense, not the document. A
+  standing figure is a claim about how things *are*, so "reads 2.2x LMDB" in
+  the README is wrong by next quarter and belongs in `claims.json` and
+  `results/` where `verify` gates it; cite the claim id and the reader gets a
+  checked number instead of a snapshot. A figure attached to a *change* is a
+  claim about what that change did, and a pull request or a commit message is
+  dated by construction, so "this made cold reads about 75x faster" is as true
+  next year as the day it landed. Put the size of the win where a reader will
+  see it in those, and round it -- an approximate magnitude survives a rerun
+  and four significant figures invites someone to diff them.
 - **No history.** Not what a section used to say, not what the design document
   called it, not what was tried first. A reader who wants that follows the
   pointer.
