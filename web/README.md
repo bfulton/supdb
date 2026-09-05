@@ -5,8 +5,8 @@ out of object storage. Reader only: there is no writer here and there is not
 meant to be.
 
 ```sh
-web/build.sh ci        # build the module, measure it, record the size
-web/test/run.sh        # build a real day index and read it in Chromium
+web/build.sh           # build the module and the floor, print their sizes
+# the browser test lives in supdb-bench, which stages this reader beside it
 ```
 
 | path | what |
@@ -15,9 +15,8 @@ web/test/run.sh        # build a real day index and read it in Chromium
 | `cache.mjs` | the caching byte source over ranged HTTP -- budget, pages, eviction |
 | `s3.mjs` | a minimal SigV4 range fetcher, the S3 adapter for `cache.mjs` |
 | `worker.mjs` | the Web Worker the reader runs in, and why it has to |
-| `build.sh` | builds the module and the floor, records `w3-bundle` |
+| `build.sh` | builds the module and the floor, and prints their sizes |
 | `floor/` | an empty cdylib with the same std surface -- the size control |
-| `test/` | two real index files, a real browser, OPFS and ranged HTTP; `test/node.mjs` runs the error paths in Node, where the browser suite only walks the happy path |
 
 ## The one decision everything else follows from
 
@@ -73,7 +72,7 @@ read path fetches whole blocks (verification and decompression want the
 enclosing bytes), so an extent-granular plan would under-report. That the
 plan is *exactly* what a read touches -- no more, no less -- is the property
 the whole design rests on, so it is asserted with recorded reads rather than
-argued: `tests/ranges.rs` natively, `w4-ranges` in `results/`, and the
+argued: `tests/ranges.rs` natively, `w4-ranges` in supdb-bench, and the
 browser test end to end.
 
 `cache.mjs` is the byte source: sparse pages in OPFS (it survives reloads),
@@ -162,7 +161,7 @@ open, because a source that cannot lend its bytes -- which an OPFS handle
 cannot -- should pay per section rather than per lookup.
 
 `count(key)` and `countFixed(key, width)` are two different things and the
-difference is 28x. See `f28-count` and W2.1-W2.4 in `claims.json`: an `Ext`
+difference is 28x. See `f28-count` and W2.1-W2.4 in supdb-bench: an `Ext`
 records block, offset, byte length and the offset of the last record, and none
 of those is a count, so the general count walks the values -- and walking them
 is *not* cheaper than reading them, which is W2.1 and is recorded as failing.
@@ -232,10 +231,12 @@ the intersection to 1.15x (EXT.17).
 
 ## Size
 
-Measured by `build.sh` into `results/w3-bundle.*.json`, against the budget in
-`src/bin/browser.rs`. There is no binding generator: the ABI is twenty
-hand-written C functions passing integers and byte ranges, because a
-generator's shim and descriptor sections are exactly what the budget is about.
+`build.sh` builds the module and an empty cdylib beside it and prints the four
+sizes; the budget those are held to is a claim, so it lives with the claims in
+[supdb-bench](https://github.com/bfulton/supdb-bench). There is no binding
+generator: the ABI is twenty-eight hand-written C functions passing integers
+and byte ranges, because a generator's shim and descriptor sections are
+exactly what the budget is about.
 R6's planning seam is the first thing to have moved the marginal number --
 4,225 gzipped bytes, visible in W3.3 -- which is what the number is for.
 
@@ -255,7 +256,7 @@ failed its checksum came back empty — an under-return, which is the one
 thing this index may never do, reported by the first downstream integration.
 The convention now is one rule applied everywhere: normalize to unsigned at
 the boundary (`v >>> 0`, `BigInt.asUintN(64, v)`), compare unsigned, return
-unsigned. `web/test/node.mjs` holds the door shut, from the zeroed-object
+unsigned. supdb-bench's `web/test/node.mjs` holds the door shut, from the zeroed-object
 repro down to a corrupt block byte throwing on every read rather than only
 the first.
 

@@ -24,6 +24,15 @@ echo "# building the reader for wasm32-unknown-unknown"
 # fine and then failed to find its own artifact.
 target=$(cargo metadata --format-version 1 --no-deps \
   | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+# An empty parse is not a missing directory, it is this script no longer
+# knowing where it is looking -- and it would surface later as a confusing
+# "no such file" for the module itself, blaming the build for a failure in
+# the question that preceded it.
+if [ -z "$target" ]; then
+  echo "could not read target_directory out of \`cargo metadata\`; its output" >&2
+  echo "format may have changed. Not guessing where the module will be." >&2
+  exit 2
+fi
 
 # The size settings are given here rather than as a named profile in
 # Cargo.toml. Cargo takes profiles from the workspace root, and this
