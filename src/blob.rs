@@ -506,8 +506,8 @@ fn open_head<B: Bytes>(src: &B) -> Result<Super> {
     // which is native-endian, while every scalar in the file is written
     // little-endian. On a big-endian target those disagree and the reader
     // would misread a valid file rather than refuse it. Refused here
-    // instead. Every browser is little-endian and so is every machine in
-    // `results/`, so nothing is given up by saying so out loud.
+    // instead. Every browser is little-endian and so is every machine the
+    // suite has run on, so nothing is given up by saying so out loud.
     if cfg!(target_endian = "big") {
         return Err(Error::new(
             ErrorKind::Unsupported,

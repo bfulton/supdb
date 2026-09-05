@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 ///
 /// Castagnoli rather than IEEE because x86-64 implements it in hardware. That
 /// matters here: a byte-at-a-time IEEE table cost 13-35% of write throughput
-/// when first measured (`results/` keeps that datapoint), which is not a
+/// when first measured (supdb-bench keeps that datapoint), which is not a
 /// reasonable price on the one axis this design is built to win. The hardware
 /// path is used when the CPU advertises SSE4.2; everything else takes a
 /// portable slice-by-8 table. A test asserts the two agree, because two

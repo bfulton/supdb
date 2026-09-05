@@ -33,8 +33,8 @@
 //! path reinterprets an extent array as `&[Ext]`, which is native-endian. The
 //! two agree only on a little-endian machine, so `Blob::open` refuses a
 //! big-endian target explicitly rather than misreading a file there. Every
-//! browser is little-endian and so is every machine in `results/`, so this
-//! costs nothing and is checked rather than assumed.
+//! browser is little-endian and so is every machine the suite has run on, so
+//! this costs nothing and is checked rather than assumed.
 
 use std::io::{Error, ErrorKind, Result};
 

@@ -2,20 +2,21 @@
 //!
 //! The four findings below are the *design document's*, taken against Uppend,
 //! RocksDB, LMDB and MapDB, and they are kept because they explain why the
-//! code is shaped as it is. Two have since been overtaken by this
-//! repository's own measurements, which is why the line above no longer says
+//! code is shaped as it is. Two have since been overtaken by the project's
+//! own measurements, which is why the line above no longer says
 //! ingest-optimized:
 //!
 //! - Finding 1's "nothing here may compromise the ingest path" did not hold:
-//!   the durable ordered load runs at 0.755x of LMDB and 0.611x of tuned
-//!   RocksDB (`EXT.22`, `EXT.32`). What the engine wins is reads, 2.14x and
-//!   6.97x of the same pair (`EXT.23`, `EXT.33`).
+//!   the durable ordered load is behind both LMDB and tuned RocksDB
+//!   (`EXT.22`, `EXT.32`). What the engine wins is reads against that same
+//!   pair (`EXT.23`, `EXT.33`).
 //! - Finding 4's choice between size and warm reads was made, and it was made
 //!   for reads: blocks are stored uncompressed by default, so a point read
 //!   decompresses nothing and the file is the larger for it. Compression is
 //!   per segment rather than global, and `W6.8` prices it on a real index.
 //!
-//! `claims.json` holds both sides. The four as stated:
+//! Those claim ids, and the measurements behind them, live in
+//! [supdb-bench](https://github.com/bfulton/supdb-bench). The four as stated:
 //!
 //! 1. Append throughput and flush cost are what an append-only log actually
 //!    wins (2-2.6x and 17-39x respectively), and they survived every
