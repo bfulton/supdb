@@ -5671,7 +5671,7 @@ fn f42_load(args: &Args, profile: Profile) -> std::io::Result<Record> {
 
 /// What does counting a key's values actually cost?
 ///
-/// R4.3 of the logshed requirements asks for `count(key)` "without decoding
+/// R4.3 asks for `count(key)` "without decoding
 /// the values", and hopes it can come out of the extent list. It cannot, and
 /// this is the experiment that says so rather than a paragraph asserting it.
 /// An `Ext` is four `u32`s -- block, offset, byte length, offset of the last
@@ -5687,7 +5687,7 @@ fn f42_load(args: &Args, profile: Profile) -> std::io::Result<Record> {
 ///                prices the format change that would add a per-extent count.
 ///   count_fixed  the floor plus one division. Available *today*, with no
 ///                format change, for a posting list whose values are all the
-///                same width -- which logshed's four-byte line ordinals are.
+///                same width -- which four-byte posting ordinals are.
 ///   count        the varint walk: one length prefix read per value, payload
 ///                skipped, nothing handed to a callback.
 ///   read_all     what exists today, with a closure that only increments.
@@ -5853,7 +5853,7 @@ fn f28_count(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // Before format v5 this gated a hypothetical: whether a stored count
     // would recover enough of the gap between `count_fixed` and `lookup` to
     // be worth four bytes an extent, and it said no (under 20 ns on the
-    // table, for a schema logshed does not have). The change was then made
+    // table, for a schema this store does not have). The change was then made
     // for the variable-width case, so the gate now measures what it bought:
     // the stored count against resolving the key and stopping, which is the
     // floor any count has. The same 20 ns bar, applied to the realized cost.

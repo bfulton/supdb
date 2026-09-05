@@ -214,13 +214,13 @@
       "arch": "x86_64"
     },
     {
-      "experiment": "w1-daysize",
+      "experiment": "w1-indexsize",
       "id": "W1.1",
       "expect": "holds",
       "because": "28.04 B/line between 50k and 250k lines against 28.03 between 250k and 1M -- 0.0% apart -- over a fixed cost of 478,045 bytes. The postings dominate and there is one per line per indexed field; the key count is bounded by field cardinalities, so it lands in the fixed term. Both figures fell when the roll moved to the segment writer: a run of four-byte ordinals is stored fixed, so it carries no length prefixes, and a run under 256 bytes lives in its index record rather than a block."
     },
     {
-      "experiment": "w1-daysize",
+      "experiment": "w1-indexsize",
       "id": "W1.2",
       "expect": "holds",
       "because": "28.03 B/line over 478,045 fixed puts the 32 MB budget at 1,179,916 lines/day; a 10M-line day is 9 objects, each independently under budget and each skippable by a time-ranged query. This is what makes R2.2(a) -- an OPFS synchronous access handle over one downloaded object -- viable, and why the reader in blob.rs stays synchronous."

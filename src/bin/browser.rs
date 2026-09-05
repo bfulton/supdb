@@ -1,29 +1,32 @@
-//! A logshed-shaped day index, built with the engine and measured for size.
+//! A synthetic inverted index, built with the engine and measured through
+//! the browser read path.
 //!
-//! logshed seals one immutable object per day and wants to answer point
-//! lookups against it *from a browser*. Whether that is possible at all is
-//! decided by one number -- how many bytes a day's index is -- and every other
-//! decision follows from it. If a day fits in a download budget then the
-//! browser can hold the whole object and the reader API stays synchronous with
-//! no shape change (OPFS, R2.2(a)); if it does not, the reader has to be
-//! turned inside out into a plan-then-fetch API over ranged GETs (R2.2(b)).
+//! The workload is an inverted index over `rows`: a set of attributes, each
+//! with a bounded number of distinct values, and a posting per row per
+//! attribute. It is the shape this store is built for -- keys whose count is
+//! set by the schema, runs whose length is set by the data -- and it is
+//! synthetic on purpose, so that what a claim measures is the format rather
+//! than somebody's corpus.
 //!
-//! So the size is measured here rather than assumed, at several day sizes,
-//! against a model of the workload stated explicitly below. Size is the one
-//! axis this repository allows to be compared across runs -- a file length is
-//! immune to the machine drift that makes timing comparisons across runs
-//! worthless -- so this experiment does not need to interleave arms.
+//! Two questions decide the reader's shape and both are answered here. How
+//! many bytes an index of a given size costs, because if a whole object fits
+//! a download budget the reader can hold it and stay synchronous (OPFS,
+//! R2.2(a)); and if it does not, what a plan-then-fetch reader over ranged
+//! GETs costs in round trips instead (R2.2(b)). Size is the one axis this
+//! repository allows to be compared across runs -- a file length is immune to
+//! the machine drift that makes timing comparisons across runs worthless --
+//! so the size experiments do not need to interleave arms.
 //!
-//! It also builds the fixture the browser test reads, because the browser test
-//! must open a real index file rather than a stub.
+//! It also builds the fixtures the browser test reads, because that test must
+//! open a real index file rather than a stub.
 //!
-//!   logshed build    write one day index and describe it
-//!   logshed budget   sweep day sizes against the download budget
-//!   logshed fixture  write the browser test's index and its expected answers
-//!   logshed segment  write the cached-reader test's index (small dictionary,
+//!   browser build    write one index and describe it
+//!   browser budget   sweep index sizes against the download budget
+//!   browser fixture  write the browser test's index and its expected answers
+//!   browser segment  write the cached-reader test's index (small dictionary,
 //!                    large data region) and its expected answers
-//!   logshed ranges   record that a read plan is exact and what it saves (R6)
-//!   logshed bundle   record the browser bundle's size against its budget
+//!   browser ranges   record that a read plan is exact and what it saves (R6)
+//!   browser bundle   record the browser bundle's size against its budget
 
 use std::path::{Path, PathBuf};
 use supdb::bench::{Finding, Profile, Record, Rng, J};
@@ -33,32 +36,33 @@ use supdb::{Blob, SegmentOptions};
 
 // ---------------------------------------------------------------- the model --
 
-/// The indexed fields of an HTTP access log, and how many distinct values a
-/// day holds of each.
+/// The indexed attributes, and how many distinct values each holds.
 ///
-/// These are the shape of the workload, and they are the assumption this whole
-/// document rests on, so they are written down rather than buried. A `path`
-/// cardinality of 5,000 assumes logshed normalises route parameters; a service
-/// that indexes raw paths with ids in them has an unbounded key count and a
-/// different problem. The `ref` and `ua` counts are the long-tailed ones and
-/// are deliberately generous.
+/// This is the shape of the workload and the assumption every size claim
+/// rests on, so it is written down rather than buried. What matters is not
+/// the individual numbers but the *ladder*: three orders of magnitude of
+/// cardinality in one file, so a single fixture covers a run of hundreds of
+/// thousands of postings (many extents, block-backed, compressible) and a run
+/// of tens (inline in its index record) and everything between. A uniform
+/// fixture would give every key the same run length and hide half the read
+/// paths.
 ///
-/// The count that actually decides the budget is not any of these. It is the
-/// line count: a posting is written per line per field, so the postings scale
-/// with the day's traffic and the keys do not.
-const FIELDS: &[(&str, usize)] = &[
-    ("method", 8),
-    ("status", 24),
-    ("host", 64),
-    ("country", 210),
-    ("ua", 500),
-    ("ref", 2000),
-    ("path", 5000),
+/// The count that decides the size is none of these. It is the row count: a
+/// posting is written per row per attribute, so the postings scale with the
+/// rows and the keys do not.
+const ATTRS: &[(&str, usize)] = &[
+    ("a0", 8),
+    ("a1", 24),
+    ("a2", 64),
+    ("a3", 210),
+    ("a4", 500),
+    ("a5", 2000),
+    ("a6", 5000),
 ];
 
-/// A posting is a line ordinal within the day: four bytes, little-endian.
+/// A posting is a row ordinal within the index: four bytes, little-endian.
 ///
-/// Four bytes rather than a varint because logshed wants to seek to the line,
+/// Four bytes rather than a varint because a consumer seeks to the row by it,
 /// and because the store already length-prefixes each value -- a varint
 /// posting would save at most two bytes against a one-byte prefix that is
 /// paid either way.
@@ -81,13 +85,13 @@ fn term(field: &str, i: usize, out: &mut Vec<u8>) {
     out.extend_from_slice(&buf);
 }
 
-/// Which value of a field a given line carries.
+/// Which value of an attribute a given row carries.
 ///
 /// Zipf-ish rather than uniform, because a real access log is: `status=200`
 /// takes most of the traffic and the tail of `ref` is nearly empty. That
 /// matters for the *shape* of the extents -- a uniform assignment gives every
 /// key the same number of postings and hides what a skewed one costs -- and it
-/// does not change the total, which is one posting per line per field.
+/// does not change the total, which is one posting per row per attribute.
 fn zipf(rng: &mut Rng, n: usize) -> usize {
     if n <= 1 {
         return 0;
@@ -107,35 +111,35 @@ struct Built {
     payload_bytes: u64,
 }
 
-/// Build one day's index and report what it cost.
-/// The day's postings as (field, value, line) words, sorted, so every term's
-/// postings are together and in line order within a term: the shape the
+/// Build one index and report what it cost.
+/// The postings as (attribute, value, row) words, sorted, so every term's
+/// postings are together and in row order within a term: the shape the
 /// roll writes when it groups by term first.
-fn sorted_pairs(lines: u64, seed: u64) -> Vec<u64> {
+fn sorted_pairs(rows: u64, seed: u64) -> Vec<u64> {
     let mut rng = Rng::new(seed);
-    let mut pairs: Vec<u64> = Vec::with_capacity((lines as usize) * FIELDS.len());
-    for line in 0..lines {
-        for (f, (_, card)) in FIELDS.iter().enumerate() {
+    let mut pairs: Vec<u64> = Vec::with_capacity((rows as usize) * ATTRS.len());
+    for row in 0..rows {
+        for (f, (_, card)) in ATTRS.iter().enumerate() {
             let i = zipf(&mut rng, *card);
-            pairs.push(((f as u64) << 56) | ((i as u64) << 32) | line);
+            pairs.push(((f as u64) << 56) | ((i as u64) << 32) | row);
         }
     }
     pairs.sort_unstable();
     pairs
 }
 
-/// The same day written by `SegmentWriter`: term order, runs up to
+/// The same index written by `SegmentWriter`: term order, runs up to
 /// `inline` bytes stored in the index record, an optional head reserve.
 /// What the roll writes (R7.3), and the shape w6 measures.
-fn build_day_segment(
+fn build_index_segment(
     path: &Path,
-    lines: u64,
+    rows: u64,
     seed: u64,
     inline: usize,
     head_reserve: usize,
     compress: bool,
     // `deltas`: store each posting as its distance from the previous one for
-    // the term, which is what logshed writes. Absolute ordinals do not
+    // the term, which is what a roll writes. Absolute ordinals do not
     // compress -- LZ4 needs repeated byte sequences and a rising counter has
     // none -- so measuring compression against them measures nothing.
     deltas: bool,
@@ -150,7 +154,7 @@ fn build_day_segment(
     // The segment writer wants keys in byte order, which is not field-index
     // order: group the sorted pairs by term, name each term, and sort the
     // terms as bytes. Lines stay in order within a term.
-    let pairs = sorted_pairs(lines, seed);
+    let pairs = sorted_pairs(rows, seed);
     let mut terms: Vec<(Vec<u8>, Vec<u32>)> = Vec::new();
     let mut key = Vec::with_capacity(32);
     let mut cur = u64::MAX;
@@ -159,7 +163,7 @@ fn build_day_segment(
         if head != cur {
             cur = head;
             term(
-                FIELDS[(head >> 24) as usize].0,
+                ATTRS[(head >> 24) as usize].0,
                 (head & 0xff_ffff) as usize,
                 &mut key,
             );
@@ -168,16 +172,12 @@ fn build_day_segment(
         terms.last_mut().unwrap().1.push(*p as u32);
     }
     terms.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    for (k, lines) in &terms {
+    for (k, rows) in &terms {
         w.begin(k)?;
         let mut prev = 0u32;
-        for line in lines {
-            let v = if deltas {
-                line.wrapping_sub(prev)
-            } else {
-                *line
-            };
-            prev = *line;
+        for row in rows {
+            let v = if deltas { row.wrapping_sub(prev) } else { *row };
+            prev = *row;
             let ord = v.to_le_bytes();
             w.value(&ord[..POSTING_BYTES]);
         }
@@ -190,17 +190,17 @@ fn build_day_segment(
     Ok(std::fs::metadata(path)?.len())
 }
 
-/// One day's index, written the way a roll should write it: postings grouped
+/// One index, written the way a roll should write it: postings grouped
 /// by term, terms in byte order, through the segment writer.
 ///
 /// The writer takes keys in byte order and nothing else, which is the whole
-/// reason a roll sorts first. It also means the arrival order of the lines
+/// reason a roll sorts first. It also means the arrival order of the rows
 /// cannot change what the file costs -- the sort is between them and the
-/// file -- so the size of a day is a function of the day, not of how it
+/// file -- so the size of an index is a function of its contents, not of how
 /// happened to be read.
-fn build_day(path: &Path, lines: u64, seed: u64) -> std::io::Result<Built> {
-    let file_bytes = build_day_segment(path, lines, seed, INLINE_MAX, 0, false, false)?;
-    let postings = lines * FIELDS.len() as u64 + 1;
+fn build_index(path: &Path, rows: u64, seed: u64) -> std::io::Result<Built> {
+    let file_bytes = build_index_segment(path, rows, seed, INLINE_MAX, 0, false, false)?;
+    let postings = rows * ATTRS.len() as u64 + 1;
     let blob = Blob::open(MmapBytes::open(path)?)?;
     Ok(Built {
         keys: blob.keys() as u64,
@@ -216,9 +216,9 @@ fn build_day(path: &Path, lines: u64, seed: u64) -> std::io::Result<Built> {
 
 // ---------------------------------------------------------------- segment --
 
-/// The fields of a logshed *segment*, as they actually are: term cardinality
-/// bounded by the schema at tens of values per field, so the whole dictionary
-/// is ~100 keys however much traffic the segment holds. This is the shape
+/// The attributes of a *segment*: cardinality bounded by the schema at tens
+/// of values each, so the whole dictionary is ~100 keys however many rows the
+/// segment holds. This is the shape
 /// that makes R6.2's premise -- index and block table resident after open --
 /// cost approximately nothing: the sections are kilobytes over a data region
 /// of megabytes, and sparseness pays where the bytes are, in the data.
@@ -226,7 +226,7 @@ fn build_day(path: &Path, lines: u64, seed: u64) -> std::io::Result<Built> {
 /// block, so a browser reading a rare term fetches nothing after the open.
 const INLINE_MAX: usize = 256;
 
-const SEG_FIELDS: &[(&str, usize)] = &[("app", 8), ("level", 6), ("host", 30), ("route", 60)];
+const SEG_ATTRS: &[(&str, usize)] = &[("b0", 8), ("b1", 6), ("b2", 30), ("b3", 60)];
 
 /// A segment value is a fixed 64-byte record (ordinal plus payload), so the
 /// fixture exercises `count_fixed` and `scan_counts_fixed` -- the calls a
@@ -262,14 +262,14 @@ fn seg_value(key: &[u8], ord: u32, out: &mut [u8; SEG_VALUE_BYTES]) {
 ///
 /// The terms are collected and sorted as bytes before anything is written,
 /// because the writer takes keys in byte order -- which is what a roll does
-/// anyway, since it is what makes the day's file the size it is.
+/// anyway, since it is what makes the file the size it is.
 fn build_segment(path: &Path, events: u64) -> std::io::Result<()> {
     let _ = std::fs::remove_file(path);
     let mut w = supdb::SegmentWriter::create(path, &SegmentOptions::default())?;
     let mut key = Vec::with_capacity(32);
     let mut val = [0u8; SEG_VALUE_BYTES];
     let mut terms: Vec<Vec<u8>> = Vec::new();
-    for (field, card) in SEG_FIELDS {
+    for (field, card) in SEG_ATTRS {
         for v in 0..*card {
             term(field, v, &mut key);
             terms.push(key.clone());
@@ -280,7 +280,7 @@ fn build_segment(path: &Path, events: u64) -> std::io::Result<()> {
         w.begin(k)?;
         // Recover the field cardinality this key belongs to, so the event
         // stride is the one the shape describes.
-        let (card, v) = SEG_FIELDS
+        let (card, v) = SEG_ATTRS
             .iter()
             .find_map(|(field, card)| {
                 (0..*card).find_map(|v| {
@@ -334,12 +334,12 @@ fn paged_bytes(ranges: &[(u64, u64)], object_len: u64, page: u64) -> u64 {
 
 /// Write the index the cached-reader browser test opens, and its answers.
 ///
-/// Small dictionary, large data region -- see `SEG_FIELDS`. The expected
+/// Small dictionary, large data region -- see `SEG_ATTRS`. The expected
 /// answers come from the native reader, so the browser test stays the same
 /// differential test the whole `web/` suite is: hand-written expectations
 /// would only confirm what their author believed. Lookups are checked by a
 /// 32-bit FNV over the concatenated values rather than by shipping them; a
-/// probe key's run here is kilobytes, not the handful of bytes the day
+/// probe key's run here is kilobytes, not the handful of bytes the wide shape
 /// fixture compares inline.
 fn segment_fixture(dir: &Path, events: u64) -> std::io::Result<()> {
     const PAGE: u64 = 64 << 10;
@@ -407,7 +407,7 @@ fn segment_fixture(dir: &Path, events: u64) -> std::io::Result<()> {
     let doc = jobj! {
         "events" => J::u(events),
         "file_bytes" => J::u(file_bytes),
-        "data_bytes" => J::u(SEG_FIELDS.len() as u64 * events * (SEG_VALUE_BYTES as u64 + 1)),
+        "data_bytes" => J::u(SEG_ATTRS.len() as u64 * events * (SEG_VALUE_BYTES as u64 + 1)),
         "keys" => J::u(blob.keys() as u64),
         "index_bytes" => J::u(blob.index_bytes() as u64),
         "value_bytes" => J::u(SEG_VALUE_BYTES as u64),
@@ -443,54 +443,55 @@ fn segment_fixture(dir: &Path, events: u64) -> std::io::Result<()> {
 /// 32 MB, because:
 ///
 ///   * it is about ten seconds on a 25 Mbit/s connection, which is the outer
-///     edge of a tolerable first-query wait, and it is paid once per day-index
+///     edge of a tolerable first-query wait, and it is paid once per index
 ///     and then cached in OPFS rather than per query;
 ///   * it is a size a phone can hold and a size OPFS grants without a quota
 ///     prompt, where a few hundred megabytes is neither;
-///   * logshed's whole current client is 32 KB, so this is already three
-///     orders of magnitude more than the application it serves, and picking a
-///     larger number would mean the index, not the app, is the product.
+///   * a browser client that reads it is tens of kilobytes, so this is
+///     already three orders of magnitude more than the application it serves,
+///     and picking a larger number would mean the index, not the app, is the
+///     product.
 ///
-/// Above it, the answer is not "download it anyway". It is to shard the day --
-/// logshed already writes one immutable object per sealed period, so a busy
-/// day becomes 24 hourly objects, each independently under budget and each
-/// individually skippable by a query with a time range.
+/// Above it, the answer is not "download it anyway". It is to shard: a
+/// consumer that seals one immutable object per period turns a busy period
+/// into several, each independently under budget and each individually
+/// skippable by a query that can exclude it.
 const BUDGET_BYTES: u64 = 32 << 20;
 
 fn budget(profile: Profile) -> std::io::Result<Record> {
-    let mut rec = Record::new("w1-daysize", profile);
+    let mut rec = Record::new("w1-indexsize", profile);
     // Three scales at every profile, because two points cannot show whether
-    // the marginal cost of a line is stable and one point cannot show anything.
+    // the marginal cost of a row is stable and one point cannot show anything.
     let scales: Vec<u64> = profile.pick(
         vec![5_000, 20_000, 50_000],
         vec![20_000, 100_000, 400_000],
         vec![50_000, 250_000, 1_000_000],
     );
-    let dir = std::env::temp_dir().join("supdb-logshed");
+    let dir = std::env::temp_dir().join("supdb-browser");
     std::fs::create_dir_all(&dir)?;
 
     rec.param("budget_bytes", J::u(BUDGET_BYTES));
     rec.param("posting_bytes", J::u(POSTING_BYTES as u64));
-    rec.param("fields", J::u(FIELDS.len() as u64));
+    rec.param("fields", J::u(ATTRS.len() as u64));
     rec.param(
         "field_cardinality",
         J::O(
-            FIELDS
+            ATTRS
                 .iter()
                 .map(|(f, c)| ((*f).to_string(), J::u(*c as u64)))
                 .collect(),
         ),
     );
 
-    let row = |lines: u64, b: &Built| -> J {
+    let row = |rows: u64, b: &Built| -> J {
         jobj! {
-            "lines" => J::u(lines),
+            "rows" => J::u(rows),
             "keys" => J::u(b.keys),
             "postings" => J::u(b.postings),
             "file_bytes" => J::u(b.file_bytes),
             "index_bytes" => J::u(b.index_bytes),
             "index_bytes_per_key" => J::fp(b.index_bytes as f64 / b.keys.max(1) as f64, 2),
-            "file_bytes_per_line" => J::fp(b.file_bytes as f64 / lines.max(1) as f64, 3),
+            "file_bytes_per_line" => J::fp(b.file_bytes as f64 / rows.max(1) as f64, 3),
             "file_bytes_per_posting" => J::fp(b.file_bytes as f64 / b.postings.max(1) as f64, 3),
             "payload_bytes" => J::u(b.payload_bytes),
             "overhead_over_payload" => J::fp(b.file_bytes as f64 / b.payload_bytes.max(1) as f64, 3),
@@ -501,22 +502,22 @@ fn budget(profile: Profile) -> std::io::Result<Record> {
 
     let mut term_rows = Vec::new();
     let mut term_bytes: Vec<u64> = Vec::new();
-    for lines in &scales {
+    for rows in &scales {
         // Not interleaved, and it does not need to be: a file length does not
         // drift with the machine, which is the one exemption CLAUDE.md grants
         // from measuring two arms in a single process.
-        let path = dir.join(format!("day-{lines}.supdb"));
-        let t = build_day(&path, *lines, 0x5109_5ed0 ^ lines)?;
-        term_rows.push(row(*lines, &t));
+        let path = dir.join(format!("index-{rows}.supdb"));
+        let t = build_index(&path, *rows, 0x5109_5ed0 ^ rows)?;
+        term_rows.push(row(*rows, &t));
         term_bytes.push(t.file_bytes);
         let _ = std::fs::remove_file(&path);
     }
     rec.series("term_order", J::arr(term_rows));
 
     // Measured, not fitted. `ext-sweep` learned this the expensive way: a
-    // straight line through a scan sweep put its intercept above the measured
+    // straight row through a scan sweep put its intercept above the measured
     // one-entry cost, and both coefficients were wrong in the same direction.
-    // So the marginal byte cost of a line is a difference quotient between
+    // So the marginal byte cost of a row is a difference quotient between
     // adjacent measured points, and the fixed cost is what is left of the
     // largest measured point once the marginal is taken out of it.
     let marginal = |i: usize, j: usize| -> f64 {
@@ -534,13 +535,13 @@ fn budget(profile: Profile) -> std::io::Result<Record> {
     let top = marginal(last - 1, last);
     let bottom = marginal(0, 1);
     let fixed = (term_bytes[last] as f64 - top * scales[last] as f64).max(0.0);
-    let lines_at_budget = if top > 0.0 {
+    let rows_at_budget = if top > 0.0 {
         ((BUDGET_BYTES as f64 - fixed) / top).max(0.0) as u64
     } else {
         0
     };
-    let shards_for_10m = if lines_at_budget > 0 {
-        (10_000_000f64 / lines_at_budget as f64).ceil() as u64
+    let shards_for_10m = if rows_at_budget > 0 {
+        (10_000_000f64 / rows_at_budget as f64).ceil() as u64
     } else {
         0
     };
@@ -551,13 +552,13 @@ fn budget(profile: Profile) -> std::io::Result<Record> {
             "marginal_bytes_per_line_top" => J::fp(top, 3),
             "marginal_bytes_per_line_bottom" => J::fp(bottom, 3),
             "fixed_bytes" => J::fp(fixed, 0),
-            "lines_at_budget" => J::u(lines_at_budget),
+            "rows_at_budget" => J::u(rows_at_budget),
             "shards_for_a_10m_line_day" => J::u(shards_for_10m),
         },
     );
 
-    // W1.1 -- can a day's size be predicted from its line count at all? If the
-    // marginal cost of a line moves with the size of the day, then the
+    // W1.1 -- can an index's size be predicted from its row count at all? If the
+    // marginal cost of a row moves with the size of the index, then the
     // extrapolation under W1.2 is not arithmetic, it is a guess.
     let drift = if bottom > 0.0 {
         (top - bottom).abs() / bottom
@@ -566,30 +567,30 @@ fn budget(profile: Profile) -> std::io::Result<Record> {
     };
     rec.finding(Finding::new(
         "W1.1",
-        "the marginal cost of a log line does not grow with the size of the day, so a day index's size can be predicted from its line count",
+        "the marginal cost of a row does not grow with the size of the index, so an index's size can be predicted from its row count",
         drift <= 0.20,
         format!(
-            "{bottom:.2} B/line between {} and {} lines against {top:.2} B/line between {} and {} \
+            "{bottom:.2} B/row between {} and {} rows against {top:.2} B/row between {} and {} \
              ({:.1}% apart), over a fixed cost of {fixed:.0} bytes. The postings dominate and \
-             there is one per line per indexed field; the key count is bounded by the field \
+             there is one per row per attribute; the key count is bounded by the attribute \
              cardinalities, so it lands in the fixed term rather than the marginal one",
             scales[0], scales[1], scales[last - 1], scales[last], drift * 100.0
         ),
     ));
 
-    // W1.2 -- the decision R2.2 turns on, stated as a line count so that it can
-    // be checked against a real day rather than argued about. Half a million,
+    // W1.2 -- the decision R2.2 turns on, stated as a row count so that it can
+    // be checked against a real index rather than argued about. Half a million,
     // deliberately below the measured ceiling: a threshold set at the measured
     // value tests the arithmetic rather than the engine.
     rec.finding(Finding::new(
         "W1.2",
-        "a day of 500,000 log lines at seven indexed fields fits in a 32 MB browser download budget, so a browser can hold a whole day and the reader API needs no asynchronous shape change",
-        lines_at_budget >= 500_000,
+        "an index of 500,000 rows over seven attributes fits in a 32 MB browser download budget, so a browser can hold a whole object and the reader API needs no asynchronous shape change",
+        rows_at_budget >= 500_000,
         format!(
-            "{top:.2} B/line over {fixed:.0} fixed puts the 32 MB budget at {lines_at_budget} \
-             lines/day. A busier day is sharded rather than downloaded: at this rate a 10M-line \
-             day is {shards_for_10m} objects, each independently under budget and each skippable \
-             by a query with a time range. This is what makes R2.2(a) -- an OPFS synchronous \
+            "{top:.2} B/row over {fixed:.0} fixed puts the 32 MB budget at {rows_at_budget} \
+             rows. A larger one is sharded rather than downloaded: at this rate 10M rows is \
+             {shards_for_10m} objects, each independently under budget and each skippable \
+             by a query that can exclude it. This is what makes R2.2(a) -- an OPFS synchronous \
              access handle over one downloaded object -- viable, and it is why the reader in \
              `blob.rs` stays synchronous"
         ),
@@ -600,17 +601,17 @@ fn budget(profile: Profile) -> std::io::Result<Record> {
 
 // ---------------------------------------------------------------- fixture --
 
-/// Write the day index the browser test opens, and the answers it must give.
+/// Write the wide index the browser test opens, and the answers it must give.
 ///
 /// The answers come from the *native* reader over the same file. So the
 /// browser test is a differential test across the wasm boundary and an OPFS
 /// handle, against a chain `tests/blob.rs` already pins to what was written.
 /// A browser test whose expectations were hand-written would only ever
 /// confirm what its author already believed.
-fn fixture(dir: &Path, lines: u64) -> std::io::Result<()> {
+fn fixture(dir: &Path, rows: u64) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let path = dir.join("day.supdb");
-    let built = build_day(&path, lines, 0x5109_5ed0)?;
+    let path = dir.join("wide.supdb");
+    let built = build_index(&path, rows, 0x5109_5ed0)?;
     let blob = Blob::open(MmapBytes::open(&path)?)?;
 
     // Keys spread across the dictionary and across run lengths: the head of a
@@ -677,10 +678,10 @@ fn fixture(dir: &Path, lines: u64) -> std::io::Result<()> {
         })
         .ok_or_else(|| std::io::Error::other("no probe key suits the corruption regression"))?;
 
-    let from = FIELDS[3].0;
-    let mut rows = Vec::new();
+    let from = ATTRS[3].0;
+    let mut table = Vec::new();
     blob.scan_counts(from.as_bytes(), 12, |k, n| {
-        rows.push(jobj! {
+        table.push(jobj! {
             "key" => J::s(String::from_utf8_lossy(k).into_owned()),
             "count" => J::u(n),
         });
@@ -733,7 +734,7 @@ fn fixture(dir: &Path, lines: u64) -> std::io::Result<()> {
                 .map(|k| k.to_vec())
                 .unwrap_or_default()
         };
-        let field = FIELDS[1].0;
+        let field = ATTRS[1].0;
         let ranges: Vec<(Vec<u8>, Option<Vec<u8>>)> = vec![
             (
                 format!("{field}=").into_bytes(),
@@ -745,10 +746,10 @@ fn fixture(dir: &Path, lines: u64) -> std::io::Result<()> {
         let mut out = Vec::new();
         for (lo, hi) in &ranges {
             let hi_ref = hi.as_deref();
-            let mut rows = Vec::new();
+            let mut table = Vec::new();
             let mut walked: Vec<(Vec<u8>, u64)> = Vec::new();
             sp.dictionary_counts(lo, hi_ref, |k, c| {
-                rows.push(jobj! {
+                table.push(jobj! {
                     "key" => J::s(String::from_utf8_lossy(k).into_owned()),
                     "count" => J::u(c),
                 });
@@ -776,7 +777,7 @@ fn fixture(dir: &Path, lines: u64) -> std::io::Result<()> {
                     Some(h) => J::s(String::from_utf8_lossy(h).into_owned()),
                     None => J::Null,
                 },
-                "rows" => J::arr(rows),
+                "rows" => J::arr(table),
                 "plan_fetch_bytes" => J::u(new_bytes(&plan)),
             });
         }
@@ -803,7 +804,7 @@ fn fixture(dir: &Path, lines: u64) -> std::io::Result<()> {
     };
 
     let doc = jobj! {
-        "lines" => J::u(lines),
+        "rows" => J::u(rows),
         "file_bytes" => J::u(built.file_bytes),
         "keys" => J::u(blob.keys() as u64),
         "index_bytes" => J::u(blob.index_bytes() as u64),
@@ -814,7 +815,7 @@ fn fixture(dir: &Path, lines: u64) -> std::io::Result<()> {
         "scan" => jobj! {
             "from" => J::s(from),
             "limit" => J::u(12),
-            "rows" => J::arr(rows),
+            "rows" => J::arr(table),
         },
         "binary_key" => jobj! {
             "bytes" => J::arr(BINARY_KEY.iter().map(|b| J::u(*b as u64)).collect()),
@@ -852,16 +853,16 @@ fn fixture(dir: &Path, lines: u64) -> std::io::Result<()> {
 /// surface, none of supdb.
 #[allow(clippy::too_many_arguments)]
 fn bundle(profile: Profile, wasm: u64, wasm_gz: u64, floor: u64, floor_gz: u64) -> Record {
-    // R3.3. logshed's whole current client is 32 KB raw and 12 KB gzipped,
-    // and that is the calibration the requirement asks for rather than the
-    // budget. 64 KB gzipped, because:
+    // R3.3. A browser client that reads one of these indexes is around 32 KB
+    // raw and 12 KB gzipped, and that is the calibration the requirement asks
+    // for rather than the budget. 64 KB gzipped, because:
     //
     //   * it is one round trip on any connection, and it is immutable and
     //     cached, so it is paid once per deploy rather than once per query;
     //   * it is 0.2% of the 32 MB index budget it exists to read, so a
     //     library that had to be twice this size to halve a download would
     //     still be worth it;
-    //   * it is five times logshed's client, and the first 12 KB of it is the
+    //   * it is five times such a client, and the first 12 KB of it is the
     //     Rust standard library's floor, which no amount of work on this side
     //     removes. Budgeting under that would be budgeting against Rust.
     const BUDGET_GZ: u64 = 64 << 10;
@@ -877,7 +878,7 @@ fn bundle(profile: Profile, wasm: u64, wasm_gz: u64, floor: u64, floor_gz: u64) 
     let marginal_gz = wasm_gz.saturating_sub(floor_gz);
     rec.param("budget_gzip_bytes", J::u(BUDGET_GZ));
     rec.param("marginal_budget_gzip_bytes", J::u(MARGINAL_BUDGET_GZ));
-    rec.param("logshed_client_gzip_bytes", J::u(12 << 10));
+    rec.param("client_gzip_bytes", J::u(12 << 10));
     rec.series(
         "sizes",
         jobj! {
@@ -927,7 +928,7 @@ fn bundle(profile: Profile, wasm: u64, wasm_gz: u64, floor: u64, floor_gz: u64) 
 
 // ------------------------------------------------------------------ dict --
 
-/// R6.3, measured on the shape it is for: the day index's wide dictionary,
+/// R6.3, measured on the shape it is for: the wide index's wide dictionary,
 /// read by range through `SparseBlob` against the whole-index open the
 /// browser did before. Byte counts, page-rounded the way `cache.mjs`
 /// fetches, plus one timing with a bound rather than a comparison.
@@ -937,16 +938,16 @@ fn dict(profile: Profile) -> std::io::Result<Record> {
     use supdb::SparseBlob;
 
     let mut rec = Record::new("w5-dict", profile);
-    let dir = std::env::temp_dir().join("supdb-logshed-dict");
+    let dir = std::env::temp_dir().join("supdb-browser-dict");
     std::fs::create_dir_all(&dir)?;
-    let day_lines: u64 = profile.pick(20_000, 100_000, 250_000);
-    rec.param("day_lines", J::u(day_lines));
+    let rows: u64 = profile.pick(20_000, 100_000, 250_000);
+    rec.param("rows", J::u(rows));
     rec.param("page_bytes", J::u(64 << 10));
     rec.param("small_page_bytes", J::u(16 << 10));
     rec.note("predictions registered in dict-plan.md before the run");
 
-    let path = dir.join("day.supdb");
-    let built = build_day(&path, day_lines, 0x5109_5ed0)?;
+    let path = dir.join("wide.supdb");
+    let built = build_index(&path, rows, 0x5109_5ed0)?;
     let file_bytes = built.file_bytes;
     let data = std::fs::read(&path)?;
     let whole = Blob::open(MmapBytes::open(&path)?)?;
@@ -973,6 +974,9 @@ fn dict(profile: Profile) -> std::io::Result<Record> {
         open_exact: bool,
         rows: Vec<J>,
         all_exact: bool,
+        /// Which ranges missed, and how. A finding whose evidence reads the
+        /// same whether it passed or failed cannot be acted on.
+        why: Vec<String>,
         proportional_2: bool,
         proportional_4: bool,
         worst_2: f64,
@@ -1006,7 +1010,7 @@ fn dict(profile: Profile) -> std::io::Result<Record> {
                 .map(|k| k.to_vec())
                 .unwrap_or_default()
         };
-        let mut ranges: Vec<(String, Vec<u8>, Option<Vec<u8>>)> = FIELDS
+        let mut ranges: Vec<(String, Vec<u8>, Option<Vec<u8>>)> = ATTRS
             .iter()
             .map(|(f, _)| {
                 (
@@ -1030,6 +1034,7 @@ fn dict(profile: Profile) -> std::io::Result<Record> {
             open_exact,
             rows: Vec::new(),
             all_exact: open_exact,
+            why: Vec::new(),
             proportional_2: true,
             proportional_4: true,
             worst_2: 0.0,
@@ -1051,7 +1056,29 @@ fn dict(profile: Profile) -> std::io::Result<Record> {
             })?;
             let read = touched(&log);
             let both: Vec<(u64, u64)> = p1.iter().chain(p2.iter()).copied().collect();
-            let exact = after_plans == merge_ranges(&p1) && read == merge_ranges(&both);
+            // Containment, not equality. A plan is a promise that fetching it
+            // is *sufficient* -- a browser that fetched it can answer without
+            // going back -- so the property to hold is that no read falls
+            // outside the plan. Reading less than planned is the reader being
+            // better than its promise, and it happens routinely: a plan names
+            // a whole 16 KiB checksum piece, and if the open already made that
+            // piece resident the walk touches only the bytes it needs.
+            // Equality also asserts the plan is *tight*, which is a different
+            // property and is the one W5.2 and W5.6 measure. Holding both here
+            // made this finding depend on whether the open happened to cover
+            // the pieces a range names -- a property of the fixture's size,
+            // not of the reader.
+            let within = |got: &[(u64, u64)], plan: &[(u64, u64)]| -> bool {
+                let plan = merge_ranges(plan);
+                got.iter().all(|(o, l)| {
+                    plan.iter()
+                        .any(|(po, pl)| *o >= *po && o.saturating_add(*l) <= po.saturating_add(*pl))
+                })
+            };
+            let exact = within(&after_plans, &p1)
+                && within(&read, &both)
+                && !p1.is_empty()
+                && !p2.is_empty();
             let mut want: Vec<(Vec<u8>, u64)> = Vec::new();
             whole.scan_counts(lo, usize::MAX, |k, c| {
                 if hi_ref.is_some_and(|h| k >= h) {
@@ -1061,6 +1088,20 @@ fn dict(profile: Profile) -> std::io::Result<Record> {
                 true
             })?;
             let agrees = walked == want;
+            if !exact || !agrees {
+                pass.why.push(format!(
+                    "{name}: plans {} rows {} (walked {} of {}); p1 {:?} after_plans {:?}; \
+                     both {:?} read {:?}",
+                    if exact { "exact" } else { "MISMATCH" },
+                    if agrees { "agree" } else { "DIFFER" },
+                    walked.len(),
+                    want.len(),
+                    merge_ranges(&p1),
+                    after_plans,
+                    merge_ranges(&both),
+                    read
+                ));
+            }
             pass.all_exact &= exact && agrees;
             let plan_paged = paged_bytes(&both, file_bytes, page);
             let plan_bytes = range_bytes(&merge_ranges(&both));
@@ -1090,7 +1131,7 @@ fn dict(profile: Profile) -> std::io::Result<Record> {
     // decodes records out of the lent span. A bound, not a comparison, so
     // the median of a few repetitions is what is recorded.
     let lending = SparseBlob::open(MmapBytes::open(&path)?)?;
-    let (f, _) = FIELDS[3];
+    let (f, _) = ATTRS[3];
     let (flo, fhi) = (format!("{f}=").into_bytes(), format!("{f}>").into_bytes());
     let mut per_key = Vec::new();
     let mut field_keys = 0u64;
@@ -1163,13 +1204,16 @@ fn dict(profile: Profile) -> std::io::Result<Record> {
     ));
     rec.finding(Finding::new(
         "W5.3",
-        "every range's walk reads exactly its two plans and agrees with the whole reader",
+        "every range's walk reads inside its two plans and nowhere else, and agrees with the whole reader",
         big.all_exact && small.all_exact,
         format!(
             "{} ranges at each page size: each field of the schema, ten keys from the middle \
              and the tail; the directory slice was read by the second plan alone, the walk read \
-             both plans and nothing else, and every row matched scan_counts over the whole index",
-            big.ranges
+             inside both plans and nowhere outside them, and every row matched scan_counts \
+             over the whole index. Misses: 64 KiB {}; 16 KiB {}",
+            big.ranges,
+            if big.why.is_empty() { "none".to_string() } else { big.why.join("; ") },
+            if small.why.is_empty() { "none".to_string() } else { small.why.join("; ") }
         ),
     ));
     rec.finding(Finding::new(
@@ -1271,6 +1315,11 @@ struct Planned {
     file_bytes: u64,
     disjoint_ranges: usize,
     widest_plan: u64,
+    /// How many probes planned a fetch, and how many planned nothing because
+    /// their run is inline in the index record. Both must be non-zero for the
+    /// probe set to have exercised both read paths.
+    block_probes: usize,
+    inline_probes: usize,
 }
 
 /// Open a store over a recording source and hold every probe's plan against
@@ -1301,6 +1350,8 @@ fn plan_shape(path: &Path, ranks: &[usize]) -> std::io::Result<Planned> {
     let mut exact = true;
     let mut why: Vec<String> = Vec::new();
     let mut widest_plan = 0u64;
+    let mut block_probes = 0usize;
+    let mut inline_probes = 0usize;
     for key in &keys {
         let plan = blob.ranges_for(key)?;
         let _ = touched(&log); // planning reads nothing; discard to be sure
@@ -1312,7 +1363,22 @@ fn plan_shape(path: &Path, ranks: &[usize]) -> std::io::Result<Planned> {
         // all, since format v5 put a record count in every extent. This
         // check was `plan == counted`, which held only while a count walked
         // the values, and went quietly false when it stopped needing to.
-        let ok = plan == read && counted.is_empty() && !plan.is_empty();
+        // Exactness is `plan == read`, and a count touches nothing since
+        // format v5 put a record count in every extent. An *empty* plan is a
+        // correct answer, not a miss: a run short enough to live inline in
+        // its index record is answered from sections already resident, which
+        // is what W6.6 is about. This clause used to require a non-empty
+        // plan, which quietly made the finding depend on where the attribute
+        // names happened to sort -- move a probe onto a tail key and correct
+        // behaviour was reported as a miss. The defence that clause was
+        // providing, against a reader that plans nothing for everything, is
+        // real, so it moves below to the probe set where it belongs.
+        if plan.is_empty() {
+            inline_probes += 1;
+        } else {
+            block_probes += 1;
+        }
+        let ok = plan == read && counted.is_empty();
         if !ok {
             why.push(format!(
                 "{}: plan {:?} read {:?} counted {:?}",
@@ -1357,6 +1423,8 @@ fn plan_shape(path: &Path, ranks: &[usize]) -> std::io::Result<Planned> {
         file_bytes,
         disjoint_ranges: many.len(),
         widest_plan,
+        block_probes,
+        inline_probes,
     })
 }
 
@@ -1366,21 +1434,21 @@ fn plan_shape(path: &Path, ranks: &[usize]) -> std::io::Result<Planned> {
 /// does not need interleaving and is safe to run beside anything.
 fn ranges(profile: Profile) -> std::io::Result<Record> {
     let mut rec = Record::new("w4-ranges", profile);
-    let dir = std::env::temp_dir().join("supdb-logshed-ranges");
+    let dir = std::env::temp_dir().join("supdb-browser-ranges");
     std::fs::create_dir_all(&dir)?;
 
-    // Both shapes this library serves. The day index has a wide dictionary
+    // Both shapes this library serves. The wide index has a wide dictionary
     // and Zipf-headed posting lists; the segment has ~100 keys over a data
-    // region that grows with traffic, which is the shape logshed actually
-    // rolls and the one where sparse fetching pays.
-    let day_lines: u64 = profile.pick(20_000, 100_000, 250_000);
+    // region that grows with the rows, which is the shape a roll actually
+    // writes and the one where sparse fetching pays.
+    let rows: u64 = profile.pick(20_000, 100_000, 250_000);
     let seg_events: u64 = profile.pick(12_000, 50_000, 120_000);
-    rec.param("day_lines", J::u(day_lines));
+    rec.param("rows", J::u(rows));
     rec.param("segment_events", J::u(seg_events));
 
-    let day_path = dir.join("day.supdb");
-    build_day(&day_path, day_lines, 0x5109_5ed0)?;
-    let day = plan_shape(&day_path, &[0, 1, 7, 64, 512, 2048, usize::MAX])?;
+    let wide_path = dir.join("wide.supdb");
+    build_index(&wide_path, rows, 0x5109_5ed0)?;
+    let wide = plan_shape(&wide_path, &[0, 1, 7, 64, 512, 2048, usize::MAX])?;
 
     let seg_path = dir.join("segment.supdb");
     build_segment(&seg_path, seg_events)?;
@@ -1400,32 +1468,45 @@ fn ranges(profile: Profile) -> std::io::Result<Record> {
                 J::fp((p.open_bytes + p.plan_bytes) as f64 / p.file_bytes as f64, 4),
         }
     };
-    rec.series("day", row(&day));
+    rec.series("wide", row(&wide));
     rec.series("segment", row(&seg));
 
     // W4.1 -- the property the design rests on, so it is asserted with the
-    // reads themselves rather than argued. Non-vacuity is checked alongside:
-    // plans are non-empty for present keys, at least one plan spans blocks,
-    // and the probe set's shared plan is not one contiguous range.
+    // reads themselves rather than argued. Non-vacuity is checked alongside,
+    // and at the probe set rather than per key: a reader that planned nothing
+    // for everything would satisfy `plan == read` trivially, so each shape's
+    // probes must include at least one that plans a fetch. Requiring it of
+    // *every* probe, which is what this used to do, made the finding depend
+    // on where the attribute names sorted -- an inline run correctly plans
+    // nothing. Both paths being present is the stronger property and is now
+    // what is asserted. Also: at least one plan spans blocks, and the shared
+    // plan is not one contiguous range.
     let spans_blocks = seg.widest_plan > 64 << 10;
-    let disjoint = day.disjoint_ranges >= 2 && seg.disjoint_ranges >= 2;
+    let disjoint = wide.disjoint_ranges >= 2 && seg.disjoint_ranges >= 2;
+    let both_paths = wide.block_probes >= 1 && seg.block_probes >= 1;
     rec.finding(Finding::new(
         "W4.1",
         "the byte ranges `ranges_for` reports for a key are exactly the ranges a subsequent read touches, on both index shapes, through recorded reads",
-        day.exact && seg.exact && spans_blocks && disjoint,
+        wide.exact && seg.exact && spans_blocks && disjoint && both_paths,
         format!(
-            "{} day probes and {} segment probes: every `read_all` and `count` must touch \
+            "{} wide probes and {} segment probes: every `read_all` and `count` must touch \
              exactly its plan, an absent key plan and read nothing, and the shared plan \
              for each probe set equal the union of its reads ({} and {} disjoint ranges; \
-             widest single plan {} bytes, so runs span blocks). The granularity is the \
+             widest single plan {} bytes, so runs span blocks). {} of {} wide probes and \
+             {} of {} segment probes plan a fetch, the rest answer from an inline run with \
+             no fetch at all, so both read paths are exercised. The granularity is the \
              stored block, because that is what the read path fetches per extent. Misses: \
-             day {}; segment {}",
-            day.probes,
+             wide {}; segment {}",
+            wide.probes,
             seg.probes,
-            day.disjoint_ranges,
+            wide.disjoint_ranges,
             seg.disjoint_ranges,
             seg.widest_plan,
-            if day.why.is_empty() { "none".to_string() } else { day.why.join("; ") },
+            wide.block_probes,
+            wide.block_probes + wide.inline_probes,
+            seg.block_probes,
+            seg.block_probes + seg.inline_probes,
+            if wide.why.is_empty() { "none".to_string() } else { wide.why.join("; ") },
             if seg.why.is_empty() { "none".to_string() } else { seg.why.join("; ") }
         ),
     ));
@@ -1465,7 +1546,7 @@ fn ranges(profile: Profile) -> std::io::Result<Record> {
             "{fixed_reads} source reads across {} extent-counted probes and a \
              {seg_keys}-key dictionary scan, against {} bytes the walked count of the same \
              probes reads. This is W2.2's 27x and W2.4's 283x carried to the network axis: \
-             what was a cache-line saving native becomes bytes never fetched",
+             what was a cache-row saving native becomes bytes never fetched",
             seg.probes, seg.plan_bytes
         ),
     ));
@@ -1475,14 +1556,14 @@ fn ranges(profile: Profile) -> std::io::Result<Record> {
     // cheap exactly while key cardinality is bounded; a trigram or free-text
     // index would break it, and that expiry is written where the premise is.
     let fraction = (seg.open_bytes + seg.plan_bytes) as f64 / seg.file_bytes as f64;
-    let day_fraction = (day.open_bytes + day.plan_bytes) as f64 / day.file_bytes as f64;
+    let wide_fraction = (wide.open_bytes + wide.plan_bytes) as f64 / wide.file_bytes as f64;
     rec.finding(Finding::new(
         "W4.3",
         "opening a segment index and answering its probe set out of a cold cache needs less than half the object; the rest is never fetched",
         fraction <= 0.5,
         format!(
             "open reads {} bytes (superblock probe, key index, block table) and \
-             the probe set plans {} more, {:.1}% of a {}-byte object; the day shape reads \
+             the probe set plans {} more, {:.1}% of a {}-byte object; the wide shape reads \
              {:.1}% of {} bytes. The resident sections are small because the dictionary is \
              bounded by field cardinality -- ~{} keys however large the segment -- which is \
              the premise, and its expiry condition: an index with unbounded keys (trigram, \
@@ -1492,8 +1573,8 @@ fn ranges(profile: Profile) -> std::io::Result<Record> {
             seg.plan_bytes,
             fraction * 100.0,
             seg.file_bytes,
-            day_fraction * 100.0,
-            day.file_bytes,
+            wide_fraction * 100.0,
+            wide.file_bytes,
             seg_keys
         ),
     ));
@@ -1514,23 +1595,21 @@ fn main() -> std::io::Result<()> {
     let cmd = argv.get(1).map(|s| s.as_str()).unwrap_or("help");
     match cmd {
         "build" => {
-            let path = PathBuf::from(arg("--path").unwrap_or_else(|| "day.supdb".into()));
-            let lines: u64 = arg("--lines")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(20_000);
-            let b = build_day(&path, lines, 0x5109_5ed0)?;
+            let path = PathBuf::from(arg("--path").unwrap_or_else(|| "wide.supdb".into()));
+            let rows: u64 = arg("--rows").and_then(|v| v.parse().ok()).unwrap_or(20_000);
+            let b = build_index(&path, rows, 0x5109_5ed0)?;
             println!(
                 "{}",
                 jobj! {
                     "path" => J::s(path.display().to_string()),
                     "blocks" => J::u(b.blocks),
                     "payload_bytes" => J::u(b.payload_bytes),
-                    "lines" => J::u(lines),
+                    "rows" => J::u(rows),
                     "keys" => J::u(b.keys),
                     "postings" => J::u(b.postings),
                     "file_bytes" => J::u(b.file_bytes),
                     "index_bytes" => J::u(b.index_bytes),
-                    "file_bytes_per_line" => J::fp(b.file_bytes as f64 / lines.max(1) as f64, 3),
+                    "file_bytes_per_line" => J::fp(b.file_bytes as f64 / rows.max(1) as f64, 3),
                 }
                 .render()
             );
@@ -1538,10 +1617,8 @@ fn main() -> std::io::Result<()> {
         }
         "fixture" => {
             let dir = PathBuf::from(arg("--dir").unwrap_or_else(|| "web/test/out".into()));
-            let lines: u64 = arg("--lines")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(20_000);
-            fixture(&dir, lines)
+            let rows: u64 = arg("--rows").and_then(|v| v.parse().ok()).unwrap_or(20_000);
+            fixture(&dir, rows)
         }
         "segment" => {
             let dir = PathBuf::from(arg("--dir").unwrap_or_else(|| "web/test/out".into()));
@@ -1624,12 +1701,12 @@ fn main() -> std::io::Result<()> {
         }
         _ => {
             eprintln!(
-                "logshed build   --path P --lines N\n\
-                 logshed budget  --profile ci|dev|full [--out results]\n\
-                 logshed fixture --dir web/test/out [--lines N]\n\
-                 logshed segment --dir web/test/out [--events N]\n\
-                 logshed ranges  --profile ci|dev|full [--out results]\n\
-                 logshed bundle  --profile P --wasm-bytes N --wasm-gzip N \
+                "browser build   --path P --rows N\n\
+                 browser budget  --profile ci|dev|full [--out results]\n\
+                 browser fixture --dir web/test/out [--rows N]\n\
+                 browser segment --dir web/test/out [--events N]\n\
+                 browser ranges  --profile ci|dev|full [--out results]\n\
+                 browser bundle  --profile P --wasm-bytes N --wasm-gzip N \
                  --floor-bytes N --floor-gzip N"
             );
             std::process::exit(2)
@@ -1783,17 +1860,17 @@ fn cold_search(
     })
 }
 
-/// w6: dependent round trips on a cold open and search, on the day fixture
+/// w6: dependent round trips on a cold open and search, on the wide fixture
 /// written three ways -- by `Store`, by `SegmentWriter`, and by
 /// `SegmentWriter` with a 128 KiB head reserve -- with and without the
-/// directory resident, through a host that fetches 16 KiB pages. R7 of
-/// logshed's requirements; predictions in waves-plan.md.
+/// directory resident, through a host that fetches 16 KiB pages. R7;
+/// predictions in waves-plan.md.
 fn waves(profile: Profile) -> std::io::Result<Record> {
-    let day_lines: u64 = profile.pick(20_000, 100_000, 250_000);
+    let rows: u64 = profile.pick(20_000, 100_000, 250_000);
     let page: u64 = 16 << 10;
     let reserve: usize = 128 << 10;
     let mut rec = Record::new("w6-waves", profile);
-    rec.param("day_lines", J::u(day_lines));
+    rec.param("rows", J::u(rows));
     rec.param("page_bytes", J::u(page));
     rec.param("head_reserve_bytes", J::u(reserve as u64));
     rec.param("inline_bytes", J::u(256));
@@ -1810,17 +1887,9 @@ fn waves(profile: Profile) -> std::io::Result<Record> {
     let store_path = dir.join("store.supdb");
     let seg_path = dir.join("segment.supdb");
     let res_path = dir.join("reserve.supdb");
-    let built = build_day(&store_path, day_lines, 0x5109_5ed0)?;
-    let seg_bytes = build_day_segment(&seg_path, day_lines, 0x5109_5ed0, 256, 0, false, false)?;
-    let res_bytes = build_day_segment(
-        &res_path,
-        day_lines,
-        0x5109_5ed0,
-        256,
-        reserve,
-        false,
-        false,
-    )?;
+    let built = build_index(&store_path, rows, 0x5109_5ed0)?;
+    let seg_bytes = build_index_segment(&seg_path, rows, 0x5109_5ed0, 256, 0, false, false)?;
+    let res_bytes = build_index_segment(&res_path, rows, 0x5109_5ed0, 256, reserve, false, false)?;
     // R7.4: the same segment with its blocks compressed. Inline runs live in
     // the key section and are untouched, so this is the block bytes alone.
     // Both arms of the size comparison store deltas, so compression is the
@@ -1828,19 +1897,12 @@ fn waves(profile: Profile) -> std::io::Result<Record> {
     // shapes use and what the other findings are measured on.
     let dz_path = dir.join("delta.supdb");
     let dzc_path = dir.join("delta-compressed.supdb");
-    let dz_bytes = build_day_segment(&dz_path, day_lines, 0x5109_5ed0, 256, reserve, false, true)?;
-    let zip_bytes = build_day_segment(&dzc_path, day_lines, 0x5109_5ed0, 256, reserve, true, true)?;
-    // The same day's ordinals compressed, to show what encoding is worth.
+    let dz_bytes = build_index_segment(&dz_path, rows, 0x5109_5ed0, 256, reserve, false, true)?;
+    let zip_bytes = build_index_segment(&dzc_path, rows, 0x5109_5ed0, 256, reserve, true, true)?;
+    // The same ordinals compressed, to show what encoding is worth.
     let ord_zip_path = dir.join("ordinal-compressed.supdb");
-    let ord_zip_bytes = build_day_segment(
-        &ord_zip_path,
-        day_lines,
-        0x5109_5ed0,
-        256,
-        reserve,
-        true,
-        false,
-    )?;
+    let ord_zip_bytes =
+        build_index_segment(&ord_zip_path, rows, 0x5109_5ed0, 256, reserve, true, false)?;
 
     // The probe keys, out of the whole reader over the store: the rarest
     // term with at least one posting and the commonest.
@@ -2022,16 +2084,37 @@ fn waves(profile: Profile) -> std::io::Result<Record> {
         ),
     ));
     let sr = get("store", false, "rare");
-    rec.finding(Finding::new(
-        "W6.5",
-        "a rare key's postings wave reads at most two chunks from the store's block",
-        sr.postings_waves == 1 && sr.postings_bytes <= 2 * page,
-        format!(
-            "{} postings in {} wave of {} bytes (page-rounded) for the store shape; the read is \
-             the 4 KiB chunks the run spans, not the block it shares",
-            sr.postings, sr.postings_waves, sr.postings_bytes
-        ),
-    ));
+    // Rule 3. This claim is about what a postings wave *costs* when one is
+    // needed, so a shape whose rare key needs no wave at all has not tested
+    // it -- reporting that as a pass would be a green for a path nothing
+    // took, and reporting it as a failure would blame the engine for being
+    // better than the claim. The old condition required exactly one wave,
+    // which quietly made this depend on whether the fixture happened to put
+    // the rare key's run in a block.
+    let w65 = "a rare key's postings wave reads at most two chunks from the store's block";
+    rec.finding(if sr.postings_waves == 0 {
+        Finding::not_exercised(
+            "W6.5",
+            w65,
+            format!(
+                "the store shape's rare key needed no postings wave at this size ({} postings, \
+                 0 bytes after the lookup), so there was no wave to price. W6.6 is the claim \
+                 for that outcome; this one wants a block-backed run",
+                sr.postings
+            ),
+        )
+    } else {
+        Finding::new(
+            "W6.5",
+            w65,
+            sr.postings_bytes <= 2 * page,
+            format!(
+                "{} postings in {} wave of {} bytes (page-rounded) for the store shape; the \
+                 read is the 4 KiB chunks the run spans, not the block it shares",
+                sr.postings, sr.postings_waves, sr.postings_bytes
+            ),
+        )
+    });
     let gr = get("segment", false, "rare");
     rec.finding(Finding::new(
         "W6.6",
@@ -2068,7 +2151,7 @@ fn waves(profile: Profile) -> std::io::Result<Record> {
         format!(
             "{} bytes compressed against {} uncompressed ({:.1}% smaller), both arms storing \
              postings as deltas so compression is the only difference; the open is still {} wave \
-             and the common key still reads {} postings. The same day stored as absolute ordinals \
+             and the common key still reads {} postings. The same index stored as absolute ordinals \
              saves {:.1}%, which is the finding under the finding: LZ4 needs repeated bytes and a \
              rising counter has none, so the encoding decides whether compression is worth \
              anything. Inline runs are in the key section and untouched either way \

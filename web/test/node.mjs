@@ -11,7 +11,7 @@
 // the one thing this index may never do. Nothing in the browser suite could
 // have seen it, because the browser suite only walks the happy path.
 //
-// Run after `logshed fixture` has written web/test/out and `web/build.sh`
+// Run after `browser fixture` has written web/test/out and `web/build.sh`
 // (or `cargo build --profile wasm ...`) has written web/supdb.wasm:
 //
 //   node web/test/node.mjs
@@ -87,8 +87,8 @@ async function main() {
   const expected = JSON.parse(
     await readFile(new URL("./out/expected.json", here), "utf8"),
   );
-  const day = new Uint8Array(await fileBytes(new URL("./out/day.supdb", here)));
-  const reader = await openMemory(wasm, day);
+  const wide = new Uint8Array(await fileBytes(new URL("./out/wide.supdb", here)));
+  const reader = await openMemory(wasm, wide);
   eq("keys", reader.keys, expected.keys);
   eq("indexBytes", reader.indexBytes, expected.index_bytes);
   for (const c of expected.lookups) {
@@ -110,7 +110,7 @@ async function main() {
 
   // Keys are bytes. A walk hands back `keyBytes`, which looks up, and
   // `key`, a text rendering that for a key that is not UTF-8 does not:
-  // logshed's equivalence test found `scanCounts` returning names that
+  // The equivalence test found `scanCounts` returning names that
   // could not be looked up, because the only thing returned was the text.
   {
     const bk = new Uint8Array(expected.binary_key.bytes);
@@ -157,7 +157,7 @@ async function main() {
   // error. The coordinates come from the fixture generator, because only the
   // native side knows which byte belongs to which key's extent; the same
   // shape is pinned natively in tests/blob.rs.
-  const dam = day.slice();
+  const dam = wide.slice();
   dam[expected.corrupt.at] ^= 0xff;
   const damaged = await openMemory(wasm, dam);
   eq(

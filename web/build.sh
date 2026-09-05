@@ -7,7 +7,7 @@
 # large or because a Rust cdylib starts out large, and those want different
 # responses. See `web/floor/Cargo.toml`.
 #
-# Writes results/w3-bundle.<profile>.json through `logshed bundle`, so the size
+# Writes results/w3-bundle.<profile>.json through `browser bundle`, so the size
 # record carries its machine and goes through the same gate as everything else.
 #
 #   web/build.sh [profile]     profile defaults to ci
@@ -32,8 +32,8 @@ sz() { wc -c < "$1" | tr -d ' '; }
 cp "$wasm" web/supdb.wasm
 echo "# wrote web/supdb.wasm"
 
-cargo build --release --bin logshed
-./target/release/logshed bundle \
+cargo build --release --bin browser
+./target/release/browser bundle \
   --profile "$profile" \
   --wasm-bytes "$(sz "$wasm")" --wasm-gzip "$(gz "$wasm")" \
   --floor-bytes "$(sz "$floor")" --floor-gzip "$(gz "$floor")"

@@ -33,11 +33,10 @@ the Rust API changed shape.
 
 That is only viable if a day's index can be downloaded whole, so that was
 settled first and with a number: `w1-daysize` measures a day index at 36.14
-bytes per log line over a 580 KB fixed cost, which puts a 32 MB download budget
-at **912,522 log lines per day** at seven indexed fields. Above that, shard the
-day -- logshed already writes one immutable object per sealed period, so a
-10M-line day is eleven objects, each under budget and each skippable by a query
-with a time range.
+bytes per row over a 580 KB fixed cost, which puts a 32 MB download budget
+at **912,522 rows** over seven attributes. Above that, shard: a consumer that
+seals one immutable object per period turns 10M rows into eleven objects, each
+under budget and each skippable by a query that can exclude it.
 
 The cost of OPFS is that sync access handles only exist inside a Web Worker.
 That is why `worker.mjs` exists and why it is not an implementation detail.
@@ -109,8 +108,8 @@ plans nothing. Only runs longer than that reach the data by plan.
 
 **The premise, and when it expires.** All of this splits the object into
 "index and block table, fetched whole at open" and "data, fetched by plan".
-That split costs approximately nothing today because logshed's key
-cardinality is bounded by its field schema -- a real segment is ~100 keys
+That split costs approximately nothing today because key cardinality is
+bounded by the schema -- a real segment is ~100 keys
 and single-digit kilobytes of index over megabytes of postings, so the open
 fetches a few pages and everything after is sparse (`w4-ranges` prices the
 open at under 20 KB of a 31 MB object). It stops being cheap the day the
@@ -143,7 +142,7 @@ The plans are exact, on the recorded reads (`tests/dict.rs` natively over
 135 ranges per index shape, `w5-dict` on the day index, and the browser
 suite over ranged HTTP: three ranges fetch exactly the pages their plans
 name that nothing before made resident). What `w5-dict` also says is that
-at logshed's current dictionary sizes the 64 KiB page is the unit that
+at realistic dictionary sizes the 64 KiB page is the unit that
 matters: the sparse open is 23,808 bytes but four pages, 279,856 against
 the whole open's 869,680 for a 686 KB index (W5.1, recorded as failing
 its 5% prediction; it crosses 5% near 5.6 MB of index), and a 210-key
@@ -168,8 +167,8 @@ records block, offset, byte length and the offset of the last record, and none
 of those is a count, so the general count walks the values -- and walking them
 is *not* cheaper than reading them, which is W2.1 and is recorded as failing.
 A *fixed-width* posting list does not need to walk: its count is arithmetic on
-`Ext::len`, checked against `Ext::last`, with no block touched. logshed's
-postings are four-byte line ordinals, so `countFixed` is the call it makes.
+`Ext::len`, checked against `Ext::last`, with no block touched. A posting list
+of four-byte ordinals is the case `countFixed` exists for.
 
 Before format v5 the same was true of `scanCounts` versus `scanCountsFixed`,
 by a factor of 283: the general form walked every posting in the range. The
@@ -202,7 +201,7 @@ roll through `SegmentWriter`.
 
 A segment's blocks can be compressed (`SegmentWriter::set_compress`),
 chunked so a point read decompresses one chunk. It is worth 19.9% on
-logshed's day when postings are stored as deltas and nothing at all when
+a real index when postings are stored as deltas and nothing at all when
 they are stored as absolute ordinals, because LZ4 needs repeated bytes.
 Runs under 256 bytes are inline in the key section and are never
 compressed, so inlining and compression trade against each other.
@@ -234,7 +233,7 @@ the intersection to 1.15x (EXT.17).
 ## Size
 
 Measured by `build.sh` into `results/w3-bundle.*.json`, against the budget in
-`src/bin/logshed.rs`. There is no binding generator: the ABI is twenty
+`src/bin/browser.rs`. There is no binding generator: the ABI is twenty
 hand-written C functions passing integers and byte ranges, because a
 generator's shim and descriptor sections are exactly what the budget is about.
 R6's planning seam is the first thing to have moved the marginal number --

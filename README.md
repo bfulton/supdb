@@ -15,7 +15,7 @@ src/flatindex.rs   the flat key index the format is built on
 src/bench/         the measurement substrate  -- repetition, significance, latency, I/O accounting
 src/bin/internal   the falsification suite    -- Supdb against itself, as it scales
 src/bin/correctness  the correctness suite    -- damaged files, crash injection
-src/bin/logshed    the browser-reader suite   -- day-index shape, round trips, size budget
+src/bin/browser    the browser-reader suite   -- index shape, round trips, size budget
 bench/external/    the comparison suite       -- Supdb inside other projects' evaluations
 web/               the browser reader, its size budget and its browser test
 results/           committed measurements     -- the source of truth for figures and claims

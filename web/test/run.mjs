@@ -1,6 +1,6 @@
 // The browser test, in the browser.
 //
-// Everything here runs against a real index file written by `logshed build`
+// Everything here runs against a real index file written by `browser build`
 // and a real `FileSystemSyncAccessHandle` -- not a stub, which the
 // requirements are explicit about, and rightly: a stub would test the framing
 // code and nothing about whether the synchronous-read premise of R2.2(a)
@@ -57,8 +57,8 @@ async function main() {
     // is the worker script's rather than this page's.
     const opened = await rpc(worker, "open", {
       wasmUrl: new URL("../supdb.wasm", location.href).href,
-      indexUrl: new URL("./out/day.supdb", location.href).href,
-      name: `day-${source}.supdb`,
+      indexUrl: new URL("./out/wide.supdb", location.href).href,
+      name: `wide-${source}.supdb`,
       source,
     });
     assert(
@@ -138,7 +138,7 @@ async function main() {
 // counts fetch nothing at all. The fixture is segment-shaped on purpose:
 // ~100 keys of index over megabytes of data, which is where sparseness
 // pays, rather than a wide dictionary that would flatter the index side.
-// R6.3: the day index -- the wide dictionary -- opened without ever fetching
+// R6.3: the wide index -- the wide dictionary -- opened without ever fetching
 // its key index whole. The open is three small plans, a range of the
 // dictionary is two more, and the expected rows and byte counts come from
 // the native SparseBlob over the same file.
@@ -148,8 +148,8 @@ async function sparseSource() {
   const worker = new Worker("../worker.mjs", { type: "module" });
   const opened = await rpc(worker, "open", {
     wasmUrl: new URL("../supdb.wasm", location.href).href,
-    indexUrl: new URL("./out/day.supdb", location.href).href,
-    name: `day-sparse-${Date.now()}`,
+    indexUrl: new URL("./out/wide.supdb", location.href).href,
+    name: `wide-sparse-${Date.now()}`,
     source: "sparse",
     budgetBytes: sp.cache_budget_bytes,
     pageSize: sp.page_size,
@@ -163,16 +163,29 @@ async function sparseSource() {
   );
 
   // A walk before its ensure must throw, not answer from nothing.
+  //
+  // Which ranges this catches depends on the fixture's geometry: a range whose
+  // bytes the open already made resident answers correctly without an ensure,
+  // and that is not a failure. So probe every range and require that at least
+  // one refuses. Probing is free either way -- a resident range fetches
+  // nothing and a refused one fetches nothing -- so it cannot disturb the
+  // per-range byte counts below. Asserting it of `ranges[0]` alone made this
+  // depend on where the dictionary happened to fall relative to the open.
   let threw = null;
-  try {
-    await rpc(worker, "dictCounts", { lo: sp.ranges[0].lo, hi: sp.ranges[0].hi });
-  } catch (e) {
-    threw = String(e);
+  let resident = 0;
+  for (const r of sp.ranges) {
+    try {
+      await rpc(worker, "dictCounts", { lo: r.lo, hi: r.hi });
+      resident += 1;
+    } catch (e) {
+      if (threw === null) threw = String(e);
+    }
   }
   assert(
     "sparse: a range walk before its ensure throws rather than answers",
     threw !== null && /not resident|refused/.test(threw),
-    threw ?? "no error",
+    threw ?? `no range refused: all ${resident} were already resident after open, so this` +
+      ` fixture no longer exercises the refusal`,
   );
 
   const afterOpen = await rpc(worker, "cacheStats");

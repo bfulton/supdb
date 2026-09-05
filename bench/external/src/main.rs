@@ -2023,9 +2023,9 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
 
 // ------------------------------------------------------------- analytics --
 
-/// logshed's term key shape: field name, '=', eight zero-padded digits, so
+/// The term key shape: attribute name, '=', eight zero-padded digits, so
 /// the dictionary sorts the way a scan wants it. Copied from
-/// `src/bin/logshed.rs` rather than imported, because that file is a binary.
+/// `src/bin/browser.rs` rather than imported, because that file is a binary.
 fn term_key(field: &str, i: usize, out: &mut Vec<u8>) {
     out.clear();
     out.extend_from_slice(field.as_bytes());
@@ -2039,7 +2039,7 @@ fn term_key(field: &str, i: usize, out: &mut Vec<u8>) {
     out.extend_from_slice(&buf);
 }
 
-/// logshed's zipf: u^2 concentrates mass at the head without needing a
+/// The same zipf: u^2 concentrates mass at the head without needing a
 /// table. `status=200` takes most of the traffic and the tail is nearly
 /// empty, and that skew is the shape q1's ranking exists to answer over.
 fn zipf_pick(rng: &mut Rng, n: usize) -> usize {
@@ -2178,7 +2178,7 @@ fn intersect_sorted(a: &[u32], b: &[u32]) -> u64 {
 ///       decode-both merge and the finding says so; LMDB merges in place
 ///       across GET_MULTIPLE pages.
 ///
-/// The dataset is one synthetic day in logshed's shape (`src/bin/logshed.rs`):
+/// The dataset is one synthetic inverted index (`src/bin/browser.rs`):
 /// two fields of zipf-skewed terms, one 4-byte line-ordinal posting per field
 /// per line, appended grouped by term because the retired line-order arm
 /// of w1-daysize showed the naive roll
@@ -2212,9 +2212,9 @@ fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
         .param("pairs", J::u(pairs))
         .param("reps", J::u(reps as u64))
         .note(
-            "one synthetic day in logshed's shape: per line, one 4-byte line-ordinal posting \
+            "one synthetic inverted index: per row, one 4-byte row-ordinal posting \
              under a zipf-picked term of each field, written grouped by term, which is the order the segment writer takes. Postings \
-             are big-endian here where logshed writes little-endian: Supdb never compares value \
+             are big-endian here where the browser suite writes little-endian: Supdb never compares value \
              bytes so it costs Supdb nothing, and it makes LMDB's dup comparator agree with \
              numeric order, so both engines walk ascending lists and the intersection needs no \
              comparator shim",
@@ -2246,7 +2246,7 @@ fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
     // ---- one day's postings, generated once, identical for every engine ----
     //
     // (field, term, line) packed into one u64 and sorted, exactly as
-    // logshed's Order::Term roll does: one sort puts every term's postings
+    // an Order::Term roll does: one sort puts every term's postings
     // together, ascending by line within a term, and the pack order is also
     // the keys' lexicographic order ("path=" < "ua=", digits zero-padded).
     let mut rng = Rng::new(0xDA7);

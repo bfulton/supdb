@@ -74,5 +74,5 @@ name = "indexlab"
 path = "src/bin/indexlab.rs"
 
 [[bin]]
-name = "logshed"
-path = "src/bin/logshed.rs"
+name = "browser"
+path = "src/bin/browser.rs"

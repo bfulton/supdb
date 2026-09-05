@@ -17,7 +17,7 @@ perf.data*
 /figures-ci-committed
 
 # Build artifacts of the browser reader: `web/build.sh` writes the module,
-# `logshed fixture` writes the day index the browser test opens.
+# `browser fixture` writes the index the browser test opens.
 /web/supdb.wasm
 /web/test/out
 /web/floor/target
