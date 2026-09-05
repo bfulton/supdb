@@ -1,130 +1,148 @@
 # Supdb
 
-A read-optimized embedded key-multivalue store in Rust, and the evidence for
-and against it. It spends space to buy read and scan speed, and the trade is
-recorded rather than implied.
+A read-optimized embedded key-multivalue store, in Rust. A key holds an
+ordered run of values; appends are cheap, and the on-disk layout spends space
+to make point reads and ordered scans fast. One reader serves both a
+memory-mapped file on a server and a browser fetching byte ranges out of
+object storage: the read path compiles to wasm and answers the same question
+from either source.
 
-This repository holds two things that are meant to stay together: the engine,
-and a benchmark suite whose job is to **try to falsify** the claims made about
-it.
+- A durable commit is one WAL append and one `fdatasync`. Batches are atomic,
+  and `Txn` builds one.
+- Data lives in immutable sealed segments behind a flat hash index. Compaction
+  partitions by key range, so a read routes to one segment.
+- Deletes are tombstones the merge collects. Small runs are stored inline in
+  the index record, so reading them touches no data block; a run of one width
+  is stored without prefixes and read as a memcpy.
+- Every data block and every piece of the key index is checksummed; a damaged
+  file fails to open rather than answering wrongly.
 
+## Benchmarks
+
+![Load, read and scan against LMDB and RocksDB](https://raw.githubusercontent.com/bfulton/supdb-bench/main/figures/ext-kv.svg)
+
+![YCSB core workloads against LMDB and RocksDB](https://raw.githubusercontent.com/bfulton/supdb-bench/main/figures/ext-ycsb.svg)
+
+Every comparison is matched: an engine is not ranked against another until
+both promise the same thing about durability, transactions and checksums, and
+where an axis cannot be equalized the result is read as a bound rather than a
+ranking. The figures are drawn from the committed measurements in
+[supdb-bench](https://github.com/bfulton/supdb-bench); the claim ids below
+name the checked numbers there.
+
+- **Point reads lead** LMDB and RocksDB tuned as it would be deployed
+  (`EXT.23`, `EXT.33`).
+- **Ordered scans lead** tuned RocksDB and are level with LMDB (`EXT.24`,
+  `EXT.34`).
+- **YCSB** A (update-heavy), C (read-only), E (short scans) and F
+  (read-modify-write) **lead** tuned RocksDB (`EXT.42`–`EXT.45`).
+- **The durable ordered load trails** both LMDB and RocksDB (`EXT.22`,
+  `EXT.28`). Under shuffled arrival the ordering inverts and the load leads
+  LMDB (`EXT.27`), because a durable commit of scattered keys dirties about
+  as many B-tree pages as it has keys. The two are one result; quote them
+  together.
+- **Space goes to RocksDB.** Blocks are stored uncompressed by default, which
+  is what a point read that decompresses nothing costs; per-segment LZ4
+  (`SegmentWriter::set_compress`) buys part of it back (`W6.8`).
+- **Out of core, reads fall off a cliff.** Once the file outgrows the memory
+  that can cache it, every miss is a synchronous page fault (`F1.2`, `F1.4`).
+
+Every statement above is a claim with a recorded expected state in
+[supdb-bench](https://github.com/bfulton/supdb-bench), whose CI reruns the
+suite against each change here and fails when a claim moves in either
+direction -- including when a known limitation gets fixed.
+
+## Usage
+
+```toml
+[dependencies]
+supdb = { git = "https://github.com/bfulton/supdb" }
 ```
-src/db.rs          the engine -- WAL, memtable, sealed segments, compaction, deletes, Txn
-src/blob.rs        the read path over any byte source; compiles for wasm
-src/flatindex.rs   the flat key index the format is built on
-src/bench/         the measurement substrate  -- repetition, significance, latency, I/O accounting
-src/bin/internal   the falsification suite    -- Supdb against itself, as it scales
-src/bin/correctness  the correctness suite    -- damaged files, crash injection
-src/bin/browser    the browser-reader suite   -- index shape, round trips, size budget
-bench/external/    the comparison suite       -- Supdb inside other projects' evaluations
-web/               the browser reader, its size budget and its browser test
-results/           committed measurements     -- the source of truth for figures and claims
-figures/           publication-quality SVG    -- generated from results/, never by hand
-claims.json        every statement, with the state it is expected to be in
-docs/              the architecture review that produced all of the above
+
+A store: append values to keys, commit, read them back.
+
+```rust
+use supdb::{Db, Options};
+
+let mut db = Db::create(std::path::Path::new("./store"), Options::default())?;
+
+db.append(b"user:42", b"logged in");
+db.append(b"user:42", b"opened report");
+db.put(b"config", b"v2");            // replace: delete and append in one batch
+db.commit()?;                        // the durability point
+
+let mut tx = db.begin();             // atomic: all of it or none of it
+tx.append(b"user:42", b"logged out");
+tx.delete(b"config");
+tx.commit()?;
+
+db.read_all(b"user:42", |v| println!("{}", String::from_utf8_lossy(v)))?;
+let n = db.count(b"user:42")?;       // costs a lookup, not a read
+db.scan(b"user:", 100, |key, value| { /* in key order */ })?;
+db.close()?;
 ```
 
-## Quick start
+A write-once segment: sorted input in, one immutable file out, read by the
+same reader the store uses.
+
+```rust
+use supdb::{Blob, MmapBytes, SegmentOptions, SegmentWriter};
+
+let path = std::path::Path::new("./day.sup");
+let mut w = SegmentWriter::create(path, &SegmentOptions::default())?;
+for (key, values) in sorted_input {   // keys in byte order
+    w.begin(key)?;
+    for v in values { w.value(v); }
+    w.end()?;
+}
+w.finish(1)?;
+
+let seg = Blob::open(MmapBytes::open(path)?)?;
+seg.read_all(b"term", |v| { /* zero-copy borrow into the mapping */ })?;
+```
+
+The same segment in a browser, over ranged HTTP from a Web Worker:
+
+```js
+import { openSparse } from "./supdb.mjs";
+import { CachedBytes, httpRangeFetcher } from "./cache.mjs";
+
+const cache = await CachedBytes.open({
+  name: "day",                          // sparse pages persist in OPFS under this name
+  fetcher: httpRangeFetcher(url),
+  budgetBytes: 32 << 20,
+});
+const reader = await openSparse(wasm, cache);
+const values = reader.lookup(new TextEncoder().encode("term"));
+```
+
+`web/README.md` covers the three byte sources -- memory, OPFS, and a
+budgeted page cache over HTTP or S3 -- and why the reader has to run in a
+Worker.
+
+## Building
 
 ```sh
-sh scripts/check.sh          # everything CI runs: build, test, lint, browser, claims, suites
-sh scripts/check.sh lint     # or one group at a time
+cargo build --release
+cargo test --release
+sh scripts/check.sh            # build, test, lint, wasm -- what CI runs
+rustup target add wasm32-unknown-unknown && sh web/build.sh   # the browser module
 ```
 
-CI calls the same script with the same group names, so what passes here is what
-passes there.
+## Documentation
 
-```sh
-cargo run --release --bin internal -- all --profile dev      # falsification suite
-cargo run --release --bin external -- all --profile dev      # against redb, LMDB, sled, RocksDB
-cargo run --release --bin correctness -- all --profile dev   # damage, oracle, crashes
-cargo run --release --bin verify                             # claims vs measurements
-cargo run --release --bin figures                            # results/ -> figures/*.svg
-```
-
-## What the measurements say
-
-The figures are in `claims.json` and `results/`, not here: they move with every
-canonical run, and only `--profile full` is citable. What is stable is their
-shape. Every comparison below is **matched** — an engine is not ranked against
-another until the two promise the same thing about durability, transactions and
-checksums.
-
-**Reads and scans lead.** Point reads beat LMDB and RocksDB tuned as it would
-be deployed (`EXT.23`, `EXT.33`). Ordered scans tie LMDB and lead tuned RocksDB
-(`EXT.24`, `EXT.34`). YCSB A, C, E and F all lead tuned RocksDB
-(`EXT.42`–`EXT.45`).
-
-**Space paid for them.** Blocks are stored uncompressed by default, which is
-what a point read that decompresses nothing costs; RocksDB keeps the smaller
-file. Compression is per segment rather than global -- `SegmentWriter` takes
-it -- and on a real day's index it saves about a fifth of the file (`W6.8`).
-
-**Ingest depends on arrival order.** The durable ordered load trails LMDB and
-tuned RocksDB (`EXT.22`, `EXT.32`); under shuffled arrival it leads LMDB
-(`EXT.27`), because a durable commit of scattered keys dirties about as many
-B-tree leaf pages as it has keys. Quote the two together or neither.
-
-**Correctness is where the suite has earned most.** The engine agrees with a
-model of itself over randomized appends, deletes and crash-reopens. Damaged
-files error rather than panic or serve wrong bytes (`C1.1`, `C1.2`). A
-segment's key index is checksummed per piece, and every recovered state after
-crash injection is an exact prefix of the commit order (`C4.1`–`C4.5`).
-
-**What is open**, and recorded as failing on purpose: the durable ordered load
-above; reads degrade sharply once the dataset outgrows memory (`F1.2`, `F1.4`);
-and the index-layout study found points on the frontier that are both smaller
-and faster than the shipping layout (`F9.7`). Each is a claim with an expected
-state, so none can improve or decay unnoticed.
-
-## The rules
-
-Four, enforced in code rather than remembered:
-
-1. **Nothing is measured once.** Configurations run interleaved; results are a
-   median with an interquartile range and a bootstrap interval.
-2. **A difference is not a difference until it clears the gate** — Mann-Whitney
-   U at p < 0.05 *and* a minimum effect size.
-3. **A finding whose precondition was not met reports `not_exercised`**, never
-   `holds`. An untested hazard must not read as a green build.
-4. **Throughput never travels alone** — latency distribution, peak RSS, and
-   bytes actually written to the device come with it.
-
-And one about method: to measure the cost of a change, run both arms
-interleaved in one process. Running the suite before and after and subtracting
-does not work here; between two such runs the *unchanged* comparators have
-moved by tens of percent.
-
-## How this stays honest
-
-`claims.json` records the expected state of every finding, *including the ones
-that currently fail*. `verify` checks it against `results/` and CI runs it, so:
-
-- a limitation that gets worse turns the build red;
-- a limitation that gets **fixed** also turns the build red, because either the
-  engine improved and the claim is stale, or the experiment stopped testing
-  anything. Both need a person.
-
-That symmetry is the point. A known problem written down is a problem that
-cannot be quietly forgotten.
-
-## Where the reasoning lives
-
-This file states what is true now. The history — why a decision was made, what
-it cost, what was tried and refuted — is kept out of it on purpose, and lives
-in:
-
-| where | what it holds |
+| where | what |
 |---|---|
-| `claims.json` | every finding, its expected state, and the evidence for it |
-| `CLAUDE.md` | the working notes: what broke, what was fixed, what not to repeat |
-| `*-plan.md` | one per experiment: predictions registered before the run, outcome appended after |
-| `docs/` | the architecture review that started it, and the engine's own design notes |
-| `tests/` | the model oracle, the read paths held to each other, the format's damage cases |
+| `docs/engine.md` | the engine's design and the measurements each decision cites |
+| `docs/index-theory.md` | the index layout, and what theory predicts that measurement does not show |
+| `web/README.md` | the browser reader |
+| [supdb-bench](https://github.com/bfulton/supdb-bench) | the experiments, the claims, the results and the figures |
 
 ## Status
 
-A prototype. The open gaps are the ones listed above, each carried as a claim.
+A prototype. The on-disk format is not yet stable: it changes its magic
+whenever an older reader would misread a newer file, and refuses the file
+rather than serving wrong bytes.
 
 ## License
 
