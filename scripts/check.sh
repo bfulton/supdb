@@ -92,6 +92,16 @@ for g in $groups; do
       ./target/release/external kv   --profile ci --out "$RESULTS"
       ./target/release/external ycsb --profile ci --keys 10000 --ops 10000 --out "$RESULTS"
       ./target/release/correctness all --profile ci --out "$RESULTS"
+      # The browser suite's experiments run here too. They used to be run by
+      # hand, and the committed records drifted from the engine without
+      # anything noticing: a fixture whose index measured 686,506 bytes when
+      # it was recorded measures 1,112,132 today, and `verify` was comparing
+      # claims against the old recording and reporting green. An experiment
+      # that is not in this script is an experiment nobody runs.
+      ./target/release/browser budget --profile ci --out "$RESULTS"
+      ./target/release/browser ranges --profile ci --out "$RESULTS"
+      ./target/release/browser dict   --profile ci --out "$RESULTS"
+      ./target/release/browser waves  --profile ci --out "$RESULTS"
       ./target/release/verify --profile ci --results "$RESULTS"
       ./target/release/figures --profile ci --results "$RESULTS" --out "$FIGURES"
       ;;

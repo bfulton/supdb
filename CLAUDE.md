@@ -117,7 +117,7 @@ is not a measurement.
 | `src/bench/` | the measurement substrate — stats, histogram, plotting, env capture |
 | `src/bin/internal.rs` | falsification suite |
 | `src/bin/correctness.rs` | damaged files (c1), crash injection with power-loss emulation (c4) |
-| `src/bin/logshed.rs` | day-index shape, size budget, browser-test fixture |
+| `src/bin/browser.rs` | index shape, size budget, browser-test fixture |
 | `bench/external/` | Supdb inside other projects' evaluations (redb, LMDB, sled, RocksDB) |
 | `web/` | the browser reader, its size control and its browser test |
 | `results/` | committed measurements — the source of truth |
@@ -382,7 +382,7 @@ order with every run in a block -- and `Blob` reads both, which is what
 rather than answering wrongly, so the magic did not move.
 
 **A cold sparse open is one or two round trips, and a cold search three
-(R7, waves-plan.md).** logshed measured seven dependent round trips for a
+(R7, waves-plan.md).** w6 measured seven dependent round trips for a
 first page of search results over a cold cache on a real day, five of
 them the store's before a posting byte moved. Three things removed them,
 each measured by `w6-waves` through a host that models the browser's
@@ -402,26 +402,32 @@ so a lookup after open is at most the records' wave (W6.3) and a cold
 search is open, records, postings -- two on the fixture, three by
 construction, from six (W6.4). And a **data read fetches the 4 KiB chunks
 an extent spans**, not its block, when the block is plain and carries
-per-chunk checksums: the rare key's postings wave is two chunks where
-logshed's two-hit word read 920 KiB (W6.5); W4.1's exactness holds on the
-chunk plan as it did on the block plan. The third ask, small values inline
-in the record, was already the segment writer's (`inline_max`, 256 bytes
-since v5's inline extension) and never the store's: a segment answers the
-rare key at the dictionary with no postings wave (W6.6), and the
-recommendation to the roll is to write through `SegmentWriter`, which
-`logshed build`'s day already sorts for.
+per-chunk checksums: a rare key's postings wave reads the chunks its run
+spans rather than the whole block it shares (W6.5); W4.1's exactness holds
+on the chunk plan as it did on the block plan. The third ask, small values
+inline in the record, is **both writers'**. `Db` passes
+`Options::inline_bytes` to its seal and its compaction exactly as
+`SegmentWriter` does (`src/db.rs`), so a store's small runs are inline too.
+This file said the opposite for a while and three findings were built on
+the difference; when the browser suite was first run against the current
+engine, about 450 KB of a 7.4 MB fixture turned out to have moved from
+blocks into the key section, W6.1's store-versus-segment wave contrast had
+gone, and W6.5 had no block left to price until it was pointed at the
+smallest run that did not fit inline. If you are relying on a shape
+difference between the two writers, measure it rather than reading it
+here.
 
 **A segment writer can compress its blocks, and the encoding decides
 whether that is worth anything (R7.4).** `SegmentWriter::set_compress`
 takes the path `write_block` always had: chunked above the chunk
 size so a point read decompresses one chunk, verbatim when compression
 does not pay, and a verbatim block now carries per-chunk checksums so
-`chunk_span` plans by chunk rather than whole. On logshed's day it saves
+`chunk_span` plans by chunk rather than whole. On the fixture's index it saves
 **19.9%** of the file, against the 25% predicted (`W6.8`, recorded as
 failing). Two things that measurement found. The same day stored as
 absolute ordinals compresses **0.0%**, byte for byte identical, because
 LZ4 matches repeated sequences and a rising counter has none -- so both
-arms of the comparison store deltas, and logshed's 2x is a property of
+arms of the comparison store deltas, and the 2x is a property of
 their encoding rather than of the flag. And 19.9% is far under the 2x LZ4
 gets on the blocks themselves, because inline runs put every run under
 256 bytes in the key section, which is not compressed; on a Zipf

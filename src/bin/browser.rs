@@ -1634,11 +1634,14 @@ fn main() -> std::io::Result<()> {
             let rec = waves(profile)?;
             rec.print_summary();
             rec.write(&out)?;
-            if rec.all_findings_hold() {
-                Ok(())
-            } else {
-                std::process::exit(1)
-            }
+            // Exit 0 whether or not every finding held. A recorded failure is
+            // a valid state in this project -- `claims.json` expects a good
+            // number of them -- and `verify` is what adjudicates a record
+            // against what was expected. Exiting non-zero here meant a run
+            // with a known-failing finding looked like a crashed program,
+            // which is why this suite could not be part of `check.sh` and so
+            // was run by hand, and so drifted.
+            Ok(())
         }
         "dict" => {
             let profile =
@@ -1647,11 +1650,14 @@ fn main() -> std::io::Result<()> {
             let rec = dict(profile)?;
             rec.print_summary();
             rec.write(&out)?;
-            if rec.all_findings_hold() {
-                Ok(())
-            } else {
-                std::process::exit(1)
-            }
+            // Exit 0 whether or not every finding held. A recorded failure is
+            // a valid state in this project -- `claims.json` expects a good
+            // number of them -- and `verify` is what adjudicates a record
+            // against what was expected. Exiting non-zero here meant a run
+            // with a known-failing finding looked like a crashed program,
+            // which is why this suite could not be part of `check.sh` and so
+            // was run by hand, and so drifted.
+            Ok(())
         }
         "ranges" => {
             let profile =
@@ -1660,11 +1666,14 @@ fn main() -> std::io::Result<()> {
             let rec = ranges(profile)?;
             rec.print_summary();
             rec.write(&out)?;
-            if rec.all_findings_hold() {
-                Ok(())
-            } else {
-                std::process::exit(1)
-            }
+            // Exit 0 whether or not every finding held. A recorded failure is
+            // a valid state in this project -- `claims.json` expects a good
+            // number of them -- and `verify` is what adjudicates a record
+            // against what was expected. Exiting non-zero here meant a run
+            // with a known-failing finding looked like a crashed program,
+            // which is why this suite could not be part of `check.sh` and so
+            // was run by hand, and so drifted.
+            Ok(())
         }
         "bundle" => {
             let profile =
@@ -1680,11 +1689,14 @@ fn main() -> std::io::Result<()> {
             );
             rec.print_summary();
             rec.write(&out)?;
-            if rec.all_findings_hold() {
-                Ok(())
-            } else {
-                std::process::exit(1)
-            }
+            // Exit 0 whether or not every finding held. A recorded failure is
+            // a valid state in this project -- `claims.json` expects a good
+            // number of them -- and `verify` is what adjudicates a record
+            // against what was expected. Exiting non-zero here meant a run
+            // with a known-failing finding looked like a crashed program,
+            // which is why this suite could not be part of `check.sh` and so
+            // was run by hand, and so drifted.
+            Ok(())
         }
         "budget" => {
             let profile =
@@ -1693,11 +1705,14 @@ fn main() -> std::io::Result<()> {
             let rec = budget(profile)?;
             rec.print_summary();
             rec.write(&out)?;
-            if rec.all_findings_hold() {
-                Ok(())
-            } else {
-                std::process::exit(1)
-            }
+            // Exit 0 whether or not every finding held. A recorded failure is
+            // a valid state in this project -- `claims.json` expects a good
+            // number of them -- and `verify` is what adjudicates a record
+            // against what was expected. Exiting non-zero here meant a run
+            // with a known-failing finding looked like a crashed program,
+            // which is why this suite could not be part of `check.sh` and so
+            // was run by hand, and so drifted.
+            Ok(())
         }
         _ => {
             eprintln!(
@@ -1906,9 +1921,22 @@ fn waves(profile: Profile) -> std::io::Result<Record> {
 
     // The probe keys, out of the whole reader over the store: the rarest
     // term with at least one posting and the commonest.
-    let (rare, common, rare_n, common_n) = {
+    //
+    // Ties on the rare side are broken by taking the one whose postings sit
+    // *furthest* into the file. Many terms share the minimum count, and which
+    // of them the scan happened to reach first decided whether its block was
+    // already resident after the open -- so W6.5, which prices a postings
+    // wave, silently stopped having a wave to price when the dictionary was
+    // reordered. Furthest-in is the one the open is least likely to have
+    // covered, which is the case the claim is about.
+    let (rare, common, rare_n, common_n, blocked) = {
         let b = Blob::open(MmapBytes::open(&store_path)?)?;
-        let mut best: Option<(Vec<u8>, u64)> = None;
+        let start_of = |k: &[u8]| -> u64 {
+            b.ranges_for(k)
+                .map(|r| r.iter().map(|(o, _)| *o).max().unwrap_or(0))
+                .unwrap_or(0)
+        };
+        let mut best: Option<(Vec<u8>, u64, u64)> = None;
         let mut top: Option<(Vec<u8>, u64)> = None;
         for r in 0..b.keys() {
             let Some(k) = b.key_at(r) else { continue };
@@ -1916,16 +1944,42 @@ fn waves(profile: Profile) -> std::io::Result<Record> {
                 continue;
             }
             let n = b.count(k)?;
-            if n >= 1 && best.as_ref().is_none_or(|(_, m)| n < *m) {
-                best = Some((k.to_vec(), n));
+            if n >= 1 {
+                let off = start_of(k);
+                let better = match &best {
+                    None => true,
+                    Some((_, m, mo)) => n < *m || (n == *m && off > *mo),
+                };
+                if better {
+                    best = Some((k.to_vec(), n, off));
+                }
             }
             if top.as_ref().is_none_or(|(_, m)| n > *m) {
                 top = Some((k.to_vec(), n));
             }
         }
-        let (rk, rn) = best.expect("a rare key");
+        let (rk, rn, _) = best.expect("a rare key");
         let (ck, cn) = top.expect("a common key");
-        (rk, ck, rn, cn)
+        // And the rarest key that is still *block-backed*. The store inlines a
+        // run up to `Options::inline_bytes` exactly as the segment writer
+        // does, so the rarest key of all has no block and no postings wave --
+        // that outcome is W6.6's. W6.5 prices the wave when there is one, so
+        // it needs the smallest run that did not fit inline.
+        let mut blocked: Option<(Vec<u8>, u64)> = None;
+        for r in 0..b.keys() {
+            let Some(k) = b.key_at(r) else { continue };
+            if k == BINARY_KEY {
+                continue;
+            }
+            if b.ranges_for(k)?.is_empty() {
+                continue; // inline: no block to fetch
+            }
+            let n = b.count(k)?;
+            if n >= 1 && blocked.as_ref().is_none_or(|(_, m)| n < *m) {
+                blocked = Some((k.to_vec(), n));
+            }
+        }
+        (rk, ck, rn, cn, blocked)
     };
     let bump = |k: &[u8]| {
         let mut n = k.to_vec();
@@ -1961,7 +2015,12 @@ fn waves(profile: Profile) -> std::io::Result<Record> {
     for (name, path, probe) in shapes {
         let data = std::fs::read(path)?;
         for directory in [false, true] {
-            for (which, key) in [("rare", &rare), ("common", &common)] {
+            let mut probes: Vec<(&'static str, &Vec<u8>)> =
+                vec![("rare", &rare), ("common", &common)];
+            if let Some((bk, _)) = blocked.as_ref() {
+                probes.push(("rare_block", bk));
+            }
+            for (which, key) in probes {
                 let s = cold_search(&data, page, probe, directory, key, &bump(key))?;
                 rows.push(jobj! {
                     "shape" => J::s(name),
@@ -2083,7 +2142,7 @@ fn waves(profile: Profile) -> std::io::Result<Record> {
             }
         ),
     ));
-    let sr = get("store", false, "rare");
+    let sr = get("store", false, "rare_block");
     // Rule 3. This claim is about what a postings wave *costs* when one is
     // needed, so a shape whose rare key needs no wave at all has not tested
     // it -- reporting that as a pass would be a green for a path nothing
@@ -2092,14 +2151,15 @@ fn waves(profile: Profile) -> std::io::Result<Record> {
     // which quietly made this depend on whether the fixture happened to put
     // the rare key's run in a block.
     let w65 = "a rare key's postings wave reads at most two chunks from the store's block";
-    rec.finding(if sr.postings_waves == 0 {
+    rec.finding(if blocked.is_none() || sr.postings_waves == 0 {
         Finding::not_exercised(
             "W6.5",
             w65,
             format!(
-                "the store shape's rare key needed no postings wave at this size ({} postings, \
-                 0 bytes after the lookup), so there was no wave to price. W6.6 is the claim \
-                 for that outcome; this one wants a block-backed run",
+                "no block-backed run to price: the smallest run that did not fit inline \
+                 needed no postings wave at this size ({} postings, 0 bytes after the \
+                 lookup). W6.6 is the claim for a key answered with no wave at all; this \
+                 one wants a block",
                 sr.postings
             ),
         )

@@ -241,7 +241,7 @@
       "experiment": "f28-count",
       "id": "W2.3",
       "expect": "holds",
-      "because": "Restated with the format change made. Before v5 this gate priced a stored per-extent count at under 20 ns of saving over `count_fixed` and declined it as not worth four bytes an extent for logshed's fixed-width schema; the priority then changed to spending space for time and variable-width counts were wanted, so the bytes were paid. The gate now measures what they bought against the floor any count has, resolving the key and stopping: 94 ns/probe for the general count against 94 for the lookup, +0.7 ns, no difference at p=0.80. A general count costs a lookup."
+      "because": "Restated with the format change made. Before v5 this gate priced a stored per-extent count at under 20 ns of saving over `count_fixed` and declined it as not worth four bytes an extent for a fixed-width schema; the priority then changed to spending space for time and variable-width counts were wanted, so the bytes were paid. The gate now measures what they bought against the floor any count has, resolving the key and stopping: 94 ns/probe for the general count against 94 for the lookup, +0.7 ns, no difference at p=0.80. A general count costs a lookup."
     },
     {
       "experiment": "f28-count",
@@ -259,7 +259,7 @@
       "experiment": "w3-bundle",
       "id": "W3.1",
       "expect": "holds",
-      "because": "R3.3 asks for a size budget stated up front and measured against. 64 KB gzipped, and the module is 47,353 (113,799 raw) with the range-readable dictionary in it; it was 41,010 (90,168 raw) before. The budget is five times logshed's entire 12 KB gzipped client, which sounds generous until W3.2: the first 12.7 KB of it is the Rust standard library's floor and is not reducible from this side. It is one round trip, it is immutable and cached so it is paid per deploy rather than per query, and it is 0.1% of the 32 MB index budget it exists to read. No binding generator -- the ABI is twenty hand-written C functions passing integers and byte ranges, because a generator's shim and descriptor sections are exactly what this budget is about."
+      "because": "R3.3 asks for a size budget stated up front and measured against. 64 KB gzipped, and the module is 47,353 (113,799 raw) with the range-readable dictionary in it; it was 41,010 (90,168 raw) before. The budget is five times a 12 KB gzipped browser client, which sounds generous until W3.2: the first 12.7 KB of it is the Rust standard library's floor and is not reducible from this side. It is one round trip, it is immutable and cached so it is paid per deploy rather than per query, and it is 0.1% of the 32 MB index budget it exists to read. No binding generator -- the ABI is twenty hand-written C functions passing integers and byte ranges, because a generator's shim and descriptor sections are exactly what this budget is about."
     },
     {
       "experiment": "w3-bundle",
@@ -289,7 +289,7 @@
       "experiment": "w4-ranges",
       "id": "W4.3",
       "expect": "holds",
-      "because": "What R6 buys, in bytes, on the shape logshed actually rolls: a segment's dictionary is bounded by field cardinality (~104 keys however much traffic), so at full the open fetches 19,832 bytes of a 31,384,960-byte object -- superblock probe, key index, block table -- and the 7-probe query set plans 2,015,000 more: 6.5% fetched, the rest never leaves object storage. The day shape reads 11.0% of 9,651,504. Both denominators are honest ones: the class_of underflow and the retained 4 MB log arena were fixed before these numbers were taken, which cost the percentages about a point against the inflated files they replaced. The browser test carries the same result end to end in Chromium: a 512 KiB cache over ranged HTTP against a 3,187,648-byte segment file that is 98% data, answers identical to the native reader's, total fetched under the data region alone, and the budget observed to evict. The premise -- index and block table fetched whole at open -- is priced in that 19,832 and expires when key cardinality does: a trigram or free-text index would need the index fetched sparsely too, which changes the JS host only, because every range in the ABI is an absolute file offset."
+      "because": "What R6 buys, in bytes, on the shape a roll actually writes: a segment's dictionary is bounded by field cardinality (~104 keys however much traffic), so at full the open fetches 19,832 bytes of a 31,384,960-byte object -- superblock probe, key index, block table -- and the 7-probe query set plans 2,015,000 more: 6.5% fetched, the rest never leaves object storage. The day shape reads 11.0% of 9,651,504. Both denominators are honest ones: the class_of underflow and the retained 4 MB log arena were fixed before these numbers were taken, which cost the percentages about a point against the inflated files they replaced. The browser test carries the same result end to end in Chromium: a 512 KiB cache over ranged HTTP against a 3,187,648-byte segment file that is 98% data, answers identical to the native reader's, total fetched under the data region alone, and the budget observed to evict. The premise -- index and block table fetched whole at open -- is priced in that 19,832 and expires when key cardinality does: a trigram or free-text index would need the index fetched sparsely too, which changes the JS host only, because every range in the ABI is an absolute file offset."
     },
     {
       "experiment": "ext-loadshape",
@@ -657,7 +657,7 @@
       "id": "F53.4",
       "profile": "full",
       "expect": "fails",
-      "because": "P53.4 refuted: the dictionary count through scan_counts costs 1.917x, 2.877x and 2.349x per key over inline records (run 3: 25.81 against 10.99 ns/key), over the 2x registered in two of three runs. Wider records mean more bytes per key under the walk; a day's 2,000-term dictionary ranks in about 50 us instead of 22, and logshed's own indexes are written by Store, which never inlines, so W2.5 stands as measured. The price is recorded rather than netted."
+      "because": "P53.4 refuted: the dictionary count through scan_counts costs 1.917x, 2.877x and 2.349x per key over inline records (run 3: 25.81 against 10.99 ns/key), over the 2x registered in two of three runs. Wider records mean more bytes per key under the walk; a day's 2,000-term dictionary ranks in about 50 us instead of 22, and an index written by `Db` inlines exactly as one written by `SegmentWriter` does -- `Db` passes `Options::inline_bytes` to its seal and its compaction, which this note previously denied, so W2.5 stands as measured. The price is recorded rather than netted."
     },
     {
       "experiment": "f53-inline",
@@ -936,15 +936,15 @@
       "experiment": "w5-dict",
       "id": "W5.5",
       "profile": "full",
-      "expect": "fails",
-      "because": "At 16 KiB pages the sparse open is 114,648 bytes (21,120 un-paged) against the whole open's 901,080 at the browser's 64 KiB page, 12.7%, over P5.5's 10%; it was 70,960 against 808,240 (8.8%) on the fixture before format v6 and the checksum row. Two things moved it, both geometry: the day file is a different file now (7.91 MB against 9.72, its runs fixed-width), so the section boundaries fall on different pages; and a checksummed index's sparse open fetches the row, which sits at the end of the section on a page nothing else in the open touches -- one 16 KiB page more, by design, since the row is what lets every later range be verified against exactly the pages the host fetched. The un-paged bytes fell (23,904 to 21,120); the paged count is what the bound is about, and at ci the same open is 7.5% and holds. Recorded as failing by the same page geometry W5.1 and W5.2 fail by; the fix that would move it is placing the row beside the fence, which the streaming writer cannot do before it knows the section's length."
+      "expect": "holds",
+      "because": "FLIPPED to holds when the browser suite was first run against the current engine. 75,000 bytes at 16 KiB pages against the whole open's 1,238,264 at 64 KiB -- 6.1%, against the 10% bound and against 12.7% when this was recorded as failing. Neither the sparse reader nor the bound moved. What moved is the denominator: `Db` inlines a run up to `Options::inline_bytes` (256) exactly as `SegmentWriter` does, so about 450 KB of postings that used to live in blocks now live in the key section. A whole-index open therefore fetches far more (901,080 -> 1,238,264) while the sparse open, which fetches only the pages a plan names, fetches less (114,648 -> 75,000). The claim is about the ratio and the ratio genuinely improved, but it improved because the thing it is measured against got bigger, which is worth knowing before quoting it. Previously: At 16 KiB pages the sparse open is 114,648 bytes (21,120 un-paged) against the whole open's 901,080 at the browser's 64 KiB page, 12.7%, over P5.5's 10%; it was 70,960 against 808,240 (8.8%) on the fixture before format v6 and the checksum row. Two things moved it, both geometry: the day file is a different file now (7.91 MB against 9.72, its runs fixed-width), so the section boundaries fall on different pages; and a checksummed index's sparse open fetches the row, which sits at the end of the section on a page nothing else in the open touches -- one 16 KiB page more, by design, since the row is what lets every later range be verified against exactly the pages the host fetched. The un-paged bytes fell (23,904 to 21,120); the paged count is what the bound is about, and at ci the same open is 7.5% and holds. Recorded as failing by the same page geometry W5.1 and W5.2 fail by; the fix that would move it is placing the row beside the fence, which the streaming writer cannot do before it knows the section's length."
     },
     {
       "experiment": "w5-dict",
       "id": "W5.6",
       "profile": "full",
-      "expect": "holds",
-      "because": "At 16 KiB pages every field's two plans come to at most 0.59 of the field's share of the index plus four pages -- a boundary at each end of each plan, the slack W5.2 taught -- and 0.98 of the two-page bound W5.2 failed at 64 KiB (P5.6)."
+      "expect": "fails",
+      "because": "FLIPPED to fails against the same cause that flipped W5.5, and in the opposite direction, which is why the pair should be read together. The worst field's two plans came to 1.10 of keys x 142.5 bytes plus four 16 KiB pages, against 0.52 of the same bound when this was recorded as holding. The per-key share grew from 87.9 to 142.5 bytes because inlined runs are now in the key section, and a range over a section that carries values as well as records spans more pages, so the fixed page-boundary slack is paid over a range that grew faster than the bound's per-key term. The reader did not regress; the bound was calibrated against a key section that held records only. Recorded as failing rather than recalibrated, because a bound moved to fit the measurement is not a prediction. Previously: At 16 KiB pages every field's two plans come to at most 0.59 of the field's share of the index plus four pages -- a boundary at each end of each plan, the slack W5.2 taught -- and 0.98 of the two-page bound W5.2 failed at 64 KiB (P5.6)."
     },
     {
       "experiment": "f61-scanmerge",
@@ -1077,8 +1077,8 @@
       "experiment": "w6-waves",
       "id": "W6.1",
       "profile": "full",
-      "expect": "holds",
-      "because": "A segment's sparse open is two waves from a 16 KiB probe -- 64,296 bytes -- where the store's is three (114,648): the superblock page carries a segment's extension, a copy of the key header and the offsets of the fence, directory, hash region and checksum row, so the first plan names the fence, the block table and the row and the second plan is empty. A store writes no extension and opens as before. P7.1's first half, on the 250k-line day fixture (7,807 keys, 1.75M postings)."
+      "expect": "fails",
+      "because": "FLIPPED to fails: the contrast it asserts no longer exists. Store 2 waves, segment 2 waves, both 75,000 bytes -- the claim wants the store at three. The superblock extension still does what it was built to do; what changed is that `Db` inlines small runs exactly as `SegmentWriter` does, so the two shapes now write the same kind of index and open the same way. W6.2 (a head reserve and a generous probe give one wave) and W6.4 (a cold search is at most three waves) are unaffected and still hold, so the property R7.1 was built for is intact; it is the store-versus-segment difference that has gone. Recorded as failing rather than restated, because 'the store takes three waves' was the registered prediction and it is now false. Previously: A segment's sparse open is two waves from a 16 KiB probe -- 64,296 bytes -- where the store's is three (114,648): the superblock page carries a segment's extension, a copy of the key header and the offsets of the fence, directory, hash region and checksum row, so the first plan names the fence, the block table and the row and the second plan is empty. A store writes no extension and opens as before. P7.1's first half, on the 250k-line day fixture (7,807 keys, 1.75M postings)."
     },
     {
       "experiment": "w6-waves",
@@ -1092,21 +1092,21 @@
       "id": "W6.3",
       "profile": "full",
       "expect": "holds",
-      "because": "With the directory resident a lookup after open is at most one wave -- the records -- on all four shapes and both keys, and none at all when the records' page came in with the open; without it the rare key costs two (directory slice, then records). The open grows by the directory: 147,416 bytes against 114,648 on the store shape, 31 KB of directory for 7,807 keys at four bytes a key. P7.2. On logshed's real day the directory is 0.37 MiB."
+      "because": "With the directory resident a lookup after open is at most one wave -- the records -- on all four shapes and both keys, and none at all when the records' page came in with the open; without it the rare key costs two (directory slice, then records). The open grows by the directory: 147,416 bytes against 114,648 on the store shape, 31 KB of directory for 7,807 keys at four bytes a key. P7.2. On a real index the directory is 0.37 MiB."
     },
     {
       "experiment": "w6-waves",
       "id": "W6.4",
       "profile": "full",
       "expect": "holds",
-      "because": "A cold search for the commonest key (88,581 postings) on the segment with a reserve, a generous probe and the directory resident is two waves -- open, then postings, the records' page having arrived with the open -- and at most three by construction: open, records, postings. The store shape from a page probe with nothing resident takes five, and six for the rare key. P7.2's search count, from the seven logshed measured."
+      "because": "A cold search for the commonest key (88,581 postings) on the segment with a reserve, a generous probe and the directory resident is two waves -- open, then postings, the records' page having arrived with the open -- and at most three by construction: open, records, postings. The store shape from a page probe with nothing resident takes five, and six for the rare key. P7.2's search count, from the seven w6 measured."
     },
     {
       "experiment": "w6-waves",
       "id": "W6.5",
       "profile": "full",
       "expect": "holds",
-      "because": "The rare key's postings wave reads 32,768 bytes page-rounded on the store shape -- the two 4 KiB chunks its 12-posting run spans, rounded to 16 KiB pages -- where it read the whole block before: a plan and a read are now the chunks an extent spans when the block is plain and carries per-chunk checksums (R7.3), and W4.1 holds on the chunk plan as it did on the block plan. logshed's 'Shuttle', two hits, read 920 KiB."
+      "because": "The rare key's postings wave reads 32,768 bytes page-rounded on the store shape -- the two 4 KiB chunks its 12-posting run spans, rounded to 16 KiB pages -- where it read the whole block before: a plan and a read are now the chunks an extent spans when the block is plain and carries per-chunk checksums (R7.3), and W4.1 holds on the chunk plan as it did on the block plan. a two-hit term previously read 920 KiB."
     },
     {
       "experiment": "w6-waves",
@@ -1127,7 +1127,7 @@
       "id": "W6.8",
       "profile": "full",
       "expect": "fails",
-      "because": "Compressing a segment's blocks saves 19.9% of the file -- 6,092,168 bytes against 7,608,372 -- against P4.1's 25%, so the prediction is refuted and the feature is kept: `SegmentWriter::set_compress` takes the path `Store::write_block` has always taken, chunked above the chunk size so a point read decompresses one chunk, verbatim when compression does not pay. Both arms store postings as deltas, so compression is the only difference between them. At ci, on a 1.15 MB day, it is 8.8%: the fixed costs and the key section are a larger share of a smaller file. Two things this measured that the ask did not predict. The same day stored as absolute ordinals compresses by 0.0% -- byte for byte identical -- because LZ4 matches repeated byte sequences and a rising counter has none, so the encoding, not the flag, decides whether compression is worth anything; logshed's 2x is a property of their deltas. And 19.9% is well under the 2x LZ4 gets on the block bytes themselves, because inline runs put every run under 256 bytes into the key section, which is not compressed: on a Zipf dictionary that is most of the terms. The 30% logshed attributed to moving off `Store` is therefore not all compression, and the remainder is worth finding before more is spent here. The open is unchanged at one wave and the common key still reads its 88,581 postings (P4.2 held)."
+      "because": "Compressing a segment's blocks saves 19.9% of the file -- 6,092,168 bytes against 7,608,372 -- against P4.1's 25%, so the prediction is refuted and the feature is kept: `SegmentWriter::set_compress` takes the path `Store::write_block` has always taken, chunked above the chunk size so a point read decompresses one chunk, verbatim when compression does not pay. Both arms store postings as deltas, so compression is the only difference between them. At ci, on a 1.15 MB day, it is 8.8%: the fixed costs and the key section are a larger share of a smaller file. Two things this measured that the ask did not predict. The same day stored as absolute ordinals compresses by 0.0% -- byte for byte identical -- because LZ4 matches repeated byte sequences and a rising counter has none, so the encoding, not the flag, decides whether compression is worth anything; the 2x is a property of those deltas. And 19.9% is well under the 2x LZ4 gets on the block bytes themselves, because inline runs put every run under 256 bytes into the key section, which is not compressed: on a Zipf dictionary that is most of the terms. The 30% attributed to moving off `Store` is therefore not all compression, and the remainder is worth finding before more is spent here. The open is unchanged at one wave and the common key still reads its 88,581 postings (P4.2 held)."
     },
     {
       "experiment": "ext-ycsb",
