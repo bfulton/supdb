@@ -175,26 +175,11 @@ jobs:
         working-directory: supdb-bench
         run: |
           set -eu
-          if [ -f scripts/check.sh ]; then
-            sh scripts/check.sh suites
-          else
-            # supdb-bench does not carry scripts/check.sh yet. Its `suites`
-            # group is the intended entry point, and this branch is what
-            # that group is, spelled out; delete it once the script exists
-            # there. Every experiment runs at `ci` into one directory and
-            # `verify` is pointed at that directory rather than at the
-            # committed results, so the verdict is about this engine.
-            cargo build --release --workspace
-            ./target/release/internal all --profile ci --out "$CHECK_RESULTS"
-            ./target/release/external kv   --profile ci --out "$CHECK_RESULTS"
-            ./target/release/external ycsb --profile ci --keys 10000 --ops 10000 --out "$CHECK_RESULTS"
-            ./target/release/correctness all --profile ci --out "$CHECK_RESULTS"
-            ./target/release/browser budget --profile ci --out "$CHECK_RESULTS"
-            ./target/release/browser ranges --profile ci --out "$CHECK_RESULTS"
-            ./target/release/browser dict   --profile ci --out "$CHECK_RESULTS"
-            ./target/release/browser waves  --profile ci --out "$CHECK_RESULTS"
-            ./target/release/verify --profile ci --results "$CHECK_RESULTS"
-          fi
+          # The suite's own entry point, run against the engine checked out
+          # above. If it is missing, that is a broken bench checkout and the
+          # job should say so rather than quietly measuring something else.
+          test -f scripts/check.sh
+          sh scripts/check.sh suites
 
       - name: Publish the run's results and figures
         if: always()

@@ -31,15 +31,3 @@ opt-level = 3
 lto = true
 codegen-units = 1
 debug = true
-
-# What the browser downloads. Size is the axis here, not speed: `opt-level`
-# "z", one codegen unit, LTO, no unwinding tables and no debug info. R3.3 sets
-# the budget and `web/build.sh` measures the blob against it.
-[profile.wasm]
-inherits = "release"
-opt-level = "z"
-lto = "fat"
-codegen-units = 1
-panic = "abort"
-strip = true
-debug = false

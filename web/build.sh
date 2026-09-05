@@ -25,8 +25,20 @@ echo "# building the reader for wasm32-unknown-unknown"
 target=$(cargo metadata --format-version 1 --no-deps \
   | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
 
-cargo build --profile wasm --lib --target wasm32-unknown-unknown
-wasm="$target/wasm32-unknown-unknown/wasm/supdb.wasm"
+# The size settings are given here rather than as a named profile in
+# Cargo.toml. Cargo takes profiles from the workspace root, and this
+# repository is a submodule of supdb-bench, where the root is a level up --
+# so a `[profile.wasm]` here was ignored there, and keeping a second copy in
+# the other manifest meant two definitions of one thing with nothing holding
+# them equal. As overrides they travel with the only script that wants them.
+cargo build --release --lib --target wasm32-unknown-unknown \
+  --config 'profile.release.opt-level="z"' \
+  --config 'profile.release.lto="fat"' \
+  --config 'profile.release.codegen-units=1' \
+  --config 'profile.release.panic="abort"' \
+  --config 'profile.release.strip=true' \
+  --config 'profile.release.debug=false' 
+wasm="$target/wasm32-unknown-unknown/release/supdb.wasm"
 
 echo "# building the floor"
 cargo build --release --target wasm32-unknown-unknown --manifest-path web/floor/Cargo.toml
