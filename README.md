@@ -114,7 +114,7 @@ This file states what is true now. The history — why a decision was made, what
 it cost, what was tried and refuted — is kept out of it on purpose, and lives
 in:
 
-| | |
+| where | what it holds |
 |---|---|
 | `claims.json` | every finding, its expected state, and the evidence for it |
 | `CLAUDE.md` | the working notes: what broke, what was fixed, what not to repeat |

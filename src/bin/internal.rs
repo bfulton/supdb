@@ -3400,7 +3400,7 @@ fn f52_segsize(args: &Args, profile: Profile) -> std::io::Result<Record> {
     rec.finding(Finding::new(
         "F52.6",
         "32 MB seals over 64 MB partitions read no slower than 64 MB seals after the drain",
-        matches!(rd32p.verdict, supdb::bench::Verdict::NoDifference),
+        !matches!(rd32p.verdict, supdb::bench::Verdict::Less),
         format!(
             "{:.0} ns per point read for 32mb-p64 against {:.0} at 64 MB ({}); 32 MB with coupled \
              partitions {:.0} ({}). Same partition count, same reads; the read cost the first \

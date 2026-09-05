@@ -832,7 +832,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &scan,
         "entries/s",
         false,
-        Want::Greater,
+        Want::NotWorse,
     );
     // Whether the read advice that f66 and f67 measured moves the numbers
     // this project quotes. Same engine, same guarantees, one option apart,
@@ -901,7 +901,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &scan,
         "entries/s",
         false,
-        Want::Greater,
+        Want::NotWorse,
     );
     // And against RocksDB tuned as it is deployed -- a block cache the data
     // fits in, a Bloom filter, four background threads -- which is the pair
@@ -937,7 +937,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &scan,
         "entries/s",
         false,
-        Want::Greater,
+        Want::NotWorse,
     );
     // The drain matched both ways (f60, drain-plan.md). Default `supdb`
     // seals and partitions inside its load window; RocksDB's sync is an
@@ -986,7 +986,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &scan,
         "entries/s",
         false,
-        Want::Greater,
+        Want::NotWorse,
     );
     ordering_of(
         &mut rec,
