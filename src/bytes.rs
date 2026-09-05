@@ -74,6 +74,29 @@ pub trait Bytes {
     /// non-native source -- not an error. There is nothing to tell an OPFS
     /// file handle about page-fault patterns.
     fn advise_random(&self) {}
+
+    /// Fetch `len` bytes at `off` in the background, now.
+    ///
+    /// `MADV_WILLNEED` on a mapped file: not a hint about a pattern but an
+    /// explicit asynchronous read of exactly those bytes, which is the one
+    /// thing a reader can tell the kernel that the kernel cannot work out --
+    /// where the span it is about to walk ends.
+    ///
+    /// Returns the span actually submitted rather than nothing, because an
+    /// implementation may clamp: a caller counting what it *asked* for would
+    /// report bytes that were never submitted, and this reader's whole
+    /// argument is that its numbers say what happened. Zero on any source
+    /// with no mapping behind it.
+    fn advise_willneed(&self, _off: u64, _len: usize) -> usize {
+        0
+    }
+
+    /// Undo `advise_random`: back to the kernel's default readahead.
+    ///
+    /// The pair exists so a reader can follow its workload rather than pick a
+    /// side once -- `f66-adaptive` measures whether that is worth doing. A
+    /// no-op wherever `advise_random` is one.
+    fn advise_normal(&self) {}
 }
 
 /// Read `len` bytes at `off`, borrowing when the source allows it.
@@ -188,6 +211,31 @@ impl Bytes for MmapBytes {
     }
     fn advise_random(&self) {
         let _ = self.0.advise(memmap2::Advice::Random);
+    }
+    fn advise_normal(&self) {
+        let _ = self.0.advise(memmap2::Advice::Normal);
+    }
+    fn advise_willneed(&self, off: u64, len: usize) -> usize {
+        // Clamped rather than trusted: the offsets come from a plan built out
+        // of a file's own block table, and a damaged one must not hand the
+        // kernel a range past the end of the mapping. `try_from` rather than
+        // `as` on the offset because a wrapped one would name a valid page
+        // that is the wrong page, which clamping cannot catch -- a length
+        // only ever comes out short, an offset comes out wrong.
+        let Ok(start) = usize::try_from(off) else {
+            return 0;
+        };
+        let start = start.min(self.0.len());
+        let span = len.min(self.0.len() - start);
+        if span > 0
+            && self
+                .0
+                .advise_range(memmap2::Advice::WillNeed, start, span)
+                .is_ok()
+        {
+            return span;
+        }
+        0
     }
 }
 

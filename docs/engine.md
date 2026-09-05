@@ -12,19 +12,20 @@ registered so the build can be falsified.
 Three measured facts no iteration on the current design can fix:
 
 1. **Index publication is O(key count).** `checkpoint` rewrites the whole key
-   index (F4.1: a 1,000-op durability window costs 25x; F31.1: checkpoint is
+   index (f4: a 1,000-op durability window costs 25x; f31: checkpoint is
    44% of a bulk load; YCSB-E loses at 0.43x even unmatched). The value log
    made durability points cheap but any checkpoint that publishes index state
    still pays in proportion to keys, not to change.
-2. **There is one appender.** F6.1: write throughput barely scales with
+2. **There is one appender.** f6: write throughput barely scales with
    writer threads, and the claim names the single appender mutex.
 3. **The mmap read path degrades 916x out-of-core** (F1.2), with default
-   readahead amplifying a random read 86,977x (F23.1) and no auto-picked
-   threshold that works (F24.1, F24.2).
+   readahead amplifying a random read 86,977x (f23) and no auto-picked
+   threshold that works (f24, on either of the two it tried).
 
 And one measured fact that says what must survive: the read lead is real,
 replicated, and mechanistic — the flat-index probe beats the B-tree descent
-per lookup (EXT.11 1.355x x86 / 2.42x Apple Silicon; ext-readdecomp run 1
+per lookup (the suite's read ordering, 1.355x x86 / 2.42x Apple Silicon; ext-readdecomp
+run 1
 and 2 agree the lead is per-lookup compute, not cache-line or page-size
 luck).
 
@@ -49,29 +50,29 @@ checkpoint.
 - **Commit** = append the batch to the WAL, one fdatasync. f39 measured that
   shape with all engine work removed at **1,191,125 ops/s** on this host
   (0.84ms/barrier), 2.08x LMDB's recorded durable load, and at **1,014,003**
-  with the per-op bookkeeping no engine can skip (F39.1, F39.2). Today's
-  engine commits 5.85x below its own floor (F39.3) on work — arena append,
+  with the per-op bookkeeping no engine can skip (f39). Today's
+  engine commits 5.85x below its own floor (f39) on work — arena append,
   section publication — that this design deletes rather than optimizes.
 - **Seal** = when the memtable reaches segment size, write one immutable
   segment (data blocks + its own flat index), fsync it, truncate the WAL.
   Sealing is off the commit path; a durability point never publishes index
-  structure, which is what removes F4.1's mechanism rather than its cost.
+  structure, which is what removes f4's mechanism rather than its cost.
 - **Read** = probe segments, newest first. f38 measured the two halves of
-  this: segmentation itself is free (F38.2 — sixteen perfectly-routed
+  this: segmentation itself is free (f38 — sixteen perfectly-routed
   segments indistinguishable from one store), and unrouted probes cost
-  90ns each (F38.1), which kills the read lead already at four segments
-  (F38.3, a registered prediction refuted — the plan said the lead survives
+  90ns each (f38), which kills the read lead already at four segments —
+  a registered prediction of f38's, refuted, because the plan said it survives
   k=4 and it does not). **Routing is therefore required, not optional** —
   and f40/f41 measured every candidate shape. Per-segment blocked Blooms
-  keep 82% of k1 (F40.1: a fixed probe order queries ~8.5 filters per
-  lookup). A generic global map manages 62% of the ceiling (F40.2, refuted)
+  keep 82% of k1 (f40: a fixed probe order queries ~8.5 filters per
+  lookup). A generic global map manages 62% of the ceiling (f40, refuted)
   and a purpose-built one-line fingerprint table 71.5% at 6.7x the blooms'
-  memory for a statistical tie with them (F41.1, F41.2, both refuted): at
+  memory for a statistical tie with them (f41, both of its findings refuted): at
   1M keys any router consulted per lookup pays a DRAM miss on a keys-sized
   structure. The conclusion is structural — the only free routing is
   information the reader already holds, so **routing belongs to compaction,
   not to filters**: compacted levels are key-range partitioned and a
-  two-comparison fence routes them for nothing (the same fence F40.3 shows
+  two-comparison fence routes them for nothing (the same fence f40 shows
   inert on overlapping ranges), while the small unpartitioned tail of
   recent segments carries per-segment Blooms. **The ceiling this paragraph
   was written around did not survive contact.** f41 had sixteen
@@ -83,7 +84,7 @@ checkpoint.
   assumption that routing recovers everything fan-out spends.
 - **Compact** = merge segments under the policy f37 already priced: geometric
   size ladders bought 3.963x on fragmenting writes for a 0.762x read tax
-  (F37.1, F37.3). The clause that used to follow — "F38.2 says read cost
+  (f37). The clause that used to follow — "f38 says read cost
   does not force merging" — is **wrong as built**: unrouted segments read
   864,624/s against ~1,020,000 routed at 1M keys (f44), so merging is what
   buys routing and reads do force it. What f44 also shows is that the
@@ -119,7 +120,7 @@ checkpoint.
   present-key reads after the drain are unaffected because partitions
   never carry tombstones (F50.4); and the merge is unaffected (F50.5).
   Format v5's count field, which the tombstone bit rides on, costs 6 B a
-  key -- decomposed to the byte in F7.2 and F11.2, beside the 8 B a key
+  key -- decomposed to the byte in f7 and f11, beside the 8 B a key
   `index_inserts` had already added.
 - **A run of one width is written without prefixes (format v6).** The
   segment writer decides at `end`: if every value in the run has the same
@@ -157,7 +158,7 @@ checkpoint.
   carries no row. `tests/segwriter.rs` flips every seventh byte of a
   segment's key section and requires the open to fail.
 - **Write scaling** = one active memtable+WAL per shard or per writer;
-  segments make the shared-appender mutex (F6.1) unnecessary rather than
+  segments make the shared-appender mutex (f6) unnecessary rather than
   cheaper.
 - **I/O** = the read path is `Bytes` all the way down; mmap is one backend,
   explicit reads another. One read path instead of the current two, and the
@@ -170,7 +171,8 @@ To be measured by the same experiments that convicted the current engine,
 interleaved where the harness allows:
 
 - **P-A, durable load: HELD, and the commit path is now at its floor.**
-  EXT.9's shape reads **955,714 ops/s** (F42.1) against a registered bar
+  The shape the suite's old read ordering used reads **955,714 ops/s** (F42.1) against a
+  registered bar
   of 600,000 — and the lazy-seal arm at 1,029,190 is *past* f39's
   raw+index floor of 1,014,003, so the append-and-commit half of the
   engine has no measured headroom left. Phase accounting puts 0.56s of
@@ -199,10 +201,10 @@ interleaved where the harness allows:
   -- for input that is already sorted, immutable and written once.
 
   **That writer was priced, declined, and then built.** f46 put its FLOOR
-  at 2.04-2.06x the general path (F46.1, replicated), under the 3x
+  at 2.04-2.06x the general path (f46, replicated), under the 3x
   registered as the price of a second writer in the format layer, and it
   was declined. The standing priority then changed -- complexity is spent
-  for time -- and `next::SegmentWriter` now writes every seal and merge
+  for time -- and `supdb::SegmentWriter` now writes every seal and merge
   output in one forward pass, same format, same `Blob`. f49 ran it against
   the general writer interleaved in one process on the f42 shape with the
   drain inside the window, three times: the seal phase was **2.5-3.2x**
@@ -215,9 +217,9 @@ interleaved where the harness allows:
   registered bars), for **1.416x** at the shipping configuration in the
   same run. Three registered predictions fell the other way and each names
   its mechanism: the disk saving is 0.945x rather than the 0.9x promised
-  (F49.3 -- the 180 MB is records, key index and tables, not slack); reads
+  (f49 -- the 180 MB is records, key index and tables, not slack); reads
   over bulk segments are **1.09-1.13x faster** where a tie was registered
-  (F49.4 -- same layout after the drain and F49.7's control ties, so it is
+  (f49 -- same layout after the drain and F49.7's control ties, so it is
   the writer's block placement, not yet isolated); and the merge is
   **write-bound now** -- its remaining 1.2s is 116 MB of output at the
   writer's own speed plus its fsync (F49.5), so finding keys faster was
@@ -226,7 +228,7 @@ interleaved where the harness allows:
   What is left on ingest after that is bytes and barriers, not bookkeeping:
   the routed shape reads and writes the data a second time by design, the
   seal's and the merge's fsyncs sit on the drain, and the commit phase
-  rises when a seal runs beside it (F49.1). f51 tried the two cheap answers
+  rises when a seal runs beside it (f49). f51 tried the two cheap answers
   to that last one -- idle I/O priority for the seal and merge threads, and
   spreading the segment writer's syncs -- and both are inert on this host
   (F51.1-F51.4, every comparison a tie), so the barrier's growth is not a
@@ -237,7 +239,7 @@ interleaved where the harness allows:
   F52.6), and are the shipping default now; smaller seals buy nothing
   until the merge is incremental (F52.1, F52.2).
 - **P-B, the read lead survives: HELD, with its condition stated.** The
-  test was "EXT.11's shape with live segment counts under the compaction
+  test was "that read ordering's shape with live segment counts under the compaction
   policy stays ≥ 1.2x on x86". At the shipping configuration it reads
   **2.2-2.5x** across the three full runs with inline runs and 1.4-1.6x
   across the seven before (EXT.23, ten consecutive holds, each p=0.0022);
@@ -279,8 +281,8 @@ interleaved where the harness allows:
   trade rather than netted against the gain.
 - **P-C, the durability curve flattens:** the F4-durability sweep shows
   window cost independent of key count — the 25x at a 1,000-op window
-  (F4.1) becomes a bounded, window-size-only cost. F4.1 flips or the design
-  failed at its main job.
+  (f4) becomes a bounded, window-size-only cost. That finding flips or the
+  design failed at its main job.
 - **P-D, writes scale: REFUTED AT THE FLOOR, before the build.** f47 ran
   raw WAL streams N-wide with no engine work: four independent streams
   commit **1.61x** one stream (F47.1), eight add nothing over four
@@ -434,6 +436,37 @@ per-commit path.
   with the merge phase at zero, reads unchanged; on uniform keys nothing
   qualifies and nothing changes (F55.1-F55.4, all held). The canonical
   run's shape is uniform, so EXT.22 does not move; a log does.
+- ~~Readahead out-of-core~~ — **answered by f65/f66**. Once the file
+  outgrows the page cache, the kernel's default readahead is the whole
+  cliff: cold point reads run 75.8x and 78.9x faster under `MADV_RANDOM`,
+  at 1.0x read amplification against 1800x, the default having fetched
+  157 GB off the device to serve 89 MB anybody asked for (F65.1, F65.2).
+  It is a trade rather than a win, because the ordered scan wants exactly
+  the pages a point read does not and pays 2.3x to 2.5x for losing them
+  (F65.3). `Options::read_advice` carries that trade: `ReadAdvice::Random`
+  takes one side of it for the life of the store, `ReadAdvice::Normal`
+  the other.
+  What removes the choice is that a store knows which of the two it is
+  doing: `read_all` and `scan` are different calls, so the advice can
+  follow the workload rather than be picked once. Doing that beats a fixed
+  `MADV_RANDOM` by 7.650x and 7.941x on a phased workload and ties an
+  oracle switching at true phase boundaries (F66.2, F66.1) — and costs
+  nothing on a workload that never scans (F66.3). The threshold is one
+  scan, which is no counter at all, because hysteresis measured as the
+  cost rather than the protection: two consecutive scans as the trigger
+  falls to 33.2% and 30.8% of the better fixed advice on a workload with
+  no phases, where one scan is 1.5x it (F66.6, F66.5). A `madvise` is
+  microseconds and a cold scan in the wrong mode is milliseconds, so the
+  policy is right to act on the first call rather than wait for a second.
+  It is `ReadAdvice::Adaptive`, it takes no threshold, because a knob whose
+  only good value is known is a knob nobody should have, and it is the
+  default. f67 is why it can be: over a `Db` of several segments, where a
+  switch costs one `madvise` each, it is 4.3-4.4x the kernel's default and
+  6.5-6.6x a fixed `MADV_RANDOM` (F67.1), and on a store that fits in
+  memory -- where it can win nothing and can only cost -- it is a tie
+  (F67.3). The canonical comparison agrees (EXT.46, EXT.47), which is what
+  a default has to be measured against rather than predicted from.
+
 - **Partitioned compaction policy** — built and measured (f43). The tail
   bound is a real dial: T8 sends 0.898x of T4's device bytes and scans
   0.910x as fast. What f43 also convicted is the merge itself — it
@@ -476,7 +509,8 @@ per-commit path.
   the write that creates it; pre-write in pages.
 - **Group commit** — whether concurrent writers share a barrier; matters
   only after P-D.
-- **What EXT.6 becomes** — segments plus a WAL will not beat LMDB on disk;
+- **What the on-disk size ordering becomes** — segments plus a WAL will not beat LMDB
+  on disk;
   the space claim stays failing and gets re-priced honestly.
 
 ## What this does not promise

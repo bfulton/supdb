@@ -74,6 +74,12 @@ for g in $groups; do
       cargo build --release --bin verify --bin figures
       ./target/release/verify --profile ci
       ./target/release/verify --profile full
+      # `dev` too, not because claims are pinned there -- almost none are, so
+      # nearly everything skips -- but because verify's results-to-claims
+      # direction only sees the profile it is given. Two committed dev records
+      # described the retired engine and nothing could see them.
+      ./target/release/verify --profile dev
+      sh scripts/claimrefs.sh
       # Figures must regenerate from the committed results, so a result whose
       # schema drifted is caught here rather than when someone redraws.
       ./target/release/figures --profile ci --out "$FIGURES-committed"

@@ -27,7 +27,7 @@ mod engines;
 
 #[cfg(feature = "rocksdb")]
 use engines::Rocks;
-use engines::{Batch, Engine, Features, Lmdb, LmdbDup, Next, Redb, Sled};
+use engines::{Batch, Engine, Features, Lmdb, LmdbDup, Redb, Sled, Supdb};
 use std::path::PathBuf;
 use std::time::Instant;
 use supdb::bench::{
@@ -78,9 +78,9 @@ fn build(root: &std::path::Path, which: &[&str]) -> Vec<Box<dyn Engine>> {
     for name in which {
         let dir = root.join(name);
         let e: Result<Box<dyn Engine>, String> = match *name {
-            "next" => Next::create(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
-            "next-ingest" => {
-                Next::create_ingest(&dir).map(|e| Box::new(e) as Box<dyn Engine>)
+            "supdb" => Supdb::create(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
+            "supdb-ingest" => {
+                Supdb::create_ingest(&dir).map(|e| Box::new(e) as Box<dyn Engine>)
             }
             "lmdb-nosync" => Lmdb::create_nosync(&dir, 8).map(|e| Box::new(e) as Box<dyn Engine>),
             "redb" => Redb::create(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
@@ -103,15 +103,38 @@ fn build(root: &std::path::Path, which: &[&str]) -> Vec<Box<dyn Engine>> {
                 "built without the rocksdb feature: cargo build -p supdb-external --features rocksdb"
                     .to_string(),
             ),
-            "next-nodrain" => Next::create_nodrain(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
+            "supdb-nodrain" => Supdb::create_nodrain(&dir).map(|e| Box::new(e) as Box<dyn Engine>),
+            "supdb-noadvice" => {
+                Supdb::create_noadvice(&dir).map(|e| Box::new(e) as Box<dyn Engine>)
+            }
             other => Err(format!("unknown engine {other}")),
         };
         match e {
             Ok(e) => out.push(e),
-            // A comparator that will not start is recorded, never skipped
-            // silently: an absent engine must not look like an engine that
-            // lost.
-            Err(err) => eprintln!("# SKIPPED {name}: {err}"),
+            // An engine that was named and will not start ends the run.
+            //
+            // This used to warn on stderr and carry on, on the reasoning that
+            // an absent engine must not look like an engine that lost. That is
+            // the right instinct and the wrong mechanism: a warning is only
+            // read by someone watching, and a canonical run is scripted. A
+            // missing arm produces no findings, a claim with no finding is
+            // skipped rather than failed, and the run therefore exits 0 having
+            // measured a fraction of what it was asked for. It happened twice
+            // in one afternoon -- both times a plain `cargo build` had replaced
+            // the binary with one built without `--features rocksdb`, and both
+            // times the result looked like a clean shorter run.
+            //
+            // Nothing names an engine by accident: the default list is written
+            // here and every other name arrives through `--engines`. So this is
+            // a caller error in any profile, and it stops.
+            Err(err) => {
+                eprintln!("cannot build the engine '{name}': {err}");
+                eprintln!(
+                    "every engine named must be measurable; a run missing an arm \
+                     reports fewer findings, not a failure"
+                );
+                std::process::exit(2);
+            }
         }
     }
     out
@@ -126,7 +149,12 @@ fn main() -> std::io::Result<()> {
     let engines: Vec<&str> = args
         .get("--engines")
         .map(|s| s.split(',').collect())
-        .unwrap_or_else(|| vec!["next", "redb", "lmdb", "sled"]);
+        // `supdb-noadvice` is in the default set so every run of this suite
+        // prices the engine's default read advice against the kernel's plain
+        // readahead. Leaving it out would mean EXT.46 and EXT.47 were only
+        // ever measured when somebody remembered to ask for them, which is
+        // how a gate stops running.
+        .unwrap_or_else(|| vec!["supdb", "supdb-noadvice", "redb", "lmdb", "sled"]);
 
     let rec = match cmd.as_str() {
         "kv" => suite_kv(&args, profile, &engines)?,
@@ -162,7 +190,8 @@ fn main() -> std::io::Result<()> {
 
 /// Does the load comparison depend on the order the keys arrive in?
 ///
-/// `EXT.10` has Supdb loading at 0.529x of an LMDB that is not syncing either,
+/// The retired undrained ordering had the engine loading at 0.529x of an LMDB
+/// that is not syncing either,
 /// and it has read 0.542x, 0.623x and 0.529x across three runs, so it is not
 /// drift. An append-structured store losing bulk ingest to a B-tree is the one
 /// result this design should not produce, and one thing about how it is
@@ -283,8 +312,8 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
     for name in [
         "lmdb-nosync",
         "lmdb",
-        "next",
-        "next-nodrain",
+        "supdb",
+        "supdb-nodrain",
         "rocksdb",
         "rocksdb-tuned",
     ] {
@@ -299,31 +328,31 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
             compare(&load[a], &load[b], supdb::bench::MIN_EFFECT),
         );
     }
-    // The next engine against LMDB, matched on durability and transactions:
+    // Supdb against LMDB, matched on durability and transactions:
     // the same pair as EXT.22, whose canonical load arrives in order and is
     // mostly piece promotion (F55.3). Shuffled arrival is the shape promotion
     // cannot help, and this is where it is recorded rather than inferred.
-    if let (Some(ns), Some(ls)) = (idx("next", true), idx("lmdb", true)) {
+    if let (Some(ns), Some(ls)) = (idx("supdb", true), idx("lmdb", true)) {
         if !load[ns].is_empty() && !load[ls].is_empty() {
             if let (Some(fa), Some(fb)) = (feats[ns], feats[ls]) {
                 let gap = fa.unmatched(&fb, true);
                 if !gap.is_empty() {
                     rec.finding(Finding::not_exercised(
                         "EXT.27",
-                        "the next engine, durable per batch, loads a shuffled key set at least as \
+                        "the engine, durable per batch, loads a shuffled key set at least as \
                          fast as LMDB",
                         format!("not an ordering: the arms differ on {}", gap.join(", ")),
                     ));
                 } else {
                     let cmp = compare(&load[ns], &load[ls], supdb::bench::MIN_EFFECT);
                     rec.compare("EXT.27_shuffled", cmp.clone());
-                    let seq = idx("next", false).zip(idx("lmdb", false));
+                    let seq = idx("supdb", false).zip(idx("lmdb", false));
                     let seq_ratio = seq
                         .map(|(a, b)| load[a].median() / load[b].median().max(1e-9))
                         .unwrap_or(f64::NAN);
                     rec.finding(Finding::new(
                         "EXT.27",
-                        "the next engine, durable per batch, loads a shuffled key set at least as \
+                        "the engine, durable per batch, loads a shuffled key set at least as \
                          fast as LMDB",
                         !matches!(cmp.verdict, Verdict::Less),
                         format!(
@@ -333,7 +362,7 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
                              transactional, so nothing leans",
                             load[ns].median(),
                             load[ls].median(),
-                            cmp.summary("next", "lmdb")
+                            cmp.summary("supdb", "lmdb")
                         ),
                     ));
                 }
@@ -344,9 +373,9 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
     // comparison EXT.27 needed before it could mean more than "an LSM beats
     // a B-tree under per-batch fsync".
     for (id, mine, rocks) in [
-        ("EXT.31", "next", "rocksdb"),
-        ("EXT.35", "next", "rocksdb-tuned"),
-        ("EXT.41", "next-nodrain", "rocksdb-tuned"),
+        ("EXT.31", "supdb", "rocksdb"),
+        ("EXT.35", "supdb", "rocksdb-tuned"),
+        ("EXT.41", "supdb-nodrain", "rocksdb-tuned"),
     ] {
         let (Some(ns), Some(rs)) = (idx(mine, true), idx(rocks, true)) else {
             continue;
@@ -357,7 +386,7 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
                 if !gap.is_empty() {
                     rec.finding(Finding::not_exercised(
                         id,
-                        "the next engine, syncing per batch, loads a shuffled key set at least as \
+                        "the engine, syncing per batch, loads a shuffled key set at least as \
                          fast as RocksDB",
                         format!("not an ordering: the arms differ on {}", gap.join(", ")),
                     ));
@@ -370,7 +399,7 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
                         .unwrap_or(f64::NAN);
                     rec.finding(Finding::new(
                         id,
-                        "the next engine, syncing per batch, loads a shuffled key set at least as \
+                        "the engine, syncing per batch, loads a shuffled key set at least as \
                          fast as RocksDB",
                         !matches!(cmp.verdict, Verdict::Less),
                         format!(
@@ -398,7 +427,8 @@ fn suite_loadshape(args: &Args, profile: Profile, which: &[&str]) -> std::io::Re
 /// subtract to remove store creation and the payload generator, exactly as
 /// `docs/profiling.md` does with `indexlab probe --lookups 0`.
 ///
-/// It exists because EXT.10 says Supdb loads at 0.54x of an LMDB that is not
+/// It exists because the retired undrained ordering had the engine loading at
+/// 0.54x of an LMDB that is not
 /// syncing either -- a B-tree beating an append-structured store at bulk
 /// ingest, which is the one thing this design is supposed to win. That is a
 /// defect to find rather than a tradeoff to accept, and no timing harness can
@@ -407,7 +437,7 @@ fn load_profile(args: &Args, which: &[&str]) -> std::io::Result<()> {
     let n = args.num("--keys", 200_000) as u64;
     let value_size = args.num("--value-size", 100);
     let batch = args.num("--batch", 1_000).max(1);
-    let name = which.first().copied().unwrap_or("next");
+    let name = which.first().copied().unwrap_or("supdb");
     let root = scratch(&format!("loadprof-{name}"));
     let Some(mut e) = build(&root, &[name]).into_iter().next() else {
         eprintln!("# no engine {name}");
@@ -463,7 +493,7 @@ fn load_profile(args: &Args, which: &[&str]) -> std::io::Result<()> {
 /// Every engine is measured `reps` times and the engines are interleaved, one
 /// round at a time, so a machine that drifts drifts across all of them rather
 /// than into one. It used to run each engine exactly once. That is the habit
-/// this whole module exists to break, and it showed: EXT.1 read 0.70x, 1.03x,
+/// this whole module exists to break, and it showed: one load ordering read 0.70x, 1.03x,
 /// 0.998x, 1.13x and 0.85x across five single runs and flipped between holding
 /// and failing on margins as small as 0.2%. An ordering now has to clear
 /// `stats::compare` -- a Mann-Whitney U test and a minimum effect size --
@@ -654,15 +684,25 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
 
     let idx = |name: &str| which.iter().position(|w| *w == name);
     // `mine` is the left-hand engine. It is a parameter rather than always
-    // "supdb" because EXT.9 compares the durable arm, and an engine comparing
+    // the engine under test because a durable ordering compares the durable arm,
+    // and an engine comparing
     // itself against a comparator on a boundary the comparator does not use is
-    // the thing EXT.9 exists to stop.
+    // the thing this parameter exists to stop.
     // `writes` says whether the metric touches the write path, which decides
     // whether the durability axis has to match for the ordering to mean
     // anything. Everything else that can be equalized must match on every
     // metric; when it does not, the pair is `not_exercised` rather than
     // ranked. That is the whole of the fix: the features table used to be a
     // note printed beside a number, and it is a precondition now.
+    // What "holds" means for a pair. Most orderings here assert a win, but a
+    // finding that a change costs nothing has to hold on a tie -- gating it on
+    // `Greater` would demand a win where there is nothing to win, which is a
+    // finding designed to fail.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Want {
+        Greater,
+        NotWorse,
+    }
     let ordering_of = |rec: &mut Record,
                        id: &str,
                        title: &str,
@@ -670,7 +710,8 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
                        other: &str,
                        s: &[Samples],
                        unit: &str,
-                       writes: bool| {
+                       writes: bool,
+                       want: Want| {
         let (Some(si), Some(oi)) = (idx(mine), idx(other)) else {
             return;
         };
@@ -698,7 +739,10 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
             return;
         }
         let cmp = compare(&s[si], &s[oi], supdb::bench::MIN_EFFECT);
-        let holds = matches!(cmp.verdict, Verdict::Greater);
+        let holds = match want {
+            Want::Greater => matches!(cmp.verdict, Verdict::Greater),
+            Want::NotWorse => !matches!(cmp.verdict, Verdict::Less),
+        };
         rec.compare(&format!("{id}_{mine}_vs_{other}"), cmp.clone());
         // Transactions are the one axis that cannot be equalized, so say which
         // way the remainder leans instead of pretending it is not there.
@@ -728,29 +772,31 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         ));
     };
 
-    // The next engine (supdb::next), measured on the same three axes against
+    // Supdb (supdb::Db), measured on the same three axes against
     // the same LMDB in the same process. Its commit is a WAL append plus one
     // fdatasync per batch -- LMDB's own boundary -- so the load comparison is
-    // matched the way EXT.9 is, with the same transactional residual.
+    // matched the way EXT.22 is, with the same transactional residual.
     ordering_of(
         &mut rec,
         "EXT.22",
-        "The next engine loads faster than LMDB when both commit durably per batch",
-        "next",
+        "Supdb loads faster than LMDB when both commit durably per batch",
+        "supdb",
         "lmdb",
         &load,
         "ops/s",
         true,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
         "EXT.23",
-        "The next engine reads faster than LMDB",
-        "next",
+        "Supdb reads faster than LMDB",
+        "supdb",
         "lmdb",
         &read,
         "reads/s",
         false,
+        Want::Greater,
     );
     // The read-for-write trade, measured in one run rather than across
     // two: same engine, same guarantees, one policy bit apart, so nothing
@@ -759,66 +805,103 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
         &mut rec,
         "EXT.25",
         "Leaving partitioning to background compaction ingests faster than doing it at flush",
-        "next-ingest",
-        "next",
+        "supdb-ingest",
+        "supdb",
         &load,
         "ops/s",
         true,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
         "EXT.26",
         "and it costs the ordered scan",
-        "next",
-        "next-ingest",
+        "supdb",
+        "supdb-ingest",
         &scan,
         "entries/s",
         false,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
         "EXT.24",
-        "The next engine scans no slower than LMDB",
-        "next",
+        "Supdb scans no slower than LMDB",
+        "supdb",
         "lmdb",
         &scan,
         "entries/s",
         false,
+        Want::Greater,
     );
-    // The same three axes against RocksDB, the engine the next engine is
+    // Whether the read advice that f66 and f67 measured moves the numbers
+    // this project quotes. Same engine, same guarantees, one option apart,
+    // so nothing needs matching -- and interleaved rather than compared
+    // across campaigns, because the unchanged comparators in this suite once
+    // moved +20% to +43% between consecutive runs.
+    //
+    // The canonical dataset is resident, which is where F67.3 says the policy
+    // can win nothing and should cost nothing. These two are the check that
+    // it costs nothing HERE, and they are what a change of default waits on.
+    ordering_of(
+        &mut rec,
+        "EXT.46",
+        "The engine's default read advice does not cost the canonical point read",
+        "supdb",
+        "supdb-noadvice",
+        &read,
+        "reads/s",
+        false,
+        Want::NotWorse,
+    );
+    ordering_of(
+        &mut rec,
+        "EXT.47",
+        "nor the ordered scan",
+        "supdb",
+        "supdb-noadvice",
+        &scan,
+        "entries/s",
+        false,
+        Want::NotWorse,
+    );
+    // The same three axes against RocksDB, the engine Supdb is
     // shaped like: both sync the WAL per batch, both apply a batch whole,
     // neither verifies a checksum on read (Features::unmatched decides the
-    // rest). This is the pair that says whether the next engine is fast or
+    // rest). This is the pair that says whether the engine is fast or
     // an LSM is; the LMDB pair cannot.
     ordering_of(
         &mut rec,
         "EXT.28",
-        "The next engine loads faster than RocksDB when both sync the WAL per batch",
-        "next",
+        "Supdb loads faster than RocksDB when both sync the WAL per batch",
+        "supdb",
         "rocksdb",
         &load,
         "ops/s",
         true,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
         "EXT.29",
-        "The next engine reads faster than RocksDB",
-        "next",
+        "Supdb reads faster than RocksDB",
+        "supdb",
         "rocksdb",
         &read,
         "reads/s",
         false,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
         "EXT.30",
-        "The next engine scans no slower than RocksDB",
-        "next",
+        "Supdb scans no slower than RocksDB",
+        "supdb",
         "rocksdb",
         &scan,
         "entries/s",
         false,
+        Want::Greater,
     );
     // And against RocksDB tuned as it is deployed -- a block cache the data
     // fits in, a Bloom filter, four background threads -- which is the pair
@@ -826,34 +909,37 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
     ordering_of(
         &mut rec,
         "EXT.32",
-        "The next engine loads faster than tuned RocksDB when both sync the WAL per batch",
-        "next",
+        "Supdb loads faster than tuned RocksDB when both sync the WAL per batch",
+        "supdb",
         "rocksdb-tuned",
         &load,
         "ops/s",
         true,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
         "EXT.33",
-        "The next engine reads faster than tuned RocksDB",
-        "next",
+        "Supdb reads faster than tuned RocksDB",
+        "supdb",
         "rocksdb-tuned",
         &read,
         "reads/s",
         false,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
         "EXT.34",
-        "The next engine scans no slower than tuned RocksDB",
-        "next",
+        "Supdb scans no slower than tuned RocksDB",
+        "supdb",
         "rocksdb-tuned",
         &scan,
         "entries/s",
         false,
+        Want::Greater,
     );
-    // The drain matched both ways (f60, drain-plan.md). Default `next`
+    // The drain matched both ways (f60, drain-plan.md). Default `supdb`
     // seals and partitions inside its load window; RocksDB's sync is an
     // fsync. So: both drained -- RocksDB flushed and compacted at sync --
     // and neither drained -- next's sync an fsync, its tail read out of the
@@ -861,52 +947,57 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
     ordering_of(
         &mut rec,
         "EXT.36",
-        "The next engine loads faster than tuned RocksDB when both drain at sync",
-        "next",
+        "Supdb loads faster than tuned RocksDB when both drain at sync",
+        "supdb",
         "rocksdb-tuned-drain",
         &load,
         "ops/s",
         true,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
         "EXT.37",
-        "The next engine loads faster than tuned RocksDB when neither drains at sync",
-        "next-nodrain",
+        "Supdb loads faster than tuned RocksDB when neither drains at sync",
+        "supdb-nodrain",
         "rocksdb-tuned",
         &load,
         "ops/s",
         true,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
         "EXT.38",
-        "The next engine reads faster than tuned RocksDB when neither drained",
-        "next-nodrain",
+        "Supdb reads faster than tuned RocksDB when neither drained",
+        "supdb-nodrain",
         "rocksdb-tuned",
         &read,
         "reads/s",
         false,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
         "EXT.39",
-        "The next engine scans no slower than tuned RocksDB when neither drained",
-        "next-nodrain",
+        "Supdb scans no slower than tuned RocksDB when neither drained",
+        "supdb-nodrain",
         "rocksdb-tuned",
         &scan,
         "entries/s",
         false,
+        Want::Greater,
     );
     ordering_of(
         &mut rec,
         "EXT.40",
-        "The next engine reads faster than tuned RocksDB when both drained",
-        "next",
+        "Supdb reads faster than tuned RocksDB when both drained",
+        "supdb",
         "rocksdb-tuned-drain",
         &read,
         "reads/s",
         false,
+        Want::Greater,
     );
     rec.note(
         "feature_score counts durable commit, transactions, checksums, reopen-for-write, \
@@ -963,7 +1054,7 @@ fn suite_kv(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<Re
 /// reads it once; this builds each store once and sweeps it warm, the
 /// `ext-sweep` precedent, because rebuilding a 4M-key LMDB store per rep does
 /// not fit any host's budget. Compare shapes *within* this record; do not
-/// average its absolute ratios with EXT.11's, they are different experiments.
+/// average its absolute ratios with the kv suite's read ordering, they are different experiments.
 /// The prediction table -- which outcome convicts which mechanism, written
 /// before the first run -- is `read-decomposition-plan.md` at the repo root.
 fn suite_readdecomp(
@@ -977,7 +1068,7 @@ fn suite_readdecomp(
     let which: Vec<&str> = if args.get("--engines").is_some() {
         engines_arg.to_vec()
     } else {
-        vec!["next", "lmdb"]
+        vec!["supdb", "lmdb"]
     };
     let keys_list = args.list(
         "--keys-list",
@@ -995,9 +1086,25 @@ fn suite_readdecomp(
     let base_value = args.num("--value-size", 100);
     let reads = args.num("--reads", profile.pick(2_000, 100_000, 500_000)) as u64;
     let batch = args.num("--batch", 1_000).max(1);
-    let reps = args.num("--reps", profile.reps());
+    // Twenty-one at `full`. Seven cannot resolve the depth arm: across six runs
+    // EXT.19 came back holds four times and fails twice on identical code,
+    // because it compares the lead at the top of the key axis against the lead
+    // at the bottom and the 100k cell is the noisiest thing in the record --
+    // 1.62x to 2.54x across those runs against 1.87x to 2.22x at 4M. A finding
+    // whose direction is decided by its noisiest cell adjudicates the host, and
+    // this one names opposite mechanisms in its plan (P1 depth against P2
+    // per-access), so a coin flip there misinforms rather than merely failing to
+    // inform. Twenty-one narrows it without settling it: of four runs at that
+    // count three read greater at p=0.0000 (1.134x, 1.253x and one more) and
+    // one read NO DIFFERENCE at ratio 1.046. Ten runs across both counts stand
+    // at seven greater to three flat, and no run has ever read less -- so the
+    // lead does not shrink with n, and whether it provably grows is a question
+    // this host answers most of the time and not all of it. The claim records
+    // what the committed run measured; the instability is the reason this
+    // comment exists rather than a footnote in a plan.
+    let reps = args.num("--reps", profile.pick(5, 5, 21));
     // The anchor: the key count the hot and value axes pivot on. The middle
-    // of the list, which at the defaults is 1M -- EXT.11's own shape.
+    // of the list, which at the defaults is 1M -- the read ordering's own shape.
     let anchor = keys_list[keys_list.len() / 2];
 
     let mut rec = Record::new("ext-readdecomp", profile);
@@ -1140,7 +1247,7 @@ fn suite_readdecomp(
         .map(|_| (0..ne).map(|_| Hist::new()).collect())
         .collect();
     let mut miss = vec![vec![0u64; ne]; nc];
-    let si = which.iter().position(|w| *w == "next");
+    let si = which.iter().position(|w| *w == "supdb");
     let li = which.iter().position(|w| *w == "lmdb");
     let mut ratio: Vec<Samples> = (0..nc).map(|_| Samples::default()).collect();
 
@@ -1413,7 +1520,7 @@ fn suite_readdecomp(
                          accesses, fewer instructions (c as compute, or d). Supdb's index probes \
                          stay scattered across the whole index section even in this cell, so the \
                          residual TLB cost leans against it and a surviving lead is conservative",
-                        hot_cmp.summary("next", "lmdb"),
+                        hot_cmp.summary("supdb", "lmdb"),
                         ratio[ac].median(),
                         ratio[hc].median(),
                         lead_cmp.summary("lead@hot", "lead@uniform")
@@ -1514,7 +1621,7 @@ fn suite_readdecomp(
 /// emit -- while the seek is bounded by the number of *dependent* memory
 /// accesses, since probe k+1 cannot issue until probe k returns. Reporting one
 /// blended entries/s figure hides which of the two an engine is losing on, and
-/// this suite has been reporting exactly that: EXT.5 is a single number at one
+/// this suite has been reporting exactly that: the retired scan ordering was a single number at one
 /// scan length.
 ///
 /// Measuring the same scan at many lengths separates them. Cost per scan is
@@ -1863,7 +1970,7 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
     let idx = |name: &str| which.iter().position(|w| *w == name);
     let wl = |prefix: char| workloads.iter().position(|w| w.0.starts_with(prefix));
 
-    // The matched pairs: the next engine, undrained after its load as
+    // The matched pairs: the engine, undrained after its load as
     // RocksDB is, against RocksDB tuned as deployed. Both commit durably
     // per batch, both apply a batch whole, neither verifies checksums on
     // read; `Features::unmatched` refuses the ordering if that ever stops
@@ -1875,8 +1982,8 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
         ("EXT.45", 'F', "read-modify-write (YCSB-F)"),
     ];
     for (id, w, what) in pairs {
-        let title = format!("the next engine sustains {what} at least as fast as tuned RocksDB");
-        let (Some(wi), Some(ni), Some(ri)) = (wl(w), idx("next-nodrain"), idx("rocksdb-tuned"))
+        let title = format!("the engine sustains {what} at least as fast as tuned RocksDB");
+        let (Some(wi), Some(ni), Some(ri)) = (wl(w), idx("supdb-nodrain"), idx("rocksdb-tuned"))
         else {
             continue;
         };
@@ -1897,7 +2004,7 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
             continue;
         }
         let cmp = compare(a, b, supdb::bench::MIN_EFFECT);
-        rec.compare(&format!("{id}_next-nodrain_vs_rocksdb-tuned"), cmp.clone());
+        rec.compare(&format!("{id}_supdb-nodrain_vs_rocksdb-tuned"), cmp.clone());
         rec.finding(Finding::new(
             id,
             &title,
@@ -1907,7 +2014,7 @@ fn suite_ycsb(args: &Args, profile: Profile, which: &[&str]) -> std::io::Result<
                  {batch}-record batches, each batch durable",
                 a.median(),
                 b.median(),
-                cmp.summary("next-nodrain", "rocksdb-tuned")
+                cmp.summary("supdb-nodrain", "rocksdb-tuned")
             ),
         ));
     }
@@ -2073,11 +2180,12 @@ fn intersect_sorted(a: &[u32], b: &[u32]) -> u64 {
 ///
 /// The dataset is one synthetic day in logshed's shape (`src/bin/logshed.rs`):
 /// two fields of zipf-skewed terms, one 4-byte line-ordinal posting per field
-/// per line, appended grouped by term because W1.3 showed the naive roll
+/// per line, appended grouped by term because the retired line-order arm
+/// of w1-daysize showed the naive roll
 /// costs 22.6x the file. ~2,000 term keys and ~1M postings at `full`.
 ///
 /// Read-only over immutable segments built once and probed repeatedly, so
-/// every number is warm, like ext-sweep's -- EXT.12 owns cold -- and
+/// every number is warm, like ext-sweep's -- ext-kv's cold arm owns cold -- and
 /// durability does not bind. The checksum axis does: supdb-nocksum is built
 /// without checksums and read without verification, which is the arm matched
 /// to LMDB, because LMDB has none to turn on. The checksummed arm (the
@@ -2113,7 +2221,7 @@ fn suite_analytics(args: &Args, profile: Profile) -> std::io::Result<Record> {
         )
         .note(
             "read-only over immutable segments built once and probed repeatedly: every number is \
-             warm, like ext-sweep's, and EXT.12 owns cold. Durability does not bind on a read; \
+             warm, like ext-sweep's, and ext-kv's cold arm owns cold. Durability does not bind on a read; \
              the checksum axis does, and supdb-nocksum -- built without checksums, read without \
              verification -- is the \
              matched arm for every claim, since LMDB has none to turn on. Plain supdb is \

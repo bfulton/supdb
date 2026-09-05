@@ -1,4 +1,4 @@
-//! Milestone-1 contract of the next engine: multivalue order across seals, a
+//! The engine's contract: multivalue order across seals, a
 //! model-checked read path, and the crash windows the module doc enumerates.
 //! Every crash here is emulated the way `tests/known_bugs.rs` emulates them:
 //! by constructing the exact on-disk state the window leaves behind, because
@@ -66,7 +66,7 @@ fn reads_see_uncommitted_and_unsealed_state() {
 
 #[test]
 fn killed_before_first_seal_opens_from_the_wal_alone() {
-    // P-E, the flip of C3.4: no segment exists, only a WAL.
+    // P-E: no segment exists, only a WAL.
     let d = dir("preseal");
     let mut db = Db::create(&d, Options::default()).unwrap();
     for i in 0u32..500 {

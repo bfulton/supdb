@@ -59,8 +59,10 @@ fn main() -> std::io::Result<()> {
         profile
     );
 
+    check_shape(&claims, &mut out);
     check_findings(&claims, &results, &profile, &mut out);
     check_metrics(&claims, &results, &profile, &mut out);
+    check_unregistered(&claims, &results, &profile, &mut out);
 
     println!("\n{} claim(s) checked", out.checked);
     if !out.skipped.is_empty() {
@@ -96,10 +98,70 @@ fn main() -> std::io::Result<()> {
     }
 }
 
-fn load(results: &Path, experiment: &str, profile: &str) -> Option<J> {
+/// A result file that is absent and one that is unreadable are different
+/// facts, and collapsing them is how a gate reports a verdict it has not
+/// earned: an absent file means a claim was not exercised at this profile,
+/// while a corrupt or truncated one means the check could not run. The first
+/// version returned `Option` for both, so a damaged result silently skipped
+/// every claim of its experiment.
+enum Load {
+    Missing,
+    Broken(String),
+    Ok(Box<J>),
+}
+
+fn load(results: &Path, experiment: &str, profile: &str) -> Load {
     let p = results.join(format!("{experiment}.{profile}.json"));
-    let text = std::fs::read_to_string(p).ok()?;
-    jparse::parse(&text).ok()
+    let text = match std::fs::read_to_string(&p) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Load::Missing,
+        Err(e) => return Load::Broken(format!("{} could not be read: {e}", p.display())),
+    };
+    match jparse::parse(&text) {
+        Ok(doc) => Load::Ok(Box::new(doc)),
+        Err(e) => Load::Broken(format!("{} is not parseable: {e:?}", p.display())),
+    }
+}
+
+/// Every claim must name an experiment and an id.
+///
+/// Both readers below reach for those with `unwrap_or("")`, and an empty one
+/// is not harmless in the same way twice. In the claims-to-results direction
+/// it looks up a result for the experiment `""`, finds nothing, and reports
+/// the claim *skipped* -- so a claim with a typo in its experiment name is
+/// silently never checked, which is the quietest way this file could fail.
+/// In the other direction it registers the pair `("", "")`, which matches no
+/// finding, so a real finding would at least be reported unregistered.
+///
+/// Checking the shape once here means neither direction has to care: a claim
+/// that cannot be read is a failure, said out loud, rather than a claim that
+/// quietly stops being adjudicated.
+///
+/// The other half of this is not here, and the reason is worth writing down.
+/// A *misspelt* experiment is as quiet as an empty one -- it reads as an
+/// experiment nobody has run, so the claims side skips it and the results
+/// side never sees the name. The obvious test is whether any result names it,
+/// and that is wrong: `check.sh suites` verifies against a directory holding
+/// only the experiments that run just produced, so every other experiment
+/// looks misspelt. It cost 46 false failures to find that out. The reference
+/// set that would work is the dispatch table in the suite binaries, which
+/// this one is deliberately not linked against, so catching it properly needs
+/// that list exported rather than a directory listing guessed at.
+fn check_shape(claims: &J, out: &mut Outcome) {
+    let Some(list) = claims.path("findings") else {
+        return;
+    };
+    for (i, c) in list.items().iter().enumerate() {
+        let exp = c.path("experiment").and_then(|v| v.as_str()).unwrap_or("");
+        let id = c.path("id").and_then(|v| v.as_str()).unwrap_or("");
+        if exp.is_empty() || id.is_empty() {
+            out.failures.push(format!(
+                "claims.json findings[{i}]: a claim must name both an experiment and an id, \
+                 and this one has experiment {exp:?} and id {id:?} -- a claim that cannot be \
+                 read is a claim nothing adjudicates"
+            ));
+        }
+    }
 }
 
 fn check_findings(claims: &J, results: &Path, profile: &str, out: &mut Outcome) {
@@ -121,9 +183,16 @@ fn check_findings(claims: &J, results: &Path, profile: &str, out: &mut Outcome) 
         }
         let label = format!("{exp}/{id}");
 
-        let Some(doc) = load(results, exp, profile) else {
-            out.skipped.push(label);
-            continue;
+        let doc = match load(results, exp, profile) {
+            Load::Ok(doc) => doc,
+            Load::Missing => {
+                out.skipped.push(label);
+                continue;
+            }
+            Load::Broken(why) => {
+                out.failures.push(format!("{label}: {why}"));
+                continue;
+            }
         };
         // Architecture pins for the same reason profile pins exist. Cache line
         // size and page size differ across targets -- Graviton is 64B/4KiB like
@@ -190,6 +259,106 @@ fn check_findings(claims: &J, results: &Path, profile: &str, out: &mut Outcome) 
     }
 }
 
+/// The other direction: a finding a run reported that no claim registers.
+///
+/// `check_findings` walks claims and looks for results, which cannot see a
+/// finding nobody claimed -- and an unclaimed finding is the exact thing this
+/// file exists to prevent, a measurement with no recorded expected state. It
+/// hid two different faults at once: findings the suites emit and nobody ever
+/// adjudicated, and findings left in a committed result by an experiment that
+/// has since stopped emitting them, which is a result file describing an
+/// engine that no longer exists.
+///
+/// Registration is what is checked, not adjudication at this profile: a claim
+/// pinned to `full` or to one architecture still registers its finding
+/// everywhere, so pins are ignored here.
+fn check_unregistered(claims: &J, results: &Path, profile: &str, out: &mut Outcome) {
+    let mut registered: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    if let Some(list) = claims.path("findings") {
+        for c in list.items() {
+            let exp = c.path("experiment").and_then(|v| v.as_str()).unwrap_or("");
+            let id = c.path("id").and_then(|v| v.as_str()).unwrap_or("");
+            registered.insert((exp.to_string(), id.to_string()));
+        }
+    }
+    let suffix = format!(".{profile}.json");
+    let dir = match std::fs::read_dir(results) {
+        Ok(d) => d,
+        Err(e) => {
+            // Not a silent return. A results directory that cannot be listed
+            // means this direction did not run, and a check that did not run
+            // must not report that it passed.
+            out.failures.push(format!(
+                "{} could not be listed, so no result could be checked for \
+                 unregistered findings: {e}",
+                results.display()
+            ));
+            return;
+        }
+    };
+    // Every entry that cannot be read is a failure, not a skip. This is the
+    // third place in this function where dropping an error would have let the
+    // check pass over a results file and still report success -- after the
+    // directory that would not list and the file that would not parse. An
+    // entry this loop never sees is a finding this direction never checks,
+    // and that is the whole thing it was added to prevent.
+    let mut files: Vec<String> = Vec::new();
+    for entry in dir {
+        let name = match entry {
+            Ok(e) => e.file_name(),
+            Err(e) => {
+                out.failures.push(format!(
+                    "{} could not be walked past an entry, so some result may not have been \
+                     checked for unregistered findings: {e}",
+                    results.display()
+                ));
+                continue;
+            }
+        };
+        match name.into_string() {
+            Ok(n) if n.ends_with(&suffix) => files.push(n),
+            Ok(_) => {}
+            Err(n) => out.failures.push(format!(
+                "{}: a file name that is not UTF-8, so it cannot be matched against an \
+                 experiment: {n:?}",
+                results.display()
+            )),
+        }
+    }
+    files.sort();
+    for name in files {
+        let exp = &name[..name.len() - suffix.len()];
+        let doc = match load(results, exp, profile) {
+            Load::Ok(doc) => doc,
+            // The name came out of the directory listing a moment ago, so
+            // absent here means it went away mid-check.
+            Load::Missing => {
+                out.failures.push(format!(
+                    "{exp}: {name} was listed and then could not be opened"
+                ));
+                continue;
+            }
+            Load::Broken(why) => {
+                out.failures.push(format!("{exp}: {why}"));
+                continue;
+            }
+        };
+        for f in doc.path("findings").map(|f| f.items()).unwrap_or(&[]) {
+            let id = f.path("id").and_then(|v| v.as_str()).unwrap_or("");
+            if id.is_empty() {
+                continue;
+            }
+            if !registered.contains(&(exp.to_string(), id.to_string())) {
+                let status = f.path("status").and_then(|v| v.as_str()).unwrap_or("");
+                out.failures.push(format!(
+                    "{exp}/{id}: the run recorded this finding ('{status}') and no claim registers it"
+                ));
+            }
+        }
+    }
+}
+
 fn check_metrics(claims: &J, results: &Path, profile: &str, out: &mut Outcome) {
     let Some(list) = claims.path("metrics") else {
         return;
@@ -207,9 +376,16 @@ fn check_metrics(claims: &J, results: &Path, profile: &str, out: &mut Outcome) {
         }
         let label = format!("{exp}:{path}");
 
-        let Some(doc) = load(results, exp, profile) else {
-            out.skipped.push(label);
-            continue;
+        let doc = match load(results, exp, profile) {
+            Load::Ok(doc) => doc,
+            Load::Missing => {
+                out.skipped.push(label);
+                continue;
+            }
+            Load::Broken(why) => {
+                out.failures.push(format!("{label}: {why}"));
+                continue;
+            }
         };
         if let Some(want_arch) = c.path("arch").and_then(|v| v.as_str()) {
             if doc.path("env.arch").and_then(|v| v.as_str()) != Some(want_arch) {

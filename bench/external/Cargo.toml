@@ -26,7 +26,7 @@ heed = "0.20"
 # so both LMDB adapters measure byte-identical C code.
 lmdb-master-sys = "0.2"
 sled = "0.34"
-# The log-structured engine the next engine is shaped like, and the one the
+# The log-structured engine supdb is shaped like, and the one the
 # shuffled-arrival win over LMDB (EXT.27) had to be measured against before
 # it meant anything: an LSM beating a B-tree under per-batch fsync is what
 # every LSM does. Built without compression libraries, since every other

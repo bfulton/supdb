@@ -44,11 +44,11 @@
 #[cfg(not(target_family = "wasm"))]
 pub mod bench;
 
-// The format modules below are vendored from the design artifact verbatim, so
-// that the architecture review's line-level references stay valid and so a
-// reader can compare what was measured against what was described. Style lints
-// are scoped off here rather than fixed in place; the harness code above and
-// in src/bin holds to -D warnings.
+// The format modules below came from the design artifact rather than being
+// written here. `block` and `index` still have their style lints scoped off
+// rather than paid down, which is all that is left of the distinction: they
+// are formatted by the same gate as every other file, and the harness code
+// above and in src/bin holds to -D warnings.
 /// The on-disk format's fixed quantities: the superblock magic and geometry.
 /// Not owned by any writer -- two of them exist and three readers parse what
 /// either produced.
@@ -79,9 +79,8 @@ pub mod db;
 /// The flat key index, including the builders a segment writer drives.
 /// Public for the same reason as `index`: a bulk writer for sorted,
 /// write-once input is a legitimate second producer of this format, and
-/// f46 prices one. The lint allowance is the only concession to making a
-/// vendored module public -- its `len()` methods predate the exposure and
-/// the module is not reformatted for it.
+/// f46 prices one. The lint allowance is the only concession to making the
+/// module public -- its `len()` methods predate the exposure.
 #[allow(clippy::len_without_is_empty)]
 pub mod flatindex;
 /// The C ABI the browser calls. Hand-written rather than generated, because
@@ -99,4 +98,6 @@ pub use bytes::{Bytes, SliceBytes, VecBytes};
 /// names were the other way round while a second engine owned the shorter
 /// one.
 #[cfg(not(target_family = "wasm"))]
-pub use db::{BackgroundIo, Db, Options, SegmentOptions, SegmentWriter, SyncPolicy, Txn};
+pub use db::{
+    BackgroundIo, Db, Options, ReadAdvice, SegmentOptions, SegmentWriter, SyncPolicy, Txn,
+};

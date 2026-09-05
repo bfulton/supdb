@@ -471,7 +471,7 @@ mod tests {
 
 /// Where a phase's wall-clock time went: on a CPU, or waiting.
 ///
-/// This closes the gap `f13-sync` and `F13.2` are about. Callgrind counts
+/// This closes the gap the retired `f13-sync` experiment was about. Callgrind counts
 /// instructions, so it can say the block table decode is 34% of them -- which
 /// was true, and mapping it changed throughput by nothing, because the
 /// workload was waiting on `fsync`. An instruction profile answers where the

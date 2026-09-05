@@ -56,6 +56,41 @@ jobs:
       - name: Build, test and lint
         run: sh scripts/check.sh build test lint
 
+  comparator-arm:
+    # The RocksDB arm is behind `--features rocksdb` and no other job builds
+    # it, because librocksdb-sys compiles RocksDB from the source it vendors
+    # and that is a ten-minute C++ build the fast path does not need: every
+    # RocksDB claim is pinned to `full`, which CI never runs.
+    #
+    # So nothing compiled it. An engine-wide rename of supdb's own `Options`
+    # to `SegmentOptions` reached into the rocksdb crate's type of the same
+    # name, and the arm stopped building -- through an entire engine
+    # retirement, unnoticed, while EXT.28 through EXT.41 sat in claims.json
+    # as though they were reproducible. The suite refuses an arm it was not
+    # built with and says so, which is correct and is also why the runs kept
+    # looking clean: a claim with no finding is skipped, not failed.
+    #
+    # This is `cargo check`, not a run. It gates compilation only, on its own
+    # job so the ten minutes stay off the fast path, and the cargo cache
+    # carries it after the first build.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # clang-sys wants a directory holding a file named exactly `libclang.so`;
+      # the runners ship the versioned library only.
+      - name: Point bindgen at libclang
+        run: |
+          set -eu
+          lib=$(ls /usr/lib/llvm-*/lib/libclang.so.1 /usr/lib/x86_64-linux-gnu/libclang-*.so.1 2>/dev/null | head -1)
+          test -n "$lib"
+          mkdir -p "$RUNNER_TEMP/libclang"
+          ln -sf "$lib" "$RUNNER_TEMP/libclang/libclang.so"
+          echo "LIBCLANG_PATH=$RUNNER_TEMP/libclang" >> "$GITHUB_ENV"
+      - name: The comparator arms compile
+        run: cargo check --release -p supdb-external --features rocksdb --all-targets
+
   cross-arm:
     # Proves the ARM paths build and pass before any ARM hardware is involved.
     runs-on: ubuntu-latest

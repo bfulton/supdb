@@ -94,9 +94,10 @@ touches, exactly, with no cache model. Cachegrind measures *misses* given a
 model, accounting for what stays resident. Agreement between them, as here, is
 much stronger evidence than either alone.
 
-## Worked example: why Supdb loses bulk ingest (EXT.10)
+## Worked example: why Supdb loses bulk ingest
 
-`EXT.10` has Supdb loading at 0.542x of an LMDB that is not syncing either.
+The external suite's undrained load ordering had Supdb at 0.542x of an LMDB that is not
+syncing either.
 An append-structured store beaten 1.85x at bulk ingest by a B-tree is a defect
 rather than a tradeoff, and no timing harness can say where it went.
 
@@ -153,7 +154,7 @@ behind a flag, interleaved in one process -- rather than assumed.
 
 ## When a miss profile points the wrong way
 
-`EXT.13` has Supdb 3.3x behind LMDB on keys arriving in order, which is the
+The suite's ordered-arrival load had Supdb 3.3x behind LMDB, which is the
 common shape. Three tools were pointed at it and the first two misled.
 
 **cachegrind, subtracted, per key of a 50k sequential load:**
@@ -190,7 +191,7 @@ The put path is within 1.17x. The whole gap is the flush.
 | fsync | 0.0007s |
 
 68.5MB of index at 169 MB/s. So the checkpoint is not sorting or encoding, it
-is *writing*, and what it writes is a structure LMDB does not have: F11.4
+is *writing*, and what it writes is a structure LMDB does not have: f11
 prices the mapped index at +73.5% on the file, deliberately, because a section
 read in place cannot be compressed.
 
@@ -203,7 +204,7 @@ slow, and an instruction count says neither.
 
 ## The put path, and the profile that had to be thrown away
 
-The whole-load decomposition (F31.1) puts 43% in `put`, against LMDB's
+The whole-load decomposition (f31) puts 43% in `put`, against LMDB's
 equivalent 0.100s lower. That difference is larger than everything lever 2
 saved and it had never been looked at, because it is the phase that was
 never the suspect.

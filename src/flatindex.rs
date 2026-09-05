@@ -1,12 +1,12 @@
 //! A key index that is read where it lies instead of rebuilt on open.
 //!
-//! The shipped index is decoded into `Vec<(Vec<u8>, Extents)>` and then hashed,
-//! which costs two failing claims at once. `F2.1`: open is not independent of
-//! key count -- 6.4ms at 100k keys, 1446ms at 10M, so 100x the keys costs 225x
-//! the open. `F7.2`: the result is 131 bytes per key, resident in every reader
-//! process, shared with nobody. Both are properties of *rebuilding*, not of
-//! the data: the bytes on disk are already an index, and the decode exists
-//! only because the on-disk shape is not one a lookup can use.
+//! The engine this replaced decoded its index into `Vec<(Vec<u8>, Extents)>`
+//! and then hashed it, which cost two things at once. Open was not independent
+//! of key count -- 6.4ms at 100k keys, 1446ms at 10M, so 100x the keys cost
+//! 225x the open -- and the result was 131 bytes per key, resident in every
+//! reader process, shared with nobody. Both are properties of *rebuilding*,
+//! not of the data: the bytes on disk are already an index, and the decode
+//! existed only because the on-disk shape was not one a lookup can use.
 //!
 //! So write a shape a lookup can use. `indexlab` measured ten candidates for
 //! this and the answer was not the elaborate one: `hash+flatfixed` -- an open
@@ -135,7 +135,11 @@ pub fn pieces(len: usize, shift: u32, base: u64) -> impl Iterator<Item = (usize,
         if at >= len {
             return None;
         }
-        let end = if at == 0 { first.min(len) } else { (at + piece).min(len) };
+        let end = if at == 0 {
+            first.min(len)
+        } else {
+            (at + piece).min(len)
+        };
         let r = (at, end);
         at = end;
         Some(r)
@@ -195,7 +199,9 @@ pub fn verify_pieces(
     base: u64,
 ) -> std::result::Result<(), usize> {
     let n = checksum_row_len(crc_off, shift, base);
-    let row = sec.get(crc_off..crc_off.checked_add(n).ok_or(usize::MAX)?).ok_or(usize::MAX)?;
+    let row = sec
+        .get(crc_off..crc_off.checked_add(n).ok_or(usize::MAX)?)
+        .ok_or(usize::MAX)?;
     for (i, (a, b)) in pieces(crc_off, shift, base).enumerate() {
         if crate::block::crc32(&sec[a..b]) != piece_crc(row, i).ok_or(usize::MAX)? {
             return Err(i);
@@ -378,7 +384,12 @@ impl<'a> FenceView<'a> {
         let offs = region.get(..offs_len)?;
         let blob_len = rd_u32(offs, h.fence_n * 4)? as usize;
         let blob = region.get(offs_len..offs_len.checked_add(blob_len)?)?;
-        Some(FenceView { offs, blob, n: h.fence_n, stride: h.fence_stride })
+        Some(FenceView {
+            offs,
+            blob,
+            n: h.fence_n,
+            stride: h.fence_stride,
+        })
     }
 
     /// Bytes the fence region spans: offsets plus blob.
@@ -672,7 +683,11 @@ pub fn plan_inline(
     // Half again, so a store whose keys gain extents can publish updates
     // without rewriting anything -- unless the caller says the section is
     // never edited in place.
-    let slack = if record_slack { at * SLACK_NUM / SLACK_DEN } else { 0 };
+    let slack = if record_slack {
+        at * SLACK_NUM / SLACK_DEN
+    } else {
+        0
+    };
     let recs_cap = at.checked_add(slack)?;
     if recs_cap > MAX_RECS {
         return None;
@@ -736,7 +751,16 @@ pub fn encode(
     insert_slack: usize,
     parallel: bool,
 ) -> Option<(Vec<u8>, usize)> {
-    encode_inline(all, &[], generation, prev, hash_of, insert_slack, true, parallel)
+    encode_inline(
+        all,
+        &[],
+        generation,
+        prev,
+        hash_of,
+        insert_slack,
+        true,
+        parallel,
+    )
 }
 
 /// `encode`, with each key's inline runs (`tails`, empty or one per key,
@@ -988,12 +1012,7 @@ pub fn encode_inline(
                             // SAFETY: `s` is masked to the table size.
                             let cell = unsafe { &*slots.0.add(s) };
                             if cell
-                                .compare_exchange(
-                                    0,
-                                    packed,
-                                    Ordering::Relaxed,
-                                    Ordering::Relaxed,
-                                )
+                                .compare_exchange(0, packed, Ordering::Relaxed, Ordering::Relaxed)
                                 .is_ok()
                             {
                                 break;
@@ -1141,7 +1160,11 @@ impl FlatIndex {
         // segment writer streams records first and puts the rest after them.
         // What is enforced is that every region sits inside the section past
         // the header and that no two overlap.
-        let regions = [(hash_off, hash_end), (dir_off, dir_end), (recs_off, recs_end)];
+        let regions = [
+            (hash_off, hash_end),
+            (dir_off, dir_end),
+            (recs_off, recs_end),
+        ];
         for (a, b) in regions {
             if a < HEADER || b > sec.len() || a > b {
                 return None;
@@ -1183,7 +1206,11 @@ impl FlatIndex {
                 return None;
             }
             // The fence region may not overlap the others either.
-            for (a, b) in [(hash_off, hash_end), (dir_off, dir_end), (recs_off, recs_end)] {
+            for (a, b) in [
+                (hash_off, hash_end),
+                (dir_off, dir_end),
+                (recs_off, recs_end),
+            ] {
                 if fence_offs_off < b && a < blob_end && a != b && fence_offs_off != blob_end {
                     return None;
                 }
@@ -1873,7 +1900,8 @@ mod tests {
     #[test]
     fn the_previous_index_is_carried() {
         let all = corpus(10);
-        let sec = padded(encode(&refs(&all), 9, Some((8, 1234, 4096, 100, 200)), h, 0, false).unwrap());
+        let sec =
+            padded(encode(&refs(&all), 9, Some((8, 1234, 4096, 100, 200)), h, 0, false).unwrap());
         let ix = FlatIndex::parse(&sec).unwrap();
         assert_eq!(ix.prev, Some((8, 1234, 4096, 100, 200)));
     }

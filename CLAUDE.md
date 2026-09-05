@@ -40,9 +40,16 @@ simple**. In practice:
 
 - **No counts that move.** Not the number of tests, assertions, claims, commits
   or files. They are wrong within a day and they never mattered.
-- **No figures that move.** Directions and trades belong there; the numbers
-  belong in `claims.json` and `results/`, where `verify` gates them. Cite the
-  claim id instead and the reader gets a checked figure rather than a snapshot.
+- **No figures that move** -- and the test is the tense, not the document. A
+  standing figure is a claim about how things *are*, so "reads 2.2x LMDB" in
+  the README is wrong by next quarter and belongs in `claims.json` and
+  `results/` where `verify` gates it; cite the claim id and the reader gets a
+  checked number instead of a snapshot. A figure attached to a *change* is a
+  claim about what that change did, and a pull request or a commit message is
+  dated by construction, so "this made cold reads about 75x faster" is as true
+  next year as the day it landed. Put the size of the win where a reader will
+  see it in those, and round it -- an approximate magnitude survives a rerun
+  and four significant figures invites someone to diff them.
 - **No history.** Not what a section used to say, not what the design document
   called it, not what was tried first. A reader who wants that follows the
   pointer.
@@ -119,11 +126,18 @@ is not a measurement.
 
 There was a second engine until recently: the one vendored from the design
 artifact, with its own writer, reader, freelist and key table. It is gone, and
-`retire-plan.md` records what went with it and why. The three format modules
-still carry a scoped `#[allow(clippy::all, dead_code)]` and are still exempt
-from the format gate, because `docs/architecture-review.md` cites line numbers
-in them; that exemption is now a reformat of three files away from being
-liftable. Everything else holds to `-D warnings`.
+`retire-plan.md` records what went with it and why. `block` and `index` still
+carry a scoped `#[allow(clippy::all, dead_code)]` -- style not yet paid down,
+rather than code anyone may not touch. Nothing is exempt from the format gate.
+Everything else holds to `-D warnings`.
+
+The exemption those two modules used to have is worth remembering, because it
+was the same shape as every other gate failure here. It was justified in
+`scripts/fmt.sh`, in `src/lib.rs` and in this file by the architecture review
+citing line numbers in the exempt files. The review cites none, and nothing
+had checked. Two of the three files turned out to be rustfmt-clean already, so
+the whole exemption was buying a reformat of one file -- and the reason it
+survived was that its justification read like one nobody needed to verify.
 
 ## Measuring a change to the engine
 
@@ -165,7 +179,7 @@ rule is the reason `Features::unmatched` exists.
 
 Equalize in **both** directions where the engines allow it, so a reader gets
 the comparison for the guarantee they care about rather than the one that
-flatters: `next` and `lmdb` both commit per batch, `next-nodrain` and
+flatters: `supdb` and `lmdb` both commit per batch, `supdb-nodrain` and
 `rocksdb-tuned` neither drain. Where an axis cannot be equalized -- LMDB
 cannot stop being transactional -- say which way the residual leans and read
 the result as a bound: a loss is at least that large, a win is not yet a win.
@@ -217,7 +231,7 @@ found zero joins that blocked on an unfinished seal under either key
 order and the manifest at 2% of the seal phase; 74% is the last memtable
 being sealed and partitioned because the adapter's `sync` drains, which
 RocksDB's `sync` (an fsync of its WAL) does not. So the drain is matched
-both ways (drain-plan.md; `next-nodrain`, `rocksdb-tuned-drain`): with
+both ways (drain-plan.md; `supdb-nodrain`, `rocksdb-tuned-drain`): with
 neither draining the durable ordered load is a **tie** (0.904x, `EXT.37`)
 and the shuffled load **2.37x** (`EXT.41`), with both draining 0.815x
 (`EXT.36`); point reads lead 4.7x undrained and 7.1x drained (`EXT.38`,
