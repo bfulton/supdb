@@ -40,7 +40,7 @@ luck).
   nothing composite scans faster), and a sealed segment is byte-for-byte the
   shape `Blob` reads today — the browser reader carries over whole.
 - **The schema-property fast paths.** `count_fixed` / `scan_counts_fixed`
-  (W2.2-W2.4), which logshed already depends on.
+  (W2.2-W2.4), which the browser reader already depends on.
 
 ## The shape
 
@@ -137,7 +137,7 @@ checkpoint.
 - **A segment's blocks can be compressed (segcompress-plan.md).**
   `set_compress` takes the path `write_block` always had: chunked above the
   chunk size, verbatim when it does not pay, and a verbatim block carries
-  per-chunk checksums so a run read plans chunks. 19.9% of logshed's day
+  per-chunk checksums so a run read plans chunks. 19.9% of a real day index
   (W6.8, under its 25% prediction). Postings stored as absolute ordinals
   compress by nothing at all, which is a fact about LZ4 and counters
   rather than about the writer.

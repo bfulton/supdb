@@ -688,8 +688,8 @@ fn a_head_reserve_opens_the_sparse_reader_from_the_probe_alone() {
 }
 
 /// Values with structure, so compression has something to find: four-byte
-/// posting *deltas*, which is what logshed stores and what LZ4 halves --
-/// small numbers, so three bytes in four are zero and the matches are long.
+/// posting *deltas*, which LZ4 halves -- small numbers, so three bytes in
+/// four are zero and the matches are long.
 /// Absolute ordinals do not compress, which the first version of this test
 /// discovered by shrinking nothing.
 fn postings(keys: usize, seed: u64) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {

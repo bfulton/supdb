@@ -29,7 +29,7 @@ fn scratch(name: &str) -> PathBuf {
     d.join("segment.supdb")
 }
 
-/// A key-multivalue segment shaped like a logshed day index: a few thousand
+/// A key-multivalue segment shaped like a term index: a few thousand
 /// keys, wildly uneven run lengths, values grouped by key.
 ///
 /// The run lengths straddle `inline_max`, so the fixture covers a run that
@@ -309,8 +309,8 @@ fn damaged_objects_do_not_panic_the_caller() {
 
 /// R4.3, the part that is a real O(extents) count.
 ///
-/// A posting list of fixed-width values -- which is what logshed writes, four
-/// bytes of line ordinal -- has a count that falls out of the extent list with
+/// A posting list of fixed-width values -- four bytes of ordinal -- has a
+/// count that falls out of the extent list with
 /// no block touched. This checks the arithmetic against the walk on a segment
 /// whose keys span one extent and many, and checks that a schema which is
 /// *not* fixed width is refused rather than answered wrongly.

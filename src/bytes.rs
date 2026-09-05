@@ -189,7 +189,8 @@ impl MmapBytes {
         let file = std::fs::File::open(path)?;
         // SAFETY: same contract `Reader::open` takes -- the file must not be
         // truncated underneath the mapping. supdb only ever appends and the
-        // logshed shape seals the object before any reader sees it.
+        // write-once shape this serves seals the object before any reader
+        // sees it.
         Ok(MmapBytes(unsafe { memmap2::Mmap::map(&file)? }))
     }
 }

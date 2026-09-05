@@ -15,7 +15,7 @@
 //                       CachedBytes (cache.mjs) holding only the parts
 //                       queries touch, under a byte budget
 //
-// The second and third are what logshed uses and the reason nothing here is
+// The second and third are the reason nothing here is
 // async past `load`/`ensure`. `FileSystemSyncAccessHandle.read(buf, {at})` is
 // a synchronous random read, so the Rust side never has to await, and
 // `flatindex` can go on handing back borrows into the index. Both are only
@@ -90,7 +90,7 @@ class Module {
   }
 }
 
-/// The reader logshed calls. R4.
+/// The browser reader. R4.
 export class SupdbReader {
   constructor(mod, handle) {
     this.mod = mod;
@@ -157,7 +157,7 @@ export class SupdbReader {
   /// `lookup` frames one view per record, which for a common trigram is
   /// hundreds of thousands of allocations; this crosses the boundary once
   /// and copies once. Fixed-width values are then one typed array:
-  /// `new Uint32Array(readConcat(key).bytes.buffer)` for logshed's postings.
+  /// `new Uint32Array(readConcat(key).bytes.buffer)` for four-byte postings.
   readConcat(key) {
     const m = this.mod;
     const n = m.withKey(key, (p, l) =>
@@ -186,7 +186,8 @@ export class SupdbReader {
   /// from the extent list with no block touched at all.
   ///
   /// `null` when the key's values are not all `width` bytes, in which case
-  /// fall back to `count`. logshed's postings are four-byte line ordinals.
+  /// fall back to `count`. A posting list of four-byte ordinals is the case
+  /// this exists for.
   countFixed(key, width) {
     const v = this.mod.withKey(key, (p, l) =>
       this.exports.supdb_count_fixed(this.handle, p, l, width),
@@ -236,7 +237,8 @@ export class SupdbReader {
   /// Covers data reads only: the superblock, key index and block table are
   /// fetched whole at open (planned by `supdb_open_plan`) and are resident
   /// after. That split costs ~nothing while key cardinality is bounded --
-  /// a logshed segment is ~100 keys of index over megabytes of postings --
+  /// a term index over enumerable fields is ~100 keys of index over
+  /// megabytes of postings --
   /// and it is the premise that expires if keys become unbounded, e.g. a
   /// trigram or free-text index. Do not index free text over this source
   /// without revisiting it; the ranges stay absolute so that day changes
@@ -292,8 +294,8 @@ export class SupdbReader {
       // `keyBytes` is the key. `key` is a rendering of it for display:
       // supdb keys are byte strings, and a key that is not valid UTF-8 --
       // a trigram cut through a multibyte character is the common case --
-      // decodes with U+FFFD in it, so the text cannot be looked up. logshed
-      // found this by round-tripping every key of a dictionary; pass
+      // decodes with U+FFFD in it, so the text cannot be looked up. Found
+      // by round-tripping every key of a dictionary; pass
       // `keyBytes` to `lookup`, `count` and the rest, never `key`.
       // Sliced, not subarrayed: the wasm memory can grow under a view.
       const keyBytes = m.mem.slice(at, at + klen);
