@@ -7,18 +7,26 @@
 # large or because a Rust cdylib starts out large, and those want different
 # responses. See `web/floor/Cargo.toml`.
 #
-# Writes results/w3-bundle.<profile>.json through `browser bundle`, so the size
-# record carries its machine and goes through the same gate as everything else.
+# Prints the four sizes it measures, one per line, as `name bytes`. Recording
+# them against a budget is the falsification suite's job, in supdb-bench: this
+# script builds the artifact and measures it, and nothing here decides whether
+# a number is good.
 #
-#   web/build.sh [profile]     profile defaults to ci
+#   web/build.sh
 set -eu
 
 cd "$(dirname "$0")/.."
-profile="${1:-ci}"
 
 echo "# building the reader for wasm32-unknown-unknown"
+# Ask cargo where its target directory is rather than assuming `target/`.
+# This repository is a submodule of supdb-bench, and there the workspace root
+# -- and so the target directory -- is a level up. A hard-coded path built
+# fine and then failed to find its own artifact.
+target=$(cargo metadata --format-version 1 --no-deps \
+  | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+
 cargo build --profile wasm --lib --target wasm32-unknown-unknown
-wasm=target/wasm32-unknown-unknown/wasm/supdb.wasm
+wasm="$target/wasm32-unknown-unknown/wasm/supdb.wasm"
 
 echo "# building the floor"
 cargo build --release --target wasm32-unknown-unknown --manifest-path web/floor/Cargo.toml
@@ -32,8 +40,7 @@ sz() { wc -c < "$1" | tr -d ' '; }
 cp "$wasm" web/supdb.wasm
 echo "# wrote web/supdb.wasm"
 
-cargo build --release --bin browser
-./target/release/browser bundle \
-  --profile "$profile" \
-  --wasm-bytes "$(sz "$wasm")" --wasm-gzip "$(gz "$wasm")" \
-  --floor-bytes "$(sz "$floor")" --floor-gzip "$(gz "$floor")"
+echo "wasm_bytes $(sz "$wasm")"
+echo "wasm_gzip $(gz "$wasm")"
+echo "floor_bytes $(sz "$floor")"
+echo "floor_gzip $(gz "$floor")"

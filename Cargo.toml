@@ -1,12 +1,3 @@
-[workspace]
-members = [".", "bench/external"]
-# The root is itself a package, so a bare `cargo build --release` here builds
-# only the engine and leaves `bench/external` at whatever revision it was last
-# built at. That is how an engine change came to be measured against a
-# benchmark binary that did not contain it: the run reported the change as
-# worth 2%, and it was worth 15x.
-default-members = [".", "bench/external"]
-
 [package]
 name = "supdb"
 version = "0.1.0"
@@ -52,27 +43,3 @@ codegen-units = 1
 panic = "abort"
 strip = true
 debug = false
-
-[[bin]]
-name = "internal"
-path = "src/bin/internal.rs"
-
-[[bin]]
-name = "verify"
-path = "src/bin/verify.rs"
-
-[[bin]]
-name = "figures"
-path = "src/bin/figures.rs"
-
-[[bin]]
-name = "correctness"
-path = "src/bin/correctness.rs"
-
-[[bin]]
-name = "indexlab"
-path = "src/bin/indexlab.rs"
-
-[[bin]]
-name = "browser"
-path = "src/bin/browser.rs"
