@@ -183,7 +183,7 @@ The put path is within 1.17x. The whole gap is the flush.
 
 **Timing inside the checkpoint** (`SUPDB_CKPT_PHASES=1`):
 
-| | |
+| phase | time |
 |---|---|
 | sort 1M keys | 0.057s |
 | encode the index | 0.089s |
