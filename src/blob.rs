@@ -284,8 +284,8 @@ struct Super {
     /// arena exists, `open` probes its first length word and refuses a
     /// nonzero one: those records are newer than everything in the index by
     /// construction, and a reader that ignored them would quietly serve the
-    /// previous state. A sealed object -- a logshed segment after its
-    /// closing checkpoint -- never trips this, having no arena to probe; the
+    /// previous state. A sealed object -- one written by a segment writer
+    /// and closed -- never trips this, having no arena to probe; the
     /// probe fires only for a store that was never cleanly closed, a
     /// writer's working file or a crash leftover, which was never this
     /// reader's contract to serve.
@@ -368,8 +368,8 @@ fn pick_super(head: &[u8], object_len: u64) -> Result<Super> {
     }
     // A section that was compressed cannot be addressed where it lies, and
     // this reader has no reason to support the varint formats -- they are
-    // what `flat_index` replaced, and a logshed day index is written by a
-    // current writer with the current defaults.
+    // what `flat_index` replaced, and a segment this reader is given is
+    // written by a current writer with the current defaults.
     if sb.key_stored != sb.key_uncompressed || sb.blk_stored != sb.blk_uncompressed {
         return Err(Error::new(
             ErrorKind::Unsupported,
@@ -853,9 +853,9 @@ impl<B: Bytes> Blob<B> {
     /// key index and the block table are read at `open` (planned by
     /// `open_ranges`) and are resident from then on; this call names only the
     /// data reads that come after. That split is cheap today because the
-    /// sections are small when key cardinality is bounded -- a logshed
-    /// segment is ~100 keys of index over megabytes of postings, since terms
-    /// come from fields with tens of values each. It stops being cheap the
+    /// sections are small when key cardinality is bounded -- a term index
+    /// over enumerable fields is ~100 keys of index over megabytes of
+    /// postings. It stops being cheap the
     /// day the keys are unbounded -- a trigram or free-text index -- and the
     /// index would then need to be planned and fetched sparsely too. The
     /// ranges here are absolute file offsets with no assumption that the
@@ -1318,8 +1318,8 @@ impl<B: Bytes> Blob<B> {
     /// prefix, so a run of them is exactly `n * (width + varint_len(width))`
     /// bytes and the count falls straight out of the extent list.
     ///
-    /// logshed's postings are four-byte line ordinals, so this is the call it
-    /// should make. `f28-count` prices the difference.
+    /// A posting list of four-byte ordinals is the case this exists for.
+    /// `f28-count` prices the difference.
     ///
     /// `None` when the stored bytes are not an exact multiple of the stride,
     /// which is what a key whose values are *not* all `width` bytes looks

@@ -199,8 +199,8 @@ pub struct Options {
     pub seal_bytes: usize,
     /// SegmentOptions for the segment writer. Fixed to `redo_log: false, shards: 1`
     /// regardless of what is passed, because a sealed segment is written
-    /// once and never reopened for writing -- the logshed finding that a
-    /// 4 MiB redo arena in a write-once file is pure waste.
+    /// once and never reopened for writing, and a 4 MiB redo arena in a
+    /// write-once file is pure waste.
     pub segment: SegmentOptions,
     /// How many overlapping L0 segments to tolerate before a partitioning
     /// merge. The brief's open "partitioned compaction policy" question in
@@ -980,8 +980,8 @@ impl SegmentWriter {
     /// Compress the blocks. Off by default, because a segment written by the
     /// the seal is read back by its own merge and the seal path
     /// has never paid for compression; a segment written as an index to be
-    /// downloaded is the other case, and logshed's day index is 30% smaller
-    /// with it on. Must be set before the first key.
+    /// downloaded is the other case, where a term index over posting deltas
+    /// is materially smaller with it on. Must be set before the first key.
     pub fn set_compress(&mut self, on: bool) {
         self.compress = on;
     }

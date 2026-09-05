@@ -3,7 +3,7 @@
 #
 #   sh scripts/check.sh          # all of it, as a contributor runs before pushing
 #   sh scripts/check.sh lint     # one group
-#   sh scripts/check.sh test browser
+#   sh scripts/check.sh test wasm
 #
 # CI calls the same groups. That is the whole point: before this existed the
 # checks were written down twice, once in a contributor's habits and once in
@@ -13,21 +13,24 @@
 # be running in one of them and not the other.
 #
 # Groups:
-#   build    the workspace, release
-#   test     cargo test --workspace (unit and integration, every target)
+#   build    the crate, release
+#   test     cargo test (unit and integration, every target)
 #   lint     clippy at -D warnings, and the format gate
-#   browser  the wasm module, the Node error paths and the Chromium suite
-#   claims   verify the committed results at both profiles, and redraw figures
-#   suites   the falsification, comparison and correctness suites at `ci`,
-#            then verify the claims against those fresh results
+#   wasm     the browser reader and its floor, built for wasm32-unknown-unknown
+#            by web/build.sh
 #
 # Not here, deliberately: cross-arm, which needs a cross toolchain and qemu
-# and so is CI-only, and `--profile full`, which takes hours and is run by
-# hand when a number is going to be cited.
+# and so is CI-only; and the falsification suite, which lives in supdb-bench
+# together with the claims it checks and the results they are checked against.
+# CI runs that suite against every pull request here, with this checkout
+# standing in for the bench repository's submodule -- the `bench` job in
+# .github/workflows/ci.yml -- so a claim about the engine still cannot go
+# stale without a build going red. The browser test went with it, because it
+# is an experiment with a recorded expected state, not a build step.
 set -eu
 cd "$(dirname "$0")/.."
 
-ALL="build test lint browser claims suites"
+ALL="build test lint wasm"
 # Lowercase because `GROUPS` is a built-in bash variable holding the current
 # user's group ids. Assigning to it does not take, so on any host where
 # /bin/sh is bash -- macOS ships bash 3.2 as /bin/sh -- this loop would have
@@ -35,65 +38,29 @@ ALL="build test lint browser claims suites"
 # /bin/sh on the Linux runners, has no such variable and hid it.
 groups="${*:-$ALL}"
 
-# Where `suites` writes. CI overrides these so it can upload them.
-#
-# Spelled out rather than `${CHECK_RESULTS:-results-ci}`, because macOS ships
-# bash 3.2 as /bin/sh and it mishandles a default expansion of an *unset*
-# variable under `set -u`: the script died there having printed nothing, on a
-# checkout that passed on both Linux runners. `${VAR+x}` is the portable test
-# for "is it set", and the `if` is not an `&&` because a false `&&` would trip
-# `set -e`.
-RESULTS=results-ci
-FIGURES=figures-ci
-if [ -n "${CHECK_RESULTS+x}" ]; then RESULTS=$CHECK_RESULTS; fi
-if [ -n "${CHECK_FIGURES+x}" ]; then FIGURES=$CHECK_FIGURES; fi
-
 say() { printf '\n=== %s ===\n' "$1"; }
 
 for g in $groups; do
   case "$g" in
     build)
       say "build"
-      cargo build --release --workspace
+      cargo build --release
       ;;
     test)
       say "test"
-      cargo test --release --workspace
+      cargo test --release
       ;;
     lint)
       say "lint"
-      cargo clippy --release --workspace --all-targets -- -D warnings
+      cargo clippy --release --all-targets -- -D warnings
       sh scripts/fmt.sh --check
       ;;
-    browser)
-      say "browser"
-      sh web/test/run.sh
-      ;;
-    claims)
-      say "claims"
-      cargo build --release --bin verify --bin figures
-      ./target/release/verify --profile ci
-      ./target/release/verify --profile full
-      # `dev` too, not because claims are pinned there -- almost none are, so
-      # nearly everything skips -- but because verify's results-to-claims
-      # direction only sees the profile it is given. Two committed dev records
-      # described the retired engine and nothing could see them.
-      ./target/release/verify --profile dev
-      sh scripts/claimrefs.sh
-      # Figures must regenerate from the committed results, so a result whose
-      # schema drifted is caught here rather than when someone redraws.
-      ./target/release/figures --profile ci --out "$FIGURES-committed"
-      test -s "$FIGURES-committed/index.html"
-      ;;
-    suites)
-      say "suites"
-      cargo build --release --workspace
-      ./target/release/internal all --profile ci --out "$RESULTS"
-      ./target/release/external kv   --profile ci --out "$RESULTS"
-      ./target/release/external ycsb --profile ci --keys 10000 --ops 10000 --out "$RESULTS"
-      ./target/release/correctness all --profile ci --out "$RESULTS"
-      ./target/release/verify --profile ci --results "$RESULTS"
-      ./target/release/figures --profile ci --results "$RESULTS" --out "$FIGURES"
+    wasm)
+      say "wasm"
+      # Builds the module and the floor and prints their sizes. Whether a
+      # size is acceptable is a claim, and claims are gated in supdb-bench;
+      # here the check is that the module still links.
+      sh web/build.sh
       ;;
     *)
       echo "unknown group: $g" >&2

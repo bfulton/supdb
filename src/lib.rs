@@ -37,18 +37,11 @@
 //! already in hand and being copied. That produces sorted runs, which is what
 //! ordered scans will need later, at close to no cost.
 
-// The measurement substrate reads `getrusage`, `clock_gettime` and `sysconf`,
-// none of which exist on wasm, and it has no business in a browser bundle
-// anyway. Eleven of the twenty-nine errors a wasm build used to produce were
-// this module alone.
-#[cfg(not(target_family = "wasm"))]
-pub mod bench;
-
 // The format modules below came from the design artifact rather than being
 // written here. `block` and `index` still have their style lints scoped off
 // rather than paid down, which is all that is left of the distinction: they
-// are formatted by the same gate as every other file, and the harness code
-// above and in src/bin holds to -D warnings.
+// are formatted by the same gate as every other file, and everything else
+// holds to -D warnings.
 /// The on-disk format's fixed quantities: the superblock magic and geometry.
 /// Not owned by any writer -- two of them exist and three readers parse what
 /// either produced.

@@ -1,4 +1,4 @@
-// The worker logshed's reader runs in.
+// The worker the browser reader runs in.
 //
 // It exists because `FileSystemSyncAccessHandle` does not exist on the main
 // thread, and that handle is the whole of R2.2(a): it is what makes a browser
@@ -44,7 +44,7 @@ async function open({ wasmUrl, indexUrl, name, source, budgetBytes, pageSize, pr
     // R6.3: the index itself by range. Same cache, a different open.
     // A smaller page than the point-read cache's: the index is where the
     // sparse reader's bytes go, and w5-dict found the 64 KiB page rather
-    // than the bytes to be its cost at logshed's dictionary sizes.
+    // than the bytes to be its cost at realistic dictionary sizes.
     cache = await CachedBytes.open({
       name,
       fetcher: httpRangeFetcher(indexUrl),
@@ -67,7 +67,7 @@ async function open({ wasmUrl, indexUrl, name, source, budgetBytes, pageSize, pr
   return { source: "opfs", keys: reader.keys, size: handle.getSize() };
 }
 
-// FNV-1a 32, the same hash `logshed segment` records, so a multi-kilobyte
+// FNV-1a 32, the same hash the fixture generator records, so a multi-kilobyte
 // lookup is checked byte-for-byte without shipping the bytes in the fixture.
 function fnv32(values) {
   let h = 0x811c9dc5 >>> 0;
