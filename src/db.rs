@@ -904,6 +904,49 @@ fn superblock(fields: &[u64; 16]) -> [u8; crate::format::SUPER_BYTES] {
 }
 
 impl SegmentWriter {
+    /// Write a whole segment from input already in hand, sizing the head
+    /// reserve exactly instead of guessing at it.
+    ///
+    /// The reserve has to be chosen before the first key is written, so a
+    /// streaming caller can only guess -- and both ways of guessing wrong are
+    /// invisible, costing a round trip or costing file. A caller that gathered
+    /// its keys first does not have to: the lengths are enough to compute the
+    /// reserve exactly, which is what `reserve::for_lengths` does and what
+    /// this does for you.
+    ///
+    /// `items` must be sorted by key, as the streaming API requires. Returns
+    /// the reserve it used, since a caller measuring segments wants to know.
+    pub fn write_sorted(
+        path: &Path,
+        opts: &SegmentOptions,
+        inline_max: usize,
+        generation: u64,
+        items: &[(&[u8], &[&[u8]])],
+    ) -> Result<usize> {
+        let lengths: Vec<(usize, usize)> = items
+            .iter()
+            .map(|(k, vals)| {
+                let lens: Vec<u32> = vals.iter().map(|v| v.len() as u32).collect();
+                (k.len(), crate::reserve::run_len(&lens))
+            })
+            .collect();
+        let reserve = crate::reserve::for_lengths(&lengths, opts.block_size, inline_max)
+            .ok_or_else(|| err("segment writer: this input cannot be a segment"))?
+            .bytes();
+        let mut w = SegmentWriter::create(path, opts)?;
+        w.set_inline_max(inline_max);
+        w.set_head_reserve(reserve);
+        for (k, vals) in items {
+            w.begin(k)?;
+            for v in *vals {
+                w.value(v);
+            }
+            w.end()?;
+        }
+        w.finish(generation)?;
+        Ok(reserve)
+    }
+
     /// Open `path` for a fresh segment. `opts` supplies the block size, the
     /// checksum switch and whether the index build may use threads; the
     /// rest of `SegmentOptions` describes machinery this writer does not have.

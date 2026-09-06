@@ -783,3 +783,346 @@ fn a_compressed_segment_agrees_with_an_uncompressed_one() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The reserve estimator against the writer it estimates for: a segment
+/// written with exactly `reserve::for_lengths` opens, plans and walks from a
+/// probe of that size, with every read outside it an error.
+///
+/// This is the check the estimator needs, because neither way of being wrong
+/// is a fault. A reserve too small does not fail; the pieces that do not fit
+/// go after the data and the sparse reader quietly takes a second round trip.
+/// A reserve too large does not fail either; it is file size. So the test
+/// makes the second round trip impossible instead of looking for an error.
+#[test]
+fn the_computed_reserve_is_what_a_segment_actually_needs() {
+    use std::cell::RefCell;
+    struct Probe {
+        data: Vec<u8>,
+        allowed: RefCell<Vec<(u64, u64)>>,
+    }
+    impl supdb::Bytes for Probe {
+        fn len(&self) -> u64 {
+            self.data.len() as u64
+        }
+        fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
+            let end = off + dst.len() as u64;
+            let ok = self
+                .allowed
+                .borrow()
+                .iter()
+                .any(|&(a, l)| a <= off && end <= a + l);
+            if !ok {
+                return Err(std::io::Error::other(format!(
+                    "read outside the probe: {off}+{}",
+                    dst.len()
+                )));
+            }
+            dst.copy_from_slice(&self.data[off as usize..end as usize]);
+            Ok(())
+        }
+    }
+
+    let _g = serial();
+    let dir = scratch("segwriter-computed-reserve");
+
+    // Four shapes, because the pieces the reserve holds are sized by
+    // different things: the fence by the sampled keys' lengths, the table by
+    // how the runs cut into blocks, the directory by the key count alone.
+    // A uniform fixture would hide an error in any of the three.
+    let shapes: [(&str, usize, usize, bool); 4] = [
+        ("tiny", 100, 4, false),
+        ("small-inline", 900, 4, true),
+        ("many-keys", 5000, 4, false),
+        ("wide-runs", 400, 900, false),
+    ];
+    for (name, keys, width, inline) in shapes {
+        let data = fixed(keys, width, 0x9E5 + keys as u64);
+        let inline_max = if inline { INLINE } else { 0 };
+        let o = opts();
+
+        // What the caller knows before writing a byte: the lengths.
+        let lengths: Vec<(usize, usize)> = data
+            .iter()
+            .map(|(k, vals)| {
+                let lens: Vec<u32> = vals.iter().map(|v| v.len() as u32).collect();
+                (k.len(), supdb::reserve::run_len(&lens))
+            })
+            .collect();
+        let need = supdb::reserve::for_lengths(&lengths, o.block_size, inline_max)
+            .unwrap_or_else(|| panic!("{name}: not plannable"))
+            .bytes();
+
+        let path = dir.join(format!("{name}.sup"));
+        {
+            let mut w = SegmentWriter::create(&path, &o).expect("create");
+            w.set_inline_max(inline_max);
+            w.set_head_reserve(need);
+            for (k, vals) in &data {
+                w.begin(k).expect("begin");
+                for v in vals {
+                    w.value(v);
+                }
+                w.end().expect("end");
+            }
+            w.finish(1).expect("finish");
+        }
+
+        let bytes = std::fs::read(&path).unwrap();
+        let probe = 4096 + need as u64;
+        assert!(
+            (bytes.len() as u64) > probe,
+            "{name}: the whole file fits in the probe, so this proves nothing"
+        );
+
+        // Everything the first plan names lies inside the probe.
+        let head = bytes[..4096].to_vec();
+        let p1 = supdb::blob::open_sparse_ranges(&head, bytes.len() as u64).unwrap();
+        for &(off, len) in &p1 {
+            assert!(
+                off + len <= probe,
+                "{name}: the open plan reaches {off}+{len}, past a {probe}-byte probe"
+            );
+        }
+
+        // And the reader opens and walks through a source that refuses every
+        // byte outside it.
+        let src = Probe {
+            data: bytes.clone(),
+            allowed: RefCell::new(vec![(0, probe)]),
+        };
+        let sparse = SparseBlob::open(src).unwrap_or_else(|e| panic!("{name}: open: {e}"));
+        assert!(sparse.opened_from_extension(), "{name}: two waves to open");
+        assert_eq!(sparse.keys(), data.len(), "{name}: key count");
+        assert!(sparse.has_fence(), "{name}: no fence copy in the reserve");
+
+        let lo = data[data.len() / 4].0.clone();
+        let hi = data[data.len() / 2].0.clone();
+        let d = sparse.dictionary_plan(&lo, Some(&hi));
+        sparse
+            .source()
+            .allowed
+            .borrow_mut()
+            .extend(d.iter().copied());
+        let r = sparse
+            .dictionary_plan_records(&lo, Some(&hi))
+            .unwrap_or_else(|e| panic!("{name}: no records plan: {e}"));
+        sparse
+            .source()
+            .allowed
+            .borrow_mut()
+            .extend(r.iter().copied());
+        let mut got = 0usize;
+        sparse
+            .dictionary_counts(&lo, Some(&hi), |_, _| {
+                got += 1;
+                true
+            })
+            .unwrap_or_else(|e| panic!("{name}: walk: {e}"));
+        assert!(got > 0, "{name}: walked nothing");
+    }
+}
+
+/// The estimator earns its keep on small segments: the reserve a hundred
+/// kilobytes of data needs is kilobytes, not the tens of kilobytes a fixed
+/// floor spends, and it grows with the key count rather than sitting still.
+#[test]
+fn the_reserve_tracks_the_segment_instead_of_a_floor() {
+    let o = opts();
+    let mut last = 0usize;
+    for keys in [100usize, 1000, 10_000] {
+        let data = fixed(keys, 4, 0x11);
+        let lengths: Vec<(usize, usize)> = data
+            .iter()
+            .map(|(k, vals)| {
+                let lens: Vec<u32> = vals.iter().map(|v| v.len() as u32).collect();
+                (k.len(), supdb::reserve::run_len(&lens))
+            })
+            .collect();
+        let need = supdb::reserve::for_lengths(&lengths, o.block_size, 0)
+            .expect("plannable")
+            .bytes();
+        assert!(need > last, "{keys} keys wants {need}, no more than {last}");
+        last = need;
+    }
+    // A hundred keys of four-byte values is about 100 KB of segment once the
+    // runs and the index are counted; its reserve is a few KB.
+    let data = fixed(100, 4, 0x11);
+    let lengths: Vec<(usize, usize)> = data
+        .iter()
+        .map(|(k, vals)| {
+            let lens: Vec<u32> = vals.iter().map(|v| v.len() as u32).collect();
+            (k.len(), supdb::reserve::run_len(&lens))
+        })
+        .collect();
+    let need = supdb::reserve::for_lengths(&lengths, o.block_size, 0)
+        .expect("plannable")
+        .bytes();
+    assert!(need < 32 << 10, "a 100-key segment wants {need} bytes");
+}
+
+/// The estimate is minimal, not merely sufficient.
+///
+/// Sufficiency alone is satisfied by any number large enough, which is what a
+/// floor was. So this searches for the smallest reserve the reader can still
+/// open and seek from, and holds the estimate to it. The search's own target
+/// stops before the directory copy -- a reader opens and seeks without it and
+/// only a lookup pays -- so what it finds is `without_directory`, and the
+/// difference between the two is the four bytes a key that copy costs.
+#[test]
+fn the_computed_reserve_is_the_smallest_one_that_works() {
+    let _g = serial();
+    let dir = scratch("segwriter-reserve-minimal");
+    let o = opts();
+    for (name, keys, width) in [("small", 200usize, 4usize), ("bigger", 2000, 4)] {
+        let data = fixed(keys, width, 0x5A1 + keys as u64);
+        let lengths: Vec<(usize, usize)> = data
+            .iter()
+            .map(|(k, vals)| {
+                let lens: Vec<u32> = vals.iter().map(|v| v.len() as u32).collect();
+                (k.len(), supdb::reserve::run_len(&lens))
+            })
+            .collect();
+        let r = supdb::reserve::for_lengths(&lengths, o.block_size, 0).expect("plannable");
+
+        // A source that refuses every byte outside the probe, so "it opened"
+        // cannot quietly mean "it fetched more".
+        struct Only {
+            data: Vec<u8>,
+            probe: u64,
+        }
+        impl supdb::Bytes for Only {
+            fn len(&self) -> u64 {
+                self.data.len() as u64
+            }
+            fn read_at(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
+                let end = off + dst.len() as u64;
+                if end > self.probe {
+                    return Err(std::io::Error::other("outside the probe"));
+                }
+                dst.copy_from_slice(&self.data[off as usize..end as usize]);
+                Ok(())
+            }
+        }
+
+        let opens = |reserve: usize| -> bool {
+            let path = dir.join(format!("{name}-{reserve}.sup"));
+            let _ = std::fs::remove_file(&path);
+            {
+                let mut w = SegmentWriter::create(&path, &o).expect("create");
+                w.set_head_reserve(reserve);
+                for (k, vals) in &data {
+                    w.begin(k).expect("begin");
+                    for v in vals {
+                        w.value(v);
+                    }
+                    w.end().expect("end");
+                }
+                w.finish(1).expect("finish");
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            let probe = 4096 + reserve as u64;
+            let head = bytes[..4096].to_vec();
+            let Ok(plan) = supdb::blob::open_sparse_ranges(&head, bytes.len() as u64) else {
+                return false;
+            };
+            let _ = std::fs::remove_file(&path);
+            if plan.iter().any(|&(off, len)| off + len > probe) {
+                return false;
+            }
+            match SparseBlob::open(Only { data: bytes, probe }) {
+                Ok(s) => s.opened_from_extension() && s.has_fence(),
+                Err(_) => false,
+            }
+        };
+
+        // The smallest reserve whose open plan stays inside the probe.
+        let (mut lo, mut hi) = (0usize, r.bytes());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if opens(mid) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        // Twelve bytes: the checksum row is taken at its worst page
+        // alignment, which is four, and the 8-aligned boundary behind it can
+        // move by eight because of them. Nothing else in the layout rounds,
+        // so a bigger gap than this means a piece is being mis-sized.
+        let slack = r.without_directory().saturating_sub(lo);
+        assert!(
+            r.without_directory() >= lo && slack <= 12,
+            "{name}: the reader needs {lo}, the estimate reserves {} for the same pieces",
+            r.without_directory()
+        );
+        assert_eq!(
+            r.directory,
+            keys * 4,
+            "{name}: the directory copy is four bytes a key"
+        );
+    }
+}
+
+/// The batch entry point writes the same segment the streaming one does, and
+/// sizes the reserve itself.
+#[test]
+fn write_sorted_matches_the_streaming_writer_and_reserves_exactly() {
+    let _g = serial();
+    let dir = scratch("segwriter-batch");
+    let o = opts();
+    let data = fixed(1500, 4, 0xBA7);
+
+    let streamed = dir.join("streamed.sup");
+    let batched = dir.join("batched.sup");
+
+    let lengths: Vec<(usize, usize)> = data
+        .iter()
+        .map(|(k, vals)| {
+            let lens: Vec<u32> = vals.iter().map(|v| v.len() as u32).collect();
+            (k.len(), supdb::reserve::run_len(&lens))
+        })
+        .collect();
+    let want = supdb::reserve::for_lengths(&lengths, o.block_size, INLINE)
+        .expect("plannable")
+        .bytes();
+
+    {
+        let mut w = SegmentWriter::create(&streamed, &o).expect("create");
+        w.set_inline_max(INLINE);
+        w.set_head_reserve(want);
+        for (k, vals) in &data {
+            w.begin(k).expect("begin");
+            for v in vals {
+                w.value(v);
+            }
+            w.end().expect("end");
+        }
+        w.finish(7).expect("finish");
+    }
+
+    let borrowed: Vec<(&[u8], Vec<&[u8]>)> = data
+        .iter()
+        .map(|(k, vals)| (k.as_slice(), vals.iter().map(|v| v.as_slice()).collect()))
+        .collect();
+    let items: Vec<(&[u8], &[&[u8]])> = borrowed
+        .iter()
+        .map(|(k, vals)| (*k, vals.as_slice()))
+        .collect();
+    let used = SegmentWriter::write_sorted(&batched, &o, INLINE, 7, &items).expect("write_sorted");
+
+    assert_eq!(used, want, "the batch writer sized the reserve differently");
+    assert_eq!(
+        std::fs::read(&streamed).unwrap(),
+        std::fs::read(&batched).unwrap(),
+        "the two writers produced different bytes"
+    );
+
+    // And it reads: same keys, same values, through the whole reader.
+    let blob = open(&batched);
+    assert_eq!(blob.keys(), data.len());
+    for (k, vals) in data.iter().take(50) {
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        blob.read_all(k, |v| got.push(v.to_vec())).expect("read");
+        assert_eq!(&got, vals, "values differ for a key");
+    }
+}

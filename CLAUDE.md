@@ -194,6 +194,20 @@ inconclusive until a path trace showed it had never reached the arm it was
 written for. `tests/db.rs` emulates every crash window by constructing the
 exact on-disk state the window leaves behind, for that reason.
 
+**A size chosen before the thing is measured is a guess, and a wrong guess
+here is never a fault.** A segment's head reserve has to be sized before the
+first key is written, and it holds the block table, the checksum row and
+copies of the fence and the directory. Too small and the pieces that do not
+fit go after the data, costing the sparse reader a round trip; too large and
+every segment carries zeroes forever. Neither raises anything, so a floor
+under it was wrong in both directions at once and nothing said so. `reserve`
+computes it instead, and it computes it by *calling the planner the writer
+calls* rather than by restating the layout -- a second copy of that
+arithmetic is a second definition of the format, and two definitions drift
+the first time one is edited. What is left over is one four-byte rounding,
+because the checksum row's length depends on where the section lands and
+that depends on the answer.
+
 **Arithmetic that underflows fails quietly and expensively.** A size-class
 calculation underflowed for every block of 4 KiB or less, which is every
 block a store of short postings produces. Debug builds panicked; release

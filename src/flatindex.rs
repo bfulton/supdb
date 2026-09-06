@@ -1966,6 +1966,14 @@ impl BlockRec {
     }
 }
 
+/// The bytes `encode_blocks` writes for `blocks` blocks: a header, one entry
+/// each, and one chunk-checksum row each. Public because the head reserve has
+/// to be sized before a single block exists, and a second copy of this sum
+/// would be a second definition of the block table.
+pub fn block_table_len(blocks: usize) -> usize {
+    BLK_HEADER + blocks * BLK_ENTRY + blocks * CRC_ROW
+}
+
 /// Serialize the block table as a flat array.
 ///
 /// The varint encoding it replaces was five varints and a flag byte per block,
@@ -1985,7 +1993,7 @@ pub fn encode_blocks(
     chunk_crcs: &[[u32; crate::block::MAX_CHUNK_CRCS]],
 ) -> Vec<u8> {
     let crcs_off = BLK_HEADER + blocks.len() * BLK_ENTRY;
-    let mut out = vec![0u8; crcs_off + blocks.len() * CRC_ROW];
+    let mut out = vec![0u8; block_table_len(blocks.len())];
     // Native-endian for the same reason as the index section's: `BlockRec` is
     // reinterpreted in place rather than decoded.
     out[0..4].copy_from_slice(&BLK_MAGIC.to_ne_bytes());

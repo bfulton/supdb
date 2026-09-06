@@ -76,6 +76,7 @@ pub mod db;
 /// the exposure.
 #[allow(clippy::len_without_is_empty)]
 pub mod flatindex;
+pub mod reserve;
 /// The C ABI the browser calls. Hand-written rather than generated, because
 /// the size of what ships is budgeted.
 #[cfg(target_family = "wasm")]
