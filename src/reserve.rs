@@ -121,8 +121,8 @@ const MAX_RUN: usize = (u32::MAX as usize) - 8;
 /// count is, but every stride the format can choose is a power of two at or
 /// above the smallest one, so every sampled key is a multiple of that
 /// smallest stride and keeping those is enough. At ten million keys that is
-/// about 2.5 MB, against the 160 MB a slice of every key's lengths would take
-/// and the gigabyte the records themselves would.
+/// about 2.5 MB, against the 160 MB a slice of every key's lengths takes on a
+/// 64-bit target and the gigabyte the records themselves would.
 pub struct Planner {
     block_size: usize,
     inline_max: usize,
@@ -316,7 +316,8 @@ impl Reserve {
 ///
 /// This is [`Planner`] over a slice, and the exactness and the failure cases
 /// are its. A caller who will not hold its records should use the planner
-/// directly: a slice of lengths is sixteen bytes a key.
+/// directly: a slice of lengths is `size_of::<(usize, usize)>()` a key, which
+/// is sixteen bytes where a pointer is eight.
 pub fn for_lengths(
     keys: &[(usize, usize)],
     block_size: usize,
@@ -452,9 +453,11 @@ mod tests {
         }
         assert_eq!(p.keys(), 1_000_000);
         assert_eq!(p.retained_bytes(), 1_000_000usize.div_ceil(16) * 4);
-        // Against sixteen bytes a key for a slice of the same lengths, and
-        // the 116 bytes a key the records themselves are.
-        assert!(p.retained_bytes() * 60 < 1_000_000 * 16);
+        // Against a slice of the same lengths, which is a pair of usizes a
+        // key -- asked of the target rather than assumed to be sixteen, since
+        // this crate also builds for wasm32, where it is eight.
+        let sliced = 1_000_000 * std::mem::size_of::<(usize, usize)>();
+        assert!(p.retained_bytes() * 30 < sliced);
         assert!(p.finish().is_some());
     }
 
