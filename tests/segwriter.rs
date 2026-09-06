@@ -1085,6 +1085,10 @@ fn write_sorted_matches_the_streaming_writer_and_reserves_exactly() {
     let want = supdb::reserve::for_lengths(&lengths, o.block_size, INLINE)
         .expect("plannable")
         .bytes();
+    let write = supdb::SegmentWrite {
+        inline_max: INLINE,
+        ..Default::default()
+    };
 
     {
         let mut w = SegmentWriter::create(&streamed, &o).expect("create");
@@ -1108,7 +1112,7 @@ fn write_sorted_matches_the_streaming_writer_and_reserves_exactly() {
         .iter()
         .map(|(k, vals)| (*k, vals.as_slice()))
         .collect();
-    let used = SegmentWriter::write_sorted(&batched, &o, INLINE, 7, &items).expect("write_sorted");
+    let used = SegmentWriter::write_sorted(&batched, &o, &write, 7, &items).expect("write_sorted");
 
     assert_eq!(used, want, "the batch writer sized the reserve differently");
     assert_eq!(
@@ -1124,5 +1128,203 @@ fn write_sorted_matches_the_streaming_writer_and_reserves_exactly() {
         let mut got: Vec<Vec<u8>> = Vec::new();
         blob.read_all(k, |v| got.push(v.to_vec())).expect("read");
         assert_eq!(&got, vals, "values differ for a key");
+    }
+}
+
+/// Values that compress: the same few bytes over and over, so LZ4 has
+/// something to find. `fixed`'s random values deliberately have none, which
+/// makes them the wrong fixture for asking whether compression happened.
+fn compressible(keys: usize, seed: u64) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+    let mut r = seed;
+    let mut out: Vec<(Vec<u8>, Vec<Vec<u8>>)> = (0..keys)
+        .map(|i| {
+            let n = 1 + (splitmix(&mut r) % 8) as usize;
+            let vals = (0..n)
+                .map(|j| {
+                    let byte = b'a' + ((i + j) % 4) as u8;
+                    vec![byte; 512]
+                })
+                .collect();
+            (format!("term={i:08}").into_bytes(), vals)
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Every per-file setting reaches the writer, and compression is the one the
+/// test exists for.
+///
+/// `SegmentOptions` refuses a compression field because a setting nothing
+/// reads does nothing quietly, and that is how a test once checked the plain
+/// path while claiming to check the compressed one. `write_sorted` took
+/// `inline_max` as a bare argument and reproduced it exactly: compression was
+/// unreachable and the segments came out plain. So this does not ask whether
+/// the flag was passed, it asks the file whether it is smaller.
+#[test]
+fn write_sorted_applies_every_per_file_setting() {
+    let _g = serial();
+    let dir = scratch("segwriter-batch-settings");
+    let o = opts();
+    let data = compressible(600, 0xC0FFEE);
+
+    let borrowed: Vec<(&[u8], Vec<&[u8]>)> = data
+        .iter()
+        .map(|(k, vals)| (k.as_slice(), vals.iter().map(|v| v.as_slice()).collect()))
+        .collect();
+    let items: Vec<(&[u8], &[&[u8]])> = borrowed
+        .iter()
+        .map(|(k, vals)| (*k, vals.as_slice()))
+        .collect();
+
+    let plain_path = dir.join("plain.sup");
+    let squeezed_path = dir.join("squeezed.sup");
+    let plain = supdb::SegmentWrite::default();
+    let squeezed = supdb::SegmentWrite {
+        compress: true,
+        ..Default::default()
+    };
+    SegmentWriter::write_sorted(&plain_path, &o, &plain, 3, &items).expect("plain");
+    SegmentWriter::write_sorted(&squeezed_path, &o, &squeezed, 3, &items).expect("squeezed");
+
+    let plain_len = std::fs::metadata(&plain_path).unwrap().len();
+    let squeezed_len = std::fs::metadata(&squeezed_path).unwrap().len();
+    assert!(
+        squeezed_len < plain_len,
+        "compression did nothing: {squeezed_len} bytes against {plain_len}"
+    );
+
+    // And the compressed segment still answers with the values that went in.
+    let blob = open(&squeezed_path);
+    assert_eq!(blob.keys(), data.len());
+    for (k, vals) in data.iter().take(40) {
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        blob.read_all(k, |v| got.push(v.to_vec())).expect("read");
+        assert_eq!(&got, vals, "a compressed key read back differently");
+    }
+
+    // Each setting produces the same bytes the streaming writer does with the
+    // same setters, which is what says they were applied and nothing else was.
+    for (name, w) in [
+        (
+            "compress",
+            supdb::SegmentWrite {
+                compress: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "inline",
+            supdb::SegmentWrite {
+                inline_max: INLINE,
+                ..Default::default()
+            },
+        ),
+        (
+            "sync_every",
+            supdb::SegmentWrite {
+                sync_every: 4096,
+                ..Default::default()
+            },
+        ),
+        (
+            "no-directory",
+            supdb::SegmentWrite {
+                directory_in_reserve: false,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let batch_path = dir.join(format!("batch-{name}.sup"));
+        let stream_path = dir.join(format!("stream-{name}.sup"));
+        let used = SegmentWriter::write_sorted(&batch_path, &o, &w, 3, &items).expect("batch");
+        {
+            let mut sw = SegmentWriter::create(&stream_path, &o).expect("create");
+            sw.set_inline_max(w.inline_max);
+            sw.set_compress(w.compress);
+            sw.set_sync_every(w.sync_every);
+            sw.set_head_reserve(used);
+            for (k, vals) in &data {
+                sw.begin(k).expect("begin");
+                for v in vals {
+                    sw.value(v);
+                }
+                sw.end().expect("end");
+            }
+            sw.finish(3).expect("finish");
+        }
+        assert_eq!(
+            std::fs::read(&batch_path).unwrap(),
+            std::fs::read(&stream_path).unwrap(),
+            "{name}: the batch writer and the streaming one disagree"
+        );
+    }
+
+    // Dropping the directory copy is worth four bytes a key and nothing else.
+    let lengths: Vec<(usize, usize)> = data
+        .iter()
+        .map(|(k, vals)| {
+            let lens: Vec<u32> = vals.iter().map(|v| v.len() as u32).collect();
+            (k.len(), supdb::reserve::run_len(&lens))
+        })
+        .collect();
+    let r = supdb::reserve::for_lengths(&lengths, o.block_size, 0).expect("plannable");
+    assert_eq!(r.directory, data.len() * 4);
+}
+
+/// The reserve is right whether or not the blocks are compressed.
+///
+/// It is computed before a byte is written and compression happens after the
+/// cut, so it should not enter the answer at all -- but "should not" is the
+/// kind of claim that is worth a file on disk, since being wrong here costs a
+/// round trip and raises nothing.
+#[test]
+fn compression_does_not_move_the_reserve() {
+    let _g = serial();
+    let dir = scratch("segwriter-reserve-compressed");
+    let o = opts();
+    let data = compressible(700, 0x5EED5);
+
+    let borrowed: Vec<(&[u8], Vec<&[u8]>)> = data
+        .iter()
+        .map(|(k, vals)| (k.as_slice(), vals.iter().map(|v| v.as_slice()).collect()))
+        .collect();
+    let items: Vec<(&[u8], &[&[u8]])> = borrowed
+        .iter()
+        .map(|(k, vals)| (*k, vals.as_slice()))
+        .collect();
+
+    let plain = SegmentWriter::write_sorted(
+        &dir.join("p.sup"),
+        &o,
+        &supdb::SegmentWrite::default(),
+        1,
+        &items,
+    )
+    .expect("plain");
+    let path = dir.join("c.sup");
+    let squeezed = SegmentWriter::write_sorted(
+        &path,
+        &o,
+        &supdb::SegmentWrite {
+            compress: true,
+            ..Default::default()
+        },
+        1,
+        &items,
+    )
+    .expect("compressed");
+    assert_eq!(plain, squeezed, "compression changed the reserve");
+
+    // And the compressed file still opens from its own probe.
+    let bytes = std::fs::read(&path).unwrap();
+    let probe = 4096 + squeezed as u64;
+    let head = bytes[..4096].to_vec();
+    let plan = supdb::blob::open_sparse_ranges(&head, bytes.len() as u64).unwrap();
+    for &(off, len) in &plan {
+        assert!(
+            off + len <= probe,
+            "the compressed segment's open plan reaches {off}+{len}, past {probe}"
+        );
     }
 }

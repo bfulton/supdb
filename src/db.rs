@@ -914,12 +914,16 @@ impl SegmentWriter {
     /// reserve exactly, which is what `reserve::for_lengths` does and what
     /// this does for you.
     ///
+    /// `write` carries the per-file settings; every one of this writer's
+    /// setters has a field there, so nothing it can be configured to do is
+    /// unreachable from here.
+    ///
     /// `items` must be sorted by key, as the streaming API requires. Returns
     /// the reserve it used, since a caller measuring segments wants to know.
     pub fn write_sorted(
         path: &Path,
         opts: &SegmentOptions,
-        inline_max: usize,
+        write: &SegmentWrite,
         generation: u64,
         items: &[(&[u8], &[&[u8]])],
     ) -> Result<usize> {
@@ -930,11 +934,25 @@ impl SegmentWriter {
                 (k.len(), crate::reserve::run_len(&lens))
             })
             .collect();
-        let reserve = crate::reserve::for_lengths(&lengths, opts.block_size, inline_max)
-            .ok_or_else(|| err("segment writer: this input cannot be a segment"))?
-            .bytes();
+        // Compression does not enter the reserve: blocks are cut on the
+        // payload the builder staged, before anything compresses it, so the
+        // block count -- and the table sized by it -- is the same either way.
+        // What compression moves is where the key section lands, and the row
+        // is already taken at its worst alignment.
+        let plan = crate::reserve::for_lengths(&lengths, opts.block_size, write.inline_max)
+            .ok_or_else(|| err("segment writer: this input cannot be a segment"))?;
+        let reserve = if write.directory_in_reserve {
+            plan.bytes()
+        } else {
+            plan.without_directory()
+        };
+
         let mut w = SegmentWriter::create(path, opts)?;
-        w.set_inline_max(inline_max);
+        // Every setter, in the order they must be called: all of these want
+        // to be set before the first key.
+        w.set_inline_max(write.inline_max);
+        w.set_compress(write.compress);
+        w.set_sync_every(write.sync_every);
         w.set_head_reserve(reserve);
         for (k, vals) in items {
             w.begin(k)?;
@@ -1550,6 +1568,52 @@ impl SegmentWriter {
         file.write_all_at(&page, 0)?;
         file.sync_all()?;
         Ok(())
+    }
+}
+
+/// The per-file settings a segment is written with: every one of
+/// `SegmentWriter`'s setters, gathered so a batch write can apply them.
+///
+/// These are separate from [`SegmentOptions`] on purpose, and the separation
+/// is the same one that struct's own note draws: `SegmentOptions` is the
+/// engine's configuration, carried to the writer for every piece it seals,
+/// while these describe one file. A term index built to be downloaded wants
+/// compression and inline runs; the segments the seal writes and its own
+/// merge reads back want neither.
+///
+/// It exists because the first `write_sorted` took `inline_max` as a bare
+/// argument and had nowhere to put the rest, so compression silently did
+/// nothing -- which is the failure `SegmentOptions` refuses a compression
+/// field to avoid, reproduced one layer up. A struct with a field per setter
+/// makes the next setter's absence a compile error in
+/// `SegmentWriter::write_sorted` rather than a quiet default.
+#[derive(Clone, Debug)]
+pub struct SegmentWrite {
+    /// Runs up to this many bytes go inline in the index record, and the
+    /// segment is written records-first so they stream. Zero keeps every run
+    /// in a block and writes the blocks-first layout `Store` writes.
+    pub inline_max: usize,
+    /// LZ4 the blocks. Off by default, as it is on the writer.
+    pub compress: bool,
+    /// fdatasync every this many bytes of blocks rather than once at the end.
+    /// Zero for the single sync.
+    pub sync_every: usize,
+    /// Put a copy of the hash directory in the head reserve. Four bytes a
+    /// key, and it is the difference between a lookup that plans its records
+    /// from the probe and one that fetches the directory first. On by
+    /// default: a segment written through this path is one whose whole input
+    /// was in hand, which is the shape that gets downloaded and read cold.
+    pub directory_in_reserve: bool,
+}
+
+impl Default for SegmentWrite {
+    fn default() -> SegmentWrite {
+        SegmentWrite {
+            inline_max: 0,
+            compress: false,
+            sync_every: 0,
+            directory_in_reserve: true,
+        }
     }
 }
 

@@ -88,8 +88,10 @@ seg.read_all(b"term", |v| { /* zero-copy borrow into the mapping */ })?;
 With the whole input in hand, `SegmentWriter::write_sorted` writes the same
 bytes and sizes the segment's head reserve exactly, so a reader's first probe
 covers the index without a second round trip and a small segment does not
-carry a large one's worth of zeroes. `supdb::reserve` answers the same
-question on its own, from lengths or from totals.
+carry a large one's worth of zeroes. `SegmentWrite` carries the per-file
+settings -- compression, inline runs, sync spreading, and whether the reserve
+holds a copy of the directory. `supdb::reserve` answers the sizing question on
+its own, from lengths or from totals.
 
 The same segment in a browser, over ranged HTTP from a Web Worker:
 
