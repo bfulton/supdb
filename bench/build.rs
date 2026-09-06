@@ -21,8 +21,10 @@ fn main() {
 }
 
 /// The files whose change means HEAD may name a different commit: HEAD, the
-/// ref it points at if it is symbolic, and packed-refs. Empty when git
-/// cannot say, in which case the stamp is computed once per build.
+/// ref it points at if it is symbolic, and packed-refs -- each only if it
+/// exists, because cargo treats a watched path that does not exist as
+/// changed on every build, which would re-run this script every time.
+/// Empty when git cannot say, in which case the stamp is computed once.
 fn git_paths() -> Vec<String> {
     let git = |args: &[&str]| {
         Command::new("git")
@@ -40,6 +42,7 @@ fn git_paths() -> Vec<String> {
     if let Some(r) = git(&["symbolic-ref", "-q", "HEAD"]) {
         paths.push(format!("{dir}/{r}"));
     }
+    paths.retain(|p| std::path::Path::new(p).exists());
     paths
 }
 

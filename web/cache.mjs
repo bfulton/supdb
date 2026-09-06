@@ -1,4 +1,4 @@
-// A caching byte source over object storage. R6.3.
+// A caching byte source over object storage.
 //
 // The whole-download path (`fetchIntoOpfs`) holds the object; this holds only
 // the parts a query touches, under a byte budget, and fetches by HTTP range.
@@ -8,7 +8,7 @@
 // zero-filling a miss, which for an index file is not an error but a wrong
 // answer.
 //
-// The contract, which is the whole design (R6.2): reads never fetch. The
+// The contract, which is the whole design: reads never fetch. The
 // caller awaits `ensure(ranges)` with the ranges the module planned --
 // `supdb_open_plan` for the open, `supdb_ranges` for a query -- and the
 // synchronous read path then finds every byte resident. A read outside what

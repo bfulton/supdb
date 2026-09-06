@@ -19,9 +19,9 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std", "fra
 # `memmap2` *resolves* for wasm32-unknown-unknown: the errors a naive build
 # gets are about `Advice`, not about `Mmap` being absent, so the type compiles
 # and there are no files to map. Excluding the dependency turns "compiles, then
-# has nothing to map" into "does not build", which is R1.3. `libc` goes with it
-# because only `src/bench` uses it, and `src/bench` is not a wasm target
-# either.
+# has nothing to map" into "does not build", which is the failure wanted.
+# `libc` goes with it: the I/O priority and advice calls that use it are
+# native-only paths.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 memmap2 = "0.9"
 libc = "0.2"

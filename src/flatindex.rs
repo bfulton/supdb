@@ -107,8 +107,7 @@ fn fence_stride(n: usize) -> usize {
 /// section's object offset modulo the piece). A section the store may edit in place
 /// carries no row: a record is published there with one aligned store into
 /// a mapping readers hold, and a piece checksum cannot be kept consistent
-/// with that lock-free. Segments are write-once and always carry one
-/// (indexsum-plan.md).
+/// with that lock-free. Segments are write-once and always carry one.
 pub const PIECE_SHIFT: u32 = 14;
 const W_CRC_OFF: usize = 160;
 const W_PIECE_SHIFT: usize = 168;
@@ -1521,7 +1520,7 @@ impl FlatIndex {
     /// once at open and applied to an in-memory table rather than served. It
     /// takes the same length and alignment care as `record` does, because a
     /// log is exactly as likely to be damaged as any other part of the file
-    /// and `c1-decoders` will feed it garbage on purpose.
+    /// and the damage tests feed it garbage on purpose.
     pub fn decode_record(rec: &[u8]) -> Option<(Vec<u8>, Vec<Ext>)> {
         let klen = rd_u16(rec, 0)? as usize;
         let n = rd_u16(rec, 2)? as usize;
@@ -1614,7 +1613,7 @@ impl FlatIndex {
         (start, end)
     }
 
-    /// `fence` selects the arm: `f18-fence` runs both over one file.
+    /// `fence` selects the arm, so both can be run over one file.
     pub fn seek_with(&self, sec: &[u8], key: &[u8], fence: bool) -> usize {
         if fence && self.fence_n > 0 {
             let (lo, hi) = self.fence_window(sec, key);

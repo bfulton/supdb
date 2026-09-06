@@ -367,7 +367,7 @@ fn model_oracle_over_random_ops_and_crashes() {
     oracle(true)
 }
 
-/// The probe merge stays behind `cursor_merge` as f49's comparison arm -- and
+/// The probe merge stays behind `cursor_merge` as the comparison arm -- and
 /// a path only one arm exercises is a path nothing tests.
 #[test]
 fn the_probe_merge_arm_passes_the_same_oracle() {
@@ -379,7 +379,7 @@ fn small_opts(l0_trigger: usize) -> Options {
     // level machinery is exercised at test scale rather than described.
     // Partitions follow the seal here (`partition_bytes: None`): these tests
     // want many small partitions, where the shipping default holds them at
-    // 64 MB whatever the seal size (f52).
+    // 64 MB whatever the seal size.
     Options {
         seal_bytes: 4 << 10,
         l0_trigger,
@@ -548,7 +548,7 @@ fn every_key_survives_partitioning_and_range_merges_at_scale() {
 }
 
 /// The original flush -- re-partition everything from every key -- stays
-/// behind `flush_ranges: false` as f54's comparison arm, and a path only one
+/// behind `flush_ranges: false` as the comparison arm, and a path only one
 /// arm exercises is a path nothing tests.
 #[test]
 fn every_key_survives_the_full_flush_too() {
@@ -902,7 +902,7 @@ fn a_batch_without_its_commit_frame_is_lost_whole() {
 
 #[test]
 fn idle_io_priority_and_sync_spreading_change_nothing_observable() {
-    // f51's two knobs move where the seal's and merge's bytes go and when;
+    // These two knobs move where the seal's and merge's bytes go and when;
     // neither may change what a reader sees, through seals, merges and a
     // reopen. The idle class may be ignored by the host's scheduler and
     // the syscall may fail -- both are silent by design, and the store
@@ -1010,8 +1010,8 @@ fn a_wal_header_torn_by_power_loss_opens_and_is_rewritten() {
     // written and not synced -- nothing in it has, until the first commit
     // into it. A power loss there leaves a prefix of the header, and the
     // store must open on its segments alone, then write a whole header
-    // before appending. c4-crash tears exactly this in a third of its
-    // trials; this is the one-shot version.
+    // before appending. The crash experiment tears exactly this in a third
+    // of its trials; this is the one-shot version.
     let d = dir("torn-header");
     let opts = Options {
         seal_bytes: 1 << 10,
@@ -1181,7 +1181,7 @@ fn recycling_survives_crashes_and_leaves_no_spare_after_close() {
 
 #[test]
 fn a_flipped_byte_anywhere_in_a_batch_loses_that_batch_and_the_ones_after() {
-    // The CRC is per batch (f59). The contract it must keep is the one a
+    // The CRC is per batch. The contract it must keep is the one a
     // CRC per frame gave: damage anywhere inside a batch -- a record
     // frame's header, its key, its value, the commit frame -- loses that
     // batch and every batch after it, and nothing before it. Every byte

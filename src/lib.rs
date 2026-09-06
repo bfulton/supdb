@@ -6,18 +6,15 @@
 //! own measurements, which is why the line above no longer says
 //! ingest-optimized:
 //!
-//! - Finding 1's "nothing here may compromise the ingest path" did not hold:
-//!   the durable ordered load is behind both LMDB and tuned RocksDB
-//!   (`EXT.22`, `EXT.32`). What the engine wins is reads against that same
-//!   pair (`EXT.23`, `EXT.33`).
+//! - Finding 1's "nothing here may compromise the ingest path" did not survive
+//!   measurement: the durable ordered load is behind both LMDB and tuned
+//!   RocksDB. What the engine wins is reads against that same pair.
 //! - Finding 4's choice between size and warm reads was made, and it was made
 //!   for reads: blocks are stored uncompressed by default, so a point read
 //!   decompresses nothing and the file is the larger for it. Compression is
-//!   per segment rather than global, and `W6.8` prices it on a real index.
+//!   per segment rather than global, and is measured on a real index.
 //!
-//! Those claim ids name the previous suite's claims, in the supdb-bench
-//! repository's history; the live measurements are `bench/`. The four as
-//! stated:
+//! The live measurements are in `bench/`. The four as stated:
 //!
 //! 1. Append throughput and flush cost are what an append-only log actually
 //!    wins (2-2.6x and 17-39x respectively), and they survived every
@@ -74,12 +71,13 @@ pub mod db;
 /// The flat key index, including the builders a segment writer drives.
 /// Public for the same reason as `index`: a bulk writer for sorted,
 /// write-once input is a legitimate second producer of this format, and
-/// f46 prices one. The lint allowance is the only concession to making the
-/// module public -- its `len()` methods predate the exposure.
+/// one is priced against the general path. The lint allowance is the only
+/// concession to making the module public -- its `len()` methods predate
+/// the exposure.
 #[allow(clippy::len_without_is_empty)]
 pub mod flatindex;
 /// The C ABI the browser calls. Hand-written rather than generated, because
-/// the whole point of R3.3 is the size of what ships.
+/// the size of what ships is budgeted.
 #[cfg(target_family = "wasm")]
 pub mod wasmapi;
 

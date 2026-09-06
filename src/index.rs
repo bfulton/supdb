@@ -29,8 +29,8 @@ pub struct Ext {
     pub last: u32,
     /// How many records the run holds, with the top bit reserved as the
     /// tombstone flag (`Ext::TOMBSTONE`). Four more bytes per extent buy an
-    /// O(extents) count for variable-width values, which f28 had measured
-    /// at the cost of reading them (W2.1), and the bit is what a delete
+    /// O(extents) count for variable-width values, which had been measured
+    /// at the cost of reading them, and the bit is what a delete
     /// needs to say "nothing older than this extent is live".
     pub count: u32,
 }
@@ -44,7 +44,7 @@ impl Ext {
     /// `len / records()`, so nothing else is stored, and `last` is
     /// `(records - 1) * width` as for any run. Format v6; a reader from
     /// before it refuses the file by its magic rather than parsing a fixed
-    /// run as prefixed (fixedrun-plan.md).
+    /// run as prefixed.
     pub const FIXED: u32 = 1 << 30;
 
     #[inline]
@@ -70,7 +70,7 @@ impl Ext {
     /// index record itself, after the extents, at `off` within that tail.
     /// A read of such a run never consults the block table or a block --
     /// two cache misses fewer per lookup at a million keys, which is what
-    /// the read lead needed past the arrangement ceiling (inline-plan.md).
+    /// the read lead needed past the arrangement ceiling.
     /// Only the segment writer produces them; `Store` never does, and a
     /// reader from before this extension errors on the block id rather
     /// than answering wrongly.

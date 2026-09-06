@@ -498,8 +498,7 @@ fn a_run_of_one_width_is_stored_without_prefixes_and_reads_the_same() {
 /// Every byte of a segment's key index is covered by its checksum row, so a
 /// flip anywhere in the section fails the open rather than changing an
 /// answer. Format v6 made this the difference between an error and a quiet
-/// misread: a flipped FIXED bit re-decodes a run under the other encoding
-/// (indexsum-plan.md, P64.1).
+/// misread: a flipped FIXED bit re-decodes a run under the other encoding.
 #[test]
 fn every_flip_in_the_key_section_fails_the_open() {
     let _g = serial();
@@ -552,8 +551,7 @@ fn every_flip_in_the_key_section_fails_the_open() {
 /// header and every offset a sparse open needs -- and, with a head reserve,
 /// the block table and a copy of the fence right after the page. A source
 /// that serves only the first probe then opens the sparse reader with no
-/// second round trip, and it agrees with the whole reader (waves-plan.md,
-/// P7.1).
+/// second round trip, and it agrees with the whole reader.
 #[test]
 fn a_head_reserve_opens_the_sparse_reader_from_the_probe_alone() {
     use std::cell::RefCell;
@@ -713,7 +711,7 @@ fn postings(keys: usize, seed: u64) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
 
 /// A compressed segment answers exactly what an uncompressed one does, on
 /// every key, and its inline runs are untouched because they live in the key
-/// section rather than in a block (segcompress-plan.md, P4.2).
+/// section rather than in a block.
 #[test]
 fn a_compressed_segment_agrees_with_an_uncompressed_one() {
     let _g = serial();

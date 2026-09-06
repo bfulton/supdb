@@ -116,7 +116,7 @@ pub type Res<T> = Result<T, String>;
 /// borrowed pairs built at the flush. What it replaces -- a `Vec` of owned
 /// pairs -- allocated and freed two vectors per record, and cachegrind put
 /// that at 640 instructions a record, a term every engine paid identically
-/// and that therefore sat inside every load ratio in `results/` (f58).
+/// and that therefore sat inside every load ratio the suite reported.
 pub struct Batch {
     keys: Vec<u8>,
     vals: Vec<u8>,
@@ -195,7 +195,7 @@ pub trait Engine {
     /// Write a batch and make it visible to this engine's own read path.
     ///
     /// Borrowed, not owned: the first form took `&[(Vec<u8>, Vec<u8>)]`,
-    /// and f58 found the two allocations, two copies and two frees that
+    /// and measured, the two allocations, two copies and two frees that
     /// cost per record to be 640 instructions -- as much as the next
     /// engine's whole commit path -- paid alike by every adapter and so
     /// folded into every load ratio the suite reports. `Batch` builds one
@@ -253,9 +253,9 @@ pub struct Supdb {
     partition: bool,
     /// Whether `sync` drains -- seals the last memtable and partitions what
     /// it sealed inside the load window -- or only makes the WAL durable and
-    /// leaves the tail in memory, as RocksDB's `sync` does. f60 found the
-    /// drain to be 11% of the canonical window and the whole of the seal
-    /// phase, so both shapes are arms (drain-plan.md).
+    /// leaves the tail in memory, as RocksDB's `sync` does. Measured, the
+    /// drain was 11% of the load window and the whole of the seal phase, so
+    /// both shapes are arms.
     drain: bool,
     /// A read advice pinned against the engine's own default, or `None` to
     /// take whatever the default is.
@@ -263,10 +263,10 @@ pub struct Supdb {
     /// `None` for the canonical arm, deliberately: the numbers this project
     /// quotes should describe what a user gets, so the arm follows the
     /// default rather than pinning a setting beside it. The contrast arm
-    /// pins the kernel's plain readahead, and `EXT.46` and `EXT.47` are the
-    /// two run interleaved -- which is the only way to price this, since the
-    /// three unchanged comparators in this suite once moved +20% to +43%
-    /// between consecutive runs.
+    /// pins the kernel's plain readahead, and the two run interleaved --
+    /// which is the only way to price this, since the three unchanged
+    /// comparators in this suite once moved +20% to +43% between
+    /// consecutive runs.
     advice: Option<supdb::ReadAdvice>,
 }
 
@@ -309,9 +309,9 @@ impl Supdb {
             },
             // The engine's own defaults: 32 MB seals over 64 MB partitions.
             // Few partitions is not an accident of the benchmark, it is the
-            // operating point the design is FOR: f44 measured the same data
-            // reading 1.19x of LMDB in one segment and 0.77x spread over
-            // eight, and f52 found that seal size and partition size had to
+            // operating point the design is FOR: measured, the same data read
+            // at 1.19x of LMDB in one segment and 0.77x spread over eight,
+            // and the seal-size sweep found seal size and partition size had to
             // be set apart -- 32 MB seals ingest 1.129x over 64 MB at the
             // same device bytes once the partitions stay at 64 MB, where
             // coupled they multiplied and cost every read. An 8 MB seal was
@@ -479,9 +479,9 @@ impl Rocks {
             o.set_block_based_table_factory(&bbo);
             o.increase_parallelism(4);
             o.set_max_background_jobs(4);
-            // The write side, tuned for the load the suite runs and stated
-            // here so EXT.32 and EXT.36 read as "against RocksDB tuned for
-            // the load" too: 128 MB write buffers, four of them, merged two
+            // The write side, tuned for the load the suite runs, so the
+            // load comparison is against RocksDB tuned for the load too:
+            // 128 MB write buffers, four of them, merged two
             // at a time, and level 0 allowed eight files before a
             // compaction -- the shape RocksDB's own tuning guide gives a
             // bulk load, against its 64 MB / two / four defaults.

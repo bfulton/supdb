@@ -170,15 +170,14 @@ The series is columns, one per class. Nothing is the canonical machine. The
 README figure is drawn per class from the latest `full` row, stamped with
 its engine commit and date.
 
-## Where the old suite goes
+## Where the old suite went
 
-Removed from `main` and reachable in the history before this design landed:
-`claims.json`, `results/`, `verify`, `figures`, the plan files, the `internal`
-and `browser` experiments. The `because` prose is real reasoning and stays
-reachable there. The browser reader's correctness checks — three readers
-agreeing, ranges exact, dictionary walks matching — are engine tests and move
-there.
-The two floors become workloads.
+Removed: the claims file, the results archive, the verifier, the committed
+figures, the plan files, and the internal and browser experiments. Its
+reasoning is in the history of the supdb-bench repository for anyone who
+wants it. The browser reader's correctness checks -- three readers agreeing,
+ranges exact, dictionary walks matching -- are engine tests and moved there.
+The two floors became workloads.
 
 ## What stays true from before
 

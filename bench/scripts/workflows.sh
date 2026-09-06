@@ -28,12 +28,15 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 status=0
+total=0
 for wf in ../.github/workflows/*.yml; do
   rm -rf "$work"/blocks
   mkdir -p "$work"/blocks
 
-  # Extract each block scalar under a `run:` key, dedented by the indent of
-  # its own first line so that a heredoc body survives the trip.
+  # Extract every `run:` value: a block scalar, dedented by the indent of
+  # its own first line so that a heredoc body survives the trip, or a
+  # one-line command, which the first version of this script skipped --
+  # and most of the steps here are one-liners.
   awk -v out="$work/blocks" '
     /^[[:space:]]*(- )?run:[[:space:]]*\|/ {
       match($0, /[^ ]/); keyind = RSTART - 1
@@ -41,6 +44,14 @@ for wf in ../.github/workflows/*.yml; do
       printf "" > file
       lineof[n] = NR
       inblock = 1; blockind = -1
+      next
+    }
+    /^[[:space:]]*(- )?run:[[:space:]]*[^|>[:space:]]/ {
+      inblock = 0
+      n += 1; file = sprintf("%s/%03d.sh", out, n)
+      line = $0; sub(/^[[:space:]]*(- )?run:[[:space:]]*/, "", line)
+      print line > file
+      lineof[n] = NR
       next
     }
     inblock {
@@ -56,6 +67,7 @@ for wf in ../.github/workflows/*.yml; do
   ' "$wf" > "$work"/index
 
   while read -r id line; do
+    total=$((total + 1))
     block="$work/blocks/$id.sh"
     if ! err=$(bash -n "$block" 2>&1); then
       echo "$wf:$line: run block does not parse as bash" >&2
@@ -74,4 +86,4 @@ done
 if [ "$status" -ne 0 ]; then
   exit 1
 fi
-echo "workflows: every run block parses, none interpolates"
+echo "workflows: every run block parses, none interpolates ($total blocks)"

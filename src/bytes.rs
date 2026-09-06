@@ -22,8 +22,8 @@
 //! caller up to the top. The browser side resolves this outside Rust: JS
 //! downloads the object into the Origin Private File System once,
 //! asynchronously, and thereafter `FileSystemSyncAccessHandle.read(buf, {at})`
-//! is a synchronous random read. That costs one full download per index --
-//! which `w1-daysize` is the measurement of -- and requires the reader to run
+//! is a synchronous random read. That costs one full download per index,
+//! which was measured and accepted, and requires the reader to run
 //! in a Web Worker, since sync access handles are not available on the main
 //! thread. Both were acceptable, so the API needed no shape change.
 //!
@@ -94,7 +94,7 @@ pub trait Bytes {
     /// Undo `advise_random`: back to the kernel's default readahead.
     ///
     /// The pair exists so a reader can follow its workload rather than pick a
-    /// side once -- `f66-adaptive` measures whether that is worth doing. A
+    /// side once; whether that is worth doing is a measurement, not a given. A
     /// no-op wherever `advise_random` is one.
     fn advise_normal(&self) {}
 }

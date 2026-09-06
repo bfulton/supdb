@@ -10,12 +10,12 @@
 //!
 //! The cross-path check that matters most is here rather than against a
 //! second reader: a source that *cannot* lend its bytes must answer
-//! identically to one that can (R2.1). That is the browser's shape, and it is
+//! identically to one that can. That is the browser's shape, and it is
 //! the seam where a difference would be the reader's rather than the format's.
 //! `tests/dict.rs` holds `SparseBlob` to this reader over every range.
 //!
 //! It also pins the property a correctness test would otherwise let rot: that
-//! the native path stays zero-copy (R2.3).
+//! the native path stays zero-copy.
 
 use std::path::{Path, PathBuf};
 use supdb::bytes::{Bytes, MmapBytes, VecBytes};
@@ -92,13 +92,13 @@ fn reads_what_was_written_opts<B: Bytes>(
     assert_eq!(blob.keys(), want.len(), "key count");
 
     for (key, vals) in want {
-        // R4.2 -- the values, in order.
+        // The values, in order.
         let mut got: Vec<Vec<u8>> = Vec::new();
         let n = blob.read_all(key, |v| got.push(v.to_vec())).expect("blob");
         assert_eq!(&got, vals, "values of {}", String::from_utf8_lossy(key));
         assert_eq!(n, vals.len() as u64, "read_all returns the value count");
 
-        // R4.3 -- the count, without materialising anything.
+        // The count, without materialising anything.
         assert_eq!(
             blob.count(key).expect("count"),
             vals.len() as u64,
@@ -138,7 +138,7 @@ fn blob_reads_back_every_key_of_a_segment() {
     let path = scratch("agree");
     let want = build(&path, 500, false);
     let blob = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
-    assert!(blob.zero_copy(), "R2.3: the native path must not copy");
+    assert!(blob.zero_copy(), "the native path must not copy");
     reads_what_was_written(&blob, &want);
 }
 
@@ -183,7 +183,7 @@ fn a_source_that_cannot_lend_answers_the_same() {
 fn compressed_blocks_read_the_same_as_plain_ones() {
     // A compressed segment takes the chunked and solo arms of `with_extent`
     // that a plain one never reaches, and its inline runs stay uncompressed
-    // in the key section either way (R7.4).
+    // in the key section either way.
     let path = scratch("compressed");
     let want = build(&path, 200, true);
     let blob = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
@@ -196,7 +196,7 @@ fn scanning_walks_the_dictionary_in_key_order_with_counts() {
     let want = build(&path, 400, false);
     let blob = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
 
-    // R4.4 -- from a prefix, in order, with each key's count.
+    // From a prefix, in order, with each key's count.
     let mut seen: Vec<(Vec<u8>, u64)> = Vec::new();
     blob.scan_counts(b"term=", usize::MAX, |k, n| {
         seen.push((k.to_vec(), n));
@@ -307,7 +307,7 @@ fn damaged_objects_do_not_panic_the_caller() {
     assert_eq!(hit, 600, "every trial must complete one way or the other");
 }
 
-/// R4.3, the part that is a real O(extents) count.
+/// The part of counting that is a real O(extents) count.
 ///
 /// A posting list of fixed-width values -- four bytes of ordinal -- has a
 /// count that falls out of the extent list with
@@ -448,7 +448,7 @@ fn a_corrupted_block_byte_fails_the_read_rather_than_under_returning() {
     let want = build(&path, 120, false);
     // k=4 holds 1,500 values: too many to live in its index record, so the
     // run is in a block and the damage has somewhere to land. A key whose run
-    // is inline plans no fetch at all (R7.3) and could not be damaged this
+    // is inline plans no fetch at all and could not be damaged this
     // way, which is the point of choosing deliberately.
     let key = want[4].0.clone();
     let clean = std::fs::read(&path).unwrap();
@@ -463,7 +463,7 @@ fn a_corrupted_block_byte_fails_the_read_rather_than_under_returning() {
     let e = exts[0];
     let ranges = blob.ranges_for(&key).expect("plan");
     assert_eq!(ranges.len(), 1);
-    // The plan is the 4 KiB chunks the run spans (R7.3), starting at a chunk
+    // The plan is the 4 KiB chunks the run spans, starting at a chunk
     // boundary at or before the run, so the run begins `e.off % 4096` into
     // it. Flip its second byte: inside the run, inside the first chunk.
     let at = (ranges[0].0 + e.off as u64 % 4096 + 1) as usize;

@@ -6,7 +6,6 @@ meant to be.
 
 ```sh
 web/build.sh           # build the module and the floor, print their sizes
-# the browser test was the previous suite's and is in supdb-bench's history
 ```
 
 | path | what |
@@ -31,8 +30,8 @@ System once, asynchronously, and every read after that goes through
 the Rust API changed shape.
 
 That is only viable if a day's index can be downloaded whole, so that was
-settled first and with a number: `w1-daysize` measures a day index at 36.14
-bytes per row over a 580 KB fixed cost, which puts a 32 MB download budget
+settled first and with a number: a day index measures 36.14 bytes per row
+over a 580 KB fixed cost, which puts a 32 MB download budget
 at **912,522 rows** over seven attributes. Above that, shard: a consumer that
 seals one immutable object per period turns 10M rows into eleven objects, each
 under budget and each skippable by a query that can exclude it.
@@ -40,7 +39,7 @@ under budget and each skippable by a query that can exclude it.
 The cost of OPFS is that sync access handles only exist inside a Web Worker.
 That is why `worker.mjs` exists and why it is not an implementation detail.
 
-## Reading without downloading (R6)
+## Reading without downloading
 
 Downloading whole was the right call for getting a reader working; it is not
 the right long-run answer, because most queries touch a sliver of the object.
@@ -52,7 +51,8 @@ block table maps extents to byte ranges; both sections are resident after
 open. So the module can name every byte a query will read *before* reading
 any of it, JavaScript fetches those ranges asynchronously, and the read then
 runs synchronously and cannot miss. The `await` lives in JS; nothing inside
-wasm suspends, so no Asyncify rewrite, no JSPI, no size cost against R3.3.
+wasm suspends, so no Asyncify rewrite, no JSPI, no size cost against the
+module's budget.
 
 Three ABI calls carry the plans (framed as `u32 n`, then `n` pairs of
 `u32 off, u32 len` -- absolute file offsets, always):
@@ -72,8 +72,8 @@ read path fetches whole blocks (verification and decompression want the
 enclosing bytes), so an extent-granular plan would under-report. That the
 plan is *exactly* what a read touches -- no more, no less -- is the property
 the whole design rests on, so it is asserted with recorded reads rather than
-argued: `tests/ranges.rs` natively, and `w4-ranges` and the browser test end
-to end in the previous suite.
+argued: `tests/ranges.rs` wraps the byte source in a recorder and requires the
+merged log of reads to equal the merged plan.
 
 `cache.mjs` is the byte source: sparse pages in OPFS (it survives reloads),
 a budget in bytes that is a real file size, CLOCK eviction, and a hard rule
@@ -92,8 +92,7 @@ Counts stay free, for any schema since format v5: every extent carries its
 record count, so `count` and `scanCounts` are sums over the resident extent
 lists exactly as `countFixed` and `scanCountsFixed` are arithmetic on them,
 and a browser ranks a segment's whole term dictionary over ranged HTTP with
-*zero* fetches after open -- recorded as W4.2 on the network axis, and as
-W2.5 (4.5 ns a key against the fixed form's 5.2) on the CPU axis.
+*zero* fetches after open, at 4.5 ns a key against the fixed form's 5.2.
 
 `readConcat(key)` returns a key's values back to back in one buffer with
 the count, one boundary crossing and one copy per key where `lookup` frames
@@ -110,14 +109,15 @@ plans nothing. Only runs longer than that reach the data by plan.
 That split costs approximately nothing today because key cardinality is
 bounded by the schema -- a real segment is ~100 keys
 and single-digit kilobytes of index over megabytes of postings, so the open
-fetches a few pages and everything after is sparse (`w4-ranges` prices the
-open at under 20 KB of a 31 MB object). It stops being cheap the day the
+fetches a few pages and everything after is sparse (the open is under 20 KB
+of a 31 MB object). It stops being cheap the day the
 keys are unbounded: a trigram or free-text index has a dictionary that grows
 with the data, and would need the *index* planned and fetched sparsely too.
-That day has a reader now (R6.3, below); it arrived as a second open and a
-handful of range calls, and the point-read reader above is unchanged.
+That day has a reader now (the sparse reader, below); it arrived as a
+second open and a handful of range calls, and the point-read reader above
+is unchanged.
 
-## Reading the dictionary by range (R6.3)
+## Reading the dictionary by range
 
 `openSparse(wasm, cache)` never fetches the key index whole. It keeps the
 section's 192-byte header and its fence -- the sampled keys `seek` already
@@ -137,19 +137,20 @@ Values follow the same shape: the walk hands out each key's extents,
 reader refuses the point-read calls by name; a whole reader refuses the
 range calls. Neither answers empty for a question it cannot see.
 
-The plans are exact, on the recorded reads (`tests/dict.rs` natively over
-135 ranges per index shape, `w5-dict` on the day index, and the browser
-suite over ranged HTTP: three ranges fetch exactly the pages their plans
-name that nothing before made resident). What `w5-dict` also says is that
-at realistic dictionary sizes the 64 KiB page is the unit that
-matters: the sparse open is 23,808 bytes but four pages, 279,856 against
-the whole open's 869,680 for a 686 KB index (W5.1, recorded as failing
-its 5% prediction; it crosses 5% near 5.6 MB of index), and a 210-key
-field's two plans are 9,860 bytes but three pages (W5.2). Ranking a field
-from the sparse reader costs 10 ns a key (W5.4). So the sparse reader's
+The plans are exact, on the recorded reads: `tests/dict.rs` checks 135
+ranges per index shape against the whole reader and holds every plan to the
+reads that follow it, and over ranged HTTP a range fetches exactly the pages
+its plans name that nothing before made resident. On a day index, at
+realistic dictionary sizes, the 64 KiB page rather than the byte count is
+the unit that matters: the sparse open is 23,808 bytes but four pages,
+279,856 against the whole open's 869,680 for a 686 KB index (nowhere near
+the 5% its byte count suggests; the ratio crosses 5% only near 5.6 MB of
+index), and a 210-key
+field's two plans are 9,860 bytes but three pages. Ranking a field
+from the sparse reader costs 10 ns a key. So the sparse reader's
 cache opens at 16 KiB pages (`openSparse` through the worker passes
 `pageSize`): the open is then 70,960 bytes, 8.8% of the whole open, and
-a field's range sits at 0.59 of its share plus four pages (W5.5, W5.6);
+a field's range sits at 0.59 of its share plus four pages;
 `ensure` coalesces adjacent pages into one request, so a block read costs
 the same number of requests at either page.
 
@@ -161,10 +162,9 @@ open, because a source that cannot lend its bytes -- which an OPFS handle
 cannot -- should pay per section rather than per lookup.
 
 `count(key)` and `countFixed(key, width)` are two different things and the
-difference is 28x. See `f28-count` and W2.1-W2.4 in the previous suite: an `Ext`
-records block, offset, byte length and the offset of the last record, and none
-of those is a count, so the general count walks the values -- and walking them
-is *not* cheaper than reading them, which is W2.1 and is recorded as failing.
+difference is 28x. An `Ext` records block, offset, byte length and the offset
+of the last record, and none of those is a count, so the general count walks
+the values -- and walking them turns out to be *no* cheaper than reading them.
 A *fixed-width* posting list does not need to walk: its count is arithmetic on
 `Ext::len`, checked against `Ext::last`, with no block touched. A posting list
 of four-byte ordinals is the case `countFixed` exists for.
@@ -172,13 +172,12 @@ of four-byte ordinals is the case `countFixed` exists for.
 Before format v5 the same was true of `scanCounts` versus `scanCountsFixed`,
 by a factor of 283: the general form walked every posting in the range. The
 count now lives in the extent record, both forms are O(extents), and the
-general one is the faster of the two (W2.4 records the flip, W2.5 the new
-bound): a whole day's term dictionary ranks in about 9 microseconds whatever
-the value width. That is the answer to "does the browser need a scan, or
-should the roll precompute the panels": it needs a scan, and precomputing buys
-nothing.
+general one is the faster of the two: a whole day's term dictionary ranks in
+about 9 microseconds whatever the value width. That is the answer to "does the
+browser need a scan, or should the roll precompute the panels": it needs a
+scan, and precomputing buys nothing.
 
-## Round trips (R7)
+## Round trips
 
 `openSparse(wasm, cache, { probe, directory })`. A segment's superblock
 page carries an extension -- a copy of the key header and the offsets of
@@ -192,8 +191,7 @@ is one round trip. `directory: true` fetches the directory whole in the
 open wave, so every dictionary plan's first phase is empty and a lookup
 after open is one round trip, the records. A data read then fetches the 4
 KiB chunks a run spans, not its block. Cold, a search is open, records,
-postings; `w6-waves` records the counts on the day fixture, and
-`waves-plan.md` the reasoning. Small runs -- under 256 bytes -- are inline
+postings. Small runs -- under 256 bytes -- are inline
 in a segment's index record and cost no postings round trip at all; a
 `Store`-written index never inlines, which is the case for writing the
 roll through `SegmentWriter`.
@@ -225,9 +223,8 @@ so, and for such a run the count is exact: the flag records the width, so the
 answer is `len / width` and nothing is assumed. For a run written with mixed
 widths the old two-quantity check still applies, and that is a check, not a
 proof -- the contract is that you know your own schema. Reading a fixed run
-is a copy of its bytes rather than a decode, which is where `ext-analytics`
-took the full-list read from 0.31x of LMDB's DUPFIXED to parity (EXT.18) and
-the intersection to 1.15x (EXT.17).
+is a copy of its bytes rather than a decode, which took the full-list read
+from 0.31x of LMDB's DUPFIXED to parity and the intersection to 1.15x.
 
 ## Size
 
@@ -236,8 +233,8 @@ sizes; nothing here decides whether a size is acceptable. There is no binding
 generator: the ABI is twenty-eight hand-written C functions passing integers
 and byte ranges, because a generator's shim and descriptor sections are
 exactly what the budget is about.
-R6's planning seam is the first thing to have moved the marginal number --
-4,225 gzipped bytes, visible in W3.3 -- which is what the number is for.
+The planning seam is the first thing to have moved the marginal number --
+4,225 gzipped bytes -- which is what the number is for.
 
 `floor/` is why the number is legible. A wasm cdylib in Rust is not small
 before any of your code is in it, so the floor is built the same way with the
@@ -255,9 +252,10 @@ failed its checksum came back empty — an under-return, which is the one
 thing this index may never do, reported by the first downstream integration.
 The convention now is one rule applied everywhere: normalize to unsigned at
 the boundary (`v >>> 0`, `BigInt.asUintN(64, v)`), compare unsigned, return
-unsigned. The previous suite's `web/test/node.mjs` held the door shut, from the zeroed-object
-repro down to a corrupt block byte throwing on every read rather than only
-the first.
+unsigned. The native half is pinned in `tests/blob.rs`: a corrupted block
+byte fails the read rather than under-returning. The JS half is that one
+rule, applied at every return, so a corrupt block byte throws on every read
+rather than only the first.
 
 ## Endianness
 

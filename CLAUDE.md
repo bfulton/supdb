@@ -68,8 +68,8 @@ measurement that is implausibly good is a broken measurement until someone
 looks. There are no claims and no expected states. The suite that had them
 -- 183 claims adjudicated by `verify` -- was retired when its gate went red
 on an engine head that had not changed; it is in the supdb-bench
-repository's history, and an id like `EXT.23` or `W4.1` in a comment here
-names one of its claims. The id is a pointer to that reasoning, not a live
+repository's history. Nothing here cites one of its claims by id: an id
+whose checker is gone is a pointer to nothing, and it comes back as a
 number.
 
 Two consequences for code in this repository:

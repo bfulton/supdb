@@ -20,11 +20,9 @@ The previous suite -- 183 claims in a JSON file, adjudicated by `verify`
 across three profiles with pins, arch guards and a `needs` field -- lived in
 the supdb-bench repository and is in its history. Its `because` prose is
 real reasoning about the engine and is worth reading when a number
-surprises you; an id like `EXT.23` or `W4.1` in an engine comment names one
-of those claims. It was retired because a
-gate that adjudicated timing comparisons on shared runners went red on an
-engine head that had not changed, and because its largest run, at 100 MB,
-never left the page cache.
+surprises you. It was retired because a gate that adjudicated timing
+comparisons on shared runners went red on an engine head that had not
+changed, and because its largest run, at 100 MB, never left the page cache.
 
 ## Rules that stay, and why
 
@@ -54,18 +52,18 @@ not running, or one reporting a verdict it had not earned. The engine's
 
 ## Shapes the bugs come in
 
-**A gate can be red for a reason that is not the engine's.** EXT.47, a
-"not resolvably slower" comparison gated on clearing a 5% minimum effect,
+**A gate can be red for a reason that is not the engine's.** A "not
+resolvably slower" comparison gated on clearing a 5% minimum effect
 recorded 0.935x on a shared runner on a head that had passed the same job
 eighty-five minutes earlier. Near-zero true effects and a fixed floor are
 the shape. The design answers it with bands drawn from the series rather
 than a typed floor, and with the arms as the dimension rather than the
 ratio between two near-identical arms.
 
-**A one-sided bound reads `holds` for a broken measurement.** F68.6 was
-`ratio >= 0.90`, and a run where the ratio came out 8.5x -- on a store
-where the mechanism says the policy can only lose -- recorded `holds`. A
-row whose value is implausibly *good* is flagged, not passed.
+**A one-sided bound passes a broken measurement.** A one-sided bound,
+`ratio >= 0.90`, recorded a pass on a run where the ratio came out 8.5x --
+on a store where the mechanism says the policy can only lose. A row whose
+value is implausibly *good* is flagged, not passed.
 
 **A number can arrive in the wrong type.** `J::u` once wrapped a `u64` into
 an `i64` on the way to JSON; a wasm `u32::MAX` arrived in JavaScript as

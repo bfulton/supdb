@@ -573,7 +573,7 @@ fn a_source_that_serves_only_what_was_ensured_is_enough() {
     }
 }
 
-/// With the directory resident (R7.2) the sparse reader plans no directory
+/// With the directory resident the sparse reader plans no directory
 /// slice at all -- phase one is empty -- and still agrees with the whole
 /// reader on every range, over a source that serves only what was ensured.
 #[test]
