@@ -84,17 +84,28 @@ fn blocks_for(runs: impl Iterator<Item = usize>, block_size: usize) -> usize {
 /// leaves what is still staged in `staged` -- which the last block takes.
 fn cut(staged: &mut usize, n: usize, block_size: usize) -> usize {
     let mut closed = 0;
-    if *staged != 0 && *staged + n > block_size {
+    // `staged + n > block_size`, without the sum: what is staged is always
+    // below the block size, and the sum is what would overflow first where a
+    // usize is 32 bits.
+    if *staged != 0 && n > block_size - *staged {
         closed += 1;
         *staged = 0;
     }
-    *staged += n;
+    *staged = staged.saturating_add(n);
     if *staged >= block_size {
         closed += 1;
         *staged = 0;
     }
     closed
 }
+
+/// The longest run this planner will size, which is the longest one the
+/// writer will store: an extent addresses its run with a `u32`, and a run
+/// past that is refused rather than written. The headroom below that limit is
+/// for the record framing's own 4-byte rounding, and it matters where a usize
+/// is 32 bits and the limit is `usize::MAX` -- there the rounding is what
+/// overflows, not the length.
+const MAX_RUN: usize = (u32::MAX as usize) - 8;
 
 /// The reserve, accumulated one key at a time.
 ///
@@ -151,9 +162,11 @@ impl Planner {
     /// [`run_len`] turns a key's value lengths into the second. Keys must
     /// arrive in the order they will be written, which is key order.
     pub fn push(&mut self, key_len: usize, run_len: usize) {
-        // The writer refuses a key it cannot frame, and so does the planner,
-        // rather than returning a number for a segment that cannot exist.
-        if key_len > u16::MAX as usize {
+        // A key the writer cannot frame with a u16 length, or a run it cannot
+        // address with a u32 extent, is refused here too: a planner that
+        // returned a number for a segment that cannot exist would be sizing a
+        // reserve for a file nobody can write.
+        if key_len > u16::MAX as usize || run_len > MAX_RUN {
             self.viable = false;
             return;
         }
@@ -162,8 +175,20 @@ impl Planner {
         }
         let inline = self.inline_max > 0 && run_len <= self.inline_max;
         let tail = if inline { run_len } else { 0 };
-        // One extent per key: that is what a segment writes.
-        self.rec_bytes += flatindex::record_len_tail(key_len, 1, tail);
+        // One extent per key: that is what a segment writes. Checked, as
+        // `plan_inline` checks the same sum -- unchecked it would wrap where
+        // a usize is 32 bits and hand back a reserve for the wrapped total,
+        // which is a wrong number rather than a refusal.
+        match self
+            .rec_bytes
+            .checked_add(flatindex::record_len_tail(key_len, 1, tail))
+        {
+            Some(n) => self.rec_bytes = n,
+            None => {
+                self.viable = false;
+                return;
+            }
+        }
         if !inline {
             self.blocks += cut(&mut self.staged, run_len, self.block_size);
         }
@@ -456,6 +481,47 @@ mod tests {
         p.push(16, 100);
         p.push(u16::MAX as usize + 1, 100);
         assert!(p.finish().is_none());
+    }
+
+    #[test]
+    fn a_run_past_what_an_extent_addresses_is_refused_rather_than_sized() {
+        let mut p = Planner::new(4096, 0);
+        p.push(16, 100);
+        p.push(16, MAX_RUN + 1);
+        assert!(p.finish().is_none());
+    }
+
+    #[test]
+    fn record_bytes_that_would_wrap_refuse_rather_than_return_the_wrapped_sum() {
+        // Runs at the largest a segment can hold, inline so every byte lands
+        // in the record region. The sum passes usize on a 32-bit target long
+        // before this many keys, and stays honest on a 64-bit one.
+        let mut p = Planner::new(4096, MAX_RUN);
+        for _ in 0..64 {
+            p.push(16, MAX_RUN);
+        }
+        // Either the sum overflowed and it refused, or it did not and the
+        // section is past what the index can address. Never a number.
+        assert!(p.finish().is_none());
+    }
+
+    #[test]
+    fn a_huge_run_does_not_wrap_the_block_cut() {
+        // `cut` used to add the run to what was staged and compare the sum,
+        // which is what overflows -- at `MAX_RUN` only where a usize is 32
+        // bits, so the value here is one that overflows at any width and
+        // takes the same path. `from_totals` reaches this with whatever
+        // `max_run_len` its caller passes, so it is not a hypothetical.
+        //
+        // Wrapped, the sum comes out small: no block closes and the run is
+        // left staged. The counts below are what says which happened.
+        let huge = usize::MAX - 10;
+        let mut staged = 0usize;
+        assert_eq!(cut(&mut staged, huge, 4096), 1);
+        assert_eq!(staged, 0);
+        let mut staged = 100usize;
+        assert_eq!(cut(&mut staged, huge, 4096), 2, "the sum wrapped");
+        assert_eq!(staged, 0);
     }
 
     #[test]
