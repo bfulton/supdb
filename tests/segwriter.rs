@@ -1252,13 +1252,6 @@ fn write_sorted_applies_every_per_file_setting() {
                 ..Default::default()
             },
         ),
-        (
-            "no-directory",
-            supdb::SegmentWrite {
-                directory_in_reserve: false,
-                ..Default::default()
-            },
-        ),
     ] {
         let batch_path = dir.join(format!("batch-{name}.sup"));
         let stream_path = dir.join(format!("stream-{name}.sup"));
@@ -1352,4 +1345,113 @@ fn compression_does_not_move_the_reserve() {
             "the compressed segment's open plan reaches {off}+{len}, past {probe}"
         );
     }
+}
+
+/// `create_with` applies every per-file setting and the reserve it is given,
+/// so a streaming caller has nothing to remember.
+///
+/// Each of those settings must be set before the first key and each is silent
+/// when forgotten, which is why they belong on the constructor rather than in
+/// four calls a caller can get wrong. The check is against the four setters
+/// called by hand: same bytes, or the constructor is not doing what it says.
+#[test]
+fn create_with_applies_the_settings_and_the_reserve() {
+    let _g = serial();
+    let dir = scratch("segwriter-create-with");
+    let o = opts();
+    let data = compressible(500, 0xC0DE);
+
+    let write = supdb::SegmentWrite {
+        inline_max: INLINE,
+        compress: true,
+        sync_every: 8192,
+    };
+    let lengths: Vec<(usize, usize)> = data
+        .iter()
+        .map(|(k, vals)| {
+            let lens: Vec<u32> = vals.iter().map(|v| v.len() as u32).collect();
+            (k.len(), supdb::reserve::run_len(&lens))
+        })
+        .collect();
+    let r =
+        supdb::reserve::for_lengths(&lengths, o.block_size, write.inline_max).expect("plannable");
+
+    let fill = |w: &mut SegmentWriter| {
+        for (k, vals) in &data {
+            w.begin(k).expect("begin");
+            for v in vals {
+                w.value(v);
+            }
+            w.end().expect("end");
+        }
+    };
+
+    for (name, reserve) in [
+        ("whole", r.bytes()),
+        ("no-directory", r.without_directory()),
+    ] {
+        let via_ctor = dir.join(format!("ctor-{name}.sup"));
+        let via_setters = dir.join(format!("setters-{name}.sup"));
+        {
+            let mut w =
+                SegmentWriter::create_with(&via_ctor, &o, &write, reserve).expect("create_with");
+            fill(&mut w);
+            w.finish(11).expect("finish");
+        }
+        {
+            let mut w = SegmentWriter::create(&via_setters, &o).expect("create");
+            w.set_inline_max(write.inline_max);
+            w.set_compress(write.compress);
+            w.set_sync_every(write.sync_every);
+            w.set_head_reserve(reserve);
+            fill(&mut w);
+            w.finish(11).expect("finish");
+        }
+        assert_eq!(
+            without_the_clock(&std::fs::read(&via_ctor).unwrap()),
+            without_the_clock(&std::fs::read(&via_setters).unwrap()),
+            "{name}: create_with and the setters disagree"
+        );
+
+        // The reserve it was handed is the reserve the file has: the open
+        // plan fits the probe for it, and the smaller one is smaller.
+        let bytes = std::fs::read(&via_ctor).unwrap();
+        let probe = 4096 + reserve as u64;
+        let head = bytes[..4096].to_vec();
+        let plan = supdb::blob::open_sparse_ranges(&head, bytes.len() as u64).unwrap();
+        for &(off, len) in &plan {
+            assert!(
+                off + len <= probe,
+                "{name}: the open plan reaches {off}+{len}, past a {probe}-byte probe"
+            );
+        }
+        let blob = open(&via_ctor);
+        assert_eq!(blob.keys(), data.len(), "{name}: key count");
+    }
+    assert!(
+        r.without_directory() < r.bytes(),
+        "dropping the directory copy saved nothing"
+    );
+
+    // And the batch writer is this constructor: same file, same reserve.
+    let borrowed: Vec<(&[u8], Vec<&[u8]>)> = data
+        .iter()
+        .map(|(k, vals)| (k.as_slice(), vals.iter().map(|v| v.as_slice()).collect()))
+        .collect();
+    let items: Vec<(&[u8], &[&[u8]])> = borrowed
+        .iter()
+        .map(|(k, vals)| (*k, vals.as_slice()))
+        .collect();
+    let batched = dir.join("batched.sup");
+    let used = SegmentWriter::write_sorted(&batched, &o, &write, 11, &items).expect("write_sorted");
+    assert_eq!(
+        used,
+        r.bytes(),
+        "write_sorted sized the reserve differently"
+    );
+    assert_eq!(
+        without_the_clock(&std::fs::read(&batched).unwrap()),
+        without_the_clock(&std::fs::read(dir.join("ctor-whole.sup")).unwrap()),
+        "write_sorted and create_with disagree"
+    );
 }

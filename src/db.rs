@@ -904,6 +904,52 @@ fn superblock(fields: &[u64; 16]) -> [u8; crate::format::SUPER_BYTES] {
 }
 
 impl SegmentWriter {
+    /// Open `path` for a fresh segment with every per-file setting applied
+    /// and the head reserve set, so nothing is left to remember.
+    ///
+    /// The four things a segment writer can be configured to do -- inline
+    /// runs, compression, spread syncs, the head reserve -- all have to be set
+    /// before the first key, and each is silent when forgotten: a plain
+    /// segment where a compressed one was wanted, or a reserve of zero that
+    /// costs the sparse reader a round trip and raises nothing. Setting them
+    /// at construction is what makes forgetting one impossible.
+    ///
+    /// `reserve` is a number rather than a policy, because the caller may
+    /// know it exactly. `reserve::for_lengths` computes it for input in hand,
+    /// and its `Reserve` prices the hash-directory copy separately:
+    ///
+    /// ```no_run
+    /// # use supdb::{SegmentOptions, SegmentWrite, SegmentWriter, reserve};
+    /// # let (path, opts, write) = (std::path::Path::new("s.sup"), SegmentOptions::default(), SegmentWrite::default());
+    /// # let lengths: Vec<(usize, usize)> = Vec::new();
+    /// let r = reserve::for_lengths(&lengths, opts.block_size, write.inline_max).unwrap();
+    /// // `r.bytes()` for a lookup that plans from the probe; `without_directory`
+    /// // to save four bytes a key and let a lookup fetch the directory itself.
+    /// let w = SegmentWriter::create_with(path, &opts, &write, r.bytes())?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn create_with(
+        path: &Path,
+        opts: &SegmentOptions,
+        write: &SegmentWrite,
+        reserve: usize,
+    ) -> Result<SegmentWriter> {
+        let mut w = SegmentWriter::create(path, opts)?;
+        // Every field of `SegmentWrite`, and the reserve. If a setter is
+        // added to this writer without a field beside it here, this stops
+        // compiling, which is the point of the struct.
+        let SegmentWrite {
+            inline_max,
+            compress,
+            sync_every,
+        } = *write;
+        w.set_inline_max(inline_max);
+        w.set_compress(compress);
+        w.set_sync_every(sync_every);
+        w.set_head_reserve(reserve);
+        Ok(w)
+    }
+
     /// Write a whole segment from input already in hand, sizing the head
     /// reserve exactly instead of guessing at it.
     ///
@@ -914,9 +960,10 @@ impl SegmentWriter {
     /// reserve exactly, which is what `reserve::for_lengths` does and what
     /// this does for you.
     ///
-    /// `write` carries the per-file settings; every one of this writer's
-    /// setters has a field there, so nothing it can be configured to do is
-    /// unreachable from here.
+    /// The reserve it computes holds the hash-directory copy, so a lookup
+    /// plans its records from the probe. To trade that for four bytes a key,
+    /// take `reserve::for_lengths(..).without_directory()` and stream through
+    /// [`SegmentWriter::create_with`] instead.
     ///
     /// `items` must be sorted by key, as the streaming API requires. Returns
     /// the reserve it used, since a caller measuring segments wants to know.
@@ -939,21 +986,11 @@ impl SegmentWriter {
         // block count -- and the table sized by it -- is the same either way.
         // What compression moves is where the key section lands, and the row
         // is already taken at its worst alignment.
-        let plan = crate::reserve::for_lengths(&lengths, opts.block_size, write.inline_max)
-            .ok_or_else(|| err("segment writer: this input cannot be a segment"))?;
-        let reserve = if write.directory_in_reserve {
-            plan.bytes()
-        } else {
-            plan.without_directory()
-        };
+        let reserve = crate::reserve::for_lengths(&lengths, opts.block_size, write.inline_max)
+            .ok_or_else(|| err("segment writer: this input cannot be a segment"))?
+            .bytes();
 
-        let mut w = SegmentWriter::create(path, opts)?;
-        // Every setter, in the order they must be called: all of these want
-        // to be set before the first key.
-        w.set_inline_max(write.inline_max);
-        w.set_compress(write.compress);
-        w.set_sync_every(write.sync_every);
-        w.set_head_reserve(reserve);
+        let mut w = SegmentWriter::create_with(path, opts, write, reserve)?;
         for (k, vals) in items {
             w.begin(k)?;
             for v in *vals {
@@ -1571,8 +1608,16 @@ impl SegmentWriter {
     }
 }
 
-/// The per-file settings a segment is written with: every one of
-/// `SegmentWriter`'s setters, gathered so a batch write can apply them.
+/// The per-file settings a segment is written with: one field for every one
+/// of `SegmentWriter`'s setters, and nothing else.
+///
+/// That invariant is the point. Every setter here must be called before the
+/// first key, and forgetting one is silent -- so
+/// [`SegmentWriter::create_with`] takes this struct and applies all of it,
+/// and a new setter that does not appear here is a compile error there rather
+/// than a quiet default. Nothing lives in this struct that `create_with` does
+/// not apply, which is why the choice of what the head reserve holds is not
+/// here: `create_with` is given the reserve as a number.
 ///
 /// These are separate from [`SegmentOptions`] on purpose, and the separation
 /// is the same one that struct's own note draws: `SegmentOptions` is the
@@ -1580,14 +1625,7 @@ impl SegmentWriter {
 /// while these describe one file. A term index built to be downloaded wants
 /// compression and inline runs; the segments the seal writes and its own
 /// merge reads back want neither.
-///
-/// It exists because the first `write_sorted` took `inline_max` as a bare
-/// argument and had nowhere to put the rest, so compression silently did
-/// nothing -- which is the failure `SegmentOptions` refuses a compression
-/// field to avoid, reproduced one layer up. A struct with a field per setter
-/// makes the next setter's absence a compile error in
-/// `SegmentWriter::write_sorted` rather than a quiet default.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct SegmentWrite {
     /// Runs up to this many bytes go inline in the index record, and the
     /// segment is written records-first so they stream. Zero keeps every run
@@ -1598,23 +1636,6 @@ pub struct SegmentWrite {
     /// fdatasync every this many bytes of blocks rather than once at the end.
     /// Zero for the single sync.
     pub sync_every: usize,
-    /// Put a copy of the hash directory in the head reserve. Four bytes a
-    /// key, and it is the difference between a lookup that plans its records
-    /// from the probe and one that fetches the directory first. On by
-    /// default: a segment written through this path is one whose whole input
-    /// was in hand, which is the shape that gets downloaded and read cold.
-    pub directory_in_reserve: bool,
-}
-
-impl Default for SegmentWrite {
-    fn default() -> SegmentWrite {
-        SegmentWrite {
-            inline_max: 0,
-            compress: false,
-            sync_every: 0,
-            directory_in_reserve: true,
-        }
-    }
 }
 
 /// How a segment file is written.
