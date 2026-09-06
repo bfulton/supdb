@@ -42,10 +42,12 @@ rocksdb = { version = "0.23", default-features = false }
 lz4_flex = "0.11"
 
 # Cargo takes profiles from the root of the workspace being built, which is
-# this manifest, so the engine's own [profile.release] -- opt-level 3, fat
-# LTO, one codegen unit -- is ignored here and cargo says so on every build.
-# These are the engine's settings, repeated, so what is measured is what a
-# user gets. `debug = 1` adds line tables for a profiler and changes no code.
+# this manifest, so the engine's own [profile.release] is ignored here and
+# cargo says so on every build. Every setting that decides code generation
+# is repeated -- opt-level 3, fat LTO, one codegen unit -- so what is
+# measured is what a user gets. Debug info is the one that differs on
+# purpose: the engine asks for all of it, this asks for line tables, which
+# is what a profiler needs to name a frame. Neither changes a byte of code.
 [profile.release]
 opt-level = 3
 lto = true
