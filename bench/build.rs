@@ -9,11 +9,38 @@
 use std::process::Command;
 
 fn main() {
-    for p in ["build.rs", "../.git/HEAD"] {
+    println!("cargo:rerun-if-changed=build.rs");
+    // HEAD alone is not enough: a commit on the same branch rewrites the
+    // branch's ref file (or packed-refs), not HEAD, and a stamp that only
+    // watched HEAD would carry the previous commit into every row after it.
+    for p in git_paths() {
         println!("cargo:rerun-if-changed={p}");
     }
     println!("cargo:rustc-env=SUPDB_SHA={}", sha());
     println!("cargo:rustc-env=SUPDB_RUSTC={}", rustc());
+}
+
+/// The files whose change means HEAD may name a different commit: HEAD, the
+/// ref it points at if it is symbolic, and packed-refs. Empty when git
+/// cannot say, in which case the stamp is computed once per build.
+fn git_paths() -> Vec<String> {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let Some(dir) = git(&["rev-parse", "--absolute-git-dir"]) else {
+        return Vec::new();
+    };
+    let mut paths = vec![format!("{dir}/HEAD"), format!("{dir}/packed-refs")];
+    if let Some(r) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        paths.push(format!("{dir}/{r}"));
+    }
+    paths
 }
 
 /// HEAD of the repository, with `-dirty` when it has uncommitted changes.

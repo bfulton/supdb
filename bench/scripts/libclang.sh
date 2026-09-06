@@ -58,7 +58,8 @@ case "$(uname -s)" in
     # Nothing unversioned anywhere. On a Debian-family host the package that
     # provides the symlink is libclang-dev; install it when we may.
     if command -v apt-get >/dev/null && command -v sudo >/dev/null; then
-      sudo apt-get install -y --no-install-recommends libclang-dev >/dev/null
+      sudo apt-get update -qq >/dev/null
+      sudo apt-get install -y -qq --no-install-recommends libclang-dev >/dev/null
       d=$(ls -d /usr/lib/llvm-*/lib 2>/dev/null | sort -V | tail -1)
       if [ -n "$d" ] && ls "$d"/libclang.so >/dev/null 2>&1; then
         emit LIBCLANG_PATH "$d"
