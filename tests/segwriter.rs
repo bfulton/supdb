@@ -1455,3 +1455,115 @@ fn create_with_applies_the_settings_and_the_reserve() {
         "write_sorted and create_with disagree"
     );
 }
+
+/// A segment written without ever holding its records.
+///
+/// This is the shape the reserve estimator exists for. The caller streams its
+/// input twice: once through `reserve::Planner`, which keeps aggregates and
+/// one `u32` per sixteenth key, and once through `create_with`, which already
+/// knows the reserve. Nothing in the test holds a key or a value beyond the
+/// one it is looking at, which is the property under test -- a version that
+/// collected the records into a Vec first would pass every assertion below
+/// and prove nothing.
+#[test]
+fn a_segment_can_be_written_without_holding_its_records() {
+    let _g = serial();
+    let dir = scratch("segwriter-streaming");
+    let o = opts();
+    let n = 20_000usize;
+
+    // The source: `i` in, one key and its values out, nothing retained.
+    let key_of = |i: usize| format!("term={i:08}").into_bytes();
+    let values_of = |i: usize| -> Vec<Vec<u8>> {
+        let count = 1 + (i * 7) % 6;
+        (0..count)
+            .map(|j| vec![b'a' + ((i + j) % 5) as u8; 40 + (i % 3) * 30])
+            .collect()
+    };
+
+    // Pass one: lengths only.
+    let mut planner = supdb::reserve::Planner::new(o.block_size, INLINE);
+    for i in 0..n {
+        let lens: Vec<u32> = values_of(i).iter().map(|v| v.len() as u32).collect();
+        planner.push(key_of(i).len(), supdb::reserve::run_len(&lens));
+    }
+    let r = planner.finish().expect("plannable");
+    let reserve = r.bytes();
+    assert_eq!(planner.keys(), n);
+    // What it held, against what the records would have been.
+    let record_bytes: usize = (0..n)
+        .map(|i| key_of(i).len() + values_of(i).iter().map(|v| v.len()).sum::<usize>())
+        .sum();
+    assert!(
+        planner.retained_bytes() * 100 < record_bytes,
+        "the planner held {} bytes against {record_bytes} of records",
+        planner.retained_bytes()
+    );
+
+    // Pass two: the records, streamed, with the reserve already known.
+    let path = dir.join("streamed.sup");
+    let write = supdb::SegmentWrite {
+        inline_max: INLINE,
+        ..Default::default()
+    };
+    {
+        let mut w = SegmentWriter::create_with(&path, &o, &write, reserve).expect("create_with");
+        for i in 0..n {
+            let k = key_of(i);
+            w.begin(&k).expect("begin");
+            for v in values_of(i) {
+                w.value(&v);
+            }
+            w.end().expect("end");
+        }
+        w.finish(5).expect("finish");
+    }
+
+    // The reserve computed without the records is the reserve the file needs:
+    // its open plan fits the probe, and the reader answers from it.
+    let bytes = std::fs::read(&path).unwrap();
+    let probe = 4096 + reserve as u64;
+    assert!(
+        (bytes.len() as u64) > probe,
+        "the file fits the probe; proves nothing"
+    );
+    let head = bytes[..4096].to_vec();
+    let plan = supdb::blob::open_sparse_ranges(&head, bytes.len() as u64).unwrap();
+    for &(off, len) in &plan {
+        assert!(
+            off + len <= probe,
+            "the open plan reaches {off}+{len}, past a {probe}-byte probe"
+        );
+    }
+
+    let blob = open(&path);
+    assert_eq!(blob.keys(), n);
+    for i in (0..n).step_by(997) {
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        blob.read_all(&key_of(i), |v| got.push(v.to_vec()))
+            .expect("read");
+        assert_eq!(got, values_of(i), "key {i} read back differently");
+    }
+
+    // And it agrees with the batch writer, which holds everything.
+    let held: Vec<(Vec<u8>, Vec<Vec<u8>>)> = (0..n).map(|i| (key_of(i), values_of(i))).collect();
+    let borrowed: Vec<(&[u8], Vec<&[u8]>)> = held
+        .iter()
+        .map(|(k, vals)| (k.as_slice(), vals.iter().map(|v| v.as_slice()).collect()))
+        .collect();
+    let items: Vec<(&[u8], &[&[u8]])> = borrowed
+        .iter()
+        .map(|(k, vals)| (*k, vals.as_slice()))
+        .collect();
+    let batched = dir.join("batched.sup");
+    let used = SegmentWriter::write_sorted(&batched, &o, &write, 5, &items).expect("write_sorted");
+    assert_eq!(
+        used, reserve,
+        "streaming and batch sized the reserve differently"
+    );
+    assert_eq!(
+        without_the_clock(&std::fs::read(&path).unwrap()),
+        without_the_clock(&std::fs::read(&batched).unwrap()),
+        "streaming and batch produced different segments"
+    );
+}
