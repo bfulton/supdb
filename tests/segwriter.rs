@@ -1116,8 +1116,8 @@ fn write_sorted_matches_the_streaming_writer_and_reserves_exactly() {
 
     assert_eq!(used, want, "the batch writer sized the reserve differently");
     assert_eq!(
-        std::fs::read(&streamed).unwrap(),
-        std::fs::read(&batched).unwrap(),
+        without_the_clock(&std::fs::read(&streamed).unwrap()),
+        without_the_clock(&std::fs::read(&batched).unwrap()),
         "the two writers produced different bytes"
     );
 
@@ -1129,6 +1129,31 @@ fn write_sorted_matches_the_streaming_writer_and_reserves_exactly() {
         blob.read_all(k, |v| got.push(v.to_vec())).expect("read");
         assert_eq!(&got, vals, "values differ for a key");
     }
+}
+
+/// A segment's bytes with the wall clock taken out of them.
+///
+/// The superblock records `SystemTime::now()` in seconds as its third field,
+/// and the FNV-1a over the fields that follows it covers that second, in each
+/// of the two slots. So two writes of identical input differ in eighteen-odd
+/// bytes whenever they straddle a tick, and comparing whole files is a test
+/// that passes on a fast machine and fails on a slow one -- which is what it
+/// did: green here, red on the macOS runner, on the arm of a loop where
+/// nothing about the setting under test touches a byte.
+///
+/// Everything else is compared, including the superblock's offsets, which are
+/// what a mis-applied setting would actually move.
+fn without_the_clock(bytes: &[u8]) -> Vec<u8> {
+    const SLOT: usize = 512;
+    const TS: usize = 16;
+    const FNV: usize = 136;
+    let mut out = bytes.to_vec();
+    for slot in [0, SLOT] {
+        for at in [slot + TS, slot + FNV] {
+            out[at..at + 8].fill(0);
+        }
+    }
+    out
 }
 
 /// Values that compress: the same few bytes over and over, so LZ4 has
@@ -1254,8 +1279,8 @@ fn write_sorted_applies_every_per_file_setting() {
             sw.finish(3).expect("finish");
         }
         assert_eq!(
-            std::fs::read(&batch_path).unwrap(),
-            std::fs::read(&stream_path).unwrap(),
+            without_the_clock(&std::fs::read(&batch_path).unwrap()),
+            without_the_clock(&std::fs::read(&stream_path).unwrap()),
             "{name}: the batch writer and the streaming one disagree"
         );
     }
