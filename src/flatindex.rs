@@ -81,6 +81,19 @@ const SLACK_DEN: usize = 2;
 /// are sixteen zero-padded ASCII digits, so for a million keys the first ten
 /// bytes are identical on every one of them. Whole keys cost more space and
 /// work for any key shape.
+///
+/// **The density is at its optimum and the rest of the seek is not the
+/// fence's to give.** The stride was swept 32 (this policy's answer at 300k
+/// keys) down to 1, every setting and LMDB in one process: the seek falls
+/// only 1,171ns to 899ns and turns back up at stride 1, while the 50- and
+/// 100-entry scans get monotonically *worse* (1,469 to 1,763ns, 1,854 to
+/// 2,216ns) and the store grows 11%. A denser fence does not remove probes,
+/// it moves them -- a binary search costs log2(nkeys) of them however the
+/// two levels are cut, and at 300k keys both levels are already cold. What
+/// is left is about twenty dependent cache misses against the three page
+/// touches LMDB's descent pays, so the lever is fanout -- nodes searched
+/// within a cache line -- and not stride. Sweeping this again will find the
+/// same floor.
 fn fence_target() -> usize {
     std::env::var("SUPDB_FENCE_TARGET")
         .ok()
