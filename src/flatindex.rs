@@ -91,7 +91,7 @@ const FENCE_MIN_STRIDE: usize = 16;
 
 /// Stride for `n` keys: enough entries to narrow the search hard, few enough
 /// that the fence stays small enough to sit in cache.
-fn fence_stride(n: usize) -> usize {
+pub fn fence_stride(n: usize) -> usize {
     let want = n.div_ceil(fence_target()).max(FENCE_MIN_STRIDE);
     want.next_power_of_two()
 }
@@ -490,7 +490,7 @@ fn record_len(klen: usize, next: usize) -> usize {
 
 /// `record_len` plus the record's tail: the bytes of its inline runs, padded
 /// so the next record stays 4-aligned.
-fn record_len_tail(klen: usize, next: usize, tail: usize) -> usize {
+pub fn record_len_tail(klen: usize, next: usize, tail: usize) -> usize {
     record_len(klen, next) + align_up(tail, REC_ALIGN)
 }
 
@@ -653,12 +653,6 @@ pub fn plan_inline(
     insert_slack: usize,
     record_slack: bool,
 ) -> Option<Plan> {
-    let mut cap = 1usize;
-    while cap < all.len() * 2 {
-        cap = cap.checked_mul(2)?;
-    }
-    cap = cap.max(16);
-
     let mut rec_offs = Vec::with_capacity(all.len());
     let mut at = 0usize;
     for (k, exts) in all {
@@ -676,22 +670,6 @@ pub fn plan_inline(
         let tail = tails.get(rec_offs.len() - 1).map_or(0, |t| t.len());
         at = at.checked_add(record_len_tail(k.len(), n, tail))?;
     }
-    if at > MAX_RECS {
-        return None;
-    }
-    // Half again, so a store whose keys gain extents can publish updates
-    // without rewriting anything -- unless the caller says the section is
-    // never edited in place.
-    let slack = if record_slack {
-        at * SLACK_NUM / SLACK_DEN
-    } else {
-        0
-    };
-    let recs_cap = at.checked_add(slack)?;
-    if recs_cap > MAX_RECS {
-        return None;
-    }
-
     // The fence samples every `stride`-th key. `fence_n + 1` offsets, so an
     // entry's key is the span between its offset and the next.
     let stride = fence_stride(all.len());
@@ -700,14 +678,87 @@ pub fn plan_inline(
         .map(|i| all[i * stride].0.len())
         .try_fold(0usize, |a, b| a.checked_add(b))?;
 
+    let l = section_layout(
+        all.len(),
+        at,
+        fence_n,
+        fence_blob_len,
+        insert_slack,
+        record_slack,
+    )?;
+    Some(Plan {
+        hash_cap: l.hash_cap,
+        dir_cap: l.dir_cap,
+        recs_len: at,
+        recs_cap: l.recs_cap,
+        rec_offs,
+        fence_n,
+        fence_stride: stride,
+        fence_offs_off: l.fence_offs_off,
+        fence_blob_off: l.fence_blob_off,
+        fence_blob_len,
+        total: l.total,
+        written: l.recs_off + at,
+    })
+}
+
+/// Where a section's regions land, from the four aggregates that decide them:
+/// the key count, the record bytes, and the fence's entry count and blob
+/// length. Nothing here needs the keys themselves.
+///
+/// Public and separate because the head reserve has to be sized before a key
+/// is written, and a caller streaming its input cannot hand over slices of
+/// everything. `plan_inline` calls this after counting; `reserve::Planner`
+/// calls it after accumulating. Two copies of this arithmetic would be two
+/// definitions of the section, and they would drift.
+pub struct SectionLayout {
+    pub hash_cap: usize,
+    pub dir_cap: usize,
+    pub fence_offs_off: usize,
+    pub fence_blob_off: usize,
+    pub recs_off: usize,
+    pub recs_cap: usize,
+    pub total: usize,
+}
+
+pub fn section_layout(
+    keys: usize,
+    rec_bytes: usize,
+    fence_n: usize,
+    fence_blob_len: usize,
+    insert_slack: usize,
+    record_slack: bool,
+) -> Option<SectionLayout> {
+    if rec_bytes > MAX_RECS {
+        return None;
+    }
+    let mut cap = 1usize;
+    while cap < keys * 2 {
+        cap = cap.checked_mul(2)?;
+    }
+    cap = cap.max(16);
+
+    // Half again, so a store whose keys gain extents can publish updates
+    // without rewriting anything -- unless the caller says the section is
+    // never edited in place.
+    let slack = if record_slack {
+        rec_bytes * SLACK_NUM / SLACK_DEN
+    } else {
+        0
+    };
+    let recs_cap = rec_bytes.checked_add(slack)?;
+    if recs_cap > MAX_RECS {
+        return None;
+    }
+
     // One buffer when nothing asked for insert room, two when something did.
     let dir_cap = if insert_slack == 0 {
         0
     } else {
-        all.len().checked_add(insert_slack)?
+        keys.checked_add(insert_slack)?
     };
     let dir_bytes = if dir_cap == 0 {
-        all.len() * 4
+        keys * 4
     } else {
         dir_cap.checked_mul(8)?
     };
@@ -717,20 +768,14 @@ pub fn plan_inline(
     // Records are 4-aligned within the section, and the blob is bytes, so the
     // record region is realigned after it.
     let recs_off = align_up(fence_blob_off + fence_blob_len, REC_ALIGN);
-    let total = recs_off + recs_cap;
-    Some(Plan {
+    Some(SectionLayout {
         hash_cap: cap,
         dir_cap,
-        recs_len: at,
-        recs_cap,
-        rec_offs,
-        fence_n,
-        fence_stride: stride,
         fence_offs_off,
         fence_blob_off,
-        fence_blob_len,
-        total,
-        written: recs_off + at,
+        recs_off,
+        recs_cap,
+        total: recs_off + recs_cap,
     })
 }
 

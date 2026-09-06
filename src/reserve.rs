@@ -12,24 +12,28 @@
 //! as latency, never as a fault, which is the shape of defect this repository
 //! keeps a list of.
 //!
-//! So the size is computed. [`for_lengths`] answers exactly, from the key and
-//! run lengths a caller that gathered its input already has. [`from_totals`]
-//! answers with an upper bound for a caller that knows only totals. Both
-//! return the [`Reserve`] broken into its four pieces, because the last of
-//! them is a decision: the directory copy costs four bytes a key and buys a
-//! lookup that plans with no second wave, and only the caller knows whether
-//! its readers are paying for round trips or for bytes.
+//! So the size is computed. [`Planner`] accumulates the answer one key at a
+//! time, holding aggregates rather than the input, for a caller that streams
+//! its records and will not hold them. [`for_lengths`] is that planner over a
+//! slice, for a caller that has one. [`from_totals`] answers with an upper
+//! bound for a caller that knows only totals. All three return the
+//! [`Reserve`] broken into its four pieces, because the last of them is a
+//! decision: the directory copy costs four bytes a key and buys a lookup that
+//! plans with no second wave, and only the caller knows whether its readers
+//! are paying for round trips or for bytes.
 //!
-//! **None of the layout arithmetic lives here.** `for_lengths` plans the key
-//! section with [`crate::flatindex::plan_inline`], the same call the writer
-//! makes, over placeholder keys of the caller's lengths; the block table's
-//! size comes from [`crate::flatindex::block_table_len`], which
-//! `encode_blocks` allocates by. A second copy of that arithmetic would be a
-//! second definition of the format, and the two would drift the first time
-//! one of them was edited.
+//! **None of the layout arithmetic lives here.** Where the key section's
+//! regions land comes from [`crate::flatindex::section_layout`], which
+//! `plan_inline` calls after counting and the planner calls after
+//! accumulating; the block table's size comes from
+//! [`crate::flatindex::block_table_len`], which `encode_blocks` allocates by;
+//! a record's bytes come from `flatindex::record_len_tail` and the fence's
+//! stride from `flatindex::fence_stride`. What is left here is the cut into
+//! blocks, which is four lines of the writer's own rule. A second copy of any
+//! of that would be a second definition of the format, and the two would
+//! drift the first time one of them was edited.
 
 use crate::flatindex;
-use crate::index::{Ext, Extents};
 
 /// The bytes a key's values encode to, which is what a block holds and what
 /// an inline run puts in the record.
@@ -66,23 +70,204 @@ fn uvarint_len(mut v: u64) -> usize {
 /// block by itself and a key's values stay contiguous. Inline runs are not
 /// passed here -- they never reach a block.
 fn blocks_for(runs: impl Iterator<Item = usize>, block_size: usize) -> usize {
-    let mut blocks = 0usize;
     let mut staged = 0usize;
-    for n in runs {
-        if staged != 0 && staged + n > block_size {
-            blocks += 1;
-            staged = 0;
-        }
-        staged += n;
-        if staged >= block_size {
-            blocks += 1;
-            staged = 0;
-        }
-    }
+    let mut blocks: usize = runs.map(|n| cut(&mut staged, n, block_size)).sum();
     if staged != 0 {
         blocks += 1;
     }
     blocks
+}
+
+/// One run through the cut, as the writer does it: a run that does not fit
+/// beside what is staged closes a block first, and a builder at or over the
+/// block size is flushed after the push. Returns how many blocks closed, and
+/// leaves what is still staged in `staged` -- which the last block takes.
+fn cut(staged: &mut usize, n: usize, block_size: usize) -> usize {
+    let mut closed = 0;
+    // `staged + n > block_size`, without the sum: what is staged is always
+    // below the block size, and the sum is what would overflow first where a
+    // usize is 32 bits.
+    if *staged != 0 && n > block_size - *staged {
+        closed += 1;
+        *staged = 0;
+    }
+    *staged = staged.saturating_add(n);
+    if *staged >= block_size {
+        closed += 1;
+        *staged = 0;
+    }
+    closed
+}
+
+/// The longest run this planner will size, which is the longest one the
+/// writer will store: an extent addresses its run with a `u32`, and a run
+/// past that is refused rather than written. The headroom below that limit is
+/// for the record framing's own 4-byte rounding, and it matters where a usize
+/// is 32 bits and the limit is `usize::MAX` -- there the rounding is what
+/// overflows, not the length.
+const MAX_RUN: usize = (u32::MAX as usize) - 8;
+
+/// The reserve, accumulated one key at a time.
+///
+/// This is the shape a caller wants who will not hold their records: the
+/// answer depends on the key count, the record bytes, how the runs cut into
+/// blocks, and the lengths of the keys the fence samples -- all of which are
+/// aggregates. So a first pass over lengths alone, with no values retained,
+/// is enough, and the second pass streams the records through
+/// [`crate::SegmentWriter::create_with`] with the reserve already known.
+///
+/// What it holds is one `u32` per sixteenth key, and nothing else that grows.
+/// The fence samples every `stride`-th key and `stride` is not known until the
+/// count is, but every stride the format can choose is a power of two at or
+/// above the smallest one, so every sampled key is a multiple of that
+/// smallest stride and keeping those is enough. At ten million keys that is
+/// about 2.5 MB, against the 160 MB a slice of every key's lengths takes on a
+/// 64-bit target and the gigabyte the records themselves would.
+pub struct Planner {
+    block_size: usize,
+    inline_max: usize,
+    keys: usize,
+    rec_bytes: usize,
+    staged: usize,
+    blocks: usize,
+    /// Key lengths at every `sample_stride`-th key, for the fence.
+    sampled: Vec<u32>,
+    sample_stride: usize,
+    /// Cleared when the input cannot be a segment, so `finish` says so.
+    viable: bool,
+}
+
+impl Planner {
+    /// `block_size` and `inline_max` are the writer's, and must be the ones
+    /// it will be given.
+    pub fn new(block_size: usize, inline_max: usize) -> Planner {
+        Planner {
+            block_size,
+            inline_max,
+            keys: 0,
+            rec_bytes: 0,
+            staged: 0,
+            blocks: 0,
+            sampled: Vec::new(),
+            // The smallest stride the fence can choose. Asking the format
+            // rather than restating it: every larger stride is a power of two
+            // multiple of this one, so a key the fence samples is always one
+            // of these.
+            sample_stride: flatindex::fence_stride(0),
+            viable: true,
+        }
+    }
+
+    /// One key, by its key length and the bytes its values encode to.
+    /// [`run_len`] turns a key's value lengths into the second. Keys must
+    /// arrive in the order they will be written, which is key order.
+    pub fn push(&mut self, key_len: usize, run_len: usize) {
+        // A key the writer cannot frame with a u16 length, or a run it cannot
+        // address with a u32 extent, is refused here too: a planner that
+        // returned a number for a segment that cannot exist would be sizing a
+        // reserve for a file nobody can write.
+        if key_len > u16::MAX as usize || run_len > MAX_RUN {
+            self.viable = false;
+            return;
+        }
+        if self.keys.is_multiple_of(self.sample_stride) {
+            self.sampled.push(key_len as u32);
+        }
+        let inline = self.inline_max > 0 && run_len <= self.inline_max;
+        let tail = if inline { run_len } else { 0 };
+        // One extent per key: that is what a segment writes. Checked, as
+        // `plan_inline` checks the same sum -- unchecked it would wrap where
+        // a usize is 32 bits and hand back a reserve for the wrapped total,
+        // which is a wrong number rather than a refusal.
+        match self
+            .rec_bytes
+            .checked_add(flatindex::record_len_tail(key_len, 1, tail))
+        {
+            Some(n) => self.rec_bytes = n,
+            None => {
+                self.viable = false;
+                return;
+            }
+        }
+        if !inline {
+            self.blocks += cut(&mut self.staged, run_len, self.block_size);
+        }
+        self.keys += 1;
+    }
+
+    /// How many keys have been pushed.
+    pub fn keys(&self) -> usize {
+        self.keys
+    }
+
+    /// The bytes this planner holds that grow with the input: the sampled key
+    /// lengths, and nothing else. One `u32` per sixteenth key, so a caller
+    /// sizing a first pass can check the claim rather than trust it.
+    pub fn retained_bytes(&self) -> usize {
+        self.sampled.len() * std::mem::size_of::<u32>()
+    }
+
+    /// The reserve for what has been pushed so far.
+    ///
+    /// Exact but for the checksum row, which can be twelve bytes over: the
+    /// row covers the key section in pieces cut on the *object's* pages, so
+    /// its length depends on where the section lands, which depends on this
+    /// answer. It is taken at its worst alignment, where the section starts
+    /// one byte before a page boundary and cuts one piece more than it
+    /// otherwise would. That is four bytes, and the 8-aligned boundary behind
+    /// the row can move by eight because of them. Nothing else rounds.
+    ///
+    /// `None` when what was pushed cannot be a segment: a key over 64 KiB, or
+    /// a key section past the flat index's limits. The writer would refuse it
+    /// too.
+    pub fn finish(&self) -> Option<Reserve> {
+        if !self.viable {
+            return None;
+        }
+        let stride = flatindex::fence_stride(self.keys);
+        let fence_n = self.keys.div_ceil(stride);
+        let mut fence_blob_len = 0usize;
+        for i in 0..fence_n {
+            // Every sampled key is a multiple of `sample_stride`, so it is in
+            // hand; if it ever is not, the format changed under this.
+            let at = (i * stride) / self.sample_stride;
+            fence_blob_len = fence_blob_len.checked_add(*self.sampled.get(at)? as usize)?;
+        }
+        let layout = flatindex::section_layout(
+            self.keys,
+            self.rec_bytes,
+            fence_n,
+            fence_blob_len,
+            // No insert room and no record slack: a segment is never edited
+            // in place, which is exactly how the writer plans it.
+            0,
+            false,
+        )?;
+
+        let mut blocks = self.blocks;
+        if self.staged != 0 {
+            blocks += 1;
+        }
+        let table = flatindex::block_table_len(blocks);
+        let row = flatindex::checksum_row_len(
+            layout.total,
+            flatindex::PIECE_SHIFT,
+            (1u64 << flatindex::PIECE_SHIFT) - 1,
+        );
+        // The fence copy is the span the reader takes: from the offset array
+        // to the record region, which is what `fence_span` reports.
+        let fence = if fence_n == 0 {
+            0
+        } else {
+            layout.recs_off - layout.fence_offs_off
+        };
+        Some(Reserve {
+            table,
+            row,
+            fence,
+            directory: self.keys * 4,
+        })
+    }
 }
 
 /// What a segment's reserve holds, in bytes, piece by piece.
@@ -123,91 +308,26 @@ impl Reserve {
     }
 }
 
-/// The reserve a segment of these keys needs.
+/// The reserve a segment of these keys needs, for a caller holding a slice.
 ///
 /// `keys` is one `(key length, run length)` per key, in key order; [`run_len`]
 /// turns a key's value lengths into the second. `inline_max` and `block_size`
 /// are the writer's, and must be the ones it will be given.
 ///
-/// Exact but for the checksum row, which can be twelve bytes over.
-///
-/// The row covers the key section in pieces cut on the *object's* pages, so
-/// its length depends on where the section lands, which depends on this
-/// answer, which is the one circularity in the layout. It is resolved the
-/// only way it can be from here: the row is taken at its worst alignment,
-/// where the section starts one byte before a page boundary and cuts one
-/// piece more than it otherwise would. That is four bytes, and the 8-aligned
-/// boundary behind the row can move by eight because of them. Nothing else
-/// rounds.
-///
-/// `None` when the input cannot be a segment at all: a key over 64 KiB, or a
-/// key section past the flat index's limits. The writer would refuse it too.
+/// This is [`Planner`] over a slice, and the exactness and the failure cases
+/// are its. A caller who will not hold its records should use the planner
+/// directly: a slice of lengths is `size_of::<(usize, usize)>()` a key, which
+/// is sixteen bytes where a pointer is eight.
 pub fn for_lengths(
     keys: &[(usize, usize)],
     block_size: usize,
     inline_max: usize,
 ) -> Option<Reserve> {
-    let inline = |run: usize| inline_max > 0 && run <= inline_max;
-
-    // Placeholder keys and one extent apiece: the planner reads their lengths
-    // and the extent count, never the bytes. A segment gives every key one
-    // extent, and its tail is the run when the run is inline.
-    let arena = vec![0u8; keys.iter().map(|&(k, _)| k).sum::<usize>()];
-    let ext = Extents::One(Ext {
-        block: 0,
-        off: 0,
-        len: 0,
-        last: 0,
-        count: 0,
-    });
-    let mut all: Vec<(&[u8], &Extents)> = Vec::with_capacity(keys.len());
-    let mut at = 0usize;
-    for &(klen, _) in keys {
-        all.push((&arena[at..at + klen], &ext));
-        at += klen;
+    let mut p = Planner::new(block_size, inline_max);
+    for &(key_len, run) in keys {
+        p.push(key_len, run);
     }
-    let tail_arena = vec![0u8; keys.iter().map(|&(_, r)| r).sum::<usize>()];
-    let mut tails: Vec<&[u8]> = Vec::with_capacity(keys.len());
-    let mut at = 0usize;
-    for &(_, run) in keys {
-        tails.push(if inline(run) {
-            &tail_arena[at..at + run]
-        } else {
-            &[]
-        });
-        at += run;
-    }
-    // No insert room and no record slack: a segment is never edited in place,
-    // which is exactly how the writer plans it.
-    let plan = flatindex::plan_inline(&all, &tails, 0, false)?;
-
-    let table = flatindex::block_table_len(blocks_for(
-        keys.iter().filter(|&&(_, r)| !inline(r)).map(|&(_, r)| r),
-        block_size,
-    ));
-    // The section's own length is the planner's total; the row is appended
-    // after it and covers everything before itself.
-    let row = flatindex::checksum_row_len(
-        plan.total,
-        flatindex::PIECE_SHIFT,
-        // The worst base: a section starting one byte before a page boundary
-        // cuts one more piece than one starting on it.
-        (1u64 << flatindex::PIECE_SHIFT) - 1,
-    );
-    // The fence copy is the span the reader will take: from the offset array
-    // to the record region, which is what `fence_span` reports.
-    let recs_off = plan.total - plan.recs_cap;
-    let fence = if plan.fence_n == 0 {
-        0
-    } else {
-        recs_off - plan.fence_offs_off
-    };
-    Some(Reserve {
-        table,
-        row,
-        fence,
-        directory: keys.len() * 4,
-    })
+    p.finish()
 }
 
 /// An upper bound on the reserve, for a caller that knows only totals.
@@ -237,8 +357,11 @@ pub fn from_totals(
     // long as the longest, runs as long as the longest, as many of both as
     // the totals allow.
     let per_key_run = run_bytes.div_ceil(keys).max(1).min(max_run_len);
-    let shaped: Vec<(usize, usize)> = (0..keys).map(|_| (max_key_len, per_key_run)).collect();
-    let mut need = for_lengths(&shaped, block_size, inline_max)?;
+    let mut p = Planner::new(block_size, inline_max);
+    for _ in 0..keys {
+        p.push(max_key_len, per_key_run);
+    }
+    let mut need = p.finish()?;
 
     // `for_lengths` on an even shape cuts the blocks evenly, and an uneven one
     // cuts more. Every block but the last holds more than `block_size -
@@ -249,7 +372,7 @@ pub fn from_totals(
     } else {
         run_bytes.div_ceil(block_size - max_run_len).min(keys)
     };
-    let even_blocks = blocks_for(shaped.iter().map(|&(_, r)| r), block_size);
+    let even_blocks = blocks_for(std::iter::repeat_n(per_key_run, keys), block_size);
     if worst_blocks > even_blocks {
         need.table = flatindex::block_table_len(worst_blocks);
     }
@@ -318,6 +441,90 @@ mod tests {
                 .bytes();
             assert!(bound >= exact, "bound {bound} below exact {exact}");
         }
+    }
+
+    #[test]
+    fn the_planner_holds_aggregates_rather_than_the_input() {
+        // A million keys of sixteen bytes: the planner keeps one u32 per
+        // sixteenth key and nothing else that grows.
+        let mut p = Planner::new(64 << 10, 0);
+        for _ in 0..1_000_000 {
+            p.push(16, 100);
+        }
+        assert_eq!(p.keys(), 1_000_000);
+        assert_eq!(p.retained_bytes(), 1_000_000usize.div_ceil(16) * 4);
+        // Against a slice of the same lengths, which is a pair of usizes a
+        // key -- asked of the target rather than assumed to be sixteen, since
+        // this crate also builds for wasm32, where it is eight.
+        let sliced = 1_000_000 * std::mem::size_of::<(usize, usize)>();
+        assert!(p.retained_bytes() * 30 < sliced);
+        assert!(p.finish().is_some());
+    }
+
+    #[test]
+    fn the_planner_and_the_slice_agree() {
+        // Uneven keys and runs, so the fence blob and the block cut both
+        // depend on the order they arrive in.
+        for n in [0usize, 1, 15, 16, 17, 4096, 40_000] {
+            let keys: Vec<(usize, usize)> = (0..n)
+                .map(|i| (8 + (i * 7) % 40, 1 + (i * 13) % 900))
+                .collect();
+            let sliced = for_lengths(&keys, 4096, 256);
+            let mut p = Planner::new(4096, 256);
+            for &(k, r) in &keys {
+                p.push(k, r);
+            }
+            assert_eq!(sliced, p.finish(), "{n} keys");
+        }
+    }
+
+    #[test]
+    fn a_key_too_long_to_frame_is_refused_rather_than_sized() {
+        let mut p = Planner::new(4096, 0);
+        p.push(16, 100);
+        p.push(u16::MAX as usize + 1, 100);
+        assert!(p.finish().is_none());
+    }
+
+    #[test]
+    fn a_run_past_what_an_extent_addresses_is_refused_rather_than_sized() {
+        let mut p = Planner::new(4096, 0);
+        p.push(16, 100);
+        p.push(16, MAX_RUN + 1);
+        assert!(p.finish().is_none());
+    }
+
+    #[test]
+    fn record_bytes_that_would_wrap_refuse_rather_than_return_the_wrapped_sum() {
+        // Runs at the largest a segment can hold, inline so every byte lands
+        // in the record region. The sum passes usize on a 32-bit target long
+        // before this many keys, and stays honest on a 64-bit one.
+        let mut p = Planner::new(4096, MAX_RUN);
+        for _ in 0..64 {
+            p.push(16, MAX_RUN);
+        }
+        // Either the sum overflowed and it refused, or it did not and the
+        // section is past what the index can address. Never a number.
+        assert!(p.finish().is_none());
+    }
+
+    #[test]
+    fn a_huge_run_does_not_wrap_the_block_cut() {
+        // `cut` used to add the run to what was staged and compare the sum,
+        // which is what overflows -- at `MAX_RUN` only where a usize is 32
+        // bits, so the value here is one that overflows at any width and
+        // takes the same path. `from_totals` reaches this with whatever
+        // `max_run_len` its caller passes, so it is not a hypothetical.
+        //
+        // Wrapped, the sum comes out small: no block closes and the run is
+        // left staged. The counts below are what says which happened.
+        let huge = usize::MAX - 10;
+        let mut staged = 0usize;
+        assert_eq!(cut(&mut staged, huge, 4096), 1);
+        assert_eq!(staged, 0);
+        let mut staged = 100usize;
+        assert_eq!(cut(&mut staged, huge, 4096), 2, "the sum wrapped");
+        assert_eq!(staged, 0);
     }
 
     #[test]

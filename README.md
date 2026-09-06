@@ -85,13 +85,15 @@ let seg = Blob::open(MmapBytes::open(path)?)?;
 seg.read_all(b"term", |v| { /* zero-copy borrow into the mapping */ })?;
 ```
 
-With the whole input in hand, `SegmentWriter::write_sorted` writes the same
-bytes and sizes the segment's head reserve exactly, so a reader's first probe
-covers the index without a second round trip and a small segment does not
-carry a large one's worth of zeroes. `SegmentWrite` carries the per-file
-settings -- compression, inline runs, sync spreading, and whether the reserve
-holds a copy of the directory. `supdb::reserve` answers the sizing question on
-its own, from lengths or from totals.
+A segment's head reserve is what lets a reader's first probe cover the index
+without a second round trip, and it has to be sized before the first key is
+written. `supdb::reserve` computes it rather than guessing, so a small segment
+does not carry a large one's worth of zeroes. With the whole input in hand,
+`SegmentWriter::write_sorted` does it for you. Without: run the lengths through
+`reserve::Planner`, which holds aggregates rather than records, then stream
+through `SegmentWriter::create_with(path, opts, write, reserve)`, which takes
+the per-file settings -- compression, inline runs, sync spreading -- and the
+reserve together, since all of them must be set before the first key.
 
 The same segment in a browser, over ranged HTTP from a Web Worker:
 
