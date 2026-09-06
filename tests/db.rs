@@ -374,6 +374,102 @@ fn the_probe_merge_arm_passes_the_same_oracle() {
     oracle(false)
 }
 
+/// The names of the live segment files, sorted. A promoted piece keeps the
+/// id the seal gave it; a merge writes a fresh one, so the id in the name is
+/// what tells the two apart on disk.
+fn seg_names(d: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(d)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sup"))
+        .collect();
+    v.sort();
+    v
+}
+
+/// A flush that leaves one full-range piece promotes it instead of merging.
+///
+/// The merge it used to fall through to read that piece back and wrote it out
+/// again as one partition over the same range -- a quarter of the load window
+/// at 100k keys, and half the device bytes the store wrote. The store this
+/// leaves has to be the one the merge would have left, so this checks the
+/// shape and every value, not just that it was fast.
+#[test]
+fn a_lone_piece_is_promoted_rather_than_rewritten() {
+    let d = dir("promote-one");
+    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+    for k in 0u32..2_000 {
+        let key = format!("key-{k:05}").into_bytes();
+        let val = format!("v-{k}").into_bytes();
+        db.append(&key, &val);
+        model.insert(key, vec![val]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+
+    let names = seg_names(&d);
+    assert_eq!(names.len(), 1, "one piece in, one partition out: {names:?}");
+    assert!(names[0].starts_with("par-"), "left unrouted: {names:?}");
+    // Id 0 is the one the seal allocated. A merge would have taken the next.
+    assert!(
+        names[0].starts_with("par-00000000-"),
+        "rewritten by a merge rather than promoted: {names:?}"
+    );
+    assert_eq!(db.segments(), 1);
+    for (key, want) in &model {
+        assert_eq!(
+            &read_vec(&db, key),
+            want,
+            "key {}",
+            String::from_utf8_lossy(key)
+        );
+    }
+    let mut seen = Vec::new();
+    db.scan(b"", model.len(), |k, _| seen.push(k.to_vec()))
+        .unwrap();
+    let mut want: Vec<Vec<u8>> = model.keys().cloned().collect();
+    want.sort();
+    assert_eq!(
+        seen, want,
+        "the promoted partition does not scan in key order"
+    );
+    db.close().unwrap();
+}
+
+/// The same flush, with a tombstone in the piece: promotion keeps the file as
+/// it is and a tombstone has to be collected, so this one must still merge.
+#[test]
+fn a_lone_piece_holding_a_tombstone_still_merges() {
+    let d = dir("promote-tomb");
+    let mut db = Db::create(&d, Options::default()).unwrap();
+    for k in 0u32..2_000 {
+        db.append(
+            format!("key-{k:05}").as_bytes(),
+            format!("v-{k}").as_bytes(),
+        );
+    }
+    db.commit().unwrap();
+    db.delete(b"key-00042");
+    db.commit().unwrap();
+    db.flush().unwrap();
+
+    let names = seg_names(&d);
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(
+        !names[0].starts_with("par-00000000-"),
+        "promoted a piece carrying a tombstone: {names:?}"
+    );
+    assert!(
+        read_vec(&db, b"key-00042").is_empty(),
+        "the delete came back"
+    );
+    assert_eq!(read_vec(&db, b"key-00041"), vec![b"v-41".to_vec()]);
+    assert_eq!(read_vec(&db, b"key-00043"), vec![b"v-43".to_vec()]);
+    db.close().unwrap();
+}
+
 fn small_opts(l0_trigger: usize) -> Options {
     // Small enough that a few hundred records seal and compact, so the
     // level machinery is exercised at test scale rather than described.

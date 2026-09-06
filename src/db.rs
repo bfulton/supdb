@@ -767,9 +767,13 @@ struct Seg {
     hi: Option<Vec<u8>>,
     bloom: Option<BlockedBloom>,
     /// Whether any extent here carries the tombstone flag. A read consults
-    /// it before paying the newest-first pass that tombstones require;
-    /// partitions are always false, because a merge writes the bottom level
-    /// and drops them.
+    /// it before paying the newest-first pass that tombstones require.
+    ///
+    /// A partition a merge wrote is always false, because a merge writes the
+    /// bottom level and drops them. A partition a PROMOTION made is whatever
+    /// its piece was: promotion renames the file and keeps this flag with it,
+    /// which is why the read path tests the flag per segment rather than
+    /// assuming it from the level.
     tombs: bool,
 }
 
@@ -3596,6 +3600,21 @@ impl Db {
     /// Before the first partitioning: if the full-range segments are
     /// disjoint in key order, they become the first partitions as they
     /// are, tiling the space from the bottom.
+    ///
+    /// One piece qualifies too, and refusing it was expensive. A flush that
+    /// leaves a single full-range piece -- every store up to about one seal,
+    /// which is every rung of the suite's `quick` ladder below 300k keys --
+    /// fell through to a merge that read that piece back and wrote it out
+    /// again as one partition covering the same range. Measured at 100k keys:
+    /// a quarter of the load window, and 4.06 device bytes a stored byte
+    /// against 2.63 without it, where 300k keys -- two pieces, so promotion
+    /// already fired -- spent nothing and wrote 2.69.
+    ///
+    /// Two conditions keep the promoted store the shape the merge would have
+    /// left. The piece must fit a partition, or a merge would have cut it
+    /// into several and promotion would not be the same store; and it must
+    /// carry no tombstone, because a merge writes the bottom level and drops
+    /// them, and a promotion keeps the file exactly as it is.
     fn promote_unpartitioned(&mut self) -> Result<bool> {
         let mut pieces: Vec<usize> = self
             .segs
@@ -3604,8 +3623,23 @@ impl Db {
             .filter(|(_, s)| s.level == 0)
             .map(|(i, _)| i)
             .collect();
-        if pieces.len() < 2 {
+        if pieces.is_empty() {
             return Ok(false);
+        }
+        if pieces.len() == 1 {
+            let s = &self.segs[pieces[0]];
+            if s.tombs {
+                return Ok(false);
+            }
+            let pb = self
+                .opts
+                .partition_bytes
+                .unwrap_or(self.opts.seal_bytes)
+                .max(1) as u64;
+            match std::fs::metadata(self.dir.join(&s.name)) {
+                Ok(m) if m.len() <= pb => {}
+                _ => return Ok(false),
+            }
         }
         let whole: Fence = (Vec::new(), None);
         let Some(bounds) = self.promotion_chain(&whole, None, &mut pieces) else {
