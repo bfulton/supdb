@@ -16,19 +16,22 @@
 //! time, holding aggregates rather than the input, for a caller that streams
 //! its records and will not hold them. [`for_lengths`] is that planner over a
 //! slice, for a caller that has one. [`from_totals`] answers with an upper
-//! bound for a caller that knows only totals. All
-//! return the [`Reserve`] broken into its four pieces, because the last of
-//! them is a decision: the directory copy costs four bytes a key and buys a
-//! lookup that plans with no second wave, and only the caller knows whether
-//! its readers are paying for round trips or for bytes.
+//! bound for a caller that knows only totals. All three return the
+//! [`Reserve`] broken into its four pieces, because the last of them is a
+//! decision: the directory copy costs four bytes a key and buys a lookup that
+//! plans with no second wave, and only the caller knows whether its readers
+//! are paying for round trips or for bytes.
 //!
-//! **None of the layout arithmetic lives here.** `for_lengths` plans the key
-//! section with [`crate::flatindex::plan_inline`], the same call the writer
-//! makes, over placeholder keys of the caller's lengths; the block table's
-//! size comes from [`crate::flatindex::block_table_len`], which
-//! `encode_blocks` allocates by. A second copy of that arithmetic would be a
-//! second definition of the format, and the two would drift the first time
-//! one of them was edited.
+//! **None of the layout arithmetic lives here.** Where the key section's
+//! regions land comes from [`crate::flatindex::section_layout`], which
+//! `plan_inline` calls after counting and the planner calls after
+//! accumulating; the block table's size comes from
+//! [`crate::flatindex::block_table_len`], which `encode_blocks` allocates by;
+//! a record's bytes come from `flatindex::record_len_tail` and the fence's
+//! stride from `flatindex::fence_stride`. What is left here is the cut into
+//! blocks, which is four lines of the writer's own rule. A second copy of any
+//! of that would be a second definition of the format, and the two would
+//! drift the first time one of them was edited.
 
 use crate::flatindex;
 
