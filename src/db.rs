@@ -2,7 +2,7 @@
 //!
 //! `docs/engine.md` is the design brief and every load-bearing decision
 //! here cites a measurement. A durable commit is one framed append and one
-//! fdatasync and nothing else, because f39 measured that shape at 1,191,125
+//! fdatasync and nothing else, because that shape was measured at 1,191,125
 //! ops/s with all engine work removed, and the engine this replaced ran
 //! 5.85x below it on per-point work this design deletes. Sealed segments are
 //! the format `Blob` reads, so everything measured about that read path
@@ -14,9 +14,9 @@
 //! Deletes are tombstones that the merge collects. Segments are compacted
 //! into key ranges, so a read routes by fence to one partition plus a
 //! bounded L0 tail that a per-segment Bloom filter guards: the unfiltered
-//! fan that queries every source was priced at 90ns a segment by f38, and
-//! f41 refuted every keys-sized global router, which is why the routing is
-//! by range and not by key.
+//! fan that queries every source was priced at 90ns a segment, and every
+//! keys-sized global router tried lost to routing by range, which is why the
+//! routing is by range and not by key.
 //!
 //! Crash discipline, in order, so every window is survivable:
 //! commit = WAL append + fdatasync (the batch is durable or its tail frame
@@ -75,7 +75,7 @@ fn get_uvarint(buf: &[u8], p: &mut usize) -> Option<u64> {
 /// torn or missing and the sequence-gap check refuses anything past a
 /// hole, so an unsynced tail is lost whole and never served in part.
 ///
-/// It exists because f47 measured this device serving ~2,700 barriers a
+/// It exists because the device was measured serving ~2,700 barriers a
 /// second however they are issued -- sharding cannot scale past 1.6x --
 /// so on a barrier-bound device the lever is fewer barriers per record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,8 +88,8 @@ pub enum SyncPolicy {
 
 /// I/O priority for the seal and merge threads. `Idle` asks the block layer
 /// to serve everything else -- the commit path's barrier above all -- before
-/// this thread's pages; f49 found the commit phase slowing whenever a seal
-/// ran beside it, and f51 prices this as the answer.
+/// this thread's pages; the commit phase was measured slowing whenever a
+/// seal ran beside it, and this is the answer priced against that.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackgroundIo {
     Normal,
@@ -119,10 +119,9 @@ fn idle_io_priority() {
 /// Once a store outgrows the page cache the kernel's default readahead is
 /// the whole out-of-core cliff: cold point reads run 75.8x and 78.9x faster
 /// under `MADV_RANDOM`, at 1.0x read amplification against 1800x -- the
-/// default fetched 157 GB off the device to serve 89 MB anybody asked for
-/// (`F65.1`, `F65.2`). It is a trade rather than a win, because an ordered
-/// scan wants exactly the pages a point read does not and pays 2.3x to 2.5x
-/// for losing them (`F65.3`).
+/// default fetched 157 GB off the device to serve 89 MB anybody asked for.
+/// It is a trade rather than a win, because an ordered scan wants exactly
+/// the pages a point read does not and pays 2.3x to 2.5x for losing them.
 ///
 /// A mapping's advice applies to the reader that set it and not to the file,
 /// so a compaction streams its inputs under the kernel's default however
@@ -146,20 +145,20 @@ pub enum ReadAdvice {
     ///
     /// The store does not have to infer which it is doing -- `read_all` and
     /// `scan` are different calls -- so the phase signal is free and exact.
-    /// There is no threshold to tune: `f66-adaptive` swept one and found that
-    /// waiting for a second consecutive scan before switching falls to 33.2%
-    /// and 30.8% of the better fixed advice on a workload with no phases,
-    /// where switching on the first is 1.5x it (`F66.5`, `F66.6`). A switch
-    /// is a `madvise` in microseconds and one cold scan in the wrong mode is
-    /// milliseconds, so there is nothing to be gained by waiting.
+    /// There is no threshold to tune: a sweep of one found that waiting for
+    /// a second consecutive scan before switching falls to 33.2% and 30.8% of
+    /// the better fixed advice on a workload with no phases, where switching
+    /// on the first is 1.5x it. A switch is a `madvise` in microseconds and
+    /// one cold scan in the wrong mode is milliseconds, so there is nothing
+    /// to be gained by waiting.
     ///
     /// The default, because it wins where the advice matters and costs
     /// nothing where it does not. Out-of-core it is 4.3-4.4x the kernel's
     /// default and 6.5-6.6x a fixed `MADV_RANDOM` over a store of several
-    /// segments (`F67.1`), and 2.0-2.1x the better of the two on a workload
-    /// with no phases (`F67.2`). On a store that fits in memory, where it can
-    /// win nothing and can only cost, it is a tie (`F67.3`) -- as it is on
-    /// the canonical comparison this project quotes (`EXT.46`, `EXT.47`).
+    /// segments, and 2.0-2.1x the better of the two on a workload with no
+    /// phases. On a store that fits in memory, where it can win nothing and
+    /// can only cost, it is a tie -- as it is on the canonical comparison
+    /// this project quotes.
     #[default]
     Adaptive,
     /// Never leave `MADV_RANDOM`, and prefetch the value bytes a scan is
@@ -170,7 +169,8 @@ pub enum ReadAdvice {
     /// a `limit`, so it knows the span, plans the exact ranges its records
     /// name and asks for those. There is no phase to detect and no mode to
     /// switch, which makes it the simplest of the four rather than the most
-    /// elaborate -- `f68-prefetch` is whether it is also the fastest.
+    /// elaborate -- whether it is also the fastest is a question for the
+    /// measurement.
     Prefetch,
 }
 
@@ -179,9 +179,9 @@ impl ReadAdvice {
     ///
     /// `Adaptive` starts advised because it leaves that mode on the first
     /// scan and being wrong in the other direction is the expensive one:
-    /// `F65.1` puts a cold point read under the kernel's default at about a
-    /// seventy-fifth of an advised one, against `F65.3`'s 2.4x for a scan
-    /// under `MADV_RANDOM`.
+    /// measured, a cold point read under the kernel's default ran at about
+    /// a seventy-fifth of an advised one, against 2.4x for a scan under
+    /// `MADV_RANDOM`.
     fn starts_random(self) -> bool {
         matches!(
             self,
@@ -199,12 +199,12 @@ pub struct Options {
     pub seal_bytes: usize,
     /// SegmentOptions for the segment writer. Fixed to `redo_log: false, shards: 1`
     /// regardless of what is passed, because a sealed segment is written
-    /// once and never reopened for writing -- the logshed finding that a
-    /// 4 MiB redo arena in a write-once file is pure waste.
+    /// once and never reopened for writing, and a 4 MiB redo arena in a
+    /// write-once file is pure waste.
     pub segment: SegmentOptions,
     /// How many overlapping L0 segments to tolerate before a partitioning
     /// merge. The brief's open "partitioned compaction policy" question in
-    /// one number; f43 sweeps it.
+    /// one number; it was chosen by sweeping it.
     pub l0_trigger: usize,
     /// The measurement instrument: false keeps every segment in the
     /// unrouted L0 fan, which is milestone 3's behaviour exactly.
@@ -214,70 +214,68 @@ pub struct Options {
     /// This is a read-for-write trade and it is a large one. Partitioning
     /// makes every later read touch exactly one segment instead of paying
     /// a Bloom check on each of several overlapping ones -- worth roughly
-    /// 1.4x on EXT.23 -- but it is a second full pass over everything just
-    /// sealed, inside whatever window the caller is timing. A writer that
-    /// is keeping up with ingest and reads later wants it off, and the
-    /// background compaction will get there on its own schedule.
+    /// 1.4x on the canonical read comparison -- but it is a second full
+    /// pass over everything just sealed, inside whatever window the caller
+    /// is timing. A writer that is keeping up with ingest and reads later
+    /// wants it off, and the background compaction will get there on its
+    /// own schedule.
     pub partition_on_flush: bool,
     /// Find the keys a merge writes by a k-way walk of the inputs' rank
     /// order (the default) rather than by collecting, sorting and probing
-    /// them. The probe path is kept as f49's comparison arm.
+    /// them. The probe path is kept as the comparison arm.
     pub cursor_merge: bool,
-    /// I/O priority of the seal and merge threads (f51).
+    /// I/O priority of the seal and merge threads.
     pub background_io: BackgroundIo,
     /// Have the segment writer fdatasync every this many bytes as it
     /// streams blocks, so its dirty pages leave in slices rather than in
-    /// one flush at the end. Zero syncs at the end only (f51).
+    /// one flush at the end. Zero syncs at the end only.
     pub seal_sync_every: usize,
     /// Promote pieces instead of merging them when nothing needs merging:
     /// a range's pieces whose keys all lie above its partition's last key,
     /// mutually disjoint, become partitions by rename, and the partition's
     /// fence closes below them. Nothing is rewritten. Ordered ingest -- a
-    /// log -- is all promotion; uniform keys never qualify (f55,
-    /// promote-plan.md).
+    /// log -- is all promotion; uniform keys never qualify.
     pub promote: bool,
     /// How a flush drains level 0 once partitions exist: merge only the
     /// ranges that hold pieces, under the live fences (`true`), or
-    /// re-partition everything from every key (`false`, the original). f54
-    /// prices the difference (merge-plan.md).
+    /// re-partition everything from every key (`false`, the original), kept
+    /// as the comparison arm.
     pub flush_ranges: bool,
     /// Runs of values up to this many bytes are stored inline in the index
     /// record rather than in a block, so a point read of such a key touches
-    /// the hash slot and the record and nothing else. Zero disables; f53
-    /// prices it (inline-plan.md).
+    /// the hash slot and the record and nothing else. Zero disables.
     pub inline_bytes: usize,
     /// Target bytes per partition: how many partitions the first
     /// partitioning cuts, and how many keys one holds before a merge splits
-    /// it. `None` uses `seal_bytes`, which is how f52 found that smaller
-    /// seals were also making more partitions and paying for them on every
-    /// read; `Some` decouples the two.
+    /// it. `None` uses `seal_bytes`, the coupling under which smaller seals
+    /// were also making more partitions and paying for them on every read;
+    /// `Some` decouples the two.
     pub partition_bytes: Option<usize>,
     /// Recycle retired WAL files instead of creating fresh ones, and
     /// pre-write the first to the seal size, so every block a commit's
     /// fdatasync touches is already allocated and written. On ext4 an
     /// fdatasync of an append that grows the file commits an inode change
     /// through the journal; an overwrite does not, and LMDB's commit is an
-    /// overwrite. f57 prices it (walreuse-plan.md).
+    /// overwrite.
     /// How reads advise the kernel about the segment mappings.
     ///
     /// See `ReadAdvice`. `Adaptive` unless changed.
     pub read_advice: ReadAdvice,
     pub recycle_wal: bool,
     /// The ordered scan's merge over unrouted sources. `true` is the merge
-    /// f61 priced and f62 replaced: one cursor over the disjoint partitions
+    /// that replaced the original: one cursor over the disjoint partitions
     /// in order rather than one per partition, each cursor's key resolved
     /// once per emitted key, and the unsealed snapshot carrying each key's
     /// memtable entry so the emit is a chain walk over a reused buffer
     /// instead of two hash probes and an allocation. `false` is the merge
-    /// before it, kept as the comparison arm (scanmerge-plan.md).
+    /// before it, kept as the comparison arm.
     pub scan_merge: bool,
     /// How the ordered scan builds its sorted snapshot of the unsealed keys.
     /// `true` keeps the keys in one arena and sorts 24-byte records (a
     /// 16-byte key prefix and an index), touching the arena only on a shared
     /// prefix; `false` is the build before it -- a `Vec<u8>` per key, sorted
     /// through two heap pointers per compare -- kept as the comparison arm.
-    /// The build runs on the first scan after a commit and cost 300 ns a key
-    /// (scansnap-plan.md).
+    /// The build runs on the first scan after a commit and cost 300 ns a key.
     pub scan_snapshot_arena: bool,
 }
 
@@ -285,10 +283,10 @@ impl Default for Options {
     fn default() -> Options {
         Options {
             sync: SyncPolicy::Always,
-            // 32 MB seals over 64 MB partitions: f52 measured 1.129x the
+            // 32 MB seals over 64 MB partitions: measured at 1.129x the
             // ingest of 64 MB seals at identical device bytes and identical
-            // reads (F52.5, F52.6). Smaller still buys nothing and costs
-            // 1.5x the device bytes.
+            // reads. Smaller still buys nothing and costs 1.5x the device
+            // bytes.
             seal_bytes: 32 << 20,
             segment: SegmentOptions::default(),
             l0_trigger: 4,
@@ -325,7 +323,7 @@ struct Wal {
     /// Bytes handed to the file so far, and how many of them were behind a
     /// barrier at the last `sync`. The difference is exactly what a power
     /// loss may take, and `Db::wal_durable` reports it so a crash
-    /// experiment can take it (c4-crash).
+    /// experiment can take it.
     written: u64,
     synced: u64,
     /// Mixed from the file's id and xored into every frame's CRC, so a
@@ -383,7 +381,7 @@ impl Wal {
     /// sizes a folio by the write that creates it, and a byte dirtied in
     /// a 1 MB folio writes back the whole megabyte. Pre-written in 1 MB
     /// pieces, every later 100 KB commit cost 11x its bytes at the device;
-    /// in 4 KB pieces, 1.04x (f57's first run, and walreuse-plan.md).
+    /// in 4 KB pieces, 1.04x.
     fn prefill(&mut self, bytes: u64) -> Result<()> {
         let zeros = vec![0u8; 4096];
         let mut at = self.written;
@@ -452,14 +450,14 @@ impl Wal {
     /// alone and a commit's is the batch CRC. `len` covers everything after
     /// `crc`.
     ///
-    /// The CRC is per batch, not per frame (f59). A record frame's `crc`
+    /// The CRC is per batch, not per frame. A record frame's `crc`
     /// word is zero; the commit frame carries, as its payload, the CRC of
     /// every byte of the batch's record frames, and its own `crc` word
     /// covers its body as before. Replay applies a batch only at a commit
     /// frame whose both CRCs verify, so a damaged byte anywhere in a batch
     /// loses that batch and the ones after it -- exactly what a CRC per
     /// frame bought, at one CRC setup and finish per batch instead of per
-    /// record: 92 of the 677 instructions a record cost (f58).
+    /// record: 92 of the 677 instructions a record cost.
     fn frame(&mut self, kind: u8, key: &[u8], value: &[u8]) {
         // `pending` holds exactly this batch's record frames: `write`
         // empties it at every commit.
@@ -701,10 +699,10 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 }
 
 /// One 64-byte block per query, four probe bits inside it: the structure
-/// f40 measured at 82.1% of a single store when it is the only routing
-/// there is. Here it guards only the bounded L0 tail, because f41
-/// refuted every keys-sized global router -- the partitioned
-/// levels below are routed by fences that cost two comparisons.
+/// measured at 82.1% of a single store when it is the only routing there
+/// is. Here it guards only the bounded L0 tail, because every keys-sized
+/// global router tried lost to routing by range -- the partitioned levels
+/// below are routed by fences that cost two comparisons.
 pub(crate) struct BlockedBloom {
     blocks: Vec<[u64; 8]>,
 }
@@ -784,7 +782,7 @@ struct Seg {
 /// to place blocks, a pending arena, a reuse log, and a checkpoint that
 /// publishes all of it. A seal and a merge need none of that -- their keys
 /// come sorted, each key's values come once and together, and nothing is
-/// ever read back or appended to -- and f46 priced the general path at
+/// ever read back or appended to -- and the general path was priced at
 /// 2.04x the floor for exactly that input. This is the writer that
 /// floor described: values are packed into blocks in the order they arrive,
 /// each key gets one extent, and the end of the pass writes the block table,
@@ -834,8 +832,7 @@ pub struct SegmentWriter {
     /// block above the chunk size is compressed chunk by chunk with its own
     /// directory, so a point read decompresses one chunk rather than the
     /// block; one that does not shrink is written verbatim. Inline runs live
-    /// in the key section and are untouched either way
-    /// (segcompress-plan.md, R7.4).
+    /// in the key section and are untouched either way.
     compress: bool,
     /// Per-chunk checksums for the blocks written verbatim, one row per
     /// block in the block table. Without them a run read fetches the whole
@@ -843,8 +840,8 @@ pub struct SegmentWriter {
     chunk_rows: Vec<[u32; block::MAX_CHUNK_CRCS]>,
     /// Bytes left free after the superblock page, into which `finish` puts
     /// the block table and a copy of the fence when they fit, so a host
-    /// whose first probe covers the reserve opens in one round trip
-    /// (waves-plan.md, R7.1). Zero for none; laid down at the first key.
+    /// whose first probe covers the reserve opens in one round trip. Zero
+    /// for none; laid down at the first key.
     head_reserve: usize,
     reserve_off: u64,
     /// The inline runs, concatenated, with each key's span in it (empty for
@@ -878,7 +875,7 @@ pub struct SegmentWriter {
 /// file and its records stream as keys arrive, the few block-backed runs
 /// are held and written after it, and the hash slots, directory and fences
 /// go after the records. Without it an inline segment wrote nothing during
-/// the pass and its whole section at `finish`, and f53 measured that as
+/// the pass and its whole section at `finish`, which measured as
 /// 0.807x on ingest for the same bytes.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Layout {
@@ -907,6 +904,67 @@ fn superblock(fields: &[u64; 16]) -> [u8; crate::format::SUPER_BYTES] {
 }
 
 impl SegmentWriter {
+    /// Write a whole segment from input already in hand, sizing the head
+    /// reserve exactly instead of guessing at it.
+    ///
+    /// The reserve has to be chosen before the first key is written, so a
+    /// streaming caller can only guess -- and both ways of guessing wrong are
+    /// invisible, costing a round trip or costing file. A caller that gathered
+    /// its keys first does not have to: the lengths are enough to compute the
+    /// reserve exactly, which is what `reserve::for_lengths` does and what
+    /// this does for you.
+    ///
+    /// `write` carries the per-file settings; every one of this writer's
+    /// setters has a field there, so nothing it can be configured to do is
+    /// unreachable from here.
+    ///
+    /// `items` must be sorted by key, as the streaming API requires. Returns
+    /// the reserve it used, since a caller measuring segments wants to know.
+    pub fn write_sorted(
+        path: &Path,
+        opts: &SegmentOptions,
+        write: &SegmentWrite,
+        generation: u64,
+        items: &[(&[u8], &[&[u8]])],
+    ) -> Result<usize> {
+        let lengths: Vec<(usize, usize)> = items
+            .iter()
+            .map(|(k, vals)| {
+                let lens: Vec<u32> = vals.iter().map(|v| v.len() as u32).collect();
+                (k.len(), crate::reserve::run_len(&lens))
+            })
+            .collect();
+        // Compression does not enter the reserve: blocks are cut on the
+        // payload the builder staged, before anything compresses it, so the
+        // block count -- and the table sized by it -- is the same either way.
+        // What compression moves is where the key section lands, and the row
+        // is already taken at its worst alignment.
+        let plan = crate::reserve::for_lengths(&lengths, opts.block_size, write.inline_max)
+            .ok_or_else(|| err("segment writer: this input cannot be a segment"))?;
+        let reserve = if write.directory_in_reserve {
+            plan.bytes()
+        } else {
+            plan.without_directory()
+        };
+
+        let mut w = SegmentWriter::create(path, opts)?;
+        // Every setter, in the order they must be called: all of these want
+        // to be set before the first key.
+        w.set_inline_max(write.inline_max);
+        w.set_compress(write.compress);
+        w.set_sync_every(write.sync_every);
+        w.set_head_reserve(reserve);
+        for (k, vals) in items {
+            w.begin(k)?;
+            for v in *vals {
+                w.value(v);
+            }
+            w.end()?;
+        }
+        w.finish(generation)?;
+        Ok(reserve)
+    }
+
     /// Open `path` for a fresh segment. `opts` supplies the block size, the
     /// checksum switch and whether the index build may use threads; the
     /// rest of `SegmentOptions` describes machinery this writer does not have.
@@ -980,8 +1038,8 @@ impl SegmentWriter {
     /// Compress the blocks. Off by default, because a segment written by the
     /// the seal is read back by its own merge and the seal path
     /// has never paid for compression; a segment written as an index to be
-    /// downloaded is the other case, and logshed's day index is 30% smaller
-    /// with it on. Must be set before the first key.
+    /// downloaded is the other case, where a term index over posting deltas
+    /// is materially smaller with it on. Must be set before the first key.
     pub fn set_compress(&mut self, on: bool) {
         self.compress = on;
     }
@@ -1179,7 +1237,7 @@ impl SegmentWriter {
         // pay. A chunked block carries its own per-chunk checksums in its
         // directory; a verbatim one gets a row beside it in the block table,
         // which is what lets a reader fetch the chunks an extent spans
-        // instead of the block (segcompress-plan.md).
+        // instead of the block.
         let uncompressed = payload.len() as u32;
         let chunked = self.compress && payload.len() > block::CHUNK;
         let stored: Option<Vec<u8>> = if chunked {
@@ -1513,6 +1571,52 @@ impl SegmentWriter {
     }
 }
 
+/// The per-file settings a segment is written with: every one of
+/// `SegmentWriter`'s setters, gathered so a batch write can apply them.
+///
+/// These are separate from [`SegmentOptions`] on purpose, and the separation
+/// is the same one that struct's own note draws: `SegmentOptions` is the
+/// engine's configuration, carried to the writer for every piece it seals,
+/// while these describe one file. A term index built to be downloaded wants
+/// compression and inline runs; the segments the seal writes and its own
+/// merge reads back want neither.
+///
+/// It exists because the first `write_sorted` took `inline_max` as a bare
+/// argument and had nowhere to put the rest, so compression silently did
+/// nothing -- which is the failure `SegmentOptions` refuses a compression
+/// field to avoid, reproduced one layer up. A struct with a field per setter
+/// makes the next setter's absence a compile error in
+/// `SegmentWriter::write_sorted` rather than a quiet default.
+#[derive(Clone, Debug)]
+pub struct SegmentWrite {
+    /// Runs up to this many bytes go inline in the index record, and the
+    /// segment is written records-first so they stream. Zero keeps every run
+    /// in a block and writes the blocks-first layout `Store` writes.
+    pub inline_max: usize,
+    /// LZ4 the blocks. Off by default, as it is on the writer.
+    pub compress: bool,
+    /// fdatasync every this many bytes of blocks rather than once at the end.
+    /// Zero for the single sync.
+    pub sync_every: usize,
+    /// Put a copy of the hash directory in the head reserve. Four bytes a
+    /// key, and it is the difference between a lookup that plans its records
+    /// from the probe and one that fetches the directory first. On by
+    /// default: a segment written through this path is one whose whole input
+    /// was in hand, which is the shape that gets downloaded and read cold.
+    pub directory_in_reserve: bool,
+}
+
+impl Default for SegmentWrite {
+    fn default() -> SegmentWrite {
+        SegmentWrite {
+            inline_max: 0,
+            compress: false,
+            sync_every: 0,
+            directory_in_reserve: true,
+        }
+    }
+}
+
 /// How a segment file is written.
 ///
 /// Three settings, which is what is left of a struct that once carried
@@ -1538,7 +1642,7 @@ pub struct SegmentOptions {
     /// into plausible bytes. The knob exists so the cost can be measured
     /// honestly -- both arms in one process, interleaved -- rather than by
     /// comparing two runs taken hours apart, which measures the machine as
-    /// much as the code (f8-checksums).
+    /// much as the code.
     pub checksums: bool,
     /// Sort and encode the key index across threads rather than on one.
     ///
@@ -1561,8 +1665,8 @@ impl Default for SegmentOptions {
 /// How a piece gets written.
 ///
 /// This was an enum: `SegmentWriter`, or the general `Store` path it
-/// replaced, kept behind an option so f49 could interleave
-/// the two in one process and price the change honestly. That comparison is
+/// replaced, kept behind an option so a measurement could interleave the
+/// two in one process and price the change honestly. That comparison is
 /// settled and the old path is gone, so what is left is a thin shim that
 /// keeps `flush` and `merge` reading as a sequence of begin/value/end calls.
 struct PieceWriter(Box<SegmentWriter>);
@@ -1614,8 +1718,8 @@ impl Seg {
     /// `random` is the mode the *store* is in right now, not the option: a
     /// segment from a seal or a merge has to join the mode its store is
     /// already in. Passing the option here instead is silent -- reads stay
-    /// correct and only the advice goes stale -- which is why `F67.4` checks
-    /// it rather than trusting it.
+    /// correct and only the advice goes stale -- which is why `advice_random`
+    /// is there to be checked against the mappings rather than trusted.
     fn open(dir: &Path, name: &str, random: bool) -> Result<Seg> {
         let src = MmapBytes::open(&dir.join(name)).map_err(|e| {
             // A manifest naming a segment that is not on disk is a damaged
@@ -1738,8 +1842,8 @@ impl Seg {
 }
 
 /// The memtable, built so that an append allocates nothing per key or per
-/// value: f42's decomposition priced the HashMap<Box<[u8]>, Vec> version at
-/// 456k ops/s of the gap to the floor, more than the seal itself (F42.3).
+/// value: a decomposition priced the HashMap<Box<[u8]>, Vec> version at
+/// 456k ops/s of the gap to the floor, more than the seal itself.
 /// Keys live in one bump arena; values live in another as per-key backward
 /// chains (each chunk records the previous chunk's offset, and a read or
 /// seal walks the chain and reverses it); the table is open-addressed with
@@ -1775,8 +1879,8 @@ struct MemEntry {
 const NO_CHUNK: u64 = u64::MAX;
 
 fn mem_hash(key: &[u8]) -> u64 {
-    // FNV-1a, then a splitmix finish; the std SipHash was part of what f42
-    // priced.
+    // FNV-1a, then a splitmix finish; the std SipHash was part of what the
+    // memtable's decomposition priced.
     let mut h = 0xcbf29ce484222325u64;
     for &b in key {
         h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
@@ -2208,7 +2312,7 @@ struct Piece {
 /// Pass two of a merge: keys arrive in rank order and go into the piece
 /// their rank belongs to, with a writer opened at each piece's first rank
 /// and finished and renamed at its last. The same
-/// emitter serves both ways of finding keys, so the arms f49 compares
+/// emitter serves both ways of finding keys, so the two arms compared
 /// differ only in that.
 struct Emitter<'a> {
     dir: &'a Path,
@@ -2589,8 +2693,8 @@ pub struct Db {
     /// The seal phase decomposed: how long the commit thread blocked on a
     /// seal still running mid-load, how long the final drain took, how long
     /// publishing (the manifest and its barriers) took, and how often a
-    /// join found the seal unfinished. f60 asks which of these the 14% of
-    /// the durable load in `phase_ns[1]` is (sealwait-plan.md).
+    /// join found the seal unfinished, so it can be said which of these the
+    /// 14% of the durable load in `phase_ns[1]` is.
     seal_wait: SealWaits,
     /// Set by `flush` while it waits for the last seal, so that wait is
     /// booked as the drain and not as backpressure.
@@ -2649,7 +2753,7 @@ struct SnapKey {
 /// The sorted keys of the unsealed sources, built lazily by `Db::scan` and
 /// kept until the next commit or seal. Keys live in one arena rather than
 /// one allocation each, which is what makes the build a sort of small
-/// records instead of a pointer chase (scansnap-plan.md).
+/// records instead of a pointer chase.
 #[derive(Default)]
 struct Snapshot {
     keys: Vec<u8>,
@@ -2983,11 +3087,10 @@ impl Db {
 
     /// Replace a key's values with one new value: a delete and an append in
     /// the same batch, so a read after the commit sees the new value alone
-    /// and a crash sees both or neither. This is the update the external
-    /// suite's YCSB phase means, and what `Store::put` and every
-    /// single-value engine there do; `append` is the other verb, and using
-    /// it for an update piled every Zipfian rewrite onto its key until each
-    /// read walked the pile (ycsb-plan.md).
+    /// and a crash sees both or neither. This is the update YCSB means, and
+    /// what `Store::put` and every single-value engine do; `append` is the
+    /// other verb, and using it for an update piled every Zipfian rewrite
+    /// onto its key until each read walked the pile.
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
         self.delete(key);
         self.append(key, value);
@@ -3102,10 +3205,11 @@ impl Db {
             // memtable's iteration order scatters each key's values across
             // blocks by hash, so an ordered scan walks the file randomly;
             // written sorted, a scan walks it forwards. This is what the
-            // retired line-order arm of w1-daysize found, in the new engine -- how the roll writes decides what
-            // the read costs -- and the sort is affordable because a seal is
-            // off the commit path. The same sort is what makes splitting at
-            // the fences a matter of slicing.
+            // retired line-order arm of the day-size measurement found, in
+            // the new engine -- how the roll writes decides what the read
+            // costs -- and the sort is affordable because a seal is off the
+            // commit path. The same sort is what makes splitting at the
+            // fences a matter of slicing.
             let mut order: Vec<&MemEntry> = mem.entries.iter().filter(|e| e.hash != 0).collect();
             order.sort_unstable_by_key(|e| MemTable::key_of(&mem.keys, e));
 
@@ -3178,8 +3282,8 @@ impl Db {
     /// Make everything written durable and seal nothing: the WAL's pending
     /// frames written and fsynced, the memtable left where it is. What a
     /// caller wants when it has stopped writing for now and will read the
-    /// tail out of memory; `flush` is the other answer, and f60 priced the
-    /// difference at 11% of a canonical load window (sealwait-plan.md).
+    /// tail out of memory; `flush` is the other answer, and the difference
+    /// was priced at 11% of a canonical load window.
     pub fn sync(&mut self) -> Result<()> {
         self.wal.commit()?;
         self.unsynced = 0;
@@ -3605,8 +3709,9 @@ impl Db {
     // so picking a single range per seal starved it -- with sixteen ranges
     // and one merge in flight, pieces accumulated faster than they were
     // consumed and a read ended up walking ten of them. That starvation
-    // cost more than the whole-store rewrite it replaced (EXT.23 0.846x ->
-    // 0.561x), which is the measurement that produced the rule.
+    // cost more than the whole-store rewrite it replaced (the canonical read
+    // comparison went from 0.846x to 0.561x), which is the measurement that
+    // produced the rule.
 
     fn l0_len(&self) -> usize {
         self.segs.iter().filter(|s| s.level == 0).count()
@@ -3626,7 +3731,7 @@ impl Db {
     /// into partitions by size. `Some(range)` is the incremental merge: one
     /// partition and the pieces aligned to it, rewritten as one partition
     /// with the same fence. The second reads and writes O(range) where the
-    /// first is O(store), which is what F43.4 and F44.1 both convicted.
+    /// first is O(store), which is what the merge measurements convicted.
     fn start_compact(&mut self, fences: Option<Vec<Fence>>) -> Result<()> {
         if let Some((_, h)) = &self.compacting {
             if !h.is_finished() {
@@ -3764,8 +3869,8 @@ impl Db {
     ///
     /// A no-op unless the mode actually changes, so the steady state costs a
     /// `Cell` load and a compare. On a change it is one `madvise` per live
-    /// segment -- the cost `F67.1` and `F67.3` exist to price, since f66
-    /// measured this over a single mapping.
+    /// segment -- a cost priced over a store of several segments, since the
+    /// earlier measurement was over a single mapping.
     fn advise(&self, random: bool) {
         if self.opts.read_advice != ReadAdvice::Adaptive || self.advice_random.get() == random {
             return;
@@ -3782,8 +3887,8 @@ impl Db {
 
     /// Which mode the segment mappings are in: `true` is `MADV_RANDOM`.
     ///
-    /// The store's own record of what it last asked for, which is what
-    /// `F67.4` needs to compare against the mappings themselves -- the
+    /// The store's own record of what it last asked for, which is what a
+    /// check needs to compare against the mappings themselves -- the
     /// interesting failure is the two disagreeing.
     pub fn advice_random(&self) -> bool {
         self.advice_random.get()
@@ -4154,7 +4259,7 @@ impl Db {
         Ok(seen)
     }
 
-    /// The merge over unrouted sources, f62's arm: one cursor walking the
+    /// The merge over unrouted sources, the `scan_merge` arm: one cursor walking the
     /// disjoint partitions in order, one cursor per level-0 segment, and the
     /// unsealed snapshot with each key's entries in hand. Every cursor's key
     /// is resolved once per emitted key. Sources are ordered oldest to
@@ -4421,14 +4526,14 @@ impl Db {
     }
 
     /// Whether a seal and a merge are running right now. A crash experiment
-    /// records the state it died in with these (c4-crash).
+    /// records the state it died in with these.
     pub fn in_flight(&self) -> (bool, bool) {
         (self.sealing.is_some(), self.compacting.is_some())
     }
 
     /// The live WAL: its path, the bytes of it behind a barrier, and the
     /// bytes written to it. Everything between the two is what a power loss
-    /// may take; `c4-crash` takes a random amount of it, because a process
+    /// may take; a crash experiment takes a random amount of it, because a process
     /// kill alone leaves the page cache intact and cannot tell `EveryN` from
     /// `Always`.
     pub fn wal_durable(&self) -> (PathBuf, u64, u64) {

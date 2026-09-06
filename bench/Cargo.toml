@@ -1,0 +1,55 @@
+# Its own workspace, deliberately: the engine's `cargo build` and `cargo test`
+# stay engine-only and never pay for the comparators' C++ builds, and the
+# engine's lockfile never lists them. The price is the profile repeated at
+# the end of this file.
+[workspace]
+
+[package]
+name = "supdb-bench"
+version = "0.2.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+name = "supdb_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[dependencies]
+# The engine under test: the repository this directory is in.
+supdb = { path = ".." }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+memmap2 = "0.9"
+serde_json = "1"
+# Comparators. Every arm is in-process Rust so the comparison carries no
+# binding overhead.
+heed = "0.20"
+# Built without compression libraries: every arm stores values uncompressed
+# and the adapter turns compression off explicitly. Not optional: RocksDB is
+# a headline comparator, and a comparison that is off by default is one that
+# does not get run. The build needs libclang for bindgen; on a host where
+# clang-sys does not find one, `scripts/libclang.sh` names the directory
+# holding it (libclang.so, or libclang.dylib on macOS).
+rocksdb = { version = "0.23", default-features = false }
+
+[dev-dependencies]
+# The payload test checks that values compress to the compressibility asked
+# for, which is what makes every arm store the same bytes.
+lz4_flex = "0.11"
+
+# Cargo takes profiles from the root of the workspace being built, which is
+# this manifest, so the engine's own [profile.release] is ignored here and
+# cargo says so on every build. Every setting that decides code generation
+# is repeated -- opt-level 3, fat LTO, one codegen unit -- so what is
+# measured is what a user gets. Debug info is the one that differs on
+# purpose: the engine asks for all of it, this asks for line tables, which
+# is what a profiler needs to name a frame. Neither changes a byte of code.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = 1

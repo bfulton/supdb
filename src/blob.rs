@@ -123,8 +123,8 @@ const SB_BYTES: usize = 144;
 const SB_FIELDS: usize = 16;
 
 /// The superblock page's extension: what a write-once segment adds after
-/// the two slots so a sparse open can plan itself from the probe alone
-/// (waves-plan.md, R7.1). Sixteen words -- magic, generation, then the
+/// the two slots so a sparse open can plan itself from the probe alone.
+/// Sixteen words -- magic, generation, then the
 /// absolute offset and length of the fence, the directory, the hash region
 /// and the checksum row, a copy of the block table and a copy of the fence
 /// when the writer placed them in a head reserve, and the fence copy's
@@ -153,7 +153,7 @@ pub struct SuperExt {
     pub row_copy: Option<u64>,
     /// A copy of the directory in the head reserve (length `dir.1`), with
     /// its CRC32C, so a directory-resident open needs nothing from the
-    /// section either (R7.2).
+    /// section either.
     pub dir_copy: Option<(u64, u32)>,
     pub header: [u8; flatindex::HEADER_BYTES],
 }
@@ -284,8 +284,8 @@ struct Super {
     /// arena exists, `open` probes its first length word and refuses a
     /// nonzero one: those records are newer than everything in the index by
     /// construction, and a reader that ignored them would quietly serve the
-    /// previous state. A sealed object -- a logshed segment after its
-    /// closing checkpoint -- never trips this, having no arena to probe; the
+    /// previous state. A sealed object -- one written by a segment writer
+    /// and closed -- never trips this, having no arena to probe; the
     /// probe fires only for a store that was never cleanly closed, a
     /// writer's working file or a crash leftover, which was never this
     /// reader's contract to serve.
@@ -368,8 +368,8 @@ fn pick_super(head: &[u8], object_len: u64) -> Result<Super> {
     }
     // A section that was compressed cannot be addressed where it lies, and
     // this reader has no reason to support the varint formats -- they are
-    // what `flat_index` replaced, and a logshed day index is written by a
-    // current writer with the current defaults.
+    // what `flat_index` replaced, and a segment this reader is given is
+    // written by a current writer with the current defaults.
     if sb.key_stored != sb.key_uncompressed || sb.blk_stored != sb.blk_uncompressed {
         return Err(Error::new(
             ErrorKind::Unsupported,
@@ -395,14 +395,14 @@ fn log_probe_range(sb: &Super) -> Option<(u64, u64)> {
 pub fn open_probe() -> u64 {
     // The whole superblock page: the two slots, and after them the
     // extension a segment writes so a sparse open can plan itself from
-    // this one read (R7.1). A store's page is zero past the slots.
+    // this one read. A store's page is zero past the slots.
     SUPER
 }
 
 /// The byte ranges `Blob::open` will read, from the first `open_probe()`
 /// bytes of an `object_len`-byte object. Sorted, merged, absolute.
 ///
-/// This is the open-time half of the planning seam (R6.2): a caching byte
+/// This is the open-time half of the planning seam: a caching byte
 /// source fetches `0..open_probe()`, hands the bytes here, fetches what comes
 /// back, and `open` then runs synchronously with no read it can miss. The
 /// plan is the superblock probe itself plus the key index and block table
@@ -506,8 +506,8 @@ fn open_head<B: Bytes>(src: &B) -> Result<Super> {
     // which is native-endian, while every scalar in the file is written
     // little-endian. On a big-endian target those disagree and the reader
     // would misread a valid file rather than refuse it. Refused here
-    // instead. Every browser is little-endian and so is every machine in
-    // `results/`, so nothing is given up by saying so out loud.
+    // instead. Every browser is little-endian and so is every machine the
+    // suite has run on, so nothing is given up by saying so out loud.
     if cfg!(target_endian = "big") {
         return Err(Error::new(
             ErrorKind::Unsupported,
@@ -559,7 +559,7 @@ pub struct BlobOptions {
     /// Sparse reader only: fetch the whole directory in the open wave and
     /// answer every directory slice from memory, so a lookup after open is
     /// one dependent read -- the records -- instead of two. Costs the
-    /// directory (four bytes a key) at open; off by default (R7.2).
+    /// directory (four bytes a key) at open; off by default.
     pub resident_directory: bool,
 }
 
@@ -636,7 +636,7 @@ impl<B: Bytes> Blob<B> {
             )
         })?;
         // The whole section is resident, so the whole row is checked here,
-        // once, and no read path pays anything after (indexsum-plan.md).
+        // once, and no read path pays anything after.
         if idx.crc_off != 0 && opts.verify_index {
             if let Err(p) =
                 flatindex::verify_pieces(key.get(&src)?, idx.crc_off, idx.piece_shift, sb.key_off)
@@ -698,7 +698,7 @@ impl<B: Bytes> Blob<B> {
         }
     }
 
-    /// Number of distinct keys. R4.5.
+    /// Number of distinct keys.
     pub fn keys(&self) -> usize {
         match &self.index {
             Index::Flat { idx, .. } => idx.len(),
@@ -706,7 +706,7 @@ impl<B: Bytes> Blob<B> {
         }
     }
 
-    /// Bytes of key index this reader addresses. R4.5.
+    /// Bytes of key index this reader addresses.
     pub fn index_bytes(&self) -> usize {
         match &self.index {
             Index::Flat { key, .. } => key.len(),
@@ -734,7 +734,7 @@ impl<B: Bytes> Blob<B> {
     /// mapping behind it. It does not make a fault cheaper; it stops the
     /// kernel fetching pages around one a point read will never touch, which
     /// is worth a great deal to a random read out of core and costs an
-    /// ordered scan the readahead it wanted. `f65-madvise` prices both.
+    /// ordered scan the readahead it wanted; both are measured.
     pub fn advise_random(&self) {
         self.src.advise_random();
     }
@@ -748,9 +748,9 @@ impl<B: Bytes> Blob<B> {
 
     /// True when the index section is borrowed rather than copied.
     ///
-    /// Diagnostic, and the thing `tests/blob.rs` asserts to keep R2.3 from
-    /// rotting: a native reader that started copying its index would still
-    /// pass every correctness test.
+    /// Diagnostic, and the thing `tests/blob.rs` asserts to keep this property
+    /// from rotting: a native reader that started copying its index would
+    /// still pass every correctness test.
     pub fn zero_copy(&self) -> bool {
         matches!(
             &self.index,
@@ -788,7 +788,7 @@ impl<B: Bytes> Blob<B> {
         idx.at_full(sec, rank)
     }
 
-    /// Rank of the first key at or after `key`, in key order. R4.4.
+    /// Rank of the first key at or after `key`, in key order.
     pub fn seek(&self, key: &[u8]) -> usize {
         match self.flat() {
             Some((sec, idx)) => idx.seek_with(sec, key, true),
@@ -831,7 +831,7 @@ impl<B: Bytes> Blob<B> {
 
     // ------------------------------------------------------------ planning --
 
-    /// The byte ranges a read of `key` will touch in the source. R6.2.
+    /// The byte ranges a read of `key` will touch in the source.
     ///
     /// A lookup is already a plan: it consults the key index and returns
     /// extents, and reads no data. An extent names a block, the block table
@@ -853,9 +853,9 @@ impl<B: Bytes> Blob<B> {
     /// key index and the block table are read at `open` (planned by
     /// `open_ranges`) and are resident from then on; this call names only the
     /// data reads that come after. That split is cheap today because the
-    /// sections are small when key cardinality is bounded -- a logshed
-    /// segment is ~100 keys of index over megabytes of postings, since terms
-    /// come from fields with tens of values each. It stops being cheap the
+    /// sections are small when key cardinality is bounded -- a term index
+    /// over enumerable fields is ~100 keys of index over megabytes of
+    /// postings. It stops being cheap the
     /// day the keys are unbounded -- a trigram or free-text index -- and the
     /// index would then need to be planned and fetched sparsely too. The
     /// ranges here are absolute file offsets with no assumption that the
@@ -997,7 +997,7 @@ impl<B: Bytes> Blob<B> {
     ) -> Result<()> {
         // `raw` holds the block's bytes from `base` on: the whole block when
         // `base` is zero and `raw` is `stored` long, else the chunks a
-        // partial read fetched (R7.3). `lo..hi` are block offsets.
+        // partial read fetched. `lo..hi` are block offsets.
         if !self.opts.verify_checksums || !block::checksums_on() {
             return Ok(());
         }
@@ -1073,8 +1073,9 @@ impl<B: Bytes> Blob<B> {
             (e.off as usize).saturating_add(e.len as usize),
         );
         // What is fetched: the chunks the run spans when the block is plain
-        // and carries per-chunk checksums, else the block (R7.3). The plan
-        // in `plan_exts` names the same bytes, which is what keeps W4.1.
+        // and carries per-chunk checksums, else the block. The plan in
+        // `plan_exts` names the same bytes, which is what keeps a plan
+        // exactly what the read after it touches.
         let (c0, c1) = chunk_span(&loc, &e);
         let mut raw_buf = self.raw_buf.take();
         let out = (|| -> Result<R> {
@@ -1112,7 +1113,7 @@ impl<B: Bytes> Blob<B> {
 
     // ------------------------------------------------------------ the API --
 
-    /// Visit every value of a key, in append order. Returns how many. R4.2.
+    /// Visit every value of a key, in append order. Returns how many.
     ///
     /// Note the return: the number of *values*. `store::Reader::read_all`
     /// returns the number of value *bytes*, which is a different quantity and
@@ -1152,8 +1153,8 @@ impl<B: Bytes> Blob<B> {
 
     /// How many values two keys' ascending fixed-width runs have in common:
     /// a two-pointer walk over the runs where they lie, comparing `width`
-    /// bytes at a time and copying nothing. The kernel EXT.17 said was
-    /// missing. Each key's extents must be fixed runs of `width` in
+    /// bytes at a time and copying nothing: the kernel an earlier comparison
+    /// found missing. Each key's extents must be fixed runs of `width` in
     /// ascending value order (postings are) and the source must lend its
     /// bytes; anything else falls back to decoding both lists, so the
     /// answer is right either way and only the speed differs.
@@ -1279,8 +1280,8 @@ impl<B: Bytes> Blob<B> {
     /// How many values a key has. O(extents): every extent carries its
     /// record count (`Ext::count`), so nothing in a block is touched.
     ///
-    /// It was not always so. f28 measured the walk this used to be at
-    /// 2,493 ns against 2,516 to read every value (W2.1): skipping a payload
+    /// It was not always so. The walk this used to be measured at
+    /// 2,493 ns against 2,516 to read every value: skipping a payload
     /// does not skip the cache lines it sits in. The count moved into the
     /// extent record with format v5, for four bytes an extent.
     pub fn count(&self, key: &[u8]) -> Result<u64> {
@@ -1297,9 +1298,10 @@ impl<B: Bytes> Blob<B> {
     ///
     /// This one is genuinely O(extents) -- `Ext::len` is the byte length of
     /// the run, so the sum touches no block at all, not even to fault a page
-    /// in. It is the shape R4.3 asked for, on the quantity the format happens
-    /// to record. For "is using the index cheaper than scanning the day", this
-    /// is the better input anyway: it is how much work a `read_all` would be.
+    /// in. It is the shape a count is asked to have, on the quantity the
+    /// format happens to record. For "is using the index cheaper than
+    /// scanning the day", this is the better input anyway: it is how much
+    /// work a `read_all` would be.
     ///
     /// It is not the sum of the value lengths. Each value costs its varint
     /// prefix too, and conflating the two is how `value_bytes` was wrong in
@@ -1318,8 +1320,8 @@ impl<B: Bytes> Blob<B> {
     /// prefix, so a run of them is exactly `n * (width + varint_len(width))`
     /// bytes and the count falls straight out of the extent list.
     ///
-    /// logshed's postings are four-byte line ordinals, so this is the call it
-    /// should make. `f28-count` prices the difference.
+    /// A posting list of four-byte ordinals is the case this exists for, and
+    /// the difference against `count` is what is measured.
     ///
     /// `None` when the stored bytes are not an exact multiple of the stride,
     /// which is what a key whose values are *not* all `width` bytes looks
@@ -1338,7 +1340,7 @@ impl<B: Bytes> Blob<B> {
     }
 
     /// Walk the dictionary in key order from `from`, with each key's value
-    /// count. R4.4 -- this is what a "top paths" or "countries" panel needs.
+    /// count -- this is what a "top paths" or "countries" panel needs.
     ///
     /// Returns how many keys were visited. Stops early when `f` returns false.
     pub fn scan_counts<F: FnMut(&[u8], u64) -> bool>(
@@ -1377,9 +1379,9 @@ impl<B: Bytes> Blob<B> {
     /// the stride, meaning its values are not all `width` bytes; the caller
     /// can fall back to `count` for that key alone rather than for the scan.
     ///
-    /// `f28-count` W2.4 measures the two against each other over a whole
-    /// dictionary, because that is what settles whether a browser can answer
-    /// top-N itself or whether the roll has to precompute it.
+    /// The two are measured against each other over a whole dictionary,
+    /// because that is what settles whether a browser can answer top-N
+    /// itself or whether the roll has to precompute it.
     pub fn scan_counts_fixed<F: FnMut(&[u8], Option<u64>) -> bool>(
         &self,
         from: &[u8],
@@ -1404,13 +1406,13 @@ impl<B: Bytes> Blob<B> {
         Ok(seen)
     }
 
-    /// Walk keys in order from `from`, visiting every value. R4.4.
+    /// Walk keys in order from `from`, visiting every value.
     ///
     /// Resolves each block ONCE for a run of keys that share it, rather
     /// than per key. A segment written by a seal or a merge holds its keys
     /// in key order (both sort before writing), so consecutive keys land in
     /// the same block and the per-key `loc_of` + slice + buffer dance was
-    /// re-deriving an answer it already had. f45 priced that indirection at
+    /// re-deriving an answer it already had. That indirection was priced at
     /// 60.1ns of an ordered scan's 90.8, against 14.5 for walking the index
     /// -- the cost is here, not in resolving keys.
     ///
@@ -1792,7 +1794,7 @@ impl<B: Bytes> SparseBlob<B> {
         }
         // The superblock page whole: a segment's extension, when present,
         // carries the section header and every offset the open needs, so
-        // nothing below reads the section's own header (R7.1).
+        // nothing below reads the section's own header.
         let mut page = vec![0u8; (SUPER.min(src.len())) as usize];
         src.read_at(0, &mut page)?;
         let ext = decode_super_ext(&page, sb.generation);
@@ -1866,7 +1868,7 @@ impl<B: Bytes> SparseBlob<B> {
         let verified = vec![0u64; (blocks.len() * block::MAX_CHUNK_CRCS).div_ceil(64)];
         let pieces = if crcs.is_empty() { 0 } else { crcs.len() / 4 };
         // The directory whole, when asked: four bytes a key, and every
-        // later lookup plans its records with no dependent read (R7.2).
+        // later lookup plans its records with no dependent read.
         let mut dir_from_section = opts.resident_directory;
         let dir = if opts.resident_directory {
             let mut raw = vec![0u8; hdr.nkeys * 4];

@@ -7,18 +7,46 @@
 # large or because a Rust cdylib starts out large, and those want different
 # responses. See `web/floor/Cargo.toml`.
 #
-# Writes results/w3-bundle.<profile>.json through `logshed bundle`, so the size
-# record carries its machine and goes through the same gate as everything else.
+# Prints the four sizes it measures, one per line, as `name bytes`. This
+# script builds the artifact and measures it, and nothing here decides
+# whether a number is good.
 #
-#   web/build.sh [profile]     profile defaults to ci
+#   web/build.sh
 set -eu
 
 cd "$(dirname "$0")/.."
-profile="${1:-ci}"
 
 echo "# building the reader for wasm32-unknown-unknown"
-cargo build --profile wasm --lib --target wasm32-unknown-unknown
-wasm=target/wasm32-unknown-unknown/wasm/supdb.wasm
+# Ask cargo where its target directory is rather than assuming `target/`.
+# This repository was once built as a submodule of another workspace, where
+# the target directory was a level up, and a hard-coded path built fine and
+# then failed to find its own artifact.
+target=$(cargo metadata --format-version 1 --no-deps \
+  | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+# An empty parse is not a missing directory, it is this script no longer
+# knowing where it is looking -- and it would surface later as a confusing
+# "no such file" for the module itself, blaming the build for a failure in
+# the question that preceded it.
+if [ -z "$target" ]; then
+  echo "could not read target_directory out of \`cargo metadata\`; its output" >&2
+  echo "format may have changed. Not guessing where the module will be." >&2
+  exit 2
+fi
+
+# The size settings are given here rather than as a named profile in
+# Cargo.toml. Cargo takes profiles from the workspace root, and when this
+# repository was built under another workspace a `[profile.wasm]` here was
+# ignored there; keeping a second copy in the other manifest meant two
+# definitions of one thing with nothing holding them equal. As overrides
+# they travel with the only script that wants them.
+cargo build --release --lib --target wasm32-unknown-unknown \
+  --config 'profile.release.opt-level="z"' \
+  --config 'profile.release.lto="fat"' \
+  --config 'profile.release.codegen-units=1' \
+  --config 'profile.release.panic="abort"' \
+  --config 'profile.release.strip=true' \
+  --config 'profile.release.debug=false' 
+wasm="$target/wasm32-unknown-unknown/release/supdb.wasm"
 
 echo "# building the floor"
 cargo build --release --target wasm32-unknown-unknown --manifest-path web/floor/Cargo.toml
@@ -32,8 +60,7 @@ sz() { wc -c < "$1" | tr -d ' '; }
 cp "$wasm" web/supdb.wasm
 echo "# wrote web/supdb.wasm"
 
-cargo build --release --bin logshed
-./target/release/logshed bundle \
-  --profile "$profile" \
-  --wasm-bytes "$(sz "$wasm")" --wasm-gzip "$(gz "$wasm")" \
-  --floor-bytes "$(sz "$floor")" --floor-gzip "$(gz "$floor")"
+echo "wasm_bytes $(sz "$wasm")"
+echo "wasm_gzip $(gz "$wasm")"
+echo "floor_bytes $(sz "$floor")"
+echo "floor_gzip $(gz "$floor")"

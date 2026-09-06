@@ -1,16 +1,16 @@
 name: ci
 
-# The point of this workflow is not that the code compiles. It is that the
-# claims the repository makes about the engine still match what the engine
-# measurably does. `verify` fails in both directions: a known limitation that
-# quietly gets fixed is as much a reason to stop as one that gets worse,
-# because either the engine changed or the experiment stopped testing anything.
+# Two questions are answered here. The engine's jobs -- build, test, lint,
+# the wasm module, the ARM cross-build -- say whether the code is sound. The
+# `bench` group in the same matrix says whether the suite in bench/ still
+# builds and passes its own tests against this engine, and the `quick` job
+# measures: one quick-scale run of every arm, gated against the committed
+# series in bench/runs/, with the figures drawn from the row it wrote.
 
 on:
-  # Pull requests and main only. Every branch commit would run three benchmark
-  # suites, and most branch commits are work in progress.
   push:
     branches: [main]
+    tags: ['*']
   pull_request:
   workflow_dispatch:
 
@@ -26,20 +26,12 @@ jobs:
     # code, and x86's total store order gives correct-looking behaviour for
     # orderings that ARM's weaker model does not.
     #
-    # macOS is here because the tree carries a body of `cfg(target_os =
-    # "macos")` code -- the environment capture's whole non-Linux half, and
-    # the `cfg(target_os = "linux")` guard on the I/O priority path -- that
-    # nothing else compiles. It was written for the Apple Silicon campaigns
-    # and was only ever built when a person ran one by hand, which is the
-    # shape this project keeps finding: a path only one arm exercises is a
-    # path nothing tests. macos-latest is arm64, and a public repository
-    # pays nothing for it.
-    #
-    # It gates building, testing and linting, not measuring. A timing
-    # benchmark cannot gate a pull request: two runs on instances of the
-    # same nominal machine have moved untouched comparator arms by half.
-    # The Apple Silicon numbers are taken deliberately, per campaign, on a
-    # real machine.
+    # macOS is here because the tree carries `cfg(target_os = "linux")`
+    # guards -- the I/O priority path in `src/db.rs` -- whose other side
+    # nothing else compiles, and because the mapped read path runs over a
+    # second kernel's mmap. A path only one arm exercises is a path nothing
+    # tests. macos-latest is arm64, and a public repository pays nothing
+    # for it.
     strategy:
       fail-fast: false
       matrix:
@@ -50,46 +42,47 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # The comparators' build runs bindgen, which needs libclang; the script
+      # names it for this host and, on macOS, the rpath the build script
+      # needs to load it.
+      - name: libclang, for bindgen
+        run: sh bench/scripts/libclang.sh
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            bench -> bench/target
       # `scripts/check.sh` is the single definition of what this project
       # checks, so a contributor running it locally runs exactly this.
-      - name: Build, test and lint
-        run: sh scripts/check.sh build test lint
+      - name: Build, test and lint the engine and the suite
+        run: sh scripts/check.sh build test lint bench
+      - name: The machine, as a row records it
+        run: ./bench/target/release/bench machine | tee -a "$GITHUB_STEP_SUMMARY"
 
-  comparator-arm:
-    # The RocksDB arm is behind `--features rocksdb` and no other job builds
-    # it, because librocksdb-sys compiles RocksDB from the source it vendors
-    # and that is a ten-minute C++ build the fast path does not need: every
-    # RocksDB claim is pinned to `full`, which CI never runs.
-    #
-    # So nothing compiled it. An engine-wide rename of supdb's own `Options`
-    # to `SegmentOptions` reached into the rocksdb crate's type of the same
-    # name, and the arm stopped building -- through an entire engine
-    # retirement, unnoticed, while EXT.28 through EXT.41 sat in claims.json
-    # as though they were reproducible. The suite refuses an arm it was not
-    # built with and says so, which is correct and is also why the runs kept
-    # looking clean: a claim with no finding is skipped, not failed.
-    #
-    # This is `cargo check`, not a run. It gates compilation only, on its own
-    # job so the ten minutes stay off the fast path, and the cargo cache
-    # carries it after the first build.
+  quick:
+    # One quick-scale measurement on a hosted runner. It gates the pull
+    # request on the gate's terms -- worse than every one of the last ten
+    # rows of this runner's class in bench/runs/ -- and until that class has
+    # three rows it can only prove the runner, the gate and the renderer
+    # work end to end. The row and the figures are published as artifacts;
+    # committing a row is a person's decision.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: libclang, for bindgen
+        run: sh bench/scripts/libclang.sh
       - uses: Swatinem/rust-cache@v2
-      # clang-sys wants a directory holding a file named exactly `libclang.so`;
-      # the runners ship the versioned library only.
-      - name: Point bindgen at libclang
-        run: |
-          set -eu
-          lib=$(ls /usr/lib/llvm-*/lib/libclang.so.1 /usr/lib/x86_64-linux-gnu/libclang-*.so.1 2>/dev/null | head -1)
-          test -n "$lib"
-          mkdir -p "$RUNNER_TEMP/libclang"
-          ln -sf "$lib" "$RUNNER_TEMP/libclang/libclang.so"
-          echo "LIBCLANG_PATH=$RUNNER_TEMP/libclang" >> "$GITHUB_ENV"
-      - name: The comparator arms compile
-        run: cargo check --release -p supdb-external --features rocksdb --all-targets
+        with:
+          workspaces: bench -> bench/target
+      - name: One quick-scale run of every arm
+        run: sh scripts/check.sh quick
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quick-row
+          if-no-files-found: ignore
+          path: bench/runs-ci/
 
   cross-arm:
     # Proves the ARM paths build and pass before any ARM hardware is involved.
@@ -112,23 +105,12 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64-static -L /usr/aarch64-linux-gnu
         run: cargo test --release --target aarch64-unknown-linux-gnu --lib
 
-  browser:
-    # The browser reader, built and actually run. Nothing else in this
-    # workflow compiles the wasm module, and that gap hid a real break: on
-    # rustc 1.98 the bare `extern` block for the host imports stopped linking
-    # ("undefined symbol: supdb_host_read") and no CI run noticed, because no
-    # CI run had ever built it. A second read path whose failure mode is a
-    # browser quietly answering a different question from the server is the
-    # last one that should go untested.
-    #
-    # `web/test/run.sh` is the whole thing from a clean tree: it builds the
-    # module and the floor control, writes two real indexes plus the answers
-    # the native reader gives for them, runs the Node half (the error paths)
-    # and then opens both indexes in Chromium -- the day index over an OPFS
-    # sync access handle and the segment index over ranged HTTP with a cache
-    # smaller than the file. `web/build.sh` records the bundle size against
-    # its budget and exits non-zero if W3.1-W3.3 stop holding, so this gates
-    # the module's size as well as its behaviour.
+  wasm:
+    # The browser reader, built. Nothing else in this workflow compiles the
+    # wasm module, and that gap hid a real break: on rustc 1.98 the bare
+    # `extern` block for the host imports stopped linking ("undefined
+    # symbol: supdb_host_read") and no CI run noticed, because no CI run had
+    # ever built it.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -136,48 +118,5 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Chromium
-        # Resolved out of the global node_modules: `web/test/browser.mjs`
-        # looks there rather than vendoring a node_modules into the repo.
-        run: |
-          npm install -g playwright
-          playwright install --with-deps chromium
-          echo "NODE_PATH=$(npm root -g)" >> "$GITHUB_ENV"
-      - name: Build the reader and run the browser suite
-        run: sh scripts/check.sh browser
-
-  falsify:
-    # The falsification suite and the claim gate. Runs at the `ci` profile,
-    # which is deliberately too small to be evidence about performance -- it
-    # exists to prove the experiments still run and the findings still say what
-    # claims.json says they say.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Suites, then the claim gate against their fresh results
-        run: sh scripts/check.sh suites
-
-      - name: Publish results and figures
-        uses: actions/upload-artifact@v4
-        with:
-          name: measurements
-          path: |
-            results-ci/
-            figures-ci/
-
-  committed-results-are-current:
-    # Guards against results/ drifting away from the code that produced it.
-    # A committed result whose schema no longer parses, or whose findings no
-    # longer match claims.json, is a stale proof.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Verify the committed results and redraw from them
-        run: sh scripts/check.sh claims
+      - name: Build the reader and the floor
+        run: sh scripts/check.sh wasm

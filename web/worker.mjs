@@ -1,15 +1,16 @@
-// The worker logshed's reader runs in.
+// The worker the browser reader runs in.
 //
 // It exists because `FileSystemSyncAccessHandle` does not exist on the main
-// thread, and that handle is the whole of R2.2(a): it is what makes a browser
-// byte fetch synchronous, which is what lets `flatindex::lookup` go on
-// returning a borrow instead of a promise.
+// thread, and that handle is the whole of the requirement that the read
+// path stay synchronous: it is what makes a browser byte fetch synchronous,
+// which is what lets `flatindex::lookup` go on returning a borrow instead
+// of a promise.
 //
 // The shape is: one asynchronous step at startup (download the object into
 // OPFS -- or, for the cached source, fetch only what the open plans), then
 // every query after that is synchronous inside the worker, except that the
 // cached source's point reads want an `ensure` first: the module plans the
-// ranges (R6.2), the ensure awaits fetching them, and the read itself is
+// ranges, the ensure awaits fetching them, and the read itself is
 // synchronous as ever. The await lives here, never inside wasm.
 
 import { openSyncHandle, openMemory, openCached, openSparse, fetchIntoOpfs } from "./supdb.mjs";
@@ -41,10 +42,10 @@ async function open({ wasmUrl, indexUrl, name, source, budgetBytes, pageSize, pr
     };
   }
   if (source === "sparse") {
-    // R6.3: the index itself by range. Same cache, a different open.
+    // The index itself by range. Same cache, a different open.
     // A smaller page than the point-read cache's: the index is where the
-    // sparse reader's bytes go, and w5-dict found the 64 KiB page rather
-    // than the bytes to be its cost at logshed's dictionary sizes.
+    // sparse reader's bytes go, and on a day index the 64 KiB page rather
+    // than the bytes turned out to be its cost at realistic dictionary sizes.
     cache = await CachedBytes.open({
       name,
       fetcher: httpRangeFetcher(indexUrl),
@@ -67,7 +68,7 @@ async function open({ wasmUrl, indexUrl, name, source, budgetBytes, pageSize, pr
   return { source: "opfs", keys: reader.keys, size: handle.getSize() };
 }
 
-// FNV-1a 32, the same hash `logshed segment` records, so a multi-kilobyte
+// FNV-1a 32, the same hash the fixture generator records, so a multi-kilobyte
 // lookup is checked byte-for-byte without shipping the bytes in the fixture.
 function fnv32(values) {
   let h = 0x811c9dc5 >>> 0;
@@ -96,19 +97,19 @@ const ops = {
   countFixed: ({ key, width }) => reader.countFixed(key, width),
   storedBytes: ({ key }) => reader.storedBytes(key),
   // Rows cross the worker boundary as text and count: `keyBytes` is the
-  // key and is what a caller passes back to a lookup (web/test/node.mjs
-  // proves the text form of a byte key does not), but the browser suite
-  // compares rows against the native fixture's text rows.
+  // key and is what a caller passes back to a lookup -- the text form of a
+  // byte key does not survive the round trip -- and the text is what a
+  // caller compares against a fixture's text rows.
   scanCounts: ({ from, limit }) => plain(reader.scanCounts(from, limit)),
   scanCountsFixed: ({ from, limit, width }) =>
     plain(reader.scanCountsFixed(from, limit, width)),
-  // R6.2: the plan, and the plan-then-fetch that makes reads miss-proof.
+  // The plan, and the plan-then-fetch that makes reads miss-proof.
   planRanges: ({ keys }) => reader.planRanges(keys),
   ensure: async ({ keys }) => {
     await reader.ensure(keys);
     return true;
   },
-  // R6.3: the dictionary by range, for the sparse source.
+  // The dictionary by range, for the sparse source.
   dictCounts: ({ lo, hi }) => plain(reader.dictCounts(lo, hi ?? null)),
   ensureDict: async ({ lo, hi }) => {
     await reader.ensureDict(lo, hi ?? null);

@@ -3,8 +3,8 @@
 // There is no binding generator here. The wasm module exports eleven C
 // functions that pass integers and byte ranges, and this file is the whole
 // glue for them -- about two hundred lines against the descriptor sections,
-// shims and reflection a generator would add to something the size budget in
-// R3.3 is explicitly about. `web/build.sh` measures what ships.
+// shims and reflection a generator would add to something the size budget
+// is explicitly about. `web/build.sh` measures what ships.
 //
 // Three byte sources, one API:
 //
@@ -15,13 +15,13 @@
 //                       CachedBytes (cache.mjs) holding only the parts
 //                       queries touch, under a byte budget
 //
-// The second and third are what logshed uses and the reason nothing here is
+// The second and third are the reason nothing here is
 // async past `load`/`ensure`. `FileSystemSyncAccessHandle.read(buf, {at})` is
 // a synchronous random read, so the Rust side never has to await, and
 // `flatindex` can go on handing back borrows into the index. Both are only
 // available inside a Web Worker, which is where `worker.mjs` runs them.
 //
-// The third source works because a lookup is already a plan (R6.2): the
+// The third source works because a lookup is already a plan: the
 // module names the byte ranges a query will touch *before* reading any of
 // them (`supdb_open_plan` for the open, `supdb_ranges` for a set of keys),
 // JavaScript awaits fetching those ranges into the cache, and the read then
@@ -90,7 +90,7 @@ class Module {
   }
 }
 
-/// The reader logshed calls. R4.
+/// The browser reader.
 export class SupdbReader {
   constructor(mod, handle) {
     this.mod = mod;
@@ -107,19 +107,18 @@ export class SupdbReader {
   // match -- which meant every error check in this file was dead and a
   // failed call was indistinguishable from an empty answer. The convention
   // is: normalize to unsigned at the boundary, compare unsigned, return the
-  // unsigned value. `web/test/node.mjs` carries the zeroed-object repro.
+  // unsigned value, so a reader over an object that failed to open throws
+  // rather than answering `[]`.
   check(v, sentinel) {
     const u = typeof v === "bigint" ? BigInt.asUintN(64, v) : v >>> 0;
     if (u === sentinel) throw new Error(this.mod.lastError());
     return u;
   }
 
-  /// R4.5
   get keys() {
     return this.check(this.exports.supdb_keys(this.handle), 0xffffffff);
   }
 
-  /// R4.5
   get indexBytes() {
     return this.check(this.exports.supdb_index_bytes(this.handle), 0xffffffff);
   }
@@ -128,7 +127,7 @@ export class SupdbReader {
     return this.check(this.exports.supdb_generation(this.handle), 0xffffffff);
   }
 
-  /// R4.2 -- every value of a key, in append order.
+  /// Every value of a key, in append order.
   lookup(key) {
     const m = this.mod;
     const n = m.withKey(key, (p, l) =>
@@ -157,7 +156,7 @@ export class SupdbReader {
   /// `lookup` frames one view per record, which for a common trigram is
   /// hundreds of thousands of allocations; this crosses the boundary once
   /// and copies once. Fixed-width values are then one typed array:
-  /// `new Uint32Array(readConcat(key).bytes.buffer)` for logshed's postings.
+  /// `new Uint32Array(readConcat(key).bytes.buffer)` for four-byte postings.
   readConcat(key) {
     const m = this.mod;
     const n = m.withKey(key, (p, l) =>
@@ -170,7 +169,7 @@ export class SupdbReader {
     return { count, bytes: m.mem.slice(base + 4, base + n) };
   }
 
-  /// R4.3 -- how many values, without decoding any of them.
+  /// How many values, without decoding any of them.
   ///
   /// O(values) but not O(bytes): it walks the length prefixes and skips the
   /// payload, and -- the part that matters here -- nothing crosses the wasm
@@ -182,11 +181,12 @@ export class SupdbReader {
     return Number(v);
   }
 
-  /// R4.3, the fast form: the count for a fixed-width posting list, derived
+  /// The fast form of `count`: the count for a fixed-width posting list, derived
   /// from the extent list with no block touched at all.
   ///
   /// `null` when the key's values are not all `width` bytes, in which case
-  /// fall back to `count`. logshed's postings are four-byte line ordinals.
+  /// fall back to `count`. A posting list of four-byte ordinals is the case
+  /// this exists for.
   countFixed(key, width) {
     const v = this.mod.withKey(key, (p, l) =>
       this.exports.supdb_count_fixed(this.handle, p, l, width),
@@ -205,7 +205,7 @@ export class SupdbReader {
     return Number(v);
   }
 
-  /// R4.4 -- the dictionary in key order from `from`, with each key's count.
+  /// The dictionary in key order from `from`, with each key's count.
   /// What a "top paths" or "countries" panel is made of.
   ///
   /// This form costs a walk over every posting in the range, which for a day
@@ -229,14 +229,15 @@ export class SupdbReader {
     );
   }
 
-  /// R6.2 -- the byte ranges a read of these keys will touch, before any of
+  /// The byte ranges a read of these keys will touch, before any of
   /// them is read. Sorted, merged, absolute file offsets. What `ensure`
   /// hands to the cache; exposed for callers that batch their own fetching.
   ///
   /// Covers data reads only: the superblock, key index and block table are
   /// fetched whole at open (planned by `supdb_open_plan`) and are resident
   /// after. That split costs ~nothing while key cardinality is bounded --
-  /// a logshed segment is ~100 keys of index over megabytes of postings --
+  /// a term index over enumerable fields is ~100 keys of index over
+  /// megabytes of postings --
   /// and it is the premise that expires if keys become unbounded, e.g. a
   /// trigram or free-text index. Do not index free text over this source
   /// without revisiting it; the ranges stay absolute so that day changes
@@ -292,8 +293,8 @@ export class SupdbReader {
       // `keyBytes` is the key. `key` is a rendering of it for display:
       // supdb keys are byte strings, and a key that is not valid UTF-8 --
       // a trigram cut through a multibyte character is the common case --
-      // decodes with U+FFFD in it, so the text cannot be looked up. logshed
-      // found this by round-tripping every key of a dictionary; pass
+      // decodes with U+FFFD in it, so the text cannot be looked up. Found
+      // by round-tripping every key of a dictionary; pass
       // `keyBytes` to `lookup`, `count` and the rest, never `key`.
       // Sliced, not subarrayed: the wasm memory can grow under a view.
       const keyBytes = m.mem.slice(at, at + klen);
@@ -355,7 +356,7 @@ export async function openMemory(wasm, bytes) {
   return new SupdbReader(mod, h);
 }
 
-/// Open over an OPFS file, read synchronously. R2.2(a).
+/// Open over an OPFS file, read synchronously.
 ///
 /// `handle` is a `FileSystemSyncAccessHandle`, which only exists inside a
 /// Web Worker. This is the path the library is designed around: the object is
@@ -391,7 +392,7 @@ export async function openSyncHandle(wasm, handle) {
 }
 
 /// Open over a `CachedBytes` (cache.mjs): the object stays in object
-/// storage, and only the parts queries touch become resident. R6.
+/// storage, and only the parts queries touch become resident.
 ///
 /// The open itself is planned, not faulted: fetch the superblock probe, ask
 /// the module (`supdb_open_plan`) which ranges the open will read -- the key
@@ -466,7 +467,7 @@ export async function fetchIntoOpfs(url, name) {
 }
 
 
-/// R6.3 -- the dictionary read by range, for an index too large to fetch
+/// The dictionary read by range, for an index too large to fetch
 /// whole. The reader holds the key section's header and fence (kilobytes)
 /// and reaches the directory and the records by plan; nothing else changes
 /// about the synchronous shape. Point reads are not on it: they would need
@@ -597,10 +598,9 @@ export class SparseReader {
 /// that is planned and fetched on demand.
 /// `opts.probe`: bytes to fetch before the first plan, at least the
 /// superblock page; a segment written with a head reserve holding its
-/// block table and fence opens in one round trip when the probe covers it
-/// (R7.1). `opts.directory`: fetch the directory whole at open, so a
-/// lookup after open is one round trip -- the records -- instead of two
-/// (R7.2).
+/// block table and fence opens in one round trip when the probe covers
+/// it. `opts.directory`: fetch the directory whole at open, so a lookup
+/// after open is one round trip -- the records -- instead of two.
 export async function openSparse(wasm, cache, opts = {}) {
   let mem = null;
   const host = {

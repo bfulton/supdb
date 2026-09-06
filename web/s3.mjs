@@ -1,7 +1,8 @@
-// SigV4 range GETs against S3, as a fetcher for `CachedBytes`. R6.4.
+// SigV4 range GETs against S3, as a fetcher for `CachedBytes`.
 //
-// The generic half of R6 -- ranges, caching, eviction, the budget -- lives in
-// `cache.mjs` and takes any `(offset, length) -> {bytes, total}` function.
+// The generic half of the cached byte source -- ranges, caching, eviction,
+// the budget -- lives in `cache.mjs` and takes any
+// `(offset, length) -> {bytes, total}` function.
 // The only AWS-specific part is signing, so this is that function for S3: a
 // deliberately minimal SigV4 signer for exactly one request shape, GET with a
 // Range header. No dependencies; WebCrypto does the HMACs. It ships with the
@@ -9,7 +10,7 @@
 // is no good reason to make every S3 caller re-derive canonical-request
 // ordering from the AWS docs.
 //
-// What stays with the caller (R6.5): credentials, the bucket, and which
+// What stays with the caller: credentials, the bucket, and which
 // object to open. Credentials live in this closure for the life of the
 // fetcher and are never persisted -- the cache stores bytes, not requests,
 // and nothing here writes a credential anywhere.

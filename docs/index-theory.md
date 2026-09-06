@@ -1,14 +1,15 @@
 # The index decision, in theoretical context
 
-`indexlab` measures twelve index layouts. This is what the theory says about
-the result — including the places the theory predicts something the
-measurement does not show, which are the interesting places.
+The experiment measured twelve index layouts at full scale, on 10M
+sixteen-byte decimal keys; every figure below is from that run. This is what
+the theory says about what it showed — including the places the theory
+predicts something the measurement does not show, which are the interesting
+places.
 
-All figures are 10M sixteen-byte decimal keys, `--profile full`, from
-`results/f9-index-layout.full.json`. The two fixed-extent paged arms are also
-measured pairwise against their varint originals, interleaved in one process,
-in `results/f10-pair-*.full.json`; the probe's own cross-layout figures come
-from sequential `Trial` blocks and are a table rather than a claim.
+The two fixed-extent paged arms were also measured pairwise against their
+varint originals, interleaved in one process; the probe's own cross-layout
+figures come from sequential, blocked trials and are a table rather than a
+comparison.
 
 | layout | hit | miss | scan | B/key | MiB @ 10M |
 |---|---|---|---|---|---|
@@ -165,8 +166,8 @@ and yet `hash+flat` lost 475 ns to 369.
 
 Hardware counters were unavailable — this is a Firecracker guest, and `perf`
 reports every PMU event as `<not supported>` — so the model's *inputs* were
-instrumented instead. `indexlab trace` records the byte ranges each lookup
-reads and counts distinct 64-byte lines and 4 KiB pages:
+instrumented instead. A tracer records the byte ranges each lookup reads
+and counts distinct 64-byte lines and 4 KiB pages:
 
 | layout | reads | distinct lines | distinct pages |
 |---|---|---|---|
@@ -204,13 +205,12 @@ lookup. The same encoding choice is still on the hot path in `hash+paged` and
 
 **DONE — and the generalisation held, at about half the strength predicted.**
 `hash+pagedfixed` and `mph+pagedfixed` apply the same change to the paged
-blob. They are arms rather than replacements, and `indexlab pair` measures
-each against its varint original **interleaved in one process**, because the
-probe's cross-layout comparisons come from sequential `Trial` blocks and that
-is not a basis for a claim about a change. At 10M keys, `--profile full`,
-decimal16:
+blob. They are arms rather than replacements, and each was measured against
+its varint original **interleaved in one process**, because the probe's
+cross-layout comparisons come from sequential, blocked trials and that is
+not a basis for a statement about a change. At 10M keys, decimal16:
 
-| pair | hit | scan | B/key | verdict |
+| pair | hit | scan | B/key | p, hit / scan |
 |---|---|---|---|---|
 | `hash+paged` → `hash+pagedfixed` | 694 → 508 ns (**1.37×**) | 5.10 → 3.22 ns/e (**1.59×**) | 42.9 → 49.8 | p=0.0022 / 0.0122 |
 | `mph+paged` → `mph+pagedfixed` | 788 → 662 ns (**1.19×**) | 5.36 → 3.32 ns/e (**1.61×**) | 20.5 → 27.4 | p=0.0022 / 0.0122 |
@@ -226,20 +226,21 @@ numerator alone overstated both.
 Absent-key lookups are **unchanged** in both pairs (p=0.25, p=0.70), which is
 the result that makes the rest credible: a miss fails at the key comparison and
 never reaches the extent, so an encoding change behind that comparison must not
-move it. That is recorded as finding P3 in each pair rather than left as an
-observation, so a future run that *does* move it fails the build.
+move it. That was stated as a prediction in each pair rather than left as
+an observation, so a run that *did* move it would be a broken measurement
+rather than a result.
 
-The scan column is the more consequential half. F9.5 fails because no composite
-scans as fast as the heap index; at 3.22 against heap-hash's 2.71 ns/entry the
-gap is 1.19× rather than 1.88×. Still failing, and F9.5 stays `fails` in
-`claims.json` — but it now fails by a margin that a page-layout change could
-plausibly close, rather than by one that says the approach is wrong.
+The scan column is the more consequential half. The prediction was that a
+composite layout would scan as fast as the heap index, and none does; but at
+3.22 against heap-hash's 2.71 ns/entry the gap is 1.19× rather than 1.88×.
+The prediction is still refuted — by a margin that a page-layout change
+could plausibly close, rather than by one that says the approach is wrong.
 
 The space cost is the thing to watch, and it is not symmetric: +16% for the
 hash arm, +34% for the MPH arm, because the MPH arm has less other space to
-absorb the same twelve bytes. Both are pinned as `max` metrics in
-`claims.json` so speed cannot be bought with space again without a person
-deciding to.
+absorb the same twelve bytes. Both are the numbers to hold a later change
+to, so that speed is not bought with space again without a person deciding
+to.
 
 **TESTED — and the prediction was too strong.** The argument was that an L2
 TLB of ~1536 entries covers 6 MiB at 4 KiB pages while these structures are
@@ -292,7 +293,7 @@ and those differ by 2× and 4× between x86-64, Graviton and Apple Silicon.
 binary adapts rather than being tuned for whichever machine it was benchmarked
 on.
 
-`indexlab sweep` tests whether the derivation is good enough. On x86-64
+A sweep of the constant tests whether the derivation is good enough. On x86-64
 (64-byte lines, 4 KiB pages, derived value 32) at 2M keys, interleaved with the
 significance gate:
 

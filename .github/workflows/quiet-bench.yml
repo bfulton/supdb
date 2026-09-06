@@ -1,50 +1,33 @@
 name: quiet-bench
 
-# The competitor comparison, run somewhere that holds still.
+# A full-scale run on a self-hosted Mac, on demand. The row is published as
+# an artifact; committing it to bench/runs/ is a person's decision.
 #
-# `ext-kv` repeats and interleaves its engines and gates every ordering on a
-# Mann-Whitney U test, which settles drift *within* a run. It does nothing
-# about drift *between* runs, and on the cloud VM that produced every number
-# in `results/` there is a great deal of it: EXT.1 has read 0.866x, 0.891x,
-# 0.892x, 1.010x, 1.154x, 1.043x and 1.331x across seven such runs with the
-# code unchanged between several of them, and LMDB's own load figure has
-# ranged from 508,205 to 1,034,797 over the same runs.
-#
-# So the point here is not a faster machine, it is a quieter one -- and
-# whether it is quieter is itself a measurement. Dispatch this twice and
-# compare the spread against that list. If a laptop somebody is using turns
-# out to wander as much as a shared VM, that is worth knowing before any of
-# these numbers get cited.
-#
-# Two engines rather than four, and kv rather than the whole suite, because
-# localmost kills a job at 600 seconds. supdb against lmdb is what EXT.1,
-# EXT.4 and EXT.5 are about.
+# The runner is resolved by localmost's own check workflow. When no
+# self-hosted runner claims the job within the window, the watchdog cancels
+# the run rather than letting it queue: a job that hangs for a day looks
+# identical to one about to start, and neither is a measurement.
 
 on:
   workflow_dispatch:
     inputs:
-      engines:
-        description: 'Engines to compare'
-        default: 'supdb,lmdb'
-      suite:
-        description: 'kv or ycsb (ignored when `internal` is set)'
-        default: 'kv'
-      internal:
-        description: 'An internal experiment (e.g. f25-arena) to run instead of the comparison'
+      top:
+        description: 'Top rung in keys (default: sized to 1.5x memory)'
         default: ''
-      args:
-        description: 'Extra args for the experiment, e.g. --keys 400000 to fit the 9-minute cap'
+      arms:
+        description: 'Comma-separated arms (default: all)'
         default: ''
       pickup_timeout_minutes:
-        description: 'Cancel the run if no self-hosted runner claims the bench within this many minutes'
+        description: 'Cancel if no self-hosted runner claims the run within this many minutes'
         default: '10'
 
 permissions:
-  actions: read
+  actions: write
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
+concurrency:
+  group: timing-benchmark
+  cancel-in-progress: false
 
 jobs:
   check:
@@ -54,10 +37,8 @@ jobs:
     needs: [check]
     if: needs.check.outputs.runner == 'self-hosted'
     runs-on: ubuntu-latest
-    permissions:
-      actions: write
     steps:
-      - name: Wait for a self-hosted runner to claim the bench
+      - name: Wait for a self-hosted runner to claim the run
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -68,171 +49,52 @@ jobs:
           deadline=$(( WINDOW * 2 ))   # polls, at 30s each
           for i in $(seq 1 "$deadline"); do
             job=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
-              --jq '.jobs[] | select(.name=="bench") | "\(.status)|\(.runner_name)"' \
-              2>&1 || true)
+              --jq '.jobs[] | select(.name=="full") | "\(.status)|\(.runner_name)"' \
+              2>/dev/null) || job=""
             status="${job%%|*}"
             runner="${job##*|}"
             echo "poll $i: status='$status' runner='$runner'"
             case "$status" in
-              queued|"")
-                # Still waiting, or the API did not answer. Keep waiting.
-                ;;
+              queued|"") ;;
               *)
-                # Anything else means a runner has it or has had it. This job
-                # is about pickup, and pickup has happened.
-                echo "bench picked up by ${runner:-?} after $(( i * 30 ))s"
+                echo "full run picked up by ${runner:-?} after $(( i * 30 ))s"
                 exit 0
                 ;;
             esac
             sleep 30
           done
-          echo "::error::bench was still queued after ${WINDOW}m and no runner took it."
-          echo "::error::Check Settings > Actions > Runners: registrations expire, and a"
-          echo "::error::stale one leaves the localmost app heartbeating with nothing listening."
-          gh api -X POST "repos/$REPO/actions/runs/$RUN_ID/cancel" >/dev/null || true
-          exit 1
-                ;;
-              "")
-                # The job has not been created yet, or the API hiccupped.
-                echo "waiting: bench job not visible yet"
-                ;;
-              *)
-                echo "waiting: bench is $status ($(( i * 30 ))s)"
-                ;;
-            esac
-            sleep 30
-          done
-          echo "::error::No self-hosted runner claimed the bench within ${WINDOW}m."
+          echo "::error::the full run was still queued after ${WINDOW}m and no runner took it."
           gh api -X POST "repos/$REPO/actions/runs/$RUN_ID/cancel" >/dev/null || true
           exit 1
 
-  bench:
+  full:
     needs: [check]
-    # No fallback to a hosted runner, for the same reason the sweep has none:
-    # a shared virtualised runner returns a number that looks like a
-    # measurement and is not, and this job exists precisely to escape one.
-    if: needs.check.outputs.runner == 'self-hosted'
     runs-on: ${{ needs.check.outputs.runner }}
-    timeout-minutes: 9
-    concurrency:
-      group: timing-benchmark
-      cancel-in-progress: false
+    timeout-minutes: 600
     steps:
       - uses: actions/checkout@v4
-      # No `dtolnay/rust-toolchain` here, unlike the hosted jobs. That action
-      # provisions a toolchain on an ephemeral runner; this runner is somebody's
-      # Mac and already has one. Running it anyway made `rustup toolchain
-      # install stable` reach for static.rust-lang.org through localmost's
-      # sandbox proxy, which answered `tunnel error: unsuccessful`, and the job
-      # died two seconds in having been claimed successfully. Use what is
-      # installed, and say so plainly if nothing is.
       - name: Use the toolchain this machine already has
         run: |
-          set -euo pipefail
-          if ! command -v cargo >/dev/null; then
-            echo "::error::No cargo on this runner and this job will not install one:"
-            echo "::error::the sandbox has no route to static.rust-lang.org. Install a"
-            echo "::error::stable toolchain on the Mac itself, once."
-            exit 1
-          fi
+          set -eu
+          command -v cargo >/dev/null || { echo "::error::no cargo on this runner"; exit 1; }
           cargo --version
-          rustc --version
-      - uses: Swatinem/rust-cache@v2
-        # Best effort: this reaches GitHub's cache service, and a runner whose
-        # egress is proxied may not get there. A cold build is slower; a failed
-        # cache step would cost the whole measurement.
-        continue-on-error: true
-        with:
-          shared-key: apple-silicon-sweep
+      - name: libclang, for bindgen
+        run: sh bench/scripts/libclang.sh
       - name: Build
-        # Only the two binaries this job runs. `--workspace` also builds
-        # internal, correctness, verify and indexlab's dependencies, and the
-        # whole job -- build included -- has to finish inside localmost's
-        # 600-second kill. Minutes spent compiling what this job never
-        # executes are minutes the measurement does not get.
+        working-directory: bench
+        run: cargo build --release --bin bench
+      - name: Run
+        working-directory: bench
         env:
-          WANT_INTERNAL: ${{ inputs.internal }}
+          TOP: ${{ inputs.top }}
+          ARMS: ${{ inputs.arms }}
         run: |
-          set -euo pipefail
-          # Offline: see the note in apple-silicon.yml. The sandbox proxy
-          # answers cargo's crates.io fetch with a 403, and this machine's
-          # cargo cache already has what a build of this lockfile needs.
-          # See the note in apple-silicon.yml: offline first, then the git
-          # index protocol, because localmost's allowlist has crates.io and
-          # static.crates.io but not index.crates.io, which is the host cargo's
-          # sparse index actually uses.
-          # `internal` is built only when asked for: it is another binary to
-          # compile inside the same 600-second kill, and the comparison runs
-          # do not use it.
-          build() {
-            cargo build --release --locked "$@" -p supdb --bin indexlab || return 1
-            if [ -n "${WANT_INTERNAL:-}" ]; then
-              cargo build --release --locked "$@" -p supdb --bin internal
-            else
-              cargo build --release --locked "$@" -p supdb-external --bin external
-            fi
-          }
-          if build --offline; then
-            echo "built from the local cargo cache"
-          elif CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git build; then
-            echo "built via the git index protocol"
-          else
-            echo "::error::Neither the local cache nor the git index protocol"
-            echo "::error::could build this. Add index.crates.io to localmost's"
-            echo "::error::DEFAULT_ALLOWED_HOSTS, or run 'cargo fetch --locked'"
-            echo "::error::once in a supdb checkout on this Mac."
-            exit 1
-          fi
-
-      - name: Record the machine and what else it was doing
-        run: |
-          ./target/release/indexlab machine | tee bench-env.txt
-          echo "# loadavg before: $(sysctl -n vm.loadavg)" | tee -a bench-env.txt
-
-      - name: Measure
-        # An internal experiment measures Supdb against itself with both arms
-        # interleaved, so unlike the comparison it answers a question about
-        # *this* machine's memory system rather than about another engine --
-        # which is the point of running it on a second architecture. Apple
-        # Silicon is 128-byte lines and 16KiB pages against x86's 64 and 4KiB;
-        # for anything cache-shaped that is a different machine, not a quieter
-        # one, and a result here replicates nothing pinned to x86.
-        env:
-          INTERNAL: ${{ inputs.internal }}
-          EXTRA: ${{ inputs.args }}
-        run: |
-          set -euo pipefail
-          # shellcheck disable=SC2086
-          if [ -n "$INTERNAL" ]; then
-            ./target/release/internal "$INTERNAL" --profile full --out out $EXTRA \
-              | tee -a bench-env.txt
-          else
-            ./target/release/external '${{ inputs.suite }}' \
-              --profile full \
-              --engines '${{ inputs.engines }}' \
-              --out out $EXTRA \
-              | tee -a bench-env.txt
-          fi
-          echo "# loadavg after: $(sysctl -n vm.loadavg)" | tee -a bench-env.txt
-
+          set -eu
+          args="run --scale full --out runs-ci"
+          [ -n "$TOP" ] && args="$args --top $TOP"
+          [ -n "$ARMS" ] && args="$args --arms $ARMS"
+          ./target/release/bench $args
       - uses: actions/upload-artifact@v4
         with:
-          name: quiet-bench-${{ inputs.internal || inputs.suite }}
-          path: |
-            out/
-            bench-env.txt
-
-      - name: Summary
-        run: |
-          {
-            echo '## ${{ inputs.internal || format('ext-{0}', inputs.suite) }}, Apple Silicon, full profile'
-            echo
-            echo 'Not evidence yet. `results/` is the source of truth, this'
-            echo 'artifact is not in it, and one run on a quiet machine is'
-            echo 'still one run. The question this is here to answer is how'
-            echo 'far two of them differ.'
-            echo
-            echo '```'
-            cat bench-env.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          name: full-row
+          path: bench/runs-ci/

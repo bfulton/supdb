@@ -33,8 +33,10 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Which runner claimed this
+        env:
+          RESOLVED: ${{ needs.check.outputs.runner }}
         run: |
-          echo "resolved runs-on: ${{ needs.check.outputs.runner }}"
+          echo "resolved runs-on: $RESOLVED"
           echo "runner name:      ${RUNNER_NAME:-?}"
           echo "os/arch:          $(uname -s) $(uname -m)"
           if [ "$(uname -s)" = "Darwin" ]; then

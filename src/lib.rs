@@ -2,20 +2,19 @@
 //!
 //! The four findings below are the *design document's*, taken against Uppend,
 //! RocksDB, LMDB and MapDB, and they are kept because they explain why the
-//! code is shaped as it is. Two have since been overtaken by this
-//! repository's own measurements, which is why the line above no longer says
+//! code is shaped as it is. Two have since been overtaken by the project's
+//! own measurements, which is why the line above no longer says
 //! ingest-optimized:
 //!
-//! - Finding 1's "nothing here may compromise the ingest path" did not hold:
-//!   the durable ordered load runs at 0.755x of LMDB and 0.611x of tuned
-//!   RocksDB (`EXT.22`, `EXT.32`). What the engine wins is reads, 2.14x and
-//!   6.97x of the same pair (`EXT.23`, `EXT.33`).
+//! - Finding 1's "nothing here may compromise the ingest path" did not survive
+//!   measurement: the durable ordered load is behind both LMDB and tuned
+//!   RocksDB. What the engine wins is reads against that same pair.
 //! - Finding 4's choice between size and warm reads was made, and it was made
 //!   for reads: blocks are stored uncompressed by default, so a point read
 //!   decompresses nothing and the file is the larger for it. Compression is
-//!   per segment rather than global, and `W6.8` prices it on a real index.
+//!   per segment rather than global, and is measured on a real index.
 //!
-//! `claims.json` holds both sides. The four as stated:
+//! The live measurements are in `bench/`. The four as stated:
 //!
 //! 1. Append throughput and flush cost are what an append-only log actually
 //!    wins (2-2.6x and 17-39x respectively), and they survived every
@@ -37,18 +36,11 @@
 //! already in hand and being copied. That produces sorted runs, which is what
 //! ordered scans will need later, at close to no cost.
 
-// The measurement substrate reads `getrusage`, `clock_gettime` and `sysconf`,
-// none of which exist on wasm, and it has no business in a browser bundle
-// anyway. Eleven of the twenty-nine errors a wasm build used to produce were
-// this module alone.
-#[cfg(not(target_family = "wasm"))]
-pub mod bench;
-
 // The format modules below came from the design artifact rather than being
 // written here. `block` and `index` still have their style lints scoped off
 // rather than paid down, which is all that is left of the distinction: they
-// are formatted by the same gate as every other file, and the harness code
-// above and in src/bin holds to -D warnings.
+// are formatted by the same gate as every other file, and everything else
+// holds to -D warnings.
 /// The on-disk format's fixed quantities: the superblock magic and geometry.
 /// Not owned by any writer -- two of them exist and three readers parse what
 /// either produced.
@@ -79,12 +71,14 @@ pub mod db;
 /// The flat key index, including the builders a segment writer drives.
 /// Public for the same reason as `index`: a bulk writer for sorted,
 /// write-once input is a legitimate second producer of this format, and
-/// f46 prices one. The lint allowance is the only concession to making the
-/// module public -- its `len()` methods predate the exposure.
+/// one is priced against the general path. The lint allowance is the only
+/// concession to making the module public -- its `len()` methods predate
+/// the exposure.
 #[allow(clippy::len_without_is_empty)]
 pub mod flatindex;
+pub mod reserve;
 /// The C ABI the browser calls. Hand-written rather than generated, because
-/// the whole point of R3.3 is the size of what ships.
+/// the size of what ships is budgeted.
 #[cfg(target_family = "wasm")]
 pub mod wasmapi;
 
@@ -99,5 +93,6 @@ pub use bytes::{Bytes, SliceBytes, VecBytes};
 /// one.
 #[cfg(not(target_family = "wasm"))]
 pub use db::{
-    BackgroundIo, Db, Options, ReadAdvice, SegmentOptions, SegmentWriter, SyncPolicy, Txn,
+    BackgroundIo, Db, Options, ReadAdvice, SegmentOptions, SegmentWrite, SegmentWriter, SyncPolicy,
+    Txn,
 };
