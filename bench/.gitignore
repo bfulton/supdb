@@ -1,0 +1,11 @@
+/target
+
+# Profiler output. A bare `valgrind --tool=cachegrind` drops one of these in
+# the cwd, and one of them reached the repository root and stayed there.
+cachegrind.out.*
+callgrind.out.*
+perf.data*
+
+# Rows a check run wrote. A local run of the checks must not dirty the tree;
+# rows worth keeping are copied into runs/ and committed by a person.
+/runs-ci

@@ -1,92 +1,54 @@
 # Contributing to supdb
 
-## The tests you can run here are not the whole gate
-
-This repository is the engine: the library, its tests, the browser reader and
-the design notes. `cargo test` and `sh scripts/check.sh` are real, and they
-are the smaller half. The falsification suite, the comparison against other
-engines, the correctness suite, the browser test and `claims.json` -- the file
-that records what the engine is expected to do, including what it is expected
-to do badly -- live in [supdb-bench](https://github.com/bfulton/supdb-bench),
-and this repository's CI runs that suite against every pull request. A change
-that passes everything here can still be red, and it is red for a reason about
-the engine rather than about the tests: the suite fails in both directions,
-when a known limitation gets worse and when one quietly gets fixed.
-
-So most engine work is done from a clone of supdb-bench with this repository
-checked out at `supdb/` inside it, where the experiment that will judge a
-change is open while the change is made. The rest of this file is the short
-form; supdb-bench's `CONTRIBUTING.md` has the flow in full and its `CLAUDE.md`
-has the reasons.
-
 ## Getting the code
 
     git clone https://github.com/bfulton/supdb
     cd supdb
-    sh scripts/check.sh            # everything that can be checked here
+    sh scripts/check.sh            # build, test, lint, wasm, bench -- what CI runs
     sh scripts/check.sh lint       # or one group; the script's header lists them
 
 Rust stable with `rustfmt` and `clippy`; the browser reader also wants the
-`wasm32-unknown-unknown` target (`web/build.sh`). CI calls the same script with
-the same group names, so what passes here passes there -- for this half.
+`wasm32-unknown-unknown` target (`web/build.sh`). The `bench` group builds
+the comparators, which is a ten-minute C++ build the first time and needs
+libclang; `bench/scripts/libclang.sh` names it when cargo cannot. CI calls
+the same script with the same group names, so what passes here passes there.
 
-Or, and usually better:
+## The suite
 
-    git clone --recurse-submodules https://github.com/bfulton/supdb-bench
-    cd supdb-bench/supdb           # this repository, at the revision the suite last recorded
-    git checkout -b my-change main
+`bench/` is the benchmark suite and its own cargo workspace. It measures
+every arm over a ladder of store sizes and writes one row of raw samples
+under `bench/runs/<scale>/`; `bench/DESIGN.md` is the specification and
+`bench/CLAUDE.md` the rules. Two scales:
 
-and work there, running the suite from the directory above.
+- `quick` runs on every pull request, on a hosted runner, about three
+  minutes. It gates the change against the last ten rows of that runner's
+  class in `bench/runs/`, and until a class has three rows it can only prove
+  the suite runs end to end.
+- `full` sizes its ladder past the machine's memory and takes hours. Run it
+  on a quiet machine (`sh scripts/check.sh quick` for the shape; `bench run
+  --scale full` for the run), and commit the row if it is worth keeping:
+
+      git add bench/runs/
+
+A `quick` row from a machine you were also using for something else is not
+worth keeping.
 
 ## How a change lands
 
-Engine CI clones supdb-bench at `main` and runs the suite against the pull
-request. Two cases.
+One pull request. If it changes the engine and the suite together, say what
+moved and why in the description; the row's `sha` names the commit that
+produced it, so a suite change that moves a number draws a new band from
+the first rows after it and nothing has to be pinned.
 
-**The change moves no claim.** Open the pull request; it is green against
-supdb-bench `main`; merge it. Nothing else to do.
-
-**The change moves a claim** -- fixes a recorded limitation, moves a measured
-number, gives an experiment something new to measure. It cannot be green on
-both sides at once, and the order is:
-
-1. Push the engine branch and open its pull request. It is red, because
-   supdb-bench `main` still carries the old claims. Expected, and not yet
-   actionable.
-2. In supdb-bench, on a branch: point the submodule at the pushed engine
-   commit (`git -C supdb checkout <sha> && git add supdb`), re-record what
-   moved, edit `claims.json`, open that pull request. It is green -- a
-   submodule pointer is a SHA, and a SHA can name a commit no branch has
-   merged. The whole workflow rests on that.
-3. **Merge supdb-bench first.**
-4. The engine pull request re-runs against the new `main` and is green. Merge
-   it.
-
-To see the engine pull request green before step 3, the repository variable
-`SUPDB_BENCH_BRANCH` points engine CI at a supdb-bench branch. Set it by hand
-and clear it when the bench merges. Never commit an override: it would have to
-survive the merge -- the engine merges after the bench, so nothing could
-remove it in time -- and would leave `main` pointed at a branch that was about
-to be deleted. While the variable is set, every engine pull request is tested
-against that branch, not only the one it was set for.
-
-## Two rules of this repository
-
-**Merge commits only.** No squash, no rebase merge, and no force-push to a
-branch once supdb-bench has pinned one of its commits. supdb-bench names
-engine commits by SHA, and rewriting them leaves those pointers naming commits
-reachable from nothing. supdb-bench itself may squash -- nothing pins its
-commits -- and the asymmetry is easy to get backwards: the repository that is
-pointed at must not rewrite; the one that points may.
-
-**The gate runs on pull requests and tags**, not on pushes to `main`. The pull
-request run has already tested the tree the merge produces; a tag is a
-revision somebody means to cite, and carries a run of its own.
+The gate runs on pull requests and tags, not on pushes to `main`: the pull
+request run has already tested the tree the merge produces, and a tag is a
+revision somebody means to cite.
 
 ## What goes where
 
 Code, tests and the design notes (`docs/engine.md`, `docs/index-theory.md`)
-here. Every number, claim, plan file and result in supdb-bench. Keep
-`README.md` and the crate docs to what is true now and likely to stay so; the
-reasoning and the history go in supdb-bench's `CLAUDE.md` and plan files,
+here; the suite, its rows and its figures under `bench/`. Keep `README.md`
+and the crate docs to what is true now and likely to stay so: no standing
+figures, a figure attached to a change goes in the pull request that made
+it, rounded. The reasoning and the history go in `CLAUDE.md` on each side,
 where a reader who wants them can follow the pointer.

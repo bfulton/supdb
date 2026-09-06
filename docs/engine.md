@@ -1,8 +1,9 @@
 # The engine: a design brief written against the measurements
 
-Every assertion here cites a recorded result or a claim in
-[supdb-bench](https://github.com/bfulton/supdb-bench), where the experiments,
-`claims.json` and `results/` live. The brief exists because the current engine's remaining
+Every assertion here cites a recorded result or a claim of the suite this
+engine was built against -- `claims.json` and `results/` in the history of
+the supdb-bench repository. Those ids are pointers to that reasoning, not
+live numbers; the live measurements are the rows and figures in `bench/`. The brief exists because the current engine's remaining
 failures are structural rather than incidental, and because the two
 load-bearing unknowns of the obvious replacement shape have now been measured
 (f38, f39) instead of assumed. Nothing below is built; the promises are

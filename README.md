@@ -19,38 +19,22 @@ from either source.
 
 ## Benchmarks
 
-![Load, read and scan against LMDB and RocksDB](https://raw.githubusercontent.com/bfulton/supdb-bench/main/figures/ext-kv.svg)
+The suite in [`bench/`](bench/) measures supdb against LMDB and RocksDB on
+ordered and shuffled loads, point reads, ordered scans and the YCSB core
+mixes, over a ladder of store sizes from ten thousand keys to past the
+machine's memory, and against two floors: a durable framed append with no
+engine, and a mapped sequential read of a file. Every comparison is
+guarantee-matched, durable against durable and buffered against buffered.
+A run writes one row of raw samples; `bench figures` draws every figure
+from the committed rows, and `bench gate` fails a change whose row is worse
+than the last ten of its machine class. [`bench/DESIGN.md`](bench/DESIGN.md)
+is the specification.
 
-![YCSB core workloads against LMDB and RocksDB](https://raw.githubusercontent.com/bfulton/supdb-bench/main/figures/ext-ycsb.svg)
-
-Every comparison is matched: an engine is not ranked against another until
-both promise the same thing about durability, transactions and checksums, and
-where an axis cannot be equalized the result is read as a bound rather than a
-ranking. The figures are drawn from the committed measurements in
-[supdb-bench](https://github.com/bfulton/supdb-bench); the claim ids below
-name the checked numbers there.
-
-- **Point reads lead** LMDB and RocksDB tuned as it would be deployed
-  (`EXT.23`, `EXT.33`).
-- **Ordered scans lead** tuned RocksDB and are level with LMDB (`EXT.24`,
-  `EXT.34`).
-- **YCSB** A (update-heavy), C (read-only), E (short scans) and F
-  (read-modify-write) **lead** tuned RocksDB (`EXT.42`–`EXT.45`).
-- **The durable ordered load trails** both LMDB and RocksDB (`EXT.22`,
-  `EXT.28`). Under shuffled arrival the ordering inverts and the load leads
-  LMDB (`EXT.27`), because a durable commit of scattered keys dirties about
-  as many B-tree pages as it has keys. The two are one result; quote them
-  together.
-- **Space goes to RocksDB.** Blocks are stored uncompressed by default, which
-  is what a point read that decompresses nothing costs; per-segment LZ4
-  (`SegmentWriter::set_compress`) buys part of it back (`W6.8`).
-- **Out of core, reads fall off a cliff.** Once the file outgrows the memory
-  that can cache it, every miss is a synchronous page fault (`F1.2`, `F1.4`).
-
-Every statement above is a claim with a recorded expected state in
-[supdb-bench](https://github.com/bfulton/supdb-bench), whose CI reruns the
-suite against each change here and fails when a claim moves in either
-direction -- including when a known limitation gets fixed.
+What the curves show, in words: point reads and the read-heavy YCSB mixes
+lead both comparators; the durable ordered load trails both, and shuffled
+arrival inverts that; ordered scans lead RocksDB and trail LMDB; once the
+store leaves memory, reads fall off a cliff, because every miss is a page
+fault. The figures carry the numbers.
 
 ## Usage
 
@@ -125,7 +109,8 @@ Worker.
 ```sh
 cargo build --release
 cargo test --release
-sh scripts/check.sh            # build, test, lint, wasm -- what CI runs
+sh scripts/check.sh            # build, test, lint, wasm, bench -- what CI runs
+sh scripts/check.sh quick      # one quick-scale measurement, on an otherwise idle machine
 rustup target add wasm32-unknown-unknown && sh web/build.sh   # the browser module
 ```
 
@@ -133,10 +118,10 @@ rustup target add wasm32-unknown-unknown && sh web/build.sh   # the browser modu
 
 | where | what |
 |---|---|
+| `bench/DESIGN.md` | the benchmark suite: workloads, arms, the ladder, the gate, the figures |
 | `docs/engine.md` | the engine's design and the measurements each decision cites |
 | `docs/index-theory.md` | the index layout, and what theory predicts that measurement does not show |
 | `web/README.md` | the browser reader |
-| [supdb-bench](https://github.com/bfulton/supdb-bench) | the experiments, the claims, the results and the figures |
 
 ## Status
 

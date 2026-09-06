@@ -1,10 +1,10 @@
 # Working in this repository
 
 Supdb is a read-optimized embedded key-multivalue store. This repository is
-the engine and its reader. The benchmark suite whose job is to try to falsify
-what is said about the engine is [supdb-bench](https://github.com/bfulton/supdb-bench),
-which carries this repository as a submodule; how a thing is measured lives
-there, and this file is about how a thing is built.
+the engine, its reader, and under `bench/` the suite that measures it
+against LMDB and RocksDB. `bench/DESIGN.md` says how a thing is measured and
+`bench/CLAUDE.md` carries that side's rules; this file is about how a thing
+is built.
 
 This file is notes to whoever picks the work up next with no memory of it:
 dense, contextual, and it explains a rule by naming the failure that produced
@@ -26,6 +26,7 @@ of the change that produced the text.
 | `src/wasmapi.rs` | the C ABI the browser calls; hand-written because the module's size is budgeted |
 | `web/` | the browser reader, its byte sources, the Worker it runs in, and the size control -- `web/README.md` |
 | `tests/` | the engine's contract, the read paths held to each other, the format's damage cases |
+| `bench/` | the benchmark suite: its own cargo workspace, the arms, the runner, the gate and the figures -- `bench/DESIGN.md` |
 
 Two writers produce the format -- `Db` when it seals or compacts, and
 `SegmentWriter` for sorted write-once input -- and three readers parse what
@@ -38,9 +39,11 @@ from the format gate, and everything else holds to `-D warnings`.
 
 ## Running the checks
 
-`sh scripts/check.sh` runs every group -- build, test, lint, wasm -- and CI
-calls the same script with the same names, so a green run here is a green
-run there. Use a group name to run one.
+`sh scripts/check.sh` runs every group -- build, test, lint, wasm, bench --
+and CI calls the same script with the same names, so a green run here is a
+green run there. Use a group name to run one. `quick` is a group too, the
+suite's three-minute measurement; it is not in the default set because a
+timing run needs the machine to itself, and CI gives it a job of its own.
 
 Keep it that way. Every gate this repository has broken has broken the same
 way: a check that was not running, or one reporting a verdict it had not
@@ -51,22 +54,23 @@ locally. `scripts/fmt.sh` once swallowed "rustfmt could not run" behind
 "formatting differs" apart from "did not run" and fails both. A second
 definition of "the checks" is how the next one of those starts.
 
-## The suite lives in supdb-bench, and it gates this repository
+## The suite lives in bench/, and it gates this repository
 
-Every measurement, every claim, every result, figure and plan file is in
-supdb-bench, and its CI runs the suite against every pull request here.
-`claims.json` there records the expected state of every statement made about
-this engine, including the ones that currently fail, and its `verify` turns
-the build red in **both** directions: a limitation that gets worse, and a
-limitation that gets fixed. The second is deliberate -- either the engine
-improved and the claim is stale, or the experiment stopped testing anything,
-and a person has to decide which.
-
-So an engine change that moves a measurement across a claim's gate needs a
-matching supdb-bench PR that updates the claim, and the two are reviewed
-together. That edit is the record that the change was intentional. Do not
-"fix" a failing claim casually: most of them are predictions the run refuted,
-kept on the books so the idea cannot quietly come back.
+`bench/` is a time series. `bench run` measures every arm -- supdb's
+shipping configurations and the comparator a user would otherwise pick,
+durable against durable and buffered against buffered -- over a ladder of
+store sizes, and writes one row of raw per-rep samples under
+`bench/runs/<scale>/`. Nothing in a row is derived. The gate compares a new
+row to the last ten rows of its machine class and fails when a quantity's
+error bars lie entirely on the worse side of every one of them; a row
+entirely on the *better* side is flagged rather than passed, because a
+measurement that is implausibly good is a broken measurement until someone
+looks. There are no claims and no expected states. The suite that had them
+-- 183 claims adjudicated by `verify` -- was retired when its gate went red
+on an engine head that had not changed; it is in the supdb-bench
+repository's history, and an id like `EXT.23` or `W4.1` in a comment here
+names one of its claims. The id is a pointer to that reasoning, not a live
+number.
 
 Two consequences for code in this repository:
 
@@ -75,10 +79,11 @@ Two consequences for code in this repository:
   kin each keep an older shape alive behind a flag because the suite prices
   the new shape against it in one process -- comparing two separate runs
   does not work, the unchanged comparators move by tens of percent between
-  them. Removing an arm removes the experiment; check supdb-bench first.
-- **Any figure here is a citation, not a number.** `EXT.23` names a claim
-  whose value is checked there. Nothing in this repository is the source of
-  truth for what the engine measures.
+  them. Removing an arm removes the experiment; check `bench/src/engines.rs`
+  first.
+- **No standing figure is written down here.** A number belongs in a row and
+  a figure is drawn from the rows by `bench figures`. A figure attached to a
+  *change* belongs in the pull request that made it, rounded.
 
 ## Invariants a change must not break
 
@@ -209,15 +214,16 @@ at open rather than wrapping.
 
 ## Standing limitations
 
-These are the engine's, as opposed to refuted predictions, and each is a
-claim in supdb-bench with its expected state recorded:
+These are the engine's, as opposed to refuted predictions. Each is a curve
+in the suite's figures, at `full` scale where it says so:
 
 - Out-of-core reads fall off a cliff. Once the file exceeds the memory that
-  can cache it, throughput drops by about three orders of magnitude and the
-  latency distribution goes bimodal -- every miss is a synchronous page fault
-  (`F1.2`, `F1.4`). This is the mapped read path's shape, not a bug.
-- The durable ordered load trails LMDB and RocksDB (`EXT.22`, `EXT.28`), and
-  shuffled arrival inverts both. Quote the pair, never one.
+  can cache it, throughput drops by orders of magnitude and the latency
+  distribution goes bimodal -- every miss is a synchronous page fault. This
+  is the mapped read path's shape, not a bug; it is the `read` curves past
+  the memory line.
+- The durable ordered load trails LMDB and RocksDB, and shuffled arrival
+  inverts both. Quote the pair, never one: the `load` and `load-shuffled`
+  figures.
 - The index layout study found smaller and faster points on the frontier
-  that the shipping layout does not occupy (`F9.3`, `F9.5`, `F9.7`;
-  `docs/index-theory.md`).
+  that the shipping layout does not occupy (`docs/index-theory.md`).

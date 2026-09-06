@@ -1,15 +1,11 @@
 name: ci
 
-# Two things are gated here, and they answer different questions.
-#
-# The engine's own jobs -- build, test, lint, the wasm module, the ARM
-# cross-build -- say whether the code is sound. The `bench` job says whether
-# the claims made about the engine still match what it measurably does: it
-# fetches the falsification suite from supdb-bench, substitutes this checkout
-# for the engine that repository carries as a submodule, and runs `verify`,
-# which fails in both directions. A known limitation that quietly gets fixed
-# is as much a reason to stop as one that gets worse, because either the
-# engine changed or the experiment stopped testing anything.
+# Two questions are answered here. The engine's jobs -- build, test, lint,
+# the wasm module, the ARM cross-build -- say whether the code is sound. The
+# `bench` group in the same matrix says whether the suite in bench/ still
+# builds and passes its own tests against this engine, and the `quick` job
+# measures: one quick-scale run of every arm, gated against the committed
+# series in bench/runs/, with the figures drawn from the row it wrote.
 
 on:
   push:
@@ -36,10 +32,6 @@ jobs:
     # second kernel's mmap. A path only one arm exercises is a path nothing
     # tests. macos-latest is arm64, and a public repository pays nothing
     # for it.
-    #
-    # It gates building, testing and linting, not measuring. A timing
-    # benchmark cannot gate a pull request: two runs on instances of the
-    # same nominal machine have moved untouched comparator arms by half.
     strategy:
       fail-fast: false
       matrix:
@@ -50,11 +42,47 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # The comparators' build runs bindgen, which needs libclang; the script
+      # names it for this host and, on macOS, the rpath the build script
+      # needs to load it.
+      - name: libclang, for bindgen
+        run: sh bench/scripts/libclang.sh
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            bench -> bench/target
       # `scripts/check.sh` is the single definition of what this project
       # checks, so a contributor running it locally runs exactly this.
-      - name: Build, test and lint
-        run: sh scripts/check.sh build test lint
+      - name: Build, test and lint the engine and the suite
+        run: sh scripts/check.sh build test lint bench
+      - name: The machine, as a row records it
+        run: ./bench/target/release/bench machine | tee -a "$GITHUB_STEP_SUMMARY"
+
+  quick:
+    # One quick-scale measurement on a hosted runner. It gates the pull
+    # request on the gate's terms -- worse than every one of the last ten
+    # rows of this runner's class in bench/runs/ -- and until that class has
+    # three rows it can only prove the runner, the gate and the renderer
+    # work end to end. The row and the figures are published as artifacts;
+    # committing a row is a person's decision.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: libclang, for bindgen
+        run: sh bench/scripts/libclang.sh
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench -> bench/target
+      - name: One quick-scale run of every arm
+        run: sh scripts/check.sh quick
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quick-row
+          if-no-files-found: ignore
+          path: bench/runs-ci/
 
   cross-arm:
     # Proves the ARM paths build and pass before any ARM hardware is involved.
@@ -82,9 +110,7 @@ jobs:
     # wasm module, and that gap hid a real break: on rustc 1.98 the bare
     # `extern` block for the host imports stopped linking ("undefined
     # symbol: supdb_host_read") and no CI run noticed, because no CI run had
-    # ever built it. Running the module against real indexes in Chromium,
-    # and holding its size to a budget, are experiments with recorded
-    # expected states and belong to supdb-bench; this job is the link step.
+    # ever built it.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -94,99 +120,3 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build the reader and the floor
         run: sh scripts/check.sh wasm
-
-  bench:
-    # The falsification suite, from supdb-bench, run against this checkout.
-    #
-    # That repository carries the engine as a submodule and records, per
-    # committed result, which engine SHA produced it. The recorded pointer is
-    # provenance, not build wiring: this job does not initialise the
-    # submodule, it puts this checkout at that path and builds the suite on
-    # top of it. Which bench ref is paired with which engine is printed
-    # first and written to the job summary, because a silently wrong pairing
-    # -- a green run against the wrong claims -- is the failure this guards
-    # against.
-    #
-    # The bench ref is `main` unless the repository variable
-    # SUPDB_BENCH_BRANCH names another. An engine change that flips a claim
-    # is green against a bench branch carrying the matching claims.json edit
-    # and red against main's claims until that branch merges; the variable
-    # is how the pair is reviewed together.
-    #
-    # Pull requests and tags, not pushes to main. A push to main would
-    # re-resolve the same engine against whatever bench ref the variable
-    # names at that moment and could only disagree with the PR run by
-    # measuring a different pairing; it would tell nobody anything new. It
-    # needs no secrets, so it runs on pull requests from forks.
-    #
-    # `ci` is the profile, and `ci` is never citable: it proves the
-    # experiments still run and the findings still say what claims.json
-    # says they say.
-    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    env:
-      BENCH_REPO: https://github.com/bfulton/supdb-bench
-      BENCH_REF: ${{ vars.SUPDB_BENCH_BRANCH || 'main' }}
-      BENCH_REF_SOURCE: ${{ vars.SUPDB_BENCH_BRANCH && 'repository variable SUPDB_BENCH_BRANCH' || 'default' }}
-      # Where the suite writes, so the run's records can be uploaded.
-      CHECK_RESULTS: results-ci
-      CHECK_FIGURES: figures-ci
-    steps:
-      - name: Clone supdb-bench at the matched ref
-        # Before the engine checkout, because the engine goes *inside* it.
-        # No `--recurse-submodules`: the submodule's directory is left
-        # empty for the next step to fill.
-        run: git clone --depth 1 --branch "$BENCH_REF" "$BENCH_REPO" supdb-bench
-
-      - name: Check out this engine where the bench expects its submodule
-        uses: actions/checkout@v4
-        with:
-          path: supdb-bench/supdb
-
-      - name: Which bench, against which engine
-        working-directory: supdb-bench
-        run: |
-          set -eu
-          bench_sha=$(git rev-parse HEAD)
-          recorded=$(git ls-tree HEAD supdb | awk '{ print $3 }')
-          engine_sha=$(git -C supdb rev-parse HEAD)
-          {
-            echo "### bench pairing"
-            echo
-            echo "| | |"
-            echo "|---|---|"
-            echo "| supdb-bench ref | \`$BENCH_REF\` ($BENCH_REF_SOURCE) |"
-            echo "| supdb-bench SHA | \`$bench_sha\` |"
-            echo "| engine under test | \`$engine_sha\` (this checkout) |"
-            echo "| submodule pointer recorded in supdb-bench | \`$recorded\` (not built) |"
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          echo "::notice title=bench pairing::supdb-bench $BENCH_REF @ $bench_sha against engine $engine_sha"
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          # The browser experiments build the reader through `web/build.sh`
-          # from inside the bench workspace.
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: supdb-bench
-
-      - name: Suites, then the claim gate against their fresh results
-        working-directory: supdb-bench
-        run: |
-          set -eu
-          # The suite's own entry point, run against the engine checked out
-          # above. If it is missing, that is a broken bench checkout and the
-          # job should say so rather than quietly measuring something else.
-          test -f scripts/check.sh
-          sh scripts/check.sh suites
-
-      - name: Publish the run's results and figures
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: measurements
-          if-no-files-found: ignore
-          path: |
-            supdb-bench/results-ci/
-            supdb-bench/figures-ci/

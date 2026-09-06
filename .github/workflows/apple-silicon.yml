@@ -1,0 +1,43 @@
+name: apple-silicon
+
+# Does the suite's machine capture read the right numbers on macOS? That is
+# a parsing question, not a timing one, so a hosted -- and therefore
+# virtualised -- Apple Silicon runner answers it. It was silently wrong once:
+# the detector read a /sys path that does not exist on macOS and defaulted to
+# a 64-byte line on a machine whose lines are 128. `bench machine` exits
+# non-zero here if the line size was defaulted rather than read.
+#
+# Timing on Apple Silicon is `quiet-bench`, on a self-hosted Mac.
+
+on:
+  pull_request:
+    paths:
+      - 'bench/src/machine.rs'
+      - 'bench/src/env.rs'
+      - '.github/workflows/apple-silicon.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: libclang, for bindgen
+        run: sh bench/scripts/libclang.sh
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench -> bench/target
+      - name: Build
+        working-directory: bench
+        run: cargo build --release --bin bench
+      - name: Detect
+        working-directory: bench
+        run: |
+          set -eu
+          ./target/release/bench machine | tee machine.json
+          grep -q '"cache_line_detected": true' machine.json
+          grep -q '"cache_line": 128' machine.json

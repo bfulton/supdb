@@ -1,0 +1,100 @@
+name: quiet-bench
+
+# A full-scale run on a self-hosted Mac, on demand. The row is published as
+# an artifact; committing it to bench/runs/ is a person's decision.
+#
+# The runner is resolved by localmost's own check workflow. When no
+# self-hosted runner claims the job within the window, the watchdog cancels
+# the run rather than letting it queue: a job that hangs for a day looks
+# identical to one about to start, and neither is a measurement.
+
+on:
+  workflow_dispatch:
+    inputs:
+      top:
+        description: 'Top rung in keys (default: sized to 1.5x memory)'
+        default: ''
+      arms:
+        description: 'Comma-separated arms (default: all)'
+        default: ''
+      pickup_timeout_minutes:
+        description: 'Cancel if no self-hosted runner claims the run within this many minutes'
+        default: '10'
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: timing-benchmark
+  cancel-in-progress: false
+
+jobs:
+  check:
+    uses: bfulton/localmost/.github/workflows/check.yaml@main
+
+  pickup-watchdog:
+    needs: [check]
+    if: needs.check.outputs.runner == 'self-hosted'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for a self-hosted runner to claim the run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          WINDOW: ${{ inputs.pickup_timeout_minutes || '10' }}
+        run: |
+          set -uo pipefail
+          deadline=$(( WINDOW * 2 ))   # polls, at 30s each
+          for i in $(seq 1 "$deadline"); do
+            job=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
+              --jq '.jobs[] | select(.name=="full") | "\(.status)|\(.runner_name)"' \
+              2>/dev/null) || job=""
+            status="${job%%|*}"
+            runner="${job##*|}"
+            echo "poll $i: status='$status' runner='$runner'"
+            case "$status" in
+              queued|"") ;;
+              *)
+                echo "full run picked up by ${runner:-?} after $(( i * 30 ))s"
+                exit 0
+                ;;
+            esac
+            sleep 30
+          done
+          echo "::error::the full run was still queued after ${WINDOW}m and no runner took it."
+          gh api -X POST "repos/$REPO/actions/runs/$RUN_ID/cancel" >/dev/null || true
+          exit 1
+
+  full:
+    needs: [check]
+    runs-on: ${{ needs.check.outputs.runner }}
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use the toolchain this machine already has
+        run: |
+          set -eu
+          command -v cargo >/dev/null || { echo "::error::no cargo on this runner"; exit 1; }
+          cargo --version
+      - name: libclang, for bindgen
+        run: sh bench/scripts/libclang.sh
+      - name: Build
+        working-directory: bench
+        run: cargo build --release --bin bench
+      - name: Run
+        working-directory: bench
+        env:
+          TOP: ${{ inputs.top }}
+          ARMS: ${{ inputs.arms }}
+        run: |
+          set -eu
+          args="run --scale full --out runs-ci"
+          [ -n "$TOP" ] && args="$args --top $TOP"
+          [ -n "$ARMS" ] && args="$args --arms $ARMS"
+          ./target/release/bench $args
+      - uses: actions/upload-artifact@v4
+        with:
+          name: full-row
+          path: bench/runs-ci/

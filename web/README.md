@@ -6,7 +6,7 @@ meant to be.
 
 ```sh
 web/build.sh           # build the module and the floor, print their sizes
-# the browser test lives in supdb-bench, which stages this reader beside it
+# the browser test was the previous suite's and is in supdb-bench's history
 ```
 
 | path | what |
@@ -72,8 +72,8 @@ read path fetches whole blocks (verification and decompression want the
 enclosing bytes), so an extent-granular plan would under-report. That the
 plan is *exactly* what a read touches -- no more, no less -- is the property
 the whole design rests on, so it is asserted with recorded reads rather than
-argued: `tests/ranges.rs` natively, `w4-ranges` in supdb-bench, and the
-browser test end to end.
+argued: `tests/ranges.rs` natively, and `w4-ranges` and the browser test end
+to end in the previous suite.
 
 `cache.mjs` is the byte source: sparse pages in OPFS (it survives reloads),
 a budget in bytes that is a real file size, CLOCK eviction, and a hard rule
@@ -161,7 +161,7 @@ open, because a source that cannot lend its bytes -- which an OPFS handle
 cannot -- should pay per section rather than per lookup.
 
 `count(key)` and `countFixed(key, width)` are two different things and the
-difference is 28x. See `f28-count` and W2.1-W2.4 in supdb-bench: an `Ext`
+difference is 28x. See `f28-count` and W2.1-W2.4 in the previous suite: an `Ext`
 records block, offset, byte length and the offset of the last record, and none
 of those is a count, so the general count walks the values -- and walking them
 is *not* cheaper than reading them, which is W2.1 and is recorded as failing.
@@ -232,8 +232,7 @@ the intersection to 1.15x (EXT.17).
 ## Size
 
 `build.sh` builds the module and an empty cdylib beside it and prints the four
-sizes; the budget those are held to is a claim, so it lives with the claims in
-[supdb-bench](https://github.com/bfulton/supdb-bench). There is no binding
+sizes; nothing here decides whether a size is acceptable. There is no binding
 generator: the ABI is twenty-eight hand-written C functions passing integers
 and byte ranges, because a generator's shim and descriptor sections are
 exactly what the budget is about.
@@ -256,7 +255,7 @@ failed its checksum came back empty — an under-return, which is the one
 thing this index may never do, reported by the first downstream integration.
 The convention now is one rule applied everywhere: normalize to unsigned at
 the boundary (`v >>> 0`, `BigInt.asUintN(64, v)`), compare unsigned, return
-unsigned. supdb-bench's `web/test/node.mjs` holds the door shut, from the zeroed-object
+unsigned. The previous suite's `web/test/node.mjs` held the door shut, from the zeroed-object
 repro down to a corrupt block byte throwing on every read rather than only
 the first.
 

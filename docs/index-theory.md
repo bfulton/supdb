@@ -4,9 +4,9 @@
 the result — including the places the theory predicts something the
 measurement does not show, which are the interesting places.
 
-The experiment, its claims and the results it wrote are in
-[supdb-bench](https://github.com/bfulton/supdb-bench); paths below are that
-repository's. All figures are 10M sixteen-byte decimal keys, `--profile full`,
+The experiment, its claims and the results it wrote were the previous
+suite's and are in the history of the supdb-bench repository; paths below
+are that repository's. All figures are 10M sixteen-byte decimal keys, `--profile full`,
 from `results/f9-index-layout.full.json`. The two fixed-extent paged arms are also
 measured pairwise against their varint originals, interleaved in one process,
 in `results/f10-pair-*.full.json`; the probe's own cross-layout figures come

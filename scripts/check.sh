@@ -18,19 +18,19 @@
 #   lint     clippy at -D warnings, and the format gate
 #   wasm     the browser reader and its floor, built for wasm32-unknown-unknown
 #            by web/build.sh
+#   bench    the benchmark suite in bench/: its build, tests and lint, through
+#            its own scripts/check.sh. Builds the comparators, which is a
+#            ten-minute C++ build the first time and cached after
+#   quick    one quick-scale measurement of every arm, the gate against
+#            bench/runs/, and the figures. Not in the default set: it is a
+#            timing run and needs the machine to itself
 #
 # Not here, deliberately: cross-arm, which needs a cross toolchain and qemu
-# and so is CI-only; and the falsification suite, which lives in supdb-bench
-# together with the claims it checks and the results they are checked against.
-# CI runs that suite against every pull request here, with this checkout
-# standing in for the bench repository's submodule -- the `bench` job in
-# .github/workflows/ci.yml -- so a claim about the engine still cannot go
-# stale without a build going red. The browser test went with it, because it
-# is an experiment with a recorded expected state, not a build step.
+# and so is CI-only.
 set -eu
 cd "$(dirname "$0")/.."
 
-ALL="build test lint wasm"
+ALL="build test lint wasm bench"
 # Lowercase because `GROUPS` is a built-in bash variable holding the current
 # user's group ids. Assigning to it does not take, so on any host where
 # /bin/sh is bash -- macOS ships bash 3.2 as /bin/sh -- this loop would have
@@ -57,10 +57,17 @@ for g in $groups; do
       ;;
     wasm)
       say "wasm"
-      # Builds the module and the floor and prints their sizes. Whether a
-      # size is acceptable is a claim, and claims are gated in supdb-bench;
-      # here the check is that the module still links.
+      # Builds the module and the floor and prints their sizes; the check
+      # is that the module still links.
       sh web/build.sh
+      ;;
+    bench)
+      say "bench"
+      sh bench/scripts/check.sh build test lint
+      ;;
+    quick)
+      say "quick"
+      sh bench/scripts/check.sh quick
       ;;
     *)
       echo "unknown group: $g" >&2

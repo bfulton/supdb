@@ -15,8 +15,9 @@
 //!   decompresses nothing and the file is the larger for it. Compression is
 //!   per segment rather than global, and `W6.8` prices it on a real index.
 //!
-//! Those claim ids, and the measurements behind them, live in
-//! [supdb-bench](https://github.com/bfulton/supdb-bench). The four as stated:
+//! Those claim ids name the previous suite's claims, in the supdb-bench
+//! repository's history; the live measurements are `bench/`. The four as
+//! stated:
 //!
 //! 1. Append throughput and flush cost are what an append-only log actually
 //!    wins (2-2.6x and 17-39x respectively), and they survived every
