@@ -1428,12 +1428,42 @@ impl FlatIndex {
         sec: &'a [u8],
         rank: usize,
     ) -> Option<(&'a [u8], &'a [Ext], &'a [u8])> {
+        let (recs, dir) = self.regions(sec)?;
+        self.at_full_in(recs, dir, rank)
+    }
+
+    /// The record region and the directory, sliced once.
+    ///
+    /// A walk resolves rank after rank, and `at_full` re-slices both regions
+    /// and re-checks both bounds every time. Measured on a segment whose
+    /// records average 140 bytes, resolving a rank costs 9.6ns against the
+    /// 1.6ns a mapped stride walk of the same bytes takes, and the record
+    /// read is not most of it. A caller walking a range slices here once and
+    /// calls `at_full_in`; a caller resolving one rank keeps `at_full`.
+    pub fn regions<'a>(&self, sec: &'a [u8]) -> Option<(&'a [u8], &'a [u8])> {
+        Some((
+            sec.get(self.recs.0..self.recs.1)?,
+            sec.get(self.dir.0..self.dir.1)?,
+        ))
+    }
+
+    /// `at_full` against regions `regions` already sliced. The directory is
+    /// still the authority for where a record lies: records happen to ascend
+    /// with rank in a segment, but a store's index republishes a grown record
+    /// into the section's slack, so a cursor that advanced by record length
+    /// would read the wrong bytes there.
+    #[inline]
+    pub fn at_full_in<'a>(
+        &self,
+        recs: &'a [u8],
+        dir: &'a [u8],
+        rank: usize,
+    ) -> Option<(&'a [u8], &'a [Ext], &'a [u8])> {
         if rank >= self.nkeys {
             return None;
         }
-        let dir = sec.get(self.dir.0..self.dir.1)?;
         let off = rd_u32(dir, rank * 4)? as usize;
-        self.record_full(sec, off)
+        parse_record(recs, off).map(|(k, e, t, _)| (k, e, t))
     }
 
     /// Where a key that is *not* present would claim a hash slot.

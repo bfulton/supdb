@@ -1351,8 +1351,14 @@ impl<B: Bytes> Blob<B> {
     ) -> Result<usize> {
         let mut rank = self.seek(from);
         let mut seen = 0usize;
+        let walk = self
+            .flat()
+            .and_then(|(sec, idx)| idx.regions(sec).map(|(recs, dir)| (idx, recs, dir)));
         while seen < limit {
-            let Some((k, exts)) = self.exts_at(rank) else {
+            let Some((k, exts)) = (match walk {
+                Some((idx, recs, dir)) => idx.at_full_in(recs, dir, rank).map(|(k, e, _)| (k, e)),
+                None => self.exts_at(rank),
+            }) else {
                 break;
             };
             // Read out of the extent records before the callback so the borrow
@@ -1392,8 +1398,14 @@ impl<B: Bytes> Blob<B> {
         let stride = width as u64 + varint_len(width as u64);
         let mut rank = self.seek(from);
         let mut seen = 0usize;
+        let walk = self
+            .flat()
+            .and_then(|(sec, idx)| idx.regions(sec).map(|(recs, dir)| (idx, recs, dir)));
         while seen < limit {
-            let Some((k, exts)) = self.exts_at(rank) else {
+            let Some((k, exts)) = (match walk {
+                Some((idx, recs, dir)) => idx.at_full_in(recs, dir, rank).map(|(k, e, _)| (k, e)),
+                None => self.exts_at(rank),
+            }) else {
                 break;
             };
             let n = fixed_count(exts, stride, width as u64);
@@ -1476,8 +1488,18 @@ impl<B: Bytes> Blob<B> {
         let mut rank = self.seek(from);
         let mut seen = 0usize;
         let mut cached: Option<(u32, &[u8])> = None;
+        // The regions once, not once a key: `exts_at_full` re-resolves the
+        // section and re-slices the directory and the records every call, and
+        // that plumbing rather than the record read is most of what resolving
+        // a rank costs.
+        let walk = self
+            .flat()
+            .and_then(|(sec, idx)| idx.regions(sec).map(|(recs, dir)| (idx, recs, dir)));
         while seen < limit {
-            let Some((k, exts, tail)) = self.exts_at_full(rank) else {
+            let Some((k, exts, tail)) = (match walk {
+                Some((idx, recs, dir)) => idx.at_full_in(recs, dir, rank),
+                None => self.exts_at_full(rank),
+            }) else {
                 break;
             };
             for e in exts {
