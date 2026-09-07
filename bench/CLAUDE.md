@@ -41,6 +41,21 @@ other is not a measurement. This includes your own agents.
 **Two rows is not a band.** The gate says "insufficient history" below
 three prior rows rather than pretending.
 
+**An A/B of two engine revisions is two runs, however you interleave
+them.** There is no arm for "the other revision", so the only honest shape
+is two binaries alternated within one sitting, several rounds each -- and
+even that is not a result until an independent sitting says the same.
+Pricing a branch here, a comparison of two full rows found a 32% load
+regression and a 1.9x scan regression that were both the machine; the
+alternating rerun found a 5% load regression at 300k and a 6% read
+regression at 100k that the next sitting turned into no effect and a 24%
+IMPROVEMENT. What survived every sitting was the large effects and the
+one quantity that is not a rate: device bytes per byte stored came back
+identical to three decimals every time, and it is what named the
+mechanism. Prefer the deterministic quantity for the WHY, demand a second
+sitting for the WHETHER, and claim nothing from a margin that only one
+sitting has seen.
+
 **Nothing typed.** The window of ten is the one parameter and it is stated
 once, in `DESIGN.md`. The moment a threshold appears in code, ask what
 measured quantity it is standing in for.
