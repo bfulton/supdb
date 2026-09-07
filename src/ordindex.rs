@@ -199,19 +199,39 @@ impl OrdIndex {
         u64::from_be_bytes(self.map.0[at..at + HEAD].try_into().expect("eight bytes"))
     }
 
-    /// The first rank at or after `from` whose head is greater than `h`.
+    /// The end of the run of heads equal to `h` that starts at `from`.
+    ///
+    /// Galloping, not a binary search over the whole array. A run is one
+    /// entry long whenever the head separates the keys, which is the usual
+    /// case and is every case in the suite -- and a seek for a key that is
+    /// PRESENT always reaches here, because its head necessarily matches.
+    /// Searching the whole array for the end of a run of one made every such
+    /// seek pay the binary search twice: measured, a seek that should cost
+    /// one search over the heads plus one key comparison was costing about
+    /// three times that.
     #[inline]
-    fn upper(&self, h: u64, from: usize) -> usize {
-        let (mut lo, mut hi) = (from, self.n);
-        while lo < hi {
-            let m = (lo + hi) / 2;
-            if self.head(m) <= h {
-                lo = m + 1;
+    fn run_end(&self, h: u64, from: usize) -> usize {
+        let mut lo = from;
+        let mut step = 1usize;
+        loop {
+            let p = from.saturating_add(step);
+            if p >= self.n || self.head(p) != h {
+                break;
+            }
+            lo = p;
+            step *= 2;
+        }
+        let mut hi = from.saturating_add(step).min(self.n);
+        let mut a = lo + 1;
+        while a < hi {
+            let m = (a + hi) / 2;
+            if self.head(m) == h {
+                a = m + 1;
             } else {
                 hi = m;
             }
         }
-        lo
+        a
     }
 
     /// The first rank whose key is not less than `key` -- what `Blob::seek`
@@ -237,7 +257,7 @@ impl OrdIndex {
         if lo >= self.n || self.head(lo) != h {
             return lo;
         }
-        let (mut a, mut b) = (lo, self.upper(h, lo));
+        let (mut a, mut b) = (lo, self.run_end(h, lo));
         while a < b {
             let m = (a + b) / 2;
             // A rank the segment will not resolve sorts as "not less", the
