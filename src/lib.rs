@@ -101,5 +101,3 @@ pub use db::{
     BackgroundIo, Db, Options, ReadAdvice, SegmentOptions, SegmentWrite, SegmentWriter, SyncPolicy,
     Txn,
 };
-#[cfg(not(target_family = "wasm"))]
-pub use ordindex::ScanIndex;

@@ -34,23 +34,7 @@ use crate::block::{self, crc32, BlockBuilder, BlockLoc};
 use crate::bytes::MmapBytes;
 use crate::flatindex;
 use crate::index::{Ext, Extents};
-use crate::ordindex::{self, OrdIndex, ScanIndex};
 use crate::Blob;
-
-/// The ordered index for a segment just written at `tmp`.
-///
-/// `Heads` is composed from the keys the writer already held, which costs
-/// 2.2ns a key. The other levels need where every key and value landed, and
-/// only the finished segment knows that, so they re-read it -- 20.2ns a key,
-/// which is what those levels cost the write path.
-fn ord_bytes(tmp: &Path, heads: Vec<u8>, level: ScanIndex) -> Result<Vec<u8>> {
-    if level == ScanIndex::Heads {
-        return Ok(heads);
-    }
-    let blob = Blob::open(MmapBytes::open(tmp)?)
-        .map_err(|e| err(&format!("ordered index: reopening the segment: {e}")))?;
-    ordindex::from_segment(&blob, level)
-}
 
 /// Write a segment's ordered index and make it durable.
 ///
@@ -290,12 +274,6 @@ pub struct Options {
     /// fdatasync of an append that grows the file commits an inode change
     /// through the journal; an overwrite does not, and LMDB's commit is an
     /// overwrite.
-    /// How much a segment's ordered index stores, and so what a scan costs.
-    ///
-    /// `Heads` by default: measured, the levels above it are faster only for
-    /// a caller that reads no value bytes and slower for one that does.
-    /// `crate::ordindex` carries the table and the reason.
-    pub scan_index: ScanIndex,
     /// How reads advise the kernel about the segment mappings.
     ///
     /// See `ReadAdvice`. `Adaptive` unless changed.
@@ -339,7 +317,6 @@ impl Default for Options {
             flush_ranges: true,
             promote: true,
             recycle_wal: false,
-            scan_index: ScanIndex::default(),
             read_advice: ReadAdvice::default(),
             scan_merge: true,
             scan_snapshot_arena: true,
@@ -812,7 +789,7 @@ struct Seg {
     /// rather than sending the seek back to `Blob::seek`. A fallback would
     /// be the slow path taken silently, which is the shape of every gate
     /// this repository has broken.
-    ord: OrdIndex,
+    ord: crate::ordindex::OrdIndex,
     /// Whether any extent here carries the tombstone flag. A read consults
     /// it before paying the newest-first pass that tombstones require.
     ///
@@ -1745,7 +1722,7 @@ impl Default for SegmentOptions {
 /// two in one process and price the change honestly. That comparison is
 /// settled and the old path is gone, so what is left is a thin shim that
 /// keeps `flush` and `merge` reading as a sequence of begin/value/end calls.
-struct PieceWriter(Box<SegmentWriter>, ordindex::Builder);
+struct PieceWriter(Box<SegmentWriter>, crate::ordindex::Builder);
 
 impl PieceWriter {
     fn create(
@@ -1757,7 +1734,7 @@ impl PieceWriter {
         let mut w = SegmentWriter::create(path, opts)?;
         w.set_sync_every(sync_every);
         w.set_inline_max(inline_max);
-        Ok(PieceWriter(Box::new(w), ordindex::Builder::new()))
+        Ok(PieceWriter(Box::new(w), crate::ordindex::Builder::new()))
     }
 
     fn begin(&mut self, k: &[u8]) -> Result<()> {
@@ -1818,7 +1795,7 @@ impl Seg {
             blob.advise_random();
         }
         let oname = Db::ord_name_for(name).ok_or_else(|| err("segment name is malformed"))?;
-        let ord = OrdIndex::open(&dir.join(&oname), blob.keys())
+        let ord = crate::ordindex::OrdIndex::open(&dir.join(&oname), blob.keys())
             .map_err(|e| err(&format!("segment {name}: {e}")))?;
         // `pcs-` is a range-ALIGNED L0 piece: a seal split at the live
         // partition boundaries, so it carries a fence like a partition and
@@ -2284,7 +2261,6 @@ struct MergePlan {
     background_io: BackgroundIo,
     sync_every: usize,
     inline_max: usize,
-    scan_index: ScanIndex,
 }
 
 fn compact_job(plan: MergePlan) -> Result<Vec<String>> {
@@ -2410,7 +2386,6 @@ struct Emitter<'a> {
     opts: &'a SegmentOptions,
     sync_every: usize,
     inline_max: usize,
-    scan_index: ScanIndex,
     pieces: Vec<Piece>,
     pi: usize,
     r: usize,
@@ -2461,7 +2436,6 @@ impl Emitter<'_> {
                 .finish()
                 .map_err(|e| err(&format!("compact finish: {e}")))?;
             let p = &self.pieces[self.pi];
-            let ord = ord_bytes(&p.tmp, ord, self.scan_index)?;
             write_ord(self.dir, &p.name, &ord)?;
             std::fs::rename(&p.tmp, self.dir.join(&p.name))?;
             self.out.push(p.name.clone());
@@ -2511,7 +2485,6 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         background_io,
         sync_every,
         inline_max,
-        scan_index,
     } = plan;
     if background_io == BackgroundIo::Idle {
         idle_io_priority();
@@ -2670,7 +2643,6 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         opts: &opts,
         sync_every,
         inline_max,
-        scan_index,
         pieces,
         pi: 0,
         r: 0,
@@ -3314,7 +3286,6 @@ impl Db {
         let background_io = self.opts.background_io;
         let sync_every = self.opts.seal_sync_every;
         let inline_max = self.opts.inline_bytes;
-        let scan_index = self.opts.scan_index;
         let end_seq = old_wal.seq;
         self.retiring_wals.push(old_wal.path.clone());
         drop(old_wal);
@@ -3387,7 +3358,6 @@ impl Db {
                 };
                 // Before the segment's own rename, so the segment never
                 // exists without it.
-                let ord = ord_bytes(&tmp, ord, scan_index)?;
                 write_ord(&dir, &name, &ord)?;
                 std::fs::rename(&tmp, dir.join(&name))?;
                 names.push(name);
@@ -3957,7 +3927,6 @@ impl Db {
         self.next_seg += (parts * 4).max(8) as u64;
         let dir = self.dir.clone();
         let opts = Db::segment_opts(&self.opts);
-        let scan_index = self.opts.scan_index;
         let cursors = self.opts.cursor_merge;
         let background_io = self.opts.background_io;
         let sync_every = self.opts.seal_sync_every;
@@ -3977,7 +3946,6 @@ impl Db {
                 background_io,
                 sync_every,
                 inline_max,
-                scan_index,
             })
         });
         self.compacting = Some((inputs, handle));
@@ -4309,16 +4277,10 @@ impl Db {
                 // the whole point of the index -- the seek was the entire
                 // measured deficit and the walk was already competitive.
                 let rank = seg.ord.seek(cursor, |r| seg.blob.key_at(r));
-                // With references the walk hands back slices without parsing
-                // a record; `Heads` has none and says so, and then the
-                // reader's own walk is what runs.
-                seen += match seg.ord.walk(seg.blob.mapped(), rank, limit - seen, &mut f) {
-                    Some(got) => got,
-                    None => seg
-                        .blob
-                        .scan_at(rank, limit - seen, &mut f)
-                        .map_err(|e| err(&format!("segment scan: {e}")))?,
-                };
+                seen += seg
+                    .blob
+                    .scan_at(rank, limit - seen, &mut f)
+                    .map_err(|e| err(&format!("segment scan: {e}")))?;
                 match &seg.hi {
                     Some(h) => cursor = h.as_slice(),
                     None => break,
