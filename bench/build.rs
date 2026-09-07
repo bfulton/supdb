@@ -16,6 +16,17 @@ fn main() {
     for p in git_paths() {
         println!("cargo:rerun-if-changed={p}");
     }
+    // Nor are the refs enough. Editing the sources moves neither HEAD nor a
+    // ref, so this script did not re-run, cargo replayed the stamp it had,
+    // and the row named a commit whose code it was not built from with the
+    // `-dirty` below never firing -- which is how an A/B of two engine
+    // revisions wrote two rows bearing one SHA. The stamp describes the
+    // sources, so the sources are what it watches.
+    for p in ["../src", "src", "../Cargo.toml", "Cargo.toml"] {
+        if std::path::Path::new(p).exists() {
+            println!("cargo:rerun-if-changed={p}");
+        }
+    }
     println!("cargo:rustc-env=SUPDB_SHA={}", sha());
     println!("cargo:rustc-env=SUPDB_RUSTC={}", rustc());
 }

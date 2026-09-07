@@ -17,7 +17,7 @@ Five, plus two floors. Each yields one or more quantities.
 | `load` | n keys in key order, 100-byte values, durable per batch | ops/s, device bytes written per byte stored |
 | `load-shuffled` | the same keys in shuffled order | ops/s |
 | `read` | uniform point reads over the loaded set | reads/s, p99 µs |
-| `scan` | one ordered pass over everything | entries/s |
+| `scan` | `size/100` scans of 100 entries, from uniform random starts | entries/s |
 | `ycsb` | core A–F on the loaded store, zipfian, a sixth of the keys in operations per mix | ops/s per mix |
 | `wal-floor` | framed 1,000-record batches appended to one file, one `fdatasync` each, no engine | ops/s |
 | `scan-floor` | one `mmap` sequential walk of a file the top rung's size (capped at 4 GiB), no engine | bytes/s |
