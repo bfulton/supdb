@@ -1781,7 +1781,12 @@ impl Seg {
     /// already in. Passing the option here instead is silent -- reads stay
     /// correct and only the advice goes stale -- which is why `advice_random`
     /// is there to be checked against the mappings rather than trusted.
-    fn open(dir: &Path, name: &str, random: bool) -> Result<Seg> {
+    /// `verify` is the store's own checksum option. It has to be passed
+    /// because the switch the writer used is process-wide and a reader
+    /// process need never have written a segment: read it off a global and
+    /// a store written with checksums off is refused by the engine that
+    /// wrote it, on every run whose values reached a block.
+    fn open(dir: &Path, name: &str, random: bool, verify: bool) -> Result<Seg> {
         let src = MmapBytes::open(&dir.join(name)).map_err(|e| {
             // A manifest naming a segment that is not on disk is a damaged
             // store, not a missing file, and saying so is the difference
@@ -1790,7 +1795,14 @@ impl Seg {
                 "the manifest names segment {name}, which is not in the store: {e}"
             ))
         })?;
-        let blob = Blob::open(src).map_err(|e| err(&format!("segment {name}: {e}")))?;
+        let blob = Blob::open_with(
+            src,
+            crate::blob::BlobOptions {
+                verify_checksums: verify,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| err(&format!("segment {name}: {e}")))?;
         if random {
             blob.advise_random();
         }
@@ -2492,8 +2504,14 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     let mut blobs = Vec::with_capacity(inputs.len());
     for name in &inputs {
         blobs.push(
-            Blob::open(MmapBytes::open(&dir.join(name))?)
-                .map_err(|e| err(&format!("compact input {name}: {e}")))?,
+            Blob::open_with(
+                MmapBytes::open(&dir.join(name))?,
+                crate::blob::BlobOptions {
+                    verify_checksums: opts.checksums,
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| err(&format!("compact input {name}: {e}")))?,
         );
     }
 
@@ -3074,7 +3092,7 @@ impl Db {
         let starts_random = opts.read_advice.starts_random();
         let mut segs = Vec::with_capacity(live.len());
         for name in &live {
-            segs.push(Seg::open(dir, name, starts_random)?);
+            segs.push(Seg::open(dir, name, starts_random, opts.segment.checksums)?);
         }
         segs.sort_by(|a, b| {
             b.level
@@ -3520,8 +3538,12 @@ impl Db {
         }
         for name in &names {
             self.covered_seq = self.covered_seq.max(Db::name_end_seq(name).unwrap_or(0));
-            self.segs
-                .push(Seg::open(&self.dir, name, self.advice_random.get())?);
+            self.segs.push(Seg::open(
+                &self.dir,
+                name,
+                self.advice_random.get(),
+                self.opts.segment.checksums,
+            )?);
         }
         self.sort_segs();
         self.frozen = None;
@@ -3970,7 +3992,12 @@ impl Db {
         }
         let mut merged = Vec::with_capacity(outputs.len());
         for name in &outputs {
-            merged.push(Seg::open(&self.dir, name, self.advice_random.get())?);
+            merged.push(Seg::open(
+                &self.dir,
+                name,
+                self.advice_random.get(),
+                self.opts.segment.checksums,
+            )?);
         }
         // Partitions first (older, disjoint), then whatever L0 arrived
         // while the merge ran, oldest to newest.

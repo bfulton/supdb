@@ -1097,7 +1097,14 @@ impl<B: Bytes> Blob<B> {
                     dec.resize(un, 0);
                 }
                 if loc.chunked {
-                    block::read_chunked_range(raw, un, a, b, &mut dec[..un])?;
+                    block::read_chunked_range(
+                        raw,
+                        un,
+                        a,
+                        b,
+                        &mut dec[..un],
+                        self.opts.verify_checksums,
+                    )?;
                 } else {
                     self.verify(e.block, loc, raw, 0, 0, raw.len())?;
                     block::decompress_into(raw, &mut dec, un)?;

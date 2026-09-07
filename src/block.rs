@@ -381,8 +381,14 @@ pub fn chunk_crcs(bytes: &[u8]) -> Option<[u32; MAX_CHUNK_CRCS]> {
 /// chunks decompress less per read and compress slightly worse; the reader
 /// takes the size from the block header, so this is a write-time choice and
 /// old blocks stay readable.
-/// When false, chunk checksums are written as zero and not verified. Set once
-/// at store creation; this is a measurement knob, not a per-call switch.
+/// When false, chunk checksums are written as zero. Set once at store
+/// creation; this is a measurement knob, not a per-call switch, and it is
+/// WRITE time only. Whether a reader verifies is the reader's own
+/// `BlobOptions::verify_checksums`, threaded down to the decoders here,
+/// because this switch is process-wide: while the read path consulted it,
+/// a store written with checksums off and then opened by any process that
+/// had not itself written a segment verified the zeroes it had stored on
+/// purpose and refused every run that reached a block.
 pub static CHECKSUMS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 #[inline]
@@ -468,6 +474,7 @@ pub fn read_chunks_into(
     b: usize,
     dst: &mut [u8],
     have: &mut [u64],
+    verify: bool,
 ) -> std::io::Result<()> {
     let Some((cs, n)) = chunk_geometry(blk) else {
         return Err(std::io::Error::new(
@@ -506,7 +513,7 @@ pub fn read_chunks_into(
             ));
         }
         let raw = &blk[header + s0..header + s1];
-        if checksums_on() && crc32(raw) != stored_crc(i) {
+        if verify && crc32(raw) != stored_crc(i) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "chunk checksum mismatch: these bytes are not what was written",
@@ -530,6 +537,7 @@ pub fn read_chunked_range(
     a: usize,
     b: usize,
     dst: &mut [u8],
+    verify: bool,
 ) -> std::io::Result<()> {
     // These bytes may not be a chunk directory at all -- under Retain::Reclaim
     // the space a superseded value occupied can have been written over. Decode
@@ -575,7 +583,7 @@ pub fn read_chunked_range(
         // Verify before decoding. LZ4 decodes many corrupted inputs into
         // plausible bytes, so a successful decompression is not evidence that
         // the bytes are the ones that were written.
-        if checksums_on() && crc32(raw) != stored_crc(i) {
+        if verify && crc32(raw) != stored_crc(i) {
             return Err(bad("chunk checksum mismatch"));
         }
         let lo = i * cs;
@@ -605,7 +613,7 @@ mod checksum_tests {
         let src = payload();
         let blk = write_chunked_sz(&src, 1024);
         let mut out = vec![0u8; src.len()];
-        read_chunked_range(&blk, src.len(), 0, src.len(), &mut out).unwrap();
+        read_chunked_range(&blk, src.len(), 0, src.len(), &mut out, true).unwrap();
         assert_eq!(out, src);
     }
 
@@ -625,7 +633,7 @@ mod checksum_tests {
             let mut damaged = blk.clone();
             damaged[off] ^= 0x01;
             let mut out = vec![0u8; src.len()];
-            match read_chunked_range(&damaged, src.len(), 0, src.len(), &mut out) {
+            match read_chunked_range(&damaged, src.len(), 0, src.len(), &mut out, true) {
                 Err(_) => caught += 1,
                 Ok(()) => {
                     if out == src {
@@ -652,7 +660,7 @@ mod checksum_tests {
             damaged[off] ^= 0xff;
             let mut out = vec![0u8; src.len()];
             // Either an error or a correct decode; never a panic.
-            let _ = read_chunked_range(&damaged, src.len(), 0, src.len(), &mut out);
+            let _ = read_chunked_range(&damaged, src.len(), 0, src.len(), &mut out, true);
         }
     }
 
