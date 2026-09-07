@@ -470,6 +470,111 @@ fn a_lone_piece_holding_a_tombstone_still_merges() {
     db.close().unwrap();
 }
 
+fn ord_names(d: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(d)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("ord-"))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Every live segment has an ordered index, and the store refuses to open
+/// without it.
+///
+/// There is deliberately no fallback to `Blob::seek`. A reader that quietly
+/// took the slow path when the index was missing would answer correctly
+/// forever and never say so -- the shape of every gate this repository has
+/// broken -- so a missing or damaged index is damage, like a torn key
+/// section, and the open fails.
+#[test]
+fn a_segment_without_its_ordered_index_refuses_to_open() {
+    let d = dir("ord-required");
+    let mut db = Db::create(&d, Options::default()).unwrap();
+    for k in 0u32..2_000 {
+        db.append(
+            format!("key-{k:05}").as_bytes(),
+            format!("v-{k}").as_bytes(),
+        );
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    let segs = seg_names(&d);
+    let ords = ord_names(&d);
+    assert_eq!(
+        ords.len(),
+        segs.len(),
+        "one index a segment: {segs:?} {ords:?}"
+    );
+    assert_eq!(read_vec(&db, b"key-00500"), vec![b"v-500".to_vec()]);
+    db.close().unwrap();
+
+    // Reopens cleanly as it stands.
+    let db = Db::open(&d, Options::default()).unwrap();
+    assert_eq!(read_vec(&db, b"key-00500"), vec![b"v-500".to_vec()]);
+    db.close().unwrap();
+
+    // Damaged: a flipped byte fails the open rather than falling back.
+    let victim = d.join(&ords[0]);
+    let mut bytes = std::fs::read(&victim).unwrap();
+    let at = bytes.len() / 2;
+    bytes[at] ^= 0x40;
+    std::fs::write(&victim, &bytes).unwrap();
+    assert!(
+        Db::open(&d, Options::default()).is_err(),
+        "opened over a damaged ordered index"
+    );
+
+    // Absent: the same answer, not a silent slow path.
+    std::fs::remove_file(&victim).unwrap();
+    assert!(
+        Db::open(&d, Options::default()).is_err(),
+        "opened with an ordered index missing"
+    );
+}
+
+/// The index has to survive a promotion, which renames the segment. It is
+/// named by the id and covered end-sequence, which a promotion keeps, so
+/// there is nothing to rename -- and this is what says so.
+#[test]
+fn an_ordered_index_survives_promotion_and_reopen() {
+    let d = dir("ord-promote");
+    let mut db = Db::create(&d, small_opts(3)).unwrap();
+    let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+    for k in 0u32..4_000 {
+        let key = format!("key-{k:06}").into_bytes();
+        let val = format!("v-{k}").into_bytes();
+        db.append(&key, &val);
+        model.insert(key, vec![val]);
+        if k % 500 == 499 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.close().unwrap();
+
+    let db = Db::open(&d, small_opts(3)).unwrap();
+    assert_eq!(ord_names(&d).len(), seg_names(&d).len());
+    for (key, want) in &model {
+        assert_eq!(
+            &read_vec(&db, key),
+            want,
+            "key {}",
+            String::from_utf8_lossy(key)
+        );
+    }
+    let mut seen = Vec::new();
+    db.scan(b"", model.len(), |k, _| seen.push(k.to_vec()))
+        .unwrap();
+    let mut want: Vec<Vec<u8>> = model.keys().cloned().collect();
+    want.sort();
+    assert_eq!(seen, want, "ordered scan after promotion and reopen");
+    db.close().unwrap();
+}
+
 fn small_opts(l0_trigger: usize) -> Options {
     // Small enough that a few hundred records seal and compact, so the
     // level machinery is exercised at test scale rather than described.

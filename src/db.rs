@@ -36,6 +36,23 @@ use crate::flatindex;
 use crate::index::{Ext, Extents};
 use crate::Blob;
 
+/// Write a segment's ordered index and make it durable.
+///
+/// The caller renames the segment into place AFTER this returns, which is
+/// the whole ordering: a segment that exists has an index, so a reader never
+/// meets one without. A crash between the two leaves an index no segment
+/// names, which the orphan sweep at open removes.
+fn write_ord(dir: &Path, seg_name: &str, bytes: &[u8]) -> Result<()> {
+    let name = Db::ord_name_for(seg_name).ok_or_else(|| err("segment name is malformed"))?;
+    let tmp = dir.join(format!("{name}.tmp"));
+    let mut f = File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, dir.join(&name))?;
+    Ok(())
+}
+
 fn err(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
 }
@@ -766,14 +783,25 @@ struct Seg {
     lo: Vec<u8>,
     hi: Option<Vec<u8>>,
     bloom: Option<BlockedBloom>,
+    /// The segment's ordered index, mapped. Not optional: it is written
+    /// before its segment is renamed into place, so a segment a reader can
+    /// see always has one, and a missing or damaged one fails the open
+    /// rather than sending the seek back to `Blob::seek`. A fallback would
+    /// be the slow path taken silently, which is the shape of every gate
+    /// this repository has broken.
+    ord: crate::ordindex::OrdIndex,
     /// Whether any extent here carries the tombstone flag. A read consults
     /// it before paying the newest-first pass that tombstones require.
     ///
-    /// A partition a merge wrote is always false, because a merge writes the
-    /// bottom level and drops them. A partition a PROMOTION made is whatever
-    /// its piece was: promotion renames the file and keeps this flag with it,
-    /// which is why the read path tests the flag per segment rather than
-    /// assuming it from the level.
+    /// False for every partition, and `Seg::open` assumes that for a `par-`
+    /// name rather than walking the keys to find out. A merge earns it by
+    /// writing the bottom level and dropping them. A promotion does not --
+    /// it renames the file as it stands -- but it does not need to: the
+    /// partitions tile the key space, so a promoted piece is the only and
+    /// therefore the oldest source over its own range, and a tombstone with
+    /// nothing older beneath it masks nothing. What the flag would still
+    /// have bought is the reclaim, which is why `promote_unpartitioned`
+    /// leaves a lone piece holding one to the merge.
     tombs: bool,
 }
 
@@ -1694,7 +1722,7 @@ impl Default for SegmentOptions {
 /// two in one process and price the change honestly. That comparison is
 /// settled and the old path is gone, so what is left is a thin shim that
 /// keeps `flush` and `merge` reading as a sequence of begin/value/end calls.
-struct PieceWriter(Box<SegmentWriter>);
+struct PieceWriter(Box<SegmentWriter>, crate::ordindex::Builder);
 
 impl PieceWriter {
     fn create(
@@ -1706,10 +1734,14 @@ impl PieceWriter {
         let mut w = SegmentWriter::create(path, opts)?;
         w.set_sync_every(sync_every);
         w.set_inline_max(inline_max);
-        Ok(PieceWriter(Box::new(w)))
+        Ok(PieceWriter(Box::new(w), crate::ordindex::Builder::new()))
     }
 
     fn begin(&mut self, k: &[u8]) -> Result<()> {
+        // The ordered index is composed here because here is where the keys
+        // already are, sorted: 2.2ns a key against the 20.2ns a later pass
+        // spends reading them back out of the finished segment.
+        self.1.push(k);
         self.0.begin(k)
     }
 
@@ -1722,8 +1754,12 @@ impl PieceWriter {
         self.0.end_with(tombstone)
     }
 
-    fn finish(self) -> Result<()> {
-        (*self.0).finish(1)
+    /// The segment, then its ordered index's bytes for the caller to write
+    /// beside it. Returning them rather than writing them keeps the naming
+    /// with the two callers that know the segment's final name.
+    fn finish(self) -> Result<Vec<u8>> {
+        (*self.0).finish(1)?;
+        Ok(self.1.finish())
     }
 }
 
@@ -1758,6 +1794,9 @@ impl Seg {
         if random {
             blob.advise_random();
         }
+        let oname = Db::ord_name_for(name).ok_or_else(|| err("segment name is malformed"))?;
+        let ord = crate::ordindex::OrdIndex::open(&dir.join(&oname), blob.keys())
+            .map_err(|e| err(&format!("segment {name}: {e}")))?;
         // `pcs-` is a range-ALIGNED L0 piece: a seal split at the live
         // partition boundaries, so it carries a fence like a partition and
         // overlaps only the pieces of its own range. That alignment is what
@@ -1784,6 +1823,7 @@ impl Seg {
                 lo,
                 hi,
                 bloom: Some(bloom),
+                ord,
                 tombs,
             });
         }
@@ -1811,6 +1851,7 @@ impl Seg {
                 lo,
                 hi,
                 bloom: None,
+                ord,
                 tombs: false,
             });
         }
@@ -1826,6 +1867,7 @@ impl Seg {
             lo: Vec::new(),
             hi: None,
             bloom: Some(bloom),
+            ord,
             tombs,
         })
     }
@@ -2390,9 +2432,11 @@ impl Emitter<'_> {
         self.r += 1;
         if self.r == to {
             let w = self.w.take().ok_or_else(|| err("merge piece not open"))?;
-            w.finish()
+            let ord = w
+                .finish()
                 .map_err(|e| err(&format!("compact finish: {e}")))?;
             let p = &self.pieces[self.pi];
+            write_ord(self.dir, &p.name, &ord)?;
             std::fs::rename(&p.tmp, self.dir.join(&p.name))?;
             self.out.push(p.name.clone());
             self.pi += 1;
@@ -2906,6 +2950,18 @@ impl Db {
         rest.strip_suffix(".sup")?.split('-').nth(i)?.parse().ok()
     }
 
+    /// A segment's ordered index is named by the two fields a promotion
+    /// keeps -- the id and the covered end-sequence -- and not by the
+    /// segment's file name, which a promotion rewrites. So a promotion has
+    /// nothing to do here at all.
+    fn ord_name(id: u64, end_seq: u64) -> String {
+        format!("ord-{id:08}-{end_seq:016}.oidx")
+    }
+
+    fn ord_name_for(seg: &str) -> Option<String> {
+        Some(Db::ord_name(Db::name_id(seg)?, Db::name_end_seq(seg)?))
+    }
+
     fn name_id(name: &str) -> Option<u64> {
         Db::name_field(name, 0)
     }
@@ -2998,6 +3054,19 @@ impl Db {
         // anything else is unreachable and is removed rather than kept.
         for name in &on_disk {
             if !live.contains(name) {
+                let _ = std::fs::remove_file(dir.join(name));
+            }
+        }
+        // The same for ordered indexes, which outlive their segment by a
+        // crash window at either end: written before a seal's rename, and
+        // still there after a merge unlinks its inputs. A promotion renames
+        // a segment but keeps the id and end-sequence its index is named by,
+        // so the live set below still claims it.
+        let live_ord: std::collections::HashSet<String> =
+            live.iter().filter_map(|n| Db::ord_name_for(n)).collect();
+        for entry in std::fs::read_dir(dir)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if name.starts_with("ord-") && !live_ord.contains(&name) {
                 let _ = std::fs::remove_file(dir.join(name));
             }
         }
@@ -3260,6 +3329,7 @@ impl Db {
                 let id = first_id + ri as u64;
                 let tmp = dir.join(format!("seal-{id:08}.tmp"));
                 let _ = std::fs::remove_file(&tmp);
+                let ord;
                 {
                     let mut w = PieceWriter::create(&tmp, &opts, sync_every, inline_max)
                         .map_err(|e| err(&format!("seal create: {e}")))?;
@@ -3275,7 +3345,7 @@ impl Db {
                         }
                         w.end_with(tomb)?;
                     }
-                    w.finish().map_err(|e| err(&format!("seal finish: {e}")))?;
+                    ord = w.finish().map_err(|e| err(&format!("seal finish: {e}")))?;
                 }
                 let name = if ranges.len() == 1 && lo.is_empty() && hi.is_none() {
                     Db::seg_name(id, end_seq)
@@ -3286,6 +3356,9 @@ impl Db {
                         hi.as_deref().map(hex).unwrap_or_default()
                     )
                 };
+                // Before the segment's own rename, so the segment never
+                // exists without it.
+                write_ord(&dir, &name, &ord)?;
                 std::fs::rename(&tmp, dir.join(&name))?;
                 names.push(name);
             }
@@ -4188,9 +4261,14 @@ impl Db {
                 if seg.lo.as_slice() > cursor.as_slice() {
                     cursor = seg.lo.clone();
                 }
+                // The ordered index answers the seek this scan starts
+                // with; the walk after it is the reader's own. That split is
+                // the whole point of the index -- the seek was the entire
+                // measured deficit and the walk was already competitive.
+                let rank = seg.ord.seek(&cursor, |r| seg.blob.key_at(r));
                 seen += seg
                     .blob
-                    .scan(&cursor, limit - seen, &mut f)
+                    .scan_at(rank, limit - seen, &mut f)
                     .map_err(|e| err(&format!("segment scan: {e}")))?;
                 match &seg.hi {
                     Some(h) => cursor = h.clone(),

@@ -1479,13 +1479,23 @@ impl<B: Bytes> Blob<B> {
         Ok(asked)
     }
 
-    pub fn scan<F: FnMut(&[u8], &[u8])>(
+    pub fn scan<F: FnMut(&[u8], &[u8])>(&self, from: &[u8], limit: usize, f: F) -> Result<usize> {
+        self.scan_at(self.seek(from), limit, f)
+    }
+
+    /// `scan`, from a rank a caller already has.
+    ///
+    /// `db::Db` has one out of its ordered index and would otherwise pay for
+    /// the seek twice. The rank is a position, not a promise: a rank past the
+    /// end walks nothing, exactly as a `from` above every key does.
+    pub fn scan_at<F: FnMut(&[u8], &[u8])>(
         &self,
-        from: &[u8],
+        from_rank: usize,
         limit: usize,
-        mut f: F,
+        f: F,
     ) -> Result<usize> {
-        let mut rank = self.seek(from);
+        let mut f = f;
+        let mut rank = from_rank;
         let mut seen = 0usize;
         let mut cached: Option<(u32, &[u8])> = None;
         // The regions once, not once a key: `exts_at_full` re-resolves the

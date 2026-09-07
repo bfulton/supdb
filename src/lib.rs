@@ -76,6 +76,11 @@ pub mod db;
 /// the exposure.
 #[allow(clippy::len_without_is_empty)]
 pub mod flatindex;
+/// The ordered index a scan seeks through: one companion file per segment,
+/// native only. The browser reader does not have it and does not need it --
+/// its dictionary walks go through `Blob` as they always did.
+#[cfg(not(target_family = "wasm"))]
+pub mod ordindex;
 pub mod reserve;
 /// The C ABI the browser calls. Hand-written rather than generated, because
 /// the size of what ships is budgeted.
