@@ -67,8 +67,28 @@ jobs:
           gh api -X POST "repos/$REPO/actions/runs/$RUN_ID/cancel" >/dev/null || true
           exit 1
 
+  # localmost's check falls back to a hosted runner when the Mac's heartbeat
+  # is stale, and for a smoke test that is right. For the sweep it is not:
+  # a timing run on a shared hosted VM produces a row that looks like a
+  # measurement and is not, and this workflow would have written one under
+  # the name `full` without anything saying so. Skipping instead would be a
+  # green run that measured nothing, which is the same fault wearing the
+  # other hat, so this fails and says which runner it got.
+  require-quiet-machine:
+    needs: [check]
+    if: needs.check.outputs.runner != 'self-hosted'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse to measure on a hosted runner
+        env:
+          RESOLVED: ${{ needs.check.outputs.runner }}
+        run: |
+          echo "::error title=no quiet machine::the runner resolved to '$RESOLVED', not the self-hosted Mac, so this sweep would be measuring a shared hosted VM. Bring localmost up on the quiet machine and dispatch again."
+          exit 1
+
   full:
     needs: [check]
+    if: needs.check.outputs.runner == 'self-hosted'
     runs-on: ${{ needs.check.outputs.runner }}
     timeout-minutes: 600
     steps:
