@@ -140,6 +140,13 @@
 //! is free: a chunk's bytes are lent to the caller, and a decompressed
 //! chunk has no bytes to lend.
 //!
+//! It is not free on the write path, and the suite is where that shows. Its
+//! eight bytes a key are eight bytes a key the seal writes and syncs, and a
+//! durable load is device bound, so the load axis pays them at any size
+//! where no rewrite is being eliminated at the same time. Removing its
+//! fsync does not get them back -- measured, that is not where the cost is;
+//! the bytes are. Price a change to this file on `load` as well as `scan`.
+//!
 //! It is a companion file rather than a region of the segment because that
 //! leaves the segment format, and the browser reader over it, untouched. It
 //! is written before its segment is renamed into place and is required to
