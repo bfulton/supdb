@@ -575,6 +575,82 @@ fn an_ordered_index_survives_promotion_and_reopen() {
     db.close().unwrap();
 }
 
+/// The three storage levels are a space-for-time dial and nothing else:
+/// they must answer identically, whatever they store.
+///
+/// `Heads` keeps only the seek's eight bytes a key and walks records.
+/// `Refs` adds where each key and value lies, so the walk parses nothing.
+/// `Copy` adds the bytes themselves, contiguous. Measured in the engine on
+/// 290k keys with one 100-byte value each, the levels above `Heads` are
+/// 1.89x on a scan that reads only lengths and 0.89x on one that reads
+/// values, for 12% and 76% more disk -- which is why `Heads` is the default
+/// and the others are asked for.
+#[test]
+fn every_scan_index_level_answers_the_same() {
+    use supdb::ScanIndex;
+    /// What one level answered: every (key, value) a scan emitted, and every
+    /// value a point read returned.
+    type Answers = (Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>);
+    let mut answers: Vec<Answers> = Vec::new();
+    let mut sizes: Vec<u64> = Vec::new();
+    for level in [ScanIndex::Heads, ScanIndex::Refs, ScanIndex::Copy] {
+        let d = dir(&format!("level-{level:?}"));
+        let opts = Options {
+            scan_index: level,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        for k in 0u32..3_000 {
+            let key = format!("key-{k:05}").into_bytes();
+            for r in 0..(k % 3) + 1 {
+                db.append(&key, format!("v{r}-{k}").as_bytes());
+            }
+        }
+        db.commit().unwrap();
+        // A delete so a key with nothing live is in the segment too: that
+        // shape wrote a region offset of zero and failed its own open.
+        db.delete(b"key-00007");
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.close().unwrap();
+
+        // Reopened, so the level came off disk rather than out of memory.
+        let db = Db::open(&d, opts).unwrap();
+        let mut scanned = Vec::new();
+        db.scan(b"", usize::MAX, |k, v| {
+            scanned.push((k.to_vec(), v.to_vec()))
+        })
+        .unwrap();
+        let reads: Vec<Vec<u8>> = (0u32..3_000)
+            .flat_map(|k| read_vec(&db, format!("key-{k:05}").as_bytes()))
+            .collect();
+        assert!(
+            read_vec(&db, b"key-00007").is_empty(),
+            "{level:?} lost a delete"
+        );
+        db.close().unwrap();
+        sizes.push(dir_bytes(&d));
+        answers.push((scanned, reads));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    assert_eq!(
+        answers[0], answers[1],
+        "Refs answers differently from Heads"
+    );
+    assert_eq!(
+        answers[0], answers[2],
+        "Copy answers differently from Heads"
+    );
+    assert!(
+        !answers[0].0.is_empty(),
+        "the scan returned nothing to compare"
+    );
+    assert!(
+        sizes[0] < sizes[1] && sizes[1] < sizes[2],
+        "the levels are a space dial and should cost more in order: {sizes:?}"
+    );
+}
+
 fn small_opts(l0_trigger: usize) -> Options {
     // Small enough that a few hundred records seal and compact, so the
     // level machinery is exercised at test scale rather than described.

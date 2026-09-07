@@ -681,6 +681,17 @@ impl<B: Bytes> Blob<B> {
 
     // ------------------------------------------------------------ diagnostics --
 
+    /// The whole object, when the source lends its bytes.
+    ///
+    /// `ordindex` addresses keys and values by offset into this, which is
+    /// what lets a scan hand back a slice without parsing the record that
+    /// holds it. `None` for a copying source, which is every source that is
+    /// not memory -- and a reference column is not built for one.
+    pub fn mapped(&self) -> Option<&[u8]> {
+        let len = usize::try_from(self.src.len()).ok()?;
+        self.src.slice_at(0, len)
+    }
+
     /// Whether the key index carries a checksum row (segments do; a store's
     /// in-place-editable index does not).
     pub fn index_checksummed(&self) -> bool {
