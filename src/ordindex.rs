@@ -85,6 +85,31 @@
 //! neither of these two but one shape that parses like the columns and
 //! touches like the records.
 //!
+//! **That shape was then built, and it dominates both.** Cut the key order
+//! into chunks of a few dozen keys and lay every column one scan window
+//! needs inside the chunk, contiguously, addressed by `u16` offsets
+//! relative to the chunk: nothing parses, and chunks sit in key order so a
+//! walk across them is a walk across adjacent bytes. Relative offsets are
+//! also what make it the SMALLEST of the three -- two bytes where the flat
+//! columns need four -- at 353 MB against the records' 378 and the flat
+//! columns' 393 on the same 1.5M keys at eight values.
+//!
+//! On the mixed workload it is about 1.4x the records warm and 1.2x to 1.8x
+//! under a memory cap, and it beats the flat columns everywhere, by 1.1x
+//! warm and up to 3.6x capped. The decomposition says why, and it is the
+//! whole point: warm, the win is entirely the scan (about 1.7x) and a point
+//! read is a shade SLOWER than a record's, because a hash probe and a chunk
+//! indirection cost more than a directory probe into an inline run. Cold it
+//! wins both, on the fewest faults an operation of the three -- fewer even
+//! than the records, whose walk still reads a directory beside them. It is
+//! a replacement rather than a companion, so the residency trap above does
+//! not apply to it at all.
+//!
+//! What is measured here is shape against shape with damage detection off
+//! on all three and no compression anywhere. Both are unpriced for this
+//! one, and neither is free: a chunk's bytes are lent to the caller, and a
+//! decompressed chunk has no bytes to lend.
+//!
 //! It is a companion file rather than a region of the segment because that
 //! leaves the segment format, and the browser reader over it, untouched. It
 //! is written before its segment is renamed into place and is required to
