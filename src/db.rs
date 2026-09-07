@@ -4250,28 +4250,39 @@ impl Db {
         // is the shape the store is in. An earlier version had this path,
         // a refactor dropped it, and the scan axis paid for it.
         if mi >= unsealed.len() && !self.segs.iter().any(|s| s.level == 0) {
-            let mut parts: Vec<&Seg> = self.segs.iter().filter(|s| s.may_reach(from)).collect();
-            parts.sort_by(|a, b| a.lo.cmp(&b.lo));
+            // `sort_segs` orders by level descending then by `lo`, and this
+            // arm runs only when every segment is a partition, so they are
+            // already in key order here. Collecting them into a `Vec` to sort
+            // them again repeated work the store had done -- and the collect,
+            // the sort and the three `Vec` clones around the cursor measured
+            // 391ns of a 648ns seek, six times what the ordered index saved.
+            // A scan is a read; it allocates nothing now.
+            debug_assert!(
+                self.segs
+                    .windows(2)
+                    .all(|w| w[0].level != w[1].level || w[0].lo <= w[1].lo),
+                "partitions are not in key order, so this walk would skip one"
+            );
             let mut seen = 0usize;
-            let mut cursor: Vec<u8> = from.to_vec();
-            for seg in parts {
+            let mut cursor: &[u8] = from;
+            for seg in self.segs.iter().filter(|s| s.may_reach(from)) {
                 if seen >= limit {
                     break;
                 }
-                if seg.lo.as_slice() > cursor.as_slice() {
-                    cursor = seg.lo.clone();
+                if seg.lo.as_slice() > cursor {
+                    cursor = seg.lo.as_slice();
                 }
                 // The ordered index answers the seek this scan starts
                 // with; the walk after it is the reader's own. That split is
                 // the whole point of the index -- the seek was the entire
                 // measured deficit and the walk was already competitive.
-                let rank = seg.ord.seek(&cursor, |r| seg.blob.key_at(r));
+                let rank = seg.ord.seek(cursor, |r| seg.blob.key_at(r));
                 seen += seg
                     .blob
                     .scan_at(rank, limit - seen, &mut f)
                     .map_err(|e| err(&format!("segment scan: {e}")))?;
                 match &seg.hi {
-                    Some(h) => cursor = h.clone(),
+                    Some(h) => cursor = h.as_slice(),
                     None => break,
                 }
             }
