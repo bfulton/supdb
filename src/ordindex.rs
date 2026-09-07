@@ -56,6 +56,35 @@
 //! engine. Anything that beats this has to REPLACE the record rather than
 //! accompany it.
 //!
+//! **A replacement was then built, and it wins warm and loses cold.** A
+//! columnar shape -- hash to rank, then separate key, run-bound and value
+//! columns -- serves every operation without the records, so it is a
+//! replacement rather than a companion. Over 1.5M keys at eight values,
+//! half point reads and half 100-key scans, it is 1.84x the record segment
+//! with everything resident. Under a memory cap it is 0.5x, because the two
+//! shapes are fast for opposite reasons: warm, a scan pays to PARSE, and the
+//! columns parse nothing; cold, a scan pays for the streams it TOUCHES, and
+//! a record run co-locates the keys and values one window needs where the
+//! columns spread them over six regions, each its own chance to miss.
+//!
+//! Carrying both and routing each operation to the better shape is worse
+//! than either, and the way it fails is the part to remember. Each shape's
+//! cliff sits at its own footprint, so two shapes move the cliff to their
+//! sum: the record segment holds its rate down to a cap of 400 MB against a
+//! 378 MB file, and the pair collapses by 400x at that cap. Skew does not
+//! save it, because the failure is not in the hot set but in the tail --
+//! with 99% of operations inside a tenth of the keys, a hot union of about
+//! 77 MB inside a 600 MB cap, the pair still reads 8.9 GB off the device in
+//! eight seconds, its footprint twelve times over, while either shape alone
+//! reads its file once and then nothing. Nor is a little mixing safe: with
+//! the workload entirely scans the record file is never touched, no union
+//! forms and the second shape is exactly free, and one point read in two
+//! hundred costs 7x. So a second shape may be selected per WORKLOAD and
+//! never per operation, extra storage is free only while the union of what
+//! a workload touches stays resident, and the thing worth building is
+//! neither of these two but one shape that parses like the columns and
+//! touches like the records.
+//!
 //! It is a companion file rather than a region of the segment because that
 //! leaves the segment format, and the browser reader over it, untouched. It
 //! is written before its segment is renamed into place and is required to
