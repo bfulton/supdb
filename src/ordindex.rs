@@ -105,10 +105,32 @@
 //! a replacement rather than a companion, so the residency trap above does
 //! not apply to it at all.
 //!
+//! The one axis it lost was the point read, and the fix was to move the
+//! offsets rather than to remove them. Splitting a chunk into columns puts
+//! a key's key-offset, run-bound, value-offset and bytes in four regions,
+//! so a point read takes four scattered lines where a record takes one
+//! span: measured, 0.64x the record's rate. Inlining a length before each
+//! value gives the point read its one span and gets it back to about parity
+//! -- and costs a sixth of the scan, because a length is a SERIAL chain
+//! where an offset is not: value j+1 cannot be located until value j's
+//! length has been read, while an array of offsets is loads the processor
+//! issues at once.
+//!
+//! Keeping the offsets but putting them INSIDE the entry -- `u16` ends,
+//! relative to the entry, ahead of the key and its values -- has both:
+//! every value's position is still an independent load, and a point read is
+//! still one span. Against the record segment it is then about 1.04x on
+//! point reads, 1.3x on scans, 1.2x on the mixed workload warm and 1.4x
+//! under a cap, in a file smaller than the records. It beats the split
+//! layout on the mixed workload at both ends and trails it only on scans
+//! alone, which is the trade to make: the entry-relative offsets cost the
+//! same bytes as the chunk-wide arrays they replace, and make the entry
+//! relocatable as well.
+//!
 //! What is measured here is shape against shape with damage detection off
-//! on all three and no compression anywhere. Both are unpriced for this
-//! one, and neither is free: a chunk's bytes are lent to the caller, and a
-//! decompressed chunk has no bytes to lend.
+//! on every arm and no compression anywhere. Both are unpriced, and neither
+//! is free: a chunk's bytes are lent to the caller, and a decompressed
+//! chunk has no bytes to lend.
 //!
 //! It is a companion file rather than a region of the segment because that
 //! leaves the segment format, and the browser reader over it, untouched. It
