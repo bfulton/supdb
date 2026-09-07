@@ -23,7 +23,15 @@
 //!
 //! Entry `i` is the segment's rank `i` -- both are key ordered -- so a seek
 //! here answers exactly what `Blob::seek` answers, and `tests/db.rs` holds
-//! the two to it. Nothing about the value bytes is duplicated: measured,
+//! the two to it.
+//!
+//! It is consulted only where `Db::scan` takes its unmerged path -- no L0
+//! segment and no unsealed key in range -- because that is the only walk
+//! that starts with one seek per segment rather than a merge. So a store
+//! being written while it is scanned does not use it at all: the suite's
+//! YCSB-E interleaves inserts, keeps an L0 segment, and measures the same
+//! either way. The `scan` workload, which reads a settled store, is where
+//! it shows. That is worth knowing before attributing a scan change to it. Nothing about the value bytes is duplicated: measured,
 //! separating values from keys is a wash on a scan that reads them, and the
 //! whole win is on the seek and on walks that do not.
 //!
