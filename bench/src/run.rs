@@ -12,7 +12,7 @@ use crate::env::IoCounters;
 use crate::hist::Hist;
 use crate::row::{Guarantee, MachineInfo, Measurement, Row};
 use crate::workload::{db_key_into, KeyDist, KeyGen, Payload, Permutation, Rng};
-use crate::{ladder, Scale};
+use crate::{ladder_from, Scale};
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::Path;
@@ -31,6 +31,11 @@ pub struct Plan {
     pub arms: Vec<String>,
     /// The ladder's top rung, in keys. The ladder rounds up to a rung.
     pub top: u64,
+    /// The ladder's bottom rung, in keys, rounded up to a rung the same way
+    /// `top` is. Zero is the whole ladder. Above zero the run measures only
+    /// the rungs from here up, for when the cheap ones cost hours and answer
+    /// a question that was already answered.
+    pub bottom: u64,
     pub reps: usize,
     pub value_size: usize,
     pub batch: usize,
@@ -43,6 +48,7 @@ impl Plan {
             scale,
             arms,
             top,
+            bottom: 0,
             reps: scale.reps(),
             value_size: VALUE_SIZE,
             batch: 1_000,
@@ -120,7 +126,7 @@ pub fn run(plan: &Plan, machine: MachineInfo, log: &mut dyn FnMut(&str)) -> Resu
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     engines::check_matched(&plan.arms, &root)?;
 
-    let rungs = ladder(plan.top);
+    let rungs = ladder_from(plan.bottom, plan.top);
     let payload = Payload::new(plan.value_size, 0.5, 0xE1);
     let mut s = Samples {
         map: BTreeMap::new(),

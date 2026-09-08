@@ -28,6 +28,15 @@ curve is what shows where an engine's behaviour changes — most importantly
 the knee where the store crosses the machine's memory. A geometric ladder
 costs about 1.5× its largest rung, so the curve is nearly free.
 
+`--bottom` starts the ladder above 10 000. The low rungs are cheap next to
+the top one but not free, and when the question is at the top they are hours
+spent re-answering what is already answered: on a 16 GiB M2 the rungs below
+ten million keys took 7h17m of a run whose next rung alone needed about a
+day. A row records the size of every measurement, so a bottom-limited run
+contributes the points it took and claims nothing about the ones it skipped
+— it is points rather than a curve, and the gate keys on size, so those
+points still land in the series beside every other run's.
+
 The floors are per-machine constants, not per-engine and not per-size. They
 are what "as fast as possible" means on that host; an engine's distance from
 them is the headroom left. The scan floor's file fits in memory at `quick`
@@ -67,8 +76,14 @@ Two. `quick` gates pull requests; `full` is the number.
 
 `full`'s top is a function of the machine, not a constant, so its curve
 crosses the memory line everywhere it runs — the 16 GB box and the 4 GB VM
-alike. The out-of-core regime is where an embedded store on a small VM
-lives, and the old suite's largest run (100 MB) never entered it.
+alike. It is also why `full` is not a job with a timeout on it: on a 16 GiB
+M2 its top rung is 222 million keys, each rung costs about 4.3× the one below
+it for 3.3× the keys, and the ladder measured 344s at 300 000 against 19 815s
+at ten million. Extrapolated, the memory line lands near a day per rung and
+the top rung near a week, so a run that must finish inside a CI job's timeout
+reaches a high rung with `--bottom` and few arms, or does not reach it. The
+out-of-core regime is where an embedded store on a small VM lives, and the
+old suite's largest run (100 MB) never entered it.
 
 A rep is one complete pass of a workload for one arm. Arms are round-robined
 within a rep; one warmup pass is discarded.

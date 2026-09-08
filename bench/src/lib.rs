@@ -59,6 +59,18 @@ impl Scale {
 /// The size ladder: 1, 3, 10, 30 ... x 10^4 keys, up to and including the
 /// first rung at or above `top`. A geometric ladder costs about 1.5x its
 /// largest rung, so the curve is nearly free next to the top rung alone.
+/// The ladder from `bottom` to `top`, both rounded up to a rung.
+///
+/// A bottom exists because the cheap rungs are not free when the question is
+/// at the top. Measured on a 16 GiB M2: the rungs below ten million keys
+/// took 7h17m of a `full` run whose top rung alone needs a day, and not one
+/// of them was the measurement that run was dispatched for. Rows record the
+/// size of every measurement, so a run that skips the low rungs contributes
+/// the points it took and nothing claims the ones it did not.
+pub fn ladder_from(bottom: u64, top: u64) -> Vec<u64> {
+    ladder(top).into_iter().filter(|&r| r >= bottom).collect()
+}
+
 pub fn ladder(top: u64) -> Vec<u64> {
     let mut out = Vec::new();
     let mut rung = 10_000u64;
@@ -88,5 +100,25 @@ mod tests {
         );
         // A top between rungs rounds up to the next rung, never down.
         assert_eq!(ladder(50_000), vec![10_000, 30_000, 100_000]);
+    }
+
+    #[test]
+    fn a_bottom_drops_the_rungs_below_it() {
+        assert_eq!(ladder_from(0, 100_000), ladder(100_000));
+        assert_eq!(
+            ladder_from(100_000, 1_000_000),
+            vec![100_000, 300_000, 1_000_000]
+        );
+        // A bottom between rungs rounds up, the same way a top does, so the
+        // rung it names is always one the ladder has.
+        assert_eq!(
+            ladder_from(50_000, 1_000_000),
+            vec![100_000, 300_000, 1_000_000]
+        );
+        // One rung is a legal ladder: the point of a bottom is to ask for it.
+        assert_eq!(ladder_from(1_000_000, 1_000_000), vec![1_000_000]);
+        // A bottom above the top leaves nothing, which the runner refuses
+        // rather than writing a row with no measurements in it.
+        assert!(ladder_from(3_000_000, 1_000_000).is_empty());
     }
 }

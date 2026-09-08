@@ -14,6 +14,9 @@ on:
       top:
         description: 'Top rung in keys (default: sized to 1.5x memory)'
         default: ''
+      bottom:
+        description: 'Bottom rung in keys, skipping the cheap ones (default: the whole ladder)'
+        default: ''
       arms:
         description: 'Comma-separated arms (default: all)'
         default: ''
@@ -107,11 +110,13 @@ jobs:
         working-directory: bench
         env:
           TOP: ${{ inputs.top }}
+          BOTTOM: ${{ inputs.bottom }}
           ARMS: ${{ inputs.arms }}
         run: |
           set -eu
           args="run --scale full --out runs-ci"
           [ -n "$TOP" ] && args="$args --top $TOP"
+          [ -n "$BOTTOM" ] && args="$args --bottom $BOTTOM"
           [ -n "$ARMS" ] && args="$args --arms $ARMS"
           ./target/release/bench $args
       - uses: actions/upload-artifact@v4

@@ -6,7 +6,7 @@ use supdb_bench::{engines, env, figures, gate, row, run, Scale};
 
 const USAGE: &str = "\
 usage:
-  bench run --scale quick|full [--out DIR] [--arms a,b,...] [--top KEYS] [--reps N]
+  bench run --scale quick|full [--out DIR] [--arms a,b,...] [--top KEYS] [--bottom KEYS] [--reps N]
   bench gate ROW.json [--runs DIR]
   bench figures [--runs DIR] [--out DIR] [--scale quick|full]
   bench machine
@@ -15,6 +15,7 @@ run    measures every arm over the size ladder and writes runs/<scale>/<utc>-<sh
        --out   directory holding runs/ (default: runs)
        --arms  comma-separated subset of the arms (default: all)
        --top   the ladder's top rung in keys (default: quick 300000; full sized to 1.5x memory)
+       --bottom the ladder's bottom rung in keys (default: the whole ladder from 10000)
        --reps  repetitions per size and arm (default: quick 5, full 7)
 gate   compares ROW to the last ten rows of its class and scale under runs/ (--runs, default runs);
        exits 1 if any quantity is worse than every one of them
@@ -157,6 +158,18 @@ fn cmd_run(a: Args) -> i32 {
         Scale::Full => run::full_top(machine.mem_total_kb, 100),
     });
     let mut plan = run::Plan::new(scale, arms, top);
+    if let Some(b) = a.num("--bottom") {
+        // Refused rather than run, because a bottom above the top leaves an
+        // empty ladder, and a row with no measurements in it is a run that
+        // reports having measured.
+        if supdb_bench::ladder_from(b, top).is_empty() {
+            eprintln!(
+                "--bottom {b} is above the top rung {top}, so the ladder is empty\n\n{USAGE}"
+            );
+            return 2;
+        }
+        plan.bottom = b;
+    }
     if let Some(r) = a.num("--reps") {
         // Rep 0 is the warmup and is not recorded, so a plan needs at least
         // one more or it writes a row with no measurements.
@@ -168,12 +181,20 @@ fn cmd_run(a: Args) -> i32 {
     }
     let out = PathBuf::from(a.get("--out").unwrap_or("runs"));
 
+    // The rungs, not just the top: with a bottom set, the top alone does not
+    // say what was measured, and this line is the only record of the plan a
+    // run that never finishes leaves behind.
+    let rungs = supdb_bench::ladder_from(plan.bottom, top);
     eprintln!(
-        "bench run: scale {} on {} ({} keys top, {} reps, arms {})",
+        "bench run: scale {} on {} ({} reps, rungs {}, arms {})",
         scale.as_str(),
         machine.cpu_model,
-        top,
         plan.reps,
+        rungs
+            .iter()
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
         plan.arms.join(",")
     );
     let mut log = |s: &str| eprintln!("{s}");
