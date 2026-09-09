@@ -20,6 +20,9 @@ on:
       arms:
         description: 'Comma-separated arms (default: all)'
         default: ''
+      reps:
+        description: 'Repetitions per size and arm (default: 7 at full)'
+        default: ''
       pickup_timeout_minutes:
         description: 'Cancel if no self-hosted runner claims the run within this many minutes'
         default: '10'
@@ -93,7 +96,13 @@ jobs:
     needs: [check]
     if: needs.check.outputs.runner == 'self-hosted'
     runs-on: ${{ needs.check.outputs.runner }}
-    timeout-minutes: 600
+    # Not 600. A full-scale rung is measured in hours and the rungs past the
+    # memory line in days: on the 16 GiB M2 the ten-million rung took 5h30m
+    # with seven arms, each rung costs about 4.3x the one below it, and a run
+    # cancelled at the ceiling skips the upload and leaves no row at all --
+    # which is exactly what happened at 600. Self-hosted jobs may run to five
+    # days; this is three, and the pickup watchdog still bounds the queue.
+    timeout-minutes: 4320
     steps:
       - uses: actions/checkout@v4
       - name: Use the toolchain this machine already has
@@ -111,12 +120,14 @@ jobs:
         env:
           TOP: ${{ inputs.top }}
           BOTTOM: ${{ inputs.bottom }}
+          REPS: ${{ inputs.reps }}
           ARMS: ${{ inputs.arms }}
         run: |
           set -eu
           args="run --scale full --out runs-ci"
           [ -n "$TOP" ] && args="$args --top $TOP"
           [ -n "$BOTTOM" ] && args="$args --bottom $BOTTOM"
+          [ -n "$REPS" ] && args="$args --reps $REPS"
           [ -n "$ARMS" ] && args="$args --arms $ARMS"
           ./target/release/bench $args
       - uses: actions/upload-artifact@v4
