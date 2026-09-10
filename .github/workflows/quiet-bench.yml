@@ -130,7 +130,13 @@ jobs:
           [ -n "$REPS" ] && args="$args --reps $REPS"
           [ -n "$ARMS" ] && args="$args --arms $ARMS"
           ./target/release/bench $args
+      # Always. The row is written as each rung finishes, so a run killed by
+      # the timeout or cancelled by hand still has the rungs that completed
+      # on disk -- and this step being conditional on success is what threw
+      # them away twice. `always()` covers cancellation too.
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: full-row
           path: bench/runs-ci/
+          if-no-files-found: warn

@@ -191,6 +191,24 @@ pub fn run(
     }
 
     for &size in &rungs {
+        // Refuse a rung that cannot fit before starting it, rather than
+        // dying part way through. A pass rebuilds its store and the store is
+        // removed after, so the peak is one arm's records plus what its
+        // compaction holds while rewriting them -- about three times. The
+        // host carrying these runs reached 97% full, and a rung that dies on
+        // ENOSPC costs the hours it had already spent.
+        let need = size * (KEY_SIZE + plan.value_size) as u64 * 3;
+        if let Some(free) = free_bytes(&root) {
+            if free < need {
+                return Err(format!(
+                    "rung {size} needs about {:.0} GB and {:.0} GB is free where the \
+                     stores are built ({}); the rungs below it are already written",
+                    need as f64 / 1e9,
+                    free as f64 / 1e9,
+                    root.display()
+                ));
+            }
+        }
         let map_gb = lmdb_map_gb(size, plan.value_size);
         for rep in 0..=plan.reps {
             for arm in &plan.arms {
@@ -543,6 +561,22 @@ fn lmdb_map_gb(size: u64, value_size: usize) -> usize {
 }
 
 /// The top rung for `full` on this machine: the store at least 1.5x memory.
+/// Free bytes on the filesystem holding `dir`, or None if it cannot be read.
+fn free_bytes(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut c = Vec::with_capacity(dir.as_os_str().as_bytes().len() + 1);
+    c.extend_from_slice(dir.as_os_str().as_bytes());
+    c.push(0);
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr().cast(), &mut st) } != 0 {
+        return None;
+    }
+    // Through u128 and `from` rather than `as`: the widths of these fields
+    // differ between the Linux that lints this and the macOS that runs it,
+    // so a cast that is redundant on one platform is narrowing on the other.
+    u64::try_from(u128::from(st.f_bavail) * u128::from(st.f_frsize)).ok()
+}
+
 pub fn full_top(mem_total_kb: u64, value_size: usize) -> u64 {
     let need = mem_total_kb as f64 * 1024.0 * 1.5;
     (need / (KEY_SIZE + value_size) as f64).ceil() as u64
