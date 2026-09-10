@@ -77,11 +77,18 @@ Two. `quick` gates pull requests; `full` is the number.
 `full`'s top is a function of the machine, not a constant, so its curve
 crosses the memory line everywhere it runs — the 16 GB box and the 4 GB VM
 alike. It is also why `full` is not a job with a timeout on it: on a 16 GiB
-M2 its top rung is 222 million keys, each rung costs about 4.3× the one below
-it for 3.3× the keys, and the ladder measured 344s at 300 000 against 19 815s
-at ten million. Extrapolated, the memory line lands near a day per rung and
-the top rung near a week, so a run that must finish inside a CI job's timeout
-reaches a high rung with `--bottom` and few arms, or does not reach it. The
+M2 its top rung is 222 million keys, and the ladder measured 344s at 300 000
+against 19 815s at ten million — about 4.3× a rung for 3.3× the keys.
+
+Do not size a run from that. It is a whole-rung figure averaged over seven
+arms, and per arm the law holds for one engine and breaks for the other. One
+pass at ten million took supdb 467s and LMDB 665s; at thirty million, LMDB
+2 624s — 3.9×, as the ladder says — and supdb 10 288s, which is 22×. A pass
+at a hundred million then ran 27.5 hours without supdb finishing it, already
+past 9.6× its own thirty-million pass. Size a run from the arm that is slowest
+at the rung you want, and treat any rung past the one you have measured as
+unbounded until you have. (The run those figures come from also carried an
+ordered-index leak, since fixed, so supdb's share of them is an upper bound.) The
 out-of-core regime is where an embedded store on a small VM lives, and the
 old suite's largest run (100 MB) never entered it.
 
