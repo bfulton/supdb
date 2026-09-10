@@ -2988,6 +2988,36 @@ impl Db {
         Db::name_field(name, 1)
     }
 
+    /// Unlink a retired segment, and the ordered index named after it when
+    /// no live segment still claims that index.
+    ///
+    /// The index has to go here rather than wait for the sweep at open. That
+    /// sweep is the backstop for a crash window; a merge is not a crash
+    /// window, it is the steady state, so a process that merges for hours
+    /// leaked one index per input it retired and nothing reclaimed them
+    /// until the store was reopened -- a run at a hundred million keys was
+    /// found with 53,596 files in one store directory, most of them indexes
+    /// whose segments were long gone.
+    ///
+    /// The liveness check is not defensive. A promotion renames a segment
+    /// and keeps the id and end-sequence its index is named by, so the
+    /// retired name and the live one address the SAME index file; unlinking
+    /// it by name alone took the index of a segment that was still open, and
+    /// seven tests said so.
+    fn retire_seg(&self, name: &str) {
+        let _ = std::fs::remove_file(self.dir.join(name));
+        let Some(ord) = Db::ord_name_for(name) else {
+            return;
+        };
+        let claimed = self
+            .segs
+            .iter()
+            .any(|s| Db::ord_name_for(&s.name).as_deref() == Some(ord.as_str()));
+        if !claimed {
+            let _ = std::fs::remove_file(self.dir.join(&ord));
+        }
+    }
+
     /// The live set, in the order the manifest should record it.
     fn live_names(&self) -> Vec<String> {
         self.segs.iter().map(|s| s.name.clone()).collect()
@@ -3849,7 +3879,7 @@ impl Db {
         self.sort_segs();
         self.publish()?;
         for old in old_names {
-            let _ = std::fs::remove_file(self.dir.join(old));
+            self.retire_seg(&old);
         }
         Ok(())
     }
@@ -4006,7 +4036,7 @@ impl Db {
         self.sort_segs();
         self.publish()?;
         for name in &inputs {
-            let _ = std::fs::remove_file(self.dir.join(name));
+            self.retire_seg(name);
         }
         self.phase_ns[2] += t.elapsed().as_nanos() as u64;
         Ok(())

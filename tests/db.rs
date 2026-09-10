@@ -1530,3 +1530,47 @@ fn a_store_written_without_checksums_reads_back_under_another_store_s_setting() 
     db.scan(b"", usize::MAX, |_k, _v| seen += 1).unwrap();
     assert_eq!(seen, 4_000 * 8, "every value scans");
 }
+
+/// A store that merges does not accumulate ordered indexes whose segments
+/// are gone. The sweep at open would collect them, but a process that
+/// merges for hours never reaches it: the leak was found as 53,596 files in
+/// one store directory on a run at a hundred million keys, and it is
+/// counted here without reopening, because reopening is what hid it.
+#[test]
+fn a_merge_takes_the_ordered_index_with_the_segment_it_retires() {
+    let d = dir("ord-leak");
+    let mut db = Db::create(
+        &d,
+        Options {
+            seal_bytes: 64 << 10,
+            partition_bytes: Some(128 << 10),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for round in 0u32..12 {
+        for k in 0u32..2_000 {
+            let key = format!("key-{k:06}").into_bytes();
+            db.append(
+                &key,
+                format!("value-{round}-{k}-{}", "z".repeat(40)).as_bytes(),
+            );
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+    }
+    db.settle().unwrap();
+    let count = |suffix: &str| {
+        std::fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(suffix))
+            .count()
+    };
+    let (segs, ords) = (count(".sup"), count(".oidx"));
+    assert!(segs > 0, "the store sealed nothing, so this proves nothing");
+    assert_eq!(
+        ords, segs,
+        "{ords} ordered indexes for {segs} segments: the retired ones leaked"
+    );
+}
