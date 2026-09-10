@@ -126,8 +126,26 @@ pub fn run(
     bank: Option<&Path>,
 ) -> Result<Row, String> {
     let utc = crate::row::utc_now();
-    let root = std::env::temp_dir().join(format!("supdb-bench-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    // Every stale working directory, not just this process's. The store a
+    // run builds is removed when `run` returns, so a run that is KILLED
+    // leaves it -- and at full scale that is tens of gigabytes. Two
+    // cancelled runs on the self-hosted M2 stranded their stores and
+    // nothing reclaimed them, because the cleanup here only knew its own
+    // pid. Two timing runs may not share a machine anyway, so anything
+    // matching the pattern is garbage from a run that is over.
+    let tmp = std::env::temp_dir();
+    if let Ok(entries) = std::fs::read_dir(&tmp) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("supdb-bench-")
+            {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    let root = tmp.join(format!("supdb-bench-{}", std::process::id()));
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     engines::check_matched(&plan.arms, &root)?;
 
