@@ -119,7 +119,12 @@ impl Samples {
     }
 }
 
-pub fn run(plan: &Plan, machine: MachineInfo, log: &mut dyn FnMut(&str)) -> Result<Row, String> {
+pub fn run(
+    plan: &Plan,
+    machine: MachineInfo,
+    log: &mut dyn FnMut(&str),
+    bank: Option<&Path>,
+) -> Result<Row, String> {
     let utc = crate::row::utc_now();
     let root = std::env::temp_dir().join(format!("supdb-bench-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -226,33 +231,57 @@ pub fn run(plan: &Plan, machine: MachineInfo, log: &mut dyn FnMut(&str)) -> Resu
                 ));
             }
         }
+        // Bank the row now that this rung is whole. A rung past the memory
+        // line is measured in days and the job carrying it can be killed by
+        // a timeout, so the rungs that finished must not depend on the ones
+        // that did not.
+        if let Some(dir) = bank {
+            match row_of(&utc, &machine, plan, &s).write(dir) {
+                Ok(p) => log(&format!(
+                    "{:>7}s  banked rungs through {size} to {}",
+                    started.elapsed().as_secs(),
+                    p.display()
+                )),
+                Err(e) => log(&format!("could not bank the row: {e}")),
+            }
+        }
     }
     let _ = std::fs::remove_dir_all(&root);
+    Ok(row_of(&utc, &machine, plan, &s))
+}
 
+/// The row for the samples taken so far.
+///
+/// Taken by reference so a run can write it after every rung and again at
+/// the end. The file name is derived from the run's utc and sha, so each
+/// write replaces the last and the row on disk always holds every rung that
+/// has finished. Two `full` runs were lost whole because this was built once,
+/// after the last rung: the artifact step never ran, and the only survivor
+/// was what the log happened to print.
+fn row_of(utc: &str, machine: &MachineInfo, plan: &Plan, s: &Samples) -> Row {
     let measurements = s
         .map
-        .into_iter()
+        .iter()
         .map(
             |((workload, size, arm, quantity), (guarantee, unit, samples))| Measurement {
-                workload,
-                arm,
-                guarantee,
-                size,
-                quantity,
+                workload: workload.clone(),
+                arm: arm.clone(),
+                guarantee: *guarantee,
+                size: *size,
+                quantity: quantity.clone(),
                 unit: unit.to_string(),
-                samples,
+                samples: samples.clone(),
             },
         )
         .collect();
-
-    Ok(Row {
-        utc,
+    Row {
+        utc: utc.to_string(),
         sha: option_env!("SUPDB_SHA").unwrap_or("unknown").to_string(),
         rustc: option_env!("SUPDB_RUSTC").unwrap_or("unknown").to_string(),
         scale: plan.scale,
-        machine,
+        machine: machine.clone(),
         measurements,
-    })
+    }
 }
 
 struct OnePass {

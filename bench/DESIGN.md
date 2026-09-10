@@ -91,7 +91,14 @@ within a rep; one warmup pass is discarded.
 ## Rows
 
 One file per run: `runs/<scale>/<utc>-<engine-sha7>.json`. Nothing in it is
-derived; everything is what was read or measured. The file is JSON; this is
+derived; everything is what was read or measured.
+
+The file is written when each rung finishes, not once at the end, and every
+write replaces the last — so the row on disk always holds the rungs that
+have completed. Two `full` runs were lost whole for want of that: both were
+killed by a job timeout, the artifact step never ran, and the only survivor
+was whatever the log had printed. A rung past the memory line takes days,
+which is long enough that the rungs below it must not depend on it. The file is JSON; this is
 its shape in outline:
 
 ```

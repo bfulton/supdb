@@ -198,7 +198,7 @@ fn cmd_run(a: Args) -> i32 {
         plan.arms.join(",")
     );
     let mut log = |s: &str| eprintln!("{s}");
-    match run::run(&plan, machine, &mut log) {
+    match run::run(&plan, machine, &mut log, Some(&out)) {
         Ok(row) => match row.write(&out) {
             Ok(p) => {
                 println!("{}", p.display());
