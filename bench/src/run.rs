@@ -189,14 +189,37 @@ pub fn run(
             scan / 1e9,
         ));
     }
+    // The scan floor's file is dead weight from here: it is the top rung's
+    // bytes capped at four gibibytes, and at `full` it sat on all four for
+    // the whole rung phase -- the days-long part, on the host that ran out
+    // of disk. Reclaimed here rather than by the cleanup at the end, which
+    // a killed run never reaches. The WAL floor already removes its own.
+    let floor = root.join("scan-floor.dat");
+    if let Ok(m) = std::fs::metadata(&floor) {
+        let bytes = m.len();
+        if std::fs::remove_file(&floor).is_ok() {
+            log(&format!(
+                "{:>7}s  reclaimed the scan floor's file, {:.1} GB",
+                started.elapsed().as_secs(),
+                bytes as f64 / 1e9
+            ));
+        }
+    }
 
     for &size in &rungs {
         // Refuse a rung that cannot fit before starting it, rather than
         // dying part way through. A pass rebuilds its store and the store is
         // removed after, so the peak is one arm's records plus what its
-        // compaction holds while rewriting them -- about three times. The
-        // host carrying these runs reached 97% full, and a rung that dies on
-        // ENOSPC costs the hours it had already spent.
+        // compaction holds while rewriting them. Three times, measured
+        // rather than guessed: 3.12x at 300k keys and 3.09x at a million,
+        // sampled while the pass ran. It is the small rungs that set that
+        // ratio -- at a hundred million the same measurement read about
+        // 1.9x, because a seal of fixed size amortises over more keys -- so
+        // this is conservative for the expensive rungs and exact for the
+        // cheap ones. If it refuses a rung you believe fits, the message
+        // names both numbers. The host carrying these runs reached 967 of
+        // 994 GB used, and a rung that dies on ENOSPC costs every hour it
+        // had already spent.
         let need = size * (KEY_SIZE + plan.value_size) as u64 * 3;
         if let Some(free) = free_bytes(&root) {
             if free < need {

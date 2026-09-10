@@ -88,6 +88,16 @@ old suite's largest run (100 MB) never entered it.
 A rep is one complete pass of a workload for one arm. Arms are round-robined
 within a rep; one warmup pass is discarded.
 
+Disk, because a run has run a host out of it. One pass builds its store and
+the store is dropped when the pass ends, so the peak is one arm's, never the
+ladder's or the matrix's: measured, about 3.1x the rung's records at the
+small rungs and 1.9x at a hundred million, where a fixed seal size amortises
+over more keys. LMDB's map is sized at three times the records but grows with
+what is written, so it costs its data and not its map. The scan floor's file
+is reclaimed once the floors are measured rather than held for the rung
+phase, and a rung whose filesystem cannot hold it is refused before it
+starts rather than dying on ENOSPC hours in.
+
 ## Rows
 
 One file per run: `runs/<scale>/<utc>-<engine-sha7>.json`. Nothing in it is
