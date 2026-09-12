@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use supdb::{Db, Options};
+use supdb::{Db, Options, ReadAdvice};
 
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-{name}-{}", std::process::id()));
@@ -1573,4 +1573,63 @@ fn a_merge_takes_the_ordered_index_with_the_segment_it_retires() {
         ords, segs,
         "{ords} ordered indexes for {segs} segments: the retired ones leaked"
     );
+}
+
+#[test]
+fn an_advising_store_advises_the_ordered_companions_too() {
+    // `Db::advise` walks the segments, and a segment's ordered companion is
+    // not one of them, so the companion was left on the kernel's default
+    // readahead under every policy. It is reached only by `seek`'s binary
+    // search -- the most random access the engine makes -- and out of core
+    // the default's readahead fetched a window per probe to consume eight
+    // bytes, costing 12% of scan throughput on a store past the page cache.
+    // Nothing failed and no check could see it.
+    let build = |name: &str, advice: ReadAdvice| {
+        let d = dir(name);
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 64 << 10,
+                partition_bytes: Some(128 << 10),
+                read_advice: advice,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for round in 0u32..6 {
+            for k in 0u32..2_000 {
+                let key = format!("key-{k:06}").into_bytes();
+                db.append(&key, format!("v-{round}-{k}-{}", "z".repeat(40)).as_bytes());
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+        }
+        db.settle().unwrap();
+        db
+    };
+
+    let db = build("ord-advice-adaptive", ReadAdvice::Adaptive);
+    let (advised, total) = db.ords_advised();
+    assert!(total > 1, "{total} segments: this proves nothing");
+    assert_eq!(advised, total, "{advised} of {total} companions advised");
+
+    // A scan puts the segments on the kernel's default -- the companion must
+    // not follow them there, because a binary search is random in either
+    // phase.
+    db.scan(b"key-000000", 32, |_, _| {}).unwrap();
+    assert!(!db.advice_random(), "the scan did not switch the segments");
+    let (advised, total) = db.ords_advised();
+    assert_eq!(
+        advised,
+        total,
+        "a scan un-advised {} companions",
+        total - advised
+    );
+
+    // And the arm that prices the advice still gets none of it, or it is
+    // measuring the same thing twice.
+    let db = build("ord-advice-normal", ReadAdvice::Normal);
+    let (advised, total) = db.ords_advised();
+    assert!(total > 1, "{total} segments: this proves nothing");
+    assert_eq!(advised, 0, "{advised} of {total} advised under Normal");
 }

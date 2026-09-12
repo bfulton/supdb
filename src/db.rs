@@ -1786,7 +1786,7 @@ impl Seg {
     /// process need never have written a segment: read it off a global and
     /// a store written with checksums off is refused by the engine that
     /// wrote it, on every run whose values reached a block.
-    fn open(dir: &Path, name: &str, random: bool, verify: bool) -> Result<Seg> {
+    fn open(dir: &Path, name: &str, random: bool, advise_ord: bool, verify: bool) -> Result<Seg> {
         let src = MmapBytes::open(&dir.join(name)).map_err(|e| {
             // A manifest naming a segment that is not on disk is a damaged
             // store, not a missing file, and saying so is the difference
@@ -1809,6 +1809,15 @@ impl Seg {
         let oname = Db::ord_name_for(name).ok_or_else(|| err("segment name is malformed"))?;
         let ord = crate::ordindex::OrdIndex::open(&dir.join(&oname), blob.keys())
             .map_err(|e| err(&format!("segment {name}: {e}")))?;
+        // Taken from the POLICY, not from the phase the store is in. The
+        // segment's advice follows the workload and `Db::advise` flips it;
+        // the companion is binary-searched in either phase, so a segment
+        // opened mid-scan -- by a seal or a merge, which pass
+        // `advice_random.get()` -- would otherwise get an unadvised index
+        // for the life of the store.
+        if advise_ord {
+            ord.advise_random();
+        }
         // `pcs-` is a range-ALIGNED L0 piece: a seal split at the live
         // partition boundaries, so it carries a fence like a partition and
         // overlaps only the pieces of its own range. That alignment is what
@@ -3122,7 +3131,13 @@ impl Db {
         let starts_random = opts.read_advice.starts_random();
         let mut segs = Vec::with_capacity(live.len());
         for name in &live {
-            segs.push(Seg::open(dir, name, starts_random, opts.segment.checksums)?);
+            segs.push(Seg::open(
+                dir,
+                name,
+                starts_random,
+                opts.read_advice != ReadAdvice::Normal,
+                opts.segment.checksums,
+            )?);
         }
         segs.sort_by(|a, b| {
             b.level
@@ -3572,6 +3587,7 @@ impl Db {
                 &self.dir,
                 name,
                 self.advice_random.get(),
+                self.opts.read_advice != ReadAdvice::Normal,
                 self.opts.segment.checksums,
             )?);
         }
@@ -4026,6 +4042,7 @@ impl Db {
                 &self.dir,
                 name,
                 self.advice_random.get(),
+                self.opts.read_advice != ReadAdvice::Normal,
                 self.opts.segment.checksums,
             )?);
         }
@@ -4061,6 +4078,10 @@ impl Db {
             return;
         }
         self.advice_random.set(random);
+        // Segments only. A segment's pages are walked in whichever way the
+        // workload is walking them, so the advice follows the phase; the
+        // ordered companion is reached only by a binary search and is left
+        // on `MADV_RANDOM` in both.
         for s in &self.segs {
             if random {
                 s.blob.advise_random();
@@ -4077,6 +4098,21 @@ impl Db {
     /// interesting failure is the two disagreeing.
     pub fn advice_random(&self) -> bool {
         self.advice_random.get()
+    }
+
+    /// How many segments' ordered companions were advised `MADV_RANDOM`, and
+    /// how many there are.
+    ///
+    /// The companion is the mapping the advice policy missed. `advise` walks
+    /// the segments and a companion is not one of them, so it sat on the
+    /// kernel's default readahead however the store was configured, and
+    /// nothing anywhere said so -- the only symptom was a scan that lost 12%
+    /// out of core. A check needs to be able to ask.
+    pub fn ords_advised(&self) -> (usize, usize) {
+        (
+            self.segs.iter().filter(|s| s.ord.advised()).count(),
+            self.segs.len(),
+        )
     }
 
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {

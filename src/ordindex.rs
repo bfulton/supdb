@@ -158,7 +158,7 @@
 //! broken.
 
 use crate::block::crc32;
-use crate::bytes::MmapBytes;
+use crate::bytes::{Bytes, MmapBytes};
 use std::io::{Error, ErrorKind, Result};
 use std::path::Path;
 
@@ -264,6 +264,12 @@ impl Builder {
 /// One segment's ordered index, mapped.
 pub struct OrdIndex {
     map: MmapBytes,
+    /// What was last asked of the kernel for this mapping, so a check can
+    /// compare the record against the policy that should have set it. The
+    /// mapping itself cannot be interrogated portably, and the failure worth
+    /// catching is not the kernel ignoring `madvise` -- it is this call site
+    /// going away again.
+    advised: std::cell::Cell<bool>,
     n: usize,
     pfx: usize,
 }
@@ -302,7 +308,31 @@ impl OrdIndex {
         if heads_at != HEADER || heads_at.checked_add(want) != Some(body) {
             return Err(bad("heads do not fill the file"));
         }
-        Ok(OrdIndex { map, n, pfx })
+        Ok(OrdIndex {
+            map,
+            n,
+            pfx,
+            advised: std::cell::Cell::new(false),
+        })
+    }
+
+    /// `MADV_RANDOM` for the heads.
+    ///
+    /// Every access to them is `seek`'s binary search, so this mapping is
+    /// random in BOTH of the store's phases -- unlike the segment, whose
+    /// advice follows the workload and which `Db::advise` flips. It was
+    /// advised by nothing at all until a measurement went looking for a
+    /// scan that collapsed once the store outgrew memory: under the
+    /// kernel's default readahead a probe fetched a window to consume its
+    /// eight bytes, and out of core that cost 12% of scan throughput.
+    pub fn advise_random(&self) {
+        self.map.advise_random();
+        self.advised.set(true);
+    }
+
+    /// Whether `advise_random` was called on this mapping.
+    pub fn advised(&self) -> bool {
+        self.advised.get()
     }
 
     pub fn len(&self) -> usize {
