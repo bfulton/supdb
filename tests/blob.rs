@@ -588,3 +588,41 @@ fn the_writer_stores_uniform_runs_without_prefixes() {
     );
     reads_what_was_written(&blob, &want);
 }
+
+#[test]
+fn a_walk_over_a_compressed_block_decompresses_each_chunk_once() {
+    // `dec_buf` is a reused buffer, and for a long time that was all it was:
+    // `with_run` decompressed the chunks covering one extent, handed them
+    // out, and kept no record of what the buffer held. Extents are laid down
+    // in key order and many share a chunk, so a walk decoded the same chunk
+    // once per key -- about forty times over where a key holds one hundred
+    // byte value and chunks are four kibibytes.
+    //
+    // Nothing is wrong with the bytes either way, which is why no correctness
+    // check ever saw this and why the assertion below counts work instead.
+    let path = scratch("dec-reuse");
+    // inline_max 0 keeps every run in a block. An inline run lives in the key
+    // section and is never compressed, so a fixture that inlines measures
+    // nothing at all.
+    let want = build_with(&path, 400, true, 0);
+    let blob = Blob::open(MmapBytes::open(&path).expect("map")).expect("open");
+
+    for (key, runs) in &want {
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        blob.read_all(key, |v| got.push(v.to_vec())).expect("read");
+        assert_eq!(&got, runs, "value bytes differ for {key:?}");
+    }
+
+    // One `with_run` per key, so without reuse this is exactly the key count
+    // -- measured at 400 of 400. With it, 71. Half the keys is the line: it
+    // cannot be reached by decoding per key, and it is not so tight that a
+    // change in the fixture's run lengths trips it.
+    let keys = want.len() as u64;
+    let decodes = blob.decodes();
+    assert!(keys >= 400, "{keys} keys: this proves nothing");
+    assert!(
+        decodes * 2 < keys,
+        "{decodes} decompressions for {keys} keys: the walk is decoding the \
+         same chunk once per key again"
+    );
+}

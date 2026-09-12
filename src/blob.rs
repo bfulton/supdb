@@ -618,6 +618,20 @@ pub struct Blob<B: Bytes> {
     /// fresh buffer rather than a panic. A host callback here is JavaScript.
     raw_buf: Cell<Vec<u8>>,
     dec_buf: Cell<Vec<u8>>,
+    /// Which block, and which chunk-aligned span of it, `dec_buf` currently
+    /// holds decompressed.
+    ///
+    /// `dec_buf` is a reused buffer and was nothing more: `with_run`
+    /// decompressed the chunks covering one extent, handed them out, and kept
+    /// no record of what was in the buffer. A run of values is laid down in
+    /// key order, so a walk over them asks for the same chunk once per value
+    /// -- about forty times over at four kibibyte chunks and hundred byte
+    /// values. Remembering what is already decoded makes the walk pay once.
+    dec_at: Cell<Option<(u32, usize, usize)>>,
+    /// How many times a block was actually decompressed. The saving is
+    /// invisible to any correctness check -- the bytes are identical either
+    /// way -- so a test needs to be able to count the work instead.
+    decodes: Cell<u64>,
 }
 
 impl<B: Bytes> Blob<B> {
@@ -666,6 +680,8 @@ impl<B: Bytes> Blob<B> {
             verified: RefCell::new(verified),
             raw_buf: Cell::new(Vec::new()),
             dec_buf: Cell::new(Vec::new()),
+            dec_at: Cell::new(None),
+            decodes: Cell::new(0),
         })
     }
 
@@ -699,6 +715,11 @@ impl<B: Bytes> Blob<B> {
     }
 
     /// Number of distinct keys.
+    /// Blocks decompressed so far by this reader.
+    pub fn decodes(&self) -> u64 {
+        self.decodes.get()
+    }
+
     pub fn keys(&self) -> usize {
         match &self.index {
             Index::Flat { idx, .. } => idx.len(),
@@ -1095,19 +1116,39 @@ impl<B: Bytes> Blob<B> {
             let r = (|| -> Result<R> {
                 if dec.len() < un {
                     dec.resize(un, 0);
+                    self.dec_at.set(None);
                 }
                 if loc.chunked {
-                    block::read_chunked_range(
-                        raw,
-                        un,
-                        a,
-                        b,
-                        &mut dec[..un],
-                        self.opts.verify_checksums,
-                    )?;
+                    // Reuse when this extent falls inside the chunk span the
+                    // buffer already holds for this block.
+                    let lo = a / block::CHUNK * block::CHUNK;
+                    let hi = b.div_ceil(block::CHUNK) * block::CHUNK;
+                    let hi = hi.min(un);
+                    let have = self.dec_at.get();
+                    let hit = matches!(have, Some((blk, l, h))
+                        if blk == e.block && l <= lo && hi <= h);
+                    if !hit {
+                        self.dec_at.set(None);
+                        self.decodes.set(self.decodes.get() + 1);
+                        block::read_chunked_range(
+                            raw,
+                            un,
+                            a,
+                            b,
+                            &mut dec[..un],
+                            self.opts.verify_checksums,
+                        )?;
+                        self.dec_at.set(Some((e.block, lo, hi)));
+                    }
                 } else {
                     self.verify(e.block, loc, raw, 0, 0, raw.len())?;
-                    block::decompress_into(raw, &mut dec, un)?;
+                    let have = self.dec_at.get();
+                    if !matches!(have, Some((blk, 0, h)) if blk == e.block && h == un) {
+                        self.dec_at.set(None);
+                        self.decodes.set(self.decodes.get() + 1);
+                        block::decompress_into(raw, &mut dec, un)?;
+                        self.dec_at.set(Some((e.block, 0, un)));
+                    }
                 }
                 f(&dec[a..b])
             })();
@@ -1955,6 +1996,8 @@ impl<B: Bytes> SparseBlob<B> {
                 verified: RefCell::new(verified),
                 raw_buf: Cell::new(Vec::new()),
                 dec_buf: Cell::new(Vec::new()),
+                dec_at: Cell::new(None),
+                decodes: Cell::new(0),
             },
         };
         // What was read out of the section is verified before it is trusted:
