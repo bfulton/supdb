@@ -278,6 +278,32 @@ pub struct Options {
     ///
     /// See `ReadAdvice`. `Adaptive` unless changed.
     pub read_advice: ReadAdvice,
+    /// Contiguous bytes a scan must expect to walk before the kernel's
+    /// readahead is worth having, under `ReadAdvice::Adaptive`.
+    ///
+    /// `Adaptive` used to put the segments on the kernel's default for every
+    /// scan, on the reasoning that a scan walks values in order and wants the
+    /// pages ahead of it. That is right for a long scan and badly wrong for a
+    /// short one: out of core, over a store at 1.33x the page cache, a scan of
+    /// a hundred entries ran 9.4x FASTER under `MADV_RANDOM` than under the
+    /// default, because each of its three hundred thousand seeks paid a
+    /// readahead it never read. The same store scanned a hundred thousand
+    /// entries at a time ran 3.6x SLOWER under `MADV_RANDOM`, where the
+    /// readahead is exactly what the scan goes on to use.
+    ///
+    /// So the question is not the phase but the span, and `scan` is handed
+    /// its limit before it touches a page -- the signal is free and exact,
+    /// the way the phase signal is. Measured at thirty million keys under a
+    /// four gibibyte cap, entries/s random against default: 11.6 KB 11.4x,
+    /// 33 KB 4.2x, 113 KB 1.56x, then 339 KB 0.85x, 1.16 MB 0.64x, 11.6 MB
+    /// 0.28x. The crossing is near 200 KB and the curve is flat across it --
+    /// within 1.6x either way between 113 KB and 339 KB -- so the number
+    /// below only has to land in that band, and the ends, where being wrong
+    /// costs an order of magnitude, are nowhere near it.
+    ///
+    /// It is NOT the device's readahead window. That was the first guess and
+    /// it is wrong by a factor of forty: this device reports 8,192 kB.
+    pub scan_readahead_bytes: usize,
     pub recycle_wal: bool,
     /// The ordered scan's merge over unrouted sources. `true` is the merge
     /// that replaced the original: one cursor over the disjoint partitions
@@ -318,6 +344,7 @@ impl Default for Options {
             promote: true,
             recycle_wal: false,
             read_advice: ReadAdvice::default(),
+            scan_readahead_bytes: 256 << 10,
             scan_merge: true,
             scan_snapshot_arena: true,
         }
@@ -2777,6 +2804,11 @@ pub struct Db {
     /// `RefCell` -- so every reader thread has its own store, its own
     /// mappings and its own mode, and two threads cannot fight over one flag.
     advice_random: std::cell::Cell<bool>,
+    /// Mean bytes a key costs across the live segments, kept rather than
+    /// recomputed because `scan` asks it on every call and a fold over the
+    /// segments there measured 5% of an in-core scan. Refreshed by
+    /// `sort_segs`, which every mutation of `segs` already ends with.
+    mean_key_bytes: std::cell::Cell<usize>,
     next_seg: u64,
     /// Commits written since the last barrier, for `SyncPolicy::EveryN`.
     unsynced: u32,
@@ -3060,6 +3092,7 @@ impl Db {
             mem_bytes: 0,
             segs: Vec::new(),
             advice_random: std::cell::Cell::new(starts_random),
+            mean_key_bytes: std::cell::Cell::new(0),
             next_seg: 0,
             frozen: None,
             sealing: None,
@@ -3207,6 +3240,7 @@ impl Db {
         }
         let wal = Wal::open_append(&wal_path, wal_id, from)?;
         let next_seg = seg_ids.iter().map(|&(n, _)| n + 1).max().unwrap_or(0);
+        let mean_key_bytes = Db::mean_key_bytes_of(&segs);
         Ok(Db {
             dir: dir.to_path_buf(),
             opts,
@@ -3219,6 +3253,7 @@ impl Db {
             // store's idea of its mode and the mappings' actual mode agree
             // from the first read rather than from the first transition.
             advice_random: std::cell::Cell::new(starts_random),
+            mean_key_bytes: std::cell::Cell::new(mean_key_bytes),
             next_seg,
             frozen: None,
             sealing: None,
@@ -3629,6 +3664,36 @@ impl Db {
                 .then_with(|| a.lo.cmp(&b.lo))
                 .then_with(|| a.name.cmp(&b.name))
         });
+        self.refresh_mean_key_bytes();
+    }
+
+    /// What a key costs on disk, averaged over the live segments.
+    ///
+    /// Every mutation of `segs` ends in `sort_segs`, so refreshing here is
+    /// what keeps this from going stale. It is the whole index section per
+    /// key -- records, directory and hash -- where a scan walks only the
+    /// records, so it reads high by about a quarter on the shape it was
+    /// measured against. That is inside the tolerance: what it feeds is a
+    /// comparison against a crossing that is flat for a factor of three
+    /// either side.
+    fn refresh_mean_key_bytes(&self) {
+        self.mean_key_bytes.set(Db::mean_key_bytes_of(&self.segs));
+    }
+
+    /// Free function over the segments, because `open` needs the number
+    /// before there is a `Db` to ask. It sorts its segments itself rather
+    /// than through `sort_segs`, so an opened store had a zero here and took
+    /// the short-scan path for every scan however long -- which the create
+    /// path's test could not see.
+    fn mean_key_bytes_of(segs: &[Seg]) -> usize {
+        let (bytes, keys) = segs.iter().fold((0usize, 0usize), |(b, k), s| {
+            (b + s.blob.index_bytes(), k + s.blob.keys())
+        });
+        if keys == 0 {
+            0
+        } else {
+            bytes / keys
+        }
     }
 
     /// A merge is due when any one range has accumulated `l0_trigger`
@@ -4073,6 +4138,26 @@ impl Db {
     /// `Cell` load and a compare. On a change it is one `madvise` per live
     /// segment -- a cost priced over a store of several segments, since the
     /// earlier measurement was over a single mapping.
+    /// Will this scan walk enough contiguous bytes for readahead to pay?
+    ///
+    /// The span is the limit times what a key costs on disk, taken from the
+    /// segments themselves rather than assumed: `index_bytes / keys` over the
+    /// live set. That is the whole section per key -- records, directory and
+    /// hash -- where a scan walks only the records, so it reads high by about
+    /// a quarter on the shape measured. It does not need to be tight. The
+    /// crossing it is compared against is flat for a factor of three either
+    /// side, and a quarter is well inside that.
+    fn scan_wants_readahead(&self, limit: usize) -> bool {
+        let mean = self.mean_key_bytes.get();
+        if mean == 0 {
+            // Nothing sealed: the scan is answered from the memtable and
+            // touches no mapping, so the advice is moot. Say no and leave the
+            // segments as they are rather than switching them for nothing.
+            return false;
+        }
+        limit.saturating_mul(mean) >= self.opts.scan_readahead_bytes
+    }
+
     fn advise(&self, random: bool) {
         if self.opts.read_advice != ReadAdvice::Adaptive || self.advice_random.get() == random {
             return;
@@ -4311,7 +4396,7 @@ impl Db {
         limit: usize,
         mut f: F,
     ) -> Result<usize> {
-        self.advise(false);
+        self.advise(!self.scan_wants_readahead(limit));
         // `Prefetch` never changes mode, so `advise` above is a no-op for it.
         // Instead the segments are told exactly which value bytes this scan
         // will walk, before it walks them. Errors are dropped: a plan that

@@ -1613,10 +1613,12 @@ fn an_advising_store_advises_the_ordered_companions_too() {
     assert!(total > 1, "{total} segments: this proves nothing");
     assert_eq!(advised, total, "{advised} of {total} companions advised");
 
-    // A scan puts the segments on the kernel's default -- the companion must
-    // not follow them there, because a binary search is random in either
-    // phase.
-    db.scan(b"key-000000", 32, |_, _| {}).unwrap();
+    // A scan long enough to want readahead puts the segments on the kernel's
+    // default -- the companion must not follow them there, because a binary
+    // search is random in either phase. It has to be a long one: a scan is
+    // advised by the span it will walk, and a short scan now keeps
+    // MADV_RANDOM for the segments too.
+    db.scan(b"key-000000", 100_000, |_, _| {}).unwrap();
     assert!(!db.advice_random(), "the scan did not switch the segments");
     let (advised, total) = db.ords_advised();
     assert_eq!(
@@ -1632,4 +1634,90 @@ fn an_advising_store_advises_the_ordered_companions_too() {
     let (advised, total) = db.ords_advised();
     assert!(total > 1, "{total} segments: this proves nothing");
     assert_eq!(advised, 0, "{advised} of {total} advised under Normal");
+}
+
+#[test]
+fn a_short_scan_keeps_the_random_advice_and_a_long_one_gives_it_up() {
+    // `Adaptive` put the segments on the kernel's default for every scan,
+    // because a scan walks values in order and wants the pages ahead of it.
+    // That is right for a long scan and wrong for a short one: out of core a
+    // hundred-entry scan ran 9.4x faster under MADV_RANDOM, each of its seeks
+    // paying for a readahead it never read, while a hundred-thousand-entry
+    // scan ran 3.6x slower under it. The limit says which is which before a
+    // page is touched, so the store does not have to guess.
+    let d = dir("scan-span-advice");
+    let mut db = Db::create(
+        &d,
+        Options {
+            seal_bytes: 64 << 10,
+            partition_bytes: Some(128 << 10),
+            scan_readahead_bytes: 256 << 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for round in 0u32..6 {
+        for k in 0u32..3_000 {
+            let key = format!("key-{k:06}").into_bytes();
+            db.append(&key, format!("v-{round}-{k}-{}", "z".repeat(60)).as_bytes());
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+    }
+    db.settle().unwrap();
+
+    // A point read leaves the store advised random; that much was already so.
+    let _ = db.read_all(b"key-000001", |_| {}).unwrap();
+    assert!(db.advice_random(), "a point read should advise random");
+
+    // A scan of one entry cannot span the threshold, so it must NOT give the
+    // advice up. This is the case that was 9.4x slow.
+    db.scan(b"key-000000", 1, |_, _| {}).unwrap();
+    assert!(
+        db.advice_random(),
+        "a one-entry scan dropped MADV_RANDOM: it cannot span {} bytes",
+        256 << 10
+    );
+
+    // A scan long enough to cover the threshold several times over wants the
+    // readahead, and has to be able to ask for it.
+    db.scan(b"key-000000", 100_000, |_, _| {}).unwrap();
+    assert!(
+        !db.advice_random(),
+        "a 100,000-entry scan kept MADV_RANDOM: readahead is what it is for"
+    );
+
+    // And back, because the span is asked per scan rather than latched once.
+    db.scan(b"key-000000", 1, |_, _| {}).unwrap();
+    assert!(
+        db.advice_random(),
+        "the advice did not come back for a short scan"
+    );
+
+    // Reopened, not created. `open` sorts its own segments instead of going
+    // through `sort_segs`, so the mean a scan compares against was seeded to
+    // zero there and every scan took the short path however long it was. The
+    // create path above cannot see that, which is the whole reason this is
+    // here.
+    drop(db);
+    let db = Db::open(
+        &d,
+        Options {
+            seal_bytes: 64 << 10,
+            partition_bytes: Some(128 << 10),
+            scan_readahead_bytes: 256 << 10,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.scan(b"key-000000", 100_000, |_, _| {}).unwrap();
+    assert!(
+        !db.advice_random(),
+        "after reopen a 100,000-entry scan kept MADV_RANDOM: the mean was never seeded"
+    );
+    db.scan(b"key-000000", 1, |_, _| {}).unwrap();
+    assert!(
+        db.advice_random(),
+        "after reopen the advice did not come back"
+    );
 }
