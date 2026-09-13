@@ -26,6 +26,7 @@
 //! replays the whole memtable or a complete renamed segment plus a WAL
 //! whose sealed prefix is skipped by sequence number.
 
+use std::cmp::Ordering;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Result, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -4629,21 +4630,9 @@ impl Db {
                 // uses, so damage widens the cut rather than moving it.
                 let end = rank.saturating_add(limit - seen).min(keys);
                 let next = unsealed.get(mi);
-                let bound = match next {
-                    Some((uk, _))
-                        if end > rank && seg.blob.key_at(end - 1).is_none_or(|k| k >= uk) =>
-                    {
-                        let (mut a, mut b) = (rank, end);
-                        while a < b {
-                            let m = a + (b - a) / 2;
-                            match seg.blob.key_at(m) {
-                                Some(k) if k < uk => a = m + 1,
-                                _ => b = m,
-                            }
-                        }
-                        a
-                    }
-                    _ => end,
+                let (bound, at_bound) = match next {
+                    Some((uk, _)) if end > rank => Self::cut_at(seg, rank, end, uk),
+                    _ => (end, Ordering::Greater),
                 };
                 if bound > rank {
                     let got = seg
@@ -4665,18 +4654,22 @@ impl Db {
                         break;
                     }
                 }
-                // The walk stands at the unsealed key's rank, or at the end
-                // of this partition's keys.
+                // The walk stands at the unsealed key's cut, or at the end
+                // of this partition's keys. The partition's own key is
+                // below its fence by construction, so only another key is
+                // asked whether it belongs past the fence, to the next
+                // partition, or past the last partition's last key, to the
+                // tail below.
                 let Some((uk, sk)) = next else { break };
-                if seg.hi.as_ref().is_some_and(|h| uk >= h.as_slice()) {
-                    // The key belongs to a later partition.
-                    break;
+                let same = rank < keys && at_bound == Ordering::Equal;
+                if !same {
+                    if seg.hi.as_ref().is_some_and(|h| uk >= h.as_slice()) {
+                        break;
+                    }
+                    if rank >= keys && seg.hi.is_none() {
+                        break;
+                    }
                 }
-                if rank >= keys && seg.hi.is_none() {
-                    // Past the last partition's last key: the tail below.
-                    break;
-                }
-                let same = rank < keys && seg.blob.key_at(rank) == Some(uk);
                 let tombs = *tombs.get_or_insert_with(|| self.has_tombstones());
                 self.emit_unsealed(
                     &mut f,
@@ -4708,6 +4701,63 @@ impl Db {
             seen += 1;
         }
         Ok(seen)
+    }
+
+    /// The first rank in `rank..end` whose key is not below `uk`, or `end`,
+    /// with how that rank's key compares to `uk` -- `Equal` for the key
+    /// itself, `Greater` for a key past it or a rank that does not resolve,
+    /// which sorts as "not less" the way the seek's damage rule has it.
+    ///
+    /// The rank itself is read first: after the Zipfian mixes the low keys
+    /// are dense with unsealed keys, and the scans that start there meet
+    /// the next one at the very rank the walk stands on, so one read
+    /// answers, and the comparison it made is the equal-key check the emit
+    /// needs. Then the window's last key, one read, for the key past the
+    /// window -- an insert past the loaded range. Only a cut inside the
+    /// window is searched, by a gallop from the rank and a binary search
+    /// over the gap it lands in, about 2 log2 d reads for a cut d ranks
+    /// away. A binary search over the whole window cost six reads for a cut
+    /// at distance one, and with two more reads a key that was eight
+    /// against the merge's three.
+    fn cut_at(seg: &Seg, rank: usize, end: usize, uk: &[u8]) -> (usize, Ordering) {
+        let at = |r: usize| seg.blob.key_at(r).map_or(Ordering::Greater, |k| k.cmp(uk));
+        let first = at(rank);
+        if first != Ordering::Less {
+            return (rank, first);
+        }
+        let last = at(end - 1);
+        if last == Ordering::Less {
+            return (end, Ordering::Greater);
+        }
+        // The cut is in rank+1 ..= end-1, and `at(hi)` is never `Less`.
+        let (mut lo, mut hi, mut at_hi) = (rank + 1, end - 1, last);
+        let mut step = 1usize;
+        loop {
+            let p = lo + step - 1;
+            if p >= hi {
+                break;
+            }
+            let c = at(p);
+            if c == Ordering::Less {
+                lo = p + 1;
+                step *= 2;
+            } else {
+                hi = p;
+                at_hi = c;
+                break;
+            }
+        }
+        while lo < hi {
+            let m = lo + (hi - lo) / 2;
+            let c = at(m);
+            if c == Ordering::Less {
+                lo = m + 1;
+            } else {
+                hi = m;
+                at_hi = c;
+            }
+        }
+        (lo, at_hi)
     }
 
     /// One unsealed key, emitted as `scan_merged` emits it with no level-0
