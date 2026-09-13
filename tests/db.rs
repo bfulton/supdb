@@ -4,7 +4,7 @@
 //! by constructing the exact on-disk state the window leaves behind, because
 //! a clean result on a path a test never took proves nothing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use supdb::{Db, Options, ReadAdvice};
@@ -1663,4 +1663,207 @@ fn a_short_scan_keeps_the_random_advice_and_a_long_one_gives_it_up() {
         db.advice_random(),
         "after reopen the advice did not come back"
     );
+}
+
+/// What a scan over the store must answer, kept beside it: each key's live
+/// values in append order, and the keys any unsealed source has touched
+/// since the last flush. A touched key is visited by the scan and counts
+/// toward its limit whether or not it has a value left -- that is what the
+/// merge over unrouted sources does with a tombstone-only key, and the bulk
+/// walk has to agree with it.
+#[derive(Default)]
+struct ScanModel {
+    vals: BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
+    touched: BTreeSet<Vec<u8>>,
+}
+
+impl ScanModel {
+    fn append(&mut self, db: &mut Db, key: &str, val: &str) {
+        db.append(key.as_bytes(), val.as_bytes());
+        self.vals
+            .entry(key.as_bytes().to_vec())
+            .or_default()
+            .push(val.as_bytes().to_vec());
+        self.touched.insert(key.as_bytes().to_vec());
+    }
+    fn delete(&mut self, db: &mut Db, key: &str) {
+        db.delete(key.as_bytes());
+        self.vals
+            .entry(key.as_bytes().to_vec())
+            .or_default()
+            .clear();
+        self.touched.insert(key.as_bytes().to_vec());
+    }
+    /// A flush merges every unsealed source into the partitions and drops
+    /// the keys with nothing left.
+    fn flushed(&mut self) {
+        self.vals.retain(|_, v| !v.is_empty());
+        self.touched.clear();
+    }
+    /// The keys a scan visits, in order.
+    fn visited(&self) -> Vec<&[u8]> {
+        self.vals
+            .iter()
+            .filter(|(k, v)| !v.is_empty() || self.touched.contains(*k))
+            .map(|(k, _)| k.as_slice())
+            .collect()
+    }
+    /// Every scan the store can be asked for, against the model: from every
+    /// visited key, from between them, from below and from past the end,
+    /// at limits from one to unbounded. Both the stream and the count.
+    fn check(&self, db: &Db, state: &str) {
+        let visited = self.visited();
+        let mut starts: Vec<Vec<u8>> = visited.iter().map(|k| k.to_vec()).collect();
+        starts.extend(visited.iter().map(|k| [k, &b"+"[..]].concat()));
+        starts.push(Vec::new());
+        starts.push(b"a".to_vec());
+        starts.push(b"zzz".to_vec());
+        for from in &starts {
+            for &limit in &[1usize, 2, 3, 5, 17, usize::MAX] {
+                let mut want: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                let mut want_n = 0usize;
+                for k in visited
+                    .iter()
+                    .filter(|k| **k >= from.as_slice())
+                    .take(limit)
+                {
+                    want_n += 1;
+                    for v in &self.vals[*k] {
+                        want.push((k.to_vec(), v.clone()));
+                    }
+                }
+                let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                let n = db
+                    .scan(from, limit, |k, v| got.push((k.to_vec(), v.to_vec())))
+                    .unwrap();
+                assert_eq!(
+                    got,
+                    want,
+                    "{state}: scan from {:?} limit {limit}",
+                    String::from_utf8_lossy(from)
+                );
+                assert_eq!(
+                    n,
+                    want_n,
+                    "{state}: count from {:?} limit {limit}",
+                    String::from_utf8_lossy(from)
+                );
+            }
+        }
+    }
+}
+
+/// The bulk walk over partitions with unsealed keys laid over it, held to
+/// the merge it stands in for, in every state the store passes through.
+///
+/// The walk used to run only when no unsealed key was at or after the
+/// scan's start. YCSB's inserts land past the end of the loaded range, so
+/// one insert sent every later scan through the merge for keys it never
+/// reached. Now the walk runs whenever there is no level-0 piece, and this
+/// holds it to a model through every source an unsealed key can come from:
+/// the live memtable alone (the YCSB shape, inserts past the end), then the
+/// frozen memtable under a seal that has not been joined -- deterministic,
+/// because only a `&mut` call joins one -- with the live table written over
+/// it: a key in all three sources, tombstones in each memtable cutting the
+/// older ones, a delete followed by an append in one table and across the
+/// two, keys below the first partition key, between existing keys, and past
+/// the last. The same model then checks the merge after `settle` publishes
+/// the level-0 pieces, and the walk alone after a flush.
+#[test]
+fn the_bulk_walk_lays_unsealed_keys_over_the_partitions_exactly_as_the_merge_does() {
+    let d = dir("overlay");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in (0..600).step_by(3) {
+        m.append(&mut db, &key(k), &format!("p{k}"));
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    let (parts, l0) = db.levels();
+    assert!(
+        parts > 1 && l0 == 0,
+        "want several partitions and no piece, got {parts}/{l0}"
+    );
+    m.check(&db, "partitions only");
+
+    // The YCSB shape: inserts past the end, committed, nothing sealed.
+    for k in (600..660).step_by(3) {
+        m.append(&mut db, &key(k), &format!("e{k}"));
+    }
+    db.commit().unwrap();
+    assert_eq!(db.levels(), (parts, 0));
+    m.check(&db, "live inserts past the end");
+
+    // What the frozen memtable will hold.
+    for k in (0..600).step_by(3) {
+        match k % 10 {
+            1 => m.append(&mut db, &key(k), "f"),
+            2 => m.append(&mut db, &key(k + 1), "f-between"),
+            4 => m.delete(&mut db, &key(k)),
+            7 => {
+                m.delete(&mut db, &key(k));
+                m.append(&mut db, &key(k), "f-after-delete");
+            }
+            _ => {}
+        }
+    }
+    m.delete(&mut db, &key(1)); // a key no source holds
+    m.append(&mut db, "kex-below", "f-below");
+    db.commit().unwrap();
+    db.seal().unwrap();
+    assert!(
+        db.in_flight().0,
+        "the seal is not joined until a &mut call joins it"
+    );
+    assert_eq!(
+        db.levels(),
+        (parts, 0),
+        "an unjoined seal publishes no piece"
+    );
+
+    // The live memtable over it, uncommitted so nothing joins the seal.
+    for k in (0..600).step_by(3) {
+        match k % 10 {
+            0 => {
+                m.delete(&mut db, &key(k));
+                m.append(&mut db, &key(k), "l-after-delete");
+            }
+            1 => m.append(&mut db, &key(k), "l"),
+            4 => m.append(&mut db, &key(k), "l-after-frozen-delete"),
+            5 => m.append(&mut db, &key(k + 2), "l-between"),
+            7 => m.delete(&mut db, &key(k)),
+            _ => {}
+        }
+    }
+    m.append(&mut db, &key(600), "l-on-frozen-insert");
+    m.append(&mut db, "kex-below", "l-below");
+    m.append(&mut db, "kez-above", "l-above");
+    assert!(db.in_flight().0);
+    assert_eq!(db.levels(), (parts, 0));
+    m.check(&db, "frozen and live over the partitions");
+
+    db.settle().unwrap();
+    assert!(db.levels().1 > 0, "settle publishes the sealed pieces");
+    m.check(&db, "level-0 pieces and live over the partitions");
+
+    db.flush().unwrap();
+    m.flushed();
+    assert_eq!(db.levels().1, 0);
+    m.check(&db, "partitions only, after the merge");
+
+    // And the YCSB shape once more on the merged store.
+    for k in (660..700).step_by(3) {
+        m.append(&mut db, &key(k), &format!("e{k}"));
+    }
+    db.commit().unwrap();
+    assert_eq!(db.levels().1, 0);
+    m.check(&db, "live inserts past the end, after the merge");
+    db.close().unwrap();
 }

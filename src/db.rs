@@ -2889,9 +2889,6 @@ struct Snapshot {
 }
 
 impl Snapshot {
-    fn len(&self) -> usize {
-        self.ents.len()
-    }
     fn get(&self, i: usize) -> Option<(&[u8], &SnapKey)> {
         self.ents
             .get(i)
@@ -4419,52 +4416,18 @@ impl Db {
         let unsealed = &cache.as_ref().expect("scan snapshot").1;
         let mut mi = unsealed.seek(from);
 
-        // When nothing overlaps -- no unsealed keys in range, no L0 -- the
-        // partitions ARE the answer in key order, and each one can be
-        // walked by `Blob::scan`, which resolves each key once. The merge
-        // below costs five or six index lookups an entry (a key_at per
-        // cursor to find the minimum, another to emit, and a third inside
-        // `values_at`) where this costs one, and after a routed flush this
-        // is the shape the store is in. An earlier version had this path,
-        // a refactor dropped it, and the scan axis paid for it.
-        if mi >= unsealed.len() && !self.segs.iter().any(|s| s.level == 0) {
-            // `sort_segs` orders by level descending then by `lo`, and this
-            // arm runs only when every segment is a partition, so they are
-            // already in key order here. Collecting them into a `Vec` to sort
-            // them again repeated work the store had done -- and the collect,
-            // the sort and the three `Vec` clones around the cursor measured
-            // 391ns of a 648ns seek, six times what the ordered index saved.
-            // A scan is a read; it allocates nothing now.
-            debug_assert!(
-                self.segs
-                    .windows(2)
-                    .all(|w| w[0].level != w[1].level || w[0].lo <= w[1].lo),
-                "partitions are not in key order, so this walk would skip one"
-            );
-            let mut seen = 0usize;
-            let mut cursor: &[u8] = from;
-            for seg in self.segs.iter().filter(|s| s.may_reach(from)) {
-                if seen >= limit {
-                    break;
-                }
-                if seg.lo.as_slice() > cursor {
-                    cursor = seg.lo.as_slice();
-                }
-                // The ordered index answers the seek this scan starts
-                // with; the walk after it is the reader's own. That split is
-                // the whole point of the index -- the seek was the entire
-                // measured deficit and the walk was already competitive.
-                let rank = seg.ord.seek(cursor, |r| seg.blob.key_at(r));
-                seen += seg
-                    .blob
-                    .scan_at(rank, limit - seen, &mut f)
-                    .map_err(|e| err(&format!("segment scan: {e}")))?;
-                match &seg.hi {
-                    Some(h) => cursor = h.as_slice(),
-                    None => break,
-                }
-            }
-            return Ok(seen);
+        // With no level-0 piece the partitions tile the key space in order
+        // and the unsealed keys are one sorted array, so the partitions can
+        // be walked in bulk by `Blob::scan_at`, which resolves each key
+        // once, with the unsealed keys laid over the walk where they fall.
+        // The merge below costs five or six index lookups an entry (a
+        // key_at per cursor to find the minimum, another to emit, and a
+        // third inside `values_at`) where this costs one, and after a
+        // routed flush this is the shape the store is in. An earlier
+        // version had this path, a refactor dropped it, and the scan axis
+        // paid for it.
+        if !self.segs.iter().any(|s| s.level == 0) {
+            return self.scan_partitions(from, limit, mi, unsealed, f);
         }
 
         if self.opts.scan_merge {
@@ -4579,6 +4542,212 @@ impl Db {
             seen += 1;
         }
         Ok(seen)
+    }
+
+    /// The partitions walked in bulk, with the unsealed keys laid over them.
+    ///
+    /// The caller has checked there is no level-0 piece, so the sources are
+    /// the partitions, which tile the key space in order, and the two
+    /// memtables, whose keys `unsealed` holds as one sorted array. Each
+    /// partition is walked by `Blob::scan_at` -- one record decode an entry
+    /// -- up to the next unsealed key that falls inside the walk. That key
+    /// is then emitted as `scan_merged` would emit it, and the walk resumes
+    /// after it. Unsealed keys beyond the last partition come out at the
+    /// end, in order.
+    ///
+    /// Before this, the bulk walk ran only when no unsealed key was at or
+    /// after `from`. YCSB's inserts land past the end of the loaded range,
+    /// so after the first one every scan failed that test for keys it never
+    /// reached and paid the merge: on one store in one process, a 5% insert
+    /// past the end with no seal cost 100-entry scans 2.8x, and a flush gave
+    /// it back.
+    ///
+    /// Whether the next unsealed key cuts a walk is decided by one key read,
+    /// the last key the walk would reach, and only when it does is its rank
+    /// found -- by a binary search over the walk's window, not the ordered
+    /// index over the whole partition. A scan that meets no unsealed key
+    /// pays one key read a partition for the question.
+    fn scan_partitions<F: FnMut(&[u8], &[u8])>(
+        &self,
+        from: &[u8],
+        limit: usize,
+        mut mi: usize,
+        unsealed: &Snapshot,
+        mut f: F,
+    ) -> Result<usize> {
+        // `sort_segs` orders by level descending then by `lo`, and this
+        // runs only when every segment is a partition, so they are already
+        // in key order here. Collecting them into a `Vec` to sort them
+        // again repeated work the store had done -- and the collect, the
+        // sort and the three `Vec` clones around the cursor measured 391ns
+        // of a 648ns seek, six times what the ordered index saved. A scan
+        // is a read; it allocates nothing until a memtable chain is walked.
+        debug_assert!(
+            self.segs
+                .windows(2)
+                .all(|w| w[0].level != w[1].level || w[0].lo <= w[1].lo),
+            "partitions are not in key order, so this walk would skip one"
+        );
+        // Whether any source holds a tombstone is asked of every segment,
+        // and only an emitted unsealed key needs the answer, so a scan that
+        // meets none never asks.
+        let mut tombs: Option<bool> = None;
+        let mut scratch: Vec<usize> = Vec::new();
+        let mut seen = 0usize;
+        let mut cursor: &[u8] = from;
+        for seg in self.segs.iter().filter(|s| s.may_reach(from)) {
+            if seen >= limit {
+                break;
+            }
+            if seg.lo.as_slice() > cursor {
+                cursor = seg.lo.as_slice();
+            }
+            let keys = seg.blob.keys();
+            // The ordered index answers the seek this partition starts
+            // with; the walk after it is the reader's own. That split is
+            // the whole point of the index -- the seek was the entire
+            // measured deficit and the walk was already competitive.
+            let mut rank = seg.ord.seek(cursor, |r| seg.blob.key_at(r));
+            while seen < limit {
+                // The walk reaches the limit or the partition's end, cut
+                // where the next unsealed key falls inside it. A rank that
+                // does not resolve sorts as "not less", the rule the seek
+                // uses, so damage widens the cut rather than moving it.
+                let end = rank.saturating_add(limit - seen).min(keys);
+                let next = unsealed.get(mi);
+                let bound = match next {
+                    Some((uk, _))
+                        if end > rank && seg.blob.key_at(end - 1).is_none_or(|k| k >= uk) =>
+                    {
+                        let (mut a, mut b) = (rank, end);
+                        while a < b {
+                            let m = a + (b - a) / 2;
+                            match seg.blob.key_at(m) {
+                                Some(k) if k < uk => a = m + 1,
+                                _ => b = m,
+                            }
+                        }
+                        a
+                    }
+                    _ => end,
+                };
+                if bound > rank {
+                    let got = seg
+                        .blob
+                        .scan_at(rank, bound - rank, &mut f)
+                        .map_err(|e| err(&format!("segment scan: {e}")))?;
+                    if got < bound - rank {
+                        // A rank below the key count that the walk could
+                        // not resolve. The seek above would have widened
+                        // past it; the walk cannot, and saying nothing
+                        // would drop every key after it.
+                        return Err(err(
+                            "segment scan: a partition's walk stopped short of its key count",
+                        ));
+                    }
+                    seen += got;
+                    rank += got;
+                    if seen >= limit {
+                        break;
+                    }
+                }
+                // The walk stands at the unsealed key's rank, or at the end
+                // of this partition's keys.
+                let Some((uk, sk)) = next else { break };
+                if seg.hi.as_ref().is_some_and(|h| uk >= h.as_slice()) {
+                    // The key belongs to a later partition.
+                    break;
+                }
+                if rank >= keys && seg.hi.is_none() {
+                    // Past the last partition's last key: the tail below.
+                    break;
+                }
+                let same = rank < keys && seg.blob.key_at(rank) == Some(uk);
+                let tombs = *tombs.get_or_insert_with(|| self.has_tombstones());
+                self.emit_unsealed(
+                    &mut f,
+                    &mut scratch,
+                    tombs,
+                    uk,
+                    sk,
+                    same.then_some((seg, rank)),
+                )?;
+                if same {
+                    rank += 1;
+                }
+                mi += 1;
+                seen += 1;
+            }
+            match &seg.hi {
+                Some(h) => cursor = h.as_slice(),
+                None => break,
+            }
+        }
+        // Unsealed keys after every partition, in order.
+        while seen < limit {
+            let Some((uk, sk)) = unsealed.get(mi) else {
+                break;
+            };
+            let tombs = *tombs.get_or_insert_with(|| self.has_tombstones());
+            self.emit_unsealed(&mut f, &mut scratch, tombs, uk, sk, None)?;
+            mi += 1;
+            seen += 1;
+        }
+        Ok(seen)
+    }
+
+    /// One unsealed key, emitted as `scan_merged` emits it with no level-0
+    /// piece in the way: the partition's values first when `part` names an
+    /// equal key, then the frozen memtable's, then the live one's, each
+    /// older source cut by a tombstone in a newer. Sources are numbered
+    /// partition 0, frozen 1, live 2; `start` is the oldest one whose
+    /// values are live.
+    fn emit_unsealed<F: FnMut(&[u8], &[u8])>(
+        &self,
+        f: &mut F,
+        scratch: &mut Vec<usize>,
+        tombs: bool,
+        key: &[u8],
+        sk: &SnapKey,
+        part: Option<(&Seg, usize)>,
+    ) -> Result<()> {
+        let mut start = 0usize;
+        if tombs {
+            if sk.mem != u32::MAX && self.mem.has_tomb(&self.mem.entries[sk.mem as usize]) {
+                start = 2;
+            } else if sk.frozen != u32::MAX
+                && self
+                    .frozen
+                    .as_ref()
+                    .is_some_and(|fr| fr.has_tomb(&fr.entries[sk.frozen as usize]))
+            {
+                start = 1;
+            }
+        }
+        if start == 0 {
+            if let Some((seg, rank)) = part {
+                seg.blob
+                    .values_at(rank, |v| f(key, v))
+                    .map_err(|e| err(&format!("segment scan read: {e}")))?;
+            }
+        }
+        if sk.frozen != u32::MAX && start <= 1 {
+            if let Some(fr) = &self.frozen {
+                let e = &fr.entries[sk.frozen as usize];
+                fr.live_offs_into(e, scratch);
+                for &off in scratch.iter() {
+                    f(key, fr.value_at(off));
+                }
+            }
+        }
+        if sk.mem != u32::MAX {
+            let e = &self.mem.entries[sk.mem as usize];
+            self.mem.live_offs_into(e, scratch);
+            for &off in scratch.iter() {
+                f(key, self.mem.value_at(off));
+            }
+        }
+        Ok(())
     }
 
     /// The merge over unrouted sources, the `scan_merge` arm: one cursor walking the
