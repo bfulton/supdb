@@ -1937,11 +1937,36 @@ impl Seg {
         Ok((bloom, tombs))
     }
 
+    /// Whether `key` sorts below this segment's lower fence. An open fence
+    /// is the empty vector, and nothing is below it -- which the compare
+    /// would also answer, at a price: `Vec::new()` holds a dangling
+    /// non-null pointer, and glibc's memcmp reads through its left operand
+    /// before it honours a zero length, so the compare costs a failed page
+    /// walk every call, 81 ns measured against 2 ns on a real pointer.
+    /// Every read that reaches the first partition or a level-0 piece was
+    /// paying it, and so was every scan that started there.
+    #[inline]
+    fn below_lo(&self, key: &[u8]) -> bool {
+        !self.lo.is_empty() && key < self.lo.as_slice()
+    }
+
+    /// The scan's cursor into this segment: `from`, or the lower fence if
+    /// that is higher. See `below_lo` for why the empty fence is not
+    /// compared.
+    #[inline]
+    fn cursor_from<'a>(&'a self, from: &'a [u8]) -> &'a [u8] {
+        if !self.lo.is_empty() && self.lo.as_slice() > from {
+            self.lo.as_slice()
+        } else {
+            from
+        }
+    }
+
     /// Could this segment hold `key`? A fence answers exactly; a Bloom
     /// answers with false positives and never a false negative.
     #[inline]
     fn may_hold(&self, key: &[u8]) -> bool {
-        if key < self.lo.as_slice() {
+        if self.below_lo(key) {
             return false;
         }
         if self.hi.as_ref().is_some_and(|h| key >= h.as_slice()) {
@@ -2460,7 +2485,9 @@ impl Emitter<'_> {
         // merge told to write a fence must contain what it writes, or the
         // read path will deny it and no test will say so.
         if let Some(k) = k {
-            if k < p.lo.as_slice() || p.hi.as_ref().is_some_and(|h| k >= h.as_slice()) {
+            if (!p.lo.is_empty() && k < p.lo.as_slice())
+                || p.hi.as_ref().is_some_and(|h| k >= h.as_slice())
+            {
                 return Err(err("compaction would write a key outside its fence"));
             }
         }
@@ -2608,7 +2635,13 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     match &fences {
         Some(fs) => {
             for (lo, hi) in fs {
-                let from = keys.partition_point(|k| k < lo.as_slice());
+                // An open fence is the empty vector, and nothing is below
+                // it; see `Seg::below_lo` for why it is not compared.
+                let from = if lo.is_empty() {
+                    0
+                } else {
+                    keys.partition_point(|k| k < lo.as_slice())
+                };
                 let to = match hi {
                     Some(h) => keys.partition_point(|k| k < h.as_slice()),
                     None => keys.len(),
@@ -4461,14 +4494,7 @@ impl Db {
             .segs
             .iter()
             .filter(|s| s.may_reach(from))
-            .map(|s| {
-                let start = if s.lo.as_slice() > from {
-                    s.lo.as_slice()
-                } else {
-                    from
-                };
-                (s, s.blob.seek(start))
-            })
+            .map(|s| (s, s.blob.seek(s.cursor_from(from))))
             .collect();
 
         let tombs = self.has_tombstones();
@@ -4614,9 +4640,7 @@ impl Db {
             if seen >= limit {
                 break;
             }
-            if seg.lo.as_slice() > cursor {
-                cursor = seg.lo.as_slice();
-            }
+            cursor = seg.cursor_from(cursor);
             let keys = seg.blob.keys();
             // The ordered index answers the seek this partition starts
             // with; the walk after it is the reader's own. That split is
@@ -4838,12 +4862,7 @@ impl Db {
         let mut pkey: Option<&[u8]> = None;
         while pi < np {
             let s = &parts[pi];
-            let start = if s.lo.as_slice() > from {
-                s.lo.as_slice()
-            } else {
-                from
-            };
-            prank = s.blob.seek(start);
+            prank = s.blob.seek(s.cursor_from(from));
             pkey = s.blob.key_at(prank);
             if pkey.is_some() {
                 break;
@@ -4859,12 +4878,7 @@ impl Db {
             .iter()
             .filter(|s| s.may_reach(from))
             .map(|s| {
-                let start = if s.lo.as_slice() > from {
-                    s.lo.as_slice()
-                } else {
-                    from
-                };
-                let rank = s.blob.seek(start);
+                let rank = s.blob.seek(s.cursor_from(from));
                 Cur {
                     seg: s,
                     rank,

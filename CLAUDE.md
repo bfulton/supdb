@@ -215,6 +215,28 @@ builds wrapped and reserved 7,680 bytes for a tiny placement, so every small
 store paid about 1.9x on every section it wrote -- visible as size, never as
 a fault.
 
+**A zero-length compare is not free when its pointer is dangling.** An
+open fence was `Vec::new()`, and every read that reached the first partition
+or a level-0 piece, and every scan that started there, compared its key
+against that empty slice. The compare is a `memcmp` with a length of zero,
+which glibc's AVX-512 variant answers by building a byte mask from the
+length and issuing a masked load through one operand and a masked compare
+through the other before anything looks at the length: a zero mask
+suppresses the fault but not the address translation, and an empty `Vec`'s
+pointer is a dangling non-null address no page table maps, so every call
+paid a failed page walk that no TLB entry could cache. Measured with a
+run-time length of zero: 81 ns with the dangling pointer as the left
+operand, 19 ns as the right, 2 ns on a real pointer. The scan's cursor
+compare had the fence on the left, a fifth of a scan's fixed cost at 300k
+keys; the read path's `may_hold` had it on the right, and the read
+measurement did not move. It was found by peeling a scan apart one call at
+a time after every layer of the engine had been cleared. The fence
+compares now go through `Seg::below_lo` and `Seg::cursor_from`, which do
+not compare an empty fence at all. The rule is general: a slice that may be
+empty, and whose bytes live in a `Vec`, must not be handed to a byte
+compare without an `is_empty` check first, and a zero-length operation is a
+real operation until a measurement says otherwise.
+
 **A sentinel that crosses the wasm boundary changes sign.** A wasm `u32`
 arrives in JavaScript as a signed i32, so a failure sentinel of `u32::MAX`
 arrives as -1 and a comparison against 4294967295 can never match. Every
