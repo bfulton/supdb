@@ -47,10 +47,50 @@ const VERSION: u32 = 3;
 const HEADER: usize = 192;
 /// Bytes per hash slot: a tag in the top eight bits, a record offset below.
 const SLOT: usize = 8;
+/// The most of the hash table that may be occupied: three quarters.
+const HASH_LOAD_NUM: usize = 3;
+const HASH_LOAD_DEN: usize = 4;
 /// Records are 4-aligned so an extent array can be borrowed as `&[Ext]`.
 const REC_ALIGN: usize = 4;
 /// Bytes per extent record: five little-endian u32s, `Ext`'s layout.
 const EXT_BYTES: usize = std::mem::size_of::<Ext>();
+
+/// Hash slots for `keys`: the smallest power of two that keeps the table at
+/// or under `HASH_MAX_LOAD`.
+///
+/// Two things ride on the bound. Neither probe loop has a termination guard
+/// -- an insert and a lookup both walk `s = (s + 1) & mask` until they find
+/// what they came for -- so a full table does not slow down, it spins. And
+/// the capacity is what the section costs: eight bytes a slot, every slot,
+/// whether or not a key ever lands in it.
+///
+/// The rule was `cap >= keys * 2`. Rounded to a power of two that is not two
+/// slots a key, it is between two and four: 290,000 keys took 1,048,576 slots,
+/// 3.62 a key at 27.7% load, and 28.93 bytes a key of a segment that came to
+/// 181.6. Three quarters is the same guarantee -- there is always an empty
+/// slot -- at half the slots: the same segment takes 524,288, 55.3% load and
+/// 14.46 bytes a key, and the store falls to 167.1.
+///
+/// What that buys is not the disk. A scan never reads a hash slot, so the
+/// bytes come off the file without coming out of the scan's working set, and
+/// the store crosses the page cache later: at thirty million keys under a
+/// four gibibyte cap, scans went from 1,981,237 entries/s to 2,638,810, a
+/// third faster, with faults a scan down from 1.14 to 0.88. In-core point
+/// reads, which are what the extra slots were buying, did not move --
+/// 1,016,175 ops/s against 999,432, inside the spread of either.
+///
+/// `nkeys > hash_cap` is refused at open, so a reader from before this reads
+/// a smaller table without noticing: the capacity is a header field and the
+/// probe masks with it, which is why this is a writer's choice and not a
+/// format change.
+fn hash_cap_for(keys: usize) -> Option<usize> {
+    let want = keys.checked_mul(HASH_LOAD_DEN)?.div_ceil(HASH_LOAD_NUM);
+    let mut cap = 1usize;
+    while cap < want {
+        cap = cap.checked_mul(2)?;
+    }
+    Some(cap.max(16))
+}
 
 /// Spare room left at the end of the record region, as a fraction of it.
 ///
@@ -555,11 +595,7 @@ pub fn stream_trailer<'a>(
         return None;
     }
     let recs_off = HEADER;
-    let mut cap = 1usize;
-    while cap < n * 2 {
-        cap = cap.checked_mul(2)?;
-    }
-    cap = cap.max(16);
+    let cap = hash_cap_for(n)?;
     let mask = cap - 1;
 
     let mut t: Vec<u8> = Vec::new();
@@ -745,11 +781,7 @@ pub fn section_layout(
     if rec_bytes > MAX_RECS {
         return None;
     }
-    let mut cap = 1usize;
-    while cap < keys * 2 {
-        cap = cap.checked_mul(2)?;
-    }
-    cap = cap.max(16);
+    let cap = hash_cap_for(keys)?;
 
     // Half again, so a store whose keys gain extents can publish updates
     // without rewriting anything -- unless the caller says the section is
@@ -1752,6 +1784,56 @@ impl FlatIndex {
             }
         }
         lo
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    #[test]
+    fn the_hash_never_fills_past_three_quarters() {
+        // Neither probe loop has a termination guard, so a table that can
+        // reach full does not get slow, it hangs. The bound is what keeps an
+        // empty slot in it. Powers of two and the counts either side of them
+        // are the cases that a "round up to the next power of two" rule gets
+        // wrong: `cap >= keys` puts 524,288 keys in 524,288 slots.
+        let mut counts: Vec<usize> = vec![0, 1, 2, 15, 16, 17, 290_000, 30_000_000];
+        for p in 4..25 {
+            let n = 1usize << p;
+            counts.extend([n - 1, n, n + 1]);
+        }
+        for n in counts {
+            let cap = hash_cap_for(n).expect("capacity");
+            assert!(
+                cap.is_power_of_two(),
+                "{n} keys: {cap} is not a power of two"
+            );
+            assert!(cap >= 16, "{n} keys: {cap} is below the floor");
+            assert!(
+                cap > n,
+                "{n} keys in {cap} slots: a full table spins in the probe loop"
+            );
+            assert!(
+                n * HASH_LOAD_DEN <= cap * HASH_LOAD_NUM,
+                "{n} keys in {cap} slots is {:.1}% load, past the bound",
+                n as f64 / cap as f64 * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn the_rule_is_tight_enough_to_be_worth_having() {
+        // The old rule asked for two slots a key and the rounding made it
+        // 3.62 at the size the suite runs. Guard the other direction too, or
+        // a future loosening buys back the bytes silently.
+        let cap = hash_cap_for(290_000).expect("capacity");
+        assert_eq!(cap, 524_288, "290,000 keys should take 524,288 slots");
+        assert!(
+            cap * SLOT / 290_000 < 16,
+            "{} bytes a key of hash is more than the rule intends",
+            cap * SLOT / 290_000
+        );
     }
 }
 
