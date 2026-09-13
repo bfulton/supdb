@@ -2895,9 +2895,23 @@ impl Snapshot {
             .map(|e| (&self.keys[e.off as usize..(e.off + e.len) as usize], e))
     }
     /// First index whose key is not below `from`.
+    ///
+    /// The ends first: a start below every unsealed key -- every scan of a
+    /// store whose inserts land past its loaded range, the YCSB shape -- is
+    /// answered by one compare instead of a binary search over the snapshot,
+    /// and a start above them all by two. A start inside the range pays
+    /// those two compares on top of the search.
     fn seek(&self, from: &[u8]) -> usize {
-        self.ents
-            .partition_point(|e| &self.keys[e.off as usize..(e.off + e.len) as usize] < from)
+        let key = |e: &SnapKey| &self.keys[e.off as usize..(e.off + e.len) as usize];
+        match self.ents.first() {
+            None => return 0,
+            Some(e) if from <= key(e) => return 0,
+            _ => {}
+        }
+        if self.ents.last().is_some_and(|e| from > key(e)) {
+            return self.ents.len();
+        }
+        self.ents.partition_point(|e| key(e) < from)
     }
     /// Merge a run of entries sorted by key into `ents`, folding a key
     /// present in both tables into one entry carrying both indices.
