@@ -394,6 +394,29 @@ impl OrdIndex {
     /// search over the run of equal heads resolves it and the answer is
     /// exact either way.
     pub fn seek<'a>(&self, key: &[u8], key_at: impl Fn(usize) -> Option<&'a [u8]>) -> usize {
+        if self.n == 0 {
+            return 0;
+        }
+        // The heads order only keys that carry the common prefix. A query
+        // that does not is above or below every key, and its own first
+        // bytes against the prefix say which; its bytes after the prefix,
+        // which the heads are, say nothing. The prefix is read off the first
+        // key, which every key starts with. A first key the segment will not
+        // resolve sorts the query below everything, widening the answer the
+        // way the record search does with damage.
+        if self.pfx > 0 {
+            let m = self.pfx.min(key.len());
+            let Some(first) = key_at(0) else {
+                return 0;
+            };
+            let m = m.min(first.len());
+            match key[..m].cmp(&first[..m]) {
+                std::cmp::Ordering::Less => return 0,
+                std::cmp::Ordering::Greater => return self.n,
+                std::cmp::Ordering::Equal if m < self.pfx => return 0,
+                std::cmp::Ordering::Equal => {}
+            }
+        }
         let h = head_of(key, self.pfx);
         let (mut lo, mut hi) = (0usize, self.n);
         while lo < hi {
@@ -514,6 +537,41 @@ mod tests {
             .collect();
         let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
         check_all(&keys, "headtie");
+    }
+
+    /// A query that does not carry the segment's common prefix: above every
+    /// key or below every key by its first bytes, and its bytes after the
+    /// prefix, which the heads are, say nothing about which. The seek once
+    /// took them anyway, and a scan from past the last key of a partition
+    /// whose keys share a prefix walked that partition from its first key.
+    #[test]
+    fn a_query_outside_the_common_prefix_seeks_to_an_end() {
+        let owned: Vec<Vec<u8>> = (552u32..600)
+            .step_by(3)
+            .map(|i| format!("key-{i:05}").into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let p = write(&build(&keys), "offprefix");
+        let idx = OrdIndex::open(&p, keys.len()).expect("opens");
+        for probe in [
+            "zzz",       // above, shorter than the prefix
+            "kez",       // above, differs inside the prefix
+            "key-006",   // above, differs at the prefix's last byte
+            "a",         // below, shorter than the prefix
+            "abc-99zzz", // below, with bytes after the prefix that read high
+            "key-00",    // below: a proper prefix of the common prefix
+            "key-005",   // the prefix itself: below the first key
+            "key-00552", // the first key
+            "key-00598", // above the last key, carrying the prefix
+        ] {
+            let b = probe.as_bytes();
+            assert_eq!(
+                idx.seek(b, resolver(&keys)),
+                lower_bound(&keys, b),
+                "probe {probe:?}"
+            );
+        }
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
