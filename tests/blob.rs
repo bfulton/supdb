@@ -626,3 +626,81 @@ fn a_walk_over_a_compressed_block_decompresses_each_chunk_once() {
          same chunk once per key again"
     );
 }
+
+#[test]
+fn a_scan_hands_out_the_bytes_read_all_does() {
+    // Every scan test before this one counted: pairs, or values a key. A
+    // fast path that walks the record region and returns the right NUMBER
+    // of entries with the wrong bytes passes all of them. This holds the
+    // scan's (key, value) stream to `read_all` key by key, over the mixed
+    // fixture -- runs that live in the record, runs that spill to a block,
+    // runs of one value and of fifteen hundred -- so a walk that takes a
+    // short cut for the common shape has to come back correctly for the
+    // rest, mid-scan, in both directions.
+    for compress in [false, true] {
+        let path = scratch(if compress {
+            "scan-bytes-lz4"
+        } else {
+            "scan-bytes"
+        });
+        let want = build(&path, 400, compress);
+        let blob = Blob::open(MmapBytes::open(&path).expect("map")).expect("open");
+
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        blob.scan(b"", usize::MAX, |k, v| got.push((k.to_vec(), v.to_vec())))
+            .expect("scan");
+
+        // Group the stream by key, keeping order.
+        let mut keys: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+        for (k, v) in got {
+            match keys.last_mut() {
+                Some((last, vals)) if *last == k => vals.push(v),
+                _ => keys.push((k, vec![v])),
+            }
+        }
+        assert_eq!(
+            keys.len(),
+            want.len(),
+            "compress={compress}: the scan visited {} keys of {}",
+            keys.len(),
+            want.len()
+        );
+        for ((k, vals), (wk, wvals)) in keys.iter().zip(&want) {
+            assert_eq!(k, wk, "compress={compress}: keys out of order or missing");
+            assert_eq!(vals, wvals, "compress={compress}: values differ for {k:?}");
+            let mut via_read = Vec::new();
+            blob.read_all(k, |v| via_read.push(v.to_vec()))
+                .expect("read_all");
+            assert_eq!(
+                vals, &via_read,
+                "compress={compress}: scan and read_all disagree for {k:?}"
+            );
+        }
+
+        // And a bounded scan from the middle: the limit counts keys, the
+        // start is exact, and the bytes are still the right ones.
+        let from = &want[150].0;
+        let mut seen: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let n = blob
+            .scan(from, 20, |k, v| seen.push((k.to_vec(), v.to_vec())))
+            .expect("scan");
+        assert_eq!(n, 20, "compress={compress}: a limit of 20 keys");
+        let mut at = 150usize;
+        let mut i = 0usize;
+        while i < seen.len() {
+            let (wk, wvals) = &want[at];
+            let run: Vec<Vec<u8>> = seen[i..i + wvals.len()]
+                .iter()
+                .map(|(_, v)| v.clone())
+                .collect();
+            assert!(seen[i..i + wvals.len()].iter().all(|(k, _)| k == wk));
+            assert_eq!(&run, wvals, "compress={compress}: bytes differ at key {at}");
+            i += wvals.len();
+            at += 1;
+        }
+        assert_eq!(
+            at, 170,
+            "compress={compress}: the bounded scan covered keys 150..170"
+        );
+    }
+}

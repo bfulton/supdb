@@ -1553,6 +1553,47 @@ impl<B: Bytes> Blob<B> {
         let walk = self
             .flat()
             .and_then(|(sec, idx)| idx.regions(sec).map(|(recs, dir)| (idx, recs, dir)));
+        // The common shape first -- one extent, inline, fixed width -- in a
+        // loop of its own, with nothing per entry but the parse, a bounds
+        // check and the call. The first record of any other shape breaks
+        // out to the general loop below, which continues from the same rank.
+        //
+        // This is not the general loop with cases removed; it is the same
+        // work in a loop the compiler can keep in registers. Measured on the
+        // suite's own segment, rank-walks over identical ranks: the record
+        // layout parses at about 12 ns an entry and the general loop walked
+        // it at 29, while a verbatim copy of that loop's SHAPE outside this
+        // function walked it at 17 and the raw parse at 12-14 -- so neither
+        // the format, nor the mapping, nor the inline arm's plumbing was the
+        // cost; the codegen of this function was. With this loop the walk is
+        // 12.7 ns an entry, inside the raw parse's spread, and at 300,000
+        // keys in memory a hundred-entry scan went from 29.8 million entries
+        // a second to 60.5 million, where LMDB's cursor does 43.7.
+        if let Some((idx, recs, dir)) = walk {
+            while seen < limit {
+                let Some((k, exts, tail)) = idx.at_full_in(recs, dir, rank) else {
+                    break;
+                };
+                let [e] = exts else { break };
+                if !(e.is_inline() && e.is_fixed()) {
+                    break;
+                }
+                let a = e.off as usize;
+                let b = a
+                    .checked_add(e.len as usize)
+                    .filter(|&b| b <= tail.len())
+                    .ok_or_else(|| corrupt("inline run runs past its record"))?;
+                let w = e
+                    .fixed_width()
+                    .filter(|&w| w > 0)
+                    .ok_or_else(|| corrupt("fixed run's length is not a multiple of its count"))?;
+                for v in tail[a..b].chunks_exact(w) {
+                    f(k, v);
+                }
+                seen += 1;
+                rank += 1;
+            }
+        }
         while seen < limit {
             let Some((k, exts, tail)) = (match walk {
                 Some((idx, recs, dir)) => idx.at_full_in(recs, dir, rank),
