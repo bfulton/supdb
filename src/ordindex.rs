@@ -25,6 +25,20 @@
 //! here answers exactly what `Blob::seek` answers, and `tests/db.rs` holds
 //! the two to it.
 //!
+//! When every key has one length, and that length is no more than the
+//! prefix plus eight bytes, a head IS its key, and the header records the
+//! length: a seek then never reads a record. Equal-length suffixes pad
+//! identically, so distinct keys have distinct heads; a query no longer
+//! than that length which ties a head is that key or a proper prefix of
+//! it, so not below it; a longer query that ties one has that key as a
+//! proper prefix, so is above it. The record read the tie search made was
+//! 170 ns of a 390 ns seek at 300k keys, and the suite's keys, sixteen
+//! digits behind a shared prefix, never needed it. Keys of two lengths can
+//! share a head -- `k-1` and `k-1\0` pad to the same eight bytes -- and
+//! keys longer than the prefix plus eight can tie on their first eight, so
+//! either mix keeps the tie search. The word sits in a header slot older
+//! files hold as zero and older readers never read, so the magic stays.
+//!
 //! It is consulted where `Db::scan` walks the partitions in bulk -- no
 //! level-0 piece, the unsealed keys laid over the walk -- because that is
 //! the only walk that starts with one seek per partition rather than a
@@ -168,6 +182,11 @@ const MAGIC: u64 = 0x3144_524f_4450_5553;
 /// the writer and the reader cannot disagree about where the body starts.
 const HEADER: usize = 64;
 const HEAD: usize = 8;
+/// Header word: one more than the keys' common length when every key has
+/// one length and it is at most `pfx + HEAD`, so a head is a whole key and
+/// a seek needs no record; 0 otherwise, and in every file from before the
+/// word existed.
+const UNIFORM_AT: usize = 32;
 
 fn bad(msg: &str) -> Error {
     Error::new(ErrorKind::InvalidData, format!("ordered index: {msg}"))
@@ -221,6 +240,10 @@ impl Builder {
     pub fn finish(mut self) -> Vec<u8> {
         self.starts.push(self.bytes.len() as u32);
         let pfx = self.common_prefix();
+        let len0 = self.starts.get(1).map_or(0, |&b| b as usize);
+        let uniform = self.n > 0
+            && len0 <= pfx + HEAD
+            && (0..self.n).all(|i| (self.starts[i + 1] - self.starts[i]) as usize == len0);
         let mut out = Vec::with_capacity(HEADER + self.n * HEAD + 4);
         out.resize(HEADER, 0);
         for i in 0..self.n {
@@ -234,6 +257,11 @@ impl Builder {
         w(&mut out, 8, self.n as u64);
         w(&mut out, 16, pfx as u64);
         w(&mut out, 24, HEADER as u64);
+        w(
+            &mut out,
+            UNIFORM_AT,
+            if uniform { len0 as u64 + 1 } else { 0 },
+        );
         // The checksum goes last and covers everything before it, the spare
         // header words included. Covering only the body left those
         // unchecked and the damage test found it: a flip there opened clean,
@@ -271,6 +299,13 @@ pub struct OrdIndex {
     advised: std::cell::Cell<bool>,
     n: usize,
     pfx: usize,
+    /// The keys' one length, when they have one and it is at most
+    /// `pfx + HEAD`: a head is then a whole key.
+    uniform_len: Option<usize>,
+    /// The common prefix, learned from the segment's first key once at
+    /// open, so the seek's prefix check reads no record. Absent until
+    /// `learn_prefix`; the seek then reads the first key itself.
+    prefix: Option<Vec<u8>>,
 }
 
 impl OrdIndex {
@@ -298,6 +333,19 @@ impl OrdIndex {
         if n != keys {
             return Err(bad("describes a different segment"));
         }
+        // The word is absent, or a length the prefix and the head bound.
+        // Anything else is damage the checksum missed, not a length with
+        // extra meaning.
+        let uniform_len = match rd(UNIFORM_AT) {
+            0 => None,
+            w => {
+                let l = (w - 1) as usize;
+                if l < pfx || l > pfx + HEAD {
+                    return Err(bad("uniform length is outside the prefix and the head"));
+                }
+                Some(l)
+            }
+        };
         // The heads have to fill the file exactly. A header saying otherwise
         // is damage, and indexing past it later would be a panic rather than
         // an error.
@@ -311,8 +359,26 @@ impl OrdIndex {
             map,
             n,
             pfx,
+            uniform_len,
+            prefix: None,
             advised: std::cell::Cell::new(false),
         })
+    }
+
+    /// Every key of one length no more than the prefix plus eight bytes,
+    /// so a seek reads no record.
+    pub fn uniform(&self) -> bool {
+        self.uniform_len.is_some()
+    }
+
+    /// Learn the common prefix from the segment's first key, which every
+    /// key starts with, so the seek's prefix check is a compare against
+    /// these bytes and not a record read. A first key shorter than the
+    /// prefix is damage; what is learned is what there is, and the seek's
+    /// compare is bounded by it either way.
+    pub fn learn_prefix(&mut self, first_key: &[u8]) {
+        let m = self.pfx.min(first_key.len());
+        self.prefix = Some(first_key[..m].to_vec());
     }
 
     /// `MADV_RANDOM` for the heads.
@@ -405,8 +471,13 @@ impl OrdIndex {
         // way the record search does with damage.
         if self.pfx > 0 {
             let m = self.pfx.min(key.len());
-            let Some(first) = key_at(0) else {
-                return 0;
+            let learned = self.prefix.as_deref();
+            let first = match learned {
+                Some(p) => p,
+                None => match key_at(0) {
+                    Some(k) => k,
+                    None => return 0,
+                },
             };
             let m = m.min(first.len());
             match key[..m].cmp(&first[..m]) {
@@ -428,6 +499,17 @@ impl OrdIndex {
         }
         if lo >= self.n || self.head(lo) != h {
             return lo;
+        }
+        if let Some(len) = self.uniform_len {
+            // A head is a whole key. A query no longer than the keys that
+            // ties one is that key or a proper prefix of it, so not below
+            // it; a longer query has the key with this head as a proper
+            // prefix, so is above it.
+            return if key.len() <= len {
+                lo
+            } else {
+                self.run_end(h, lo)
+            };
         }
         let (mut a, mut b) = (lo, self.run_end(h, lo));
         while a < b {
@@ -568,6 +650,134 @@ mod tests {
                 idx.seek(b, resolver(&keys)),
                 lower_bound(&keys, b),
                 "probe {probe:?}"
+            );
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Sixteen-digit keys behind a twelve-byte prefix have one length,
+    /// four short of the prefix plus eight, so the index records it and a
+    /// seek reads no record: the resolver here panics if asked. Present
+    /// keys, keys between, shorter and longer queries, and queries outside
+    /// the prefix, against the lower bound over the keys.
+    #[test]
+    fn a_uniform_index_seeks_without_reading_a_record() {
+        let owned: Vec<Vec<u8>> = (0u32..3_000)
+            .map(|i| format!("{i:016}").into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let p = write(&build(&keys), "uniform");
+        let mut idx = OrdIndex::open(&p, keys.len()).expect("opens");
+        assert!(idx.uniform(), "every key has one length within prefix + 8");
+        idx.learn_prefix(keys[0]);
+        let never = |r: usize| -> Option<&'static [u8]> { panic!("read record {r}") };
+        let mut probes: Vec<Vec<u8>> = owned.clone();
+        for i in [0u32, 1, 7, 1_005, 2_999] {
+            let k = format!("{i:016}");
+            probes.push(format!("{k}x").into_bytes()); // longer: above the key
+            probes.push(format!("{k}\0").into_bytes()); // longer by a zero: still above
+            probes.push(k.as_bytes()[..15].to_vec()); // shorter: a prefix, so not above
+            probes.push(k.as_bytes()[..12].to_vec());
+        }
+        probes.push(b"0000000000005000".to_vec()); // between, past the end
+        probes.push(b"".to_vec());
+        probes.push(b"9".to_vec());
+        probes.push(b"00000000000".to_vec()); // a proper prefix of the prefix
+        for q in &probes {
+            assert_eq!(
+                idx.seek(q, never),
+                lower_bound(&keys, q),
+                "probe {:?}",
+                String::from_utf8_lossy(q)
+            );
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Keys shorter than the prefix plus eight pad their heads with zeros,
+    /// so `k-1`, `k-1\0` and `k-1\0\0` share one head while being three
+    /// keys in order. The flag must stay off for such a file and the tie
+    /// search must still answer exactly, resolver and all.
+    #[test]
+    fn mixed_lengths_keep_the_tie_search() {
+        let mut owned: Vec<Vec<u8>> = Vec::new();
+        for i in 0u32..50 {
+            let base = format!("k-{i:02}").into_bytes();
+            owned.push(base.clone());
+            let mut z1 = base.clone();
+            z1.push(0);
+            owned.push(z1);
+            let mut z2 = base.clone();
+            z2.extend_from_slice(&[0, 0]);
+            owned.push(z2);
+            let mut full = base.clone();
+            full.extend_from_slice(b"000000"); // exactly prefix + 8
+            owned.push(full);
+        }
+        owned.sort();
+        owned.dedup();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let p = write(&build(&keys), "mixed");
+        let idx = OrdIndex::open(&p, keys.len()).expect("opens");
+        assert!(!idx.uniform(), "lengths differ, so a head is not a key");
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(
+                idx.seek(k, resolver(&keys)),
+                lower_bound(&keys, k),
+                "present {i}"
+            );
+        }
+        for q in [
+            &b"k-07\0"[..],
+            b"k-07\0\0\0",
+            b"k-07x",
+            b"k-0",
+            b"k-99",
+            b"k-070000000",
+        ] {
+            assert_eq!(
+                idx.seek(q, resolver(&keys)),
+                lower_bound(&keys, q),
+                "probe {:?}",
+                String::from_utf8_lossy(q)
+            );
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// One length, but longer than the prefix plus eight: keys can tie on
+    /// their first eight suffix bytes and differ after, so the index must
+    /// not claim a head is a key.
+    #[test]
+    fn equal_lengths_past_the_head_keep_the_tie_search() {
+        let owned: Vec<Vec<u8>> = (0u32..40)
+            .flat_map(|i| (0u32..5).map(move |j| format!("pre{i:02}000000{j:02}").into_bytes()))
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+        let p = write(&build(&keys), "toolong");
+        let idx = OrdIndex::open(&p, keys.len()).expect("opens");
+        assert!(
+            !idx.uniform(),
+            "fifteen-byte keys behind a three-byte prefix tie on their heads"
+        );
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(
+                idx.seek(k, resolver(&keys)),
+                lower_bound(&keys, k),
+                "present {i}"
+            );
+        }
+        for q in [
+            &b"pre0700000003"[..],
+            b"pre07000000",
+            b"pre0700000004x",
+            b"pre99",
+        ] {
+            assert_eq!(
+                idx.seek(q, resolver(&keys)),
+                lower_bound(&keys, q),
+                "probe {:?}",
+                String::from_utf8_lossy(q)
             );
         }
         let _ = std::fs::remove_file(&p);

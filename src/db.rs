@@ -1835,8 +1835,13 @@ impl Seg {
             blob.advise_random();
         }
         let oname = Db::ord_name_for(name).ok_or_else(|| err("segment name is malformed"))?;
-        let ord = crate::ordindex::OrdIndex::open(&dir.join(&oname), blob.keys())
+        let mut ord = crate::ordindex::OrdIndex::open(&dir.join(&oname), blob.keys())
             .map_err(|e| err(&format!("segment {name}: {e}")))?;
+        // The common prefix, once, off the first key, so a seek's prefix
+        // check reads no record.
+        if let Some(first) = blob.key_at(0) {
+            ord.learn_prefix(first);
+        }
         // Taken from the POLICY, not from the phase the store is in. The
         // segment's advice follows the workload and `Db::advise` flips it;
         // the companion is binary-searched in either phase, so a segment
