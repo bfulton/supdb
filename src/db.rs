@@ -4499,7 +4499,7 @@ impl Db {
             .segs
             .iter()
             .filter(|s| s.may_reach(from))
-            .map(|s| (s, s.blob.seek(s.cursor_from(from))))
+            .map(|s| (s, s.ord.seek(s.cursor_from(from), |r| s.blob.key_at(r))))
             .collect();
 
         let tombs = self.has_tombstones();
@@ -4867,7 +4867,7 @@ impl Db {
         let mut pkey: Option<&[u8]> = None;
         while pi < np {
             let s = &parts[pi];
-            prank = s.blob.seek(s.cursor_from(from));
+            prank = s.ord.seek(s.cursor_from(from), |r| s.blob.key_at(r));
             pkey = s.blob.key_at(prank);
             if pkey.is_some() {
                 break;
@@ -4883,7 +4883,7 @@ impl Db {
             .iter()
             .filter(|s| s.may_reach(from))
             .map(|s| {
-                let rank = s.blob.seek(s.cursor_from(from));
+                let rank = s.ord.seek(s.cursor_from(from), |r| s.blob.key_at(r));
                 Cur {
                     seg: s,
                     rank,
