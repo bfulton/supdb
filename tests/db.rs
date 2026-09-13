@@ -1771,10 +1771,23 @@ impl ScanModel {
 /// the level-0 pieces, and the walk alone after a flush.
 #[test]
 fn the_bulk_walk_lays_unsealed_keys_over_the_partitions_exactly_as_the_merge_does() {
-    let d = dir("overlay");
+    overlay_model("overlay", false);
+}
+
+/// The same model against the block cache: a scan walks cached copies of
+/// the blocks it crosses, and every write between the checks must drop
+/// the copy of the block it lands in.
+#[test]
+fn the_block_cache_answers_the_same_model() {
+    overlay_model("overlay-cache", true);
+}
+
+fn overlay_model(name: &str, block_cache: bool) {
+    let d = dir(name);
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(2 << 10),
+        scan_block_cache: block_cache,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -1792,6 +1805,15 @@ fn the_bulk_walk_lays_unsealed_keys_over_the_partitions_exactly_as_the_merge_doe
         "want several partitions and no piece, got {parts}/{l0}"
     );
     m.check(&db, "partitions only");
+
+    // A few writes in one partition's range: an update, a delete, a new
+    // key between two, so a block holds unsealed keys without being dense
+    // with them.
+    m.append(&mut db, &key(300), "s");
+    m.delete(&mut db, &key(306));
+    m.append(&mut db, &key(310), "s-between");
+    db.commit().unwrap();
+    m.check(&db, "a few unsealed keys in one partition");
 
     // The YCSB shape: inserts past the end, committed, nothing sealed.
     for k in (600..660).step_by(3) {

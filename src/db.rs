@@ -314,6 +314,12 @@ pub struct Options {
     /// instead of two hash probes and an allocation. `false` is the merge
     /// before it, kept as the comparison arm.
     pub scan_merge: bool,
+    /// PROTOTYPE, off by default: keep merged copies of the partition
+    /// blocks that scans read over unsealed keys, so a scan over them
+    /// walks one sorted copy instead of merging. Read side only: a block
+    /// is built on first read through the merge, dropped by a write to any
+    /// key it owns, and dropped whole whenever the segments change.
+    pub scan_block_cache: bool,
     /// How the ordered scan builds its sorted snapshot of the unsealed keys.
     /// `true` keeps the keys in one arena and sorts 24-byte records (a
     /// 16-byte key prefix and an index), touching the arena only on a shared
@@ -347,6 +353,7 @@ impl Default for Options {
             read_advice: ReadAdvice::default(),
             scan_readahead_bytes: 256 << 10,
             scan_merge: true,
+            scan_block_cache: false,
             scan_snapshot_arena: true,
         }
     }
@@ -804,9 +811,18 @@ type Compaction = (Vec<String>, std::thread::JoinHandle<Result<Vec<String>>>);
 /// and whatever routing it carries. L0 segments come straight from a seal,
 /// overlap each other freely, and are gated by a Bloom; L1 segments come
 /// from a partitioning merge, are disjoint, and are gated by their fence.
+/// PROTOTYPE: a segment id unique for the life of the process, what the
+/// block cache keys on.
+fn next_seg_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 struct Seg {
     blob: Blob<MmapBytes>,
     name: String,
+    /// Unique for the life of the process: what the block cache keys on.
+    id: u64,
     level: u8,
     lo: Vec<u8>,
     hi: Option<Vec<u8>>,
@@ -1873,6 +1889,7 @@ impl Seg {
             return Ok(Seg {
                 blob,
                 name: name.to_string(),
+                id: next_seg_id(),
                 level: 0,
                 lo,
                 hi,
@@ -1901,6 +1918,7 @@ impl Seg {
             return Ok(Seg {
                 blob,
                 name: name.to_string(),
+                id: next_seg_id(),
                 level: 1,
                 lo,
                 hi,
@@ -1917,6 +1935,7 @@ impl Seg {
         Ok(Seg {
             blob,
             name: name.to_string(),
+            id: next_seg_id(),
             level: 0,
             lo: Vec::new(),
             hi: None,
@@ -2035,6 +2054,15 @@ fn mem_hash(key: &[u8]) -> u64 {
     h | 1 // 0 marks a vacant slot
 }
 
+/// PROTOTYPE: what a memtable write did, for the block cache's bookkeeping.
+#[derive(Clone, Copy, Default)]
+struct Wrote {
+    /// The slot of a key this write created.
+    new_slot: Option<u32>,
+    /// The table rehashed on the way, so every slot index moved.
+    grew: bool,
+}
+
 impl MemTable {
     fn new() -> MemTable {
         MemTable {
@@ -2066,9 +2094,11 @@ impl MemTable {
         self.mask = mask;
     }
 
-    fn append(&mut self, key: &[u8], value: &[u8]) {
+    fn append(&mut self, key: &[u8], value: &[u8]) -> Wrote {
+        let mut wrote = Wrote::default();
         if (self.len + 1) * 2 > self.entries.len() {
             self.grow();
+            wrote.grew = true;
         }
         let hash = mem_hash(key);
         let mut i = (hash as usize) & self.mask;
@@ -2086,13 +2116,14 @@ impl MemTable {
                     count: 1,
                 };
                 self.len += 1;
-                return;
+                wrote.new_slot = Some(i as u32);
+                return wrote;
             }
             if e.hash == hash && MemTable::key_of(&self.keys, &e) == key {
                 let head = self.push_chunk(e.head - 1, value);
                 self.entries[i].head = head + 1;
                 self.entries[i].count += 1;
-                return;
+                return wrote;
             }
             i = (i + 1) & self.mask;
         }
@@ -2111,9 +2142,11 @@ impl MemTable {
     /// head of the chain, and the live count back to zero. A key never seen
     /// before gets an entry too, because the tombstone has older sources to
     /// mask even when this memtable holds nothing of its own.
-    fn delete(&mut self, key: &[u8]) {
+    fn delete(&mut self, key: &[u8]) -> Wrote {
+        let mut wrote = Wrote::default();
         if (self.len + 1) * 2 > self.entries.len() {
             self.grow();
+            wrote.grew = true;
         }
         let hash = mem_hash(key);
         let mut i = (hash as usize) & self.mask;
@@ -2132,14 +2165,15 @@ impl MemTable {
                 };
                 self.len += 1;
                 self.tombs += 1;
-                return;
+                wrote.new_slot = Some(i as u32);
+                return wrote;
             }
             if e.hash == hash && MemTable::key_of(&self.keys, &e) == key {
                 let head = self.push_tomb(e.head - 1);
                 self.entries[i].head = head + 1;
                 self.entries[i].count = 0;
                 self.tombs += 1;
-                return;
+                return wrote;
             }
             i = (i + 1) & self.mask;
         }
@@ -2823,6 +2857,113 @@ pub struct SealWaits {
     pub joins: u64,
 }
 
+/// PROTOTYPE: records of one partition block a scan reads over unsealed
+/// keys. Both the block's own records and the unsealed keys that fall in
+/// its key range, each key once with its live values, in order, so a scan
+/// over the block walks this and merges nothing.
+#[derive(Default)]
+struct CachedBlock {
+    keys: Vec<u8>,
+    vals: Vec<u8>,
+    /// key offset, key length, run offset, run length; the run is values
+    /// each behind a u32 length.
+    ents: Vec<[u32; 4]>,
+}
+
+impl CachedBlock {
+    fn begin(&mut self, key: &[u8]) {
+        let e = [
+            self.keys.len() as u32,
+            key.len() as u32,
+            self.vals.len() as u32,
+            0,
+        ];
+        self.keys.extend_from_slice(key);
+        self.ents.push(e);
+    }
+    fn push(&mut self, v: &[u8]) {
+        self.vals.extend_from_slice(&(v.len() as u32).to_le_bytes());
+        self.vals.extend_from_slice(v);
+    }
+    fn end(&mut self) {
+        if let Some(e) = self.ents.last_mut() {
+            e[3] = self.vals.len() as u32 - e[2];
+        }
+    }
+    fn key(&self, e: &[u32; 4]) -> &[u8] {
+        &self.keys[e[0] as usize..(e[0] + e[1]) as usize]
+    }
+    /// First entry whose key is not below `from`.
+    fn lower_bound(&self, from: &[u8]) -> usize {
+        self.ents.partition_point(|e| self.key(e) < from)
+    }
+    fn each_value(&self, e: &[u32; 4], mut f: impl FnMut(&[u8])) {
+        let run = &self.vals[e[2] as usize..(e[2] + e[3]) as usize];
+        let mut p = 0usize;
+        while p < run.len() {
+            let n = u32::from_le_bytes(run[p..p + 4].try_into().unwrap()) as usize;
+            f(&run[p + 4..p + 4 + n]);
+            p += 4 + n;
+        }
+    }
+}
+
+/// PROTOTYPE: what the cache knows about a block.
+enum Cached {
+    /// No unsealed key falls in it: the partition's own records are the
+    /// answer, walked directly.
+    Clean,
+    /// A few unsealed keys fall in it, each resolved once: the rank it
+    /// cuts the partition's walk at, whether that rank is the key itself,
+    /// and its values. The block is walked in the partition with these
+    /// slipped in at their cuts, so the walk restarts only where a key
+    /// falls and reads nothing from the memtable.
+    Sparse(Vec<Delta>),
+    /// Dense with unsealed keys: one merged copy, walked without a merge.
+    Block(CachedBlock),
+}
+
+/// PROTOTYPE: unsealed keys in a block from which a merged copy pays.
+/// Read from `CACHE_DENSE` in the environment once, for the measurement
+/// that picks it; 8 otherwise.
+/// PROTOTYPE: one unsealed key of a sparse block, resolved.
+struct Delta {
+    key: Vec<u8>,
+    /// The first rank of the block's partition records not below the key.
+    cut: u32,
+    /// The record at `cut` is this key: its values are in `vals` already,
+    /// and the walk steps over it.
+    same: bool,
+    /// The key's live values, each behind a u32 length.
+    vals: Vec<u8>,
+}
+
+fn cache_dense() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("CACHE_DENSE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    })
+}
+
+/// PROTOTYPE: records a block spans. A scan of the suite's length touches
+/// one or two.
+const CACHE_BLOCK: usize = 64;
+
+/// PROTOTYPE: the unsealed keys of a key range, in order, each with what
+/// `emit_unsealed` needs.
+type Overlay<'a> = Vec<(&'a [u8], SnapKey)>;
+
+/// PROTOTYPE: a block's rank range and key range in its partition.
+struct BlockBounds<'a> {
+    lo: usize,
+    hi: usize,
+    lo_key: &'a [u8],
+    end_key: Option<&'a [u8]>,
+}
+
 pub struct Db {
     dir: PathBuf,
     opts: Options,
@@ -2903,6 +3044,15 @@ pub struct Db {
     /// ext-kv scan phase spent 15 minutes a rep in that walk, twice -- once
     /// through the live table and once through the frozen one.
     scan_keys: std::cell::RefCell<Option<(u64, Snapshot)>>,
+    /// PROTOTYPE: merged partition blocks, keyed by segment id and block.
+    block_cache: std::cell::RefCell<std::collections::HashMap<(u64, u32), Cached>>,
+    /// PROTOTYPE: slots of the keys the live memtable gained since the
+    /// scan snapshot was built, sorted by key, so a commit does not force
+    /// a rebuild: materialization merges these with the snapshot's keys.
+    snap_added: std::cell::RefCell<Vec<u32>>,
+    /// PROTOTYPE: the live memtable rehashed since the snapshot was built,
+    /// so its slot indices are stale and the next scan rebuilds.
+    snap_rehashed: std::cell::Cell<bool>,
 }
 
 /// One key of the unsealed snapshot a scan merges: where the key sits in
@@ -2928,6 +3078,9 @@ struct Snapshot {
 }
 
 impl Snapshot {
+    fn len(&self) -> usize {
+        self.ents.len()
+    }
     fn get(&self, i: usize) -> Option<(&[u8], &SnapKey)> {
         self.ents
             .get(i)
@@ -3153,6 +3306,9 @@ impl Db {
             spare_wals,
             covered_seq: 0,
             scan_keys: std::cell::RefCell::new(None),
+            block_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            snap_added: std::cell::RefCell::new(Vec::new()),
+            snap_rehashed: std::cell::Cell::new(false),
             seal_wait: SealWaits::default(),
             draining: false,
         })
@@ -3314,6 +3470,9 @@ impl Db {
             spare_wals,
             covered_seq: sealed,
             scan_keys: std::cell::RefCell::new(None),
+            block_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            snap_added: std::cell::RefCell::new(Vec::new()),
+            snap_rehashed: std::cell::Cell::new(false),
             seal_wait: SealWaits::default(),
             draining: false,
         })
@@ -3322,8 +3481,10 @@ impl Db {
     /// Buffered until `commit`; visible to this handle's reads immediately,
     /// which is the read-your-writes contract `Store::read_all` set.
     pub fn append(&mut self, key: &[u8], value: &[u8]) {
+        self.evict_block_of(key);
         self.wal.append(key, value);
-        self.mem.append(key, value);
+        let wrote = self.mem.append(key, value);
+        self.note_write(wrote);
         self.mem_bytes += key.len() + value.len();
     }
 
@@ -3342,8 +3503,10 @@ impl Db {
     /// start fresh. Durable at the next `commit`, exactly like an append,
     /// and reclaimed by the next merge that reaches the key.
     pub fn delete(&mut self, key: &[u8]) {
+        self.evict_block_of(key);
         self.wal.delete(key);
-        self.mem.delete(key);
+        let wrote = self.mem.delete(key);
+        self.note_write(wrote);
         self.mem_bytes += key.len() + 16;
     }
 
@@ -3406,6 +3569,9 @@ impl Db {
         }
         self.join_seal()?;
         let frozen = std::sync::Arc::new(std::mem::replace(&mut self.mem, MemTable::new()));
+        self.snap_added.borrow_mut().clear();
+        self.snap_rehashed.set(false);
+        self.block_cache.borrow_mut().clear();
         self.mem_bytes = 0;
         let new_wal = self.next_wal(self.wal_id + 1)?;
         let old_wal = std::mem::replace(&mut self.wal, new_wal);
@@ -3708,6 +3874,7 @@ impl Db {
     /// binary-searches the first group and walks a contiguous run of the
     /// second, so both depend on this order.
     fn sort_segs(&mut self) {
+        self.block_cache.borrow_mut().clear();
         self.segs.sort_by(|a, b| {
             b.level
                 .cmp(&a.level)
@@ -4457,12 +4624,28 @@ impl Db {
                 let _ = seg.blob.prefetch_scan(from, limit);
             }
         }
-        let gen = self.wal.seq ^ (self.next_seg << 48) ^ ((self.frozen.is_some() as u64) << 63);
+        let structural = (self.next_seg << 48) ^ ((self.frozen.is_some() as u64) << 63);
+        // With the block cache the snapshot outlives commits: keys added
+        // since it was built sit in a sorted side list materialization
+        // merges in, until they outgrow an eighth of it or the table
+        // rehashes. Without it, a commit is a rebuild, as before.
+        let gen = if self.opts.scan_block_cache {
+            structural
+        } else {
+            self.wal.seq ^ structural
+        };
         {
             let mut cache = self.scan_keys.borrow_mut();
-            let stale = cache.as_ref().is_none_or(|(g, _)| *g != gen);
+            let mut stale = cache.as_ref().is_none_or(|(g, _)| *g != gen);
+            if self.opts.scan_block_cache && !stale {
+                let held = cache.as_ref().map_or(0, |(_, s)| s.len());
+                stale =
+                    self.snap_rehashed.get() || self.snap_added.borrow().len() > held.max(512) / 8;
+            }
             if stale {
                 *cache = Some((gen, self.build_snapshot()));
+                self.snap_added.borrow_mut().clear();
+                self.snap_rehashed.set(false);
             }
         }
         let cache = self.scan_keys.borrow();
@@ -4480,6 +4663,9 @@ impl Db {
         // version had this path, a refactor dropped it, and the scan axis
         // paid for it.
         if !self.segs.iter().any(|s| s.level == 0) {
+            if self.opts.scan_block_cache {
+                return self.scan_blocks(from, limit, unsealed, f);
+            }
             return self.scan_partitions(from, limit, mi, unsealed, f);
         }
 
@@ -4588,6 +4774,515 @@ impl Db {
             seen += 1;
         }
         Ok(seen)
+    }
+
+    /// PROTOTYPE: the block that owns `key` in the partition holding it,
+    /// dropped from the cache. The owner is the block whose first key is
+    /// not above `key`; a key below every key of the partition belongs to
+    /// block 0, and one above every key to the last block, which is where
+    /// `materialize` puts them.
+    fn evict_block_of(&self, key: &[u8]) {
+        let mut cache = self.block_cache.borrow_mut();
+        if cache.is_empty() {
+            return;
+        }
+        let np = self.segs.partition_point(|s| s.level > 0);
+        let at =
+            self.segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+        let Some(seg) = self.segs[..np].get(at) else {
+            return;
+        };
+        let keys = seg.blob.keys();
+        if keys == 0 {
+            return;
+        }
+        let rank = seg.ord.seek(key, |r| seg.blob.key_at(r));
+        let owner = if rank < keys && seg.blob.key_at(rank) == Some(key) {
+            rank
+        } else {
+            rank.saturating_sub(1)
+        };
+        cache.remove(&(seg.id, (owner / CACHE_BLOCK) as u32));
+    }
+
+    /// PROTOTYPE: bookkeeping after a memtable write, when the block cache
+    /// is on: a rehash voids every slot the snapshot and the side list
+    /// hold, and a created key joins the side list in key order.
+    fn note_write(&self, wrote: Wrote) {
+        if !self.opts.scan_block_cache {
+            return;
+        }
+        if wrote.grew {
+            self.snap_rehashed.set(true);
+            self.snap_added.borrow_mut().clear();
+            self.block_cache.borrow_mut().clear();
+            return;
+        }
+        if self.snap_rehashed.get() {
+            return;
+        }
+        if let Some(slot) = wrote.new_slot {
+            let key = MemTable::key_of(&self.mem.keys, &self.mem.entries[slot as usize]);
+            let mut added = self.snap_added.borrow_mut();
+            let at = added.partition_point(|&i| {
+                MemTable::key_of(&self.mem.keys, &self.mem.entries[i as usize]) < key
+            });
+            added.insert(at, slot);
+        }
+    }
+
+    /// PROTOTYPE: the unsealed keys in `lo_key ..end_key` (open when
+    /// `end_key` is `None`), in order: the snapshot's and the side list's
+    /// merged. Each carries what `emit_unsealed` needs.
+    fn overlay_in<'a>(
+        &'a self,
+        unsealed: &'a Snapshot,
+        added: &[u32],
+        lo_key: &[u8],
+        end_key: Option<&[u8]>,
+    ) -> Overlay<'a> {
+        let inside = |k: &[u8]| end_key.is_none_or(|e| k < e);
+        let mut out: Overlay = Vec::new();
+        let mut mi = unsealed.seek(lo_key);
+        while let Some((k, sk)) = unsealed.get(mi) {
+            if !inside(k) {
+                break;
+            }
+            out.push((k, *sk));
+            mi += 1;
+        }
+        let key_of = |slot: u32| MemTable::key_of(&self.mem.keys, &self.mem.entries[slot as usize]);
+        let from = added.partition_point(|&i| key_of(i) < lo_key);
+        let fresh: Overlay = added[from..]
+            .iter()
+            .map(|&i| key_of(i))
+            .take_while(|k| inside(k))
+            .zip(added[from..].iter())
+            .map(|(k, &i)| {
+                (
+                    k,
+                    SnapKey {
+                        off: 0,
+                        len: 0,
+                        mem: i,
+                        frozen: u32::MAX,
+                    },
+                )
+            })
+            .collect();
+        if fresh.is_empty() {
+            return out;
+        }
+        if out.is_empty() {
+            return fresh;
+        }
+        let mut merged = Vec::with_capacity(out.len() + fresh.len());
+        let (mut a, mut b) = (0usize, 0usize);
+        while a < out.len() || b < fresh.len() {
+            let take_a = b >= fresh.len() || (a < out.len() && out[a].0 <= fresh[b].0);
+            if take_a {
+                merged.push(out[a]);
+                a += 1;
+            } else {
+                merged.push(fresh[b]);
+                b += 1;
+            }
+        }
+        merged
+    }
+
+    /// PROTOTYPE: block `b`'s rank range and key range in `seg`. Block 0's
+    /// keys start at the partition's lower fence and the last block's end
+    /// at its upper one, so every unsealed key in the partition's range
+    /// has one block.
+    fn block_bounds<'a>(&self, seg: &'a Seg, b: usize) -> Result<BlockBounds<'a>> {
+        let keys = seg.blob.keys();
+        let lo = b * CACHE_BLOCK;
+        let hi = ((b + 1) * CACHE_BLOCK).min(keys);
+        let lo_key: &[u8] = if b == 0 {
+            seg.lo.as_slice()
+        } else {
+            seg.blob
+                .key_at(lo)
+                .ok_or_else(|| err("block cache: a rank did not resolve"))?
+        };
+        let end_key: Option<&[u8]> = if hi < keys {
+            Some(
+                seg.blob
+                    .key_at(hi)
+                    .ok_or_else(|| err("block cache: a rank did not resolve"))?,
+            )
+        } else {
+            seg.hi.as_deref()
+        };
+        Ok(BlockBounds {
+            lo,
+            hi,
+            lo_key,
+            end_key,
+        })
+    }
+
+    /// PROTOTYPE: the walk over ranks `from..hi` of `seg` with `overlay`,
+    /// the unsealed keys of the range in order, laid over it: the same
+    /// walk `scan_partitions` makes, on a block. `on_key` sees every key
+    /// once before its values, tombstone-only keys included, which is what
+    /// a copy needs and a caller's closure does not.
+    fn walk_block<F: FnMut(&[u8], &[u8]), K: FnMut(&[u8])>(
+        &self,
+        seg: &Seg,
+        ranks: std::ops::Range<usize>,
+        overlay: &[(&[u8], SnapKey)],
+        limit: usize,
+        mut on_key: K,
+        mut f: F,
+    ) -> Result<usize> {
+        let hi = ranks.end;
+        let mut seen = 0usize;
+        let mut rank = ranks.start;
+        let mut oi = 0usize;
+        let mut tombs: Option<bool> = None;
+        let mut scratch: Vec<usize> = Vec::new();
+        while seen < limit {
+            let end = rank.saturating_add(limit - seen).min(hi);
+            let next = overlay.get(oi);
+            let (bound, at_bound) = match next {
+                Some((uk, _)) if end > rank => Self::cut_at(seg, rank, end, uk),
+                _ => (end, Ordering::Greater),
+            };
+            if bound > rank {
+                let got = seg
+                    .blob
+                    .scan_at(rank, bound - rank, |k, v| {
+                        on_key(k);
+                        f(k, v)
+                    })
+                    .map_err(|e| err(&format!("segment scan: {e}")))?;
+                if got < bound - rank {
+                    return Err(err(
+                        "segment scan: a partition's walk stopped short of its key count",
+                    ));
+                }
+                seen += got;
+                rank += got;
+                if seen >= limit {
+                    break;
+                }
+            }
+            let Some((uk, sk)) = next else { break };
+            let same = rank < hi && at_bound == Ordering::Equal;
+            let tombs = *tombs.get_or_insert_with(|| self.has_tombstones());
+            on_key(uk);
+            self.emit_unsealed(
+                &mut f,
+                &mut scratch,
+                tombs,
+                uk,
+                sk,
+                same.then_some((seg, rank)),
+            )?;
+            if same {
+                rank += 1;
+            }
+            oi += 1;
+            seen += 1;
+        }
+        Ok(seen)
+    }
+
+    /// PROTOTYPE: what the cache should hold for block `b`: `Clean` with
+    /// no unsealed key in its range, `Sparse` with a few, and a merged copy
+    /// when it is dense with them.
+    fn materialize(&self, seg: &Seg, b: usize, unsealed: &Snapshot) -> Result<Cached> {
+        let BlockBounds {
+            lo,
+            hi,
+            lo_key,
+            end_key,
+        } = self.block_bounds(seg, b)?;
+        let added = self.snap_added.borrow();
+        let overlay = self.overlay_in(unsealed, &added, lo_key, end_key);
+        if overlay.is_empty() {
+            return Ok(Cached::Clean);
+        }
+        if overlay.len() < cache_dense() {
+            return Ok(Cached::Sparse(self.deltas_for(seg, lo, hi, &overlay)?));
+        }
+        Ok(Cached::Block(self.copy_block(seg, lo, hi, &overlay)?))
+    }
+
+    /// PROTOTYPE: the unsealed keys of ranks `lo..hi` resolved against the
+    /// partition once: where each cuts the walk, and its values, the
+    /// partition's own for an equal key first.
+    fn deltas_for(
+        &self,
+        seg: &Seg,
+        lo: usize,
+        hi: usize,
+        overlay: &[(&[u8], SnapKey)],
+    ) -> Result<Vec<Delta>> {
+        let tombs = self.has_tombstones();
+        let mut scratch: Vec<usize> = Vec::new();
+        let mut out = Vec::with_capacity(overlay.len());
+        let mut rank = lo;
+        for (uk, sk) in overlay {
+            let (cut, at) = if rank < hi {
+                Self::cut_at(seg, rank, hi, uk)
+            } else {
+                (hi, Ordering::Greater)
+            };
+            let same = cut < hi && at == Ordering::Equal;
+            let mut vals: Vec<u8> = Vec::new();
+            self.emit_unsealed(
+                &mut |_k: &[u8], v: &[u8]| {
+                    vals.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    vals.extend_from_slice(v);
+                },
+                &mut scratch,
+                tombs,
+                uk,
+                sk,
+                same.then_some((seg, cut)),
+            )?;
+            out.push(Delta {
+                key: uk.to_vec(),
+                cut: cut as u32,
+                same,
+                vals,
+            });
+            rank = cut + same as usize;
+        }
+        Ok(out)
+    }
+
+    /// PROTOTYPE: the walk over ranks `from..hi` with resolved deltas
+    /// slipped in at their cuts; only deltas whose key is not below
+    /// `cursor` are emitted, which is every one after the first block.
+    fn walk_deltas<F: FnMut(&[u8], &[u8])>(
+        &self,
+        seg: &Seg,
+        ranks: std::ops::Range<usize>,
+        deltas: &[Delta],
+        cursor: &[u8],
+        limit: usize,
+        mut f: F,
+    ) -> Result<usize> {
+        let hi = ranks.end;
+        let mut seen = 0usize;
+        let mut rank = ranks.start;
+        let di = deltas.partition_point(|d| d.key.as_slice() < cursor);
+        for d in &deltas[di..] {
+            let cut = (d.cut as usize).max(rank);
+            if cut > rank && seen < limit {
+                let want = (cut - rank).min(limit - seen);
+                let got = seg
+                    .blob
+                    .scan_at(rank, want, &mut f)
+                    .map_err(|e| err(&format!("segment scan: {e}")))?;
+                if got < want {
+                    return Err(err(
+                        "segment scan: a partition's walk stopped short of its key count",
+                    ));
+                }
+                seen += got;
+                rank += got;
+            }
+            if seen >= limit {
+                return Ok(seen);
+            }
+            let run = &d.vals;
+            let mut p = 0usize;
+            while p < run.len() {
+                let n = u32::from_le_bytes(run[p..p + 4].try_into().unwrap()) as usize;
+                f(&d.key, &run[p + 4..p + 4 + n]);
+                p += 4 + n;
+            }
+            seen += 1;
+            if d.same {
+                rank += 1;
+            }
+        }
+        if seen < limit && rank < hi {
+            let want = (hi - rank).min(limit - seen);
+            let got = seg
+                .blob
+                .scan_at(rank, want, &mut f)
+                .map_err(|e| err(&format!("segment scan: {e}")))?;
+            if got < want {
+                return Err(err(
+                    "segment scan: a partition's walk stopped short of its key count",
+                ));
+            }
+            seen += got;
+        }
+        Ok(seen)
+    }
+
+    /// PROTOTYPE: the merged copy of ranks `lo..hi` with `overlay` laid
+    /// over them.
+    fn copy_block(
+        &self,
+        seg: &Seg,
+        lo: usize,
+        hi: usize,
+        overlay: &[(&[u8], SnapKey)],
+    ) -> Result<CachedBlock> {
+        // Every key once, then its values: the walk's `on_key` opens an
+        // entry on a key change, and a key without values still gets one.
+        // The two closures never run at once; the cell is for the borrow
+        // checker.
+        let blk = std::cell::RefCell::new(CachedBlock::default());
+        let mut current: Vec<u8> = Vec::new();
+        let mut open = false;
+        self.walk_block(
+            seg,
+            lo..hi,
+            overlay,
+            usize::MAX,
+            |k| {
+                if !open || current.as_slice() != k {
+                    let mut b = blk.borrow_mut();
+                    if open {
+                        b.end();
+                    }
+                    b.begin(k);
+                    current.clear();
+                    current.extend_from_slice(k);
+                    open = true;
+                }
+            },
+            |_k, v| blk.borrow_mut().push(v),
+        )?;
+        let mut blk = blk.into_inner();
+        if open {
+            blk.end();
+        }
+        Ok(blk)
+    }
+
+    /// PROTOTYPE: the scan over partitions and unsealed keys, block by
+    /// block: a cached block is walked, a clean one is walked in the
+    /// partition, and a block not yet seen is built first.
+    fn scan_blocks<F: FnMut(&[u8], &[u8])>(
+        &self,
+        from: &[u8],
+        limit: usize,
+        unsealed: &Snapshot,
+        mut f: F,
+    ) -> Result<usize> {
+        let mut seen = 0usize;
+        let mut cursor: &[u8] = from;
+        for seg in self.segs.iter().filter(|s| s.may_reach(from)) {
+            if seen >= limit {
+                break;
+            }
+            cursor = seg.cursor_from(cursor);
+            let keys = seg.blob.keys();
+            if keys == 0 {
+                match &seg.hi {
+                    Some(h) => {
+                        cursor = h.as_slice();
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            let rank = seg.ord.seek(cursor, |r| seg.blob.key_at(r));
+            let owner = if rank < keys && seg.blob.key_at(rank) == Some(cursor) {
+                rank
+            } else {
+                rank.saturating_sub(1)
+            };
+            let nblocks = keys.div_ceil(CACHE_BLOCK);
+            let mut b = owner / CACHE_BLOCK;
+            let mut first = true;
+            while seen < limit && b < nblocks {
+                let id = (seg.id, b as u32);
+                let mut cache = self.block_cache.borrow_mut();
+                if let std::collections::hash_map::Entry::Vacant(slot) = cache.entry(id) {
+                    slot.insert(self.materialize(seg, b, unsealed)?);
+                }
+                match cache.get(&id).expect("just inserted") {
+                    Cached::Sparse(deltas) => {
+                        let lo = b * CACHE_BLOCK;
+                        let hi = ((b + 1) * CACHE_BLOCK).min(keys);
+                        let start = if first { rank.max(lo) } else { lo };
+                        let from_key: &[u8] = if first { cursor } else { b"" };
+                        seen += self.walk_deltas(
+                            seg,
+                            start..hi,
+                            deltas,
+                            from_key,
+                            limit - seen,
+                            &mut f,
+                        )?;
+                    }
+                    Cached::Clean => {
+                        let start = if first {
+                            rank.max(b * CACHE_BLOCK)
+                        } else {
+                            b * CACHE_BLOCK
+                        };
+                        let end = ((b + 1) * CACHE_BLOCK).min(keys);
+                        if start < end {
+                            let want = (end - start).min(limit - seen);
+                            let got = seg
+                                .blob
+                                .scan_at(start, want, &mut f)
+                                .map_err(|e| err(&format!("segment scan: {e}")))?;
+                            if got < want {
+                                return Err(err("segment scan: a partition's walk stopped short of its key count"));
+                            }
+                            seen += got;
+                        }
+                    }
+                    Cached::Block(blk) => {
+                        let i = if first { blk.lower_bound(cursor) } else { 0 };
+                        for e in &blk.ents[i..] {
+                            if seen >= limit {
+                                break;
+                            }
+                            let k = blk.key(e);
+                            blk.each_value(e, |v| f(k, v));
+                            seen += 1;
+                        }
+                    }
+                }
+                b += 1;
+                first = false;
+            }
+            match &seg.hi {
+                Some(h) => cursor = h.as_slice(),
+                None => break,
+            }
+        }
+        Ok(seen)
+    }
+
+    /// PROTOTYPE: the cache's size, for a measurement: blocks held and
+    /// bytes of keys and values in them.
+    pub fn block_cache_size(&self) -> (usize, usize) {
+        let cache = self.block_cache.borrow();
+        let (mut clean, mut sparse, mut copies) = (0usize, 0usize, 0usize);
+        for c in cache.values() {
+            match c {
+                Cached::Clean => clean += 1,
+                Cached::Sparse(_) => sparse += 1,
+                Cached::Block(_) => copies += 1,
+            }
+        }
+        eprintln!("  cache: {clean} clean, {sparse} sparse, {copies} copies");
+        let bytes = cache
+            .values()
+            .map(|c| match c {
+                Cached::Clean => 0,
+                Cached::Sparse(deltas) => {
+                    deltas.iter().map(|d| d.key.len() + d.vals.len() + 16).sum()
+                }
+                Cached::Block(b) => b.keys.len() + b.vals.len() + b.ents.len() * 16,
+            })
+            .sum();
+        (cache.len(), bytes)
     }
 
     /// The partitions walked in bulk, with the unsealed keys laid over them.
