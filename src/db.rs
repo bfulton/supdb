@@ -2949,7 +2949,30 @@ enum Cached {
     Sparse(SparseBlock),
     /// Dense with unsealed keys: one merged copy, walked without a merge.
     Block(CachedBlock),
+    /// PROTOTYPE: too many keys above the partition to hold as either --
+    /// the last block of the last partition, whose range is open above
+    /// and collects every key inserted past the end. Its sources are
+    /// sorted already, so a scan seeks each of them to its start and
+    /// merges only the entries it walks; the block keeps just the filed
+    /// keys in key order, and a write never drops it, since it holds no
+    /// value. Before this the block was a copy of every such key, rebuilt
+    /// after every inserting commit: 7 MB and 12 ms a rebuild by the end
+    /// of ycsb-E on a store of three million keys.
+    Wide(WideBlock),
 }
+
+/// PROTOTYPE: a wide block's filed keys in key order, and how many of
+/// the block's filed entries that order covers; the rest are merged in
+/// at the next walk.
+#[derive(Default)]
+struct WideBlock {
+    sorted: Vec<(u32, u32)>,
+    seen: usize,
+}
+
+/// PROTOTYPE: keys above the partition past which a block is walked as a
+/// merge instead of built.
+const WIDE: usize = 4 * CACHE_BLOCK;
 
 /// PROTOTYPE: a sparse block's keys above the partition, resolved once:
 /// each key's bytes, where it cuts the walk, and its values as (source,
@@ -2996,6 +3019,7 @@ impl Cached {
             Cached::Clean => 0,
             Cached::Sparse(b) => b.keys.len() + b.ents.len() * 24 + b.refs.len() * 8,
             Cached::Block(b) => b.keys.len() + b.vals.len() + b.ents.len() * 16,
+            Cached::Wide(w) => w.sorted.len() * 8,
         }
     }
 }
@@ -4863,12 +4887,18 @@ impl Db {
                 // bounds each table walked are walked again on its next
                 // touch.
                 self.snap_gen.set(self.snap_gen.get().wrapping_add(1));
-                for s in &self.segs {
+                let np = self.segs.partition_point(|s| s.level > 0);
+                for (p, s) in self.segs[..np].iter().enumerate() {
                     if let Some(t) = s.blocks.borrow_mut().as_mut() {
                         for list in &mut t.added {
                             list.clear();
                         }
                         t.filed = 0;
+                        for b in 0..t.slots.len() {
+                            if matches!(t.slots[b], Some(Cached::Wide(_))) {
+                                self.unlist(p, b, t);
+                            }
+                        }
                     }
                 }
             }
@@ -5168,7 +5198,7 @@ impl Db {
                 continue;
             };
             let (b, cut) = Self::owner_of(seg, key);
-            if b < table.slots.len() {
+            if b < table.slots.len() && !matches!(table.slots[b], Some(Cached::Wide(_))) {
                 self.unlist(at, b, table);
             }
             if new {
@@ -5310,6 +5340,13 @@ impl Db {
                             *slot = to(*slot);
                         }
                     }
+                    for c in t.slots.iter_mut().flatten() {
+                        if let Cached::Wide(w) = c {
+                            for (slot, _) in w.sorted.iter_mut() {
+                                *slot = to(*slot);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -5397,19 +5434,20 @@ impl Db {
         )
     }
 
-    /// PROTOTYPE: the memtables' keys in block `b`, in order: the
-    /// snapshot's run between the table's bounds, and the keys created
-    /// since, filed under the block when they were written, merged.
+    /// PROTOTYPE: the memtables' keys of a block, in order: a run of the
+    /// snapshot and the filed keys, merged. The filed keys are put in key
+    /// order here unless `sorted` says they are, with their keys resolved
+    /// once; sorting the slots through a key read per compare cost a
+    /// dense block's build measurably.
     fn overlay_mem<'a>(
         &'a self,
-        table: &BlockTable,
-        b: usize,
         unsealed: &'a Snapshot,
+        snap: std::ops::Range<usize>,
+        filed: &[(u32, u32)],
+        sorted: bool,
     ) -> Result<Vec<Over<'a>>> {
-        let (s0, s1) = (table.snap_at[b] as usize, table.snap_at[b + 1] as usize);
-        let filed = &table.added[b];
-        let mut out: Vec<Over> = Vec::with_capacity(s1.saturating_sub(s0) + filed.len());
-        for i in s0..s1 {
+        let mut out: Vec<Over> = Vec::with_capacity(snap.len() + filed.len());
+        for i in snap {
             let (k, sk) = unsealed
                 .get(i)
                 .ok_or_else(|| err("block cache: a snapshot bound did not resolve"))?;
@@ -5438,7 +5476,9 @@ impl Db {
                 pieces: 0..0,
             })
             .collect();
-        fresh.sort_by(|x, y| x.key.cmp(y.key));
+        if !sorted {
+            fresh.sort_by(|x, y| x.key.cmp(y.key));
+        }
         if out.is_empty() {
             return Ok(fresh);
         }
@@ -5474,23 +5514,27 @@ impl Db {
         Ok(merged)
     }
 
-    /// PROTOTYPE: every key above the partition in block `b`: the
-    /// memtables' and the level-0 pieces', folded by key with the pieces
-    /// holding it oldest first. A piece's ranks for the block are the
-    /// table's; nothing is seeked.
-    fn overlay_all<'a>(
+    /// PROTOTYPE: the filed entries of a block in key order.
+    fn sorted_filed(&self, filed: &[(u32, u32)]) -> Vec<(u32, u32)> {
+        let key_of = |slot: u32| MemTable::key_of(&self.mem.keys, &self.mem.entries[slot as usize]);
+        let mut v = filed.to_vec();
+        v.sort_by(|x, y| key_of(x.0).cmp(key_of(y.0)));
+        v
+    }
+
+    /// PROTOTYPE: the memtables' keys and the pieces' over given runs,
+    /// folded by key with the pieces holding it oldest first.
+    fn overlay_runs<'a>(
         &'a self,
         src: Sources<'a>,
-        table: &BlockTable,
-        b: usize,
-        unsealed: &'a Snapshot,
+        mem: Vec<Over<'a>>,
+        pieces: &[(usize, std::ops::Range<usize>)],
     ) -> Result<Overlay<'a>> {
-        let mem = self.overlay_mem(table, b, unsealed)?;
         let mut held: Vec<(&[u8], usize, usize, u32)> = Vec::new();
-        for (j, at) in &table.pieces {
+        for (j, run) in pieces {
             let p = &src.l0[*j];
             let ranks = p.ranks.borrow();
-            for r in at[b] as usize..at[b + 1] as usize {
+            for r in run.clone() {
                 let k = p
                     .blob
                     .key_at(r)
@@ -5538,6 +5582,85 @@ impl Db {
             });
         }
         Ok(Overlay { over, held })
+    }
+
+    /// PROTOTYPE: every key above the partition in block `b`, from the
+    /// table's bounds; nothing is seeked.
+    fn overlay_all<'a>(
+        &'a self,
+        src: Sources<'a>,
+        table: &BlockTable,
+        b: usize,
+        unsealed: &'a Snapshot,
+    ) -> Result<Overlay<'a>> {
+        let snap = table.snap_at[b] as usize..table.snap_at[b + 1] as usize;
+        let mem = self.overlay_mem(unsealed, snap, &table.added[b], false)?;
+        let pieces: Vec<(usize, std::ops::Range<usize>)> = table
+            .pieces
+            .iter()
+            .map(|(j, at)| (*j, at[b] as usize..at[b + 1] as usize))
+            .collect();
+        self.overlay_runs(src, mem, &pieces)
+    }
+
+    /// PROTOTYPE: how many keys above the partition block `b` has, from
+    /// the table's bounds alone.
+    fn overlay_count(table: &BlockTable, b: usize) -> usize {
+        (table.snap_at[b + 1] - table.snap_at[b]) as usize
+            + table.added[b].len()
+            + table
+                .pieces
+                .iter()
+                .map(|(_, at)| (at[b + 1] - at[b]) as usize)
+                .sum::<usize>()
+    }
+
+    /// PROTOTYPE: a wide block's keys above the partition from `cursor`
+    /// on, at most `limit` from each source: each source seeked to the
+    /// cursor inside the block's run of it, and the runs merged as a
+    /// build merges whole ones. What a scan of a wide block walks, and
+    /// all it ever assembles of the block.
+    fn overlay_window<'a>(
+        &'a self,
+        src: Sources<'a>,
+        table: &BlockTable,
+        b: usize,
+        unsealed: &'a Snapshot,
+        wide: &WideBlock,
+        window: (&[u8], usize),
+    ) -> Result<Overlay<'a>> {
+        let (cursor, limit) = window;
+        let (s0, s1) = (table.snap_at[b] as usize, table.snap_at[b + 1] as usize);
+        let key_at = |i: usize| unsealed.get(i).map(|(k, _)| k);
+        let mut lo = s0;
+        let mut hi = s1;
+        while lo < hi {
+            let m = lo + (hi - lo) / 2;
+            if key_at(m).is_some_and(|k| k < cursor) {
+                lo = m + 1;
+            } else {
+                hi = m;
+            }
+        }
+        let snap = lo..s1.min(lo.saturating_add(limit));
+        let key_of = |slot: u32| MemTable::key_of(&self.mem.keys, &self.mem.entries[slot as usize]);
+        let f0 = wide.sorted.partition_point(|&(i, _)| key_of(i) < cursor);
+        let filed = &wide.sorted[f0..wide.sorted.len().min(f0.saturating_add(limit))];
+        let mem = self.overlay_mem(unsealed, snap, filed, true)?;
+        let pieces: Vec<(usize, std::ops::Range<usize>)> = table
+            .pieces
+            .iter()
+            .map(|(j, at)| {
+                let p = &src.l0[*j];
+                let (r0, r1) = (at[b] as usize, at[b + 1] as usize);
+                let r = p
+                    .ord
+                    .seek(p.cursor_from(cursor), |i| p.blob.key_at(i))
+                    .clamp(r0, r1);
+                (*j, r..r1.min(r.saturating_add(limit)))
+            })
+            .collect();
+        self.overlay_runs(src, mem, &pieces)
     }
 
     /// PROTOTYPE: the oldest source whose values for an overlay key are
@@ -5799,6 +5922,12 @@ impl Db {
         let keys = src.seg.blob.keys();
         let lo = b * CACHE_BLOCK;
         let hi = ((b + 1) * CACHE_BLOCK).min(keys);
+        if Self::overlay_count(table, b) > WIDE {
+            return Ok(Cached::Wide(WideBlock {
+                sorted: self.sorted_filed(&table.added[b]),
+                seen: table.added[b].len(),
+            }));
+        }
         let ov = self.overlay_all(src, table, b, unsealed)?;
         if ov.over.is_empty() {
             return Ok(Cached::Clean);
@@ -6058,6 +6187,34 @@ impl Db {
                     self.shed(pi, b, table);
                 }
                 table.touched[b] = tick;
+                if let Some(Cached::Wide(w)) = table.slots[b].as_mut() {
+                    // Filed since the order was made: sorted and merged in.
+                    let filed = &table.added[b];
+                    if filed.len() > w.seen {
+                        let fresh = self.sorted_filed(&filed[w.seen..]);
+                        let key_of = |slot: u32| {
+                            MemTable::key_of(&self.mem.keys, &self.mem.entries[slot as usize])
+                        };
+                        let mut merged = Vec::with_capacity(w.sorted.len() + fresh.len());
+                        let (mut i, mut j) = (0usize, 0usize);
+                        while i < w.sorted.len() || j < fresh.len() {
+                            let take_old = j >= fresh.len()
+                                || (i < w.sorted.len()
+                                    && key_of(w.sorted[i].0) <= key_of(fresh[j].0));
+                            if take_old {
+                                merged.push(w.sorted[i]);
+                                i += 1;
+                            } else {
+                                merged.push(fresh[j]);
+                                j += 1;
+                            }
+                        }
+                        let grew = (merged.len() - w.sorted.len()) * 8;
+                        w.sorted = merged;
+                        w.seen = filed.len();
+                        self.cache_bytes.set(self.cache_bytes.get() + grew);
+                    }
+                }
                 match table.slots[b].as_ref().expect("just built") {
                     Cached::Sparse(deltas) => {
                         seen += self.walk_deltas(
@@ -6106,6 +6263,12 @@ impl Db {
                             seen += 1;
                         }
                     }
+                    Cached::Wide(w) => {
+                        let window = (from_key, limit - seen);
+                        let ov = self.overlay_window(src, table, b, unsealed, w, window)?;
+                        seen +=
+                            self.walk_block(src, start..hi, &ov, limit - seen, |_k| {}, &mut f)?;
+                    }
                 }
                 b += 1;
                 first = false;
@@ -6121,7 +6284,8 @@ impl Db {
     /// PROTOTYPE: the cache's size, for a measurement: blocks held and
     /// bytes of keys and values in them.
     pub fn block_cache_size(&self) -> (usize, usize) {
-        let (mut clean, mut sparse, mut copies, mut bytes) = (0usize, 0usize, 0usize, 0usize);
+        let (mut clean, mut sparse, mut copies, mut wide, mut bytes) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
         for s in &self.segs {
             for c in s
                 .blocks
@@ -6140,14 +6304,18 @@ impl Db {
                         copies += 1;
                         bytes += b.keys.len() + b.vals.len() + b.ents.len() * 16;
                     }
+                    Cached::Wide(w) => {
+                        wide += 1;
+                        bytes += w.sorted.len() * 8;
+                    }
                 }
             }
         }
         eprintln!(
-            "  cache: {clean} clean, {sparse} sparse, {copies} copies; {bytes} B walked, {} B counted",
+            "  cache: {clean} clean, {sparse} sparse, {copies} copies, {wide} wide; {bytes} B walked, {} B counted",
             self.cache_bytes.get()
         );
-        (clean + sparse + copies, bytes)
+        (clean + sparse + copies + wide, bytes)
     }
 
     /// PROTOTYPE: the bytes the cache counts itself holding, for a test

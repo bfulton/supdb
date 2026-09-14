@@ -1845,19 +1845,37 @@ fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
     // More keys than the side list may hold before a scan rebuilds the
     // snapshot: the rebuild happens with the tables standing, and the
     // writes after are filed under blocks whose bounds were walked again.
-    // Then a second burst, past the count the memtable holds before it
-    // rehashes, with the first burst's live keys in the snapshot: the
-    // rehash renumbers the slots the snapshot and the tables' lists name.
+    // The blocks these land in hold hundreds of keys above the partition
+    // from here on, and are walked as a merge rather than built.
     let burst = |k: u32| format!("key-00{:03}x{:02}", 100 + k % 500, k / 500);
     for k in 0..4200 {
         m.append(&mut db, &burst(k), "burst");
     }
     m.check(&db, "a burst that rebuilds the snapshot under the tables");
     held(&db, 0);
-    for k in 4200..8400 {
+    // Fewer than the snapshot holds, so no rebuild: the wide blocks take
+    // these as filed keys and keep them in order.
+    for k in 4200..6200 {
         m.append(&mut db, &burst(k), "burst");
     }
-    m.check(&db, "a burst that rehashes the memtable under the snapshot");
+    m.check(&db, "a burst the wide blocks file");
+    held(&db, 0);
+    // Past the snapshot's count again, and past the count the memtable
+    // holds before it rehashes: the rebuild happens with wide blocks
+    // standing that hold filed keys, whose order names slots the new
+    // snapshot holds; the rehash renumbers every slot named anywhere.
+    for k in 6200..10600 {
+        m.append(&mut db, &burst(k), "burst");
+    }
+    m.check(&db, "a burst that rebuilds the snapshot under wide blocks");
+    held(&db, 0);
+    // Keys filed into wide blocks after that rebuild: a wide block kept
+    // across it would count them against the order it made before.
+    for k in 10600..10640 {
+        m.append(&mut db, &burst(k), "after-rebuild");
+    }
+    m.delete(&mut db, &burst(7));
+    m.check(&db, "keys filed into wide blocks after the rebuild");
     held(&db, 0);
     m.delete(&mut db, &key(303));
     m.append(&mut db, &key(309), "l-after-rebuild");
