@@ -1782,6 +1782,52 @@ fn the_block_cache_answers_the_same_model() {
     overlay_model("overlay-cache", true);
 }
 
+/// A key the frozen memtable holds and the live one then touches, with a
+/// scan between the seal and the touch so the snapshot of unsealed keys
+/// was built with the frozen entry and the live one arrives through the
+/// side list: the two must fold into one key, a live tombstone cutting
+/// the frozen values, a live append following them.
+#[test]
+fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
+    let d = dir("overlay-fold");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        scan_block_cache: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in (0..600).step_by(3) {
+        m.append(&mut db, &key(k), &format!("p{k}"));
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    assert!(db.levels().0 > 1);
+    for k in [300, 303, 306, 600, 603] {
+        m.append(&mut db, &key(k), "f");
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    assert!(db.in_flight().0);
+    m.check(&db, "frozen over the partitions, snapshot built");
+    // Live writes to frozen keys, each creating a live entry.
+    m.delete(&mut db, &key(300));
+    m.append(&mut db, &key(303), "l");
+    m.delete(&mut db, &key(306));
+    m.append(&mut db, &key(306), "l-after-delete");
+    m.delete(&mut db, &key(600));
+    m.append(&mut db, &key(603), "l");
+    m.check(&db, "live over frozen, through the side list");
+    db.settle().unwrap();
+    m.check(&db, "pieces and live");
+    db.flush().unwrap();
+    m.flushed();
+    m.check(&db, "merged");
+}
+
 fn overlay_model(name: &str, block_cache: bool) {
     let d = dir(name);
     let opts = Options {

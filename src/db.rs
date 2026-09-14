@@ -4951,6 +4951,11 @@ impl Db {
         if out.is_empty() {
             return fresh;
         }
+        // A key in both is one key: the snapshot's entry names its frozen
+        // slot, the side list's the live slot created since, and the live
+        // one's tombstone must cut the frozen values. Merged as two entries
+        // they came out as two keys, the tombstone cutting nothing, and the
+        // test that scans between a seal and a live delete found it.
         let mut merged = Vec::with_capacity(out.len() + fresh.len());
         let (mut out, mut fresh) = (out.into_iter().peekable(), fresh.into_iter().peekable());
         loop {
@@ -4958,13 +4963,20 @@ impl Db {
                 (None, None) => break,
                 (Some(_), None) => merged.push(out.next().unwrap()),
                 (None, Some(_)) => merged.push(fresh.next().unwrap()),
-                (Some(x), Some(y)) => {
-                    if x.key <= y.key {
-                        merged.push(out.next().unwrap());
-                    } else {
-                        merged.push(fresh.next().unwrap());
+                (Some(x), Some(y)) => match x.key.cmp(y.key) {
+                    Ordering::Less => merged.push(out.next().unwrap()),
+                    Ordering::Greater => merged.push(fresh.next().unwrap()),
+                    Ordering::Equal => {
+                        let (x, y) = (out.next().unwrap(), fresh.next().unwrap());
+                        let (xs, ys) = (x.sk.expect("snapshot key"), y.sk.expect("side-list key"));
+                        debug_assert_eq!(xs.mem, u32::MAX, "a live key was created twice");
+                        merged.push(Over {
+                            key: x.key,
+                            sk: Some(SnapKey { mem: ys.mem, ..xs }),
+                            pieces: 0..0,
+                        });
                     }
-                }
+                },
             }
         }
         merged
