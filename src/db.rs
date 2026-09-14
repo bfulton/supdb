@@ -4165,6 +4165,29 @@ impl Db {
                 .all(|s| parts.iter().any(|p| p.lo == s.lo && p.hi == s.hi))
     }
 
+    /// The first of the partitions `segs[..np]` that may hold a key at or
+    /// after `from`: they tile the key space in order, so it is the first
+    /// whose upper fence is above `from`, and every partition after it may
+    /// reach too. Found by galloping from the front and then a binary
+    /// search over the bracket. A scan filtered every partition by its
+    /// fence, a compare per partition below its start; a binary search
+    /// over all of them was measured next and was slower on ycsb-E, whose
+    /// Zipfian starts fall in the first few partitions, where the walk
+    /// was one to three predictable compares and the search seven
+    /// mispredicting ones. The gallop is one compare for a start in the
+    /// first partition and logarithmic for a far one.
+    fn first_reaching(&self, np: usize, from: &[u8]) -> usize {
+        let parts = &self.segs[..np];
+        let below = |i: usize| parts[i].hi.as_ref().is_some_and(|h| h.as_slice() <= from);
+        let (mut lo, mut step) = (0usize, 1usize);
+        while step <= np && below(step - 1) {
+            lo = step;
+            step *= 2;
+        }
+        let end = step.min(np);
+        lo + parts[lo..end].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= from))
+    }
+
     /// The level-0 pieces a read of a key in partition `at` consults. When
     /// every piece is aligned to a partition they are the run over `at`
     /// alone: the pieces sort by lower fence and then by name, so one
@@ -6225,11 +6248,12 @@ impl Db {
         self.scan_tick.set(tick);
         let mut seen = 0usize;
         let mut cursor: &[u8] = from;
-        for (pi, seg) in self.segs[..np]
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.may_reach(from))
-        {
+        // The partitions tile the key space in order, so the first that
+        // may reach the start is found by binary search and every one
+        // after it may; filtering each in turn was a fence compare per
+        // partition below the start, on every scan.
+        let first = self.first_reaching(np, from);
+        for (pi, seg) in self.segs[..np].iter().enumerate().skip(first) {
             if seen >= limit {
                 break;
             }
@@ -6526,7 +6550,10 @@ impl Db {
         let mut scratch: Vec<usize> = Vec::new();
         let mut seen = 0usize;
         let mut cursor: &[u8] = from;
-        for seg in self.segs.iter().filter(|s| s.may_reach(from)) {
+        // Every segment is a partition here, and the first that may reach
+        // the start is found by binary search; see `first_reaching`.
+        let first = self.first_reaching(self.segs.len(), from);
+        for seg in &self.segs[first..] {
             if seen >= limit {
                 break;
             }

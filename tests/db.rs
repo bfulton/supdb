@@ -2179,6 +2179,40 @@ fn a_seal_drops_the_scan_snapshot_before_the_next_rehash() {
     m.check(&db, "the seal joined");
 }
 
+/// A scan starts at the first partition that may reach its start, found
+/// by a gallop from the front: over enough partitions for the gallop to
+/// double past them several times, every scan from every sampled start,
+/// on both scan paths, against the model, with unsealed keys in the
+/// first range and the last so the start's partition is not always the
+/// one the keys are in.
+#[test]
+fn a_scan_starts_at_the_first_partition_that_reaches_it() {
+    for block_cache in [false, true] {
+        let d = dir(&format!("scan-start-{block_cache}"));
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(1 << 10),
+            scan_block_cache: block_cache,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        for k in 0..3000 {
+            m.append(&mut db, &format!("key-{k:05}"), "p");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        assert!(db.levels().0 > 40, "partitions: {}", db.levels().0);
+        m.append(&mut db, "key-00001x", "l");
+        m.append(&mut db, "key-02999x", "l");
+        m.check(
+            &db,
+            &format!("scans over many partitions, cache {block_cache}"),
+        );
+    }
+}
+
 /// After a check has filled the cache: the bytes it counts against a
 /// walk of what it holds, and against the budget with one block's slack,
 /// since the block a scan is about to walk is never shed.
