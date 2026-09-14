@@ -214,7 +214,22 @@ pub struct Options {
     /// Memtable bytes that trigger a seal at the next commit. Sealing is off
     /// the commit path in cost accounting but runs on the committing thread
     /// in milestone 1; the brief's "Segment size" question owns this number.
+    /// With `seal_grows` this is the floor: see there.
     pub seal_bytes: usize,
+    /// Let the seal grow with the store, so a merge takes in at least a
+    /// quarter of what it rewrites. A seal of a fixed size drops a slice
+    /// into every range, and the slice shrinks as ranges multiply: on a
+    /// store of thirty million keys a 32 MiB seal put 0.3 MB into each of
+    /// 104 ranges, `l0_trigger` of them made 1.2 MB, and merging them
+    /// rewrote a 64 MB partition -- fifty times the bytes -- while twenty
+    /// more seals landed on the ranges the job covered. Level-0 reached 24
+    /// pieces a range and every read checked 24 Blooms. With the seal at
+    /// a sixteenth of the partitions' bytes, level-0 stayed under three,
+    /// and D went from 35k to 533k ops/s, E from 14k to 334k. The divisor
+    /// is `4 * l0_trigger`: the bytes a merge rewrites over the bytes it
+    /// takes in, held to four. Off, the seal is `seal_bytes` and nothing
+    /// else, the shape the suite's arms were measured in before this.
+    pub seal_grows: bool,
     /// SegmentOptions for the segment writer. Fixed to `redo_log: false, shards: 1`
     /// regardless of what is passed, because a sealed segment is written
     /// once and never reopened for writing, and a 4 MiB redo arena in a
@@ -345,6 +360,7 @@ impl Default for Options {
             // reads. Smaller still buys nothing and costs 1.5x the device
             // bytes.
             seal_bytes: 32 << 20,
+            seal_grows: true,
             segment: SegmentOptions::default(),
             l0_trigger: 4,
             compact: true,
@@ -3182,6 +3198,9 @@ pub struct Db {
     /// segments there measured 5% of an in-core scan. Refreshed by
     /// `sort_segs`, which every mutation of `segs` already ends with.
     mean_key_bytes: std::cell::Cell<usize>,
+    /// The partitions' bytes on disk, refreshed with the segment set: what
+    /// a merge rewrites, and so what the seal is sized against.
+    store_bytes: std::cell::Cell<u64>,
     next_seg: u64,
     /// Commits written since the last barrier, for `SyncPolicy::EveryN`.
     unsynced: u32,
@@ -3514,6 +3533,7 @@ impl Db {
             segs: Vec::new(),
             advice_random: std::cell::Cell::new(starts_random),
             mean_key_bytes: std::cell::Cell::new(0),
+            store_bytes: std::cell::Cell::new(0),
             next_seg: 0,
             frozen: None,
             sealing: None,
@@ -3670,6 +3690,7 @@ impl Db {
         let wal = Wal::open_append(&wal_path, wal_id, from)?;
         let next_seg = seg_ids.iter().map(|&(n, _)| n + 1).max().unwrap_or(0);
         let mean_key_bytes = Db::mean_key_bytes_of(&segs);
+        let store_bytes = Db::store_bytes_of(dir, &segs);
         Ok(Db {
             dir: dir.to_path_buf(),
             opts,
@@ -3683,6 +3704,7 @@ impl Db {
             // from the first read rather than from the first transition.
             advice_random: std::cell::Cell::new(starts_random),
             mean_key_bytes: std::cell::Cell::new(mean_key_bytes),
+            store_bytes: std::cell::Cell::new(store_bytes),
             next_seg,
             frozen: None,
             sealing: None,
@@ -3775,7 +3797,7 @@ impl Db {
         if self.sealing.as_ref().is_some_and(|h| h.is_finished()) {
             self.join_seal()?;
         }
-        if self.mem_bytes >= self.opts.seal_bytes {
+        if self.mem_bytes >= self.seal_threshold() {
             self.seal()?;
         }
         Ok(())
@@ -4110,6 +4132,32 @@ impl Db {
                 .then_with(|| a.name.cmp(&b.name))
         });
         self.refresh_mean_key_bytes();
+        self.store_bytes
+            .set(Db::store_bytes_of(&self.dir, &self.segs));
+    }
+
+    /// The partitions' bytes on disk. A free function over the segments,
+    /// like `mean_key_bytes_of`, because `open` needs it before there is a
+    /// `Db` to ask.
+    fn store_bytes_of(dir: &Path, segs: &[Seg]) -> u64 {
+        segs.iter()
+            .filter(|s| s.level > 0)
+            .filter_map(|s| std::fs::metadata(dir.join(&s.name)).ok())
+            .map(|m| m.len())
+            .sum()
+    }
+
+    /// The memtable bytes at which the next commit seals: `seal_bytes`, or
+    /// with `seal_grows` the larger of that and the partitions' bytes over
+    /// four times `l0_trigger`.
+    pub fn seal_threshold(&self) -> usize {
+        if !self.opts.seal_grows {
+            return self.opts.seal_bytes;
+        }
+        let grown = self.store_bytes.get() / (4 * self.opts.l0_trigger.max(1)) as u64;
+        self.opts
+            .seal_bytes
+            .max(usize::try_from(grown).unwrap_or(usize::MAX))
     }
 
     /// What a key costs on disk, averaged over the live segments.

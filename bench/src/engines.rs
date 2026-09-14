@@ -322,7 +322,10 @@ impl Supdb {
                 checksums: false,
                 ..Default::default()
             },
-            // The engine's own defaults: 32 MB seals over 64 MB partitions.
+            // The engine's own defaults: 32 MB seals over 64 MB partitions,
+            // the seal growing with the store past that floor as the
+            // engine's default has it, since a fixed seal at thirty million
+            // keys left level-0 at 24 pieces a range.
             // Few partitions is not an accident of the benchmark, it is the
             // operating point the design is FOR: measured, the same data read
             // at 1.19x of LMDB in one segment and 0.77x spread over eight,

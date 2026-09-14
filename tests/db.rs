@@ -1796,6 +1796,58 @@ fn the_block_cache_answers_the_same_model_under_a_budget() {
     overlay_model("overlay-budget", true, 2048);
 }
 
+/// The seal grows with the partitions: past the floor, a memtable seals
+/// only once it holds a sixteenth of what a merge would rewrite. On a
+/// store whose partitions are far larger than the floor, a commit past
+/// the floor and under the grown threshold seals nothing, and with the
+/// growth off the same commit seals.
+#[test]
+fn the_seal_grows_with_the_store() {
+    for grows in [true, false] {
+        let d = dir(if grows { "seal-grows" } else { "seal-fixed" });
+        let opts = Options {
+            seal_bytes: 64 << 10,
+            partition_bytes: Some(256 << 10),
+            seal_grows: grows,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let val = vec![7u8; 200];
+        for k in 0..20_000u32 {
+            db.append(format!("key-{k:06}").as_bytes(), &val);
+            if k % 500 == 499 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        let (parts, _) = db.levels();
+        assert!(parts > 1, "the load did not partition: {parts}");
+        let floor = 64usize << 10;
+        let threshold = db.seal_threshold();
+        if grows {
+            assert!(
+                threshold > 4 * floor,
+                "the threshold did not grow past the floor: {threshold}"
+            );
+        } else {
+            assert_eq!(threshold, floor);
+        }
+        // Twice the floor, under the grown threshold.
+        for k in 0..600u32 {
+            db.append(format!("late-{k:06}").as_bytes(), &val);
+        }
+        db.commit().unwrap();
+        let sealed = db.in_flight().0 || db.levels().1 > 0;
+        assert_eq!(
+            sealed, !grows,
+            "seal_grows={grows}: a commit of twice the floor sealed={sealed}"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 /// A key the frozen memtable holds and the live one then touches, with a
 /// scan between the seal and the touch so the snapshot of unsealed keys
 /// was built with the frozen entry and the live one arrives through the

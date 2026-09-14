@@ -420,6 +420,21 @@ per-commit path.
   332,397 ops/s) with the merge phase at zero, reads unchanged; on uniform
   keys nothing qualifies and nothing changes. The canonical run's shape is
   uniform, so its figure does not move; a log's does.
+- ~~Seal size at scale~~ — **answered by measurement at thirty million
+  keys**. A seal of a fixed size drops a slice into every range, and the
+  slice shrinks as ranges multiply: 3 MB a range at three million keys,
+  0.3 MB at thirty million, where `l0_trigger` of them made 1.2 MB and
+  merging them rewrote a 64 MB partition, fifty times the bytes, while
+  twenty more seals landed on the ranges the job covered. Level-0 reached
+  24 pieces a range, every read checked 24 Blooms and every scan merged
+  24 pieces: on the suite's mixes D fell to 35k ops/s and E to 14k
+  against LMDB's 489k and 354k. `Options::seal_grows` sizes the seal at a
+  sixteenth of the partitions' bytes past the `seal_bytes` floor -- the
+  divisor is four times the trigger, so a merge takes in at least a
+  quarter of what it rewrites -- and at thirty million keys level-0 stayed
+  under three pieces a range: D 533k, E 334k, A 352k against LMDB's 50k,
+  F 282k against 51k, the load at 0.96x. At and below three million the
+  floor is the larger number and nothing changes.
 - ~~Readahead out-of-core~~ — **answered**. Once the file outgrows the
   page cache, the kernel's default readahead is the whole cliff: cold
   point reads run 75.8x and 78.9x faster under `MADV_RANDOM`, at 1.0x read
