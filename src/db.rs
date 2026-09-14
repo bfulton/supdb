@@ -811,18 +811,13 @@ type Compaction = (Vec<String>, std::thread::JoinHandle<Result<Vec<String>>>);
 /// and whatever routing it carries. L0 segments come straight from a seal,
 /// overlap each other freely, and are gated by a Bloom; L1 segments come
 /// from a partitioning merge, are disjoint, and are gated by their fence.
-/// PROTOTYPE: a segment id unique for the life of the process, what the
-/// block cache keys on.
-fn next_seg_id() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
 struct Seg {
     blob: Blob<MmapBytes>,
     name: String,
-    /// Unique for the life of the process: what the block cache keys on.
-    id: u64,
+    /// PROTOTYPE: the block cache's entries for this partition, indexed
+    /// by block number, sized on first use and emptied whenever the
+    /// segments change. One load finds a block; nothing is hashed.
+    blocks: std::cell::RefCell<Vec<Option<Cached>>>,
     level: u8,
     lo: Vec<u8>,
     hi: Option<Vec<u8>>,
@@ -1889,7 +1884,7 @@ impl Seg {
             return Ok(Seg {
                 blob,
                 name: name.to_string(),
-                id: next_seg_id(),
+                blocks: std::cell::RefCell::new(Vec::new()),
                 level: 0,
                 lo,
                 hi,
@@ -1918,7 +1913,7 @@ impl Seg {
             return Ok(Seg {
                 blob,
                 name: name.to_string(),
-                id: next_seg_id(),
+                blocks: std::cell::RefCell::new(Vec::new()),
                 level: 1,
                 lo,
                 hi,
@@ -1935,7 +1930,7 @@ impl Seg {
         Ok(Seg {
             blob,
             name: name.to_string(),
-            id: next_seg_id(),
+            blocks: std::cell::RefCell::new(Vec::new()),
             level: 0,
             lo: Vec::new(),
             hi: None,
@@ -2918,7 +2913,7 @@ enum Cached {
     /// and its values. The block is walked in the partition with these
     /// slipped in at their cuts, so the walk restarts only where a key
     /// falls and reads nothing from the memtable.
-    Sparse(Vec<Delta>),
+    Sparse(SparseBlock),
     /// Dense with unsealed keys: one merged copy, walked without a merge.
     Block(CachedBlock),
 }
@@ -2926,16 +2921,41 @@ enum Cached {
 /// PROTOTYPE: unsealed keys in a block from which a merged copy pays.
 /// Read from `CACHE_DENSE` in the environment once, for the measurement
 /// that picks it; 8 otherwise.
-/// PROTOTYPE: one unsealed key of a sparse block, resolved.
-struct Delta {
-    key: Vec<u8>,
-    /// The first rank of the block's partition records not below the key.
+/// PROTOTYPE: a sparse block's keys above the partition, resolved once
+/// and packed: one buffer holds every key and every value, one array the
+/// entries, so a walk over the block touches two allocations however
+/// many keys it has.
+#[derive(Default)]
+struct SparseBlock {
+    buf: Vec<u8>,
+    ents: Vec<DeltaEnt>,
+}
+
+/// PROTOTYPE: one key of a sparse block: where its key and its run of
+/// values (each behind a u32 length) sit in the block's buffer, the first
+/// rank of the partition's records not below it, and whether that rank is
+/// the key itself, whose values are then in the run already and which the
+/// walk steps over.
+struct DeltaEnt {
+    key: (u32, u32),
     cut: u32,
-    /// The record at `cut` is this key: its values are in `vals` already,
-    /// and the walk steps over it.
     same: bool,
-    /// The key's live values, each behind a u32 length.
-    vals: Vec<u8>,
+    vals: (u32, u32),
+}
+
+impl SparseBlock {
+    fn key(&self, e: &DeltaEnt) -> &[u8] {
+        &self.buf[e.key.0 as usize..(e.key.0 + e.key.1) as usize]
+    }
+    fn each_value(&self, e: &DeltaEnt, mut f: impl FnMut(&[u8])) {
+        let run = &self.buf[e.vals.0 as usize..(e.vals.0 + e.vals.1) as usize];
+        let mut p = 0usize;
+        while p < run.len() {
+            let n = u32::from_le_bytes(run[p..p + 4].try_into().unwrap()) as usize;
+            f(&run[p + 4..p + 4 + n]);
+            p += 4 + n;
+        }
+    }
 }
 
 fn cache_dense() -> usize {
@@ -3058,8 +3078,9 @@ pub struct Db {
     /// ext-kv scan phase spent 15 minutes a rep in that walk, twice -- once
     /// through the live table and once through the frozen one.
     scan_keys: std::cell::RefCell<Option<(u64, Snapshot)>>,
-    /// PROTOTYPE: merged partition blocks, keyed by segment id and block.
-    block_cache: std::cell::RefCell<std::collections::HashMap<(u64, u32), Cached>>,
+    /// PROTOTYPE: whether any partition holds a cached block, so a write
+    /// with nothing cached skips the lookup that would drop one.
+    cache_used: std::cell::Cell<bool>,
     /// PROTOTYPE: slots of the keys the live memtable gained since the
     /// scan snapshot was built, sorted by key, so a commit does not force
     /// a rebuild: materialization merges these with the snapshot's keys.
@@ -3320,7 +3341,7 @@ impl Db {
             spare_wals,
             covered_seq: 0,
             scan_keys: std::cell::RefCell::new(None),
-            block_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            cache_used: std::cell::Cell::new(false),
             snap_added: std::cell::RefCell::new(Vec::new()),
             snap_rehashed: std::cell::Cell::new(false),
             seal_wait: SealWaits::default(),
@@ -3484,7 +3505,7 @@ impl Db {
             spare_wals,
             covered_seq: sealed,
             scan_keys: std::cell::RefCell::new(None),
-            block_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            cache_used: std::cell::Cell::new(false),
             snap_added: std::cell::RefCell::new(Vec::new()),
             snap_rehashed: std::cell::Cell::new(false),
             seal_wait: SealWaits::default(),
@@ -3585,7 +3606,7 @@ impl Db {
         let frozen = std::sync::Arc::new(std::mem::replace(&mut self.mem, MemTable::new()));
         self.snap_added.borrow_mut().clear();
         self.snap_rehashed.set(false);
-        self.block_cache.borrow_mut().clear();
+        self.drop_blocks();
         self.mem_bytes = 0;
         let new_wal = self.next_wal(self.wal_id + 1)?;
         let old_wal = std::mem::replace(&mut self.wal, new_wal);
@@ -3888,7 +3909,7 @@ impl Db {
     /// binary-searches the first group and walks a contiguous run of the
     /// second, so both depend on this order.
     fn sort_segs(&mut self) {
-        self.block_cache.borrow_mut().clear();
+        self.drop_blocks();
         self.segs.sort_by(|a, b| {
             b.level
                 .cmp(&a.level)
@@ -4794,14 +4815,22 @@ impl Db {
         Ok(seen)
     }
 
+    /// PROTOTYPE: every cached block dropped, and the flag that says a
+    /// write need not look.
+    fn drop_blocks(&self) {
+        for s in &self.segs {
+            s.blocks.borrow_mut().clear();
+        }
+        self.cache_used.set(false);
+    }
+
     /// PROTOTYPE: the block that owns `key` in the partition holding it,
     /// dropped from the cache. The owner is the block whose first key is
     /// not above `key`; a key below every key of the partition belongs to
     /// block 0, and one above every key to the last block, which is where
     /// `materialize` puts them.
     fn evict_block_of(&self, key: &[u8]) {
-        let mut cache = self.block_cache.borrow_mut();
-        if cache.is_empty() {
+        if !self.cache_used.get() {
             return;
         }
         let np = self.segs.partition_point(|s| s.level > 0);
@@ -4820,7 +4849,9 @@ impl Db {
         } else {
             rank.saturating_sub(1)
         };
-        cache.remove(&(seg.id, (owner / CACHE_BLOCK) as u32));
+        if let Some(slot) = seg.blocks.borrow_mut().get_mut(owner / CACHE_BLOCK) {
+            *slot = None;
+        }
     }
 
     /// PROTOTYPE: bookkeeping after a memtable write, when the block cache
@@ -4833,7 +4864,7 @@ impl Db {
         if wrote.grew {
             self.snap_rehashed.set(true);
             self.snap_added.borrow_mut().clear();
-            self.block_cache.borrow_mut().clear();
+            self.drop_blocks();
             return;
         }
         if self.snap_rehashed.get() {
@@ -5180,18 +5211,22 @@ impl Db {
 
     /// PROTOTYPE: the overlay's keys resolved against the partition once:
     /// where each cuts the walk, and its values from every source that
-    /// holds it, the partition's own for an equal key first.
+    /// holds it, the partition's own for an equal key first, packed into
+    /// one block.
     fn deltas_for(
         &self,
         src: Sources,
         ranks: std::ops::Range<usize>,
         overlay: &[Over],
-    ) -> Result<Vec<Delta>> {
+    ) -> Result<SparseBlock> {
         let seg = src.seg;
         let hi = ranks.end;
         let tombs = self.has_tombstones();
         let mut scratch: Vec<usize> = Vec::new();
-        let mut out = Vec::with_capacity(overlay.len());
+        let mut blk = SparseBlock {
+            buf: Vec::new(),
+            ents: Vec::with_capacity(overlay.len()),
+        };
         let mut rank = ranks.start;
         for o in overlay {
             let (cut, at) = if rank < hi {
@@ -5200,11 +5235,15 @@ impl Db {
                 (hi, Ordering::Greater)
             };
             let same = cut < hi && at == Ordering::Equal;
-            let mut vals: Vec<u8> = Vec::new();
+            let key_at = blk.buf.len() as u32;
+            blk.buf.extend_from_slice(o.key);
+            let vals_at = blk.buf.len() as u32;
+            let buf = std::cell::RefCell::new(&mut blk.buf);
             self.emit_over(
                 &mut |_k: &[u8], v: &[u8]| {
-                    vals.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                    vals.extend_from_slice(v);
+                    let mut b = buf.borrow_mut();
+                    b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    b.extend_from_slice(v);
                 },
                 &mut scratch,
                 tombs,
@@ -5212,25 +5251,26 @@ impl Db {
                 same.then_some(cut),
                 src,
             )?;
-            out.push(Delta {
-                key: o.key.to_vec(),
+            let vals_len = blk.buf.len() as u32 - vals_at;
+            blk.ents.push(DeltaEnt {
+                key: (key_at, o.key.len() as u32),
                 cut: cut as u32,
                 same,
-                vals,
+                vals: (vals_at, vals_len),
             });
             rank = cut + same as usize;
         }
-        Ok(out)
+        Ok(blk)
     }
 
-    /// PROTOTYPE: the walk over ranks `from..hi` with resolved deltas
-    /// slipped in at their cuts; only deltas whose key is not below
-    /// `cursor` are emitted, which is every one after the first block.
+    /// PROTOTYPE: the walk over ranks `from..hi` with the block's resolved
+    /// keys slipped in at their cuts; only keys not below `cursor` are
+    /// emitted, which is every one after the first block.
     fn walk_deltas<F: FnMut(&[u8], &[u8])>(
         &self,
         seg: &Seg,
         ranks: std::ops::Range<usize>,
-        deltas: &[Delta],
+        blk: &SparseBlock,
         cursor: &[u8],
         limit: usize,
         mut f: F,
@@ -5238,9 +5278,9 @@ impl Db {
         let hi = ranks.end;
         let mut seen = 0usize;
         let mut rank = ranks.start;
-        let di = deltas.partition_point(|d| d.key.as_slice() < cursor);
-        for d in &deltas[di..] {
-            let cut = (d.cut as usize).max(rank);
+        let di = blk.ents.partition_point(|e| blk.key(e) < cursor);
+        for e in &blk.ents[di..] {
+            let cut = (e.cut as usize).max(rank);
             if cut > rank && seen < limit {
                 let want = (cut - rank).min(limit - seen);
                 let got = seg
@@ -5258,15 +5298,10 @@ impl Db {
             if seen >= limit {
                 return Ok(seen);
             }
-            let run = &d.vals;
-            let mut p = 0usize;
-            while p < run.len() {
-                let n = u32::from_le_bytes(run[p..p + 4].try_into().unwrap()) as usize;
-                f(&d.key, &run[p + 4..p + 4 + n]);
-                p += 4 + n;
-            }
+            let k = blk.key(e);
+            blk.each_value(e, |v| f(k, v));
             seen += 1;
-            if d.same {
+            if e.same {
                 rank += 1;
             }
         }
@@ -5368,12 +5403,15 @@ impl Db {
             let mut b = owner / CACHE_BLOCK;
             let mut first = true;
             while seen < limit && b < nblocks {
-                let id = (seg.id, b as u32);
-                let mut cache = self.block_cache.borrow_mut();
-                if let std::collections::hash_map::Entry::Vacant(slot) = cache.entry(id) {
-                    slot.insert(self.materialize(src, b, unsealed)?);
+                let mut table = seg.blocks.borrow_mut();
+                if table.is_empty() {
+                    table.resize_with(nblocks, || None);
                 }
-                match cache.get(&id).expect("just inserted") {
+                if table[b].is_none() {
+                    table[b] = Some(self.materialize(src, b, unsealed)?);
+                    self.cache_used.set(true);
+                }
+                match table[b].as_ref().expect("just built") {
                     Cached::Sparse(deltas) => {
                         let lo = b * CACHE_BLOCK;
                         let hi = ((b + 1) * CACHE_BLOCK).min(keys);
@@ -5433,27 +5471,24 @@ impl Db {
     /// PROTOTYPE: the cache's size, for a measurement: blocks held and
     /// bytes of keys and values in them.
     pub fn block_cache_size(&self) -> (usize, usize) {
-        let cache = self.block_cache.borrow();
-        let (mut clean, mut sparse, mut copies) = (0usize, 0usize, 0usize);
-        for c in cache.values() {
-            match c {
-                Cached::Clean => clean += 1,
-                Cached::Sparse(_) => sparse += 1,
-                Cached::Block(_) => copies += 1,
+        let (mut clean, mut sparse, mut copies, mut bytes) = (0usize, 0usize, 0usize, 0usize);
+        for s in &self.segs {
+            for c in s.blocks.borrow().iter().flatten() {
+                match c {
+                    Cached::Clean => clean += 1,
+                    Cached::Sparse(b) => {
+                        sparse += 1;
+                        bytes += b.buf.len() + b.ents.len() * 24;
+                    }
+                    Cached::Block(b) => {
+                        copies += 1;
+                        bytes += b.keys.len() + b.vals.len() + b.ents.len() * 16;
+                    }
+                }
             }
         }
         eprintln!("  cache: {clean} clean, {sparse} sparse, {copies} copies");
-        let bytes = cache
-            .values()
-            .map(|c| match c {
-                Cached::Clean => 0,
-                Cached::Sparse(deltas) => {
-                    deltas.iter().map(|d| d.key.len() + d.vals.len() + 16).sum()
-                }
-                Cached::Block(b) => b.keys.len() + b.vals.len() + b.ents.len() * 16,
-            })
-            .sum();
-        (cache.len(), bytes)
+        (clean + sparse + copies, bytes)
     }
 
     /// The partitions walked in bulk, with the unsealed keys laid over them.
