@@ -320,6 +320,13 @@ pub struct Options {
     /// is built on first read through the merge, dropped by a write to any
     /// key it owns, and dropped whole whenever the segments change.
     pub scan_block_cache: bool,
+    /// PROTOTYPE: the most bytes the block cache holds in built blocks,
+    /// or 0 for no bound. Past it, a build sheds the least recently
+    /// touched of a few sampled blocks until under; a shed block is
+    /// rebuilt from the partition, the pieces and the memtables when a
+    /// scan next wants it, so the pieces on disk are what the cache
+    /// overflows to.
+    pub scan_cache_bytes: usize,
     /// How the ordered scan builds its sorted snapshot of the unsealed keys.
     /// `true` keeps the keys in one arena and sorts 24-byte records (a
     /// 16-byte key prefix and an index), touching the arena only on a shared
@@ -354,6 +361,7 @@ impl Default for Options {
             scan_readahead_bytes: 256 << 10,
             scan_merge: true,
             scan_block_cache: false,
+            scan_cache_bytes: 0,
             scan_snapshot_arena: true,
         }
     }
@@ -2970,6 +2978,17 @@ impl SparseBlock {
     }
 }
 
+impl Cached {
+    /// PROTOTYPE: what the block holds beyond its slot, for the budget.
+    fn bytes(&self) -> usize {
+        match self {
+            Cached::Clean => 0,
+            Cached::Sparse(b) => b.keys.len() + b.ents.len() * 24 + b.refs.len() * 8,
+            Cached::Block(b) => b.keys.len() + b.vals.len() + b.ents.len() * 16,
+        }
+    }
+}
+
 /// PROTOTYPE: unsealed keys in a block from which a merged copy pays.
 /// Read from `CACHE_DENSE` in the environment once, for the measurement
 /// that picks it; 8 otherwise.
@@ -3034,6 +3053,10 @@ struct Sources<'a> {
 /// by block as they are written.
 struct BlockTable {
     slots: Vec<Option<Cached>>,
+    /// The scan count when each block was last walked.
+    touched: Vec<u32>,
+    /// Each block's index in `Db::built`, or `u32::MAX` when unlisted.
+    listed: Vec<u32>,
     /// Per level-0 piece meeting the partition's range: its index in the
     /// level, and the first rank not below each block's lower bound, one
     /// more for the partition's upper fence, so block `b` holds the
@@ -3168,6 +3191,20 @@ pub struct Db {
     /// PROTOTYPE: whether any partition holds a cached block, so a write
     /// with nothing cached skips the lookup that would drop one.
     cache_used: std::cell::Cell<bool>,
+    /// PROTOTYPE: bytes the built blocks hold, kept exact at every build,
+    /// eviction and drop, for the budget.
+    cache_bytes: std::cell::Cell<usize>,
+    /// PROTOTYPE: counts scans on the block path; a block records the
+    /// count when walked, and the budget sheds the block with the oldest.
+    scan_tick: std::cell::Cell<u32>,
+    /// PROTOTYPE: the state of the sampler that picks blocks to shed.
+    shed_seed: std::cell::Cell<u64>,
+    /// PROTOTYPE: every built block holding bytes, as (partition index,
+    /// block), so the sampler draws from blocks and never from empty
+    /// slots. Sampling slots was tried: with a tenth of them built, a
+    /// round of eight misses ended the shedding and one large block left
+    /// the cache twice its budget.
+    built: std::cell::RefCell<Vec<(u32, u32)>>,
     /// PROTOTYPE: slots of the keys the live memtable gained since the
     /// scan snapshot was built, sorted by key, so a commit does not force
     /// a rebuild: materialization merges these with the snapshot's keys.
@@ -3431,6 +3468,10 @@ impl Db {
             covered_seq: 0,
             scan_keys: std::cell::RefCell::new(None),
             cache_used: std::cell::Cell::new(false),
+            cache_bytes: std::cell::Cell::new(0),
+            scan_tick: std::cell::Cell::new(0),
+            shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
+            built: std::cell::RefCell::new(Vec::new()),
             snap_added: std::cell::RefCell::new(Vec::new()),
             snap_gen: std::cell::Cell::new(0),
             seal_wait: SealWaits::default(),
@@ -3595,6 +3636,10 @@ impl Db {
             covered_seq: sealed,
             scan_keys: std::cell::RefCell::new(None),
             cache_used: std::cell::Cell::new(false),
+            cache_bytes: std::cell::Cell::new(0),
+            scan_tick: std::cell::Cell::new(0),
+            shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
+            built: std::cell::RefCell::new(Vec::new()),
             snap_added: std::cell::RefCell::new(Vec::new()),
             snap_gen: std::cell::Cell::new(0),
             seal_wait: SealWaits::default(),
@@ -4932,6 +4977,124 @@ impl Db {
             *s.blocks.borrow_mut() = None;
         }
         self.cache_used.set(false);
+        self.cache_bytes.set(0);
+        self.built.borrow_mut().clear();
+    }
+
+    /// PROTOTYPE: a built block takes its place in the list the sampler
+    /// draws from, and the count grows by what it holds.
+    fn list_built(&self, p: usize, b: usize, table: &mut BlockTable) {
+        let bytes = table.slots[b].as_ref().map_or(0, |c| c.bytes());
+        self.cache_bytes.set(self.cache_bytes.get() + bytes);
+        if bytes > 0 {
+            let mut built = self.built.borrow_mut();
+            table.listed[b] = built.len() as u32;
+            built.push((p as u32, b as u32));
+        }
+    }
+
+    /// PROTOTYPE: a block leaves the cache: its bytes leave the count and
+    /// its place in the list goes to the last listed block, whose table
+    /// is `table` when it is the one in hand and borrowed otherwise.
+    fn unlist(&self, p: usize, b: usize, table: &mut BlockTable) -> usize {
+        let Some(c) = table.slots[b].take() else {
+            return 0;
+        };
+        let bytes = c.bytes();
+        self.cache_bytes.set(self.cache_bytes.get() - bytes);
+        let at = std::mem::replace(&mut table.listed[b], u32::MAX);
+        if at != u32::MAX {
+            let mut built = self.built.borrow_mut();
+            let last = built.pop().expect("a listed block is in the list");
+            if (at as usize) < built.len() {
+                built[at as usize] = last;
+                let (lp, lb) = (last.0 as usize, last.1 as usize);
+                if lp == p {
+                    table.listed[lb] = at;
+                } else if let Some(t) = self.segs[lp].blocks.borrow_mut().as_mut() {
+                    t.listed[lb] = at;
+                }
+            }
+        }
+        bytes
+    }
+
+    /// PROTOTYPE: bring the cache under its budget by shedding built
+    /// blocks: of eight drawn at random from the list of built blocks,
+    /// the one walked longest ago, again until under. `cur` is the
+    /// partition whose table the caller holds, reached through `table`
+    /// rather than borrowed again, and `keep` the block it is about to
+    /// walk, never shed: a budget below one block holds that block.
+    fn shed(&self, cur: usize, keep: usize, table: &mut BlockTable) {
+        let budget = self.opts.scan_cache_bytes;
+        if budget == 0 {
+            return;
+        }
+        let tick = self.scan_tick.get();
+        while self.cache_bytes.get() > budget {
+            let mut best: Option<(usize, usize, u32)> = None;
+            {
+                let built = self.built.borrow();
+                if built.is_empty() {
+                    break;
+                }
+                for _ in 0..8 {
+                    let mut x = self.shed_seed.get();
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    self.shed_seed.set(x);
+                    let (p, b) = built[(x as usize) % built.len()];
+                    let (p, b) = (p as usize, b as usize);
+                    if p == cur && b == keep {
+                        continue;
+                    }
+                    let touched = if p == cur {
+                        table.touched[b]
+                    } else {
+                        match self.segs[p].blocks.borrow().as_ref() {
+                            Some(t) => t.touched[b],
+                            None => continue,
+                        }
+                    };
+                    let age = tick.wrapping_sub(touched);
+                    if best.is_none_or(|(_, _, a)| age > a) {
+                        best = Some((p, b, age));
+                    }
+                }
+            }
+            let Some((p, b, _)) = best else { break };
+            if p == cur {
+                self.unlist(p, b, table);
+            } else {
+                // The other table's borrow must end before `unlist`
+                // borrows a third table to fix the moved entry, so the
+                // block is taken out through a short borrow of its own.
+                let mut held = self.segs[p].blocks.borrow_mut();
+                let Some(t) = held.as_mut() else { break };
+                if t.slots[b].is_none() {
+                    break;
+                }
+                let c = t.slots[b].take().expect("checked");
+                let bytes = c.bytes();
+                self.cache_bytes.set(self.cache_bytes.get() - bytes);
+                let at = std::mem::replace(&mut t.listed[b], u32::MAX);
+                drop(held);
+                if at != u32::MAX {
+                    let mut built = self.built.borrow_mut();
+                    let last = built.pop().expect("a listed block is in the list");
+                    if (at as usize) < built.len() {
+                        built[at as usize] = last;
+                        let (lp, lb) = (last.0 as usize, last.1 as usize);
+                        if lp == cur {
+                            table.listed[lb] = at;
+                        } else if let Some(t) = self.segs[lp].blocks.borrow_mut().as_mut() {
+                            t.listed[lb] = at;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// PROTOTYPE: the block that owns `key` in the partition holding it,
@@ -4955,8 +5118,8 @@ impl Db {
         let mut held = seg.blocks.borrow_mut();
         let table = held.as_mut()?;
         let (b, cut) = Self::owner_of(seg, key);
-        if let Some(slot) = table.slots.get_mut(b) {
-            *slot = None;
+        if b < table.slots.len() {
+            self.unlist(at, b, table);
         }
         Some((at, b, cut))
     }
@@ -5151,6 +5314,8 @@ impl Db {
         }
         Ok(BlockTable {
             slots: (0..nblocks).map(|_| None).collect(),
+            touched: vec![0; nblocks],
+            listed: vec![u32::MAX; nblocks],
             pieces,
             snap_at,
             snap_gen: self.snap_gen.get(),
@@ -5750,9 +5915,15 @@ impl Db {
     ) -> Result<usize> {
         let np = self.segs.partition_point(|s| s.level > 0);
         let l0 = &self.segs[np..];
+        let tick = self.scan_tick.get().wrapping_add(1);
+        self.scan_tick.set(tick);
         let mut seen = 0usize;
         let mut cursor: &[u8] = from;
-        for seg in self.segs[..np].iter().filter(|s| s.may_reach(from)) {
+        for (pi, seg) in self.segs[..np]
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.may_reach(from))
+        {
             if seen >= limit {
                 break;
             }
@@ -5795,7 +5966,10 @@ impl Db {
                 if table.slots[b].is_none() {
                     let built = self.materialize(src, table, b, unsealed)?;
                     table.slots[b] = Some(built);
+                    self.list_built(pi, b, table);
+                    self.shed(pi, b, table);
                 }
+                table.touched[b] = tick;
                 match table.slots[b].as_ref().expect("just built") {
                     Cached::Sparse(deltas) => {
                         seen += self.walk_deltas(
@@ -5868,8 +6042,36 @@ impl Db {
                 }
             }
         }
-        eprintln!("  cache: {clean} clean, {sparse} sparse, {copies} copies");
+        eprintln!(
+            "  cache: {clean} clean, {sparse} sparse, {copies} copies; {bytes} B walked, {} B counted",
+            self.cache_bytes.get()
+        );
         (clean + sparse + copies, bytes)
+    }
+
+    /// PROTOTYPE: the bytes the cache counts itself holding, for a test
+    /// to hold against a walk of it.
+    pub fn block_cache_bytes(&self) -> usize {
+        self.cache_bytes.get()
+    }
+
+    /// PROTOTYPE: the most bytes any one built block holds, the slack a
+    /// budget allows since the block in hand is never shed.
+    pub fn block_cache_largest(&self) -> usize {
+        self.segs
+            .iter()
+            .map(|s| {
+                s.blocks.borrow().as_ref().map_or(0, |t| {
+                    t.slots
+                        .iter()
+                        .flatten()
+                        .map(|c| c.bytes())
+                        .max()
+                        .unwrap_or(0)
+                })
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     /// The partitions walked in bulk, with the unsealed keys laid over them.

@@ -1777,7 +1777,7 @@ impl ScanModel {
 /// the level-0 pieces, and the walk alone after a flush.
 #[test]
 fn the_bulk_walk_lays_unsealed_keys_over_the_partitions_exactly_as_the_merge_does() {
-    overlay_model("overlay", false);
+    overlay_model("overlay", false, 0);
 }
 
 /// The same model against the block cache: a scan walks cached copies of
@@ -1785,7 +1785,15 @@ fn the_bulk_walk_lays_unsealed_keys_over_the_partitions_exactly_as_the_merge_doe
 /// the copy of the block it lands in.
 #[test]
 fn the_block_cache_answers_the_same_model() {
-    overlay_model("overlay-cache", true);
+    overlay_model("overlay-cache", true, 0);
+}
+
+/// Under a budget of a couple of blocks, every build sheds another, and
+/// a scan finds blocks dropped since its last visit; the answers must not
+/// change, and the bytes the cache counts must be the bytes it holds.
+#[test]
+fn the_block_cache_answers_the_same_model_under_a_budget() {
+    overlay_model("overlay-budget", true, 2048);
 }
 
 /// A key the frozen memtable holds and the live one then touches, with a
@@ -1824,6 +1832,7 @@ fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
     db.seal().unwrap();
     assert!(db.in_flight().0);
     m.check(&db, "frozen over the partitions, snapshot built");
+    held(&db, 0);
     // Live writes to frozen keys, each creating a live entry.
     m.delete(&mut db, &key(300));
     m.append(&mut db, &key(303), "l");
@@ -1832,6 +1841,7 @@ fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
     m.delete(&mut db, &key(600));
     m.append(&mut db, &key(603), "l");
     m.check(&db, "live over frozen, through the side list");
+    held(&db, 0);
     // More keys than the side list may hold before a scan rebuilds the
     // snapshot: the rebuild happens with the tables standing, and the
     // writes after are filed under blocks whose bounds were walked again.
@@ -1843,22 +1853,27 @@ fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
         m.append(&mut db, &burst(k), "burst");
     }
     m.check(&db, "a burst that rebuilds the snapshot under the tables");
+    held(&db, 0);
     for k in 4200..8400 {
         m.append(&mut db, &burst(k), "burst");
     }
     m.check(&db, "a burst that rehashes the memtable under the snapshot");
+    held(&db, 0);
     m.delete(&mut db, &key(303));
     m.append(&mut db, &key(309), "l-after-rebuild");
     m.delete(&mut db, "key-00150x");
     m.append(&mut db, "key-00151y", "between-after-rebuild");
     m.check(&db, "writes filed after the rebuild");
+    held(&db, 0);
     db.settle().unwrap();
     m.check(&db, "pieces and live");
+    held(&db, 0);
     m.delete(&mut db, &key(309));
     m.delete(&mut db, &key(30));
     m.append(&mut db, &key(33), "l-over-piece");
     m.append(&mut db, "key-00152y", "over pieces");
     m.check(&db, "writes filed over the pieces");
+    held(&db, 0);
     db.flush().unwrap();
     m.flushed();
     // Keys created while their partition has no table yet: the flush
@@ -1879,12 +1894,32 @@ fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
     );
 }
 
-fn overlay_model(name: &str, block_cache: bool) {
+/// After a check has filled the cache: the bytes it counts against a
+/// walk of what it holds, and against the budget with one block's slack,
+/// since the block a scan is about to walk is never shed.
+fn held(db: &Db, budget: usize) {
+    let (_, walked) = db.block_cache_size();
+    assert_eq!(
+        walked,
+        db.block_cache_bytes(),
+        "the cache miscounts what it holds"
+    );
+    if budget > 0 {
+        let largest = db.block_cache_largest();
+        assert!(
+            walked <= budget + largest,
+            "the cache holds {walked} B against a budget of {budget} and a largest block of {largest}"
+        );
+    }
+}
+
+fn overlay_model(name: &str, block_cache: bool, budget: usize) {
     let d = dir(name);
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(2 << 10),
         scan_block_cache: block_cache,
+        scan_cache_bytes: budget,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -1902,6 +1937,7 @@ fn overlay_model(name: &str, block_cache: bool) {
         "want several partitions and no piece, got {parts}/{l0}"
     );
     m.check(&db, "partitions only");
+    held(&db, budget);
 
     // A few writes in one partition's range: an update, a delete, a new
     // key between two, so a block holds unsealed keys without being dense
@@ -1911,6 +1947,7 @@ fn overlay_model(name: &str, block_cache: bool) {
     m.append(&mut db, &key(310), "s-between");
     db.commit().unwrap();
     m.check(&db, "a few unsealed keys in one partition");
+    held(&db, budget);
 
     // The YCSB shape: inserts past the end, committed, nothing sealed.
     for k in (600..660).step_by(3) {
@@ -1919,6 +1956,7 @@ fn overlay_model(name: &str, block_cache: bool) {
     db.commit().unwrap();
     assert_eq!(db.levels(), (parts, 0));
     m.check(&db, "live inserts past the end");
+    held(&db, budget);
 
     // What the frozen memtable will hold.
     for k in (0..600).step_by(3) {
@@ -1967,15 +2005,18 @@ fn overlay_model(name: &str, block_cache: bool) {
     assert!(db.in_flight().0);
     assert_eq!(db.levels(), (parts, 0));
     m.check(&db, "frozen and live over the partitions");
+    held(&db, budget);
 
     db.settle().unwrap();
     assert!(db.levels().1 > 0, "settle publishes the sealed pieces");
     m.check(&db, "level-0 pieces and live over the partitions");
+    held(&db, budget);
 
     db.flush().unwrap();
     m.flushed();
     assert_eq!(db.levels().1, 0);
     m.check(&db, "partitions only, after the merge");
+    held(&db, budget);
 
     // And the YCSB shape once more on the merged store.
     for k in (660..700).step_by(3) {
@@ -1984,5 +2025,6 @@ fn overlay_model(name: &str, block_cache: bool) {
     db.commit().unwrap();
     assert_eq!(db.levels().1, 0);
     m.check(&db, "live inserts past the end, after the merge");
+    held(&db, budget);
     db.close().unwrap();
 }
