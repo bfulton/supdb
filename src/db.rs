@@ -2069,8 +2069,10 @@ fn mem_hash(key: &[u8]) -> u64 {
 /// PROTOTYPE: what a memtable write did, for the block cache's bookkeeping.
 #[derive(Default)]
 struct Wrote {
-    /// The slot of a key this write created.
-    new_slot: Option<u32>,
+    /// The slot of the key written, created by this write or found.
+    slot: u32,
+    /// Whether this write created it.
+    new: bool,
     /// The table rehashed on the way, so every slot index moved: for each
     /// old slot, the new one, or `u32::MAX` for a slot that was empty.
     /// The rehash visits every entry anyway, and the map lets what names
@@ -2134,13 +2136,15 @@ impl MemTable {
                     count: 1,
                 };
                 self.len += 1;
-                wrote.new_slot = Some(i as u32);
+                wrote.slot = i as u32;
+                wrote.new = true;
                 return wrote;
             }
             if e.hash == hash && MemTable::key_of(&self.keys, &e) == key {
                 let head = self.push_chunk(e.head - 1, value);
                 self.entries[i].head = head + 1;
                 self.entries[i].count += 1;
+                wrote.slot = i as u32;
                 return wrote;
             }
             i = (i + 1) & self.mask;
@@ -2182,7 +2186,8 @@ impl MemTable {
                 };
                 self.len += 1;
                 self.tombs += 1;
-                wrote.new_slot = Some(i as u32);
+                wrote.slot = i as u32;
+                wrote.new = true;
                 return wrote;
             }
             if e.hash == hash && MemTable::key_of(&self.keys, &e) == key {
@@ -2190,6 +2195,7 @@ impl MemTable {
                 self.entries[i].head = head + 1;
                 self.entries[i].count = 0;
                 self.tombs += 1;
+                wrote.slot = i as u32;
                 return wrote;
             }
             i = (i + 1) & self.mask;
@@ -2263,6 +2269,11 @@ impl MemTable {
     }
 
     fn get(&self, key: &[u8]) -> Option<&MemEntry> {
+        self.slot_of(key).map(|i| &self.entries[i])
+    }
+
+    /// The slot holding `key`, if the table has it.
+    fn slot_of(&self, key: &[u8]) -> Option<usize> {
         let hash = mem_hash(key);
         let mut i = (hash as usize) & self.mask;
         loop {
@@ -2271,7 +2282,7 @@ impl MemTable {
                 return None;
             }
             if e.hash == hash && MemTable::key_of(&self.keys, e) == key {
-                return Some(e);
+                return Some(i);
             }
             i = (i + 1) & self.mask;
         }
@@ -3057,6 +3068,10 @@ struct BlockTable {
     touched: Vec<u32>,
     /// Each block's index in `Db::built`, or `u32::MAX` when unlisted.
     listed: Vec<u32>,
+    /// How many keys the per-block lists hold, so a partition with no
+    /// piece meeting it, no snapshot key in its range and nothing filed
+    /// is known to be clean throughout without a look at any block.
+    filed: usize,
     /// Per level-0 piece meeting the partition's range: its index in the
     /// level, and the first rank not below each block's lower bound, one
     /// more for the partition's upper fence, so block `b` holds the
@@ -3070,6 +3085,16 @@ struct BlockTable {
     /// falls in, in creation order, each with the cut the write's seek
     /// found.
     added: Vec<Vec<(u32, u32)>>,
+}
+
+impl BlockTable {
+    /// PROTOTYPE: nothing above the partition anywhere in its range: no
+    /// piece meets it, the snapshot's run over it is empty, and nothing
+    /// was filed since. A scan then walks the partition's records as the
+    /// bulk walk does, with no block touched.
+    fn clean_throughout(&self) -> bool {
+        self.pieces.is_empty() && self.filed == 0 && self.snap_at.first() == self.snap_at.last()
+    }
 }
 
 /// PROTOTYPE: where a sorted source's positions fall against a
@@ -3199,6 +3224,14 @@ pub struct Db {
     scan_tick: std::cell::Cell<u32>,
     /// PROTOTYPE: the state of the sampler that picks blocks to shed.
     shed_seed: std::cell::Cell<u64>,
+    /// PROTOTYPE: keys written since the last scan on the block path, as
+    /// (key offset, key length, created) in the live memtable's arena,
+    /// with a run of writes to one key recorded once. A write used to seek
+    /// the key in its partition to drop the block it lands in; the suite's
+    /// ycsb-A, which follows a scan phase, paid that seek twice an update
+    /// and lost a fifth. The next scan drops and files the distinct keys
+    /// at once, and a mix that never scans never pays.
+    pending: std::cell::RefCell<Vec<(u32, u32, bool)>>,
     /// PROTOTYPE: every built block holding bytes, as (partition index,
     /// block), so the sampler draws from blocks and never from empty
     /// slots. Sampling slots was tried: with a tenth of them built, a
@@ -3472,6 +3505,7 @@ impl Db {
             scan_tick: std::cell::Cell::new(0),
             shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
             built: std::cell::RefCell::new(Vec::new()),
+            pending: std::cell::RefCell::new(Vec::new()),
             snap_added: std::cell::RefCell::new(Vec::new()),
             snap_gen: std::cell::Cell::new(0),
             seal_wait: SealWaits::default(),
@@ -3640,6 +3674,7 @@ impl Db {
             scan_tick: std::cell::Cell::new(0),
             shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
             built: std::cell::RefCell::new(Vec::new()),
+            pending: std::cell::RefCell::new(Vec::new()),
             snap_added: std::cell::RefCell::new(Vec::new()),
             snap_gen: std::cell::Cell::new(0),
             seal_wait: SealWaits::default(),
@@ -3650,10 +3685,9 @@ impl Db {
     /// Buffered until `commit`; visible to this handle's reads immediately,
     /// which is the read-your-writes contract `Store::read_all` set.
     pub fn append(&mut self, key: &[u8], value: &[u8]) {
-        let at = self.evict_block_of(key);
         self.wal.append(key, value);
         let wrote = self.mem.append(key, value);
-        self.note_write(wrote, at);
+        self.note_write(wrote);
         self.mem_bytes += key.len() + value.len();
     }
 
@@ -3672,10 +3706,9 @@ impl Db {
     /// start fresh. Durable at the next `commit`, exactly like an append,
     /// and reclaimed by the next merge that reaches the key.
     pub fn delete(&mut self, key: &[u8]) {
-        let at = self.evict_block_of(key);
         self.wal.delete(key);
         let wrote = self.mem.delete(key);
-        self.note_write(wrote, at);
+        self.note_write(wrote);
         self.mem_bytes += key.len() + 16;
     }
 
@@ -4812,6 +4845,9 @@ impl Db {
         } else {
             self.wal.seq ^ structural
         };
+        if use_cache {
+            self.settle_pending();
+        }
         {
             let mut cache = self.scan_keys.borrow_mut();
             let mut stale = cache.as_ref().is_none_or(|(g, _)| *g != gen);
@@ -4832,6 +4868,7 @@ impl Db {
                         for list in &mut t.added {
                             list.clear();
                         }
+                        t.filed = 0;
                     }
                 }
             }
@@ -4979,6 +5016,7 @@ impl Db {
         self.cache_used.set(false);
         self.cache_bytes.set(0);
         self.built.borrow_mut().clear();
+        self.pending.borrow_mut().clear();
     }
 
     /// PROTOTYPE: a built block takes its place in the list the sampler
@@ -5097,31 +5135,51 @@ impl Db {
         }
     }
 
-    /// PROTOTYPE: the block that owns `key` in the partition holding it,
-    /// dropped from the cache and named, so the write can be filed under
-    /// it. The owner is the block whose first key is not above `key`; a
-    /// key below every key of the partition belongs to block 0, and one
-    /// above every key to the last block, which is where the bounds put
-    /// them. `None` when the partition has no table: nothing to drop and
-    /// nowhere to file.
-    fn evict_block_of(&self, key: &[u8]) -> Option<(usize, usize, u32)> {
-        if !self.cache_used.get() {
-            return None;
+    /// PROTOTYPE: the writes since the last scan on the block path, settled:
+    /// each distinct key's block dropped from the cache, and a key created
+    /// since the snapshot filed under its block when its partition has a
+    /// table. The keys are sorted by arena offset so a key written many
+    /// times costs one seek, the created one's record first so the flag
+    /// survives the fold.
+    fn settle_pending(&self) {
+        let mut pending = std::mem::take(&mut *self.pending.borrow_mut());
+        if pending.is_empty() {
+            return;
         }
+        pending.sort_unstable_by_key(|&(off, _, new)| (off, !new));
         let np = self.segs.partition_point(|s| s.level > 0);
-        let at =
-            self.segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
-        let seg = self.segs[..np].get(at)?;
-        if seg.blob.keys() == 0 {
-            return None;
+        let mut last = u32::MAX;
+        for &(off, len, new) in &pending {
+            if off == last {
+                continue;
+            }
+            last = off;
+            let key = &self.mem.keys[off as usize..(off + len) as usize];
+            let at = self.segs[..np]
+                .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+            let Some(seg) = self.segs[..np].get(at) else {
+                continue;
+            };
+            if seg.blob.keys() == 0 {
+                continue;
+            }
+            let mut held = seg.blocks.borrow_mut();
+            let Some(table) = held.as_mut() else {
+                continue;
+            };
+            let (b, cut) = Self::owner_of(seg, key);
+            if b < table.slots.len() {
+                self.unlist(at, b, table);
+            }
+            if new {
+                if let (Some(slot), Some(list)) = (self.mem.slot_of(key), table.added.get_mut(b)) {
+                    list.push((slot as u32, cut));
+                    table.filed += 1;
+                }
+            }
         }
-        let mut held = seg.blocks.borrow_mut();
-        let table = held.as_mut()?;
-        let (b, cut) = Self::owner_of(seg, key);
-        if b < table.slots.len() {
-            self.unlist(at, b, table);
-        }
-        Some((at, b, cut))
+        pending.clear();
+        *self.pending.borrow_mut() = pending;
     }
 
     /// PROTOTYPE: the block whose key range holds `key`.
@@ -5215,10 +5273,10 @@ impl Db {
 
     /// PROTOTYPE: bookkeeping after a memtable write, when the block cache
     /// is on: a rehash renumbers every slot the snapshot and the lists
-    /// hold, and a created key joins the list of keys since the snapshot
-    /// and, when its partition has a table, that table's list for its
-    /// block.
-    fn note_write(&self, wrote: Wrote, at: Option<(usize, usize, u32)>) {
+    /// hold, a created key joins the list of keys since the snapshot, and
+    /// while any partition has a table the key joins the writes the next
+    /// scan settles.
+    fn note_write(&self, wrote: Wrote) {
         if !self.opts.scan_block_cache {
             return;
         }
@@ -5255,13 +5313,15 @@ impl Db {
                 }
             }
         }
-        let Some(slot) = wrote.new_slot else { return };
-        self.snap_added.borrow_mut().push(slot);
-        if let Some((p, b, cut)) = at {
-            if let Some(t) = self.segs[p].blocks.borrow_mut().as_mut() {
-                if let Some(list) = t.added.get_mut(b) {
-                    list.push((slot, cut));
-                }
+        if wrote.new {
+            self.snap_added.borrow_mut().push(wrote.slot);
+        }
+        if self.cache_used.get() {
+            let e = &self.mem.entries[wrote.slot as usize];
+            let mut pending = self.pending.borrow_mut();
+            match pending.last_mut() {
+                Some(last) if last.0 == e.key_off => last.2 |= wrote.new,
+                _ => pending.push((e.key_off, e.key_len, wrote.new)),
             }
         }
     }
@@ -5312,6 +5372,7 @@ impl Db {
                 added[b].push((slot, cut));
             }
         }
+        let filed = added.iter().map(Vec::len).sum();
         Ok(BlockTable {
             slots: (0..nblocks).map(|_| None).collect(),
             touched: vec![0; nblocks],
@@ -5320,6 +5381,7 @@ impl Db {
             snap_at,
             snap_gen: self.snap_gen.get(),
             added,
+            filed,
         })
     }
 
@@ -5956,6 +6018,32 @@ impl Db {
                 table.snap_at = Self::snap_bounds(seg, nblocks, unsealed)?;
                 table.snap_gen = self.snap_gen.get();
             }
+            if table.clean_throughout() {
+                // The suite's scan workload, and any store between a flush
+                // and its next write: one walk from the seek, as the bulk
+                // walk makes it. Measured through the blocks it was a
+                // tenth slower, in first touches and bookkeeping.
+                if rank < keys {
+                    let want = (keys - rank).min(limit - seen);
+                    let got = seg
+                        .blob
+                        .scan_at(rank, want, &mut f)
+                        .map_err(|e| err(&format!("segment scan: {e}")))?;
+                    if got < want {
+                        return Err(err(
+                            "segment scan: a partition's walk stopped short of its key count",
+                        ));
+                    }
+                    seen += got;
+                }
+                match &seg.hi {
+                    Some(h) => {
+                        cursor = h.as_slice();
+                        continue;
+                    }
+                    None => break,
+                }
+            }
             let mut b = owner / CACHE_BLOCK;
             let mut first = true;
             while seen < limit && b < nblocks {
@@ -5982,8 +6070,21 @@ impl Db {
                         )?;
                     }
                     Cached::Clean => {
-                        if start < hi {
-                            let want = (hi - start).min(limit - seen);
+                        // Every clean block built after this one joins the
+                        // run: on a store with nothing unsealed, a scan of
+                        // a hundred entries is one walk, as the bulk walk
+                        // makes it, not three block-sized ones.
+                        let mut run_hi = hi;
+                        while b + 1 < nblocks
+                            && run_hi - start < limit - seen
+                            && matches!(table.slots[b + 1], Some(Cached::Clean))
+                        {
+                            b += 1;
+                            table.touched[b] = tick;
+                            run_hi = ((b + 1) * CACHE_BLOCK).min(keys);
+                        }
+                        if start < run_hi {
+                            let want = (run_hi - start).min(limit - seen);
                             let got = seg
                                 .blob
                                 .scan_at(start, want, &mut f)
