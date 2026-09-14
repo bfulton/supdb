@@ -3201,6 +3201,11 @@ pub struct Db {
     /// The partitions' bytes on disk, refreshed with the segment set: what
     /// a merge rewrites, and so what the seal is sized against.
     store_bytes: std::cell::Cell<u64>,
+    /// Whether every level-0 piece is aligned to a partition -- its fence
+    /// one partition's -- so a read finds the pieces over its key by
+    /// binary search instead of a walk over all of them; see
+    /// `pieces_over`. Refreshed by `sort_segs`.
+    l0_aligned: bool,
     next_seg: u64,
     /// Commits written since the last barrier, for `SyncPolicy::EveryN`.
     unsynced: u32,
@@ -3534,6 +3539,7 @@ impl Db {
             advice_random: std::cell::Cell::new(starts_random),
             mean_key_bytes: std::cell::Cell::new(0),
             store_bytes: std::cell::Cell::new(0),
+            l0_aligned: false,
             next_seg: 0,
             frozen: None,
             sealing: None,
@@ -3691,6 +3697,7 @@ impl Db {
         let next_seg = seg_ids.iter().map(|&(n, _)| n + 1).max().unwrap_or(0);
         let mean_key_bytes = Db::mean_key_bytes_of(&segs);
         let store_bytes = Db::store_bytes_of(dir, &segs);
+        let l0_aligned = Db::l0_aligned_of(&segs);
         Ok(Db {
             dir: dir.to_path_buf(),
             opts,
@@ -3705,6 +3712,7 @@ impl Db {
             advice_random: std::cell::Cell::new(starts_random),
             mean_key_bytes: std::cell::Cell::new(mean_key_bytes),
             store_bytes: std::cell::Cell::new(store_bytes),
+            l0_aligned,
             next_seg,
             frozen: None,
             sealing: None,
@@ -4141,6 +4149,45 @@ impl Db {
         self.refresh_mean_key_bytes();
         self.store_bytes
             .set(Db::store_bytes_of(&self.dir, &self.segs));
+        self.l0_aligned = Db::l0_aligned_of(&self.segs);
+    }
+
+    /// Whether every level-0 piece's fence is some partition's, over a
+    /// segment list `sort_segs` has ordered. Nothing to align to is not
+    /// aligned: before the first partitioning every piece spans the whole
+    /// key space.
+    fn l0_aligned_of(segs: &[Seg]) -> bool {
+        let np = segs.partition_point(|s| s.level > 0);
+        let (parts, l0) = segs.split_at(np);
+        !parts.is_empty()
+            && l0
+                .iter()
+                .all(|s| parts.iter().any(|p| p.lo == s.lo && p.hi == s.hi))
+    }
+
+    /// The level-0 pieces a read of a key in partition `at` consults. When
+    /// every piece is aligned to a partition they are the run over `at`
+    /// alone: the pieces sort by lower fence and then by name, so one
+    /// range's pieces are consecutive and oldest first, and two binary
+    /// searches bound the run. Otherwise all of them, each answering from
+    /// its own fence, as every read did before: a walk over every piece
+    /// in the store, two fence compares each, that grew with the range
+    /// count times the pieces over a range.
+    fn pieces_over(&self, np: usize, at: usize) -> &[Seg] {
+        let l0 = &self.segs[np..];
+        if !self.l0_aligned || at >= np {
+            return l0;
+        }
+        // The first partition's lower fence is empty, and so is that of
+        // every piece aligned to it; see `below_lo` for why an empty fence
+        // is never handed to a compare.
+        let lo = self.segs[at].lo.as_slice();
+        let before = |s: &Seg| !lo.is_empty() && (s.lo.is_empty() || s.lo.as_slice() < lo);
+        let same =
+            |s: &Seg| s.lo.is_empty() == lo.is_empty() && (lo.is_empty() || s.lo.as_slice() == lo);
+        let from = l0.partition_point(before);
+        let to = from + l0[from..].partition_point(same);
+        &l0[from..to]
     }
 
     /// The partitions' bytes on disk. A free function over the segments,
@@ -4685,6 +4732,12 @@ impl Db {
         self.advice_random.get()
     }
 
+    /// Whether reads route to the pieces over their range, for a test to
+    /// know which path it is on: `false` whenever a piece spans ranges.
+    pub fn pieces_aligned(&self) -> bool {
+        self.l0_aligned
+    }
+
     /// How many segments' ordered companions were advised `MADV_RANDOM`, and
     /// how many there are.
     ///
@@ -4706,7 +4759,7 @@ impl Db {
         let at =
             self.segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
         let part = self.segs[..np].get(at).filter(|s| s.may_hold(key));
-        let l0 = &self.segs[np..];
+        let l0 = self.pieces_over(np, at);
         // Sources oldest to newest: the partition (0), the level-0 pieces
         // (1..), the frozen memtable, the live one. `start` is the source
         // live values begin at: 0 unless a newer source holds a tombstone
@@ -6838,7 +6891,7 @@ impl Db {
         let at =
             self.segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
         let part = self.segs[..np].get(at).filter(|s| s.may_hold(key));
-        let l0 = &self.segs[np..];
+        let l0 = self.pieces_over(np, at);
         let (fr_ix, mem_ix) = (1 + l0.len(), 2 + l0.len());
         let mut start = 0usize;
         if self.has_tombstones() {

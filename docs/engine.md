@@ -426,8 +426,9 @@ per-commit path.
   0.3 MB at thirty million, where `l0_trigger` of them made 1.2 MB and
   merging them rewrote a 64 MB partition, fifty times the bytes, while
   twenty more seals landed on the ranges the job covered. Level-0 reached
-  24 pieces a range, every read checked 24 Blooms and every scan merged
-  24 pieces: on the suite's mixes D fell to 35k ops/s and E to 14k
+  24 pieces a range, every read walked 2,496 pieces' fences and probed 24
+  Blooms, and every scan merged 24 pieces: on the suite's mixes D fell to
+  35k ops/s and E to 14k
   against LMDB's 489k and 354k. `Options::seal_grows` sizes the seal at a
   sixteenth of the partitions' bytes past the `seal_bytes` floor -- the
   divisor is four times the trigger, so a merge takes in at least a
@@ -435,6 +436,24 @@ per-commit path.
   under three pieces a range: D 533k, E 334k, A 352k against LMDB's 50k,
   F 282k against 51k, the load at 0.96x. At and below three million the
   floor is the larger number and nothing changes.
+- ~~Level-0 pieces on the read path~~ — **answered by measurement at thirty
+  million keys**. With the seal grown, D still read at 0.8x of LMDB, and
+  the same store loaded under a hand-set 320 MiB seal, 11 partitions
+  instead of 42, read D a third faster; the partition count looked like
+  the cost. It was not. A read found its partition by a fence search and
+  then walked every level-0 piece in the store, two fence compares each,
+  to find the ones over its range: 84 pieces over 42 ranges, 22 over 11,
+  2,496 with the seal fixed. The pieces sort by lower fence and then by
+  name, so a range's pieces are one consecutive run, oldest first, and
+  two binary searches bound it (`Db::pieces_over`) whenever every piece
+  is aligned to a partition, which the segment sort records; a piece that
+  spans ranges, sealed during the first partitioning, puts the walk back.
+  Measured on one machine, one binary with the routing switched by
+  environment, two rounds interleaved and one reversed: D **295k-303k to
+  415k-480k ops/s** against LMDB's 344k-354k, F 216k-220k to 233k-238k,
+  the other mixes and the load inside their round-to-round spread. A
+  flag for whether any segment holds a tombstone, in place of the read's
+  walk over every segment's, was measured beside it and moved nothing.
 - ~~Readahead out-of-core~~ — **answered**. Once the file outgrows the
   page cache, the kernel's default readahead is the whole cliff: cold
   point reads run 75.8x and 78.9x faster under `MADV_RANDOM`, at 1.0x read

@@ -2029,6 +2029,116 @@ fn a_key_held_by_many_pieces_counts_once_toward_a_wide_block() {
     assert_eq!(db.block_cache_wide(), 1, "the tail's block is wide");
 }
 
+/// A read consults the level-0 pieces over its key, found by their
+/// fences: every piece while one spans the ranges, and once every piece
+/// is aligned to a partition, the run over the key's range alone, oldest
+/// first after the partition and before the memtables. Keys in the first
+/// range, middle ones and the last, through the values and the count,
+/// with a tombstone sealed into a piece cutting the sources below it.
+#[test]
+fn a_read_consults_the_pieces_over_its_range() {
+    let d = dir("read-route");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(1 << 10),
+        l0_trigger: 5,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let key = |k: u32| format!("key-{k:05}");
+    let val = |v: &str| format!("{v:<16}");
+    let write = |db: &mut Db, v: &str| {
+        for k in (0..600).step_by(3) {
+            db.append(key(k).as_bytes(), val(v).as_bytes());
+        }
+        db.commit().unwrap();
+    };
+    let read = |db: &Db, k: u32| -> (Vec<String>, u64, u64) {
+        let mut got = Vec::new();
+        let n = db
+            .read_all(key(k).as_bytes(), |v| {
+                got.push(String::from_utf8(v.to_vec()).unwrap())
+            })
+            .unwrap();
+        (got, n, db.count(key(k).as_bytes()).unwrap())
+    };
+    let want = |tags: &[&str]| tags.iter().map(|t| val(t)).collect::<Vec<_>>();
+    let probe = [0, 3, 297, 300, 303, 594, 597];
+    // Five seals reach the trigger when the sixth joins them, which starts
+    // the first partitioning; the sixth is cut with no fence to split at,
+    // so it spans every range the partitioning makes, and a read anywhere
+    // must consult it.
+    for round in 0..6 {
+        write(&mut db, &format!("s{round}"));
+        db.seal().unwrap();
+    }
+    db.settle().unwrap();
+    let (parts, l0) = db.levels();
+    assert!(
+        parts >= 3 && l0 == 1,
+        "partitions with one piece spanning them, got {parts} and {l0}"
+    );
+    assert!(!db.pieces_aligned());
+    for k in probe {
+        let (got, n, c) = read(&db, k);
+        assert_eq!(got, want(&["s0", "s1", "s2", "s3", "s4", "s5"]), "key {k}");
+        assert_eq!((n, c), (6, 6), "key {k}");
+    }
+    // Merged, then two seals split at the fences and joined: two aligned
+    // pieces over every range, a frozen memtable under a seal not joined,
+    // and live writes over all of it.
+    db.flush().unwrap();
+    let parts = db.levels().0;
+    for round in 0..2 {
+        write(&mut db, &format!("a{round}"));
+        db.seal().unwrap();
+        db.settle().unwrap();
+    }
+    assert_eq!(db.levels(), (parts, 2 * parts));
+    assert!(db.pieces_aligned());
+    write(&mut db, "f");
+    db.seal().unwrap();
+    assert!(db.in_flight().0);
+    for k in (0..600).step_by(3) {
+        db.append(key(k).as_bytes(), val("l").as_bytes());
+    }
+    let all = ["s0", "s1", "s2", "s3", "s4", "s5", "a0", "a1", "f", "l"];
+    for k in probe {
+        let (got, n, c) = read(&db, k);
+        assert_eq!(got, want(&all), "key {k} over aligned pieces");
+        assert_eq!((n, c), (10, 10), "key {k}");
+    }
+    // Tombstones: live first, then sealed with the live values into a
+    // third piece over every range, where a read of a deleted key finds
+    // the tombstone and skips every source below it, and a read of its
+    // neighbour finds everything, the live value now in that piece.
+    db.delete(key(3).as_bytes());
+    db.delete(key(300).as_bytes());
+    for k in [3, 300] {
+        let (got, n, c) = read(&db, k);
+        assert!(got.is_empty() && n == 0 && c == 0, "key {k} deleted live");
+    }
+    db.seal().unwrap();
+    db.settle().unwrap();
+    assert!(db.pieces_aligned());
+    assert!(
+        db.levels().1 > 3 * parts,
+        "the tombstones' seal made pieces"
+    );
+    for k in [3, 300] {
+        let (got, n, c) = read(&db, k);
+        assert!(
+            got.is_empty() && n == 0 && c == 0,
+            "key {k} deleted in a piece"
+        );
+    }
+    for k in [0, 297, 303, 597] {
+        let (got, n, c) = read(&db, k);
+        assert_eq!(got, want(&all), "key {k} beside a deleted one");
+        assert_eq!((n, c), (10, 10), "key {k}");
+    }
+}
+
 /// A scan builds its snapshot of the unsealed keys naming the live
 /// memtable's slots; a seal replaces that memtable with an empty one,
 /// and the inserts after it rehash the new table at a few hundred keys,
