@@ -818,6 +818,12 @@ struct Seg {
     /// first use and dropped whenever the segments change. One load finds
     /// a block; nothing is hashed.
     blocks: std::cell::RefCell<Option<BlockTable>>,
+    /// PROTOTYPE: for a level-0 piece aligned to a partition, each of its
+    /// keys' rank in that partition, shifted left one, with the low bit
+    /// set when the partition holds the key: where the key cuts a block's
+    /// walk, found once when the piece is published instead of by a
+    /// search over the block's records at every build.
+    ranks: std::cell::RefCell<Option<Vec<u32>>>,
     level: u8,
     lo: Vec<u8>,
     hi: Option<Vec<u8>>,
@@ -1885,6 +1891,7 @@ impl Seg {
                 blob,
                 name: name.to_string(),
                 blocks: std::cell::RefCell::new(None),
+                ranks: std::cell::RefCell::new(None),
                 level: 0,
                 lo,
                 hi,
@@ -1914,6 +1921,7 @@ impl Seg {
                 blob,
                 name: name.to_string(),
                 blocks: std::cell::RefCell::new(None),
+                ranks: std::cell::RefCell::new(None),
                 level: 1,
                 lo,
                 hi,
@@ -1931,6 +1939,7 @@ impl Seg {
             blob,
             name: name.to_string(),
             blocks: std::cell::RefCell::new(None),
+            ranks: std::cell::RefCell::new(None),
             level: 0,
             lo: Vec::new(),
             hi: None,
@@ -2984,6 +2993,10 @@ const CACHE_BLOCK: usize = 64;
 struct Over<'a> {
     key: &'a [u8],
     sk: Option<SnapKey>,
+    /// The key's rank in the partition, shifted left one with the low bit
+    /// for an equal partition key, or `u32::MAX` when no source carried
+    /// it and the build searches.
+    cut: u32,
     /// The key's entries in `Overlay::held`, contiguous: piece index and
     /// rank, oldest piece first.
     pieces: std::ops::Range<u32>,
@@ -2993,7 +3006,9 @@ struct Over<'a> {
 /// entries they refer to, in one list so a key allocates nothing.
 struct Overlay<'a> {
     over: Vec<Over<'a>>,
-    held: Vec<(&'a [u8], usize, usize)>,
+    /// Key, piece index, rank in the piece, and the key's cut from the
+    /// piece's ranks or `u32::MAX`.
+    held: Vec<(&'a [u8], usize, usize, u32)>,
 }
 
 /// PROTOTYPE: what emitting an overlay key needs beyond the key: whether
@@ -3028,8 +3043,9 @@ struct BlockTable {
     snap_at: Vec<u32>,
     snap_gen: u64,
     /// Live slots created since that snapshot, under the block their key
-    /// falls in, in creation order.
-    added: Vec<Vec<u32>>,
+    /// falls in, in creation order, each with the cut the write's seek
+    /// found.
+    added: Vec<Vec<(u32, u32)>>,
 }
 
 /// PROTOTYPE: where a sorted source's positions fall against a
@@ -3950,6 +3966,9 @@ impl Db {
         }
         self.sort_segs();
         self.frozen = None;
+        if self.opts.scan_block_cache {
+            self.rank_pieces()?;
+        }
         let tp = std::time::Instant::now();
         self.publish()?;
         self.seal_wait.publish_ns += tp.elapsed().as_nanos() as u64;
@@ -4921,7 +4940,7 @@ impl Db {
     /// above every key to the last block, which is where the bounds put
     /// them. `None` when the partition has no table: nothing to drop and
     /// nowhere to file.
-    fn evict_block_of(&self, key: &[u8]) -> Option<(usize, usize)> {
+    fn evict_block_of(&self, key: &[u8]) -> Option<(usize, usize, u32)> {
         if !self.cache_used.get() {
             return None;
         }
@@ -4934,23 +4953,100 @@ impl Db {
         }
         let mut held = seg.blocks.borrow_mut();
         let table = held.as_mut()?;
-        let b = Self::owner_block(seg, key);
+        let (b, cut) = Self::owner_of(seg, key);
         if let Some(slot) = table.slots.get_mut(b) {
             *slot = None;
         }
-        Some((at, b))
+        Some((at, b, cut))
     }
 
     /// PROTOTYPE: the block whose key range holds `key`.
-    fn owner_block(seg: &Seg, key: &[u8]) -> usize {
+    fn owner_of(seg: &Seg, key: &[u8]) -> (usize, u32) {
         let keys = seg.blob.keys();
         let rank = seg.ord.seek(key, |r| seg.blob.key_at(r));
-        let owner = if rank < keys && seg.blob.key_at(rank) == Some(key) {
-            rank
+        let same = rank < keys && seg.blob.key_at(rank) == Some(key);
+        let owner = if same { rank } else { rank.saturating_sub(1) };
+        (owner / CACHE_BLOCK, ((rank as u32) << 1) | same as u32)
+    }
+
+    /// PROTOTYPE: a cut carried with a key, as `cut_at` would answer it for
+    /// a walk standing at `rank` and ending at `end`.
+    fn cut_known(cut: u32, rank: usize, end: usize) -> (usize, Ordering) {
+        let c = (cut >> 1) as usize;
+        debug_assert!(c >= rank, "an overlay key's cut is behind the walk");
+        let c = c.max(rank);
+        if c >= end {
+            (end, Ordering::Greater)
+        } else if cut & 1 == 1 {
+            (c, Ordering::Equal)
         } else {
-            rank.saturating_sub(1)
-        };
-        owner / CACHE_BLOCK
+            (c, Ordering::Greater)
+        }
+    }
+
+    /// PROTOTYPE: each key of `piece` ranked in `part`, the partition it is
+    /// aligned to, from one forward walk: a gallop from the last rank, then
+    /// a binary search inside the gallop's span, so a run of keys the
+    /// partition also holds costs two reads a key.
+    fn ranks_over(part: &Seg, piece: &Seg) -> Result<Vec<u32>> {
+        let n = piece.blob.keys();
+        let pk = part.blob.keys();
+        let mut out = Vec::with_capacity(n);
+        let mut r = 0usize;
+        for i in 0..n {
+            let key = piece
+                .blob
+                .key_at(i)
+                .ok_or_else(|| err("block cache: a rank did not resolve"))?;
+            let below = |j: usize| part.blob.key_at(j).is_some_and(|k| k < key);
+            if r < pk && below(r) {
+                let mut lo = r;
+                let mut step = 1usize;
+                let hi = loop {
+                    let probe = lo + step;
+                    if probe >= pk {
+                        break pk;
+                    }
+                    if below(probe) {
+                        lo = probe;
+                        step *= 2;
+                    } else {
+                        break probe;
+                    }
+                };
+                let (mut a, mut b) = (lo + 1, hi);
+                while a < b {
+                    let m = a + (b - a) / 2;
+                    if below(m) {
+                        a = m + 1;
+                    } else {
+                        b = m;
+                    }
+                }
+                r = a;
+            }
+            let same = r < pk && part.blob.key_at(r) == Some(key);
+            out.push(((r as u32) << 1) | same as u32);
+        }
+        Ok(out)
+    }
+
+    /// PROTOTYPE: rank the keys of every piece aligned to a partition that
+    /// has none yet. Called when a seal publishes its pieces, so the work
+    /// is off the read path, and by a table's making for pieces that were
+    /// opened from disk.
+    fn rank_pieces(&self) -> Result<()> {
+        let np = self.segs.partition_point(|s| s.level > 0);
+        let (parts, l0) = self.segs.split_at(np);
+        for p in l0 {
+            if p.ranks.borrow().is_some() {
+                continue;
+            }
+            if let Some(part) = parts.iter().find(|q| q.lo == p.lo && q.hi == p.hi) {
+                *p.ranks.borrow_mut() = Some(Self::ranks_over(part, p)?);
+            }
+        }
+        Ok(())
     }
 
     /// PROTOTYPE: bookkeeping after a memtable write, when the block cache
@@ -4958,7 +5054,7 @@ impl Db {
     /// hold, and a created key joins the list of keys since the snapshot
     /// and, when its partition has a table, that table's list for its
     /// block.
-    fn note_write(&self, wrote: Wrote, at: Option<(usize, usize)>) {
+    fn note_write(&self, wrote: Wrote, at: Option<(usize, usize, u32)>) {
         if !self.opts.scan_block_cache {
             return;
         }
@@ -4988,7 +5084,7 @@ impl Db {
             for s in &self.segs {
                 if let Some(t) = s.blocks.borrow_mut().as_mut() {
                     for list in &mut t.added {
-                        for slot in list.iter_mut() {
+                        for (slot, _) in list.iter_mut() {
                             *slot = to(*slot);
                         }
                     }
@@ -4997,10 +5093,10 @@ impl Db {
         }
         let Some(slot) = wrote.new_slot else { return };
         self.snap_added.borrow_mut().push(slot);
-        if let Some((p, b)) = at {
+        if let Some((p, b, cut)) = at {
             if let Some(t) = self.segs[p].blocks.borrow_mut().as_mut() {
                 if let Some(list) = t.added.get_mut(b) {
-                    list.push(slot);
+                    list.push((slot, cut));
                 }
             }
         }
@@ -5014,6 +5110,7 @@ impl Db {
     /// million keys, three microseconds of a seven microsecond build.
     fn make_table(&self, seg: &Seg, l0: &[Seg], unsealed: &Snapshot) -> Result<BlockTable> {
         let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
+        self.rank_pieces()?;
         let mut pieces = Vec::new();
         for (j, p) in l0.iter().enumerate() {
             if !seg.lo.is_empty()
@@ -5040,14 +5137,15 @@ impl Db {
             pieces.push((j, at));
         }
         let snap_at = Self::snap_bounds(seg, nblocks, unsealed)?;
-        let mut added: Vec<Vec<u32>> = (0..nblocks).map(|_| Vec::new()).collect();
+        let mut added: Vec<Vec<(u32, u32)>> = (0..nblocks).map(|_| Vec::new()).collect();
         if nblocks > 0 {
             for &slot in self.snap_added.borrow().iter() {
                 let key = MemTable::key_of(&self.mem.keys, &self.mem.entries[slot as usize]);
                 if seg.below_lo(key) || seg.hi.as_ref().is_some_and(|h| key >= h.as_slice()) {
                     continue;
                 }
-                added[Self::owner_block(seg, key)].push(slot);
+                let (b, cut) = Self::owner_of(seg, key);
+                added[b].push((slot, cut));
             }
         }
         Ok(BlockTable {
@@ -5090,6 +5188,7 @@ impl Db {
             out.push(Over {
                 key: k,
                 sk: Some(*sk),
+                cut: u32::MAX,
                 pieces: 0..0,
             });
         }
@@ -5099,7 +5198,7 @@ impl Db {
         let key_of = |slot: u32| MemTable::key_of(&self.mem.keys, &self.mem.entries[slot as usize]);
         let mut fresh: Vec<Over> = filed
             .iter()
-            .map(|&i| Over {
+            .map(|&(i, cut)| Over {
                 key: key_of(i),
                 sk: Some(SnapKey {
                     off: 0,
@@ -5107,6 +5206,7 @@ impl Db {
                     mem: i,
                     frozen: u32::MAX,
                 }),
+                cut,
                 pieces: 0..0,
             })
             .collect();
@@ -5136,6 +5236,7 @@ impl Db {
                         merged.push(Over {
                             key: x.key,
                             sk: Some(SnapKey { mem: ys.mem, ..xs }),
+                            cut: y.cut,
                             pieces: 0..0,
                         });
                     }
@@ -5157,15 +5258,17 @@ impl Db {
         unsealed: &'a Snapshot,
     ) -> Result<Overlay<'a>> {
         let mem = self.overlay_mem(table, b, unsealed)?;
-        let mut held: Vec<(&[u8], usize, usize)> = Vec::new();
+        let mut held: Vec<(&[u8], usize, usize, u32)> = Vec::new();
         for (j, at) in &table.pieces {
             let p = &src.l0[*j];
+            let ranks = p.ranks.borrow();
             for r in at[b] as usize..at[b + 1] as usize {
                 let k = p
                     .blob
                     .key_at(r)
                     .ok_or_else(|| err("block cache: a rank did not resolve"))?;
-                held.push((k, *j, r));
+                let cut = ranks.as_ref().map_or(u32::MAX, |v| v[r]);
+                held.push((k, *j, r, cut));
             }
         }
         if held.is_empty() {
@@ -5183,17 +5286,26 @@ impl Db {
             }
             let k = held[h].0;
             let from = h;
+            let mut cut = u32::MAX;
             while h < held.len() && held[h].0 == k {
+                if cut == u32::MAX {
+                    cut = held[h].3;
+                }
                 h += 1;
             }
             let sk = if mem.peek().is_some_and(|m| m.key == k) {
-                mem.next().unwrap().sk
+                let m = mem.next().unwrap();
+                if cut == u32::MAX {
+                    cut = m.cut;
+                }
+                m.sk
             } else {
                 None
             };
             over.push(Over {
                 key: k,
                 sk,
+                cut,
                 pieces: from as u32..h as u32,
             });
         }
@@ -5235,7 +5347,7 @@ impl Db {
                 }
             }
             if start == 0 {
-                for &(_, j, rank) in held.iter().rev() {
+                for &(_, j, rank, _) in held.iter().rev() {
                     let p = &src.l0[j];
                     if !p.tombs {
                         continue;
@@ -5254,7 +5366,7 @@ impl Db {
                 src.seg.blob.values_at(r, |v| f(key, v)).map_err(read)?;
             }
         }
-        for &(_, j, rank) in held {
+        for &(_, j, rank, _) in held {
             if j + 1 >= start {
                 src.l0[j]
                     .blob
@@ -5307,6 +5419,7 @@ impl Db {
             let end = rank.saturating_add(limit - seen).min(hi);
             let next = ov.over.get(oi);
             let (bound, at_bound) = match next {
+                Some(o) if o.cut != u32::MAX => Self::cut_known(o.cut, rank, end),
                 Some(o) if end > rank => Self::cut_at(seg, rank, end, o.key),
                 _ => (end, Ordering::Greater),
             };
@@ -5398,7 +5511,9 @@ impl Db {
         };
         let mut rank = ranks.start;
         for (oi, o) in ov.over.iter().enumerate() {
-            let (cut, at) = if rank < hi {
+            let (cut, at) = if o.cut != u32::MAX {
+                Self::cut_known(o.cut, rank, hi)
+            } else if rank < hi {
                 Self::cut_at(seg, rank, hi, o.key)
             } else {
                 (hi, Ordering::Greater)
