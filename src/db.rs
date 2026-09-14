@@ -2932,46 +2932,47 @@ enum Cached {
     Block(CachedBlock),
 }
 
-/// PROTOTYPE: unsealed keys in a block from which a merged copy pays.
-/// Read from `CACHE_DENSE` in the environment once, for the measurement
-/// that picks it; 8 otherwise.
-/// PROTOTYPE: a sparse block's keys above the partition, resolved once
-/// and packed: one buffer holds every key and every value, one array the
-/// entries, so a walk over the block touches two allocations however
-/// many keys it has.
+/// PROTOTYPE: a sparse block's keys above the partition, resolved once:
+/// each key's bytes, where it cuts the walk, and its values as (source,
+/// position) pairs read from the source at walk time -- the partition or
+/// a piece by rank, a memtable by value offset. The values were copied
+/// into the block before; measured against references on one store of
+/// three million keys, the copies bought a sparse block nothing and cost
+/// a seventh of the cache. The dense copy keeps its bytes: there,
+/// references cost the hot region most of a microsecond a scan. A walk
+/// over the block touches three allocations however many keys it has.
 #[derive(Default)]
 struct SparseBlock {
-    buf: Vec<u8>,
+    keys: Vec<u8>,
     ents: Vec<DeltaEnt>,
+    /// Sources numbered as `emit_over` numbers them.
+    refs: Vec<(u32, u32)>,
 }
 
-/// PROTOTYPE: one key of a sparse block: where its key and its run of
-/// values (each behind a u32 length) sit in the block's buffer, the first
-/// rank of the partition's records not below it, and whether that rank is
-/// the key itself, whose values are then in the run already and which the
-/// walk steps over.
+/// PROTOTYPE: one key of a sparse block: where its key sits in the
+/// block's keys, the first rank of the partition's records not below it,
+/// whether that rank is the key itself -- whose values are then among the
+/// references already and which the walk steps over -- and its run of
+/// references.
 struct DeltaEnt {
     key: (u32, u32),
     cut: u32,
     same: bool,
-    vals: (u32, u32),
+    refs: (u32, u32),
 }
 
 impl SparseBlock {
     fn key(&self, e: &DeltaEnt) -> &[u8] {
-        &self.buf[e.key.0 as usize..(e.key.0 + e.key.1) as usize]
+        &self.keys[e.key.0 as usize..(e.key.0 + e.key.1) as usize]
     }
-    fn each_value(&self, e: &DeltaEnt, mut f: impl FnMut(&[u8])) {
-        let run = &self.buf[e.vals.0 as usize..(e.vals.0 + e.vals.1) as usize];
-        let mut p = 0usize;
-        while p < run.len() {
-            let n = u32::from_le_bytes(run[p..p + 4].try_into().unwrap()) as usize;
-            f(&run[p + 4..p + 4 + n]);
-            p += 4 + n;
-        }
+    fn refs(&self, e: &DeltaEnt) -> &[(u32, u32)] {
+        &self.refs[e.refs.0 as usize..(e.refs.0 + e.refs.1) as usize]
     }
 }
 
+/// PROTOTYPE: unsealed keys in a block from which a merged copy pays.
+/// Read from `CACHE_DENSE` in the environment once, for the measurement
+/// that picks it; 8 otherwise.
 fn cache_dense() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -5312,26 +5313,19 @@ impl Db {
         Ok(Overlay { over, held })
     }
 
-    /// PROTOTYPE: one overlay key emitted as `scan_merged` emits it.
-    /// Sources are numbered oldest to newest -- the partition 0, level-0
-    /// pieces 1 through their count, the frozen memtable, the live one --
-    /// and the newest that holds a tombstone for the key cuts every older
-    /// one. `part_rank` names the partition's own record for the key, if
-    /// it has one.
-    fn emit_over<F: FnMut(&[u8], &[u8])>(
+    /// PROTOTYPE: the oldest source whose values for an overlay key are
+    /// live: 0 with no tombstone in the way, else one past the newest
+    /// source holding one. Sources are numbered oldest to newest -- the
+    /// partition 0, level-0 pieces 1 through their count, the frozen
+    /// memtable, the live one.
+    fn oldest_live(
         &self,
-        f: &mut F,
-        em: &mut Emit,
-        ov: &Overlay,
-        oi: usize,
-        part_rank: Option<usize>,
+        em: &Emit,
+        o: &Over,
+        held: &[(&[u8], usize, usize, u32)],
         src: Sources,
-    ) -> Result<()> {
-        let o = &ov.over[oi];
-        let held = &ov.held[o.pieces.start as usize..o.pieces.end as usize];
+    ) -> usize {
         let nc = src.l0.len();
-        let key = o.key;
-        let read = |e: std::io::Error| err(&format!("block cache read: {e}"));
         let mut start = 0usize;
         if em.tombs {
             if let Some(sk) = o.sk {
@@ -5361,6 +5355,107 @@ impl Db {
                 }
             }
         }
+        start
+    }
+
+    /// PROTOTYPE: an overlay key's values as references, in the order
+    /// `emit_over` emits them: the source number and the rank or value
+    /// offset within it.
+    fn refs_over(
+        &self,
+        em: &mut Emit,
+        ov: &Overlay,
+        oi: usize,
+        part_rank: Option<usize>,
+        src: Sources,
+        out: &mut Vec<(u32, u32)>,
+    ) {
+        let o = &ov.over[oi];
+        let held = &ov.held[o.pieces.start as usize..o.pieces.end as usize];
+        let nc = src.l0.len();
+        let start = self.oldest_live(em, o, held, src);
+        if start == 0 {
+            if let Some(r) = part_rank {
+                out.push((0, r as u32));
+            }
+        }
+        for &(_, j, rank, _) in held {
+            if j + 1 >= start {
+                out.push((j as u32 + 1, rank as u32));
+            }
+        }
+        if let Some(sk) = o.sk {
+            if sk.frozen != u32::MAX && nc + 1 >= start {
+                if let Some(fr) = &self.frozen {
+                    fr.live_offs_into(&fr.entries[sk.frozen as usize], &mut em.scratch);
+                    out.extend(em.scratch.iter().map(|&off| (nc as u32 + 1, off as u32)));
+                }
+            }
+            if sk.mem != u32::MAX {
+                self.mem
+                    .live_offs_into(&self.mem.entries[sk.mem as usize], &mut em.scratch);
+                out.extend(em.scratch.iter().map(|&off| (nc as u32 + 2, off as u32)));
+            }
+        }
+    }
+
+    /// PROTOTYPE: one reference resolved and emitted.
+    #[inline]
+    fn emit_ref<F: FnMut(&[u8], &[u8])>(
+        &self,
+        src: Sources,
+        key: &[u8],
+        r: (u32, u32),
+        f: &mut F,
+    ) -> Result<()> {
+        let nc = src.l0.len() as u32;
+        let read = |e: std::io::Error| err(&format!("block cache read: {e}"));
+        match r.0 {
+            0 => {
+                src.seg
+                    .blob
+                    .values_at(r.1 as usize, |v| f(key, v))
+                    .map_err(read)?;
+            }
+            j if j <= nc => {
+                src.l0[j as usize - 1]
+                    .blob
+                    .values_at(r.1 as usize, |v| f(key, v))
+                    .map_err(read)?;
+            }
+            j if j == nc + 1 => {
+                let fr = self
+                    .frozen
+                    .as_ref()
+                    .ok_or_else(|| err("block cache: a frozen reference with no frozen table"))?;
+                f(key, fr.value_at(r.1 as usize));
+            }
+            _ => f(key, self.mem.value_at(r.1 as usize)),
+        }
+        Ok(())
+    }
+
+    /// PROTOTYPE: one overlay key emitted as `scan_merged` emits it.
+    /// Sources are numbered oldest to newest -- the partition 0, level-0
+    /// pieces 1 through their count, the frozen memtable, the live one --
+    /// and the newest that holds a tombstone for the key cuts every older
+    /// one. `part_rank` names the partition's own record for the key, if
+    /// it has one.
+    fn emit_over<F: FnMut(&[u8], &[u8])>(
+        &self,
+        f: &mut F,
+        em: &mut Emit,
+        ov: &Overlay,
+        oi: usize,
+        part_rank: Option<usize>,
+        src: Sources,
+    ) -> Result<()> {
+        let o = &ov.over[oi];
+        let held = &ov.held[o.pieces.start as usize..o.pieces.end as usize];
+        let nc = src.l0.len();
+        let key = o.key;
+        let read = |e: std::io::Error| err(&format!("block cache read: {e}"));
+        let start = self.oldest_live(em, o, held, src);
         if start == 0 {
             if let Some(r) = part_rank {
                 src.seg.blob.values_at(r, |v| f(key, v)).map_err(read)?;
@@ -5504,10 +5599,11 @@ impl Db {
             scratch: Vec::new(),
         };
         // Sized once from the key count: a buffer grown by doubling from
-        // empty reallocates eight times for a block of a few keys.
+        // empty reallocates several times for a block of a few keys.
         let mut blk = SparseBlock {
-            buf: Vec::with_capacity(ov.over.len() * 192),
+            keys: Vec::with_capacity(ov.over.len() * 24),
             ents: Vec::with_capacity(ov.over.len()),
+            refs: Vec::with_capacity(ov.over.len() * 2),
         };
         let mut rank = ranks.start;
         for (oi, o) in ov.over.iter().enumerate() {
@@ -5519,28 +5615,15 @@ impl Db {
                 (hi, Ordering::Greater)
             };
             let same = cut < hi && at == Ordering::Equal;
-            let key_at = blk.buf.len() as u32;
-            blk.buf.extend_from_slice(o.key);
-            let vals_at = blk.buf.len() as u32;
-            let buf = std::cell::RefCell::new(&mut blk.buf);
-            self.emit_over(
-                &mut |_k: &[u8], v: &[u8]| {
-                    let mut b = buf.borrow_mut();
-                    b.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                    b.extend_from_slice(v);
-                },
-                &mut em,
-                ov,
-                oi,
-                same.then_some(cut),
-                src,
-            )?;
-            let vals_len = blk.buf.len() as u32 - vals_at;
+            let key_at = blk.keys.len() as u32;
+            blk.keys.extend_from_slice(o.key);
+            let at = blk.refs.len() as u32;
+            self.refs_over(&mut em, ov, oi, same.then_some(cut), src, &mut blk.refs);
             blk.ents.push(DeltaEnt {
                 key: (key_at, o.key.len() as u32),
                 cut: cut as u32,
                 same,
-                vals: (vals_at, vals_len),
+                refs: (at, blk.refs.len() as u32 - at),
             });
             rank = cut + same as usize;
         }
@@ -5552,13 +5635,14 @@ impl Db {
     /// emitted, which is every one after the first block.
     fn walk_deltas<F: FnMut(&[u8], &[u8])>(
         &self,
-        seg: &Seg,
+        src: Sources,
         ranks: std::ops::Range<usize>,
         blk: &SparseBlock,
         cursor: &[u8],
         limit: usize,
         mut f: F,
     ) -> Result<usize> {
+        let seg = src.seg;
         let hi = ranks.end;
         let mut seen = 0usize;
         let mut rank = ranks.start;
@@ -5583,7 +5667,9 @@ impl Db {
                 return Ok(seen);
             }
             let k = blk.key(e);
-            blk.each_value(e, |v| f(k, v));
+            for &r in blk.refs(e) {
+                self.emit_ref(src, k, r, &mut f)?;
+            }
             seen += 1;
             if e.same {
                 rank += 1;
@@ -5713,7 +5799,7 @@ impl Db {
                 match table.slots[b].as_ref().expect("just built") {
                     Cached::Sparse(deltas) => {
                         seen += self.walk_deltas(
-                            seg,
+                            src,
                             start..hi,
                             deltas,
                             from_key,
@@ -5773,7 +5859,7 @@ impl Db {
                     Cached::Clean => clean += 1,
                     Cached::Sparse(b) => {
                         sparse += 1;
-                        bytes += b.buf.len() + b.ents.len() * 24;
+                        bytes += b.keys.len() + b.ents.len() * 24 + b.refs.len() * 8;
                     }
                     Cached::Block(b) => {
                         copies += 1;

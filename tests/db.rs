@@ -1815,6 +1815,11 @@ fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
     for k in [300, 303, 306, 600, 603] {
         m.append(&mut db, &key(k), "f");
     }
+    // Two keys alone in a block far from the others: their block stays
+    // sparse, so a later tombstone over them exercises the sparse form's
+    // shadowing, not the dense copy's.
+    m.append(&mut db, &key(30), "f");
+    m.append(&mut db, &key(33), "f");
     db.commit().unwrap();
     db.seal().unwrap();
     assert!(db.in_flight().0);
@@ -1850,6 +1855,8 @@ fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
     db.settle().unwrap();
     m.check(&db, "pieces and live");
     m.delete(&mut db, &key(309));
+    m.delete(&mut db, &key(30));
+    m.append(&mut db, &key(33), "l-over-piece");
     m.append(&mut db, "key-00152y", "over pieces");
     m.check(&db, "writes filed over the pieces");
     db.flush().unwrap();
