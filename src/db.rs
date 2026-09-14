@@ -336,11 +336,17 @@ pub struct Options {
     /// key it owns, and dropped whole whenever the segments change.
     pub scan_block_cache: bool,
     /// PROTOTYPE: the most bytes the block cache holds in built blocks,
-    /// or 0 for no bound. Past it, a build sheds the least recently
-    /// touched of a few sampled blocks until under; a shed block is
-    /// rebuilt from the partition, the pieces and the memtables when a
-    /// scan next wants it, so the pieces on disk are what the cache
-    /// overflows to.
+    /// or 0 for no bound, the default. The cache holds what the scans
+    /// touched: about a tenth of the store after a pass that reaches
+    /// every block, at three million keys and at thirty, and a budget
+    /// under that sheds blocks the next pass rebuilds -- at thirty
+    /// million keys a sixteenth of the store cost ycsb-E a quarter of its
+    /// rate and a sixty-fourth three fifths -- so the bound is the
+    /// caller's to set from the memory it has. Past it, a build sheds the
+    /// least recently touched of a few sampled blocks until under; a shed
+    /// block is rebuilt from the partition, the pieces and the memtables
+    /// when a scan next wants it, so the pieces on disk are what the
+    /// cache overflows to.
     pub scan_cache_bytes: usize,
     /// How the ordered scan builds its sorted snapshot of the unsealed keys.
     /// `true` keeps the keys in one arena and sorts 24-byte records (a
@@ -3041,17 +3047,11 @@ impl Cached {
 }
 
 /// PROTOTYPE: unsealed keys in a block from which a merged copy pays.
-/// Read from `CACHE_DENSE` in the environment once, for the measurement
-/// that picks it; 8 otherwise.
-fn cache_dense() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("CACHE_DENSE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8)
-    })
-}
+/// Measured on ycsb-E at 300k keys: copying every block with an unsealed
+/// key held 31 MB and ran slower than copying only the blocks with eight
+/// or more, since a block the Zipfian tail touches once or twice never
+/// repays its copy, and copying by touch count instead was slower still.
+const CACHE_DENSE: usize = 8;
 
 /// PROTOTYPE: records a block spans. A scan of the suite's length touches
 /// one or two.
@@ -5987,7 +5987,7 @@ impl Db {
         if ov.over.is_empty() {
             return Ok(Cached::Clean);
         }
-        if ov.over.len() < cache_dense() {
+        if ov.over.len() < CACHE_DENSE {
             return Ok(Cached::Sparse(self.deltas_for(src, lo..hi, &ov)?));
         }
         Ok(Cached::Block(self.copy_block(src, lo..hi, &ov)?))

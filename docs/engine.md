@@ -484,6 +484,32 @@ per-commit path.
   through the posting-counting walk, and a hash probe per key per source.
   Both are fixed and both arms gained. The ordered scan needs re-measuring
   against LMDB before anyone knows where the ordered axis stands.
+- **The block cache** (`Options::scan_block_cache`, off; `scan_cache_bytes`,
+  none) — built and measured, an arm of the suite, not shipped. The
+  ordered scan over unsealed keys merged the memtable's chained values
+  with the partition at about 80 ns a key, and ycsb-E scans the keys the
+  mixes before it updated: four times behind LMDB at 300k keys, where the
+  same scans over the compacted store tie it. The cache keeps, for each
+  partition block a scan crosses, the block as it would read compacted
+  -- clean; the partition's walk with a few resolved keys slipped in at
+  their cuts; a dense copy from eight keys up, since copying every touched
+  block held more and ran slower; or, past four blocks' worth of keys
+  above it, no copy at all but a merge seeked into each source -- built
+  on first touch, dropped by a write to a key it owns and rebuilt at the
+  next scan, with the level-0 pieces aligned to a partition ranked
+  against it once so their keys cut the walk without a compare. On the
+  suite's mixes E runs at three to four times the arm without it. Memory
+  is what the pass touched: E's starts reach nearly every block, so
+  unbounded the cache holds about a tenth of the store at three million
+  keys and at thirty, and a budget below that sheds blocks E touches
+  again -- at thirty million, a sixteenth of the store cost E a quarter
+  of its rate and a sixty-fourth three fifths, one machine, rounds
+  interleaved. So the budget's default is none: the bound is the memory
+  the caller has, which only the caller knows. What a shipped design
+  still needs is the write path: a write drops the block it lands in, so
+  a mix that updates and scans the same keys rebuilds its hot blocks per
+  write, and a cached block updated in place is the part not built. Until
+  it is, the option is off and its code is marked.
 - ~~Segment size~~ — **swept.** 16 and 8 MB seals are ties on ingest at
   1.5x the device bytes; 32 MB seals are an interior optimum, 1.129x at
   identical device bytes -- once the partition size was set apart from the
