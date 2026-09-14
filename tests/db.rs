@@ -1821,11 +1821,42 @@ fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
     m.delete(&mut db, &key(600));
     m.append(&mut db, &key(603), "l");
     m.check(&db, "live over frozen, through the side list");
+    // More keys than the side list may hold before a scan rebuilds the
+    // snapshot: the rebuild happens with the tables standing, and the
+    // writes after it are filed under blocks whose bounds were walked
+    // again.
+    for k in 0..200 {
+        m.append(&mut db, &format!("key-00{:03}x", 100 + k), "burst");
+    }
+    m.check(&db, "a burst that rebuilds the snapshot under the tables");
+    m.delete(&mut db, &key(303));
+    m.append(&mut db, &key(309), "l-after-rebuild");
+    m.delete(&mut db, "key-00150x");
+    m.append(&mut db, "key-00151y", "between-after-rebuild");
+    m.check(&db, "writes filed after the rebuild");
     db.settle().unwrap();
     m.check(&db, "pieces and live");
+    m.delete(&mut db, &key(309));
+    m.append(&mut db, "key-00152y", "over pieces");
+    m.check(&db, "writes filed over the pieces");
     db.flush().unwrap();
     m.flushed();
-    m.check(&db, "merged");
+    // Keys created while their partition has no table yet: the flush
+    // dropped every table, a scan that stays in the first partition makes
+    // only that one's, the writes below land in the last partition's
+    // range, and the check makes the last partition's table with those
+    // keys already written.
+    let mut n = 0usize;
+    db.scan(key(0).as_bytes(), 1, |_, _| n += 1).unwrap();
+    assert_eq!(n, 1);
+    m.append(&mut db, "key-00590a", "before-the-table");
+    m.delete(&mut db, &key(594));
+    m.append(&mut db, &key(597), "before-the-table");
+    m.append(&mut db, "key-00599z", "before-the-table");
+    m.check(
+        &db,
+        "merged, with keys created before their partition's table",
+    );
 }
 
 fn overlay_model(name: &str, block_cache: bool) {

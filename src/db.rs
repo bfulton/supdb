@@ -814,10 +814,10 @@ type Compaction = (Vec<String>, std::thread::JoinHandle<Result<Vec<String>>>);
 struct Seg {
     blob: Blob<MmapBytes>,
     name: String,
-    /// PROTOTYPE: the block cache's entries for this partition, indexed
-    /// by block number, sized on first use and emptied whenever the
-    /// segments change. One load finds a block; nothing is hashed.
-    blocks: std::cell::RefCell<Vec<Option<Cached>>>,
+    /// PROTOTYPE: the block cache's table for this partition, made on
+    /// first use and dropped whenever the segments change. One load finds
+    /// a block; nothing is hashed.
+    blocks: std::cell::RefCell<Option<BlockTable>>,
     level: u8,
     lo: Vec<u8>,
     hi: Option<Vec<u8>>,
@@ -1884,7 +1884,7 @@ impl Seg {
             return Ok(Seg {
                 blob,
                 name: name.to_string(),
-                blocks: std::cell::RefCell::new(Vec::new()),
+                blocks: std::cell::RefCell::new(None),
                 level: 0,
                 lo,
                 hi,
@@ -1913,7 +1913,7 @@ impl Seg {
             return Ok(Seg {
                 blob,
                 name: name.to_string(),
-                blocks: std::cell::RefCell::new(Vec::new()),
+                blocks: std::cell::RefCell::new(None),
                 level: 1,
                 lo,
                 hi,
@@ -1930,7 +1930,7 @@ impl Seg {
         Ok(Seg {
             blob,
             name: name.to_string(),
-            blocks: std::cell::RefCell::new(Vec::new()),
+            blocks: std::cell::RefCell::new(None),
             level: 0,
             lo: Vec::new(),
             hi: None,
@@ -3006,12 +3006,61 @@ struct Sources<'a> {
     l0: &'a [Seg],
 }
 
-/// PROTOTYPE: a block's rank range and key range in its partition.
-struct BlockBounds<'a> {
-    lo: usize,
-    hi: usize,
-    lo_key: &'a [u8],
-    end_key: Option<&'a [u8]>,
+/// PROTOTYPE: a partition's block cache, with what every block's build
+/// needs found once for the whole partition instead of by seeks per
+/// block: where the level-0 pieces' keys and the snapshot's fall against
+/// the block boundaries, and the keys created since the snapshot, filed
+/// by block as they are written.
+struct BlockTable {
+    slots: Vec<Option<Cached>>,
+    /// Per level-0 piece meeting the partition's range: its index in the
+    /// level, and the first rank not below each block's lower bound, one
+    /// more for the partition's upper fence, so block `b` holds the
+    /// piece's ranks `at[b]..at[b + 1]`.
+    pieces: Vec<(usize, Vec<u32>)>,
+    /// The same over the snapshot of unsealed keys, for the snapshot
+    /// `snap_gen` names; walked again when a rebuild replaces it.
+    snap_at: Vec<u32>,
+    snap_gen: u64,
+    /// Live slots created since that snapshot, under the block their key
+    /// falls in, in creation order.
+    added: Vec<Vec<u32>>,
+}
+
+/// PROTOTYPE: where a sorted source's positions fall against a
+/// partition's block boundaries: the first position not below each
+/// block's lower bound, and last the first not below the partition's
+/// upper fence, so block `b` holds positions `at[b]..at[b + 1]`. The two
+/// fences are answered by `seek`; between them the source is walked with
+/// `below`, reading each boundary key of the partition once. An open
+/// fence is the source's start or end, never a compare against an empty
+/// slice.
+fn block_bounds_of(
+    seg: &Seg,
+    nblocks: usize,
+    len: usize,
+    seek: impl Fn(&[u8]) -> usize,
+    below: impl Fn(usize, &[u8]) -> bool,
+) -> Result<Vec<u32>> {
+    let mut at = Vec::with_capacity(nblocks + 1);
+    let mut i = if seg.lo.is_empty() { 0 } else { seek(&seg.lo) };
+    at.push(i as u32);
+    for b in 1..nblocks {
+        let bound = seg
+            .blob
+            .key_at(b * CACHE_BLOCK)
+            .ok_or_else(|| err("block cache: a rank did not resolve"))?;
+        while i < len && below(i, bound) {
+            i += 1;
+        }
+        at.push(i as u32);
+    }
+    let end = match &seg.hi {
+        Some(h) => seek(h).max(i),
+        None => len,
+    };
+    at.push(end as u32);
+    Ok(at)
 }
 
 pub struct Db {
@@ -3104,6 +3153,9 @@ pub struct Db {
     /// PROTOTYPE: the live memtable rehashed since the snapshot was built,
     /// so its slot indices are stale and the next scan rebuilds.
     snap_rehashed: std::cell::Cell<bool>,
+    /// PROTOTYPE: counts the snapshot's rebuilds, so a table can tell
+    /// whether its bounds were walked over the snapshot that stands.
+    snap_gen: std::cell::Cell<u64>,
 }
 
 /// One key of the unsealed snapshot a scan merges: where the key sits in
@@ -3360,6 +3412,7 @@ impl Db {
             cache_used: std::cell::Cell::new(false),
             snap_added: std::cell::RefCell::new(Vec::new()),
             snap_rehashed: std::cell::Cell::new(false),
+            snap_gen: std::cell::Cell::new(0),
             seal_wait: SealWaits::default(),
             draining: false,
         })
@@ -3524,6 +3577,7 @@ impl Db {
             cache_used: std::cell::Cell::new(false),
             snap_added: std::cell::RefCell::new(Vec::new()),
             snap_rehashed: std::cell::Cell::new(false),
+            snap_gen: std::cell::Cell::new(0),
             seal_wait: SealWaits::default(),
             draining: false,
         })
@@ -3532,10 +3586,10 @@ impl Db {
     /// Buffered until `commit`; visible to this handle's reads immediately,
     /// which is the read-your-writes contract `Store::read_all` set.
     pub fn append(&mut self, key: &[u8], value: &[u8]) {
-        self.evict_block_of(key);
+        let at = self.evict_block_of(key);
         self.wal.append(key, value);
         let wrote = self.mem.append(key, value);
-        self.note_write(wrote);
+        self.note_write(wrote, at);
         self.mem_bytes += key.len() + value.len();
     }
 
@@ -3554,10 +3608,10 @@ impl Db {
     /// start fresh. Durable at the next `commit`, exactly like an append,
     /// and reclaimed by the next merge that reaches the key.
     pub fn delete(&mut self, key: &[u8]) {
-        self.evict_block_of(key);
+        let at = self.evict_block_of(key);
         self.wal.delete(key);
         let wrote = self.mem.delete(key);
-        self.note_write(wrote);
+        self.note_write(wrote, at);
         self.mem_bytes += key.len() + 16;
     }
 
@@ -4701,6 +4755,18 @@ impl Db {
                 *cache = Some((gen, self.build_snapshot()));
                 self.snap_added.borrow_mut().clear();
                 self.snap_rehashed.set(false);
+                // Every key created since the old snapshot is in the new
+                // one: the lists that held them are emptied, and the
+                // bounds each table walked are walked again on its next
+                // touch.
+                self.snap_gen.set(self.snap_gen.get().wrapping_add(1));
+                for s in &self.segs {
+                    if let Some(t) = s.blocks.borrow_mut().as_mut() {
+                        for list in &mut t.added {
+                            list.clear();
+                        }
+                    }
+                }
             }
         }
         let cache = self.scan_keys.borrow();
@@ -4841,51 +4907,62 @@ impl Db {
     /// write need not look.
     fn drop_blocks(&self) {
         for s in &self.segs {
-            s.blocks.borrow_mut().clear();
+            *s.blocks.borrow_mut() = None;
         }
         self.cache_used.set(false);
     }
 
     /// PROTOTYPE: the block that owns `key` in the partition holding it,
-    /// dropped from the cache. The owner is the block whose first key is
-    /// not above `key`; a key below every key of the partition belongs to
-    /// block 0, and one above every key to the last block, which is where
-    /// `materialize` puts them.
-    fn evict_block_of(&self, key: &[u8]) {
+    /// dropped from the cache and named, so the write can be filed under
+    /// it. The owner is the block whose first key is not above `key`; a
+    /// key below every key of the partition belongs to block 0, and one
+    /// above every key to the last block, which is where the bounds put
+    /// them. `None` when the partition has no table: nothing to drop and
+    /// nowhere to file.
+    fn evict_block_of(&self, key: &[u8]) -> Option<(usize, usize)> {
         if !self.cache_used.get() {
-            return;
+            return None;
         }
         let np = self.segs.partition_point(|s| s.level > 0);
         let at =
             self.segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
-        let Some(seg) = self.segs[..np].get(at) else {
-            return;
-        };
-        let keys = seg.blob.keys();
-        if keys == 0 {
-            return;
+        let seg = self.segs[..np].get(at)?;
+        if seg.blob.keys() == 0 {
+            return None;
         }
+        let mut held = seg.blocks.borrow_mut();
+        let table = held.as_mut()?;
+        let b = Self::owner_block(seg, key);
+        if let Some(slot) = table.slots.get_mut(b) {
+            *slot = None;
+        }
+        Some((at, b))
+    }
+
+    /// PROTOTYPE: the block whose key range holds `key`.
+    fn owner_block(seg: &Seg, key: &[u8]) -> usize {
+        let keys = seg.blob.keys();
         let rank = seg.ord.seek(key, |r| seg.blob.key_at(r));
         let owner = if rank < keys && seg.blob.key_at(rank) == Some(key) {
             rank
         } else {
             rank.saturating_sub(1)
         };
-        if let Some(slot) = seg.blocks.borrow_mut().get_mut(owner / CACHE_BLOCK) {
-            *slot = None;
-        }
+        owner / CACHE_BLOCK
     }
 
     /// PROTOTYPE: bookkeeping after a memtable write, when the block cache
-    /// is on: a rehash voids every slot the snapshot and the side list
-    /// hold, and a created key joins the side list in key order.
-    fn note_write(&self, wrote: Wrote) {
+    /// is on: a rehash voids every slot the snapshot and the lists hold,
+    /// and a created key joins the list of keys since the snapshot and,
+    /// when its partition has a table, that table's list for its block.
+    fn note_write(&self, wrote: Wrote, at: Option<(usize, usize)>) {
         if !self.opts.scan_block_cache {
             return;
         }
         if wrote.grew {
-            // The snapshot and the side list name slots and are void; the
-            // cached blocks hold copied values and stand.
+            // The snapshot and the lists name slots and are void; the
+            // cached blocks hold copied values and stand. The rebuild the
+            // flag forces empties every table's lists.
             self.snap_rehashed.set(true);
             self.snap_added.borrow_mut().clear();
             return;
@@ -4893,49 +4970,112 @@ impl Db {
         if self.snap_rehashed.get() {
             return;
         }
-        if let Some(slot) = wrote.new_slot {
-            let key = MemTable::key_of(&self.mem.keys, &self.mem.entries[slot as usize]);
-            let mut added = self.snap_added.borrow_mut();
-            let at = added.partition_point(|&i| {
-                MemTable::key_of(&self.mem.keys, &self.mem.entries[i as usize]) < key
-            });
-            added.insert(at, slot);
+        let Some(slot) = wrote.new_slot else { return };
+        self.snap_added.borrow_mut().push(slot);
+        if let Some((p, b)) = at {
+            if let Some(t) = self.segs[p].blocks.borrow_mut().as_mut() {
+                if let Some(list) = t.added.get_mut(b) {
+                    list.push(slot);
+                }
+            }
         }
     }
 
-    /// PROTOTYPE: the memtables' keys in `lo_key..end_key` (open when
-    /// `end_key` is `None`), in order: the snapshot's and the side list's
-    /// merged, each with what emitting it needs.
+    /// PROTOTYPE: a partition's table, made on its first touch: every
+    /// level-0 piece meeting its range walked once against its block
+    /// boundaries, the snapshot walked once, and the keys created since
+    /// the snapshot filed by block. Before this every block's build
+    /// seeked each of those sources from scratch: on one store of three
+    /// million keys, three microseconds of a seven microsecond build.
+    fn make_table(&self, seg: &Seg, l0: &[Seg], unsealed: &Snapshot) -> Result<BlockTable> {
+        let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
+        let mut pieces = Vec::new();
+        for (j, p) in l0.iter().enumerate() {
+            if !seg.lo.is_empty()
+                && p.hi
+                    .as_ref()
+                    .is_some_and(|h| h.as_slice() <= seg.lo.as_slice())
+            {
+                continue;
+            }
+            if seg
+                .hi
+                .as_ref()
+                .is_some_and(|h| !p.lo.is_empty() && p.lo.as_slice() >= h.as_slice())
+            {
+                continue;
+            }
+            let at = block_bounds_of(
+                seg,
+                nblocks,
+                p.blob.keys(),
+                |k| p.ord.seek(p.cursor_from(k), |i| p.blob.key_at(i)),
+                |i, bound| p.blob.key_at(i).is_some_and(|k| k < bound),
+            )?;
+            pieces.push((j, at));
+        }
+        let snap_at = Self::snap_bounds(seg, nblocks, unsealed)?;
+        let mut added: Vec<Vec<u32>> = (0..nblocks).map(|_| Vec::new()).collect();
+        if nblocks > 0 {
+            for &slot in self.snap_added.borrow().iter() {
+                let key = MemTable::key_of(&self.mem.keys, &self.mem.entries[slot as usize]);
+                if seg.below_lo(key) || seg.hi.as_ref().is_some_and(|h| key >= h.as_slice()) {
+                    continue;
+                }
+                added[Self::owner_block(seg, key)].push(slot);
+            }
+        }
+        Ok(BlockTable {
+            slots: (0..nblocks).map(|_| None).collect(),
+            pieces,
+            snap_at,
+            snap_gen: self.snap_gen.get(),
+            added,
+        })
+    }
+
+    /// PROTOTYPE: where the snapshot's keys fall against the partition's
+    /// block boundaries.
+    fn snap_bounds(seg: &Seg, nblocks: usize, unsealed: &Snapshot) -> Result<Vec<u32>> {
+        block_bounds_of(
+            seg,
+            nblocks,
+            unsealed.len(),
+            |k| unsealed.seek(k),
+            |i, bound| unsealed.get(i).is_some_and(|(k, _)| k < bound),
+        )
+    }
+
+    /// PROTOTYPE: the memtables' keys in block `b`, in order: the
+    /// snapshot's run between the table's bounds, and the keys created
+    /// since, filed under the block when they were written, merged.
     fn overlay_mem<'a>(
         &'a self,
+        table: &BlockTable,
+        b: usize,
         unsealed: &'a Snapshot,
-        added: &[u32],
-        lo_key: &[u8],
-        end_key: Option<&[u8]>,
-    ) -> Vec<Over<'a>> {
-        let inside = |k: &[u8]| end_key.is_none_or(|e| k < e);
-        let mut out: Vec<Over> = Vec::new();
-        let mut mi = unsealed.seek(lo_key);
-        while let Some((k, sk)) = unsealed.get(mi) {
-            if !inside(k) {
-                break;
-            }
+    ) -> Result<Vec<Over<'a>>> {
+        let (s0, s1) = (table.snap_at[b] as usize, table.snap_at[b + 1] as usize);
+        let filed = &table.added[b];
+        let mut out: Vec<Over> = Vec::with_capacity(s1.saturating_sub(s0) + filed.len());
+        for i in s0..s1 {
+            let (k, sk) = unsealed
+                .get(i)
+                .ok_or_else(|| err("block cache: a snapshot bound did not resolve"))?;
             out.push(Over {
                 key: k,
                 sk: Some(*sk),
                 pieces: 0..0,
             });
-            mi += 1;
+        }
+        if filed.is_empty() {
+            return Ok(out);
         }
         let key_of = |slot: u32| MemTable::key_of(&self.mem.keys, &self.mem.entries[slot as usize]);
-        let from = added.partition_point(|&i| key_of(i) < lo_key);
-        let fresh: Vec<Over> = added[from..]
+        let mut fresh: Vec<Over> = filed
             .iter()
-            .map(|&i| key_of(i))
-            .take_while(|k| inside(k))
-            .zip(added[from..].iter())
-            .map(|(k, &i)| Over {
-                key: k,
+            .map(|&i| Over {
+                key: key_of(i),
                 sk: Some(SnapKey {
                     off: 0,
                     len: 0,
@@ -4945,11 +5085,9 @@ impl Db {
                 pieces: 0..0,
             })
             .collect();
-        if fresh.is_empty() {
-            return out;
-        }
+        fresh.sort_by(|x, y| x.key.cmp(y.key));
         if out.is_empty() {
-            return fresh;
+            return Ok(fresh);
         }
         // A key in both is one key: the snapshot's entry names its frozen
         // slot, the side list's the live slot created since, and the live
@@ -4979,43 +5117,34 @@ impl Db {
                 },
             }
         }
-        merged
+        Ok(merged)
     }
 
-    /// PROTOTYPE: every key above the partition in `lo_key..end_key`: the
+    /// PROTOTYPE: every key above the partition in block `b`: the
     /// memtables' and the level-0 pieces', folded by key with the pieces
-    /// holding it oldest first. A piece is read only where its range meets
-    /// the block's, from one seek into its ordered index.
+    /// holding it oldest first. A piece's ranks for the block are the
+    /// table's; nothing is seeked.
     fn overlay_all<'a>(
         &'a self,
         src: Sources<'a>,
+        table: &BlockTable,
+        b: usize,
         unsealed: &'a Snapshot,
-        added: &[u32],
-        lo_key: &[u8],
-        end_key: Option<&[u8]>,
-    ) -> Overlay<'a> {
-        let mem = self.overlay_mem(unsealed, added, lo_key, end_key);
-        let inside = |k: &[u8]| end_key.is_none_or(|e| k < e);
+    ) -> Result<Overlay<'a>> {
+        let mem = self.overlay_mem(table, b, unsealed)?;
         let mut held: Vec<(&[u8], usize, usize)> = Vec::new();
-        for (j, p) in src.l0.iter().enumerate() {
-            if p.hi.as_ref().is_some_and(|h| h.as_slice() <= lo_key) {
-                continue;
-            }
-            if end_key.is_some_and(|e| !p.lo.is_empty() && p.lo.as_slice() >= e) {
-                continue;
-            }
-            let start = p.cursor_from(lo_key);
-            let mut r = p.ord.seek(start, |i| p.blob.key_at(i));
-            while let Some(k) = p.blob.key_at(r) {
-                if !inside(k) {
-                    break;
-                }
-                held.push((k, j, r));
-                r += 1;
+        for (j, at) in &table.pieces {
+            let p = &src.l0[*j];
+            for r in at[b] as usize..at[b + 1] as usize {
+                let k = p
+                    .blob
+                    .key_at(r)
+                    .ok_or_else(|| err("block cache: a rank did not resolve"))?;
+                held.push((k, *j, r));
             }
         }
         if held.is_empty() {
-            return Overlay { over: mem, held };
+            return Ok(Overlay { over: mem, held });
         }
         held.sort_by(|x, y| x.0.cmp(y.0).then(x.1.cmp(&y.1)));
         let mut over: Vec<Over> = Vec::with_capacity(mem.len() + held.len());
@@ -5043,7 +5172,7 @@ impl Db {
                 pieces: from as u32..h as u32,
             });
         }
-        Overlay { over, held }
+        Ok(Overlay { over, held })
     }
 
     /// PROTOTYPE: one overlay key emitted as `scan_merged` emits it.
@@ -5129,38 +5258,6 @@ impl Db {
         Ok(())
     }
 
-    /// PROTOTYPE: block `b`'s rank range and key range in `seg`. Block 0's
-    /// keys start at the partition's lower fence and the last block's end
-    /// at its upper one, so every key above the partition in its range
-    /// has one block.
-    fn block_bounds<'a>(&self, seg: &'a Seg, b: usize) -> Result<BlockBounds<'a>> {
-        let keys = seg.blob.keys();
-        let lo = b * CACHE_BLOCK;
-        let hi = ((b + 1) * CACHE_BLOCK).min(keys);
-        let lo_key: &[u8] = if b == 0 {
-            seg.lo.as_slice()
-        } else {
-            seg.blob
-                .key_at(lo)
-                .ok_or_else(|| err("block cache: a rank did not resolve"))?
-        };
-        let end_key: Option<&[u8]> = if hi < keys {
-            Some(
-                seg.blob
-                    .key_at(hi)
-                    .ok_or_else(|| err("block cache: a rank did not resolve"))?,
-            )
-        } else {
-            seg.hi.as_deref()
-        };
-        Ok(BlockBounds {
-            lo,
-            hi,
-            lo_key,
-            end_key,
-        })
-    }
-
     /// PROTOTYPE: the walk over the partition's ranks with the overlay's
     /// keys laid over: the walk `scan_partitions` makes, on a block, with
     /// every source. `on_key` sees every key once before its values,
@@ -5232,15 +5329,17 @@ impl Db {
     /// through its overlay once and building on the second: on one store
     /// of three million keys, five of every six blocks E touched it
     /// touched again, and each of those paid the overlay twice.
-    fn materialize(&self, src: Sources, b: usize, unsealed: &Snapshot) -> Result<Cached> {
-        let BlockBounds {
-            lo,
-            hi,
-            lo_key,
-            end_key,
-        } = self.block_bounds(src.seg, b)?;
-        let added = self.snap_added.borrow();
-        let ov = self.overlay_all(src, unsealed, &added, lo_key, end_key);
+    fn materialize(
+        &self,
+        src: Sources,
+        table: &BlockTable,
+        b: usize,
+        unsealed: &Snapshot,
+    ) -> Result<Cached> {
+        let keys = src.seg.blob.keys();
+        let lo = b * CACHE_BLOCK;
+        let hi = ((b + 1) * CACHE_BLOCK).min(keys);
+        let ov = self.overlay_all(src, table, b, unsealed)?;
         if ov.over.is_empty() {
             return Ok(Cached::Clean);
         }
@@ -5450,6 +5549,16 @@ impl Db {
                 rank.saturating_sub(1)
             };
             let nblocks = keys.div_ceil(CACHE_BLOCK);
+            let mut held = seg.blocks.borrow_mut();
+            if held.is_none() {
+                *held = Some(self.make_table(seg, l0, unsealed)?);
+                self.cache_used.set(true);
+            }
+            let table = held.as_mut().expect("just made");
+            if table.snap_gen != self.snap_gen.get() {
+                table.snap_at = Self::snap_bounds(seg, nblocks, unsealed)?;
+                table.snap_gen = self.snap_gen.get();
+            }
             let mut b = owner / CACHE_BLOCK;
             let mut first = true;
             while seen < limit && b < nblocks {
@@ -5457,15 +5566,11 @@ impl Db {
                 let hi = ((b + 1) * CACHE_BLOCK).min(keys);
                 let start = if first { rank.max(lo) } else { lo };
                 let from_key: &[u8] = if first { cursor } else { b"" };
-                let mut table = seg.blocks.borrow_mut();
-                if table.is_empty() {
-                    table.resize_with(nblocks, || None);
+                if table.slots[b].is_none() {
+                    let built = self.materialize(src, table, b, unsealed)?;
+                    table.slots[b] = Some(built);
                 }
-                if table[b].is_none() {
-                    table[b] = Some(self.materialize(src, b, unsealed)?);
-                    self.cache_used.set(true);
-                }
-                match table[b].as_ref().expect("just built") {
+                match table.slots[b].as_ref().expect("just built") {
                     Cached::Sparse(deltas) => {
                         seen += self.walk_deltas(
                             seg,
@@ -5517,7 +5622,13 @@ impl Db {
     pub fn block_cache_size(&self) -> (usize, usize) {
         let (mut clean, mut sparse, mut copies, mut bytes) = (0usize, 0usize, 0usize, 0usize);
         for s in &self.segs {
-            for c in s.blocks.borrow().iter().flatten() {
+            for c in s
+                .blocks
+                .borrow()
+                .iter()
+                .flat_map(|t| t.slots.iter())
+                .flatten()
+            {
                 match c {
                     Cached::Clean => clean += 1,
                     Cached::Sparse(b) => {
