@@ -4862,9 +4862,10 @@ impl Db {
             return;
         }
         if wrote.grew {
+            // The snapshot and the side list name slots and are void; the
+            // cached blocks hold copied values and stand.
             self.snap_rehashed.set(true);
             self.snap_added.borrow_mut().clear();
-            self.drop_blocks();
             return;
         }
         if self.snap_rehashed.get() {
