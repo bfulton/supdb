@@ -2029,6 +2029,46 @@ fn a_key_held_by_many_pieces_counts_once_toward_a_wide_block() {
     assert_eq!(db.block_cache_wide(), 1, "the tail's block is wide");
 }
 
+/// A scan builds its snapshot of the unsealed keys naming the live
+/// memtable's slots; a seal replaces that memtable with an empty one,
+/// and the inserts after it rehash the new table at a few hundred keys,
+/// renumbering every slot the snapshot names through a map the size of
+/// the new table. The snapshot must not outlive the memtable it names:
+/// thousands of keys in the old one, so their slots run past the new
+/// map, then a seal, then enough inserts to rehash before any scan.
+#[test]
+fn a_seal_drops_the_scan_snapshot_before_the_next_rehash() {
+    let d = dir("seal-snapshot");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(64 << 10),
+        scan_block_cache: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    for k in 0..2100 {
+        m.append(&mut db, &format!("key-{k:05}"), "p");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    assert!(db.levels().0 > 1);
+    for k in 0..2100 {
+        m.append(&mut db, &format!("live-{k:05}"), "l");
+    }
+    db.commit().unwrap();
+    m.check(&db, "a snapshot over thousands of live keys");
+    db.seal().unwrap();
+    assert!(db.in_flight().0);
+    for k in 0..600 {
+        m.append(&mut db, &format!("new-{k:05}"), "n");
+    }
+    m.check(&db, "inserts past a rehash of the memtable the seal made");
+    db.settle().unwrap();
+    m.check(&db, "the seal joined");
+}
+
 /// After a check has filled the cache: the bytes it counts against a
 /// walk of what it holds, and against the budget with one block's slack,
 /// since the block a scan is about to walk is never shed.

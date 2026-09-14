@@ -3817,6 +3817,13 @@ impl Db {
         }
         self.join_seal()?;
         let frozen = std::sync::Arc::new(std::mem::replace(&mut self.mem, MemTable::new()));
+        // The scan snapshot names the live memtable's slots, and the live
+        // memtable is new: a write's bookkeeping renumbers the snapshot at
+        // every rehash, and the fresh table's first rehash has a thousand
+        // slots where the snapshot names hundreds of thousands. It stood
+        // stale until the next scan rebuilt it, and six hundred inserts
+        // between a seal and that scan were enough to index past the map.
+        *self.scan_keys.borrow_mut() = None;
         self.snap_added.borrow_mut().clear();
         self.drop_blocks();
         self.mem_bytes = 0;
