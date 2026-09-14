@@ -257,6 +257,14 @@ pub struct Supdb {
     /// drain was 11% of the load window and the whole of the seal phase, so
     /// both shapes are arms.
     drain: bool,
+    /// The block cache: scans over unsealed keys walk cached copies of the
+    /// partition blocks they cross instead of merging every source, and a
+    /// write drops the block it lands in. Off in the default arm because
+    /// the option is off by default; the arm that turns it on runs
+    /// interleaved with the one that does not, which is the only way to
+    /// price it, and with LMDB, whose in-place tree is what the cache is
+    /// measured against on the scan mixes.
+    block_cache: bool,
     /// A read advice pinned against the engine's own default, or `None` to
     /// take whatever the default is.
     ///
@@ -272,24 +280,30 @@ pub struct Supdb {
 
 impl Supdb {
     pub fn create(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, true, true, None)
+        Supdb::with_policy(path, true, true, None, false)
     }
 
     pub fn create_ingest(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, false, true, None)
+        Supdb::with_policy(path, false, true, None, false)
     }
 
     /// `sync` fsyncs and seals nothing; reads then answer from the
     /// memtable, the unrouted tail and the partitions together.
     pub fn create_nodrain(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, true, false, None)
+        Supdb::with_policy(path, true, false, None, false)
     }
 
     /// `supdb` in every respect but the read advice, which is pinned to the
     /// kernel's plain readahead. The pair differs by one option and needs no
     /// matching.
     pub fn create_noadvice(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, true, true, Some(supdb::ReadAdvice::Normal))
+        Supdb::with_policy(path, true, true, Some(supdb::ReadAdvice::Normal), false)
+    }
+
+    /// `supdb` in every respect but the block cache, on. The pair differs
+    /// by one option and needs no matching.
+    pub fn create_blockcache(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(path, true, true, None, true)
     }
 
     fn with_policy(
@@ -297,6 +311,7 @@ impl Supdb {
         partition: bool,
         drain: bool,
         advice: Option<supdb::ReadAdvice>,
+        block_cache: bool,
     ) -> Res<Supdb> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         // Checksums off in the segments, because LMDB has none and the axis
@@ -325,6 +340,10 @@ impl Supdb {
             // to background compaction. Both arms are measured rather than
             // argued about.
             partition_on_flush: partition,
+            // The option and nothing beside it: the budget stays at the
+            // engine's default, so the arm's memory over the ladder is the
+            // option's own and a row's figure describes what a user gets.
+            scan_block_cache: block_cache,
             ..Default::default()
         };
         let opts = match advice {
@@ -341,17 +360,24 @@ impl Supdb {
             partition,
             drain,
             advice,
+            block_cache,
         })
     }
 }
 
 impl Engine for Supdb {
     fn name(&self) -> &'static str {
-        match (self.partition, self.drain, self.advice.is_some()) {
-            (true, true, true) => "supdb-noadvice",
-            (true, true, false) => "supdb",
-            (false, _, _) => "supdb-ingest",
-            (true, false, _) => "supdb-nodrain",
+        match (
+            self.partition,
+            self.drain,
+            self.advice.is_some(),
+            self.block_cache,
+        ) {
+            (true, true, false, true) => "supdb-blockcache",
+            (true, true, true, _) => "supdb-noadvice",
+            (true, true, false, false) => "supdb",
+            (false, _, _, _) => "supdb-ingest",
+            (true, false, _, _) => "supdb-nodrain",
         }
     }
     fn features(&self) -> Features {
@@ -732,9 +758,10 @@ use crate::row::Guarantee;
 /// Every arm a run measures, in the order they are interleaved. Each is a
 /// shipping supdb configuration or the comparator a user would otherwise
 /// pick. Comparisons are made within a guarantee, never across one.
-pub const ARMS: [&str; 7] = [
+pub const ARMS: [&str; 8] = [
     "supdb",
     "supdb-noadvice",
+    "supdb-blockcache",
     "lmdb",
     "rocksdb-tuned",
     "supdb-ingest",
@@ -744,7 +771,9 @@ pub const ARMS: [&str; 7] = [
 
 pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
-        "supdb" | "supdb-noadvice" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
+        "supdb" | "supdb-noadvice" | "supdb-blockcache" | "lmdb" | "rocksdb-tuned" => {
+            Guarantee::Durable
+        }
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
     })
@@ -756,6 +785,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
     Ok(match arm {
         "supdb" => Box::new(Supdb::create(dir)?),
         "supdb-noadvice" => Box::new(Supdb::create_noadvice(dir)?),
+        "supdb-blockcache" => Box::new(Supdb::create_blockcache(dir)?),
         "supdb-ingest" => Box::new(Supdb::create_ingest(dir)?),
         "lmdb" => Box::new(Lmdb::create(dir, map_gb)?),
         "lmdb-nosync" => Box::new(Lmdb::create_nosync(dir, map_gb)?),

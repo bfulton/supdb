@@ -55,7 +55,7 @@ comparator a user would otherwise pick.
 
 | guarantee | supdb | comparators |
 |---|---|---|
-| durable per batch | `supdb` (default), `supdb-noadvice` | `lmdb`, `rocksdb-tuned` |
+| durable per batch | `supdb` (default), `supdb-noadvice`, `supdb-blockcache` | `lmdb`, `rocksdb-tuned` |
 | buffered | `supdb-ingest` | `lmdb-nosync`, `rocksdb-nosync` |
 
 Every shipping option is an arm because a user can choose it and deserves the

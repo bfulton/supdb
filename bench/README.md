@@ -43,9 +43,9 @@ unversioned exists). CI runs the same script.
 | `ycsb-A` … `ycsb-F` | the YCSB core mixes on the loaded store |
 | `wal-floor`, `scan-floor` | what the device does with no engine in the way |
 
-Arms: `supdb`, `supdb-noadvice`, `lmdb`, `rocksdb-tuned` (durable per
-batch); `supdb-ingest`, `lmdb-nosync`, `rocksdb-nosync` (buffered). Every
-comparison is within a guarantee.
+Arms: `supdb`, `supdb-noadvice`, `supdb-blockcache`, `lmdb`,
+`rocksdb-tuned` (durable per batch); `supdb-ingest`, `lmdb-nosync`,
+`rocksdb-nosync` (buffered). Every comparison is within a guarantee.
 
 ## Checks
 

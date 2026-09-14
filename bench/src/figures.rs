@@ -40,11 +40,13 @@ const TOP: f64 = 88.0;
 const BOTTOM: f64 = 48.0;
 
 /// How an arm is drawn: colour and dash. The default in ink, the shipping
-/// option in the accent, comparators in grey with the second dashed.
+/// options in the accent with the second dashed, comparators in grey with
+/// the second dashed.
 fn style(arm: &str) -> (&'static str, &'static str) {
     match arm {
         "supdb" | "supdb-ingest" => (INK, ""),
         "supdb-noadvice" => (ACCENT, ""),
+        "supdb-blockcache" => (ACCENT, "7,4"),
         "lmdb" | "lmdb-nosync" => (GREY, ""),
         "rocksdb-tuned" | "rocksdb-nosync" => (GREY, "7,4"),
         _ => (GREY, "2,3"),
@@ -56,6 +58,7 @@ fn pretty(arm: &str) -> &'static str {
     match arm {
         "supdb" => "supdb",
         "supdb-noadvice" => "supdb (no advice)",
+        "supdb-blockcache" => "supdb (block cache)",
         "supdb-ingest" => "supdb (buffered)",
         "lmdb" => "LMDB",
         "lmdb-nosync" => "LMDB (nosync)",
