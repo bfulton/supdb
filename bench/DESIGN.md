@@ -47,6 +47,15 @@ YCSB-D reads uniformly over the loaded keys rather than skewed to the latest
 inserts: the latest distribution needs a Zipfian over a count that grows
 with every insert, and tracking that is not a cost to charge the engines.
 
+Every workload runs one thread against the engine. Concurrency is on the
+backlog, for the matrix as much as for the engine: a thread count as a
+dimension of `read`, `scan` and the mixes, readers beside a writer and
+writers beside each other, each a quantity per thread count so a row shows
+where an arm's throughput stops scaling. LMDB and RocksDB take it as they
+are; supdb is single-writer with reads that borrow the writer, and the
+engine side of the item is in `docs/engine.md` under what is open. Until
+both sides exist a row measures no concurrency and claims none.
+
 ## Arms
 
 Every comparison is guarantee-matched: durable against durable, buffered

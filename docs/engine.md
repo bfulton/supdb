@@ -552,13 +552,28 @@ per-commit path.
   in pages.
 - **Group commit** — whether concurrent writers share a barrier; matters
   only after P-D.
+- **Read and write concurrency** — on the backlog, not built, in two
+  parts. The engine is single-writer and a read borrows it: `Db` is one
+  value, a write takes it mutably, a read immutably, and the scan
+  snapshot and the block cache keep their state in cells that assume one
+  thread. Readers beside the writer need a handle over a published view,
+  the segment set and the memtables as of a commit, that a seal, a join
+  or a merge replaces rather than edits, and a memtable a reader can
+  probe while the writer appends to it or a frozen one it reads while
+  the writer fills the next. Writers beside each other are the appender
+  question (2 above): a WAL and memtable per writer, or a shared barrier
+  (group commit, above). Neither is promised until it is measured, and
+  the suite has to be able to ask: the matrix gains a thread count as a
+  dimension, readers beside a writer and writers beside each other, with
+  LMDB and RocksDB alongside since both support it (`bench/DESIGN.md`).
 - **What the on-disk size ordering becomes** — segments plus a WAL will
   not beat LMDB on disk; that loss stands and gets re-priced honestly.
 
 ## What this does not promise
 
-Multi-reader snapshots (MVCC beyond the single-writer borrow), or beating
-LMDB out-of-core. Transactions it does promise now -- atomic batches,
+Multi-reader snapshots (MVCC beyond the single-writer borrow) -- on the
+backlog above, promised once built and measured -- or beating LMDB
+out-of-core. Transactions it does promise now -- atomic batches,
 rollback, read-your-writes -- and deletes that reclaim their bytes. The
 guarantee set stays what `Features` can equalize, so every comparison
 against another engine remains matched: the durable-commit axis is
