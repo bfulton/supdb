@@ -2050,12 +2050,16 @@ fn mem_hash(key: &[u8]) -> u64 {
 }
 
 /// PROTOTYPE: what a memtable write did, for the block cache's bookkeeping.
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 struct Wrote {
     /// The slot of a key this write created.
     new_slot: Option<u32>,
-    /// The table rehashed on the way, so every slot index moved.
-    grew: bool,
+    /// The table rehashed on the way, so every slot index moved: for each
+    /// old slot, the new one, or `u32::MAX` for a slot that was empty.
+    /// The rehash visits every entry anyway, and the map lets what names
+    /// slots -- the scan snapshot and the block tables' lists -- be
+    /// patched in place instead of rebuilt.
+    moved: Option<Vec<u32>>,
 }
 
 impl MemTable {
@@ -2074,26 +2078,28 @@ impl MemTable {
         &keys[e.key_off as usize..(e.key_off + e.key_len) as usize]
     }
 
-    fn grow(&mut self) {
+    fn grow(&mut self) -> Vec<u32> {
         let cap = self.entries.len() * 2;
         let mut entries = vec![MemEntry::default(); cap];
+        let mut moved = vec![u32::MAX; self.entries.len()];
         let mask = cap - 1;
-        for e in self.entries.iter().filter(|e| e.hash != 0) {
+        for (old, e) in self.entries.iter().enumerate().filter(|(_, e)| e.hash != 0) {
             let mut i = (e.hash as usize) & mask;
             while entries[i].hash != 0 {
                 i = (i + 1) & mask;
             }
             entries[i] = *e;
+            moved[old] = i as u32;
         }
         self.entries = entries;
         self.mask = mask;
+        moved
     }
 
     fn append(&mut self, key: &[u8], value: &[u8]) -> Wrote {
         let mut wrote = Wrote::default();
         if (self.len + 1) * 2 > self.entries.len() {
-            self.grow();
-            wrote.grew = true;
+            wrote.moved = Some(self.grow());
         }
         let hash = mem_hash(key);
         let mut i = (hash as usize) & self.mask;
@@ -2140,8 +2146,7 @@ impl MemTable {
     fn delete(&mut self, key: &[u8]) -> Wrote {
         let mut wrote = Wrote::default();
         if (self.len + 1) * 2 > self.entries.len() {
-            self.grow();
-            wrote.grew = true;
+            wrote.moved = Some(self.grow());
         }
         let hash = mem_hash(key);
         let mut i = (hash as usize) & self.mask;
@@ -3152,7 +3157,6 @@ pub struct Db {
     snap_added: std::cell::RefCell<Vec<u32>>,
     /// PROTOTYPE: the live memtable rehashed since the snapshot was built,
     /// so its slot indices are stale and the next scan rebuilds.
-    snap_rehashed: std::cell::Cell<bool>,
     /// PROTOTYPE: counts the snapshot's rebuilds, so a table can tell
     /// whether its bounds were walked over the snapshot that stands.
     snap_gen: std::cell::Cell<u64>,
@@ -3411,7 +3415,6 @@ impl Db {
             scan_keys: std::cell::RefCell::new(None),
             cache_used: std::cell::Cell::new(false),
             snap_added: std::cell::RefCell::new(Vec::new()),
-            snap_rehashed: std::cell::Cell::new(false),
             snap_gen: std::cell::Cell::new(0),
             seal_wait: SealWaits::default(),
             draining: false,
@@ -3576,7 +3579,6 @@ impl Db {
             scan_keys: std::cell::RefCell::new(None),
             cache_used: std::cell::Cell::new(false),
             snap_added: std::cell::RefCell::new(Vec::new()),
-            snap_rehashed: std::cell::Cell::new(false),
             snap_gen: std::cell::Cell::new(0),
             seal_wait: SealWaits::default(),
             draining: false,
@@ -3675,7 +3677,6 @@ impl Db {
         self.join_seal()?;
         let frozen = std::sync::Arc::new(std::mem::replace(&mut self.mem, MemTable::new()));
         self.snap_added.borrow_mut().clear();
-        self.snap_rehashed.set(false);
         self.drop_blocks();
         self.mem_bytes = 0;
         let new_wal = self.next_wal(self.wal_id + 1)?;
@@ -4731,9 +4732,12 @@ impl Db {
         }
         let structural = (self.next_seg << 48) ^ ((self.frozen.is_some() as u64) << 63);
         // With the block cache the snapshot outlives commits: keys added
-        // since it was built sit in a sorted side list materialization
-        // merges in, until they outgrow an eighth of it or the table
-        // rehashes. Without it, a commit is a rebuild, as before.
+        // since it was built are filed by block and merged in when a
+        // block builds, until they outnumber the snapshot. The bound was
+        // an eighth of the snapshot when the keys
+        // sat in one sorted list every build searched; filed by block,
+        // what grows with their count is only the walk a new table makes
+        // over them. Without the cache, a commit is a rebuild, as before.
         // The cache wants partitions to hang blocks on: before the first
         // partitioning it stands aside.
         let use_cache =
@@ -4748,13 +4752,11 @@ impl Db {
             let mut stale = cache.as_ref().is_none_or(|(g, _)| *g != gen);
             if use_cache && !stale {
                 let held = cache.as_ref().map_or(0, |(_, s)| s.len());
-                stale =
-                    self.snap_rehashed.get() || self.snap_added.borrow().len() > held.max(512) / 8;
+                stale = self.snap_added.borrow().len() > held.max(4096);
             }
             if stale {
                 *cache = Some((gen, self.build_snapshot()));
                 self.snap_added.borrow_mut().clear();
-                self.snap_rehashed.set(false);
                 // Every key created since the old snapshot is in the new
                 // one: the lists that held them are emptied, and the
                 // bounds each table walked are walked again on its next
@@ -4952,23 +4954,46 @@ impl Db {
     }
 
     /// PROTOTYPE: bookkeeping after a memtable write, when the block cache
-    /// is on: a rehash voids every slot the snapshot and the lists hold,
-    /// and a created key joins the list of keys since the snapshot and,
-    /// when its partition has a table, that table's list for its block.
+    /// is on: a rehash renumbers every slot the snapshot and the lists
+    /// hold, and a created key joins the list of keys since the snapshot
+    /// and, when its partition has a table, that table's list for its
+    /// block.
     fn note_write(&self, wrote: Wrote, at: Option<(usize, usize)>) {
         if !self.opts.scan_block_cache {
             return;
         }
-        if wrote.grew {
-            // The snapshot and the lists name slots and are void; the
-            // cached blocks hold copied values and stand. The rebuild the
-            // flag forces empties every table's lists.
-            self.snap_rehashed.set(true);
-            self.snap_added.borrow_mut().clear();
-            return;
-        }
-        if self.snap_rehashed.get() {
-            return;
+        if let Some(moved) = &wrote.moved {
+            // Every slot the snapshot and the lists name has a new number,
+            // and the rehash said which. Patching them is one pass over
+            // each; voiding them was a rebuild of the snapshot at the next
+            // scan, and a fresh table after a seal doubles its way up, so
+            // on one store of three million keys that was three rebuilds
+            // in every pass of ycsb-E. The cached blocks hold copied
+            // values and stand either way.
+            let to = |slot: u32| {
+                let new = moved[slot as usize];
+                debug_assert_ne!(new, u32::MAX, "a named slot was empty at the rehash");
+                new
+            };
+            if let Some((_, snap)) = self.scan_keys.borrow_mut().as_mut() {
+                for e in &mut snap.ents {
+                    if e.mem != u32::MAX {
+                        e.mem = to(e.mem);
+                    }
+                }
+            }
+            for slot in self.snap_added.borrow_mut().iter_mut() {
+                *slot = to(*slot);
+            }
+            for s in &self.segs {
+                if let Some(t) = s.blocks.borrow_mut().as_mut() {
+                    for list in &mut t.added {
+                        for slot in list.iter_mut() {
+                            *slot = to(*slot);
+                        }
+                    }
+                }
+            }
         }
         let Some(slot) = wrote.new_slot else { return };
         self.snap_added.borrow_mut().push(slot);

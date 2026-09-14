@@ -1713,8 +1713,14 @@ impl ScanModel {
     /// at limits from one to unbounded. Both the stream and the count.
     fn check(&self, db: &Db, state: &str) {
         let visited = self.visited();
-        let mut starts: Vec<Vec<u8>> = visited.iter().map(|k| k.to_vec()).collect();
-        starts.extend(visited.iter().map(|k| [k, &b"+"[..]].concat()));
+        // Every visited key is a start while there are few; past a few
+        // hundred, every scan still streams every key but the starts are
+        // sampled, or a check over a burst of thousands takes minutes in
+        // the debug build.
+        let step = visited.len().div_ceil(400).max(1);
+        let sample = visited.iter().step_by(step);
+        let mut starts: Vec<Vec<u8>> = sample.clone().map(|k| k.to_vec()).collect();
+        starts.extend(sample.map(|k| [k, &b"+"[..]].concat()));
         starts.push(Vec::new());
         starts.push(b"a".to_vec());
         starts.push(b"zzz".to_vec());
@@ -1823,12 +1829,19 @@ fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
     m.check(&db, "live over frozen, through the side list");
     // More keys than the side list may hold before a scan rebuilds the
     // snapshot: the rebuild happens with the tables standing, and the
-    // writes after it are filed under blocks whose bounds were walked
-    // again.
-    for k in 0..200 {
-        m.append(&mut db, &format!("key-00{:03}x", 100 + k), "burst");
+    // writes after are filed under blocks whose bounds were walked again.
+    // Then a second burst, past the count the memtable holds before it
+    // rehashes, with the first burst's live keys in the snapshot: the
+    // rehash renumbers the slots the snapshot and the tables' lists name.
+    let burst = |k: u32| format!("key-00{:03}x{:02}", 100 + k % 500, k / 500);
+    for k in 0..4200 {
+        m.append(&mut db, &burst(k), "burst");
     }
     m.check(&db, "a burst that rebuilds the snapshot under the tables");
+    for k in 4200..8400 {
+        m.append(&mut db, &burst(k), "burst");
+    }
+    m.check(&db, "a burst that rehashes the memtable under the snapshot");
     m.delete(&mut db, &key(303));
     m.append(&mut db, &key(309), "l-after-rebuild");
     m.delete(&mut db, "key-00150x");
