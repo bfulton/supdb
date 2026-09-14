@@ -2986,8 +2986,8 @@ struct WideBlock {
     seen: usize,
 }
 
-/// PROTOTYPE: keys above the partition past which a block is walked as a
-/// merge instead of built.
+/// PROTOTYPE: keys above the partition, as `overlay_count` counts them,
+/// past which a block is walked as a merge instead of built.
 const WIDE: usize = 4 * CACHE_BLOCK;
 
 /// PROTOTYPE: a sparse block's keys above the partition, resolved once:
@@ -5651,16 +5651,23 @@ impl Db {
         self.overlay_runs(src, mem, &pieces)
     }
 
-    /// PROTOTYPE: how many keys above the partition block `b` has, from
-    /// the table's bounds alone.
+    /// PROTOTYPE: a floor under how many keys above the partition block
+    /// `b` has, from the table's bounds alone: its largest source's run
+    /// over it. Summing the runs was tried first, and a key updated in
+    /// every seal is in every piece, so the sum counted it once per
+    /// piece: with seven pieces over a range it called every hot block
+    /// wide, and a wide block's walk merges every source for every scan
+    /// through it. Any one source holds distinct keys, so its run is a
+    /// floor; a block can hold more than the floor, spread thin across
+    /// its sources, and the merge at `l0_trigger` bounds how thin.
     fn overlay_count(table: &BlockTable, b: usize) -> usize {
-        (table.snap_at[b + 1] - table.snap_at[b]) as usize
-            + table.added[b].len()
-            + table
-                .pieces
-                .iter()
-                .map(|(_, at)| (at[b + 1] - at[b]) as usize)
-                .sum::<usize>()
+        let snap = (table.snap_at[b + 1] - table.snap_at[b]) as usize;
+        let pieces = table
+            .pieces
+            .iter()
+            .map(|(_, at)| (at[b + 1] - at[b]) as usize);
+        snap.max(table.added[b].len())
+            .max(pieces.max().unwrap_or(0))
     }
 
     /// PROTOTYPE: a wide block's keys above the partition from `cursor`
@@ -6389,6 +6396,23 @@ impl Db {
             })
             .max()
             .unwrap_or(0)
+    }
+
+    /// PROTOTYPE: how many blocks the cache holds as wide, for a test to
+    /// hold the count that makes one to its definition.
+    pub fn block_cache_wide(&self) -> usize {
+        self.segs
+            .iter()
+            .map(|s| {
+                s.blocks.borrow().as_ref().map_or(0, |t| {
+                    t.slots
+                        .iter()
+                        .flatten()
+                        .filter(|c| matches!(c, Cached::Wide(_)))
+                        .count()
+                })
+            })
+            .sum()
     }
 
     /// The partitions walked in bulk, with the unsealed keys laid over them.

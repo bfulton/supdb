@@ -1905,6 +1905,10 @@ fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
     }
     m.check(&db, "a burst that rebuilds the snapshot under the tables");
     held(&db, 0);
+    assert!(
+        db.block_cache_wide() > 0,
+        "the burst's blocks are walked wide"
+    );
     // Fewer than the snapshot holds, so no rebuild: the wide blocks take
     // these as filed keys and keep them in order.
     for k in 4200..6200 {
@@ -1929,6 +1933,10 @@ fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
     m.delete(&mut db, &burst(7));
     m.check(&db, "keys filed into wide blocks after the rebuild");
     held(&db, 0);
+    assert!(
+        db.block_cache_wide() > 0,
+        "the wide blocks stand after the rebuild"
+    );
     m.delete(&mut db, &key(303));
     m.append(&mut db, &key(309), "l-after-rebuild");
     m.delete(&mut db, "key-00150x");
@@ -1962,6 +1970,63 @@ fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
         &db,
         "merged, with keys created before their partition's table",
     );
+}
+
+/// A key updated in every seal is in every piece over its range, and it
+/// is one key above the partition: a block whose every key sits in
+/// sixteen pieces holds a block's worth, not sixteen, and is built rather
+/// than walked as a merge of seventeen sources on every scan through it.
+/// A block with three hundred keys past the end in one source is wide
+/// still.
+#[test]
+fn a_key_held_by_many_pieces_counts_once_toward_a_wide_block() {
+    let d = dir("overlay-pieces");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in (0..600).step_by(3) {
+        m.append(&mut db, &key(k), &format!("p{k}"));
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    let parts = db.levels().0;
+    assert!(parts > 1);
+    // Every loaded key again in each of sixteen seals, each joined:
+    // sixteen pieces over every range, each holding every key of every
+    // block, and the blocks here hold about twenty keys, so summed once
+    // per piece every block would be over the wide threshold.
+    for round in 0..16 {
+        for k in (0..600).step_by(3) {
+            m.append(&mut db, &key(k), &format!("r{round}"));
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        db.settle().unwrap();
+    }
+    assert_eq!(db.levels().1, 16 * parts, "sixteen pieces over every range");
+    m.check(&db, "every key in eight pieces");
+    held(&db, 0);
+    assert_eq!(
+        db.block_cache_wide(),
+        0,
+        "a key in sixteen pieces counted once per piece"
+    );
+    // Three hundred keys past the end, filed under the last block from
+    // the live memtable alone: one source, and the block is wide.
+    for k in 0..300 {
+        m.append(&mut db, &format!("key-00600x{k:03}"), "tail");
+    }
+    m.check(&db, "three hundred keys past the end in one source");
+    held(&db, 0);
+    assert_eq!(db.block_cache_wide(), 1, "the tail's block is wide");
 }
 
 /// After a check has filled the cache: the bytes it counts against a
