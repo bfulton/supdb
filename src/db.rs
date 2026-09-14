@@ -2979,7 +2979,23 @@ const CACHE_BLOCK: usize = 64;
 struct Over<'a> {
     key: &'a [u8],
     sk: Option<SnapKey>,
-    pieces: Vec<(usize, usize)>,
+    /// The key's entries in `Overlay::held`, contiguous: piece index and
+    /// rank, oldest piece first.
+    pieces: std::ops::Range<u32>,
+}
+
+/// PROTOTYPE: a block's keys above the partition, in order, and the piece
+/// entries they refer to, in one list so a key allocates nothing.
+struct Overlay<'a> {
+    over: Vec<Over<'a>>,
+    held: Vec<(&'a [u8], usize, usize)>,
+}
+
+/// PROTOTYPE: what emitting an overlay key needs beyond the key: whether
+/// any source holds a tombstone, and a scratch buffer for memtable chains.
+struct Emit {
+    tombs: bool,
+    scratch: Vec<usize>,
 }
 
 /// PROTOTYPE: what a block is built from: its partition and the store's
@@ -4689,6 +4705,15 @@ impl Db {
         }
         let cache = self.scan_keys.borrow();
         let unsealed = &cache.as_ref().expect("scan snapshot").1;
+        // The block path finds the unsealed keys a block needs when it
+        // builds the block, from the block's own bounds, and never from
+        // this cursor. Seeking it anyway was a binary search over every
+        // unsealed key on every scan, with its lower levels cold: on one
+        // store of three million keys, half a microsecond of a far scan's
+        // three, for a number nothing read.
+        if use_cache {
+            return self.scan_blocks(from, limit, unsealed, f);
+        }
         let mut mi = unsealed.seek(from);
 
         // With no level-0 piece the partitions tile the key space in order
@@ -4701,9 +4726,6 @@ impl Db {
         // routed flush this is the shape the store is in. An earlier
         // version had this path, a refactor dropped it, and the scan axis
         // paid for it.
-        if use_cache {
-            return self.scan_blocks(from, limit, unsealed, f);
-        }
         if !self.segs.iter().any(|s| s.level == 0) {
             return self.scan_partitions(from, limit, mi, unsealed, f);
         }
@@ -4901,7 +4923,7 @@ impl Db {
             out.push(Over {
                 key: k,
                 sk: Some(*sk),
-                pieces: Vec::new(),
+                pieces: 0..0,
             });
             mi += 1;
         }
@@ -4920,7 +4942,7 @@ impl Db {
                     mem: i,
                     frozen: u32::MAX,
                 }),
-                pieces: Vec::new(),
+                pieces: 0..0,
             })
             .collect();
         if fresh.is_empty() {
@@ -4930,7 +4952,6 @@ impl Db {
             return fresh;
         }
         let mut merged = Vec::with_capacity(out.len() + fresh.len());
-        let (mut a, mut b) = (0usize, 0usize);
         let (mut out, mut fresh) = (out.into_iter().peekable(), fresh.into_iter().peekable());
         loop {
             match (out.peek(), fresh.peek()) {
@@ -4940,15 +4961,12 @@ impl Db {
                 (Some(x), Some(y)) => {
                     if x.key <= y.key {
                         merged.push(out.next().unwrap());
-                        a += 1;
                     } else {
                         merged.push(fresh.next().unwrap());
-                        b += 1;
                     }
                 }
             }
         }
-        let _ = (a, b);
         merged
     }
 
@@ -4963,7 +4981,7 @@ impl Db {
         added: &[u32],
         lo_key: &[u8],
         end_key: Option<&[u8]>,
-    ) -> Vec<Over<'a>> {
+    ) -> Overlay<'a> {
         let mem = self.overlay_mem(unsealed, added, lo_key, end_key);
         let inside = |k: &[u8]| end_key.is_none_or(|e| k < e);
         let mut held: Vec<(&[u8], usize, usize)> = Vec::new();
@@ -4985,34 +5003,35 @@ impl Db {
             }
         }
         if held.is_empty() {
-            return mem;
+            return Overlay { over: mem, held };
         }
         held.sort_by(|x, y| x.0.cmp(y.0).then(x.1.cmp(&y.1)));
-        let mut out: Vec<Over> = Vec::with_capacity(mem.len() + held.len());
+        let mut over: Vec<Over> = Vec::with_capacity(mem.len() + held.len());
         let mut mem = mem.into_iter().peekable();
         let mut h = 0usize;
         while mem.peek().is_some() || h < held.len() {
             let take_mem = h >= held.len() || mem.peek().is_some_and(|m| m.key < held[h].0);
             if take_mem {
-                out.push(mem.next().unwrap());
+                over.push(mem.next().unwrap());
                 continue;
             }
             let k = held[h].0;
-            let mut over = Over {
-                key: k,
-                sk: None,
-                pieces: Vec::new(),
-            };
+            let from = h;
             while h < held.len() && held[h].0 == k {
-                over.pieces.push((held[h].1, held[h].2));
                 h += 1;
             }
-            if mem.peek().is_some_and(|m| m.key == k) {
-                over.sk = mem.next().unwrap().sk;
-            }
-            out.push(over);
+            let sk = if mem.peek().is_some_and(|m| m.key == k) {
+                mem.next().unwrap().sk
+            } else {
+                None
+            };
+            over.push(Over {
+                key: k,
+                sk,
+                pieces: from as u32..h as u32,
+            });
         }
-        out
+        Overlay { over, held }
     }
 
     /// PROTOTYPE: one overlay key emitted as `scan_merged` emits it.
@@ -5024,18 +5043,20 @@ impl Db {
     fn emit_over<F: FnMut(&[u8], &[u8])>(
         &self,
         f: &mut F,
-        scratch: &mut Vec<usize>,
-        tombs: bool,
-        over: &Over,
+        em: &mut Emit,
+        ov: &Overlay,
+        oi: usize,
         part_rank: Option<usize>,
         src: Sources,
     ) -> Result<()> {
+        let o = &ov.over[oi];
+        let held = &ov.held[o.pieces.start as usize..o.pieces.end as usize];
         let nc = src.l0.len();
-        let key = over.key;
+        let key = o.key;
         let read = |e: std::io::Error| err(&format!("block cache read: {e}"));
         let mut start = 0usize;
-        if tombs {
-            if let Some(sk) = over.sk {
+        if em.tombs {
+            if let Some(sk) = o.sk {
                 if sk.mem != u32::MAX && self.mem.has_tomb(&self.mem.entries[sk.mem as usize]) {
                     start = nc + 2;
                 } else if sk.frozen != u32::MAX
@@ -5048,7 +5069,7 @@ impl Db {
                 }
             }
             if start == 0 {
-                for &(j, rank) in over.pieces.iter().rev() {
+                for &(_, j, rank) in held.iter().rev() {
                     let p = &src.l0[j];
                     if !p.tombs {
                         continue;
@@ -5067,7 +5088,7 @@ impl Db {
                 src.seg.blob.values_at(r, |v| f(key, v)).map_err(read)?;
             }
         }
-        for &(j, rank) in &over.pieces {
+        for &(_, j, rank) in held {
             if j + 1 >= start {
                 src.l0[j]
                     .blob
@@ -5075,20 +5096,20 @@ impl Db {
                     .map_err(read)?;
             }
         }
-        if let Some(sk) = over.sk {
+        if let Some(sk) = o.sk {
             if sk.frozen != u32::MAX && nc + 1 >= start {
                 if let Some(fr) = &self.frozen {
                     let e = &fr.entries[sk.frozen as usize];
-                    fr.live_offs_into(e, scratch);
-                    for &off in scratch.iter() {
+                    fr.live_offs_into(e, &mut em.scratch);
+                    for &off in em.scratch.iter() {
                         f(key, fr.value_at(off));
                     }
                 }
             }
             if sk.mem != u32::MAX {
                 let e = &self.mem.entries[sk.mem as usize];
-                self.mem.live_offs_into(e, scratch);
-                for &off in scratch.iter() {
+                self.mem.live_offs_into(e, &mut em.scratch);
+                for &off in em.scratch.iter() {
                     f(key, self.mem.value_at(off));
                 }
             }
@@ -5128,30 +5149,29 @@ impl Db {
         })
     }
 
-    /// PROTOTYPE: the walk over the partition's ranks with `overlay`, the
-    /// keys above it in order, laid over: the walk `scan_partitions`
-    /// makes, on a block, with every source. `on_key` sees every key once
-    /// before its values, tombstone-only keys included, which is what a
-    /// copy needs and a caller's closure does not.
+    /// PROTOTYPE: the walk over the partition's ranks with the overlay's
+    /// keys laid over: the walk `scan_partitions` makes, on a block, with
+    /// every source. `on_key` sees every key once before its values,
+    /// tombstone-only keys included, which is what a copy needs and a
+    /// caller's closure does not.
     fn walk_block<F: FnMut(&[u8], &[u8]), K: FnMut(&[u8])>(
         &self,
         src: Sources,
         ranks: std::ops::Range<usize>,
-        overlay: &[Over],
+        ov: &Overlay,
         limit: usize,
         mut on_key: K,
         mut f: F,
     ) -> Result<usize> {
+        let mut oi = 0usize;
         let seg = src.seg;
         let hi = ranks.end;
         let mut seen = 0usize;
         let mut rank = ranks.start;
-        let mut oi = 0usize;
-        let mut tombs: Option<bool> = None;
-        let mut scratch: Vec<usize> = Vec::new();
+        let mut em: Option<Emit> = None;
         while seen < limit {
             let end = rank.saturating_add(limit - seen).min(hi);
-            let next = overlay.get(oi);
+            let next = ov.over.get(oi);
             let (bound, at_bound) = match next {
                 Some(o) if end > rank => Self::cut_at(seg, rank, end, o.key),
                 _ => (end, Ordering::Greater),
@@ -5177,9 +5197,12 @@ impl Db {
             }
             let Some(o) = next else { break };
             let same = rank < hi && at_bound == Ordering::Equal;
-            let tombs = *tombs.get_or_insert_with(|| self.has_tombstones());
+            let em = em.get_or_insert_with(|| Emit {
+                tombs: self.has_tombstones(),
+                scratch: Vec::new(),
+            });
             on_key(o.key);
-            self.emit_over(&mut f, &mut scratch, tombs, o, same.then_some(rank), src)?;
+            self.emit_over(&mut f, em, ov, oi, same.then_some(rank), src)?;
             if same {
                 rank += 1;
             }
@@ -5189,9 +5212,14 @@ impl Db {
         Ok(seen)
     }
 
-    /// PROTOTYPE: what the cache should hold for block `b`: `Clean` with
-    /// no key above the partition in its range, resolved deltas with a
-    /// few, and a merged copy when it is dense with them.
+    /// PROTOTYPE: the cached form of block `b`, built on its first touch:
+    /// `Clean` with no key above the partition in its range, resolved
+    /// deltas with a few, and a merged copy when it is dense with them.
+    ///
+    /// Building on the first touch was measured against walking the block
+    /// through its overlay once and building on the second: on one store
+    /// of three million keys, five of every six blocks E touched it
+    /// touched again, and each of those paid the overlay twice.
     fn materialize(&self, src: Sources, b: usize, unsealed: &Snapshot) -> Result<Cached> {
         let BlockBounds {
             lo,
@@ -5200,14 +5228,14 @@ impl Db {
             end_key,
         } = self.block_bounds(src.seg, b)?;
         let added = self.snap_added.borrow();
-        let overlay = self.overlay_all(src, unsealed, &added, lo_key, end_key);
-        if overlay.is_empty() {
+        let ov = self.overlay_all(src, unsealed, &added, lo_key, end_key);
+        if ov.over.is_empty() {
             return Ok(Cached::Clean);
         }
-        if overlay.len() < cache_dense() {
-            return Ok(Cached::Sparse(self.deltas_for(src, lo..hi, &overlay)?));
+        if ov.over.len() < cache_dense() {
+            return Ok(Cached::Sparse(self.deltas_for(src, lo..hi, &ov)?));
         }
-        Ok(Cached::Block(self.copy_block(src, lo..hi, &overlay)?))
+        Ok(Cached::Block(self.copy_block(src, lo..hi, &ov)?))
     }
 
     /// PROTOTYPE: the overlay's keys resolved against the partition once:
@@ -5218,18 +5246,22 @@ impl Db {
         &self,
         src: Sources,
         ranks: std::ops::Range<usize>,
-        overlay: &[Over],
+        ov: &Overlay,
     ) -> Result<SparseBlock> {
         let seg = src.seg;
         let hi = ranks.end;
-        let tombs = self.has_tombstones();
-        let mut scratch: Vec<usize> = Vec::new();
+        let mut em = Emit {
+            tombs: self.has_tombstones(),
+            scratch: Vec::new(),
+        };
+        // Sized once from the key count: a buffer grown by doubling from
+        // empty reallocates eight times for a block of a few keys.
         let mut blk = SparseBlock {
-            buf: Vec::new(),
-            ents: Vec::with_capacity(overlay.len()),
+            buf: Vec::with_capacity(ov.over.len() * 192),
+            ents: Vec::with_capacity(ov.over.len()),
         };
         let mut rank = ranks.start;
-        for o in overlay {
+        for (oi, o) in ov.over.iter().enumerate() {
             let (cut, at) = if rank < hi {
                 Self::cut_at(seg, rank, hi, o.key)
             } else {
@@ -5246,9 +5278,9 @@ impl Db {
                     b.extend_from_slice(&(v.len() as u32).to_le_bytes());
                     b.extend_from_slice(v);
                 },
-                &mut scratch,
-                tombs,
-                o,
+                &mut em,
+                ov,
+                oi,
                 same.then_some(cut),
                 src,
             )?;
@@ -5322,25 +5354,30 @@ impl Db {
         Ok(seen)
     }
 
-    /// PROTOTYPE: the merged copy of the ranks with `overlay` laid over
+    /// PROTOTYPE: the merged copy of the ranks with the overlay laid over
     /// them.
     fn copy_block(
         &self,
         src: Sources,
         ranks: std::ops::Range<usize>,
-        overlay: &[Over],
+        ov: &Overlay,
     ) -> Result<CachedBlock> {
         // Every key once, then its values: the walk's `on_key` opens an
         // entry on a key change, and a key without values still gets one.
         // The two closures never run at once; the cell is for the borrow
         // checker.
-        let blk = std::cell::RefCell::new(CachedBlock::default());
-        let mut current: Vec<u8> = Vec::new();
+        let n = ranks.len() + ov.over.len();
+        let blk = std::cell::RefCell::new(CachedBlock {
+            keys: Vec::with_capacity(n * 16),
+            vals: Vec::with_capacity(n * 128),
+            ents: Vec::with_capacity(n),
+        });
+        let mut current: Vec<u8> = Vec::with_capacity(32);
         let mut open = false;
         self.walk_block(
             src,
             ranks,
-            overlay,
+            ov,
             usize::MAX,
             |k| {
                 if !open || current.as_slice() != k {
@@ -5404,6 +5441,10 @@ impl Db {
             let mut b = owner / CACHE_BLOCK;
             let mut first = true;
             while seen < limit && b < nblocks {
+                let lo = b * CACHE_BLOCK;
+                let hi = ((b + 1) * CACHE_BLOCK).min(keys);
+                let start = if first { rank.max(lo) } else { lo };
+                let from_key: &[u8] = if first { cursor } else { b"" };
                 let mut table = seg.blocks.borrow_mut();
                 if table.is_empty() {
                     table.resize_with(nblocks, || None);
@@ -5414,10 +5455,6 @@ impl Db {
                 }
                 match table[b].as_ref().expect("just built") {
                     Cached::Sparse(deltas) => {
-                        let lo = b * CACHE_BLOCK;
-                        let hi = ((b + 1) * CACHE_BLOCK).min(keys);
-                        let start = if first { rank.max(lo) } else { lo };
-                        let from_key: &[u8] = if first { cursor } else { b"" };
                         seen += self.walk_deltas(
                             seg,
                             start..hi,
@@ -5428,14 +5465,8 @@ impl Db {
                         )?;
                     }
                     Cached::Clean => {
-                        let start = if first {
-                            rank.max(b * CACHE_BLOCK)
-                        } else {
-                            b * CACHE_BLOCK
-                        };
-                        let end = ((b + 1) * CACHE_BLOCK).min(keys);
-                        if start < end {
-                            let want = (end - start).min(limit - seen);
+                        if start < hi {
+                            let want = (hi - start).min(limit - seen);
                             let got = seg
                                 .blob
                                 .scan_at(start, want, &mut f)
