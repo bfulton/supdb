@@ -3317,11 +3317,136 @@ struct SnapKey {
 struct Snapshot {
     keys: Vec<u8>,
     ents: Vec<SnapKey>,
+    /// Keys created since the build, on the merge paths: filed here from
+    /// `snap_added` at each scan, in key order, so the snapshot outlives
+    /// a write. A rebuild after every write batch was the whole cost of
+    /// ycsb-E at thirty million keys without the block cache: 2,500
+    /// rebuilds over two million unsealed keys. `fresh` takes each
+    /// filing and is folded into `side` past a few hundred, so a filing
+    /// moves a few hundred entries and not every key filed so far.
+    side: Vec<SnapKey>,
+    fresh: Vec<SnapKey>,
+    /// How many of `snap_added` are filed.
+    filed: usize,
+}
+
+/// Entries a filing may leave in `fresh` before it is folded into `side`.
+const SNAP_FRESH: usize = 256;
+
+/// A scan's position in a snapshot: one index per run, and the key at
+/// the front is the least of the three runs' heads, folded when the main
+/// run and a side run hold it -- a key in the frozen table written again
+/// live after the build, whose live slot only the side run knows.
+#[derive(Clone, Copy)]
+struct SnapCursor {
+    i: usize,
+    j: usize,
+    k: usize,
 }
 
 impl Snapshot {
     fn len(&self) -> usize {
         self.ents.len()
+    }
+    fn key_of(&self, e: &SnapKey) -> &[u8] {
+        &self.keys[e.off as usize..(e.off + e.len) as usize]
+    }
+    fn seek_in(&self, run: &[SnapKey], from: &[u8]) -> usize {
+        run.partition_point(|e| self.key_of(e) < from)
+    }
+    fn cursor(&self, from: &[u8]) -> SnapCursor {
+        SnapCursor {
+            i: self.seek(from),
+            j: self.seek_in(&self.side, from),
+            k: self.seek_in(&self.fresh, from),
+        }
+    }
+    /// The key at the cursor and its entry, folded across the runs.
+    fn peek(&self, c: SnapCursor) -> Option<(&[u8], SnapKey)> {
+        let heads = [self.ents.get(c.i), self.side.get(c.j), self.fresh.get(c.k)];
+        let mut best: Option<(&[u8], SnapKey)> = None;
+        for e in heads.into_iter().flatten() {
+            let k = self.key_of(e);
+            best = match best {
+                None => Some((k, *e)),
+                Some((bk, _)) if k < bk => Some((k, *e)),
+                Some((bk, be)) if k == bk => Some((
+                    bk,
+                    SnapKey {
+                        mem: if e.mem != u32::MAX { e.mem } else { be.mem },
+                        frozen: if e.frozen != u32::MAX {
+                            e.frozen
+                        } else {
+                            be.frozen
+                        },
+                        ..be
+                    },
+                )),
+                other => other,
+            };
+        }
+        best
+    }
+    /// Past the key at the cursor, in every run that holds it.
+    fn advance(&self, c: &mut SnapCursor) {
+        let Some((key, _)) = self.peek(*c) else {
+            return;
+        };
+        let key: &[u8] = key;
+        if self.ents.get(c.i).is_some_and(|e| self.key_of(e) == key) {
+            c.i += 1;
+        }
+        if self.side.get(c.j).is_some_and(|e| self.key_of(e) == key) {
+            c.j += 1;
+        }
+        if self.fresh.get(c.k).is_some_and(|e| self.key_of(e) == key) {
+            c.k += 1;
+        }
+    }
+    /// File the live memtable's slots `slots`, created since the build,
+    /// as a sorted run: their keys copied into the arena, the batch
+    /// sorted, merged into `fresh`, and `fresh` folded into `side` once
+    /// it holds more than `SNAP_FRESH`.
+    fn file(&mut self, mem: &MemTable, slots: &[u32]) {
+        let mut batch: Vec<SnapKey> = Vec::with_capacity(slots.len());
+        for &slot in slots {
+            let e = &mem.entries[slot as usize];
+            let key = MemTable::key_of(&mem.keys, e);
+            let off = self.keys.len() as u32;
+            self.keys.extend_from_slice(key);
+            batch.push(SnapKey {
+                off,
+                len: key.len() as u32,
+                mem: slot,
+                frozen: u32::MAX,
+            });
+        }
+        batch.sort_by(|a, b| self.key_of(a).cmp(self.key_of(b)));
+        let fresh = std::mem::take(&mut self.fresh);
+        self.fresh = self.merged(fresh, batch);
+        if self.fresh.len() > SNAP_FRESH {
+            let (side, fresh) = (
+                std::mem::take(&mut self.side),
+                std::mem::take(&mut self.fresh),
+            );
+            self.side = self.merged(side, fresh);
+        }
+    }
+    fn merged(&self, a: Vec<SnapKey>, b: Vec<SnapKey>) -> Vec<SnapKey> {
+        let mut out = Vec::with_capacity(a.len() + b.len());
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < a.len() && j < b.len() {
+            if self.key_of(&a[i]) <= self.key_of(&b[j]) {
+                out.push(a[i]);
+                i += 1;
+            } else {
+                out.push(b[j]);
+                j += 1;
+            }
+        }
+        out.extend_from_slice(&a[i..]);
+        out.extend_from_slice(&b[j..]);
+        out
     }
     fn get(&self, i: usize) -> Option<(&[u8], &SnapKey)> {
         self.ents
@@ -4873,6 +4998,7 @@ impl Db {
                 self.mem.keys.len() + self.frozen.as_ref().map_or(0, |f| f.keys.len()),
             ),
             ents: Vec::with_capacity(n),
+            ..Default::default()
         };
         if self.opts.scan_snapshot_arena {
             // Arena build. The hash table is walked in slot order, which
@@ -4983,32 +5109,42 @@ impl Db {
                 let _ = seg.blob.prefetch_scan(from, limit);
             }
         }
-        let structural = (self.next_seg << 48) ^ ((self.frozen.is_some() as u64) << 63);
-        // With the block cache the snapshot outlives commits: keys added
-        // since it was built are filed by block and merged in when a
-        // block builds, until they outnumber the snapshot. The bound was
-        // an eighth of the snapshot when the keys
-        // sat in one sorted list every build searched; filed by block,
-        // what grows with their count is only the walk a new table makes
-        // over them. Without the cache, a commit is a rebuild, as before.
-        // The cache wants partitions to hang blocks on: before the first
-        // partitioning it stands aside.
+        let gen = (self.next_seg << 48) ^ ((self.frozen.is_some() as u64) << 63);
+        // The snapshot outlives writes on both paths. With the block
+        // cache, the keys created since it was built are filed by block
+        // and merged in when a block builds, until they outnumber the
+        // snapshot; filed by block, what grows with their count is only
+        // the walk a new table makes over them. On the merge paths they
+        // are filed into the snapshot's side runs at each scan, until they
+        // reach an eighth of it, since a scan merges those runs over its
+        // whole length. Before this a write was a rebuild on those paths,
+        // and at thirty million keys ycsb-E made 2,500 of them over two
+        // million unsealed keys. The cache wants partitions to hang blocks
+        // on: before the first partitioning it stands aside.
         let use_cache =
             self.opts.scan_block_cache && self.segs.first().is_some_and(|s| s.level > 0);
-        let gen = if use_cache {
-            structural
-        } else {
-            self.wal.seq ^ structural
-        };
         if use_cache {
             self.settle_pending();
         }
         {
             let mut cache = self.scan_keys.borrow_mut();
             let mut stale = cache.as_ref().is_none_or(|(g, _)| *g != gen);
-            if use_cache && !stale {
+            if !stale {
                 let held = cache.as_ref().map_or(0, |(_, s)| s.len());
-                stale = self.snap_added.borrow().len() > held.max(4096);
+                let added = self.snap_added.borrow().len();
+                stale = if use_cache {
+                    added > held.max(4096)
+                } else {
+                    added > (held / 8).max(4096)
+                };
+            }
+            if !stale && !use_cache {
+                let (_, snap) = cache.as_mut().expect("not stale");
+                let added = self.snap_added.borrow();
+                if added.len() > snap.filed {
+                    snap.file(&self.mem, &added[snap.filed..]);
+                    snap.filed = added.len();
+                }
             }
             if stale {
                 *cache = Some((gen, self.build_snapshot()));
@@ -5045,7 +5181,7 @@ impl Db {
         if use_cache {
             return self.scan_blocks(from, limit, unsealed, f);
         }
-        let mut mi = unsealed.seek(from);
+        let mut mc = unsealed.cursor(from);
 
         // With no level-0 piece the partitions tile the key space in order
         // and the unsealed keys are one sorted array, so the partitions can
@@ -5058,11 +5194,11 @@ impl Db {
         // version had this path, a refactor dropped it, and the scan axis
         // paid for it.
         if !self.segs.iter().any(|s| s.level == 0) {
-            return self.scan_partitions(from, limit, mi, unsealed, f);
+            return self.scan_partitions(from, limit, mc, unsealed, f);
         }
 
         if self.opts.scan_merge {
-            return self.scan_merged(from, limit, mi, unsealed, f);
+            return self.scan_merged(from, limit, mc, unsealed, f);
         }
 
         // A k-way merge over rank cursors, allocating nothing per key.
@@ -5092,7 +5228,7 @@ impl Db {
                     }
                 }
             }
-            if let Some((k, _)) = unsealed.get(mi) {
+            if let Some((k, _)) = unsealed.peek(mc) {
                 if next.is_none_or(|n| k < n) {
                     next = Some(k);
                 }
@@ -5106,7 +5242,7 @@ impl Db {
             // frozen memtable, then the live one -- so the newest source with
             // a tombstone for this key is a cut, and live values start there.
             let nc = cursors.len();
-            let in_unsealed = unsealed.get(mi).map(|(k, _)| k) == Some(key);
+            let in_unsealed = unsealed.peek(mc).map(|(k, _)| k) == Some(key);
             let mut start = 0usize;
             if tombs {
                 if in_unsealed {
@@ -5161,7 +5297,7 @@ impl Db {
                         }
                     }
                 }
-                mi += 1;
+                unsealed.advance(&mut mc);
             }
             seen += 1;
         }
@@ -5438,9 +5574,6 @@ impl Db {
     /// while any partition has a table the key joins the writes the next
     /// scan settles.
     fn note_write(&self, wrote: Wrote) {
-        if !self.opts.scan_block_cache {
-            return;
-        }
         if let Some(moved) = &wrote.moved {
             // Every slot the snapshot and the lists name has a new number,
             // and the rehash said which. Patching them is one pass over
@@ -5455,7 +5588,12 @@ impl Db {
                 new
             };
             if let Some((_, snap)) = self.scan_keys.borrow_mut().as_mut() {
-                for e in &mut snap.ents {
+                for e in snap
+                    .ents
+                    .iter_mut()
+                    .chain(snap.side.iter_mut())
+                    .chain(snap.fresh.iter_mut())
+                {
                     if e.mem != u32::MAX {
                         e.mem = to(e.mem);
                     }
@@ -6526,7 +6664,7 @@ impl Db {
         &self,
         from: &[u8],
         limit: usize,
-        mut mi: usize,
+        mut mc: SnapCursor,
         unsealed: &Snapshot,
         mut f: F,
     ) -> Result<usize> {
@@ -6570,7 +6708,7 @@ impl Db {
                 // does not resolve sorts as "not less", the rule the seek
                 // uses, so damage widens the cut rather than moving it.
                 let end = rank.saturating_add(limit - seen).min(keys);
-                let next = unsealed.get(mi);
+                let next = unsealed.peek(mc);
                 let (bound, at_bound) = match next {
                     Some((uk, _)) if end > rank => Self::cut_at(seg, rank, end, uk),
                     _ => (end, Ordering::Greater),
@@ -6617,13 +6755,13 @@ impl Db {
                     &mut scratch,
                     tombs,
                     uk,
-                    sk,
+                    &sk,
                     same.then_some((seg, rank)),
                 )?;
                 if same {
                     rank += 1;
                 }
-                mi += 1;
+                unsealed.advance(&mut mc);
                 seen += 1;
             }
             match &seg.hi {
@@ -6633,12 +6771,12 @@ impl Db {
         }
         // Unsealed keys after every partition, in order.
         while seen < limit {
-            let Some((uk, sk)) = unsealed.get(mi) else {
+            let Some((uk, sk)) = unsealed.peek(mc) else {
                 break;
             };
             let tombs = *tombs.get_or_insert_with(|| self.has_tombstones());
-            self.emit_unsealed(&mut f, &mut scratch, tombs, uk, sk, None)?;
-            mi += 1;
+            self.emit_unsealed(&mut f, &mut scratch, tombs, uk, &sk, None)?;
+            unsealed.advance(&mut mc);
             seen += 1;
         }
         Ok(seen)
@@ -6766,7 +6904,7 @@ impl Db {
         &self,
         from: &[u8],
         limit: usize,
-        mut mi: usize,
+        mut mc: SnapCursor,
         unsealed: &Snapshot,
         mut f: F,
     ) -> Result<usize> {
@@ -6842,7 +6980,7 @@ impl Db {
                     }
                 }
             }
-            let snap = unsealed.get(mi);
+            let snap = unsealed.peek(mc);
             if let Some((k, _)) = snap {
                 if next.is_none_or(|n| k < n) {
                     next = Some(k);
@@ -6926,7 +7064,7 @@ impl Db {
                         f(key, self.mem.value_at(off));
                     }
                 }
-                mi += 1;
+                unsealed.advance(&mut mc);
             }
             seen += 1;
         }

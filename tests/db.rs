@@ -1855,11 +1855,24 @@ fn the_seal_grows_with_the_store() {
 /// the frozen values, a live append following them.
 #[test]
 fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
-    let d = dir("overlay-fold");
+    fold_model(true);
+}
+
+/// The same phases on the merge path, where the keys written since the
+/// snapshot are filed into its side runs instead of by block: a burst
+/// under the rebuild threshold is filed and folded, one over it rebuilds,
+/// and a rehash under either renumbers the runs' slots.
+#[test]
+fn the_merge_path_files_the_keys_written_since_its_snapshot() {
+    fold_model(false);
+}
+
+fn fold_model(block_cache: bool) {
+    let d = dir(&format!("overlay-fold-{block_cache}"));
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(2 << 10),
-        scan_block_cache: true,
+        scan_block_cache: block_cache,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -1906,7 +1919,7 @@ fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
     m.check(&db, "a burst that rebuilds the snapshot under the tables");
     held(&db, 0);
     assert!(
-        db.block_cache_wide() > 0,
+        !block_cache || db.block_cache_wide() > 0,
         "the burst's blocks are walked wide"
     );
     // Fewer than the snapshot holds, so no rebuild: the wide blocks take
@@ -1916,11 +1929,19 @@ fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
     }
     m.check(&db, "a burst the wide blocks file");
     held(&db, 0);
-    // Past the snapshot's count again, and past the count the memtable
-    // holds before it rehashes: the rebuild happens with wide blocks
+    // Still under the rebuild threshold, and past the count the memtable
+    // holds before it rehashes: every filed key's slot is renumbered,
+    // in the wide blocks' orders and in the snapshot's side runs, and
+    // the check reads through them.
+    for k in 6200..8200 {
+        m.append(&mut db, &burst(k), "burst");
+    }
+    m.check(&db, "a burst that rehashes under the filed keys");
+    held(&db, 0);
+    // Past the snapshot's count: the rebuild happens with wide blocks
     // standing that hold filed keys, whose order names slots the new
-    // snapshot holds; the rehash renumbers every slot named anywhere.
-    for k in 6200..10600 {
+    // snapshot holds.
+    for k in 8200..10600 {
         m.append(&mut db, &burst(k), "burst");
     }
     m.check(&db, "a burst that rebuilds the snapshot under wide blocks");
@@ -1934,7 +1955,7 @@ fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
     m.check(&db, "keys filed into wide blocks after the rebuild");
     held(&db, 0);
     assert!(
-        db.block_cache_wide() > 0,
+        !block_cache || db.block_cache_wide() > 0,
         "the wide blocks stand after the rebuild"
     );
     m.delete(&mut db, &key(303));

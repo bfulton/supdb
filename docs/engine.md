@@ -454,6 +454,23 @@ per-commit path.
   the other mixes and the load inside their round-to-round spread. A
   flag for whether any segment holds a tombstone, in place of the read's
   walk over every segment's, was measured beside it and moved nothing.
+- ~~The scan snapshot on the merge path~~ — **answered by measurement at
+  thirty million keys**. Without the block cache, the scan's snapshot of
+  the unsealed keys was rebuilt at the first scan after any write, and
+  after the mixes before it had left a million keys unsealed, ycsb-E's
+  2,500 write batches made 2,500 rebuilds: 336 s of a 427 s pass, a scan
+  at 89 µs. The snapshot now outlives writes on that path as it did with
+  the cache: the keys created since the build are filed into sorted side
+  runs at each scan, a cursor merges the runs and folds a key held by the
+  main run and a side one, a rehash renumbers the runs' slots with the
+  rest, and the snapshot is rebuilt once the filed keys reach an eighth
+  of it. Same machine, one binary switched by environment, two rounds
+  interleaved: E **11.7k to 59k-61k ops/s**, the scan at 17 µs. What is
+  left in those 17 µs is the merge over the partition, the pieces and the
+  memtables, which is what the block cache replaces at 4 µs a scan; the
+  merge path's scan opens a cursor into each piece over its range now
+  rather than every piece in the store, measured beside this at a fifth
+  of the gain.
 - ~~Readahead out-of-core~~ — **answered**. Once the file outgrows the
   page cache, the kernel's default readahead is the whole cliff: cold
   point reads run 75.8x and 78.9x faster under `MADV_RANDOM`, at 1.0x read
