@@ -546,6 +546,30 @@ per-commit path.
   a mix that updates and scans the same keys rebuilds its hot blocks per
   write, and a cached block updated in place is the part not built. Until
   it is, the option is off and its code is marked.
+- **Ordered ingest straight into segments** — the ceiling measured, the
+  path not built. The load's keys arrive in order and go through a
+  memtable, a WAL frame, a seal that sorts the sorted, and a partitioning
+  pass; the segment writer for sorted input would take them as they come,
+  with the growing segment's own tail as the log. The same bytes through
+  the writer alone, 64 MB segments, one fdatasync a thousand-key batch or
+  none, interleaved with the engine's load on one machine:
+
+  | keys | engine, durable | writer, durable | LMDB, durable | engine, buffered | writer, buffered |
+  |---|---|---|---|---|---|
+  | 300k | 351k–360k | 701k–815k | 516k | 469k–476k | 1.47M–1.66M |
+  | 3M | 424k–435k | 638k–699k | 462k | 635k–694k | 1.06M–1.53M |
+  | 30M | 357k–392k | 481k–560k | 478k–483k | 541k–597k | 1.04M–1.11M |
+
+  So the direct path's ceiling is 1.4x to 2.2x the engine's durable load
+  and 1.9x to 3.5x its buffered one, and it stands ahead of LMDB's durable
+  load at every rung where the engine trails it. Detection needs no
+  interface: the store knows its greatest key, and a batch entirely above
+  it and in order goes direct while any other goes through the WAL, so a
+  commit keeps its one barrier. The shallow form keeps the memtable for
+  reads and replaces only the WAL frame and the seal; its cost against
+  this ceiling is the memtable's insert, unmeasured until it is built.
+  What the path adds is one file state, a segment open for append, and
+  one recovery case, an unclosed tail cut at its last whole record.
 - ~~Segment size~~ — **swept.** 16 and 8 MB seals are ties on ingest at
   1.5x the device bytes; 32 MB seals are an interior optimum, 1.129x at
   identical device bytes -- once the partition size was set apart from the
