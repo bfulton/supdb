@@ -6192,7 +6192,10 @@ impl Db {
     /// the same variant left a sixth of the blocks E touched unbuilt after
     /// its pass and gained three to four percent on that pass, nothing on
     /// the next, which built every one of them: inside the spread, for a
-    /// form more and a walk twice.
+    /// form more and a walk twice. Fetching every overlay key's memtable
+    /// entry and newest chunk ahead of the build, in two sweeps so the
+    /// misses overlap, was measured the same way and moved nothing: the
+    /// build's cost is not those misses.
     fn materialize(
         &self,
         src: Sources,

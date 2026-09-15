@@ -2256,6 +2256,61 @@ fn a_scan_starts_at_the_first_partition_that_reaches_it() {
     }
 }
 
+/// The ordered index's seek brackets its search with a top level of every
+/// sixty-fourth head: over a partition of tens of thousands of keys the
+/// scans from sampled starts, at keys and between them, must land where
+/// the model says on both scan paths, across hundreds of brackets and
+/// their edges. Live keys between and past the loaded ones so the seek's
+/// answer is laid over, not only read.
+#[test]
+fn a_seek_brackets_its_search_in_the_top_level() {
+    for block_cache in [false, true] {
+        let d = dir(&format!("seek-top-{block_cache}"));
+        let opts = Options {
+            seal_bytes: 8 << 20,
+            partition_bytes: Some(64 << 20),
+            scan_block_cache: block_cache,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        for k in 0..50_000u32 {
+            m.append(&mut db, &format!("key-{:06}", k * 2), "p");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        assert_eq!(db.levels().0, 1, "one partition of fifty thousand keys");
+        for k in (1..50_000u32).step_by(997) {
+            m.append(&mut db, &format!("key-{:06}", k * 2 - 1), "l");
+        }
+        m.append(&mut db, "key-100001", "l");
+        m.check(
+            &db,
+            &format!("seeks over a large partition, cache {block_cache}"),
+        );
+        // Starts exactly on a sample's rank and just below one, which the
+        // check's sampling never lands on: rank r is the loaded key 2r.
+        let visited = m.visited();
+        for r in (64..50_000usize).step_by(64 * 3) {
+            for from in [format!("key-{:06}", r * 2), format!("key-{:06}", r * 2 - 1)] {
+                let want: Vec<(Vec<u8>, Vec<u8>)> = visited
+                    .iter()
+                    .filter(|k| **k >= from.as_bytes())
+                    .take(3)
+                    .flat_map(|k| m.vals[*k].iter().map(move |v| (k.to_vec(), v.clone())))
+                    .collect();
+                let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                db.scan(from.as_bytes(), 3, |k, v| {
+                    got.push((k.to_vec(), v.to_vec()))
+                })
+                .unwrap();
+                assert_eq!(got, want, "scan from {from} at a sample's edge");
+            }
+        }
+    }
+}
+
 /// After a check has filled the cache: the bytes it counts against a
 /// walk of what it holds, and against the budget with one block's slack,
 /// since the block a scan is about to walk is never shed.
