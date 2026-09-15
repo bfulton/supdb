@@ -2115,6 +2115,70 @@ fn a_write_settles_into_the_block_it_lands_in() {
     m.check(&db, "reopened");
 }
 
+/// A builder ahead of the reader: after a publish, the blocks the pieces
+/// overlay are built on a thread from the partitions and the pieces and
+/// installed at the store's next scan with the memtable's keys spliced
+/// in, so the first scan over a block finds it built. One scan of three
+/// keys leaves every block of every partition built; the model holds the
+/// installed forms to the merge, with keys written after the publish that
+/// only the store knew.
+#[test]
+fn a_builder_ahead_of_the_reader_fills_the_cache() {
+    let d = dir("build-ahead");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in (0..1200).step_by(3) {
+        m.append(&mut db, &key(k), &format!("p{k}"));
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    let parts = db.levels().0;
+    assert!(parts > 1);
+    // A piece over every range: every loaded key updated once and sealed;
+    // `settle` waits for the builder the join started.
+    for k in (0..1200).step_by(3) {
+        m.append(&mut db, &key(k), "r1");
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    assert_eq!(db.levels().1, parts, "a piece over every range");
+    // Keys the builder never saw, written after the publish.
+    for k in (1..1200).step_by(50) {
+        m.append(&mut db, &key(k), "live");
+    }
+    db.commit().unwrap();
+    let mut sink = 0usize;
+    db.scan(key(0).as_bytes(), 3, |_k, v| sink += v.len())
+        .unwrap();
+    let (blocks, _) = db.block_cache_size();
+    assert!(
+        blocks >= parts,
+        "every partition's blocks built ahead: {blocks} blocks over {parts} partitions after one scan of three"
+    );
+    m.check(
+        &db,
+        "installed forms with the keys since the publish spliced in",
+    );
+    // More writes settle into the installed forms as into any built block.
+    for k in (2..1200).step_by(70) {
+        m.append(&mut db, &key(k), "later");
+    }
+    m.delete(&mut db, &key(600));
+    db.commit().unwrap();
+    m.check(&db, "writes settled into installed forms");
+}
+
 /// A key updated in every seal is in every piece over its range, and it
 /// is one key above the partition: a block whose every key sits in
 /// sixteen pieces holds a block's worth, not sixteen, and is built rather

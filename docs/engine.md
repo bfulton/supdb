@@ -598,10 +598,26 @@ per-commit path.
   block whose overlay crosses the wide bound is dropped for the next
   scan to build wide, which the wide-block test found missing; and a
   replaced run's bytes stay until they outweigh the live ones, when the
-  block is dropped instead. What a shipped design still needs is the
-  builder ahead of the reader: the dense blocks built on a thread after
-  each seal, which waits on the reader-beside-writer concurrency below.
-  Until it is, the option is off and its code is marked.
+  block is dropped instead. The builder ahead of the reader
+  (`scan_cache_ahead`, off) needed none of the concurrency below: the
+  segment files are immutable and stay readable while mapped, so after
+  every publish a thread opens readers of its own over the published
+  names and builds from the partitions and the pieces with an empty
+  memtable, and the store installs each form at its next scan and
+  splices the memtable's keys over the block in through the settle. The
+  build functions were lifted off `Db` onto a context -- the segments,
+  the two memtables, the tombstone flag -- that either side holds; the
+  read path priced the same before and after at ten million keys and
+  thirty. What it buys on the suite's E at thirty million is small,
+  because E starts with a million and a half unsealed keys from F, and
+  splicing those into a pre-built sparse form costs about what building
+  it at the scan costs, and the copies alone are a twentieth of the
+  pass. Two rounds interleaved at thirty million: building every block
+  ahead, E's first pass 345k–380k against 345k–374k with it off and its
+  second 385k–409k against 412k–437k; copies only, 360k–375k and
+  418k–443k, at 311 MB against 290. A tie, and it stays one until E
+  starts on a smaller memtable, so the option stays off and its code is
+  marked.
 - **Ordered ingest straight into segments** — built, and the default.
   The load's keys arrive in order and went through a memtable, a WAL
   frame, a seal that sorts the sorted, and a partitioning pass; the
