@@ -3275,12 +3275,19 @@ impl Cached {
     }
 }
 
-/// PROTOTYPE: unsealed keys in a block from which a merged copy pays.
+/// PROTOTYPE: overlay keys in a block from which a merged copy pays;
+/// below it the block is resolved deltas over the partition's own walk.
 /// Measured on ycsb-E at 300k keys: copying every block with an unsealed
 /// key held 31 MB and ran slower than copying only the blocks with eight
 /// or more, since a block the Zipfian tail touches once or twice never
 /// repays its copy, and copying by touch count instead was slower still.
-const CACHE_DENSE: usize = 8;
+/// At thirty million, on the store A, F and D leave -- 82 pieces, most
+/// blocks with a few overlay keys and a tenth with eight or more --
+/// sixteen built E's first pass 6-13% faster than eight at half the
+/// memory and tied its second; sixty-four lost 10% on the first and a
+/// quarter on the second, a walk cut every few keys costing more than
+/// the copy it saves. Rounds interleaved, one machine.
+const CACHE_DENSE: usize = 16;
 
 /// PROTOTYPE: records a block spans. A scan of the suite's length touches
 /// one or two.
