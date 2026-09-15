@@ -568,8 +568,18 @@ per-commit path.
   the sparse form now keeps its values: five rounds interleaved, the
   first pass unchanged at 253k a median either way, since the read
   moves from the first walk to the build, and the second 300k-318k
-  against 285k-305k, at 290 MB of cache against 202. Pre-faulting the
-  mappings at
+  against 285k-305k, at 290 MB of cache against 202. A copy's build at
+  the sixteen-key threshold is 42 µs, 13 of them the three buffers'
+  allocation and 29 the merged walk, and eighteen thousand of them in a
+  first pass are a twentieth of it; the sparse builds about as much
+  again, so the builds together are a tenth of the dirty store's first
+  pass and the rest of its excess over the second is first touch. Where
+  that leaves E at thirty million on the store A, F and D leave, two
+  rounds interleaved with LMDB: the first pass 261k–266k against
+  321k–331k, 0.79x to 0.83x; the second 316k–319k against 324k–329k,
+  0.96x to 0.98x. The same store flushed reads a fifth ahead of LMDB on
+  both passes, so what remains is the overlay, which LMDB never has
+  because it patches its pages at write time. Pre-faulting the mappings at
   open gained 2-3% on the first pass and nothing on the second: the
   build's cold reads are not page faults. What a shipped design
   still needs is the write path: a write drops the block it lands in, so
@@ -602,11 +612,12 @@ per-commit path.
 
   Durable, 1.2x to 2.0x the WAL path, level with LMDB at 300k and ahead
   of it at three million keys; at thirty million the pair was measured
-  in a later run through the suite's own load loop, interleaved, at
-  460k–467k against LMDB's 526k–536k, 0.87x to 0.89x -- the first
-  draft of this entry put an LMDB figure from an earlier run in that
-  cell and read it as a lead, which is the cross-run comparison this
-  repository's notes warn against. Buffered, 2.0x to 2.5x, and level
+  in later runs through the suite's own load loop, interleaved: 460k–467k
+  against LMDB's 526k–536k in one, 637k–660k against 605k–610k in the
+  next, so level, the machine moving both by a fifth between runs --
+  the first draft of this entry put an LMDB figure from an earlier run
+  in that cell and read it as a lead, which is the cross-run comparison
+  this repository's notes warn against. Buffered, 2.0x to 2.5x, and level
   with the writer alone at three million and thirty, whose close runs
   on the thread that writes. What stands between the durable path
   and its ceiling is the fdatasync on a file that grows, which the writer
