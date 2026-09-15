@@ -44,7 +44,7 @@ const VERSION: u32 = 3;
 /// reader that took a v1 header for a v2 one would read the fence offset as a
 /// record offset, and this repository has already shipped one misparse that
 /// presented as file corruption.
-const HEADER: usize = 192;
+pub(crate) const HEADER: usize = 192;
 /// Bytes per hash slot: a tag in the top eight bits, a record offset below.
 const SLOT: usize = 8;
 /// The most of the hash table that may be occupied: three quarters.

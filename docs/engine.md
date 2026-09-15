@@ -51,6 +51,17 @@ checkpoint.
   with the per-op bookkeeping no engine can skip. The previous engine
   committed 5.85x below its own floor on work — arena append, section
   publication — that this design deletes rather than optimizes.
+- **Ordered ingest** = a run of keys above the store's greatest, with
+  values the record holds inline, goes to an ordered memtable -- appended
+  in key order, searched by binary search, never hashed -- and at each
+  commit to a segment open for append: the batch's records, a commit
+  marker, one fdatasync on that file, and the WAL untouched. No seal and
+  no partitioning pass follow, since the keys are already in their final
+  order above every partition. The segment closes at the seal threshold,
+  or at the first write the run cannot take, on the seal thread, and
+  joins as a piece the promotion rule renames. Detection needs no
+  interface: the store knows its greatest key. `direct_ingest: false` is
+  the WAL path, kept as the comparison arm.
 - **Seal** = when the memtable reaches segment size, write one immutable
   segment (data blocks + its own flat index), fsync it, truncate the WAL.
   Sealing is off the commit path; a durability point never publishes index
@@ -546,30 +557,44 @@ per-commit path.
   a mix that updates and scans the same keys rebuilds its hot blocks per
   write, and a cached block updated in place is the part not built. Until
   it is, the option is off and its code is marked.
-- **Ordered ingest straight into segments** — the ceiling measured, the
-  path not built. The load's keys arrive in order and go through a
-  memtable, a WAL frame, a seal that sorts the sorted, and a partitioning
-  pass; the segment writer for sorted input would take them as they come,
-  with the growing segment's own tail as the log. The same bytes through
-  the writer alone, 64 MB segments, one fdatasync a thousand-key batch or
-  none, interleaved with the engine's load on one machine:
+- **Ordered ingest straight into segments** — built, and the default.
+  The load's keys arrive in order and went through a memtable, a WAL
+  frame, a seal that sorts the sorted, and a partitioning pass; the
+  segment writer for sorted input takes them as they come, with the
+  growing segment's own tail as the log (the shape above; the crash
+  windows in `CLAUDE.md`). The ceiling was measured first, the same
+  bytes through the writer alone, and the path was built twice against
+  it. The first form kept the hash memtable for reads and closed the
+  segment on the commit thread, and measured *below* the WAL path it
+  bypassed at three million keys and at thirty: timed apart, the
+  memtable insert was a quarter of the load and the close a tenth, and
+  what the path had removed -- the WAL write and the sort -- was less
+  than either. The second form fills an ordered memtable, appended in
+  key order with no hashing and searched by binary search, and closes
+  on the seal thread. Interleaved on one machine, durable and buffered,
+  the WAL path (`direct_ingest: false`) beside it and the writer alone
+  as the ceiling; LMDB from the same container:
 
-  | keys | engine, durable | writer, durable | LMDB, durable | engine, buffered | writer, buffered |
-  |---|---|---|---|---|---|
-  | 300k | 351k–360k | 701k–815k | 516k | 469k–476k | 1.47M–1.66M |
-  | 3M | 424k–435k | 638k–699k | 462k | 635k–694k | 1.06M–1.53M |
-  | 30M | 357k–392k | 481k–560k | 478k–483k | 541k–597k | 1.04M–1.11M |
+  | keys | direct, durable | WAL path, durable | writer, durable | LMDB, durable | direct, buffered | WAL path, buffered | writer, buffered |
+  |---|---|---|---|---|---|---|---|
+  | 300k | 540k–673k | 336k–365k | 787k–877k | 643k | 0.98M–1.14M | 452k–510k | 1.30M–1.71M |
+  | 3M | 635k–706k | 491k–499k | 762k–852k | 581k | 1.64M–1.65M | 683k–725k | 1.49M–1.62M |
+  | 30M | 498k–531k | 403k–431k | 632k–685k | 478k–483k | 1.24M–1.27M | 575k–601k | 1.15M–1.23M |
 
-  So the direct path's ceiling is 1.4x to 2.2x the engine's durable load
-  and 1.9x to 3.5x its buffered one, and it stands ahead of LMDB's durable
-  load at every rung where the engine trails it. Detection needs no
-  interface: the store knows its greatest key, and a batch entirely above
-  it and in order goes direct while any other goes through the WAL, so a
-  commit keeps its one barrier. The shallow form keeps the memtable for
-  reads and replaces only the WAL frame and the seal; its cost against
-  this ceiling is the memtable's insert, unmeasured until it is built.
-  What the path adds is one file state, a segment open for append, and
-  one recovery case, an unclosed tail cut at its last whole record.
+  Durable, 1.2x to 2.0x the WAL path, level with LMDB at 300k and ahead
+  of it at three million keys and thirty; buffered, 2.0x to 2.5x, and
+  level with the writer alone at three million and thirty, whose close
+  runs on the thread that writes. What stands between the durable path
+  and its ceiling is the fdatasync on a file that grows, which the writer
+  alone pays too, and the ordered memtable's copy of every value, which
+  the reads want. Detection needs no interface: the store knows its
+  greatest key, and a key above it with a value the record holds inline
+  goes to the run, while any other write ends the run and goes through
+  the WAL. The partition shape is the seal's: the run closes at the seal
+  threshold and joins as a piece the promotion rule renames, so a load
+  leaves the same partitions either way. The suite does not price the
+  arm yet; a `direct_ingest: false` arm beside the default is the row
+  that would.
 - ~~Segment size~~ — **swept.** 16 and 8 MB seals are ties on ingest at
   1.5x the device bytes; 32 MB seals are an interior optimum, 1.129x at
   identical device bytes -- once the partition size was set apart from the

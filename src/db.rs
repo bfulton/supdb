@@ -230,6 +230,19 @@ pub struct Options {
     /// takes in, held to four. Off, the seal is `seal_bytes` and nothing
     /// else, the shape the suite's arms were measured in before this.
     pub seal_grows: bool,
+    /// Ordered ingest goes straight into a segment. Keys arriving above the
+    /// store's greatest, with values the record holds inline
+    /// (`inline_bytes`), while the memtable is empty, fill an ordered
+    /// memtable -- appended in key order and searched by binary search,
+    /// never hashed -- and each commit streams them to a segment open for
+    /// append: one fdatasync on it instead of the WAL, and no seal or
+    /// partitioning pass after, since they are in their final order above
+    /// every partition. At the seal threshold, or at the first write the
+    /// run cannot take, the segment closes on the seal thread and joins as
+    /// a piece for promotion by rename, as a seal's does. `false` is the
+    /// path before it, every batch through the WAL and the seal, kept as
+    /// the comparison arm.
+    pub direct_ingest: bool,
     /// SegmentOptions for the segment writer. Fixed to `redo_log: false, shards: 1`
     /// regardless of what is passed, because a sealed segment is written
     /// once and never reopened for writing, and a 4 MiB redo arena in a
@@ -367,6 +380,7 @@ impl Default for Options {
             // bytes.
             seal_bytes: 32 << 20,
             seal_grows: true,
+            direct_ingest: true,
             segment: SegmentOptions::default(),
             l0_trigger: 4,
             compact: true,
@@ -394,6 +408,17 @@ impl Default for Options {
 /// value's length is `len` minus what precedes it, so values cost no second
 /// length field.
 const FRAME_HEADER: usize = 8;
+
+/// A commit marker in a direct segment's record stream: a record head no
+/// key produces -- zero key length and zero extents, where every key
+/// writes one -- then this tag, the CRC and length of the records since
+/// the previous marker, and the count of records before it. Readers
+/// reach records by directory offset and never step on it; recovery
+/// walks the stream to the last one whose three quantities agree with
+/// the bytes before it, since a crash can land the page a marker is on
+/// and not a page of the batch it closes.
+const DIRECT_MARK: [u8; 4] = *b"SUPD";
+const DIRECT_MARK_LEN: usize = 24;
 
 struct Wal {
     file: File,
@@ -762,6 +787,16 @@ fn fence_lo(min_key: &[u8]) -> Vec<u8> {
     min_key[..min_key.len().min(FENCE_MAX)].to_vec()
 }
 
+/// A segment open for ordered ingest: its writer, the temp file it streams
+/// to, its id, and how many of the ordered memtable's entries it holds --
+/// the rest are the batch in progress.
+struct Direct {
+    w: PieceWriter,
+    tmp: PathBuf,
+    id: u64,
+    committed: usize,
+}
+
 /// A half-open key range `[lo, hi)`, `None` above meaning unbounded. The
 /// live partitions tile the key space with these, and every merge output
 /// is named by one.
@@ -935,6 +970,12 @@ pub struct SegmentWriter {
     /// Runs up to this many bytes go into the record's tail instead of a
     /// block (`Ext::INLINE`); zero keeps every run in blocks.
     inline_max: usize,
+    /// Whether the records are hashed batch by batch for `mark`: on for
+    /// a direct segment, off for a seal, which never marks.
+    marks: bool,
+    /// The CRC of the records since the last marker, and where they start.
+    mark_crc: u32,
+    mark_start: usize,
     /// LZ4 the blocks, as `Store` does when `SegmentOptions::compress` is set. A
     /// block above the chunk size is compressed chunk by chunk with its own
     /// directory, so a point read decompresses one chunk rather than the
@@ -1008,6 +1049,15 @@ fn superblock(fields: &[u64; 16]) -> [u8; crate::format::SUPER_BYTES] {
     }
     out[136..144].copy_from_slice(&h.to_le_bytes());
     out
+}
+
+/// Whether a run of `run_len` bytes goes into its record's tail rather
+/// than a block, under an inline limit: the writer's one rule for it, and
+/// the direct path's, which asks it of a batch's values at `append`,
+/// since a run in a block is held until `finish` and is not durable at
+/// a marker.
+fn inlines(inline_max: usize, run_len: usize) -> bool {
+    inline_max > 0 && run_len <= inline_max
 }
 
 impl SegmentWriter {
@@ -1150,6 +1200,9 @@ impl SegmentWriter {
             sync_every: 0,
             since_sync: 0,
             inline_max: 0,
+            marks: false,
+            mark_crc: 0,
+            mark_start: 0,
             compress: false,
             chunk_rows: Vec::new(),
             head_reserve: 0,
@@ -1171,10 +1224,117 @@ impl SegmentWriter {
         self.sync_every = bytes as u64;
     }
 
+    /// A commit marker after the records so far, in the records-first
+    /// layout: what `recover_direct` cuts at. A batch of a direct segment
+    /// ends with one, before its sync, so a crash leaves whole batches.
+    pub fn mark(&mut self) -> Result<()> {
+        if self.open_key.is_some() {
+            return Err(err("segment writer: mark while a key is open"));
+        }
+        if self.layout()? != Layout::RecordsFirst {
+            return Err(err(
+                "segment writer: a marker needs the records-first layout",
+            ));
+        }
+        if !self.marks {
+            return Err(err("segment writer: mark on a writer not set to mark"));
+        }
+        let mut m = [0u8; DIRECT_MARK_LEN];
+        m[4..8].copy_from_slice(&DIRECT_MARK);
+        m[8..12].copy_from_slice(&self.mark_crc.to_le_bytes());
+        m[12..16].copy_from_slice(&((self.recs_len - self.mark_start) as u32).to_le_bytes());
+        m[16..24].copy_from_slice(&(self.spans.len() as u64).to_le_bytes());
+        self.out.write_all(&m)?;
+        self.pos += DIRECT_MARK_LEN as u64;
+        self.recs_len += DIRECT_MARK_LEN;
+        self.mark_crc = 0;
+        self.mark_start = self.recs_len;
+        Ok(())
+    }
+
+    /// Everything written so far made durable: a direct segment's commit.
+    pub fn sync(&mut self) -> Result<()> {
+        self.out.flush()?;
+        self.out.get_ref().sync_data()
+    }
+
+    /// The keys and values a direct segment's stream holds up to its last
+    /// commit marker, in order: what a crash left acknowledged. The stream
+    /// starts after the superblock region and the section header, where
+    /// `create` puts it with no head reserve; each key carries one inline
+    /// extent, a fixed run of one value or a prefixed one. A record the
+    /// stream cannot parse ends the
+    /// walk, as does a marker whose CRC, length or count disagrees with
+    /// the records before it; what follows the last good marker is a
+    /// batch that never committed.
+    pub fn recover_direct(path: &Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let buf = std::fs::read(path)?;
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut committed = 0usize;
+        let mut p = crate::format::SUPER as usize + flatindex::HEADER;
+        let mut batch = p;
+        while p + 4 <= buf.len() {
+            let klen = u16::from_le_bytes([buf[p], buf[p + 1]]);
+            let n = u16::from_le_bytes([buf[p + 2], buf[p + 3]]);
+            if klen == 0 && n == 0 {
+                if p + DIRECT_MARK_LEN > buf.len() || buf[p + 4..p + 8] != DIRECT_MARK {
+                    break;
+                }
+                let crc = u32::from_le_bytes(buf[p + 8..p + 12].try_into().expect("four"));
+                let len = u32::from_le_bytes(buf[p + 12..p + 16].try_into().expect("four"));
+                let count = u64::from_le_bytes(buf[p + 16..p + 24].try_into().expect("eight"));
+                if len as usize != p - batch
+                    || count as usize != out.len()
+                    || crc != crc32(&buf[batch..p])
+                {
+                    break;
+                }
+                committed = out.len();
+                p += DIRECT_MARK_LEN;
+                batch = p;
+                continue;
+            }
+            let Some((key, exts, tail, len)) = flatindex::parse_record(&buf, p) else {
+                break;
+            };
+            let [e] = exts else { break };
+            if !e.is_inline() || e.is_tombstone() {
+                break;
+            }
+            let run =
+                match tail.get(e.off as usize..(e.off as usize).saturating_add(e.len as usize)) {
+                    Some(r) => r,
+                    None => break,
+                };
+            let value = if e.count & Ext::FIXED != 0 {
+                run
+            } else {
+                let mut q = 0usize;
+                let Some(vlen) = get_uvarint(run, &mut q) else {
+                    break;
+                };
+                match run.get(q..q.saturating_add(vlen as usize)) {
+                    Some(v) => v,
+                    None => break,
+                }
+            };
+            out.push((key.to_vec(), value.to_vec()));
+            p += len;
+        }
+        out.truncate(committed);
+        Ok(out)
+    }
+
     /// Store runs up to `bytes` long inline in the index record, and write
     /// the segment records-first so they stream. Zero keeps every run in a
     /// block and the blocks-first layout `Store` writes. Must be set before
     /// the first key.
+    /// Hash the records batch by batch for `mark`. Must be set before
+    /// the first key; a marker on a writer without it is an error.
+    pub fn set_marks(&mut self, on: bool) {
+        self.marks = on;
+    }
+
     pub fn set_inline_max(&mut self, bytes: usize) {
         self.inline_max = bytes;
     }
@@ -1229,10 +1389,10 @@ impl SegmentWriter {
         }
         if m == Layout::RecordsFirst {
             // The section header is written last, once the trailer's
-            // offsets are known; its 192 bytes are reserved now so the
+            // offsets are known; its bytes are reserved now so the
             // records start where `stream_trailer` says they do.
-            self.out.write_all(&[0u8; 192])?;
-            self.pos += 192;
+            self.out.write_all(&[0u8; flatindex::HEADER])?;
+            self.pos += flatindex::HEADER as u64;
         }
         self.mode = Some(m);
         Ok(m)
@@ -1305,7 +1465,7 @@ impl SegmentWriter {
         }
         let count = self.records | flag | if tombstone { Ext::TOMBSTONE } else { 0 };
         let layout = self.layout()?;
-        let inline = self.inline_max > 0 && n <= self.inline_max;
+        let inline = inlines(self.inline_max, n);
         let ext = if inline {
             // Into the record: a read of this key never touches a block.
             // `off` is within this key's tail, and a key has one run here.
@@ -1345,6 +1505,9 @@ impl SegmentWriter {
                 let wrote = flatindex::stream_record(&mut self.rec_buf, key, &[ext], tail)
                     .ok_or_else(|| err("segment writer: record exceeds the flat index's limits"))?;
                 self.out.write_all(&self.rec_buf)?;
+                if self.marks {
+                    self.mark_crc = block::crc32_resume(self.mark_crc, &self.rec_buf);
+                }
                 self.pos += wrote as u64;
                 self.rec_offs.push(self.recs_len as u32);
                 self.recs_len += wrote;
@@ -1829,6 +1992,18 @@ impl PieceWriter {
         self.0.end_with(tombstone)
     }
 
+    fn set_marks(&mut self, on: bool) {
+        self.0.set_marks(on)
+    }
+
+    fn mark(&mut self) -> Result<()> {
+        self.0.mark()
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        self.0.sync()
+    }
+
     /// The segment, then its ordered index's bytes for the caller to write
     /// beside it. Returning them rather than writing them keeps the naming
     /// with the two callers that know the segment's final name.
@@ -2049,7 +2224,13 @@ impl Seg {
 /// linear probing at load <= 0.5, resized by rehash of the fixed-size
 /// entries only -- key and value bytes never move.
 struct MemTable {
+    /// Hash slots -- or, `ordered`, the entries in the order they arrived,
+    /// which is key order: dense, never probed, a lookup a binary search
+    /// and an insert a push. What ordered ingest fills while its segment
+    /// is open, since a hash insert was the cost that path was measured
+    /// to keep.
     entries: Vec<MemEntry>,
+    ordered: bool,
     mask: usize,
     len: usize,
     keys: Vec<u8>,
@@ -2107,7 +2288,21 @@ impl MemTable {
     fn new() -> MemTable {
         MemTable {
             entries: vec![MemEntry::default(); 1024],
+            ordered: false,
             mask: 1023,
+            len: 0,
+            keys: Vec::new(),
+            vals: Vec::new(),
+            tombs: 0,
+        }
+    }
+
+    /// A table for keys that arrive in order: each above the last.
+    fn new_ordered() -> MemTable {
+        MemTable {
+            entries: Vec::new(),
+            ordered: true,
+            mask: 0,
             len: 0,
             keys: Vec::new(),
             vals: Vec::new(),
@@ -2138,6 +2333,30 @@ impl MemTable {
     }
 
     fn append(&mut self, key: &[u8], value: &[u8]) -> Wrote {
+        if self.ordered {
+            debug_assert!(
+                self.entries
+                    .last()
+                    .is_none_or(|e| MemTable::key_of(&self.keys, e) < key),
+                "an ordered memtable takes each key above its last"
+            );
+            let key_off = self.keys.len() as u32;
+            self.keys.extend_from_slice(key);
+            let head = self.push_chunk(NO_CHUNK, value);
+            self.entries.push(MemEntry {
+                hash: mem_hash(key),
+                key_off,
+                key_len: key.len() as u32,
+                head: head + 1,
+                count: 1,
+            });
+            self.len += 1;
+            return Wrote {
+                slot: (self.len - 1) as u32,
+                new: true,
+                moved: None,
+            };
+        }
         let mut wrote = Wrote::default();
         if (self.len + 1) * 2 > self.entries.len() {
             wrote.moved = Some(self.grow());
@@ -2187,6 +2406,10 @@ impl MemTable {
     /// before gets an entry too, because the tombstone has older sources to
     /// mask even when this memtable holds nothing of its own.
     fn delete(&mut self, key: &[u8]) -> Wrote {
+        assert!(
+            !self.ordered,
+            "a delete never reaches an ordered memtable: the store leaves order first"
+        );
         let mut wrote = Wrote::default();
         if (self.len + 1) * 2 > self.entries.len() {
             wrote.moved = Some(self.grow());
@@ -2296,6 +2519,12 @@ impl MemTable {
 
     /// The slot holding `key`, if the table has it.
     fn slot_of(&self, key: &[u8]) -> Option<usize> {
+        if self.ordered {
+            return self
+                .entries
+                .binary_search_by(|e| MemTable::key_of(&self.keys, e).cmp(key))
+                .ok();
+        }
         let hash = mem_hash(key);
         let mut i = (hash as usize) & self.mask;
         loop {
@@ -3206,6 +3435,21 @@ pub struct Db {
     /// binary search instead of a walk over all of them; see
     /// `pieces_over`. Refreshed by `sort_segs`.
     l0_aligned: bool,
+    /// The segment ordered ingest streams into, while one is open. The
+    /// memtable is ordered exactly while a run is forming or open.
+    direct: Option<Direct>,
+    /// The store's greatest key, or empty for none: what a key has to be
+    /// above to go direct.
+    max_key: Vec<u8>,
+    /// Scratch for the run a value would encode as, measured at `append`
+    /// against the inline limit.
+    run_scratch: Vec<u8>,
+    /// Direct segments' temp names, unlinked once the manifest names the
+    /// segment; until then the temp name is what recovery reads.
+    retiring_tmps: Vec<PathBuf>,
+    /// An error from leaving order mid-batch, which `append` and `delete`
+    /// cannot return: the next `commit` does.
+    pending_err: Option<std::io::Error>,
     next_seg: u64,
     /// Commits written since the last barrier, for `SyncPolicy::EveryN`.
     unsynced: u32,
@@ -3665,6 +3909,11 @@ impl Db {
             mean_key_bytes: std::cell::Cell::new(0),
             store_bytes: std::cell::Cell::new(0),
             l0_aligned: false,
+            direct: None,
+            max_key: Vec::new(),
+            run_scratch: Vec::new(),
+            retiring_tmps: Vec::new(),
+            pending_err: None,
             next_seg: 0,
             frozen: None,
             sealing: None,
@@ -3706,7 +3955,7 @@ impl Db {
                 on_disk.push(name);
             }
         }
-        let (sealed, live) = match manifest_read(dir)? {
+        let (sealed, mut live) = match manifest_read(dir)? {
             Some((covered, names)) => (covered, names),
             None => {
                 let mut names: Vec<String> = on_disk
@@ -3726,6 +3975,66 @@ impl Db {
             if !live.contains(name) {
                 let _ = std::fs::remove_file(dir.join(name));
             }
+        }
+        // A direct segment a crash left open: its records up to the last
+        // commit marker are the batches that were acknowledged, rewritten
+        // as a piece over the last range -- the whole range before the
+        // first partitioning -- and named live for the merge to promote.
+        // A temp file whose id the manifest already names is a close that
+        // published and never unlinked it.
+        let mut direct_tmps: Vec<(u64, PathBuf)> = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if let Some(id) = name
+                .strip_prefix("direct-")
+                .and_then(|r| r.strip_suffix(".tmp"))
+                .and_then(|r| r.parse::<u64>().ok())
+            {
+                direct_tmps.push((id, dir.join(&name)));
+            }
+        }
+        for (id, tmp) in direct_tmps {
+            if live.iter().any(|n| Db::name_id(n) == Some(id)) {
+                let _ = std::fs::remove_file(&tmp);
+                continue;
+            }
+            let recs = SegmentWriter::recover_direct(&tmp)?;
+            if recs.is_empty() {
+                let _ = std::fs::remove_file(&tmp);
+                continue;
+            }
+            let last_lo: Option<Vec<u8>> = live
+                .iter()
+                .filter(|n| n.starts_with("par-"))
+                .filter_map(|n| {
+                    let f: Vec<&str> = n.trim_end_matches(".sup").split('-').collect();
+                    (f.len() == 4 && f[3].is_empty())
+                        .then(|| unhex(f[2]))
+                        .flatten()
+                })
+                .next();
+            let name = match &last_lo {
+                Some(lo) => format!("pcs-{id:08}-{sealed:016}-{}-.sup", hex(lo)),
+                None => Db::seg_name(id, sealed),
+            };
+            let rebuilt = dir.join(format!("seal-{id:08}.tmp"));
+            let _ = std::fs::remove_file(&rebuilt);
+            let ord = {
+                let mut w =
+                    PieceWriter::create(&rebuilt, &Db::segment_opts(&opts), 0, opts.inline_bytes)?;
+                for (k, v) in &recs {
+                    w.begin(k)?;
+                    w.value(v);
+                    w.end_with(false)?;
+                }
+                w.finish()?
+            };
+            write_ord(dir, &name, &ord)?;
+            std::fs::rename(&rebuilt, dir.join(&name))?;
+            File::open(dir)?.sync_all()?;
+            live.push(name);
+            manifest_write(dir, sealed, &live)?;
+            let _ = std::fs::remove_file(&tmp);
         }
         // The same for ordered indexes, which outlive their segment by a
         // crash window at either end: written before a seal's rename, and
@@ -3823,6 +4132,7 @@ impl Db {
         let mean_key_bytes = Db::mean_key_bytes_of(&segs);
         let store_bytes = Db::store_bytes_of(dir, &segs);
         let l0_aligned = Db::l0_aligned_of(&segs);
+        let max_key = Db::max_key_of(&segs, &mem);
         Ok(Db {
             dir: dir.to_path_buf(),
             opts,
@@ -3838,6 +4148,11 @@ impl Db {
             mean_key_bytes: std::cell::Cell::new(mean_key_bytes),
             store_bytes: std::cell::Cell::new(store_bytes),
             l0_aligned,
+            direct: None,
+            max_key,
+            run_scratch: Vec::new(),
+            retiring_tmps: Vec::new(),
+            pending_err: None,
             next_seg,
             frozen: None,
             sealing: None,
@@ -3864,10 +4179,106 @@ impl Db {
     /// Buffered until `commit`; visible to this handle's reads immediately,
     /// which is the read-your-writes contract `Store::read_all` set.
     pub fn append(&mut self, key: &[u8], value: &[u8]) {
+        if self.mem.ordered || self.direct_can_open() {
+            if self.goes_direct(key, value) {
+                if !self.mem.ordered {
+                    self.mem = MemTable::new_ordered();
+                }
+                self.max_key.clear();
+                self.max_key.extend_from_slice(key);
+                let wrote = self.mem.append(key, value);
+                self.note_write(wrote);
+                self.mem_bytes += key.len() + value.len();
+                return;
+            }
+            if self.mem.ordered {
+                self.leave_direct();
+            }
+        }
+        if key > self.max_key.as_slice() {
+            self.max_key.clear();
+            self.max_key.extend_from_slice(key);
+        }
         self.wal.append(key, value);
         let wrote = self.mem.append(key, value);
         self.note_write(wrote);
         self.mem_bytes += key.len() + value.len();
+    }
+
+    /// Whether the next key could start a direct run: ordered ingest on,
+    /// the memtable empty, nothing of this batch staged before it. A seal
+    /// in flight is no bar -- the run's keys lie above the frozen table's,
+    /// and the run's own close joins the seal first.
+    fn direct_can_open(&self) -> bool {
+        self.opts.direct_ingest && self.mem.is_empty() && self.wal.pending.is_empty()
+    }
+
+    /// Whether a write goes into the direct run: a key above the store's
+    /// greatest -- not the empty key, which is below every other and is
+    /// the shape a direct segment's marker takes -- with a value the
+    /// record holds inline, by the writer's own encoder, since a run in a
+    /// block is held until the segment closes and is not durable at a
+    /// marker.
+    fn goes_direct(&mut self, key: &[u8], value: &[u8]) -> bool {
+        if key.is_empty() || key <= self.max_key.as_slice() {
+            return false;
+        }
+        crate::index::encode_run(value, &[value.len() as u32], &mut self.run_scratch);
+        inlines(self.opts.inline_bytes, self.run_scratch.len())
+    }
+
+    /// The batch has written something the run cannot take. The run's
+    /// committed entries close as a segment; the batch's own -- appended
+    /// since the last commit, so nothing on disk has them -- move to a
+    /// fresh hashed memtable with the WAL frames they never had, in the
+    /// order they came, and the write that ended the run follows them.
+    /// `append` and `delete` cannot fail, so an error closing the run
+    /// waits for the next `commit`.
+    fn leave_direct(&mut self) {
+        let committed = self.direct.as_ref().map_or(0, |d| d.committed);
+        let tail: Vec<(Vec<u8>, Vec<u8>)> = self.mem.entries[committed..]
+            .iter()
+            .map(|e| {
+                (
+                    MemTable::key_of(&self.mem.keys, e).to_vec(),
+                    self.mem.value_at((e.head - 1) as usize).to_vec(),
+                )
+            })
+            .collect();
+        self.mem.entries.truncate(committed);
+        self.mem.len = committed;
+        if let Err(e) = self.close_direct() {
+            self.pending_err = Some(e);
+        }
+        for (k, v) in tail {
+            self.wal.append(&k, &v);
+            let wrote = self.mem.append(&k, &v);
+            self.note_write(wrote);
+            self.mem_bytes += k.len() + v.len();
+        }
+    }
+
+    /// The greatest key any source holds: the partitions' and pieces' last
+    /// keys and the memtable's, for a store that opens with all of them.
+    fn max_key_of(segs: &[Seg], mem: &MemTable) -> Vec<u8> {
+        let mut best: Vec<u8> = Vec::new();
+        for s in segs {
+            let b = &s.blob;
+            if b.keys() > 0 {
+                if let Some(k) = b.key_at(b.keys() - 1) {
+                    if k > best.as_slice() {
+                        best = k.to_vec();
+                    }
+                }
+            }
+        }
+        for e in mem.entries.iter().filter(|e| e.hash != 0) {
+            let k = MemTable::key_of(&mem.keys, e);
+            if k > best.as_slice() {
+                best = k.to_vec();
+            }
+        }
+        best
     }
 
     /// Replace a key's values with one new value: a delete and an append in
@@ -3885,6 +4296,9 @@ impl Db {
     /// start fresh. Durable at the next `commit`, exactly like an append,
     /// and reclaimed by the next merge that reaches the key.
     pub fn delete(&mut self, key: &[u8]) {
+        if self.mem.ordered {
+            self.leave_direct();
+        }
         self.wal.delete(key);
         let wrote = self.mem.delete(key);
         self.note_write(wrote);
@@ -3910,29 +4324,154 @@ impl Db {
             || self.segs.iter().any(|s| s.tombs)
     }
 
-    /// The durability point: WAL append + fdatasync. If the memtable has
-    /// crossed the seal threshold, seal after the commit -- after, so the
-    /// batch's durability never waits on a segment write.
+    /// The durability point: WAL append + fdatasync -- or, under ordered
+    /// ingest, the batch streamed to the direct segment and that synced.
+    /// If the memtable has crossed the seal threshold, seal after the
+    /// commit -- after, so the batch's durability never waits on a segment
+    /// write.
     pub fn commit(&mut self) -> Result<()> {
+        if let Some(e) = self.pending_err.take() {
+            return Err(e);
+        }
         let t = std::time::Instant::now();
-        self.wal.mark_commit();
-        self.wal.write()?;
+        if self.mem.ordered {
+            self.commit_direct()?;
+        } else {
+            self.wal.mark_commit();
+            self.wal.write()?;
+            self.unsynced += 1;
+            let due = match self.opts.sync {
+                SyncPolicy::Always => true,
+                SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
+            };
+            if due {
+                self.wal.sync()?;
+                self.unsynced = 0;
+            }
+        }
+        self.phase_ns[0] += t.elapsed().as_nanos() as u64;
+        if self.sealing.as_ref().is_some_and(|h| h.is_finished()) {
+            self.join_seal()?;
+        }
+        // A direct run closes when a seal would: it joins whole, as a
+        // seal's piece does by promotion, so the two paths leave one shape.
+        if self.mem_bytes >= self.seal_threshold() {
+            self.seal()?;
+        }
+        Ok(())
+    }
+
+    /// What is staged made durable where it is going: the batch's records
+    /// to the direct segment under an ordered memtable, the WAL's pending
+    /// frames otherwise. What `sync` and `flush` do before anything else.
+    fn commit_staged(&mut self) -> Result<()> {
+        if let Some(e) = self.pending_err.take() {
+            return Err(e);
+        }
+        if self.mem.ordered {
+            self.commit_direct()
+        } else {
+            self.wal.commit()
+        }
+    }
+
+    /// The batch -- the ordered memtable's entries since the last commit
+    /// -- written to the direct segment, opened here on the first: each
+    /// key and its one value, then a commit marker, then the sync the
+    /// policy asks for. The segment is their log; the WAL never sees them.
+    fn commit_direct(&mut self) -> Result<()> {
+        if self.direct.as_ref().map_or(0, |d| d.committed) == self.mem.len {
+            return Ok(());
+        }
+        if self.direct.is_none() {
+            let id = self.next_seg;
+            self.next_seg += 1;
+            let tmp = self.dir.join(format!("direct-{id:08}.tmp"));
+            let _ = std::fs::remove_file(&tmp);
+            let opts = Db::segment_opts(&self.opts);
+            let mut w = PieceWriter::create(&tmp, &opts, 0, self.opts.inline_bytes)?;
+            w.set_marks(true);
+            self.direct = Some(Direct {
+                w,
+                tmp,
+                id,
+                committed: 0,
+            });
+        }
+        let d = self.direct.as_mut().expect("opened above");
+        for e in &self.mem.entries[d.committed..] {
+            debug_assert_eq!(
+                e.count, 1,
+                "an ordered entry has the one value it was appended with"
+            );
+            d.w.begin(MemTable::key_of(&self.mem.keys, e))?;
+            d.w.value(self.mem.value_at((e.head - 1) as usize));
+            d.w.end_with(false)?;
+        }
+        d.w.mark()?;
+        d.committed = self.mem.len;
         self.unsynced += 1;
         let due = match self.opts.sync {
             SyncPolicy::Always => true,
             SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
         };
         if due {
-            self.wal.sync()?;
+            d.w.sync()?;
             self.unsynced = 0;
         }
-        self.phase_ns[0] += t.elapsed().as_nanos() as u64;
-        if self.sealing.as_ref().is_some_and(|h| h.is_finished()) {
-            self.join_seal()?;
-        }
-        if self.mem_bytes >= self.seal_threshold() {
-            self.seal()?;
-        }
+        Ok(())
+    }
+
+    /// The direct run closed: its segment finished, indexed and linked
+    /// under a piece's name on the seal thread, with the ordered memtable
+    /// frozen for reads until the join publishes it, as a seal's is. It
+    /// joins as a piece over the last range -- above every partition's
+    /// last key by construction -- for promotion to take by rename when
+    /// the range is due, as it takes a seal's piece: the seal's rule is
+    /// the only one. The temp name stays linked until the manifest names
+    /// the segment, since a name the manifest lacks is swept at open and
+    /// the temp name is what recovery reads. Nothing rotates: the run has
+    /// no WAL frames, and its name covers the sequence so far so that the
+    /// frames of what follows replay.
+    fn close_direct(&mut self) -> Result<()> {
+        *self.scan_keys.borrow_mut() = None;
+        self.snap_added.borrow_mut().clear();
+        self.drop_blocks();
+        self.mem_bytes = 0;
+        let Some(d) = self.direct.take() else {
+            // A run forming with nothing committed: no file, nothing to close.
+            self.mem = MemTable::new();
+            return Ok(());
+        };
+        self.join_seal()?;
+        debug_assert_eq!(self.mem.len, d.committed, "a run closes between batches");
+        let frozen = std::sync::Arc::new(std::mem::replace(&mut self.mem, MemTable::new()));
+        let end_seq = self.wal.seq;
+        let np = self.segs.partition_point(|s| s.level > 0);
+        let name = if np == 0 {
+            Db::seg_name(d.id, end_seq)
+        } else {
+            format!(
+                "pcs-{:08}-{:016}-{}-.sup",
+                d.id,
+                end_seq,
+                hex(&self.segs[np - 1].lo)
+            )
+        };
+        let dir = self.dir.clone();
+        let tmp = d.tmp;
+        let w = d.w;
+        self.retiring_tmps.push(tmp.clone());
+        self.frozen = Some(frozen);
+        self.sealing = Some(std::thread::spawn(move || {
+            let ord = w
+                .finish()
+                .map_err(|e| err(&format!("direct finish: {e}")))?;
+            write_ord(&dir, &name, &ord)?;
+            std::fs::hard_link(&tmp, dir.join(&name))?;
+            File::open(&dir)?.sync_all()?;
+            Ok(vec![name])
+        }));
         Ok(())
     }
 
@@ -3943,6 +4482,15 @@ impl Db {
     /// Commits continue into the new WAL while it runs; at most one seal is
     /// in flight, so a second trigger joins the first (backpressure).
     pub fn seal(&mut self) -> Result<()> {
+        if let Some(e) = self.pending_err.take() {
+            return Err(e);
+        }
+        if self.mem.ordered {
+            // The ordered memtable is the direct segment: committing what
+            // is staged and closing it is the seal.
+            self.commit_direct()?;
+            return self.close_direct();
+        }
         self.wal.commit()?;
         self.unsynced = 0;
         if self.mem.is_empty() {
@@ -4084,7 +4632,7 @@ impl Db {
     /// tail out of memory; `flush` is the other answer, and the difference
     /// was priced at 11% of a canonical load window.
     pub fn sync(&mut self) -> Result<()> {
-        self.wal.commit()?;
+        self.commit_staged()?;
         self.unsynced = 0;
         Ok(())
     }
@@ -4097,7 +4645,7 @@ impl Db {
     /// table for the rest of the phase -- the same artifact the seal was
     /// supposed to remove, back through the side door.
     pub fn flush(&mut self) -> Result<()> {
-        self.wal.commit()?;
+        self.commit_staged()?;
         self.unsynced = 0;
         self.draining = true;
         let sealed = self.seal().and_then(|_| self.join_seal());
@@ -4252,6 +4800,9 @@ impl Db {
                 }
             }
             let _ = std::fs::remove_file(old);
+        }
+        for tmp in std::mem::take(&mut self.retiring_tmps) {
+            let _ = std::fs::remove_file(tmp);
         }
         self.phase_ns[1] += t.elapsed().as_nanos() as u64;
         if self.opts.compact {

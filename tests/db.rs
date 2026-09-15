@@ -102,7 +102,9 @@ fn uncommitted_tail_is_lost_whole_and_committed_state_survives() {
 #[test]
 fn a_torn_tail_loses_its_batch_whole_and_earlier_batches_survive() {
     let d = dir("torn");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    // The WAL's own window: these keys arrive in order and would go
+    // straight into a segment, so the WAL path is held on its arm.
+    let mut db = Db::create(&d, wal_arm()).unwrap();
     db.append(b"a", b"1");
     db.commit().unwrap();
     db.append(b"b", b"2");
@@ -575,6 +577,17 @@ fn an_ordered_index_survives_promotion_and_reopen() {
     db.close().unwrap();
 }
 
+/// The write path before direct ingest: every batch through the WAL and
+/// the seal. What a test of the WAL's own crash windows, or of the shape a
+/// seal leaves, has to ask for, since ordered writes otherwise never reach
+/// either.
+fn wal_arm() -> Options {
+    Options {
+        direct_ingest: false,
+        ..Options::default()
+    }
+}
+
 fn small_opts(l0_trigger: usize) -> Options {
     // Small enough that a few hundred records seal and compact, so the
     // level machinery is exercised at test scale rather than described.
@@ -873,9 +886,10 @@ fn every_n_loses_the_unsynced_tail_whole_and_never_in_part() {
     // never got.
     use supdb::SyncPolicy;
     let d = dir("everyn");
+    // The WAL's own window, on its arm; see `wal_arm`.
     let opts = Options {
         sync: SyncPolicy::EveryN(16),
-        ..Options::default()
+        ..wal_arm()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
     // 16 commits reach a barrier; the next 7 do not.
@@ -1054,7 +1068,8 @@ fn a_batch_without_its_commit_frame_is_lost_whole() {
     // at it, or inside its last record -- the whole batch is gone, and it
     // stays gone after the next commit rather than being adopted by it.
     let d = dir("torn-batch");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    // The WAL's own window, on its arm; see `wal_arm`.
+    let mut db = Db::create(&d, wal_arm()).unwrap();
     for i in 0..3u32 {
         db.append(format!("a{i}").as_bytes(), b"A");
     }
@@ -1075,7 +1090,7 @@ fn a_batch_without_its_commit_frame_is_lost_whole() {
             }
         }
         std::fs::write(dd.join("wal-00000000"), &full[..full.len() - cut]).unwrap();
-        let mut db = Db::open(&dd, Options::default()).unwrap();
+        let mut db = Db::open(&dd, wal_arm()).unwrap();
         for i in 0..3u32 {
             assert_eq!(
                 read_vec(&db, format!("a{i}").as_bytes()),
@@ -1090,7 +1105,7 @@ fn a_batch_without_its_commit_frame_is_lost_whole() {
         db.append(b"c0", b"C");
         db.commit().unwrap();
         drop(db);
-        let db = Db::open(&dd, Options::default()).unwrap();
+        let db = Db::open(&dd, wal_arm()).unwrap();
         assert_eq!(read_vec(&db, b"c0"), vec![b"C".to_vec()]);
         for i in 0..3u32 {
             assert!(
@@ -1712,6 +1727,25 @@ impl ScanModel {
     /// visited key, from between them, from below and from past the end,
     /// at limits from one to unbounded. Both the stream and the count.
     fn check(&self, db: &Db, state: &str) {
+        // Point reads and counts of a sample of every key ever written,
+        // deleted ones included: a scan and a read take different paths
+        // into the memtables, and a lookup that answered nothing while the
+        // scans stayed right went unseen until this was added.
+        for k in self.touched.iter().step_by(7) {
+            let want = self.vals.get(k).cloned().unwrap_or_default();
+            assert_eq!(
+                read_vec(db, k),
+                want,
+                "{state}: read {:?}",
+                String::from_utf8_lossy(k)
+            );
+            assert_eq!(
+                db.count(k).unwrap(),
+                want.len() as u64,
+                "{state}: count {:?}",
+                String::from_utf8_lossy(k)
+            );
+        }
         let visited = self.visited();
         // Every visited key is a start while there are few; past a few
         // hundred, every scan still streams every key but the starts are
@@ -1833,12 +1867,14 @@ fn the_seal_grows_with_the_store() {
         } else {
             assert_eq!(threshold, floor);
         }
-        // Twice the floor, under the grown threshold.
+        // Twice the floor, under the grown threshold. On the direct path a
+        // seal of these ordered keys is a partition more, not a piece.
+        let parts = db.levels().0;
         for k in 0..600u32 {
             db.append(format!("late-{k:06}").as_bytes(), &val);
         }
         db.commit().unwrap();
-        let sealed = db.in_flight().0 || db.levels().1 > 0;
+        let sealed = db.in_flight().0 || db.levels().1 > 0 || db.levels().0 > parts;
         assert_eq!(
             sealed, !grows,
             "seal_grows={grows}: a commit of twice the floor sealed={sealed}"
@@ -2059,11 +2095,13 @@ fn a_key_held_by_many_pieces_counts_once_toward_a_wide_block() {
 #[test]
 fn a_read_consults_the_pieces_over_its_range() {
     let d = dir("read-route");
+    // The spanning piece needs the first partitioning to happen under a
+    // seal; on the direct path the first seal is already a partition.
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(1 << 10),
         l0_trigger: 5,
-        ..Options::default()
+        ..wal_arm()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let key = |k: u32| format!("key-{k:05}");
@@ -2207,7 +2245,9 @@ fn a_seal_drops_the_scan_snapshot_before_the_next_rehash() {
     db.flush().unwrap();
     m.flushed();
     assert!(db.levels().0 > 1);
-    for k in 0..2100 {
+    // Written high to low: an ordered batch over an empty memtable would
+    // go straight to a segment, and this test is about the memtable's seal.
+    for k in (0..2100).rev() {
         m.append(&mut db, &format!("live-{k:05}"), "l");
     }
     db.commit().unwrap();
@@ -2308,6 +2348,307 @@ fn a_seek_brackets_its_search_in_the_top_level() {
                 assert_eq!(got, want, "scan from {from} at a sample's edge");
             }
         }
+    }
+}
+
+/// Ordered ingest goes straight into a segment: a load of keys in order,
+/// batch by batch, leaves the WAL holding nothing but its header, the
+/// store readable and scannable throughout against the model, and the
+/// segments closing at the partition size as partitions whose fences
+/// tile the space. A batch that is not in order under an open segment
+/// closes it and goes through the WAL whole, and the store reopens to
+/// the same model, so the batch's frames replay and the segment's do not.
+#[test]
+fn an_ordered_load_goes_straight_into_segments() {
+    for block_cache in [false, true] {
+        let d = dir(&format!("direct-{block_cache}"));
+        // A direct segment closes at the seal threshold and joins whole,
+        // so the seal is the small size here and the partition the larger.
+        let opts = Options {
+            seal_bytes: 32 << 10,
+            partition_bytes: Some(256 << 10),
+            scan_block_cache: block_cache,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:06}");
+        let val = |k: u32| format!("value-{k:06}-{:>20}", "");
+        for batch in 0..60u32 {
+            for k in batch * 100..(batch + 1) * 100 {
+                m.append(&mut db, &key(k), &val(k));
+            }
+            db.commit().unwrap();
+            if batch % 30 == 29 {
+                m.check(&db, &format!("under the direct segment, batch {batch}"));
+            }
+        }
+        // Nothing but the WAL's eight-byte header.
+        let (_, _, written) = db.wal_durable();
+        assert!(
+            written <= 8,
+            "the WAL took {written} bytes under an ordered load"
+        );
+        // The segments closed at the seal threshold, and joined as a
+        // seal's pieces do: promoted to partitions by rename once their
+        // range held enough of them, the rest still pieces over it.
+        db.settle().unwrap();
+        let (parts, l0) = db.levels();
+        assert!(
+            parts >= 4 && parts + l0 >= 6,
+            "segments as the threshold was crossed: {parts} partitions, {l0} pieces"
+        );
+        assert!(db.pieces_aligned() || l0 == 0);
+        // One more ordered batch, so a segment is open for what follows.
+        for k in 10000..10100u32 {
+            m.append(&mut db, &key(k), &val(k));
+        }
+        db.commit().unwrap();
+        assert!(db.wal_durable().2 <= 8);
+        let (parts, l0) = db.levels();
+        // Not in order: inserts past the end, then an update of a loaded
+        // key. The inserts went into the run; at the update the run's
+        // committed batches close as a segment and the inserts move to
+        // the memtable with the WAL frames they never had, in order, and
+        // the batch goes whole through the WAL -- as do the ordered
+        // batches after it, since the memtable is no longer empty.
+        for k in 10100..10150u32 {
+            m.append(&mut db, &key(k), &val(k));
+        }
+        m.check(&db, "ordered inserts staged in the run");
+        m.delete(&mut db, &key(7));
+        m.append(&mut db, &key(7), "updated");
+        m.check(&db, "a mixed batch staged, the segment closing under it");
+        db.commit().unwrap();
+        m.check(&db, "a mixed batch under the segment");
+        db.settle().unwrap();
+        let (parts_after, l0_after) = db.levels();
+        assert!(
+            parts_after > parts || l0_after > l0,
+            "the segment closed and joined: {parts}+{l0} -> {parts_after}+{l0_after}"
+        );
+        m.check(&db, "the closed segment joined");
+        assert!(
+            db.wal_durable().2 > 8,
+            "the mixed batch went through the WAL"
+        );
+        let before = db.wal_durable().2;
+        for k in 10150..10300u32 {
+            m.append(&mut db, &key(k), &val(k));
+        }
+        db.commit().unwrap();
+        assert!(
+            db.wal_durable().2 > before,
+            "through the WAL, the memtable not empty"
+        );
+        m.check(&db, "ordered batches after, through the WAL");
+        // Reopened: the partitions from the manifest, the mixed batch and
+        // what followed from the WAL, the same model.
+        drop(db);
+        let mut db = Db::open(&d, opts.clone()).unwrap();
+        m.check(&db, "reopened");
+        db.flush().unwrap();
+        m.flushed();
+        m.check(&db, "flushed");
+        // Empty again after the flush: the next ordered batch goes direct.
+        for k in 11000..11100u32 {
+            m.append(&mut db, &key(k), &val(k));
+        }
+        let before = db.wal_durable().2;
+        db.commit().unwrap();
+        assert_eq!(
+            db.wal_durable().2,
+            before,
+            "direct again over an empty memtable"
+        );
+        m.check(&db, "direct again");
+        db.flush().unwrap();
+        m.flushed();
+        // A run forming with nothing committed yet, left the same way: the
+        // inserts move to the memtable, and there is no segment to close.
+        for k in 12000..12050u32 {
+            m.append(&mut db, &key(k), &val(k));
+        }
+        m.delete(&mut db, &key(9));
+        db.commit().unwrap();
+        m.check(&db, "a forming run left mid-batch");
+        drop(db);
+        let db = Db::open(&d, opts.clone()).unwrap();
+        m.check(&db, "reopened: the moved inserts from the WAL");
+        // A close flushes, and the flush's merge reclaims the tombstone.
+        db.close().unwrap();
+        m.flushed();
+        let db = Db::open(&d, opts).unwrap();
+        m.check(&db, "reopened after close");
+    }
+}
+
+/// A direct segment's crash windows, emulated on the file a dropped store
+/// leaves: batches after the last commit marker are lost whole, whatever
+/// bytes follow it; a marker torn in half loses its batch; and a temp file
+/// whose id the manifest already names is a close that published and never
+/// unlinked, removed rather than recovered twice.
+#[test]
+fn a_direct_segment_recovers_to_its_last_commit_marker() {
+    let key = |k: u32| format!("key-{k:06}");
+    let load = |d: &std::path::Path| -> (Db, ScanModel) {
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(1 << 20),
+            ..Options::default()
+        };
+        let mut db = Db::create(d, opts).unwrap();
+        let mut m = ScanModel::default();
+        for batch in 0..3u32 {
+            for k in batch * 100..(batch + 1) * 100 {
+                m.append(&mut db, &key(k), "v");
+            }
+            db.commit().unwrap();
+        }
+        (db, m)
+    };
+    let tmp_of = |d: &std::path::Path| d.join("direct-00000000.tmp");
+    // Bytes after the last marker: a batch that never committed.
+    {
+        let d = dir("direct-torn-tail");
+        let (db, m) = load(&d);
+        std::mem::forget(db);
+        let tmp = tmp_of(&d);
+        assert!(tmp.exists(), "the open segment's temp file");
+        let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
+        std::io::Write::write_all(&mut f, &[0x2a; 777]).unwrap();
+        drop(f);
+        let db = Db::open(&d, Options::default()).unwrap();
+        assert!(!tmp.exists(), "recovered and removed");
+        m.check(
+            &db,
+            "three batches, the garbage after the last marker ignored",
+        );
+    }
+    // The last marker torn: its batch is gone whole, the two before stand.
+    {
+        let d = dir("direct-torn-marker");
+        let (db, mut m) = load(&d);
+        std::mem::forget(db);
+        let tmp = tmp_of(&d);
+        let len = std::fs::metadata(&tmp).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp)
+            .unwrap()
+            .set_len(len - 8)
+            .unwrap();
+        for k in 200..300u32 {
+            m.vals.remove(key(k).as_bytes());
+            m.touched.remove(key(k).as_bytes());
+        }
+        let mut db = Db::open(&d, Options::default()).unwrap();
+        m.check(&db, "two batches");
+        for k in 200..300u32 {
+            assert!(
+                read_vec(&db, key(k).as_bytes()).is_empty(),
+                "key {k} lost whole"
+            );
+        }
+        // The recovered piece merges like any other.
+        db.flush().unwrap();
+        m.flushed();
+        m.check(&db, "two batches, merged");
+    }
+    // The marker's page on disk and not a page of its batch: one byte of
+    // the last batch's last key flipped, so the record still parses and
+    // the marker after it is whole and counts the batch correctly. The
+    // batch is gone whole; a marker vouches for its bytes, not for its
+    // own presence.
+    {
+        let d = dir("direct-lost-page");
+        let (db, mut m) = load(&d);
+        std::mem::forget(db);
+        let tmp = tmp_of(&d);
+        let mut bytes = std::fs::read(&tmp).unwrap();
+        let last = key(299);
+        let at = bytes
+            .windows(last.len())
+            .rposition(|w| w == last.as_bytes())
+            .expect("the last key in the stream");
+        bytes[at + last.len() - 1] ^= 0x40;
+        std::fs::write(&tmp, &bytes).unwrap();
+        for k in 200..300u32 {
+            m.vals.remove(key(k).as_bytes());
+            m.touched.remove(key(k).as_bytes());
+        }
+        let db = Db::open(&d, Options::default()).unwrap();
+        m.check(
+            &db,
+            "two batches, the third's record damaged under its marker",
+        );
+        assert!(
+            read_vec(&db, key(299).as_bytes()).is_empty(),
+            "the damaged key"
+        );
+        assert!(
+            read_vec(&db, key(200).as_bytes()).is_empty(),
+            "its batch, whole"
+        );
+    }
+    // A close that published and never unlinked its temp file.
+    {
+        let d = dir("direct-stale-tmp");
+        let (mut db, mut m) = load(&d);
+        db.flush().unwrap();
+        m.flushed();
+        let parts = db.levels().0;
+        let par = std::fs::read_dir(&d)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|n| n.starts_with("par-00000000-"))
+            .expect("the closed segment as a partition");
+        drop(db);
+        std::fs::copy(d.join(&par), tmp_of(&d)).unwrap();
+        let db = Db::open(&d, Options::default()).unwrap();
+        assert!(!tmp_of(&d).exists());
+        assert_eq!(db.levels(), (parts, 0), "not recovered twice");
+        m.check(&db, "the stale temp file removed");
+    }
+}
+
+/// A value above the inline size goes to a block, which a direct segment
+/// holds in memory until it closes, so a batch carrying one goes through
+/// the WAL: durable at its commit and back after a crash. Beside it the
+/// same keys with values one byte shorter, which do fit, to show which
+/// path each takes.
+#[test]
+fn a_value_the_record_cannot_hold_sends_its_batch_through_the_wal() {
+    let key = |k: u32| format!("key-{k:06}");
+    for (name, big) in [("direct-fits", false), ("direct-block", true)] {
+        let d = dir(name);
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(1 << 20),
+            ..Options::default()
+        };
+        let val = "x".repeat(opts.inline_bytes + usize::from(big));
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        for batch in 0..3u32 {
+            for k in batch * 100..(batch + 1) * 100 {
+                m.append(&mut db, &key(k), &val);
+            }
+            db.commit().unwrap();
+        }
+        let (_, _, written) = db.wal_durable();
+        let tmp = d.join("direct-00000000.tmp");
+        if big {
+            assert!(written > 8, "{name}: through the WAL");
+            assert!(!tmp.exists(), "{name}: no segment opened");
+        } else {
+            assert!(written <= 8, "{name}: the WAL untouched");
+            assert!(tmp.exists(), "{name}: a segment open");
+        }
+        std::mem::forget(db);
+        let db = Db::open(&d, Options::default()).unwrap();
+        m.check(&db, &format!("{name}: every batch back after a crash"));
     }
 }
 

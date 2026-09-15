@@ -60,8 +60,8 @@ const fn build_crc_tables() -> [[u32; 256]; 8] {
 }
 
 /// Portable slice-by-8. Consumes eight bytes per round rather than one.
-fn crc32c_scalar(data: &[u8]) -> u32 {
-    let mut c = 0xFFFF_FFFFu32;
+fn crc32c_scalar(init: u32, data: &[u8]) -> u32 {
+    let mut c = init;
     let mut chunks = data.chunks_exact(8);
     for w in &mut chunks {
         let lo = u32::from_le_bytes([w[0], w[1], w[2], w[3]]) ^ c;
@@ -83,9 +83,9 @@ fn crc32c_scalar(data: &[u8]) -> u32 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.2")]
-unsafe fn crc32c_hw(data: &[u8]) -> u32 {
+unsafe fn crc32c_hw(init: u32, data: &[u8]) -> u32 {
     use core::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
-    let mut c = 0xFFFF_FFFFu64;
+    let mut c = init as u64;
     let mut chunks = data.chunks_exact(8);
     for w in &mut chunks {
         c = _mm_crc32_u64(c, u64::from_le_bytes(w.try_into().unwrap()));
@@ -101,9 +101,9 @@ unsafe fn crc32c_hw(data: &[u8]) -> u32 {
 /// optional in the base ISA, so it is still feature-detected.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "crc")]
-unsafe fn crc32c_hw(data: &[u8]) -> u32 {
+unsafe fn crc32c_hw(init: u32, data: &[u8]) -> u32 {
     use core::arch::aarch64::{__crc32cb, __crc32cd};
-    let mut c = 0xFFFF_FFFFu32;
+    let mut c = init;
     let mut chunks = data.chunks_exact(8);
     for w in &mut chunks {
         c = __crc32cd(c, u64::from_le_bytes(w.try_into().unwrap()));
@@ -118,6 +118,17 @@ unsafe fn crc32c_hw(data: &[u8]) -> u32 {
 static CRC_IMPL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 pub fn crc32(data: &[u8]) -> u32 {
+    crc32_from(0xFFFF_FFFF, data)
+}
+
+/// The CRC of `data` appended to what `prev` is the CRC of: the state a
+/// finished CRC hides behind its final xor, resumed. Zero is the empty
+/// input's CRC, so `crc32_resume(0, d)` is `crc32(d)`.
+pub fn crc32_resume(prev: u32, data: &[u8]) -> u32 {
+    crc32_from(prev ^ 0xFFFF_FFFF, data)
+}
+
+fn crc32_from(init: u32, data: &[u8]) -> u32 {
     #[allow(unused_imports)]
     use std::sync::atomic::Ordering;
     #[cfg(target_arch = "aarch64")]
@@ -133,7 +144,7 @@ pub fn crc32(data: &[u8]) -> u32 {
         }
         if which == 1 {
             // SAFETY: only reached once the CPU has advertised the CRC extension.
-            return unsafe { crc32c_hw(data) };
+            return unsafe { crc32c_hw(init, data) };
         }
     }
     #[cfg(target_arch = "x86_64")]
@@ -149,10 +160,10 @@ pub fn crc32(data: &[u8]) -> u32 {
         }
         if which == 1 {
             // SAFETY: only reached once the CPU has advertised SSE4.2.
-            return unsafe { crc32c_hw(data) };
+            return unsafe { crc32c_hw(init, data) };
         }
     }
-    crc32c_scalar(data)
+    crc32c_scalar(init, data)
 }
 
 /// Where a block lives and how big it is in each form.
@@ -602,6 +613,21 @@ pub fn read_chunked_range(
 mod checksum_tests {
     use super::*;
 
+    #[test]
+    fn a_resumed_crc_is_the_whole_input_s_crc() {
+        use super::{crc32, crc32_resume};
+        let data: Vec<u8> = (0..1000u32).map(|i| (i * 7 + i / 13) as u8).collect();
+        for cut in [0usize, 1, 7, 8, 9, 500, 999, 1000] {
+            let (a, b) = data.split_at(cut);
+            assert_eq!(crc32_resume(crc32(a), b), crc32(&data), "cut at {cut}");
+        }
+        assert_eq!(crc32_resume(0, &data), crc32(&data));
+        assert_ne!(
+            crc32_resume(crc32(&data[..500]), &data[499..]),
+            crc32(&data)
+        );
+    }
+
     fn payload() -> Vec<u8> {
         // Compressible enough that chunks actually shrink, varied enough that
         // they are not all identical.
@@ -687,8 +713,12 @@ mod checksum_tests {
                     (seed & 0xff) as u8
                 })
                 .collect();
-            let hw = unsafe { crc32c_hw(&data) };
-            assert_eq!(hw, crc32c_scalar(&data), "diverged at len {len}");
+            let hw = unsafe { crc32c_hw(0xFFFF_FFFF, &data) };
+            assert_eq!(
+                hw,
+                crc32c_scalar(0xFFFF_FFFF, &data),
+                "diverged at len {len}"
+            );
             assert_eq!(
                 hw,
                 crc32(&data),

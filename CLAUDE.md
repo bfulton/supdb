@@ -166,6 +166,27 @@ the contract found it. `settle` is what joins an in-flight seal; `sync` does
 not, and an experiment that assumed otherwise measured a 286,000-key seal it
 had never joined.
 
+Ordered ingest has its own log and one more window. A run of keys above the
+store's greatest goes to an ordered memtable and, at each commit, to a
+segment open for append: the batch's records, then a commit marker carrying
+their CRC, length and count, then one fdatasync on that file. The WAL never
+sees them (`direct_ingest: false` is the arm that still sends them there).
+Recovery walks the temp file's record stream to the last marker whose three
+quantities agree with the records before it and rewrites what precedes it as
+a piece; what follows is a batch nobody was told was durable. The CRC is
+there because a crash can land the page a marker is on and not a page of its
+batch, and a record whose bytes came back zero still parses. The close is
+the seal's shape with one difference: the finished segment is hard-linked
+under its piece name rather than renamed, and the temp name stays until the
+manifest names the segment, because a name the manifest lacks is swept at
+open and the temp name is what recovery reads; a temp name whose id the
+manifest already names is that window's leftover, removed at open. The first
+version of this path kept the hash memtable for reads and closed the segment
+on the commit thread, and measured slower than the WAL it bypassed at three
+million keys and at thirty: the memtable insert was a quarter of the load
+and the close a tenth. A path that keeps the structure it was built to
+bypass has bypassed nothing.
+
 ## Shapes the bugs come in
 
 The reproducers for the previous engine's defects retired with it. The
@@ -258,8 +279,9 @@ in the suite's figures, at `full` scale where it says so:
   distribution goes bimodal -- every miss is a synchronous page fault. This
   is the mapped read path's shape, not a bug; it is the `read` curves past
   the memory line.
-- The durable ordered load trails LMDB and RocksDB, and shuffled arrival
-  inverts both. Quote the pair, never one: the `load` and `load-shuffled`
-  figures.
+- The durable ordered load trailed LMDB and RocksDB until ordered ingest
+  went straight into segments; the suite's rows since say where it stands,
+  and shuffled arrival still inverts both. Quote the pair, never one: the
+  `load` and `load-shuffled` figures.
 - The index layout study found smaller and faster points on the frontier
   that the shipping layout does not occupy (`docs/index-theory.md`).
