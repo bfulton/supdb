@@ -579,12 +579,17 @@ per-commit path.
   |---|---|---|---|---|---|---|---|
   | 300k | 540k–673k | 336k–365k | 787k–877k | 643k | 0.98M–1.14M | 452k–510k | 1.30M–1.71M |
   | 3M | 635k–706k | 491k–499k | 762k–852k | 581k | 1.64M–1.65M | 683k–725k | 1.49M–1.62M |
-  | 30M | 498k–531k | 403k–431k | 632k–685k | 478k–483k | 1.24M–1.27M | 575k–601k | 1.15M–1.23M |
+  | 30M | 498k–531k | 403k–431k | 632k–685k | see below | 1.24M–1.27M | 575k–601k | 1.15M–1.23M |
 
   Durable, 1.2x to 2.0x the WAL path, level with LMDB at 300k and ahead
-  of it at three million keys and thirty; buffered, 2.0x to 2.5x, and
-  level with the writer alone at three million and thirty, whose close
-  runs on the thread that writes. What stands between the durable path
+  of it at three million keys; at thirty million the pair was measured
+  in a later run through the suite's own load loop, interleaved, at
+  460k–467k against LMDB's 526k–536k, 0.87x to 0.89x -- the first
+  draft of this entry put an LMDB figure from an earlier run in that
+  cell and read it as a lead, which is the cross-run comparison this
+  repository's notes warn against. Buffered, 2.0x to 2.5x, and level
+  with the writer alone at three million and thirty, whose close runs
+  on the thread that writes. What stands between the durable path
   and its ceiling is the fdatasync on a file that grows, which the writer
   alone pays too, and the ordered memtable's copy of every value, which
   the reads want. Detection needs no interface: the store knows its
