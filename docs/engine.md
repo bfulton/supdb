@@ -539,8 +539,9 @@ per-commit path.
   same scans over the compacted store tie it. The cache keeps, for each
   partition block a scan crosses, the block as it would read compacted
   -- clean; the partition's walk with a few resolved keys slipped in at
-  their cuts; a dense copy from eight keys up, since copying every touched
-  block held more and ran slower; or, past four blocks' worth of keys
+  their cuts; a dense copy from sixteen keys up, since copying every
+  touched block held more and ran slower and a walk cut every few keys
+  costs more than the copy it saves; or, past four blocks' worth of keys
   above it, no copy at all but a merge seeked into each source -- built
   on first touch, dropped by a write to a key it owns and rebuilt at the
   next scan, with the level-0 pieces aligned to a partition ranked
@@ -552,7 +553,25 @@ per-commit path.
   again -- at thirty million, a sixteenth of the store cost E a quarter
   of its rate and a sixty-fourth three fifths, one machine, rounds
   interleaved. So the budget's default is none: the bound is the memory
-  the caller has, which only the caller knows. What a shipped design
+  the caller has, which only the caller knows. Where E's time goes at
+  thirty million, timed apart by form on the store A, F and D leave --
+  82 pieces over 41 partitions, 90k blocks clean, 275k sparse, 42k
+  copies -- against the same store flushed before E: a scan of a hundred
+  is 4.4 µs on its first pass and 3.4 on its second there, 2.3 and 2.2
+  flushed, where it beats LMDB by a fifth. The seek is 0.6 either way.
+  The dirty store's first pass builds for 0.8 µs a scan, three quarters
+  of it copies at 68 µs each, and walks for 2.1 against the clean walk's
+  1.5, most of that in copies because the blocks E scans most are the
+  ones A and F updated most; the copy walks at a clean walk's price, and
+  the sparse walk cost 2.5x that, 2.9 gap walks at 0.44 µs and 2.4
+  emissions at 0.5, each a read into a piece's cold page, which is why
+  the sparse form now keeps its values: five rounds interleaved, the
+  first pass unchanged at 253k a median either way, since the read
+  moves from the first walk to the build, and the second 300k-318k
+  against 285k-305k, at 290 MB of cache against 202. Pre-faulting the
+  mappings at
+  open gained 2-3% on the first pass and nothing on the second: the
+  build's cold reads are not page faults. What a shipped design
   still needs is the write path: a write drops the block it lands in, so
   a mix that updates and scans the same keys rebuilds its hot blocks per
   write, and a cached block updated in place is the part not built. Until
