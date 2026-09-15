@@ -6187,7 +6187,12 @@ impl Db {
     /// Building on the first touch was measured against walking the block
     /// through its overlay once and building on the second: on one store
     /// of three million keys, five of every six blocks E touched it
-    /// touched again, and each of those paid the overlay twice.
+    /// touched again, and each of those paid the overlay twice. At thirty
+    /// million, where a copy's build is sixty microseconds of cold reads,
+    /// the same variant left a sixth of the blocks E touched unbuilt after
+    /// its pass and gained three to four percent on that pass, nothing on
+    /// the next, which built every one of them: inside the spread, for a
+    /// form more and a walk twice.
     fn materialize(
         &self,
         src: Sources,
