@@ -2084,6 +2084,28 @@ fn a_read_consults_the_pieces_over_its_range() {
         assert_eq!(got, want(&["s0", "s1", "s2", "s3", "s4", "s5"]), "key {k}");
         assert_eq!((n, c), (6, 6), "key {k}");
     }
+    // A scan across the same store: the merge over the partitions and
+    // the spanning piece, on both scan paths, must carry the piece's
+    // values for keys in every range.
+    for from in [0, 297, 591] {
+        let mut got: Vec<(String, String)> = Vec::new();
+        let n = db
+            .scan(key(from).as_bytes(), 3, |k, v| {
+                got.push((
+                    String::from_utf8(k.to_vec()).unwrap(),
+                    String::from_utf8(v.to_vec()).unwrap(),
+                ))
+            })
+            .unwrap();
+        assert_eq!(n, 3, "scan from {from}");
+        let mut want_all: Vec<(String, String)> = Vec::new();
+        for k in [from, from + 3, from + 6] {
+            for t in ["s0", "s1", "s2", "s3", "s4", "s5"] {
+                want_all.push((key(k), val(t)));
+            }
+        }
+        assert_eq!(got, want_all, "scan from {from} over the spanning piece");
+    }
     // Merged, then two seals split at the fences and joined: two aligned
     // pieces over every range, a frozen memtable under a seal not joined,
     // and live writes over all of it.

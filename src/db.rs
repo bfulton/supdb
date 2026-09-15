@@ -6772,42 +6772,68 @@ impl Db {
     ) -> Result<usize> {
         let np = self.segs.partition_point(|s| s.level > 0);
         let parts = &self.segs[..np];
+        struct Cur<'a> {
+            seg: &'a Seg,
+            rank: usize,
+            key: Option<&'a [u8]>,
+        }
+        // The level-0 cursors. With every piece aligned to a partition
+        // they are the pieces over the range the walk is in, seeked to
+        // its start there and re-seeked when it crosses into the next
+        // range; a range is left once its partition and its pieces are
+        // both exhausted, since a piece can hold keys above its
+        // partition's last. Otherwise, every piece that may reach the
+        // start, seeked once, and the walk of every key over every one:
+        // what every scan did, and paid a cursor per piece in the store
+        // at the seek and a compare per piece per key.
+        let routed = self.l0_aligned;
+        let seek_l0 = |pi: usize, from: &[u8]| -> Vec<Cur> {
+            let pieces = if routed {
+                self.pieces_over(np, pi)
+            } else {
+                &self.segs[np..]
+            };
+            pieces
+                .iter()
+                .filter(|s| s.may_reach(from))
+                .map(|s| {
+                    let rank = s.ord.seek(s.cursor_from(from), |r| s.blob.key_at(r));
+                    Cur {
+                        seg: s,
+                        rank,
+                        key: s.blob.key_at(rank),
+                    }
+                })
+                .collect()
+        };
         // The partition cursor: the first partition whose fence can reach
         // `from`, then each following one from its first key.
-        let mut pi = parts.partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= from));
+        let mut pi = self.first_reaching(np, from);
         let mut prank = 0usize;
         let mut pkey: Option<&[u8]> = None;
         while pi < np {
             let s = &parts[pi];
             prank = s.ord.seek(s.cursor_from(from), |r| s.blob.key_at(r));
             pkey = s.blob.key_at(prank);
-            if pkey.is_some() {
+            if pkey.is_some() || routed {
                 break;
             }
             pi += 1;
         }
-        struct Cur<'a> {
-            seg: &'a Seg,
-            rank: usize,
-            key: Option<&'a [u8]>,
-        }
-        let mut l0: Vec<Cur> = self.segs[np..]
-            .iter()
-            .filter(|s| s.may_reach(from))
-            .map(|s| {
-                let rank = s.ord.seek(s.cursor_from(from), |r| s.blob.key_at(r));
-                Cur {
-                    seg: s,
-                    rank,
-                    key: s.blob.key_at(rank),
-                }
-            })
-            .collect();
-        let nc = l0.len();
+        let mut l0: Vec<Cur> = seek_l0(pi.min(np), from);
         let tombs = self.has_tombstones();
         let mut scratch: Vec<usize> = Vec::new();
         let mut seen = 0usize;
         while seen < limit {
+            if routed {
+                while pkey.is_none() && l0.iter().all(|c| c.key.is_none()) && pi + 1 < np {
+                    pi += 1;
+                    prank = 0;
+                    pkey = parts[pi].blob.key_at(0);
+                    l0 = seek_l0(pi, parts[pi].lo.as_slice());
+                }
+            }
+            let nc = l0.len();
             let mut next: Option<&[u8]> = pkey;
             for c in &l0 {
                 if let Some(k) = c.key {
@@ -6865,7 +6891,7 @@ impl Db {
                 }
                 prank += 1;
                 pkey = parts[pi].blob.key_at(prank);
-                while pkey.is_none() && pi + 1 < np {
+                while !routed && pkey.is_none() && pi + 1 < np {
                     pi += 1;
                     prank = 0;
                     pkey = parts[pi].blob.key_at(0);
