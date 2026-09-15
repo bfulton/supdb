@@ -75,6 +75,17 @@ the shape. The design answers it with bands drawn from the series rather
 than a typed floor, and with the arms as the dimension rather than the
 ratio between two near-identical arms.
 
+**A guarantee is what the arm was opened with, not the row it sits in.**
+`supdb-ingest` sat in the buffered row and committed durably on every
+batch: no supdb arm set a sync policy, the engine's default is durable, and
+the matching check let it through, because it skipped the durability axis
+for the buffered group on the reasoning that a buffered metric does not
+care when a commit lands -- true of a read, false of the group. So every
+buffered load figure priced a durable supdb against comparators that were
+not. The arm now sets the policy its row names, `Features` reports it from
+the options the arm was opened with, and the check compares every axis
+within a group.
+
 **A one-sided bound passes a broken measurement.** A one-sided bound,
 `ratio >= 0.90`, recorded a pass on a run where the ratio came out 8.5x --
 on a store where the mechanism says the policy can only lose. A row whose

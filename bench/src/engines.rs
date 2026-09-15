@@ -26,7 +26,7 @@
 //!
 //!     So every axis that can be equalized is, in the adapter, before a number
 //!     is reported: `supdb-durable` checkpoints on LMDB's commit boundary, and
-//!     `lmdb-nosync` gives up durability the way Supdb's default does. The
+//!     `lmdb-nosync` gives up durability the way `supdb-ingest` does. The
 //!     checksum axis equalizes downward, since LMDB has none to turn on -- and
 //!     that one was costing Supdb 8.5% on every write number in the other
 //!     direction, unequalized for just as long.
@@ -56,13 +56,16 @@ impl Features {
     /// made to promise the same, restricted to those that bear on this metric.
     ///
     /// A non-empty answer means the pair is not comparable on that metric --
-    /// not that the number is noisy, that it is not an ordering. `durable`
-    /// says whether the metric touches the write path; a read or a scan does
-    /// not care when a commit reaches the device, and does care about
-    /// verification.
-    pub fn unmatched(&self, other: &Features, durable: bool) -> Vec<&'static str> {
+    /// not that the number is noisy, that it is not an ordering. Durability
+    /// is an axis like the others: a guarantee group is defined by it, and
+    /// for as long as this skipped it on the buffered group -- on the
+    /// reasoning that a read does not care when a commit lands, which is
+    /// true of a read and not of the group -- `supdb-ingest` sat in that
+    /// group committing durably on every batch and the check reported the
+    /// group matched.
+    pub fn unmatched(&self, other: &Features) -> Vec<&'static str> {
         let mut v = Vec::new();
-        if durable && self.durable_commit != other.durable_commit {
+        if self.durable_commit != other.durable_commit {
             v.push("durable_commit");
         }
         if self.checksums != other.checksums {
@@ -238,9 +241,10 @@ fn dir_size(p: &Path) -> u64 {
 // ------------------------------------------------------------------- next --
 
 /// Supdb (`supdb::Db`): a WAL-only commit with sealed segments in
-/// today's store format. Always durable -- a commit is a WAL append plus one
-/// fdatasync, which is LMDB's own boundary, so this arm is guarantee-matched
-/// against `lmdb` the way `supdb-durable` is. Scans pay the unrouted fan
+/// today's store format. Durable in the durable arms -- a commit is a WAL
+/// append plus one fdatasync, which is LMDB's own boundary -- and buffered
+/// in `supdb-ingest`, frames written per commit and fsynced at `sync`, the
+/// boundary `lmdb-nosync` and `rocksdb-nosync` commit on. Scans pay the unrouted fan
 /// (every segment contributes candidates) until range-partitioned compaction
 /// lands; that cost is the arm's to show, not to hide.
 pub struct Supdb {
@@ -276,34 +280,46 @@ pub struct Supdb {
     /// comparators in this suite once moved +20% to +43% between
     /// consecutive runs.
     advice: Option<supdb::ReadAdvice>,
+    /// Whether a commit reaches the device before it returns: the axis the
+    /// arm's guarantee row is about, set here rather than inherited. Every
+    /// supdb arm took the engine's durable default for as long as none set
+    /// it, `supdb-ingest` included, which sat in the buffered row.
+    durable: bool,
 }
 
 impl Supdb {
     pub fn create(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, true, true, None, false)
+        Supdb::with_policy(path, true, true, None, false, true)
     }
 
     pub fn create_ingest(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, false, true, None, false)
+        Supdb::with_policy(path, false, true, None, false, false)
     }
 
     /// `sync` fsyncs and seals nothing; reads then answer from the
     /// memtable, the unrouted tail and the partitions together.
     pub fn create_nodrain(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, true, false, None, false)
+        Supdb::with_policy(path, true, false, None, false, true)
     }
 
     /// `supdb` in every respect but the read advice, which is pinned to the
     /// kernel's plain readahead. The pair differs by one option and needs no
     /// matching.
     pub fn create_noadvice(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, true, true, Some(supdb::ReadAdvice::Normal), false)
+        Supdb::with_policy(
+            path,
+            true,
+            true,
+            Some(supdb::ReadAdvice::Normal),
+            false,
+            true,
+        )
     }
 
     /// `supdb` in every respect but the block cache, on. The pair differs
     /// by one option and needs no matching.
     pub fn create_blockcache(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, true, true, None, true)
+        Supdb::with_policy(path, true, true, None, true, true)
     }
 
     fn with_policy(
@@ -312,6 +328,7 @@ impl Supdb {
         drain: bool,
         advice: Option<supdb::ReadAdvice>,
         block_cache: bool,
+        durable: bool,
     ) -> Res<Supdb> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         // Checksums off in the segments, because LMDB has none and the axis
@@ -347,6 +364,15 @@ impl Supdb {
             // engine's default, so the arm's memory over the ladder is the
             // option's own and a row's figure describes what a user gets.
             scan_block_cache: block_cache,
+            // The guarantee the arm's row names, not the engine's default:
+            // durable per batch, or frames written per commit and fsynced
+            // at `sync`, which is how `lmdb-nosync` and `rocksdb-nosync`
+            // buffer.
+            sync: if durable {
+                supdb::SyncPolicy::Always
+            } else {
+                supdb::SyncPolicy::EveryN(u32::MAX)
+            },
             ..Default::default()
         };
         let opts = match advice {
@@ -364,6 +390,7 @@ impl Supdb {
             drain,
             advice,
             block_cache,
+            durable,
         })
     }
 }
@@ -385,7 +412,7 @@ impl Engine for Supdb {
     }
     fn features(&self) -> Features {
         Features {
-            durable_commit: true,
+            durable_commit: self.durable,
             // A batch is the WAL frames behind one commit frame and replay
             // applies it whole or not at all; `Txn` stages, commits as one
             // batch, and aborts by dropping; and the engine is single-writer
@@ -814,9 +841,8 @@ pub fn check_matched(arms: &[String], dir: &Path) -> Res<()> {
         by_g.entry(g).or_default().push((a.clone(), f));
     }
     for (g, list) in by_g {
-        let durable = g == Guarantee::Durable;
         for w in list.windows(2) {
-            let gap = w[0].1.unmatched(&w[1].1, durable);
+            let gap = w[0].1.unmatched(&w[1].1);
             if !gap.is_empty() {
                 return Err(format!(
                     "{} and {} are both {:?} but differ on {}",
@@ -829,4 +855,29 @@ pub fn check_matched(arms: &[String], dir: &Path) -> Res<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The buffered group is defined by what it gives up: an arm that
+    /// commits durably does not belong in it, whatever its row says.
+    #[test]
+    fn durability_is_an_axis_the_matching_checks() {
+        let buffered = Features {
+            durable_commit: false,
+            transactions: false,
+            checksums: false,
+            reopen_for_write: true,
+            read_your_writes: true,
+            ordered_scan: true,
+        };
+        let durable = Features {
+            durable_commit: true,
+            ..buffered
+        };
+        assert_eq!(durable.unmatched(&buffered), vec!["durable_commit"]);
+        assert!(buffered.unmatched(&buffered).is_empty());
+    }
 }
