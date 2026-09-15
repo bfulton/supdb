@@ -6195,7 +6195,12 @@ impl Db {
     /// form more and a walk twice. Fetching every overlay key's memtable
     /// entry and newest chunk ahead of the build, in two sweeps so the
     /// misses overlap, was measured the same way and moved nothing: the
-    /// build's cost is not those misses.
+    /// build's cost is not those misses. Timed apart at thirty million, a
+    /// copy's build is the pieces' key runs merged, the copy's three
+    /// buffers allocated -- fresh heap pages faulted in as the cache
+    /// grows, a quarter of the build -- eleven record walks between the
+    /// overlay's keys, and twenty keys' values read from their sources,
+    /// each a few microseconds and none the most of it.
     fn materialize(
         &self,
         src: Sources,
