@@ -581,11 +581,27 @@ per-commit path.
   both passes, so what remains is the overlay, which LMDB never has
   because it patches its pages at write time. Pre-faulting the mappings at
   open gained 2-3% on the first pass and nothing on the second: the
-  build's cold reads are not page faults. What a shipped design
-  still needs is the write path: a write drops the block it lands in, so
-  a mix that updates and scans the same keys rebuilds its hot blocks per
-  write, and a cached block updated in place is the part not built. Until
-  it is, the option is off and its code is marked.
+  build's cold reads are not page faults. The write path settles in
+  place: a write is queued and, at the next scan, spliced into the built
+  block it landed in -- the key's run resolved as a build resolves it,
+  the partition's values for an equal key, then the pieces' and the
+  memtables', a tombstone masking older -- a clean block becoming sparse,
+  a sparse or copied block taking the key at its place or its run
+  replaced, a deleted key an empty run that counts as the model counts it
+  until a merge reclaims it. Before this the block was dropped and
+  rebuilt at the next scan that crossed it. A mix that updates and scans
+  one hot range of ten thousand keys at three million, rounds of a
+  hundred updates then a hundred scans of fifty on the cache an E pass
+  built, three rounds interleaved: the scans 5.8–6.7 µs against 2.5–2.9
+  patched, the updates level, 4.7–10.1 against 5.0–6.1. Two rules kept
+  the patch equal to a rebuild: only a build chooses the wide form, so a
+  block whose overlay crosses the wide bound is dropped for the next
+  scan to build wide, which the wide-block test found missing; and a
+  replaced run's bytes stay until they outweigh the live ones, when the
+  block is dropped instead. What a shipped design still needs is the
+  builder ahead of the reader: the dense blocks built on a thread after
+  each seal, which waits on the reader-beside-writer concurrency below.
+  Until it is, the option is off and its code is marked.
 - **Ordered ingest straight into segments** — built, and the default.
   The load's keys arrive in order and went through a memtable, a WAL
   frame, a seal that sorts the sorted, and a partitioning pass; the

@@ -2029,6 +2029,92 @@ fn fold_model(block_cache: bool) {
     );
 }
 
+/// A write is settled into the built block it lands in, in place, as a
+/// rebuild would have it: a clean block becomes sparse with the key's
+/// merged run; a sparse block takes a new key at its place and an update
+/// of a partition key as one entry standing for the partition's record;
+/// a copy takes a new key at its place, an update in the key's run, and a
+/// delete as an empty run. One partition of several blocks, since a
+/// partition with nothing unsealed anywhere is walked in bulk and its
+/// blocks never built: the first write makes the rest materialize clean,
+/// and every later write finds a built block to patch. The model's scans
+/// and reads hold each result to the merge.
+#[test]
+fn a_write_settles_into_the_block_it_lands_in() {
+    let d = dir("settle-in-place");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(64 << 10),
+        scan_block_cache: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in (0..1200).step_by(3) {
+        m.append(&mut db, &key(k), &format!("p{k}"));
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    assert_eq!(db.levels(), (1, 0), "one partition of several blocks");
+    m.check(&db, "the partition, walked in bulk");
+    // The first write: the partition is no longer clean throughout, and
+    // the scans after it build every block, this one sparse from sources.
+    m.append(&mut db, &key(301), "new");
+    db.commit().unwrap();
+    m.check(&db, "a new key in a partition that was clean throughout");
+    // A clean block becomes sparse: a new key between two partition keys.
+    m.append(&mut db, &key(1001), "new in a clean block");
+    db.commit().unwrap();
+    m.check(&db, "a new key settled into a clean block");
+    // The same block, sparse now: an update of a partition key beside it,
+    // one entry standing for the partition's record and the new value.
+    m.delete(&mut db, &key(303));
+    m.append(&mut db, &key(303), "updated");
+    db.commit().unwrap();
+    m.check(&db, "a partition key updated in a sparse block");
+    // A clean block elsewhere, its first write an update of a partition
+    // key: sparse now with one entry standing for the partition's record.
+    m.delete(&mut db, &key(900));
+    m.append(&mut db, &key(900), "updated clean");
+    db.commit().unwrap();
+    m.check(&db, "a partition key updated in a clean block");
+    // A block made dense enough to be a copy: twenty new keys in it, then
+    // the copy patched with a new key, an update and a delete.
+    for k in (600..660).step_by(3) {
+        m.append(&mut db, &key(k + 1), "dense");
+    }
+    db.commit().unwrap();
+    let mut sink = 0usize;
+    db.scan(key(600).as_bytes(), 40, |_k, v| sink += v.len())
+        .unwrap();
+    assert!(sink > 0);
+    m.append(&mut db, &key(632), "inserted");
+    m.delete(&mut db, &key(612));
+    m.append(&mut db, &key(612), "updated");
+    m.delete(&mut db, &key(615));
+    db.commit().unwrap();
+    m.check(
+        &db,
+        "a copy patched: a key inserted, one updated, one deleted",
+    );
+    // Reads and scans after a reopen see the same store: the cache held
+    // nothing the WAL did not.
+    drop(db);
+    let db = Db::open(
+        &d,
+        Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(64 << 10),
+            scan_block_cache: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    m.check(&db, "reopened");
+}
+
 /// A key updated in every seal is in every piece over its range, and it
 /// is one key above the partition: a block whose every key sits in
 /// sixteen pieces holds a block's worth, not sixteen, and is built rather

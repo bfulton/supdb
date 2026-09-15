@@ -344,9 +344,10 @@ pub struct Options {
     pub scan_merge: bool,
     /// PROTOTYPE, off by default: keep merged copies of the partition
     /// blocks that scans read over unsealed keys, so a scan over them
-    /// walks one sorted copy instead of merging. Read side only: a block
-    /// is built on first read through the merge, dropped by a write to any
-    /// key it owns, and dropped whole whenever the segments change.
+    /// walks one sorted copy instead of merging. A block is built on first
+    /// read through the merge; a write to a key it owns is settled into it
+    /// in place at the next scan, the key's run resolved as a build would;
+    /// and every block is dropped whenever the segments change.
     pub scan_block_cache: bool,
     /// PROTOTYPE: the most bytes the block cache holds in built blocks,
     /// or 0 for no bound, the default. The cache holds what the scans
@@ -5692,7 +5693,7 @@ impl Db {
         let use_cache =
             self.opts.scan_block_cache && self.segs.first().is_some_and(|s| s.level > 0);
         if use_cache {
-            self.settle_pending();
+            self.settle_pending()?;
         }
         {
             let mut cache = self.scan_keys.borrow_mut();
@@ -6006,15 +6007,27 @@ impl Db {
     /// table. The keys are sorted by arena offset so a key written many
     /// times costs one seek, the created one's record first so the flag
     /// survives the fold.
-    fn settle_pending(&self) {
+    fn settle_pending(&self) -> Result<()> {
         let mut pending = std::mem::take(&mut *self.pending.borrow_mut());
         if pending.is_empty() {
-            return;
+            return Ok(());
         }
         pending.sort_unstable_by_key(|&(off, _, new)| (off, !new));
+        // A write that could not be settled leaves the block it landed in
+        // stale, so an error drops every table rather than leave one.
+        let settled = self.settle_each(&pending);
+        if settled.is_err() {
+            self.drop_blocks();
+        }
+        pending.clear();
+        *self.pending.borrow_mut() = pending;
+        settled
+    }
+
+    fn settle_each(&self, pending: &[(u32, u32, bool)]) -> Result<()> {
         let np = self.segs.partition_point(|s| s.level > 0);
         let mut last = u32::MAX;
-        for &(off, len, new) in &pending {
+        for &(off, len, new) in pending {
             if off == last {
                 continue;
             }
@@ -6033,8 +6046,8 @@ impl Db {
                 continue;
             };
             let (b, cut) = Self::owner_of(seg, key);
-            if b < table.slots.len() && !matches!(table.slots[b], Some(Cached::Wide(_))) {
-                self.unlist(at, b, table);
+            if b < table.slots.len() {
+                self.patch_block(at, b, table, key, cut)?;
             }
             if new {
                 if let (Some(slot), Some(list)) = (self.mem.slot_of(key), table.added.get_mut(b)) {
@@ -6042,9 +6055,157 @@ impl Db {
                     table.filed += 1;
                 }
             }
+            // Only a build chooses the wide form, and a patched block is
+            // never rebuilt: past the bound, the block is dropped so the
+            // next scan builds it wide, as the drop-and-rebuild did.
+            if b < table.slots.len()
+                && Self::overlay_count(table, b) > WIDE
+                && !matches!(table.slots[b], Some(Cached::Wide(_)))
+            {
+                self.unlist(at, b, table);
+            }
         }
-        pending.clear();
-        *self.pending.borrow_mut() = pending;
+        Ok(())
+    }
+
+    /// PROTOTYPE: a write settled into the block it landed in, in place:
+    /// the key's run as a build would resolve it -- the partition's values
+    /// for an equal key, then the pieces' and the memtables', a tombstone
+    /// masking everything older -- spliced into whatever form the block
+    /// holds, a clean block becoming sparse. Before this the block was
+    /// dropped and rebuilt at the next scan that crossed it, a copy at 68
+    /// µs at thirty million keys, so a mix that updates and scans the same
+    /// keys rebuilt its hot blocks per write. A replaced run's bytes stay
+    /// in the block until they outweigh the live ones, when the block is
+    /// dropped instead. A wide block holds no values and is left alone; an
+    /// unbuilt one has nothing to patch.
+    fn patch_block(
+        &self,
+        at: usize,
+        b: usize,
+        table: &mut BlockTable,
+        key: &[u8],
+        cut: u32,
+    ) -> Result<()> {
+        if matches!(table.slots[b], None | Some(Cached::Wide(_))) {
+            return Ok(());
+        }
+        let np = self.segs.partition_point(|s| s.level > 0);
+        let seg = &self.segs[at];
+        let l0 = &self.segs[np..];
+        let src = Sources { seg, l0 };
+        let keys = seg.blob.keys();
+        let lo = b * CACHE_BLOCK;
+        let hi = ((b + 1) * CACHE_BLOCK).min(keys);
+        let mut held: Vec<(&[u8], usize, usize, u32)> = Vec::new();
+        for &(j, _) in &table.pieces {
+            let p = &l0[j];
+            let r = p.ord.seek(key, |i| p.blob.key_at(i));
+            if r < p.blob.keys() && p.blob.key_at(r) == Some(key) {
+                held.push((key, j, r, u32::MAX));
+            }
+        }
+        let slot_in = |t: &MemTable| t.slot_of(key).map_or(u32::MAX, |i| i as u32);
+        let sk = SnapKey {
+            off: 0,
+            len: 0,
+            mem: slot_in(&self.mem),
+            frozen: self.frozen.as_ref().map_or(u32::MAX, |fr| slot_in(fr)),
+        };
+        let ov = Overlay {
+            over: vec![Over {
+                key,
+                sk: Some(sk),
+                cut,
+                pieces: 0..held.len() as u32,
+            }],
+            held,
+        };
+        let (c, at_eq) = Self::cut_known(cut, lo, hi);
+        let same = c < hi && at_eq == Ordering::Equal;
+        let mut em = Emit {
+            tombs: self.has_tombstones(),
+            scratch: Vec::new(),
+        };
+        let mut run: Vec<u8> = Vec::new();
+        self.emit_over(
+            &mut |_, v: &[u8]| {
+                run.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                run.extend_from_slice(v);
+            },
+            &mut em,
+            &ov,
+            0,
+            same.then_some(c),
+            src,
+        )?;
+        let before = table.slots[b].as_ref().map_or(0, |c| c.bytes());
+        let was_clean = matches!(table.slots[b], Some(Cached::Clean));
+        let mut bloated = false;
+        match table.slots[b].as_mut().expect("checked above") {
+            Cached::Block(blk) => {
+                let i = blk.lower_bound(key);
+                let at_run = blk.vals.len() as u32;
+                blk.vals.extend_from_slice(&run);
+                if i < blk.ents.len() && blk.key(&blk.ents[i]) == key {
+                    blk.ents[i][2] = at_run;
+                    blk.ents[i][3] = run.len() as u32;
+                } else {
+                    let key_at = blk.keys.len() as u32;
+                    blk.keys.extend_from_slice(key);
+                    blk.ents
+                        .insert(i, [key_at, key.len() as u32, at_run, run.len() as u32]);
+                }
+                let live: usize = blk.ents.iter().map(|e| e[3] as usize).sum();
+                bloated = blk.vals.len() > 2 * live.max(4096);
+            }
+            Cached::Sparse(sb) => {
+                let i = sb.ents.partition_point(|e| sb.key(e) < key);
+                let at_run = sb.vals.len() as u32;
+                sb.vals.extend_from_slice(&run);
+                if i < sb.ents.len() && sb.key(&sb.ents[i]) == key {
+                    sb.ents[i].run = (at_run, run.len() as u32);
+                } else {
+                    let key_at = sb.keys.len() as u32;
+                    sb.keys.extend_from_slice(key);
+                    sb.ents.insert(
+                        i,
+                        DeltaEnt {
+                            key: (key_at, key.len() as u32),
+                            cut: c as u32,
+                            same,
+                            run: (at_run, run.len() as u32),
+                        },
+                    );
+                }
+                let live: usize = sb.ents.iter().map(|e| e.run.1 as usize).sum();
+                bloated = sb.vals.len() > 2 * live.max(4096);
+            }
+            slot @ Cached::Clean => {
+                *slot = Cached::Sparse(SparseBlock {
+                    keys: key.to_vec(),
+                    ents: vec![DeltaEnt {
+                        key: (0, key.len() as u32),
+                        cut: c as u32,
+                        same,
+                        run: (0, run.len() as u32),
+                    }],
+                    vals: run,
+                });
+            }
+            Cached::Wide(_) => unreachable!("a wide block is left alone above"),
+        }
+        if was_clean {
+            self.list_built(at, b, table);
+        } else {
+            let after = table.slots[b].as_ref().map_or(0, |c| c.bytes());
+            self.cache_bytes
+                .set(self.cache_bytes.get() + after - before);
+        }
+        if bloated {
+            self.unlist(at, b, table);
+        }
+        Ok(())
     }
 
     /// PROTOTYPE: the block whose key range holds `key`.
