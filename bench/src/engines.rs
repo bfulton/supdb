@@ -221,7 +221,15 @@ pub trait Engine {
     fn size_bytes(&self) -> u64;
 }
 
+/// Every file under `p` at any depth, in the blocks the filesystem has
+/// given them rather than their lengths: a file's length can run past what
+/// was ever written to it, and a store that reserves a map it has not
+/// filled would be charged for the reservation. Measured on the arms here
+/// the two agree within a thousandth, so this is robustness against a
+/// sparse file rather than a correction to one -- but `du` is what a user
+/// checks, and `du` counts blocks.
 fn dir_size(p: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
     let mut total = 0;
     if let Ok(rd) = std::fs::read_dir(p) {
         for e in rd.flatten() {
@@ -229,11 +237,11 @@ fn dir_size(p: &Path) -> u64 {
             total += if m.is_dir() {
                 dir_size(&e.path())
             } else {
-                m.len()
+                m.blocks() * 512
             };
         }
     } else if let Ok(m) = std::fs::metadata(p) {
-        total = m.len();
+        total = m.blocks() * 512;
     }
     total
 }

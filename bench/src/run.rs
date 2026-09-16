@@ -9,6 +9,7 @@
 
 use crate::engines::{self, Batch, Engine};
 use crate::env::IoCounters;
+use crate::gate;
 use crate::hist::Hist;
 use crate::row::{Guarantee, MachineInfo, Measurement, Row};
 use crate::workload::{db_key_into, KeyDist, KeyGen, Payload, Permutation, Rng};
@@ -106,6 +107,15 @@ impl Samples {
         (quantity, unit): (&str, &'static str),
         v: f64,
     ) {
+        // A quantity the gate has no direction for is a quantity the gate
+        // refuses to judge, and it refuses at gate time -- after the run
+        // that produced it. This is the one place a quantity enters a row,
+        // so it is the place to find out, and there is no second list to
+        // drift from: `higher_is_better` is the list.
+        assert!(
+            gate::higher_is_better(quantity).is_some(),
+            "quantity {quantity:?} has no direction; add it to gate::higher_is_better"
+        );
         self.map
             .entry((
                 workload.to_string(),
@@ -351,29 +361,6 @@ fn row_of(utc: &str, machine: &MachineInfo, plan: &Plan, s: &Samples) -> Row {
     }
 }
 
-/// The bytes the files under `dir` are allocated on disk, walked to any
-/// depth: allocated blocks rather than lengths, since a map file's length
-/// can run past what was ever written to it.
-fn dir_bytes(dir: &Path) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    let mut total = 0u64;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for e in rd.flatten() {
-            let Ok(md) = e.metadata() else { continue };
-            if md.is_dir() {
-                stack.push(e.path());
-            } else {
-                total += md.blocks() * 512;
-            }
-        }
-    }
-    total
-}
-
 struct OnePass {
     load_ops_s: f64,
     load_bpb: f64,
@@ -401,7 +388,25 @@ fn one_pass(
     let mut e = engines::open(arm, dir, map_gb)?;
     let (load_s, wrote) = load(e.as_mut(), size, plan, payload, |i| i)?;
     let stored = size as f64 * (KEY_SIZE + plan.value_size) as f64;
-    let on_disk = dir_bytes(dir);
+    // Read here so that this and the device bytes describe one moment: what
+    // the engine wrote to get there, and what it occupies having got there.
+    // Neither follows from the other -- ordered ingest cut supdb's device
+    // bytes from 2.63 to 1.48 per byte stored and left its 1.44 on disk
+    // exactly where it was.
+    //
+    // Through the engine rather than over its directory, because
+    // `Engine::size_bytes` is already the trait's answer to this and every
+    // adapter implements it; a second walk here would be a second
+    // definition of what a store weighs, and an engine that one day keeps
+    // a file somewhere else would have to be taught twice.
+    //
+    // It is what the arm has on disk when it says the load is durable, not
+    // what it settles to: `rocksdb-tuned` holds its memtable rather than
+    // flushing it, on purpose, because a flush would charge that arm a
+    // compaction the others do not pay here. Measured at 300k keys that is
+    // 1.03 against the 1.00 its flushed SST weighs, so the point costs it
+    // about 3% and is not where a size comparison turns.
+    let on_disk = e.size_bytes();
 
     let mut kb = [0u8; KEY_SIZE];
     let mut g = KeyGen::new(KeyDist::Uniform, size, 7);
@@ -640,4 +645,45 @@ fn free_bytes(dir: &Path) -> Option<u64> {
 pub fn full_top(mem_total_kb: u64, value_size: usize) -> u64 {
     let need = mem_total_kb as f64 * 1024.0 * 1.5;
     (need / (KEY_SIZE + value_size) as f64).ceil() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The guard in `Samples::push` is the whole reason a quantity cannot be
+    /// recorded without a direction, so it is held to firing. Written after
+    /// `store_bytes_per_byte` was added and the four places it had to be
+    /// named were found by grep: the gate is the one that fails a run rather
+    /// than a build, and it fails it after the measuring is done.
+    #[test]
+    #[should_panic(expected = "has no direction")]
+    fn a_quantity_the_gate_cannot_judge_is_refused_where_it_is_recorded() {
+        let mut s = Samples {
+            map: BTreeMap::new(),
+        };
+        s.push(
+            "load",
+            Some(10),
+            "supdb",
+            Guarantee::Durable,
+            ("bytes_per_fortnight", "B/f"),
+            1.0,
+        );
+    }
+
+    #[test]
+    fn every_quantity_the_runner_records_has_a_direction() {
+        for q in [
+            "ops_per_s",
+            "device_bytes_per_byte",
+            "bytes_on_disk_per_byte",
+            "reads_per_s",
+            "p99_us",
+            "entries_per_s",
+            "bytes_per_s",
+        ] {
+            assert!(gate::higher_is_better(q).is_some(), "{q}");
+        }
+    }
 }

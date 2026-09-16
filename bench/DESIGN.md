@@ -43,16 +43,30 @@ them is the headroom left. The scan floor's file fits in memory at `quick`
 and is served from the page cache after its first walk, which is also what a
 store that fits in memory sees; at `full` neither fits.
 
-The load's two byte quantities are taken apart. Device bytes written per
-byte stored is the device's write counter across the load: what the
-engine made the disk do to take the keys durably, amplification included.
-Bytes on disk per byte stored is what the store's files hold once the
-load is done and before any read, every file under the arm's directory
-at any depth, in allocated blocks rather than lengths, since a map file's
-length can run past what was ever written to it: what a user pays in
-space, with whatever an engine leaves unmerged at that point -- a log
-tail, a memtable's worth not yet sealed -- counted as the user would find
-it.
+The load's two byte quantities are taken apart, and they are not the same
+question. Device bytes written per byte stored is a flow: the device's
+write counter across the load, what the engine made the disk do to take
+the keys durably, amplification included. Bytes on disk per byte stored is
+a state: what the store's files hold once the load is done and before any
+read, every file under the arm's directory at any depth, in allocated
+blocks rather than lengths, since a map file's length can run past what
+was ever written to it.
+
+Neither follows from the other. Ordered ingest cut supdb's device bytes
+from 2.63 to 1.48 and left its 1.44 on disk exactly where it was, because
+what went away was the WAL write and not a byte of the segment. The state
+is also what the ladder's own top depends on, since `full` stops at the
+rung where the store is 1.5x the machine's memory.
+
+Both are read at one point, the moment the load's guarantee is met, so the
+pair describes one moment rather than two. That is what an arm has on disk
+when it says the load is durable and not what it settles to, so whatever an
+engine leaves unmerged at that point -- a log tail, a memtable's worth not
+yet sealed -- counts as a user would find it. What the choice of point
+costs is measured rather than assumed: `rocksdb-tuned` holds its memtable
+there on purpose, because flushing it would charge that arm a compaction
+the others do not pay, and at 300 000 keys its WAL weighs 1.03 against the
+1.00 of the SST it becomes.
 
 YCSB-D reads uniformly over the loaded keys rather than skewed to the latest
 inserts: the latest distribution needs a Zipfian over a count that grows
