@@ -4459,8 +4459,10 @@ pub struct Db {
     retiring_tmps: Vec<PathBuf>,
     /// EXPERIMENT: the memtable's entry count when the last builder was
     /// started from a commit, so the next starts a burst later and not a
-    /// batch later.
+    /// batch later, and the state's generation then, since a publish
+    /// stops the builder and retires what it had organised.
     built_ahead_len: usize,
+    built_ahead_gen: u64,
     /// An error from leaving order mid-batch, which `append` and `delete`
     /// cannot return: the next `commit` does.
     pending_err: Option<std::io::Error>,
@@ -7638,6 +7640,7 @@ impl Db {
             run_scratch: Vec::new(),
             retiring_tmps: Vec::new(),
             built_ahead_len: 0,
+            built_ahead_gen: 0,
             pending_err: None,
             next_seg: 0,
             sealing: None,
@@ -7912,6 +7915,7 @@ impl Db {
             run_scratch: Vec::new(),
             retiring_tmps: Vec::new(),
             built_ahead_len: 0,
+            built_ahead_gen: 0,
             pending_err: None,
             next_seg,
             sealing: None,
@@ -8430,9 +8434,19 @@ impl Db {
             // A seal: the memtable is new and the count starts over.
             self.built_ahead_len = 0;
         }
-        if len - self.built_ahead_len < due {
+        // A publish stops the builder and retires the forms it made, so
+        // the state that replaces it has none and the writes it carries
+        // are nobody's: a generation this handle has not organised is
+        // due whatever the memtable has taken since. Without this the
+        // builder started at a commit, the seal's own publish killed it,
+        // and no later commit was a burst away from the last -- a store
+        // with a hundred pieces reached its reads with one block built.
+        let gen = self.state().gen;
+        let fresh = gen != self.built_ahead_gen;
+        if !fresh && len - self.built_ahead_len < due {
             return;
         }
+        self.built_ahead_gen = gen;
         self.built_ahead_len = len;
         self.start_ahead();
     }
@@ -8617,11 +8631,18 @@ impl Db {
             l0_aligned,
             segs_tombs,
         };
-        self.publish_state(next);
+        self.publish_and_organise(next);
     }
 
     /// `next` becomes the state; the one before it is retired at the
     /// epoch this bumps and freed once no reader is pinned before it.
+    /// EXPERIMENT: after a publish, which stopped the builder and
+    /// retired its forms, organise the state that replaced it.
+    fn publish_and_organise(&mut self, next: State) {
+        self.publish_state(next);
+        self.build_ahead_if_due();
+    }
+
     fn publish_state(&mut self, next: State) {
         // The builder holds the state it builds over, and its forms are
         // of that state: stopped before the swap, so its handle is gone
@@ -8730,7 +8751,7 @@ impl Db {
             l0_aligned: cur.l0_aligned,
             segs_tombs: cur.segs_tombs,
         };
-        self.publish_state(next);
+        self.publish_and_organise(next);
     }
 
     /// The state with `frozen` as the frozen memtable.
@@ -8752,7 +8773,7 @@ impl Db {
             l0_aligned: cur.l0_aligned,
             segs_tombs: cur.segs_tombs,
         };
-        self.publish_state(next);
+        self.publish_and_organise(next);
     }
 
     /// The live memtable frozen and a fresh one live, in one publish;
@@ -8776,7 +8797,7 @@ impl Db {
             l0_aligned: cur.l0_aligned,
             segs_tombs: cur.segs_tombs,
         };
-        self.publish_state(next);
+        self.publish_and_organise(next);
         frozen
     }
 
