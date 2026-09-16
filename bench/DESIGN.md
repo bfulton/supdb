@@ -54,7 +54,12 @@ writers beside each other, each a quantity per thread count so a row shows
 where an arm's throughput stops scaling. LMDB and RocksDB take it as they
 are; supdb is single-writer with reads that borrow the writer, and the
 engine side of the item is in `docs/engine.md` under what is open. Until
-both sides exist a row measures no concurrency and claims none.
+both sides exist a row measures no concurrency and claims none. An
+engine's own threads are the engine's: supdb seals, merges and, with
+the block cache, builds the cache ahead of a scan on threads of its own,
+as RocksDB compacts on its own; the workload thread is still one, and
+the figure is that thread's throughput with the engine doing what it
+does beside it.
 
 ## Arms
 

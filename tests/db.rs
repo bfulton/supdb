@@ -2115,13 +2115,18 @@ fn a_write_settles_into_the_block_it_lands_in() {
     m.check(&db, "reopened");
 }
 
-/// A builder ahead of the reader: after a publish, the blocks the pieces
-/// overlay are built on a thread from the partitions and the pieces and
-/// installed at the store's next scan with the memtable's keys spliced
-/// in, so the first scan over a block finds it built. One scan of three
-/// keys leaves every block of every partition built; the model holds the
-/// installed forms to the merge, with keys written after the publish that
-/// only the store knew.
+/// A builder ahead of the reader: at the writer's first scan over a
+/// state, and again at a commit once the memtable has grown by an eighth
+/// since, the blocks a piece or an unsealed key overlays are built on a
+/// thread from the partitions, the pieces and the memtables as of the
+/// last commit, and installed at the store's next scan with the keys
+/// written since that commit spliced in. A scan starts it, `settle`
+/// waits for it, and the scan after finds every block of every partition
+/// built; the model holds the installed forms to the merge, with keys
+/// written after the builder's commit that only the store knew, and with
+/// the store reopened between, so the second builder's forms are the
+/// ones installed and the memtable it built from is the one the log
+/// replayed and then grew.
 #[test]
 fn a_builder_ahead_of_the_reader_fills_the_cache() {
     let d = dir("build-ahead");
@@ -2153,12 +2158,17 @@ fn a_builder_ahead_of_the_reader_fills_the_cache() {
     db.seal().unwrap();
     db.settle().unwrap();
     assert_eq!(db.levels().1, parts, "a piece over every range");
-    // Keys the builder never saw, written after the publish.
+    // The first scan over the published state starts the builder, over
+    // the memtable as of the last commit; the keys written after it are
+    // the builder's to lack and the install's to splice.
+    let mut sink = 0usize;
+    db.scan(key(0).as_bytes(), 3, |_k, v| sink += v.len())
+        .unwrap();
+    db.settle().unwrap();
     for k in (1..1200).step_by(50) {
         m.append(&mut db, &key(k), "live");
     }
     db.commit().unwrap();
-    let mut sink = 0usize;
     db.scan(key(0).as_bytes(), 3, |_k, v| sink += v.len())
         .unwrap();
     let (blocks, _) = db.block_cache_size();
@@ -2168,7 +2178,7 @@ fn a_builder_ahead_of_the_reader_fills_the_cache() {
     );
     m.check(
         &db,
-        "installed forms with the keys since the publish spliced in",
+        "installed forms with the keys since the builder's commit spliced in",
     );
     // More writes settle into the installed forms as into any built block.
     for k in (2..1200).step_by(70) {
@@ -2177,6 +2187,62 @@ fn a_builder_ahead_of_the_reader_fills_the_cache() {
     m.delete(&mut db, &key(600));
     db.commit().unwrap();
     m.check(&db, "writes settled into installed forms");
+    // Reopened: the cache is empty, the memtable is the log's replay, and
+    // the builder is gone. A scan starts one; a commit of more than a
+    // thousand writes, an eighth of the memtable and more, starts another
+    // over the memtable as of that commit, dropping the first's forms;
+    // `settle` waits for it, with its forms held for the next scan.
+    drop(db);
+    let mut db = Db::open(
+        &d,
+        Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(2 << 10),
+            l0_trigger: 64,
+            scan_block_cache: true,
+            scan_cache_ahead: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    db.scan(key(0).as_bytes(), 3, |_k, v| sink += v.len())
+        .unwrap();
+    let between = |k: u32| format!("key-{k:05}x");
+    for k in 0..1100 {
+        m.append(&mut db, &between(k), "m");
+    }
+    for k in (0..1200).step_by(9) {
+        m.append(&mut db, &key(k), "m2");
+    }
+    m.delete(&mut db, &key(300));
+    db.commit().unwrap();
+    db.settle().unwrap();
+    // Written after the builder's commit: keys its forms lack, that the
+    // install splices in, among them a key it built and one it never saw.
+    for k in (5..1200).step_by(40) {
+        m.append(&mut db, &key(k), "since");
+    }
+    m.append(&mut db, &between(1100), "since");
+    m.delete(&mut db, &key(9));
+    m.delete(&mut db, &between(7));
+    db.commit().unwrap();
+    db.scan(key(0).as_bytes(), 3, |_k, v| sink += v.len())
+        .unwrap();
+    let (blocks, _) = db.block_cache_size();
+    assert!(
+        blocks >= parts,
+        "every partition's blocks built ahead from the memtable: {blocks} blocks over {parts} partitions after one scan of three"
+    );
+    m.check(
+        &db,
+        "forms built from the memtable, with the keys since the builder's commit spliced in",
+    );
+    for k in (3..1200).step_by(90) {
+        m.append(&mut db, &key(k), "later2");
+    }
+    db.commit().unwrap();
+    m.check(&db, "writes settled into the second builder's forms");
+    std::hint::black_box(sink);
 }
 
 /// A key updated in every seal is in every piece over its range, and it
@@ -3226,6 +3292,53 @@ fn the_reader_table_has_a_slot_for_each_handle() {
     assert!(db.reader().is_err(), "one more is refused");
     held.pop();
     assert!(db.reader().is_ok(), "a dropped handle's slot is free");
+}
+
+/// What a reopen replays from the WAL was committed before the crash, and
+/// a reader handle under `Latest` sees it from the open on: the replayed
+/// memtable carries the commit watermark, not zero until the writer's
+/// first commit after. Found by the builder ahead of the reader, which
+/// reads a reopened store at that watermark and built as if the memtable
+/// were empty.
+#[test]
+fn a_reader_sees_the_replayed_writes_from_the_open_on() {
+    let d = dir("reopen-watermark");
+    let mut db = Db::create(&d, Options::default()).unwrap();
+    for k in 0..300u32 {
+        db.append(format!("key-{k:05}").as_bytes(), b"v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    for k in (0..300u32).step_by(7) {
+        db.append(format!("key-{k:05}").as_bytes(), b"v1");
+    }
+    db.delete(b"key-00001");
+    db.commit().unwrap();
+    drop(db);
+    let db = Db::open(&d, Options::default()).unwrap();
+    let reader = db.reader().unwrap();
+    assert_eq!(reader.isolation(), Isolation::Latest);
+    assert_eq!(
+        read_vec(&reader, b"key-00007"),
+        vec![b"v0".to_vec(), b"v1".to_vec()]
+    );
+    assert_eq!(read_vec(&reader, b"key-00001"), Vec::<Vec<u8>>::new());
+    assert_eq!(reader.count(b"key-00014").unwrap(), 2);
+    let mut n = 0;
+    reader
+        .scan(b"key-00006", 3, |k, v| {
+            if k == b"key-00007" && v == b"v1" {
+                n += 1;
+            }
+        })
+        .unwrap();
+    assert_eq!(n, 1, "the replayed append in a scan");
+    reader.snapshot();
+    assert_eq!(
+        read_vec(&reader, b"key-00021"),
+        vec![b"v0".to_vec(), b"v1".to_vec()]
+    );
+    reader.release();
 }
 
 /// A piece sealed while a merge of its range runs is kept across the

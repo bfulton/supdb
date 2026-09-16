@@ -680,24 +680,50 @@ per-commit path.
   scan to build wide, which the wide-block test found missing; and a
   replaced run's bytes stay until they outweigh the live ones, when the
   block is dropped instead. The builder ahead of the reader
-  (`scan_cache_ahead`, off) needed none of the concurrency below: the
-  segment files are immutable and stay readable while mapped, so after
-  every publish a thread opens readers of its own over the published
-  names and builds from the partitions and the pieces with an empty
-  memtable, and the store installs each form at its next scan and
-  splices the memtable's keys over the block in through the settle. The
-  build functions were lifted off `Db` onto a context -- the segments,
-  the two memtables, the tombstone flag -- that either side holds; the
-  read path priced the same before and after at ten million keys and
-  thirty. What it buys on the suite's E at thirty million is small,
-  because E starts with a million and a half unsealed keys from F, and
-  splicing those into a pre-built sparse form costs about what building
-  it at the scan costs, and the copies alone are a twentieth of the
-  pass. Two rounds interleaved at thirty million: building every block
-  ahead, E's first pass 345k–380k against 345k–374k with it off and its
-  second 385k–409k against 412k–437k; copies only, 360k–375k and
-  418k–443k, at 311 MB against 290. A tie, and it stays one until E
-  starts on a smaller memtable, so the builder stays off. The cache is
+  (`scan_cache_ahead`, on) is a reader handle on a thread of its own,
+  started by the writer's first scan over a published state: it pins the
+  state as of the last commit -- the watermark, the write log's length
+  and the entry count the memtable records at each commit -- builds its
+  own snapshot of the unsealed keys and every block a piece or one of
+  them overlays, sparse forms included, and sends each form back as it
+  is built; the writer installs them at its scans while the state is the
+  one they were built over, and splices in the keys logged after the
+  builder's commit, which it lists as it reads the log, seeded with what
+  it had read past the commit already -- a staged batch its own scans
+  see. Once per state: an installed form is kept current by the settle
+  of every write after, so a second builder over the same state has
+  nothing to add. Its first version built from the segments alone with
+  an empty memtable, because the memtable was one thread's; that version
+  was a tie at thirty million, where E starts on a million and a half
+  unsealed keys and splicing those into a form costs about what building
+  it costs. This one builds from the memtable, and what it buys is
+  bounded by what a build costs the scan that would have done it, less
+  what a thread beside the scans costs them: at three million keys the
+  builder sends 37k forms in 140–160 ms, the scans have 30–32k of them
+  installed by the sixth percentile of the pass, and E prices 558k–590k
+  against 537k–572k without it, two rounds interleaved, the scan 1.37–
+  1.47 µs against 1.44–1.55; at 300k, five rounds, 598k–665k against
+  622k–670k, a tie, since the first pass there costs its cold cache and
+  not its builds: 3.9k forms in 14 ms, 3.1k installed by the eighth
+  percentile, and the pass moved by nothing; at thirty million, two
+  rounds, 438k–463k against 401k–434k, the scan 1.84–1.89 µs against
+  1.90–1.95, with the write mixes before it level. Two versions between
+  were measured and thrown out. One restarted the builder at a commit once
+  the memtable had grown by an eighth, and once a run's forms were all
+  installed restarted it at every commit: at three million it ran three
+  times beside E's scans, every form of the second and third run dropped
+  for a slot already filled, and E priced 397k–427k against 498k–517k;
+  at 300k, restarting from zero, 180k–305k against 490k–655k. A thread
+  sweeping the store beside the scan thread costs the scans a quarter
+  while it runs, so it runs once. The other read each piece's ranks
+  through a read-write lock at every block build, twenty-two pieces a
+  block at three million, so the builder and the scans bounced the lock
+  words between their cores; the lock is taken once per table now, which
+  clones the shared vector, and a build reads it lock-free. The arm
+  without the builder priced 498k–517k on E at three million in the run
+  with the lock and 537k–572k in the run after it, nothing else in that
+  arm changed, and that is not a comparison the suite would accept: the
+  lock did not stay on the count alone. The cache is
   on by default: its write path settles in place, and in every quick row
   the arm with it prices the same as the arm without on every workload
   but E, where it runs three times the merge -- what it costs is the
@@ -862,7 +888,7 @@ per-commit path.
   freeze builds the next one and swaps it, and the one before is
   retired at the epoch the swap bumps and freed past every pinned
   reader. A segment is immutable once open -- its block table left it
-  for the handle, its piece ranks a lock any thread may fill, and the
+  for the handle, its piece ranks a lock a table takes once, and the
   blob's checksum memo became atomic words and its
   decompression buffers the thread's -- so a `State` is `Send + Sync`,
   which a test asks the compiler. `Db` is now the writer over a

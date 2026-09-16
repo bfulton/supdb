@@ -45,6 +45,11 @@ green run there. Use a group name to run one. `quick` is a group too, the
 suite's three-minute measurement; it is not in the default set because a
 timing run needs the machine to itself, and CI gives it a job of its own.
 
+The tests leave their stores under the temp directory, one per test and
+process (`supdb-next-<name>-<pid>`), so a day of test runs on one box is
+tens of thousands of them and the disk they fill; `rm -rf
+$TMPDIR/supdb-next-*` between runs.
+
 Keep it that way. Every gate this repository has broken has broken the same
 way: a check that was not running, or one reporting a verdict it had not
 earned. CI never built the wasm module at all, so a link break in
@@ -235,6 +240,20 @@ so the case is reached every run. The rule: a cache derived from one
 object is keyed by that object's identity, never by its place or its
 range, because a publish that keeps the position and replaces the object
 is exactly what a merge does.
+
+**A replay that builds the thing without the last step of the live
+path.** A reopen replays the WAL into the memtable through the same
+`append` and `delete` a live write takes, and stopped there: the live
+path ends in a commit that records the watermark, so the replayed table
+carried none, and a reader handle under `Latest` saw nothing of what the
+WAL had committed until the writer's first commit after the open. Every
+test read a reopened store through the writer's own handle, which
+honours no watermark. The builder ahead of the reader found it, reading a
+reopened store at the watermark and building as if the memtable were
+empty; the open commits what it replayed now, and a test reads a
+reopened store through a handle. The rule: a path that rebuilds a
+structure ends where the live path ends, and a reader that honours a
+mark the live path sets is the test that tells the two apart.
 
 **A path only one arm exercises is a path nothing tests.** A delete was never
 marked dirty, and the checkpoint asked to carry it dropped it, leaving the key

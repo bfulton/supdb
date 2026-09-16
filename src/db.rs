@@ -369,15 +369,17 @@ pub struct Options {
     /// when a scan next wants it, so the pieces on disk are what the
     /// cache overflows to.
     pub scan_cache_bytes: usize,
-    /// PROTOTYPE, off by default: with the block cache, build ahead of
-    /// the reader. After every publish a thread opens readers of its own
-    /// over the published segments -- immutable files, readable while
-    /// mapped -- and builds every block the pieces overlay from the
-    /// partitions and the pieces alone, sending each form back as it is
-    /// built; the store installs a form at its next scan, if the segments
-    /// have not changed since, and splices the memtable's keys over the
-    /// block in as it settles a write. The first scan over a block then
-    /// finds it built.
+    /// PROTOTYPE: with the block cache, build ahead of the reader on a
+    /// thread of its own. At the writer's first scan over a published
+    /// state, a reader handle pins the store as of the last commit and
+    /// builds every block a piece or an unsealed key overlays, sending
+    /// each form back as it is built; the store installs the forms at
+    /// its scans, while the state is the one they were built over, and
+    /// splices in the keys written after the builder's commit, which its
+    /// own read of the write log lists. The scans after find the blocks
+    /// built. Once per state: an installed form is kept current by the
+    /// settle of every write after. Under `scan_cache_bytes` the builder
+    /// stops at the budget. `false` is the arm without the thread.
     pub scan_cache_ahead: bool,
     /// How the ordered scan builds its sorted snapshot of the unsealed keys.
     /// `true` keeps the keys in one arena and sorts 24-byte records (a
@@ -416,7 +418,7 @@ impl Default for Options {
             scan_merge: true,
             scan_block_cache: true,
             scan_cache_bytes: 0,
-            scan_cache_ahead: false,
+            scan_cache_ahead: true,
             scan_snapshot_arena: true,
         }
     }
@@ -907,8 +909,11 @@ struct Seg {
     /// is kept across the merge's publish, under a new partition, and
     /// ranks taken against the old one are behind by every key the merge
     /// folded in below. A lock rather than a once-cell for that reason,
-    /// taken once per block build and piece; any reader may fill it.
-    ranks: std::sync::RwLock<Option<(u64, Vec<u32>)>>,
+    /// taken once per table made, which clones the shared vector and
+    /// reads it lock-free at every block build after: a lock per block
+    /// build and piece bounced its word between a builder's thread and
+    /// the scan's, twenty-two pieces a block at three million keys.
+    ranks: std::sync::RwLock<Option<(u64, std::sync::Arc<Vec<u32>>)>>,
     level: u8,
     /// The WAL sequence the segment's name carries: what orders the
     /// level-0 pieces over one fence oldest to newest, which a read's
@@ -2307,6 +2312,12 @@ struct MemTable {
     /// The value arena's tail at the last commit: a chunk at or past it
     /// is a write no commit has covered.
     committed: AtomicU64,
+    /// The write log's length and the entry count at the last commit:
+    /// what a builder ahead of the reader takes its watermark with, so
+    /// the writes it lacks are exactly the log from that length on and
+    /// the entries its snapshot covers are exactly the committed ones.
+    committed_log: AtomicUsize,
+    committed_len: AtomicUsize,
     /// Indexes a rebuild replaced, each with the epoch it was retired at,
     /// freed once no reader is pinned before that epoch. Writer-only.
     retired: UnsafeCell<Vec<(u64, Box<Index>)>>,
@@ -2690,6 +2701,8 @@ impl MemTable {
             vals: ByteArena::new(),
             tombs: AtomicUsize::new(0),
             committed: AtomicU64::new(0),
+            committed_log: AtomicUsize::new(0),
+            committed_len: AtomicUsize::new(0),
             retired: UnsafeCell::new(Vec::new()),
             log: Slab::new(),
         }
@@ -2705,6 +2718,8 @@ impl MemTable {
             vals: ByteArena::new(),
             tombs: AtomicUsize::new(0),
             committed: AtomicU64::new(0),
+            committed_log: AtomicUsize::new(0),
+            committed_len: AtomicUsize::new(0),
             retired: UnsafeCell::new(Vec::new()),
             log: Slab::new(),
         }
@@ -2776,6 +2791,10 @@ impl MemTable {
 
     /// Writer: what is written is committed.
     fn commit(&self) {
+        self.committed_log
+            .store(self.log.len(), AtomicOrdering::Release);
+        self.committed_len
+            .store(self.entries.len(), AtomicOrdering::Release);
         self.committed
             .store(self.vals.tail() as u64, AtomicOrdering::Release);
     }
@@ -2783,6 +2802,16 @@ impl MemTable {
     /// The watermark a reader honours to see committed chunks only.
     fn committed(&self) -> u64 {
         self.committed.load(AtomicOrdering::Acquire)
+    }
+
+    /// The write log's length at the last commit.
+    fn committed_log(&self) -> usize {
+        self.committed_log.load(AtomicOrdering::Acquire)
+    }
+
+    /// The entry count at the last commit.
+    fn committed_len(&self) -> usize {
+        self.committed_len.load(AtomicOrdering::Acquire)
     }
 
     /// Writer: the entry for `key`, made if the table lacks it -- its key
@@ -3972,6 +4001,10 @@ struct BlockTable {
     /// more for the partition's upper fence, so block `b` holds the
     /// piece's ranks `at[b]..at[b + 1]`.
     pieces: Vec<(usize, Vec<u32>)>,
+    /// Per entry of `pieces`, the piece's ranks against this partition,
+    /// taken when the table was made, or none when it has none against
+    /// it and the cut is searched for instead.
+    piece_ranks: Vec<Option<std::sync::Arc<Vec<u32>>>>,
     /// The same over the snapshot of unsealed keys, for the snapshot
     /// `snap_gen` names; walked again when a rebuild replaces it.
     snap_at: Vec<u32>,
@@ -4186,8 +4219,8 @@ pub struct Reader {
     /// snapshot already, not a key to file.
     snap_entries: std::cell::Cell<usize>,
     /// PROTOTYPE: the builder ahead of the reader, while one is running
-    /// or has forms still to install.
-    ahead: Option<Ahead>,
+    /// or has forms still to install. The writer's handle alone has one.
+    ahead: std::cell::RefCell<Option<Ahead>>,
 }
 
 pub struct Db {
@@ -4618,6 +4651,28 @@ impl Reader {
         // SAFETY: pinned above, so not freed under this handle.
         self.wm.set(unsafe { &*p }.mem.committed());
         self.isolation.set(Isolation::Snapshot);
+    }
+
+    /// PROTOTYPE: hold the state of generation `gen` under watermark `wm`,
+    /// both named by the writer for its builder ahead, as `snapshot`
+    /// holds the latest; false, and nothing held, when the state has moved
+    /// on already.
+    fn pin_at(&self, gen: u64, wm: u64) -> bool {
+        let Some(slot) = self.slot else { return false };
+        if self.isolation.get() == Isolation::Snapshot {
+            self.release();
+        }
+        self.shared.readers.pin(slot);
+        let p = self.shared.state.load(AtomicOrdering::Acquire);
+        // SAFETY: pinned above, so not freed under this handle.
+        if unsafe { &*p }.gen != gen {
+            self.shared.readers.unpin(slot);
+            return false;
+        }
+        self.held.store(p, AtomicOrdering::Relaxed);
+        self.wm.set(wm);
+        self.isolation.set(Isolation::Snapshot);
+        true
     }
 
     /// Let the snapshot go: reads see the latest commit again.
@@ -5379,6 +5434,11 @@ impl Reader {
         let covered = self.snap_entries.get();
         let mut added = self.snap_added.borrow_mut();
         let mut pending = self.pending.borrow_mut();
+        let ahead = self.ahead.borrow();
+        let mut since = ahead
+            .as_ref()
+            .filter(|a| !a.done.get())
+            .map(|a| (a.from, a.since.borrow_mut()));
         for i in seen..n {
             let (id, new) = mem.log_at(i);
             // Created since the snapshot: a key the snapshot holds already
@@ -5392,6 +5452,12 @@ impl Reader {
                 match pending.last_mut() {
                     Some(last) if last.0 == e.key_off => last.2 |= new,
                     _ => pending.push((e.key_off, e.key_len, new)),
+                }
+            }
+            if let Some((from, since)) = since.as_mut() {
+                if i >= *from {
+                    let e = mem.entry(id);
+                    since.file(e.key_off, e.key_len);
                 }
             }
         }
@@ -5416,16 +5482,31 @@ impl Reader {
     /// keys filed since, which is what a build here would have merged --
     /// so the installed block equals one built here.
     fn install_ahead(&self, unsealed: &Snapshot) -> Result<()> {
-        let Some(a) = &self.ahead else {
+        let mut ahead = self.ahead.borrow_mut();
+        let Some(a) = ahead.as_mut() else {
             return Ok(());
         };
+        if a.done.get() {
+            return Ok(());
+        }
         let np = self.segs().partition_point(|s| s.level > 0);
         let l0 = &self.segs()[np..];
-        while let Ok(built) = a.rx.try_recv() {
-            // Every publish stops the builder before the set it built over
-            // changes, so a form of another generation cannot arrive here
-            // today; the check guards a path that sorts the segments
-            // without one.
+        let mut since = a.since.borrow_mut();
+        since.settle(self.mem());
+        let mut done = false;
+        loop {
+            let built = match a.rx.try_recv() {
+                Ok(b) => b,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    done = true;
+                    break;
+                }
+            };
+            // Every publish stops the builder before the state it built
+            // over changes, so a form of another generation cannot arrive
+            // here today; the check guards a path that publishes without
+            // one.
             if built.gen != self.state().gen {
                 continue;
             }
@@ -5454,24 +5535,35 @@ impl Reader {
             table.slots[b] = Some(built.form);
             self.list_built(pi, b, table);
             self.shed(pi, b, table);
-            let (lo, hi) = (table.snap_at[b] as usize, table.snap_at[b + 1] as usize);
-            let mut keys: Vec<(Vec<u8>, u32)> = Vec::with_capacity(hi - lo + table.added[b].len());
-            for i in lo..hi {
-                if let Some((k, _)) = unsealed.get(i) {
-                    keys.push((k.to_vec(), u32::MAX));
-                }
+            // The keys written since the builder's watermark that fall in
+            // the block, spliced in as a settle splices a write: the
+            // block's range runs from its first key, or the partition's
+            // lower fence for the first block, to the next block's first
+            // key, or the upper fence for the last.
+            let lo = if b == 0 {
+                (!seg.lo.is_empty()).then_some(seg.lo.as_slice())
+            } else {
+                seg.blob.key_at(b * CACHE_BLOCK)
+            };
+            let hi = seg.blob.key_at((b + 1) * CACHE_BLOCK).or(seg.hi.as_deref());
+            let run = since.range(self.mem(), lo, hi);
+            for i in run {
+                let (off, len) = since.at(i);
+                let k = self.mem().key_at(off, len);
+                let cut = BuildCtx::owner_of(seg, k).1;
+                self.patch_block(pi, b, table, k, cut)?;
             }
-            for &(slot, cut) in &table.added[b] {
-                let k = self.mem().key_of(self.mem().entry(slot as usize));
-                keys.push((k.to_vec(), cut));
-            }
-            for (k, cut) in keys {
-                let cut = if cut == u32::MAX {
-                    BuildCtx::owner_of(seg, &k).1
-                } else {
-                    cut
-                };
-                self.patch_block(pi, b, table, &k, cut)?;
+        }
+        if done {
+            // Every form the builder made is installed or dropped, and the
+            // thread is joined; the builder stays, as the mark that this
+            // state has had one and the length its forms covered, and the
+            // keys since are nobody's to splice.
+            *since = Since::default();
+            drop(since);
+            a.done.set(true);
+            if let Some(h) = a.handle.take() {
+                let _ = h.join();
             }
         }
         Ok(())
@@ -5832,7 +5924,7 @@ impl Reader {
         let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
         let ctx = self.build_ctx();
         ctx.rank_pieces()?;
-        let (pieces, snap_at) = ctx.table_bounds(seg, l0, unsealed)?;
+        let (pieces, piece_ranks, snap_at) = ctx.table_bounds(seg, l0, unsealed)?;
         let mut added: Vec<Vec<(u32, u32)>> = (0..nblocks).map(|_| Vec::new()).collect();
         if nblocks > 0 {
             for &slot in self.snap_added.borrow().iter() {
@@ -5850,6 +5942,7 @@ impl Reader {
             touched: vec![0; nblocks],
             listed: vec![u32::MAX; nblocks],
             pieces,
+            piece_ranks,
             snap_at,
             snap_gen: self.snap_gen.get(),
             added,
@@ -5872,6 +5965,9 @@ impl Reader {
         let l0 = &self.segs()[np..];
         let tick = self.scan_tick.get().wrapping_add(1);
         self.scan_tick.set(tick);
+        if self.opts.scan_cache_ahead && self.ahead.borrow().is_none() {
+            self.start_ahead();
+        }
         self.install_ahead(unsealed)?;
         // One context for the scan: its tombstone flag is a walk over every
         // segment, which a context per block paid on every sparse walk.
@@ -6768,7 +6864,7 @@ impl Db {
             log_seen: std::cell::Cell::new(0),
             log_gen: std::cell::Cell::new(0),
             snap_entries: std::cell::Cell::new(0),
-            ahead: None,
+            ahead: std::cell::RefCell::new(None),
         };
         Ok(Db {
             r,
@@ -6959,6 +7055,11 @@ impl Db {
             from = next;
             valid_len = valid;
         }
+        // What replayed is what the WAL had committed: a reader under
+        // `Latest` sees it from the open on, not from the first commit
+        // after. The builder ahead of the reader found it missing, reading
+        // a reopened store at its watermark.
+        mem.commit();
         // Older WALs are kept, not swept: their records are in the
         // memtable and the memtable is not durable. They retire at the
         // next seal, when a named segment covers them.
@@ -7023,7 +7124,7 @@ impl Db {
             log_seen: std::cell::Cell::new(0),
             log_gen: std::cell::Cell::new(0),
             snap_entries: std::cell::Cell::new(0),
-            ahead: None,
+            ahead: std::cell::RefCell::new(None),
         };
         Ok(Db {
             r,
@@ -7623,7 +7724,6 @@ impl Db {
         let tp = std::time::Instant::now();
         self.publish()?;
         self.seal_wait.publish_ns += tp.elapsed().as_nanos() as u64;
-        self.build_ahead();
         for old in std::mem::take(&mut self.retiring_wals) {
             if self.opts.recycle_wal && self.spare_wals.is_empty() {
                 let id = old
@@ -7679,6 +7779,10 @@ impl Db {
     /// `next` becomes the state; the one before it is retired at the
     /// epoch this bumps and freed once no reader is pinned before it.
     fn publish_state(&mut self, next: State) {
+        // The builder holds the state it builds over, and its forms are
+        // of that state: stopped before the swap, so its handle is gone
+        // before the state it pinned is retired.
+        self.stop_ahead();
         let p = Box::into_raw(Box::new(next));
         let old = self.shared.state.swap(p, AtomicOrdering::AcqRel);
         let tag = self.shared.readers.bump();
@@ -7694,7 +7798,9 @@ impl Db {
     pub fn retired_states(&self) -> usize {
         self.shared.retired.lock().expect("the retired list").len()
     }
+}
 
+impl Reader {
     /// A handle that reads this store from any thread, under `Latest`
     /// isolation to begin with, with caches of its own and a slot in the
     /// reader table for its life. It is `Send` and not `Sync`: one
@@ -7726,10 +7832,12 @@ impl Db {
             log_seen: std::cell::Cell::new(0),
             log_gen: std::cell::Cell::new(0),
             snap_entries: std::cell::Cell::new(0),
-            ahead: None,
+            ahead: std::cell::RefCell::new(None),
         })
     }
+}
 
+impl Db {
     /// The state with `mem` as the live memtable.
     fn set_mem(&mut self, mem: std::sync::Arc<MemTable>) {
         let cur = self.state();
@@ -8043,7 +8151,6 @@ impl Db {
         for old in old_names {
             self.retire_seg(&old);
         }
-        self.build_ahead();
         Ok(())
     }
 
@@ -8188,7 +8295,6 @@ impl Db {
             self.build_ctx().rank_pieces()?;
         }
         self.publish()?;
-        self.build_ahead();
         for name in &inputs {
             self.retire_seg(name);
         }
@@ -8200,43 +8306,63 @@ impl Db {
     fn tables_for(n: usize) -> Vec<std::cell::RefCell<Option<BlockTable>>> {
         (0..n).map(|_| std::cell::RefCell::new(None)).collect()
     }
+}
 
-    /// PROTOTYPE: a built block takes its place in the list the sampler
-    /// draws from, and the count grows by what it holds.
-    /// PROTOTYPE: start the builder ahead of the reader over the segment
-    /// set just published, stopping one still running for an older set.
-    /// Nothing to build without a piece: every block of a partition no
-    /// piece overlays is clean, and a form for it is nothing.
-    fn build_ahead(&mut self) {
-        if !(self.opts.scan_block_cache && self.opts.scan_cache_ahead) {
+impl Reader {
+    /// PROTOTYPE: the builder started over the state as of the last
+    /// commit, by the writer's own handle at its first scan on the block
+    /// path over a state: a reader handle of its own, pinned to this
+    /// generation under the commit's watermark, the write log's length at
+    /// the commit as the first write its forms lack. Once, per state: an
+    /// installed form is kept current by the settle of every write after,
+    /// so a second builder over the same state has nothing to add, and
+    /// one that ran anyway cost the scans beside it a quarter at three
+    /// million keys.
+    fn start_ahead(&self) {
+        if self.slot.is_some() {
             return;
         }
         self.stop_ahead();
-        if !self.segs().iter().any(|s| s.level == 0) {
+        if self.segs().first().is_none_or(|s| s.level == 0) {
             return;
         }
-        let names: Vec<String> = self.segs().iter().map(|s| s.name.clone()).collect();
+        let Ok(r) = self.reader() else {
+            return;
+        };
         let gen = self.state().gen;
-        let dir = self.dir.clone();
-        let random = self.advice_random();
-        let advise_ord = self.opts.read_advice != ReadAdvice::Normal;
-        let verify = self.opts.segment.checksums;
+        let mem = self.mem();
+        let (wm, from, live_len) = (mem.committed(), mem.committed_log(), mem.committed_len());
+        // Writes logged past the commit that this handle has read already
+        // -- a batch staged and not committed, which the writer's own
+        // scans see -- are filed now; the log is read on from where it
+        // was, so nothing is filed twice.
+        let mut since = Since::default();
+        if self.log_gen.get() == gen {
+            for i in from..self.log_seen.get() {
+                let (id, _) = mem.log_at(i);
+                let e = mem.entry(id);
+                since.file(e.key_off, e.key_len);
+            }
+        }
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
         let flag = stop.clone();
         let handle = std::thread::spawn(move || {
-            let _ = build_ahead_job(&dir, &names, gen, random, advise_ord, verify, &flag, &tx);
+            let _ = r.build_ahead_job(gen, wm, live_len, &flag, &tx);
         });
-        self.ahead = Some(Ahead {
+        *self.ahead.borrow_mut() = Some(Ahead {
             handle: Some(handle),
             rx,
             stop,
+            from,
+            since: std::cell::RefCell::new(since),
+            done: std::cell::Cell::new(false),
         });
     }
 
     /// PROTOTYPE: the builder told to stop and joined, its forms dropped.
-    fn stop_ahead(&mut self) {
-        if let Some(mut a) = self.ahead.take() {
+    fn stop_ahead(&self) {
+        if let Some(mut a) = self.ahead.borrow_mut().take() {
             a.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             if let Some(h) = a.handle.take() {
                 let _ = h.join();
@@ -8247,14 +8373,16 @@ impl Db {
     /// PROTOTYPE: the builder waited for, its forms kept for the next
     /// scan to install. What `settle` does, for a test or an experiment
     /// that wants the cache as the builder leaves it.
-    fn join_ahead(&mut self) {
-        if let Some(a) = self.ahead.as_mut() {
+    fn join_ahead(&self) {
+        if let Some(a) = self.ahead.borrow_mut().as_mut() {
             if let Some(h) = a.handle.take() {
                 let _ = h.join();
             }
         }
     }
+}
 
+impl Db {
     pub fn phase_ns(&self) -> (u64, u64, u64) {
         (self.phase_ns[0], self.phase_ns[1], self.phase_ns[2])
     }
@@ -8394,17 +8522,105 @@ impl Txn<'_> {
 /// the level and the first rank not below each block's lower bound, as
 /// `BlockTable::pieces` holds them.
 type PieceBounds = Vec<(usize, Vec<u32>)>;
+/// PROTOTYPE: a piece's run over one block, as a build merges it: the
+/// piece's index in the level, the run of its ranks, and its ranks
+/// against the partition when it has them.
+type PieceRun<'a> = (usize, std::ops::Range<usize>, Option<&'a [u32]>);
+/// PROTOTYPE: per entry of a `PieceBounds`, the piece's ranks against the
+/// partition, as `BlockTable::piece_ranks` holds them.
+type PieceRanks = Vec<Option<std::sync::Arc<Vec<u32>>>>;
 
 /// PROTOTYPE: a builder ahead of the reader in flight: its thread while
-/// it runs, the forms it sends, and the flag that stops it.
+/// it runs, the forms it sends, the flag that stops it, the write log's
+/// length its forms cover, and the keys written from there on, for the
+/// install to splice into them.
 struct Ahead {
     handle: Option<std::thread::JoinHandle<()>>,
     rx: std::sync::mpsc::Receiver<Built>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The write log's length at the commit the builder took its
+    /// watermark from: every write logged from here on is one its forms
+    /// lack, filed into `since` as the log is read, until every form is
+    /// installed or dropped and `done` says so.
+    from: usize,
+    since: std::cell::RefCell<Since>,
+    done: std::cell::Cell<bool>,
 }
 
-/// PROTOTYPE: one form built ahead: the segment set's generation it was
-/// built at, the partition by name, the block, and the form.
+/// PROTOTYPE: the keys written since a builder ahead took its watermark,
+/// each as (key offset, key length) in the live memtable's arena, a run
+/// of writes to one key filed once, in key order once settled so an
+/// install finds a block's run of them by two searches. Its memory is
+/// the writes between two builders, and it leaves with the builder.
+#[derive(Default)]
+struct Since {
+    sorted: Vec<(u32, u32)>,
+    fresh: Vec<(u32, u32)>,
+}
+
+impl Since {
+    fn file(&mut self, off: u32, len: u32) {
+        if self.fresh.last().is_some_and(|l| l.0 == off) {
+            return;
+        }
+        self.fresh.push((off, len));
+    }
+    /// The keys filed since the last settle, sorted and folded into the
+    /// sorted run, one entry per key.
+    fn settle(&mut self, mem: &MemTable) {
+        if self.fresh.is_empty() {
+            return;
+        }
+        let key = |e: &(u32, u32)| mem.key_at(e.0, e.1);
+        let mut fresh = std::mem::take(&mut self.fresh);
+        fresh.sort_unstable_by(|a, b| key(a).cmp(key(b)));
+        fresh.dedup_by_key(|e| e.0);
+        let sorted = std::mem::take(&mut self.sorted);
+        let mut out = Vec::with_capacity(sorted.len() + fresh.len());
+        let (mut i, mut j) = (0, 0);
+        while i < sorted.len() && j < fresh.len() {
+            match key(&sorted[i]).cmp(key(&fresh[j])) {
+                Ordering::Less => {
+                    out.push(sorted[i]);
+                    i += 1;
+                }
+                Ordering::Greater => {
+                    out.push(fresh[j]);
+                    j += 1;
+                }
+                Ordering::Equal => {
+                    out.push(sorted[i]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        out.extend_from_slice(&sorted[i..]);
+        out.extend_from_slice(&fresh[j..]);
+        self.sorted = out;
+    }
+    /// The settled keys in `[lo, hi)`, unbounded on a side given as
+    /// `None`, as a range of indexes into the sorted run.
+    fn range(
+        &self,
+        mem: &MemTable,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+    ) -> std::ops::Range<usize> {
+        let key = |e: &(u32, u32)| mem.key_at(e.0, e.1);
+        let a = lo.map_or(0, |lo| self.sorted.partition_point(|e| key(e) < lo));
+        let b = hi.map_or(self.sorted.len(), |hi| {
+            self.sorted.partition_point(|e| key(e) < hi)
+        });
+        a..b.max(a)
+    }
+    fn at(&self, i: usize) -> (u32, u32) {
+        self.sorted[i]
+    }
+}
+
+/// PROTOTYPE: one form built ahead: the state's generation it was built
+/// at, the partition by name, the block, and the form.
 struct Built {
     gen: u64,
     name: String,
@@ -8412,97 +8628,88 @@ struct Built {
     form: Cached,
 }
 
-/// PROTOTYPE: the builder ahead of the reader: readers of its own over
-/// the published segments, every block the pieces overlay built from the
-/// partitions and the pieces with an empty memtable, each form sent back
-/// as it is built. Stops when told, or when the store has dropped the
-/// channel's other end. A block with no overlay is clean and needs no
-/// form; one past the wide bound is the store's to build.
-#[allow(clippy::too_many_arguments)]
-fn build_ahead_job(
-    dir: &Path,
-    names: &[String],
-    gen: u64,
-    random: bool,
-    advise_ord: bool,
-    verify: bool,
-    stop: &std::sync::atomic::AtomicBool,
-    tx: &std::sync::mpsc::Sender<Built>,
-) -> Result<()> {
-    let mut segs: Vec<std::sync::Arc<Seg>> = Vec::with_capacity(names.len());
-    for n in names {
-        segs.push(std::sync::Arc::new(Seg::open(
-            dir, n, random, advise_ord, verify,
-        )?));
-    }
-    segs.sort_by(|a, b| seg_order(a, b));
-    let mem = MemTable::new();
-    let unsealed = Snapshot::default();
-    let ctx = BuildCtx {
-        wm: SEE_ALL,
-        segs: &segs,
-        mem: &mem,
-        frozen: None,
-        tombs: segs.iter().any(|s| s.tombs),
-    };
-    ctx.rank_pieces()?;
-    let np = segs.partition_point(|s| s.level > 0);
-    let l0 = &segs[np..];
-    for seg in &segs[..np] {
-        let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
-        let (pieces, snap_at) = ctx.table_bounds(seg, l0, &unsealed)?;
-        if pieces.is_empty() {
-            continue;
+impl Reader {
+    /// PROTOTYPE: the builder ahead of the reader, on a handle of its
+    /// own: the state of generation `gen` held under the last commit's
+    /// watermark `wm`, a snapshot of the `live_len` entries that commit
+    /// covers, and every block a piece or an unsealed key overlays built
+    /// from the partitions, the pieces and the memtables, each form sent
+    /// back as it is built. Stops when told, when the state has moved on
+    /// before it held it, or when the store has dropped the channel's
+    /// other end. A block with no overlay is clean and needs no form;
+    /// one past the wide bound is the store's to walk.
+    fn build_ahead_job(
+        &self,
+        gen: u64,
+        wm: u64,
+        live_len: usize,
+        stop: &std::sync::atomic::AtomicBool,
+        tx: &std::sync::mpsc::Sender<Built>,
+    ) -> Result<()> {
+        if !self.pin_at(gen, wm) {
+            return Ok(());
         }
-        let table = BlockTable {
-            slots: (0..nblocks).map(|_| None).collect(),
-            touched: vec![0; nblocks],
-            listed: vec![u32::MAX; nblocks],
-            pieces,
-            snap_at,
-            snap_gen: 0,
-            added: (0..nblocks).map(|_| Vec::new()).collect(),
-            filed: 0,
-        };
-        let src = Sources { seg, l0 };
-        for b in 0..nblocks {
-            if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                return Ok(());
-            }
-            let n = BuildCtx::overlay_count(&table, b);
-            if n == 0 || n > WIDE {
-                continue;
-            }
-            let form = ctx.materialize(src, &table, b, &unsealed)?;
-            // Copies only: a sparse form costs about as much to build at
-            // the scan as the memtable's keys cost to splice into one
-            // built here, measured at thirty million with a million and a
-            // half unsealed keys at E's start, and a clean block is
-            // nothing. A copy is the build that pays back.
-            if !matches!(form, Cached::Block(_)) {
-                continue;
-            }
-            let built = Built {
-                gen,
-                name: seg.name.clone(),
-                b: b as u32,
-                form,
+        let unsealed = self.build_snapshot(live_len);
+        let ctx = self.build_ctx();
+        // Under a budget, the forms queued for the install are bounded
+        // by it too: the store sheds past the budget only as it installs.
+        let budget = self.opts.scan_cache_bytes;
+        let mut sent = 0usize;
+        ctx.rank_pieces()?;
+        let np = self.segs().partition_point(|s| s.level > 0);
+        let l0 = &self.segs()[np..];
+        for seg in &self.segs()[..np] {
+            let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
+            let (pieces, piece_ranks, snap_at) = ctx.table_bounds(seg, l0, &unsealed)?;
+            let table = BlockTable {
+                slots: (0..nblocks).map(|_| None).collect(),
+                touched: vec![0; nblocks],
+                listed: vec![u32::MAX; nblocks],
+                pieces,
+                piece_ranks,
+                snap_at,
+                snap_gen: 0,
+                added: (0..nblocks).map(|_| Vec::new()).collect(),
+                filed: 0,
             };
-            if tx.send(built).is_err() {
-                return Ok(());
+            if table.clean_throughout() {
+                continue;
+            }
+            let src = Sources { seg, l0 };
+            for b in 0..nblocks {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(());
+                }
+                let n = BuildCtx::overlay_count(&table, b);
+                if n == 0 || n > WIDE {
+                    continue;
+                }
+                let form = ctx.materialize(src, &table, b, &unsealed)?;
+                if matches!(form, Cached::Clean | Cached::Wide(_)) {
+                    continue;
+                }
+                let built = Built {
+                    gen,
+                    name: seg.name.clone(),
+                    b: b as u32,
+                    form,
+                };
+                sent += built.form.bytes();
+                if tx.send(built).is_err() || (budget > 0 && sent > budget) {
+                    return Ok(());
+                }
             }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 /// PROTOTYPE: what building a cached block reads, and nothing the cache
 /// keeps: the segments, the live and the frozen memtable, and whether any
-/// source holds a tombstone. `Db` makes one over its own state for every
-/// build and every settle; a builder ahead of the reader makes one over
-/// readers of its own on the published segments and an empty memtable,
-/// since the files are immutable and stay readable while mapped, and the
-/// store splices the memtable's keys in when the block is installed.
+/// source holds a tombstone. A handle makes one over the state it holds
+/// for every build and every settle; the builder ahead of the reader is a
+/// handle holding the state as of a commit, and the store splices in the
+/// keys written after that commit when it installs a block.
 struct BuildCtx<'s> {
     /// The watermark the live memtable's chains are walked under.
     wm: u64,
@@ -8521,9 +8728,11 @@ impl<'s> BuildCtx<'s> {
         seg: &Seg,
         l0: &[std::sync::Arc<Seg>],
         unsealed: &Snapshot,
-    ) -> Result<(PieceBounds, Vec<u32>)> {
+    ) -> Result<(PieceBounds, PieceRanks, Vec<u32>)> {
         let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
+        let against = seg.blob.id();
         let mut pieces = Vec::new();
+        let mut ranks = Vec::new();
         for (j, p) in l0.iter().enumerate() {
             if !seg.lo.is_empty()
                 && p.hi
@@ -8547,9 +8756,18 @@ impl<'s> BuildCtx<'s> {
                 |i, bound| p.blob.key_at(i).is_some_and(|k| k < bound),
             )?;
             pieces.push((j, at));
+            // Ranks against another partition are no ranks.
+            ranks.push(
+                p.ranks
+                    .read()
+                    .expect("a piece's ranks")
+                    .as_ref()
+                    .filter(|(id, _)| *id == against)
+                    .map(|(_, v)| v.clone()),
+            );
         }
         let snap_at = Self::snap_bounds(seg, nblocks, unsealed)?;
-        Ok((pieces, snap_at))
+        Ok((pieces, ranks, snap_at))
     }
 
     /// PROTOTYPE: the block whose key range holds `key`.
@@ -8640,7 +8858,7 @@ impl<'s> BuildCtx<'s> {
             {
                 continue;
             }
-            let ranks = BuildCtx::ranks_over(part, p)?;
+            let ranks = std::sync::Arc::new(BuildCtx::ranks_over(part, p)?);
             *p.ranks.write().expect("a piece's ranks") = Some((id, ranks));
         }
         Ok(())
@@ -8748,19 +8966,11 @@ impl<'s> BuildCtx<'s> {
         &'a self,
         src: Sources<'a>,
         mem: Vec<Over<'a>>,
-        pieces: &[(usize, std::ops::Range<usize>)],
+        pieces: &[PieceRun<'_>],
     ) -> Result<Overlay<'a>> {
         let mut held: Vec<(&[u8], usize, usize, u32)> = Vec::new();
-        let against = src.seg.blob.id();
-        for (j, run) in pieces {
+        for (j, run, ranks) in pieces {
             let p = &src.l0[*j];
-            // Ranks against another partition are no ranks: the cut is
-            // searched for instead.
-            let against_it = p.ranks.read().expect("a piece's ranks");
-            let ranks = against_it
-                .as_ref()
-                .filter(|(id, _)| *id == against)
-                .map(|(_, v)| v);
             for r in run.clone() {
                 let k = p
                     .blob
@@ -8821,10 +9031,17 @@ impl<'s> BuildCtx<'s> {
     ) -> Result<Overlay<'a>> {
         let snap = table.snap_at[b] as usize..table.snap_at[b + 1] as usize;
         let mem = self.overlay_mem(unsealed, snap, &table.added[b], false)?;
-        let pieces: Vec<(usize, std::ops::Range<usize>)> = table
+        let pieces: Vec<PieceRun<'_>> = table
             .pieces
             .iter()
-            .map(|(j, at)| (*j, at[b] as usize..at[b + 1] as usize))
+            .zip(&table.piece_ranks)
+            .map(|((j, at), ranks)| {
+                (
+                    *j,
+                    at[b] as usize..at[b + 1] as usize,
+                    ranks.as_ref().map(|v| v.as_slice()),
+                )
+            })
             .collect();
         self.overlay_runs(src, mem, &pieces)
     }
@@ -8878,17 +9095,22 @@ impl<'s> BuildCtx<'s> {
         let f0 = wide.sorted.partition_point(|&(i, _)| key_of(i) < cursor);
         let filed = &wide.sorted[f0..wide.sorted.len().min(f0.saturating_add(limit))];
         let mem = self.overlay_mem(unsealed, snap, filed, true)?;
-        let pieces: Vec<(usize, std::ops::Range<usize>)> = table
+        let pieces: Vec<PieceRun<'_>> = table
             .pieces
             .iter()
-            .map(|(j, at)| {
+            .zip(&table.piece_ranks)
+            .map(|((j, at), ranks)| {
                 let p = &src.l0[*j];
                 let (r0, r1) = (at[b] as usize, at[b + 1] as usize);
                 let r = p
                     .ord
                     .seek(p.cursor_from(cursor), |i| p.blob.key_at(i))
                     .clamp(r0, r1);
-                (*j, r..r1.min(r.saturating_add(limit)))
+                (
+                    *j,
+                    r..r1.min(r.saturating_add(limit)),
+                    ranks.as_ref().map(|v| v.as_slice()),
+                )
             })
             .collect();
         self.overlay_runs(src, mem, &pieces)
