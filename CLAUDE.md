@@ -201,9 +201,15 @@ prove it.
 **Crash discipline is an order, and every window in it is survivable.**
 Commit is a WAL append and one fdatasync; the batch is durable or its tail
 frame fails its CRC and replay stops before it. Seal is write to a temp name,
-fsync, rename into place, fsync the directory, then reset the WAL; a crash
-between any two of those leaves either a WAL that replays the whole memtable
-or a complete segment plus a WAL whose sealed prefix is skipped by sequence.
+fsync, rename into place, then publish -- the manifest written, fsynced and
+renamed, and the directory fsynced once for the segment's entry and the
+manifest's together -- then reset the WAL; a crash between any two of those
+leaves either a WAL that replays the whole memtable or a complete segment
+plus a WAL whose sealed prefix is skipped by sequence, and a segment the
+manifest never named is swept at open. A store's first seal under a flush
+writes the partition's name directly when the piece is tombstone-free and
+fits one, since that is what the flush's promotion would link it as under a
+second publish.
 Replay applies the frames between commit frames whole or not at all -- a
 partial batch used to replay as whole, and the first test written against
 the contract found it. `settle` is what joins an in-flight seal; `sync` does

@@ -3418,6 +3418,81 @@ fn a_reader_under_latest_sees_the_commit_of_a_key_it_settled_uncommitted() {
     );
 }
 
+/// A store's first flush seals its partition directly: one publish, the
+/// file under the partition's name, no piece to promote -- through the
+/// direct segment an ordered run takes and through the memtable a
+/// shuffled one takes. A piece with a tombstone cannot be a partition as
+/// it is, so that flush publishes twice and still leaves one partition.
+#[test]
+fn a_first_flush_seals_the_partition_in_one_publish() {
+    let key = |k: u32| format!("key-{k:05}").into_bytes();
+    let files = |d: &std::path::Path| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".sup"))
+            .collect();
+        v.sort();
+        v
+    };
+    for (name, shuffled) in [
+        ("first-partition-ordered", false),
+        ("first-partition-shuffled", true),
+    ] {
+        let d = dir(name);
+        let mut db = Db::create(&d, Options::default()).unwrap();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for i in 0..3000u32 {
+            let k = if shuffled {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x % 3000) as u32
+            } else {
+                i
+            };
+            db.append(&key(k), b"v");
+            if i % 100 == 99 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+        let before = db.seal_waits().publishes;
+        db.flush().unwrap();
+        assert_eq!(db.levels(), (1, 0), "{name}: one partition, no piece");
+        assert_eq!(
+            db.seal_waits().publishes - before,
+            1,
+            "{name}: the flush published once"
+        );
+        let names = files(&d);
+        assert_eq!(names.len(), 1, "{name}: {names:?}");
+        assert!(
+            names[0].starts_with("par-") && names[0].ends_with("--.sup"),
+            "{name}: the file carries the partition's name with empty fences: {names:?}"
+        );
+        assert_eq!(read_vec(&db, &key(7)), vec![b"v".to_vec()]);
+        let mut n = 0usize;
+        db.scan(&key(0), 5000, |_k, _v| n += 1).unwrap();
+        assert_eq!(n, 3000, "{name}");
+    }
+    let d = dir("first-partition-tombstone");
+    let mut db = Db::create(&d, Options::default()).unwrap();
+    for i in 0..3000u32 {
+        db.append(&key(i), b"v");
+    }
+    db.delete(&key(5));
+    db.commit().unwrap();
+    let before = db.seal_waits().publishes;
+    db.flush().unwrap();
+    assert_eq!(db.levels(), (1, 0));
+    assert!(
+        db.seal_waits().publishes - before >= 2,
+        "a piece with a tombstone is not a partition as it is"
+    );
+    assert_eq!(read_vec(&db, &key(5)), Vec::<Vec<u8>>::new());
+}
+
 /// A piece sealed while a merge of its range runs is kept across the
 /// merge's publish, under a new partition over the same range. The ranks
 /// it was given at its own publish -- each key's cut in the partition it

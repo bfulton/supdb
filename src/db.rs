@@ -2019,7 +2019,7 @@ impl Default for SegmentOptions {
 /// two in one process and price the change honestly. That comparison is
 /// settled and the old path is gone, so what is left is a thin shim that
 /// keeps `flush` and `merge` reading as a sequence of begin/value/end calls.
-struct PieceWriter(Box<SegmentWriter>, crate::ordindex::Builder);
+struct PieceWriter(Box<SegmentWriter>, crate::ordindex::Builder, bool);
 
 impl PieceWriter {
     fn create(
@@ -2031,7 +2031,11 @@ impl PieceWriter {
         let mut w = SegmentWriter::create(path, opts)?;
         w.set_sync_every(sync_every);
         w.set_inline_max(inline_max);
-        Ok(PieceWriter(Box::new(w), crate::ordindex::Builder::new()))
+        Ok(PieceWriter(
+            Box::new(w),
+            crate::ordindex::Builder::new(),
+            false,
+        ))
     }
 
     fn begin(&mut self, k: &[u8]) -> Result<()> {
@@ -2048,7 +2052,14 @@ impl PieceWriter {
     }
 
     fn end_with(&mut self, tombstone: bool) -> Result<()> {
+        self.2 |= tombstone;
         self.0.end_with(tombstone)
+    }
+
+    /// Whether any key ended with a tombstone: a piece with one cannot
+    /// be a partition as it is, since the bottom level drops them.
+    fn tombs(&self) -> bool {
+        self.2
     }
 
     fn set_marks(&mut self, on: bool) {
@@ -3747,6 +3758,8 @@ pub struct SealWaits {
     pub publish_ns: u64,
     pub blocked_joins: u64,
     pub joins: u64,
+    /// Manifests written: every publish of the live set.
+    pub publishes: u64,
 }
 
 /// PROTOTYPE: records of one partition block a scan reads over unsealed
@@ -6925,6 +6938,32 @@ impl Db {
         format!("seg-{n:08}-{end_seq:016}.sup")
     }
 
+    /// The name a full-range piece takes as the store's first partition:
+    /// what `apply_promotion` would link it under, with the empty fences.
+    fn first_partition_name(n: u64, end_seq: u64) -> String {
+        format!("par-{n:08}-{end_seq:016}--.sup")
+    }
+
+    /// Whether a seal that drains may write the store's first partition
+    /// directly: the store holds no segment, so a full-range piece that
+    /// carries no tombstone and fits a partition is what the flush's
+    /// promotion would link it as, under a second publish. Naming it so
+    /// in the seal saves that publish: at ten thousand keys the drain was
+    /// a third of the load, and the promotion's link, second open,
+    /// directory sync, manifest sync and directory sync a quarter of the
+    /// drain.
+    fn seals_first_partition(&self) -> bool {
+        self.draining && self.opts.promote && self.segs().is_empty()
+    }
+
+    /// The largest file a partition may be, in bytes.
+    fn partition_limit(&self) -> u64 {
+        self.opts
+            .partition_bytes
+            .unwrap_or(self.opts.seal_bytes)
+            .max(1) as u64
+    }
+
     /// Both `seg-` and `par-` names carry id then covered end-sequence in
     /// their first two fields, so one parser serves the manifest, the
     /// orphan sweep and the replay bound.
@@ -7632,14 +7671,26 @@ impl Db {
         let dir = self.dir.clone();
         let tmp = d.tmp;
         let w = d.w;
+        let first_partition = self.seals_first_partition();
+        let limit = self.partition_limit();
+        let (id, seq) = (d.id, end_seq);
         self.retiring_tmps.push(tmp.clone());
         self.sealing = Some(std::thread::spawn(move || {
+            let tombs = w.tombs();
             let ord = w
                 .finish()
                 .map_err(|e| err(&format!("direct finish: {e}")))?;
+            let name = if first_partition && !tombs && std::fs::metadata(&tmp)?.len() <= limit {
+                Db::first_partition_name(id, seq)
+            } else {
+                name
+            };
             write_ord(&dir, &name, &ord)?;
             std::fs::hard_link(&tmp, dir.join(&name))?;
-            File::open(&dir)?.sync_all()?;
+            // The directory's entries are made durable by the publish that
+            // names the segment in the manifest, before the WAL retires; a
+            // sync here as well was one more device round trip a drain
+            // waited for.
             Ok(vec![name])
         }));
         Ok(())
@@ -7648,7 +7699,8 @@ impl Db {
     /// Freeze the memtable, rotate the WAL, and hand the frozen table to a
     /// thread that writes it as one immutable segment in today's store
     /// format -- fsync, rename into place (the name carrying the covered
-    /// end-sequence), fsync the directory, delete the rotated-out WAL.
+    /// end-sequence); the join publishes the manifest and syncs the
+    /// directory, then the rotated-out WAL is retired.
     /// Commits continue into the new WAL while it runs; at most one seal is
     /// in flight, so a second trigger joins the first (backpressure).
     pub fn seal(&mut self) -> Result<()> {
@@ -7709,6 +7761,8 @@ impl Db {
         let end_seq = old_wal.seq;
         self.retiring_wals.push(old_wal.path.clone());
         drop(old_wal);
+        let first_partition = self.seals_first_partition();
+        let limit = self.partition_limit();
         let mem = frozen.clone();
         self.sealing = Some(std::thread::spawn(move || {
             if background_io == BackgroundIo::Idle {
@@ -7749,6 +7803,7 @@ impl Db {
                 let tmp = dir.join(format!("seal-{id:08}.tmp"));
                 let _ = std::fs::remove_file(&tmp);
                 let ord;
+                let tombs;
                 {
                     let mut w = PieceWriter::create(&tmp, &opts, sync_every, inline_max)
                         .map_err(|e| err(&format!("seal create: {e}")))?;
@@ -7764,9 +7819,17 @@ impl Db {
                         }
                         w.end_with(tomb)?;
                     }
+                    tombs = w.tombs();
                     ord = w.finish().map_err(|e| err(&format!("seal finish: {e}")))?;
                 }
-                let name = if ranges.len() == 1 && lo.is_empty() && hi.is_none() {
+                let whole = ranges.len() == 1 && lo.is_empty() && hi.is_none();
+                let name = if whole
+                    && first_partition
+                    && !tombs
+                    && std::fs::metadata(&tmp)?.len() <= limit
+                {
+                    Db::first_partition_name(id, end_seq)
+                } else if whole {
                     Db::seg_name(id, end_seq)
                 } else {
                     format!(
@@ -7781,7 +7844,8 @@ impl Db {
                 std::fs::rename(&tmp, dir.join(&name))?;
                 names.push(name);
             }
-            File::open(&dir)?.sync_all()?;
+            // The directory's entries are made durable by the publish that
+            // names the segments in the manifest, before the WAL retires.
             Ok(names)
         }));
         Ok(())
@@ -8349,6 +8413,7 @@ impl Db {
     /// Name the live set durably. Everything before this call is a file on
     /// disk that nothing reaches; everything after it is the store.
     fn publish(&mut self) -> Result<()> {
+        self.seal_wait.publishes += 1;
         manifest_write(&self.dir, self.covered_seq, &self.live_names())
     }
 

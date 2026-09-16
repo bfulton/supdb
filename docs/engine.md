@@ -188,7 +188,15 @@ engine, interleaved in one process where the comparison allows:
   step is piece promotion: the canonical load's keys ascend, so every
   seal's keys lie above the last partition's and the drain routes by rename
   with no merge -- say so when quoting it, because a uniformly random key
-  order does not qualify and sits near 0.42x. The transactions axis is
+  order does not qualify and sits near 0.42x. A store's first flush now
+  writes the partition's name in the seal itself when the piece is
+  tombstone-free and fits one, which is what the promotion would have
+  linked it as under a second publish: at ten thousand keys, where the
+  drain was a third of the load, the probe's drain went from 6.4–8.1 ms
+  to 4.5–5.0 ms over four rounds alternated, the promotion's link, second
+  open, directory sync, manifest sync and directory sync gone, and the
+  seal threads' own directory sync with them, since the publish's covers
+  the entries they made. The transactions axis is
   matched, so it is a measurement and not a bound. Leaving partitioning to
   compaction no longer separates the arms at this load (ties both ways).
   The whole of that move is below. The gap on random keys is there because
