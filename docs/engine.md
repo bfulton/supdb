@@ -798,20 +798,62 @@ per-commit path.
   in pages.
 - **Group commit** — whether concurrent writers share a barrier; matters
   only after P-D.
-- **Read and write concurrency** — on the backlog, not built, in two
-  parts. The engine is single-writer and a read borrows it: `Db` is one
-  value, a write takes it mutably, a read immutably, and the scan
-  snapshot and the block cache keep their state in cells that assume one
-  thread. Readers beside the writer need a handle over a published view,
-  the segment set and the memtables as of a commit, that a seal, a join
-  or a merge replaces rather than edits, and a memtable a reader can
-  probe while the writer appends to it or a frozen one it reads while
-  the writer fills the next. Writers beside each other are the appender
-  question (2 above): a WAL and memtable per writer, or a shared barrier
-  (group commit, above). Neither is promised until it is measured, and
-  the suite has to be able to ask: the matrix gains a thread count as a
-  dimension, readers beside a writer and writers beside each other, with
-  LMDB and RocksDB alongside since both support it (`bench/DESIGN.md`).
+- **Read and write concurrency** — being built, readers first, in the
+  order the structures depend on each other; writers beside each other
+  stay on the backlog as the appender question (2 above): a WAL and
+  memtable per writer, or a shared barrier (group commit, above). The
+  model is LMDB's: one writer, any number of readers, no lock between
+  them, and a reader table of slots where each reader handle pins the
+  epoch it is reading in, so the writer can free what it replaced once
+  no slot holds an older epoch and never waits for a reader. The
+  isolation is the reader's to choose, and it falls out of one
+  mechanism: a committed watermark on the memtable's value arena. Since
+  chunks are appended in time order, the arena's tail at the last commit
+  divides every key's chain into an uncommitted prefix and a committed
+  rest; a reader that honours the latest watermark reads committed, one
+  that pins a watermark and a state reads a snapshot, and one that
+  honours none reads dirty, which is what the store's own reads have
+  always done and keep doing.
+
+  *The memtable* is the first part, built: nothing in it moves once
+  published. Keys and values live in arenas of blocks that are never
+  reallocated (a value larger than a block gets a block of its own, and a
+  reservation never straddles two); the entries are a slab of the same
+  kind, numbered in the order they were made, so a number handed to the
+  scan snapshot or a block table stays good for the table's life; the
+  hash index is a table of entry numbers under the hash's high half, and
+  when it fills it is rebuilt whole and published by one pointer store,
+  the table it replaces retired at the epoch the publish bumps and freed
+  past every pinned reader. A chunk is `[prev: u64][len: u32][value]`,
+  the length fixed so the header is one read of twelve bytes all written
+  before the head that names them; a head, an index slot and the slab's
+  length are each published with a release store after everything they
+  name, and read with an acquire. Before this the entries lived in the
+  hash table itself and a rehash moved every one, which is why every
+  structure that named a slot -- the snapshot, the block tables' lists,
+  the wide blocks -- had to be patched from a map the rehash returned;
+  that machinery is gone with the move. What the split costs is a line:
+  at thirty million keys the slot and the entry behind it are both
+  misses where the entry in the slot was one, so the index carries the
+  hash's high half beside the number to skip the entries a probe will
+  not match, a put probes once for its tombstone and its value where a
+  delete then an append probed twice, and every write and point read
+  fetches its slot line first and does the store's bookkeeping -- the
+  WAL frame, the fences -- while it comes in. Measured single-threaded
+  against the head before it, every mix, two rounds interleaved, in
+  thousands of ops/s: at thirty million keys the load 729–734 to
+  766–780, A 359–387 to 393–409, B 1387–1404 to 1475–1478, C 2580–2796
+  to 2672–2732, D 770–835 to 891–932, E 469–490 to 494–501 and its
+  second pass 547–556 to 559–575, F 315–329 to 337–338; at three
+  million every mix level or ahead by the same margins, D 908–976 to
+  1105–1118 the widest. Before the slot prefetch and the one-probe put,
+  A at thirty million read 5–8% behind the head, the extra miss on
+  every hit; with them it reads ahead. The rest follows: a published state (the segment set and the two
+  memtables as of a commit, swapped whole at a seal, a join or a merge)
+  behind one pointer, a reader handle that is `Send + Sync` with the read
+  API on it, the block cache's slots as atomic pointers a miss fills by
+  compare-and-swap and a settle patches by copy, and a thread count in
+  the suite's matrix with LMDB alongside (`bench/DESIGN.md`).
 - **What the on-disk size ordering becomes** — segments plus a WAL will
   not beat LMDB on disk; that loss stands and gets re-priced honestly.
 

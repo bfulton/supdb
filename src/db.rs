@@ -26,10 +26,12 @@
 //! replays the whole memtable or a complete renamed segment plus a WAL
 //! whose sealed prefix is skipped by sequence number.
 
+use std::cell::UnsafeCell;
 use std::cmp::Ordering;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Result, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 
 use crate::block::{self, crc32, BlockBuilder, BlockLoc};
 use crate::bytes::MmapBytes;
@@ -2234,46 +2236,85 @@ impl Seg {
 
 /// The memtable, built so that an append allocates nothing per key or per
 /// value: a decomposition priced the HashMap<Box<[u8]>, Vec> version at
-/// 456k ops/s of the gap to the floor, more than the seal itself.
-/// Keys live in one bump arena; values live in another as per-key backward
-/// chains (each chunk records the previous chunk's offset, and a read or
-/// seal walks the chain and reverses it); the table is open-addressed with
-/// linear probing at load <= 0.5, resized by rehash of the fixed-size
-/// entries only -- key and value bytes never move.
+/// 456k ops/s of the gap to the floor, more than the seal itself. Keys
+/// live in one arena; values live in another as per-key backward chains
+/// (each chunk records the previous chunk's offset, and a read or seal
+/// walks the chain and reverses it).
+///
+/// Built for one writer and any number of readers with no lock between
+/// them. Nothing in it moves once published: the arenas are blocks that
+/// are never reallocated, the entries a slab of the same kind, numbered
+/// in the order they were made, and the hash index -- a table of entry
+/// numbers -- is rebuilt whole when it fills and published by one
+/// pointer store, the table it replaces kept until every reader that
+/// could hold it has moved on. A reader reaches an entry through the
+/// index or through a number it was handed, and everything the entry
+/// names was written before the store that published it: the key's
+/// bytes before the index slot, a chunk's bytes before the head that
+/// names it. A chunk is `[prev: u64][len: u32][value]`, the length fixed
+/// so the header is one read of twelve bytes that were all written
+/// before the head moved.
+///
+/// The value arena's offset is also the version: chunks are appended in
+/// time order, so `committed`, the arena's tail at the last commit,
+/// divides every chain into an uncommitted prefix and a committed rest,
+/// and a reader that honours it walks past the prefix. The store's own
+/// reads pass no watermark and see their own uncommitted writes, the
+/// contract `read_all` set; a reader handle chooses.
+///
+/// The writer is the store, made single by `&mut Db`; the writer-only
+/// fields are cells it alone touches, and that is the whole of what the
+/// `Sync` below asserts.
 struct MemTable {
-    /// Hash slots -- or, `ordered`, the entries in the order they arrived,
-    /// which is key order: dense, never probed, a lookup a binary search
-    /// and an insert a push. What ordered ingest fills while its segment
-    /// is open, since a hash insert was the cost that path was measured
-    /// to keep.
-    entries: Vec<MemEntry>,
+    /// Every entry in the order it was made -- key order, when
+    /// `ordered`, since ordered ingest pushes each key above the last and
+    /// a lookup there is a binary search, never a probe.
+    entries: Slab<MemEntry>,
+    /// Entry numbers by hash, or null when `ordered`.
+    index: AtomicPtr<Index>,
     ordered: bool,
-    mask: usize,
-    len: usize,
-    keys: Vec<u8>,
-    vals: Vec<u8>,
+    keys: ByteArena,
+    vals: ByteArena,
     /// Tombstone chunks pushed so far. Non-zero is what tells a read that
     /// this memtable can end a key's older values; zero lets it skip the
     /// check entirely.
-    tombs: usize,
+    tombs: AtomicUsize,
+    /// The value arena's tail at the last commit: a chunk at or past it
+    /// is a write no commit has covered.
+    committed: AtomicU64,
+    /// Indexes a rebuild replaced, each with the epoch it was retired at,
+    /// freed once no reader is pinned before that epoch. Writer-only.
+    retired: UnsafeCell<Vec<(u64, Box<Index>)>>,
 }
 
-/// A chain chunk whose length prefix is this is a tombstone: it holds no
+// SAFETY: the writer-only cells (`retired`, and the arenas' and the
+// slab's tails) are touched by the one writer `&mut Db` makes, and
+// everything a reader follows is published with a release store after
+// the bytes it names were written; see the type's doc.
+unsafe impl Sync for MemTable {}
+unsafe impl Send for MemTable {}
+
+/// A chain chunk whose length word is this is a tombstone: it holds no
 /// value, and nothing older than it -- in this chain or in any older
 /// source -- is live.
-const TOMB_LEN: u64 = u64::MAX;
+const TOMB_LEN: u32 = u32::MAX;
+/// A chunk: the previous chunk's offset, the value's length, the value.
+const CHUNK_HDR: usize = 12;
 
-#[derive(Clone, Copy, Default)]
 struct MemEntry {
     hash: u64,
     key_off: u32,
     key_len: u32,
-    /// Offset+1 of this key's newest chunk in `vals`; 0 = vacant slot.
-    head: u64,
-    count: u64,
+    /// Offset+1 of this key's newest chunk in `vals`, stored after the
+    /// chunk's bytes; 0 = no chunk yet, which no published entry has.
+    head: AtomicU64,
+    count: AtomicU64,
 }
 
 const NO_CHUNK: u64 = u64::MAX;
+
+/// No watermark: every chunk in a chain is visible, committed or not.
+const SEE_ALL: u64 = u64::MAX;
 
 fn mem_hash(key: &[u8]) -> u64 {
     // FNV-1a, then a splitmix finish; the std SipHash was part of what the
@@ -2289,275 +2330,703 @@ fn mem_hash(key: &[u8]) -> u64 {
 /// PROTOTYPE: what a memtable write did, for the block cache's bookkeeping.
 #[derive(Default)]
 struct Wrote {
-    /// The slot of the key written, created by this write or found.
+    /// The entry written, created by this write or found.
     slot: u32,
     /// Whether this write created it.
     new: bool,
-    /// The table rehashed on the way, so every slot index moved: for each
-    /// old slot, the new one, or `u32::MAX` for a slot that was empty.
-    /// The rehash visits every entry anyway, and the map lets what names
-    /// slots -- the scan snapshot and the block tables' lists -- be
-    /// patched in place instead of rebuilt.
-    moved: Option<Vec<u32>>,
+}
+
+/// The hash index: per slot the hash's high half over the entry number
+/// plus one, zero vacant, open addressing with linear probing at load
+/// <= 0.5. A slot is stored once, with a release, and never moved:
+/// growth is a new table. The tag is what keeps a probe from reading an
+/// entry it will not match -- the entry is a line of its own, and at
+/// thirty million keys the slot and the entry are both misses.
+struct Index {
+    slots: Box<[AtomicU64]>,
+    mask: usize,
+}
+
+impl Index {
+    fn with_slots(n: usize) -> Index {
+        debug_assert!(n.is_power_of_two());
+        Index {
+            slots: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            mask: n - 1,
+        }
+    }
+
+    fn word(hash: u64, id: usize) -> u64 {
+        (hash & !0xffff_ffff) | (id as u64 + 1)
+    }
+}
+
+/// Bytes in blocks that never move. A block is `ARENA_BLOCK` bytes, or
+/// a value's own size when the value is larger; a reservation never
+/// straddles two, so the tail steps to a fresh block when one will not
+/// hold it. Offsets are logical, block number times the block size plus
+/// the place inside, so an offset finds its block with a shift.
+const ARENA_SHIFT: u32 = 22;
+const ARENA_BLOCK: usize = 1 << ARENA_SHIFT;
+/// Blocks an arena can address: sixteen gigabytes of the plain size.
+const ARENA_BLOCKS: usize = 1 << 12;
+
+struct ByteArena {
+    blocks: Box<[AtomicPtr<u8>]>,
+    caps: Box<[AtomicUsize]>,
+    /// Writer-only.
+    tail: UnsafeCell<ArenaTail>,
+    used: AtomicUsize,
+}
+
+#[derive(Default)]
+struct ArenaTail {
+    at: usize,
+    block_end: usize,
+    next_block: usize,
+}
+
+impl ByteArena {
+    fn new() -> ByteArena {
+        ByteArena {
+            blocks: (0..ARENA_BLOCKS)
+                .map(|_| AtomicPtr::new(std::ptr::null_mut()))
+                .collect(),
+            caps: (0..ARENA_BLOCKS).map(|_| AtomicUsize::new(0)).collect(),
+            tail: UnsafeCell::new(ArenaTail::default()),
+            used: AtomicUsize::new(0),
+        }
+    }
+
+    /// Writer: `n` contiguous bytes, at the offset returned.
+    fn reserve(&self, n: usize) -> usize {
+        // SAFETY: writer-only, see the memtable's doc.
+        let t = unsafe { &mut *self.tail.get() };
+        if t.at + n > t.block_end {
+            let b = t.next_block;
+            assert!(
+                b < ARENA_BLOCKS,
+                "memtable arena: more bytes than it addresses"
+            );
+            let cap = ARENA_BLOCK.max((n + 63) & !63);
+            let layout = std::alloc::Layout::from_size_align(cap, 64).expect("arena block layout");
+            // SAFETY: a non-zero layout; the block is freed by `Drop`.
+            let p = unsafe { std::alloc::alloc_zeroed(layout) };
+            assert!(!p.is_null(), "memtable arena: out of memory");
+            self.caps[b].store(cap, AtomicOrdering::Release);
+            self.blocks[b].store(p, AtomicOrdering::Release);
+            t.at = b << ARENA_SHIFT;
+            t.block_end = t.at + cap;
+            t.next_block = b + cap.div_ceil(ARENA_BLOCK);
+        }
+        let off = t.at;
+        t.at += n;
+        self.used.fetch_add(n, AtomicOrdering::Relaxed);
+        off
+    }
+
+    /// Writer: the tail, where the next reservation starts.
+    fn tail(&self) -> usize {
+        // SAFETY: writer-only.
+        unsafe { (*self.tail.get()).at }
+    }
+
+    fn block(&self, off: usize, len: usize) -> (*mut u8, usize) {
+        let b = off >> ARENA_SHIFT;
+        let w = off & (ARENA_BLOCK - 1);
+        let p = self.blocks[b].load(AtomicOrdering::Acquire);
+        assert!(
+            !p.is_null(),
+            "memtable arena: an offset past what was published"
+        );
+        assert!(
+            w + len <= self.caps[b].load(AtomicOrdering::Acquire),
+            "memtable arena: a read past its block"
+        );
+        (p, w)
+    }
+
+    /// Writer: `bytes` into a reserved range at `off`.
+    fn write(&self, off: usize, bytes: &[u8]) {
+        let (p, w) = self.block(off, bytes.len());
+        // SAFETY: inside the block, a range this writer reserved and no
+        // reader can reach until it is published.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.add(w), bytes.len()) };
+    }
+
+    /// Anyone: published bytes at `off`.
+    fn slice(&self, off: usize, len: usize) -> &[u8] {
+        let (p, w) = self.block(off, len);
+        // SAFETY: inside a block that lives as long as the arena, bytes
+        // the writer wrote before publishing the offset that names them.
+        unsafe { std::slice::from_raw_parts(p.add(w), len) }
+    }
+
+    /// A hint to fetch the lines at `off`, clipped to the block; nothing
+    /// is read.
+    fn prefetch(&self, off: usize, len: usize) {
+        let b = off >> ARENA_SHIFT;
+        let w = off & (ARENA_BLOCK - 1);
+        let p = self.blocks[b].load(AtomicOrdering::Acquire);
+        if p.is_null() {
+            return;
+        }
+        let cap = self.caps[b].load(AtomicOrdering::Acquire);
+        if w < cap {
+            // SAFETY: a hint over addresses inside the block.
+            prefetch_lines(unsafe { p.add(w) }, len.min(cap - w));
+        }
+    }
+
+    fn used(&self) -> usize {
+        self.used.load(AtomicOrdering::Relaxed)
+    }
+}
+
+impl Drop for ByteArena {
+    fn drop(&mut self) {
+        for (b, cap) in self.blocks.iter().zip(self.caps.iter()) {
+            let p = b.load(AtomicOrdering::Relaxed);
+            if !p.is_null() {
+                let cap = cap.load(AtomicOrdering::Relaxed);
+                let layout =
+                    std::alloc::Layout::from_size_align(cap, 64).expect("arena block layout");
+                // SAFETY: allocated by `reserve` with this layout.
+                unsafe { std::alloc::dealloc(p, layout) };
+            }
+        }
+    }
+}
+
+/// Entries in blocks that never move, numbered in push order. A block
+/// holds `SLAB_BLOCK` entries; a push writes the entry and then publishes
+/// the length, so a reader that loaded the length may read every entry
+/// below it, and one handed a number by an index slot may read that one.
+const SLAB_SHIFT: u32 = 16;
+const SLAB_BLOCK: usize = 1 << SLAB_SHIFT;
+const SLAB_BLOCKS: usize = 1 << 12;
+
+struct Slab<T> {
+    blocks: Box<[AtomicPtr<T>]>,
+    len: AtomicUsize,
+}
+
+impl<T> Slab<T> {
+    fn new() -> Slab<T> {
+        Slab {
+            blocks: (0..SLAB_BLOCKS)
+                .map(|_| AtomicPtr::new(std::ptr::null_mut()))
+                .collect(),
+            len: AtomicUsize::new(0),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len.load(AtomicOrdering::Acquire)
+    }
+
+    /// Writer: `v` at the next number, published.
+    fn push(&self, v: T) -> usize {
+        let id = self.len.load(AtomicOrdering::Relaxed);
+        let (b, w) = (id >> SLAB_SHIFT, id & (SLAB_BLOCK - 1));
+        assert!(
+            b < SLAB_BLOCKS,
+            "memtable: more entries than the slab addresses"
+        );
+        let mut p = self.blocks[b].load(AtomicOrdering::Acquire);
+        if p.is_null() {
+            let layout = std::alloc::Layout::array::<T>(SLAB_BLOCK).expect("slab block layout");
+            // SAFETY: a non-zero layout; the block is freed by `Drop`.
+            p = unsafe { std::alloc::alloc_zeroed(layout) } as *mut T;
+            assert!(!p.is_null(), "memtable: out of memory");
+            self.blocks[b].store(p, AtomicOrdering::Release);
+        }
+        // SAFETY: inside the block, at a number no reader has been given.
+        unsafe { std::ptr::write(p.add(w), v) };
+        self.len.store(id + 1, AtomicOrdering::Release);
+        id
+    }
+
+    /// A published entry.
+    fn get(&self, id: usize) -> &T {
+        debug_assert!(
+            id < self.len(),
+            "memtable: an entry number past the published length"
+        );
+        let p = self.blocks[id >> SLAB_SHIFT].load(AtomicOrdering::Acquire);
+        assert!(
+            !p.is_null(),
+            "memtable: an entry number past what was published"
+        );
+        // SAFETY: a published entry in a block that lives as long as the
+        // slab.
+        unsafe { &*p.add(id & (SLAB_BLOCK - 1)) }
+    }
+
+    /// Writer: forget the entries from `n` on. Only for a table that will
+    /// never be pushed to again -- the ordered table leaving a direct run,
+    /// frozen right after -- since a reader handed a number past `n`
+    /// still reads the entry there, and a push would overwrite it.
+    fn truncate(&self, n: usize) {
+        debug_assert!(n <= self.len());
+        self.len.store(n, AtomicOrdering::Release);
+    }
+}
+
+impl<T> Drop for Slab<T> {
+    fn drop(&mut self) {
+        // The entries are plain data with nothing to drop: this slab holds
+        // `MemEntry` only.
+        for b in self.blocks.iter() {
+            let p = b.load(AtomicOrdering::Relaxed);
+            if !p.is_null() {
+                let layout = std::alloc::Layout::array::<T>(SLAB_BLOCK).expect("slab block layout");
+                // SAFETY: allocated by `push` with this layout.
+                unsafe { std::alloc::dealloc(p as *mut u8, layout) };
+            }
+        }
+    }
+}
+
+/// The reader table: LMDB's shape. A reader handle owns a slot for its
+/// life and pins by storing the epoch it observed there; the writer
+/// bumps the epoch when it publishes a structure that replaces another,
+/// tags the replaced one with the new epoch, and frees it once no slot
+/// holds an older epoch, so a reader that pinned before the publish keeps
+/// what it may still be walking. Readers store and the writer scans;
+/// neither locks, and neither ever waits for the other -- a reader that
+/// holds a pin only holds memory.
+pub(crate) struct Readers {
+    epoch: AtomicU64,
+    slots: Box<[AtomicU64]>,
+}
+
+const READER_SLOTS: usize = 256;
+
+impl Readers {
+    fn new() -> Readers {
+        Readers {
+            epoch: AtomicU64::new(1),
+            slots: (0..READER_SLOTS).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    /// The writer: a new epoch, after publishing what it replaces.
+    fn bump(&self) -> u64 {
+        self.epoch.fetch_add(1, AtomicOrdering::SeqCst) + 1
+    }
+
+    /// Whether every pinned reader pinned at or after `epoch`, so nothing
+    /// retired at `epoch` can still be walked.
+    fn none_before(&self, epoch: u64) -> bool {
+        self.slots.iter().all(|s| {
+            let v = s.load(AtomicOrdering::SeqCst);
+            v == 0 || v >= epoch
+        })
+    }
 }
 
 impl MemTable {
     fn new() -> MemTable {
         MemTable {
-            entries: vec![MemEntry::default(); 1024],
+            entries: Slab::new(),
+            index: AtomicPtr::new(Box::into_raw(Box::new(Index::with_slots(1024)))),
             ordered: false,
-            mask: 1023,
-            len: 0,
-            keys: Vec::new(),
-            vals: Vec::new(),
-            tombs: 0,
+            keys: ByteArena::new(),
+            vals: ByteArena::new(),
+            tombs: AtomicUsize::new(0),
+            committed: AtomicU64::new(0),
+            retired: UnsafeCell::new(Vec::new()),
         }
     }
 
     /// A table for keys that arrive in order: each above the last.
     fn new_ordered() -> MemTable {
         MemTable {
-            entries: Vec::new(),
+            entries: Slab::new(),
+            index: AtomicPtr::new(std::ptr::null_mut()),
             ordered: true,
-            mask: 0,
-            len: 0,
-            keys: Vec::new(),
-            vals: Vec::new(),
-            tombs: 0,
+            keys: ByteArena::new(),
+            vals: ByteArena::new(),
+            tombs: AtomicUsize::new(0),
+            committed: AtomicU64::new(0),
+            retired: UnsafeCell::new(Vec::new()),
         }
     }
 
-    fn key_of<'a>(keys: &'a [u8], e: &MemEntry) -> &'a [u8] {
-        &keys[e.key_off as usize..(e.key_off + e.key_len) as usize]
+    fn index(&self) -> Option<&Index> {
+        let p = self.index.load(AtomicOrdering::Acquire);
+        // SAFETY: an index the writer published, freed only past every
+        // reader that could hold it.
+        (!p.is_null()).then(|| unsafe { &*p })
     }
 
-    fn grow(&mut self) -> Vec<u32> {
-        let cap = self.entries.len() * 2;
-        let mut entries = vec![MemEntry::default(); cap];
-        let mut moved = vec![u32::MAX; self.entries.len()];
-        let mask = cap - 1;
-        for (old, e) in self.entries.iter().enumerate().filter(|(_, e)| e.hash != 0) {
-            let mut i = (e.hash as usize) & mask;
-            while entries[i].hash != 0 {
-                i = (i + 1) & mask;
-            }
-            entries[i] = *e;
-            moved[old] = i as u32;
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn entry(&self, id: usize) -> &MemEntry {
+        self.entries.get(id)
+    }
+
+    fn key_of(&self, e: &MemEntry) -> &[u8] {
+        self.keys.slice(e.key_off as usize, e.key_len as usize)
+    }
+
+    fn key_at(&self, off: u32, len: u32) -> &[u8] {
+        self.keys.slice(off as usize, len as usize)
+    }
+
+    fn key_bytes(&self) -> usize {
+        self.keys.used()
+    }
+
+    fn tombs(&self) -> usize {
+        self.tombs.load(AtomicOrdering::Relaxed)
+    }
+
+    /// The offset of the entry's newest chunk, or `NO_CHUNK`.
+    fn head(e: &MemEntry) -> u64 {
+        match e.head.load(AtomicOrdering::Acquire) {
+            0 => NO_CHUNK,
+            h => h - 1,
         }
-        self.entries = entries;
-        self.mask = mask;
-        moved
     }
 
-    fn append(&mut self, key: &[u8], value: &[u8]) -> Wrote {
+    /// Writer: the entries from `n` on forgotten; see `Slab::truncate`.
+    fn truncate_entries(&self, n: usize) {
+        self.entries.truncate(n);
+    }
+
+    /// Writer: what is written is committed.
+    fn commit(&self) {
+        self.committed
+            .store(self.vals.tail() as u64, AtomicOrdering::Release);
+    }
+
+    /// Writer: the entry for `key`, made if the table lacks it -- its key
+    /// copied, its first chunk pushed with no predecessor -- or found,
+    /// with a chunk pushed onto its chain. `value` is `None` for a
+    /// tombstone. `rd` is for an index rebuild's retirement.
+    fn write(&self, hash: u64, key: &[u8], value: Option<&[u8]>, rd: &Readers) -> Wrote {
         if self.ordered {
             debug_assert!(
-                self.entries
-                    .last()
-                    .is_none_or(|e| MemTable::key_of(&self.keys, e) < key),
+                value.is_some(),
+                "a delete never reaches an ordered memtable"
+            );
+            debug_assert!(
+                self.is_empty() || self.key_of(self.entry(self.len() - 1)) < key,
                 "an ordered memtable takes each key above its last"
             );
-            let key_off = self.keys.len() as u32;
-            self.keys.extend_from_slice(key);
-            let head = self.push_chunk(NO_CHUNK, value);
-            self.entries.push(MemEntry {
-                hash: mem_hash(key),
-                key_off,
-                key_len: key.len() as u32,
-                head: head + 1,
-                count: 1,
-            });
-            self.len += 1;
+            let id = self.new_entry(hash, key, value);
             return Wrote {
-                slot: (self.len - 1) as u32,
+                slot: id as u32,
                 new: true,
-                moved: None,
             };
         }
-        let mut wrote = Wrote::default();
-        if (self.len + 1) * 2 > self.entries.len() {
-            wrote.moved = Some(self.grow());
+        if let Some(id) = self.probe(hash, key) {
+            let e = self.entry(id);
+            let prev = MemTable::head(e);
+            let off = match value {
+                Some(v) => self.push_chunk(prev, v),
+                None => self.push_tomb(prev),
+            };
+            e.head.store(off + 1, AtomicOrdering::Release);
+            match value {
+                Some(_) => {
+                    e.count.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                None => e.count.store(0, AtomicOrdering::Relaxed),
+            }
+            return Wrote {
+                slot: id as u32,
+                new: false,
+            };
         }
-        let hash = mem_hash(key);
-        let mut i = (hash as usize) & self.mask;
-        loop {
-            let e = self.entries[i];
-            if e.hash == 0 {
-                let key_off = self.keys.len() as u32;
-                self.keys.extend_from_slice(key);
-                let head = self.push_chunk(NO_CHUNK, value);
-                self.entries[i] = MemEntry {
-                    hash,
-                    key_off,
-                    key_len: key.len() as u32,
-                    head: head + 1,
-                    count: 1,
-                };
-                self.len += 1;
-                wrote.slot = i as u32;
-                wrote.new = true;
-                return wrote;
-            }
-            if e.hash == hash && MemTable::key_of(&self.keys, &e) == key {
-                let head = self.push_chunk(e.head - 1, value);
-                self.entries[i].head = head + 1;
-                self.entries[i].count += 1;
-                wrote.slot = i as u32;
-                return wrote;
-            }
-            i = (i + 1) & self.mask;
+        let id = self.new_entry(hash, key, value);
+        self.index_insert(hash, id, rd);
+        Wrote {
+            slot: id as u32,
+            new: true,
         }
     }
 
-    fn push_chunk(&mut self, prev: u64, value: &[u8]) -> u64 {
-        let off = self.vals.len() as u64;
-        self.vals.extend_from_slice(&prev.to_le_bytes());
-        put_uvarint(&mut self.vals, value.len() as u64);
-        self.vals.extend_from_slice(value);
-        off
+    fn append(&self, hash: u64, key: &[u8], value: &[u8], rd: &Readers) -> Wrote {
+        self.write(hash, key, Some(value), rd)
     }
 
-    /// Chunk offsets for one entry, oldest first.
+    /// A tombstone and then `value` on `key`'s chain, one probe for both:
+    /// what a put is, and half the misses of a delete then an append at
+    /// thirty million keys.
+    fn put(&self, hash: u64, key: &[u8], value: &[u8], rd: &Readers) -> Wrote {
+        assert!(!self.ordered, "a put never reaches an ordered memtable");
+        if let Some(id) = self.probe(hash, key) {
+            let e = self.entry(id);
+            let tomb = self.push_tomb(MemTable::head(e));
+            let off = self.push_chunk(tomb, value);
+            e.head.store(off + 1, AtomicOrdering::Release);
+            e.count.store(1, AtomicOrdering::Relaxed);
+            return Wrote {
+                slot: id as u32,
+                new: false,
+            };
+        }
+        let id = self.new_entry(hash, key, None);
+        let e = self.entry(id);
+        let off = self.push_chunk(MemTable::head(e), value);
+        e.head.store(off + 1, AtomicOrdering::Release);
+        e.count.store(1, AtomicOrdering::Relaxed);
+        self.index_insert(hash, id, rd);
+        Wrote {
+            slot: id as u32,
+            new: true,
+        }
+    }
+
     /// End every value of `key` before this point: a tombstone chunk at the
     /// head of the chain, and the live count back to zero. A key never seen
     /// before gets an entry too, because the tombstone has older sources to
     /// mask even when this memtable holds nothing of its own.
-    fn delete(&mut self, key: &[u8]) -> Wrote {
+    fn delete(&self, hash: u64, key: &[u8], rd: &Readers) -> Wrote {
         assert!(
             !self.ordered,
             "a delete never reaches an ordered memtable: the store leaves order first"
         );
-        let mut wrote = Wrote::default();
-        if (self.len + 1) * 2 > self.entries.len() {
-            wrote.moved = Some(self.grow());
-        }
-        let hash = mem_hash(key);
-        let mut i = (hash as usize) & self.mask;
-        loop {
-            let e = self.entries[i];
-            if e.hash == 0 {
-                let key_off = self.keys.len() as u32;
-                self.keys.extend_from_slice(key);
-                let head = self.push_tomb(NO_CHUNK);
-                self.entries[i] = MemEntry {
-                    hash,
-                    key_off,
-                    key_len: key.len() as u32,
-                    head: head + 1,
-                    count: 0,
-                };
-                self.len += 1;
-                self.tombs += 1;
-                wrote.slot = i as u32;
-                wrote.new = true;
-                return wrote;
-            }
-            if e.hash == hash && MemTable::key_of(&self.keys, &e) == key {
-                let head = self.push_tomb(e.head - 1);
-                self.entries[i].head = head + 1;
-                self.entries[i].count = 0;
-                self.tombs += 1;
-                wrote.slot = i as u32;
-                return wrote;
-            }
-            i = (i + 1) & self.mask;
-        }
+        self.write(hash, key, None, rd)
     }
 
-    fn push_tomb(&mut self, prev: u64) -> u64 {
-        let off = self.vals.len() as u64;
-        self.vals.extend_from_slice(&prev.to_le_bytes());
-        put_uvarint(&mut self.vals, TOMB_LEN);
-        off
+    /// Writer: a new entry, its key and first chunk written, published by
+    /// the slab's length; the index is the caller's.
+    fn new_entry(&self, hash: u64, key: &[u8], value: Option<&[u8]>) -> usize {
+        let key_off = self.keys.reserve(key.len());
+        self.keys.write(key_off, key);
+        let (off, count) = match value {
+            Some(v) => (self.push_chunk(NO_CHUNK, v), 1),
+            None => (self.push_tomb(NO_CHUNK), 0),
+        };
+        self.entries.push(MemEntry {
+            hash,
+            key_off: u32::try_from(key_off).expect("a memtable's keys stay under four gigabytes"),
+            key_len: key.len() as u32,
+            head: AtomicU64::new(off + 1),
+            count: AtomicU64::new(count),
+        })
     }
 
-    fn is_tomb(&self, at: usize) -> bool {
-        let mut p = at + 8;
-        get_uvarint(&self.vals, &mut p) == Some(TOMB_LEN)
+    /// Writer: entry `id` into the index at `hash`, after a rebuild when
+    /// the table is at half load.
+    fn index_insert(&self, hash: u64, id: usize, rd: &Readers) {
+        let idx = self.index().expect("a hashed table has an index");
+        let idx = if self.len() * 2 > idx.slots.len() {
+            self.rebuild_index(idx, rd)
+        } else {
+            idx
+        };
+        let mut i = (hash as usize) & idx.mask;
+        while idx.slots[i].load(AtomicOrdering::Relaxed) != 0 {
+            i = (i + 1) & idx.mask;
+        }
+        idx.slots[i].store(Index::word(hash, id), AtomicOrdering::Release);
+    }
+
+    /// Writer: a table twice the size with every entry reinserted,
+    /// published, the old one retired at the epoch the publish bumps.
+    fn rebuild_index(&self, old: &Index, rd: &Readers) -> &Index {
+        let cap = old.slots.len() * 2;
+        let fresh = Index::with_slots(cap);
+        for id in 0..self.len() {
+            let hash = self.entry(id).hash;
+            let mut i = (hash as usize) & fresh.mask;
+            while fresh.slots[i].load(AtomicOrdering::Relaxed) != 0 {
+                i = (i + 1) & fresh.mask;
+            }
+            fresh.slots[i].store(Index::word(hash, id), AtomicOrdering::Relaxed);
+        }
+        let fresh = Box::into_raw(Box::new(fresh));
+        let old = self.index.swap(fresh, AtomicOrdering::AcqRel);
+        let tag = rd.bump();
+        // SAFETY: writer-only; `old` was published by this table and is
+        // owned by it until freed here or in `Drop`.
+        unsafe {
+            (*self.retired.get()).push((tag, Box::from_raw(old)));
+        }
+        self.reclaim(rd);
+        // SAFETY: just published, freed only past every reader.
+        unsafe { &*fresh }
+    }
+
+    /// Writer: free the retired indexes no reader can still hold.
+    fn reclaim(&self, rd: &Readers) {
+        // SAFETY: writer-only.
+        let retired = unsafe { &mut *self.retired.get() };
+        retired.retain(|(tag, _)| !rd.none_before(*tag));
+    }
+
+    fn push_chunk(&self, prev: u64, value: &[u8]) -> u64 {
+        let off = self.vals.reserve(CHUNK_HDR + value.len());
+        self.vals.write(off, &prev.to_le_bytes());
+        self.vals
+            .write(off + 8, &(value.len() as u32).to_le_bytes());
+        self.vals.write(off + CHUNK_HDR, value);
+        off as u64
+    }
+
+    fn push_tomb(&self, prev: u64) -> u64 {
+        let off = self.vals.reserve(CHUNK_HDR);
+        self.vals.write(off, &prev.to_le_bytes());
+        self.vals.write(off + 8, &TOMB_LEN.to_le_bytes());
+        self.tombs.fetch_add(1, AtomicOrdering::Relaxed);
+        off as u64
+    }
+
+    fn chunk_prev(&self, off: u64) -> u64 {
+        u64::from_le_bytes(
+            self.vals
+                .slice(off as usize, 8)
+                .try_into()
+                .expect("eight bytes"),
+        )
+    }
+
+    fn chunk_len(&self, off: u64) -> u32 {
+        u32::from_le_bytes(
+            self.vals
+                .slice(off as usize + 8, 4)
+                .try_into()
+                .expect("four bytes"),
+        )
+    }
+
+    fn is_tomb(&self, off: u64) -> bool {
+        self.chunk_len(off) == TOMB_LEN
     }
 
     /// The key's live values, oldest first, and whether a tombstone ends
     /// the chain -- in which case everything older, here and in every older
-    /// source, is dead.
-    fn live_chain(&self, e: &MemEntry) -> (Vec<usize>, bool) {
-        let mut offs = Vec::with_capacity(e.count as usize);
-        let mut at = e.head - 1;
-        while at != NO_CHUNK {
-            if self.is_tomb(at as usize) {
-                offs.reverse();
-                return (offs, true);
-            }
-            offs.push(at as usize);
-            at = u64::from_le_bytes(self.vals[at as usize..at as usize + 8].try_into().unwrap());
-        }
-        offs.reverse();
-        (offs, false)
+    /// source, is dead. Chunks at or past `wm` are skipped: a reader's
+    /// watermark, or `SEE_ALL`.
+    fn live_chain(&self, e: &MemEntry, wm: u64) -> (Vec<usize>, bool) {
+        let mut offs = Vec::with_capacity(e.count.load(AtomicOrdering::Relaxed) as usize);
+        let tomb = self.live_offs_into(e, &mut offs, wm);
+        (offs, tomb)
     }
 
     /// `live_chain` into a caller's buffer, oldest first, allocating nothing
     /// after the buffer has grown once; returns whether a tombstone cut it.
-    fn live_offs_into(&self, e: &MemEntry, out: &mut Vec<usize>) -> bool {
+    fn live_offs_into(&self, e: &MemEntry, out: &mut Vec<usize>, wm: u64) -> bool {
         out.clear();
-        let mut at = e.head - 1;
+        let mut at = MemTable::head(e);
         let mut tomb = false;
         while at != NO_CHUNK {
-            if self.is_tomb(at as usize) {
+            if at >= wm {
+                at = self.chunk_prev(at);
+                continue;
+            }
+            if self.is_tomb(at) {
                 tomb = true;
                 break;
             }
             out.push(at as usize);
-            at = u64::from_le_bytes(self.vals[at as usize..at as usize + 8].try_into().unwrap());
+            at = self.chunk_prev(at);
         }
         out.reverse();
         tomb
     }
 
-    /// Whether a tombstone sits anywhere in the key's chain.
-    fn has_tomb(&self, e: &MemEntry) -> bool {
-        let mut at = e.head - 1;
+    /// Whether a tombstone sits anywhere in the key's chain below `wm`.
+    fn has_tomb(&self, e: &MemEntry, wm: u64) -> bool {
+        let mut at = MemTable::head(e);
         while at != NO_CHUNK {
-            if self.is_tomb(at as usize) {
+            if at < wm && self.is_tomb(at) {
                 return true;
             }
-            at = u64::from_le_bytes(self.vals[at as usize..at as usize + 8].try_into().unwrap());
+            at = self.chunk_prev(at);
         }
         false
     }
 
     fn value_at(&self, off: usize) -> &[u8] {
-        let mut p = off + 8;
-        let len = get_uvarint(&self.vals, &mut p).expect("memtable framing") as usize;
-        &self.vals[p..p + len]
+        let len = self.chunk_len(off as u64);
+        debug_assert_ne!(len, TOMB_LEN, "a tombstone has no value");
+        self.vals.slice(off + CHUNK_HDR, len as usize)
     }
 
     fn get(&self, key: &[u8]) -> Option<&MemEntry> {
-        self.slot_of(key).map(|i| &self.entries[i])
+        self.slot_of(key).map(|i| self.entry(i))
     }
 
-    /// The slot holding `key`, if the table has it.
+    /// `get` with the hash `prefetch` returned.
+    fn get_with(&self, hash: u64, key: &[u8]) -> Option<&MemEntry> {
+        if self.ordered {
+            return self.get(key);
+        }
+        self.probe(hash, key).map(|i| self.entry(i))
+    }
+
+    /// The entry number holding `key`, if the table has it.
     fn slot_of(&self, key: &[u8]) -> Option<usize> {
         if self.ordered {
-            return self
-                .entries
-                .binary_search_by(|e| MemTable::key_of(&self.keys, e).cmp(key))
-                .ok();
-        }
-        let hash = mem_hash(key);
-        let mut i = (hash as usize) & self.mask;
-        loop {
-            let e = &self.entries[i];
-            if e.hash == 0 {
-                return None;
+            let n = self.len();
+            let (mut lo, mut hi) = (0usize, n);
+            while lo < hi {
+                let m = lo + (hi - lo) / 2;
+                match self.key_of(self.entry(m)).cmp(key) {
+                    Ordering::Less => lo = m + 1,
+                    Ordering::Greater => hi = m,
+                    Ordering::Equal => return Some(m),
+                }
             }
-            if e.hash == hash && MemTable::key_of(&self.keys, e) == key {
-                return Some(i);
-            }
-            i = (i + 1) & self.mask;
+            return None;
         }
+        self.probe(mem_hash(key), key)
     }
 
-    fn is_empty(&self) -> bool {
-        self.len == 0
+    /// A hint to fetch the slot line `key` probes first, and its hash for
+    /// the probe: issued at the top of a write or a read, the store's
+    /// bookkeeping before the probe -- the WAL frame, the fences -- runs
+    /// while the line comes in. At thirty million keys the slot and the
+    /// entry behind it are both misses, and this hides the first.
+    fn prefetch(&self, key: &[u8]) -> u64 {
+        let hash = mem_hash(key);
+        if let Some(idx) = self.index() {
+            let i = (hash as usize) & idx.mask;
+            prefetch_lines(idx.slots[i..].as_ptr() as *const u8, 64);
+        }
+        hash
+    }
+
+    fn probe(&self, hash: u64, key: &[u8]) -> Option<usize> {
+        let idx = self.index()?;
+        let mut i = (hash as usize) & idx.mask;
+        loop {
+            let s = idx.slots[i].load(AtomicOrdering::Acquire);
+            if s == 0 {
+                return None;
+            }
+            if s >> 32 == hash >> 32 {
+                let id = ((s & 0xffff_ffff) - 1) as usize;
+                let e = self.entry(id);
+                if e.hash == hash && self.key_of(e) == key {
+                    return Some(id);
+                }
+            }
+            i = (i + 1) & idx.mask;
+        }
+    }
+}
+
+impl Drop for MemTable {
+    fn drop(&mut self) {
+        let p = self.index.load(AtomicOrdering::Relaxed);
+        if !p.is_null() {
+            // SAFETY: published by this table, owned by it.
+            drop(unsafe { Box::from_raw(p) });
+        }
+        // The retired indexes drop with the cell.
     }
 }
 
@@ -3499,7 +3968,10 @@ pub struct Db {
     opts: Options,
     wal: Wal,
     wal_id: u64,
-    mem: MemTable,
+    mem: std::sync::Arc<MemTable>,
+    /// The reader table: slots for reader handles, and the epoch the
+    /// writer bumps at each publish.
+    readers: Readers,
     mem_bytes: usize,
     /// Live segments. Partitioned (L1) first and disjoint, then L0 oldest
     /// to newest: a key's values come back in append order because a merge
@@ -3753,8 +4225,8 @@ impl Snapshot {
     fn file(&mut self, mem: &MemTable, slots: &[u32]) {
         let mut batch: Vec<SnapKey> = Vec::with_capacity(slots.len());
         for &slot in slots {
-            let e = &mem.entries[slot as usize];
-            let key = MemTable::key_of(&mem.keys, e);
+            let e = mem.entry(slot as usize);
+            let key = mem.key_of(e);
             let off = self.keys.len() as u32;
             self.keys.extend_from_slice(key);
             batch.push(SnapKey {
@@ -4001,7 +4473,8 @@ impl Db {
             opts,
             wal,
             wal_id: 0,
-            mem: MemTable::new(),
+            mem: std::sync::Arc::new(MemTable::new()),
+            readers: Readers::new(),
             mem_bytes: 0,
             segs: Vec::new(),
             advice_random: std::cell::Cell::new(starts_random),
@@ -4190,17 +4663,18 @@ impl Db {
             }
         }
         wal_ids.sort_unstable();
-        let mut mem = MemTable::new();
+        let mem = MemTable::new();
+        let readers = Readers::new();
         let mut mem_bytes = 0usize;
         let mut from = sealed;
         let mut valid_len = 0u64;
         for &id in &wal_ids {
             let (next, valid) = Wal::replay(&Db::wal_path(dir, id), id, from, |kind, k, v| {
                 if kind == WAL_DEL {
-                    mem.delete(k);
+                    mem.delete(mem_hash(k), k, &readers);
                     mem_bytes += k.len() + 16;
                 } else {
-                    mem.append(k, v);
+                    mem.append(mem_hash(k), k, v, &readers);
                     mem_bytes += k.len() + v.len();
                 }
             })?;
@@ -4239,7 +4713,8 @@ impl Db {
             opts,
             wal,
             wal_id,
-            mem,
+            mem: std::sync::Arc::new(mem),
+            readers,
             mem_bytes,
             segs,
             // The same value the segments above were opened with, so the
@@ -4285,11 +4760,11 @@ impl Db {
         if self.mem.ordered || self.direct_can_open() {
             if self.goes_direct(key, value) {
                 if !self.mem.ordered {
-                    self.mem = MemTable::new_ordered();
+                    self.mem = std::sync::Arc::new(MemTable::new_ordered());
                 }
                 self.max_key.clear();
                 self.max_key.extend_from_slice(key);
-                let wrote = self.mem.append(key, value);
+                let wrote = self.mem.append(mem_hash(key), key, value, &self.readers);
                 self.note_write(wrote);
                 self.mem_bytes += key.len() + value.len();
                 return;
@@ -4298,12 +4773,13 @@ impl Db {
                 self.leave_direct();
             }
         }
+        let hash = self.mem.prefetch(key);
         if key > self.max_key.as_slice() {
             self.max_key.clear();
             self.max_key.extend_from_slice(key);
         }
         self.wal.append(key, value);
-        let wrote = self.mem.append(key, value);
+        let wrote = self.mem.append(hash, key, value, &self.readers);
         self.note_write(wrote);
         self.mem_bytes += key.len() + value.len();
     }
@@ -4339,23 +4815,22 @@ impl Db {
     /// waits for the next `commit`.
     fn leave_direct(&mut self) {
         let committed = self.direct.as_ref().map_or(0, |d| d.committed);
-        let tail: Vec<(Vec<u8>, Vec<u8>)> = self.mem.entries[committed..]
-            .iter()
+        let tail: Vec<(Vec<u8>, Vec<u8>)> = (committed..self.mem.len())
+            .map(|i| self.mem.entry(i))
             .map(|e| {
                 (
-                    MemTable::key_of(&self.mem.keys, e).to_vec(),
-                    self.mem.value_at((e.head - 1) as usize).to_vec(),
+                    self.mem.key_of(e).to_vec(),
+                    self.mem.value_at(MemTable::head(e) as usize).to_vec(),
                 )
             })
             .collect();
-        self.mem.entries.truncate(committed);
-        self.mem.len = committed;
+        self.mem.truncate_entries(committed);
         if let Err(e) = self.close_direct() {
             self.pending_err = Some(e);
         }
         for (k, v) in tail {
             self.wal.append(&k, &v);
-            let wrote = self.mem.append(&k, &v);
+            let wrote = self.mem.append(mem_hash(&k), &k, &v, &self.readers);
             self.note_write(wrote);
             self.mem_bytes += k.len() + v.len();
         }
@@ -4375,8 +4850,8 @@ impl Db {
                 }
             }
         }
-        for e in mem.entries.iter().filter(|e| e.hash != 0) {
-            let k = MemTable::key_of(&mem.keys, e);
+        for e in (0..mem.len()).map(|i| mem.entry(i)) {
+            let k = mem.key_of(e);
             if k > best.as_slice() {
                 best = k.to_vec();
             }
@@ -4391,8 +4866,19 @@ impl Db {
     /// other verb, and using it for an update piled every Zipfian rewrite
     /// onto its key until each read walked the pile.
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
-        self.delete(key);
-        self.append(key, value);
+        if self.mem.ordered {
+            self.leave_direct();
+        }
+        if key > self.max_key.as_slice() {
+            self.max_key.clear();
+            self.max_key.extend_from_slice(key);
+        }
+        let hash = self.mem.prefetch(key);
+        self.wal.delete(key);
+        self.wal.append(key, value);
+        let wrote = self.mem.put(hash, key, value, &self.readers);
+        self.note_write(wrote);
+        self.mem_bytes += key.len() + 16 + key.len() + value.len();
     }
 
     /// End every value of `key` written before this point; later appends
@@ -4402,8 +4888,9 @@ impl Db {
         if self.mem.ordered {
             self.leave_direct();
         }
+        let hash = self.mem.prefetch(key);
         self.wal.delete(key);
-        let wrote = self.mem.delete(key);
+        let wrote = self.mem.delete(hash, key, &self.readers);
         self.note_write(wrote);
         self.mem_bytes += key.len() + 16;
     }
@@ -4422,8 +4909,8 @@ impl Db {
     /// nothing was ever deleted from, which lets every read skip the
     /// newest-first pass tombstones require.
     fn has_tombstones(&self) -> bool {
-        self.mem.tombs > 0
-            || self.frozen.as_ref().is_some_and(|f| f.tombs > 0)
+        self.mem.tombs() > 0
+            || self.frozen.as_ref().is_some_and(|f| f.tombs() > 0)
             || self.segs.iter().any(|s| s.tombs)
     }
 
@@ -4442,6 +4929,7 @@ impl Db {
         } else {
             self.wal.mark_commit();
             self.wal.write()?;
+            self.mem.commit();
             self.unsynced += 1;
             let due = match self.opts.sync {
                 SyncPolicy::Always => true,
@@ -4474,7 +4962,9 @@ impl Db {
         if self.mem.ordered {
             self.commit_direct()
         } else {
-            self.wal.commit()
+            self.wal.commit()?;
+            self.mem.commit();
+            Ok(())
         }
     }
 
@@ -4483,7 +4973,7 @@ impl Db {
     /// key and its one value, then a commit marker, then the sync the
     /// policy asks for. The segment is their log; the WAL never sees them.
     fn commit_direct(&mut self) -> Result<()> {
-        if self.direct.as_ref().map_or(0, |d| d.committed) == self.mem.len {
+        if self.direct.as_ref().map_or(0, |d| d.committed) == self.mem.len() {
             return Ok(());
         }
         if self.direct.is_none() {
@@ -4502,17 +4992,20 @@ impl Db {
             });
         }
         let d = self.direct.as_mut().expect("opened above");
-        for e in &self.mem.entries[d.committed..] {
+        for i in d.committed..self.mem.len() {
+            let e = self.mem.entry(i);
             debug_assert_eq!(
-                e.count, 1,
+                e.count.load(AtomicOrdering::Relaxed),
+                1,
                 "an ordered entry has the one value it was appended with"
             );
-            d.w.begin(MemTable::key_of(&self.mem.keys, e))?;
-            d.w.value(self.mem.value_at((e.head - 1) as usize));
+            d.w.begin(self.mem.key_of(e))?;
+            d.w.value(self.mem.value_at(MemTable::head(e) as usize));
             d.w.end_with(false)?;
         }
         d.w.mark()?;
-        d.committed = self.mem.len;
+        d.committed = self.mem.len();
+        self.mem.commit();
         self.unsynced += 1;
         let due = match self.opts.sync {
             SyncPolicy::Always => true,
@@ -4543,12 +5036,12 @@ impl Db {
         self.mem_bytes = 0;
         let Some(d) = self.direct.take() else {
             // A run forming with nothing committed: no file, nothing to close.
-            self.mem = MemTable::new();
+            self.mem = std::sync::Arc::new(MemTable::new());
             return Ok(());
         };
         self.join_seal()?;
-        debug_assert_eq!(self.mem.len, d.committed, "a run closes between batches");
-        let frozen = std::sync::Arc::new(std::mem::replace(&mut self.mem, MemTable::new()));
+        debug_assert_eq!(self.mem.len(), d.committed, "a run closes between batches");
+        let frozen = std::mem::replace(&mut self.mem, std::sync::Arc::new(MemTable::new()));
         let end_seq = self.wal.seq;
         let np = self.segs.partition_point(|s| s.level > 0);
         let name = if np == 0 {
@@ -4595,12 +5088,13 @@ impl Db {
             return self.close_direct();
         }
         self.wal.commit()?;
+        self.mem.commit();
         self.unsynced = 0;
         if self.mem.is_empty() {
             return Ok(());
         }
         self.join_seal()?;
-        let frozen = std::sync::Arc::new(std::mem::replace(&mut self.mem, MemTable::new()));
+        let frozen = std::mem::replace(&mut self.mem, std::sync::Arc::new(MemTable::new()));
         // The scan snapshot names the live memtable's slots, and the live
         // memtable is new: a write's bookkeeping renumbers the snapshot at
         // every rehash, and the fresh table's first rehash has a thousand
@@ -4656,8 +5150,8 @@ impl Db {
             // costs -- and the sort is affordable because a seal is off the
             // commit path. The same sort is what makes splitting at the
             // fences a matter of slicing.
-            let mut order: Vec<&MemEntry> = mem.entries.iter().filter(|e| e.hash != 0).collect();
-            order.sort_unstable_by_key(|e| MemTable::key_of(&mem.keys, e));
+            let mut order: Vec<&MemEntry> = (0..mem.len()).map(|i| mem.entry(i)).collect();
+            order.sort_unstable_by_key(|e| mem.key_of(e));
 
             let ranges: Vec<Fence> = if fences.is_empty() {
                 vec![(Vec::new(), None)]
@@ -4669,7 +5163,7 @@ impl Db {
             for (ri, (lo, hi)) in ranges.iter().enumerate() {
                 let start = at;
                 while at < order.len() {
-                    let k = MemTable::key_of(&mem.keys, order[at]);
+                    let k = mem.key_of(order[at]);
                     if hi.as_ref().is_some_and(|h| k >= h.as_slice()) {
                         break;
                     }
@@ -4686,11 +5180,11 @@ impl Db {
                     let mut w = PieceWriter::create(&tmp, &opts, sync_every, inline_max)
                         .map_err(|e| err(&format!("seal create: {e}")))?;
                     for e in &order[start..at] {
-                        let key = MemTable::key_of(&mem.keys, e);
+                        let key = mem.key_of(e);
                         // Only what is live after the newest tombstone, and
                         // the flag if there was one: the segment carries the
                         // delete forward for the sources older than it.
-                        let (offs, tomb) = mem.live_chain(e);
+                        let (offs, tomb) = mem.live_chain(e, SEE_ALL);
                         w.begin(key)?;
                         for off in offs {
                             w.value(mem.value_at(off));
@@ -5563,6 +6057,7 @@ impl Db {
 
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
         self.advise(true);
+        let hash = self.mem.prefetch(key);
         let np = self.segs.partition_point(|s| s.level > 0);
         let at =
             self.segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
@@ -5578,8 +6073,8 @@ impl Db {
         let mut start = 0usize;
         if self.has_tombstones() {
             if !self.mem.is_empty() {
-                if let Some(e) = self.mem.get(key) {
-                    if self.mem.has_tomb(e) {
+                if let Some(e) = self.mem.get_with(hash, key) {
+                    if self.mem.has_tomb(e, SEE_ALL) {
                         start = mem_ix;
                     }
                 }
@@ -5587,7 +6082,7 @@ impl Db {
             if start == 0 {
                 if let Some(fr) = &self.frozen {
                     if let Some(e) = fr.get(key) {
-                        if fr.has_tomb(e) {
+                        if fr.has_tomb(e, SEE_ALL) {
                             start = fr_ix;
                         }
                     }
@@ -5628,7 +6123,7 @@ impl Db {
         if fr_ix >= start {
             if let Some(fr) = &self.frozen {
                 if let Some(e) = fr.get(key) {
-                    let (offs, _) = fr.live_chain(e);
+                    let (offs, _) = fr.live_chain(e, SEE_ALL);
                     n += offs.len() as u64;
                     for off in offs {
                         f(fr.value_at(off));
@@ -5637,8 +6132,8 @@ impl Db {
             }
         }
         if mem_ix >= start && !self.mem.is_empty() {
-            if let Some(e) = self.mem.get(key) {
-                let (offs, _) = self.mem.live_chain(e);
+            if let Some(e) = self.mem.get_with(hash, key) {
+                let (offs, _) = self.mem.live_chain(e, SEE_ALL);
                 n += offs.len() as u64;
                 for off in offs {
                     f(self.mem.value_at(off));
@@ -5652,10 +6147,10 @@ impl Db {
     /// live), one entry per key. Two builds behind `scan_snapshot_arena`;
     /// both walk the hash tables once and both end in the same `Snapshot`.
     fn build_snapshot(&self) -> Snapshot {
-        let n = self.mem.len + self.frozen.as_ref().map_or(0, |f| f.len);
+        let n = self.mem.len() + self.frozen.as_ref().map_or(0, |f| f.len());
         let mut snap = Snapshot {
             keys: Vec::with_capacity(
-                self.mem.keys.len() + self.frozen.as_ref().map_or(0, |f| f.keys.len()),
+                self.mem.key_bytes() + self.frozen.as_ref().map_or(0, |f| f.key_bytes()),
             ),
             ents: Vec::with_capacity(n),
             ..Default::default()
@@ -5676,16 +6171,13 @@ impl Db {
                 // (key offset, key length, slot): the copy below needs no
                 // slot access, since a slot in key order is a random one.
                 order.clear();
-                order.extend(
-                    mem.entries
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, e)| e.hash != 0)
-                        .map(|(i, e)| (e.key_off, e.key_len, i as u32)),
-                );
+                order.extend((0..mem.len()).map(|i| {
+                    let e = mem.entry(i);
+                    (e.key_off, e.key_len, i as u32)
+                }));
                 radix_by_first(&mut order, &mut scratch);
                 for &(off, len, i) in &order {
-                    let k = &mem.keys[off as usize..(off + len) as usize];
+                    let k = mem.key_at(off, len);
                     let (a, b) = key_prefix(k);
                     recs.push((a, b, pending.len() as u32));
                     pending.push(SnapKey {
@@ -5725,9 +6217,9 @@ impl Db {
             }
             let mut all: Vec<Old> = Vec::with_capacity(n);
             let mut take = |mem: &MemTable, live: bool| {
-                for (i, e) in mem.entries.iter().enumerate().filter(|(_, e)| e.hash != 0) {
+                for (i, e) in (0..mem.len()).map(|i| (i, mem.entry(i))) {
                     all.push(Old {
-                        key: MemTable::key_of(&mem.keys, e).to_vec(),
+                        key: mem.key_of(e).to_vec(),
                         mem: if live { i as u32 } else { u32::MAX },
                         frozen: if live { u32::MAX } else { i as u32 },
                     });
@@ -5906,12 +6398,16 @@ impl Db {
             let mut start = 0usize;
             if tombs {
                 if in_unsealed {
-                    if self.mem.get(key).is_some_and(|e| self.mem.has_tomb(e)) {
+                    if self
+                        .mem
+                        .get(key)
+                        .is_some_and(|e| self.mem.has_tomb(e, SEE_ALL))
+                    {
                         start = nc + 1;
                     } else if self
                         .frozen
                         .as_ref()
-                        .and_then(|fr| fr.get(key).map(|e| fr.has_tomb(e)))
+                        .and_then(|fr| fr.get(key).map(|e| fr.has_tomb(e, SEE_ALL)))
                         .unwrap_or(false)
                     {
                         start = nc;
@@ -5944,7 +6440,7 @@ impl Db {
                 if nc >= start {
                     if let Some(fr) = &self.frozen {
                         if let Some(e) = fr.get(key) {
-                            for off in fr.live_chain(e).0 {
+                            for off in fr.live_chain(e, SEE_ALL).0 {
                                 f(key, fr.value_at(off));
                             }
                         }
@@ -5952,7 +6448,7 @@ impl Db {
                 }
                 if nc + 1 >= start {
                     if let Some(e) = self.mem.get(key) {
-                        for off in self.mem.live_chain(e).0 {
+                        for off in self.mem.live_chain(e, SEE_ALL).0 {
                             f(key, self.mem.value_at(off));
                         }
                     }
@@ -6083,7 +6579,7 @@ impl Db {
                 }
             }
             for &(slot, cut) in &table.added[b] {
-                let k = MemTable::key_of(&self.mem.keys, &self.mem.entries[slot as usize]);
+                let k = self.mem.key_of(self.mem.entry(slot as usize));
                 keys.push((k.to_vec(), cut));
             }
             for (k, cut) in keys {
@@ -6253,7 +6749,7 @@ impl Db {
                 continue;
             }
             last = off;
-            let key = &self.mem.keys[off as usize..(off + len) as usize];
+            let key = self.mem.key_at(off, len);
             let at = self.segs[..np]
                 .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
             let Some(seg) = self.segs[..np].get(at) else {
@@ -6435,56 +6931,11 @@ impl Db {
     /// while any partition has a table the key joins the writes the next
     /// scan settles.
     fn note_write(&self, wrote: Wrote) {
-        if let Some(moved) = &wrote.moved {
-            // Every slot the snapshot and the lists name has a new number,
-            // and the rehash said which. Patching them is one pass over
-            // each; voiding them was a rebuild of the snapshot at the next
-            // scan, and a fresh table after a seal doubles its way up, so
-            // on one store of three million keys that was three rebuilds
-            // in every pass of ycsb-E. The cached blocks hold copied
-            // values and stand either way.
-            let to = |slot: u32| {
-                let new = moved[slot as usize];
-                debug_assert_ne!(new, u32::MAX, "a named slot was empty at the rehash");
-                new
-            };
-            if let Some((_, snap)) = self.scan_keys.borrow_mut().as_mut() {
-                for e in snap
-                    .ents
-                    .iter_mut()
-                    .chain(snap.side.iter_mut())
-                    .chain(snap.fresh.iter_mut())
-                {
-                    if e.mem != u32::MAX {
-                        e.mem = to(e.mem);
-                    }
-                }
-            }
-            for slot in self.snap_added.borrow_mut().iter_mut() {
-                *slot = to(*slot);
-            }
-            for s in &self.segs {
-                if let Some(t) = s.blocks.borrow_mut().as_mut() {
-                    for list in &mut t.added {
-                        for (slot, _) in list.iter_mut() {
-                            *slot = to(*slot);
-                        }
-                    }
-                    for c in t.slots.iter_mut().flatten() {
-                        if let Cached::Wide(w) = c {
-                            for (slot, _) in w.sorted.iter_mut() {
-                                *slot = to(*slot);
-                            }
-                        }
-                    }
-                }
-            }
-        }
         if wrote.new {
             self.snap_added.borrow_mut().push(wrote.slot);
         }
         if self.cache_used.get() {
-            let e = &self.mem.entries[wrote.slot as usize];
+            let e = self.mem.entry(wrote.slot as usize);
             let mut pending = self.pending.borrow_mut();
             match pending.last_mut() {
                 Some(last) if last.0 == e.key_off => last.2 |= wrote.new,
@@ -6507,7 +6958,7 @@ impl Db {
         let mut added: Vec<Vec<(u32, u32)>> = (0..nblocks).map(|_| Vec::new()).collect();
         if nblocks > 0 {
             for &slot in self.snap_added.borrow().iter() {
-                let key = MemTable::key_of(&self.mem.keys, &self.mem.entries[slot as usize]);
+                let key = self.mem.key_of(self.mem.entry(slot as usize));
                 if seg.below_lo(key) || seg.hi.as_ref().is_some_and(|h| key >= h.as_slice()) {
                     continue;
                 }
@@ -6632,9 +7083,7 @@ impl Db {
                     let filed = &table.added[b];
                     if filed.len() > w.seen {
                         let fresh = ctx.sorted_filed(&filed[w.seen..]);
-                        let key_of = |slot: u32| {
-                            MemTable::key_of(&self.mem.keys, &self.mem.entries[slot as usize])
-                        };
+                        let key_of = |slot: u32| self.mem.key_of(self.mem.entry(slot as usize));
                         let mut merged = Vec::with_capacity(w.sorted.len() + fresh.len());
                         let (mut i, mut j) = (0usize, 0usize);
                         while i < w.sorted.len() || j < fresh.len() {
@@ -6969,13 +7418,13 @@ impl Db {
     ) -> Result<()> {
         let mut start = 0usize;
         if tombs {
-            if sk.mem != u32::MAX && self.mem.has_tomb(&self.mem.entries[sk.mem as usize]) {
+            if sk.mem != u32::MAX && self.mem.has_tomb(self.mem.entry(sk.mem as usize), SEE_ALL) {
                 start = 2;
             } else if sk.frozen != u32::MAX
                 && self
                     .frozen
                     .as_ref()
-                    .is_some_and(|fr| fr.has_tomb(&fr.entries[sk.frozen as usize]))
+                    .is_some_and(|fr| fr.has_tomb(fr.entry(sk.frozen as usize), SEE_ALL))
             {
                 start = 1;
             }
@@ -6989,16 +7438,16 @@ impl Db {
         }
         if sk.frozen != u32::MAX && start <= 1 {
             if let Some(fr) = &self.frozen {
-                let e = &fr.entries[sk.frozen as usize];
-                fr.live_offs_into(e, scratch);
+                let e = fr.entry(sk.frozen as usize);
+                fr.live_offs_into(e, scratch, SEE_ALL);
                 for &off in scratch.iter() {
                     f(key, fr.value_at(off));
                 }
             }
         }
         if sk.mem != u32::MAX {
-            let e = &self.mem.entries[sk.mem as usize];
-            self.mem.live_offs_into(e, scratch);
+            let e = self.mem.entry(sk.mem as usize);
+            self.mem.live_offs_into(e, scratch, SEE_ALL);
             for &off in scratch.iter() {
                 f(key, self.mem.value_at(off));
             }
@@ -7108,13 +7557,15 @@ impl Db {
             let mut start = 0usize;
             if tombs {
                 if let Some(sk) = snap.filter(|_| in_unsealed) {
-                    if sk.mem != u32::MAX && self.mem.has_tomb(&self.mem.entries[sk.mem as usize]) {
+                    if sk.mem != u32::MAX
+                        && self.mem.has_tomb(self.mem.entry(sk.mem as usize), SEE_ALL)
+                    {
                         start = nc + 2;
                     } else if sk.frozen != u32::MAX
                         && self
                             .frozen
                             .as_ref()
-                            .is_some_and(|fr| fr.has_tomb(&fr.entries[sk.frozen as usize]))
+                            .is_some_and(|fr| fr.has_tomb(fr.entry(sk.frozen as usize), SEE_ALL))
                     {
                         start = nc + 1;
                     }
@@ -7163,16 +7614,16 @@ impl Db {
             if let Some(sk) = snap.filter(|_| in_unsealed) {
                 if sk.frozen != u32::MAX && nc + 1 >= start {
                     if let Some(fr) = &self.frozen {
-                        let e = &fr.entries[sk.frozen as usize];
-                        fr.live_offs_into(e, &mut scratch);
+                        let e = fr.entry(sk.frozen as usize);
+                        fr.live_offs_into(e, &mut scratch, SEE_ALL);
                         for &off in &scratch {
                             f(key, fr.value_at(off));
                         }
                     }
                 }
                 if sk.mem != u32::MAX && nc + 2 >= start {
-                    let e = &self.mem.entries[sk.mem as usize];
-                    self.mem.live_offs_into(e, &mut scratch);
+                    let e = self.mem.entry(sk.mem as usize);
+                    self.mem.live_offs_into(e, &mut scratch, SEE_ALL);
                     for &off in &scratch {
                         f(key, self.mem.value_at(off));
                     }
@@ -7191,6 +7642,7 @@ impl Db {
         // A count resolves one key, so it is a point read for advice
         // purposes even though it returns no bytes (`F28`: 94 ns, a lookup).
         self.advise(true);
+        let hash = self.mem.prefetch(key);
         let np = self.segs.partition_point(|s| s.level > 0);
         let at =
             self.segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
@@ -7200,8 +7652,8 @@ impl Db {
         let mut start = 0usize;
         if self.has_tombstones() {
             if !self.mem.is_empty() {
-                if let Some(e) = self.mem.get(key) {
-                    if self.mem.has_tomb(e) {
+                if let Some(e) = self.mem.get_with(hash, key) {
+                    if self.mem.has_tomb(e, SEE_ALL) {
                         start = mem_ix;
                     }
                 }
@@ -7209,7 +7661,7 @@ impl Db {
             if start == 0 {
                 if let Some(fr) = &self.frozen {
                     if let Some(e) = fr.get(key) {
-                        if fr.has_tomb(e) {
+                        if fr.has_tomb(e, SEE_ALL) {
                             start = fr_ix;
                         }
                     }
@@ -7250,13 +7702,13 @@ impl Db {
         if fr_ix >= start {
             if let Some(fr) = &self.frozen {
                 if let Some(e) = fr.get(key) {
-                    n += e.count;
+                    n += e.count.load(AtomicOrdering::Relaxed);
                 }
             }
         }
         if mem_ix >= start && !self.mem.is_empty() {
-            if let Some(e) = self.mem.get(key) {
-                n += e.count;
+            if let Some(e) = self.mem.get_with(hash, key) {
+                n += e.count.load(AtomicOrdering::Relaxed);
             }
         }
         Ok(n)
@@ -7274,7 +7726,7 @@ impl Db {
     /// Keys held by the unsealed sources: the live memtable and, while a
     /// seal is in flight, the frozen one. A key in both counts twice.
     pub fn unsealed_keys(&self) -> usize {
-        self.mem.len + self.frozen.as_ref().map_or(0, |f| f.len)
+        self.mem.len() + self.frozen.as_ref().map_or(0, |f| f.len())
     }
 
     pub fn segments(&self) -> usize {
@@ -7695,7 +8147,7 @@ impl<'s> BuildCtx<'s> {
         if filed.is_empty() {
             return Ok(out);
         }
-        let key_of = |slot: u32| MemTable::key_of(&self.mem.keys, &self.mem.entries[slot as usize]);
+        let key_of = |slot: u32| self.mem.key_of(self.mem.entry(slot as usize));
         let mut fresh: Vec<Over> = filed
             .iter()
             .map(|&(i, cut)| Over {
@@ -7749,7 +8201,7 @@ impl<'s> BuildCtx<'s> {
     }
     /// PROTOTYPE: the filed entries of a block in key order.
     fn sorted_filed(&self, filed: &[(u32, u32)]) -> Vec<(u32, u32)> {
-        let key_of = |slot: u32| MemTable::key_of(&self.mem.keys, &self.mem.entries[slot as usize]);
+        let key_of = |slot: u32| self.mem.key_of(self.mem.entry(slot as usize));
         let mut v = filed.to_vec();
         v.sort_by(|x, y| key_of(x.0).cmp(key_of(y.0)));
         v
@@ -7879,7 +8331,7 @@ impl<'s> BuildCtx<'s> {
             }
         }
         let snap = lo..s1.min(lo.saturating_add(limit));
-        let key_of = |slot: u32| MemTable::key_of(&self.mem.keys, &self.mem.entries[slot as usize]);
+        let key_of = |slot: u32| self.mem.key_of(self.mem.entry(slot as usize));
         let f0 = wide.sorted.partition_point(|&(i, _)| key_of(i) < cursor);
         let filed = &wide.sorted[f0..wide.sorted.len().min(f0.saturating_add(limit))];
         let mem = self.overlay_mem(unsealed, snap, filed, true)?;
@@ -7914,13 +8366,14 @@ impl<'s> BuildCtx<'s> {
         let mut start = 0usize;
         if em.tombs {
             if let Some(sk) = o.sk {
-                if sk.mem != u32::MAX && self.mem.has_tomb(&self.mem.entries[sk.mem as usize]) {
+                if sk.mem != u32::MAX && self.mem.has_tomb(self.mem.entry(sk.mem as usize), SEE_ALL)
+                {
                     start = nc + 2;
                 } else if sk.frozen != u32::MAX
                     && self
                         .frozen
                         .as_ref()
-                        .is_some_and(|fr| fr.has_tomb(&fr.entries[sk.frozen as usize]))
+                        .is_some_and(|fr| fr.has_tomb(fr.entry(sk.frozen as usize), SEE_ALL))
                 {
                     start = nc + 1;
                 }
@@ -7979,16 +8432,16 @@ impl<'s> BuildCtx<'s> {
         if let Some(sk) = o.sk {
             if sk.frozen != u32::MAX && nc + 1 >= start {
                 if let Some(fr) = self.frozen {
-                    let e = &fr.entries[sk.frozen as usize];
-                    fr.live_offs_into(e, &mut em.scratch);
+                    let e = fr.entry(sk.frozen as usize);
+                    fr.live_offs_into(e, &mut em.scratch, SEE_ALL);
                     for &off in em.scratch.iter() {
                         f(key, fr.value_at(off));
                     }
                 }
             }
             if sk.mem != u32::MAX {
-                let e = &self.mem.entries[sk.mem as usize];
-                self.mem.live_offs_into(e, &mut em.scratch);
+                let e = self.mem.entry(sk.mem as usize);
+                self.mem.live_offs_into(e, &mut em.scratch, SEE_ALL);
                 for &off in em.scratch.iter() {
                     f(key, self.mem.value_at(off));
                 }
@@ -8236,8 +8689,8 @@ impl<'s> BuildCtx<'s> {
             let Some(sk) = o.sk else { continue };
             for (t, slot) in [(tables[0], sk.mem), (tables[1], sk.frozen)] {
                 if let Some(t) = t {
-                    if slot != u32::MAX && (slot as usize) < t.entries.len() {
-                        let e = &t.entries[slot as usize];
+                    if slot != u32::MAX && (slot as usize) < t.len() {
+                        let e = t.entry(slot as usize);
                         prefetch_lines(
                             e as *const MemEntry as *const u8,
                             std::mem::size_of::<MemEntry>(),
@@ -8250,15 +8703,11 @@ impl<'s> BuildCtx<'s> {
             let Some(sk) = o.sk else { continue };
             for (t, slot) in [(tables[0], sk.mem), (tables[1], sk.frozen)] {
                 if let Some(t) = t {
-                    if slot != u32::MAX && (slot as usize) < t.entries.len() {
-                        let head = t.entries[slot as usize].head;
-                        if head != 0 {
-                            let at = (head - 1) as usize;
-                            let from = at.saturating_sub(64);
-                            let to = (at + 128).min(t.vals.len());
-                            if from < to {
-                                prefetch_lines(t.vals[from..].as_ptr(), to - from);
-                            }
+                    if slot != u32::MAX && (slot as usize) < t.len() {
+                        let head = MemTable::head(t.entry(slot as usize));
+                        if head != NO_CHUNK {
+                            let at = head as usize;
+                            t.vals.prefetch(at.saturating_sub(64), 192);
                         }
                     }
                 }
