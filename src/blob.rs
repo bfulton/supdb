@@ -1634,25 +1634,61 @@ impl<B: Bytes> Blob<B> {
         // 12.7 ns an entry, inside the raw parse's spread, and at 300,000
         // keys in memory a hundred-entry scan went from 29.8 million entries
         // a second to 60.5 million, where LMDB's cursor does 43.7.
+        //
+        // The record is read in place here rather than through
+        // `parse_record`, which resolves a record's regions one checked
+        // step at a time for any shape: the header, then the key, then the
+        // extents as a slice, then a pass over them for the tail's length,
+        // then the tail, each through an `Option`. For one inline fixed
+        // extent the whole record is a header, a key, five words and a
+        // run, and each of those is one bounds check against the region;
+        // a step that finds another shape falls through to the general
+        // loop at the same rank, exactly as before. Measured with
+        // callgrind on the suite's scan pass: 145 instructions an entry
+        // through the parse, of which the parse was 78, and 69 in place;
+        // the probe's warm scan pass, two binaries alternated over three
+        // rounds, went from 78-84M entries a second to 99-116M at ten
+        // thousand keys, 62-68M to 70-83M at a hundred thousand, and
+        // 37-44M to 45-50M at three hundred thousand.
         if let Some((idx, recs, dir)) = walk {
-            while seen < limit {
-                let Some((k, exts, tail)) = idx.at_full_in(recs, dir, rank) else {
+            let nkeys = idx.len();
+            while seen < limit && rank < nkeys {
+                let Some(off) = crate::flatindex::rd_u32(dir, rank * 4) else {
                     break;
                 };
-                let [e] = exts else { break };
-                if !(e.is_inline() && e.is_fixed()) {
+                let off = off as usize;
+                let Some(h) = recs.get(off..off + 4) else {
+                    break;
+                };
+                let klen = u16::from_le_bytes([h[0], h[1]]) as usize;
+                if u16::from_le_bytes([h[2], h[3]]) != 1 {
                     break;
                 }
-                let a = e.off as usize;
-                let b = a
-                    .checked_add(e.len as usize)
-                    .filter(|&b| b <= tail.len())
-                    .ok_or_else(|| corrupt("inline run runs past its record"))?;
-                let w = e
-                    .fixed_width()
-                    .filter(|&w| w > 0)
-                    .ok_or_else(|| corrupt("fixed run's length is not a multiple of its count"))?;
-                for v in tail[a..b].chunks_exact(w) {
+                let key_at = off + 4;
+                let e_at = (key_at + klen + 3) & !3;
+                let Some(eb) = recs.get(e_at..e_at + 20) else {
+                    break;
+                };
+                let block = u32::from_le_bytes([eb[0], eb[1], eb[2], eb[3]]);
+                let count = u32::from_le_bytes([eb[16], eb[17], eb[18], eb[19]]);
+                if block != Ext::INLINE || count & Ext::FIXED == 0 {
+                    break;
+                }
+                let eoff = u32::from_le_bytes([eb[4], eb[5], eb[6], eb[7]]) as usize;
+                let elen = u32::from_le_bytes([eb[8], eb[9], eb[10], eb[11]]) as usize;
+                let records = (count & !(Ext::TOMBSTONE | Ext::FIXED)) as usize;
+                if records == 0 || elen == 0 || !elen.is_multiple_of(records) {
+                    return Err(corrupt("fixed run's length is not a multiple of its count"));
+                }
+                let w = elen / records;
+                let a = e_at + 20 + eoff;
+                let Some(run) = recs.get(a..a + elen) else {
+                    return Err(corrupt("inline run runs past its record"));
+                };
+                let Some(k) = recs.get(key_at..key_at + klen) else {
+                    break;
+                };
+                for v in run.chunks_exact(w) {
                     f(k, v);
                 }
                 seen += 1;

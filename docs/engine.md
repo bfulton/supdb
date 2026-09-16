@@ -766,7 +766,21 @@ per-commit path.
   now, a byte a pass over the bytes the largest key offset has, the
   first scan at ten thousand keys costs 24–40 µs, the mapping's first
   touches, and the build over 428k unsealed keys is unchanged at 10–11
-  ms. The cache is
+  ms. The walk itself then: callgrind put the suite's scan pass at 145
+  instructions an entry, 78 of them in `parse_record`, which resolves a
+  record's regions one checked step at a time for any shape. The common
+  shape, one inline fixed extent, is read in place now, a bounds check
+  per region and no `Option` chain, at 69 an entry; the probe's warm
+  scan pass went from 78–84M entries a second to 99–116M at ten
+  thousand keys, 62–68M to 70–83M at a hundred thousand and 37–44M to
+  45–50M at three hundred thousand, and E through the probe rose by a
+  sixth at a hundred thousand. At a hundred thousand keys the pass the
+  suite times is colder than any of those: the store is sixteen
+  megabytes, past this machine's private caches, the read passes before
+  it leave the walk slower than a fresh mapping's (5,400 cycles a scan
+  against 4,200–4,600, and 3,400 warm), and a software prefetch of the
+  span, of 4 KB or of a line per page, measured neutral to worse; that
+  pass is memory-bound, and bytes an entry are its lever. The cache is
   on by default: its write path settles in place, and in every quick row
   the arm with it prices the same as the arm without on every workload
   but E, where it runs three times the merge -- what it costs is the

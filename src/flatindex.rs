@@ -489,7 +489,7 @@ fn rd_ne_u32(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_ne_bytes(b.get(at..at + 4)?.try_into().ok()?))
 }
 
-fn rd_u32(b: &[u8], at: usize) -> Option<u32> {
+pub(crate) fn rd_u32(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
 }
 fn rd_u64(b: &[u8], at: usize) -> Option<u64> {
