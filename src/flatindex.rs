@@ -1488,7 +1488,9 @@ impl FlatIndex {
         if rank >= self.nkeys {
             return None;
         }
-        let last = (rank + n).min(self.nkeys - 1);
+        // A caller's span can be a scan's whole limit, `usize::MAX`
+        // included: the sum saturates rather than wraps.
+        let last = rank.saturating_add(n).min(self.nkeys - 1);
         let a = rd_u32(dir, rank * 4)? as usize;
         let b = rd_u32(dir, last * 4)? as usize;
         Some((a, b.max(a)))

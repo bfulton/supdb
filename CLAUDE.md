@@ -51,8 +51,15 @@ earned. CI never built the wasm module at all, so a link break in
 `src/wasmapi.rs` survived until a toolchain update happened to surface it
 locally. `scripts/fmt.sh` once swallowed "rustfmt could not run" behind
 `|| true` and reported green for never having run, which is why it now tells
-"formatting differs" apart from "did not run" and fails both. A second
-definition of "the checks" is how the next one of those starts.
+"formatting differs" apart from "did not run" and fails both. The tests ran
+under the release profile, with overflow checks and debug assertions off,
+so a prefetch span that added a rank to a scan's limit of `usize::MAX`
+wrapped, passed every check green, and panicked in the first debug build
+that reached it; the tests now run under `profile.checked`, the release
+profile with both on, and the wasm module and the suite's binaries keep the
+release profile because the checks cost code size there and time in a
+measurement. A second definition of "the checks" is how the next one of
+those starts.
 
 ## The suite lives in bench/, and it gates this repository
 

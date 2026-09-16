@@ -31,3 +31,14 @@ opt-level = 3
 lto = true
 codegen-units = 1
 debug = true
+
+# What the tests run under: the release profile with the arithmetic and
+# the invariants checked. `cargo test --release` ran with neither, and a
+# prefetch span that summed a rank and a scan's limit of `usize::MAX`
+# wrapped through the checks green and panicked in every debug build.
+# The wasm module and the suite's binaries keep the release profile:
+# the checks cost code size there and time in a measurement.
+[profile.checked]
+inherits = "release"
+overflow-checks = true
+debug-assertions = true

@@ -14,7 +14,8 @@
 #
 # Groups:
 #   build    the crate, release
-#   test     cargo test (unit and integration, every target)
+#   test     cargo test (unit and integration, every target), optimized
+#            with overflow and invariant checks on
 #   lint     clippy at -D warnings, and the format gate
 #   wasm     the browser reader and its floor, built for wasm32-unknown-unknown
 #            by web/build.sh
@@ -48,7 +49,7 @@ for g in $groups; do
       ;;
     test)
       say "test"
-      cargo test --release
+      cargo test --profile checked
       ;;
     lint)
       say "lint"
