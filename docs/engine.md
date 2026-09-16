@@ -1011,6 +1011,37 @@ per-commit path.
   before; the state records the answer at publish. Ten rounds after:
   427k–480k against 464k–501k at 300k, 94%, and level at 100k in seven
   rounds of ten with three a third slower that the base did not show.
+  The range-read structure written at ingest, as `commit_forms`: the
+  writer keeps a canonical form of every overlaid block current at each
+  commit, in a table the state carries, a slot per block that the writer
+  installs into with one atomic swap; a reader whose watermark is the
+  commit the table was maintained at walks those forms and builds
+  nothing, and once the table is complete a block with no form is clean.
+  The writer patches its own copy and swaps that in, so a reader walking
+  a form is never overtaken, and a replaced form is retired against the
+  reader epoch and freed past every reader that could hold it. The
+  regime is a runtime property and not a build-time one: the forms are
+  maintained for a store that is being range-read, which the scan path
+  records in the state, so a write-only stretch pays nothing and a
+  scanned store pays at its commits. Measured with the probe over the
+  store the mixes leave, three rounds alternated, the first pass and the
+  steady pass of a thousand scans of a hundred: at a hundred thousand
+  keys one thread 6.9 ms and 2.6 to 4.0 and 2.0, four threads 6.5 and
+  2.8 to 4.0 and 2.4; at three hundred thousand, one thread 21.1 and 9.7
+  to 12.6 and 7.4, four threads 21.0 and 10.8 to 12.9 and 8.2. The
+  writer pays for it: E through its own handle, which holds the forms
+  and gains nothing, 689k to 662k ops/s at a hundred thousand and 706k
+  to 608k at three hundred thousand, and A 456k to 449k and 496k to
+  475k. The dense threshold stays the one the cache measured: a copy of
+  every overlaid block instead cost E 628k and 501k and held 3.1 MB and
+  22.4 MB against 1.3 MB and 3.7 MB, which is what the handles' own
+  cache holds. One property shapes what the forms can buy: a form is
+  current to a commit, so a reader between commits walks it and a reader
+  behind the writer builds its own, and under a writer committing every
+  fifty puts the threaded test's readers took none at all. Maintenance
+  pays where scans outnumber commits, which is the policy the arm exists
+  to price.
+
   A block cache shared between handles was built and measured, and not
   kept. Three versions: a table under a mutex, one under a read-write
   lock, and one of atomic slots in the state, a slot per block, a form

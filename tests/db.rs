@@ -3520,6 +3520,275 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
     assert_eq!(read_vec(&db, &key(7)), vec![b"v".to_vec()]);
 }
 
+/// The range-read structure written at ingest: with `commit_forms` the
+/// writer keeps a canonical form of every overlaid block current at each
+/// commit, and a reader handle under `Latest` walks those forms instead
+/// of building its own. Held to the model through a commit, a staged
+/// batch, a seal, a merge and a delete, with a reader taking the forms,
+/// a second reader pinned behind them, and the writer reading its own.
+#[test]
+fn a_reader_walks_the_forms_the_writer_maintains_at_commit() {
+    let d = dir("commit-forms");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        commit_forms: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 1, "several partitions");
+    // Overlay keys in most blocks, and the commit that maintains them.
+    for k in (0..1500u32).step_by(5) {
+        m.append(&mut db, &key(k), "v1");
+    }
+    m.delete(&mut db, &key(77));
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    let mut sink = 0usize;
+    // The first scan is what tells the store it is range-read; nothing
+    // was maintained before it, so this one builds for itself.
+    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    assert_eq!(
+        db.canonical_forms().0,
+        0,
+        "nothing maintained before a scan"
+    );
+    for k in (1..1500u32).step_by(13) {
+        m.append(&mut db, &key(k), "v1b");
+    }
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    let (forms, bytes, takes, complete) = db.canonical_forms();
+    assert!(forms > 0 && bytes > 0, "{forms} forms, {bytes} bytes");
+    assert!(complete, "the table is complete after a maintained commit");
+    assert!(takes > 0, "the reader walked the forms: {takes}");
+    let (built, _) = r.block_cache_size();
+    assert_eq!(built, 0, "the reader built nothing of its own");
+    m.check(&r, "a reader over the maintained forms");
+    m.check(&db, "the writer over its own forms");
+    // A batch staged and not committed: the reader must not see it, and
+    // the forms it walks must not hold it.
+    for k in (1..1500u32).step_by(11) {
+        m.append(&mut db, &key(k), "staged");
+    }
+    // Key 1 took "v1b" at the commit before, and "staged" after it.
+    let mut got = Vec::new();
+    r.scan(key(1).as_bytes(), 1, |k, v| {
+        if k == key(1).as_bytes() {
+            got.push(v.to_vec());
+        }
+    })
+    .unwrap();
+    assert_eq!(
+        got,
+        vec![b"v0".to_vec(), b"v1b".to_vec()],
+        "a staged write is not in what a reader walks"
+    );
+    let mut staged = 0usize;
+    r.scan(key(0).as_bytes(), 1500, |_k, v| {
+        if v == b"staged" {
+            staged += 1;
+        }
+    })
+    .unwrap();
+    assert_eq!(staged, 0, "no staged value anywhere in a reader's scan");
+    db.commit().unwrap();
+    m.check(&r, "after the staged batch committed");
+    // A second reader pinned before the commit keeps its own answer.
+    for k in (2..1500u32).step_by(23) {
+        m.append(&mut db, &key(k), "v2");
+    }
+    db.commit().unwrap();
+    let pinned = db.reader().unwrap();
+    pinned.snapshot();
+    let before: Vec<Vec<u8>> = {
+        let mut v = Vec::new();
+        pinned
+            .scan(key(4).as_bytes(), 1, |k, val| {
+                if k == key(4).as_bytes() {
+                    v.push(val.to_vec());
+                }
+            })
+            .unwrap();
+        v
+    };
+    for k in (4..1500u32).step_by(37) {
+        m.append(&mut db, &key(k), "v3");
+    }
+    db.commit().unwrap();
+    let after: Vec<Vec<u8>> = {
+        let mut v = Vec::new();
+        pinned
+            .scan(key(4).as_bytes(), 1, |k, val| {
+                if k == key(4).as_bytes() {
+                    v.push(val.to_vec());
+                }
+            })
+            .unwrap();
+        v
+    };
+    assert_eq!(before, after, "a pinned reader is not moved by a commit");
+    m.check(&r, "a reader at the latest commit");
+    pinned.release();
+    m.check(&pinned, "the released reader");
+    // A seal and a merge: a new state, an empty table, and the forms
+    // maintained again from the commits after it.
+    // A seal, which keeps every tombstone in its piece, so a deleted key
+    // is still visited with no values; only the merge below drops one.
+    db.seal().unwrap();
+    db.settle().unwrap();
+    for k in (3..1500u32).step_by(17) {
+        m.append(&mut db, &key(k), "v4");
+    }
+    m.delete(&mut db, &key(300));
+    db.commit().unwrap();
+    m.check(&r, "after a seal, through the reader");
+    db.flush().unwrap();
+    m.flushed();
+    for k in (7..1500u32).step_by(29) {
+        m.append(&mut db, &key(k), "v5");
+    }
+    db.commit().unwrap();
+    m.check(&r, "after a merge, through the reader");
+    m.check(&db, "after a merge, through the writer");
+    // Keys above the store's greatest, which fall in the last block
+    // alone, and a reader over them.
+    for k in 1500..1700u32 {
+        m.append(&mut db, &key(k), "top");
+    }
+    db.commit().unwrap();
+    m.check(&r, "keys past the top");
+    std::hint::black_box(sink);
+}
+
+/// Three reader threads and a writer that seals and merges under
+/// `commit_forms`: every version a thread reads is one the writer wrote,
+/// no scan comes back out of order, and no key holds two values.
+#[test]
+fn reader_threads_over_maintained_forms_keep_answering() {
+    let d = dir("commit-forms-threads");
+    let opts = Options {
+        seal_bytes: 32 << 10,
+        partition_bytes: Some(64 << 10),
+        l0_trigger: 2,
+        scan_block_cache: true,
+        commit_forms: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let keys = 3000u32;
+    let key = |k: u32| format!("key-{k:05}").into_bytes();
+    for k in 0..keys {
+        db.append(&key(k), b"0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut threads = Vec::new();
+    for t in 0..3u64 {
+        let r = db.reader().unwrap();
+        let stop = stop.clone();
+        threads.push(std::thread::spawn(move || {
+            let mut seen: HashMap<u32, u64> = HashMap::new();
+            let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ t;
+            let mut ops = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                if x.is_multiple_of(4) {
+                    let mut last: Option<Vec<u8>> = None;
+                    r.scan(&key(k), 30, |kk, v| {
+                        if let Some(l) = &last {
+                            assert!(l.as_slice() < kk, "a scan out of key order");
+                        }
+                        last = Some(kk.to_vec());
+                        let s = std::str::from_utf8(v).unwrap();
+                        assert!(
+                            s.parse::<u64>().is_ok(),
+                            "a scanned value that is no version: {s}"
+                        );
+                    })
+                    .unwrap();
+                } else {
+                    let got = read_vec(&r, &key(k));
+                    assert!(got.len() <= 1, "a put key with two values");
+                    if let Some(v) = got.first() {
+                        let ver: u64 = std::str::from_utf8(v).unwrap().parse().unwrap();
+                        let prev = seen.entry(k).or_insert(0);
+                        assert!(
+                            ver >= *prev,
+                            "a version that went backwards: key {k} read {ver} after {prev}"
+                        );
+                        *prev = ver;
+                    }
+                }
+                ops += 1;
+            }
+            ops
+        }));
+    }
+    let mut x = 42u64;
+    for round in 1..=200u64 {
+        for _ in 0..50 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % keys as u64) as u32;
+            db.put(&key(k), round.to_string().as_bytes());
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut total = 0usize;
+    for t in threads {
+        total += t.join().unwrap();
+    }
+    assert!(total > 100, "the threads did some work: {total}");
+    // The forms are current to a commit, so a reader only walks them
+    // while the writer is between commits: under the writer above, which
+    // commits every fifty puts, a reader is behind the table and builds
+    // its own, which is what the invariants held. With the writer quiet
+    // the same handle takes them.
+    for k in (0..keys).step_by(9) {
+        db.put(&key(k), b"901");
+    }
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    let mut sink = 0usize;
+    r.scan(&key(0), 500, |_k, v| sink += v.len()).unwrap();
+    for k in (1..keys).step_by(11) {
+        db.put(&key(k), b"902");
+    }
+    db.commit().unwrap();
+    let before = db.canonical_forms().2;
+    r.scan(&key(0), 500, |_k, v| sink += v.len()).unwrap();
+    let (forms, _, takes, _) = db.canonical_forms();
+    assert!(forms > 0, "the quiet writer maintained forms: {forms}");
+    assert!(
+        takes > before,
+        "a reader over a quiet store walks them: {takes} against {before}"
+    );
+    std::hint::black_box(sink);
+}
+
 /// A piece sealed while a merge of its range runs is kept across the
 /// merge's publish, under a new partition over the same range. The ranks
 /// it was given at its own publish -- each key's cut in the partition it
