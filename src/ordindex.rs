@@ -300,7 +300,7 @@ pub struct OrdIndex {
     /// mapping itself cannot be interrogated portably, and the failure worth
     /// catching is not the kernel ignoring `madvise` -- it is this call site
     /// going away again.
-    advised: std::cell::Cell<bool>,
+    advised: std::sync::atomic::AtomicBool,
     n: usize,
     pfx: usize,
     /// The keys' one length, when they have one and it is at most
@@ -316,7 +316,7 @@ pub struct OrdIndex {
     /// Without it a seek over a partition of seven hundred thousand keys
     /// was twenty probes, the lower ten of them cache misses into a 5 MB
     /// file, 0.4 us of a 2.6 us scan at thirty million keys.
-    top: std::cell::OnceCell<Vec<u64>>,
+    top: std::sync::OnceLock<Vec<u64>>,
 }
 
 impl OrdIndex {
@@ -372,8 +372,8 @@ impl OrdIndex {
             pfx,
             uniform_len,
             prefix: None,
-            advised: std::cell::Cell::new(false),
-            top: std::cell::OnceCell::new(),
+            advised: std::sync::atomic::AtomicBool::new(false),
+            top: std::sync::OnceLock::new(),
         })
     }
 
@@ -404,12 +404,13 @@ impl OrdIndex {
     /// eight bytes, and out of core that cost 12% of scan throughput.
     pub fn advise_random(&self) {
         self.map.advise_random();
-        self.advised.set(true);
+        self.advised
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether `advise_random` was called on this mapping.
     pub fn advised(&self) -> bool {
-        self.advised.get()
+        self.advised.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn len(&self) -> usize {

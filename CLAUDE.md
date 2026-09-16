@@ -107,6 +107,25 @@ against a module size that is budgeted. Format knowledge stays in Rust for the
 same reason a plan is computed there: a superblock constant hand-copied into
 the JS side has drifted once already.
 
+**One writer, any readers, and nothing a reader follows moves.** A `Db` is
+the writer and one thread's; a `Reader` from `Db::reader` is another
+thread's, `Send` and not `Sync`, with the scan snapshot and the block tables
+of its own. What they share is published whole: the segment set and the two
+memtables as one `State` behind one pointer that a seal, a join, a merge or
+a freeze swaps, and a memtable whose arenas, entries and index never move
+once published. A reader pins the epoch it reads in through its slot in the
+reader table, and the writer frees a replaced state or index only past
+every pinned slot; it never waits for a reader. A read takes the state once,
+at its start, and holds it: a read that loaded the state twice took an
+entry from one memtable to the chains of another when a freeze landed
+between, and three reader threads found it in their first minute. The
+isolation is the reader's: `Latest` honours the memtable's watermark at the
+last commit, `Snapshot` pins a state and a watermark, `Dirty` honours none,
+which is what the writer's own reads do. A `#[cfg(test)]` module asks the
+compiler that `State` is `Send + Sync` and `Reader` is `Send`; that is what
+keeps a cell out of a segment, a blob or a memtable, since a raw pointer
+behind an atomic would let one in unasked.
+
 **`Blob::zero_copy()` stays true on the native path.** `Bytes` has two halves
 for one reason: `read_at` copies and every source can answer it; `slice_at`
 lends and only a source backed by memory can. Native takes the second for
@@ -199,6 +218,24 @@ bypass has bypassed nothing.
 The reproducers for the previous engine's defects retired with it. The
 shapes are worth keeping, because this engine can take them too.
 
+**A derived thing keyed by position outlives the thing it was derived
+from.** A level-0 piece's ranks -- each key's cut in the partition it is
+aligned to, taken once when the piece is published -- were kept for the
+piece's life, and a piece sealed while a merge of its range ran was kept
+across the merge's publish under a new partition over the same fences, so
+every cut below a key the merge folded in was behind by that key. Nothing
+raised in release: a block built through a stale cut emitted the piece's
+key where the old partition had it. The checked profile's tests reached
+it as a debug assertion in about one run in twenty, once the seal's
+timing put a piece inside a merge, and the chain that landed the reader
+handle went red on a change of four ampersands. The ranks now carry the
+blob id of the partition they were taken against and are taken again at
+a merge's publish; `tests/db.rs` makes the merge long and the seal short
+so the case is reached every run. The rule: a cache derived from one
+object is keyed by that object's identity, never by its place or its
+range, because a publish that keeps the position and replaces the object
+is exactly what a merge does.
+
 **A path only one arm exercises is a path nothing tests.** A delete was never
 marked dirty, and the checkpoint asked to carry it dropped it, leaving the key
 readable at its old extents. It was invisible for as long as every insertion
@@ -264,6 +301,19 @@ not compare an empty fence at all. The rule is general: a slice that may be
 empty, and whose bytes live in a `Vec`, must not be handed to a byte
 compare without an `is_empty` check first, and a zero-length operation is a
 real operation until a measurement says otherwise.
+
+**An order that held by name.** The live segments sort partitions first and
+then the level-0 pieces, and the pieces sorted by fence and then by name.
+Every piece a seal makes after the first partitioning is named `pcs-` with
+its fences; one sealed before it is named `seg-` with the empty fence, and
+so are the pieces aligned to the first partition, and `pcs` sorts before
+`seg`: an older piece came after a newer one, a read took the older piece's
+tombstone as the newest source and answered a version it had already
+answered past. It held for as long as the merge took the unaligned piece
+before a read met the pair, and reader threads beside a writer that sealed
+every few hundred puts met it in their first minute. The pieces over one
+fence now order by the sequence their names carry, and a read's
+"oldest to newest" is a property of that order and not of the names.
 
 **A sentinel that crosses the wasm boundary changes sign.** A wasm `u32`
 arrives in JavaScript as a signed i32, so a failure sentinel of `u32::MAX`

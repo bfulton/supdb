@@ -66,6 +66,28 @@ db.scan(b"user:", 100, |key, value| { /* in key order */ })?;
 db.close()?;
 ```
 
+Readers on other threads, beside the writer, with no lock between them: a
+`Reader` has the read API, reads whatever the writer has committed, and
+holds a snapshot when asked to.
+
+```rust
+use supdb::{Db, Isolation, Options};
+
+let mut db = Db::create(std::path::Path::new("./store"), Options::default())?;
+let reader = db.reader()?;           // one per thread; `Send`, not `Sync`
+let t = std::thread::spawn(move || {
+    let mut n = 0;
+    reader.read_all(b"user:42", |_v| n += 1).unwrap();   // every commit before it
+    reader.snapshot();               // the store as of now, until `release`
+    reader.scan(b"user:", 100, |_k, _v| {}).unwrap();
+    reader.release();
+    reader.set_isolation(Isolation::Dirty);   // the writer's staged batch too
+    n
+});
+db.append(b"user:42", b"logged in");
+db.commit()?;                        // the reader sees this from here on
+```
+
 A write-once segment: sorted input in, one immutable file out, read by the
 same reader the store uses.
 

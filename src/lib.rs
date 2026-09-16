@@ -98,6 +98,6 @@ pub use bytes::{Bytes, SliceBytes, VecBytes};
 /// one.
 #[cfg(not(target_family = "wasm"))]
 pub use db::{
-    BackgroundIo, Db, Options, ReadAdvice, SegmentOptions, SegmentWrite, SegmentWriter, SyncPolicy,
-    Txn,
+    BackgroundIo, Db, Isolation, Options, ReadAdvice, Reader, SegmentOptions, SegmentWrite,
+    SegmentWriter, SyncPolicy, Txn,
 };

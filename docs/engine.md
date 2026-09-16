@@ -545,7 +545,13 @@ per-commit path.
   above it, no copy at all but a merge seeked into each source -- built
   on first touch, dropped by a write to a key it owns and rebuilt at the
   next scan, with the level-0 pieces aligned to a partition ranked
-  against it once so their keys cut the walk without a compare. On the
+  against it, keyed to that partition, so their keys cut the walk
+  without a compare: a piece sealed while a merge of its range ran is
+  kept across the merge's publish under a new partition, and its ranks
+  against the old one were behind by every key the merge folded in
+  below, which the checked profile's tests reached as an assertion in
+  about one run in twenty until the ranks carried the partition's
+  identity and were taken again at the merge's publish. On the
   suite's mixes E runs at three to four times the arm without it. Memory
   is what the pass touched: E's starts reach nearly every block, so
   unbounded the cache holds about a tenth of the store at three million
@@ -848,12 +854,49 @@ per-commit path.
   million every mix level or ahead by the same margins, D 908–976 to
   1105–1118 the widest. Before the slot prefetch and the one-probe put,
   A at thirty million read 5–8% behind the head, the extra miss on
-  every hit; with them it reads ahead. The rest follows: a published state (the segment set and the two
-  memtables as of a commit, swapped whole at a seal, a join or a merge)
-  behind one pointer, a reader handle that is `Send + Sync` with the read
-  API on it, the block cache's slots as atomic pointers a miss fills by
-  compare-and-swap and a settle patches by copy, and a thread count in
-  the suite's matrix with LMDB alongside (`bench/DESIGN.md`).
+  every hit; with them it reads ahead.
+
+  *The published state and the reader handle* are the second part,
+  built. The segment set, the live memtable and the frozen one are one
+  `State` behind one pointer; a seal, a join, a merge, a promotion or a
+  freeze builds the next one and swaps it, and the one before is
+  retired at the epoch the swap bumps and freed past every pinned
+  reader. A segment is immutable once open -- its block table left it
+  for the handle, its piece ranks a lock any thread may fill, and the
+  blob's checksum memo became atomic words and its
+  decompression buffers the thread's -- so a `State` is `Send + Sync`,
+  which a test asks the compiler. `Db` is now the writer over a
+  `Reader`, the handle that carries the read API and the caches of its
+  own: the scan snapshot, the block tables, and where it has read to in
+  the memtable's write log, which is how a handle learns the keys
+  written since its snapshot without the writer keeping a list for it.
+  The writer's own handle is one of them, so there is one read path.
+  `Db::reader` makes another with a slot in the reader table, `Send`
+  and not `Sync`; a read pins the epoch through the slot, takes the
+  state once and holds it to the end -- a read that took it twice
+  crossed a freeze and walked one memtable's entry down another's
+  chains -- and takes its watermark: the memtable's last commit under
+  `Latest`, the snapshot's under `Snapshot`, which also holds its state
+  through every publish after it, none under `Dirty`. One caveat the
+  block cache already had: a key created past the watermark, like a
+  deleted key before the merge reclaims it, can appear in a scan with
+  no values. The tests hold each level to its word across a staged
+  batch, a commit, a seal and a merge, run three reader threads through
+  a writer that seals and merges every few hundred puts, and fill the
+  reader table to its last slot; the threaded one found an order that
+  had held only by name (`CLAUDE.md`, the shapes). Single-threaded
+  against the head with the memtable alone, every mix, two rounds
+  interleaved, thousands of ops/s: at thirty million the load 742–746
+  to 736–760, A 388–402 to 376–391, C 2534–2624 to 2345–2432, E
+  464–474 to 462–474 and its second pass 543–550 to 524–527, the rest
+  level; at three million level throughout; at three hundred thousand,
+  where a first pair read the load and the write mixes a tenth behind,
+  five rounds put every mix at 0.98x to 1.07x of the head. What a read
+  pays for the handle is one load of the state pointer and a null check
+  at its start. The block cache's slots as atomic pointers a
+  miss fills by compare-and-swap and a settle patches by copy, so the
+  handles share one cache, and a thread count in the suite's matrix
+  with LMDB alongside (`bench/DESIGN.md`), follow.
 - **What the on-disk size ordering becomes** — segments plus a WAL will
   not beat LMDB on disk; that loss stands and gets re-priced honestly.
 

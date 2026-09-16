@@ -898,17 +898,27 @@ type Compaction = (Vec<String>, std::thread::JoinHandle<Result<Vec<String>>>);
 struct Seg {
     blob: Blob<MmapBytes>,
     name: String,
-    /// PROTOTYPE: the block cache's table for this partition, made on
-    /// first use and dropped whenever the segments change. One load finds
-    /// a block; nothing is hashed.
-    blocks: std::cell::RefCell<Option<BlockTable>>,
     /// PROTOTYPE: for a level-0 piece aligned to a partition, each of its
     /// keys' rank in that partition, shifted left one, with the low bit
     /// set when the partition holds the key: where the key cuts a block's
     /// walk, found once when the piece is published instead of by a
-    /// search over the block's records at every build.
-    ranks: std::cell::RefCell<Option<Vec<u32>>>,
+    /// search over the block's records at every build. Keyed by the
+    /// partition's blob id: a piece sealed while a merge of its range ran
+    /// is kept across the merge's publish, under a new partition, and
+    /// ranks taken against the old one are behind by every key the merge
+    /// folded in below. A lock rather than a once-cell for that reason,
+    /// taken once per block build and piece; any reader may fill it.
+    ranks: std::sync::RwLock<Option<(u64, Vec<u32>)>>,
     level: u8,
+    /// The WAL sequence the segment's name carries: what orders the
+    /// level-0 pieces over one fence oldest to newest, which a read's
+    /// tombstone rule and a merge's value order both rest on. Ordered by
+    /// name alone, a piece sealed before the first partitioning, named
+    /// `seg-`, came after a newer `pcs-` piece over the same empty fence,
+    /// and a read took the older piece's tombstone as the newest source:
+    /// a reader thread saw a version go backwards, and the writer's own
+    /// reads would have too.
+    seq: u64,
     lo: Vec<u8>,
     hi: Option<Vec<u8>>,
     bloom: Option<BlockedBloom>,
@@ -932,6 +942,21 @@ struct Seg {
     /// have bought is the reclaim, which is why `promote_unpartitioned`
     /// leaves a lone piece holding one to the merge.
     tombs: bool,
+}
+
+/// The order the live segments hold: partitions first, disjoint and by
+/// fence; then the level-0 pieces by fence, so the pieces over one range
+/// are one run `pieces_over` can bracket, and within a fence oldest to
+/// newest by the sequence their names carry, and by name last. A piece
+/// sealed before the first partitioning has the empty fence, as the
+/// pieces aligned to the first partition do, and it is the sequence that
+/// puts it before them.
+fn seg_order(a: &Seg, b: &Seg) -> Ordering {
+    b.level
+        .cmp(&a.level)
+        .then_with(|| a.lo.cmp(&b.lo))
+        .then_with(|| a.seq.cmp(&b.seq))
+        .then_with(|| a.name.cmp(&b.name))
 }
 
 // ------------------------------------------------------- the segment writer --
@@ -2114,9 +2139,9 @@ impl Seg {
             return Ok(Seg {
                 blob,
                 name: name.to_string(),
-                blocks: std::cell::RefCell::new(None),
-                ranks: std::cell::RefCell::new(None),
+                ranks: std::sync::RwLock::new(None),
                 level: 0,
+                seq: Db::name_end_seq(name).unwrap_or(0),
                 lo,
                 hi,
                 bloom: Some(bloom),
@@ -2144,9 +2169,9 @@ impl Seg {
             return Ok(Seg {
                 blob,
                 name: name.to_string(),
-                blocks: std::cell::RefCell::new(None),
-                ranks: std::cell::RefCell::new(None),
+                ranks: std::sync::RwLock::new(None),
                 level: 1,
+                seq: Db::name_end_seq(name).unwrap_or(0),
                 lo,
                 hi,
                 bloom: None,
@@ -2162,9 +2187,9 @@ impl Seg {
         Ok(Seg {
             blob,
             name: name.to_string(),
-            blocks: std::cell::RefCell::new(None),
-            ranks: std::cell::RefCell::new(None),
+            ranks: std::sync::RwLock::new(None),
             level: 0,
+            seq: Db::name_end_seq(name).unwrap_or(0),
             lo: Vec::new(),
             hi: None,
             bloom: Some(bloom),
@@ -2285,6 +2310,12 @@ struct MemTable {
     /// Indexes a rebuild replaced, each with the epoch it was retired at,
     /// freed once no reader is pinned before that epoch. Writer-only.
     retired: UnsafeCell<Vec<(u64, Box<Index>)>>,
+    /// Every write, in order: the entry's number, with the high bit set
+    /// when the write made the entry. What a handle reads to learn the
+    /// keys written since it last looked -- for the scan snapshot and
+    /// for settling into cached blocks -- without the writer keeping a
+    /// list for it.
+    log: Slab<u32>,
 }
 
 // SAFETY: the writer-only cells (`retired`, and the arenas' and the
@@ -2325,15 +2356,6 @@ fn mem_hash(key: &[u8]) -> u64 {
     }
     h = (h ^ (h >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
     h | 1 // 0 marks a vacant slot
-}
-
-/// PROTOTYPE: what a memtable write did, for the block cache's bookkeeping.
-#[derive(Default)]
-struct Wrote {
-    /// The entry written, created by this write or found.
-    slot: u32,
-    /// Whether this write created it.
-    new: bool,
 }
 
 /// The hash index: per slot the hash's high half over the entry number
@@ -2624,6 +2646,38 @@ impl Readers {
             v == 0 || v >= epoch
         })
     }
+
+    /// A slot for a reader handle's life, or none when every slot is
+    /// taken.
+    fn claim(&self) -> Option<usize> {
+        (0..READER_SLOTS).find(|&i| {
+            self.slots[i]
+                .compare_exchange(0, u64::MAX, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst)
+                .is_ok()
+        })
+    }
+
+    fn release(&self, slot: usize) {
+        self.slots[slot].store(0, AtomicOrdering::SeqCst);
+    }
+
+    /// Pin the current epoch in `slot`: a load, a store, and the load
+    /// again, so an epoch the writer bumped between the two is not the one
+    /// left pinned. Between operations a claimed slot holds `u64::MAX`,
+    /// which no retirement is ever older than.
+    fn pin(&self, slot: usize) {
+        loop {
+            let e = self.epoch.load(AtomicOrdering::SeqCst);
+            self.slots[slot].store(e, AtomicOrdering::SeqCst);
+            if self.epoch.load(AtomicOrdering::SeqCst) == e {
+                return;
+            }
+        }
+    }
+
+    fn unpin(&self, slot: usize) {
+        self.slots[slot].store(u64::MAX, AtomicOrdering::SeqCst);
+    }
 }
 
 impl MemTable {
@@ -2637,6 +2691,7 @@ impl MemTable {
             tombs: AtomicUsize::new(0),
             committed: AtomicU64::new(0),
             retired: UnsafeCell::new(Vec::new()),
+            log: Slab::new(),
         }
     }
 
@@ -2651,7 +2706,24 @@ impl MemTable {
             tombs: AtomicUsize::new(0),
             committed: AtomicU64::new(0),
             retired: UnsafeCell::new(Vec::new()),
+            log: Slab::new(),
         }
+    }
+
+    /// The writes so far, for a handle's `log_at`.
+    fn log_len(&self) -> usize {
+        self.log.len()
+    }
+
+    /// The `i`th write: the entry it wrote and whether it made it.
+    fn log_at(&self, i: usize) -> (usize, bool) {
+        let w = *self.log.get(i);
+        ((w & 0x7fff_ffff) as usize, w >> 31 != 0)
+    }
+
+    /// Writer: the write logged, after the entry it names is published.
+    fn log_write(&self, id: usize, new: bool) {
+        self.log.push(id as u32 | ((new as u32) << 31));
     }
 
     fn index(&self) -> Option<&Index> {
@@ -2708,11 +2780,16 @@ impl MemTable {
             .store(self.vals.tail() as u64, AtomicOrdering::Release);
     }
 
+    /// The watermark a reader honours to see committed chunks only.
+    fn committed(&self) -> u64 {
+        self.committed.load(AtomicOrdering::Acquire)
+    }
+
     /// Writer: the entry for `key`, made if the table lacks it -- its key
     /// copied, its first chunk pushed with no predecessor -- or found,
     /// with a chunk pushed onto its chain. `value` is `None` for a
     /// tombstone. `rd` is for an index rebuild's retirement.
-    fn write(&self, hash: u64, key: &[u8], value: Option<&[u8]>, rd: &Readers) -> Wrote {
+    fn write(&self, hash: u64, key: &[u8], value: Option<&[u8]>, rd: &Readers) {
         if self.ordered {
             debug_assert!(
                 value.is_some(),
@@ -2723,10 +2800,8 @@ impl MemTable {
                 "an ordered memtable takes each key above its last"
             );
             let id = self.new_entry(hash, key, value);
-            return Wrote {
-                slot: id as u32,
-                new: true,
-            };
+            self.log_write(id, true);
+            return;
         }
         if let Some(id) = self.probe(hash, key) {
             let e = self.entry(id);
@@ -2742,27 +2817,22 @@ impl MemTable {
                 }
                 None => e.count.store(0, AtomicOrdering::Relaxed),
             }
-            return Wrote {
-                slot: id as u32,
-                new: false,
-            };
+            self.log_write(id, false);
+            return;
         }
         let id = self.new_entry(hash, key, value);
         self.index_insert(hash, id, rd);
-        Wrote {
-            slot: id as u32,
-            new: true,
-        }
+        self.log_write(id, true);
     }
 
-    fn append(&self, hash: u64, key: &[u8], value: &[u8], rd: &Readers) -> Wrote {
+    fn append(&self, hash: u64, key: &[u8], value: &[u8], rd: &Readers) {
         self.write(hash, key, Some(value), rd)
     }
 
     /// A tombstone and then `value` on `key`'s chain, one probe for both:
     /// what a put is, and half the misses of a delete then an append at
     /// thirty million keys.
-    fn put(&self, hash: u64, key: &[u8], value: &[u8], rd: &Readers) -> Wrote {
+    fn put(&self, hash: u64, key: &[u8], value: &[u8], rd: &Readers) {
         assert!(!self.ordered, "a put never reaches an ordered memtable");
         if let Some(id) = self.probe(hash, key) {
             let e = self.entry(id);
@@ -2770,10 +2840,8 @@ impl MemTable {
             let off = self.push_chunk(tomb, value);
             e.head.store(off + 1, AtomicOrdering::Release);
             e.count.store(1, AtomicOrdering::Relaxed);
-            return Wrote {
-                slot: id as u32,
-                new: false,
-            };
+            self.log_write(id, false);
+            return;
         }
         let id = self.new_entry(hash, key, None);
         let e = self.entry(id);
@@ -2781,17 +2849,14 @@ impl MemTable {
         e.head.store(off + 1, AtomicOrdering::Release);
         e.count.store(1, AtomicOrdering::Relaxed);
         self.index_insert(hash, id, rd);
-        Wrote {
-            slot: id as u32,
-            new: true,
-        }
+        self.log_write(id, true);
     }
 
     /// End every value of `key` before this point: a tombstone chunk at the
     /// head of the chain, and the live count back to zero. A key never seen
     /// before gets an entry too, because the tombstone has older sources to
     /// mask even when this memtable holds nothing of its own.
-    fn delete(&self, hash: u64, key: &[u8], rd: &Readers) -> Wrote {
+    fn delete(&self, hash: u64, key: &[u8], rd: &Readers) {
         assert!(
             !self.ordered,
             "a delete never reaches an ordered memtable: the store leaves order first"
@@ -3884,7 +3949,7 @@ struct Emit {
 #[derive(Clone, Copy)]
 struct Sources<'a> {
     seg: &'a Seg,
-    l0: &'a [Seg],
+    l0: &'a [std::sync::Arc<Seg>],
 }
 
 /// PROTOTYPE: a partition's block cache, with what every block's build
@@ -3963,42 +4028,174 @@ fn block_bounds_of(
     Ok(at)
 }
 
-pub struct Db {
-    dir: PathBuf,
-    opts: Options,
-    wal: Wal,
-    wal_id: u64,
-    mem: std::sync::Arc<MemTable>,
-    /// The reader table: slots for reader handles, and the epoch the
-    /// writer bumps at each publish.
-    readers: Readers,
-    mem_bytes: usize,
+/// What a reader reads: the store as of a publish. The writer builds a
+/// new one at every seal, join, merge or freeze and swaps it in whole,
+/// so a reader that loaded the old one keeps it, unchanged, until its
+/// operation ends; the old one is freed past every pinned reader.
+struct State {
     /// Live segments. Partitioned (L1) first and disjoint, then L0 oldest
     /// to newest: a key's values come back in append order because a merge
     /// preserves it and everything L0 holds is newer than everything L1
     /// holds.
-    segs: Vec<Seg>,
-    /// Which mode the segment mappings are in: `true` is `MADV_RANDOM`.
-    ///
-    /// One flag for the whole store rather than one per segment, because the
-    /// phase is a property of what the caller is doing and not of which file
-    /// answers. A `Cell` because `Db` is not `Sync` -- `Blob` holds a
-    /// `RefCell` -- so every reader thread has its own store, its own
-    /// mappings and its own mode, and two threads cannot fight over one flag.
-    advice_random: std::cell::Cell<bool>,
+    segs: Vec<std::sync::Arc<Seg>>,
+    mem: std::sync::Arc<MemTable>,
+    /// A seal in flight: the frozen memtable stays readable (it is newer
+    /// than every segment and older than `mem`) while a thread writes it
+    /// out; `join_seal` collects the finished segment.
+    frozen: Option<std::sync::Arc<MemTable>>,
+    /// Bumped at every publish: what a scan snapshot and a block table
+    /// are keyed by, so either is rebuilt when the segments or the
+    /// memtables change under it.
+    gen: u64,
     /// Mean bytes a key costs across the live segments, kept rather than
     /// recomputed because `scan` asks it on every call and a fold over the
     /// segments there measured 5% of an in-core scan. Refreshed by
     /// `sort_segs`, which every mutation of `segs` already ends with.
-    mean_key_bytes: std::cell::Cell<usize>,
+    mean_key_bytes: usize,
     /// The partitions' bytes on disk, refreshed with the segment set: what
     /// a merge rewrites, and so what the seal is sized against.
-    store_bytes: std::cell::Cell<u64>,
+    store_bytes: u64,
     /// Whether every level-0 piece is aligned to a partition -- its fence
     /// one partition's -- so a read finds the pieces over its key by
     /// binary search instead of a walk over all of them; see
     /// `pieces_over`. Refreshed by `sort_segs`.
     l0_aligned: bool,
+}
+
+/// What every handle on one store shares: the state, the reader table
+/// the writer frees against, and the mappings' advice mode.
+struct Shared {
+    state: AtomicPtr<State>,
+    /// The reader table: slots for reader handles, and the epoch the
+    /// writer bumps at each publish.
+    readers: Readers,
+    /// States a publish replaced, each with the epoch it was retired at,
+    /// freed once no reader is pinned before it. The writer's, behind a
+    /// lock only because the shared struct must be `Sync`; it is never
+    /// contended.
+    retired: std::sync::Mutex<Vec<(u64, Box<State>)>>,
+    /// Which mode the segment mappings are in: `true` is `MADV_RANDOM`.
+    /// One flag for the whole store rather than one per segment, because
+    /// the phase is a property of what the caller is doing and not of
+    /// which file answers; the mappings are shared, so the flag is.
+    advice_random: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        let p = self.state.load(AtomicOrdering::Relaxed);
+        if !p.is_null() {
+            // SAFETY: published by the writer, owned here.
+            drop(unsafe { Box::from_raw(p) });
+        }
+    }
+}
+
+/// What a reader handle sees of the writer's work: the reader's choice,
+/// and one mechanism. Chunks are appended to the memtable's value arena
+/// in time order, so the arena's tail at the last commit is a watermark
+/// that divides every key's chain into an uncommitted prefix and a
+/// committed rest, and a read walks past what it does not honour.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Isolation {
+    /// Each read sees every commit before it, and nothing of the batch
+    /// the writer is still staging. The default.
+    #[default]
+    Latest,
+    /// Each read sees the store as it was at `Reader::snapshot`, whatever
+    /// the writer commits, seals or merges after, until `Reader::release`.
+    Snapshot,
+    /// Each read sees the writer's staged batch too: what the store's own
+    /// reads see, the read-your-writes contract `Db::read_all` set.
+    Dirty,
+}
+
+/// A handle that reads the store: the read API, over the state the
+/// writer publishes, with caches of its own -- the scan snapshot and the
+/// block tables -- so that no two handles share anything but what the
+/// writer published. A `Db` is one of these plus the writer; another
+/// comes from `Db::reader`, is `Send`, and reads from whatever thread
+/// holds it while the writer keeps writing, with no lock between them.
+pub struct Reader {
+    shared: std::sync::Arc<Shared>,
+    /// This handle's slot in the reader table, or none for the writer's
+    /// own handle, under which nothing is ever freed.
+    slot: Option<usize>,
+    isolation: std::cell::Cell<Isolation>,
+    /// The state pinned by `snapshot`, or null: what `state` answers
+    /// instead of the writer's latest while it is held. An atomic only
+    /// so the handle is `Send`; one thread touches it.
+    held: AtomicPtr<State>,
+    /// The watermark the operation in progress reads the live memtable
+    /// under: the last commit's under `Latest`, the snapshot's under
+    /// `Snapshot`, none under `Dirty` and for the writer's own handle.
+    wm: std::cell::Cell<u64>,
+    opts: Options,
+    /// PROTOTYPE: the block cache's table for each segment, by position
+    /// in `segs`, made on first use and dropped whenever the segments
+    /// change. One load finds a block; nothing is hashed. This handle's
+    /// own: a reader handle has tables of its own over the same segments.
+    tables: std::cell::RefCell<Vec<std::cell::RefCell<Option<BlockTable>>>>,
+    /// Sorted keys of the unsealed sources (memtable + frozen), built lazily
+    /// by `scan` and reused until a write or a seal changes what is
+    /// unsealed. Without this, every scan walked the whole memtable: the
+    /// ext-kv scan phase spent 15 minutes a rep in that walk, twice -- once
+    /// through the live table and once through the frozen one.
+    scan_keys: std::cell::RefCell<Option<(u64, Snapshot)>>,
+    /// PROTOTYPE: whether any partition holds a cached block, so a write
+    /// with nothing cached skips the lookup that would drop one.
+    cache_used: std::cell::Cell<bool>,
+    /// PROTOTYPE: bytes the built blocks hold, kept exact at every build,
+    /// eviction and drop, for the budget.
+    cache_bytes: std::cell::Cell<usize>,
+    /// PROTOTYPE: counts scans on the block path; a block records the
+    /// count when walked, and the budget sheds the block with the oldest.
+    scan_tick: std::cell::Cell<u32>,
+    /// PROTOTYPE: the state of the sampler that picks blocks to shed.
+    shed_seed: std::cell::Cell<u64>,
+    /// PROTOTYPE: keys written since the last scan on the block path, as
+    /// (key offset, key length, created) in the live memtable's arena,
+    /// with a run of writes to one key recorded once. A write used to seek
+    /// the key in its partition to drop the block it lands in; the suite's
+    /// ycsb-A, which follows a scan phase, paid that seek twice an update
+    /// and lost a fifth. The next scan drops and files the distinct keys
+    /// at once, and a mix that never scans never pays.
+    pending: std::cell::RefCell<Vec<(u32, u32, bool)>>,
+    /// PROTOTYPE: every built block holding bytes, as (partition index,
+    /// block), so the sampler draws from blocks and never from empty
+    /// slots. Sampling slots was tried: with a tenth of them built, a
+    /// round of eight misses ended the shedding and one large block left
+    /// the cache twice its budget.
+    built: std::cell::RefCell<Vec<(u32, u32)>>,
+    /// PROTOTYPE: the live memtable rehashed since the snapshot was built,
+    /// so its slot indices are stale and the next scan rebuilds.
+    /// PROTOTYPE: counts the snapshot's rebuilds, so a table can tell
+    /// whether its bounds were walked over the snapshot that stands.
+    snap_gen: std::cell::Cell<u64>,
+    /// PROTOTYPE: slots of the keys the live memtable gained since the
+    /// scan snapshot was built, sorted by key, so a commit does not force
+    /// a rebuild: materialization merges these with the snapshot's keys.
+    snap_added: std::cell::RefCell<Vec<u32>>,
+    /// How far into the memtable's write log this handle has looked, and
+    /// the generation it looked in: a new generation is a new memtable
+    /// or a new segment set, and the log is read from the start again.
+    log_seen: std::cell::Cell<usize>,
+    log_gen: std::cell::Cell<u64>,
+    /// How many of the live memtable's entries the scan snapshot covers:
+    /// a key the log says was created at a number below it is in the
+    /// snapshot already, not a key to file.
+    snap_entries: std::cell::Cell<usize>,
+    /// PROTOTYPE: the builder ahead of the reader, while one is running
+    /// or has forms still to install.
+    ahead: Option<Ahead>,
+}
+
+pub struct Db {
+    r: Reader,
+    dir: PathBuf,
+    wal: Wal,
+    wal_id: u64,
+    mem_bytes: usize,
     /// The segment ordered ingest streams into, while one is open. The
     /// memtable is ordered exactly while a run is forming or open.
     direct: Option<Direct>,
@@ -4058,58 +4255,39 @@ pub struct Db {
     /// until the manifest names its outputs instead, which is what makes
     /// the swap atomic across a crash.
     compacting: Option<Compaction>,
-    /// A seal in flight: the frozen memtable stays readable (it is newer
-    /// than every segment and older than `mem`) while a thread writes it
-    /// out; `join_seal` collects the finished segment.
-    frozen: Option<std::sync::Arc<MemTable>>,
     sealing: Option<std::thread::JoinHandle<Result<Vec<String>>>>,
-    /// Sorted keys of the unsealed sources (memtable + frozen), built lazily
-    /// by `scan` and reused until a write or a seal changes what is
-    /// unsealed. Without this, every scan walked the whole memtable: the
-    /// ext-kv scan phase spent 15 minutes a rep in that walk, twice -- once
-    /// through the live table and once through the frozen one.
-    scan_keys: std::cell::RefCell<Option<(u64, Snapshot)>>,
-    /// PROTOTYPE: whether any partition holds a cached block, so a write
-    /// with nothing cached skips the lookup that would drop one.
-    cache_used: std::cell::Cell<bool>,
-    /// PROTOTYPE: bytes the built blocks hold, kept exact at every build,
-    /// eviction and drop, for the budget.
-    cache_bytes: std::cell::Cell<usize>,
-    /// PROTOTYPE: counts scans on the block path; a block records the
-    /// count when walked, and the budget sheds the block with the oldest.
-    scan_tick: std::cell::Cell<u32>,
-    /// PROTOTYPE: the segment set's generation, bumped by `sort_segs`: a
-    /// form built ahead carries the generation it was built at and is
-    /// installed only while that holds.
-    seg_gen: u64,
-    /// PROTOTYPE: the builder ahead of the reader, while one is running
-    /// or has forms still to install.
-    ahead: Option<Ahead>,
-    /// PROTOTYPE: the state of the sampler that picks blocks to shed.
-    shed_seed: std::cell::Cell<u64>,
-    /// PROTOTYPE: keys written since the last scan on the block path, as
-    /// (key offset, key length, created) in the live memtable's arena,
-    /// with a run of writes to one key recorded once. A write used to seek
-    /// the key in its partition to drop the block it lands in; the suite's
-    /// ycsb-A, which follows a scan phase, paid that seek twice an update
-    /// and lost a fifth. The next scan drops and files the distinct keys
-    /// at once, and a mix that never scans never pays.
-    pending: std::cell::RefCell<Vec<(u32, u32, bool)>>,
-    /// PROTOTYPE: every built block holding bytes, as (partition index,
-    /// block), so the sampler draws from blocks and never from empty
-    /// slots. Sampling slots was tried: with a tenth of them built, a
-    /// round of eight misses ended the shedding and one large block left
-    /// the cache twice its budget.
-    built: std::cell::RefCell<Vec<(u32, u32)>>,
-    /// PROTOTYPE: slots of the keys the live memtable gained since the
-    /// scan snapshot was built, sorted by key, so a commit does not force
-    /// a rebuild: materialization merges these with the snapshot's keys.
-    snap_added: std::cell::RefCell<Vec<u32>>,
-    /// PROTOTYPE: the live memtable rehashed since the snapshot was built,
-    /// so its slot indices are stale and the next scan rebuilds.
-    /// PROTOTYPE: counts the snapshot's rebuilds, so a table can tell
-    /// whether its bounds were walked over the snapshot that stands.
-    snap_gen: std::cell::Cell<u64>,
+}
+
+/// A read in progress on a handle; dropping it ends the read.
+struct Entered<'a> {
+    r: &'a Reader,
+}
+
+impl Drop for Entered<'_> {
+    fn drop(&mut self) {
+        self.r.leave();
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot {
+            self.shared.readers.release(slot);
+        }
+    }
+}
+
+impl std::ops::Deref for Db {
+    type Target = Reader;
+    fn deref(&self) -> &Reader {
+        &self.r
+    }
+}
+
+impl std::ops::DerefMut for Db {
+    fn deref_mut(&mut self) -> &mut Reader {
+        &mut self.r
+    }
 }
 
 /// One key of the unsealed snapshot a scan merges: where the key sits in
@@ -4346,6 +4524,2094 @@ fn key_prefix(k: &[u8]) -> (u64, u64) {
     )
 }
 
+impl Reader {
+    /// The state the writer last published. Valid for as long as the
+    /// borrow of this handle: the writer frees a state only past every
+    /// pinned reader, and never under its own handle.
+    fn state(&self) -> &State {
+        let held = self.held.load(AtomicOrdering::Relaxed);
+        let p = if held.is_null() {
+            self.shared.state.load(AtomicOrdering::Acquire)
+        } else {
+            held
+        };
+        // SAFETY: see above; the pointer is never null after `open`, and a
+        // held one is pinned.
+        unsafe { &*p }
+    }
+
+    /// The watermark the operation in progress walks the live memtable
+    /// under; see `Isolation`.
+    fn wm(&self) -> u64 {
+        self.wm.get()
+    }
+
+    /// The start of a read: under `Latest` and `Dirty` the handle's slot
+    /// pins the epoch, so nothing the read walks is freed under it, the
+    /// state is taken once and held for the read, so the writer's next
+    /// publish cannot change the segments or the memtables under it
+    /// midway, and the watermark is taken; under `Snapshot` all three
+    /// were fixed at the snapshot. The writer's own handle pins nothing
+    /// and holds nothing: it publishes nothing while a borrow of itself
+    /// is out. The guard ends the read.
+    fn enter(&self) -> Entered<'_> {
+        if let Some(slot) = self.slot {
+            match self.isolation.get() {
+                Isolation::Snapshot => {}
+                Isolation::Latest => {
+                    self.shared.readers.pin(slot);
+                    let p = self.shared.state.load(AtomicOrdering::Acquire);
+                    self.held.store(p, AtomicOrdering::Relaxed);
+                    // SAFETY: pinned above, so not freed under this handle.
+                    self.wm.set(unsafe { &*p }.mem.committed());
+                }
+                Isolation::Dirty => {
+                    self.shared.readers.pin(slot);
+                    let p = self.shared.state.load(AtomicOrdering::Acquire);
+                    self.held.store(p, AtomicOrdering::Relaxed);
+                    self.wm.set(SEE_ALL);
+                }
+            }
+        }
+        Entered { r: self }
+    }
+
+    fn leave(&self) {
+        if let Some(slot) = self.slot {
+            if self.isolation.get() != Isolation::Snapshot {
+                self.held
+                    .store(std::ptr::null_mut(), AtomicOrdering::Relaxed);
+                self.shared.readers.unpin(slot);
+            }
+        }
+    }
+
+    /// What this handle's reads see of the writer's work; `Latest` to
+    /// begin with. Setting it releases a snapshot held.
+    pub fn set_isolation(&self, isolation: Isolation) {
+        if self.slot.is_none() {
+            // The writer's own handle reads its own writes, always.
+            return;
+        }
+        if self.isolation.get() == Isolation::Snapshot {
+            self.release();
+        }
+        self.isolation.set(isolation);
+    }
+
+    pub fn isolation(&self) -> Isolation {
+        self.isolation.get()
+    }
+
+    /// Hold the store as it is now -- the segments, the memtables and
+    /// the last commit -- for every read until `release`. A snapshot
+    /// held keeps what the writer replaces after it in memory and holds
+    /// nothing else: the writer never waits for it.
+    pub fn snapshot(&self) {
+        let Some(slot) = self.slot else { return };
+        if self.isolation.get() == Isolation::Snapshot {
+            return;
+        }
+        self.shared.readers.pin(slot);
+        let p = self.shared.state.load(AtomicOrdering::Acquire);
+        self.held.store(p, AtomicOrdering::Relaxed);
+        // SAFETY: pinned above, so not freed under this handle.
+        self.wm.set(unsafe { &*p }.mem.committed());
+        self.isolation.set(Isolation::Snapshot);
+    }
+
+    /// Let the snapshot go: reads see the latest commit again.
+    pub fn release(&self) {
+        let Some(slot) = self.slot else { return };
+        if self.isolation.get() != Isolation::Snapshot {
+            return;
+        }
+        self.held
+            .store(std::ptr::null_mut(), AtomicOrdering::Relaxed);
+        self.isolation.set(Isolation::Latest);
+        self.shared.readers.unpin(slot);
+    }
+
+    fn segs(&self) -> &[std::sync::Arc<Seg>] {
+        &self.state().segs
+    }
+
+    fn mem(&self) -> &std::sync::Arc<MemTable> {
+        &self.state().mem
+    }
+
+    fn frozen(&self) -> Option<&std::sync::Arc<MemTable>> {
+        self.state().frozen.as_ref()
+    }
+
+    fn set_advice_random(&self, random: bool) {
+        self.shared
+            .advice_random
+            .store(random, AtomicOrdering::Relaxed);
+    }
+}
+
+impl Reader {
+    /// The live set, in the order the manifest should record it.
+    fn live_names(&self) -> Vec<String> {
+        self.segs().iter().map(|s| s.name.clone()).collect()
+    }
+
+    /// Whether any source can end a key's older values. False for a store
+    /// nothing was ever deleted from, which lets every read skip the
+    /// newest-first pass tombstones require.
+    fn has_tombstones(&self) -> bool {
+        self.mem().tombs() > 0
+            || self.frozen().as_ref().is_some_and(|f| f.tombs() > 0)
+            || self.segs().iter().any(|s| s.tombs)
+    }
+
+    /// The fences a range merge should rewrite now, or `None` when the store
+    /// is not partitioned yet (the first partitioning takes every key). A
+    /// piece that is not aligned to a live range -- sealed during the first
+    /// partitioning against fences that no longer exist -- selects every
+    /// range it overlaps; otherwise a range is selected when it holds at
+    /// least `threshold` pieces. `maybe_compact` uses the trigger as the
+    /// threshold; a flush uses one.
+    fn merge_due(&self, threshold: usize) -> Option<Vec<Fence>> {
+        let parts: Vec<Fence> = self
+            .segs()
+            .iter()
+            .filter(|s| s.level > 0)
+            .map(|s| (s.lo.clone(), s.hi.clone()))
+            .collect();
+        if parts.is_empty() {
+            return None;
+        }
+        if let Some(wide) = self
+            .segs()
+            .iter()
+            .find(|s| s.level == 0 && !parts.iter().any(|f| (s.lo.clone(), s.hi.clone()) == *f))
+        {
+            let (wlo, whi) = (wide.lo.clone(), wide.hi.clone());
+            return Some(
+                parts
+                    .into_iter()
+                    .filter(|(lo, hi)| {
+                        let below = hi.as_ref().is_some_and(|h| &wlo >= h);
+                        let above = whi.as_ref().is_some_and(|h| h <= lo);
+                        !below && !above
+                    })
+                    .collect(),
+            );
+        }
+        Some(
+            parts
+                .into_iter()
+                .filter(|f| {
+                    self.segs()
+                        .iter()
+                        .filter(|s| s.level == 0 && s.lo == f.0 && s.hi == f.1)
+                        .count()
+                        >= threshold
+                })
+                .collect(),
+        )
+    }
+
+    /// The first of the partitions `segs[..np]` that may hold a key at or
+    /// after `from`: they tile the key space in order, so it is the first
+    /// whose upper fence is above `from`, and every partition after it may
+    /// reach too. Found by galloping from the front and then a binary
+    /// search over the bracket. A scan filtered every partition by its
+    /// fence, a compare per partition below its start; a binary search
+    /// over all of them was measured next and was slower on ycsb-E, whose
+    /// Zipfian starts fall in the first few partitions, where the walk
+    /// was one to three predictable compares and the search seven
+    /// mispredicting ones. The gallop is one compare for a start in the
+    /// first partition and logarithmic for a far one.
+    fn first_reaching(&self, np: usize, from: &[u8]) -> usize {
+        let parts = &self.segs()[..np];
+        let below = |i: usize| parts[i].hi.as_ref().is_some_and(|h| h.as_slice() <= from);
+        let (mut lo, mut step) = (0usize, 1usize);
+        while step <= np && below(step - 1) {
+            lo = step;
+            step *= 2;
+        }
+        let end = step.min(np);
+        lo + parts[lo..end].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= from))
+    }
+
+    /// The level-0 pieces a read of a key in partition `at` consults. When
+    /// every piece is aligned to a partition they are the run over `at`
+    /// alone: the pieces sort by lower fence and then by name, so one
+    /// range's pieces are consecutive and oldest first, and two binary
+    /// searches bound the run. Otherwise all of them, each answering from
+    /// its own fence, as every read did before: a walk over every piece
+    /// in the store, two fence compares each, that grew with the range
+    /// count times the pieces over a range.
+    fn pieces_over(&self, np: usize, at: usize) -> &[std::sync::Arc<Seg>] {
+        let l0 = &self.segs()[np..];
+        if !self.state().l0_aligned || at >= np {
+            return l0;
+        }
+        // The first partition's lower fence is empty, and so is that of
+        // every piece aligned to it; see `below_lo` for why an empty fence
+        // is never handed to a compare.
+        let lo = self.segs()[at].lo.as_slice();
+        let before =
+            |s: &std::sync::Arc<Seg>| !lo.is_empty() && (s.lo.is_empty() || s.lo.as_slice() < lo);
+        let same = |s: &std::sync::Arc<Seg>| {
+            s.lo.is_empty() == lo.is_empty() && (lo.is_empty() || s.lo.as_slice() == lo)
+        };
+        let from = l0.partition_point(before);
+        let to = from + l0[from..].partition_point(same);
+        &l0[from..to]
+    }
+
+    /// The memtable bytes at which the next commit seals: `seal_bytes`, or
+    /// with `seal_grows` the larger of that and the partitions' bytes over
+    /// four times `l0_trigger`.
+    pub fn seal_threshold(&self) -> usize {
+        if !self.opts.seal_grows {
+            return self.opts.seal_bytes;
+        }
+        let grown = self.state().store_bytes / (4 * self.opts.l0_trigger.max(1)) as u64;
+        self.opts
+            .seal_bytes
+            .max(usize::try_from(grown).unwrap_or(usize::MAX))
+    }
+
+    /// Order `pieces` by first key and check the chain: every piece's first
+    /// key, taken as a fence, must lie strictly above what came before it
+    /// (the partition's last key, then the previous piece's last key) and
+    /// inside the range. Returns each piece's fence boundary, or `None` when
+    /// something overlaps and a merge is what is needed.
+    fn promotion_chain(
+        &self,
+        range: &Fence,
+        floor: Option<Vec<u8>>,
+        pieces: &mut [usize],
+    ) -> Option<Vec<Vec<u8>>> {
+        if pieces.is_empty() {
+            return None;
+        }
+        let first_of = |si: usize| -> Option<Vec<u8>> {
+            let b = &self.segs()[si].blob;
+            if b.keys() == 0 {
+                None
+            } else {
+                b.key_at(0).map(|k| k.to_vec())
+            }
+        };
+        let last_of = |si: usize| -> Option<Vec<u8>> {
+            let b = &self.segs()[si].blob;
+            if b.keys() == 0 {
+                None
+            } else {
+                b.key_at(b.keys() - 1).map(|k| k.to_vec())
+            }
+        };
+        // An empty piece has nothing to promote; leave it to the merge.
+        if pieces.iter().any(|&si| self.segs()[si].blob.keys() == 0) {
+            return None;
+        }
+        pieces.sort_by_key(|&si| first_of(si));
+        let mut bounds = Vec::with_capacity(pieces.len());
+        let mut prev_last: Option<Vec<u8>> = floor;
+        for &si in pieces.iter() {
+            let first = first_of(si)?;
+            let b = fence_lo(&first);
+            // Strictly above everything before it, and inside the range.
+            if let Some(pl) = &prev_last {
+                if *pl >= b {
+                    return None;
+                }
+            }
+            if b < range.0 || range.1.as_ref().is_some_and(|h| &b >= h) {
+                return None;
+            }
+            bounds.push(b);
+            prev_last = last_of(si);
+        }
+        Some(bounds)
+    }
+
+    // The starvation lesson that shaped `merge_due`: EVERY range that is
+    // over its bound merges in one job, not just the worst. A per-range
+    // merge has to run once per range where the whole-store merge ran once,
+    // so picking a single range per seal starved it -- with sixteen ranges
+    // and one merge in flight, pieces accumulated faster than they were
+    // consumed and a read ended up walking ten of them. That starvation
+    // cost more than the whole-store rewrite it replaced (the canonical read
+    // comparison went from 0.846x to 0.561x), which is the measurement that
+    // produced the rule.
+
+    fn l0_len(&self) -> usize {
+        self.segs().iter().filter(|s| s.level == 0).count()
+    }
+
+    /// Every value for `key`, in append order: partitions first, then L0
+    /// oldest to newest, then the frozen memtable, then the live one.
+    ///
+    /// `may_hold` is the routing F38-F41 settled. A partition answers from
+    /// its fence in two comparisons and no memory beyond the `Seg`; an L0
+    /// segment answers from a Bloom in one cache line. Neither can produce
+    /// a false negative, so a skipped segment is a segment that provably
+    /// holds nothing for this key.
+    /// Put the segment mappings in `random` if they are not already there.
+    ///
+    /// A no-op unless the mode actually changes, so the steady state costs a
+    /// `Cell` load and a compare. On a change it is one `madvise` per live
+    /// segment -- a cost priced over a store of several segments, since the
+    /// earlier measurement was over a single mapping.
+    /// Will this scan walk enough contiguous bytes for readahead to pay?
+    ///
+    /// The span is the limit times what a key costs on disk, taken from the
+    /// segments themselves rather than assumed: `index_bytes / keys` over the
+    /// live set. That is the whole section per key -- records, directory and
+    /// hash -- where a scan walks only the records, so it reads high by about
+    /// a quarter on the shape measured. It does not need to be tight. The
+    /// crossing it is compared against is flat for a factor of three either
+    /// side, and a quarter is well inside that.
+    fn scan_wants_readahead(&self, limit: usize) -> bool {
+        let mean = self.state().mean_key_bytes;
+        if mean == 0 {
+            // Nothing sealed: the scan is answered from the memtable and
+            // touches no mapping, so the advice is moot. Say no and leave the
+            // segments as they are rather than switching them for nothing.
+            return false;
+        }
+        limit.saturating_mul(mean) >= self.opts.scan_readahead_bytes
+    }
+
+    fn advise(&self, random: bool) {
+        if self.opts.read_advice != ReadAdvice::Adaptive || self.advice_random() == random {
+            return;
+        }
+        self.set_advice_random(random);
+        // Segments only. A segment's pages are walked in whichever way the
+        // workload is walking them, so the advice follows the phase; the
+        // ordered companion is reached only by a binary search and is left
+        // on `MADV_RANDOM` in both.
+        for s in self.segs() {
+            if random {
+                s.blob.advise_random();
+            } else {
+                s.blob.advise_normal();
+            }
+        }
+    }
+
+    /// Which mode the segment mappings are in: `true` is `MADV_RANDOM`.
+    ///
+    /// The store's own record of what it last asked for, which is what a
+    /// check needs to compare against the mappings themselves -- the
+    /// interesting failure is the two disagreeing.
+    pub fn advice_random(&self) -> bool {
+        self.shared.advice_random.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Whether reads route to the pieces over their range, for a test to
+    /// know which path it is on: `false` whenever a piece spans ranges.
+    pub fn pieces_aligned(&self) -> bool {
+        let _entered = self.enter();
+        self.state().l0_aligned
+    }
+
+    /// How many segments' ordered companions were advised `MADV_RANDOM`, and
+    /// how many there are.
+    ///
+    /// The companion is the mapping the advice policy missed. `advise` walks
+    /// the segments and a companion is not one of them, so it sat on the
+    /// kernel's default readahead however the store was configured, and
+    /// nothing anywhere said so -- the only symptom was a scan that lost 12%
+    /// out of core. A check needs to be able to ask.
+    pub fn ords_advised(&self) -> (usize, usize) {
+        let _entered = self.enter();
+        (
+            self.segs().iter().filter(|s| s.ord.advised()).count(),
+            self.segs().len(),
+        )
+    }
+
+    pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
+        let _entered = self.enter();
+        self.advise(true);
+        let hash = self.mem().prefetch(key);
+        let np = self.segs().partition_point(|s| s.level > 0);
+        let at = self.segs()[..np]
+            .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+        let part = self.segs()[..np].get(at).filter(|s| s.may_hold(key));
+        let l0 = self.pieces_over(np, at);
+        // Sources oldest to newest: the partition (0), the level-0 pieces
+        // (1..), the frozen memtable, the live one. `start` is the source
+        // live values begin at: 0 unless a newer source holds a tombstone
+        // for this key. Only a store with tombstones in it checks, and the
+        // check is what a delete costs a read -- a second probe on the
+        // sources that hold the key.
+        let (fr_ix, mem_ix) = (1 + l0.len(), 2 + l0.len());
+        let mut start = 0usize;
+        if self.has_tombstones() {
+            if !self.mem().is_empty() {
+                if let Some(e) = self.mem().get_with(hash, key) {
+                    if self.mem().has_tomb(e, self.wm()) {
+                        start = mem_ix;
+                    }
+                }
+            }
+            if start == 0 {
+                if let Some(fr) = self.frozen() {
+                    if let Some(e) = fr.get(key) {
+                        if fr.has_tomb(e, SEE_ALL) {
+                            start = fr_ix;
+                        }
+                    }
+                }
+            }
+            if start == 0 {
+                for (i, seg) in l0.iter().enumerate().rev() {
+                    if !seg.tombs || !seg.may_hold(key) {
+                        continue;
+                    }
+                    if let Some(exts) = seg.blob.lookup(key) {
+                        if exts.iter().any(|e| e.is_tombstone()) {
+                            start = 1 + i;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let mut n = 0u64;
+        if start == 0 {
+            if let Some(seg) = part {
+                n += seg
+                    .blob
+                    .read_all(key, &mut f)
+                    .map_err(|e| err(&format!("segment read: {e}")))?;
+            }
+        }
+        for (i, seg) in l0.iter().enumerate() {
+            if 1 + i < start || !seg.may_hold(key) {
+                continue;
+            }
+            n += seg
+                .blob
+                .read_all(key, &mut f)
+                .map_err(|e| err(&format!("segment read: {e}")))?;
+        }
+        if fr_ix >= start {
+            if let Some(fr) = self.frozen() {
+                if let Some(e) = fr.get(key) {
+                    let (offs, _) = fr.live_chain(e, SEE_ALL);
+                    n += offs.len() as u64;
+                    for off in offs {
+                        f(fr.value_at(off));
+                    }
+                }
+            }
+        }
+        if mem_ix >= start && !self.mem().is_empty() {
+            if let Some(e) = self.mem().get_with(hash, key) {
+                let (offs, _) = self.mem().live_chain(e, self.wm());
+                n += offs.len() as u64;
+                for off in offs {
+                    f(self.mem().value_at(off));
+                }
+            }
+        }
+        Ok(n)
+    }
+
+    /// The sorted snapshot of every unsealed key (frozen table first, then
+    /// live), one entry per key. Two builds behind `scan_snapshot_arena`;
+    /// both walk the hash tables once and both end in the same `Snapshot`.
+    /// The snapshot over the frozen table and the live one's first
+    /// `live_len` entries: the count is the caller's, taken once, since
+    /// the writer may be appending while this builds, and what the
+    /// snapshot covers is what the log replay must not file again.
+    fn build_snapshot(&self, live_len: usize) -> Snapshot {
+        let n = live_len + self.frozen().as_ref().map_or(0, |f| f.len());
+        let mut snap = Snapshot {
+            keys: Vec::with_capacity(
+                self.mem().key_bytes() + self.frozen().as_ref().map_or(0, |f| f.key_bytes()),
+            ),
+            ents: Vec::with_capacity(n),
+            ..Default::default()
+        };
+        if self.opts.scan_snapshot_arena {
+            // Arena build. The hash table is walked in slot order, which
+            // visits the key bytes in random order -- one cache miss a key,
+            // and at 428k keys that walk, not the sort, was most of the
+            // build. So the walk records (key offset, slot) without touching
+            // a key, a radix pass puts them in arena order, and the copy
+            // into the snapshot's arena is sequential. Then sort (prefix,
+            // prefix, index) records, touching the arena only on a tie.
+            let mut recs: Vec<(u64, u64, u32)> = Vec::with_capacity(n);
+            let mut pending: Vec<SnapKey> = Vec::with_capacity(n);
+            let mut order: Vec<(u32, u32, u32)> = Vec::with_capacity(n);
+            let mut scratch: Vec<(u32, u32, u32)> = Vec::with_capacity(n);
+            let mut take = |mem: &MemTable, live: bool| {
+                // (key offset, key length, slot): the copy below needs no
+                // slot access, since a slot in key order is a random one.
+                order.clear();
+                let upto = if live { live_len } else { mem.len() };
+                order.extend((0..upto).map(|i| {
+                    let e = mem.entry(i);
+                    (e.key_off, e.key_len, i as u32)
+                }));
+                radix_by_first(&mut order, &mut scratch);
+                for &(off, len, i) in &order {
+                    let k = mem.key_at(off, len);
+                    let (a, b) = key_prefix(k);
+                    recs.push((a, b, pending.len() as u32));
+                    pending.push(SnapKey {
+                        off: snap.keys.len() as u32,
+                        len: k.len() as u32,
+                        mem: if live { i } else { u32::MAX },
+                        frozen: if live { u32::MAX } else { i },
+                    });
+                    snap.keys.extend_from_slice(k);
+                }
+            };
+            if let Some(fr) = self.frozen() {
+                take(fr, false);
+            }
+            take(self.mem(), true);
+            let keys = &snap.keys;
+            let key_of = |e: &SnapKey| &keys[e.off as usize..(e.off + e.len) as usize];
+            recs.sort_unstable_by(|x, y| {
+                (x.0, x.1).cmp(&(y.0, y.1)).then_with(|| {
+                    key_of(&pending[x.2 as usize])
+                        .cmp(key_of(&pending[y.2 as usize]))
+                        // Frozen entries were pushed first; on a tie the
+                        // live one must come later so the fold sees it.
+                        .then(x.2.cmp(&y.2))
+                })
+            });
+            for r in recs {
+                snap.push_sorted(pending[r.2 as usize]);
+            }
+        } else {
+            // The build before it: one allocation per key, sorted through
+            // the pointers, then copied into the arena the merge expects.
+            struct Old {
+                key: Vec<u8>,
+                mem: u32,
+                frozen: u32,
+            }
+            let mut all: Vec<Old> = Vec::with_capacity(n);
+            let mut take = |mem: &MemTable, live: bool| {
+                let upto = if live { live_len } else { mem.len() };
+                for (i, e) in (0..upto).map(|i| (i, mem.entry(i))) {
+                    all.push(Old {
+                        key: mem.key_of(e).to_vec(),
+                        mem: if live { i as u32 } else { u32::MAX },
+                        frozen: if live { u32::MAX } else { i as u32 },
+                    });
+                }
+            };
+            if let Some(fr) = self.frozen() {
+                take(fr, false);
+            }
+            take(self.mem(), true);
+            all.sort_by(|a, b| a.key.cmp(&b.key));
+            for o in all {
+                let off = snap.keys.len() as u32;
+                snap.keys.extend_from_slice(&o.key);
+                snap.push_sorted(SnapKey {
+                    off,
+                    len: o.key.len() as u32,
+                    mem: o.mem,
+                    frozen: o.frozen,
+                });
+            }
+        }
+        snap
+    }
+
+    pub fn scan<F: FnMut(&[u8], &[u8])>(
+        &self,
+        from: &[u8],
+        limit: usize,
+        mut f: F,
+    ) -> Result<usize> {
+        let _entered = self.enter();
+        self.advise(!self.scan_wants_readahead(limit));
+        // `Prefetch` never changes mode, so `advise` above is a no-op for it.
+        // Instead the segments are told exactly which value bytes this scan
+        // will walk, before it walks them. Errors are dropped: a plan that
+        // cannot be built is a scan that fetches the way it always did, not a
+        // scan that fails.
+        if self.opts.read_advice == ReadAdvice::Prefetch {
+            for seg in self.segs() {
+                let _ = seg.blob.prefetch_scan(from, limit);
+            }
+        }
+        let gen = self.state().gen;
+        // The snapshot outlives writes on both paths. With the block
+        // cache, the keys created since it was built are filed by block
+        // and merged in when a block builds, until they outnumber the
+        // snapshot; filed by block, what grows with their count is only
+        // the walk a new table makes over them. On the merge paths they
+        // are filed into the snapshot's side runs at each scan, until they
+        // reach an eighth of it, since a scan merges those runs over its
+        // whole length. Before this a write was a rebuild on those paths,
+        // and at thirty million keys ycsb-E made 2,500 of them over two
+        // million unsealed keys. The cache wants partitions to hang blocks
+        // on: before the first partitioning it stands aside.
+        let use_cache =
+            self.opts.scan_block_cache && self.segs().first().is_some_and(|s| s.level > 0);
+        self.sync_log();
+        if use_cache {
+            self.settle_pending()?;
+        }
+        {
+            let mut cache = self.scan_keys.borrow_mut();
+            let mut stale = cache.as_ref().is_none_or(|(g, _)| *g != gen);
+            if !stale {
+                let held = cache.as_ref().map_or(0, |(_, s)| s.len());
+                let added = self.snap_added.borrow().len();
+                stale = if use_cache {
+                    added > held.max(4096)
+                } else {
+                    added > (held / 8).max(4096)
+                };
+            }
+            if !stale && !use_cache {
+                let (_, snap) = cache.as_mut().expect("not stale");
+                let added = self.snap_added.borrow();
+                if added.len() > snap.filed {
+                    snap.file(self.mem(), &added[snap.filed..]);
+                    snap.filed = added.len();
+                }
+            }
+            if stale {
+                let live_len = self.mem().len();
+                self.snap_entries.set(live_len);
+                *cache = Some((gen, self.build_snapshot(live_len)));
+                self.snap_added.borrow_mut().clear();
+                // Every key created since the old snapshot is in the new
+                // one: the lists that held them are emptied, and the
+                // bounds each table walked are walked again on its next
+                // touch.
+                self.snap_gen.set(self.snap_gen.get().wrapping_add(1));
+                let np = self.segs().partition_point(|s| s.level > 0);
+                let tables = self.tables.borrow();
+                for p in 0..np {
+                    if let Some(t) = tables[p].borrow_mut().as_mut() {
+                        for list in &mut t.added {
+                            list.clear();
+                        }
+                        t.filed = 0;
+                        for b in 0..t.slots.len() {
+                            if matches!(t.slots[b], Some(Cached::Wide(_))) {
+                                self.unlist(p, b, t);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let cache = self.scan_keys.borrow();
+        let unsealed = &cache.as_ref().expect("scan snapshot").1;
+        // The block path finds the unsealed keys a block needs when it
+        // builds the block, from the block's own bounds, and never from
+        // this cursor. Seeking it anyway was a binary search over every
+        // unsealed key on every scan, with its lower levels cold: on one
+        // store of three million keys, half a microsecond of a far scan's
+        // three, for a number nothing read.
+        if use_cache {
+            return self.scan_blocks(from, limit, unsealed, f);
+        }
+        let mut mc = unsealed.cursor(from);
+
+        // With no level-0 piece the partitions tile the key space in order
+        // and the unsealed keys are one sorted array, so the partitions can
+        // be walked in bulk by `Blob::scan_at`, which resolves each key
+        // once, with the unsealed keys laid over the walk where they fall.
+        // The merge below costs five or six index lookups an entry (a
+        // key_at per cursor to find the minimum, another to emit, and a
+        // third inside `values_at`) where this costs one, and after a
+        // routed flush this is the shape the store is in. An earlier
+        // version had this path, a refactor dropped it, and the scan axis
+        // paid for it.
+        if !self.segs().iter().any(|s| s.level == 0) {
+            return self.scan_partitions(from, limit, mc, unsealed, f);
+        }
+
+        if self.opts.scan_merge {
+            return self.scan_merged(from, limit, mc, unsealed, f);
+        }
+
+        // A k-way merge over rank cursors, allocating nothing per key.
+        //
+        // The version before this one materialised every candidate key from
+        // every source, sorted them and re-read each one: three copies and
+        // a sort per key, which cost more than the reads. `Blob::key_at`
+        // borrows out of the mapped index and the unsealed snapshot is
+        // already sorted, so the merge can run on borrowed keys and emit
+        // values straight from the position it is already holding.
+        let mut cursors: Vec<(&std::sync::Arc<Seg>, usize)> = self
+            .segs()
+            .iter()
+            .filter(|s| s.may_reach(from))
+            .map(|s| (s, s.ord.seek(s.cursor_from(from), |r| s.blob.key_at(r))))
+            .collect();
+
+        let tombs = self.has_tombstones();
+        let mut seen = 0usize;
+        while seen < limit {
+            // The next key is the smallest any source is holding.
+            let mut next: Option<&[u8]> = None;
+            for (seg, rank) in &cursors {
+                if let Some(k) = seg.blob.key_at(*rank) {
+                    if next.is_none_or(|n| k < n) {
+                        next = Some(k);
+                    }
+                }
+            }
+            if let Some((k, _)) = unsealed.peek(mc) {
+                if next.is_none_or(|n| k < n) {
+                    next = Some(k);
+                }
+            }
+            let Some(key) = next else { break };
+
+            // Emit in append order -- partitions, then L0 oldest to
+            // newest, then the frozen memtable, then the live one -- and
+            // advance every cursor that was sitting on this key.
+            // Sources are ordered oldest to newest -- the cursors, then the
+            // frozen memtable, then the live one -- so the newest source with
+            // a tombstone for this key is a cut, and live values start there.
+            let nc = cursors.len();
+            let in_unsealed = unsealed.peek(mc).map(|(k, _)| k) == Some(key);
+            let mut start = 0usize;
+            if tombs {
+                if in_unsealed {
+                    if self
+                        .mem()
+                        .get(key)
+                        .is_some_and(|e| self.mem().has_tomb(e, self.wm()))
+                    {
+                        start = nc + 1;
+                    } else if self
+                        .frozen()
+                        .as_ref()
+                        .and_then(|fr| fr.get(key).map(|e| fr.has_tomb(e, SEE_ALL)))
+                        .unwrap_or(false)
+                    {
+                        start = nc;
+                    }
+                }
+                if start == 0 {
+                    for (j, (seg, rank)) in cursors.iter().enumerate().rev() {
+                        if seg.tombs && seg.blob.key_at(*rank) == Some(key) {
+                            if let Some((_, exts)) = seg.blob.exts_at(*rank) {
+                                if exts.iter().any(|e| e.is_tombstone()) {
+                                    start = j;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for (j, (seg, rank)) in cursors.iter_mut().enumerate() {
+                if seg.blob.key_at(*rank) == Some(key) {
+                    if j >= start {
+                        seg.blob
+                            .values_at(*rank, |v| f(key, v))
+                            .map_err(|e| err(&format!("segment scan read: {e}")))?;
+                    }
+                    *rank += 1;
+                }
+            }
+            if in_unsealed {
+                if nc >= start {
+                    if let Some(fr) = self.frozen() {
+                        if let Some(e) = fr.get(key) {
+                            for off in fr.live_chain(e, SEE_ALL).0 {
+                                f(key, fr.value_at(off));
+                            }
+                        }
+                    }
+                }
+                if nc + 1 >= start {
+                    if let Some(e) = self.mem().get(key) {
+                        for off in self.mem().live_chain(e, self.wm()).0 {
+                            f(key, self.mem().value_at(off));
+                        }
+                    }
+                }
+                unsealed.advance(&mut mc);
+            }
+            seen += 1;
+        }
+        Ok(seen)
+    }
+
+    /// PROTOTYPE: every cached block dropped, and the flag that says a
+    /// write need not look.
+    /// PROTOTYPE: the writes since this handle last looked, from the
+    /// memtable's log: the keys created since the snapshot, for filing,
+    /// and every write's key, for settling into the block it landed in
+    /// when the cache is in use. A new generation -- a seal, a join, a
+    /// merge, a fresh memtable -- makes this handle's tables and snapshot
+    /// stale, so they are dropped and the log is read from its start.
+    fn sync_log(&self) {
+        let st = self.state();
+        if self.log_gen.get() != st.gen {
+            self.log_gen.set(st.gen);
+            self.log_seen.set(0);
+            self.snap_entries.set(0);
+            *self.scan_keys.borrow_mut() = None;
+            self.snap_added.borrow_mut().clear();
+            self.pending.borrow_mut().clear();
+            self.drop_blocks();
+            if self.tables.borrow().len() != st.segs.len() {
+                *self.tables.borrow_mut() = Db::tables_for(st.segs.len());
+            }
+        }
+        let mem = &st.mem;
+        let n = mem.log_len();
+        let seen = self.log_seen.get();
+        if seen == n {
+            return;
+        }
+        let file = self.cache_used.get();
+        let covered = self.snap_entries.get();
+        let mut added = self.snap_added.borrow_mut();
+        let mut pending = self.pending.borrow_mut();
+        for i in seen..n {
+            let (id, new) = mem.log_at(i);
+            // Created since the snapshot: a key the snapshot holds already
+            // was created below its count, however late the log says so.
+            let new = new && id >= covered;
+            if new {
+                added.push(id as u32);
+            }
+            if file {
+                let e = mem.entry(id);
+                match pending.last_mut() {
+                    Some(last) if last.0 == e.key_off => last.2 |= new,
+                    _ => pending.push((e.key_off, e.key_len, new)),
+                }
+            }
+        }
+        self.log_seen.set(n);
+    }
+
+    fn drop_blocks(&self) {
+        for t in self.tables.borrow().iter() {
+            *t.borrow_mut() = None;
+        }
+        self.cache_used.set(false);
+        self.cache_bytes.set(0);
+        self.built.borrow_mut().clear();
+        self.pending.borrow_mut().clear();
+    }
+
+    /// PROTOTYPE: the forms the builder ahead has sent, installed: each
+    /// into its partition's table, made here if the partition has none,
+    /// if the segment set is still the one it was built at and the block
+    /// is unbuilt and not past the wide bound; then the memtable's keys
+    /// over the block spliced in -- the snapshot's run over it and the
+    /// keys filed since, which is what a build here would have merged --
+    /// so the installed block equals one built here.
+    fn install_ahead(&self, unsealed: &Snapshot) -> Result<()> {
+        let Some(a) = &self.ahead else {
+            return Ok(());
+        };
+        let np = self.segs().partition_point(|s| s.level > 0);
+        let l0 = &self.segs()[np..];
+        while let Ok(built) = a.rx.try_recv() {
+            // Every publish stops the builder before the set it built over
+            // changes, so a form of another generation cannot arrive here
+            // today; the check guards a path that sorts the segments
+            // without one.
+            if built.gen != self.state().gen {
+                continue;
+            }
+            let Some(pi) = self.segs()[..np].iter().position(|s| s.name == built.name) else {
+                continue;
+            };
+            let seg = &self.segs()[pi];
+            let tables = self.tables.borrow();
+            let mut held = tables[pi].borrow_mut();
+            if held.is_none() {
+                *held = Some(self.make_table(seg, l0, unsealed)?);
+                self.cache_used.set(true);
+            }
+            let table = held.as_mut().expect("just made");
+            if table.snap_gen != self.snap_gen.get() {
+                table.snap_at = BuildCtx::snap_bounds(seg, table.slots.len(), unsealed)?;
+                table.snap_gen = self.snap_gen.get();
+            }
+            let b = built.b as usize;
+            if b >= table.slots.len()
+                || table.slots[b].is_some()
+                || BuildCtx::overlay_count(table, b) > WIDE
+            {
+                continue;
+            }
+            table.slots[b] = Some(built.form);
+            self.list_built(pi, b, table);
+            self.shed(pi, b, table);
+            let (lo, hi) = (table.snap_at[b] as usize, table.snap_at[b + 1] as usize);
+            let mut keys: Vec<(Vec<u8>, u32)> = Vec::with_capacity(hi - lo + table.added[b].len());
+            for i in lo..hi {
+                if let Some((k, _)) = unsealed.get(i) {
+                    keys.push((k.to_vec(), u32::MAX));
+                }
+            }
+            for &(slot, cut) in &table.added[b] {
+                let k = self.mem().key_of(self.mem().entry(slot as usize));
+                keys.push((k.to_vec(), cut));
+            }
+            for (k, cut) in keys {
+                let cut = if cut == u32::MAX {
+                    BuildCtx::owner_of(seg, &k).1
+                } else {
+                    cut
+                };
+                self.patch_block(pi, b, table, &k, cut)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// PROTOTYPE: the build context over this store's own state.
+    fn build_ctx(&self) -> BuildCtx<'_> {
+        BuildCtx {
+            wm: self.wm(),
+            segs: self.segs(),
+            mem: self.mem(),
+            frozen: self.frozen().map(|f| f.as_ref()),
+            tombs: self.has_tombstones(),
+        }
+    }
+
+    fn list_built(&self, p: usize, b: usize, table: &mut BlockTable) {
+        let bytes = table.slots[b].as_ref().map_or(0, |c| c.bytes());
+        self.cache_bytes.set(self.cache_bytes.get() + bytes);
+        if bytes > 0 {
+            let mut built = self.built.borrow_mut();
+            table.listed[b] = built.len() as u32;
+            built.push((p as u32, b as u32));
+        }
+    }
+
+    /// PROTOTYPE: a block leaves the cache: its bytes leave the count and
+    /// its place in the list goes to the last listed block, whose table
+    /// is `table` when it is the one in hand and borrowed otherwise.
+    fn unlist(&self, p: usize, b: usize, table: &mut BlockTable) -> usize {
+        let Some(c) = table.slots[b].take() else {
+            return 0;
+        };
+        let bytes = c.bytes();
+        self.cache_bytes.set(self.cache_bytes.get() - bytes);
+        let at = std::mem::replace(&mut table.listed[b], u32::MAX);
+        if at != u32::MAX {
+            let mut built = self.built.borrow_mut();
+            let last = built.pop().expect("a listed block is in the list");
+            if (at as usize) < built.len() {
+                built[at as usize] = last;
+                let (lp, lb) = (last.0 as usize, last.1 as usize);
+                if lp == p {
+                    table.listed[lb] = at;
+                } else if let Some(t) = self.tables.borrow()[lp].borrow_mut().as_mut() {
+                    t.listed[lb] = at;
+                }
+            }
+        }
+        bytes
+    }
+
+    /// PROTOTYPE: bring the cache under its budget by shedding built
+    /// blocks: of eight drawn at random from the list of built blocks,
+    /// the one walked longest ago, again until under. `cur` is the
+    /// partition whose table the caller holds, reached through `table`
+    /// rather than borrowed again, and `keep` the block it is about to
+    /// walk, never shed: a budget below one block holds that block.
+    fn shed(&self, cur: usize, keep: usize, table: &mut BlockTable) {
+        let budget = self.opts.scan_cache_bytes;
+        if budget == 0 {
+            return;
+        }
+        let tick = self.scan_tick.get();
+        while self.cache_bytes.get() > budget {
+            let mut best: Option<(usize, usize, u32)> = None;
+            {
+                let built = self.built.borrow();
+                if built.is_empty() {
+                    break;
+                }
+                for _ in 0..8 {
+                    let mut x = self.shed_seed.get();
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    self.shed_seed.set(x);
+                    let (p, b) = built[(x as usize) % built.len()];
+                    let (p, b) = (p as usize, b as usize);
+                    if p == cur && b == keep {
+                        continue;
+                    }
+                    let touched = if p == cur {
+                        table.touched[b]
+                    } else {
+                        match self.tables.borrow()[p].borrow().as_ref() {
+                            Some(t) => t.touched[b],
+                            None => continue,
+                        }
+                    };
+                    let age = tick.wrapping_sub(touched);
+                    if best.is_none_or(|(_, _, a)| age > a) {
+                        best = Some((p, b, age));
+                    }
+                }
+            }
+            let Some((p, b, _)) = best else { break };
+            if p == cur {
+                self.unlist(p, b, table);
+            } else {
+                // The other table's borrow must end before `unlist`
+                // borrows a third table to fix the moved entry, so the
+                // block is taken out through a short borrow of its own.
+                let tables = self.tables.borrow();
+                let mut held = tables[p].borrow_mut();
+                let Some(t) = held.as_mut() else { break };
+                if t.slots[b].is_none() {
+                    break;
+                }
+                let c = t.slots[b].take().expect("checked");
+                let bytes = c.bytes();
+                self.cache_bytes.set(self.cache_bytes.get() - bytes);
+                let at = std::mem::replace(&mut t.listed[b], u32::MAX);
+                drop(held);
+                if at != u32::MAX {
+                    let mut built = self.built.borrow_mut();
+                    let last = built.pop().expect("a listed block is in the list");
+                    if (at as usize) < built.len() {
+                        built[at as usize] = last;
+                        let (lp, lb) = (last.0 as usize, last.1 as usize);
+                        if lp == cur {
+                            table.listed[lb] = at;
+                        } else if let Some(t) = self.tables.borrow()[lp].borrow_mut().as_mut() {
+                            t.listed[lb] = at;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// PROTOTYPE: the writes since the last scan on the block path, settled:
+    /// each distinct key's block dropped from the cache, and a key created
+    /// since the snapshot filed under its block when its partition has a
+    /// table. The keys are sorted by arena offset so a key written many
+    /// times costs one seek, the created one's record first so the flag
+    /// survives the fold.
+    fn settle_pending(&self) -> Result<()> {
+        let mut pending = std::mem::take(&mut *self.pending.borrow_mut());
+        if pending.is_empty() {
+            return Ok(());
+        }
+        pending.sort_unstable_by_key(|&(off, _, new)| (off, !new));
+        // A write that could not be settled leaves the block it landed in
+        // stale, so an error drops every table rather than leave one.
+        let settled = self.settle_each(&pending);
+        if settled.is_err() {
+            self.drop_blocks();
+        }
+        pending.clear();
+        *self.pending.borrow_mut() = pending;
+        settled
+    }
+
+    fn settle_each(&self, pending: &[(u32, u32, bool)]) -> Result<()> {
+        let np = self.segs().partition_point(|s| s.level > 0);
+        let mut last = u32::MAX;
+        for &(off, len, new) in pending {
+            if off == last {
+                continue;
+            }
+            last = off;
+            let key = self.mem().key_at(off, len);
+            let at = self.segs()[..np]
+                .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+            let Some(seg) = self.segs()[..np].get(at) else {
+                continue;
+            };
+            if seg.blob.keys() == 0 {
+                continue;
+            }
+            let tables = self.tables.borrow();
+            let mut held = tables[at].borrow_mut();
+            let Some(table) = held.as_mut() else {
+                continue;
+            };
+            let (b, cut) = BuildCtx::owner_of(seg, key);
+            if b < table.slots.len() {
+                self.patch_block(at, b, table, key, cut)?;
+            }
+            if new {
+                if let (Some(slot), Some(list)) = (self.mem().slot_of(key), table.added.get_mut(b))
+                {
+                    list.push((slot as u32, cut));
+                    table.filed += 1;
+                }
+            }
+            // Only a build chooses the wide form, and a patched block is
+            // never rebuilt: past the bound, the block is dropped so the
+            // next scan builds it wide, as the drop-and-rebuild did.
+            if b < table.slots.len()
+                && BuildCtx::overlay_count(table, b) > WIDE
+                && !matches!(table.slots[b], Some(Cached::Wide(_)))
+            {
+                self.unlist(at, b, table);
+            }
+        }
+        Ok(())
+    }
+
+    /// PROTOTYPE: a write settled into the block it landed in, in place:
+    /// the key's run as a build would resolve it -- the partition's values
+    /// for an equal key, then the pieces' and the memtables', a tombstone
+    /// masking everything older -- spliced into whatever form the block
+    /// holds, a clean block becoming sparse. Before this the block was
+    /// dropped and rebuilt at the next scan that crossed it, a copy at 68
+    /// µs at thirty million keys, so a mix that updates and scans the same
+    /// keys rebuilt its hot blocks per write. A replaced run's bytes stay
+    /// in the block until they outweigh the live ones, when the block is
+    /// dropped instead. A wide block holds no values and is left alone; an
+    /// unbuilt one has nothing to patch.
+    fn patch_block(
+        &self,
+        at: usize,
+        b: usize,
+        table: &mut BlockTable,
+        key: &[u8],
+        cut: u32,
+    ) -> Result<()> {
+        if matches!(table.slots[b], None | Some(Cached::Wide(_))) {
+            return Ok(());
+        }
+        let np = self.segs().partition_point(|s| s.level > 0);
+        let seg = &self.segs()[at];
+        let l0 = &self.segs()[np..];
+        let src = Sources { seg, l0 };
+        let keys = seg.blob.keys();
+        let lo = b * CACHE_BLOCK;
+        let hi = ((b + 1) * CACHE_BLOCK).min(keys);
+        let mut held: Vec<(&[u8], usize, usize, u32)> = Vec::new();
+        for &(j, _) in &table.pieces {
+            let p = &l0[j];
+            let r = p.ord.seek(key, |i| p.blob.key_at(i));
+            if r < p.blob.keys() && p.blob.key_at(r) == Some(key) {
+                held.push((key, j, r, u32::MAX));
+            }
+        }
+        let slot_in = |t: &MemTable| t.slot_of(key).map_or(u32::MAX, |i| i as u32);
+        let sk = SnapKey {
+            off: 0,
+            len: 0,
+            mem: slot_in(self.mem()),
+            frozen: self.frozen().as_ref().map_or(u32::MAX, |fr| slot_in(fr)),
+        };
+        let ov = Overlay {
+            over: vec![Over {
+                key,
+                sk: Some(sk),
+                cut,
+                pieces: 0..held.len() as u32,
+            }],
+            held,
+        };
+        let (c, at_eq) = BuildCtx::cut_known(cut, lo, hi);
+        let same = c < hi && at_eq == Ordering::Equal;
+        let mut em = Emit {
+            tombs: self.has_tombstones(),
+            scratch: Vec::new(),
+        };
+        let mut run: Vec<u8> = Vec::new();
+        self.build_ctx().emit_over(
+            &mut |_, v: &[u8]| {
+                run.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                run.extend_from_slice(v);
+            },
+            &mut em,
+            &ov,
+            0,
+            same.then_some(c),
+            src,
+        )?;
+        let before = table.slots[b].as_ref().map_or(0, |c| c.bytes());
+        let was_clean = matches!(table.slots[b], Some(Cached::Clean));
+        let mut bloated = false;
+        match table.slots[b].as_mut().expect("checked above") {
+            Cached::Block(blk) => {
+                let i = blk.lower_bound(key);
+                let at_run = blk.vals.len() as u32;
+                blk.vals.extend_from_slice(&run);
+                if i < blk.ents.len() && blk.key(&blk.ents[i]) == key {
+                    blk.ents[i][2] = at_run;
+                    blk.ents[i][3] = run.len() as u32;
+                } else {
+                    let key_at = blk.keys.len() as u32;
+                    blk.keys.extend_from_slice(key);
+                    blk.ents
+                        .insert(i, [key_at, key.len() as u32, at_run, run.len() as u32]);
+                }
+                let live: usize = blk.ents.iter().map(|e| e[3] as usize).sum();
+                bloated = blk.vals.len() > 2 * live.max(4096);
+            }
+            Cached::Sparse(sb) => {
+                let i = sb.ents.partition_point(|e| sb.key(e) < key);
+                let at_run = sb.vals.len() as u32;
+                sb.vals.extend_from_slice(&run);
+                if i < sb.ents.len() && sb.key(&sb.ents[i]) == key {
+                    sb.ents[i].run = (at_run, run.len() as u32);
+                } else {
+                    let key_at = sb.keys.len() as u32;
+                    sb.keys.extend_from_slice(key);
+                    sb.ents.insert(
+                        i,
+                        DeltaEnt {
+                            key: (key_at, key.len() as u32),
+                            cut: c as u32,
+                            same,
+                            run: (at_run, run.len() as u32),
+                        },
+                    );
+                }
+                let live: usize = sb.ents.iter().map(|e| e.run.1 as usize).sum();
+                bloated = sb.vals.len() > 2 * live.max(4096);
+            }
+            slot @ Cached::Clean => {
+                *slot = Cached::Sparse(SparseBlock {
+                    keys: key.to_vec(),
+                    ents: vec![DeltaEnt {
+                        key: (0, key.len() as u32),
+                        cut: c as u32,
+                        same,
+                        run: (0, run.len() as u32),
+                    }],
+                    vals: run,
+                });
+            }
+            Cached::Wide(_) => unreachable!("a wide block is left alone above"),
+        }
+        if was_clean {
+            self.list_built(at, b, table);
+        } else {
+            let after = table.slots[b].as_ref().map_or(0, |c| c.bytes());
+            self.cache_bytes
+                .set(self.cache_bytes.get() + after - before);
+        }
+        if bloated {
+            self.unlist(at, b, table);
+        }
+        Ok(())
+    }
+
+    /// PROTOTYPE: bookkeeping after a memtable write, when the block cache
+    /// is on: a rehash renumbers every slot the snapshot and the lists
+    /// hold, a created key joins the list of keys since the snapshot, and
+    /// while any partition has a table the key joins the writes the next
+    /// scan settles.
+    /// PROTOTYPE: a partition's table, made on its first touch: every
+    /// level-0 piece meeting its range walked once against its block
+    /// boundaries, the snapshot walked once, and the keys created since
+    /// the snapshot filed by block. Before this every block's build
+    /// seeked each of those sources from scratch: on one store of three
+    /// million keys, three microseconds of a seven microsecond build.
+    fn make_table(
+        &self,
+        seg: &Seg,
+        l0: &[std::sync::Arc<Seg>],
+        unsealed: &Snapshot,
+    ) -> Result<BlockTable> {
+        let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
+        let ctx = self.build_ctx();
+        ctx.rank_pieces()?;
+        let (pieces, snap_at) = ctx.table_bounds(seg, l0, unsealed)?;
+        let mut added: Vec<Vec<(u32, u32)>> = (0..nblocks).map(|_| Vec::new()).collect();
+        if nblocks > 0 {
+            for &slot in self.snap_added.borrow().iter() {
+                let key = self.mem().key_of(self.mem().entry(slot as usize));
+                if seg.below_lo(key) || seg.hi.as_ref().is_some_and(|h| key >= h.as_slice()) {
+                    continue;
+                }
+                let (b, cut) = BuildCtx::owner_of(seg, key);
+                added[b].push((slot, cut));
+            }
+        }
+        let filed = added.iter().map(Vec::len).sum();
+        Ok(BlockTable {
+            slots: (0..nblocks).map(|_| None).collect(),
+            touched: vec![0; nblocks],
+            listed: vec![u32::MAX; nblocks],
+            pieces,
+            snap_at,
+            snap_gen: self.snap_gen.get(),
+            added,
+            filed,
+        })
+    }
+
+    /// PROTOTYPE: the scan over partitions and everything above them,
+    /// block by block: a cached copy is walked, a clean block is walked in
+    /// the partition, a sparse one with its deltas, and a block not yet
+    /// seen is built first.
+    fn scan_blocks<F: FnMut(&[u8], &[u8])>(
+        &self,
+        from: &[u8],
+        limit: usize,
+        unsealed: &Snapshot,
+        mut f: F,
+    ) -> Result<usize> {
+        let np = self.segs().partition_point(|s| s.level > 0);
+        let l0 = &self.segs()[np..];
+        let tick = self.scan_tick.get().wrapping_add(1);
+        self.scan_tick.set(tick);
+        self.install_ahead(unsealed)?;
+        // One context for the scan: its tombstone flag is a walk over every
+        // segment, which a context per block paid on every sparse walk.
+        let ctx = self.build_ctx();
+        let mut seen = 0usize;
+        let mut cursor: &[u8] = from;
+        // The partitions tile the key space in order, so the first that
+        // may reach the start is found by binary search and every one
+        // after it may; filtering each in turn was a fence compare per
+        // partition below the start, on every scan.
+        let first = self.first_reaching(np, from);
+        for (pi, seg) in self.segs()[..np].iter().enumerate().skip(first) {
+            if seen >= limit {
+                break;
+            }
+            let src = Sources { seg, l0 };
+            cursor = seg.cursor_from(cursor);
+            let keys = seg.blob.keys();
+            if keys == 0 {
+                match &seg.hi {
+                    Some(h) => {
+                        cursor = h.as_slice();
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            let rank = seg.ord.seek(cursor, |r| seg.blob.key_at(r));
+            let owner = if rank < keys && seg.blob.key_at(rank) == Some(cursor) {
+                rank
+            } else {
+                rank.saturating_sub(1)
+            };
+            let nblocks = keys.div_ceil(CACHE_BLOCK);
+            let tables = self.tables.borrow();
+            let mut held = tables[pi].borrow_mut();
+            if held.is_none() {
+                *held = Some(self.make_table(seg, l0, unsealed)?);
+                self.cache_used.set(true);
+            }
+            let table = held.as_mut().expect("just made");
+            if table.snap_gen != self.snap_gen.get() {
+                table.snap_at = BuildCtx::snap_bounds(seg, nblocks, unsealed)?;
+                table.snap_gen = self.snap_gen.get();
+            }
+            if table.clean_throughout() {
+                // The suite's scan workload, and any store between a flush
+                // and its next write: one walk from the seek, as the bulk
+                // walk makes it. Measured through the blocks it was a
+                // tenth slower, in first touches and bookkeeping.
+                if rank < keys {
+                    let want = (keys - rank).min(limit - seen);
+                    let got = seg
+                        .blob
+                        .scan_at(rank, want, &mut f)
+                        .map_err(|e| err(&format!("segment scan: {e}")))?;
+                    if got < want {
+                        return Err(err(
+                            "segment scan: a partition's walk stopped short of its key count",
+                        ));
+                    }
+                    seen += got;
+                }
+                match &seg.hi {
+                    Some(h) => {
+                        cursor = h.as_slice();
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            let mut b = owner / CACHE_BLOCK;
+            let mut first = true;
+            while seen < limit && b < nblocks {
+                let lo = b * CACHE_BLOCK;
+                let hi = ((b + 1) * CACHE_BLOCK).min(keys);
+                let start = if first { rank.max(lo) } else { lo };
+                let from_key: &[u8] = if first { cursor } else { b"" };
+                if table.slots[b].is_none() {
+                    let built = ctx.materialize(src, table, b, unsealed)?;
+                    table.slots[b] = Some(built);
+                    self.list_built(pi, b, table);
+                    self.shed(pi, b, table);
+                }
+                table.touched[b] = tick;
+                if let Some(Cached::Wide(w)) = table.slots[b].as_mut() {
+                    // Filed since the order was made: sorted and merged in.
+                    let filed = &table.added[b];
+                    if filed.len() > w.seen {
+                        let fresh = ctx.sorted_filed(&filed[w.seen..]);
+                        let key_of = |slot: u32| self.mem().key_of(self.mem().entry(slot as usize));
+                        let mut merged = Vec::with_capacity(w.sorted.len() + fresh.len());
+                        let (mut i, mut j) = (0usize, 0usize);
+                        while i < w.sorted.len() || j < fresh.len() {
+                            let take_old = j >= fresh.len()
+                                || (i < w.sorted.len()
+                                    && key_of(w.sorted[i].0) <= key_of(fresh[j].0));
+                            if take_old {
+                                merged.push(w.sorted[i]);
+                                i += 1;
+                            } else {
+                                merged.push(fresh[j]);
+                                j += 1;
+                            }
+                        }
+                        let grew = (merged.len() - w.sorted.len()) * 8;
+                        w.sorted = merged;
+                        w.seen = filed.len();
+                        self.cache_bytes.set(self.cache_bytes.get() + grew);
+                    }
+                }
+                // This block's cold lines, and the next block's when the
+                // scan will cross into it, fetched while this one walks.
+                let ahead = limit - seen;
+                prefetch_block(&seg.blob, table, b, start, ahead);
+                if hi - start < ahead && b + 1 < nblocks {
+                    prefetch_block(&seg.blob, table, b + 1, hi, ahead - (hi - start));
+                }
+                match table.slots[b].as_ref().expect("just built") {
+                    Cached::Sparse(deltas) => {
+                        seen += ctx.walk_deltas(
+                            src,
+                            start..hi,
+                            deltas,
+                            from_key,
+                            limit - seen,
+                            &mut f,
+                        )?;
+                    }
+                    Cached::Clean => {
+                        // Every clean block built after this one joins the
+                        // run: on a store with nothing unsealed, a scan of
+                        // a hundred entries is one walk, as the bulk walk
+                        // makes it, not three block-sized ones.
+                        let mut run_hi = hi;
+                        while b + 1 < nblocks
+                            && run_hi - start < limit - seen
+                            && matches!(table.slots[b + 1], Some(Cached::Clean))
+                        {
+                            b += 1;
+                            table.touched[b] = tick;
+                            run_hi = ((b + 1) * CACHE_BLOCK).min(keys);
+                        }
+                        if start < run_hi {
+                            let want = (run_hi - start).min(limit - seen);
+                            let got = seg
+                                .blob
+                                .scan_at(start, want, &mut f)
+                                .map_err(|e| err(&format!("segment scan: {e}")))?;
+                            if got < want {
+                                return Err(err("segment scan: a partition's walk stopped short of its key count"));
+                            }
+                            seen += got;
+                        }
+                    }
+                    Cached::Block(blk) => {
+                        let i = if first { blk.lower_bound(cursor) } else { 0 };
+                        for e in &blk.ents[i..] {
+                            if seen >= limit {
+                                break;
+                            }
+                            let k = blk.key(e);
+                            blk.each_value(e, |v| f(k, v));
+                            seen += 1;
+                        }
+                    }
+                    Cached::Wide(w) => {
+                        let window = (from_key, limit - seen);
+                        let ov = ctx.overlay_window(src, table, b, unsealed, w, window)?;
+                        seen +=
+                            ctx.walk_block(src, start..hi, &ov, limit - seen, |_k| {}, &mut f)?;
+                    }
+                }
+                b += 1;
+                first = false;
+            }
+            match &seg.hi {
+                Some(h) => cursor = h.as_slice(),
+                None => break,
+            }
+        }
+        Ok(seen)
+    }
+
+    /// PROTOTYPE: the cache's size, for a measurement: blocks held and
+    /// bytes of keys and values in them.
+    pub fn block_cache_size(&self) -> (usize, usize) {
+        let (mut clean, mut sparse, mut copies, mut wide, mut bytes) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
+        for t in self.tables.borrow().iter() {
+            for c in t.borrow().iter().flat_map(|t| t.slots.iter()).flatten() {
+                match c {
+                    Cached::Clean => clean += 1,
+                    Cached::Sparse(b) => {
+                        sparse += 1;
+                        bytes += b.keys.len() + b.ents.len() * 24 + b.vals.len();
+                    }
+                    Cached::Block(b) => {
+                        copies += 1;
+                        bytes += b.keys.len() + b.vals.len() + b.ents.len() * 16;
+                    }
+                    Cached::Wide(w) => {
+                        wide += 1;
+                        bytes += w.sorted.len() * 8;
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "  cache: {clean} clean, {sparse} sparse, {copies} copies, {wide} wide; {bytes} B walked, {} B counted",
+            self.cache_bytes.get()
+        );
+        (clean + sparse + copies + wide, bytes)
+    }
+
+    /// PROTOTYPE: the bytes the cache counts itself holding, for a test
+    /// to hold against a walk of it.
+    pub fn block_cache_bytes(&self) -> usize {
+        self.cache_bytes.get()
+    }
+
+    /// PROTOTYPE: the most bytes any one built block holds, the slack a
+    /// budget allows since the block in hand is never shed.
+    pub fn block_cache_largest(&self) -> usize {
+        self.tables
+            .borrow()
+            .iter()
+            .map(|t| {
+                t.borrow().as_ref().map_or(0, |t| {
+                    t.slots
+                        .iter()
+                        .flatten()
+                        .map(|c| c.bytes())
+                        .max()
+                        .unwrap_or(0)
+                })
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// PROTOTYPE: how many blocks the cache holds as wide, for a test to
+    /// hold the count that makes one to its definition.
+    pub fn block_cache_wide(&self) -> usize {
+        self.tables
+            .borrow()
+            .iter()
+            .map(|t| {
+                t.borrow().as_ref().map_or(0, |t| {
+                    t.slots
+                        .iter()
+                        .flatten()
+                        .filter(|c| matches!(c, Cached::Wide(_)))
+                        .count()
+                })
+            })
+            .sum()
+    }
+
+    /// The partitions walked in bulk, with the unsealed keys laid over them.
+    ///
+    /// The caller has checked there is no level-0 piece, so the sources are
+    /// the partitions, which tile the key space in order, and the two
+    /// memtables, whose keys `unsealed` holds as one sorted array. Each
+    /// partition is walked by `Blob::scan_at` -- one record decode an entry
+    /// -- up to the next unsealed key that falls inside the walk. That key
+    /// is then emitted as `scan_merged` would emit it, and the walk resumes
+    /// after it. Unsealed keys beyond the last partition come out at the
+    /// end, in order.
+    ///
+    /// Before this, the bulk walk ran only when no unsealed key was at or
+    /// after `from`. YCSB's inserts land past the end of the loaded range,
+    /// so after the first one every scan failed that test for keys it never
+    /// reached and paid the merge: on one store in one process, a 5% insert
+    /// past the end with no seal cost 100-entry scans 2.8x, and a flush gave
+    /// it back.
+    ///
+    /// Whether the next unsealed key cuts a walk is decided by one key read,
+    /// the last key the walk would reach, and only when it does is its rank
+    /// found -- by a binary search over the walk's window, not the ordered
+    /// index over the whole partition. A scan that meets no unsealed key
+    /// pays one key read a partition for the question.
+    fn scan_partitions<F: FnMut(&[u8], &[u8])>(
+        &self,
+        from: &[u8],
+        limit: usize,
+        mut mc: SnapCursor,
+        unsealed: &Snapshot,
+        mut f: F,
+    ) -> Result<usize> {
+        // `sort_segs` orders by level descending then by `lo`, and this
+        // runs only when every segment is a partition, so they are already
+        // in key order here. Collecting them into a `Vec` to sort them
+        // again repeated work the store had done -- and the collect, the
+        // sort and the three `Vec` clones around the cursor measured 391ns
+        // of a 648ns seek, six times what the ordered index saved. A scan
+        // is a read; it allocates nothing until a memtable chain is walked.
+        debug_assert!(
+            self.segs()
+                .windows(2)
+                .all(|w| w[0].level != w[1].level || w[0].lo <= w[1].lo),
+            "partitions are not in key order, so this walk would skip one"
+        );
+        // Whether any source holds a tombstone is asked of every segment,
+        // and only an emitted unsealed key needs the answer, so a scan that
+        // meets none never asks.
+        let mut tombs: Option<bool> = None;
+        let mut scratch: Vec<usize> = Vec::new();
+        let mut seen = 0usize;
+        let mut cursor: &[u8] = from;
+        // Every segment is a partition here, and the first that may reach
+        // the start is found by binary search; see `first_reaching`.
+        let first = self.first_reaching(self.segs().len(), from);
+        for seg in &self.segs()[first..] {
+            if seen >= limit {
+                break;
+            }
+            cursor = seg.cursor_from(cursor);
+            let keys = seg.blob.keys();
+            // The ordered index answers the seek this partition starts
+            // with; the walk after it is the reader's own. That split is
+            // the whole point of the index -- the seek was the entire
+            // measured deficit and the walk was already competitive.
+            let mut rank = seg.ord.seek(cursor, |r| seg.blob.key_at(r));
+            while seen < limit {
+                // The walk reaches the limit or the partition's end, cut
+                // where the next unsealed key falls inside it. A rank that
+                // does not resolve sorts as "not less", the rule the seek
+                // uses, so damage widens the cut rather than moving it.
+                let end = rank.saturating_add(limit - seen).min(keys);
+                let next = unsealed.peek(mc);
+                let (bound, at_bound) = match next {
+                    Some((uk, _)) if end > rank => BuildCtx::cut_at(seg, rank, end, uk),
+                    _ => (end, Ordering::Greater),
+                };
+                if bound > rank {
+                    let got = seg
+                        .blob
+                        .scan_at(rank, bound - rank, &mut f)
+                        .map_err(|e| err(&format!("segment scan: {e}")))?;
+                    if got < bound - rank {
+                        // A rank below the key count that the walk could
+                        // not resolve. The seek above would have widened
+                        // past it; the walk cannot, and saying nothing
+                        // would drop every key after it.
+                        return Err(err(
+                            "segment scan: a partition's walk stopped short of its key count",
+                        ));
+                    }
+                    seen += got;
+                    rank += got;
+                    if seen >= limit {
+                        break;
+                    }
+                }
+                // The walk stands at the unsealed key's cut, or at the end
+                // of this partition's keys. The partition's own key is
+                // below its fence by construction, so only another key is
+                // asked whether it belongs past the fence, to the next
+                // partition, or past the last partition's last key, to the
+                // tail below.
+                let Some((uk, sk)) = next else { break };
+                let same = rank < keys && at_bound == Ordering::Equal;
+                if !same {
+                    if seg.hi.as_ref().is_some_and(|h| uk >= h.as_slice()) {
+                        break;
+                    }
+                    if rank >= keys && seg.hi.is_none() {
+                        break;
+                    }
+                }
+                let tombs = *tombs.get_or_insert_with(|| self.has_tombstones());
+                self.emit_unsealed(
+                    &mut f,
+                    &mut scratch,
+                    tombs,
+                    uk,
+                    &sk,
+                    same.then_some((seg, rank)),
+                )?;
+                if same {
+                    rank += 1;
+                }
+                unsealed.advance(&mut mc);
+                seen += 1;
+            }
+            match &seg.hi {
+                Some(h) => cursor = h.as_slice(),
+                None => break,
+            }
+        }
+        // Unsealed keys after every partition, in order.
+        while seen < limit {
+            let Some((uk, sk)) = unsealed.peek(mc) else {
+                break;
+            };
+            let tombs = *tombs.get_or_insert_with(|| self.has_tombstones());
+            self.emit_unsealed(&mut f, &mut scratch, tombs, uk, &sk, None)?;
+            unsealed.advance(&mut mc);
+            seen += 1;
+        }
+        Ok(seen)
+    }
+
+    /// One unsealed key, emitted as `scan_merged` emits it with no level-0
+    /// piece in the way: the partition's values first when `part` names an
+    /// equal key, then the frozen memtable's, then the live one's, each
+    /// older source cut by a tombstone in a newer. Sources are numbered
+    /// partition 0, frozen 1, live 2; `start` is the oldest one whose
+    /// values are live.
+    fn emit_unsealed<F: FnMut(&[u8], &[u8])>(
+        &self,
+        f: &mut F,
+        scratch: &mut Vec<usize>,
+        tombs: bool,
+        key: &[u8],
+        sk: &SnapKey,
+        part: Option<(&Seg, usize)>,
+    ) -> Result<()> {
+        let mut start = 0usize;
+        if tombs {
+            if sk.mem != u32::MAX
+                && self
+                    .mem()
+                    .has_tomb(self.mem().entry(sk.mem as usize), self.wm())
+            {
+                start = 2;
+            } else if sk.frozen != u32::MAX
+                && self
+                    .frozen()
+                    .as_ref()
+                    .is_some_and(|fr| fr.has_tomb(fr.entry(sk.frozen as usize), SEE_ALL))
+            {
+                start = 1;
+            }
+        }
+        if start == 0 {
+            if let Some((seg, rank)) = part {
+                seg.blob
+                    .values_at(rank, |v| f(key, v))
+                    .map_err(|e| err(&format!("segment scan read: {e}")))?;
+            }
+        }
+        if sk.frozen != u32::MAX && start <= 1 {
+            if let Some(fr) = self.frozen() {
+                let e = fr.entry(sk.frozen as usize);
+                fr.live_offs_into(e, scratch, SEE_ALL);
+                for &off in scratch.iter() {
+                    f(key, fr.value_at(off));
+                }
+            }
+        }
+        if sk.mem != u32::MAX {
+            let e = self.mem().entry(sk.mem as usize);
+            self.mem().live_offs_into(e, scratch, self.wm());
+            for &off in scratch.iter() {
+                f(key, self.mem().value_at(off));
+            }
+        }
+        Ok(())
+    }
+
+    /// The merge over unrouted sources, the `scan_merge` arm: one cursor walking the
+    /// disjoint partitions in order, one cursor per level-0 segment, and the
+    /// unsealed snapshot with each key's entries in hand. Every cursor's key
+    /// is resolved once per emitted key. Sources are ordered oldest to
+    /// newest -- the partition, level 0 oldest first, the frozen memtable,
+    /// the live one -- and a tombstone in the newest source that holds the
+    /// key cuts everything older, as in `read_all`.
+    fn scan_merged<F: FnMut(&[u8], &[u8])>(
+        &self,
+        from: &[u8],
+        limit: usize,
+        mut mc: SnapCursor,
+        unsealed: &Snapshot,
+        mut f: F,
+    ) -> Result<usize> {
+        let np = self.segs().partition_point(|s| s.level > 0);
+        let parts = &self.segs()[..np];
+        struct Cur<'a> {
+            seg: &'a Seg,
+            rank: usize,
+            key: Option<&'a [u8]>,
+        }
+        // The level-0 cursors. With every piece aligned to a partition
+        // they are the pieces over the range the walk is in, seeked to
+        // its start there and re-seeked when it crosses into the next
+        // range; a range is left once its partition and its pieces are
+        // both exhausted, since a piece can hold keys above its
+        // partition's last. Otherwise, every piece that may reach the
+        // start, seeked once, and the walk of every key over every one:
+        // what every scan did, and paid a cursor per piece in the store
+        // at the seek and a compare per piece per key.
+        let routed = self.state().l0_aligned;
+        let seek_l0 = |pi: usize, from: &[u8]| -> Vec<Cur> {
+            let pieces = if routed {
+                self.pieces_over(np, pi)
+            } else {
+                &self.segs()[np..]
+            };
+            pieces
+                .iter()
+                .filter(|s| s.may_reach(from))
+                .map(|s| {
+                    let rank = s.ord.seek(s.cursor_from(from), |r| s.blob.key_at(r));
+                    Cur {
+                        seg: s,
+                        rank,
+                        key: s.blob.key_at(rank),
+                    }
+                })
+                .collect()
+        };
+        // The partition cursor: the first partition whose fence can reach
+        // `from`, then each following one from its first key.
+        let mut pi = self.first_reaching(np, from);
+        let mut prank = 0usize;
+        let mut pkey: Option<&[u8]> = None;
+        while pi < np {
+            let s = &parts[pi];
+            prank = s.ord.seek(s.cursor_from(from), |r| s.blob.key_at(r));
+            pkey = s.blob.key_at(prank);
+            if pkey.is_some() || routed {
+                break;
+            }
+            pi += 1;
+        }
+        let mut l0: Vec<Cur> = seek_l0(pi.min(np), from);
+        let tombs = self.has_tombstones();
+        let mut scratch: Vec<usize> = Vec::new();
+        let mut seen = 0usize;
+        while seen < limit {
+            if routed {
+                while pkey.is_none() && l0.iter().all(|c| c.key.is_none()) && pi + 1 < np {
+                    pi += 1;
+                    prank = 0;
+                    pkey = parts[pi].blob.key_at(0);
+                    l0 = seek_l0(pi, parts[pi].lo.as_slice());
+                }
+            }
+            let nc = l0.len();
+            let mut next: Option<&[u8]> = pkey;
+            for c in &l0 {
+                if let Some(k) = c.key {
+                    if next.is_none_or(|n| k < n) {
+                        next = Some(k);
+                    }
+                }
+            }
+            let snap = unsealed.peek(mc);
+            if let Some((k, _)) = snap {
+                if next.is_none_or(|n| k < n) {
+                    next = Some(k);
+                }
+            }
+            let Some(key) = next else { break };
+            let in_unsealed = snap.is_some_and(|(k, _)| k == key);
+            let snap = snap.map(|(_, sk)| sk);
+
+            // Source indices: partition 0, level 0 at 1..=nc, frozen nc+1,
+            // live nc+2. `start` is the oldest source whose values are live.
+            let mut start = 0usize;
+            if tombs {
+                if let Some(sk) = snap.filter(|_| in_unsealed) {
+                    if sk.mem != u32::MAX
+                        && self
+                            .mem()
+                            .has_tomb(self.mem().entry(sk.mem as usize), self.wm())
+                    {
+                        start = nc + 2;
+                    } else if sk.frozen != u32::MAX
+                        && self
+                            .frozen()
+                            .as_ref()
+                            .is_some_and(|fr| fr.has_tomb(fr.entry(sk.frozen as usize), SEE_ALL))
+                    {
+                        start = nc + 1;
+                    }
+                }
+                if start == 0 {
+                    for (j, c) in l0.iter().enumerate().rev() {
+                        if c.seg.tombs && c.key == Some(key) {
+                            if let Some((_, exts)) = c.seg.blob.exts_at(c.rank) {
+                                if exts.iter().any(|e| e.is_tombstone()) {
+                                    start = j + 1;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if pkey == Some(key) {
+                if start == 0 {
+                    parts[pi]
+                        .blob
+                        .values_at(prank, |v| f(key, v))
+                        .map_err(|e| err(&format!("segment scan read: {e}")))?;
+                }
+                prank += 1;
+                pkey = parts[pi].blob.key_at(prank);
+                while !routed && pkey.is_none() && pi + 1 < np {
+                    pi += 1;
+                    prank = 0;
+                    pkey = parts[pi].blob.key_at(0);
+                }
+            }
+            for (j, c) in l0.iter_mut().enumerate() {
+                if c.key == Some(key) {
+                    if j + 1 >= start {
+                        c.seg
+                            .blob
+                            .values_at(c.rank, |v| f(key, v))
+                            .map_err(|e| err(&format!("segment scan read: {e}")))?;
+                    }
+                    c.rank += 1;
+                    c.key = c.seg.blob.key_at(c.rank);
+                }
+            }
+            if let Some(sk) = snap.filter(|_| in_unsealed) {
+                if sk.frozen != u32::MAX && nc + 1 >= start {
+                    if let Some(fr) = self.frozen() {
+                        let e = fr.entry(sk.frozen as usize);
+                        fr.live_offs_into(e, &mut scratch, SEE_ALL);
+                        for &off in &scratch {
+                            f(key, fr.value_at(off));
+                        }
+                    }
+                }
+                if sk.mem != u32::MAX && nc + 2 >= start {
+                    let e = self.mem().entry(sk.mem as usize);
+                    self.mem().live_offs_into(e, &mut scratch, self.wm());
+                    for &off in &scratch {
+                        f(key, self.mem().value_at(off));
+                    }
+                }
+                unsealed.advance(&mut mc);
+            }
+            seen += 1;
+        }
+        Ok(seen)
+    }
+
+    /// Values of `key` across every source. O(extents) per segment touched:
+    /// each extent carries its record count (`Ext::count`, format v5), so no
+    /// block is read. The memtable keeps a live count per key.
+    pub fn count(&self, key: &[u8]) -> Result<u64> {
+        let _entered = self.enter();
+        // A count resolves one key, so it is a point read for advice
+        // purposes even though it returns no bytes (`F28`: 94 ns, a lookup).
+        self.advise(true);
+        let hash = self.mem().prefetch(key);
+        let np = self.segs().partition_point(|s| s.level > 0);
+        let at = self.segs()[..np]
+            .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+        let part = self.segs()[..np].get(at).filter(|s| s.may_hold(key));
+        let l0 = self.pieces_over(np, at);
+        let (fr_ix, mem_ix) = (1 + l0.len(), 2 + l0.len());
+        let mut start = 0usize;
+        if self.has_tombstones() {
+            if !self.mem().is_empty() {
+                if let Some(e) = self.mem().get_with(hash, key) {
+                    if self.mem().has_tomb(e, self.wm()) {
+                        start = mem_ix;
+                    }
+                }
+            }
+            if start == 0 {
+                if let Some(fr) = self.frozen() {
+                    if let Some(e) = fr.get(key) {
+                        if fr.has_tomb(e, SEE_ALL) {
+                            start = fr_ix;
+                        }
+                    }
+                }
+            }
+            if start == 0 {
+                for (i, seg) in l0.iter().enumerate().rev() {
+                    if !seg.tombs || !seg.may_hold(key) {
+                        continue;
+                    }
+                    if let Some(exts) = seg.blob.lookup(key) {
+                        if exts.iter().any(|e| e.is_tombstone()) {
+                            start = 1 + i;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let mut n = 0u64;
+        if start == 0 {
+            if let Some(seg) = part {
+                n += seg
+                    .blob
+                    .count(key)
+                    .map_err(|e| err(&format!("segment count: {e}")))?;
+            }
+        }
+        for (i, seg) in l0.iter().enumerate() {
+            if 1 + i < start || !seg.may_hold(key) {
+                continue;
+            }
+            n += seg
+                .blob
+                .count(key)
+                .map_err(|e| err(&format!("segment count: {e}")))?;
+        }
+        if fr_ix >= start {
+            if let Some(fr) = self.frozen() {
+                if let Some(e) = fr.get(key) {
+                    n += e.count.load(AtomicOrdering::Relaxed);
+                }
+            }
+        }
+        if mem_ix >= start && !self.mem().is_empty() {
+            if let Some(e) = self.mem().get_with(hash, key) {
+                n += self.mem().live_chain(e, self.wm()).0.len() as u64;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Keys held by the unsealed sources: the live memtable and, while a
+    /// seal is in flight, the frozen one. A key in both counts twice.
+    pub fn unsealed_keys(&self) -> usize {
+        let _entered = self.enter();
+        self.mem().len() + self.frozen().as_ref().map_or(0, |f| f.len())
+    }
+
+    /// Live segment count by level: (partitioned, L0). The compaction
+    /// experiment reports both, because "how many segments does a read
+    /// touch" is the whole question.
+    pub fn levels(&self) -> (usize, usize) {
+        let _entered = self.enter();
+        (self.segs().len() - self.l0_len(), self.l0_len())
+    }
+}
+
 impl Db {
     /// WAL files are numbered and rotate at each seal: the sealing thread
     /// owns the old file and deletes it once its segment is renamed into
@@ -4436,17 +6702,12 @@ impl Db {
             return;
         };
         let claimed = self
-            .segs
+            .segs()
             .iter()
             .any(|s| Db::ord_name_for(&s.name).as_deref() == Some(ord.as_str()));
         if !claimed {
             let _ = std::fs::remove_file(self.dir.join(&ord));
         }
-    }
-
-    /// The live set, in the order the manifest should record it.
-    fn live_names(&self) -> Vec<String> {
-        self.segs.iter().map(|s| s.name.clone()).collect()
     }
 
     fn segment_opts(opts: &Options) -> SegmentOptions {
@@ -4468,26 +6729,59 @@ impl Db {
             spare_wals.push(spare);
             File::open(dir)?.sync_all()?;
         }
-        Ok(Db {
-            dir: dir.to_path_buf(),
+        let segs: Vec<std::sync::Arc<Seg>> = Vec::new();
+        let mean_key_bytes = 0;
+        let store_bytes = 0;
+        let l0_aligned = false;
+        let state = State {
+            segs,
+            mem: std::sync::Arc::new(MemTable::new()),
+            frozen: None,
+            gen: 1,
+            mean_key_bytes,
+            store_bytes,
+            l0_aligned,
+        };
+        let shared = std::sync::Arc::new(Shared {
+            state: AtomicPtr::new(Box::into_raw(Box::new(state))),
+            readers: Readers::new(),
+            retired: std::sync::Mutex::new(Vec::new()),
+            advice_random: std::sync::atomic::AtomicBool::new(starts_random),
+        });
+        let r = Reader {
+            shared,
+            slot: None,
+            isolation: std::cell::Cell::new(Isolation::Dirty),
+            held: AtomicPtr::new(std::ptr::null_mut()),
+            wm: std::cell::Cell::new(SEE_ALL),
             opts,
+            tables: std::cell::RefCell::new(Vec::new()),
+            scan_keys: std::cell::RefCell::new(None),
+            cache_used: std::cell::Cell::new(false),
+            cache_bytes: std::cell::Cell::new(0),
+            scan_tick: std::cell::Cell::new(0),
+            shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
+            pending: std::cell::RefCell::new(Vec::new()),
+            built: std::cell::RefCell::new(Vec::new()),
+            snap_gen: std::cell::Cell::new(0),
+            snap_added: std::cell::RefCell::new(Vec::new()),
+            log_seen: std::cell::Cell::new(0),
+            log_gen: std::cell::Cell::new(0),
+            snap_entries: std::cell::Cell::new(0),
+            ahead: None,
+        };
+        Ok(Db {
+            r,
+            dir: dir.to_path_buf(),
             wal,
             wal_id: 0,
-            mem: std::sync::Arc::new(MemTable::new()),
-            readers: Readers::new(),
             mem_bytes: 0,
-            segs: Vec::new(),
-            advice_random: std::cell::Cell::new(starts_random),
-            mean_key_bytes: std::cell::Cell::new(0),
-            store_bytes: std::cell::Cell::new(0),
-            l0_aligned: false,
             direct: None,
             max_key: Vec::new(),
             run_scratch: Vec::new(),
             retiring_tmps: Vec::new(),
             pending_err: None,
             next_seg: 0,
-            frozen: None,
             sealing: None,
             compacting: None,
             unsynced: 0,
@@ -4495,17 +6789,6 @@ impl Db {
             retiring_wals: Vec::new(),
             spare_wals,
             covered_seq: 0,
-            scan_keys: std::cell::RefCell::new(None),
-            cache_used: std::cell::Cell::new(false),
-            cache_bytes: std::cell::Cell::new(0),
-            scan_tick: std::cell::Cell::new(0),
-            seg_gen: 0,
-            ahead: None,
-            shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
-            built: std::cell::RefCell::new(Vec::new()),
-            pending: std::cell::RefCell::new(Vec::new()),
-            snap_added: std::cell::RefCell::new(Vec::new()),
-            snap_gen: std::cell::Cell::new(0),
             seal_wait: SealWaits::default(),
             draining: false,
         })
@@ -4635,12 +6918,7 @@ impl Db {
                 opts.segment.checksums,
             )?);
         }
-        segs.sort_by(|a, b| {
-            b.level
-                .cmp(&a.level)
-                .then_with(|| a.lo.cmp(&b.lo))
-                .then_with(|| a.name.cmp(&b.name))
-        });
+        segs.sort_by(seg_order);
         let seg_ids: Vec<(u64, u64)> = live
             .iter()
             .filter_map(|n| Some((Db::name_id(n)?, Db::name_end_seq(n)?)))
@@ -4704,33 +6982,61 @@ impl Db {
         }
         let wal = Wal::open_append(&wal_path, wal_id, from)?;
         let next_seg = seg_ids.iter().map(|&(n, _)| n + 1).max().unwrap_or(0);
+        let segs: Vec<std::sync::Arc<Seg>> = segs.into_iter().map(std::sync::Arc::new).collect();
         let mean_key_bytes = Db::mean_key_bytes_of(&segs);
         let store_bytes = Db::store_bytes_of(dir, &segs);
         let l0_aligned = Db::l0_aligned_of(&segs);
         let max_key = Db::max_key_of(&segs, &mem);
-        Ok(Db {
-            dir: dir.to_path_buf(),
+        let ntables = segs.len();
+        let state = State {
+            segs,
+            mem: std::sync::Arc::new(mem),
+            frozen: None,
+            gen: 1,
+            mean_key_bytes,
+            store_bytes,
+            l0_aligned,
+        };
+        let shared = std::sync::Arc::new(Shared {
+            state: AtomicPtr::new(Box::into_raw(Box::new(state))),
+            readers,
+            retired: std::sync::Mutex::new(Vec::new()),
+            advice_random: std::sync::atomic::AtomicBool::new(starts_random),
+        });
+        let r = Reader {
+            shared,
+            slot: None,
+            isolation: std::cell::Cell::new(Isolation::Dirty),
+            held: AtomicPtr::new(std::ptr::null_mut()),
+            wm: std::cell::Cell::new(SEE_ALL),
             opts,
+            tables: std::cell::RefCell::new(Db::tables_for(ntables)),
+            scan_keys: std::cell::RefCell::new(None),
+            cache_used: std::cell::Cell::new(false),
+            cache_bytes: std::cell::Cell::new(0),
+            scan_tick: std::cell::Cell::new(0),
+            shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
+            pending: std::cell::RefCell::new(Vec::new()),
+            built: std::cell::RefCell::new(Vec::new()),
+            snap_gen: std::cell::Cell::new(0),
+            snap_added: std::cell::RefCell::new(Vec::new()),
+            log_seen: std::cell::Cell::new(0),
+            log_gen: std::cell::Cell::new(0),
+            snap_entries: std::cell::Cell::new(0),
+            ahead: None,
+        };
+        Ok(Db {
+            r,
+            dir: dir.to_path_buf(),
             wal,
             wal_id,
-            mem: std::sync::Arc::new(mem),
-            readers,
             mem_bytes,
-            segs,
-            // The same value the segments above were opened with, so the
-            // store's idea of its mode and the mappings' actual mode agree
-            // from the first read rather than from the first transition.
-            advice_random: std::cell::Cell::new(starts_random),
-            mean_key_bytes: std::cell::Cell::new(mean_key_bytes),
-            store_bytes: std::cell::Cell::new(store_bytes),
-            l0_aligned,
             direct: None,
             max_key,
             run_scratch: Vec::new(),
             retiring_tmps: Vec::new(),
             pending_err: None,
             next_seg,
-            frozen: None,
             sealing: None,
             compacting: None,
             unsynced: 0,
@@ -4738,17 +7044,6 @@ impl Db {
             retiring_wals: retiring,
             spare_wals,
             covered_seq: sealed,
-            scan_keys: std::cell::RefCell::new(None),
-            cache_used: std::cell::Cell::new(false),
-            cache_bytes: std::cell::Cell::new(0),
-            scan_tick: std::cell::Cell::new(0),
-            seg_gen: 0,
-            ahead: None,
-            shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
-            built: std::cell::RefCell::new(Vec::new()),
-            pending: std::cell::RefCell::new(Vec::new()),
-            snap_added: std::cell::RefCell::new(Vec::new()),
-            snap_gen: std::cell::Cell::new(0),
             seal_wait: SealWaits::default(),
             draining: false,
         })
@@ -4757,30 +7052,29 @@ impl Db {
     /// Buffered until `commit`; visible to this handle's reads immediately,
     /// which is the read-your-writes contract `Store::read_all` set.
     pub fn append(&mut self, key: &[u8], value: &[u8]) {
-        if self.mem.ordered || self.direct_can_open() {
+        if self.mem().ordered || self.direct_can_open() {
             if self.goes_direct(key, value) {
-                if !self.mem.ordered {
-                    self.mem = std::sync::Arc::new(MemTable::new_ordered());
+                if !self.mem().ordered {
+                    self.set_mem(std::sync::Arc::new(MemTable::new_ordered()));
                 }
                 self.max_key.clear();
                 self.max_key.extend_from_slice(key);
-                let wrote = self.mem.append(mem_hash(key), key, value, &self.readers);
-                self.note_write(wrote);
+                self.mem()
+                    .append(mem_hash(key), key, value, &self.shared.readers);
                 self.mem_bytes += key.len() + value.len();
                 return;
             }
-            if self.mem.ordered {
+            if self.mem().ordered {
                 self.leave_direct();
             }
         }
-        let hash = self.mem.prefetch(key);
+        let hash = self.mem().prefetch(key);
         if key > self.max_key.as_slice() {
             self.max_key.clear();
             self.max_key.extend_from_slice(key);
         }
         self.wal.append(key, value);
-        let wrote = self.mem.append(hash, key, value, &self.readers);
-        self.note_write(wrote);
+        self.mem().append(hash, key, value, &self.shared.readers);
         self.mem_bytes += key.len() + value.len();
     }
 
@@ -4789,7 +7083,7 @@ impl Db {
     /// in flight is no bar -- the run's keys lie above the frozen table's,
     /// and the run's own close joins the seal first.
     fn direct_can_open(&self) -> bool {
-        self.opts.direct_ingest && self.mem.is_empty() && self.wal.pending.is_empty()
+        self.opts.direct_ingest && self.mem().is_empty() && self.wal.pending.is_empty()
     }
 
     /// Whether a write goes into the direct run: a key above the store's
@@ -4815,30 +7109,30 @@ impl Db {
     /// waits for the next `commit`.
     fn leave_direct(&mut self) {
         let committed = self.direct.as_ref().map_or(0, |d| d.committed);
-        let tail: Vec<(Vec<u8>, Vec<u8>)> = (committed..self.mem.len())
-            .map(|i| self.mem.entry(i))
+        let tail: Vec<(Vec<u8>, Vec<u8>)> = (committed..self.mem().len())
+            .map(|i| self.mem().entry(i))
             .map(|e| {
                 (
-                    self.mem.key_of(e).to_vec(),
-                    self.mem.value_at(MemTable::head(e) as usize).to_vec(),
+                    self.mem().key_of(e).to_vec(),
+                    self.mem().value_at(MemTable::head(e) as usize).to_vec(),
                 )
             })
             .collect();
-        self.mem.truncate_entries(committed);
+        self.mem().truncate_entries(committed);
         if let Err(e) = self.close_direct() {
             self.pending_err = Some(e);
         }
         for (k, v) in tail {
             self.wal.append(&k, &v);
-            let wrote = self.mem.append(mem_hash(&k), &k, &v, &self.readers);
-            self.note_write(wrote);
+            self.mem()
+                .append(mem_hash(&k), &k, &v, &self.shared.readers);
             self.mem_bytes += k.len() + v.len();
         }
     }
 
     /// The greatest key any source holds: the partitions' and pieces' last
     /// keys and the memtable's, for a store that opens with all of them.
-    fn max_key_of(segs: &[Seg], mem: &MemTable) -> Vec<u8> {
+    fn max_key_of(segs: &[std::sync::Arc<Seg>], mem: &MemTable) -> Vec<u8> {
         let mut best: Vec<u8> = Vec::new();
         for s in segs {
             let b = &s.blob;
@@ -4866,18 +7160,17 @@ impl Db {
     /// other verb, and using it for an update piled every Zipfian rewrite
     /// onto its key until each read walked the pile.
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
-        if self.mem.ordered {
+        if self.mem().ordered {
             self.leave_direct();
         }
         if key > self.max_key.as_slice() {
             self.max_key.clear();
             self.max_key.extend_from_slice(key);
         }
-        let hash = self.mem.prefetch(key);
+        let hash = self.mem().prefetch(key);
         self.wal.delete(key);
         self.wal.append(key, value);
-        let wrote = self.mem.put(hash, key, value, &self.readers);
-        self.note_write(wrote);
+        self.mem().put(hash, key, value, &self.shared.readers);
         self.mem_bytes += key.len() + 16 + key.len() + value.len();
     }
 
@@ -4885,13 +7178,12 @@ impl Db {
     /// start fresh. Durable at the next `commit`, exactly like an append,
     /// and reclaimed by the next merge that reaches the key.
     pub fn delete(&mut self, key: &[u8]) {
-        if self.mem.ordered {
+        if self.mem().ordered {
             self.leave_direct();
         }
-        let hash = self.mem.prefetch(key);
+        let hash = self.mem().prefetch(key);
         self.wal.delete(key);
-        let wrote = self.mem.delete(hash, key, &self.readers);
-        self.note_write(wrote);
+        self.mem().delete(hash, key, &self.shared.readers);
         self.mem_bytes += key.len() + 16;
     }
 
@@ -4905,15 +7197,6 @@ impl Db {
         }
     }
 
-    /// Whether any source can end a key's older values. False for a store
-    /// nothing was ever deleted from, which lets every read skip the
-    /// newest-first pass tombstones require.
-    fn has_tombstones(&self) -> bool {
-        self.mem.tombs() > 0
-            || self.frozen.as_ref().is_some_and(|f| f.tombs() > 0)
-            || self.segs.iter().any(|s| s.tombs)
-    }
-
     /// The durability point: WAL append + fdatasync -- or, under ordered
     /// ingest, the batch streamed to the direct segment and that synced.
     /// If the memtable has crossed the seal threshold, seal after the
@@ -4924,12 +7207,12 @@ impl Db {
             return Err(e);
         }
         let t = std::time::Instant::now();
-        if self.mem.ordered {
+        if self.mem().ordered {
             self.commit_direct()?;
         } else {
             self.wal.mark_commit();
             self.wal.write()?;
-            self.mem.commit();
+            self.mem().commit();
             self.unsynced += 1;
             let due = match self.opts.sync {
                 SyncPolicy::Always => true,
@@ -4959,11 +7242,11 @@ impl Db {
         if let Some(e) = self.pending_err.take() {
             return Err(e);
         }
-        if self.mem.ordered {
+        if self.mem().ordered {
             self.commit_direct()
         } else {
             self.wal.commit()?;
-            self.mem.commit();
+            self.mem().commit();
             Ok(())
         }
     }
@@ -4973,7 +7256,7 @@ impl Db {
     /// key and its one value, then a commit marker, then the sync the
     /// policy asks for. The segment is their log; the WAL never sees them.
     fn commit_direct(&mut self) -> Result<()> {
-        if self.direct.as_ref().map_or(0, |d| d.committed) == self.mem.len() {
+        if self.direct.as_ref().map_or(0, |d| d.committed) == self.mem().len() {
             return Ok(());
         }
         if self.direct.is_none() {
@@ -4991,23 +7274,24 @@ impl Db {
                 committed: 0,
             });
         }
+        let mem = self.r.mem().clone();
         let d = self.direct.as_mut().expect("opened above");
-        for i in d.committed..self.mem.len() {
-            let e = self.mem.entry(i);
+        for i in d.committed..mem.len() {
+            let e = mem.entry(i);
             debug_assert_eq!(
                 e.count.load(AtomicOrdering::Relaxed),
                 1,
                 "an ordered entry has the one value it was appended with"
             );
-            d.w.begin(self.mem.key_of(e))?;
-            d.w.value(self.mem.value_at(MemTable::head(e) as usize));
+            d.w.begin(mem.key_of(e))?;
+            d.w.value(mem.value_at(MemTable::head(e) as usize));
             d.w.end_with(false)?;
         }
         d.w.mark()?;
-        d.committed = self.mem.len();
-        self.mem.commit();
+        d.committed = mem.len();
+        mem.commit();
         self.unsynced += 1;
-        let due = match self.opts.sync {
+        let due = match self.r.opts.sync {
             SyncPolicy::Always => true,
             SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
         };
@@ -5036,14 +7320,18 @@ impl Db {
         self.mem_bytes = 0;
         let Some(d) = self.direct.take() else {
             // A run forming with nothing committed: no file, nothing to close.
-            self.mem = std::sync::Arc::new(MemTable::new());
+            self.set_mem(std::sync::Arc::new(MemTable::new()));
             return Ok(());
         };
         self.join_seal()?;
-        debug_assert_eq!(self.mem.len(), d.committed, "a run closes between batches");
-        let frozen = std::mem::replace(&mut self.mem, std::sync::Arc::new(MemTable::new()));
+        debug_assert_eq!(
+            self.mem().len(),
+            d.committed,
+            "a run closes between batches"
+        );
+        self.freeze();
         let end_seq = self.wal.seq;
-        let np = self.segs.partition_point(|s| s.level > 0);
+        let np = self.segs().partition_point(|s| s.level > 0);
         let name = if np == 0 {
             Db::seg_name(d.id, end_seq)
         } else {
@@ -5051,14 +7339,13 @@ impl Db {
                 "pcs-{:08}-{:016}-{}-.sup",
                 d.id,
                 end_seq,
-                hex(&self.segs[np - 1].lo)
+                hex(&self.segs()[np - 1].lo)
             )
         };
         let dir = self.dir.clone();
         let tmp = d.tmp;
         let w = d.w;
         self.retiring_tmps.push(tmp.clone());
-        self.frozen = Some(frozen);
         self.sealing = Some(std::thread::spawn(move || {
             let ord = w
                 .finish()
@@ -5081,20 +7368,20 @@ impl Db {
         if let Some(e) = self.pending_err.take() {
             return Err(e);
         }
-        if self.mem.ordered {
+        if self.mem().ordered {
             // The ordered memtable is the direct segment: committing what
             // is staged and closing it is the seal.
             self.commit_direct()?;
             return self.close_direct();
         }
         self.wal.commit()?;
-        self.mem.commit();
+        self.mem().commit();
         self.unsynced = 0;
-        if self.mem.is_empty() {
+        if self.mem().is_empty() {
             return Ok(());
         }
         self.join_seal()?;
-        let frozen = std::mem::replace(&mut self.mem, std::sync::Arc::new(MemTable::new()));
+        let frozen = self.freeze();
         // The scan snapshot names the live memtable's slots, and the live
         // memtable is new: a write's bookkeeping renumbers the snapshot at
         // every rehash, and the fresh table's first rehash has a thousand
@@ -5120,7 +7407,7 @@ impl Db {
         // the whole store. Before the first partitioning there are none and
         // the seal writes a single full-range segment.
         let fences: Vec<Fence> = self
-            .segs
+            .segs()
             .iter()
             .filter(|s| s.level > 0)
             .map(|s| (s.lo.clone(), s.hi.clone()))
@@ -5136,7 +7423,6 @@ impl Db {
         self.retiring_wals.push(old_wal.path.clone());
         drop(old_wal);
         let mem = frozen.clone();
-        self.frozen = Some(frozen);
         self.sealing = Some(std::thread::spawn(move || {
             if background_io == BackgroundIo::Idle {
                 idle_io_priority();
@@ -5268,7 +7554,7 @@ impl Db {
         // touched and not the store. Without it, or before the first
         // partitioning, everything is re-partitioned from every key.
         let mut rounds = 0usize;
-        while self.segs.iter().any(|s| s.level == 0) {
+        while self.segs().iter().any(|s| s.level == 0) {
             let plan = if self.opts.flush_ranges {
                 self.merge_due(1)
             } else {
@@ -5301,54 +7587,6 @@ impl Db {
         Ok(())
     }
 
-    /// The fences a range merge should rewrite now, or `None` when the store
-    /// is not partitioned yet (the first partitioning takes every key). A
-    /// piece that is not aligned to a live range -- sealed during the first
-    /// partitioning against fences that no longer exist -- selects every
-    /// range it overlaps; otherwise a range is selected when it holds at
-    /// least `threshold` pieces. `maybe_compact` uses the trigger as the
-    /// threshold; a flush uses one.
-    fn merge_due(&self, threshold: usize) -> Option<Vec<Fence>> {
-        let parts: Vec<Fence> = self
-            .segs
-            .iter()
-            .filter(|s| s.level > 0)
-            .map(|s| (s.lo.clone(), s.hi.clone()))
-            .collect();
-        if parts.is_empty() {
-            return None;
-        }
-        if let Some(wide) = self
-            .segs
-            .iter()
-            .find(|s| s.level == 0 && !parts.iter().any(|f| (s.lo.clone(), s.hi.clone()) == *f))
-        {
-            let (wlo, whi) = (wide.lo.clone(), wide.hi.clone());
-            return Some(
-                parts
-                    .into_iter()
-                    .filter(|(lo, hi)| {
-                        let below = hi.as_ref().is_some_and(|h| &wlo >= h);
-                        let above = whi.as_ref().is_some_and(|h| h <= lo);
-                        !below && !above
-                    })
-                    .collect(),
-            );
-        }
-        Some(
-            parts
-                .into_iter()
-                .filter(|f| {
-                    self.segs
-                        .iter()
-                        .filter(|s| s.level == 0 && s.lo == f.0 && s.hi == f.1)
-                        .count()
-                        >= threshold
-                })
-                .collect(),
-        )
-    }
-
     /// Collect a finished (or in-flight) seal: join the thread, open its
     /// segment, retire the frozen memtable.
     fn join_seal(&mut self) -> Result<()> {
@@ -5366,18 +7604,19 @@ impl Db {
             self.seal_wait.join_wait_ns += waited;
             self.seal_wait.blocked_joins += 1;
         }
+        let mut segs = self.segs().to_vec();
         for name in &names {
             self.covered_seq = self.covered_seq.max(Db::name_end_seq(name).unwrap_or(0));
-            self.segs.push(Seg::open(
+            segs.push(std::sync::Arc::new(Seg::open(
                 &self.dir,
                 name,
-                self.advice_random.get(),
+                self.advice_random(),
                 self.opts.read_advice != ReadAdvice::Normal,
                 self.opts.segment.checksums,
-            )?);
+            )?));
         }
-        self.sort_segs();
-        self.frozen = None;
+        self.publish_segs(segs);
+        self.set_frozen(None);
         if self.opts.scan_block_cache {
             self.build_ctx().rank_pieces()?;
         }
@@ -5414,26 +7653,136 @@ impl Db {
     /// Partitions first in key order, then L0 by (range, age). `read_all`
     /// binary-searches the first group and walks a contiguous run of the
     /// second, so both depend on this order.
-    fn sort_segs(&mut self) {
+    /// The segment set `segs`, sorted, its derived quantities refreshed,
+    /// published as the state: the writer's one way to change the
+    /// segments. Every block table is dropped with it.
+    fn publish_segs(&mut self, mut segs: Vec<std::sync::Arc<Seg>>) {
         self.drop_blocks();
-        self.seg_gen += 1;
-        self.segs.sort_by(|a, b| {
-            b.level
-                .cmp(&a.level)
-                .then_with(|| a.lo.cmp(&b.lo))
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        self.refresh_mean_key_bytes();
-        self.store_bytes
-            .set(Db::store_bytes_of(&self.dir, &self.segs));
-        self.l0_aligned = Db::l0_aligned_of(&self.segs);
+        segs.sort_by(|a, b| seg_order(a, b));
+        *self.tables.borrow_mut() = Db::tables_for(segs.len());
+        let mean_key_bytes = Db::mean_key_bytes_of(&segs);
+        let store_bytes = Db::store_bytes_of(&self.dir, &segs);
+        let l0_aligned = Db::l0_aligned_of(&segs);
+        let cur = self.state();
+        let next = State {
+            segs,
+            mem: cur.mem.clone(),
+            frozen: cur.frozen.clone(),
+            gen: cur.gen + 1,
+            mean_key_bytes,
+            store_bytes,
+            l0_aligned,
+        };
+        self.publish_state(next);
+    }
+
+    /// `next` becomes the state; the one before it is retired at the
+    /// epoch this bumps and freed once no reader is pinned before it.
+    fn publish_state(&mut self, next: State) {
+        let p = Box::into_raw(Box::new(next));
+        let old = self.shared.state.swap(p, AtomicOrdering::AcqRel);
+        let tag = self.shared.readers.bump();
+        let mut retired = self.shared.retired.lock().expect("the retired list");
+        // SAFETY: published by this writer, owned by it until freed.
+        retired.push((tag, unsafe { Box::from_raw(old) }));
+        let readers = &self.shared.readers;
+        retired.retain(|(t, _)| !readers.none_before(*t));
+    }
+
+    /// PROTOTYPE: how many states a publish replaced are still held for a
+    /// reader, for a test to hold the reader table to its word.
+    pub fn retired_states(&self) -> usize {
+        self.shared.retired.lock().expect("the retired list").len()
+    }
+
+    /// A handle that reads this store from any thread, under `Latest`
+    /// isolation to begin with, with caches of its own and a slot in the
+    /// reader table for its life. It is `Send` and not `Sync`: one
+    /// thread reads through it at a time, and a thread that wants its
+    /// own asks for its own. Fails when every slot is taken.
+    pub fn reader(&self) -> Result<Reader> {
+        let slot = self
+            .shared
+            .readers
+            .claim()
+            .ok_or_else(|| err("reader table: every slot is taken"))?;
+        Ok(Reader {
+            shared: self.shared.clone(),
+            slot: Some(slot),
+            isolation: std::cell::Cell::new(Isolation::Latest),
+            held: AtomicPtr::new(std::ptr::null_mut()),
+            wm: std::cell::Cell::new(SEE_ALL),
+            opts: self.opts.clone(),
+            tables: std::cell::RefCell::new(Vec::new()),
+            scan_keys: std::cell::RefCell::new(None),
+            cache_used: std::cell::Cell::new(false),
+            cache_bytes: std::cell::Cell::new(0),
+            scan_tick: std::cell::Cell::new(0),
+            shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
+            pending: std::cell::RefCell::new(Vec::new()),
+            built: std::cell::RefCell::new(Vec::new()),
+            snap_gen: std::cell::Cell::new(0),
+            snap_added: std::cell::RefCell::new(Vec::new()),
+            log_seen: std::cell::Cell::new(0),
+            log_gen: std::cell::Cell::new(0),
+            snap_entries: std::cell::Cell::new(0),
+            ahead: None,
+        })
+    }
+
+    /// The state with `mem` as the live memtable.
+    fn set_mem(&mut self, mem: std::sync::Arc<MemTable>) {
+        let cur = self.state();
+        let next = State {
+            segs: cur.segs.clone(),
+            mem,
+            frozen: cur.frozen.clone(),
+            gen: cur.gen + 1,
+            mean_key_bytes: cur.mean_key_bytes,
+            store_bytes: cur.store_bytes,
+            l0_aligned: cur.l0_aligned,
+        };
+        self.publish_state(next);
+    }
+
+    /// The state with `frozen` as the frozen memtable.
+    fn set_frozen(&mut self, frozen: Option<std::sync::Arc<MemTable>>) {
+        let cur = self.state();
+        let next = State {
+            segs: cur.segs.clone(),
+            mem: cur.mem.clone(),
+            frozen,
+            gen: cur.gen + 1,
+            mean_key_bytes: cur.mean_key_bytes,
+            store_bytes: cur.store_bytes,
+            l0_aligned: cur.l0_aligned,
+        };
+        self.publish_state(next);
+    }
+
+    /// The live memtable frozen and a fresh one live, in one publish;
+    /// the frozen one returned for the seal.
+    fn freeze(&mut self) -> std::sync::Arc<MemTable> {
+        let cur = self.state();
+        let frozen = cur.mem.clone();
+        let next = State {
+            segs: cur.segs.clone(),
+            mem: std::sync::Arc::new(MemTable::new()),
+            frozen: Some(frozen.clone()),
+            gen: cur.gen + 1,
+            mean_key_bytes: cur.mean_key_bytes,
+            store_bytes: cur.store_bytes,
+            l0_aligned: cur.l0_aligned,
+        };
+        self.publish_state(next);
+        frozen
     }
 
     /// Whether every level-0 piece's fence is some partition's, over a
     /// segment list `sort_segs` has ordered. Nothing to align to is not
     /// aligned: before the first partitioning every piece spans the whole
     /// key space.
-    fn l0_aligned_of(segs: &[Seg]) -> bool {
+    fn l0_aligned_of(segs: &[std::sync::Arc<Seg>]) -> bool {
         let np = segs.partition_point(|s| s.level > 0);
         let (parts, l0) = segs.split_at(np);
         !parts.is_empty()
@@ -5442,76 +7791,15 @@ impl Db {
                 .all(|s| parts.iter().any(|p| p.lo == s.lo && p.hi == s.hi))
     }
 
-    /// The first of the partitions `segs[..np]` that may hold a key at or
-    /// after `from`: they tile the key space in order, so it is the first
-    /// whose upper fence is above `from`, and every partition after it may
-    /// reach too. Found by galloping from the front and then a binary
-    /// search over the bracket. A scan filtered every partition by its
-    /// fence, a compare per partition below its start; a binary search
-    /// over all of them was measured next and was slower on ycsb-E, whose
-    /// Zipfian starts fall in the first few partitions, where the walk
-    /// was one to three predictable compares and the search seven
-    /// mispredicting ones. The gallop is one compare for a start in the
-    /// first partition and logarithmic for a far one.
-    fn first_reaching(&self, np: usize, from: &[u8]) -> usize {
-        let parts = &self.segs[..np];
-        let below = |i: usize| parts[i].hi.as_ref().is_some_and(|h| h.as_slice() <= from);
-        let (mut lo, mut step) = (0usize, 1usize);
-        while step <= np && below(step - 1) {
-            lo = step;
-            step *= 2;
-        }
-        let end = step.min(np);
-        lo + parts[lo..end].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= from))
-    }
-
-    /// The level-0 pieces a read of a key in partition `at` consults. When
-    /// every piece is aligned to a partition they are the run over `at`
-    /// alone: the pieces sort by lower fence and then by name, so one
-    /// range's pieces are consecutive and oldest first, and two binary
-    /// searches bound the run. Otherwise all of them, each answering from
-    /// its own fence, as every read did before: a walk over every piece
-    /// in the store, two fence compares each, that grew with the range
-    /// count times the pieces over a range.
-    fn pieces_over(&self, np: usize, at: usize) -> &[Seg] {
-        let l0 = &self.segs[np..];
-        if !self.l0_aligned || at >= np {
-            return l0;
-        }
-        // The first partition's lower fence is empty, and so is that of
-        // every piece aligned to it; see `below_lo` for why an empty fence
-        // is never handed to a compare.
-        let lo = self.segs[at].lo.as_slice();
-        let before = |s: &Seg| !lo.is_empty() && (s.lo.is_empty() || s.lo.as_slice() < lo);
-        let same =
-            |s: &Seg| s.lo.is_empty() == lo.is_empty() && (lo.is_empty() || s.lo.as_slice() == lo);
-        let from = l0.partition_point(before);
-        let to = from + l0[from..].partition_point(same);
-        &l0[from..to]
-    }
-
     /// The partitions' bytes on disk. A free function over the segments,
     /// like `mean_key_bytes_of`, because `open` needs it before there is a
     /// `Db` to ask.
-    fn store_bytes_of(dir: &Path, segs: &[Seg]) -> u64 {
+    fn store_bytes_of(dir: &Path, segs: &[std::sync::Arc<Seg>]) -> u64 {
         segs.iter()
             .filter(|s| s.level > 0)
             .filter_map(|s| std::fs::metadata(dir.join(&s.name)).ok())
             .map(|m| m.len())
             .sum()
-    }
-
-    /// The memtable bytes at which the next commit seals: `seal_bytes`, or
-    /// with `seal_grows` the larger of that and the partitions' bytes over
-    /// four times `l0_trigger`.
-    pub fn seal_threshold(&self) -> usize {
-        if !self.opts.seal_grows {
-            return self.opts.seal_bytes;
-        }
-        let grown = self.store_bytes.get() / (4 * self.opts.l0_trigger.max(1)) as u64;
-        self.opts
-            .seal_bytes
-            .max(usize::try_from(grown).unwrap_or(usize::MAX))
     }
 
     /// What a key costs on disk, averaged over the live segments.
@@ -5523,16 +7811,12 @@ impl Db {
     /// measured against. That is inside the tolerance: what it feeds is a
     /// comparison against a crossing that is flat for a factor of three
     /// either side.
-    fn refresh_mean_key_bytes(&self) {
-        self.mean_key_bytes.set(Db::mean_key_bytes_of(&self.segs));
-    }
-
     /// Free function over the segments, because `open` needs the number
     /// before there is a `Db` to ask. It sorts its segments itself rather
     /// than through `sort_segs`, so an opened store had a zero here and took
     /// the short-scan path for every scan however long -- which the create
     /// path's test could not see.
-    fn mean_key_bytes_of(segs: &[Seg]) -> usize {
+    fn mean_key_bytes_of(segs: &[std::sync::Arc<Seg>]) -> usize {
         let (bytes, keys) = segs.iter().fold((0usize, 0usize), |(b, k), s| {
             (b + s.blob.index_bytes(), k + s.blob.keys())
         });
@@ -5605,11 +7889,11 @@ impl Db {
         let mut rest = Vec::new();
         for f in due {
             let part = self
-                .segs
+                .segs()
                 .iter()
                 .position(|s| s.level > 0 && s.lo == f.0 && s.hi == f.1);
             let mut pieces: Vec<usize> = self
-                .segs
+                .segs()
                 .iter()
                 .enumerate()
                 .filter(|(_, s)| s.level == 0 && s.lo == f.0 && s.hi == f.1)
@@ -5621,7 +7905,7 @@ impl Db {
             };
             // The partition's last key, or nothing if it is empty.
             let floor: Option<Vec<u8>> = {
-                let b = &self.segs[pi].blob;
+                let b = &self.segs()[pi].blob;
                 if b.keys() == 0 {
                     None
                 } else {
@@ -5670,7 +7954,7 @@ impl Db {
     /// them, and a promotion keeps the file exactly as it is.
     fn promote_unpartitioned(&mut self) -> Result<bool> {
         let mut pieces: Vec<usize> = self
-            .segs
+            .segs()
             .iter()
             .enumerate()
             .filter(|(_, s)| s.level == 0)
@@ -5680,7 +7964,7 @@ impl Db {
             return Ok(false);
         }
         if pieces.len() == 1 {
-            let s = &self.segs[pieces[0]];
+            let s = &self.segs()[pieces[0]];
             if s.tombs {
                 return Ok(false);
             }
@@ -5716,67 +8000,13 @@ impl Db {
         Ok(true)
     }
 
-    /// Order `pieces` by first key and check the chain: every piece's first
-    /// key, taken as a fence, must lie strictly above what came before it
-    /// (the partition's last key, then the previous piece's last key) and
-    /// inside the range. Returns each piece's fence boundary, or `None` when
-    /// something overlaps and a merge is what is needed.
-    fn promotion_chain(
-        &self,
-        range: &Fence,
-        floor: Option<Vec<u8>>,
-        pieces: &mut [usize],
-    ) -> Option<Vec<Vec<u8>>> {
-        if pieces.is_empty() {
-            return None;
-        }
-        let first_of = |si: usize| -> Option<Vec<u8>> {
-            let b = &self.segs[si].blob;
-            if b.keys() == 0 {
-                None
-            } else {
-                b.key_at(0).map(|k| k.to_vec())
-            }
-        };
-        let last_of = |si: usize| -> Option<Vec<u8>> {
-            let b = &self.segs[si].blob;
-            if b.keys() == 0 {
-                None
-            } else {
-                b.key_at(b.keys() - 1).map(|k| k.to_vec())
-            }
-        };
-        // An empty piece has nothing to promote; leave it to the merge.
-        if pieces.iter().any(|&si| self.segs[si].blob.keys() == 0) {
-            return None;
-        }
-        pieces.sort_by_key(|&si| first_of(si));
-        let mut bounds = Vec::with_capacity(pieces.len());
-        let mut prev_last: Option<Vec<u8>> = floor;
-        for &si in pieces.iter() {
-            let first = first_of(si)?;
-            let b = fence_lo(&first);
-            // Strictly above everything before it, and inside the range.
-            if let Some(pl) = &prev_last {
-                if *pl >= b {
-                    return None;
-                }
-            }
-            if b < range.0 || range.1.as_ref().is_some_and(|h| &b >= h) {
-                return None;
-            }
-            bounds.push(b);
-            prev_last = last_of(si);
-        }
-        Some(bounds)
-    }
-
     /// Give each segment its new fence and level by hard link, publish,
     /// then unlink the old names.
     fn apply_promotion(&mut self, renames: Vec<(usize, Fence)>) -> Result<()> {
         let mut old_names = Vec::with_capacity(renames.len());
+        let mut segs = self.segs().to_vec();
         for (si, (lo, hi)) in renames {
-            let old = self.segs[si].name.clone();
+            let old = segs[si].name.clone();
             // Keep the id and covered-sequence fields verbatim; only the
             // prefix and the fences change.
             let stem = old.trim_end_matches(".sup");
@@ -5795,35 +8025,26 @@ impl Db {
                 continue;
             }
             std::fs::hard_link(self.dir.join(&old), self.dir.join(&new))?;
-            let seg = &mut self.segs[si];
-            seg.name = new;
-            seg.lo = lo;
-            seg.hi = hi;
-            seg.level = 1;
-            seg.bloom = None;
+            // A segment is immutable once open, so the promoted one is
+            // opened again under its new name: the partition's fences and
+            // level come from the name.
+            segs[si] = std::sync::Arc::new(Seg::open(
+                &self.dir,
+                &new,
+                self.advice_random(),
+                self.opts.read_advice != ReadAdvice::Normal,
+                self.opts.segment.checksums,
+            )?);
             old_names.push(old);
         }
         File::open(&self.dir)?.sync_all()?;
-        self.sort_segs();
+        self.publish_segs(segs);
         self.publish()?;
         for old in old_names {
             self.retire_seg(&old);
         }
         self.build_ahead();
         Ok(())
-    }
-    // The starvation lesson that shaped `merge_due`: EVERY range that is
-    // over its bound merges in one job, not just the worst. A per-range
-    // merge has to run once per range where the whole-store merge ran once,
-    // so picking a single range per seal starved it -- with sixteen ranges
-    // and one merge in flight, pieces accumulated faster than they were
-    // consumed and a read ended up walking ten of them. That starvation
-    // cost more than the whole-store rewrite it replaced (the canonical read
-    // comparison went from 0.846x to 0.561x), which is the measurement that
-    // produced the rule.
-
-    fn l0_len(&self) -> usize {
-        self.segs.iter().filter(|s| s.level == 0).count()
     }
 
     /// Name the live set durably. Everything before this call is a file on
@@ -5854,7 +8075,7 @@ impl Db {
         let inputs: Vec<String> = match &fences {
             None => self.live_names(),
             Some(fs) => self
-                .segs
+                .segs()
                 .iter()
                 .filter(|s| {
                     // Everything the output fences will cover: the
@@ -5894,7 +8115,7 @@ impl Db {
             .map(|m| m.len())
             .sum();
         let live_keys: usize = self
-            .segs
+            .segs()
             .iter()
             .filter(|s| inputs.contains(&s.name))
             .map(|s| s.blob.keys())
@@ -5943,27 +8164,29 @@ impl Db {
         let outputs = handle
             .join()
             .map_err(|_| err("compaction thread panicked"))??;
-        let mut kept: Vec<Seg> = Vec::new();
-        for seg in self.segs.drain(..) {
-            if !inputs.contains(&seg.name) {
-                kept.push(seg);
-            }
-        }
-        let mut merged = Vec::with_capacity(outputs.len());
+        let kept: Vec<std::sync::Arc<Seg>> = self
+            .segs()
+            .iter()
+            .filter(|seg| !inputs.contains(&seg.name))
+            .cloned()
+            .collect();
+        let mut merged = Vec::with_capacity(outputs.len() + kept.len());
         for name in &outputs {
-            merged.push(Seg::open(
+            merged.push(std::sync::Arc::new(Seg::open(
                 &self.dir,
                 name,
-                self.advice_random.get(),
+                self.advice_random(),
                 self.opts.read_advice != ReadAdvice::Normal,
                 self.opts.segment.checksums,
-            )?);
+            )?));
         }
         // Partitions first (older, disjoint), then whatever L0 arrived
         // while the merge ran, oldest to newest.
         merged.extend(kept);
-        self.segs = merged;
-        self.sort_segs();
+        self.publish_segs(merged);
+        if self.opts.scan_block_cache {
+            self.build_ctx().rank_pieces()?;
+        }
         self.publish()?;
         self.build_ahead();
         for name in &inputs {
@@ -5973,503 +8196,9 @@ impl Db {
         Ok(())
     }
 
-    /// Every value for `key`, in append order: partitions first, then L0
-    /// oldest to newest, then the frozen memtable, then the live one.
-    ///
-    /// `may_hold` is the routing F38-F41 settled. A partition answers from
-    /// its fence in two comparisons and no memory beyond the `Seg`; an L0
-    /// segment answers from a Bloom in one cache line. Neither can produce
-    /// a false negative, so a skipped segment is a segment that provably
-    /// holds nothing for this key.
-    /// Put the segment mappings in `random` if they are not already there.
-    ///
-    /// A no-op unless the mode actually changes, so the steady state costs a
-    /// `Cell` load and a compare. On a change it is one `madvise` per live
-    /// segment -- a cost priced over a store of several segments, since the
-    /// earlier measurement was over a single mapping.
-    /// Will this scan walk enough contiguous bytes for readahead to pay?
-    ///
-    /// The span is the limit times what a key costs on disk, taken from the
-    /// segments themselves rather than assumed: `index_bytes / keys` over the
-    /// live set. That is the whole section per key -- records, directory and
-    /// hash -- where a scan walks only the records, so it reads high by about
-    /// a quarter on the shape measured. It does not need to be tight. The
-    /// crossing it is compared against is flat for a factor of three either
-    /// side, and a quarter is well inside that.
-    fn scan_wants_readahead(&self, limit: usize) -> bool {
-        let mean = self.mean_key_bytes.get();
-        if mean == 0 {
-            // Nothing sealed: the scan is answered from the memtable and
-            // touches no mapping, so the advice is moot. Say no and leave the
-            // segments as they are rather than switching them for nothing.
-            return false;
-        }
-        limit.saturating_mul(mean) >= self.opts.scan_readahead_bytes
-    }
-
-    fn advise(&self, random: bool) {
-        if self.opts.read_advice != ReadAdvice::Adaptive || self.advice_random.get() == random {
-            return;
-        }
-        self.advice_random.set(random);
-        // Segments only. A segment's pages are walked in whichever way the
-        // workload is walking them, so the advice follows the phase; the
-        // ordered companion is reached only by a binary search and is left
-        // on `MADV_RANDOM` in both.
-        for s in &self.segs {
-            if random {
-                s.blob.advise_random();
-            } else {
-                s.blob.advise_normal();
-            }
-        }
-    }
-
-    /// Which mode the segment mappings are in: `true` is `MADV_RANDOM`.
-    ///
-    /// The store's own record of what it last asked for, which is what a
-    /// check needs to compare against the mappings themselves -- the
-    /// interesting failure is the two disagreeing.
-    pub fn advice_random(&self) -> bool {
-        self.advice_random.get()
-    }
-
-    /// Whether reads route to the pieces over their range, for a test to
-    /// know which path it is on: `false` whenever a piece spans ranges.
-    pub fn pieces_aligned(&self) -> bool {
-        self.l0_aligned
-    }
-
-    /// How many segments' ordered companions were advised `MADV_RANDOM`, and
-    /// how many there are.
-    ///
-    /// The companion is the mapping the advice policy missed. `advise` walks
-    /// the segments and a companion is not one of them, so it sat on the
-    /// kernel's default readahead however the store was configured, and
-    /// nothing anywhere said so -- the only symptom was a scan that lost 12%
-    /// out of core. A check needs to be able to ask.
-    pub fn ords_advised(&self) -> (usize, usize) {
-        (
-            self.segs.iter().filter(|s| s.ord.advised()).count(),
-            self.segs.len(),
-        )
-    }
-
-    pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
-        self.advise(true);
-        let hash = self.mem.prefetch(key);
-        let np = self.segs.partition_point(|s| s.level > 0);
-        let at =
-            self.segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
-        let part = self.segs[..np].get(at).filter(|s| s.may_hold(key));
-        let l0 = self.pieces_over(np, at);
-        // Sources oldest to newest: the partition (0), the level-0 pieces
-        // (1..), the frozen memtable, the live one. `start` is the source
-        // live values begin at: 0 unless a newer source holds a tombstone
-        // for this key. Only a store with tombstones in it checks, and the
-        // check is what a delete costs a read -- a second probe on the
-        // sources that hold the key.
-        let (fr_ix, mem_ix) = (1 + l0.len(), 2 + l0.len());
-        let mut start = 0usize;
-        if self.has_tombstones() {
-            if !self.mem.is_empty() {
-                if let Some(e) = self.mem.get_with(hash, key) {
-                    if self.mem.has_tomb(e, SEE_ALL) {
-                        start = mem_ix;
-                    }
-                }
-            }
-            if start == 0 {
-                if let Some(fr) = &self.frozen {
-                    if let Some(e) = fr.get(key) {
-                        if fr.has_tomb(e, SEE_ALL) {
-                            start = fr_ix;
-                        }
-                    }
-                }
-            }
-            if start == 0 {
-                for (i, seg) in l0.iter().enumerate().rev() {
-                    if !seg.tombs || !seg.may_hold(key) {
-                        continue;
-                    }
-                    if let Some(exts) = seg.blob.lookup(key) {
-                        if exts.iter().any(|e| e.is_tombstone()) {
-                            start = 1 + i;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        let mut n = 0u64;
-        if start == 0 {
-            if let Some(seg) = part {
-                n += seg
-                    .blob
-                    .read_all(key, &mut f)
-                    .map_err(|e| err(&format!("segment read: {e}")))?;
-            }
-        }
-        for (i, seg) in l0.iter().enumerate() {
-            if 1 + i < start || !seg.may_hold(key) {
-                continue;
-            }
-            n += seg
-                .blob
-                .read_all(key, &mut f)
-                .map_err(|e| err(&format!("segment read: {e}")))?;
-        }
-        if fr_ix >= start {
-            if let Some(fr) = &self.frozen {
-                if let Some(e) = fr.get(key) {
-                    let (offs, _) = fr.live_chain(e, SEE_ALL);
-                    n += offs.len() as u64;
-                    for off in offs {
-                        f(fr.value_at(off));
-                    }
-                }
-            }
-        }
-        if mem_ix >= start && !self.mem.is_empty() {
-            if let Some(e) = self.mem.get_with(hash, key) {
-                let (offs, _) = self.mem.live_chain(e, SEE_ALL);
-                n += offs.len() as u64;
-                for off in offs {
-                    f(self.mem.value_at(off));
-                }
-            }
-        }
-        Ok(n)
-    }
-
-    /// The sorted snapshot of every unsealed key (frozen table first, then
-    /// live), one entry per key. Two builds behind `scan_snapshot_arena`;
-    /// both walk the hash tables once and both end in the same `Snapshot`.
-    fn build_snapshot(&self) -> Snapshot {
-        let n = self.mem.len() + self.frozen.as_ref().map_or(0, |f| f.len());
-        let mut snap = Snapshot {
-            keys: Vec::with_capacity(
-                self.mem.key_bytes() + self.frozen.as_ref().map_or(0, |f| f.key_bytes()),
-            ),
-            ents: Vec::with_capacity(n),
-            ..Default::default()
-        };
-        if self.opts.scan_snapshot_arena {
-            // Arena build. The hash table is walked in slot order, which
-            // visits the key bytes in random order -- one cache miss a key,
-            // and at 428k keys that walk, not the sort, was most of the
-            // build. So the walk records (key offset, slot) without touching
-            // a key, a radix pass puts them in arena order, and the copy
-            // into the snapshot's arena is sequential. Then sort (prefix,
-            // prefix, index) records, touching the arena only on a tie.
-            let mut recs: Vec<(u64, u64, u32)> = Vec::with_capacity(n);
-            let mut pending: Vec<SnapKey> = Vec::with_capacity(n);
-            let mut order: Vec<(u32, u32, u32)> = Vec::with_capacity(n);
-            let mut scratch: Vec<(u32, u32, u32)> = Vec::with_capacity(n);
-            let mut take = |mem: &MemTable, live: bool| {
-                // (key offset, key length, slot): the copy below needs no
-                // slot access, since a slot in key order is a random one.
-                order.clear();
-                order.extend((0..mem.len()).map(|i| {
-                    let e = mem.entry(i);
-                    (e.key_off, e.key_len, i as u32)
-                }));
-                radix_by_first(&mut order, &mut scratch);
-                for &(off, len, i) in &order {
-                    let k = mem.key_at(off, len);
-                    let (a, b) = key_prefix(k);
-                    recs.push((a, b, pending.len() as u32));
-                    pending.push(SnapKey {
-                        off: snap.keys.len() as u32,
-                        len: k.len() as u32,
-                        mem: if live { i } else { u32::MAX },
-                        frozen: if live { u32::MAX } else { i },
-                    });
-                    snap.keys.extend_from_slice(k);
-                }
-            };
-            if let Some(fr) = &self.frozen {
-                take(fr, false);
-            }
-            take(&self.mem, true);
-            let keys = &snap.keys;
-            let key_of = |e: &SnapKey| &keys[e.off as usize..(e.off + e.len) as usize];
-            recs.sort_unstable_by(|x, y| {
-                (x.0, x.1).cmp(&(y.0, y.1)).then_with(|| {
-                    key_of(&pending[x.2 as usize])
-                        .cmp(key_of(&pending[y.2 as usize]))
-                        // Frozen entries were pushed first; on a tie the
-                        // live one must come later so the fold sees it.
-                        .then(x.2.cmp(&y.2))
-                })
-            });
-            for r in recs {
-                snap.push_sorted(pending[r.2 as usize]);
-            }
-        } else {
-            // The build before it: one allocation per key, sorted through
-            // the pointers, then copied into the arena the merge expects.
-            struct Old {
-                key: Vec<u8>,
-                mem: u32,
-                frozen: u32,
-            }
-            let mut all: Vec<Old> = Vec::with_capacity(n);
-            let mut take = |mem: &MemTable, live: bool| {
-                for (i, e) in (0..mem.len()).map(|i| (i, mem.entry(i))) {
-                    all.push(Old {
-                        key: mem.key_of(e).to_vec(),
-                        mem: if live { i as u32 } else { u32::MAX },
-                        frozen: if live { u32::MAX } else { i as u32 },
-                    });
-                }
-            };
-            if let Some(fr) = &self.frozen {
-                take(fr, false);
-            }
-            take(&self.mem, true);
-            all.sort_by(|a, b| a.key.cmp(&b.key));
-            for o in all {
-                let off = snap.keys.len() as u32;
-                snap.keys.extend_from_slice(&o.key);
-                snap.push_sorted(SnapKey {
-                    off,
-                    len: o.key.len() as u32,
-                    mem: o.mem,
-                    frozen: o.frozen,
-                });
-            }
-        }
-        snap
-    }
-
-    pub fn scan<F: FnMut(&[u8], &[u8])>(
-        &self,
-        from: &[u8],
-        limit: usize,
-        mut f: F,
-    ) -> Result<usize> {
-        self.advise(!self.scan_wants_readahead(limit));
-        // `Prefetch` never changes mode, so `advise` above is a no-op for it.
-        // Instead the segments are told exactly which value bytes this scan
-        // will walk, before it walks them. Errors are dropped: a plan that
-        // cannot be built is a scan that fetches the way it always did, not a
-        // scan that fails.
-        if self.opts.read_advice == ReadAdvice::Prefetch {
-            for seg in &self.segs {
-                let _ = seg.blob.prefetch_scan(from, limit);
-            }
-        }
-        let gen = (self.next_seg << 48) ^ ((self.frozen.is_some() as u64) << 63);
-        // The snapshot outlives writes on both paths. With the block
-        // cache, the keys created since it was built are filed by block
-        // and merged in when a block builds, until they outnumber the
-        // snapshot; filed by block, what grows with their count is only
-        // the walk a new table makes over them. On the merge paths they
-        // are filed into the snapshot's side runs at each scan, until they
-        // reach an eighth of it, since a scan merges those runs over its
-        // whole length. Before this a write was a rebuild on those paths,
-        // and at thirty million keys ycsb-E made 2,500 of them over two
-        // million unsealed keys. The cache wants partitions to hang blocks
-        // on: before the first partitioning it stands aside.
-        let use_cache =
-            self.opts.scan_block_cache && self.segs.first().is_some_and(|s| s.level > 0);
-        if use_cache {
-            self.settle_pending()?;
-        }
-        {
-            let mut cache = self.scan_keys.borrow_mut();
-            let mut stale = cache.as_ref().is_none_or(|(g, _)| *g != gen);
-            if !stale {
-                let held = cache.as_ref().map_or(0, |(_, s)| s.len());
-                let added = self.snap_added.borrow().len();
-                stale = if use_cache {
-                    added > held.max(4096)
-                } else {
-                    added > (held / 8).max(4096)
-                };
-            }
-            if !stale && !use_cache {
-                let (_, snap) = cache.as_mut().expect("not stale");
-                let added = self.snap_added.borrow();
-                if added.len() > snap.filed {
-                    snap.file(&self.mem, &added[snap.filed..]);
-                    snap.filed = added.len();
-                }
-            }
-            if stale {
-                *cache = Some((gen, self.build_snapshot()));
-                self.snap_added.borrow_mut().clear();
-                // Every key created since the old snapshot is in the new
-                // one: the lists that held them are emptied, and the
-                // bounds each table walked are walked again on its next
-                // touch.
-                self.snap_gen.set(self.snap_gen.get().wrapping_add(1));
-                let np = self.segs.partition_point(|s| s.level > 0);
-                for (p, s) in self.segs[..np].iter().enumerate() {
-                    if let Some(t) = s.blocks.borrow_mut().as_mut() {
-                        for list in &mut t.added {
-                            list.clear();
-                        }
-                        t.filed = 0;
-                        for b in 0..t.slots.len() {
-                            if matches!(t.slots[b], Some(Cached::Wide(_))) {
-                                self.unlist(p, b, t);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let cache = self.scan_keys.borrow();
-        let unsealed = &cache.as_ref().expect("scan snapshot").1;
-        // The block path finds the unsealed keys a block needs when it
-        // builds the block, from the block's own bounds, and never from
-        // this cursor. Seeking it anyway was a binary search over every
-        // unsealed key on every scan, with its lower levels cold: on one
-        // store of three million keys, half a microsecond of a far scan's
-        // three, for a number nothing read.
-        if use_cache {
-            return self.scan_blocks(from, limit, unsealed, f);
-        }
-        let mut mc = unsealed.cursor(from);
-
-        // With no level-0 piece the partitions tile the key space in order
-        // and the unsealed keys are one sorted array, so the partitions can
-        // be walked in bulk by `Blob::scan_at`, which resolves each key
-        // once, with the unsealed keys laid over the walk where they fall.
-        // The merge below costs five or six index lookups an entry (a
-        // key_at per cursor to find the minimum, another to emit, and a
-        // third inside `values_at`) where this costs one, and after a
-        // routed flush this is the shape the store is in. An earlier
-        // version had this path, a refactor dropped it, and the scan axis
-        // paid for it.
-        if !self.segs.iter().any(|s| s.level == 0) {
-            return self.scan_partitions(from, limit, mc, unsealed, f);
-        }
-
-        if self.opts.scan_merge {
-            return self.scan_merged(from, limit, mc, unsealed, f);
-        }
-
-        // A k-way merge over rank cursors, allocating nothing per key.
-        //
-        // The version before this one materialised every candidate key from
-        // every source, sorted them and re-read each one: three copies and
-        // a sort per key, which cost more than the reads. `Blob::key_at`
-        // borrows out of the mapped index and the unsealed snapshot is
-        // already sorted, so the merge can run on borrowed keys and emit
-        // values straight from the position it is already holding.
-        let mut cursors: Vec<(&Seg, usize)> = self
-            .segs
-            .iter()
-            .filter(|s| s.may_reach(from))
-            .map(|s| (s, s.ord.seek(s.cursor_from(from), |r| s.blob.key_at(r))))
-            .collect();
-
-        let tombs = self.has_tombstones();
-        let mut seen = 0usize;
-        while seen < limit {
-            // The next key is the smallest any source is holding.
-            let mut next: Option<&[u8]> = None;
-            for (seg, rank) in &cursors {
-                if let Some(k) = seg.blob.key_at(*rank) {
-                    if next.is_none_or(|n| k < n) {
-                        next = Some(k);
-                    }
-                }
-            }
-            if let Some((k, _)) = unsealed.peek(mc) {
-                if next.is_none_or(|n| k < n) {
-                    next = Some(k);
-                }
-            }
-            let Some(key) = next else { break };
-
-            // Emit in append order -- partitions, then L0 oldest to
-            // newest, then the frozen memtable, then the live one -- and
-            // advance every cursor that was sitting on this key.
-            // Sources are ordered oldest to newest -- the cursors, then the
-            // frozen memtable, then the live one -- so the newest source with
-            // a tombstone for this key is a cut, and live values start there.
-            let nc = cursors.len();
-            let in_unsealed = unsealed.peek(mc).map(|(k, _)| k) == Some(key);
-            let mut start = 0usize;
-            if tombs {
-                if in_unsealed {
-                    if self
-                        .mem
-                        .get(key)
-                        .is_some_and(|e| self.mem.has_tomb(e, SEE_ALL))
-                    {
-                        start = nc + 1;
-                    } else if self
-                        .frozen
-                        .as_ref()
-                        .and_then(|fr| fr.get(key).map(|e| fr.has_tomb(e, SEE_ALL)))
-                        .unwrap_or(false)
-                    {
-                        start = nc;
-                    }
-                }
-                if start == 0 {
-                    for (j, (seg, rank)) in cursors.iter().enumerate().rev() {
-                        if seg.tombs && seg.blob.key_at(*rank) == Some(key) {
-                            if let Some((_, exts)) = seg.blob.exts_at(*rank) {
-                                if exts.iter().any(|e| e.is_tombstone()) {
-                                    start = j;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            for (j, (seg, rank)) in cursors.iter_mut().enumerate() {
-                if seg.blob.key_at(*rank) == Some(key) {
-                    if j >= start {
-                        seg.blob
-                            .values_at(*rank, |v| f(key, v))
-                            .map_err(|e| err(&format!("segment scan read: {e}")))?;
-                    }
-                    *rank += 1;
-                }
-            }
-            if in_unsealed {
-                if nc >= start {
-                    if let Some(fr) = &self.frozen {
-                        if let Some(e) = fr.get(key) {
-                            for off in fr.live_chain(e, SEE_ALL).0 {
-                                f(key, fr.value_at(off));
-                            }
-                        }
-                    }
-                }
-                if nc + 1 >= start {
-                    if let Some(e) = self.mem.get(key) {
-                        for off in self.mem.live_chain(e, SEE_ALL).0 {
-                            f(key, self.mem.value_at(off));
-                        }
-                    }
-                }
-                unsealed.advance(&mut mc);
-            }
-            seen += 1;
-        }
-        Ok(seen)
-    }
-
-    /// PROTOTYPE: every cached block dropped, and the flag that says a
-    /// write need not look.
-    fn drop_blocks(&self) {
-        for s in &self.segs {
-            *s.blocks.borrow_mut() = None;
-        }
-        self.cache_used.set(false);
-        self.cache_bytes.set(0);
-        self.built.borrow_mut().clear();
-        self.pending.borrow_mut().clear();
+    /// One empty table cell per segment.
+    fn tables_for(n: usize) -> Vec<std::cell::RefCell<Option<BlockTable>>> {
+        (0..n).map(|_| std::cell::RefCell::new(None)).collect()
     }
 
     /// PROTOTYPE: a built block takes its place in the list the sampler
@@ -6483,13 +8212,13 @@ impl Db {
             return;
         }
         self.stop_ahead();
-        if !self.segs.iter().any(|s| s.level == 0) {
+        if !self.segs().iter().any(|s| s.level == 0) {
             return;
         }
-        let names: Vec<String> = self.segs.iter().map(|s| s.name.clone()).collect();
-        let gen = self.seg_gen;
+        let names: Vec<String> = self.segs().iter().map(|s| s.name.clone()).collect();
+        let gen = self.state().gen;
         let dir = self.dir.clone();
-        let random = self.advice_random.get();
+        let random = self.advice_random();
         let advise_ord = self.opts.read_advice != ReadAdvice::Normal;
         let verify = self.opts.segment.checksums;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -6526,1194 +8255,6 @@ impl Db {
         }
     }
 
-    /// PROTOTYPE: the forms the builder ahead has sent, installed: each
-    /// into its partition's table, made here if the partition has none,
-    /// if the segment set is still the one it was built at and the block
-    /// is unbuilt and not past the wide bound; then the memtable's keys
-    /// over the block spliced in -- the snapshot's run over it and the
-    /// keys filed since, which is what a build here would have merged --
-    /// so the installed block equals one built here.
-    fn install_ahead(&self, unsealed: &Snapshot) -> Result<()> {
-        let Some(a) = &self.ahead else {
-            return Ok(());
-        };
-        let np = self.segs.partition_point(|s| s.level > 0);
-        let l0 = &self.segs[np..];
-        while let Ok(built) = a.rx.try_recv() {
-            // Every publish stops the builder before the set it built over
-            // changes, so a form of another generation cannot arrive here
-            // today; the check guards a path that sorts the segments
-            // without one.
-            if built.gen != self.seg_gen {
-                continue;
-            }
-            let Some(pi) = self.segs[..np].iter().position(|s| s.name == built.name) else {
-                continue;
-            };
-            let seg = &self.segs[pi];
-            let mut held = seg.blocks.borrow_mut();
-            if held.is_none() {
-                *held = Some(self.make_table(seg, l0, unsealed)?);
-                self.cache_used.set(true);
-            }
-            let table = held.as_mut().expect("just made");
-            if table.snap_gen != self.snap_gen.get() {
-                table.snap_at = BuildCtx::snap_bounds(seg, table.slots.len(), unsealed)?;
-                table.snap_gen = self.snap_gen.get();
-            }
-            let b = built.b as usize;
-            if b >= table.slots.len()
-                || table.slots[b].is_some()
-                || BuildCtx::overlay_count(table, b) > WIDE
-            {
-                continue;
-            }
-            table.slots[b] = Some(built.form);
-            self.list_built(pi, b, table);
-            self.shed(pi, b, table);
-            let (lo, hi) = (table.snap_at[b] as usize, table.snap_at[b + 1] as usize);
-            let mut keys: Vec<(Vec<u8>, u32)> = Vec::with_capacity(hi - lo + table.added[b].len());
-            for i in lo..hi {
-                if let Some((k, _)) = unsealed.get(i) {
-                    keys.push((k.to_vec(), u32::MAX));
-                }
-            }
-            for &(slot, cut) in &table.added[b] {
-                let k = self.mem.key_of(self.mem.entry(slot as usize));
-                keys.push((k.to_vec(), cut));
-            }
-            for (k, cut) in keys {
-                let cut = if cut == u32::MAX {
-                    BuildCtx::owner_of(seg, &k).1
-                } else {
-                    cut
-                };
-                self.patch_block(pi, b, table, &k, cut)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// PROTOTYPE: the build context over this store's own state.
-    fn build_ctx(&self) -> BuildCtx<'_> {
-        BuildCtx {
-            segs: &self.segs,
-            mem: &self.mem,
-            frozen: self.frozen.as_deref(),
-            tombs: self.has_tombstones(),
-        }
-    }
-
-    fn list_built(&self, p: usize, b: usize, table: &mut BlockTable) {
-        let bytes = table.slots[b].as_ref().map_or(0, |c| c.bytes());
-        self.cache_bytes.set(self.cache_bytes.get() + bytes);
-        if bytes > 0 {
-            let mut built = self.built.borrow_mut();
-            table.listed[b] = built.len() as u32;
-            built.push((p as u32, b as u32));
-        }
-    }
-
-    /// PROTOTYPE: a block leaves the cache: its bytes leave the count and
-    /// its place in the list goes to the last listed block, whose table
-    /// is `table` when it is the one in hand and borrowed otherwise.
-    fn unlist(&self, p: usize, b: usize, table: &mut BlockTable) -> usize {
-        let Some(c) = table.slots[b].take() else {
-            return 0;
-        };
-        let bytes = c.bytes();
-        self.cache_bytes.set(self.cache_bytes.get() - bytes);
-        let at = std::mem::replace(&mut table.listed[b], u32::MAX);
-        if at != u32::MAX {
-            let mut built = self.built.borrow_mut();
-            let last = built.pop().expect("a listed block is in the list");
-            if (at as usize) < built.len() {
-                built[at as usize] = last;
-                let (lp, lb) = (last.0 as usize, last.1 as usize);
-                if lp == p {
-                    table.listed[lb] = at;
-                } else if let Some(t) = self.segs[lp].blocks.borrow_mut().as_mut() {
-                    t.listed[lb] = at;
-                }
-            }
-        }
-        bytes
-    }
-
-    /// PROTOTYPE: bring the cache under its budget by shedding built
-    /// blocks: of eight drawn at random from the list of built blocks,
-    /// the one walked longest ago, again until under. `cur` is the
-    /// partition whose table the caller holds, reached through `table`
-    /// rather than borrowed again, and `keep` the block it is about to
-    /// walk, never shed: a budget below one block holds that block.
-    fn shed(&self, cur: usize, keep: usize, table: &mut BlockTable) {
-        let budget = self.opts.scan_cache_bytes;
-        if budget == 0 {
-            return;
-        }
-        let tick = self.scan_tick.get();
-        while self.cache_bytes.get() > budget {
-            let mut best: Option<(usize, usize, u32)> = None;
-            {
-                let built = self.built.borrow();
-                if built.is_empty() {
-                    break;
-                }
-                for _ in 0..8 {
-                    let mut x = self.shed_seed.get();
-                    x ^= x << 13;
-                    x ^= x >> 7;
-                    x ^= x << 17;
-                    self.shed_seed.set(x);
-                    let (p, b) = built[(x as usize) % built.len()];
-                    let (p, b) = (p as usize, b as usize);
-                    if p == cur && b == keep {
-                        continue;
-                    }
-                    let touched = if p == cur {
-                        table.touched[b]
-                    } else {
-                        match self.segs[p].blocks.borrow().as_ref() {
-                            Some(t) => t.touched[b],
-                            None => continue,
-                        }
-                    };
-                    let age = tick.wrapping_sub(touched);
-                    if best.is_none_or(|(_, _, a)| age > a) {
-                        best = Some((p, b, age));
-                    }
-                }
-            }
-            let Some((p, b, _)) = best else { break };
-            if p == cur {
-                self.unlist(p, b, table);
-            } else {
-                // The other table's borrow must end before `unlist`
-                // borrows a third table to fix the moved entry, so the
-                // block is taken out through a short borrow of its own.
-                let mut held = self.segs[p].blocks.borrow_mut();
-                let Some(t) = held.as_mut() else { break };
-                if t.slots[b].is_none() {
-                    break;
-                }
-                let c = t.slots[b].take().expect("checked");
-                let bytes = c.bytes();
-                self.cache_bytes.set(self.cache_bytes.get() - bytes);
-                let at = std::mem::replace(&mut t.listed[b], u32::MAX);
-                drop(held);
-                if at != u32::MAX {
-                    let mut built = self.built.borrow_mut();
-                    let last = built.pop().expect("a listed block is in the list");
-                    if (at as usize) < built.len() {
-                        built[at as usize] = last;
-                        let (lp, lb) = (last.0 as usize, last.1 as usize);
-                        if lp == cur {
-                            table.listed[lb] = at;
-                        } else if let Some(t) = self.segs[lp].blocks.borrow_mut().as_mut() {
-                            t.listed[lb] = at;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// PROTOTYPE: the writes since the last scan on the block path, settled:
-    /// each distinct key's block dropped from the cache, and a key created
-    /// since the snapshot filed under its block when its partition has a
-    /// table. The keys are sorted by arena offset so a key written many
-    /// times costs one seek, the created one's record first so the flag
-    /// survives the fold.
-    fn settle_pending(&self) -> Result<()> {
-        let mut pending = std::mem::take(&mut *self.pending.borrow_mut());
-        if pending.is_empty() {
-            return Ok(());
-        }
-        pending.sort_unstable_by_key(|&(off, _, new)| (off, !new));
-        // A write that could not be settled leaves the block it landed in
-        // stale, so an error drops every table rather than leave one.
-        let settled = self.settle_each(&pending);
-        if settled.is_err() {
-            self.drop_blocks();
-        }
-        pending.clear();
-        *self.pending.borrow_mut() = pending;
-        settled
-    }
-
-    fn settle_each(&self, pending: &[(u32, u32, bool)]) -> Result<()> {
-        let np = self.segs.partition_point(|s| s.level > 0);
-        let mut last = u32::MAX;
-        for &(off, len, new) in pending {
-            if off == last {
-                continue;
-            }
-            last = off;
-            let key = self.mem.key_at(off, len);
-            let at = self.segs[..np]
-                .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
-            let Some(seg) = self.segs[..np].get(at) else {
-                continue;
-            };
-            if seg.blob.keys() == 0 {
-                continue;
-            }
-            let mut held = seg.blocks.borrow_mut();
-            let Some(table) = held.as_mut() else {
-                continue;
-            };
-            let (b, cut) = BuildCtx::owner_of(seg, key);
-            if b < table.slots.len() {
-                self.patch_block(at, b, table, key, cut)?;
-            }
-            if new {
-                if let (Some(slot), Some(list)) = (self.mem.slot_of(key), table.added.get_mut(b)) {
-                    list.push((slot as u32, cut));
-                    table.filed += 1;
-                }
-            }
-            // Only a build chooses the wide form, and a patched block is
-            // never rebuilt: past the bound, the block is dropped so the
-            // next scan builds it wide, as the drop-and-rebuild did.
-            if b < table.slots.len()
-                && BuildCtx::overlay_count(table, b) > WIDE
-                && !matches!(table.slots[b], Some(Cached::Wide(_)))
-            {
-                self.unlist(at, b, table);
-            }
-        }
-        Ok(())
-    }
-
-    /// PROTOTYPE: a write settled into the block it landed in, in place:
-    /// the key's run as a build would resolve it -- the partition's values
-    /// for an equal key, then the pieces' and the memtables', a tombstone
-    /// masking everything older -- spliced into whatever form the block
-    /// holds, a clean block becoming sparse. Before this the block was
-    /// dropped and rebuilt at the next scan that crossed it, a copy at 68
-    /// µs at thirty million keys, so a mix that updates and scans the same
-    /// keys rebuilt its hot blocks per write. A replaced run's bytes stay
-    /// in the block until they outweigh the live ones, when the block is
-    /// dropped instead. A wide block holds no values and is left alone; an
-    /// unbuilt one has nothing to patch.
-    fn patch_block(
-        &self,
-        at: usize,
-        b: usize,
-        table: &mut BlockTable,
-        key: &[u8],
-        cut: u32,
-    ) -> Result<()> {
-        if matches!(table.slots[b], None | Some(Cached::Wide(_))) {
-            return Ok(());
-        }
-        let np = self.segs.partition_point(|s| s.level > 0);
-        let seg = &self.segs[at];
-        let l0 = &self.segs[np..];
-        let src = Sources { seg, l0 };
-        let keys = seg.blob.keys();
-        let lo = b * CACHE_BLOCK;
-        let hi = ((b + 1) * CACHE_BLOCK).min(keys);
-        let mut held: Vec<(&[u8], usize, usize, u32)> = Vec::new();
-        for &(j, _) in &table.pieces {
-            let p = &l0[j];
-            let r = p.ord.seek(key, |i| p.blob.key_at(i));
-            if r < p.blob.keys() && p.blob.key_at(r) == Some(key) {
-                held.push((key, j, r, u32::MAX));
-            }
-        }
-        let slot_in = |t: &MemTable| t.slot_of(key).map_or(u32::MAX, |i| i as u32);
-        let sk = SnapKey {
-            off: 0,
-            len: 0,
-            mem: slot_in(&self.mem),
-            frozen: self.frozen.as_ref().map_or(u32::MAX, |fr| slot_in(fr)),
-        };
-        let ov = Overlay {
-            over: vec![Over {
-                key,
-                sk: Some(sk),
-                cut,
-                pieces: 0..held.len() as u32,
-            }],
-            held,
-        };
-        let (c, at_eq) = BuildCtx::cut_known(cut, lo, hi);
-        let same = c < hi && at_eq == Ordering::Equal;
-        let mut em = Emit {
-            tombs: self.has_tombstones(),
-            scratch: Vec::new(),
-        };
-        let mut run: Vec<u8> = Vec::new();
-        self.build_ctx().emit_over(
-            &mut |_, v: &[u8]| {
-                run.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                run.extend_from_slice(v);
-            },
-            &mut em,
-            &ov,
-            0,
-            same.then_some(c),
-            src,
-        )?;
-        let before = table.slots[b].as_ref().map_or(0, |c| c.bytes());
-        let was_clean = matches!(table.slots[b], Some(Cached::Clean));
-        let mut bloated = false;
-        match table.slots[b].as_mut().expect("checked above") {
-            Cached::Block(blk) => {
-                let i = blk.lower_bound(key);
-                let at_run = blk.vals.len() as u32;
-                blk.vals.extend_from_slice(&run);
-                if i < blk.ents.len() && blk.key(&blk.ents[i]) == key {
-                    blk.ents[i][2] = at_run;
-                    blk.ents[i][3] = run.len() as u32;
-                } else {
-                    let key_at = blk.keys.len() as u32;
-                    blk.keys.extend_from_slice(key);
-                    blk.ents
-                        .insert(i, [key_at, key.len() as u32, at_run, run.len() as u32]);
-                }
-                let live: usize = blk.ents.iter().map(|e| e[3] as usize).sum();
-                bloated = blk.vals.len() > 2 * live.max(4096);
-            }
-            Cached::Sparse(sb) => {
-                let i = sb.ents.partition_point(|e| sb.key(e) < key);
-                let at_run = sb.vals.len() as u32;
-                sb.vals.extend_from_slice(&run);
-                if i < sb.ents.len() && sb.key(&sb.ents[i]) == key {
-                    sb.ents[i].run = (at_run, run.len() as u32);
-                } else {
-                    let key_at = sb.keys.len() as u32;
-                    sb.keys.extend_from_slice(key);
-                    sb.ents.insert(
-                        i,
-                        DeltaEnt {
-                            key: (key_at, key.len() as u32),
-                            cut: c as u32,
-                            same,
-                            run: (at_run, run.len() as u32),
-                        },
-                    );
-                }
-                let live: usize = sb.ents.iter().map(|e| e.run.1 as usize).sum();
-                bloated = sb.vals.len() > 2 * live.max(4096);
-            }
-            slot @ Cached::Clean => {
-                *slot = Cached::Sparse(SparseBlock {
-                    keys: key.to_vec(),
-                    ents: vec![DeltaEnt {
-                        key: (0, key.len() as u32),
-                        cut: c as u32,
-                        same,
-                        run: (0, run.len() as u32),
-                    }],
-                    vals: run,
-                });
-            }
-            Cached::Wide(_) => unreachable!("a wide block is left alone above"),
-        }
-        if was_clean {
-            self.list_built(at, b, table);
-        } else {
-            let after = table.slots[b].as_ref().map_or(0, |c| c.bytes());
-            self.cache_bytes
-                .set(self.cache_bytes.get() + after - before);
-        }
-        if bloated {
-            self.unlist(at, b, table);
-        }
-        Ok(())
-    }
-
-    /// PROTOTYPE: bookkeeping after a memtable write, when the block cache
-    /// is on: a rehash renumbers every slot the snapshot and the lists
-    /// hold, a created key joins the list of keys since the snapshot, and
-    /// while any partition has a table the key joins the writes the next
-    /// scan settles.
-    fn note_write(&self, wrote: Wrote) {
-        if wrote.new {
-            self.snap_added.borrow_mut().push(wrote.slot);
-        }
-        if self.cache_used.get() {
-            let e = self.mem.entry(wrote.slot as usize);
-            let mut pending = self.pending.borrow_mut();
-            match pending.last_mut() {
-                Some(last) if last.0 == e.key_off => last.2 |= wrote.new,
-                _ => pending.push((e.key_off, e.key_len, wrote.new)),
-            }
-        }
-    }
-
-    /// PROTOTYPE: a partition's table, made on its first touch: every
-    /// level-0 piece meeting its range walked once against its block
-    /// boundaries, the snapshot walked once, and the keys created since
-    /// the snapshot filed by block. Before this every block's build
-    /// seeked each of those sources from scratch: on one store of three
-    /// million keys, three microseconds of a seven microsecond build.
-    fn make_table(&self, seg: &Seg, l0: &[Seg], unsealed: &Snapshot) -> Result<BlockTable> {
-        let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
-        let ctx = self.build_ctx();
-        ctx.rank_pieces()?;
-        let (pieces, snap_at) = ctx.table_bounds(seg, l0, unsealed)?;
-        let mut added: Vec<Vec<(u32, u32)>> = (0..nblocks).map(|_| Vec::new()).collect();
-        if nblocks > 0 {
-            for &slot in self.snap_added.borrow().iter() {
-                let key = self.mem.key_of(self.mem.entry(slot as usize));
-                if seg.below_lo(key) || seg.hi.as_ref().is_some_and(|h| key >= h.as_slice()) {
-                    continue;
-                }
-                let (b, cut) = BuildCtx::owner_of(seg, key);
-                added[b].push((slot, cut));
-            }
-        }
-        let filed = added.iter().map(Vec::len).sum();
-        Ok(BlockTable {
-            slots: (0..nblocks).map(|_| None).collect(),
-            touched: vec![0; nblocks],
-            listed: vec![u32::MAX; nblocks],
-            pieces,
-            snap_at,
-            snap_gen: self.snap_gen.get(),
-            added,
-            filed,
-        })
-    }
-
-    /// PROTOTYPE: the scan over partitions and everything above them,
-    /// block by block: a cached copy is walked, a clean block is walked in
-    /// the partition, a sparse one with its deltas, and a block not yet
-    /// seen is built first.
-    fn scan_blocks<F: FnMut(&[u8], &[u8])>(
-        &self,
-        from: &[u8],
-        limit: usize,
-        unsealed: &Snapshot,
-        mut f: F,
-    ) -> Result<usize> {
-        let np = self.segs.partition_point(|s| s.level > 0);
-        let l0 = &self.segs[np..];
-        let tick = self.scan_tick.get().wrapping_add(1);
-        self.scan_tick.set(tick);
-        self.install_ahead(unsealed)?;
-        // One context for the scan: its tombstone flag is a walk over every
-        // segment, which a context per block paid on every sparse walk.
-        let ctx = self.build_ctx();
-        let mut seen = 0usize;
-        let mut cursor: &[u8] = from;
-        // The partitions tile the key space in order, so the first that
-        // may reach the start is found by binary search and every one
-        // after it may; filtering each in turn was a fence compare per
-        // partition below the start, on every scan.
-        let first = self.first_reaching(np, from);
-        for (pi, seg) in self.segs[..np].iter().enumerate().skip(first) {
-            if seen >= limit {
-                break;
-            }
-            let src = Sources { seg, l0 };
-            cursor = seg.cursor_from(cursor);
-            let keys = seg.blob.keys();
-            if keys == 0 {
-                match &seg.hi {
-                    Some(h) => {
-                        cursor = h.as_slice();
-                        continue;
-                    }
-                    None => break,
-                }
-            }
-            let rank = seg.ord.seek(cursor, |r| seg.blob.key_at(r));
-            let owner = if rank < keys && seg.blob.key_at(rank) == Some(cursor) {
-                rank
-            } else {
-                rank.saturating_sub(1)
-            };
-            let nblocks = keys.div_ceil(CACHE_BLOCK);
-            let mut held = seg.blocks.borrow_mut();
-            if held.is_none() {
-                *held = Some(self.make_table(seg, l0, unsealed)?);
-                self.cache_used.set(true);
-            }
-            let table = held.as_mut().expect("just made");
-            if table.snap_gen != self.snap_gen.get() {
-                table.snap_at = BuildCtx::snap_bounds(seg, nblocks, unsealed)?;
-                table.snap_gen = self.snap_gen.get();
-            }
-            if table.clean_throughout() {
-                // The suite's scan workload, and any store between a flush
-                // and its next write: one walk from the seek, as the bulk
-                // walk makes it. Measured through the blocks it was a
-                // tenth slower, in first touches and bookkeeping.
-                if rank < keys {
-                    let want = (keys - rank).min(limit - seen);
-                    let got = seg
-                        .blob
-                        .scan_at(rank, want, &mut f)
-                        .map_err(|e| err(&format!("segment scan: {e}")))?;
-                    if got < want {
-                        return Err(err(
-                            "segment scan: a partition's walk stopped short of its key count",
-                        ));
-                    }
-                    seen += got;
-                }
-                match &seg.hi {
-                    Some(h) => {
-                        cursor = h.as_slice();
-                        continue;
-                    }
-                    None => break,
-                }
-            }
-            let mut b = owner / CACHE_BLOCK;
-            let mut first = true;
-            while seen < limit && b < nblocks {
-                let lo = b * CACHE_BLOCK;
-                let hi = ((b + 1) * CACHE_BLOCK).min(keys);
-                let start = if first { rank.max(lo) } else { lo };
-                let from_key: &[u8] = if first { cursor } else { b"" };
-                if table.slots[b].is_none() {
-                    let built = ctx.materialize(src, table, b, unsealed)?;
-                    table.slots[b] = Some(built);
-                    self.list_built(pi, b, table);
-                    self.shed(pi, b, table);
-                }
-                table.touched[b] = tick;
-                if let Some(Cached::Wide(w)) = table.slots[b].as_mut() {
-                    // Filed since the order was made: sorted and merged in.
-                    let filed = &table.added[b];
-                    if filed.len() > w.seen {
-                        let fresh = ctx.sorted_filed(&filed[w.seen..]);
-                        let key_of = |slot: u32| self.mem.key_of(self.mem.entry(slot as usize));
-                        let mut merged = Vec::with_capacity(w.sorted.len() + fresh.len());
-                        let (mut i, mut j) = (0usize, 0usize);
-                        while i < w.sorted.len() || j < fresh.len() {
-                            let take_old = j >= fresh.len()
-                                || (i < w.sorted.len()
-                                    && key_of(w.sorted[i].0) <= key_of(fresh[j].0));
-                            if take_old {
-                                merged.push(w.sorted[i]);
-                                i += 1;
-                            } else {
-                                merged.push(fresh[j]);
-                                j += 1;
-                            }
-                        }
-                        let grew = (merged.len() - w.sorted.len()) * 8;
-                        w.sorted = merged;
-                        w.seen = filed.len();
-                        self.cache_bytes.set(self.cache_bytes.get() + grew);
-                    }
-                }
-                // This block's cold lines, and the next block's when the
-                // scan will cross into it, fetched while this one walks.
-                let ahead = limit - seen;
-                prefetch_block(&seg.blob, table, b, start, ahead);
-                if hi - start < ahead && b + 1 < nblocks {
-                    prefetch_block(&seg.blob, table, b + 1, hi, ahead - (hi - start));
-                }
-                match table.slots[b].as_ref().expect("just built") {
-                    Cached::Sparse(deltas) => {
-                        seen += ctx.walk_deltas(
-                            src,
-                            start..hi,
-                            deltas,
-                            from_key,
-                            limit - seen,
-                            &mut f,
-                        )?;
-                    }
-                    Cached::Clean => {
-                        // Every clean block built after this one joins the
-                        // run: on a store with nothing unsealed, a scan of
-                        // a hundred entries is one walk, as the bulk walk
-                        // makes it, not three block-sized ones.
-                        let mut run_hi = hi;
-                        while b + 1 < nblocks
-                            && run_hi - start < limit - seen
-                            && matches!(table.slots[b + 1], Some(Cached::Clean))
-                        {
-                            b += 1;
-                            table.touched[b] = tick;
-                            run_hi = ((b + 1) * CACHE_BLOCK).min(keys);
-                        }
-                        if start < run_hi {
-                            let want = (run_hi - start).min(limit - seen);
-                            let got = seg
-                                .blob
-                                .scan_at(start, want, &mut f)
-                                .map_err(|e| err(&format!("segment scan: {e}")))?;
-                            if got < want {
-                                return Err(err("segment scan: a partition's walk stopped short of its key count"));
-                            }
-                            seen += got;
-                        }
-                    }
-                    Cached::Block(blk) => {
-                        let i = if first { blk.lower_bound(cursor) } else { 0 };
-                        for e in &blk.ents[i..] {
-                            if seen >= limit {
-                                break;
-                            }
-                            let k = blk.key(e);
-                            blk.each_value(e, |v| f(k, v));
-                            seen += 1;
-                        }
-                    }
-                    Cached::Wide(w) => {
-                        let window = (from_key, limit - seen);
-                        let ov = ctx.overlay_window(src, table, b, unsealed, w, window)?;
-                        seen +=
-                            ctx.walk_block(src, start..hi, &ov, limit - seen, |_k| {}, &mut f)?;
-                    }
-                }
-                b += 1;
-                first = false;
-            }
-            match &seg.hi {
-                Some(h) => cursor = h.as_slice(),
-                None => break,
-            }
-        }
-        Ok(seen)
-    }
-
-    /// PROTOTYPE: the cache's size, for a measurement: blocks held and
-    /// bytes of keys and values in them.
-    pub fn block_cache_size(&self) -> (usize, usize) {
-        let (mut clean, mut sparse, mut copies, mut wide, mut bytes) =
-            (0usize, 0usize, 0usize, 0usize, 0usize);
-        for s in &self.segs {
-            for c in s
-                .blocks
-                .borrow()
-                .iter()
-                .flat_map(|t| t.slots.iter())
-                .flatten()
-            {
-                match c {
-                    Cached::Clean => clean += 1,
-                    Cached::Sparse(b) => {
-                        sparse += 1;
-                        bytes += b.keys.len() + b.ents.len() * 24 + b.vals.len();
-                    }
-                    Cached::Block(b) => {
-                        copies += 1;
-                        bytes += b.keys.len() + b.vals.len() + b.ents.len() * 16;
-                    }
-                    Cached::Wide(w) => {
-                        wide += 1;
-                        bytes += w.sorted.len() * 8;
-                    }
-                }
-            }
-        }
-        eprintln!(
-            "  cache: {clean} clean, {sparse} sparse, {copies} copies, {wide} wide; {bytes} B walked, {} B counted",
-            self.cache_bytes.get()
-        );
-        (clean + sparse + copies + wide, bytes)
-    }
-
-    /// PROTOTYPE: the bytes the cache counts itself holding, for a test
-    /// to hold against a walk of it.
-    pub fn block_cache_bytes(&self) -> usize {
-        self.cache_bytes.get()
-    }
-
-    /// PROTOTYPE: the most bytes any one built block holds, the slack a
-    /// budget allows since the block in hand is never shed.
-    pub fn block_cache_largest(&self) -> usize {
-        self.segs
-            .iter()
-            .map(|s| {
-                s.blocks.borrow().as_ref().map_or(0, |t| {
-                    t.slots
-                        .iter()
-                        .flatten()
-                        .map(|c| c.bytes())
-                        .max()
-                        .unwrap_or(0)
-                })
-            })
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// PROTOTYPE: how many blocks the cache holds as wide, for a test to
-    /// hold the count that makes one to its definition.
-    pub fn block_cache_wide(&self) -> usize {
-        self.segs
-            .iter()
-            .map(|s| {
-                s.blocks.borrow().as_ref().map_or(0, |t| {
-                    t.slots
-                        .iter()
-                        .flatten()
-                        .filter(|c| matches!(c, Cached::Wide(_)))
-                        .count()
-                })
-            })
-            .sum()
-    }
-
-    /// The partitions walked in bulk, with the unsealed keys laid over them.
-    ///
-    /// The caller has checked there is no level-0 piece, so the sources are
-    /// the partitions, which tile the key space in order, and the two
-    /// memtables, whose keys `unsealed` holds as one sorted array. Each
-    /// partition is walked by `Blob::scan_at` -- one record decode an entry
-    /// -- up to the next unsealed key that falls inside the walk. That key
-    /// is then emitted as `scan_merged` would emit it, and the walk resumes
-    /// after it. Unsealed keys beyond the last partition come out at the
-    /// end, in order.
-    ///
-    /// Before this, the bulk walk ran only when no unsealed key was at or
-    /// after `from`. YCSB's inserts land past the end of the loaded range,
-    /// so after the first one every scan failed that test for keys it never
-    /// reached and paid the merge: on one store in one process, a 5% insert
-    /// past the end with no seal cost 100-entry scans 2.8x, and a flush gave
-    /// it back.
-    ///
-    /// Whether the next unsealed key cuts a walk is decided by one key read,
-    /// the last key the walk would reach, and only when it does is its rank
-    /// found -- by a binary search over the walk's window, not the ordered
-    /// index over the whole partition. A scan that meets no unsealed key
-    /// pays one key read a partition for the question.
-    fn scan_partitions<F: FnMut(&[u8], &[u8])>(
-        &self,
-        from: &[u8],
-        limit: usize,
-        mut mc: SnapCursor,
-        unsealed: &Snapshot,
-        mut f: F,
-    ) -> Result<usize> {
-        // `sort_segs` orders by level descending then by `lo`, and this
-        // runs only when every segment is a partition, so they are already
-        // in key order here. Collecting them into a `Vec` to sort them
-        // again repeated work the store had done -- and the collect, the
-        // sort and the three `Vec` clones around the cursor measured 391ns
-        // of a 648ns seek, six times what the ordered index saved. A scan
-        // is a read; it allocates nothing until a memtable chain is walked.
-        debug_assert!(
-            self.segs
-                .windows(2)
-                .all(|w| w[0].level != w[1].level || w[0].lo <= w[1].lo),
-            "partitions are not in key order, so this walk would skip one"
-        );
-        // Whether any source holds a tombstone is asked of every segment,
-        // and only an emitted unsealed key needs the answer, so a scan that
-        // meets none never asks.
-        let mut tombs: Option<bool> = None;
-        let mut scratch: Vec<usize> = Vec::new();
-        let mut seen = 0usize;
-        let mut cursor: &[u8] = from;
-        // Every segment is a partition here, and the first that may reach
-        // the start is found by binary search; see `first_reaching`.
-        let first = self.first_reaching(self.segs.len(), from);
-        for seg in &self.segs[first..] {
-            if seen >= limit {
-                break;
-            }
-            cursor = seg.cursor_from(cursor);
-            let keys = seg.blob.keys();
-            // The ordered index answers the seek this partition starts
-            // with; the walk after it is the reader's own. That split is
-            // the whole point of the index -- the seek was the entire
-            // measured deficit and the walk was already competitive.
-            let mut rank = seg.ord.seek(cursor, |r| seg.blob.key_at(r));
-            while seen < limit {
-                // The walk reaches the limit or the partition's end, cut
-                // where the next unsealed key falls inside it. A rank that
-                // does not resolve sorts as "not less", the rule the seek
-                // uses, so damage widens the cut rather than moving it.
-                let end = rank.saturating_add(limit - seen).min(keys);
-                let next = unsealed.peek(mc);
-                let (bound, at_bound) = match next {
-                    Some((uk, _)) if end > rank => BuildCtx::cut_at(seg, rank, end, uk),
-                    _ => (end, Ordering::Greater),
-                };
-                if bound > rank {
-                    let got = seg
-                        .blob
-                        .scan_at(rank, bound - rank, &mut f)
-                        .map_err(|e| err(&format!("segment scan: {e}")))?;
-                    if got < bound - rank {
-                        // A rank below the key count that the walk could
-                        // not resolve. The seek above would have widened
-                        // past it; the walk cannot, and saying nothing
-                        // would drop every key after it.
-                        return Err(err(
-                            "segment scan: a partition's walk stopped short of its key count",
-                        ));
-                    }
-                    seen += got;
-                    rank += got;
-                    if seen >= limit {
-                        break;
-                    }
-                }
-                // The walk stands at the unsealed key's cut, or at the end
-                // of this partition's keys. The partition's own key is
-                // below its fence by construction, so only another key is
-                // asked whether it belongs past the fence, to the next
-                // partition, or past the last partition's last key, to the
-                // tail below.
-                let Some((uk, sk)) = next else { break };
-                let same = rank < keys && at_bound == Ordering::Equal;
-                if !same {
-                    if seg.hi.as_ref().is_some_and(|h| uk >= h.as_slice()) {
-                        break;
-                    }
-                    if rank >= keys && seg.hi.is_none() {
-                        break;
-                    }
-                }
-                let tombs = *tombs.get_or_insert_with(|| self.has_tombstones());
-                self.emit_unsealed(
-                    &mut f,
-                    &mut scratch,
-                    tombs,
-                    uk,
-                    &sk,
-                    same.then_some((seg, rank)),
-                )?;
-                if same {
-                    rank += 1;
-                }
-                unsealed.advance(&mut mc);
-                seen += 1;
-            }
-            match &seg.hi {
-                Some(h) => cursor = h.as_slice(),
-                None => break,
-            }
-        }
-        // Unsealed keys after every partition, in order.
-        while seen < limit {
-            let Some((uk, sk)) = unsealed.peek(mc) else {
-                break;
-            };
-            let tombs = *tombs.get_or_insert_with(|| self.has_tombstones());
-            self.emit_unsealed(&mut f, &mut scratch, tombs, uk, &sk, None)?;
-            unsealed.advance(&mut mc);
-            seen += 1;
-        }
-        Ok(seen)
-    }
-
-    /// One unsealed key, emitted as `scan_merged` emits it with no level-0
-    /// piece in the way: the partition's values first when `part` names an
-    /// equal key, then the frozen memtable's, then the live one's, each
-    /// older source cut by a tombstone in a newer. Sources are numbered
-    /// partition 0, frozen 1, live 2; `start` is the oldest one whose
-    /// values are live.
-    fn emit_unsealed<F: FnMut(&[u8], &[u8])>(
-        &self,
-        f: &mut F,
-        scratch: &mut Vec<usize>,
-        tombs: bool,
-        key: &[u8],
-        sk: &SnapKey,
-        part: Option<(&Seg, usize)>,
-    ) -> Result<()> {
-        let mut start = 0usize;
-        if tombs {
-            if sk.mem != u32::MAX && self.mem.has_tomb(self.mem.entry(sk.mem as usize), SEE_ALL) {
-                start = 2;
-            } else if sk.frozen != u32::MAX
-                && self
-                    .frozen
-                    .as_ref()
-                    .is_some_and(|fr| fr.has_tomb(fr.entry(sk.frozen as usize), SEE_ALL))
-            {
-                start = 1;
-            }
-        }
-        if start == 0 {
-            if let Some((seg, rank)) = part {
-                seg.blob
-                    .values_at(rank, |v| f(key, v))
-                    .map_err(|e| err(&format!("segment scan read: {e}")))?;
-            }
-        }
-        if sk.frozen != u32::MAX && start <= 1 {
-            if let Some(fr) = &self.frozen {
-                let e = fr.entry(sk.frozen as usize);
-                fr.live_offs_into(e, scratch, SEE_ALL);
-                for &off in scratch.iter() {
-                    f(key, fr.value_at(off));
-                }
-            }
-        }
-        if sk.mem != u32::MAX {
-            let e = self.mem.entry(sk.mem as usize);
-            self.mem.live_offs_into(e, scratch, SEE_ALL);
-            for &off in scratch.iter() {
-                f(key, self.mem.value_at(off));
-            }
-        }
-        Ok(())
-    }
-
-    /// The merge over unrouted sources, the `scan_merge` arm: one cursor walking the
-    /// disjoint partitions in order, one cursor per level-0 segment, and the
-    /// unsealed snapshot with each key's entries in hand. Every cursor's key
-    /// is resolved once per emitted key. Sources are ordered oldest to
-    /// newest -- the partition, level 0 oldest first, the frozen memtable,
-    /// the live one -- and a tombstone in the newest source that holds the
-    /// key cuts everything older, as in `read_all`.
-    fn scan_merged<F: FnMut(&[u8], &[u8])>(
-        &self,
-        from: &[u8],
-        limit: usize,
-        mut mc: SnapCursor,
-        unsealed: &Snapshot,
-        mut f: F,
-    ) -> Result<usize> {
-        let np = self.segs.partition_point(|s| s.level > 0);
-        let parts = &self.segs[..np];
-        struct Cur<'a> {
-            seg: &'a Seg,
-            rank: usize,
-            key: Option<&'a [u8]>,
-        }
-        // The level-0 cursors. With every piece aligned to a partition
-        // they are the pieces over the range the walk is in, seeked to
-        // its start there and re-seeked when it crosses into the next
-        // range; a range is left once its partition and its pieces are
-        // both exhausted, since a piece can hold keys above its
-        // partition's last. Otherwise, every piece that may reach the
-        // start, seeked once, and the walk of every key over every one:
-        // what every scan did, and paid a cursor per piece in the store
-        // at the seek and a compare per piece per key.
-        let routed = self.l0_aligned;
-        let seek_l0 = |pi: usize, from: &[u8]| -> Vec<Cur> {
-            let pieces = if routed {
-                self.pieces_over(np, pi)
-            } else {
-                &self.segs[np..]
-            };
-            pieces
-                .iter()
-                .filter(|s| s.may_reach(from))
-                .map(|s| {
-                    let rank = s.ord.seek(s.cursor_from(from), |r| s.blob.key_at(r));
-                    Cur {
-                        seg: s,
-                        rank,
-                        key: s.blob.key_at(rank),
-                    }
-                })
-                .collect()
-        };
-        // The partition cursor: the first partition whose fence can reach
-        // `from`, then each following one from its first key.
-        let mut pi = self.first_reaching(np, from);
-        let mut prank = 0usize;
-        let mut pkey: Option<&[u8]> = None;
-        while pi < np {
-            let s = &parts[pi];
-            prank = s.ord.seek(s.cursor_from(from), |r| s.blob.key_at(r));
-            pkey = s.blob.key_at(prank);
-            if pkey.is_some() || routed {
-                break;
-            }
-            pi += 1;
-        }
-        let mut l0: Vec<Cur> = seek_l0(pi.min(np), from);
-        let tombs = self.has_tombstones();
-        let mut scratch: Vec<usize> = Vec::new();
-        let mut seen = 0usize;
-        while seen < limit {
-            if routed {
-                while pkey.is_none() && l0.iter().all(|c| c.key.is_none()) && pi + 1 < np {
-                    pi += 1;
-                    prank = 0;
-                    pkey = parts[pi].blob.key_at(0);
-                    l0 = seek_l0(pi, parts[pi].lo.as_slice());
-                }
-            }
-            let nc = l0.len();
-            let mut next: Option<&[u8]> = pkey;
-            for c in &l0 {
-                if let Some(k) = c.key {
-                    if next.is_none_or(|n| k < n) {
-                        next = Some(k);
-                    }
-                }
-            }
-            let snap = unsealed.peek(mc);
-            if let Some((k, _)) = snap {
-                if next.is_none_or(|n| k < n) {
-                    next = Some(k);
-                }
-            }
-            let Some(key) = next else { break };
-            let in_unsealed = snap.is_some_and(|(k, _)| k == key);
-            let snap = snap.map(|(_, sk)| sk);
-
-            // Source indices: partition 0, level 0 at 1..=nc, frozen nc+1,
-            // live nc+2. `start` is the oldest source whose values are live.
-            let mut start = 0usize;
-            if tombs {
-                if let Some(sk) = snap.filter(|_| in_unsealed) {
-                    if sk.mem != u32::MAX
-                        && self.mem.has_tomb(self.mem.entry(sk.mem as usize), SEE_ALL)
-                    {
-                        start = nc + 2;
-                    } else if sk.frozen != u32::MAX
-                        && self
-                            .frozen
-                            .as_ref()
-                            .is_some_and(|fr| fr.has_tomb(fr.entry(sk.frozen as usize), SEE_ALL))
-                    {
-                        start = nc + 1;
-                    }
-                }
-                if start == 0 {
-                    for (j, c) in l0.iter().enumerate().rev() {
-                        if c.seg.tombs && c.key == Some(key) {
-                            if let Some((_, exts)) = c.seg.blob.exts_at(c.rank) {
-                                if exts.iter().any(|e| e.is_tombstone()) {
-                                    start = j + 1;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if pkey == Some(key) {
-                if start == 0 {
-                    parts[pi]
-                        .blob
-                        .values_at(prank, |v| f(key, v))
-                        .map_err(|e| err(&format!("segment scan read: {e}")))?;
-                }
-                prank += 1;
-                pkey = parts[pi].blob.key_at(prank);
-                while !routed && pkey.is_none() && pi + 1 < np {
-                    pi += 1;
-                    prank = 0;
-                    pkey = parts[pi].blob.key_at(0);
-                }
-            }
-            for (j, c) in l0.iter_mut().enumerate() {
-                if c.key == Some(key) {
-                    if j + 1 >= start {
-                        c.seg
-                            .blob
-                            .values_at(c.rank, |v| f(key, v))
-                            .map_err(|e| err(&format!("segment scan read: {e}")))?;
-                    }
-                    c.rank += 1;
-                    c.key = c.seg.blob.key_at(c.rank);
-                }
-            }
-            if let Some(sk) = snap.filter(|_| in_unsealed) {
-                if sk.frozen != u32::MAX && nc + 1 >= start {
-                    if let Some(fr) = &self.frozen {
-                        let e = fr.entry(sk.frozen as usize);
-                        fr.live_offs_into(e, &mut scratch, SEE_ALL);
-                        for &off in &scratch {
-                            f(key, fr.value_at(off));
-                        }
-                    }
-                }
-                if sk.mem != u32::MAX && nc + 2 >= start {
-                    let e = self.mem.entry(sk.mem as usize);
-                    self.mem.live_offs_into(e, &mut scratch, SEE_ALL);
-                    for &off in &scratch {
-                        f(key, self.mem.value_at(off));
-                    }
-                }
-                unsealed.advance(&mut mc);
-            }
-            seen += 1;
-        }
-        Ok(seen)
-    }
-
-    /// Values of `key` across every source. O(extents) per segment touched:
-    /// each extent carries its record count (`Ext::count`, format v5), so no
-    /// block is read. The memtable keeps a live count per key.
-    pub fn count(&self, key: &[u8]) -> Result<u64> {
-        // A count resolves one key, so it is a point read for advice
-        // purposes even though it returns no bytes (`F28`: 94 ns, a lookup).
-        self.advise(true);
-        let hash = self.mem.prefetch(key);
-        let np = self.segs.partition_point(|s| s.level > 0);
-        let at =
-            self.segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
-        let part = self.segs[..np].get(at).filter(|s| s.may_hold(key));
-        let l0 = self.pieces_over(np, at);
-        let (fr_ix, mem_ix) = (1 + l0.len(), 2 + l0.len());
-        let mut start = 0usize;
-        if self.has_tombstones() {
-            if !self.mem.is_empty() {
-                if let Some(e) = self.mem.get_with(hash, key) {
-                    if self.mem.has_tomb(e, SEE_ALL) {
-                        start = mem_ix;
-                    }
-                }
-            }
-            if start == 0 {
-                if let Some(fr) = &self.frozen {
-                    if let Some(e) = fr.get(key) {
-                        if fr.has_tomb(e, SEE_ALL) {
-                            start = fr_ix;
-                        }
-                    }
-                }
-            }
-            if start == 0 {
-                for (i, seg) in l0.iter().enumerate().rev() {
-                    if !seg.tombs || !seg.may_hold(key) {
-                        continue;
-                    }
-                    if let Some(exts) = seg.blob.lookup(key) {
-                        if exts.iter().any(|e| e.is_tombstone()) {
-                            start = 1 + i;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        let mut n = 0u64;
-        if start == 0 {
-            if let Some(seg) = part {
-                n += seg
-                    .blob
-                    .count(key)
-                    .map_err(|e| err(&format!("segment count: {e}")))?;
-            }
-        }
-        for (i, seg) in l0.iter().enumerate() {
-            if 1 + i < start || !seg.may_hold(key) {
-                continue;
-            }
-            n += seg
-                .blob
-                .count(key)
-                .map_err(|e| err(&format!("segment count: {e}")))?;
-        }
-        if fr_ix >= start {
-            if let Some(fr) = &self.frozen {
-                if let Some(e) = fr.get(key) {
-                    n += e.count.load(AtomicOrdering::Relaxed);
-                }
-            }
-        }
-        if mem_ix >= start && !self.mem.is_empty() {
-            if let Some(e) = self.mem.get_with(hash, key) {
-                n += e.count.load(AtomicOrdering::Relaxed);
-            }
-        }
-        Ok(n)
-    }
-
     pub fn phase_ns(&self) -> (u64, u64, u64) {
         (self.phase_ns[0], self.phase_ns[1], self.phase_ns[2])
     }
@@ -7723,21 +8264,8 @@ impl Db {
         self.seal_wait
     }
 
-    /// Keys held by the unsealed sources: the live memtable and, while a
-    /// seal is in flight, the frozen one. A key in both counts twice.
-    pub fn unsealed_keys(&self) -> usize {
-        self.mem.len() + self.frozen.as_ref().map_or(0, |f| f.len())
-    }
-
     pub fn segments(&self) -> usize {
-        self.segs.len() + usize::from(self.sealing.is_some())
-    }
-
-    /// Live segment count by level: (partitioned, L0). The compaction
-    /// experiment reports both, because "how many segments does a read
-    /// touch" is the whole question.
-    pub fn levels(&self) -> (usize, usize) {
-        (self.segs.len() - self.l0_len(), self.l0_len())
+        self.segs().len() + usize::from(self.sealing.is_some())
     }
 
     /// Whether a seal and a merge are running right now. A crash experiment
@@ -7901,19 +8429,17 @@ fn build_ahead_job(
     stop: &std::sync::atomic::AtomicBool,
     tx: &std::sync::mpsc::Sender<Built>,
 ) -> Result<()> {
-    let mut segs = Vec::with_capacity(names.len());
+    let mut segs: Vec<std::sync::Arc<Seg>> = Vec::with_capacity(names.len());
     for n in names {
-        segs.push(Seg::open(dir, n, random, advise_ord, verify)?);
+        segs.push(std::sync::Arc::new(Seg::open(
+            dir, n, random, advise_ord, verify,
+        )?));
     }
-    segs.sort_by(|a, b| {
-        b.level
-            .cmp(&a.level)
-            .then_with(|| a.lo.cmp(&b.lo))
-            .then_with(|| a.name.cmp(&b.name))
-    });
+    segs.sort_by(|a, b| seg_order(a, b));
     let mem = MemTable::new();
     let unsealed = Snapshot::default();
     let ctx = BuildCtx {
+        wm: SEE_ALL,
         segs: &segs,
         mem: &mem,
         frozen: None,
@@ -7978,7 +8504,9 @@ fn build_ahead_job(
 /// since the files are immutable and stay readable while mapped, and the
 /// store splices the memtable's keys in when the block is installed.
 struct BuildCtx<'s> {
-    segs: &'s [Seg],
+    /// The watermark the live memtable's chains are walked under.
+    wm: u64,
+    segs: &'s [std::sync::Arc<Seg>],
     mem: &'s MemTable,
     frozen: Option<&'s MemTable>,
     tombs: bool,
@@ -7991,7 +8519,7 @@ impl<'s> BuildCtx<'s> {
     fn table_bounds(
         &self,
         seg: &Seg,
-        l0: &[Seg],
+        l0: &[std::sync::Arc<Seg>],
         unsealed: &Snapshot,
     ) -> Result<(PieceBounds, Vec<u32>)> {
         let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
@@ -8092,20 +8620,28 @@ impl<'s> BuildCtx<'s> {
         }
         Ok(out)
     }
-    /// PROTOTYPE: rank the keys of every piece aligned to a partition that
-    /// has none yet. Called when a seal publishes its pieces, so the work
-    /// is off the read path, and by a table's making for pieces that were
-    /// opened from disk.
+    /// PROTOTYPE: rank the keys of every piece aligned to a partition
+    /// that has no ranks against that partition yet. Called when a seal
+    /// or a merge publishes, so the work is off the read path, and by a
+    /// table's making for pieces that were opened from disk.
     fn rank_pieces(&self) -> Result<()> {
         let np = self.segs.partition_point(|s| s.level > 0);
         let (parts, l0) = self.segs.split_at(np);
         for p in l0 {
-            if p.ranks.borrow().is_some() {
+            let Some(part) = parts.iter().find(|q| q.lo == p.lo && q.hi == p.hi) else {
+                continue;
+            };
+            let id = part.blob.id();
+            if p.ranks
+                .read()
+                .expect("a piece's ranks")
+                .as_ref()
+                .is_some_and(|(against, _)| *against == id)
+            {
                 continue;
             }
-            if let Some(part) = parts.iter().find(|q| q.lo == p.lo && q.hi == p.hi) {
-                *p.ranks.borrow_mut() = Some(BuildCtx::ranks_over(part, p)?);
-            }
+            let ranks = BuildCtx::ranks_over(part, p)?;
+            *p.ranks.write().expect("a piece's ranks") = Some((id, ranks));
         }
         Ok(())
     }
@@ -8215,15 +8751,22 @@ impl<'s> BuildCtx<'s> {
         pieces: &[(usize, std::ops::Range<usize>)],
     ) -> Result<Overlay<'a>> {
         let mut held: Vec<(&[u8], usize, usize, u32)> = Vec::new();
+        let against = src.seg.blob.id();
         for (j, run) in pieces {
             let p = &src.l0[*j];
-            let ranks = p.ranks.borrow();
+            // Ranks against another partition are no ranks: the cut is
+            // searched for instead.
+            let against_it = p.ranks.read().expect("a piece's ranks");
+            let ranks = against_it
+                .as_ref()
+                .filter(|(id, _)| *id == against)
+                .map(|(_, v)| v);
             for r in run.clone() {
                 let k = p
                     .blob
                     .key_at(r)
                     .ok_or_else(|| err("block cache: a rank did not resolve"))?;
-                let cut = ranks.as_ref().map_or(u32::MAX, |v| v[r]);
+                let cut = ranks.map_or(u32::MAX, |v| v[r]);
                 held.push((k, *j, r, cut));
             }
         }
@@ -8366,7 +8909,7 @@ impl<'s> BuildCtx<'s> {
         let mut start = 0usize;
         if em.tombs {
             if let Some(sk) = o.sk {
-                if sk.mem != u32::MAX && self.mem.has_tomb(self.mem.entry(sk.mem as usize), SEE_ALL)
+                if sk.mem != u32::MAX && self.mem.has_tomb(self.mem.entry(sk.mem as usize), self.wm)
                 {
                     start = nc + 2;
                 } else if sk.frozen != u32::MAX
@@ -8441,7 +8984,7 @@ impl<'s> BuildCtx<'s> {
             }
             if sk.mem != u32::MAX {
                 let e = self.mem.entry(sk.mem as usize);
-                self.mem.live_offs_into(e, &mut em.scratch, SEE_ALL);
+                self.mem.live_offs_into(e, &mut em.scratch, self.wm);
                 for &off in em.scratch.iter() {
                     f(key, self.mem.value_at(off));
                 }
@@ -8792,5 +9335,20 @@ impl Drop for Db {
         if let Some((_, h)) = self.compacting.take() {
             let _ = h.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod threading {
+    /// A reader handle crosses threads, and the state it reads is shared
+    /// between them: the compiler holds both, which is what keeps a cell
+    /// out of a segment or a memtable.
+    #[test]
+    fn the_state_is_shared_and_the_handle_is_sent() {
+        fn shared<T: Send + Sync>() {}
+        fn sent<T: Send>() {}
+        shared::<super::State>();
+        shared::<super::Shared>();
+        sent::<super::Reader>();
     }
 }

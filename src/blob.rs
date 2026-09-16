@@ -31,8 +31,9 @@ use crate::block::{self, BlockLoc};
 use crate::bytes::{short, take, Bytes};
 use crate::flatindex::{self, FlatIndex, MappedBlocks};
 use crate::index::Ext;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::io::{Error, ErrorKind, Result};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 fn corrupt(msg: &str) -> Error {
     Error::new(ErrorKind::InvalidData, format!("supdb: {msg}"))
@@ -589,9 +590,11 @@ struct SparseIndex {
     hdr: flatindex::Header,
     fence: Vec<u8>,
     /// The checksum row, empty for a section without one, and one bit per
-    /// piece already verified by this reader.
+    /// piece already verified through this reader. Atomic words, since a
+    /// reader is shared between threads; a piece verified twice by two
+    /// of them is a race nobody loses.
     crcs: Vec<u8>,
-    verified: RefCell<Vec<u64>>,
+    verified: Box<[AtomicU64]>,
     /// The directory, when `resident_directory` fetched it at open.
     dir: Option<Vec<u32>>,
     /// Whether the open planned itself from the superblock extension.
@@ -609,30 +612,53 @@ pub struct Blob<B: Bytes> {
     /// One bit per (block, chunk), so a chunk is checksummed once per reader
     /// and not once per value. Same argument as `Reader::verified`: an
     /// uncompressed block is handed out where it lies, so re-verifying it per
-    /// read is O(block) work to return O(value) bytes.
-    verified: RefCell<Vec<u64>>,
-    /// Reused buffers for a source that cannot lend, and for decompression.
-    ///
-    /// `Cell` rather than `RefCell` on purpose: these are held across a
-    /// user callback, and a callback that re-enters the reader should get a
-    /// fresh buffer rather than a panic. A host callback here is JavaScript.
-    raw_buf: Cell<Vec<u8>>,
-    dec_buf: Cell<Vec<u8>>,
-    /// Which block, and which chunk-aligned span of it, `dec_buf` currently
-    /// holds decompressed.
-    ///
-    /// `dec_buf` is a reused buffer and was nothing more: `with_run`
-    /// decompressed the chunks covering one extent, handed them out, and kept
-    /// no record of what was in the buffer. A run of values is laid down in
-    /// key order, so a walk over them asks for the same chunk once per value
-    /// -- about forty times over at four kibibyte chunks and hundred byte
-    /// values. Remembering what is already decoded makes the walk pay once.
-    dec_at: Cell<Option<(u32, usize, usize)>>,
+    /// read is O(block) work to return O(value) bytes. Atomic words, since
+    /// a reader is shared between threads.
+    verified: Box<[AtomicU64]>,
+    /// Which reader this is, for the thread's scratch: the decoded span it
+    /// remembers is this reader's or nobody's.
+    id: u64,
     /// How many times a block was actually decompressed. The saving is
     /// invisible to any correctness check -- the bytes are identical either
     /// way -- so a test needs to be able to count the work instead.
-    decodes: Cell<u64>,
+    decodes: AtomicU64,
 }
+
+/// The thread's reused buffers for a source that cannot lend and for
+/// decompression, and which block and which chunk-aligned span of it the
+/// decompression buffer holds, for which reader. A reader is shared
+/// between threads, so the buffers are the thread's rather than the
+/// reader's; `Cell` rather than `RefCell` on purpose: they are held
+/// across a user callback, and a callback that re-enters the reader
+/// should get a fresh buffer rather than a panic. A host callback here
+/// is JavaScript.
+///
+/// The decompression buffer was once nothing more than a reused buffer:
+/// `with_run` decompressed the chunks covering one extent, handed them
+/// out, and kept no record of what was in the buffer. A run of values is
+/// laid down in key order, so a walk over them asks for the same chunk
+/// once per value -- about forty times over at four kibibyte chunks and
+/// hundred byte values. Remembering what is already decoded makes the
+/// walk pay once.
+struct Scratch {
+    raw: Cell<Vec<u8>>,
+    dec: Cell<Vec<u8>>,
+    /// Reader id, block, and the chunk-aligned span decoded.
+    dec_at: Cell<Option<(u64, u32, usize, usize)>>,
+}
+
+thread_local! {
+    static SCRATCH: Scratch = const {
+        Scratch {
+            raw: Cell::new(Vec::new()),
+            dec: Cell::new(Vec::new()),
+            dec_at: Cell::new(None),
+        }
+    };
+}
+
+/// Reader ids, one per open.
+static NEXT_BLOB_ID: AtomicU64 = AtomicU64::new(1);
 
 impl<B: Bytes> Blob<B> {
     pub fn open(src: B) -> Result<Blob<B>> {
@@ -677,11 +703,9 @@ impl<B: Bytes> Blob<B> {
             blocks,
             timestamp: sb.timestamp,
             opts,
-            verified: RefCell::new(verified),
-            raw_buf: Cell::new(Vec::new()),
-            dec_buf: Cell::new(Vec::new()),
-            dec_at: Cell::new(None),
-            decodes: Cell::new(0),
+            verified: verified.into_iter().map(AtomicU64::new).collect(),
+            id: NEXT_BLOB_ID.fetch_add(1, AtomicOrdering::Relaxed),
+            decodes: AtomicU64::new(0),
         })
     }
 
@@ -717,7 +741,14 @@ impl<B: Bytes> Blob<B> {
     /// Number of distinct keys.
     /// Blocks decompressed so far by this reader.
     pub fn decodes(&self) -> u64 {
-        self.decodes.get()
+        self.decodes.load(AtomicOrdering::Relaxed)
+    }
+
+    /// A number no other open blob in this process has: what a cache
+    /// derived from one blob is keyed by, so it cannot be read against
+    /// another over the same range.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn keys(&self) -> usize {
@@ -1011,17 +1042,29 @@ impl<B: Bytes> Blob<B> {
         let (w, bit) = (slot / 64, 1u64 << (slot % 64));
         // Out of room means never remembered: check every time rather than skip.
         self.verified
-            .borrow()
             .get(w)
-            .is_some_and(|cell| cell & bit != 0)
+            .is_some_and(|cell| cell.load(AtomicOrdering::Relaxed) & bit != 0)
     }
 
     fn set_verified(&self, i: u32, j: usize) {
         let slot = i as usize * block::MAX_CHUNK_CRCS + j;
         let (w, bit) = (slot / 64, 1u64 << (slot % 64));
-        if let Some(cell) = self.verified.borrow_mut().get_mut(w) {
-            *cell |= bit;
+        if let Some(cell) = self.verified.get(w) {
+            cell.fetch_or(bit, AtomicOrdering::Relaxed);
         }
+    }
+
+    /// The span of a block the thread's decompression buffer holds, when
+    /// it is this reader's.
+    fn dec_at(&self) -> Option<(u32, usize, usize)> {
+        SCRATCH.with(|s| match s.dec_at.get() {
+            Some((id, b, lo, hi)) if id == self.id => Some((b, lo, hi)),
+            _ => None,
+        })
+    }
+
+    fn set_dec_at(&self, at: Option<(u32, usize, usize)>) {
+        SCRATCH.with(|s| s.dec_at.set(at.map(|(b, lo, hi)| (self.id, b, lo, hi))));
     }
 
     /// Verify only the chunks `lo..hi` of a block actually touches.
@@ -1120,7 +1163,7 @@ impl<B: Bytes> Blob<B> {
         // `plan_exts` names the same bytes, which is what keeps a plan
         // exactly what the read after it touches.
         let (c0, c1) = chunk_span(&loc, &e);
-        let mut raw_buf = self.raw_buf.take();
+        let mut raw_buf = SCRATCH.with(|s| s.raw.take());
         let out = (|| -> Result<R> {
             let raw = take(&self.src, loc.off + c0 as u64, c1 - c0, &mut raw_buf)?;
             if loc.is_plain() {
@@ -1134,11 +1177,11 @@ impl<B: Bytes> Blob<B> {
             if b > un {
                 return Err(corrupt("extent runs past its block"));
             }
-            let mut dec = self.dec_buf.take();
+            let mut dec = SCRATCH.with(|s| s.dec.take());
             let r = (|| -> Result<R> {
                 if dec.len() < un {
                     dec.resize(un, 0);
-                    self.dec_at.set(None);
+                    self.set_dec_at(None);
                 }
                 if loc.chunked {
                     // Reuse when this extent falls inside the chunk span the
@@ -1146,12 +1189,12 @@ impl<B: Bytes> Blob<B> {
                     let lo = a / block::CHUNK * block::CHUNK;
                     let hi = b.div_ceil(block::CHUNK) * block::CHUNK;
                     let hi = hi.min(un);
-                    let have = self.dec_at.get();
+                    let have = self.dec_at();
                     let hit = matches!(have, Some((blk, l, h))
                         if blk == e.block && l <= lo && hi <= h);
                     if !hit {
-                        self.dec_at.set(None);
-                        self.decodes.set(self.decodes.get() + 1);
+                        self.set_dec_at(None);
+                        self.decodes.fetch_add(1, AtomicOrdering::Relaxed);
                         block::read_chunked_range(
                             raw,
                             un,
@@ -1160,24 +1203,24 @@ impl<B: Bytes> Blob<B> {
                             &mut dec[..un],
                             self.opts.verify_checksums,
                         )?;
-                        self.dec_at.set(Some((e.block, lo, hi)));
+                        self.set_dec_at(Some((e.block, lo, hi)));
                     }
                 } else {
                     self.verify(e.block, loc, raw, 0, 0, raw.len())?;
-                    let have = self.dec_at.get();
+                    let have = self.dec_at();
                     if !matches!(have, Some((blk, 0, h)) if blk == e.block && h == un) {
-                        self.dec_at.set(None);
-                        self.decodes.set(self.decodes.get() + 1);
+                        self.set_dec_at(None);
+                        self.decodes.fetch_add(1, AtomicOrdering::Relaxed);
                         block::decompress_into(raw, &mut dec, un)?;
-                        self.dec_at.set(Some((e.block, 0, un)));
+                        self.set_dec_at(Some((e.block, 0, un)));
                     }
                 }
                 f(&dec[a..b])
             })();
-            self.dec_buf.set(dec);
+            SCRATCH.with(|s| s.dec.set(dec));
             r
         })();
-        self.raw_buf.set(raw_buf);
+        SCRATCH.with(|s| s.raw.set(raw_buf));
         out
     }
 
@@ -2048,7 +2091,9 @@ impl<B: Bytes> SparseBlob<B> {
                     hdr,
                     fence,
                     crcs,
-                    verified: RefCell::new(vec![0u64; pieces.div_ceil(64)]),
+                    verified: (0..pieces.div_ceil(64))
+                        .map(|_| AtomicU64::new(0))
+                        .collect(),
                     dir,
                     from_ext: ext.is_some(),
                 }),
@@ -2056,11 +2101,9 @@ impl<B: Bytes> SparseBlob<B> {
                 blocks,
                 timestamp: sb.timestamp,
                 opts,
-                verified: RefCell::new(verified),
-                raw_buf: Cell::new(Vec::new()),
-                dec_buf: Cell::new(Vec::new()),
-                dec_at: Cell::new(None),
-                decodes: Cell::new(0),
+                verified: verified.into_iter().map(AtomicU64::new).collect(),
+                id: NEXT_BLOB_ID.fetch_add(1, AtomicOrdering::Relaxed),
+                decodes: AtomicU64::new(0),
             },
         };
         // What was read out of the section is verified before it is trusted:
@@ -2097,7 +2140,7 @@ impl<B: Bytes> SparseBlob<B> {
         let p1 = (b.div_ceil(piece) - first_page) as usize;
         let mut buf: Vec<u8> = Vec::new();
         for p in p0..p1 {
-            if s.verified.borrow()[p / 64] & (1u64 << (p % 64)) != 0 {
+            if s.verified[p / 64].load(AtomicOrdering::Relaxed) & (1u64 << (p % 64)) != 0 {
                 continue;
             }
             let start = ((first_page + p as u64) * piece).max(s.off);
@@ -2112,7 +2155,7 @@ impl<B: Bytes> SparseBlob<B> {
                     "key index checksum mismatch in piece {p}"
                 )));
             }
-            s.verified.borrow_mut()[p / 64] |= 1u64 << (p % 64);
+            s.verified[p / 64].fetch_or(1u64 << (p % 64), AtomicOrdering::Relaxed);
         }
         Ok(())
     }

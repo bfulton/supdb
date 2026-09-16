@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use supdb::{Db, Options, ReadAdvice};
+use supdb::{Db, Isolation, Options, ReadAdvice, Reader};
 
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("supdb-next-{name}-{}", std::process::id()));
@@ -16,7 +16,7 @@ fn dir(name: &str) -> PathBuf {
     d
 }
 
-fn read_vec(db: &Db, key: &[u8]) -> Vec<Vec<u8>> {
+fn read_vec(db: &Reader, key: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     db.read_all(key, |v| out.push(v.to_vec())).unwrap();
     out
@@ -1726,7 +1726,7 @@ impl ScanModel {
     /// Every scan the store can be asked for, against the model: from every
     /// visited key, from between them, from below and from past the end,
     /// at limits from one to unbounded. Both the stream and the count.
-    fn check(&self, db: &Db, state: &str) {
+    fn check(&self, db: &Reader, state: &str) {
         // Point reads and counts of a sample of every key ever written,
         // deleted ones included: a scan and a read take different paths
         // into the memtables, and a lookup that answered nothing while the
@@ -2940,4 +2940,402 @@ fn overlay_model(name: &str, block_cache: bool, budget: usize) {
     m.check(&db, "live inserts past the end, after the merge");
     held(&db, budget);
     db.close().unwrap();
+}
+
+/// What a reader handle on another thread asks of the store, and what it
+/// answers with.
+enum Ask {
+    Read(Vec<u8>),
+    Scan(Vec<u8>, usize),
+    Isolation(Isolation),
+    Snapshot,
+    Release,
+    Stop,
+}
+
+fn serve(
+    r: Reader,
+    asks: std::sync::mpsc::Receiver<Ask>,
+    answers: std::sync::mpsc::Sender<Vec<Vec<u8>>>,
+) {
+    for ask in asks {
+        match ask {
+            Ask::Read(k) => answers.send(read_vec(&r, &k)).unwrap(),
+            Ask::Scan(from, n) => {
+                let mut out = Vec::new();
+                r.scan(&from, n, |k, v| out.push([k, b":", v].concat()))
+                    .unwrap();
+                answers.send(out).unwrap();
+            }
+            Ask::Isolation(i) => {
+                r.set_isolation(i);
+                answers.send(Vec::new()).unwrap();
+            }
+            Ask::Snapshot => {
+                r.snapshot();
+                answers.send(Vec::new()).unwrap();
+            }
+            Ask::Release => {
+                r.release();
+                answers.send(Vec::new()).unwrap();
+            }
+            Ask::Stop => {
+                answers.send(Vec::new()).unwrap();
+                break;
+            }
+        }
+    }
+}
+
+/// A reader handle on another thread sees each commit as the writer makes
+/// it and nothing of the batch the writer is still staging; a dirty one
+/// sees the batch; a snapshot holds its view across commits, a seal and a
+/// merge until it is released, and the states it held are freed once it
+/// lets go. The writer never waits for any of them.
+#[test]
+fn a_reader_handle_sees_what_its_isolation_says() {
+    let d = dir("reader-isolation");
+    let opts = Options {
+        seal_bytes: 64 << 10,
+        partition_bytes: Some(128 << 10),
+        l0_trigger: 2,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let key = |k: u32| format!("key-{k:05}").into_bytes();
+    for k in 0..2000u32 {
+        db.append(&key(k), b"v0");
+    }
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    let (ask, asks) = std::sync::mpsc::channel();
+    let (answer, answers) = std::sync::mpsc::channel();
+    let t = std::thread::spawn(move || serve(r, asks, answer));
+    let read = |k: u32| -> Vec<Vec<u8>> {
+        ask.send(Ask::Read(key(k))).unwrap();
+        answers.recv().unwrap()
+    };
+    let tell = |a: Ask| {
+        ask.send(a).unwrap();
+        answers.recv().unwrap();
+    };
+    assert_eq!(
+        read(7),
+        vec![b"v0".to_vec()],
+        "a committed value, from the other thread"
+    );
+    // A batch staged and not committed: latest reads stop at the commit,
+    // dirty reads see the batch.
+    db.put(&key(7), b"v1");
+    db.append(&key(2500), b"new");
+    assert_eq!(
+        read(7),
+        vec![b"v0".to_vec()],
+        "latest: the staged put is not there"
+    );
+    assert_eq!(
+        read(2500),
+        Vec::<Vec<u8>>::new(),
+        "latest: the staged key is not there"
+    );
+    tell(Ask::Isolation(Isolation::Dirty));
+    assert_eq!(
+        read(7),
+        vec![b"v1".to_vec()],
+        "dirty: the staged put is there"
+    );
+    assert_eq!(
+        read(2500),
+        vec![b"new".to_vec()],
+        "dirty: the staged key is there"
+    );
+    tell(Ask::Isolation(Isolation::Latest));
+    db.commit().unwrap();
+    assert_eq!(read(7), vec![b"v1".to_vec()], "latest, after the commit");
+    // A snapshot holds through commits, a seal that moves the memtable
+    // into a segment, and the merge that follows.
+    tell(Ask::Snapshot);
+    for k in 0..2000u32 {
+        db.put(&key(k), b"v2");
+    }
+    db.commit().unwrap();
+    assert_eq!(
+        read(7),
+        vec![b"v1".to_vec()],
+        "snapshot: the commit after it is invisible"
+    );
+    db.seal().unwrap();
+    db.settle().unwrap();
+    assert!(
+        db.retired_states() >= 1,
+        "the state the snapshot holds is kept"
+    );
+    assert_eq!(
+        read(7),
+        vec![b"v1".to_vec()],
+        "snapshot: the seal after it is invisible"
+    );
+    assert_eq!(
+        read(1999),
+        vec![b"v0".to_vec()],
+        "snapshot: a key the puts after it changed"
+    );
+    ask.send(Ask::Scan(key(5), 3)).unwrap();
+    let got = answers.recv().unwrap();
+    assert_eq!(
+        got,
+        vec![
+            [key(5), b":v0".to_vec()].concat(),
+            [key(6), b":v0".to_vec()].concat(),
+            [key(7), b":v1".to_vec()].concat()
+        ],
+        "snapshot: a scan sees the view it took"
+    );
+    tell(Ask::Release);
+    assert_eq!(read(7), vec![b"v2".to_vec()], "released: the latest commit");
+    // Another publish, and the states the snapshot held are freed: nothing
+    // is pinned before them.
+    db.append(&key(3000), b"x");
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    assert_eq!(db.retired_states(), 0, "no reader pins the retired states");
+    tell(Ask::Stop);
+    t.join().unwrap();
+}
+
+/// Reader handles on their own threads keep answering while the writer
+/// puts, seals, promotes and merges under them: every value read is one
+/// the writer wrote for that key, a key's version never goes backwards
+/// for one reader, and a scan comes back in key order with each value
+/// under its key.
+#[test]
+fn readers_on_threads_keep_answering_through_seals_and_merges() {
+    let d = dir("readers-threads");
+    let opts = Options {
+        seal_bytes: 32 << 10,
+        partition_bytes: Some(64 << 10),
+        l0_trigger: 2,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let keys = 3000u32;
+    let key = |k: u32| format!("key-{k:05}").into_bytes();
+    for k in 0..keys {
+        db.append(&key(k), b"0");
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut threads = Vec::new();
+    for t in 0..3u64 {
+        let r = db.reader().unwrap();
+        let stop = stop.clone();
+        threads.push(std::thread::spawn(move || {
+            let mut seen: HashMap<u32, u64> = HashMap::new();
+            let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ t;
+            let mut reads = 0usize;
+            let mut scans = 0usize;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                if x.is_multiple_of(8) {
+                    let mut last: Option<Vec<u8>> = None;
+                    r.scan(&key(k), 20, |kk, v| {
+                        if let Some(l) = &last {
+                            assert!(l.as_slice() < kk, "a scan out of key order");
+                        }
+                        last = Some(kk.to_vec());
+                        let s = std::str::from_utf8(v).unwrap();
+                        assert!(
+                            s.parse::<u64>().is_ok(),
+                            "a scanned value that is no version: {s}"
+                        );
+                    })
+                    .unwrap();
+                    scans += 1;
+                } else {
+                    let got = read_vec(&r, &key(k));
+                    assert!(got.len() <= 1, "a put key with two values");
+                    if let Some(v) = got.first() {
+                        let ver: u64 = std::str::from_utf8(v).unwrap().parse().unwrap();
+                        let prev = seen.entry(k).or_insert(0);
+                        assert!(
+                            ver >= *prev,
+                            "a version that went backwards: key {k} read {ver} after {prev}"
+                        );
+                        *prev = ver;
+                    }
+                    reads += 1;
+                }
+            }
+            (reads, scans)
+        }));
+    }
+    let mut x = 42u64;
+    for round in 1..=300u64 {
+        for _ in 0..50 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % keys as u64) as u32;
+            db.put(&key(k), round.to_string().as_bytes());
+        }
+        db.commit().unwrap();
+    }
+    db.flush().unwrap();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut total = (0usize, 0usize);
+    for t in threads {
+        let (r, s) = t.join().unwrap();
+        total.0 += r;
+        total.1 += s;
+    }
+    assert!(
+        total.0 > 1000 && total.1 > 100,
+        "the readers read: {total:?}"
+    );
+    assert!(
+        db.levels().0 > 1,
+        "the writer partitioned under them: {:?}",
+        db.levels()
+    );
+    // Every key's last version, from the writer's own handle and from a
+    // fresh reader, agree.
+    let r = db.reader().unwrap();
+    for k in (0..keys).step_by(97) {
+        assert_eq!(read_vec(&db, &key(k)), read_vec(&r, &key(k)), "key {k}");
+    }
+}
+
+/// The reader table has a slot for each handle and no more: the handle
+/// past the last slot is refused, and a dropped handle's slot is free
+/// again.
+#[test]
+fn the_reader_table_has_a_slot_for_each_handle() {
+    let d = dir("reader-slots");
+    let db = Db::create(&d, Options::default()).unwrap();
+    let mut held = Vec::new();
+    while let Ok(r) = db.reader() {
+        held.push(r);
+    }
+    assert_eq!(held.len(), 256, "the table's slots, all claimed");
+    assert!(db.reader().is_err(), "one more is refused");
+    held.pop();
+    assert!(db.reader().is_ok(), "a dropped handle's slot is free");
+}
+
+/// A piece sealed while a merge of its range runs is kept across the
+/// merge's publish, under a new partition over the same range. The ranks
+/// it was given at its own publish -- each key's cut in the partition it
+/// was aligned to -- were taken against the partition the merge replaced,
+/// and against the new one every cut below a key the merge folded in is
+/// behind by that key. A block built through a stale cut emits the
+/// piece's key where the old partition had it. The oracle test reached
+/// this in about one run in twenty as an assertion under the checked
+/// profile, once the seal's timing put a piece inside a merge; here the
+/// merge is long and the seal short, so the piece is published while the
+/// merge runs every time, and the pieces the merge folds in carry new
+/// keys below the kept piece's, so the old ranks are wrong by ten.
+#[test]
+fn a_piece_kept_across_a_merge_is_ranked_against_the_partition_it_meets() {
+    let d = dir("kept-piece-ranks");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(64 << 20),
+        l0_trigger: 2,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    let key = |k: u32| format!("key-{k:06}").into_bytes();
+    let between = |k: u32, i: u32| format!("key-{k:06}x{i}").into_bytes();
+    let put = |db: &mut Db, model: &mut BTreeMap<Vec<u8>, Vec<Vec<u8>>>, k: &[u8], v: &str| {
+        db.append(k, v.as_bytes());
+        model
+            .entry(k.to_vec())
+            .or_default()
+            .push(v.as_bytes().to_vec());
+    };
+    for k in 0..400_000 {
+        put(&mut db, &mut model, &key(k), "p");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.levels(), (1, 0), "one partition over every key");
+    // Two pieces over keys the partition holds, so the range is merged
+    // rather than promoted, each with new keys below the third piece's.
+    for i in 0..10 {
+        put(&mut db, &mut model, &key(1000 + i), "a");
+        put(&mut db, &mut model, &between(1000, i), "a");
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    for i in 0..10 {
+        put(&mut db, &mut model, &key(2000 + i), "b");
+        put(&mut db, &mut model, &between(2000, i), "b");
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    // The third piece: keys the partition holds and keys between them.
+    // Its seal joins the second piece's first, which publishes it and
+    // starts the merge, so the merge is running when this piece seals.
+    for i in 0..10 {
+        put(&mut db, &mut model, &key(3000 + i), "c");
+        put(&mut db, &mut model, &between(3000, i), "c");
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    assert!(
+        db.in_flight().1,
+        "the merge did not start at the second piece's publish"
+    );
+    // A commit joins a finished seal and leaves a running merge alone:
+    // the third piece is published, and ranked, under the old partition.
+    while db.in_flight().0 {
+        db.commit().unwrap();
+        std::thread::yield_now();
+    }
+    assert!(
+        db.in_flight().1,
+        "the merge finished before the third piece was published; the case was not reached"
+    );
+    assert_eq!(db.levels(), (1, 3));
+    db.settle().unwrap();
+    assert_eq!(
+        db.levels(),
+        (1, 1),
+        "a new partition, and the third piece kept over it"
+    );
+    let mut seen: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    db.scan(b"", usize::MAX, |k, v| {
+        seen.entry(k.to_vec()).or_default().push(v.to_vec())
+    })
+    .unwrap();
+    assert_eq!(seen.len(), model.len(), "the scan's key count");
+    assert!(seen == model, "the scan disagrees with the model");
+    // Short scans from inside the blocks the kept piece's keys land in,
+    // which are built from those keys' cuts.
+    for k in [2990u32, 2999, 3000, 3004, 3009, 3010] {
+        let from = key(k);
+        let mut got: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+        db.scan(&from, 20, |k, v| match got.last_mut() {
+            Some((last, vals)) if last.as_slice() == k => vals.push(v.to_vec()),
+            _ => got.push((k.to_vec(), vec![v.to_vec()])),
+        })
+        .unwrap();
+        let want: Vec<(Vec<u8>, Vec<Vec<u8>>)> = model
+            .range(from.clone()..)
+            .take(20)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        assert!(
+            got == want,
+            "a scan of twenty from {} disagrees with the model",
+            String::from_utf8_lossy(&from)
+        );
+    }
 }
