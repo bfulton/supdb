@@ -2479,11 +2479,16 @@ fn a_seek_brackets_its_search_in_the_top_level() {
             &db,
             &format!("seeks over a large partition, cache {block_cache}"),
         );
-        // Starts exactly on a sample's rank and just below one, which the
-        // check's sampling never lands on: rank r is the loaded key 2r.
+        // Starts exactly on a sample's rank, just below one and just past
+        // one, which the check's sampling never lands on: rank r is the
+        // loaded key 2r.
         let visited = m.visited();
         for r in (64..50_000usize).step_by(64 * 3) {
-            for from in [format!("key-{:06}", r * 2), format!("key-{:06}", r * 2 - 1)] {
+            for from in [
+                format!("key-{:06}", r * 2),
+                format!("key-{:06}", r * 2 - 1),
+                format!("key-{:06}", r * 2 + 2),
+            ] {
                 let want: Vec<(Vec<u8>, Vec<u8>)> = visited
                     .iter()
                     .filter(|k| **k >= from.as_bytes())

@@ -577,11 +577,30 @@ per-commit path.
   that leaves E at thirty million on the store A, F and D leave, two
   rounds interleaved with LMDB: the first pass 261k–266k against
   321k–331k, 0.79x to 0.83x; the second 316k–319k against 324k–329k,
-  0.96x to 0.98x. The same store flushed reads a fifth ahead of LMDB on
+  0.96x to 0.98x. With the write path settling in place and the cache on
+  by default, the same pair again: the first pass 360k–380k against
+  398k–441k, 0.82x to 0.95x, the second 430k–443k against 401k–421k,
+  1.02x to 1.11x, and the ordered load ahead at 704k–732k against
+  599k–617k. The same store flushed reads a fifth ahead of LMDB on
   both passes, so what remains is the overlay, which LMDB never has
   because it patches its pages at write time. Pre-faulting the mappings at
   open gained 2-3% on the first pass and nothing on the second: the
-  build's cold reads are not page faults. The write path settles in
+  build's cold reads are not page faults. A second level over the
+  seek's samples, every sixty-fourth of them, was a tie the same way:
+  two rounds at thirty million timed by step, the seek 0.38–0.49 µs a
+  scan without it and 0.42–0.45 with, inside the spread the unchanged
+  walks showed between runs, so the first level's 90 KB a partition
+  stays cached through a pass and the seek's rest is the heads' cold
+  lines. Rebuilding a sparse block as a copy once eight scans had walked
+  it lost at every size, two rounds each: at thirty million 44k of the
+  298k sparse blocks were promoted for a fifth fewer sparse walks and
+  two and a half times the copy builds, E's first pass 318k–334k
+  against 331k–336k, and the cache 625 MB against 290; at three million
+  357k–370k against 382k–416k. The blocks E walks most are copies from
+  their first build, F having updated them densest, and a sparse block
+  walked eight times is walked seven more on average, under the
+  eighteen a copy's build costs in the walks it saves. The write path
+  settles in
   place: a write is queued and, at the next scan, spliced into the built
   block it landed in -- the key's run resolved as a build resolves it,
   the partition's values for an equal key, then the pieces' and the
@@ -631,7 +650,31 @@ per-commit path.
   in `MADV_FREE` regions with a validity word the kernel zeroes when it
   reclaims one, so a form that comes back zeroed is rebuilt, or a
   watcher on memory pressure sheds to a target. Neither moves a row,
-  since no run here is under pressure; both are on the backlog.
+  since no run here is under pressure; both are on the backlog, with
+  the shape to build them in: two targets in place of `scan_cache_bytes`,
+  each a byte count or a percentage of the memory available at open
+  (`MemAvailable`, or what a cgroup limit set under it leaves, because a
+  container's `/proc/meminfo` is the host's), a hard target the cache
+  keeps whatever the pressure and a soft one it grows to and gives back
+  from under pressure, oldest-touched first, the way the page cache
+  reclaims its inactive list rather than all at once. A build sheds to
+  the soft target as it sheds to the bound now. The tables are the
+  reader thread's (`Cell`s, unshared), so a watcher thread polling
+  `/proc/pressure/memory` can only set the request, and the next scan
+  sheds a slice of what lies above the hard target while the pressure
+  holds -- which is release only in a process that scans, and the
+  `MADV_FREE` form, every cached form flat in pages of its own with a
+  word in each that the kernel's zeroing clears, is what gives memory
+  back from an idle one. The defaults would be a hard target of a tenth
+  of available memory and a soft one of half, which on the machine class
+  here is inert: the cache after a pass at thirty million is under
+  300 MB against fifteen thousand available. The arms would match as
+  they match now, RocksDB's block cache gives nothing back under
+  pressure so `supdb-cache256` sets both targets to 256 MB, and the page
+  cache LMDB reads through has no bound but the machine's and keeps
+  nothing under pressure, hard 0 and soft unbounded. The two are built
+  together: a soft target ahead of the release is a label on a bound
+  that does not release, the ingest arm's mistake in another place.
 - **Ordered ingest straight into segments** — built, and the default.
   The load's keys arrive in order and went through a memtable, a WAL
   frame, a seal that sorts the sorted, and a partitioning pass; the
