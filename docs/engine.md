@@ -1042,6 +1042,28 @@ per-commit path.
   pays where scans outnumber commits, which is the policy the arm exists
   to price.
 
+  A block held two ways at once, with the read choosing, as
+  `promote_entries`: a block keeps a merged copy beside its cheap form
+  once reads have taken enough entries from it, every read after that
+  walks the copy, and a write drops the copy and halves the count. The
+  threshold is the measured crossover between the two walks, about
+  twenty-two cycles an entry against a build of three to five thousand,
+  so a few hundred entries. It switches as designed and it loses. Over
+  the probe's six mixes at a hundred thousand keys, at three hundred
+  entries: 144 of 1,537 blocks promoted, 935 block walks over a copy
+  against 23,993 over the cheap form, 1.25 MB of copies, E 705k to 649k
+  ops/s and the scan pass 42M and 52M to 30M and 26M entries a second,
+  with 259 and 525 minor faults where there had been two -- the copies'
+  fresh pages. At a thousand entries three blocks promote; at four
+  thousand none, and the arm is the default. The lesson is the one
+  `CACHE_DENSE` already carries, now from the read side: a second form
+  costs the page cache and the fresh pages it faults, not just the
+  build, and a threshold set by hand is wrong in both directions at
+  once. What the mechanism is for is a policy that sets it from
+  feedback, and what it leaves behind is the machinery to do that: the
+  choice is per read, the counters say what the reads chose, and the
+  writes' drops are the other half of the signal.
+
   A block cache shared between handles was built and measured, and not
   kept. Three versions: a table under a mutex, one under a read-write
   lock, and one of atomic slots in the state, a slot per block, a form

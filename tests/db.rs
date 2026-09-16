@@ -3789,6 +3789,134 @@ fn reader_threads_over_maintained_forms_keep_answering() {
     std::hint::black_box(sink);
 }
 
+/// A block held two ways at once, and the read choosing: with
+/// `promote_entries` the store keeps a merged copy of a block beside its
+/// cheap form once reads have taken enough entries from it, and every
+/// read after that walks the copy. A write to the block drops the copy
+/// and halves the count, so a block the writes own is never held twice.
+/// The answers are the model's throughout, whichever form a read picked.
+#[test]
+fn a_block_the_reads_pay_for_is_held_as_a_copy_too() {
+    let d = dir("promote-forms");
+    fn opts_promote() -> usize {
+        300
+    }
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(8 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        promote_entries: opts_promote(),
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..4000u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 1, "several partitions");
+    // A few overlay keys in every block, which is the shape a block is
+    // walked as deltas in: below `CACHE_DENSE`, so nothing is a copy yet.
+    for k in (0..4000u32).step_by(23) {
+        m.append(&mut db, &key(k), "v1");
+    }
+    db.commit().unwrap();
+    let mut sink = 0usize;
+    db.scan(key(0).as_bytes(), 64, |_k, v| sink += v.len())
+        .unwrap();
+    let [promoted, dropped, on_copy, on_cheap, bytes] = db.form_choices();
+    assert_eq!(promoted, 0, "nothing promoted by one scan of a block");
+    assert_eq!(on_copy, 0, "no copy to walk yet");
+    assert!(on_cheap > 0 && dropped == 0 && bytes == 0);
+    // The hot range, read until the reads have paid for a copy of it.
+    for _ in 0..12 {
+        db.scan(key(0).as_bytes(), 64, |_k, v| sink += v.len())
+            .unwrap();
+    }
+    let [promoted, _, on_copy, _, bytes] = db.form_choices();
+    assert!(promoted > 0, "the reads paid for a copy: {promoted}");
+    assert!(on_copy > 0, "and the reads after walk it: {on_copy}");
+    assert!(bytes > 0, "the copy holds bytes: {bytes}");
+    m.check(&db, "a block held as a copy too");
+    // A write into the hot block drops its copy; the reads that follow
+    // walk the cheap form until they have paid for it again, which the
+    // halved count makes half the entries.
+    let hot = key(0);
+    let before = db.form_choices();
+    m.append(&mut db, &key(7), "v2");
+    db.commit().unwrap();
+    db.scan(hot.as_bytes(), 64, |_k, v| sink += v.len())
+        .unwrap();
+    let after = db.form_choices();
+    assert!(
+        after[1] > before[1],
+        "the write dropped the copy: {after:?} against {before:?}"
+    );
+    let (_, _, dense, reads, kind) = db.block_state(hot.as_bytes()).expect("the hot block");
+    assert!(!dense, "and the block is held one way again");
+    assert_eq!(kind, "sparse", "as deltas over the partition");
+    assert!(
+        reads > 0 && (reads as usize) < opts_promote(),
+        "the count is halved, not cleared: {reads}"
+    );
+    // Nothing but scans of the hot range from here, so the promotion
+    // that follows is the reads' and no model check is between.
+    let mut promoted_again = 0u64;
+    for _ in 0..4 {
+        db.scan(hot.as_bytes(), 64, |_k, v| sink += v.len())
+            .unwrap();
+        let now = db.form_choices();
+        if now[0] > after[0] {
+            promoted_again = now[0] - after[0];
+            break;
+        }
+    }
+    assert_eq!(
+        promoted_again,
+        1,
+        "the copy is back for a block the reads still own: {:?} against {after:?}",
+        db.form_choices()
+    );
+    let (_, _, dense, _, _) = db.block_state(hot.as_bytes()).expect("the hot block");
+    assert!(dense, "held both ways again");
+    m.check(&db, "after the copy came back");
+    // A cold range the writes own: every scan of it is one entry, and
+    // its blocks are never held twice.
+    let cold = db.form_choices()[0];
+    for r in 0..40u32 {
+        m.append(&mut db, &key(3000 + r), "w");
+        db.commit().unwrap();
+        db.scan(key(3000).as_bytes(), 1, |_k, v| sink += v.len())
+            .unwrap();
+    }
+    assert_eq!(
+        db.form_choices()[0],
+        cold,
+        "a block the writes own is not promoted"
+    );
+    m.check(&db, "a range the writes own");
+    // Through a reader handle, which holds its own forms and makes its
+    // own choices, over the same store.
+    let r = db.reader().unwrap();
+    for _ in 0..12 {
+        r.scan(key(0).as_bytes(), 64, |_k, v| sink += v.len())
+            .unwrap();
+    }
+    assert!(
+        r.form_choices()[0] > 0,
+        "a reader handle promotes for itself: {:?}",
+        r.form_choices()
+    );
+    m.check(&r, "through a reader handle");
+    std::hint::black_box(sink);
+}
+
 /// A piece sealed while a merge of its range runs is kept across the
 /// merge's publish, under a new partition over the same range. The ranks
 /// it was given at its own publish -- each key's cut in the partition it

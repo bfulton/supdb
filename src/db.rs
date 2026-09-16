@@ -397,6 +397,20 @@ pub struct Options {
     /// and builds nothing; see `CanonicalForm`. `false` is the arm where
     /// every handle builds and settles its own.
     pub commit_forms: bool,
+    /// EXPERIMENT: entries reads must have taken from a block before the
+    /// store holds it a second way, as a merged copy beside the cheap
+    /// form, so that the reads ask for the shape rather than the writes
+    /// implying it. Zero holds every block one way, which is the cache
+    /// as it was, with `CACHE_DENSE` choosing that way from the
+    /// overlay's size. The number is a measured crossover and nothing
+    /// else: walking a copy saves about twenty-two cycles an entry over
+    /// walking deltas over the partition, and building one costs three
+    /// to five thousand, so a block repays a copy after a few hundred
+    /// entries of reading. A write to a block drops its copy and halves
+    /// its count, which is the hysteresis: a block the writes own never
+    /// holds one, and a block the reads own has it back after half the
+    /// entries.
+    pub promote_entries: usize,
     /// EXPERIMENT: overlay keys in a block from which the writer's
     /// canonical form is a merged copy rather than resolved deltas; zero
     /// is `CACHE_DENSE`, the threshold a handle building for itself
@@ -445,6 +459,7 @@ impl Default for Options {
             scan_cache_ahead: true,
             scan_cache_ahead_min_blocks: 1024,
             commit_forms: false,
+            promote_entries: 0,
             form_dense_from: 0,
             scan_snapshot_arena: true,
         }
@@ -4076,6 +4091,15 @@ struct BlockTable {
     /// forms table (`SharedForms`) and made this handle's own by a
     /// copy-on-write the first time a settle touches it.
     slots: Vec<Option<std::sync::Arc<Cached>>>,
+    /// EXPERIMENT: the same block held a second way, as a merged copy,
+    /// for as long as the reads pay for it. A read walks this when it is
+    /// here and the cheap form when it is not, so the block is two
+    /// shapes at once and the choice is the read's; see
+    /// `Options::promote_entries`.
+    dense: Vec<Option<std::sync::Arc<Cached>>>,
+    /// EXPERIMENT: entries reads have taken from each block since it was
+    /// last written, which is what pays for a copy.
+    reads: Vec<u32>,
     /// The scan count when each block was last walked.
     touched: Vec<u32>,
     /// Each block's index in `Db::built`, or `u32::MAX` when unlisted.
@@ -4359,6 +4383,10 @@ pub struct Reader {
     /// maintained the canonical forms at; a commit with the count
     /// unmoved maintains nothing.
     scans_seen: std::cell::Cell<u64>,
+    /// EXPERIMENT: what the reads chose, for a run to report:
+    /// promotions, drops by a write, walks over a copy, walks over the
+    /// cheap form, and the copies' bytes.
+    choices: std::cell::Cell<[u64; 5]>,
     /// PROTOTYPE: every built block holding bytes, as (partition index,
     /// block), so the sampler draws from blocks and never from empty
     /// slots. Sampling slots was tried: with a tenth of them built, a
@@ -5862,6 +5890,40 @@ impl Reader {
         }
     }
 
+    /// EXPERIMENT: where a key's block stands: its partition, its block,
+    /// whether the block is held as a copy too, the entries reads have
+    /// taken from it since it was written, and the cheap form's shape.
+    pub fn block_state(&self, key: &[u8]) -> Option<(usize, usize, bool, u32, &'static str)> {
+        let _e = self.enter();
+        let np = self.segs().partition_point(|s| s.level > 0);
+        let at = self.segs()[..np]
+            .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+        let seg = self.segs()[..np].get(at)?;
+        let (b, _) = BuildCtx::owner_of(seg, key);
+        let tables = self.tables.borrow();
+        let held = tables.get(at)?.borrow();
+        let t = held.as_ref()?;
+        if b >= t.slots.len() {
+            return None;
+        }
+        let kind = match t.slots[b].as_deref() {
+            None => "unbuilt",
+            Some(Cached::Clean) => "clean",
+            Some(Cached::Sparse(_)) => "sparse",
+            Some(Cached::Block(_)) => "copy",
+            Some(Cached::Wide(_)) => "wide",
+        };
+        Some((at, b, t.dense[b].is_some(), t.reads[b], kind))
+    }
+
+    /// EXPERIMENT: what the reads chose: blocks promoted to a copy
+    /// beside their cheap form, copies dropped by a write, block walks
+    /// over a copy, block walks over the cheap form, and the bytes the
+    /// copies hold now.
+    pub fn form_choices(&self) -> [u64; 5] {
+        self.choices.get()
+    }
+
     /// EXPERIMENT: the canonical forms table's size: forms held, their
     /// bytes, how many walks took one, and whether the table is complete.
     pub fn canonical_forms(&self) -> (usize, usize, usize, bool) {
@@ -6256,6 +6318,20 @@ impl Reader {
             };
             let (b, cut) = BuildCtx::owner_of(seg, key);
             if b < table.slots.len() {
+                // The copy this block was also held as is the writes'
+                // to drop: patching two forms for one write is what the
+                // promotion is paid out of, and the halved count is
+                // what brings the copy back for a block the reads still
+                // own.
+                if let Some(old) = table.dense[b].take() {
+                    self.cache_bytes
+                        .set(self.cache_bytes.get().saturating_sub(old.bytes()));
+                    let mut c = self.choices.get();
+                    c[1] += 1;
+                    c[4] = c[4].saturating_sub(old.bytes() as u64);
+                    self.choices.set(c);
+                }
+                table.reads[b] /= 2;
                 // A write into a block the writer holds no form for
                 // leaves the table incomplete rather than building one:
                 // a reader then builds that block itself, as it does
@@ -6470,6 +6546,8 @@ impl Reader {
         let filed = added.iter().map(Vec::len).sum();
         Ok(BlockTable {
             slots: (0..nblocks).map(|_| None).collect(),
+            dense: (0..nblocks).map(|_| None).collect(),
+            reads: vec![0; nblocks],
             touched: vec![0; nblocks],
             listed: vec![u32::MAX; nblocks],
             last_key: seg
@@ -6645,10 +6723,23 @@ impl Reader {
                 // This block's cold lines, and the next block's when the
                 // scan will cross into it, fetched while this one walks.
                 let ahead = limit - seen;
-                let form: &Cached = match canon {
+                // The choice, per read and per block: the copy when this
+                // block is also held as one, the cheap form when it is
+                // not. Both are current -- a write drops the copy and
+                // patches the cheap form -- so the pick costs one load
+                // and a branch.
+                let cheap: &Cached = match canon {
                     Some(f) => f,
                     None => table.slots[b].as_deref().expect("just built"),
                 };
+                let form: &Cached = match table.dense[b].as_deref() {
+                    Some(d) => d,
+                    None => cheap,
+                };
+                let mut c = self.choices.get();
+                c[if table.dense[b].is_some() { 2 } else { 3 }] += 1;
+                self.choices.set(c);
+                let took_from = seen;
                 prefetch_block(&seg.blob, form, start, ahead);
                 if hi - start < ahead && b + 1 < nblocks {
                     let next = match canonical.then(|| self.canonical(pi, b + 1)).flatten() {
@@ -6719,6 +6810,34 @@ impl Reader {
                         let ov = ctx.overlay_window(src, table, b, unsealed, w, window)?;
                         seen +=
                             ctx.walk_block(src, start..hi, &ov, limit - seen, |_k| {}, &mut f)?;
+                    }
+                }
+                // What this read took from the block is what pays for a
+                // copy of it; past the crossover the store holds it both
+                // ways from here on. Only a block walked as deltas has
+                // anything to gain: a clean one is already the bulk
+                // walk's, and a dense cheap form is a copy already.
+                let promote = self.opts.promote_entries;
+                if promote > 0 && table.dense[b].is_none() {
+                    let took = (seen - took_from) as u32;
+                    table.reads[b] = table.reads[b].saturating_add(took);
+                    if table.reads[b] as usize >= promote
+                        && matches!(table.slots[b].as_deref(), Some(Cached::Sparse(_)))
+                    {
+                        let copied = BuildCtx {
+                            dense_from: 1,
+                            ..self.build_ctx()
+                        }
+                        .materialize(src, table, b, unsealed)?;
+                        if matches!(copied, Cached::Block(_)) {
+                            let mut c = self.choices.get();
+                            c[0] += 1;
+                            c[4] += copied.bytes() as u64;
+                            self.choices.set(c);
+                            self.cache_bytes
+                                .set(self.cache_bytes.get() + copied.bytes());
+                            table.dense[b] = Some(std::sync::Arc::new(copied));
+                        }
                     }
                 }
                 b += 1;
@@ -7482,6 +7601,7 @@ impl Db {
             built: std::cell::RefCell::new(Vec::new()),
             to_publish: std::cell::RefCell::new(Vec::new()),
             scans_seen: std::cell::Cell::new(0),
+            choices: std::cell::Cell::new([0; 5]),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),
             log_seen: std::cell::Cell::new(0),
@@ -7754,6 +7874,7 @@ impl Db {
             built: std::cell::RefCell::new(Vec::new()),
             to_publish: std::cell::RefCell::new(Vec::new()),
             scans_seen: std::cell::Cell::new(0),
+            choices: std::cell::Cell::new([0; 5]),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),
             log_seen: std::cell::Cell::new(0),
@@ -8525,6 +8646,7 @@ impl Reader {
             built: std::cell::RefCell::new(Vec::new()),
             to_publish: std::cell::RefCell::new(Vec::new()),
             scans_seen: std::cell::Cell::new(0),
+            choices: std::cell::Cell::new([0; 5]),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),
             log_seen: std::cell::Cell::new(0),
@@ -9471,6 +9593,8 @@ impl Reader {
             let (pieces, piece_ranks, snap_at) = ctx.table_bounds(seg, l0, &unsealed)?;
             let table = BlockTable {
                 slots: (0..nblocks).map(|_| None).collect(),
+                dense: (0..nblocks).map(|_| None).collect(),
+                reads: vec![0; nblocks],
                 touched: vec![0; nblocks],
                 listed: vec![u32::MAX; nblocks],
                 last_key: Vec::new(),
