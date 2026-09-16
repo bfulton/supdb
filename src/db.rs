@@ -3770,7 +3770,7 @@ impl CachedBlock {
     }
     /// First entry whose key is not below `from`.
     fn lower_bound(&self, from: &[u8]) -> usize {
-        self.ents.partition_point(|e| self.key(e) < from)
+        select_lower_bound(self.ents.len(), |i| self.key(&self.ents[i]) < from)
     }
     /// PROTOTYPE: pull the entries and the keys toward the core, and the
     /// first lines of the values, ahead of a walk. After a pass over
@@ -3811,6 +3811,26 @@ pub(crate) fn prefetch_lines(ptr: *const u8, bytes: usize) {
     }
     #[cfg(not(target_arch = "x86_64"))]
     let _ = (ptr, bytes);
+}
+
+/// The first index in `0..n` for which `below` is false, or `n`, given
+/// `below` true for a prefix: `partition_point`, with each step a mask
+/// and not a branch. Written as a select the compiler turned it back
+/// into a branch, and a mask it cannot; measured on the probe's E at a
+/// hundred thousand keys and three hundred, six rounds interleaved, it
+/// moved nothing the machine's own predictor was not already hiding,
+/// and it stays because the ordered index's doc says the top search
+/// selects, which it now does.
+#[inline(always)]
+pub(crate) fn select_lower_bound(n: usize, below: impl Fn(usize) -> bool) -> usize {
+    let mut lo = 0usize;
+    let mut len = n;
+    while len > 1 {
+        let half = len / 2;
+        lo += half & usize::from(below(lo + half - 1)).wrapping_neg();
+        len -= half;
+    }
+    lo + usize::from(len == 1 && below(lo))
 }
 
 /// PROTOTYPE: the lines a walk of block `b` from rank `from` for `n`
@@ -9558,7 +9578,7 @@ impl<'s> BuildCtx<'s> {
         let hi = ranks.end;
         let mut seen = 0usize;
         let mut rank = ranks.start;
-        let di = blk.ents.partition_point(|e| blk.key(e) < cursor);
+        let di = select_lower_bound(blk.ents.len(), |i| blk.key(&blk.ents[i]) < cursor);
         for e in &blk.ents[di..] {
             let cut = (e.cut as usize).max(rank);
             if cut > rank && seen < limit {

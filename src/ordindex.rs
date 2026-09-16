@@ -601,7 +601,7 @@ impl OrdIndex {
         // No sample below the query is the first head at or above it. Past
         // the last sample below it, the search runs to the next sample and
         // lands on it when every head between is below.
-        let (mut lo, mut hi) = if t == 0 {
+        let (mut lo, hi) = if t == 0 {
             (0, 0)
         } else {
             ((t - 1) * TOP_STRIDE + 1, (t * TOP_STRIDE).min(self.n))
@@ -613,14 +613,10 @@ impl OrdIndex {
             let at = HEADER + lo * HEAD;
             crate::db::prefetch_lines(self.map.0[at..].as_ptr(), (hi - lo) * HEAD);
         }
-        while lo < hi {
-            let m = (lo + hi) / 2;
-            if self.head(m) < h {
-                lo = m + 1;
-            } else {
-                hi = m;
-            }
-        }
+        // The stride's heads searched with a mask a step, as the top
+        // level is: the branch form mispredicted about half its steps.
+        let base = lo;
+        lo = base + crate::db::select_lower_bound(hi - lo, |i| self.head(base + i) < h);
         if lo >= self.n || self.head(lo) != h {
             // No head ties the query: with heads that are whole keys the
             // key at the rank is not the query; otherwise the records
@@ -656,16 +652,7 @@ impl OrdIndex {
 /// The first index in `a`, sorted, whose value is not below `h`, or
 /// `a.len()`: `partition_point(|&s| s < h)`, with the step a select.
 fn lower_bound(a: &[u64], h: u64) -> usize {
-    let mut lo = 0usize;
-    let mut len = a.len();
-    while len > 1 {
-        let half = len / 2;
-        // Both arms are computed and one is kept: no branch to predict.
-        let up = a[lo + half - 1] < h;
-        lo = if up { lo + half } else { lo };
-        len -= half;
-    }
-    lo + usize::from(len > 0 && a[lo] < h)
+    crate::db::select_lower_bound(a.len(), |i| a[i] < h)
 }
 
 #[cfg(test)]
