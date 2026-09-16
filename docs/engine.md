@@ -707,8 +707,16 @@ per-commit path.
   not its builds: 3.9k forms in 14 ms, 3.1k installed by the eighth
   percentile, and the pass moved by nothing; at thirty million, two
   rounds, 438k–463k against 401k–434k, the scan 1.84–1.89 µs against
-  1.90–1.95, with the write mixes before it level. Two versions between
-  were measured and thrown out. One restarted the builder at a commit once
+  1.90–1.95, with the write mixes before it level. Below a hundred
+  thousand keys the builder is a loss, and a large one: its run beside a
+  pass of two milliseconds costs the scans more than the builds it
+  saves, 310k–351k against 598k–699k at ten thousand keys and 588k–635k
+  against 529k–772k at thirty thousand, six rounds interleaved, where at
+  a hundred thousand it reads 702k–773k against 682k–758k; so no builder
+  starts on partitions of fewer than `scan_cache_ahead_min_blocks`, a
+  thousand blocks, and with that gate the small rungs read level with
+  the arm without it. Two versions between were measured and thrown
+  out. One restarted the builder at a commit once
   the memtable had grown by an eighth, and once a run's forms were all
   installed restarted it at every commit: at three million it ran three
   times beside E's scans, every form of the second and third run dropped

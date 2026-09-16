@@ -379,8 +379,17 @@ pub struct Options {
     /// own read of the write log lists. The scans after find the blocks
     /// built. Once per state: an installed form is kept current by the
     /// settle of every write after. Under `scan_cache_bytes` the builder
-    /// stops at the budget. `false` is the arm without the thread.
+    /// stops at the budget, and a store whose partitions hold fewer than
+    /// `scan_cache_ahead_min_blocks` gets none. `false` is the arm
+    /// without the thread.
     pub scan_cache_ahead: bool,
+    /// PROTOTYPE: the partitions' blocks below which no builder starts.
+    /// Measured on the probe's E, six rounds interleaved, the builder
+    /// against none: at ten thousand keys, 160 blocks, 310k-351k against
+    /// 598k-699k ops/s; at thirty thousand, 470 blocks, 588k-635k against
+    /// 529k-772k; at a hundred thousand, 1,560 blocks, 702k-773k against
+    /// 682k-758k. A test that wants the builder on a small store sets 0.
+    pub scan_cache_ahead_min_blocks: usize,
     /// How the ordered scan builds its sorted snapshot of the unsealed keys.
     /// `true` keeps the keys in one arena and sorts 24-byte records (a
     /// 16-byte key prefix and an index), touching the arena only on a shared
@@ -419,6 +428,7 @@ impl Default for Options {
             scan_block_cache: true,
             scan_cache_bytes: 0,
             scan_cache_ahead: true,
+            scan_cache_ahead_min_blocks: 1024,
             scan_snapshot_arena: true,
         }
     }
@@ -8399,6 +8409,18 @@ impl Reader {
         }
         self.stop_ahead();
         if self.segs().first().is_none_or(|s| s.level == 0) {
+            return;
+        }
+        // A store too small for a builder: its run beside the scans costs
+        // them more than the builds it saves; the option's doc has the
+        // measurement.
+        let blocks: usize = self
+            .segs()
+            .iter()
+            .take_while(|s| s.level > 0)
+            .map(|s| s.blob.keys().div_ceil(CACHE_BLOCK))
+            .sum();
+        if blocks < self.opts.scan_cache_ahead_min_blocks {
             return;
         }
         let Ok(r) = self.reader() else {
