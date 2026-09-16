@@ -621,7 +621,17 @@ per-commit path.
   the arm with it prices the same as the arm without on every workload
   but E, where it runs three times the merge -- what it costs is the
   memory, which `scan_cache_bytes` bounds when the caller says so. The
-  merge on every scan is the comparison arm, `supdb-nocache` in the suite.
+  merge on every scan is the comparison arm, `supdb-nocache` in the
+  suite, and the suite matches caches as it matches guarantees: the
+  unbounded default against LMDB, whose page cache has no bound but the
+  machine's, and `supdb-cache256` against `rocksdb-tuned`'s 256 MB block
+  cache. What the unbounded default still lacks to be the page cache's
+  equal is giving memory back under pressure, which the page cache does
+  page by page and a heap cache cannot on its own: either the forms live
+  in `MADV_FREE` regions with a validity word the kernel zeroes when it
+  reclaims one, so a form that comes back zeroed is rebuilt, or a
+  watcher on memory pressure sheds to a target. Neither moves a row,
+  since no run here is under pressure; both are on the backlog.
 - **Ordered ingest straight into segments** — built, and the default.
   The load's keys arrive in order and went through a memtable, a WAL
   frame, a seal that sorts the sorted, and a partitioning pass; the

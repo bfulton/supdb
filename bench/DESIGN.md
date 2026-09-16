@@ -64,11 +64,14 @@ comparator a user would otherwise pick.
 
 | guarantee | supdb | comparators |
 |---|---|---|
-| durable per batch | `supdb` (default), `supdb-noadvice`, `supdb-nocache` | `lmdb`, `rocksdb-tuned` |
+| durable per batch | `supdb` (default), `supdb-noadvice`, `supdb-nocache`, `supdb-cache256` | `lmdb`, `rocksdb-tuned` |
 | buffered | `supdb-ingest` | `lmdb-nosync`, `rocksdb-nosync` |
 
 Every shipping option is an arm because a user can choose it and deserves the
-number. An option that is never better than the default on any machine class
+number. A cache is matched like a guarantee: `supdb`'s block cache has no
+bound, as LMDB's page cache has none but the machine's, and `supdb-cache256`
+bounds it at the 256 MB `rocksdb-tuned` runs its block cache on, so each
+comparator is read against the arm on the same memory. An option that is never better than the default on any machine class
 is a question the series answers.
 
 All arms in one process, interleaved one round at a time, so a machine that

@@ -280,6 +280,12 @@ pub struct Supdb {
     /// comparators in this suite once moved +20% to +43% between
     /// consecutive runs.
     advice: Option<supdb::ReadAdvice>,
+    /// The block cache's budget in bytes, 0 for the engine's default of no
+    /// bound. The default arm matches LMDB, whose cache is the page cache
+    /// with no bound but the machine's; `supdb-cache256` matches
+    /// `rocksdb-tuned`, whose block cache is 256 MB, so the pair is priced
+    /// on the same memory.
+    budget: usize,
     /// Whether a commit reaches the device before it returns: the axis the
     /// arm's guarantee row is about, set here rather than inherited. Every
     /// supdb arm took the engine's durable default for as long as none set
@@ -289,17 +295,17 @@ pub struct Supdb {
 
 impl Supdb {
     pub fn create(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, true, true, None, true, true)
+        Supdb::with_policy(path, true, true, None, true, true, 0)
     }
 
     pub fn create_ingest(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, false, true, None, false, false)
+        Supdb::with_policy(path, false, true, None, false, false, 0)
     }
 
     /// `sync` fsyncs and seals nothing; reads then answer from the
     /// memtable, the unrouted tail and the partitions together.
     pub fn create_nodrain(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, true, false, None, true, true)
+        Supdb::with_policy(path, true, false, None, true, true, 0)
     }
 
     /// `supdb` in every respect but the read advice, which is pinned to the
@@ -313,6 +319,7 @@ impl Supdb {
             Some(supdb::ReadAdvice::Normal),
             true,
             true,
+            0,
         )
     }
 
@@ -320,7 +327,14 @@ impl Supdb {
     /// every scan, the shape before the cache, kept as the comparison arm.
     /// The pair differs by one option and needs no matching.
     pub fn create_nocache(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, true, true, None, false, true)
+        Supdb::with_policy(path, true, true, None, false, true, 0)
+    }
+
+    /// `supdb` with the block cache bounded at 256 MB, the budget
+    /// `rocksdb-tuned` runs its block cache on, so that comparison is on
+    /// the same memory. Below the bound the two arms are one.
+    pub fn create_cache256(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(path, true, true, None, true, true, 256 << 20)
     }
 
     fn with_policy(
@@ -330,6 +344,7 @@ impl Supdb {
         advice: Option<supdb::ReadAdvice>,
         block_cache: bool,
         durable: bool,
+        budget: usize,
     ) -> Res<Supdb> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         // Checksums off in the segments, because LMDB has none and the axis
@@ -365,6 +380,7 @@ impl Supdb {
             // engine's default, so the arm's memory over the ladder is the
             // option's own and a row's figure describes what a user gets.
             scan_block_cache: block_cache,
+            scan_cache_bytes: budget,
             // The guarantee the arm's row names, not the engine's default:
             // durable per batch, or frames written per commit and fsynced
             // at `sync`, which is how `lmdb-nosync` and `rocksdb-nosync`
@@ -392,12 +408,16 @@ impl Supdb {
             advice,
             block_cache,
             durable,
+            budget,
         })
     }
 }
 
 impl Engine for Supdb {
     fn name(&self) -> &'static str {
+        if self.budget > 0 {
+            return "supdb-cache256";
+        }
         match (
             self.partition,
             self.drain,
@@ -789,10 +809,11 @@ use crate::row::Guarantee;
 /// Every arm a run measures, in the order they are interleaved. Each is a
 /// shipping supdb configuration or the comparator a user would otherwise
 /// pick. Comparisons are made within a guarantee, never across one.
-pub const ARMS: [&str; 8] = [
+pub const ARMS: [&str; 9] = [
     "supdb",
     "supdb-noadvice",
     "supdb-nocache",
+    "supdb-cache256",
     "lmdb",
     "rocksdb-tuned",
     "supdb-ingest",
@@ -802,9 +823,8 @@ pub const ARMS: [&str; 8] = [
 
 pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
-        "supdb" | "supdb-noadvice" | "supdb-nocache" | "lmdb" | "rocksdb-tuned" => {
-            Guarantee::Durable
-        }
+        "supdb" | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb"
+        | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
     })
@@ -817,6 +837,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb" => Box::new(Supdb::create(dir)?),
         "supdb-noadvice" => Box::new(Supdb::create_noadvice(dir)?),
         "supdb-nocache" => Box::new(Supdb::create_nocache(dir)?),
+        "supdb-cache256" => Box::new(Supdb::create_cache256(dir)?),
         "supdb-ingest" => Box::new(Supdb::create_ingest(dir)?),
         "lmdb" => Box::new(Lmdb::create(dir, map_gb)?),
         "lmdb-nosync" => Box::new(Lmdb::create_nosync(dir, map_gb)?),
