@@ -4198,13 +4198,18 @@ struct State {
     /// EXPERIMENT: whether every block an unsealed key overlays has a
     /// canonical form, so a null slot is a clean block.
     forms_complete: std::sync::atomic::AtomicBool,
-    /// EXPERIMENT: whether any handle has scanned this state on the
+    /// EXPERIMENT: scans any handle has made over this state on the
     /// block path. The regime the canonical forms are maintained for is
-    /// a store that is range-read: a store nobody scans pays nothing for
-    /// them, and one that is scanned pays at its commits. Set by the
-    /// scan and read by the writer's commit, so it is a store's property
-    /// and not one handle's.
-    scanned: std::sync::atomic::AtomicBool,
+    /// a store being range-read *now*: the writer maintains them at a
+    /// commit only when a scan has happened since the last one, so a
+    /// run of writes nobody reads between pays nothing and a mix that
+    /// scans between its writes pays at each. Counted by the scan and
+    /// read by the writer's commit, so the regime is the store's
+    /// behaviour and not a setting. Whether a store was scanned at all
+    /// was the first rule, and it kept maintenance on through eight
+    /// thousand updates with no scan among them: the suite's A and F
+    /// paid 30% and 43% for forms nothing read.
+    scans: AtomicU64,
     forms_bytes: AtomicUsize,
     forms_takes: AtomicUsize,
 }
@@ -4350,6 +4355,10 @@ pub struct Reader {
     /// the last commit, to publish as canonical at the next; the
     /// writer's own handle alone fills it.
     to_publish: std::cell::RefCell<Vec<(u32, u32)>>,
+    /// EXPERIMENT: the state's scan count at the last commit this handle
+    /// maintained the canonical forms at; a commit with the count
+    /// unmoved maintains nothing.
+    scans_seen: std::cell::Cell<u64>,
     /// PROTOTYPE: every built block holding bytes, as (partition index,
     /// block), so the sampler draws from blocks and never from empty
     /// slots. Sampling slots was tried: with a tenth of them built, a
@@ -5619,6 +5628,9 @@ impl Reader {
             moved = true;
             self.log_gen.set(st.gen);
             self.log_seen.set(0);
+            // A new state counts its own scans from zero, so the count
+            // this handle last maintained at belongs to the old one.
+            self.scans_seen.set(0);
             self.snap_entries.set(0);
             *self.scan_keys.borrow_mut() = None;
             self.snap_added.borrow_mut().clear();
@@ -5887,15 +5899,6 @@ impl Reader {
         }
     }
 
-    /// EXPERIMENT: whether the writer builds a form for a block its
-    /// settle reaches with none: once the canonical table is complete, so
-    /// that it stays so.
-    fn builds_missing(&self) -> bool {
-        self.opts.commit_forms
-            && self.slot.is_none()
-            && self.state().forms_complete.load(AtomicOrdering::Relaxed)
-    }
-
     /// The scan snapshot, current: what the scan preamble held inline
     /// before a commit needed the same. `gen` is the state's, `moved`
     /// whether the log or the state has moved since this handle looked.
@@ -5971,12 +5974,17 @@ impl Reader {
         if st.forms.is_empty() || self.segs().first().is_none_or(|s| s.level == 0) {
             return Ok(());
         }
-        // Nothing to maintain for a store nobody has scanned: the
-        // structure is for range reads, and a write-only stretch pays
-        // nothing for it.
-        if !st.scanned.load(AtomicOrdering::Relaxed) {
+        // Nothing to maintain where nothing has been scanned since the
+        // last commit: the structure is for range reads, and a run of
+        // writes with no read between them pays nothing for it. What is
+        // published stays where it was, so a reader past it builds its
+        // own, and the blocks touched meanwhile are published by the
+        // first commit a scan precedes.
+        let scans = st.scans.load(AtomicOrdering::Relaxed);
+        if scans == self.scans_seen.get() {
             return Ok(());
         }
+        self.scans_seen.set(scans);
         self.cache_used.set(true);
         let gen = st.gen;
         let moved = self.sync_log() || self.scan_keys.borrow().is_none();
@@ -5991,12 +5999,26 @@ impl Reader {
         // the writer builds one for any block a write lands in, so a
         // block without one is clean. Under a cache budget a form may be
         // shed, so the table is never called complete.
+        //
+        // The fill itself belongs to the builder ahead, on a core the
+        // writer is not using: filling it from the commit put the whole
+        // overlay of the mixes before E into E's own window, and E read
+        // 0.70x-0.81x of the arm without forms where a table already
+        // filled read 1.01x-1.33x. The builder declines a store too
+        // small for one, and there the commit fills it, which at ten
+        // thousand keys is a few hundred blocks.
         if self.opts.scan_cache_bytes == 0 && !st.forms_complete.load(AtomicOrdering::Relaxed) {
-            let cache = self.scan_keys.borrow();
-            let unsealed = &cache.as_ref().expect("scan snapshot").1;
-            self.complete_forms(unsealed)?;
-            drop(cache);
-            st.forms_complete.store(true, AtomicOrdering::Release);
+            if self.opts.scan_cache_ahead && self.ahead.borrow().is_none() {
+                self.start_ahead();
+            }
+            let filling = self.ahead.borrow().as_ref().is_some_and(|a| !a.done.get());
+            if !filling {
+                let cache = self.scan_keys.borrow();
+                let unsealed = &cache.as_ref().expect("scan snapshot").1;
+                self.complete_forms(unsealed)?;
+                drop(cache);
+                st.forms_complete.store(true, AtomicOrdering::Release);
+            }
         }
         let touched = std::mem::take(&mut *self.to_publish.borrow_mut());
         {
@@ -6234,21 +6256,19 @@ impl Reader {
             };
             let (b, cut) = BuildCtx::owner_of(seg, key);
             if b < table.slots.len() {
-                // Under canonical forms, a block the writer holds no form
-                // for is one no unsealed key overlaid, clean to every
-                // reader: built now so the table stays complete, and the
-                // write settles into it below.
-                if table.slots[b].is_none() && self.builds_missing() {
-                    let cache = self.scan_keys.borrow();
-                    if let Some((_, snap)) = cache.as_ref() {
-                        let l0 = &self.segs()[np..];
-                        let src = Sources { seg, l0 };
-                        let built =
-                            std::sync::Arc::new(self.build_ctx().materialize(src, table, b, snap)?);
-                        let bytes = built.bytes();
-                        table.slots[b] = Some(built);
-                        self.list_built_bytes(at, b, table, bytes);
-                    }
+                // A write into a block the writer holds no form for
+                // leaves the table incomplete rather than building one:
+                // a reader then builds that block itself, as it does
+                // without the forms at all. Building it here instead,
+                // to keep every empty slot meaning clean, made the
+                // writer build a form for every block any write landed
+                // in, which over a uniform update mix is the whole
+                // store, where a skewed scan reads a fraction of it: E
+                // read 0.73x-0.75x of the arm without forms.
+                if table.slots[b].is_none() && self.opts.commit_forms && self.slot.is_none() {
+                    self.state()
+                        .forms_complete
+                        .store(false, AtomicOrdering::Release);
                 }
                 self.patch_block(at, b, table, key, cut)?;
             }
@@ -6492,8 +6512,8 @@ impl Reader {
         // clean. The writer's own handle holds those forms already, with
         // whatever it has staged since settled into them.
         let st = self.state();
-        if self.opts.commit_forms && !st.scanned.load(AtomicOrdering::Relaxed) {
-            st.scanned.store(true, AtomicOrdering::Relaxed);
+        if self.opts.commit_forms {
+            st.scans.fetch_add(1, AtomicOrdering::Relaxed);
         }
         let canonical = self.opts.commit_forms
             && self.slot.is_some()
@@ -7426,7 +7446,7 @@ impl Db {
             forms: Reader::forms_for(&segs),
             forms_at: AtomicUsize::new(usize::MAX),
             forms_complete: std::sync::atomic::AtomicBool::new(false),
-            scanned: std::sync::atomic::AtomicBool::new(false),
+            scans: AtomicU64::new(0),
             forms_bytes: AtomicUsize::new(0),
             forms_takes: AtomicUsize::new(0),
             segs,
@@ -7461,6 +7481,7 @@ impl Db {
             pending: std::cell::RefCell::new(Vec::new()),
             built: std::cell::RefCell::new(Vec::new()),
             to_publish: std::cell::RefCell::new(Vec::new()),
+            scans_seen: std::cell::Cell::new(0),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),
             log_seen: std::cell::Cell::new(0),
@@ -7697,7 +7718,7 @@ impl Db {
             forms: Reader::forms_for(&segs),
             forms_at: AtomicUsize::new(usize::MAX),
             forms_complete: std::sync::atomic::AtomicBool::new(false),
-            scanned: std::sync::atomic::AtomicBool::new(false),
+            scans: AtomicU64::new(0),
             forms_bytes: AtomicUsize::new(0),
             forms_takes: AtomicUsize::new(0),
             segs,
@@ -7732,6 +7753,7 @@ impl Db {
             pending: std::cell::RefCell::new(Vec::new()),
             built: std::cell::RefCell::new(Vec::new()),
             to_publish: std::cell::RefCell::new(Vec::new()),
+            scans_seen: std::cell::Cell::new(0),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),
             log_seen: std::cell::Cell::new(0),
@@ -8410,7 +8432,7 @@ impl Db {
             forms: Reader::forms_for(&segs),
             forms_at: AtomicUsize::new(usize::MAX),
             forms_complete: std::sync::atomic::AtomicBool::new(false),
-            scanned: std::sync::atomic::AtomicBool::new(false),
+            scans: AtomicU64::new(0),
             forms_bytes: AtomicUsize::new(0),
             forms_takes: AtomicUsize::new(0),
             segs,
@@ -8502,6 +8524,7 @@ impl Reader {
             pending: std::cell::RefCell::new(Vec::new()),
             built: std::cell::RefCell::new(Vec::new()),
             to_publish: std::cell::RefCell::new(Vec::new()),
+            scans_seen: std::cell::Cell::new(0),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),
             log_seen: std::cell::Cell::new(0),
@@ -8521,7 +8544,7 @@ impl Db {
             forms: Reader::forms_for(&cur.segs),
             forms_at: AtomicUsize::new(usize::MAX),
             forms_complete: std::sync::atomic::AtomicBool::new(false),
-            scanned: std::sync::atomic::AtomicBool::new(false),
+            scans: AtomicU64::new(0),
             forms_bytes: AtomicUsize::new(0),
             forms_takes: AtomicUsize::new(0),
             segs: cur.segs.clone(),
@@ -8543,7 +8566,7 @@ impl Db {
             forms: Reader::forms_for(&cur.segs),
             forms_at: AtomicUsize::new(usize::MAX),
             forms_complete: std::sync::atomic::AtomicBool::new(false),
-            scanned: std::sync::atomic::AtomicBool::new(false),
+            scans: AtomicU64::new(0),
             forms_bytes: AtomicUsize::new(0),
             forms_takes: AtomicUsize::new(0),
             segs: cur.segs.clone(),
@@ -8567,7 +8590,7 @@ impl Db {
             forms: Reader::forms_for(&cur.segs),
             forms_at: AtomicUsize::new(usize::MAX),
             forms_complete: std::sync::atomic::AtomicBool::new(false),
-            scanned: std::sync::atomic::AtomicBool::new(false),
+            scans: AtomicU64::new(0),
             forms_bytes: AtomicUsize::new(0),
             forms_takes: AtomicUsize::new(0),
             segs: cur.segs.clone(),
