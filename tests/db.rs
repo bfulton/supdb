@@ -3491,6 +3491,33 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
         "a piece with a tombstone is not a partition as it is"
     );
     assert_eq!(read_vec(&db, &key(5)), Vec::<Vec<u8>>::new());
+    // A store that does not partition on flush keeps its piece a piece:
+    // the seal names only what the flush would have promoted.
+    let d = dir("first-partition-unpartitioned");
+    let mut db = Db::create(
+        &d,
+        Options {
+            partition_on_flush: false,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    for i in 0..3000u32 {
+        db.append(&key(i), b"v");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert_eq!(
+        db.levels(),
+        (0, 1),
+        "no partition where the flush makes none"
+    );
+    let names = files(&d);
+    assert!(
+        names.len() == 1 && names[0].starts_with("seg-"),
+        "the piece keeps its name: {names:?}"
+    );
+    assert_eq!(read_vec(&db, &key(7)), vec![b"v".to_vec()]);
 }
 
 /// A piece sealed while a merge of its range runs is kept across the

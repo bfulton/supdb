@@ -207,9 +207,11 @@ manifest's together -- then reset the WAL; a crash between any two of those
 leaves either a WAL that replays the whole memtable or a complete segment
 plus a WAL whose sealed prefix is skipped by sequence, and a segment the
 manifest never named is swept at open. A store's first seal under a flush
-writes the partition's name directly when the piece is tombstone-free and
-fits one, since that is what the flush's promotion would link it as under a
-second publish.
+that partitions writes the partition's name directly when the piece is
+tombstone-free and fits one, since that is what the flush's promotion would
+link it as under a second publish; the first version named it so for a
+store that does not partition on flush too, and the suite's ingest arm,
+which keeps its piece a piece, scanned three times faster for one row.
 Replay applies the frames between commit frames whole or not at all -- a
 partial batch used to replay as whole, and the first test written against
 the contract found it. `settle` is what joins an in-flight seal; `sync` does

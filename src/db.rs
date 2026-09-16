@@ -6953,7 +6953,11 @@ impl Db {
     /// directory sync, manifest sync and directory sync a quarter of the
     /// drain.
     fn seals_first_partition(&self) -> bool {
-        self.draining && self.opts.promote && self.segs().is_empty()
+        self.draining
+            && self.opts.compact
+            && self.opts.partition_on_flush
+            && self.opts.promote
+            && self.segs().is_empty()
     }
 
     /// The largest file a partition may be, in bytes.
