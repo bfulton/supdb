@@ -923,9 +923,24 @@ per-commit path.
   464–474 to 462–474 and its second pass 543–550 to 524–527, the rest
   level; at three million level throughout; at three hundred thousand,
   where a first pair read the load and the write mixes a tenth behind,
-  five rounds put every mix at 0.98x to 1.07x of the head. What a read
-  pays for the handle is one load of the state pointer and a null check
-  at its start. The block cache's slots as atomic pointers a
+  five rounds put every mix at 0.98x to 1.07x of the head. Those rounds
+  were too few and too short for a point read: ten rounds of the probe's
+  C alone, each pass ten times the suite's, put the two commits together
+  at 83% of the commit before them at 300k keys and 94% at 100k, about
+  thirty-five nanoseconds on a read of two hundred. Two of the three
+  costs were taken back. The read hashed the key and fetched the
+  memtable's slot line before knowing the table was empty, which every
+  read over a store just flushed is; the hash and the prefetch wait for a
+  table with entries now. It also took the state through an accessor at
+  every step, two loads and a branch each; it takes the state once. And
+  a read asked every segment whether it held a tombstone, forty-one
+  pointer chases at thirty million keys, in this engine and the one
+  before; the state records the answer at publish. Ten rounds after:
+  427k–480k against 464k–501k at 300k, 94%, and level at 100k in seven
+  rounds of ten with three a third slower that the base did not show.
+  The six percent left is the pointer to the state and the `Arc` each
+  segment sits behind, and it is the price of a state a reader thread
+  can hold. The block cache's slots as atomic pointers a
   miss fills by compare-and-swap and a settle patches by copy, so the
   handles share one cache, and a thread count in the suite's matrix
   with LMDB alongside (`bench/DESIGN.md`), follow.

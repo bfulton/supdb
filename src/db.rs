@@ -4099,6 +4099,10 @@ struct State {
     /// binary search instead of a walk over all of them; see
     /// `pieces_over`. Refreshed by `sort_segs`.
     l0_aligned: bool,
+    /// Whether any live segment holds a tombstone, found once here: a
+    /// read asked it of every segment, forty-one pointer chases a read
+    /// at thirty million keys.
+    segs_tombs: bool,
 }
 
 /// What every handle on one store shares: the state, the reader table
@@ -4722,9 +4726,7 @@ impl Reader {
     /// nothing was ever deleted from, which lets every read skip the
     /// newest-first pass tombstones require.
     fn has_tombstones(&self) -> bool {
-        self.mem().tombs() > 0
-            || self.frozen().as_ref().is_some_and(|f| f.tombs() > 0)
-            || self.segs().iter().any(|s| s.tombs)
+        self.state().has_tombstones()
     }
 
     /// The fences a range merge should rewrite now, or `None` when the store
@@ -4807,14 +4809,27 @@ impl Reader {
     /// in the store, two fence compares each, that grew with the range
     /// count times the pieces over a range.
     fn pieces_over(&self, np: usize, at: usize) -> &[std::sync::Arc<Seg>] {
-        let l0 = &self.segs()[np..];
-        if !self.state().l0_aligned || at >= np {
+        self.state().pieces_over(np, at)
+    }
+}
+
+impl State {
+    fn has_tombstones(&self) -> bool {
+        self.segs_tombs
+            || self.mem.tombs() > 0
+            || self.frozen.as_ref().is_some_and(|f| f.tombs() > 0)
+    }
+
+    /// The level-0 pieces a read of a key in partition `at` consults.
+    fn pieces_over(&self, np: usize, at: usize) -> &[std::sync::Arc<Seg>] {
+        let l0 = &self.segs[np..];
+        if !self.l0_aligned || at >= np {
             return l0;
         }
         // The first partition's lower fence is empty, and so is that of
         // every piece aligned to it; see `below_lo` for why an empty fence
         // is never handed to a compare.
-        let lo = self.segs()[at].lo.as_slice();
+        let lo = self.segs[at].lo.as_slice();
         let before =
             |s: &std::sync::Arc<Seg>| !lo.is_empty() && (s.lo.is_empty() || s.lo.as_slice() < lo);
         let same = |s: &std::sync::Arc<Seg>| {
@@ -4824,7 +4839,9 @@ impl Reader {
         let to = from + l0[from..].partition_point(same);
         &l0[from..to]
     }
+}
 
+impl Reader {
     /// The memtable bytes at which the next commit seals: `seal_bytes`, or
     /// with `seal_grows` the larger of that and the partitions' bytes over
     /// four times `l0_trigger`.
@@ -4994,12 +5011,19 @@ impl Reader {
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
         let _entered = self.enter();
         self.advise(true);
-        let hash = self.mem().prefetch(key);
-        let np = self.segs().partition_point(|s| s.level > 0);
-        let at = self.segs()[..np]
-            .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
-        let part = self.segs()[..np].get(at).filter(|s| s.may_hold(key));
-        let l0 = self.pieces_over(np, at);
+        // The state once, and the memtable's hash and slot line only when
+        // it has entries: a read over a store just flushed hashed the key
+        // and fetched a line of an empty table, and took the state through
+        // an accessor at every step, thirty nanoseconds on a read of two
+        // hundred at three hundred thousand keys.
+        let st = self.state();
+        let (segs, mem) = (&st.segs, &*st.mem);
+        let mem_empty = mem.is_empty();
+        let hash = if mem_empty { 0 } else { mem.prefetch(key) };
+        let np = segs.partition_point(|s| s.level > 0);
+        let at = segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+        let part = segs[..np].get(at).filter(|s| s.may_hold(key));
+        let l0 = st.pieces_over(np, at);
         // Sources oldest to newest: the partition (0), the level-0 pieces
         // (1..), the frozen memtable, the live one. `start` is the source
         // live values begin at: 0 unless a newer source holds a tombstone
@@ -5008,16 +5032,16 @@ impl Reader {
         // sources that hold the key.
         let (fr_ix, mem_ix) = (1 + l0.len(), 2 + l0.len());
         let mut start = 0usize;
-        if self.has_tombstones() {
-            if !self.mem().is_empty() {
-                if let Some(e) = self.mem().get_with(hash, key) {
-                    if self.mem().has_tomb(e, self.wm()) {
+        if st.has_tombstones() {
+            if !mem_empty {
+                if let Some(e) = mem.get_with(hash, key) {
+                    if mem.has_tomb(e, self.wm()) {
                         start = mem_ix;
                     }
                 }
             }
             if start == 0 {
-                if let Some(fr) = self.frozen() {
+                if let Some(fr) = &st.frozen {
                     if let Some(e) = fr.get(key) {
                         if fr.has_tomb(e, SEE_ALL) {
                             start = fr_ix;
@@ -5058,7 +5082,7 @@ impl Reader {
                 .map_err(|e| err(&format!("segment read: {e}")))?;
         }
         if fr_ix >= start {
-            if let Some(fr) = self.frozen() {
+            if let Some(fr) = &st.frozen {
                 if let Some(e) = fr.get(key) {
                     let (offs, _) = fr.live_chain(e, SEE_ALL);
                     n += offs.len() as u64;
@@ -5068,12 +5092,12 @@ impl Reader {
                 }
             }
         }
-        if mem_ix >= start && !self.mem().is_empty() {
-            if let Some(e) = self.mem().get_with(hash, key) {
-                let (offs, _) = self.mem().live_chain(e, self.wm());
+        if mem_ix >= start && !mem_empty {
+            if let Some(e) = mem.get_with(hash, key) {
+                let (offs, _) = mem.live_chain(e, self.wm());
                 n += offs.len() as u64;
                 for off in offs {
-                    f(self.mem().value_at(off));
+                    f(mem.value_at(off));
                 }
             }
         }
@@ -6626,24 +6650,26 @@ impl Reader {
         // A count resolves one key, so it is a point read for advice
         // purposes even though it returns no bytes (`F28`: 94 ns, a lookup).
         self.advise(true);
-        let hash = self.mem().prefetch(key);
-        let np = self.segs().partition_point(|s| s.level > 0);
-        let at = self.segs()[..np]
-            .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
-        let part = self.segs()[..np].get(at).filter(|s| s.may_hold(key));
-        let l0 = self.pieces_over(np, at);
+        let st = self.state();
+        let (segs, mem) = (&st.segs, &*st.mem);
+        let mem_empty = mem.is_empty();
+        let hash = if mem_empty { 0 } else { mem.prefetch(key) };
+        let np = segs.partition_point(|s| s.level > 0);
+        let at = segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+        let part = segs[..np].get(at).filter(|s| s.may_hold(key));
+        let l0 = st.pieces_over(np, at);
         let (fr_ix, mem_ix) = (1 + l0.len(), 2 + l0.len());
         let mut start = 0usize;
-        if self.has_tombstones() {
-            if !self.mem().is_empty() {
-                if let Some(e) = self.mem().get_with(hash, key) {
-                    if self.mem().has_tomb(e, self.wm()) {
+        if st.has_tombstones() {
+            if !mem_empty {
+                if let Some(e) = mem.get_with(hash, key) {
+                    if mem.has_tomb(e, self.wm()) {
                         start = mem_ix;
                     }
                 }
             }
             if start == 0 {
-                if let Some(fr) = self.frozen() {
+                if let Some(fr) = &st.frozen {
                     if let Some(e) = fr.get(key) {
                         if fr.has_tomb(e, SEE_ALL) {
                             start = fr_ix;
@@ -6684,15 +6710,15 @@ impl Reader {
                 .map_err(|e| err(&format!("segment count: {e}")))?;
         }
         if fr_ix >= start {
-            if let Some(fr) = self.frozen() {
+            if let Some(fr) = &st.frozen {
                 if let Some(e) = fr.get(key) {
                     n += e.count.load(AtomicOrdering::Relaxed);
                 }
             }
         }
-        if mem_ix >= start && !self.mem().is_empty() {
-            if let Some(e) = self.mem().get_with(hash, key) {
-                n += self.mem().live_chain(e, self.wm()).0.len() as u64;
+        if mem_ix >= start && !mem_empty {
+            if let Some(e) = mem.get_with(hash, key) {
+                n += mem.live_chain(e, self.wm()).0.len() as u64;
             }
         }
         Ok(n)
@@ -6835,6 +6861,7 @@ impl Db {
         let mean_key_bytes = 0;
         let store_bytes = 0;
         let l0_aligned = false;
+        let segs_tombs = false;
         let state = State {
             segs,
             mem: std::sync::Arc::new(MemTable::new()),
@@ -6843,6 +6870,7 @@ impl Db {
             mean_key_bytes,
             store_bytes,
             l0_aligned,
+            segs_tombs,
         };
         let shared = std::sync::Arc::new(Shared {
             state: AtomicPtr::new(Box::into_raw(Box::new(state))),
@@ -7093,6 +7121,7 @@ impl Db {
         let mean_key_bytes = Db::mean_key_bytes_of(&segs);
         let store_bytes = Db::store_bytes_of(dir, &segs);
         let l0_aligned = Db::l0_aligned_of(&segs);
+        let segs_tombs = segs.iter().any(|s| s.tombs);
         let max_key = Db::max_key_of(&segs, &mem);
         let ntables = segs.len();
         let state = State {
@@ -7103,6 +7132,7 @@ impl Db {
             mean_key_bytes,
             store_bytes,
             l0_aligned,
+            segs_tombs,
         };
         let shared = std::sync::Arc::new(Shared {
             state: AtomicPtr::new(Box::into_raw(Box::new(state))),
@@ -7769,6 +7799,7 @@ impl Db {
         let mean_key_bytes = Db::mean_key_bytes_of(&segs);
         let store_bytes = Db::store_bytes_of(&self.dir, &segs);
         let l0_aligned = Db::l0_aligned_of(&segs);
+        let segs_tombs = segs.iter().any(|s| s.tombs);
         let cur = self.state();
         let next = State {
             segs,
@@ -7778,6 +7809,7 @@ impl Db {
             mean_key_bytes,
             store_bytes,
             l0_aligned,
+            segs_tombs,
         };
         self.publish_state(next);
     }
@@ -7855,6 +7887,7 @@ impl Db {
             mean_key_bytes: cur.mean_key_bytes,
             store_bytes: cur.store_bytes,
             l0_aligned: cur.l0_aligned,
+            segs_tombs: cur.segs_tombs,
         };
         self.publish_state(next);
     }
@@ -7870,6 +7903,7 @@ impl Db {
             mean_key_bytes: cur.mean_key_bytes,
             store_bytes: cur.store_bytes,
             l0_aligned: cur.l0_aligned,
+            segs_tombs: cur.segs_tombs,
         };
         self.publish_state(next);
     }
@@ -7887,6 +7921,7 @@ impl Db {
             mean_key_bytes: cur.mean_key_bytes,
             store_bytes: cur.store_bytes,
             l0_aligned: cur.l0_aligned,
+            segs_tombs: cur.segs_tombs,
         };
         self.publish_state(next);
         frozen
