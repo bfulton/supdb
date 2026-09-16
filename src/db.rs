@@ -8121,6 +8121,7 @@ impl<'s> BuildCtx<'s> {
             tombs: self.tombs,
             scratch: Vec::new(),
         };
+        self.prefetch_overlay(ov);
         // Sized once from the key count: a buffer grown by doubling from
         // empty reallocates several times for a block of a few keys.
         let mut blk = SparseBlock {
@@ -8221,6 +8222,49 @@ impl<'s> BuildCtx<'s> {
         }
         Ok(seen)
     }
+    /// PROTOTYPE: the memtable lines an overlay's emits will miss, fetched
+    /// in two sweeps so the misses overlap instead of following one
+    /// another key by key: every key's entry, then the chunk at its head
+    /// with the line before it, where the tombstone a put leaves sits.
+    /// At three hundred thousand keys, with nothing sealed since the
+    /// mixes, every overlay value is in the memtable, and a copy's build
+    /// spent 15 of its 23 us emitting 33 keys: two misses a key into a
+    /// 5 MB arena.
+    fn prefetch_overlay(&self, ov: &Overlay) {
+        let tables: [Option<&MemTable>; 2] = [Some(self.mem), self.frozen];
+        for o in &ov.over {
+            let Some(sk) = o.sk else { continue };
+            for (t, slot) in [(tables[0], sk.mem), (tables[1], sk.frozen)] {
+                if let Some(t) = t {
+                    if slot != u32::MAX && (slot as usize) < t.entries.len() {
+                        let e = &t.entries[slot as usize];
+                        prefetch_lines(
+                            e as *const MemEntry as *const u8,
+                            std::mem::size_of::<MemEntry>(),
+                        );
+                    }
+                }
+            }
+        }
+        for o in &ov.over {
+            let Some(sk) = o.sk else { continue };
+            for (t, slot) in [(tables[0], sk.mem), (tables[1], sk.frozen)] {
+                if let Some(t) = t {
+                    if slot != u32::MAX && (slot as usize) < t.entries.len() {
+                        let head = t.entries[slot as usize].head;
+                        if head != 0 {
+                            let at = (head - 1) as usize;
+                            let from = at.saturating_sub(64);
+                            let to = (at + 128).min(t.vals.len());
+                            if from < to {
+                                prefetch_lines(t.vals[from..].as_ptr(), to - from);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     /// PROTOTYPE: the merged copy of the ranks with the overlay laid over
     /// them.
     fn copy_block(
@@ -8233,6 +8277,7 @@ impl<'s> BuildCtx<'s> {
         // entry on a key change, and a key without values still gets one.
         // The two closures never run at once; the cell is for the borrow
         // checker.
+        self.prefetch_overlay(ov);
         let n = ranks.len() + ov.over.len();
         let blk = std::cell::RefCell::new(CachedBlock {
             keys: Vec::with_capacity(n * 16),

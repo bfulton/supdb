@@ -643,7 +643,19 @@ per-commit path.
   sparse build 0.22–0.25 µs a scan to 0.15–0.18 by the timers, and on
   plain probes over four rounds E's first pass 620k–692k to 659k–700k
   at a hundred thousand and 452k–653k to 630k–649k at three hundred,
-  the second pass level. The write
+  the second pass level. What was left of a build at those sizes was
+  the emit: with nothing sealed since the mixes every overlay value is
+  in the memtable, and a copy's build spent 15 of its 23 µs emitting 33
+  keys, two misses a key into a 5 MB arena, the entry and then the
+  chunk at its head. The build now fetches them in two sweeps before
+  it emits, every key's entry and then every head chunk with the line
+  before it, where the tombstone a put leaves sits, so the misses
+  overlap: the emit 5 µs a copy build by the timers, the sparse build
+  0.20 to 0.16 µs a scan at three hundred thousand. On plain probes the
+  pass moves less than the machine does: 664k–705k to 682k–704k at
+  three hundred thousand over three rounds, 552k to 577k–590k and then
+  541k–570k to 543k–550k at three million, 425k–498k either way at
+  thirty million over five rounds. The write
   path settles in
   place: a write is queued and, at the next scan, spliced into the built
   block it landed in -- the key's run resolved as a build resolves it,
