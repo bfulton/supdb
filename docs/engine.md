@@ -633,7 +633,17 @@ per-commit path.
   1.27x to 1.33x; at three million 565k against 498k–500k and
   645k–675k against 500k–514k. The overlay LMDB never has now costs
   less than the walk it saves, so the standing above is the one before
-  this and not the one to quote. The write
+  this and not the one to quote. At a hundred thousand keys and three
+  hundred, where the suite's rows still trail LMDB, the scan timed by
+  step is a third builds on its first pass, the pass a row measures,
+  and the sparse build's cost was the cut search: a gallop and a binary
+  search of parsed records for each overlay key. It runs over the
+  ordered index's heads for the block now, eight lines hot after the
+  first build, with one key read to say whether the cut is the key: the
+  sparse build 0.22–0.25 µs a scan to 0.15–0.18 by the timers, and on
+  plain probes over four rounds E's first pass 620k–692k to 659k–700k
+  at a hundred thousand and 452k–653k to 630k–649k at three hundred,
+  the second pass level. The write
   path settles in
   place: a write is queued and, at the next scan, spliced into the built
   block it landed in -- the key's run resolved as a build resolves it,

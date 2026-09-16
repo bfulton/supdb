@@ -426,6 +426,75 @@ impl OrdIndex {
         u64::from_be_bytes(self.map.0[at..at + HEAD].try_into().expect("eight bytes"))
     }
 
+    /// `seek` within ranks `lo..hi`: the first rank there whose key is
+    /// not below `key`, or `hi` when none is. The search runs over the
+    /// range's heads alone -- a block's sixty-four are eight lines, hot
+    /// after the block's first build -- and reads a key only to break a
+    /// tie, as `seek` does. A block's build asked this of the records
+    /// before, a gallop and a binary search of parsed keys for each of
+    /// the block's overlay keys.
+    pub fn seek_in<'a>(
+        &self,
+        lo: usize,
+        hi: usize,
+        key: &[u8],
+        key_at: impl Fn(usize) -> Option<&'a [u8]>,
+    ) -> usize {
+        let hi = hi.min(self.n);
+        if lo >= hi {
+            return hi;
+        }
+        // A query without the common prefix is below or above every key,
+        // as `seek` decides it; below is `lo` here, above is `hi`.
+        if self.pfx > 0 {
+            let m = self.pfx.min(key.len());
+            let learned = self.prefix.as_deref();
+            let first = match learned {
+                Some(p) => p,
+                None => match key_at(0) {
+                    Some(k) => k,
+                    None => return lo,
+                },
+            };
+            let m = m.min(first.len());
+            match key[..m].cmp(&first[..m]) {
+                std::cmp::Ordering::Less => return lo,
+                std::cmp::Ordering::Greater => return hi,
+                std::cmp::Ordering::Equal if m < self.pfx => return lo,
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+        let h = head_of(key, self.pfx);
+        let (mut a, mut b) = (lo, hi);
+        while a < b {
+            let m = (a + b) / 2;
+            if self.head(m) < h {
+                a = m + 1;
+            } else {
+                b = m;
+            }
+        }
+        if a >= hi || self.head(a) != h {
+            return a;
+        }
+        if let Some(len) = self.uniform_len {
+            return if key.len() <= len {
+                a
+            } else {
+                self.run_end(h, a).min(hi)
+            };
+        }
+        let (mut a, mut b) = (a, self.run_end(h, a).min(hi));
+        while a < b {
+            let m = (a + b) / 2;
+            match key_at(m) {
+                Some(k) if k < key => a = m + 1,
+                _ => b = m,
+            }
+        }
+        a
+    }
+
     /// The end of the run of heads equal to `h` that starts at `from`.
     ///
     /// Galloping, not a binary search over the whole array. A run is one

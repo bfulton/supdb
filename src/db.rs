@@ -8283,44 +8283,17 @@ impl<'s> BuildCtx<'s> {
     /// at distance one, and with two more reads a key that was eight
     /// against the merge's three.
     fn cut_at(seg: &Seg, rank: usize, end: usize, uk: &[u8]) -> (usize, Ordering) {
-        let at = |r: usize| seg.blob.key_at(r).map_or(Ordering::Greater, |k| k.cmp(uk));
-        let first = at(rank);
-        if first != Ordering::Less {
-            return (rank, first);
-        }
-        let last = at(end - 1);
-        if last == Ordering::Less {
+        // The ordered index's heads over the block, then one key read to
+        // say whether the cut is the key itself. Before this the cut was
+        // searched in the records, a gallop and a binary search of parsed
+        // keys: at 300k keys a sparse block's build was 3 us, most of it
+        // here, a fifth of E's first pass.
+        let r = seg.ord.seek_in(rank, end, uk, |i| seg.blob.key_at(i));
+        if r >= end {
             return (end, Ordering::Greater);
         }
-        // The cut is in rank+1 ..= end-1, and `at(hi)` is never `Less`.
-        let (mut lo, mut hi, mut at_hi) = (rank + 1, end - 1, last);
-        let mut step = 1usize;
-        loop {
-            let p = lo + step - 1;
-            if p >= hi {
-                break;
-            }
-            let c = at(p);
-            if c == Ordering::Less {
-                lo = p + 1;
-                step *= 2;
-            } else {
-                hi = p;
-                at_hi = c;
-                break;
-            }
-        }
-        while lo < hi {
-            let m = lo + (hi - lo) / 2;
-            let c = at(m);
-            if c == Ordering::Less {
-                lo = m + 1;
-            } else {
-                hi = m;
-                at_hi = c;
-            }
-        }
-        (lo, at_hi)
+        let at = seg.blob.key_at(r).map_or(Ordering::Greater, |k| k.cmp(uk));
+        (r, at)
     }
 }
 
