@@ -8271,23 +8271,15 @@ impl<'s> BuildCtx<'s> {
     /// itself, `Greater` for a key past it or a rank that does not resolve,
     /// which sorts as "not less" the way the seek's damage rule has it.
     ///
-    /// The rank itself is read first: after the Zipfian mixes the low keys
-    /// are dense with unsealed keys, and the scans that start there meet
-    /// the next one at the very rank the walk stands on, so one read
-    /// answers, and the comparison it made is the equal-key check the emit
-    /// needs. Then the window's last key, one read, for the key past the
-    /// window -- an insert past the loaded range. Only a cut inside the
-    /// window is searched, by a gallop from the rank and a binary search
-    /// over the gap it lands in, about 2 log2 d reads for a cut d ranks
-    /// away. A binary search over the whole window cost six reads for a cut
-    /// at distance one, and with two more reads a key that was eight
-    /// against the merge's three.
+    /// Searched over the ordered index's heads for the window -- sixty-four
+    /// eight-byte heads in eight lines, hot after the block's first build
+    /// -- with one key read after, for the comparison the emit needs.
+    /// Before this the search read the records: the rank itself first,
+    /// then the window's last key, then a gallop from the rank and a
+    /// binary search over the gap it landed in, a parsed key at every
+    /// probe; at 300k keys a sparse block's build was 3 us, most of it
+    /// here, and a fifth of E's first pass.
     fn cut_at(seg: &Seg, rank: usize, end: usize, uk: &[u8]) -> (usize, Ordering) {
-        // The ordered index's heads over the block, then one key read to
-        // say whether the cut is the key itself. Before this the cut was
-        // searched in the records, a gallop and a binary search of parsed
-        // keys: at 300k keys a sparse block's build was 3 us, most of it
-        // here, a fifth of E's first pass.
         let r = seg.ord.seek_in(rank, end, uk, |i| seg.blob.key_at(i));
         if r >= end {
             return (end, Ordering::Greater);
