@@ -2443,8 +2443,12 @@ impl ByteArena {
             );
             let cap = ARENA_BLOCK.max((n + 63) & !63);
             let layout = std::alloc::Layout::from_size_align(cap, 64).expect("arena block layout");
+            // Not zeroed: a byte is read only past a write that covered
+            // it, and zeroing a fresh table's first blocks -- eleven
+            // megabytes with the slabs -- cost its first write 3.7 ms,
+            // which was 3x of ycsb-B at ten thousand keys.
             // SAFETY: a non-zero layout; the block is freed by `Drop`.
-            let p = unsafe { std::alloc::alloc_zeroed(layout) };
+            let p = unsafe { std::alloc::alloc(layout) };
             assert!(!p.is_null(), "memtable arena: out of memory");
             self.caps[b].store(cap, AtomicOrdering::Release);
             self.blocks[b].store(p, AtomicOrdering::Release);
@@ -2569,8 +2573,10 @@ impl<T> Slab<T> {
         let mut p = self.blocks[b].load(AtomicOrdering::Acquire);
         if p.is_null() {
             let layout = std::alloc::Layout::array::<T>(SLAB_BLOCK).expect("slab block layout");
+            // Not zeroed: an entry is read only below `len`, and each is
+            // written whole before `len` covers it. See the arena.
             // SAFETY: a non-zero layout; the block is freed by `Drop`.
-            p = unsafe { std::alloc::alloc_zeroed(layout) } as *mut T;
+            p = unsafe { std::alloc::alloc(layout) } as *mut T;
             assert!(!p.is_null(), "memtable: out of memory");
             self.blocks[b].store(p, AtomicOrdering::Release);
         }

@@ -84,6 +84,13 @@ repository's history. Nothing here cites one of its claims by id: an id
 whose checker is gone is a pointer to nothing, and it comes back as a
 number.
 
+The ladder's small rungs are not a formality. A fresh memtable's first
+write zeroed eleven megabytes of blocks it would never read, 3.7 ms that
+five interleaved rounds of a probe at 300k keys could not see and the
+quick row's ycsb-B at ten thousand keys, a pass under a millisecond,
+showed as 3x. Take the quick row before a change is called flat, and
+read its smallest rung.
+
 Two consequences for code in this repository:
 
 - **The comparison arms in `Options` are not dead code.** `cursor_merge`,

@@ -850,7 +850,13 @@ per-commit path.
   *The memtable* is the first part, built: nothing in it moves once
   published. Keys and values live in arenas of blocks that are never
   reallocated (a value larger than a block gets a block of its own, and a
-  reservation never straddles two); the entries are a slab of the same
+  reservation never straddles two) and never zeroed: a byte is read only
+  past a write that covered it, and the first version zeroed a fresh
+  table's first blocks, eleven megabytes with the slabs, so its first
+  write cost 3.7 ms and ycsb-B at ten thousand keys, whose whole pass is
+  under a millisecond, priced 3x below its rows; the quick row found it
+  where five rounds at 300k could not, and the first write costs 19 µs
+  now; the entries are a slab of the same
   kind, numbered in the order they were made, so a number handed to the
   scan snapshot or a block table stays good for the table's life; the
   hash index is a table of entry numbers under the hash's high half, and
