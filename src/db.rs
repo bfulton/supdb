@@ -3193,6 +3193,17 @@ impl CachedBlock {
     fn lower_bound(&self, from: &[u8]) -> usize {
         self.ents.partition_point(|e| self.key(e) < from)
     }
+    /// PROTOTYPE: pull the entries and the keys toward the core, and the
+    /// first lines of the values, ahead of a walk. After a pass over
+    /// hundreds of megabytes of blocks a copy's three buffers are cold,
+    /// and the lower bound over its entries is six dependent misses into
+    /// two of them; issued together they cost one, and the values stream
+    /// behind the walk once its first lines are in.
+    fn prefetch(&self) {
+        prefetch_lines(self.ents.as_ptr() as *const u8, self.ents.len() * 16);
+        prefetch_lines(self.keys.as_ptr(), self.keys.len());
+        prefetch_lines(self.vals.as_ptr(), self.vals.len().min(1024));
+    }
     fn each_value(&self, e: &[u32; 4], mut f: impl FnMut(&[u8])) {
         let run = &self.vals[e[2] as usize..(e[2] + e[3]) as usize];
         let mut p = 0usize;
@@ -3202,6 +3213,25 @@ impl CachedBlock {
             p += 4 + n;
         }
     }
+}
+
+/// PROTOTYPE: a hint to the core to fetch the lines of a buffer, none of
+/// which it waits for; on any other architecture, nothing.
+#[inline]
+fn prefetch_lines(ptr: *const u8, bytes: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        let mut off = 0usize;
+        while off < bytes {
+            // SAFETY: a prefetch is a hint that faults on no address, and
+            // every address here is inside the buffer.
+            unsafe { _mm_prefetch(ptr.add(off) as *const i8, _MM_HINT_T0) };
+            off += 64;
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (ptr, bytes);
 }
 
 /// PROTOTYPE: what the cache knows about a block.
@@ -6595,6 +6625,16 @@ impl Db {
                         w.sorted = merged;
                         w.seen = filed.len();
                         self.cache_bytes.set(self.cache_bytes.get() + grew);
+                    }
+                }
+                // This block's buffers, and the next block's when the
+                // scan will cross into it, fetched while this one walks.
+                if let Some(Cached::Block(blk)) = table.slots[b].as_ref() {
+                    blk.prefetch();
+                }
+                if hi - start < limit - seen && b + 1 < nblocks {
+                    if let Some(Cached::Block(next)) = table.slots[b + 1].as_ref() {
+                        next.prefetch();
                     }
                 }
                 match table.slots[b].as_ref().expect("just built") {

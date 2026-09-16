@@ -599,8 +599,23 @@ per-commit path.
   357k–370k against 382k–416k. The blocks E walks most are copies from
   their first build, F having updated them densest, and a sparse block
   walked eight times is walked seven more on average, under the
-  eighteen a copy's build costs in the walks it saves. The write path
-  settles in
+  eighteen a copy's build costs in the walks it saves. What a copy's
+  walk paid was not the entries it emitted but the lines it waited for:
+  after a pass over hundreds of megabytes of blocks a copy's three
+  buffers are cold, and the lower bound over its entries, a binary
+  search whose every compare reads a key, was six dependent misses into
+  two of them before a byte was emitted. The walk now issues a fetch
+  for the entries, the keys and the first kilobyte of the values before
+  the search, and for the next block's while this one walks when the
+  scan will cross into it, so the misses overlap and cost one. Two
+  rounds interleaved, timed by step: at thirty million the copy walk
+  1.06–1.12 µs a scan to 0.37–0.45, E's first pass 264k–280k to
+  306k–350k and its second 295k–313k to 385k–406k; at three million
+  the walk 0.90 to 0.32–0.40, E 297k–300k to 355k–422k and 333k–335k
+  to 410k–481k; at three hundred thousand, where the buffers are warm,
+  the walk 0.29–0.34 to 0.22–0.24, the first pass level at 457k–528k
+  against 502k–509k and the second 638k–655k to 684k–696k. The write
+  path settles in
   place: a write is queued and, at the next scan, spliced into the built
   block it landed in -- the key's run resolved as a build resolves it,
   the partition's values for an equal key, then the pieces' and the
