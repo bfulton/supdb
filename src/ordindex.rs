@@ -541,8 +541,22 @@ impl OrdIndex {
     /// search over the run of equal heads resolves it and the answer is
     /// exact either way.
     pub fn seek<'a>(&self, key: &[u8], key_at: impl Fn(usize) -> Option<&'a [u8]>) -> usize {
+        self.seek_exact(key, key_at).0
+    }
+
+    /// `seek`, and whether the key at the rank is `key` itself when the
+    /// heads alone can say: `Some` when every key is one length no longer
+    /// than a head, where a head that ties the query is the query, and
+    /// `None` where the segment's records would have to be read to tell.
+    /// A scan's start asked the segment for the key at the rank to learn
+    /// which block owns it, a record read on a cold line every scan.
+    pub fn seek_exact<'a>(
+        &self,
+        key: &[u8],
+        key_at: impl Fn(usize) -> Option<&'a [u8]>,
+    ) -> (usize, Option<bool>) {
         if self.n == 0 {
-            return 0;
+            return (0, Some(false));
         }
         // The heads order only keys that carry the common prefix. A query
         // that does not is above or below every key, and its own first
@@ -558,14 +572,14 @@ impl OrdIndex {
                 Some(p) => p,
                 None => match key_at(0) {
                     Some(k) => k,
-                    None => return 0,
+                    None => return (0, Some(false)),
                 },
             };
             let m = m.min(first.len());
             match key[..m].cmp(&first[..m]) {
-                std::cmp::Ordering::Less => return 0,
-                std::cmp::Ordering::Greater => return self.n,
-                std::cmp::Ordering::Equal if m < self.pfx => return 0,
+                std::cmp::Ordering::Less => return (0, Some(false)),
+                std::cmp::Ordering::Greater => return (self.n, Some(false)),
+                std::cmp::Ordering::Equal if m < self.pfx => return (0, Some(false)),
                 std::cmp::Ordering::Equal => {}
             }
         }
@@ -579,7 +593,11 @@ impl OrdIndex {
                 .map(|i| self.head(i))
                 .collect()
         });
-        let t = top.partition_point(|&s| s < h);
+        // A binary search whose step is a select and not a branch: the
+        // branch form mispredicted about half its eleven steps over the
+        // 2,300 samples of a partition at 300k keys, and each miss cost
+        // what a step costs three times over.
+        let t = lower_bound(top, h);
         // No sample below the query is the first head at or above it. Past
         // the last sample below it, the search runs to the next sample and
         // lands on it when every head between is below.
@@ -604,7 +622,10 @@ impl OrdIndex {
             }
         }
         if lo >= self.n || self.head(lo) != h {
-            return lo;
+            // No head ties the query: with heads that are whole keys the
+            // key at the rank is not the query; otherwise the records
+            // would have to say.
+            return (lo, self.uniform_len.map(|_| false));
         }
         if let Some(len) = self.uniform_len {
             // A head is a whole key. A query no longer than the keys that
@@ -612,9 +633,9 @@ impl OrdIndex {
             // it; a longer query has the key with this head as a proper
             // prefix, so is above it.
             return if key.len() <= len {
-                lo
+                (lo, Some(key.len() == len))
             } else {
-                self.run_end(h, lo)
+                (self.run_end(h, lo), Some(false))
             };
         }
         let (mut a, mut b) = (lo, self.run_end(h, lo));
@@ -628,13 +649,58 @@ impl OrdIndex {
                 _ => b = m,
             }
         }
-        a
+        (a, None)
     }
+}
+
+/// The first index in `a`, sorted, whose value is not below `h`, or
+/// `a.len()`: `partition_point(|&s| s < h)`, with the step a select.
+fn lower_bound(a: &[u64], h: u64) -> usize {
+    let mut lo = 0usize;
+    let mut len = a.len();
+    while len > 1 {
+        let half = len / 2;
+        // Both arms are computed and one is kept: no branch to predict.
+        let up = a[lo + half - 1] < h;
+        lo = if up { lo + half } else { lo };
+        len -= half;
+    }
+    lo + usize::from(len > 0 && a[lo] < h)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_select_search_answers_as_partition_point_does() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for n in [0usize, 1, 2, 3, 7, 64, 65, 1000, 2301] {
+            let mut a: Vec<u64> = (0..n).map(|_| next() % 5000).collect();
+            a.sort_unstable();
+            for _ in 0..200 {
+                let h = next() % 5200;
+                assert_eq!(
+                    super::lower_bound(&a, h),
+                    a.partition_point(|&s| s < h),
+                    "n {n} h {h}"
+                );
+            }
+            for &h in a.iter().take(50) {
+                assert_eq!(super::lower_bound(&a, h), a.partition_point(|&s| s < h));
+                assert_eq!(
+                    super::lower_bound(&a, h + 1),
+                    a.partition_point(|&s| s < h + 1)
+                );
+            }
+        }
+    }
 
     fn build(keys: &[&[u8]]) -> Vec<u8> {
         let mut b = Builder::new();

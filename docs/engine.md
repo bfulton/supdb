@@ -723,7 +723,33 @@ per-commit path.
   without the builder priced 498k–517k on E at three million in the run
   with the lock and 537k–572k in the run after it, nothing else in that
   arm changed, and that is not a comparison the suite would accept: the
-  lock did not stay on the count alone. The cache is
+  lock did not stay on the count alone. With the builder on, a scan at
+  300k keys was decomposed with cycle counters, each pair of which cost
+  about thirty nanoseconds on this hypervisor, so the counters resolved
+  the hundreds and not the tens: of about 1.2 µs, the walk of fifty keys
+  took some 400, the block prefetch 180 that paid for itself twice over
+  in the walk, the seek 180, the install of the builder's forms 110, the
+  preamble 120, and the builds the builder had not reached 70. Four
+  things came off. The install compared each form's block bounds
+  against the keys written since through the memtable's arena, twenty-
+  two cold lines a form, and read two index records for the bounds of
+  every block though every key a mix inserts past the end falls in the
+  last one; the keys' bytes are copied as they are filed, a block learns
+  by one compare against the partition's last key that none fall in it,
+  and the builder sends its forms sixty-four to a message with their
+  sizes, so the install touches nothing another core wrote, and raises a
+  flag the scan reads before it asks the channel: 110 ns a scan to 55. A
+  scan settled writes and checked its snapshot's staleness at every
+  call, four cell borrows and a length, when the log had not moved since
+  the last; it asks the log first. And the seek read the partition's
+  record at the rank to learn whether the key there was the query, which
+  the ordered index's heads already know when every key is one length,
+  and searched its top level with a branch a step, half of them
+  mispredicted; the index answers the tie, and the top search selects
+  instead of branching. Six rounds interleaved against the head before,
+  every mix: E 627k–732k against 642k–716k at 300k, level within the
+  spread at 100k, and 565k–636k against 541k–546k at three million in
+  two rounds. The cache is
   on by default: its write path settles in place, and in every quick row
   the arm with it prices the same as the arm without on every workload
   but E, where it runs three times the merge -- what it costs is the

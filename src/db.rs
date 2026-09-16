@@ -4002,6 +4002,9 @@ struct BlockTable {
     /// piece meeting it, no snapshot key in its range and nothing filed
     /// is known to be clean throughout without a look at any block.
     filed: usize,
+    /// The partition's last key, so an install can tell that keys written
+    /// past it fall in the last block alone without reading the index.
+    last_key: Vec<u8>,
     /// Per level-0 piece meeting the partition's range: its index in the
     /// level, and the first rank not below each block's lower bound, one
     /// more for the partition's upper fence, so block `b` holds the
@@ -5243,11 +5246,16 @@ impl Reader {
         // on: before the first partitioning it stands aside.
         let use_cache =
             self.opts.scan_block_cache && self.segs().first().is_some_and(|s| s.level > 0);
-        self.sync_log();
-        if use_cache {
+        // Nothing written or published since the last scan: nothing to
+        // settle, and the snapshot that stood then stands. Every scan paid
+        // the checks below, four cell borrows and a snapshot's length,
+        // seventy nanoseconds of a scan of a microsecond at 300k keys, on
+        // a mix that writes once in twenty operations.
+        let moved = self.sync_log() || self.scan_keys.borrow().is_none();
+        if use_cache && moved {
             self.settle_pending()?;
         }
-        {
+        if moved {
             let mut cache = self.scan_keys.borrow_mut();
             let mut stale = cache.as_ref().is_none_or(|(g, _)| *g != gen);
             if !stale {
@@ -5440,9 +5448,11 @@ impl Reader {
     /// when the cache is in use. A new generation -- a seal, a join, a
     /// merge, a fresh memtable -- makes this handle's tables and snapshot
     /// stale, so they are dropped and the log is read from its start.
-    fn sync_log(&self) {
+    fn sync_log(&self) -> bool {
         let st = self.state();
+        let mut moved = false;
         if self.log_gen.get() != st.gen {
+            moved = true;
             self.log_gen.set(st.gen);
             self.log_seen.set(0);
             self.snap_entries.set(0);
@@ -5458,7 +5468,7 @@ impl Reader {
         let n = mem.log_len();
         let seen = self.log_seen.get();
         if seen == n {
-            return;
+            return moved;
         }
         let file = self.cache_used.get();
         let covered = self.snap_entries.get();
@@ -5487,11 +5497,12 @@ impl Reader {
             if let Some((from, since)) = since.as_mut() {
                 if i >= *from {
                     let e = mem.entry(id);
-                    since.file(e.key_off, e.key_len);
+                    since.file(mem, e.key_off, e.key_len);
                 }
             }
         }
         self.log_seen.set(n);
+        true
     }
 
     fn drop_blocks(&self) {
@@ -5516,13 +5527,13 @@ impl Reader {
         let Some(a) = ahead.as_mut() else {
             return Ok(());
         };
-        if a.done.get() {
+        if a.done.get() || !a.posted.swap(false, std::sync::atomic::Ordering::AcqRel) {
             return Ok(());
         }
         let np = self.segs().partition_point(|s| s.level > 0);
         let l0 = &self.segs()[np..];
         let mut since = a.since.borrow_mut();
-        since.settle(self.mem());
+        since.settle();
         let mut done = false;
         loop {
             let built = match a.rx.try_recv() {
@@ -5555,33 +5566,47 @@ impl Reader {
                 table.snap_at = BuildCtx::snap_bounds(seg, table.slots.len(), unsealed)?;
                 table.snap_gen = self.snap_gen.get();
             }
-            let b = built.b as usize;
-            if b >= table.slots.len()
-                || table.slots[b].is_some()
-                || BuildCtx::overlay_count(table, b) > WIDE
-            {
-                continue;
-            }
-            table.slots[b] = Some(built.form);
-            self.list_built(pi, b, table);
-            self.shed(pi, b, table);
-            // The keys written since the builder's watermark that fall in
-            // the block, spliced in as a settle splices a write: the
-            // block's range runs from its first key, or the partition's
-            // lower fence for the first block, to the next block's first
-            // key, or the upper fence for the last.
-            let lo = if b == 0 {
-                (!seg.lo.is_empty()).then_some(seg.lo.as_slice())
-            } else {
-                seg.blob.key_at(b * CACHE_BLOCK)
-            };
-            let hi = seg.blob.key_at((b + 1) * CACHE_BLOCK).or(seg.hi.as_deref());
-            let run = since.range(self.mem(), lo, hi);
-            for i in run {
-                let (off, len) = since.at(i);
-                let k = self.mem().key_at(off, len);
-                let cut = BuildCtx::owner_of(seg, k).1;
-                self.patch_block(pi, b, table, k, cut)?;
+            for (b, bytes, form) in built.forms {
+                let b = b as usize;
+                if b >= table.slots.len()
+                    || table.slots[b].is_some()
+                    || BuildCtx::overlay_count(table, b) > WIDE
+                {
+                    continue;
+                }
+                table.slots[b] = Some(form);
+                self.list_built_bytes(pi, b, table, bytes);
+                self.shed(pi, b, table);
+                // The keys written since the builder's watermark that fall
+                // in the block, spliced in as a settle splices a write: the
+                // block's range runs from its first key, or the partition's
+                // lower fence for the first block, to the next block's
+                // first key, or the upper fence for the last. Keys past the
+                // partition's last key fall in its last block alone, which
+                // is where every key a mix inserts past the end goes, and
+                // any other block learns so by one compare.
+                if since.is_empty() {
+                    continue;
+                }
+                let past_all = b + 1 < table.slots.len()
+                    && !table.last_key.is_empty()
+                    && since.first().is_some_and(|k| k > table.last_key.as_slice());
+                if past_all {
+                    continue;
+                }
+                let lo = if b == 0 {
+                    (!seg.lo.is_empty()).then_some(seg.lo.as_slice())
+                } else {
+                    seg.blob.key_at(b * CACHE_BLOCK)
+                };
+                let hi = seg.blob.key_at((b + 1) * CACHE_BLOCK).or(seg.hi.as_deref());
+                if since.meets(lo, hi) {
+                    for i in since.range(lo, hi) {
+                        let k = since.at(i);
+                        let cut = BuildCtx::owner_of(seg, k).1;
+                        self.patch_block(pi, b, table, k, cut)?;
+                    }
+                }
             }
         }
         if done {
@@ -5612,6 +5637,11 @@ impl Reader {
 
     fn list_built(&self, p: usize, b: usize, table: &mut BlockTable) {
         let bytes = table.slots[b].as_ref().map_or(0, |c| c.bytes());
+        self.list_built_bytes(p, b, table, bytes);
+    }
+
+    /// `list_built` for a form whose size is known already.
+    fn list_built_bytes(&self, p: usize, b: usize, table: &mut BlockTable, bytes: usize) {
         self.cache_bytes.set(self.cache_bytes.get() + bytes);
         if bytes > 0 {
             let mut built = self.built.borrow_mut();
@@ -5971,6 +6001,12 @@ impl Reader {
             slots: (0..nblocks).map(|_| None).collect(),
             touched: vec![0; nblocks],
             listed: vec![u32::MAX; nblocks],
+            last_key: seg
+                .blob
+                .keys()
+                .checked_sub(1)
+                .and_then(|r| seg.blob.key_at(r))
+                .map_or_else(Vec::new, <[u8]>::to_vec),
             pieces,
             piece_ranks,
             snap_at,
@@ -6025,12 +6061,10 @@ impl Reader {
                     None => break,
                 }
             }
-            let rank = seg.ord.seek(cursor, |r| seg.blob.key_at(r));
-            let owner = if rank < keys && seg.blob.key_at(rank) == Some(cursor) {
-                rank
-            } else {
-                rank.saturating_sub(1)
-            };
+            let (rank, exact) = seg.ord.seek_exact(cursor, |r| seg.blob.key_at(r));
+            let same =
+                rank < keys && exact.unwrap_or_else(|| seg.blob.key_at(rank) == Some(cursor));
+            let owner = if same { rank } else { rank.saturating_sub(1) };
             let nblocks = keys.div_ceil(CACHE_BLOCK);
             let tables = self.tables.borrow();
             let mut held = tables[pi].borrow_mut();
@@ -8382,14 +8416,18 @@ impl Reader {
             for i in from..self.log_seen.get() {
                 let (id, _) = mem.log_at(i);
                 let e = mem.entry(id);
-                since.file(e.key_off, e.key_len);
+                since.file(mem, e.key_off, e.key_len);
             }
         }
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let posted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
         let flag = stop.clone();
+        let post = posted.clone();
         let handle = std::thread::spawn(move || {
-            let _ = r.build_ahead_job(gen, wm, live_len, &flag, &tx);
+            let _ = r.build_ahead_job(gen, wm, live_len, &flag, &tx, &post);
+            drop(tx);
+            post.store(true, std::sync::atomic::Ordering::Release);
         });
         *self.ahead.borrow_mut() = Some(Ahead {
             handle: Some(handle),
@@ -8398,6 +8436,7 @@ impl Reader {
             from,
             since: std::cell::RefCell::new(since),
             done: std::cell::Cell::new(false),
+            posted,
         });
     }
 
@@ -8586,6 +8625,12 @@ struct Ahead {
     from: usize,
     since: std::cell::RefCell<Since>,
     done: std::cell::Cell<bool>,
+    /// Raised by the builder after each form it sends and once more when
+    /// it ends, taken down by the install that drains the channel: a scan
+    /// with nothing posted asks the channel nothing. Polling the channel
+    /// at every scan cost the scans a tenth at three hundred thousand
+    /// keys, most of it after the builder was done.
+    posted: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// PROTOTYPE: the keys written since a builder ahead took its watermark,
@@ -8593,34 +8638,58 @@ struct Ahead {
 /// of writes to one key filed once, in key order once settled so an
 /// install finds a block's run of them by two searches. Its memory is
 /// the writes between two builders, and it leaves with the builder.
-#[derive(Default)]
 struct Since {
+    /// The keys' bytes, copied as they are filed: a search over the
+    /// memtable's arena for each compare read twenty-two cold lines an
+    /// install, a microsecond, where the copies are a few thousand bytes
+    /// that stay in cache.
+    keys: Vec<u8>,
+    /// (offset, length) into `keys`, in key order once settled.
     sorted: Vec<(u32, u32)>,
     fresh: Vec<(u32, u32)>,
+    /// The memtable offset last filed, so a run of writes to one key
+    /// files it once.
+    last_off: u32,
+}
+
+impl Default for Since {
+    fn default() -> Since {
+        Since {
+            keys: Vec::new(),
+            sorted: Vec::new(),
+            fresh: Vec::new(),
+            last_off: u32::MAX,
+        }
+    }
 }
 
 impl Since {
-    fn file(&mut self, off: u32, len: u32) {
-        if self.fresh.last().is_some_and(|l| l.0 == off) {
+    fn file(&mut self, mem: &MemTable, off: u32, len: u32) {
+        if off == self.last_off {
             return;
         }
-        self.fresh.push((off, len));
+        self.last_off = off;
+        let at = self.keys.len() as u32;
+        self.keys.extend_from_slice(mem.key_at(off, len));
+        self.fresh.push((at, len));
+    }
+    fn key(&self, e: (u32, u32)) -> &[u8] {
+        &self.keys[e.0 as usize..(e.0 + e.1) as usize]
     }
     /// The keys filed since the last settle, sorted and folded into the
     /// sorted run, one entry per key.
-    fn settle(&mut self, mem: &MemTable) {
+    fn settle(&mut self) {
         if self.fresh.is_empty() {
             return;
         }
-        let key = |e: &(u32, u32)| mem.key_at(e.0, e.1);
         let mut fresh = std::mem::take(&mut self.fresh);
-        fresh.sort_unstable_by(|a, b| key(a).cmp(key(b)));
-        fresh.dedup_by_key(|e| e.0);
+        fresh.sort_unstable_by(|&a, &b| self.key(a).cmp(self.key(b)));
+        fresh.dedup_by(|&mut a, &mut b| self.key(a) == self.key(b));
         let sorted = std::mem::take(&mut self.sorted);
         let mut out = Vec::with_capacity(sorted.len() + fresh.len());
         let (mut i, mut j) = (0, 0);
         while i < sorted.len() && j < fresh.len() {
-            match key(&sorted[i]).cmp(key(&fresh[j])) {
+            match self.key(sorted[i]).cmp(self.key(fresh[j])) {
                 Ordering::Less => {
                     out.push(sorted[i]);
                     i += 1;
@@ -8630,7 +8699,7 @@ impl Since {
                     j += 1;
                 }
                 Ordering::Equal => {
-                    out.push(sorted[i]);
+                    out.push(fresh[j]);
                     i += 1;
                     j += 1;
                 }
@@ -8640,23 +8709,34 @@ impl Since {
         out.extend_from_slice(&fresh[j..]);
         self.sorted = out;
     }
+    fn is_empty(&self) -> bool {
+        self.sorted.is_empty()
+    }
+    fn first(&self) -> Option<&[u8]> {
+        self.sorted.first().map(|&e| self.key(e))
+    }
+    /// Whether any settled key could fall in `[lo, hi)`: one compare at
+    /// each end before a search, since nearly every block's range holds
+    /// none of the keys written since.
+    fn meets(&self, lo: Option<&[u8]>, hi: Option<&[u8]>) -> bool {
+        match (self.sorted.first(), self.sorted.last()) {
+            (Some(&f), Some(&l)) => {
+                hi.is_none_or(|hi| self.key(f) < hi) && lo.is_none_or(|lo| self.key(l) >= lo)
+            }
+            _ => false,
+        }
+    }
     /// The settled keys in `[lo, hi)`, unbounded on a side given as
     /// `None`, as a range of indexes into the sorted run.
-    fn range(
-        &self,
-        mem: &MemTable,
-        lo: Option<&[u8]>,
-        hi: Option<&[u8]>,
-    ) -> std::ops::Range<usize> {
-        let key = |e: &(u32, u32)| mem.key_at(e.0, e.1);
-        let a = lo.map_or(0, |lo| self.sorted.partition_point(|e| key(e) < lo));
+    fn range(&self, lo: Option<&[u8]>, hi: Option<&[u8]>) -> std::ops::Range<usize> {
+        let a = lo.map_or(0, |lo| self.sorted.partition_point(|&e| self.key(e) < lo));
         let b = hi.map_or(self.sorted.len(), |hi| {
-            self.sorted.partition_point(|e| key(e) < hi)
+            self.sorted.partition_point(|&e| self.key(e) < hi)
         });
         a..b.max(a)
     }
-    fn at(&self, i: usize) -> (u32, u32) {
-        self.sorted[i]
+    fn at(&self, i: usize) -> &[u8] {
+        self.key(self.sorted[i])
     }
 }
 
@@ -8665,9 +8745,15 @@ impl Since {
 struct Built {
     gen: u64,
     name: String,
-    b: u32,
-    form: Cached,
+    /// (block, bytes, form), up to `AHEAD_BATCH` of one partition's: a
+    /// message per form cost the install 150 ns to receive each and a
+    /// name each, and the form's size is read here so the install does
+    /// not touch the form's buffers, which another core wrote.
+    forms: Vec<(u32, usize, Cached)>,
 }
+
+/// PROTOTYPE: forms the builder sends in one message.
+const AHEAD_BATCH: usize = 64;
 
 impl Reader {
     /// PROTOTYPE: the builder ahead of the reader, on a handle of its
@@ -8686,6 +8772,7 @@ impl Reader {
         live_len: usize,
         stop: &std::sync::atomic::AtomicBool,
         tx: &std::sync::mpsc::Sender<Built>,
+        posted: &std::sync::atomic::AtomicBool,
     ) -> Result<()> {
         if !self.pin_at(gen, wm) {
             return Ok(());
@@ -8706,6 +8793,7 @@ impl Reader {
                 slots: (0..nblocks).map(|_| None).collect(),
                 touched: vec![0; nblocks],
                 listed: vec![u32::MAX; nblocks],
+                last_key: Vec::new(),
                 pieces,
                 piece_ranks,
                 snap_at,
@@ -8717,7 +8805,23 @@ impl Reader {
                 continue;
             }
             let src = Sources { seg, l0 };
-            for b in 0..nblocks {
+            let mut forms: Vec<(u32, usize, Cached)> = Vec::with_capacity(AHEAD_BATCH);
+            for b in 0..=nblocks {
+                let full = forms.len() == AHEAD_BATCH || (b == nblocks && !forms.is_empty());
+                if full {
+                    let built = Built {
+                        gen,
+                        name: seg.name.clone(),
+                        forms: std::mem::replace(&mut forms, Vec::with_capacity(AHEAD_BATCH)),
+                    };
+                    if tx.send(built).is_err() || (budget > 0 && sent > budget) {
+                        return Ok(());
+                    }
+                    posted.store(true, std::sync::atomic::Ordering::Release);
+                }
+                if b == nblocks {
+                    break;
+                }
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     return Ok(());
                 }
@@ -8729,16 +8833,9 @@ impl Reader {
                 if matches!(form, Cached::Clean | Cached::Wide(_)) {
                     continue;
                 }
-                let built = Built {
-                    gen,
-                    name: seg.name.clone(),
-                    b: b as u32,
-                    form,
-                };
-                sent += built.form.bytes();
-                if tx.send(built).is_err() || (budget > 0 && sent > budget) {
-                    return Ok(());
-                }
+                let bytes = form.bytes();
+                sent += bytes;
+                forms.push((b as u32, bytes, form));
             }
         }
         Ok(())
