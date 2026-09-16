@@ -3343,6 +3343,81 @@ fn a_reader_sees_the_replayed_writes_from_the_open_on() {
     reader.release();
 }
 
+/// A handle under `Latest` reads the write log as far as it goes, past the
+/// last commit, and settles a key it finds there into the block the key
+/// falls in under the committed watermark: the uncommitted value is left
+/// out, as it must be. When the commit lands, the log has not moved, so
+/// the handle's next scan must still find the value the commit made
+/// visible, in the block it settled and in the run of a block it builds
+/// after.
+#[test]
+fn a_reader_under_latest_sees_the_commit_of_a_key_it_settled_uncommitted() {
+    let d = dir("latest-commit-after-settle");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..2000u32 {
+        db.append(key(k).as_bytes(), b"v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 1);
+    let reader = db.reader().unwrap();
+    let scan_one = |r: &supdb::Reader, k: u32| -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let want = key(k);
+        r.scan(want.as_bytes(), 1, |kk, v| {
+            if kk == want.as_bytes() {
+                out.push(v.to_vec());
+            }
+        })
+        .unwrap();
+        out
+    };
+    // Built clean through the handle, then a write the handle settles
+    // while it is uncommitted.
+    assert_eq!(scan_one(&reader, 100), vec![b"v0".to_vec()]);
+    assert_eq!(scan_one(&reader, 1500), vec![b"v0".to_vec()]);
+    db.append(key(100).as_bytes(), b"v1");
+    db.append(key(1500).as_bytes(), b"v1");
+    assert_eq!(
+        scan_one(&reader, 100),
+        vec![b"v0".to_vec()],
+        "uncommitted, so unseen under Latest"
+    );
+    db.commit().unwrap();
+    assert_eq!(
+        scan_one(&reader, 100),
+        vec![b"v0".to_vec(), b"v1".to_vec()],
+        "the commit of a key the handle settled while uncommitted"
+    );
+    assert_eq!(
+        scan_one(&reader, 1500),
+        vec![b"v0".to_vec(), b"v1".to_vec()],
+        "the commit of a key the handle settled while uncommitted, in a block it had not walked since"
+    );
+    assert_eq!(
+        read_vec(&reader, key(100).as_bytes()),
+        vec![b"v0".to_vec(), b"v1".to_vec()]
+    );
+    // The same through a block the handle builds after the commit.
+    db.append(key(700).as_bytes(), b"v1");
+    db.commit().unwrap();
+    assert_eq!(
+        scan_one(&reader, 700),
+        vec![b"v0".to_vec(), b"v1".to_vec()],
+        "a block built after the commit"
+    );
+}
+
 /// A piece sealed while a merge of its range runs is kept across the
 /// merge's publish, under a new partition over the same range. The ranks
 /// it was given at its own publish -- each key's cut in the partition it

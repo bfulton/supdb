@@ -4274,6 +4274,16 @@ pub struct Reader {
     /// or a new segment set, and the log is read from the start again.
     log_seen: std::cell::Cell<usize>,
     log_gen: std::cell::Cell<u64>,
+    /// How far into the write log this handle may look: the log's length
+    /// at the commit whose watermark it reads under, taken before the
+    /// watermark so it never runs ahead of it, or unbounded under `Dirty`
+    /// and for the writer's own handle. A handle that read the log to
+    /// its end settled a key's uncommitted write under the committed
+    /// watermark, leaving the value out as it must, and when the commit
+    /// landed the log had not moved, so the block kept the old run for
+    /// as long as it was cached; the point read beside it, through the
+    /// memtable, answered the new value.
+    log_bound: std::cell::Cell<usize>,
     /// How many of the live memtable's entries the scan snapshot covers:
     /// a key the log says was created at a number below it is in the
     /// snapshot already, not a key to file.
@@ -4704,12 +4714,18 @@ impl Reader {
                     let p = self.shared.state.load(AtomicOrdering::Acquire);
                     self.held.store(p, AtomicOrdering::Relaxed);
                     // SAFETY: pinned above, so not freed under this handle.
-                    self.wm.set(unsafe { &*p }.mem.committed());
+                    let mem = &unsafe { &*p }.mem;
+                    // The log's length first: a commit stores it before
+                    // the watermark, so a length read first belongs to
+                    // the watermark's commit or an earlier one.
+                    self.log_bound.set(mem.committed_log());
+                    self.wm.set(mem.committed());
                 }
                 Isolation::Dirty => {
                     self.shared.readers.pin(slot);
                     let p = self.shared.state.load(AtomicOrdering::Acquire);
                     self.held.store(p, AtomicOrdering::Relaxed);
+                    self.log_bound.set(usize::MAX);
                     self.wm.set(SEE_ALL);
                 }
             }
@@ -4757,7 +4773,9 @@ impl Reader {
         let p = self.shared.state.load(AtomicOrdering::Acquire);
         self.held.store(p, AtomicOrdering::Relaxed);
         // SAFETY: pinned above, so not freed under this handle.
-        self.wm.set(unsafe { &*p }.mem.committed());
+        let mem = &unsafe { &*p }.mem;
+        self.log_bound.set(mem.committed_log());
+        self.wm.set(mem.committed());
         self.isolation.set(Isolation::Snapshot);
     }
 
@@ -4765,7 +4783,7 @@ impl Reader {
     /// both named by the writer for its builder ahead, as `snapshot`
     /// holds the latest; false, and nothing held, when the state has moved
     /// on already.
-    fn pin_at(&self, gen: u64, wm: u64) -> bool {
+    fn pin_at(&self, gen: u64, wm: u64, log: usize) -> bool {
         let Some(slot) = self.slot else { return false };
         if self.isolation.get() == Isolation::Snapshot {
             self.release();
@@ -4778,6 +4796,7 @@ impl Reader {
             return false;
         }
         self.held.store(p, AtomicOrdering::Relaxed);
+        self.log_bound.set(log);
         self.wm.set(wm);
         self.isolation.set(Isolation::Snapshot);
         true
@@ -5560,9 +5579,9 @@ impl Reader {
             }
         }
         let mem = &st.mem;
-        let n = mem.log_len();
+        let n = mem.log_len().min(self.log_bound.get());
         let seen = self.log_seen.get();
-        if seen == n {
+        if seen >= n {
             return moved;
         }
         let file = self.cache_used.get();
@@ -7026,6 +7045,7 @@ impl Db {
             snap_added: std::cell::RefCell::new(Vec::new()),
             log_seen: std::cell::Cell::new(0),
             log_gen: std::cell::Cell::new(0),
+            log_bound: std::cell::Cell::new(usize::MAX),
             snap_entries: std::cell::Cell::new(0),
             ahead: std::cell::RefCell::new(None),
         };
@@ -7288,6 +7308,7 @@ impl Db {
             snap_added: std::cell::RefCell::new(Vec::new()),
             log_seen: std::cell::Cell::new(0),
             log_gen: std::cell::Cell::new(0),
+            log_bound: std::cell::Cell::new(usize::MAX),
             snap_entries: std::cell::Cell::new(0),
             ahead: std::cell::RefCell::new(None),
         };
@@ -7998,6 +8019,7 @@ impl Reader {
             snap_added: std::cell::RefCell::new(Vec::new()),
             log_seen: std::cell::Cell::new(0),
             log_gen: std::cell::Cell::new(0),
+            log_bound: std::cell::Cell::new(usize::MAX),
             snap_entries: std::cell::Cell::new(0),
             ahead: std::cell::RefCell::new(None),
         })
@@ -8513,7 +8535,14 @@ impl Reader {
         };
         let gen = self.state().gen;
         let mem = self.mem();
-        let (wm, from, live_len) = (mem.committed(), mem.committed_log(), mem.committed_len());
+        // The log's length first and the watermark last, the order a
+        // commit stores them in reversed, so the length and the count
+        // belong to the watermark's commit or an earlier one: a length
+        // from a later commit would leave the keys logged between the
+        // two outside the builder's forms and outside the splice.
+        let from = mem.committed_log();
+        let live_len = mem.committed_len();
+        let wm = mem.committed();
         // Writes logged past the commit that this handle has read already
         // -- a batch staged and not committed, which the writer's own
         // scans see -- are filed now; the log is read on from where it
@@ -8532,7 +8561,13 @@ impl Reader {
         let flag = stop.clone();
         let post = posted.clone();
         let handle = std::thread::spawn(move || {
-            let _ = r.build_ahead_job(gen, wm, live_len, &flag, &tx, &post);
+            let at = AtCommit {
+                gen,
+                wm,
+                log: from,
+                len: live_len,
+            };
+            let _ = r.build_ahead_job(at, &flag, &tx, &post);
             drop(tx);
             post.store(true, std::sync::atomic::Ordering::Release);
         });
@@ -8862,6 +8897,16 @@ struct Built {
 /// PROTOTYPE: forms the builder sends in one message.
 const AHEAD_BATCH: usize = 64;
 
+/// PROTOTYPE: a commit as the builder ahead holds it: the state's
+/// generation, the watermark, the write log's length and the entry
+/// count, read in the order the commit stores them reversed.
+struct AtCommit {
+    gen: u64,
+    wm: u64,
+    log: usize,
+    len: usize,
+}
+
 impl Reader {
     /// PROTOTYPE: the builder ahead of the reader, on a handle of its
     /// own: the state of generation `gen` held under the last commit's
@@ -8874,17 +8919,16 @@ impl Reader {
     /// one past the wide bound is the store's to walk.
     fn build_ahead_job(
         &self,
-        gen: u64,
-        wm: u64,
-        live_len: usize,
+        at: AtCommit,
         stop: &std::sync::atomic::AtomicBool,
         tx: &std::sync::mpsc::Sender<Built>,
         posted: &std::sync::atomic::AtomicBool,
     ) -> Result<()> {
-        if !self.pin_at(gen, wm) {
+        let AtCommit { gen, wm, log, len } = at;
+        if !self.pin_at(gen, wm, log) {
             return Ok(());
         }
-        let unsealed = self.build_snapshot(live_len);
+        let unsealed = self.build_snapshot(len);
         let ctx = self.build_ctx();
         // Under a budget, the forms queued for the install are bounded
         // by it too: the store sheds past the budget only as it installs.

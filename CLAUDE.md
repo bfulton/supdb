@@ -334,6 +334,22 @@ empty, and whose bytes live in a `Vec`, must not be handed to a byte
 compare without an `is_empty` check first, and a zero-length operation is a
 real operation until a measurement says otherwise.
 
+**A log read past the mark it honours.** A reader handle under
+`Latest` reads the memtable's write log to settle its cached blocks,
+and read it to its end: a key's write staged and not yet committed was
+settled under the committed watermark, which left the value out as it
+must, and when the commit landed the log had not moved, so the block
+kept the old run for as long as it was cached while the point read
+beside it, through the memtable, answered the new value. Every test
+read a written key through the writer's own handle, which honours no
+mark, or through a handle that had not cached the block. The handle
+reads the log only to the length it had at the commit whose watermark
+it holds, taken before the watermark since a commit stores the length
+first, and the builder ahead takes its three quantities in that order
+too. The rule: a structure kept current by a log is current to a
+position in it, and the position a handle may read to is the one its
+isolation names, never the log's end.
+
 **A slot table whose slots share a line.** The reader table's slots
 were adjacent words, eight to a cache line, and every read stores its
 handle's slot twice, at the pin and at the unpin, so four handles

@@ -905,7 +905,11 @@ per-commit path.
   rest; a reader that honours the latest watermark reads committed, one
   that pins a watermark and a state reads a snapshot, and one that
   honours none reads dirty, which is what the store's own reads have
-  always done and keep doing.
+  always done and keep doing. The write log a handle settles its cached
+  blocks from is read to the same mark: the length it had at the
+  watermark's commit, taken before the watermark. Read to its end, a
+  handle settled a staged write under the committed watermark and kept
+  the old run after the commit, since the log had not moved.
 
   *The memtable* is the first part, built: nothing in it moves once
   published. Keys and values live in arenas of blocks that are never
