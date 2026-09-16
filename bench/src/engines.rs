@@ -219,7 +219,34 @@ pub trait Engine {
     /// Make everything written durable and readable.
     fn sync(&mut self) -> Res<()>;
     fn size_bytes(&self) -> u64;
+    /// A reader for a thread of its own, made here on the thread that
+    /// owns the engine and opened on the thread that reads through it.
+    /// Two steps because the engines differ in which one binds to a
+    /// thread: supdb's `Db::reader` claims a slot in the reader table
+    /// here and hands back a `Send` handle; RocksDB's handle is shared,
+    /// so the opener carries a reference to it; LMDB's read transaction
+    /// is bound to the thread that begins it -- heed's `RoTxn` is not
+    /// `Send` without the crate feature that opens the environment with
+    /// `MDB_NOTLS` -- so the opener carries the environment and begins
+    /// the transaction on the thread. The runner times the reads, never
+    /// the opening.
+    fn thread_reader(&self) -> Res<ReaderOpener>;
 }
+
+/// What a reader thread reads through: the two reads of `Engine`, over a
+/// handle the thread opened for itself and drops when it is done. Not
+/// `Send`, because it never leaves that thread, which is what lets an
+/// LMDB transaction sit in one.
+pub trait ThreadReader {
+    /// Bytes returned for the key; 0 for a miss.
+    fn get(&mut self, key: &[u8]) -> Res<usize>;
+    /// Bytes visited scanning `n` entries from `from`.
+    fn range(&mut self, from: &[u8], n: usize) -> Res<usize>;
+}
+
+/// Becomes a `ThreadReader` on the thread that calls it; see
+/// `Engine::thread_reader`.
+pub type ReaderOpener = Box<dyn FnOnce() -> Res<Box<dyn ThreadReader>> + Send>;
 
 /// Every file under `p` at any depth, in the blocks the filesystem has
 /// given them rather than their lengths: a file's length can run past what
@@ -421,6 +448,31 @@ impl Supdb {
     }
 }
 
+/// One read, whichever handle answers it: the writer's own in `Engine`,
+/// under its read-your-writes isolation, or a thread's from `Db::reader`.
+fn supdb_get(r: &supdb::Reader, key: &[u8]) -> Res<usize> {
+    let mut n = 0usize;
+    r.read_all(key, |v| n += v.len())
+        .map_err(|e| e.to_string())?;
+    Ok(n)
+}
+
+fn supdb_range(r: &supdb::Reader, from: &[u8], n: usize) -> Res<usize> {
+    let mut bytes = 0usize;
+    r.scan(from, n, |_k, v| bytes += v.len())
+        .map_err(|e| e.to_string())?;
+    Ok(bytes)
+}
+
+impl ThreadReader for supdb::Reader {
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        supdb_get(self, key)
+    }
+    fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
+        supdb_range(self, from, n)
+    }
+}
+
 impl Engine for Supdb {
     fn name(&self) -> &'static str {
         if self.budget > 0 {
@@ -472,17 +524,19 @@ impl Engine for Supdb {
     }
     fn get(&mut self, key: &[u8]) -> Res<usize> {
         let db = self.db.as_ref().ok_or("db closed")?;
-        let mut n = 0usize;
-        db.read_all(key, |v| n += v.len())
-            .map_err(|e| e.to_string())?;
-        Ok(n)
+        supdb_get(db, key)
     }
     fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
         let db = self.db.as_ref().ok_or("db closed")?;
-        let mut bytes = 0usize;
-        db.scan(from, n, |_k, v| bytes += v.len())
-            .map_err(|e| e.to_string())?;
-        Ok(bytes)
+        supdb_range(db, from, n)
+    }
+    fn thread_reader(&self) -> Res<ReaderOpener> {
+        let db = self.db.as_ref().ok_or("db closed")?;
+        // Claimed now, on this thread: the handle's slot in the reader
+        // table. `Latest`, the handle's default, sees every commit before
+        // a read, and the load's last is behind `sync`.
+        let r = db.reader().map_err(|e| e.to_string())?;
+        Ok(Box::new(move || Ok(Box::new(r) as Box<dyn ThreadReader>)))
     }
     fn sync(&mut self) -> Res<()> {
         if let Some(db) = self.db.as_mut() {
@@ -515,7 +569,9 @@ impl Engine for Supdb {
 /// deliberately *not* mmap-based. It is therefore the comparison that isolates
 /// the mmap decision rather than confounding it with the storage model.
 pub struct Rocks {
-    db: rocksdb::DB,
+    /// Shared with the reader threads: the handle is `Sync`, and a thread
+    /// reads through this one with read options of its own.
+    db: std::sync::Arc<rocksdb::DB>,
     path: PathBuf,
     sync: bool,
     tuned: bool,
@@ -579,13 +635,59 @@ impl Rocks {
         let mut read = rocksdb::ReadOptions::default();
         read.set_verify_checksums(false);
         Ok(Rocks {
-            db,
+            db: std::sync::Arc::new(db),
             path: path.to_path_buf(),
             sync,
             tuned,
             drain,
             read,
         })
+    }
+}
+
+/// One read through whichever handle: the arm's own or a thread's.
+fn rocks_get(db: &rocksdb::DB, read: &rocksdb::ReadOptions, key: &[u8]) -> Res<usize> {
+    // Pinned: the value is borrowed from the block cache, not copied out,
+    // which is the cheapest read RocksDB offers and the fair one against
+    // engines that hand back a borrow.
+    Ok(db
+        .get_pinned_opt(key, read)
+        .map_err(|e| e.to_string())?
+        .map(|v| v.len())
+        .unwrap_or(0))
+}
+
+fn rocks_range(db: &rocksdb::DB, from: &[u8], n: usize) -> Res<usize> {
+    // By value, and `ReadOptions` does not clone: one per scan, which is
+    // one small allocation against a walk of `n` entries.
+    let mut ro = rocksdb::ReadOptions::default();
+    ro.set_verify_checksums(false);
+    let mut it = db.raw_iterator_opt(ro);
+    it.seek(from);
+    let mut bytes = 0usize;
+    let mut seen = 0usize;
+    while it.valid() && seen < n {
+        bytes += it.value().map(|v| v.len()).unwrap_or(0);
+        seen += 1;
+        it.next();
+    }
+    it.status().map_err(|e| e.to_string())?;
+    Ok(bytes)
+}
+
+/// A reader thread's RocksDB: the shared handle, and read options of the
+/// thread's own.
+struct RocksReader {
+    db: std::sync::Arc<rocksdb::DB>,
+    read: rocksdb::ReadOptions,
+}
+
+impl ThreadReader for RocksReader {
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        rocks_get(&self.db, &self.read, key)
+    }
+    fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
+        rocks_range(&self.db, from, n)
     }
 }
 
@@ -623,32 +725,20 @@ impl Engine for Rocks {
         self.db.write_opt(b, &wo).map_err(|e| e.to_string())
     }
     fn get(&mut self, key: &[u8]) -> Res<usize> {
-        // Pinned: the value is borrowed from the block cache, not copied out,
-        // which is the cheapest read RocksDB offers and the fair one against
-        // engines that hand back a borrow.
-        Ok(self
-            .db
-            .get_pinned_opt(key, &self.read)
-            .map_err(|e| e.to_string())?
-            .map(|v| v.len())
-            .unwrap_or(0))
+        rocks_get(&self.db, &self.read, key)
     }
     fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
-        // By value, and `ReadOptions` does not clone: one per scan, which is
-        // one small allocation against a walk of `n` entries.
-        let mut ro = rocksdb::ReadOptions::default();
-        ro.set_verify_checksums(false);
-        let mut it = self.db.raw_iterator_opt(ro);
-        it.seek(from);
-        let mut bytes = 0usize;
-        let mut seen = 0usize;
-        while it.valid() && seen < n {
-            bytes += it.value().map(|v| v.len()).unwrap_or(0);
-            seen += 1;
-            it.next();
-        }
-        it.status().map_err(|e| e.to_string())?;
-        Ok(bytes)
+        rocks_range(&self.db, from, n)
+    }
+    fn thread_reader(&self) -> Res<ReaderOpener> {
+        // The handle is shared; what a thread gets of its own is read
+        // options, made where they are used.
+        let db = self.db.clone();
+        Ok(Box::new(move || {
+            let mut read = rocksdb::ReadOptions::default();
+            read.set_verify_checksums(false);
+            Ok(Box::new(RocksReader { db, read }) as Box<dyn ThreadReader>)
+        }))
     }
     fn sync(&mut self) -> Res<()> {
         // Everything written reaches the device: the WAL is fsynced, which
@@ -749,6 +839,44 @@ impl Lmdb {
     }
 }
 
+type LmdbDb = heed::Database<heed::types::Bytes, heed::types::Bytes>;
+
+/// One read under whichever transaction: the arm's held one or a thread's.
+fn lmdb_get(db: LmdbDb, r: &heed::RoTxn<'_>, key: &[u8]) -> Res<usize> {
+    // Values are borrowed from the mapping, never copied.
+    Ok(db
+        .get(r, key)
+        .map_err(|e| e.to_string())?
+        .map(|v| v.len())
+        .unwrap_or(0))
+}
+
+fn lmdb_range(db: LmdbDb, r: &heed::RoTxn<'_>, from: &[u8], n: usize) -> Res<usize> {
+    let mut bytes = 0usize;
+    let range = (std::ops::Bound::Included(from), std::ops::Bound::Unbounded);
+    for row in db.range(r, &range).map_err(|e| e.to_string())?.take(n) {
+        let (_, v) = row.map_err(|e| e.to_string())?;
+        bytes += v.len();
+    }
+    Ok(bytes)
+}
+
+/// A reader thread's LMDB: a read transaction begun on the thread, over
+/// the shared environment it holds a handle to.
+struct LmdbReader {
+    db: LmdbDb,
+    txn: heed::RoTxn<'static>,
+}
+
+impl ThreadReader for LmdbReader {
+    fn get(&mut self, key: &[u8]) -> Res<usize> {
+        lmdb_get(self.db, &self.txn, key)
+    }
+    fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
+        lmdb_range(self.db, &self.txn, from, n)
+    }
+}
+
 impl Engine for Lmdb {
     fn name(&self) -> &'static str {
         if self.nosync {
@@ -780,23 +908,25 @@ impl Engine for Lmdb {
     fn get(&mut self, key: &[u8]) -> Res<usize> {
         let db = self.db;
         let r = self.snapshot()?;
-        // Values are borrowed from the mapping, never copied.
-        Ok(db
-            .get(r, key)
-            .map_err(|e| e.to_string())?
-            .map(|v| v.len())
-            .unwrap_or(0))
+        lmdb_get(db, r, key)
     }
     fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
         let db = self.db;
         let r = self.snapshot()?;
-        let mut bytes = 0usize;
-        let range = (std::ops::Bound::Included(from), std::ops::Bound::Unbounded);
-        for row in db.range(r, &range).map_err(|e| e.to_string())?.take(n) {
-            let (_, v) = row.map_err(|e| e.to_string())?;
-            bytes += v.len();
-        }
-        Ok(bytes)
+        lmdb_range(db, r, from, n)
+    }
+    fn thread_reader(&self) -> Res<ReaderOpener> {
+        // The environment is shared and the transaction is the thread's:
+        // begun on it, since without `MDB_NOTLS` a read transaction lives
+        // in the slot of the thread that began it, and dropped on it with
+        // the reader. Begun after the load's last commit, so it reads the
+        // store as loaded, as the arm's own held transaction does.
+        let env = self.env.clone();
+        let db = self.db;
+        Ok(Box::new(move || {
+            let txn = env.static_read_txn().map_err(|e| e.to_string())?;
+            Ok(Box::new(LmdbReader { db, txn }) as Box<dyn ThreadReader>)
+        }))
     }
     fn sync(&mut self) -> Res<()> {
         self.txn = None;

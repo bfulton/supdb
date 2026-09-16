@@ -20,10 +20,14 @@ pub const WINDOW: usize = 10;
 pub const MIN_HISTORY: usize = 3;
 
 /// Which way is worse. Every quantity a workload records is named here;
-/// one that is not is an error, never a guess.
+/// one that is not is an error, never a guess. The threaded read and scan
+/// quantities are one per count in `run::THREADS`, and a count added
+/// there is named here or `every_threaded_quantity_is_named` fails --
+/// before a run has paid for the measurement the gate would refuse.
 pub fn higher_is_better(quantity: &str) -> Option<bool> {
     Some(match quantity {
         "ops_per_s" | "reads_per_s" | "entries_per_s" | "bytes_per_s" => true,
+        "reads_per_s_2t" | "reads_per_s_4t" | "entries_per_s_2t" | "entries_per_s_4t" => true,
         "p99_us" | "device_bytes_per_byte" | "bytes_on_disk_per_byte" => false,
         _ => return None,
     })
@@ -430,6 +434,19 @@ mod tests {
         let rep = gate(&new, &dir).unwrap();
         assert_eq!(rep.prior_rows, 0);
         assert!(!rep.regressed());
+    }
+
+    /// One name per thread count the runner measures at. Kept in step
+    /// here rather than derived, since a derived direction is a guess
+    /// about a quantity nobody has looked at.
+    #[test]
+    fn every_threaded_quantity_is_named() {
+        for t in crate::run::THREADS {
+            for base in ["reads_per_s", "entries_per_s"] {
+                let q = crate::run::threaded_quantity(base, t);
+                assert_eq!(higher_is_better(&q), Some(true), "{q} is not named");
+            }
+        }
     }
 
     #[test]

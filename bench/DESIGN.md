@@ -16,8 +16,8 @@ Five, plus two floors. Each yields one or more quantities.
 |---|---|---|
 | `load` | n keys in key order, 100-byte values, durable per batch | ops/s, device bytes written per byte stored, bytes on disk per byte stored |
 | `load-shuffled` | the same keys in shuffled order | ops/s |
-| `read` | uniform point reads over the loaded set | reads/s, p99 µs |
-| `scan` | `size/100` scans of 100 entries, from uniform random starts | entries/s |
+| `read` | uniform point reads over the loaded set, on one thread and again on 2 and on 4 | reads/s, p99 µs; reads/s per thread count |
+| `scan` | `size/100` scans of 100 entries, from uniform random starts, on one thread and again on 2 and on 4 | entries/s; entries/s per thread count |
 | `ycsb` | core A–F on the loaded store, zipfian, a sixth of the keys in operations per mix | ops/s per mix |
 | `wal-floor` | framed 1,000-record batches appended to one file, one `fdatasync` each, no engine | ops/s |
 | `scan-floor` | one `mmap` sequential walk of a file the top rung's size (capped at 4 GiB), no engine | bytes/s |
@@ -72,19 +72,34 @@ YCSB-D reads uniformly over the loaded keys rather than skewed to the latest
 inserts: the latest distribution needs a Zipfian over a count that grows
 with every insert, and tracking that is not a cost to charge the engines.
 
-Every workload runs one thread against the engine. Concurrency is on the
-backlog, for the matrix as much as for the engine: a thread count as a
-dimension of `read`, `scan` and the mixes, readers beside a writer and
-writers beside each other, each a quantity per thread count so a row shows
-where an arm's throughput stops scaling. LMDB and RocksDB take it as they
-are; supdb is single-writer with reads that borrow the writer, and the
-engine side of the item is in `docs/engine.md` under what is open. Until
-both sides exist a row measures no concurrency and claims none. An
-engine's own threads are the engine's: supdb seals, merges and, with
-the block cache, builds the cache ahead of a scan on threads of its own,
-as RocksDB compacts on its own; the workload thread is still one, and
-the figure is that thread's throughput with the engine doing what it
-does beside it.
+Every workload runs one thread against the engine, and `read` and `scan`
+run again on two and on four reader threads, so a row shows where an
+arm's throughput stops scaling against LMDB and RocksDB at the same
+count. Each count is a quantity of its own on the workload it repeats:
+`reads_per_s_2t`, `reads_per_s_4t`, `entries_per_s_2t`,
+`entries_per_s_4t`. The threaded passes run on the store as loaded, after
+the single-threaded pass they repeat and before the mixes, with the writer
+idle. Every thread reads through a handle of its own -- supdb's
+`Db::reader`, an LMDB read transaction begun on the thread, RocksDB's
+shared handle -- and draws its keys from a uniform generator seeded apart
+from the others'. The threads split the single-threaded pass's operations
+evenly, so the work at every count is the same and the numbers compare;
+they are released together, each times itself from its release to its
+finish, and the quantity is the aggregate throughput over the span from
+the first release to the last finish, so the spawning and the opening are
+outside the clock. Every thread's bytes are held to
+what the loaded store holds, because a reader that answered a different
+store would post a throughput like any other. The counts are one, two and
+four because the class the suite gates on has four cores; a class with
+more runs the same counts, since the counts name the quantities and the
+gate names every quantity. Still on the backlog: the mixes threaded,
+readers beside a writer, and writers beside each other, which is an
+engine question first, since supdb is single-writer. An engine's own
+threads are the engine's: supdb seals, merges and, with the block cache,
+builds the cache ahead of a scan on threads of its own, as RocksDB
+compacts on its own; a workload's thread count is the count of threads
+reading, and the figure is their throughput with the engine doing what it
+does beside them.
 
 ## Arms
 

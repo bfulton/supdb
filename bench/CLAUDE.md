@@ -125,6 +125,19 @@ so is invisible in every ratio.** `Batch` builds a batch without allocating
 per record after that was found to cost as much as an engine's whole commit
 path.
 
+**A clock on the thread that releases the others starts late.** The
+threaded read and scan passes release their threads on a barrier, and
+the first version started the clock when the main thread's own `wait`
+returned -- on a loaded box, tens of microseconds after the workers were
+running, and a hundred scans of a hundred entries on four threads at ten
+thousand keys were over by then: the smoke run recorded them at billions
+of entries a second, a thousand times the single-threaded figure, with
+nothing raised. Each thread times itself now, from its release to its
+finish, and the aggregate is the span from the first release to the
+last finish. A pass a few times the scheduler's skew is still a pass to
+read with that in mind, and the ladder's smallest rung is where the
+threaded scan is shortest.
+
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`

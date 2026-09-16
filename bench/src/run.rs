@@ -27,6 +27,31 @@ pub const VALUE_SIZE: usize = 100;
 /// The arm name the floors are recorded under: no engine ran.
 pub const FLOOR_ARM: &str = "floor";
 
+/// The reader-thread counts `read` and `scan` run at beside their
+/// single-threaded pass, each a quantity of its own (`reads_per_s_2t`)
+/// on the same workload, so a row shows where an arm's throughput stops
+/// scaling. Two and four, because the class the suite gates on has four
+/// cores; a class with more runs the same counts, since the counts name
+/// the quantities and the gate names every quantity. A count added here
+/// is named in `gate::higher_is_better`, or the gate's test says so.
+pub const THREADS: [usize; 2] = [2, 4];
+
+/// The quantity `base` measured over `threads` reader threads:
+/// `reads_per_s_4t`.
+pub fn threaded_quantity(base: &str, threads: usize) -> String {
+    format!("{base}_{threads}t")
+}
+
+/// The thread count a quantity's name carries, or none for a
+/// single-threaded quantity.
+pub fn threads_of(quantity: &str) -> Option<usize> {
+    let (base, count) = quantity.rsplit_once('_')?;
+    if !matches!(base, "reads_per_s" | "entries_per_s") {
+        return None;
+    }
+    count.strip_suffix('t')?.parse().ok()
+}
+
 pub struct Plan {
     pub scale: Scale,
     pub arms: Vec<String>,
@@ -286,6 +311,14 @@ pub fn run(
                         ("entries_per_s", "entries/s"),
                         one.scan_entries_s,
                     );
+                    for (threads, v) in &one.reads_s_threaded {
+                        let q = threaded_quantity("reads_per_s", *threads);
+                        s.push("read", sz, arm, g, (q.as_str(), "reads/s"), *v);
+                    }
+                    for (threads, v) in &one.scan_entries_s_threaded {
+                        let q = threaded_quantity("entries_per_s", *threads);
+                        s.push("scan", sz, arm, g, (q.as_str(), "entries/s"), *v);
+                    }
                     for (letter, ops_s) in &one.ycsb_ops_s {
                         s.push(
                             &format!("ycsb-{letter}"),
@@ -297,13 +330,22 @@ pub fn run(
                         );
                     }
                 }
+                let top = *THREADS.last().unwrap_or(&1);
+                let at_top = |v: &[(usize, f64)]| {
+                    v.iter()
+                        .find(|(t, _)| *t == top)
+                        .map(|(_, v)| *v)
+                        .unwrap_or(0.0)
+                };
                 log(&format!(
-                    "{:>7}s  size {size:>9}  rep {rep}{}  {arm:<15} load {:>10.0} ops/s  read {:>10.0}/s  scan {:>11.0}/s  ycsb-A {:>9.0}/s",
+                    "{:>7}s  size {size:>9}  rep {rep}{}  {arm:<15} load {:>10.0} ops/s  read {:>10.0}/s  {top}t {:>10.0}/s  scan {:>11.0}/s  {top}t {:>11.0}/s  ycsb-A {:>9.0}/s",
                     started.elapsed().as_secs(),
                     if rep == 0 { " (warmup)" } else { "" },
                     one.load_ops_s,
                     one.reads_s,
+                    at_top(&one.reads_s_threaded),
                     one.scan_entries_s,
+                    at_top(&one.scan_entries_s_threaded),
                     one.ycsb_ops_s.iter().find(|(l, _)| *l == 'A').map(|(_, v)| *v).unwrap_or(0.0),
                 ));
             }
@@ -372,6 +414,10 @@ struct OnePass {
     reads_s: f64,
     p99_us: f64,
     scan_entries_s: f64,
+    /// The same reads and scans again over each count in `THREADS`:
+    /// (threads, aggregate throughput).
+    reads_s_threaded: Vec<(usize, f64)>,
+    scan_entries_s_threaded: Vec<(usize, f64)>,
     ycsb_ops_s: Vec<(char, f64)>,
 }
 
@@ -420,18 +466,53 @@ fn one_pass(
     }
     let read_s = t.elapsed().as_secs_f64();
 
+    // The same reads over each thread count, on the store as loaded and
+    // with the writer idle. Every key was loaded with one value of
+    // `value_size` bytes, and that is what the threads must read back.
+    let mut reads_s_threaded = Vec::with_capacity(THREADS.len());
+    for threads in THREADS {
+        let (secs, bytes) = threaded(e.as_ref(), threads, size, size, 0x7EAD, Op::Get)?;
+        let want = size * plan.value_size as u64;
+        if bytes != want {
+            return Err(format!(
+                "{arm} at {size}: point reads on {threads} threads read back {bytes} bytes \
+                 and the store holds {want}; a reader over a different store is not a measurement"
+            ));
+        }
+        reads_s_threaded.push((threads, size as f64 / secs));
+    }
+
     let scans = (size / plan.scan_len as u64).max(1);
-    let mut g2 = KeyGen::new(
-        KeyDist::Uniform,
-        size.saturating_sub(plan.scan_len as u64).max(1),
-        11,
-    );
+    let scan_keys = size.saturating_sub(plan.scan_len as u64).max(1);
+    let mut g2 = KeyGen::new(KeyDist::Uniform, scan_keys, 11);
     let t = Instant::now();
     for _ in 0..scans {
         db_key_into(g2.next(), &mut kb);
         e.range(&kb, plan.scan_len)?;
     }
     let scan_s = t.elapsed().as_secs_f64();
+
+    // And the same scans. Every start is at least `scan_len` below the
+    // top, so every scan walks `scan_len` loaded entries.
+    let mut scan_entries_s_threaded = Vec::with_capacity(THREADS.len());
+    for threads in THREADS {
+        let (secs, bytes) = threaded(
+            e.as_ref(),
+            threads,
+            scans,
+            scan_keys,
+            0x5CA0,
+            Op::Range(plan.scan_len),
+        )?;
+        let want = scans * (plan.scan_len as u64).min(size) * plan.value_size as u64;
+        if bytes != want {
+            return Err(format!(
+                "{arm} at {size}: scans on {threads} threads read back {bytes} bytes \
+                 and the store holds {want}; a reader over a different store is not a measurement"
+            ));
+        }
+        scan_entries_s_threaded.push((threads, (scans * plan.scan_len as u64) as f64 / secs));
+    }
 
     let mut ycsb_ops_s = Vec::with_capacity(YCSB.len());
     let mut inserted = 0u64;
@@ -458,8 +539,116 @@ fn one_pass(
         reads_s: size as f64 / read_s,
         p99_us: h.percentile(99.0) as f64 / 1000.0,
         scan_entries_s: (scans * plan.scan_len as u64) as f64 / scan_s,
+        reads_s_threaded,
+        scan_entries_s_threaded,
         ycsb_ops_s,
     })
+}
+
+/// What a reader thread does per operation.
+#[derive(Clone, Copy)]
+enum Op {
+    Get,
+    Range(usize),
+}
+
+/// Thread `i` of `threads`' share of `ops`: as even as `ops` divides,
+/// the remainder one each to the first threads, so the shares sum to
+/// `ops` and the work at every count is the single-threaded pass's.
+fn share(ops: u64, threads: usize, i: usize) -> u64 {
+    ops / threads as u64 + u64::from((i as u64) < ops % threads as u64)
+}
+
+/// `ops` operations of `op`, keys drawn uniformly below `keys`, split
+/// across `threads` threads, each through a reader of its own -- made on
+/// this thread, opened on its own -- and a generator seeded apart from
+/// the others'. The threads are released together and each times itself
+/// from its release to its finish; the result is the aggregate, seconds
+/// from the first release to the last finish, so the spawning and the
+/// opening are outside the clock, and the bytes every thread read back,
+/// which the caller holds to what the store holds, since a reader over a
+/// different store would post a throughput like any other.
+///
+/// The clock is the threads' own and not this thread's. The first
+/// version started it when this thread's `wait` returned, which on a
+/// loaded box was tens of microseconds after the workers were running,
+/// and a hundred scans on four threads at ten thousand keys were over by
+/// then: the smoke run recorded them at billions of entries a second.
+fn threaded(
+    e: &dyn Engine,
+    threads: usize,
+    ops: u64,
+    keys: u64,
+    seed: u64,
+    op: Op,
+) -> Result<(f64, u64), String> {
+    if threads == 0 {
+        return Err("a threaded pass needs at least one thread".to_string());
+    }
+    let mut openers = Vec::with_capacity(threads);
+    for _ in 0..threads {
+        openers.push(e.thread_reader()?);
+    }
+    let barrier = std::sync::Barrier::new(threads + 1);
+    type Timed = Result<(Instant, Instant, u64), String>;
+    let results: Vec<Timed> = std::thread::scope(|s| {
+        let workers: Vec<_> = openers
+            .into_iter()
+            .enumerate()
+            .map(|(i, open)| {
+                let barrier = &barrier;
+                let share = share(ops, threads, i);
+                // Distinct per thread and deterministic: one multiplicative
+                // mix of the base and the thread's index, so the streams
+                // do not start a few steps apart.
+                let seed = (seed + i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                s.spawn(move || -> Timed {
+                    // Every thread reaches the barrier whatever opening
+                    // did: one that returned before it would leave the
+                    // others and the clock waiting forever, and a panic
+                    // in an opener is caught for the same reason.
+                    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(open))
+                        .unwrap_or_else(|_| Err("the reader's opener panicked".to_string()));
+                    let mut g = KeyGen::new(KeyDist::Uniform, keys, seed);
+                    let mut kb = [0u8; KEY_SIZE];
+                    barrier.wait();
+                    let start = Instant::now();
+                    let mut r = opened?;
+                    let mut bytes = 0u64;
+                    for _ in 0..share {
+                        db_key_into(g.next(), &mut kb);
+                        bytes += match op {
+                            Op::Get => r.get(&kb)?,
+                            Op::Range(n) => r.range(&kb, n)?,
+                        } as u64;
+                    }
+                    Ok((start, Instant::now(), bytes))
+                })
+            })
+            .collect();
+        barrier.wait();
+        workers
+            .into_iter()
+            .map(|w| {
+                w.join()
+                    .unwrap_or_else(|_| Err("a reader thread panicked".to_string()))
+            })
+            .collect()
+    });
+    let mut bytes = 0u64;
+    let mut first: Option<Instant> = None;
+    let mut last: Option<Instant> = None;
+    for r in results {
+        let (start, end, b) = r?;
+        bytes += b;
+        first = Some(first.map_or(start, |f| f.min(start)));
+        last = Some(last.map_or(end, |l| l.max(end)));
+    }
+    let secs = match (first, last) {
+        (Some(f), Some(l)) => l.duration_since(f).as_secs_f64(),
+        _ => 0.0,
+    };
+    Ok((secs, bytes))
 }
 
 /// One YCSB workload over a loaded store: `ycsb_ops(size)` operations,
@@ -685,5 +874,83 @@ mod tests {
         ] {
             assert!(gate::higher_is_better(q).is_some(), "{q}");
         }
+    }
+
+    #[test]
+    fn shares_sum_to_the_work_and_differ_by_at_most_one() {
+        for (ops, threads) in [
+            (10_000u64, 4usize),
+            (10_001, 4),
+            (7, 4),
+            (3, 4),
+            (1, 2),
+            (0, 2),
+        ] {
+            let shares: Vec<u64> = (0..threads).map(|i| share(ops, threads, i)).collect();
+            assert_eq!(
+                shares.iter().sum::<u64>(),
+                ops,
+                "{ops} over {threads}: {shares:?}"
+            );
+            let lo = shares.iter().min().unwrap();
+            let hi = shares.iter().max().unwrap();
+            assert!(hi - lo <= 1, "{ops} over {threads}: {shares:?}");
+        }
+    }
+
+    #[test]
+    fn a_threaded_quantity_names_its_count_and_nothing_else_does() {
+        assert_eq!(threaded_quantity("reads_per_s", 4), "reads_per_s_4t");
+        assert_eq!(threads_of("reads_per_s_4t"), Some(4));
+        assert_eq!(threads_of("entries_per_s_2t"), Some(2));
+        assert_eq!(threads_of("reads_per_s"), None);
+        assert_eq!(threads_of("entries_per_s"), None);
+        assert_eq!(threads_of("p99_us"), None);
+        assert_eq!(threads_of("ops_per_s_2t"), None);
+    }
+
+    /// Every engine's threaded readers read the store the writer loaded:
+    /// each key's one value, every entry of every scan, on two threads.
+    /// What it pins is the handle each adapter hands a thread -- supdb's
+    /// under `Latest` after the load's last commit, on the durable arm
+    /// and on the ingest arm whose keys took the ordered path; LMDB's
+    /// transaction begun on the thread after the writes; RocksDB's shared
+    /// handle -- since a reader over the wrong state would post a
+    /// throughput like any other, and the runner's own check would be
+    /// the first to say so, after the load it had paid for.
+    #[test]
+    fn threaded_readers_read_the_loaded_store() {
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-threaded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let plan = Plan::new(Scale::Quick, vec![], 10_000);
+        let payload = Payload::new(plan.value_size, 0.5, 0xE1);
+        let size = 2_000u64;
+        for arm in ["supdb", "supdb-ingest", "lmdb", "rocksdb-tuned"] {
+            let dir = root.join(arm);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut e = engines::open(arm, &dir, 1).unwrap();
+            load(e.as_mut(), size, &plan, &payload, |i| i).unwrap();
+            let (secs, bytes) = threaded(e.as_ref(), 2, size, size, 1, Op::Get).unwrap();
+            assert_eq!(bytes, size * plan.value_size as u64, "{arm}: point reads");
+            assert!(secs > 0.0, "{arm}: a pass took no time");
+            let scans = size / plan.scan_len as u64;
+            let (_, bytes) = threaded(
+                e.as_ref(),
+                2,
+                scans,
+                size - plan.scan_len as u64,
+                2,
+                Op::Range(plan.scan_len),
+            )
+            .unwrap();
+            assert_eq!(
+                bytes,
+                scans * (plan.scan_len * plan.value_size) as u64,
+                "{arm}: scans"
+            );
+            drop(e);
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

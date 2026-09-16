@@ -522,11 +522,14 @@ fn message(
     let mine = at("supdb").or_else(|| at("supdb-ingest"));
     let noun = workload_noun(workload);
     let what = match quantity {
-        "ops_per_s" | "reads_per_s" | "entries_per_s" => "throughput",
-        "p99_us" => "p99 latency",
-        "device_bytes_per_byte" => "device bytes per byte",
-        "bytes_on_disk_per_byte" => "bytes on disk per byte",
-        _ => quantity,
+        "ops_per_s" | "reads_per_s" | "entries_per_s" => "throughput".to_string(),
+        "p99_us" => "p99 latency".to_string(),
+        "device_bytes_per_byte" => "device bytes per byte".to_string(),
+        "bytes_on_disk_per_byte" => "bytes on disk per byte".to_string(),
+        q => match crate::run::threads_of(q) {
+            Some(t) => format!("aggregate throughput on {t} threads"),
+            None => q.to_string(),
+        },
     };
     let g = match guarantee {
         Guarantee::Durable => "durable per batch",
