@@ -757,7 +757,16 @@ per-commit path.
   instead of branching. Six rounds interleaved against the head before,
   every mix: E 627k–732k against 642k–716k at 300k, level within the
   spread at 100k, and 565k–636k against 541k–546k at three million in
-  two rounds. The cache is
+  two rounds. One more cost sat outside the counters, on the first scan
+  of a store: the snapshot build's radix sort zeroed two histograms of
+  65,536 words for every call, over a memtable the load had left empty,
+  and the faults on those fresh pages were 400 µs at ten thousand keys
+  and at a hundred thousand, three quarters of the suite's hundred-scan
+  pass at the smallest rung. The counters are 256 words on the stack
+  now, a byte a pass over the bytes the largest key offset has, the
+  first scan at ten thousand keys costs 24–40 µs, the mapping's first
+  touches, and the build over 428k unsealed keys is unchanged at 10–11
+  ms. The cache is
   on by default: its write path settles in place, and in every quick row
   the arm with it prices the same as the arm without on every workload
   but E, where it runs three times the merge -- what it costs is the

@@ -88,8 +88,14 @@ The ladder's small rungs are not a formality. A fresh memtable's first
 write zeroed eleven megabytes of blocks it would never read, 3.7 ms that
 five interleaved rounds of a probe at 300k keys could not see and the
 quick row's ycsb-B at ten thousand keys, a pass under a millisecond,
-showed as 3x. Take the quick row before a change is called flat, and
-read its smallest rung.
+showed as 3x. The scan snapshot's radix sort zeroed two histograms of
+half a megabyte on every build, over a memtable that after the load
+held nothing, and the faults on those pages were 400 us of the first
+scan at every rung: the row's scan pass at ten thousand keys, a hundred
+scans, sat at 0.64x LMDB's while a thousand scans through the probe
+ran 1.4x it. Take the quick row before a change is called flat, and
+read its smallest rung, and when a small pass trails, time its first
+operation on its own.
 
 Two consequences for code in this repository:
 

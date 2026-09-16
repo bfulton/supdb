@@ -4578,16 +4578,23 @@ impl Snapshot {
     }
 }
 
-/// LSD radix sort of `(key, a, b)` triples by the key, two 16-bit passes.
-/// Stable, O(n), and what puts a hash table's entries back into the order
-/// their keys were appended so the copy that follows is sequential.
+/// LSD radix sort of `(key, a, b)` triples by the key, a byte a pass over
+/// the bytes the largest key has, with the counters on the stack. Stable,
+/// O(n), and what puts a hash table's entries back into the order their
+/// keys were appended so the copy that follows is sequential. It was two
+/// 16-bit passes, each over a histogram of 65,536 words zeroed for the
+/// call: 512 KB of fresh pages twice, whose faults were the first scan
+/// of every store, 400 us at ten thousand keys and at a hundred thousand,
+/// over a memtable that held nothing.
 fn radix_by_first(v: &mut Vec<(u32, u32, u32)>, scratch: &mut Vec<(u32, u32, u32)>) {
+    let max = v.iter().map(|t| t.0).max().unwrap_or(0);
     scratch.clear();
     scratch.resize(v.len(), (0, 0, 0));
-    for shift in [0u32, 16] {
-        let mut counts = vec![0usize; 1 << 16];
+    let mut shift = 0u32;
+    while shift < 32 && (max >> shift) != 0 {
+        let mut counts = [0usize; 256];
         for &(k, _, _) in v.iter() {
-            counts[((k >> shift) & 0xFFFF) as usize] += 1;
+            counts[((k >> shift) & 0xFF) as usize] += 1;
         }
         let mut sum = 0usize;
         for c in counts.iter_mut() {
@@ -4596,11 +4603,52 @@ fn radix_by_first(v: &mut Vec<(u32, u32, u32)>, scratch: &mut Vec<(u32, u32, u32
             sum += n;
         }
         for &t in v.iter() {
-            let b = ((t.0 >> shift) & 0xFFFF) as usize;
+            let b = ((t.0 >> shift) & 0xFF) as usize;
             scratch[counts[b]] = t;
             counts[b] += 1;
         }
         std::mem::swap(v, scratch);
+        shift += 8;
+    }
+}
+
+#[cfg(test)]
+mod radix {
+    /// The radix pass orders by the first word and keeps the input order
+    /// among equal words, over keys of every width up to the full four
+    /// bytes, and over nothing.
+    #[test]
+    fn the_radix_pass_orders_as_a_stable_sort_by_the_first_word_does() {
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut rng = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for (n, bits) in [
+            (0, 32),
+            (1, 0),
+            (7, 3),
+            (1000, 8),
+            (5000, 12),
+            (20000, 20),
+            (3000, 32),
+        ] {
+            let mask = if bits == 32 {
+                u32::MAX
+            } else {
+                (1u32 << bits) - 1
+            };
+            let mut v: Vec<(u32, u32, u32)> = (0..n)
+                .map(|i| ((rng() as u32) & mask, i as u32, rng() as u32))
+                .collect();
+            let mut want = v.clone();
+            want.sort_by_key(|t| t.0);
+            let mut scratch = Vec::new();
+            super::radix_by_first(&mut v, &mut scratch);
+            assert_eq!(v, want, "{n} keys of {bits} bits");
+        }
     }
 }
 
