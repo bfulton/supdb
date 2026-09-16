@@ -1479,6 +1479,21 @@ impl FlatIndex {
         ))
     }
 
+    /// Where the records at `rank` and `n` ranks on lie by the directory:
+    /// the first's offset and the last's, for a hint of what a walk
+    /// between them streams. Records ascend with rank in a segment; where
+    /// a store's index has republished one into the slack the span is
+    /// clipped to the first, since this is a hint and not a read.
+    pub fn record_span(&self, dir: &[u8], rank: usize, n: usize) -> Option<(usize, usize)> {
+        if rank >= self.nkeys {
+            return None;
+        }
+        let last = (rank + n).min(self.nkeys - 1);
+        let a = rd_u32(dir, rank * 4)? as usize;
+        let b = rd_u32(dir, last * 4)? as usize;
+        Some((a, b.max(a)))
+    }
+
     /// `at_full` against regions `regions` already sliced. The directory is
     /// still the authority for where a record lies: records happen to ascend
     /// with rank in a segment, but a store's index republishes a grown record

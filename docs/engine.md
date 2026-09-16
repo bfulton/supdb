@@ -614,7 +614,19 @@ per-commit path.
   the walk 0.90 to 0.32–0.40, E 297k–300k to 355k–422k and 333k–335k
   to 410k–481k; at three hundred thousand, where the buffers are warm,
   the walk 0.29–0.34 to 0.22–0.24, the first pass level at 457k–528k
-  against 502k–509k and the second 638k–655k to 684k–696k. The write
+  against 502k–509k and the second 638k–655k to 684k–696k. The same
+  for the rest of what a scan waits on, timed the same way: a sparse
+  block's buffers before the lower bound over its deltas; the
+  partition's records a sparse or clean walk streams, from the
+  directory's word for the first rank to its word for the last, capped
+  at 4 KB, so the stream starts with its lines in flight instead of
+  ramping the hardware prefetcher from a miss; and the seek's stride of
+  heads, eight lines the search probed three of one after another. Two
+  rounds: at thirty million the sparse walk 0.42–0.51 µs a scan to
+  0.16–0.17, the seek 0.41–0.48 to 0.35–0.38, E's first pass 357k–381k
+  to 392k–415k and its second 382k–414k to 461k–470k; at three million
+  the sparse walk 0.45 to 0.18, the seek 0.25–0.31 to 0.21–0.23, E
+  427k–432k to 484k–496k and 480k–512k to 561k–574k. The write
   path settles in
   place: a write is queued and, at the next scan, spliced into the built
   block it landed in -- the key's run resolved as a build resolves it,

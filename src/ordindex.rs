@@ -518,6 +518,13 @@ impl OrdIndex {
         } else {
             ((t - 1) * TOP_STRIDE + 1, (t * TOP_STRIDE).min(self.n))
         };
+        // The stride's eight lines together: the search below probes
+        // three of them one after another, each a miss on a cold
+        // partition, and issued at once they cost one.
+        if lo < hi {
+            let at = HEADER + lo * HEAD;
+            crate::db::prefetch_lines(self.map.0[at..].as_ptr(), (hi - lo) * HEAD);
+        }
         while lo < hi {
             let m = (lo + hi) / 2;
             if self.head(m) < h {

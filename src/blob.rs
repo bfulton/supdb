@@ -817,6 +817,28 @@ impl<B: Bytes> Blob<B> {
         }
     }
 
+    /// PROTOTYPE: a hint to fetch the lines of the records from `rank`
+    /// for `n` ranks, ahead of a walk over them; nothing is waited for.
+    /// The directory says where the first and the last lie, and the span
+    /// between them, capped at 4 KB, is what the walk streams; past the
+    /// directory's own lines nothing is read here.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn prefetch_ranks(&self, rank: usize, n: usize) {
+        let Some((sec, idx)) = self.flat() else {
+            return;
+        };
+        let Some((recs, dir)) = idx.regions(sec) else {
+            return;
+        };
+        let Some((a, b)) = idx.record_span(dir, rank, n) else {
+            return;
+        };
+        let b = b.min(a + 4096).min(recs.len());
+        if a < b {
+            crate::db::prefetch_lines(recs[a..].as_ptr(), b - a);
+        }
+    }
+
     /// The key at `rank` in key order.
     pub fn key_at(&self, rank: usize) -> Option<&[u8]> {
         let (sec, idx) = self.flat()?;

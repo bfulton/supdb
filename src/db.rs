@@ -3218,7 +3218,7 @@ impl CachedBlock {
 /// PROTOTYPE: a hint to the core to fetch the lines of a buffer, none of
 /// which it waits for; on any other architecture, nothing.
 #[inline]
-fn prefetch_lines(ptr: *const u8, bytes: usize) {
+pub(crate) fn prefetch_lines(ptr: *const u8, bytes: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
@@ -3232,6 +3232,23 @@ fn prefetch_lines(ptr: *const u8, bytes: usize) {
     }
     #[cfg(not(target_arch = "x86_64"))]
     let _ = (ptr, bytes);
+}
+
+/// PROTOTYPE: the lines a walk of block `b` from rank `from` for `n`
+/// entries touches first, by the block's form: a copy's or a sparse
+/// block's buffers, and the partition's records a sparse or clean walk
+/// streams. Nothing is waited for, and a block not yet built has nothing
+/// to fetch.
+fn prefetch_block(blob: &Blob<MmapBytes>, table: &BlockTable, b: usize, from: usize, n: usize) {
+    match table.slots[b].as_ref() {
+        Some(Cached::Block(blk)) => blk.prefetch(),
+        Some(Cached::Sparse(sb)) => {
+            sb.prefetch();
+            blob.prefetch_ranks(from, n);
+        }
+        Some(Cached::Clean) => blob.prefetch_ranks(from, n),
+        _ => {}
+    }
 }
 
 /// PROTOTYPE: what the cache knows about a block.
@@ -3305,6 +3322,17 @@ struct DeltaEnt {
 }
 
 impl SparseBlock {
+    /// PROTOTYPE: the block's three buffers toward the core ahead of a
+    /// walk, as a copy's; the lower bound over the deltas is the same
+    /// dependent misses into two of them.
+    fn prefetch(&self) {
+        prefetch_lines(
+            self.ents.as_ptr() as *const u8,
+            self.ents.len() * std::mem::size_of::<DeltaEnt>(),
+        );
+        prefetch_lines(self.keys.as_ptr(), self.keys.len());
+        prefetch_lines(self.vals.as_ptr(), self.vals.len().min(1024));
+    }
     fn key(&self, e: &DeltaEnt) -> &[u8] {
         &self.keys[e.key.0 as usize..(e.key.0 + e.key.1) as usize]
     }
@@ -6627,15 +6655,12 @@ impl Db {
                         self.cache_bytes.set(self.cache_bytes.get() + grew);
                     }
                 }
-                // This block's buffers, and the next block's when the
+                // This block's cold lines, and the next block's when the
                 // scan will cross into it, fetched while this one walks.
-                if let Some(Cached::Block(blk)) = table.slots[b].as_ref() {
-                    blk.prefetch();
-                }
-                if hi - start < limit - seen && b + 1 < nblocks {
-                    if let Some(Cached::Block(next)) = table.slots[b + 1].as_ref() {
-                        next.prefetch();
-                    }
+                let ahead = limit - seen;
+                prefetch_block(&seg.blob, table, b, start, ahead);
+                if hi - start < ahead && b + 1 < nblocks {
+                    prefetch_block(&seg.blob, table, b + 1, hi, ahead - (hi - start));
                 }
                 match table.slots[b].as_ref().expect("just built") {
                     Cached::Sparse(deltas) => {
