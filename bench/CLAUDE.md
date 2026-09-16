@@ -134,9 +134,11 @@ thousand keys were over by then: the smoke run recorded them at billions
 of entries a second, a thousand times the single-threaded figure, with
 nothing raised. Each thread times itself now, from its release to its
 finish, and the aggregate is the span from the first release to the
-last finish. A pass a few times the scheduler's skew is still a pass to
-read with that in mind, and the ladder's smallest rung is where the
-threaded scan is shortest.
+last finish. The threads also split the single-threaded pass's
+operations at first, so the pass on four threads was a quarter as long
+and the smallest rung's scans were tens of microseconds, a few times the
+scheduler's skew; every thread runs the whole pass now, and a pass on
+four threads is as long as the pass on one.
 
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft

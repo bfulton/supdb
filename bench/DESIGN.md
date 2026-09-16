@@ -82,8 +82,9 @@ the single-threaded pass they repeat and before the mixes, with the writer
 idle. Every thread reads through a handle of its own -- supdb's
 `Db::reader`, an LMDB read transaction begun on the thread, RocksDB's
 shared handle -- and draws its keys from a uniform generator seeded apart
-from the others'. The threads split the single-threaded pass's operations
-evenly, so the work at every count is the same and the numbers compare;
+from the others'. Every thread runs the single-threaded pass's
+operations, so a pass on four threads is as long as the pass on one and
+not a quarter of it, and the quantity is total operations over the pass;
 they are released together, each times itself from its release to its
 finish, and the quantity is the aggregate throughput over the span from
 the first release to the last finish, so the spawning and the opening are

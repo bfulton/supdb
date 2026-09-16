@@ -467,19 +467,24 @@ fn one_pass(
     let read_s = t.elapsed().as_secs_f64();
 
     // The same reads over each thread count, on the store as loaded and
-    // with the writer idle. Every key was loaded with one value of
-    // `value_size` bytes, and that is what the threads must read back.
+    // with the writer idle: the single-threaded pass's operations on every
+    // thread, so a pass on four threads runs about as long as the pass on
+    // one and not a quarter of it -- split four ways, the smallest rung's
+    // scans were over in the time a thread takes to wake. Every key was
+    // loaded with one value of `value_size` bytes, and that is what each
+    // thread must read back.
     let mut reads_s_threaded = Vec::with_capacity(THREADS.len());
     for threads in THREADS {
-        let (secs, bytes) = threaded(e.as_ref(), threads, size, size, 0x7EAD, Op::Get)?;
-        let want = size * plan.value_size as u64;
+        let ops = size * threads as u64;
+        let (secs, bytes) = threaded(e.as_ref(), threads, ops, size, 0x7EAD, Op::Get)?;
+        let want = ops * plan.value_size as u64;
         if bytes != want {
             return Err(format!(
                 "{arm} at {size}: point reads on {threads} threads read back {bytes} bytes \
                  and the store holds {want}; a reader over a different store is not a measurement"
             ));
         }
-        reads_s_threaded.push((threads, size as f64 / secs));
+        reads_s_threaded.push((threads, ops as f64 / secs));
     }
 
     let scans = (size / plan.scan_len as u64).max(1);
@@ -496,22 +501,23 @@ fn one_pass(
     // top, so every scan walks `scan_len` loaded entries.
     let mut scan_entries_s_threaded = Vec::with_capacity(THREADS.len());
     for threads in THREADS {
+        let ops = scans * threads as u64;
         let (secs, bytes) = threaded(
             e.as_ref(),
             threads,
-            scans,
+            ops,
             scan_keys,
             0x5CA0,
             Op::Range(plan.scan_len),
         )?;
-        let want = scans * (plan.scan_len as u64).min(size) * plan.value_size as u64;
+        let want = ops * (plan.scan_len as u64).min(size) * plan.value_size as u64;
         if bytes != want {
             return Err(format!(
                 "{arm} at {size}: scans on {threads} threads read back {bytes} bytes \
                  and the store holds {want}; a reader over a different store is not a measurement"
             ));
         }
-        scan_entries_s_threaded.push((threads, (scans * plan.scan_len as u64) as f64 / secs));
+        scan_entries_s_threaded.push((threads, (ops * plan.scan_len as u64) as f64 / secs));
     }
 
     let mut ycsb_ops_s = Vec::with_capacity(YCSB.len());
