@@ -871,8 +871,11 @@ per-commit path.
   model is LMDB's: one writer, any number of readers, no lock between
   them, and a reader table of slots where each reader handle pins the
   epoch it is reading in, so the writer can free what it replaced once
-  no slot holds an older epoch and never waits for a reader. The
-  isolation is the reader's to choose, and it falls out of one
+  no slot holds an older epoch and never waits for a reader. Each slot
+  has a cache line of its own, since every read stores to its handle's
+  slot: with eight slots to a line, four threads read a partitioned
+  store of ten thousand keys at one thread's rate, and at 3.8x it once
+  the slots were spaced. The isolation is the reader's to choose, and it falls out of one
   mechanism: a committed watermark on the memtable's value arena. Since
   chunks are appended in time order, the arena's tail at the last commit
   divides every key's chain into an uncommitted prefix and a committed

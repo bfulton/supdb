@@ -2647,8 +2647,22 @@ impl<T> Drop for Slab<T> {
 /// holds a pin only holds memory.
 pub(crate) struct Readers {
     epoch: AtomicU64,
-    slots: Box<[AtomicU64]>,
+    slots: Box<[Slot]>,
 }
+
+/// A reader's slot on a cache line of its own. The slots were adjacent
+/// words, eight to a line, and every read pins and unpins its handle's
+/// slot with a store, so four handles claimed in order stored to one
+/// line from four cores on every read. Measured on a partitioned store
+/// of ten thousand keys, uniform point reads through a handle per
+/// thread, two binaries alternated over three rounds: one thread 8.8M
+/// a second and four threads 8.9M with the slots adjacent, 9.0M and
+/// 33.7M with each on a line; at thirty thousand, 7.2M and 6.9M against
+/// 7.7M and 29.1M. 128 bytes covers a machine whose lines are that wide.
+#[repr(align(128))]
+struct Slot(AtomicU64);
+
+const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() >= 128);
 
 const READER_SLOTS: usize = 256;
 
@@ -2656,7 +2670,7 @@ impl Readers {
     fn new() -> Readers {
         Readers {
             epoch: AtomicU64::new(1),
-            slots: (0..READER_SLOTS).map(|_| AtomicU64::new(0)).collect(),
+            slots: (0..READER_SLOTS).map(|_| Slot(AtomicU64::new(0))).collect(),
         }
     }
 
@@ -2669,7 +2683,7 @@ impl Readers {
     /// retired at `epoch` can still be walked.
     fn none_before(&self, epoch: u64) -> bool {
         self.slots.iter().all(|s| {
-            let v = s.load(AtomicOrdering::SeqCst);
+            let v = s.0.load(AtomicOrdering::SeqCst);
             v == 0 || v >= epoch
         })
     }
@@ -2679,13 +2693,14 @@ impl Readers {
     fn claim(&self) -> Option<usize> {
         (0..READER_SLOTS).find(|&i| {
             self.slots[i]
+                .0
                 .compare_exchange(0, u64::MAX, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst)
                 .is_ok()
         })
     }
 
     fn release(&self, slot: usize) {
-        self.slots[slot].store(0, AtomicOrdering::SeqCst);
+        self.slots[slot].0.store(0, AtomicOrdering::SeqCst);
     }
 
     /// Pin the current epoch in `slot`: a load, a store, and the load
@@ -2695,15 +2710,17 @@ impl Readers {
     fn pin(&self, slot: usize) {
         loop {
             let e = self.epoch.load(AtomicOrdering::SeqCst);
-            self.slots[slot].store(e, AtomicOrdering::SeqCst);
+            self.slots[slot].0.store(e, AtomicOrdering::SeqCst);
             if self.epoch.load(AtomicOrdering::SeqCst) == e {
                 return;
             }
         }
     }
 
+    /// Release suffices: the writer's `none_before` wants the unpin to
+    /// come after the reads it ends, and nothing here waits on it.
     fn unpin(&self, slot: usize) {
-        self.slots[slot].store(u64::MAX, AtomicOrdering::SeqCst);
+        self.slots[slot].0.store(u64::MAX, AtomicOrdering::Release);
     }
 }
 

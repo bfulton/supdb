@@ -328,6 +328,18 @@ empty, and whose bytes live in a `Vec`, must not be handed to a byte
 compare without an `is_empty` check first, and a zero-length operation is a
 real operation until a measurement says otherwise.
 
+**A slot table whose slots share a line.** The reader table's slots
+were adjacent words, eight to a cache line, and every read stores its
+handle's slot twice, at the pin and at the unpin, so four handles
+claimed in order stored to one line from four cores on every read, and
+four threads read a partitioned store of ten thousand keys at one
+thread's rate. Nothing raised and nothing was wrong: the first row
+with threaded reads showed four threads at 2.5x one, and the probe with
+the suite's shape showed 1.0x. A slot per line reads 3.8x. The rule: a
+word one thread writes on every operation lives on a line no other
+thread writes, and adjacent words, the layout nobody chose, are the bug
+until the layout is chosen.
+
 **An order that held by name.** The live segments sort partitions first and
 then the level-0 pieces, and the pieces sorted by fence and then by name.
 Every piece a seal makes after the first partitioning is named `pcs-` with
