@@ -411,6 +411,18 @@ pub struct Options {
     /// holds one, and a block the reads own has it back after half the
     /// entries.
     pub promote_entries: usize,
+    /// EXPERIMENT: unsealed entries written since the last builder that
+    /// start another from a commit, rather than waiting for a scan to
+    /// ask. The builder organises what the writes left -- a snapshot of
+    /// the unsealed keys and a form for every block they overlay -- and
+    /// that work is what the first read after a write burst pays for
+    /// today: measured on the lag sweep at a hundred thousand keys, a
+    /// scan pass over a store with every key rewritten costs 33 µs a
+    /// scan the first time and 1.3 µs after, and the fault count goes
+    /// from five to five thousand with it. Zero waits for the scan,
+    /// which is where the builder started before. A builder already
+    /// running is left alone.
+    pub build_ahead_on_commit: usize,
     /// EXPERIMENT: overlay keys in a block from which the writer's
     /// canonical form is a merged copy rather than resolved deltas; zero
     /// is `CACHE_DENSE`, the threshold a handle building for itself
@@ -460,6 +472,7 @@ impl Default for Options {
             scan_cache_ahead_min_blocks: 1024,
             commit_forms: false,
             promote_entries: 0,
+            build_ahead_on_commit: 0,
             form_dense_from: 0,
             scan_snapshot_arena: true,
         }
@@ -4444,6 +4457,10 @@ pub struct Db {
     /// Direct segments' temp names, unlinked once the manifest names the
     /// segment; until then the temp name is what recovery reads.
     retiring_tmps: Vec<PathBuf>,
+    /// EXPERIMENT: the memtable's entry count when the last builder was
+    /// started from a commit, so the next starts a burst later and not a
+    /// batch later.
+    built_ahead_len: usize,
     /// An error from leaving order mid-batch, which `append` and `delete`
     /// cannot return: the next `commit` does.
     pending_err: Option<std::io::Error>,
@@ -7620,6 +7637,7 @@ impl Db {
             max_key: Vec::new(),
             run_scratch: Vec::new(),
             retiring_tmps: Vec::new(),
+            built_ahead_len: 0,
             pending_err: None,
             next_seg: 0,
             sealing: None,
@@ -7893,6 +7911,7 @@ impl Db {
             max_key,
             run_scratch: Vec::new(),
             retiring_tmps: Vec::new(),
+            built_ahead_len: 0,
             pending_err: None,
             next_seg,
             sealing: None,
@@ -8082,6 +8101,7 @@ impl Db {
             }
         }
         self.maintain_forms()?;
+        self.build_ahead_if_due();
         self.sweep_retired_forms();
         self.phase_ns[0] += t.elapsed().as_nanos() as u64;
         if self.sealing.as_ref().is_some_and(|h| h.is_finished()) {
@@ -8383,6 +8403,38 @@ impl Db {
             Ok(names)
         }));
         Ok(())
+    }
+
+    /// EXPERIMENT: a builder started from a commit once the writes have
+    /// piled up, so the organisation the first read would otherwise
+    /// build -- the snapshot of the unsealed keys and a form per block
+    /// they overlay -- is made on a core the writer is not using, before
+    /// a read asks. A builder still running is left to finish; the
+    /// count is the memtable's, so a seal's fresh table starts the next
+    /// one over.
+    fn build_ahead_if_due(&mut self) {
+        let due = self.opts.build_ahead_on_commit;
+        if due == 0 || !self.opts.scan_block_cache {
+            return;
+        }
+        let running = self
+            .ahead
+            .borrow()
+            .as_ref()
+            .is_some_and(|a| a.handle.as_ref().is_some_and(|h| !h.is_finished()));
+        if running {
+            return;
+        }
+        let len = self.mem().len();
+        if len < self.built_ahead_len {
+            // A seal: the memtable is new and the count starts over.
+            self.built_ahead_len = 0;
+        }
+        if len - self.built_ahead_len < due {
+            return;
+        }
+        self.built_ahead_len = len;
+        self.start_ahead();
     }
 
     /// Wait for whatever seal and merge are in flight, starting nothing new
