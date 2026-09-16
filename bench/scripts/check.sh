@@ -6,7 +6,8 @@
 #   sh scripts/check.sh lint quick   # some groups
 #
 # build  the crate, release
-# test   unit tests
+# test   unit tests, under the release profile with the arithmetic and the
+#        invariants checked -- see [profile.checked] in Cargo.toml
 # lint   clippy -D warnings, rustfmt --check, the shell inside the workflows
 # quick  a quick-scale run of every arm, written under runs-ci/ (ignored),
 #        then the gate against runs/ and the figures; proves the runner,
@@ -31,7 +32,7 @@ for g in $groups; do
       ;;
     test)
       say test
-      cargo test --release
+      cargo test --profile checked
       ;;
     lint)
       say lint

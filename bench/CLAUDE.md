@@ -66,6 +66,21 @@ Every gate this suite has broken has broken the same way: a check that was
 not running, or one reporting a verdict it had not earned. The engine's
 `scripts/check.sh` calls this one by group name and CI calls that.
 
+**The tests run under `checked`; only what a measurement times runs under
+`release`.** This side ran `cargo test --release` for a while after the
+engine had moved off it -- so every test here, and every line of engine
+code they reach, ran with the arithmetic and the invariants unchecked,
+which is how a prefetch span that summed a rank and a scan's limit of
+`usize::MAX` wrapped past a green engine test suite. There was no reason
+for the difference; nobody had written one down, which is the shape of a
+check that is not running rather than a decision. `[profile.checked]`
+inherits `release` and turns both on. The `quick` group's binary stays on
+`release`, because the checks cost time and time is what it measures. A
+profile is worth as much as the proof it is in effect: both flags were
+held to firing, a `usize::MAX + 1` that wraps silently under `release` and
+panics under `checked`, and a `debug_assert!(false)` that is compiled out
+under one and fails under the other.
+
 ## Shapes the bugs come in
 
 **A gate can be red for a reason that is not the engine's.** A "not

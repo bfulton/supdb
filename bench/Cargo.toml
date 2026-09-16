@@ -53,3 +53,16 @@ opt-level = 3
 lto = true
 codegen-units = 1
 debug = 1
+
+# What this workspace's tests run under, as the engine's do. `cargo test
+# --release` ran with the arithmetic and the invariants unchecked on both
+# sides of the repository; the engine moved off it after a prefetch span
+# summed a rank and a scan's limit of `usize::MAX`, wrapped, and passed
+# every check green. This side kept `--release` for a while longer for no
+# reason anyone had written down, which is the whole shape of a check that
+# is not running. The binaries a measurement uses stay on `release`: the
+# checks cost time, and time is what they measure.
+[profile.checked]
+inherits = "release"
+overflow-checks = true
+debug-assertions = true
