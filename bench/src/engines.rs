@@ -263,11 +263,11 @@ pub struct Supdb {
     drain: bool,
     /// The block cache: scans over unsealed keys walk cached copies of the
     /// partition blocks they cross instead of merging every source, and a
-    /// write drops the block it lands in. Off in the default arm because
-    /// the option is off by default; the arm that turns it on runs
-    /// interleaved with the one that does not, which is the only way to
-    /// price it, and with LMDB, whose in-place tree is what the cache is
-    /// measured against on the scan mixes.
+    /// write is settled into the block it lands in. On in the default arm
+    /// because the option is on by default; the arm that turns it off
+    /// runs interleaved with it, which is the only way to price it, and
+    /// with LMDB, whose in-place tree is what the cache is measured
+    /// against on the scan mixes.
     block_cache: bool,
     /// A read advice pinned against the engine's own default, or `None` to
     /// take whatever the default is.
@@ -289,7 +289,7 @@ pub struct Supdb {
 
 impl Supdb {
     pub fn create(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, true, true, None, false, true)
+        Supdb::with_policy(path, true, true, None, true, true)
     }
 
     pub fn create_ingest(path: &Path) -> Res<Supdb> {
@@ -299,7 +299,7 @@ impl Supdb {
     /// `sync` fsyncs and seals nothing; reads then answer from the
     /// memtable, the unrouted tail and the partitions together.
     pub fn create_nodrain(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, true, false, None, false, true)
+        Supdb::with_policy(path, true, false, None, true, true)
     }
 
     /// `supdb` in every respect but the read advice, which is pinned to the
@@ -311,15 +311,16 @@ impl Supdb {
             true,
             true,
             Some(supdb::ReadAdvice::Normal),
-            false,
+            true,
             true,
         )
     }
 
-    /// `supdb` in every respect but the block cache, on. The pair differs
-    /// by one option and needs no matching.
-    pub fn create_blockcache(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(path, true, true, None, true, true)
+    /// `supdb` in every respect but the block cache, off: the merge on
+    /// every scan, the shape before the cache, kept as the comparison arm.
+    /// The pair differs by one option and needs no matching.
+    pub fn create_nocache(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(path, true, true, None, false, true)
     }
 
     fn with_policy(
@@ -403,9 +404,9 @@ impl Engine for Supdb {
             self.advice.is_some(),
             self.block_cache,
         ) {
-            (true, true, false, true) => "supdb-blockcache",
+            (true, true, false, false) => "supdb-nocache",
             (true, true, true, _) => "supdb-noadvice",
-            (true, true, false, false) => "supdb",
+            (true, true, false, true) => "supdb",
             (false, _, _, _) => "supdb-ingest",
             (true, false, _, _) => "supdb-nodrain",
         }
@@ -791,7 +792,7 @@ use crate::row::Guarantee;
 pub const ARMS: [&str; 8] = [
     "supdb",
     "supdb-noadvice",
-    "supdb-blockcache",
+    "supdb-nocache",
     "lmdb",
     "rocksdb-tuned",
     "supdb-ingest",
@@ -801,7 +802,7 @@ pub const ARMS: [&str; 8] = [
 
 pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
-        "supdb" | "supdb-noadvice" | "supdb-blockcache" | "lmdb" | "rocksdb-tuned" => {
+        "supdb" | "supdb-noadvice" | "supdb-nocache" | "lmdb" | "rocksdb-tuned" => {
             Guarantee::Durable
         }
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
@@ -815,7 +816,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
     Ok(match arm {
         "supdb" => Box::new(Supdb::create(dir)?),
         "supdb-noadvice" => Box::new(Supdb::create_noadvice(dir)?),
-        "supdb-blockcache" => Box::new(Supdb::create_blockcache(dir)?),
+        "supdb-nocache" => Box::new(Supdb::create_nocache(dir)?),
         "supdb-ingest" => Box::new(Supdb::create_ingest(dir)?),
         "lmdb" => Box::new(Lmdb::create(dir, map_gb)?),
         "lmdb-nosync" => Box::new(Lmdb::create_nosync(dir, map_gb)?),

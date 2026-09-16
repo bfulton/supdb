@@ -46,7 +46,7 @@ fn style(arm: &str) -> (&'static str, &'static str) {
     match arm {
         "supdb" | "supdb-ingest" => (INK, ""),
         "supdb-noadvice" => (ACCENT, ""),
-        "supdb-blockcache" => (ACCENT, "7,4"),
+        "supdb-nocache" => (ACCENT, "7,4"),
         "lmdb" | "lmdb-nosync" => (GREY, ""),
         "rocksdb-tuned" | "rocksdb-nosync" => (GREY, "7,4"),
         _ => (GREY, "2,3"),
@@ -58,7 +58,7 @@ fn pretty(arm: &str) -> &'static str {
     match arm {
         "supdb" => "supdb",
         "supdb-noadvice" => "supdb (no advice)",
-        "supdb-blockcache" => "supdb (block cache)",
+        "supdb-nocache" => "supdb (no block cache)",
         "supdb-ingest" => "supdb (buffered)",
         "lmdb" => "LMDB",
         "lmdb-nosync" => "LMDB (nosync)",

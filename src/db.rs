@@ -342,9 +342,14 @@ pub struct Options {
     /// instead of two hash probes and an allocation. `false` is the merge
     /// before it, kept as the comparison arm.
     pub scan_merge: bool,
-    /// PROTOTYPE, off by default: keep merged copies of the partition
+    /// PROTOTYPE, on by default: keep merged copies of the partition
     /// blocks that scans read over unsealed keys, so a scan over them
-    /// walks one sorted copy instead of merging. A block is built on first
+    /// walks one sorted copy instead of merging. `false` is the merge on
+    /// every scan, the shape before it, kept as the comparison arm. What
+    /// the cache costs is memory, about a tenth of the store after a pass
+    /// that reaches every block, unbounded unless `scan_cache_bytes` says
+    /// otherwise; on every workload but the scan mixes it prices the same
+    /// as the arm without it. A block is built on first
     /// read through the merge; a write to a key it owns is settled into it
     /// in place at the next scan, the key's run resolved as a build would;
     /// and every block is dropped whenever the segments change.
@@ -407,7 +412,7 @@ impl Default for Options {
             read_advice: ReadAdvice::default(),
             scan_readahead_bytes: 256 << 10,
             scan_merge: true,
-            scan_block_cache: false,
+            scan_block_cache: true,
             scan_cache_bytes: 0,
             scan_cache_ahead: false,
             scan_snapshot_arena: true,

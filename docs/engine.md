@@ -531,7 +531,7 @@ per-commit path.
   through the posting-counting walk, and a hash probe per key per source.
   Both are fixed and both arms gained. The ordered scan needs re-measuring
   against LMDB before anyone knows where the ordered axis stands.
-- **The block cache** (`Options::scan_block_cache`, off; `scan_cache_bytes`,
+- **The block cache** (`Options::scan_block_cache`, on; `scan_cache_bytes`,
   none) — built and measured, an arm of the suite, not shipped. The
   ordered scan over unsealed keys merged the memtable's chained values
   with the partition at about 80 ns a key, and ycsb-E scans the keys the
@@ -616,8 +616,12 @@ per-commit path.
   ahead, E's first pass 345k–380k against 345k–374k with it off and its
   second 385k–409k against 412k–437k; copies only, 360k–375k and
   418k–443k, at 311 MB against 290. A tie, and it stays one until E
-  starts on a smaller memtable, so the option stays off and its code is
-  marked.
+  starts on a smaller memtable, so the builder stays off. The cache is
+  on by default: its write path settles in place, and in every quick row
+  the arm with it prices the same as the arm without on every workload
+  but E, where it runs three times the merge -- what it costs is the
+  memory, which `scan_cache_bytes` bounds when the caller says so. The
+  merge on every scan is the comparison arm, `supdb-nocache` in the suite.
 - **Ordered ingest straight into segments** — built, and the default.
   The load's keys arrive in order and went through a memtable, a WAL
   frame, a seal that sorts the sorted, and a partitioning pass; the
