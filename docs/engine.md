@@ -626,7 +626,14 @@ per-commit path.
   0.16–0.17, the seek 0.41–0.48 to 0.35–0.38, E's first pass 357k–381k
   to 392k–415k and its second 382k–414k to 461k–470k; at three million
   the sparse walk 0.45 to 0.18, the seek 0.25–0.31 to 0.21–0.23, E
-  427k–432k to 484k–496k and 480k–512k to 561k–574k. The write
+  427k–432k to 484k–496k and 480k–512k to 561k–574k. Where that
+  leaves E against LMDB with both, two rounds interleaved on the store
+  A, F and D leave: at thirty million the first pass 454k–460k against
+  404k–415k, 1.09x to 1.14x, the second 539k–554k against 418k–423k,
+  1.27x to 1.33x; at three million 565k against 498k–500k and
+  645k–675k against 500k–514k. The overlay LMDB never has now costs
+  less than the walk it saves, so the standing above is the one before
+  this and not the one to quote. The write
   path settles in
   place: a write is queued and, at the next scan, spliced into the built
   block it landed in -- the key's run resolved as a build resolves it,
