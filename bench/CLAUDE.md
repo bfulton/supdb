@@ -50,9 +50,10 @@ regression and a 1.9x scan regression that were both the machine; the
 alternating rerun found a 5% load regression at 300k and a 6% read
 regression at 100k that the next sitting turned into no effect and a 24%
 IMPROVEMENT. What survived every sitting was the large effects and the
-one quantity that is not a rate: device bytes per byte stored came back
+quantities that are not rates: device bytes per byte stored came back
 identical to three decimals every time, and it is what named the
-mechanism. Prefer the deterministic quantity for the WHY, demand a second
+mechanism; bytes on disk per byte stored, the store's files as
+allocated after the load, is the other. Prefer the deterministic quantity for the WHY, demand a second
 sitting for the WHETHER, and claim nothing from a margin that only one
 sitting has seen.
 

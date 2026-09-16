@@ -14,7 +14,7 @@ Five, plus two floors. Each yields one or more quantities.
 
 | workload | shape | quantities |
 |---|---|---|
-| `load` | n keys in key order, 100-byte values, durable per batch | ops/s, device bytes written per byte stored |
+| `load` | n keys in key order, 100-byte values, durable per batch | ops/s, device bytes written per byte stored, bytes on disk per byte stored |
 | `load-shuffled` | the same keys in shuffled order | ops/s |
 | `read` | uniform point reads over the loaded set | reads/s, p99 µs |
 | `scan` | `size/100` scans of 100 entries, from uniform random starts | entries/s |
@@ -42,6 +42,17 @@ are what "as fast as possible" means on that host; an engine's distance from
 them is the headroom left. The scan floor's file fits in memory at `quick`
 and is served from the page cache after its first walk, which is also what a
 store that fits in memory sees; at `full` neither fits.
+
+The load's two byte quantities are taken apart. Device bytes written per
+byte stored is the device's write counter across the load: what the
+engine made the disk do to take the keys durably, amplification included.
+Bytes on disk per byte stored is what the store's files hold once the
+load is done and before any read, every file under the arm's directory
+at any depth, in allocated blocks rather than lengths, since a map file's
+length can run past what was ever written to it: what a user pays in
+space, with whatever an engine leaves unmerged at that point -- a log
+tail, a memtable's worth not yet sealed -- counted as the user would find
+it.
 
 YCSB-D reads uniformly over the loaded keys rather than skewed to the latest
 inserts: the latest distribution needs a Zipfian over a count that grows

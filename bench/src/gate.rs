@@ -24,7 +24,7 @@ pub const MIN_HISTORY: usize = 3;
 pub fn higher_is_better(quantity: &str) -> Option<bool> {
     Some(match quantity {
         "ops_per_s" | "reads_per_s" | "entries_per_s" | "bytes_per_s" => true,
-        "p99_us" | "device_bytes_per_byte" => false,
+        "p99_us" | "device_bytes_per_byte" | "bytes_on_disk_per_byte" => false,
         _ => return None,
     })
 }

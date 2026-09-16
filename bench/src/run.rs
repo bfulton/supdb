@@ -251,6 +251,14 @@ pub fn run(
                         one.load_bpb,
                     );
                     s.push(
+                        "load",
+                        sz,
+                        arm,
+                        g,
+                        ("bytes_on_disk_per_byte", "B/B"),
+                        one.disk_bpb,
+                    );
+                    s.push(
                         "load-shuffled",
                         sz,
                         arm,
@@ -343,9 +351,36 @@ fn row_of(utc: &str, machine: &MachineInfo, plan: &Plan, s: &Samples) -> Row {
     }
 }
 
+/// The bytes the files under `dir` are allocated on disk, walked to any
+/// depth: allocated blocks rather than lengths, since a map file's length
+/// can run past what was ever written to it.
+fn dir_bytes(dir: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                stack.push(e.path());
+            } else {
+                total += md.blocks() * 512;
+            }
+        }
+    }
+    total
+}
+
 struct OnePass {
     load_ops_s: f64,
     load_bpb: f64,
+    /// Bytes the store's files hold on disk after the load, per byte
+    /// stored: what a user pays in space, beside what the device was made
+    /// to write to get there.
+    disk_bpb: f64,
     shuffled_ops_s: f64,
     reads_s: f64,
     p99_us: f64,
@@ -366,6 +401,7 @@ fn one_pass(
     let mut e = engines::open(arm, dir, map_gb)?;
     let (load_s, wrote) = load(e.as_mut(), size, plan, payload, |i| i)?;
     let stored = size as f64 * (KEY_SIZE + plan.value_size) as f64;
+    let on_disk = dir_bytes(dir);
 
     let mut kb = [0u8; KEY_SIZE];
     let mut g = KeyGen::new(KeyDist::Uniform, size, 7);
@@ -412,6 +448,7 @@ fn one_pass(
     Ok(OnePass {
         load_ops_s: size as f64 / load_s,
         load_bpb: wrote as f64 / stored,
+        disk_bpb: on_disk as f64 / stored,
         shuffled_ops_s: size as f64 / shuf_s,
         reads_s: size as f64 / read_s,
         p99_us: h.percentile(99.0) as f64 / 1000.0,

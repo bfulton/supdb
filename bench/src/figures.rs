@@ -525,6 +525,7 @@ fn message(
         "ops_per_s" | "reads_per_s" | "entries_per_s" => "throughput",
         "p99_us" => "p99 latency",
         "device_bytes_per_byte" => "device bytes per byte",
+        "bytes_on_disk_per_byte" => "bytes on disk per byte",
         _ => quantity,
     };
     let g = match guarantee {
