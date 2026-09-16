@@ -117,11 +117,17 @@ comparator a user would otherwise pick.
 
 | guarantee | supdb | comparators |
 |---|---|---|
-| durable per batch | `supdb` (default), `supdb-noadvice`, `supdb-nocache`, `supdb-cache256` | `lmdb`, `rocksdb-tuned` |
+| durable per batch | `supdb` (default), `supdb-forms`, `supdb-noadvice`, `supdb-nocache`, `supdb-cache256` | `lmdb`, `rocksdb-tuned` |
 | buffered | `supdb-ingest` | `lmdb-nosync`, `rocksdb-nosync` |
 
 Every shipping option is an arm because a user can choose it and deserves the
-number. A cache is matched like a guarantee: `supdb`'s block cache has no
+number. `supdb-forms` is where the range-read structure is kept: the writer
+holds every overlaid block's form current at each commit, so a reader walks
+one structure, against the default where each reader merges the partition
+with the unsealed keys for itself. The pair prices the trade directly --
+what the writer pays at its commits against what a scan past unsealed
+writes costs -- and `scan-mixed`, the threaded scans on the store the mixes
+leave, is the workload it was added for. A cache is matched like a guarantee: `supdb`'s block cache has no
 bound, as LMDB's page cache has none but the machine's, and `supdb-cache256`
 bounds it at the 256 MB `rocksdb-tuned` runs its block cache on, so each
 comparator is read against the arm on the same memory. An option that is never better than the default on any machine class
