@@ -2136,6 +2136,7 @@ fn a_builder_ahead_of_the_reader_fills_the_cache() {
         l0_trigger: 64,
         scan_block_cache: true,
         scan_cache_ahead: true,
+        scan_cache_ahead_min_blocks: 0,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -2201,6 +2202,7 @@ fn a_builder_ahead_of_the_reader_fills_the_cache() {
             l0_trigger: 64,
             scan_block_cache: true,
             scan_cache_ahead: true,
+            scan_cache_ahead_min_blocks: 0,
             ..Options::default()
         },
     )
