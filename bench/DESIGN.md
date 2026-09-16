@@ -93,7 +93,14 @@ what the loaded store holds, because a reader that answered a different
 store would post a throughput like any other. The counts are one, two and
 four because the class the suite gates on has four cores; a class with
 more runs the same counts, since the counts name the quantities and the
-gate names every quantity. Still on the backlog: the mixes threaded,
+gate names every quantity. The threaded scans run once more after the
+mixes, on the store they leave, as the workload `scan-mixed`: the keys
+the mixes updated and inserted are unsealed there, so every handle's
+pass builds the blocks it walks over them, and what the pass measures
+is an engine's cost of reading past its own unsealed writes on several
+threads; the pass on the store as loaded walks clean partitions and
+measures the walk. Every thread's bytes are held to at least the loaded
+store's, since a mix only adds to a key. Still on the backlog: the mixes threaded,
 readers beside a writer, and writers beside each other, which is an
 engine question first, since supdb is single-writer. An engine's own
 threads are the engine's: supdb seals, merges and, with the block cache,

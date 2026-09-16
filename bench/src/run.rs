@@ -329,6 +329,10 @@ pub fn run(
                             *ops_s,
                         );
                     }
+                    for (threads, v) in &one.scan_mixed_threaded {
+                        let q = threaded_quantity("entries_per_s", *threads);
+                        s.push("scan-mixed", sz, arm, g, (q.as_str(), "entries/s"), *v);
+                    }
                 }
                 let top = *THREADS.last().unwrap_or(&1);
                 let at_top = |v: &[(usize, f64)]| {
@@ -419,6 +423,10 @@ struct OnePass {
     reads_s_threaded: Vec<(usize, f64)>,
     scan_entries_s_threaded: Vec<(usize, f64)>,
     ycsb_ops_s: Vec<(char, f64)>,
+    /// The threaded scans again on the store the mixes leave, where the
+    /// keys they updated and inserted are unsealed: (threads, aggregate
+    /// throughput).
+    scan_mixed_threaded: Vec<(usize, f64)>,
 }
 
 fn one_pass(
@@ -527,6 +535,33 @@ fn one_pass(
         let secs = ycsb(e.as_mut(), w, size, &mut inserted, payload)?;
         ycsb_ops_s.push((letter, ycsb_ops(size) as f64 / secs));
     }
+
+    // The threaded scans again, on the store the mixes leave: the keys
+    // they updated and inserted are unsealed, so a handle's pass builds
+    // the blocks it walks, where the pass on the store as loaded walks
+    // clean partitions. Every thread's bytes are at least the loaded
+    // store's, since a mix only adds to a key; what an engine adds for
+    // an update is its own and is not held to.
+    let mut scan_mixed_threaded = Vec::with_capacity(THREADS.len());
+    for threads in THREADS {
+        let ops = scans * threads as u64;
+        let (secs, bytes) = threaded(
+            e.as_ref(),
+            threads,
+            ops,
+            scan_keys,
+            0x5CA1,
+            Op::Range(plan.scan_len),
+        )?;
+        let want = ops * (plan.scan_len as u64).min(size) * plan.value_size as u64;
+        if bytes < want {
+            return Err(format!(
+                "{arm} at {size}: scans on {threads} threads after the mixes read back {bytes} bytes \
+                 and the loaded store alone holds {want}; a reader over a different store is not a measurement"
+            ));
+        }
+        scan_mixed_threaded.push((threads, (ops * plan.scan_len as u64) as f64 / secs));
+    }
     drop(e);
     let _ = std::fs::remove_dir_all(dir);
 
@@ -548,6 +583,7 @@ fn one_pass(
         reads_s_threaded,
         scan_entries_s_threaded,
         ycsb_ops_s,
+        scan_mixed_threaded,
     })
 }
 

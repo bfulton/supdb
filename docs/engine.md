@@ -1002,6 +1002,28 @@ per-commit path.
   before; the state records the answer at publish. Ten rounds after:
   427k–480k against 464k–501k at 300k, 94%, and level at 100k in seven
   rounds of ten with three a third slower that the base did not show.
+  A block cache shared between handles was built and measured, and not
+  kept. Three versions: a table under a mutex, one under a read-write
+  lock, and one of atomic slots in the state, a slot per block, a form
+  installed by compare-and-swap at the log position its handle had
+  settled to and taken by a handle at the same position, replaced forms
+  retired against the reader epoch and freed by the writer. All three
+  answered the model. Timed per block with cycle counters, four reader
+  threads over the store A leaves at a hundred thousand keys: a
+  handle's own first touch is a build of 3,300–4,600 cycles and a walk
+  of 1,800; a shared one is a take of 500–1,300 and a walk of
+  3,500–5,100, since the form's buffers were written by another core
+  and its refcount is contended, and a build that installs costs 1,400
+  more than one that does not. The passes came out even: the build a
+  take saves reads the memtable across cores, and the take reads the
+  form across cores instead. At three million keys, four threads,
+  three passes each, shared 185–203, 125–142 and 111–114 ms against
+  176–197, 117–122 and 106–110 for the handles' own. What sharing buys
+  is one copy of the forms in memory rather than one per handle, and
+  the builder ahead's forms reaching reader handles; neither moved a
+  figure, so the handles keep their own. The suite's `scan-mixed`
+  workload, threaded scans on the store the mixes leave, is where a
+  later attempt would show.
   The six percent left is the pointer to the state and the `Arc` each
   segment sits behind, and it is the price of a state a reader thread
   can hold. The block cache's slots as atomic pointers a
