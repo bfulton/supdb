@@ -111,6 +111,14 @@ fn ycsb_ops(size: u64) -> u64 {
     (size / 6).max(1_000)
 }
 
+/// The store updated by this much of itself, as a percentage, before the
+/// scans at each point of the lag sweep. Zero is the drained store, and
+/// a hundred is every key written once with nothing merged since, which
+/// at the ladder's top rung is past the seal and so is one or more
+/// unmerged pieces -- which is what lag is. The points are fractions
+/// rather than counts so a quantity means the same thing at every rung.
+const LAG_PCT: [u64; 4] = [0, 1, 10, 100];
+
 /// The scan floor's file: the top rung's bytes, capped, so `full` on a
 /// large machine does not spend its disk on a file that is not a store.
 const SCAN_FLOOR_CAP: u64 = 4 << 30;
@@ -311,6 +319,10 @@ pub fn run(
                         ("entries_per_s", "entries/s"),
                         one.scan_entries_s,
                     );
+                    for (pct, v) in &one.scan_lag {
+                        let q = format!("entries_per_s_lag{pct}pct");
+                        s.push("scan-lag", sz, arm, g, (q.as_str(), "entries/s"), *v);
+                    }
                     for (threads, v) in &one.reads_s_threaded {
                         let q = threaded_quantity("reads_per_s", *threads);
                         s.push("read", sz, arm, g, (q.as_str(), "reads/s"), *v);
@@ -418,6 +430,12 @@ struct OnePass {
     reads_s: f64,
     p99_us: f64,
     scan_entries_s: f64,
+    /// Scans over a store with this much of itself written and nothing
+    /// merged since: (percent updated, entries per second). The axis the
+    /// engine's shape lives on -- one fully merged form reads the same
+    /// at every point, and a store that defers merging trades this curve
+    /// for its write cost.
+    scan_lag: Vec<(u64, f64)>,
     /// The same reads and scans again over each count in `THREADS`:
     /// (threads, aggregate throughput).
     reads_s_threaded: Vec<(usize, f64)>,
@@ -570,6 +588,46 @@ fn one_pass(
     let mut e = engines::open(arm, dir, map_gb)?;
     let perm = Permutation::new(size, 0x5EED);
     let (shuf_s, _) = load(e.as_mut(), size, plan, payload, |i| perm.at(i))?;
+
+    // The lag sweep, on the store the shuffled load just left, so it
+    // costs no load of its own: the same scans as the scan workload, at
+    // each depth of unmerged writes. The first point is the drained
+    // store; each point after it writes another slice of the store and
+    // scans without merging in between, so the curve is scan throughput
+    // against merge lag rather than one number at whatever lag a
+    // workload happened to leave.
+    let mut scan_lag = Vec::with_capacity(LAG_PCT.len());
+    let mut vrng = Rng::new(0x1A5);
+    let mut updated = 0u64;
+    let mut ug = KeyGen::new(KeyDist::Uniform, size, 0x1A6);
+    let mut buf = Batch::with_capacity(plan.batch, payload.value_size());
+    for pct in LAG_PCT {
+        let want = size * pct / 100;
+        while updated < want {
+            db_key_into(ug.next(), &mut kb);
+            buf.push(&kb, payload.get(&mut vrng));
+            updated += 1;
+            if buf.len() == plan.batch {
+                buf.flush_updates(e.as_mut())?;
+            }
+        }
+        if !buf.is_empty() {
+            buf.flush_updates(e.as_mut())?;
+        }
+        if pct == 0 {
+            // Nothing unmerged: the shuffled load's own tail is drained
+            // here, so the first point is the fully merged store.
+            e.sync()?;
+        }
+        let mut g3 = KeyGen::new(KeyDist::Uniform, scan_keys, 0x1A7);
+        let t = Instant::now();
+        for _ in 0..scans {
+            db_key_into(g3.next(), &mut kb);
+            e.range(&kb, plan.scan_len)?;
+        }
+        let secs = t.elapsed().as_secs_f64();
+        scan_lag.push((pct, (scans * plan.scan_len as u64) as f64 / secs));
+    }
     drop(e);
 
     Ok(OnePass {
@@ -577,6 +635,7 @@ fn one_pass(
         load_bpb: wrote as f64 / stored,
         disk_bpb: on_disk as f64 / stored,
         shuffled_ops_s: size as f64 / shuf_s,
+        scan_lag,
         reads_s: size as f64 / read_s,
         p99_us: h.percentile(99.0) as f64 / 1000.0,
         scan_entries_s: (scans * plan.scan_len as u64) as f64 / scan_s,

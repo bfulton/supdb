@@ -79,6 +79,7 @@ fn workload_noun(w: &str) -> &'static str {
         "read" => "Point reads",
         "scan" => "Ordered scans",
         "scan-mixed" => "Ordered scans on the store the mixes leave",
+        "scan-lag" => "Ordered scans against merge lag",
         "ycsb-A" => "YCSB-A, update-heavy (50/50 read/update, zipfian)",
         "ycsb-B" => "YCSB-B, read-mostly (95/5 read/update, zipfian)",
         "ycsb-C" => "YCSB-C, read-only (zipfian)",

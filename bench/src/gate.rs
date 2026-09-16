@@ -28,6 +28,8 @@ pub fn higher_is_better(quantity: &str) -> Option<bool> {
     Some(match quantity {
         "ops_per_s" | "reads_per_s" | "entries_per_s" | "bytes_per_s" => true,
         "reads_per_s_2t" | "reads_per_s_4t" | "entries_per_s_2t" | "entries_per_s_4t" => true,
+        "entries_per_s_lag0pct" | "entries_per_s_lag1pct" => true,
+        "entries_per_s_lag10pct" | "entries_per_s_lag100pct" => true,
         "p99_us" | "device_bytes_per_byte" | "bytes_on_disk_per_byte" => false,
         _ => return None,
     })
