@@ -329,6 +329,9 @@ pub struct Supdb {
     /// Whether the writer keeps the range-read structure current at each
     /// commit; `supdb-forms`.
     forms: bool,
+    /// Whether the sorted unsealed keys are the state's, built once and
+    /// carried forward, or each handle's own sorted afresh; `supdb-snap`.
+    snap: bool,
 }
 
 /// What an arm differs from `supdb` by. One struct rather than a row of
@@ -341,6 +344,7 @@ struct Policy {
     durable: bool,
     budget: usize,
     forms: bool,
+    snap: bool,
 }
 
 impl Default for Policy {
@@ -354,6 +358,7 @@ impl Default for Policy {
             durable: true,
             budget: 0,
             forms: false,
+            snap: false,
         }
     }
 }
@@ -384,6 +389,21 @@ impl Supdb {
             path,
             Policy {
                 forms: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` in every respect but where the sorted unsealed keys live:
+    /// in the state, built once and carried forward by merging each batch
+    /// into the run, instead of every handle sorting all of them for
+    /// itself whenever its own went stale; `share_snapshot` in the
+    /// engine. The pair differs by one option and needs no matching.
+    pub fn create_snap(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                snap: true,
                 ..Policy::default()
             },
         )
@@ -449,6 +469,7 @@ impl Supdb {
             durable,
             budget,
             forms,
+            snap,
         } = policy;
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         // Checksums off in the segments, because LMDB has none and the axis
@@ -488,6 +509,12 @@ impl Supdb {
             // The range-read structure written at ingest, or every
             // reader building its own: the engine's arm, priced here.
             commit_forms: forms,
+            // The sorted unsealed keys published in the state and carried
+            // forward, or each handle's own sorted from nothing: the
+            // engine's arm, priced here. `snapshot_adopt_behind` stays at
+            // the engine's default, since a run short of current is
+            // carried forward rather than taken as it stands.
+            share_snapshot: snap,
             // The guarantee the arm's row names, not the engine's default:
             // durable per batch, or frames written per commit and fsynced
             // at `sync`, which is how `lmdb-nosync` and `rocksdb-nosync`
@@ -517,6 +544,7 @@ impl Supdb {
             durable,
             budget,
             forms,
+            snap,
         })
     }
 }
@@ -553,6 +581,9 @@ impl Engine for Supdb {
         }
         if self.forms {
             return "supdb-forms";
+        }
+        if self.snap {
+            return "supdb-snap";
         }
         match (
             self.partition,
@@ -1023,9 +1054,10 @@ use crate::row::Guarantee;
 /// Every arm a run measures, in the order they are interleaved. Each is a
 /// shipping supdb configuration or the comparator a user would otherwise
 /// pick. Comparisons are made within a guarantee, never across one.
-pub const ARMS: [&str; 10] = [
+pub const ARMS: [&str; 11] = [
     "supdb",
     "supdb-forms",
+    "supdb-snap",
     "supdb-noadvice",
     "supdb-nocache",
     "supdb-cache256",
@@ -1038,8 +1070,8 @@ pub const ARMS: [&str; 10] = [
 
 pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
-        "supdb" | "supdb-forms" | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256"
-        | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
+        "supdb" | "supdb-forms" | "supdb-snap" | "supdb-noadvice" | "supdb-nocache"
+        | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
     })
@@ -1051,6 +1083,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
     Ok(match arm {
         "supdb" => Box::new(Supdb::create(dir)?),
         "supdb-forms" => Box::new(Supdb::create_forms(dir)?),
+        "supdb-snap" => Box::new(Supdb::create_snap(dir)?),
         "supdb-noadvice" => Box::new(Supdb::create_noadvice(dir)?),
         "supdb-nocache" => Box::new(Supdb::create_nocache(dir)?),
         "supdb-cache256" => Box::new(Supdb::create_cache256(dir)?),
