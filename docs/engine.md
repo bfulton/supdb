@@ -724,6 +724,27 @@ per-commit path.
   rather than only at the writer's publish, because a store between
   seals never reaches that and each retired snapshot holds the key bytes
   of everything unsealed.
+- **A snapshot is carried forward, not sorted again.** A committed batch
+  cannot change, so its order is settled once: the keys written since a
+  run was built are sorted on their own and merged into it, which is
+  linear in the run where a build is a radix pass and a sort of every
+  unsealed key with a random touch on each tie. Over one burst of writes
+  at a hundred thousand keys, the organiser went from fifteen builds to
+  three builds and fifteen merges, and the merges cost 0.13 ms at 1,976
+  keys rising to 2.3 ms at 61,377 against a build's 9.5 ms at 63,242.
+  The reader's own first scan is the same decision: the state's run
+  stopped 1,480 keys short of current, and taking that as it stands
+  would leave those in the added list while sorting afresh throws away a
+  run that is nearly all of the answer -- it merges instead, 3.6 ms
+  against 9.5. A handle carries forward whichever run is longer, its own
+  or the state's, and publishes what it ends with. First contact over a
+  fully unmerged store goes from 21.3 to 16.1 us a scan, six rounds
+  interleaved, and the round after it from 1.76 to 1.64. What a merge
+  still pays that it need not is the arena: the run's key bytes are
+  copied because the published run is immutable, so a merge is linear in
+  the run rather than in the batch. Runs kept side by side and folded
+  rarely -- what `side` and `fresh` already are on the merge path --
+  would drop that, and are what to do next.
 - **A published snapshot stops where its builder stopped, and the
   adopting handle must key its added list to that** and not to the
   memtable's end. The slots past it stay in the handle's list, where

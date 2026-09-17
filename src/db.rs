@@ -4334,6 +4334,10 @@ struct Shared {
     /// EXPERIMENT: scan snapshots built over this store's life, which is
     /// what publishing one is meant to bring down; for a test.
     snap_builds: AtomicU64,
+    /// EXPERIMENT: snapshots carried forward by merging a batch into the
+    /// run rather than sorting everything again; the count that should
+    /// rise where `snap_builds` stops.
+    snap_extends: AtomicU64,
 }
 
 /// EXPERIMENT: a replaced canonical form on its way to being freed. A
@@ -4728,6 +4732,72 @@ impl Snapshot {
             self.side = self.merged(side, fresh);
         }
     }
+    /// This snapshot with the live slots from where it stops up to `to`
+    /// folded in: their keys copied after the run's, so the run's offsets
+    /// stand, that batch sorted on its own, and the two merged. A
+    /// committed batch cannot change, so its order is settled once and
+    /// the run it joins never has to be sorted again -- the build it
+    /// replaces sorts every unsealed key afresh, which at 63,242 of them
+    /// is 9 ms, and the organiser paid that fifteen times over one burst
+    /// of writes. Only for a run with nothing filed into it: a handle's
+    /// side runs are that handle's own and are not what gets published.
+    fn extend(&self, mem: &MemTable, to: usize) -> Snapshot {
+        let from = self.live_len;
+        let mut out = Snapshot {
+            keys: self.keys.clone(),
+            ents: Vec::with_capacity(self.ents.len() + (to - from)),
+            live_len: to,
+            ..Default::default()
+        };
+        let mut batch: Vec<SnapKey> = Vec::with_capacity(to - from);
+        for i in from..to {
+            let e = mem.entry(i);
+            let key = mem.key_of(e);
+            let off = out.keys.len() as u32;
+            out.keys.extend_from_slice(key);
+            batch.push(SnapKey {
+                off,
+                len: key.len() as u32,
+                mem: i as u32,
+                frozen: u32::MAX,
+            });
+        }
+        let keys = &out.keys;
+        let key_at = |e: &SnapKey| &keys[e.off as usize..(e.off + e.len) as usize];
+        batch.sort_unstable_by(|a, b| key_at(a).cmp(key_at(b)));
+        let (mut i, mut j) = (0usize, 0usize);
+        let mut merged: Vec<SnapKey> = Vec::with_capacity(self.ents.len() + batch.len());
+        while i < self.ents.len() || j < batch.len() {
+            // The run first where the keys are equal, as the build pushes
+            // the frozen table's entries before the live ones. Which of
+            // the two is kept does not decide the fold -- `push_sorted`
+            // takes both slots onto whichever it kept and the key bytes
+            // are the same -- and reversing this passes every check; it
+            // is the build's order, and it leaves the kept entry's bytes
+            // in the older part of the arena. Only two can meet: the run
+            // holds one entry a key and the memtable gives a key one
+            // slot, so a slot past `from` is a key the run has from the
+            // frozen table alone.
+            let run_first = match (self.ents.get(i), batch.get(j)) {
+                (Some(a), Some(b)) => self.key_of(a) <= key_at(b),
+                (Some(_), None) => true,
+                _ => false,
+            };
+            merged.push(if run_first {
+                i += 1;
+                self.ents[i - 1]
+            } else {
+                j += 1;
+                batch[j - 1]
+            });
+        }
+        out.ents = Vec::with_capacity(merged.len());
+        for e in merged {
+            out.push_sorted(e);
+        }
+        out
+    }
+
     fn merged(&self, a: Vec<SnapKey>, b: Vec<SnapKey>) -> Vec<SnapKey> {
         let mut out = Vec::with_capacity(a.len() + b.len());
         let (mut i, mut j) = (0usize, 0usize);
@@ -5938,6 +6008,33 @@ impl Reader {
     /// EXPERIMENT: this state's published snapshot, cloned. Called under
     /// a pin, which is what holds the pointee across the clone: a swap
     /// beside it retires the old reference rather than dropping it.
+    /// EXPERIMENT: a snapshot of the live memtable up to `to`, over this
+    /// state, got the cheapest way that is correct: carried forward from
+    /// `have` when it is a run of the same state that stops short of
+    /// `to`, and sorted from nothing when it is not. Whatever comes back
+    /// is offered to the state.
+    fn snapshot_to(
+        &self,
+        to: usize,
+        have: Option<std::sync::Arc<Snapshot>>,
+    ) -> std::sync::Arc<Snapshot> {
+        let carry = have.filter(|s| {
+            s.live_len <= to && s.side.is_empty() && s.fresh.is_empty() && s.live_len > 0
+        });
+        let snap = match carry {
+            Some(s) if s.live_len == to => return s,
+            Some(s) => {
+                self.shared
+                    .snap_extends
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                std::sync::Arc::new(s.extend(self.mem(), to))
+            }
+            None => std::sync::Arc::new(self.build_snapshot(to)),
+        };
+        self.publish_snapshot(&snap);
+        snap
+    }
+
     fn adopt_snapshot(&self) -> Option<std::sync::Arc<Snapshot>> {
         if !self.opts.share_snapshot {
             return None;
@@ -6165,16 +6262,34 @@ impl Reader {
             // saving: the sort is of every unsealed key, and a handle
             // that scans a store someone else is already scanning would
             // otherwise repeat it in full.
+            // What this handle holds already, when it is a run over this
+            // same state: carrying that forward is a merge of the batch
+            // written since, where building is a sort of everything.
+            let have = cache
+                .as_ref()
+                .filter(|(g, _)| *g == gen)
+                .map(|(_, s)| s.clone());
             let snap = match self.adopt_snapshot() {
                 Some(s)
                     if live_len.saturating_sub(s.live_len) <= self.opts.snapshot_adopt_behind =>
                 {
                     s
                 }
-                _ => {
-                    let s = std::sync::Arc::new(self.build_snapshot(live_len));
-                    self.publish_snapshot(&s);
-                    s
+                // Short of current: carry the longer of the two runs
+                // forward rather than sort everything again. Taking it
+                // as it stands would leave the keys past it in the added
+                // list; sorting afresh throws away a run that is nearly
+                // all of the answer -- at a hundred thousand keys each
+                // updated once, the state's run stopped 1,480 keys short
+                // and the build that replaced it cost 9.5 ms where the
+                // merge costs 2.
+                published => {
+                    let base = match (have, published) {
+                        (Some(a), Some(b)) if b.live_len > a.live_len => Some(b),
+                        (Some(a), _) => Some(a),
+                        (None, b) => b,
+                    };
+                    self.snapshot_to(live_len, base)
                 }
             };
             // The keys the snapshot has are not added keys; an adopted
@@ -7779,6 +7894,7 @@ impl Db {
             retired_forms: std::sync::Mutex::new(Vec::new()),
             retired_snaps: std::sync::Mutex::new(Vec::new()),
             snap_builds: AtomicU64::new(0),
+            snap_extends: AtomicU64::new(0),
         });
         let r = Reader {
             shared,
@@ -8057,6 +8173,7 @@ impl Db {
             retired_forms: std::sync::Mutex::new(Vec::new()),
             retired_snaps: std::sync::Mutex::new(Vec::new()),
             snap_builds: AtomicU64::new(0),
+            snap_extends: AtomicU64::new(0),
         });
         let r = Reader {
             shared,
@@ -8870,6 +8987,12 @@ impl Db {
     /// read it, which is what a test asks.
     pub fn snapshot_builds(&self) -> u64 {
         self.shared.snap_builds.load(AtomicOrdering::Relaxed)
+    }
+
+    /// EXPERIMENT: snapshots carried forward by a merge rather than a
+    /// sort of everything; see `Snapshot::extend`.
+    pub fn snapshot_extends(&self) -> u64 {
+        self.shared.snap_extends.load(AtomicOrdering::Relaxed)
     }
 
     /// PROTOTYPE: how many states a publish replaced are still held for a
@@ -9844,13 +9967,14 @@ impl Reader {
         if !self.pin_at(gen, wm, log) {
             return Ok(());
         }
-        // The builder does not adopt one: it needs the keys up to `len`
-        // exactly, and a published snapshot stops wherever the handle
-        // that built it stopped. It publishes, which is the point --
-        // this build is off the read path, and a handle that reads the
-        // state after it takes these keys instead of sorting them again.
-        let unsealed = std::sync::Arc::new(self.build_snapshot(len));
-        self.publish_snapshot(&unsealed);
+        // The builder needs the keys up to `len` exactly, so it takes a
+        // published snapshot only to carry it forward: one that stops
+        // short is merged with the batch since, and one past `len` holds
+        // keys this commit does not cover and is no use. It publishes
+        // what it ends with, which is the point of it -- this work is on
+        // a core the reads are not using, and a handle that reads the
+        // state after takes these keys instead of sorting them again.
+        let unsealed = self.snapshot_to(len, self.adopt_snapshot().filter(|s| s.live_len <= len));
         let ctx = self.build_ctx();
         // Under a budget, the forms queued for the install are bounded
         // by it too: the store sheds past the budget only as it installs.

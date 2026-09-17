@@ -4151,3 +4151,81 @@ fn a_handle_that_adopts_a_snapshot_sees_the_keys_written_past_it() {
         "and it read them without building one of its own"
     );
 }
+
+/// A snapshot carried forward rather than sorted again: the batch written
+/// since it was built is sorted on its own and merged into the run, which
+/// is what an immutable batch costs once. The merge has to fold as the
+/// build's sort does: a key the frozen memtable holds and a live write
+/// then touches is one key with two slots, and left as two entries the
+/// merge path emits the frozen values and drops the live ones.
+#[test]
+fn a_snapshot_carried_forward_folds_a_live_write_onto_a_frozen_key() {
+    carry_model(true);
+}
+
+/// The same on the merge path, where the snapshot's runs are what a scan
+/// walks rather than the bounds of a block it builds: a key left in the
+/// run twice is emitted twice there, which the block path does not show.
+#[test]
+fn a_snapshot_carried_forward_on_the_merge_path_folds_it_too() {
+    carry_model(false);
+}
+
+fn carry_model(block_cache: bool) {
+    let d = dir(&format!("extend-snap-{block_cache}"));
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        scan_block_cache: block_cache,
+        scan_cache_ahead: false,
+        share_snapshot: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:06}");
+    for k in (0..6000u32).step_by(3) {
+        m.append(&mut db, &key(k), "p");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    assert!(db.levels().0 > 1, "several partitions");
+    // A seal that is not joined, so the snapshot is built over a frozen
+    // memtable and a live one both.
+    for k in (0..6000u32).step_by(6) {
+        m.append(&mut db, &key(k), "f");
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    assert!(db.in_flight().0, "a seal in flight");
+    for k in (0..6000u32).step_by(12) {
+        m.append(&mut db, &key(k), "l0");
+    }
+    db.commit().unwrap();
+    let mut sink = 0usize;
+    db.scan(key(0).as_bytes(), 6000, |_k, v| sink += v.len())
+        .unwrap();
+    let built = db.snapshot_builds();
+    assert_eq!(db.snapshot_extends(), 0, "the first one is sorted");
+    // More new slots than a snapshot may lack before a scan renews it.
+    // Half of these are live writes onto keys only the frozen table
+    // holds, which is the fold; the rest are keys nothing holds yet.
+    for k in (0..6000u32).step_by(6) {
+        m.append(&mut db, &key(k), "l1");
+    }
+    m.delete(&mut db, &key(18));
+    for k in 6000..13000u32 {
+        m.append(&mut db, &key(k), "l1");
+    }
+    db.commit().unwrap();
+    db.scan(key(0).as_bytes(), 6000, |_k, v| sink += v.len())
+        .unwrap();
+    assert_eq!(
+        db.snapshot_builds(),
+        built,
+        "the second is carried forward, not sorted again"
+    );
+    assert_eq!(db.snapshot_extends(), 1, "by one merge");
+    m.check(&db, "a snapshot carried forward over a frozen memtable");
+}
