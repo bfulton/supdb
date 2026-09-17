@@ -182,13 +182,32 @@ to the order, and the direction always favours the arm being tried. What
 survives the swap is what the suite can say: `scan-mixed` on four threads
 read 1.135x with the arm third and 1.136x with it first.
 
-Why the first pass of a rep is dearer is not yet known, so nothing here
-corrects for it: a pass removes its store when it ends, and the first arm of
-the next rep starts against whatever the filesystem is still reclaiming,
-which is a guess and not a measurement. Until it is measured, read a
-cross-arm ratio on `load` or `scan-lag` as carrying that bias, and confirm
-any ratio that matters by running the roster with the arm in another
-position.
+What the penalty is made of, measured by timing each pass's load in two
+parts and printing it by position. It is a fixed cost and not a rate: the
+arm at position zero was dearer than the five behind it by 1.167x at ten
+thousand keys, 1.062x at thirty, 1.100x at a hundred and 0.979x at three
+hundred -- a few milliseconds, which is a fifth of a twelve-millisecond
+load and a hundredth of a three-hundred-millisecond one. It is not the
+teardown: removing the store a pass leaves took 0 to 6 ms for every arm
+alike, position zero included. Part of it is the device: syncing and
+letting it settle before each pass cut the penalty to 1.067x, 1.056x and
+1.019x at the first three rungs, so the first arm of a rep does wait on
+what the pass before it queued -- position zero is the only arm whose
+predecessor is the previous rep's last, `rocksdb-nosync`, which never
+flushes and hands the kernel its memtable at close. A sync without the
+settle did not reproduce that, so queued writeback is part of the cause
+and not all of it.
+
+Nothing here corrects for it yet, because neither intervention is clean
+where the penalty is largest: at the two smallest rungs a load is 11-37 ms
+and settling the device before each pass moves it by about as much as the
+bias does, so the cure is inside the error of the disease. Rotating the
+roster would spread the cost rather than remove it, and with eleven arms
+and five reps it cannot spread it evenly, so it would trade a bias that is
+named for one that is not. Until the residual is found, read a cross-arm
+ratio on `load` or `scan-lag` against `supdb` as carrying a few percent
+that is the order's, and confirm any ratio worth acting on by running the
+roster with the arm somewhere else.
 
 Disk, because a run has run a host out of it. One pass builds its store and
 the store is dropped when the pass ends, so the peak is one arm's, never the
