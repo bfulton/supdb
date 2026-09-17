@@ -4028,3 +4028,126 @@ fn a_piece_kept_across_a_merge_is_ranked_against_the_partition_it_meets() {
         );
     }
 }
+
+/// The scan snapshot is the sorted keys of everything unsealed, and a
+/// handle that builds its own sorts all of them: at a hundred thousand
+/// keys each updated once, 9 ms, paid again by every handle that reads
+/// the same state. Published in the state, the first handle to want one
+/// builds it and the rest adopt it.
+#[test]
+fn every_handle_after_the_first_adopts_the_snapshot_it_published() {
+    let d = dir("share-snap");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        share_snapshot: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    // Unsealed keys, which are what a snapshot holds.
+    for k in (0..1500u32).step_by(3) {
+        m.append(&mut db, &key(k), "v1");
+    }
+    db.commit().unwrap();
+    let before = db.snapshot_builds();
+    let mut sink = 0usize;
+    let first = db.reader().unwrap();
+    first
+        .scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    assert_eq!(
+        db.snapshot_builds(),
+        before + 1,
+        "the handle that wants one first builds it"
+    );
+    let mut others = Vec::new();
+    for _ in 0..4 {
+        let r = db.reader().unwrap();
+        r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+            .unwrap();
+        others.push(r);
+    }
+    assert_eq!(
+        db.snapshot_builds(),
+        before + 1,
+        "the handles after it adopt that one"
+    );
+    for (i, r) in others.iter().enumerate() {
+        m.check(r, &format!("handle {i} over a snapshot it adopted"));
+    }
+}
+
+/// A published snapshot stops where the memtable was when it was built,
+/// and a handle that adopts it is typically past that point: the slots
+/// created since stay in the handle's added list, keyed by the length
+/// the snapshot it took covers rather than by the length it would have
+/// built at. Getting that wrong loses exactly the newest keys, which no
+/// scan of a store written and read in one go would show.
+#[test]
+fn a_handle_that_adopts_a_snapshot_sees_the_keys_written_past_it() {
+    let d = dir("share-snap-past");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        share_snapshot: true,
+        // Wide enough that the writes below leave the published snapshot
+        // adoptable, which is what this test is about.
+        snapshot_adopt_behind: 4096,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    for k in (0..1500u32).step_by(3) {
+        m.append(&mut db, &key(k), "v1");
+    }
+    db.commit().unwrap();
+    let mut sink = 0usize;
+    let first = db.reader().unwrap();
+    first
+        .scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    let published = db.snapshot_builds();
+    // Keys the published snapshot cannot hold: some beyond its greatest,
+    // some between the keys it has, and one it must stop reporting.
+    for k in 1500..1700u32 {
+        m.append(&mut db, &key(k), "v2");
+    }
+    for k in (1..1500u32).step_by(7) {
+        m.append(&mut db, &key(k), "v2");
+    }
+    m.delete(&mut db, &key(9));
+    db.commit().unwrap();
+    let next = db.reader().unwrap();
+    m.check(
+        &next,
+        "a handle over a snapshot from before the last writes",
+    );
+    assert_eq!(
+        db.snapshot_builds(),
+        published,
+        "and it read them without building one of its own"
+    );
+}

@@ -701,7 +701,41 @@ per-commit path.
   it had read past the commit already -- a staged batch its own scans
   see. Once per state: an installed form is kept current by the settle
   of every write after, so a second builder over the same state has
-  nothing to add. Its first version built from the segments alone with
+  nothing to add.
+- **The snapshot is the state's, not the handle's** (`share_snapshot`,
+  off until the suite prices it). The snapshot is a sort of every
+  unsealed key, and it was each handle's own: at a hundred thousand keys
+  each updated once, four fresh handles scanning the same store sorted
+  the same 63,242 keys four times, 7.1-10.5 ms each on the scan that
+  wanted it. With the organiser running it was worse, not better -- the
+  organiser starts a builder every few thousand commits and each one
+  built the snapshot from scratch on its own thread, fifteen builds and
+  37 ms of a core over one burst of writes, and the reading thread then
+  built a sixteenth for itself. A handle now offers the snapshot it
+  built to the state, behind one pointer that only moves forward, and
+  the handles after it clone it rather than sort again: four handles,
+  one build, and the first scan of every handle after the first goes
+  from 7.1-10.5 ms to 1.09-1.37 ms, what is left being its own block
+  tables. The builder ahead publishes too, which is the point of it --
+  that build is on a core the reads are not using. What a state gives up
+  when it is replaced is freed past every pinned reader, as the
+  canonical forms beside it are, since a handle can be between loading
+  the pointer and cloning it; the sweep runs wherever one is retired
+  rather than only at the writer's publish, because a store between
+  seals never reaches that and each retired snapshot holds the key bytes
+  of everything unsealed.
+- **A published snapshot stops where its builder stopped, and the
+  adopting handle must key its added list to that** and not to the
+  memtable's end. The slots past it stay in the handle's list, where
+  each is carried into the block it overlays; keying them to the end
+  instead loses exactly the newest keys, which no scan of a store
+  written and read in one go would show, and which a handle's own
+  snapshot could never suffer because it is built at the end by
+  construction. How far behind a published snapshot may be and still be
+  worth adopting is its own quantity (`snapshot_adopt_behind`, 0): at
+  zero a handle takes only a snapshot that is current, which is the
+  whole of the saving above and buys no list at all, and the looser
+  settings are the arm for a store written between the reads. Its first version built from the segments alone with
   an empty memtable, because the memtable was one thread's; that version
   was a tie at thirty million, where E starts on a million and a half
   unsealed keys and splicing those into a form costs about what building

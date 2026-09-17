@@ -397,6 +397,17 @@ pub struct Options {
     /// and builds nothing; see `CanonicalForm`. `false` is the arm where
     /// every handle builds and settles its own.
     pub commit_forms: bool,
+    /// EXPERIMENT: publish the scan snapshot in the state, where every
+    /// handle adopts it instead of sorting the unsealed keys again. Off
+    /// is the shape before it, where the snapshot is the handle's own.
+    pub share_snapshot: bool,
+    /// EXPERIMENT: the most live keys a published snapshot may lack
+    /// before a handle sorts its own instead. A published snapshot stops
+    /// where the handle that built it stopped, and the slots past that
+    /// stay in the adopting handle's added list, where each is carried
+    /// into the block it overlays: adopting saves the sort and buys that
+    /// list. See the sweep in the pull request for where the two cross.
+    pub snapshot_adopt_behind: usize,
     /// EXPERIMENT: entries reads must have taken from a block before the
     /// store holds it a second way, as a merged copy beside the cheap
     /// form, so that the reads ask for the shape rather than the writes
@@ -471,6 +482,8 @@ impl Default for Options {
             scan_cache_ahead: true,
             scan_cache_ahead_min_blocks: 1024,
             commit_forms: false,
+            share_snapshot: false,
+            snapshot_adopt_behind: 0,
             promote_entries: 0,
             build_ahead_on_commit: 0,
             form_dense_from: 0,
@@ -4229,6 +4242,17 @@ struct State {
     /// block of every partition, null where none is installed; see
     /// `CanonicalForm`.
     forms: Vec<Box<[AtomicPtr<CanonicalForm>]>>,
+    /// EXPERIMENT: this state's sorted unsealed keys, built by whichever
+    /// handle wanted them first and adopted by the rest. A handle that
+    /// builds its own sorts every unsealed key: at a hundred thousand
+    /// keys each updated once, 9 ms, and with the organiser running, the
+    /// builder's thread and the reading thread sorted the same 63,242
+    /// keys inside one pass. The pointer is an `Arc` this state owns, so
+    /// a handle adopts by cloning it under its pin; a swap retires the
+    /// reference the state gives up past every reader pinned before it,
+    /// since a handle can be between the load and the clone. It only
+    /// ever moves forward, to a snapshot over more of the memtable.
+    snap: AtomicPtr<Snapshot>,
     /// EXPERIMENT: the write log position every canonical form is
     /// current to, `usize::MAX` while the table is not maintained.
     forms_at: AtomicUsize,
@@ -4273,6 +4297,12 @@ impl Drop for State {
                 drop(unsafe { Box::from_raw(p) });
             }
         }
+        let p = self.snap.load(AtomicOrdering::Relaxed);
+        if !p.is_null() {
+            // SAFETY: published into this state, which has owned the
+            // reference since and is freed past every reader.
+            drop(unsafe { std::sync::Arc::from_raw(p as *const Snapshot) });
+        }
     }
 }
 
@@ -4297,6 +4327,13 @@ struct Shared {
     /// epoch it was replaced at, freed once no reader is pinned at or
     /// before that epoch.
     retired_forms: std::sync::Mutex<Vec<(u64, RetiredForm)>>,
+    /// EXPERIMENT: snapshots a publish replaced, freed past every pinned
+    /// reader as the forms beside them are. Any handle may push here, so
+    /// unlike the forms' list this one is contended.
+    retired_snaps: std::sync::Mutex<Vec<(u64, RetiredSnap)>>,
+    /// EXPERIMENT: scan snapshots built over this store's life, which is
+    /// what publishing one is meant to bring down; for a test.
+    snap_builds: AtomicU64,
 }
 
 /// EXPERIMENT: a replaced canonical form on its way to being freed. A
@@ -4304,9 +4341,15 @@ struct Shared {
 /// still be walking it; `Send` because the writer frees it from its own
 /// thread once every such reader has left.
 struct RetiredForm(*mut CanonicalForm);
+
+/// EXPERIMENT: a snapshot a publish replaced, as `RetiredForm`.
+struct RetiredSnap(*const Snapshot);
 // SAFETY: see the type's doc; the pointee is never touched through this
 // wrapper except to free it past every pinned reader.
 unsafe impl Send for RetiredForm {}
+// SAFETY: as `RetiredForm`; the pointee is a `Snapshot`, which is `Send`
+// and `Sync`, and only the sweep touches it after the swap.
+unsafe impl Send for RetiredSnap {}
 
 impl Drop for Shared {
     fn drop(&mut self) {
@@ -4368,7 +4411,7 @@ pub struct Reader {
     /// unsealed. Without this, every scan walked the whole memtable: the
     /// ext-kv scan phase spent 15 minutes a rep in that walk, twice -- once
     /// through the live table and once through the frozen one.
-    scan_keys: std::cell::RefCell<Option<(u64, Snapshot)>>,
+    scan_keys: std::cell::RefCell<Option<(u64, std::sync::Arc<Snapshot>)>>,
     /// PROTOTYPE: whether any partition holds a cached block, so a write
     /// with nothing cached skips the lookup that would drop one.
     cache_used: std::cell::Cell<bool>,
@@ -4561,10 +4604,15 @@ struct SnapKey {
 /// kept until the next commit or seal. Keys live in one arena rather than
 /// one allocation each, which is what makes the build a sort of small
 /// records instead of a pointer chase.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Snapshot {
     keys: Vec<u8>,
     ents: Vec<SnapKey>,
+    /// The live memtable prefix `ents` was built over, which with the
+    /// frozen table is everything it holds. A handle that adopts this
+    /// snapshot rather than building its own reads it to know which of
+    /// its logged slots the snapshot already has.
+    live_len: usize,
     /// Keys created since the build, on the merge paths: filed here from
     /// `snap_added` at each scan, in key order, so the snapshot outlives
     /// a write. A rebuild after every write batch was the whole cost of
@@ -5381,8 +5429,12 @@ impl Reader {
     /// the writer may be appending while this builds, and what the
     /// snapshot covers is what the log replay must not file again.
     fn build_snapshot(&self, live_len: usize) -> Snapshot {
+        self.shared
+            .snap_builds
+            .fetch_add(1, AtomicOrdering::Relaxed);
         let n = live_len + self.frozen().as_ref().map_or(0, |f| f.len());
         let mut snap = Snapshot {
+            live_len,
             keys: Vec::with_capacity(
                 self.mem().key_bytes() + self.frozen().as_ref().map_or(0, |f| f.key_bytes()),
             ),
@@ -5523,7 +5575,7 @@ impl Reader {
         }
         self.refresh_snapshot(gen, use_cache, moved);
         let cache = self.scan_keys.borrow();
-        let unsealed = &cache.as_ref().expect("scan snapshot").1;
+        let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
         // The block path finds the unsealed keys a block needs when it
         // builds the block, from the block's own bounds, and never from
         // this cursor. Seeking it anyway was a binary search over every
@@ -5883,6 +5935,97 @@ impl Reader {
 
     /// EXPERIMENT: the writer installs `form` as block `b` of partition
     /// `p`'s canonical form, retiring the one it replaces.
+    /// EXPERIMENT: this state's published snapshot, cloned. Called under
+    /// a pin, which is what holds the pointee across the clone: a swap
+    /// beside it retires the old reference rather than dropping it.
+    fn adopt_snapshot(&self) -> Option<std::sync::Arc<Snapshot>> {
+        if !self.opts.share_snapshot {
+            return None;
+        }
+        let p = self.state().snap.load(AtomicOrdering::Acquire);
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: published into the state this handle has pinned, and a
+        // swap frees what it replaces only past every reader pinned then.
+        Some(unsafe {
+            std::sync::Arc::increment_strong_count(p);
+            std::sync::Arc::from_raw(p as *const Snapshot)
+        })
+    }
+
+    /// EXPERIMENT: offer a snapshot to the state for the handles that
+    /// come after. Kept only when it covers more of the live memtable
+    /// than the one there, so the pointer only moves forward and two
+    /// handles racing cannot leave the shorter one published.
+    fn publish_snapshot(&self, snap: &std::sync::Arc<Snapshot>) {
+        if !self.opts.share_snapshot {
+            return;
+        }
+        let st = self.state();
+        let mut cur = st.snap.load(AtomicOrdering::Acquire);
+        loop {
+            // SAFETY: as in `adopt_snapshot`.
+            if !cur.is_null() && unsafe { &*cur }.live_len >= snap.live_len {
+                return;
+            }
+            let new = std::sync::Arc::into_raw(snap.clone()) as *mut Snapshot;
+            match st.snap.compare_exchange_weak(
+                cur,
+                new,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => {
+                    if !cur.is_null() {
+                        let epoch = self.shared.readers.epoch.load(AtomicOrdering::SeqCst);
+                        self.shared
+                            .retired_snaps
+                            .lock()
+                            .expect("the retired snapshots")
+                            .push((epoch, RetiredSnap(cur)));
+                        self.sweep_retired_snaps();
+                    }
+                    return;
+                }
+                Err(now) => {
+                    // SAFETY: ours, and no other handle was given it.
+                    drop(unsafe { std::sync::Arc::from_raw(new as *const Snapshot) });
+                    cur = now;
+                }
+            }
+        }
+    }
+
+    /// EXPERIMENT: the snapshots a publish replaced, freed past every
+    /// reader pinned before the swap, as the canonical forms are. Called
+    /// by whichever handle retired one rather than by the writer alone:
+    /// a store between seals never reaches the writer's sweep, and a
+    /// retired snapshot holds the key bytes of everything unsealed. It
+    /// does not bump the epoch -- that is the writer's -- so a sweep
+    /// before every reader has left simply leaves them for the next.
+    fn sweep_retired_snaps(&self) {
+        let mut retired = self
+            .shared
+            .retired_snaps
+            .lock()
+            .expect("the retired snapshots");
+        if retired.is_empty() {
+            return;
+        }
+        let readers = &self.shared.readers;
+        retired.retain(|(t, s)| {
+            if readers.none_before(t + 1) {
+                // SAFETY: replaced in the state, and every handle that
+                // could be between the load and the clone has left.
+                drop(unsafe { std::sync::Arc::from_raw(s.0) });
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     fn publish_form(&self, p: usize, b: usize, form: &std::sync::Arc<Cached>) {
         let st = self.state();
         let Some(slot) = st.forms.get(p).and_then(|f| f.get(b)) else {
@@ -5988,29 +6131,60 @@ impl Reader {
             return;
         }
         let mut cache = self.scan_keys.borrow_mut();
+        // What a snapshot may lack before it is worth building again:
+        // the keys created since it was built, against the keys it has.
+        let behind = |held: usize, added: usize| {
+            if use_cache {
+                added > held.max(4096)
+            } else {
+                added > (held / 8).max(4096)
+            }
+        };
         let mut stale = cache.as_ref().is_none_or(|(g, _)| *g != gen);
         if !stale {
             let held = cache.as_ref().map_or(0, |(_, s)| s.len());
             let added = self.snap_added.borrow().len();
-            stale = if use_cache {
-                added > held.max(4096)
-            } else {
-                added > (held / 8).max(4096)
-            };
+            stale = behind(held, added);
         }
         if !stale && !use_cache {
             let (_, snap) = cache.as_mut().expect("not stale");
             let added = self.snap_added.borrow();
             if added.len() > snap.filed {
+                // A snapshot this handle adopted is shared, and filing
+                // its own keys into it is the handle's business alone:
+                // the copy is taken here and not by every reader.
+                let snap = std::sync::Arc::make_mut(snap);
                 snap.file(self.mem(), &added[snap.filed..]);
                 snap.filed = added.len();
             }
         }
         if stale {
             let live_len = self.mem().len();
-            self.snap_entries.set(live_len);
-            *cache = Some((gen, self.build_snapshot(live_len)));
-            self.snap_added.borrow_mut().clear();
+            // The state's, when it covers enough of the memtable, and
+            // this handle's own otherwise. Adopting is the whole of the
+            // saving: the sort is of every unsealed key, and a handle
+            // that scans a store someone else is already scanning would
+            // otherwise repeat it in full.
+            let snap = match self.adopt_snapshot() {
+                Some(s)
+                    if live_len.saturating_sub(s.live_len) <= self.opts.snapshot_adopt_behind =>
+                {
+                    s
+                }
+                _ => {
+                    let s = std::sync::Arc::new(self.build_snapshot(live_len));
+                    self.publish_snapshot(&s);
+                    s
+                }
+            };
+            // The keys the snapshot has are not added keys; an adopted
+            // one may stop short of the memtable's end, and the slots
+            // past where it stops stay in the list for the tables.
+            self.snap_entries.set(snap.live_len);
+            self.snap_added
+                .borrow_mut()
+                .retain(|&slot| slot as usize >= snap.live_len);
+            *cache = Some((gen, snap));
             // Every key created since the old snapshot is in the new one:
             // the lists that held them are emptied, and the bounds each
             // table walked are walked again on its next touch.
@@ -6072,7 +6246,7 @@ impl Reader {
         self.refresh_snapshot(gen, true, moved);
         {
             let cache = self.scan_keys.borrow();
-            let unsealed = &cache.as_ref().expect("scan snapshot").1;
+            let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
             self.install_ahead(unsealed)?;
         }
         self.settle_pending()?;
@@ -6095,7 +6269,7 @@ impl Reader {
             let filling = self.ahead.borrow().as_ref().is_some_and(|a| !a.done.get());
             if !filling {
                 let cache = self.scan_keys.borrow();
-                let unsealed = &cache.as_ref().expect("scan snapshot").1;
+                let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
                 self.complete_forms(unsealed)?;
                 drop(cache);
                 st.forms_complete.store(true, AtomicOrdering::Release);
@@ -7582,6 +7756,7 @@ impl Db {
         let segs_tombs = false;
         let state = State {
             forms: Reader::forms_for(&segs),
+            snap: AtomicPtr::new(std::ptr::null_mut()),
             forms_at: AtomicUsize::new(usize::MAX),
             forms_complete: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
@@ -7602,6 +7777,8 @@ impl Db {
             retired: std::sync::Mutex::new(Vec::new()),
             advice_random: std::sync::atomic::AtomicBool::new(starts_random),
             retired_forms: std::sync::Mutex::new(Vec::new()),
+            retired_snaps: std::sync::Mutex::new(Vec::new()),
+            snap_builds: AtomicU64::new(0),
         });
         let r = Reader {
             shared,
@@ -7857,6 +8034,7 @@ impl Db {
         let ntables = segs.len();
         let state = State {
             forms: Reader::forms_for(&segs),
+            snap: AtomicPtr::new(std::ptr::null_mut()),
             forms_at: AtomicUsize::new(usize::MAX),
             forms_complete: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
@@ -7877,6 +8055,8 @@ impl Db {
             retired: std::sync::Mutex::new(Vec::new()),
             advice_random: std::sync::atomic::AtomicBool::new(starts_random),
             retired_forms: std::sync::Mutex::new(Vec::new()),
+            retired_snaps: std::sync::Mutex::new(Vec::new()),
+            snap_builds: AtomicU64::new(0),
         });
         let r = Reader {
             shared,
@@ -8617,6 +8797,7 @@ impl Db {
         let cur = self.state();
         let next = State {
             forms: Reader::forms_for(&segs),
+            snap: AtomicPtr::new(std::ptr::null_mut()),
             forms_at: AtomicUsize::new(usize::MAX),
             forms_complete: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
@@ -8665,6 +8846,7 @@ impl Db {
     /// past. The epoch is bumped first, so a form retired under the
     /// current epoch can be freed once its readers leave.
     fn sweep_retired_forms(&self) {
+        self.sweep_retired_snaps();
         let mut retired = self.shared.retired_forms.lock().expect("the retired forms");
         if retired.is_empty() {
             return;
@@ -8681,6 +8863,13 @@ impl Db {
                 true
             }
         });
+    }
+
+    /// EXPERIMENT: scan snapshots built over this store's life. Sharing
+    /// one is meant to hold this at one per state however many handles
+    /// read it, which is what a test asks.
+    pub fn snapshot_builds(&self) -> u64 {
+        self.shared.snap_builds.load(AtomicOrdering::Relaxed)
     }
 
     /// PROTOTYPE: how many states a publish replaced are still held for a
@@ -8737,6 +8926,7 @@ impl Db {
         let cur = self.state();
         let next = State {
             forms: Reader::forms_for(&cur.segs),
+            snap: AtomicPtr::new(std::ptr::null_mut()),
             forms_at: AtomicUsize::new(usize::MAX),
             forms_complete: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
@@ -8759,6 +8949,7 @@ impl Db {
         let cur = self.state();
         let next = State {
             forms: Reader::forms_for(&cur.segs),
+            snap: AtomicPtr::new(std::ptr::null_mut()),
             forms_at: AtomicUsize::new(usize::MAX),
             forms_complete: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
@@ -8783,6 +8974,7 @@ impl Db {
         let frozen = cur.mem.clone();
         let next = State {
             forms: Reader::forms_for(&cur.segs),
+            snap: AtomicPtr::new(std::ptr::null_mut()),
             forms_at: AtomicUsize::new(usize::MAX),
             forms_complete: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
@@ -9652,7 +9844,13 @@ impl Reader {
         if !self.pin_at(gen, wm, log) {
             return Ok(());
         }
-        let unsealed = self.build_snapshot(len);
+        // The builder does not adopt one: it needs the keys up to `len`
+        // exactly, and a published snapshot stops wherever the handle
+        // that built it stopped. It publishes, which is the point --
+        // this build is off the read path, and a handle that reads the
+        // state after it takes these keys instead of sorting them again.
+        let unsealed = std::sync::Arc::new(self.build_snapshot(len));
+        self.publish_snapshot(&unsealed);
         let ctx = self.build_ctx();
         // Under a budget, the forms queued for the install are bounded
         // by it too: the store sheds past the budget only as it installs.
