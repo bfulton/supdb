@@ -198,8 +198,22 @@ flushes and hands the kernel its memtable at close. A sync without the
 settle did not reproduce that, so queued writeback is part of the cause
 and not all of it.
 
-Nothing here corrects for it yet, because neither intervention is clean
-where the penalty is largest: at the two smallest rungs a load is 11-37 ms
+Two corrections were tried and neither is confirmed, so neither landed. A
+discarded pass at the head of every rep, so that no measured arm stands
+first -- the rule rep zero already follows one rung up -- removed the
+penalty at a hundred thousand keys in one run (1.095x to 1.016x) and left
+it at ten and thirty thousand; made a whole discarded pass rather than a
+load, it removed it at thirty thousand (1.143x to 1.039x) and left it at a
+hundred. The scatter is the instrument, not the fix: the same statistic on
+`ycsb-C` and on `scan`, where the arms differ by an option that cannot move
+either much, wandered between 0.838x and 1.059x across those runs. One run
+of five reps cannot resolve a six-to-fifteen percent effect at these rungs,
+so confirming any fix needs about three rows per condition, and what is
+written above survives only because the rotation test compares one
+quantity between two orderings rather than across conditions.
+
+Nothing here corrects for it yet, then, and not because the interventions
+are unclean so much as unmeasured: at the two smallest rungs a load is 11-37 ms
 and settling the device before each pass moves it by about as much as the
 bias does, so the cure is inside the error of the disease. Rotating the
 roster would spread the cost rather than remove it, and with eleven arms
