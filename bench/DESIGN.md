@@ -166,6 +166,30 @@ old suite's largest run (100 MB) never entered it.
 A rep is one complete pass of a workload for one arm. Arms are round-robined
 within a rep; one warmup pass is discarded.
 
+**The arm order is the same in every rep, and the arm that goes first pays
+for it.** Interleaving was meant to spread a drifting machine across the
+arms, and it does, but position is not drift: `plan.arms[0]` is first in
+every rep, so whatever a rep's first pass pays it pays in the same arm every
+time. Measured over four rows at one commit, every supdb arm beat `supdb` on
+the load -- 1.041x, 1.076x, 1.058x, 1.072x, 1.072x for the arms in positions
+two to six -- and `supdb-cache256`, whose budget is above anything the quick
+ladder reaches, was 1.072x with fifteen of sixteen rungs ahead. On
+`scan-lag` at full lag the same arm was 1.083x. Rotating the roster so that
+one arm ran first instead inverted both: the arm that had been 1.076x on the
+load became 0.934x, and 1.081x on `scan-lag` became 0.943x. So a cross-arm
+ratio against `supdb` on those two quantities carries about 7% that belongs
+to the order, and the direction always favours the arm being tried. What
+survives the swap is what the suite can say: `scan-mixed` on four threads
+read 1.135x with the arm third and 1.136x with it first.
+
+Why the first pass of a rep is dearer is not yet known, so nothing here
+corrects for it: a pass removes its store when it ends, and the first arm of
+the next rep starts against whatever the filesystem is still reclaiming,
+which is a guess and not a measurement. Until it is measured, read a
+cross-arm ratio on `load` or `scan-lag` as carrying that bias, and confirm
+any ratio that matters by running the roster with the arm in another
+position.
+
 Disk, because a run has run a host out of it. One pass builds its store and
 the store is dropped when the pass ends, so the peak is one arm's, never the
 ladder's or the matrix's: measured, about 3.1x the rung's records at the
