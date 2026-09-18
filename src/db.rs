@@ -405,8 +405,26 @@ pub struct Options {
     /// and 1.441x of the arm without them on the threaded scan mix and
     /// 0.849x and 0.879x on ycsb-E, which is the writer scanning its own
     /// store. One such scan is the evidence that the first case is the
-    /// one this store is in. Zero maintains regardless, which is the
-    /// shape before the regime.
+    /// one this store is in.
+    ///
+    /// Zero maintains wherever anything has been scanned since the last
+    /// commit, and the measurements say that is where this wants to be:
+    /// with the snapshot published in the state rather than rebuilt by
+    /// every handle the forms cost ycsb-E nothing, and maintaining
+    /// regardless read 1.035x and 1.086x of this setting there and
+    /// 1.156x and 1.186x on the threaded scan mix, over two roster
+    /// positions. The two are not independent -- the forms were dear
+    /// only while a reader was rebuilding the very structure they were
+    /// meant to save it. It is not the default because zero reaches a
+    /// defect this does not: a live key lands in the carried-forward
+    /// snapshot and in a block's side list both, and the overlay merge's
+    /// `a live key was created twice` fires. Set it to zero and
+    /// `a_snapshot_carried_forward_folds_a_live_write_onto_a_frozen_key`
+    /// reproduces it. The suspect is a form the builder ahead built
+    /// against a snapshot longer than the one the reader holds, so the
+    /// reader counts as added what the form already overlays; that is
+    /// where to look, and it is worth 1.15x on the workload this engine
+    /// is furthest behind on.
     pub forms_from_reader_scans: usize,
     /// Publish the scan snapshot in the state, where every handle adopts
     /// it instead of sorting the unsealed keys again. Off is the shape

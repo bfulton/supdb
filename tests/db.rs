@@ -4245,6 +4245,11 @@ fn the_writer_maintains_the_forms_once_a_reader_handle_is_live() {
         l0_trigger: 64,
         scan_block_cache: true,
         scan_cache_ahead: false,
+        // The regime this test is about, which is the arm rather than the
+        // default: the default maintains wherever anything has scanned,
+        // since with the snapshot shared the forms cost the writer's own
+        // reads nothing.
+        forms_from_reader_scans: 1,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
