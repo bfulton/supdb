@@ -4229,3 +4229,85 @@ fn carry_model(block_cache: bool) {
     assert_eq!(db.snapshot_extends(), 1, "by one merge");
     m.check(&db, "a snapshot carried forward over a frozen memtable");
 }
+
+/// The maintenance regime is the store's behaviour, not a setting: the
+/// canonical forms cost the writer at every commit and are read by
+/// whoever holds a handle, so they pay where several read and lose where
+/// the writer reads its own store -- 1.280x and 1.441x of the arm without
+/// them on the threaded scan mix, 0.849x and 0.879x on ycsb-E. The writer
+/// maintains them once a handle its caller made is live, and not before.
+#[test]
+fn the_writer_maintains_the_forms_once_a_reader_handle_is_live() {
+    let d = dir("regime-readers");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 1, "several partitions");
+    let mut sink = 0usize;
+    // The writer reading its own store: it scans, it writes, it commits,
+    // and nothing is maintained, because there is nobody to read it.
+    for round in 0..3 {
+        for k in (0..1500u32).step_by(5) {
+            m.append(&mut db, &key(k), "vw");
+        }
+        db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+            .unwrap();
+        db.commit().unwrap();
+        assert_eq!(
+            db.canonical_forms().0,
+            0,
+            "round {round}: nothing maintained for the writer alone"
+        );
+    }
+    // A handle the caller holds, scanning: from the next commit the
+    // writer keeps the forms current for it.
+    let r = db.reader().unwrap();
+    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    for k in (1..1500u32).step_by(7) {
+        m.append(&mut db, &key(k), "vr");
+    }
+    db.commit().unwrap();
+    assert!(
+        db.canonical_forms().0 > 0,
+        "maintained once a handle is live"
+    );
+    m.check(&r, "a reader over the forms the writer maintains for it");
+    // The evidence is the store's rather than the state's, so a seal
+    // carries it: a store being read through handles goes on being read,
+    // and kept per state the threaded scan mix at three hundred thousand
+    // keys measured 1.49x for the arm that maintains regardless, because
+    // a seal lands there often enough that the writer commits several
+    // times before a handle reads again. Nothing has to forget, since a
+    // commit with no scan since the last one maintains nothing anyway.
+    let r2 = db.reader().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    for k in (2..1500u32).step_by(11) {
+        m.append(&mut db, &key(k), "vg");
+    }
+    r2.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    db.commit().unwrap();
+    assert!(
+        db.canonical_forms().0 > 0,
+        "the state after the seal keeps what the store learned"
+    );
+    m.check(&r2, "a reader over the state a seal published");
+}

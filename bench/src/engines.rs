@@ -358,7 +358,7 @@ impl Default for Policy {
             durable: true,
             budget: 0,
             forms: false,
-            snap: false,
+            snap: true,
         }
     }
 }
@@ -380,10 +380,11 @@ impl Supdb {
         )
     }
 
-    /// `supdb` in every respect but the range-read structure, which the
-    /// writer keeps current at each commit instead of every reader
-    /// building its own; `commit_forms` in the engine. The pair differs
-    /// by one option and needs no matching.
+    /// `supdb` with the range-read structure maintained at every commit
+    /// whether or not anyone holds a handle to read it, which is the
+    /// shape before the regime was asked of the store: it prices the
+    /// gate, since `supdb` maintains only once a caller's handle is live.
+    /// The pair differs by one option and needs no matching.
     pub fn create_forms(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
@@ -395,15 +396,14 @@ impl Supdb {
     }
 
     /// `supdb` in every respect but where the sorted unsealed keys live:
-    /// in the state, built once and carried forward by merging each batch
-    /// into the run, instead of every handle sorting all of them for
-    /// itself whenever its own went stale; `share_snapshot` in the
-    /// engine. The pair differs by one option and needs no matching.
-    pub fn create_snap(path: &Path) -> Res<Supdb> {
+    /// each handle's own, sorted from nothing whenever it goes stale,
+    /// which is the shape before they were published in the state. The
+    /// pair differs by one option and needs no matching.
+    pub fn create_nosnap(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                snap: true,
+                snap: false,
                 ..Policy::default()
             },
         )
@@ -506,15 +506,18 @@ impl Supdb {
             // option's own and a row's figure describes what a user gets.
             scan_block_cache: block_cache,
             scan_cache_bytes: budget,
-            // The range-read structure written at ingest, or every
-            // reader building its own: the engine's arm, priced here.
-            commit_forms: forms,
+            // Always on now; what varies is when the writer acts on it,
+            // which `forms_from_readers` below says.
+            commit_forms: true,
             // The sorted unsealed keys published in the state and carried
             // forward, or each handle's own sorted from nothing: the
             // engine's arm, priced here. `snapshot_adopt_behind` stays at
             // the engine's default, since a run short of current is
             // carried forward rather than taken as it stands.
             share_snapshot: snap,
+            // Zero maintains the forms at every commit whoever is
+            // reading; the engine's default waits for a caller's handle.
+            forms_from_reader_scans: if forms { 0 } else { 1 },
             // The guarantee the arm's row names, not the engine's default:
             // durable per batch, or frames written per commit and fsynced
             // at `sync`, which is how `lmdb-nosync` and `rocksdb-nosync`
@@ -582,8 +585,8 @@ impl Engine for Supdb {
         if self.forms {
             return "supdb-forms";
         }
-        if self.snap {
-            return "supdb-snap";
+        if !self.snap {
+            return "supdb-nosnap";
         }
         match (
             self.partition,
@@ -1057,7 +1060,7 @@ use crate::row::Guarantee;
 pub const ARMS: [&str; 11] = [
     "supdb",
     "supdb-forms",
-    "supdb-snap",
+    "supdb-nosnap",
     "supdb-noadvice",
     "supdb-nocache",
     "supdb-cache256",
@@ -1070,7 +1073,7 @@ pub const ARMS: [&str; 11] = [
 
 pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
-        "supdb" | "supdb-forms" | "supdb-snap" | "supdb-noadvice" | "supdb-nocache"
+        "supdb" | "supdb-forms" | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache"
         | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
@@ -1083,7 +1086,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
     Ok(match arm {
         "supdb" => Box::new(Supdb::create(dir)?),
         "supdb-forms" => Box::new(Supdb::create_forms(dir)?),
-        "supdb-snap" => Box::new(Supdb::create_snap(dir)?),
+        "supdb-nosnap" => Box::new(Supdb::create_nosnap(dir)?),
         "supdb-noadvice" => Box::new(Supdb::create_noadvice(dir)?),
         "supdb-nocache" => Box::new(Supdb::create_nocache(dir)?),
         "supdb-cache256" => Box::new(Supdb::create_cache256(dir)?),

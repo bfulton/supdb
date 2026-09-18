@@ -397,9 +397,22 @@ pub struct Options {
     /// and builds nothing; see `CanonicalForm`. `false` is the arm where
     /// every handle builds and settles its own.
     pub commit_forms: bool,
-    /// EXPERIMENT: publish the scan snapshot in the state, where every
-    /// handle adopts it instead of sorting the unsealed keys again. Off
-    /// is the shape before it, where the snapshot is the handle's own.
+    /// Scans over a state, through handles the caller made, before the
+    /// writer keeps the canonical forms current at its commits. The
+    /// structure is built once and read by whoever holds a handle, so
+    /// its cost is the writer's and its benefit divides among the
+    /// readers: measured over two roster positions, forms read 1.280x
+    /// and 1.441x of the arm without them on the threaded scan mix and
+    /// 0.849x and 0.879x on ycsb-E, which is the writer scanning its own
+    /// store. One such scan is the evidence that the first case is the
+    /// one this store is in. Zero maintains regardless, which is the
+    /// shape before the regime.
+    pub forms_from_reader_scans: usize,
+    /// Publish the scan snapshot in the state, where every handle adopts
+    /// it instead of sorting the unsealed keys again. Off is the shape
+    /// before it, kept as the comparison arm: measured against it over
+    /// two roster positions, the threaded scan mix read 1.145x and
+    /// 1.212x and nothing else moved, so this is on.
     pub share_snapshot: bool,
     /// EXPERIMENT: the most live keys a published snapshot may lack
     /// before a handle sorts its own instead. A published snapshot stops
@@ -481,8 +494,9 @@ impl Default for Options {
             scan_cache_bytes: 0,
             scan_cache_ahead: true,
             scan_cache_ahead_min_blocks: 1024,
-            commit_forms: false,
-            share_snapshot: false,
+            commit_forms: true,
+            forms_from_reader_scans: 1,
+            share_snapshot: true,
             snapshot_adopt_behind: 0,
             promote_entries: 0,
             build_ahead_on_commit: 0,
@@ -4253,6 +4267,26 @@ struct State {
     /// since a handle can be between the load and the clone. It only
     /// ever moves forward, to a snapshot over more of the memtable.
     snap: AtomicPtr<Snapshot>,
+    /// Scans over this state by handles the caller made -- not the
+    /// writer's own and not the builder's. The regime the canonical
+    /// forms are maintained under: the structure costs the writer at
+    /// every commit and is read by whoever holds a handle, so it pays
+    /// where other handles read this state and loses where the writer
+    /// reads its own store. Asking whether a handle is live at the
+    /// instant of a commit is the wrong question and was tried -- a
+    /// workload that writes in one phase and reads through handles in
+    /// another answers no at every commit, and the threaded scan mix
+    /// measured 1.537x for the arm that maintains regardless. A scan is
+    /// the evidence, and it is kept for the state's life, so a seal or a
+    /// merge would ask again -- so a publish carries it forward. It does
+    /// not need to decay: `maintain_forms` already returns where nothing
+    /// has been scanned since the last commit, so a store whose readers
+    /// have gone quiet stops paying without this having to forget. Kept
+    /// per state and not carried, the threaded scan mix at three hundred
+    /// thousand keys measured 1.49x for the arm that maintains
+    /// regardless, because a seal there lands often enough that the
+    /// writer commits several times before a handle reads again.
+    reader_scans: AtomicU64,
     /// EXPERIMENT: the write log position every canonical form is
     /// current to, `usize::MAX` while the table is not maintained.
     forms_at: AtomicUsize,
@@ -4392,6 +4426,10 @@ pub enum Isolation {
 /// holds it while the writer keeps writing, with no lock between them.
 pub struct Reader {
     shared: std::sync::Arc<Shared>,
+    /// Whether this handle is one the caller asked for, and so one the
+    /// maintenance regime counts; the writer's own and the builder's are
+    /// the engine's and are not.
+    counted: bool,
     /// This handle's slot in the reader table, or none for the writer's
     /// own handle, under which nothing is ever freed.
     slot: Option<usize>,
@@ -6340,7 +6378,19 @@ impl Reader {
         if !(self.opts.commit_forms && self.opts.scan_block_cache) {
             return Ok(());
         }
+        // The regime, asked of the store rather than set for it: the
+        // forms cost the writer at every commit and are read by whoever
+        // holds a handle, so they pay where several do and lose where the
+        // writer reads its own store. Stopping is safe at any commit --
+        // `forms_at` stops advancing, and a reader trusts the forms only
+        // where it matches the log position the reader holds, so it
+        // builds its own from the next one.
+
         let st = self.state();
+        if st.reader_scans.load(AtomicOrdering::Relaxed) < self.opts.forms_from_reader_scans as u64
+        {
+            return Ok(());
+        }
         if st.forms.is_empty() || self.segs().first().is_none_or(|s| s.level == 0) {
             return Ok(());
         }
@@ -6900,6 +6950,9 @@ impl Reader {
         let st = self.state();
         if self.opts.commit_forms {
             st.scans.fetch_add(1, AtomicOrdering::Relaxed);
+            if self.counted {
+                st.reader_scans.fetch_add(1, AtomicOrdering::Relaxed);
+            }
         }
         let canonical = self.opts.commit_forms
             && self.slot.is_some()
@@ -7872,6 +7925,7 @@ impl Db {
         let state = State {
             forms: Reader::forms_for(&segs),
             snap: AtomicPtr::new(std::ptr::null_mut()),
+            reader_scans: AtomicU64::new(0),
             forms_at: AtomicUsize::new(usize::MAX),
             forms_complete: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
@@ -7898,6 +7952,7 @@ impl Db {
         });
         let r = Reader {
             shared,
+            counted: false,
             slot: None,
             isolation: std::cell::Cell::new(Isolation::Dirty),
             held: AtomicPtr::new(std::ptr::null_mut()),
@@ -8151,6 +8206,7 @@ impl Db {
         let state = State {
             forms: Reader::forms_for(&segs),
             snap: AtomicPtr::new(std::ptr::null_mut()),
+            reader_scans: AtomicU64::new(0),
             forms_at: AtomicUsize::new(usize::MAX),
             forms_complete: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
@@ -8177,6 +8233,7 @@ impl Db {
         });
         let r = Reader {
             shared,
+            counted: false,
             slot: None,
             isolation: std::cell::Cell::new(Isolation::Dirty),
             held: AtomicPtr::new(std::ptr::null_mut()),
@@ -8915,6 +8972,7 @@ impl Db {
         let next = State {
             forms: Reader::forms_for(&segs),
             snap: AtomicPtr::new(std::ptr::null_mut()),
+            reader_scans: AtomicU64::new(cur.reader_scans.load(AtomicOrdering::Relaxed)),
             forms_at: AtomicUsize::new(usize::MAX),
             forms_complete: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
@@ -9009,6 +9067,13 @@ impl Reader {
     /// thread reads through it at a time, and a thread that wants its
     /// own asks for its own. Fails when every slot is taken.
     pub fn reader(&self) -> Result<Reader> {
+        self.new_reader(true)
+    }
+
+    /// A handle for the engine's own use -- the builder ahead's -- which
+    /// claims a slot like any other but is not one of the caller's, so it
+    /// cannot be what turns the maintenance regime on for itself.
+    fn new_reader(&self, counted: bool) -> Result<Reader> {
         let slot = self
             .shared
             .readers
@@ -9016,6 +9081,7 @@ impl Reader {
             .ok_or_else(|| err("reader table: every slot is taken"))?;
         Ok(Reader {
             shared: self.shared.clone(),
+            counted,
             slot: Some(slot),
             isolation: std::cell::Cell::new(Isolation::Latest),
             held: AtomicPtr::new(std::ptr::null_mut()),
@@ -9050,6 +9116,7 @@ impl Db {
         let next = State {
             forms: Reader::forms_for(&cur.segs),
             snap: AtomicPtr::new(std::ptr::null_mut()),
+            reader_scans: AtomicU64::new(cur.reader_scans.load(AtomicOrdering::Relaxed)),
             forms_at: AtomicUsize::new(usize::MAX),
             forms_complete: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
@@ -9073,6 +9140,7 @@ impl Db {
         let next = State {
             forms: Reader::forms_for(&cur.segs),
             snap: AtomicPtr::new(std::ptr::null_mut()),
+            reader_scans: AtomicU64::new(cur.reader_scans.load(AtomicOrdering::Relaxed)),
             forms_at: AtomicUsize::new(usize::MAX),
             forms_complete: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
@@ -9098,6 +9166,7 @@ impl Db {
         let next = State {
             forms: Reader::forms_for(&cur.segs),
             snap: AtomicPtr::new(std::ptr::null_mut()),
+            reader_scans: AtomicU64::new(cur.reader_scans.load(AtomicOrdering::Relaxed)),
             forms_at: AtomicUsize::new(usize::MAX),
             forms_complete: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
@@ -9569,7 +9638,7 @@ impl Reader {
         if blocks < self.opts.scan_cache_ahead_min_blocks {
             return;
         }
-        let Ok(r) = self.reader() else {
+        let Ok(r) = self.new_reader(false) else {
             return;
         };
         let gen = self.state().gen;
