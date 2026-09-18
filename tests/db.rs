@@ -3808,6 +3808,12 @@ fn a_block_the_reads_pay_for_is_held_as_a_copy_too() {
         scan_block_cache: true,
         scan_cache_ahead: false,
         promote_entries: opts_promote(),
+        // Read-driven promotion is what this test is about, and it is a
+        // property of a handle that builds its own forms: with the
+        // writer maintaining them a reader walks what it is given, pays
+        // for no block and promotes nothing, which is the point of the
+        // maintenance rather than a fault in it.
+        commit_forms: false,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();

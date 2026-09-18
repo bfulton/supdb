@@ -407,24 +407,21 @@ pub struct Options {
     /// store. One such scan is the evidence that the first case is the
     /// one this store is in.
     ///
-    /// Zero maintains wherever anything has been scanned since the last
-    /// commit, and the measurements say that is where this wants to be:
-    /// with the snapshot published in the state rather than rebuilt by
-    /// every handle the forms cost ycsb-E nothing, and maintaining
-    /// regardless read 1.035x and 1.086x of this setting there and
-    /// 1.156x and 1.186x on the threaded scan mix, over two roster
-    /// positions. The two are not independent -- the forms were dear
-    /// only while a reader was rebuilding the very structure they were
-    /// meant to save it. It is not the default because zero reaches a
-    /// defect this does not: a live key lands in the carried-forward
-    /// snapshot and in a block's side list both, and the overlay merge's
-    /// `a live key was created twice` fires. Set it to zero and
-    /// `a_snapshot_carried_forward_folds_a_live_write_onto_a_frozen_key`
-    /// reproduces it. The suspect is a form the builder ahead built
-    /// against a snapshot longer than the one the reader holds, so the
-    /// reader counts as added what the form already overlays; that is
-    /// where to look, and it is worth 1.15x on the workload this engine
-    /// is furthest behind on.
+    /// Whether one is the right answer is NOT settled, and three rows
+    /// say so with two signs. Those ycsb-E figures were taken while
+    /// every handle also sorted the unsealed keys for itself, and with
+    /// the snapshot published in the state that cost is gone: on ycsb-E
+    /// the two settings are a wash (1.029x), so the reason this gate was
+    /// built has expired. On the threaded scan mix two rows read 1.156x
+    /// and 1.186x for maintaining regardless and a third read 1.247x the
+    /// other way, per rung 1.48, 1.48, 1.02, 0.66 -- a comparison whose
+    /// sign flips between rows is a comparison one row cannot make, and
+    /// that is the same lesson the arm-position bias taught. What is
+    /// steady over all three is `scan-lag` at full lag, where gating
+    /// reads 1.20x to 1.36x: a fully unmerged store read through the
+    /// writer's own handle is where maintaining for nobody costs most.
+    /// So one stands, on the one direction that held, until somebody
+    /// spends three rows a setting on the mix.
     pub forms_from_reader_scans: usize,
     /// Publish the scan snapshot in the state, where every handle adopts
     /// it instead of sorting the unsealed keys again. Off is the shape
@@ -6426,13 +6423,28 @@ impl Reader {
         self.cache_used.set(true);
         let gen = st.gen;
         let moved = self.sync_log() || self.scan_keys.borrow().is_none();
+        // Settle before the snapshot moves, which is the order the scan
+        // path takes and the reason it was never wrong. A pending write
+        // carries the flag `sync_log` gave it -- created since the
+        // snapshot, or in it already -- and that flag is about the
+        // snapshot standing when the log was read. Settled after a
+        // refresh that carried the snapshot past those keys, every one of
+        // them is filed into the block it lands in as new while the
+        // snapshot holds it too, and the overlay merge meets the same
+        // live slot twice: `a live key was created twice`, with slot 1000
+        // on both sides of it and a snapshot 8,000 entries long. This was
+        // here before the snapshot was ever carried forward -- a rebuild
+        // moves it just as far -- and it never fired because nothing
+        // maintained the forms by default, so nothing reached this line.
+        if moved {
+            self.settle_pending()?;
+        }
         self.refresh_snapshot(gen, true, moved);
         {
             let cache = self.scan_keys.borrow();
             let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
             self.install_ahead(unsealed)?;
         }
-        self.settle_pending()?;
         // A form for every overlaid block, once per state: from here on
         // the writer builds one for any block a write lands in, so a
         // block without one is clean. Under a cache budget a form may be
