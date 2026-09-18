@@ -231,6 +231,18 @@ pub trait Engine {
     /// the transaction on the thread. The runner times the reads, never
     /// the opening.
     fn thread_reader(&self) -> Res<ReaderOpener>;
+
+    /// What the engine did to get here, rather than how fast: the counts
+    /// a mechanism is made of. Throughput over a whole pass is the noisy
+    /// quantity -- a run of it cannot tell a 15% option apart from the
+    /// machine -- and a count is exact, so `bench ab` reports these
+    /// beside the timings and they are what a mechanism is judged on.
+    /// Empty for an engine with nothing to say, which is every
+    /// comparator: this is supdb's own instrumentation, not a fairness
+    /// axis, and nothing compares an engine to another through it.
+    fn counters(&self) -> Vec<(&'static str, f64)> {
+        Vec::new()
+    }
 }
 
 /// What a reader thread reads through: the two reads of `Engine`, over a
@@ -639,6 +651,19 @@ impl Engine for Supdb {
     fn range(&mut self, from: &[u8], n: usize) -> Res<usize> {
         let db = self.db.as_ref().ok_or("db closed")?;
         supdb_range(db, from, n)
+    }
+    fn counters(&self) -> Vec<(&'static str, f64)> {
+        let Some(db) = self.db.as_ref() else {
+            return Vec::new();
+        };
+        let (forms, form_bytes, form_walks, _) = db.canonical_forms();
+        vec![
+            ("snapshot_builds", db.snapshot_builds() as f64),
+            ("snapshot_extends", db.snapshot_extends() as f64),
+            ("forms_held", forms as f64),
+            ("form_walks", form_walks as f64),
+            ("form_bytes", form_bytes as f64),
+        ]
     }
     fn thread_reader(&self) -> Res<ReaderOpener> {
         let db = self.db.as_ref().ok_or("db closed")?;

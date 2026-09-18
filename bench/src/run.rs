@@ -445,6 +445,43 @@ struct OnePass {
     /// keys they updated and inserted are unsealed: (threads, aggregate
     /// throughput).
     scan_mixed_threaded: Vec<(usize, f64)>,
+    /// What the engine says it did, rather than how fast; see
+    /// `Engine::counters`.
+    counters: Vec<(&'static str, f64)>,
+}
+
+impl OnePass {
+    /// Every quantity of the pass under one name, for `ab` to pair.
+    fn flat(&self) -> Vec<(String, f64)> {
+        let mut v = vec![
+            ("load ops_per_s".into(), self.load_ops_s),
+            ("load device_bytes_per_byte".into(), self.load_bpb),
+            ("load bytes_on_disk_per_byte".into(), self.disk_bpb),
+            ("load-shuffled ops_per_s".into(), self.shuffled_ops_s),
+            ("read reads_per_s".into(), self.reads_s),
+            ("read p99_us".into(), self.p99_us),
+            ("scan entries_per_s".into(), self.scan_entries_s),
+        ];
+        for (pct, x) in &self.scan_lag {
+            v.push((format!("scan-lag entries_per_s_lag{pct}pct"), *x));
+        }
+        for (t, x) in &self.reads_s_threaded {
+            v.push((format!("read reads_per_s_{t}t"), *x));
+        }
+        for (t, x) in &self.scan_entries_s_threaded {
+            v.push((format!("scan entries_per_s_{t}t"), *x));
+        }
+        for (t, x) in &self.scan_mixed_threaded {
+            v.push((format!("scan-mixed entries_per_s_{t}t"), *x));
+        }
+        for (c, x) in &self.ycsb_ops_s {
+            v.push((format!("ycsb-{c} ops_per_s"), *x));
+        }
+        for (n, x) in &self.counters {
+            v.push((format!("count {n}"), *x));
+        }
+        v
+    }
 }
 
 fn one_pass(
@@ -628,6 +665,7 @@ fn one_pass(
         let secs = t.elapsed().as_secs_f64();
         scan_lag.push((pct, (scans * plan.scan_len as u64) as f64 / secs));
     }
+    let counters = e.counters();
     drop(e);
 
     Ok(OnePass {
@@ -643,7 +681,139 @@ fn one_pass(
         scan_entries_s_threaded,
         ycsb_ops_s,
         scan_mixed_threaded,
+        counters,
     })
+}
+
+/// Two arms in one process, alternating, paired rep by rep.
+///
+/// The row series answers whether a quantity moved between commits, and
+/// is the wrong instrument for whether one option beats another: its arms
+/// run in a fixed order, so the first pays a few milliseconds nobody else
+/// does, and a median of five whole-pass throughputs carries about as
+/// much spread as a fifteen percent option is worth. Both were measured.
+/// A gate on the canonical forms read 1.156x and 1.186x for maintaining
+/// regardless over two rows and 1.247x the other way over a third, per
+/// rung 1.48, 1.48, 1.02, 0.66, and that comparison was never going to
+/// resolve one row at a time.
+///
+/// So: one process, the two arms alternating, and the order swapped on
+/// every other rep so neither stands first more often than the other.
+/// Each rep is a pair over the same machine minute, and the difference
+/// within a pair is what is reported -- a drift that lifts or drops both
+/// cancels instead of landing on whichever arm met it. The sign test over
+/// the pairs is the verdict; the ratio of medians is only its size.
+pub fn ab(
+    arms: (&str, &str),
+    size: u64,
+    reps: usize,
+    plan: &Plan,
+    log: &mut dyn std::io::Write,
+) -> Result<Vec<AbQuantity>, String> {
+    let payload = Payload::new(plan.value_size, 0.5, 0xE1);
+    let map_gb = lmdb_map_gb(size, plan.value_size);
+    let root = std::env::temp_dir().join(format!("supdb-ab-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&root);
+    let mut pairs: std::collections::BTreeMap<String, Vec<(f64, f64)>> = Default::default();
+    let t0 = Instant::now();
+    for rep in 0..=reps {
+        // Alternate which arm goes first, so the cost of standing first
+        // falls on each of them equally instead of on one of them always.
+        let order = if rep % 2 == 0 {
+            [arms.0, arms.1]
+        } else {
+            [arms.1, arms.0]
+        };
+        let mut got: Vec<(String, f64)> = Vec::new();
+        let mut first_is_a = true;
+        for (i, arm) in order.iter().enumerate() {
+            let dir = root.join(format!("{arm}-{rep}-{i}"));
+            let one = one_pass(arm, &dir, size, map_gb, plan, &payload)?;
+            let _ = std::fs::remove_dir_all(&dir);
+            if i == 0 {
+                first_is_a = *arm == arms.0;
+                got = one.flat();
+            } else if rep > 0 {
+                // Rep zero is the warmup, as it is for a row.
+                for (name, second) in one.flat() {
+                    let Some((_, first)) = got.iter().find(|(n, _)| *n == name) else {
+                        continue;
+                    };
+                    let (a, b) = if first_is_a {
+                        (*first, second)
+                    } else {
+                        (second, *first)
+                    };
+                    pairs.entry(name).or_default().push((a, b));
+                }
+            }
+        }
+        let _ = writeln!(
+            log,
+            "{:>6.0}s  rep {rep}/{reps}{}",
+            t0.elapsed().as_secs_f64(),
+            if rep == 0 { " (warmup)" } else { "" }
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(pairs
+        .into_iter()
+        .map(|(quantity, v)| AbQuantity::of(quantity, v))
+        .collect())
+}
+
+/// One quantity's verdict over the pairs.
+pub struct AbQuantity {
+    pub quantity: String,
+    pub a: f64,
+    pub b: f64,
+    /// Pairs where B was above A, and pairs that were not a tie.
+    pub up: usize,
+    pub n: usize,
+    /// Two-sided sign test over those pairs.
+    pub p: f64,
+}
+
+impl AbQuantity {
+    fn of(quantity: String, v: Vec<(f64, f64)>) -> AbQuantity {
+        let med = |mut x: Vec<f64>| -> f64 {
+            x.sort_by(|p, q| p.partial_cmp(q).unwrap_or(std::cmp::Ordering::Equal));
+            if x.is_empty() {
+                return f64::NAN;
+            }
+            x[x.len() / 2]
+        };
+        let a = med(v.iter().map(|p| p.0).collect());
+        let b = med(v.iter().map(|p| p.1).collect());
+        let up = v.iter().filter(|(x, y)| y > x).count();
+        let n = v.iter().filter(|(x, y)| y != x).count();
+        AbQuantity {
+            quantity,
+            a,
+            b,
+            up,
+            n,
+            p: sign_p(up, n),
+        }
+    }
+}
+
+/// Two-sided sign test: the chance of a split at least this lopsided from
+/// a coin. Exact, since the pair counts here are small.
+fn sign_p(up: usize, n: usize) -> f64 {
+    if n == 0 {
+        return 1.0;
+    }
+    let hi = up.max(n - up);
+    let mut tail = 0f64;
+    for k in hi..=n {
+        let mut c = 1f64;
+        for i in 0..k {
+            c = c * (n - i) as f64 / (i + 1) as f64;
+        }
+        tail += c;
+    }
+    (2.0 * tail / 2f64.powi(n as i32)).min(1.0)
 }
 
 /// What a reader thread does per operation.

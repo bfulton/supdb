@@ -7,6 +7,7 @@ use supdb_bench::{engines, env, figures, gate, row, run, Scale};
 const USAGE: &str = "\
 usage:
   bench run --scale quick|full [--out DIR] [--arms a,b,...] [--top KEYS] [--bottom KEYS] [--reps N]
+  bench ab --arms A,B [--size KEYS] [--reps N]
   bench gate ROW.json [--runs DIR]
   bench figures [--runs DIR] [--out DIR] [--scale quick|full]
   bench machine
@@ -17,6 +18,11 @@ run    measures every arm over the size ladder and writes runs/<scale>/<utc>-<sh
        --top   the ladder's top rung in keys (default: quick 300000; full sized to 1.5x memory)
        --bottom the ladder's bottom rung in keys (default: the whole ladder from 10000)
        --reps  repetitions per size and arm (default: quick 5, full 7)
+ab     two arms in one process, alternating and paired rep by rep, for choosing
+       between them rather than for the series: the order swaps every other rep
+       so neither stands first more often, and the verdict is a sign test over
+       the pairs. Reports the counts an engine keeps beside the timings.
+       --size  keys (default 100000)   --reps  pairs after the warmup (default 12)
 gate   compares ROW to the last ten rows of its class and scale under runs/ (--runs, default runs);
        exits 1 if any quantity is worse than every one of them
 figures draws every figure for the latest row of each class at --scale (default full) into
@@ -41,6 +47,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(|s| s.as_str()) {
         Some("run") => cmd_run(Args(args[1..].to_vec())),
+        Some("ab") => cmd_ab(Args(args[1..].to_vec())),
         Some("gate") => cmd_gate(Args(args[1..].to_vec())),
         Some("figures") => cmd_figures(Args(args[1..].to_vec())),
         Some("machine") => cmd_machine(),
@@ -129,6 +136,61 @@ fn cmd_gate(a: Args) -> i32 {
             2
         }
     }
+}
+
+fn cmd_ab(a: Args) -> i32 {
+    let arms: Vec<String> = a
+        .get("--arms")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let [a0, b0] = &arms[..] else {
+        eprintln!("--arms takes exactly two, as A,B\n\n{USAGE}");
+        return 2;
+    };
+    for arm in [a0, b0] {
+        if engines::guarantee(arm).is_none() {
+            eprintln!("no arm named {arm}\n\n{USAGE}");
+            return 2;
+        }
+    }
+    let size = a.num("--size").unwrap_or(100_000);
+    let reps = a.num("--reps").unwrap_or(12).max(1) as usize;
+    let plan = run::Plan::new(Scale::Quick, vec![a0.clone(), b0.clone()], size);
+    eprintln!("bench ab: {a0} against {b0} at {size} keys, {reps} pairs after a warmup");
+    let mut log = std::io::stderr();
+    let got = match run::ab((a0, b0), size, reps, &plan, &mut log) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("bench ab: {e}");
+            return 1;
+        }
+    };
+    println!(
+        "\n{:<34} {:>13} {:>13} {:>8} {:>9} {:>8}",
+        "quantity", a0, b0, "B/A", "B above A", "sign p"
+    );
+    for q in &got {
+        // A ratio is only the size of the thing; the sign test is whether
+        // there is a thing. Marked where a coin would give this or worse
+        // less than one time in twenty.
+        let ratio = if q.a != 0.0 { q.b / q.a } else { f64::NAN };
+        println!(
+            "{:<34} {:>13.4} {:>13.4} {:>7.3}x {:>5}/{:<3} {:>8.3}{}",
+            q.quantity,
+            q.a,
+            q.b,
+            ratio,
+            q.up,
+            q.n,
+            q.p,
+            if q.p < 0.05 { "  *" } else { "" }
+        );
+    }
+    0
 }
 
 fn cmd_run(a: Args) -> i32 {

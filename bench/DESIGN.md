@@ -166,6 +166,22 @@ old suite's largest run (100 MB) never entered it.
 A rep is one complete pass of a workload for one arm. Arms are round-robined
 within a rep; one warmup pass is discarded.
 
+`bench ab` is the instrument for choosing between two arms; the series is
+not. It runs both in one process with the order swapped every other rep,
+so neither stands first more often than the other, pairs them rep by rep
+so a drift that lifts or drops both cancels, and reports a sign test over
+the pairs rather than two medians. It also reports what the engine counts
+-- forms held, snapshot builds, snapshot merges -- because a count is
+exact where a whole-pass throughput is not. The first question put to it
+had defeated three rows of this series: maintaining the canonical forms
+regardless read 1.156x, then 1.186x, then 1.247x the other way on the
+threaded scan mix, and fifteen pairs answered 0.880x on five pairs of
+fifteen, which is a coin, while `scan-lag` at full lag came out 0.866x on
+fifteen of fifteen. The counts settled what the timings could not:
+maintaining regardless holds 1,562 forms and 1.5 MB at a hundred thousand
+keys and walks none of them. Use `ab` for an option; use the series for a
+commit.
+
 **The arm order is the same in every rep, and the arm that goes first pays
 for it.** Interleaving was meant to spread a drifting machine across the
 arms, and it does, but position is not drift: `plan.arms[0]` is first in

@@ -407,21 +407,21 @@ pub struct Options {
     /// store. One such scan is the evidence that the first case is the
     /// one this store is in.
     ///
-    /// Whether one is the right answer is NOT settled, and three rows
-    /// say so with two signs. Those ycsb-E figures were taken while
-    /// every handle also sorted the unsealed keys for itself, and with
-    /// the snapshot published in the state that cost is gone: on ycsb-E
-    /// the two settings are a wash (1.029x), so the reason this gate was
-    /// built has expired. On the threaded scan mix two rows read 1.156x
-    /// and 1.186x for maintaining regardless and a third read 1.247x the
-    /// other way, per rung 1.48, 1.48, 1.02, 0.66 -- a comparison whose
-    /// sign flips between rows is a comparison one row cannot make, and
-    /// that is the same lesson the arm-position bias taught. What is
-    /// steady over all three is `scan-lag` at full lag, where gating
-    /// reads 1.20x to 1.36x: a fully unmerged store read through the
-    /// writer's own handle is where maintaining for nobody costs most.
-    /// So one stands, on the one direction that held, until somebody
-    /// spends three rows a setting on the mix.
+    /// One, settled by `bench ab` over fifteen pairs at a hundred
+    /// thousand keys. Maintaining regardless reads 0.866x on `scan-lag`
+    /// at full lag with every one of the fifteen pairs agreeing, and is
+    /// detectably better nowhere: the threaded scan mix comes out 0.880x
+    /// on five pairs of fifteen, which is a coin, and ycsb-E 0.979x on
+    /// eight of fifteen, so the cost this gate was built for has indeed
+    /// expired but nothing has replaced it. Three rows of the series had
+    /// said 1.156x, 1.186x and then 1.247x the other way on that mix; a
+    /// ratio with no consistency under it is what a row shows and a
+    /// paired run does not.
+    ///
+    /// What the counts say is plainer than any of it: maintaining
+    /// regardless holds 1,562 forms and 1.5 MB at that size and walks
+    /// none of them. The forms are being built and not read, which is
+    /// where to look before this setting is worth revisiting.
     pub forms_from_reader_scans: usize,
     /// Publish the scan snapshot in the state, where every handle adopts
     /// it instead of sorting the unsealed keys again. Off is the shape
