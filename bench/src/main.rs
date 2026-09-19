@@ -7,7 +7,7 @@ use supdb_bench::{engines, env, figures, gate, row, run, Scale};
 const USAGE: &str = "\
 usage:
   bench run --scale quick|full [--out DIR] [--arms a,b,...] [--top KEYS] [--bottom KEYS] [--reps N]
-  bench ab --arms A,B [--size KEYS] [--reps N]
+  bench ab --arms A,B [--size KEYS] [--reps N] [--len ENTRIES]
   bench gate ROW.json [--runs DIR]
   bench figures [--runs DIR] [--out DIR] [--scale quick|full]
   bench machine
@@ -23,6 +23,8 @@ ab     two arms in one process, alternating and paired rep by rep, for choosing
        so neither stands first more often, and the verdict is a sign test over
        the pairs. Reports the counts an engine keeps beside the timings.
        --size  keys (default 100000)   --reps  pairs after the warmup (default 12)
+       --len   entries a scan takes (default 100). Swept, it separates what a
+               scan pays once from what it pays per entry.
 gate   compares ROW to the last ten rows of its class and scale under runs/ (--runs, default runs);
        exits 1 if any quantity is worse than every one of them
 figures draws every figure for the latest row of each class at --scale (default full) into
@@ -159,8 +161,14 @@ fn cmd_ab(a: Args) -> i32 {
     }
     let size = a.num("--size").unwrap_or(100_000);
     let reps = a.num("--reps").unwrap_or(12).max(1) as usize;
-    let plan = run::Plan::new(Scale::Quick, vec![a0.clone(), b0.clone()], size);
-    eprintln!("bench ab: {a0} against {b0} at {size} keys, {reps} pairs after a warmup");
+    let mut plan = run::Plan::new(Scale::Quick, vec![a0.clone(), b0.clone()], size);
+    if let Some(l) = a.num("--len") {
+        plan.scan_len = (l as usize).max(1);
+    }
+    eprintln!(
+        "bench ab: {a0} against {b0} at {size} keys, scans of {}, {reps} pairs after a warmup",
+        plan.scan_len
+    );
     let mut log = std::io::stderr();
     let got = match run::ab((a0, b0), size, reps, &plan, &mut log) {
         Ok(g) => g,

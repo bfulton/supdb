@@ -194,6 +194,26 @@ fifteen pairs. Forms at a commit are worth 1.71x there and cost 1.172x
 on `scan-lag` and 1.130x on ycsb-E. A count says what happened; which
 two things to put beside it is still the hard part.
 
+Swept over `--len`, `ab` separates what a scan pays once from what it
+pays per entry, which is the difference between a structural cost and a
+loop. Four threads at a hundred thousand keys, seven pairs a point,
+against LMDB, fitting microseconds per scan over lengths 1, 10, 100 and
+1000:
+
+| | fixed per scan | per entry |
+|---|---|---|
+| `scan`, drained | 232 ns vs 126 (1.84x) | 3.99 ns vs 4.81 (**0.83x**) |
+| `scan-mixed`, unsealed keys | 301 ns vs 134 (2.24x) | 6.91 ns vs 5.84 (1.18x) |
+
+So the walk itself is faster than LMDB's and the losses are two things
+that can be named: a fixed cost of about 230-300 ns a scan against its
+130, which is the whole of why short scans read 1.7x to 2.0x behind, and
+an unsealed key costing 6.91 ns against this engine's own 3.99 on a
+drained store. At a length of a hundred those are 167 ns and 290 ns of a
+993 ns scan, and closing both would put `scan-mixed` at about 0.70 us
+against LMDB's 0.682. That is what the aggregate throughput of a row
+cannot tell anyone, and it took four `ab` runs.
+
 A counter has to be read where the thing happens. These said no read ever
 took a form until the instrument was fixed: a pass opens two stores, the
 loaded one and a fresh one for the shuffled load and the lag sweep, and
