@@ -529,43 +529,63 @@ that stays resident: the 280 ns of waiting is the copies themselves.
 
 #### What the forms at commit cost, and who pays
 
-The canonical forms the writer maintains are taken only by a handle with
-a slot, and the writer's own has none, so a store whose reads are the
-writer's pays for a structure it cannot read. The suite is exactly that
-store in one phase and its opposite in another, and one `quick` row
-prices both from within itself, against the arm that maintains at every
-commit but builds no form (`supdb-settle`):
+Two options decide this and `supdb-settle` moves both, which is how the
+first reading of it went wrong. The arm is `forms_from_reader_scans: 0`
+*and* `commit_forms_build: false`: it maintains at every commit whoever
+is reading, and builds no form when it does. `supdb-forms` moves only
+the first. Against `supdb`, fifteen pairs at ten thousand keys:
 
-| | 10k | 30k | 100k | 300k |
-|---|---|---|---|---|
-| ycsb-E, `supdb-settle` over `supdb` | 1.23x | 1.18x | 1.10x | 1.06x |
-| scan-mixed 4t, the same pair | 0.74x | 0.70x | 0.57x | 0.75x |
+| | settle over supdb | forms over supdb |
+|---|---|---|
+| scan-lag, 10% unmerged | **4.157x** (15/15) | **3.186x** (15/15) |
+| scan-lag, 1% unmerged | 1.222x (13/15) | 1.314x (13/15) |
+| ycsb-E | **1.231x** (15/15) | 0.968x (6/15, ns) |
+| scan-mixed 4t | 0.675x (0/15) | 1.036x (11/15, ns) |
 
-ycsb-E reads through the writer -- the mix driver holds `&mut dyn
-Engine` and never opens a handle -- so every form built during it is
-cost. The threaded scan mix reads through handles, and every form it
-takes was built by the last commits of the mixes before it, because the
-mix phase is the only one that commits: the scan phases write nothing.
-So the phase that cannot use the forms is the phase that builds them,
-and the phase that uses them cannot.
+So the two numbers have two different causes. ycsb-E's 1.231x is the
+build: the regime alone does nothing for it. The lag sweep's 4.157x is
+mostly the regime, 3.186x of it, and only the rest is the build.
 
-The obvious repair is to let the writer read what it maintains, and it
-does not work. `supdb-wforms` admits the writer's handle when nothing
-has been written past the commit the forms were settled at, which is the
-only window in which a form is what a read honouring no watermark must
-see. Eleven pairs at a hundred thousand keys: the writer takes them --
-`form_takes` 24,225 against 51,113, `canon_hit` 6,000 against 19,862,
-blocks built by the engine 2,801 against 2,653 -- and **ycsb-E reads
-0.981x, one win in eleven, p=0.012**. So what `supdb-settle` measures is
-the building and publishing, not the not-reading, and the arm stays off.
+The regime is the larger finding and it is the opposite of what this
+file assumed. `maintain_forms` waits for a handle the *caller* made to
+have scanned, on the reasoning that the forms "lose where the writer
+reads its own store". The suite's lag store is exactly that store --
+loaded shuffled, swept by `e.range` on the writer's own handle, and
+never touched by a handle from `Db::reader` -- so under the default the
+maintenance never runs there at all, and the writer's own reads pay at
+scan time for the settling no commit did. Maintaining regardless reads
+3.19x at ten thousand keys with a tenth of the store unmerged.
 
-The regime cannot repair it either, for a reason worth writing down:
-gating maintenance on reader scans *since the last commit* rather than
-on any ever would stop it through the mixes, where no handle scans, and
-the scan phase that follows issues no commit to start it again. It would
-hand the threaded mix the settle arm's 0.57x-0.75x to buy ycsb-E's
-1.06x-1.23x. The default picks the threaded mix, and that is a choice
-rather than an oversight.
+It is not a default, because it does not hold at size. Eleven pairs at a
+hundred thousand: scan-lag at 1% reads 1.340x (10/11, p=0.012), at 10%
+1.055x (ns), and at 100% **0.869x** (1/11, p=0.012) -- a real loss --
+while the forms held go 1,537 to 3,099 and their bytes 1.30 MB to 2.82
+MB, 2.18x the memory. A win of 3x at one rung and a loss at another
+rung's deepest lag is a policy question, not a constant.
+
+What does not work is letting the writer read what it maintains.
+`supdb-wforms` admits the writer's handle when nothing has been written
+past the commit the forms were settled at, which is the only window in
+which a form is what a read honouring no watermark must see. It takes
+them -- at a hundred thousand keys `form_takes` 24,225 against 51,113,
+`canon_hit` 6,000 against 19,862, blocks built by the engine 2,801
+against 2,653 -- and ycsb-E reads **0.981x**, one win in eleven,
+p=0.012. At ten thousand it takes nothing the counters can see:
+`canon_hit` stays at 600 while `canon_tried` goes 1,200 to 3,285, so
+every writer scan there checked and missed. A probe of the lag shape
+shows the other end of it -- the writer hitting 20,000 of 20,000 and
+reading 2,026 ns against 1,938 -- so the admission is sound and the
+reading is simply not worth what the check costs.
+
+Two warnings from doing this. A quick row's small rungs are 3 ms
+measurements: ycsb-E's 1.23x at ten thousand keys is real only because
+the five samples of the two arms do not overlap (500-594k against
+594-760k), and the same row's 1.06x at three hundred thousand is noise
+(438-473k against 435-494k). And a probe that reproduces neither number
+is a probe missing an ingredient, not a refutation: three of them here
+ran the lag shape at about 51M entries/s, which is the *settle* arm's
+44M and not the shipping arm's 10.6M, because none of them loaded the
+keys shuffled.
 
 ### Arrival order
 
