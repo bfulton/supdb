@@ -350,6 +350,10 @@ pub struct Supdb {
     wforms: bool,
     /// The unsealed share past which a commit stops; `supdb-regime`.
     lagcap: usize,
+    /// The seal cap this arm pins, or none for the engine's own;
+    /// `supdb-noseal` pins zero. `Option` and not a number, because the
+    /// shipping arm must inherit a default rather than restate it.
+    sealcap: Option<usize>,
 }
 
 /// What an arm differs from `supdb` by. One struct rather than a row of
@@ -372,6 +376,9 @@ struct Policy {
     /// The share of the store that may be unsealed before a commit
     /// stops maintaining; zero is no bound. `supdb-regime`.
     lagcap: usize,
+    /// The seal cap this arm pins, or none for the engine's own.
+    /// `supdb-noseal`.
+    sealcap: Option<usize>,
 }
 
 impl Default for Policy {
@@ -389,6 +396,7 @@ impl Default for Policy {
             settle: false,
             wforms: false,
             lagcap: 0,
+            sealcap: None,
         }
     }
 }
@@ -440,6 +448,27 @@ impl Supdb {
             Policy {
                 forms: true,
                 settle: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the seal capped only by `seal_bytes`, which is the
+    /// shape every arm had before the cap: on a store smaller than the
+    /// 32 MiB floor the memtable can hold the whole of it and never seal.
+    /// Against `supdb` it prices the cap, and it prices the lag axis and
+    /// the load axis together, which is the only way either means
+    /// anything. `SEALPCT` pins a different share for a sweep.
+    pub fn create_noseal(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                sealcap: Some(
+                    std::env::var("SEALPCT")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0),
+                ),
                 ..Policy::default()
             },
         )
@@ -551,7 +580,11 @@ impl Supdb {
             settle,
             wforms,
             lagcap,
+            sealcap,
         } = policy;
+        // What the engine ships, so an arm that pins nothing inherits it
+        // rather than restating it and drifting from it.
+        let base_seal_max_pct = supdb::Options::default().seal_max_pct;
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         // Checksums off in the segments, because LMDB has none and the axis
         // is equalizable -- the same call `supdb-durable` makes, and the
@@ -609,6 +642,9 @@ impl Supdb {
             // arm can maintain whoever is reading without paying for it
             // on a store that is nearly all unmerged.
             forms_max_unsealed_pct: lagcap,
+            // The seal capped by a share of the store, so the memtable
+            // cannot hold the whole of a store smaller than the floor.
+            seal_max_pct: sealcap.unwrap_or(base_seal_max_pct),
             // The guarantee the arm's row names, not the engine's default:
             // durable per batch, or frames written per commit and fsynced
             // at `sync`, which is how `lmdb-nosync` and `rocksdb-nosync`
@@ -642,6 +678,7 @@ impl Supdb {
             settle,
             wforms,
             lagcap,
+            sealcap,
         })
     }
 }
@@ -678,6 +715,9 @@ impl Engine for Supdb {
         }
         if self.settle {
             return "supdb-settle";
+        }
+        if self.sealcap.is_some() {
+            return "supdb-noseal";
         }
         if self.lagcap > 0 {
             return "supdb-regime";
@@ -1203,8 +1243,8 @@ pub const ARMS: [&str; 12] = [
 pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
         "supdb" | "supdb-forms" | "supdb-settle" | "supdb-wforms" | "supdb-regime"
-        | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb"
-        | "rocksdb-tuned" => Guarantee::Durable,
+        | "supdb-noseal" | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache"
+        | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
     })
@@ -1217,6 +1257,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb" => Box::new(Supdb::create(dir)?),
         "supdb-forms" => Box::new(Supdb::create_forms(dir)?),
         "supdb-settle" => Box::new(Supdb::create_settle(dir)?),
+        "supdb-noseal" => Box::new(Supdb::create_noseal(dir)?),
         "supdb-regime" => Box::new(Supdb::create_regime(dir)?),
         "supdb-wforms" => Box::new(Supdb::create_wforms(dir)?),
         "supdb-nosnap" => Box::new(Supdb::create_nosnap(dir)?),

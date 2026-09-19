@@ -4388,3 +4388,60 @@ fn the_writers_own_handle_takes_the_forms_it_maintains() {
         m.check(&db, "committed");
     }
 }
+
+/// EXPERIMENT: the seal capped by a share of the store, so a store
+/// smaller than `seal_bytes` cannot hold the whole of itself unsealed.
+/// The cap engages only once something has been sealed, since a store of
+/// no bytes has no share to take, which is why a first load runs
+/// uncapped.
+#[test]
+fn a_store_below_the_seal_floor_still_seals_once_it_has_bytes() {
+    // Values big enough that a few thousand keys clear `SEAL_CAP_FLOOR`
+    // without the test writing for a second.
+    let val = "v".repeat(400);
+    let key = |k: u32| format!("key-{k:06}");
+    let run = |cap: usize| -> (usize, usize) {
+        let d = dir(&format!("sealcap-{cap}"));
+        let opts = Options {
+            // Far above anything this test writes, so the cap is the only
+            // thing that can seal it.
+            seal_bytes: 32 << 20,
+            seal_max_pct: cap,
+            partition_bytes: Some(2 << 20),
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        for k in 0..9000u32 {
+            db.append(key(k).as_bytes(), val.as_bytes());
+            if k % 500 == 499 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let after_load = db.levels().0;
+        // Updates to a store that now has bytes: the capped arm seals
+        // through them, the uncapped one holds them all.
+        for k in (0..9000u32).step_by(2) {
+            db.append(key(k).as_bytes(), val.as_bytes());
+            if k % 500 == 498 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+        let sealed = db.levels().1;
+        assert!(after_load > 0, "cap {cap}: the load left partitions");
+        (after_load, sealed)
+    };
+    let (_, uncapped) = run(0);
+    let (_, capped) = run(10);
+    assert_eq!(
+        uncapped, 0,
+        "uncapped, the memtable holds every update: it is far below `seal_bytes`"
+    );
+    assert!(
+        capped > 0,
+        "capped, the updates seal once they pass a share of the store; got {capped}"
+    );
+}

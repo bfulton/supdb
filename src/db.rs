@@ -232,6 +232,33 @@ pub struct Options {
     /// takes in, held to four. Off, the seal is `seal_bytes` and nothing
     /// else, the shape the suite's arms were measured in before this.
     pub seal_grows: bool,
+    /// EXPERIMENT: the share of the store's bytes the memtable may reach
+    /// before a commit seals, as a cap on `seal_threshold` rather than a
+    /// floor under it; zero is no cap.
+    ///
+    /// `seal_bytes` and `seal_grows` are both floors, so on a store
+    /// smaller than the floor the memtable can hold the whole of it and
+    /// never seal: a hundred thousand keys are six megabytes against a
+    /// 32 MiB seal, so the lag sweep's every point sits unsealed. That is
+    /// the axis where this engine is not competitive -- drained it reads
+    /// 1.35x-1.64x of LMDB and with a tenth of the store unmerged
+    /// 0.24x-0.35x -- and a B-tree has no such axis because it pays for
+    /// every write where the write happens. The cap moves that cost back
+    /// to the writer, which is what it buys and what it costs, so the
+    /// load and the lag sweep are priced together or not at all.
+    ///
+    /// It engages only once something has been sealed, since a store of
+    /// no bytes has no share to take, so a first load runs uncapped and
+    /// the load axis does not move: measured, `device_bytes_per_byte` is
+    /// identical with it and without.
+    ///
+    /// Ten percent, floored at `SEAL_CAP_FLOOR`, is what the sweep left.
+    /// At a hundred thousand keys it reads ycsb-E at 1.302x-1.421x of the
+    /// uncapped arm (9/9 and 11/11, p<=0.004) and the fully unmerged lag
+    /// point at 5.66x-5.96x, for ycsb-F at 0.834x-0.907x. That trade is
+    /// one-sided on the ladder: ycsb-E is the only mix this engine loses
+    /// to LMDB, at 0.74x-0.87x, and ycsb-F it wins by 2.84x-6.27x.
+    pub seal_max_pct: usize,
     /// Ordered ingest goes straight into a segment. Keys arriving above the
     /// store's greatest, with values the record holds inline
     /// (`inline_bytes`), while the memtable is empty, fill an ordered
@@ -539,6 +566,7 @@ impl Default for Options {
             // reads. Smaller still buys nothing and costs 1.5x the device
             // bytes.
             seal_bytes: 32 << 20,
+            seal_max_pct: 10,
             seal_grows: true,
             direct_ingest: true,
             segment: SegmentOptions::default(),
@@ -5362,18 +5390,43 @@ impl State {
     }
 }
 
+/// EXPERIMENT: the smallest a `seal_max_pct` cap may make the seal, and
+/// the variable the sweep turned on rather than the share.
+///
+/// At ten thousand keys the store is about 600 KB, so any floor below it
+/// binds. With the floor at 64 KiB a tenth of the store is 64 KiB, the
+/// memtable seals on nearly every commit, and ycsb-F reads 0.571x of the
+/// uncapped arm (0/15, p=0.000); at 256 KiB, ycsb-E reads 0.792x and the
+/// threaded scan mix 0.673x (0/9 and 1/9, p<=0.039). At a megabyte the
+/// rung is clean -- every mix within noise -- and keeps a 1.755x on the
+/// fully unmerged lag point, while a hundred thousand keys, whose store
+/// clears the floor, keeps the whole win. So the floor is what makes the
+/// cap a no-op on a store too small to have a lag problem.
+const SEAL_CAP_FLOOR: usize = 1 << 20;
+
 impl Reader {
     /// The memtable bytes at which the next commit seals: `seal_bytes`, or
     /// with `seal_grows` the larger of that and the partitions' bytes over
     /// four times `l0_trigger`.
     pub fn seal_threshold(&self) -> usize {
-        if !self.opts.seal_grows {
-            return self.opts.seal_bytes;
+        let base = if !self.opts.seal_grows {
+            self.opts.seal_bytes
+        } else {
+            let grown = self.state().store_bytes / (4 * self.opts.l0_trigger.max(1)) as u64;
+            self.opts
+                .seal_bytes
+                .max(usize::try_from(grown).unwrap_or(usize::MAX))
+        };
+        if self.opts.seal_max_pct == 0 {
+            return base;
         }
-        let grown = self.state().store_bytes / (4 * self.opts.l0_trigger.max(1)) as u64;
-        self.opts
-            .seal_bytes
-            .max(usize::try_from(grown).unwrap_or(usize::MAX))
+        let store = usize::try_from(self.state().store_bytes).unwrap_or(usize::MAX);
+        // Nothing sealed yet is nothing to take a share of, and the floor
+        // keeps a store of a few kilobytes off a seal a commit.
+        match store / 100 * self.opts.seal_max_pct {
+            0 => base,
+            cap => base.min(cap.max(SEAL_CAP_FLOOR)),
+        }
     }
 
     /// Order `pieces` by first key and check the chain: every piece's first

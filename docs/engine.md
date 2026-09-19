@@ -630,6 +630,49 @@ maintenance. The option and `supdb-regime` stay as the vehicle for the
 next attempt, and at 1 they do bound: forms held 157 against 103 and
 their bytes 0.185x, with the 10% win given up for it.
 
+#### Capping the seal by a share of the store
+
+`seal_bytes` and `seal_grows` are both floors, so on a store smaller
+than the floor the memtable can hold the whole of it and never seal. A
+hundred thousand keys are six megabytes against a 32 MiB seal, which is
+why every point of the lag sweep sat unsealed and why the engine read
+0.03x-0.35x of LMDB there. `seal_max_pct` caps the threshold at a share
+of the store instead, ten percent, floored at a megabyte.
+
+Paired against the arm that keeps the old shape, eleven pairs at a
+hundred thousand keys:
+
+| | capped over uncapped |
+|---|---|
+| scan-lag, all of it unmerged | **5.68x** (11/11, p=0.001) |
+| ycsb-E | **1.31x** (11/11, p=0.001) |
+| ycsb-F | 0.81x (10/11, p=0.012) |
+| load ops/s | 0.94x (ns) |
+| bytes on disk, device bytes | identical |
+
+The trade is one-sided on the ladder, which is the whole reason to take
+it. ycsb-E is the only mix this engine loses to LMDB -- 0.76x, 0.74x,
+0.78x, 0.87x across the rungs, against 1.46x-6.39x on A, B, C, D and F
+-- so 1.31x at a hundred thousand puts E at about 1.02x and leaves F,
+which the cap costs, at about 3.3x instead of 4.08x. Nine reps at ten
+thousand keys move nothing either way except the fully unmerged lag
+point, at 1.755x. Thirty and three hundred thousand are not measured.
+
+The cap engages only once something has been sealed, because a store of
+no bytes has no share to take. That is why the load axis does not move
+and `device_bytes_per_byte` is identical with the cap and without: a
+first load runs uncapped, and the cap is about the updates that follow.
+
+The floor, not the share, is what the sweep turned on. At ten thousand
+keys the store is about 600 KB, so a floor below it binds and the
+memtable seals on nearly every commit: at 64 KiB ycsb-F reads 0.571x
+(0/15, p=0.000), at 256 KiB ycsb-E reads 0.792x and the threaded scan
+mix 0.673x (0/9 and 1/9). At a megabyte the small rung is clean and the
+hundred-thousand rung keeps the whole win, because a store too small to
+have a lag problem is one the cap should not touch. Sweeping the share
+instead -- a tenth, a quarter, a half -- moved the lag point around and
+never recovered ycsb-E at the rungs where the floor was binding.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and
