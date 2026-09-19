@@ -695,6 +695,8 @@ impl Engine for Supdb {
             ("snapshot_builds", db.snapshot_builds() as f64),
             ("snapshot_extends", db.snapshot_extends() as f64),
             ("form_takes", db.form_takes() as f64),
+            ("blk_by_reader", db.blocks_built().0 as f64),
+            ("blk_by_engine", db.blocks_built().1 as f64),
             ("rd_scans", db.reader_scans().0 as f64),
             ("rd_blockpath", db.reader_scans().1 as f64),
             ("canon_tried", db.canonical_tries().0 as f64),

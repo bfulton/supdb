@@ -4417,6 +4417,18 @@ struct Shared {
     canon_hit: AtomicU64,
     rd_scans: AtomicU64,
     rd_blocks: AtomicU64,
+    /// Blocks materialised, by a handle the caller made and by the
+    /// engine's own. These were added to size what sharing the block
+    /// tables between handles would be worth, the last structure thought
+    /// to be built per handle, and the answer is nothing: over a pass at
+    /// a hundred thousand keys a caller's handles materialise none at
+    /// all, and every one of the 2,801 is the writer's or the builder's.
+    /// A reader takes a canonical form or walks a clean block; the
+    /// per-handle rebuild went away when the forms went into the state.
+    /// They stay because that is worth knowing again after any change
+    /// to what a read may adopt.
+    blk_reader: AtomicU64,
+    blk_engine: AtomicU64,
     /// EXPERIMENT: snapshots carried forward by merging a batch into the
     /// run rather than sorting everything again; the count that should
     /// rise where `snap_builds` stops.
@@ -6217,6 +6229,16 @@ impl Reader {
         });
     }
 
+    /// One block materialised, charged to whoever built it.
+    fn count_built(&self) {
+        let c = if self.counted {
+            &self.shared.blk_reader
+        } else {
+            &self.shared.blk_engine
+        };
+        c.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
     fn publish_form(&self, p: usize, b: usize, form: &std::sync::Arc<Cached>) {
         let st = self.state();
         let Some(slot) = st.forms.get(p).and_then(|f| f.get(b)) else {
@@ -6572,6 +6594,7 @@ impl Reader {
                     continue;
                 }
                 let built = std::sync::Arc::new(ctx.materialize(src, table, b, unsealed)?);
+                self.count_built();
                 let bytes = built.bytes();
                 table.slots[b] = Some(built);
                 self.list_built_bytes(pi, b, table, bytes);
@@ -7127,6 +7150,7 @@ impl Reader {
                     };
                 if canon.is_none() && table.slots[b].is_none() {
                     let built = std::sync::Arc::new(ctx.materialize(src, table, b, unsealed)?);
+                    self.count_built();
                     let bytes = built.bytes();
                     table.slots[b] = Some(built);
                     self.list_built_bytes(pi, b, table, bytes);
@@ -8035,6 +8059,8 @@ impl Db {
             canon_hit: AtomicU64::new(0),
             rd_scans: AtomicU64::new(0),
             rd_blocks: AtomicU64::new(0),
+            blk_reader: AtomicU64::new(0),
+            blk_engine: AtomicU64::new(0),
             snap_extends: AtomicU64::new(0),
         });
         let r = Reader {
@@ -8321,6 +8347,8 @@ impl Db {
             canon_hit: AtomicU64::new(0),
             rd_scans: AtomicU64::new(0),
             rd_blocks: AtomicU64::new(0),
+            blk_reader: AtomicU64::new(0),
+            blk_engine: AtomicU64::new(0),
             snap_extends: AtomicU64::new(0),
         });
         let r = Reader {
@@ -9164,6 +9192,15 @@ impl Db {
 
     /// EXPERIMENT: scans through a caller's handle, and those of them
     /// that took the block path at all.
+    /// EXPERIMENT: blocks materialised by a caller's handle and by the
+    /// engine's own; see `Shared::blk_reader`.
+    pub fn blocks_built(&self) -> (u64, u64) {
+        (
+            self.shared.blk_reader.load(AtomicOrdering::Relaxed),
+            self.shared.blk_engine.load(AtomicOrdering::Relaxed),
+        )
+    }
+
     pub fn reader_scans(&self) -> (u64, u64) {
         (
             self.shared.rd_scans.load(AtomicOrdering::Relaxed),
