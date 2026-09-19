@@ -678,6 +678,41 @@ have a lag problem is one the cap should not touch. Sweeping the share
 instead -- a tenth, a quarter, a half -- moved the lag point around and
 never recovered ycsb-E at the rungs where the floor was binding.
 
+#### The small rungs, where ycsb-E still loses
+
+The seal cap closed ycsb-E at a hundred thousand keys and above. At ten
+and thirty thousand it does not bind -- the store is 600 KB and 1.8 MB,
+and the mixes write about 150 KB against a megabyte floor -- and E stays
+at 0.76x and 0.74x of LMDB. What is there instead, measured:
+
+- **The commit-time fill costs E 19%.** `supdb-forms` against
+  `supdb-settle` differ in `commit_forms_build` alone: fifteen pairs at
+  ten thousand keys give ycsb-E 1.190x (15/15, p=0.000) without the
+  fill, scan-lag at 10% unmerged 1.302x (13/15), against the fully
+  unmerged point at 0.184x -- the fill is worth 5.44x there -- and the
+  threaded scan mix at two threads 0.837x (3/15). A trade, and at this
+  rung it is one the fill wins.
+- **Moving the fill to the builder thread buys nothing.** Below
+  `scan_cache_ahead_min_blocks` the builder declines and the writer fills
+  inline at the commit, and that threshold was measured as the builder
+  against *no* builder rather than against the inline fill. Measured
+  against the inline fill, fifteen pairs at ten thousand: ycsb-E 1.010x
+  (7/15, ns), the drained scan **0.700x** and scan-lag at 0% **0.705x**
+  (1/15, p=0.001 both), ycsb-A 0.927x. The threshold stands.
+- **A perfect `memcmp` would not close it.** `__memcmp_evex_movbe` is
+  9.7% of a scan at this rung, all of it 16-byte key compares through a
+  libc call, so inlining them is worth at most that -- 0.76x to about
+  0.83x.
+
+Which leaves the arithmetic. The best lever here, dropping the fill,
+takes E from 0.76x to about 0.90x and costs the deep lag point 5.44x. So
+the small rungs do not lose E to any one thing the block cache does;
+they lose it to what a scan costs before it reads anything, 232 ns
+against LMDB's 126 on a drained store, and that is spread -- roughly a
+quarter in the seek, a fifth in the walk of the first entry, an eighth
+in the preamble, an eighth in the prefetch. Closing it is a fixed-cost
+problem, not a policy one.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and

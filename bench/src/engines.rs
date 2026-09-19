@@ -350,6 +350,9 @@ pub struct Supdb {
     wforms: bool,
     /// The unsealed share past which a commit stops; `supdb-regime`.
     lagcap: usize,
+    /// The partitions' blocks below which no builder starts, or none for
+    /// the engine's own. `supdb-ahead`.
+    aheadmin: Option<usize>,
     /// The seal cap this arm pins, or none for the engine's own;
     /// `supdb-noseal` pins zero. `Option` and not a number, because the
     /// shipping arm must inherit a default rather than restate it.
@@ -376,6 +379,9 @@ struct Policy {
     /// The share of the store that may be unsealed before a commit
     /// stops maintaining; zero is no bound. `supdb-regime`.
     lagcap: usize,
+    /// The builder's minimum blocks, or none for the engine's own.
+    /// `supdb-ahead`.
+    aheadmin: Option<usize>,
     /// The seal cap this arm pins, or none for the engine's own.
     /// `supdb-noseal`.
     sealcap: Option<usize>,
@@ -397,6 +403,7 @@ impl Default for Policy {
             wforms: false,
             lagcap: 0,
             sealcap: None,
+            aheadmin: None,
         }
     }
 }
@@ -448,6 +455,22 @@ impl Supdb {
             Policy {
                 forms: true,
                 settle: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the builder starting on any store. Below
+    /// `scan_cache_ahead_min_blocks` the builder declines and the writer
+    /// fills the forms inline at the commit instead; the threshold was
+    /// measured as the builder against no builder at all, never against
+    /// that inline fill, and at ten and thirty thousand keys the inline
+    /// fill is what ycsb-E pays for.
+    pub fn create_ahead(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                aheadmin: Some(0),
                 ..Policy::default()
             },
         )
@@ -581,6 +604,7 @@ impl Supdb {
             wforms,
             lagcap,
             sealcap,
+            aheadmin,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -645,6 +669,11 @@ impl Supdb {
             // The seal capped by a share of the store, so the memtable
             // cannot hold the whole of a store smaller than the floor.
             seal_max_pct: sealcap.unwrap_or(base_seal_max_pct),
+            // Below this the builder declines and the writer fills the
+            // forms inline on the commit path instead, which is the
+            // comparison the threshold was never measured against.
+            scan_cache_ahead_min_blocks: aheadmin
+                .unwrap_or(supdb::Options::default().scan_cache_ahead_min_blocks),
             // The guarantee the arm's row names, not the engine's default:
             // durable per batch, or frames written per commit and fsynced
             // at `sync`, which is how `lmdb-nosync` and `rocksdb-nosync`
@@ -679,6 +708,7 @@ impl Supdb {
             wforms,
             lagcap,
             sealcap,
+            aheadmin,
         })
     }
 }
@@ -715,6 +745,9 @@ impl Engine for Supdb {
         }
         if self.settle {
             return "supdb-settle";
+        }
+        if self.aheadmin.is_some() {
+            return "supdb-ahead";
         }
         if self.sealcap.is_some() {
             return "supdb-noseal";
@@ -1243,7 +1276,7 @@ pub const ARMS: [&str; 12] = [
 pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
         "supdb" | "supdb-forms" | "supdb-settle" | "supdb-wforms" | "supdb-regime"
-        | "supdb-noseal" | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache"
+        | "supdb-noseal" | "supdb-ahead" | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache"
         | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
@@ -1257,6 +1290,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb" => Box::new(Supdb::create(dir)?),
         "supdb-forms" => Box::new(Supdb::create_forms(dir)?),
         "supdb-settle" => Box::new(Supdb::create_settle(dir)?),
+        "supdb-ahead" => Box::new(Supdb::create_ahead(dir)?),
         "supdb-noseal" => Box::new(Supdb::create_noseal(dir)?),
         "supdb-regime" => Box::new(Supdb::create_regime(dir)?),
         "supdb-wforms" => Box::new(Supdb::create_wforms(dir)?),
