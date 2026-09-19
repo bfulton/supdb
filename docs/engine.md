@@ -668,6 +668,21 @@ no bytes has no share to take. That is why the load axis does not move
 and `device_bytes_per_byte` is identical with the cap and without: a
 first load runs uncapped, and the cap is about the updates that follow.
 
+The share cannot be pushed further, and the point that would want it is
+scan-lag at a tenth unmerged, which the cap does not reach: the row puts
+it at 0.23x-0.28x of LMDB at every rung, unmoved. At a hundred thousand
+keys a tenth of the store is about 900 KB against the 600 KB that point
+writes, so it never trips. Nine pairs there, with the floor at 512 KiB
+so it is the share that varies: a twentieth reaches it, 1.711x (9/9,
+p=0.004), and takes ycsb-E to 1.372x -- but ycsb-D falls to 0.749x,
+ycsb-A to 0.879x, ycsb-F to 0.874x and the drained scan to 0.924x (1/9
+each, p=0.039). A thirtieth reaches the same lag point and reverses
+ycsb-E outright, 0.873x, with ycsb-D at 0.636x (0/9, p=0.004). Since
+ycsb-D reads 1.41x of LMDB at that rung, a quarter off it is most of its
+margin, and what it buys is about six percent more on ycsb-E. A tenth is
+the point. The floor makes no difference there -- 512 KiB and a megabyte
+measure the same at a tenth -- so it stays where the small rungs put it.
+
 The floor, not the share, is what the sweep turned on. At ten thousand
 keys the store is about 600 KB, so a floor below it binds and the
 memtable seals on nearly every commit: at 64 KiB ycsb-F reads 0.571x
