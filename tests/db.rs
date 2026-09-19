@@ -4322,3 +4322,69 @@ fn the_writer_maintains_the_forms_once_a_reader_handle_is_live() {
     );
     m.check(&r2, "a reader over the state a seal published");
 }
+
+/// EXPERIMENT: the writer's own handle reads the canonical forms it
+/// maintains, and declines them where it has staged writes they cannot
+/// carry. Without `forms_to_writer` the maintenance is pure cost on a
+/// store whose reads are the writer's own, which is the suite's ycsb-E.
+#[test]
+fn the_writers_own_handle_takes_the_forms_it_maintains() {
+    for to_writer in [false, true] {
+        let d = dir(if to_writer { "wforms-on" } else { "wforms-off" });
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(2 << 10),
+            l0_trigger: 64,
+            scan_block_cache: true,
+            scan_cache_ahead: false,
+            // Maintained for the writer alone, which is the case this is
+            // about: with the default the writer's own scans start it too,
+            // but only once a handle the caller made has scanned.
+            forms_from_reader_scans: 0,
+            forms_to_writer: to_writer,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..1500u32 {
+            m.append(&mut db, &key(k), "v0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        assert!(db.levels().0 > 1, "several partitions");
+        let mut sink = 0usize;
+        // A scan over the state, so the commit after it has something to
+        // maintain for, then writes, then the commit that maintains.
+        db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+            .unwrap();
+        for k in (0..1500u32).step_by(5) {
+            m.append(&mut db, &key(k), "vw");
+        }
+        db.commit().unwrap();
+        assert!(db.canonical_forms().0 > 0, "the commit maintained forms");
+        let before = db.form_takes();
+        m.check(&db, "the writer over the forms it maintains");
+        let took = db.form_takes() - before;
+        if to_writer {
+            assert!(took > 0, "the writer takes the forms it maintains");
+        } else {
+            assert_eq!(took, 0, "without the arm the writer builds its own");
+        }
+        // Staged past that commit: the forms are settled at it and cannot
+        // carry this, and the writer's reads honour no watermark, so the
+        // scan must build its own and must answer the staged value.
+        m.append(&mut db, &key(7), "staged");
+        let before = db.form_takes();
+        m.check(&db, "the writer with a write staged past the forms");
+        assert_eq!(
+            db.form_takes() - before,
+            0,
+            "a form settled at the last commit cannot carry a staged write"
+        );
+        db.commit().unwrap();
+        m.check(&db, "committed");
+    }
+}

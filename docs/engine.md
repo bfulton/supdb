@@ -527,6 +527,46 @@ apiece on every block walked. Skipping them took a scan of one entry from
 sixteen entries or sixty-four. That is the size of a bookkeeping array
 that stays resident: the 280 ns of waiting is the copies themselves.
 
+#### What the forms at commit cost, and who pays
+
+The canonical forms the writer maintains are taken only by a handle with
+a slot, and the writer's own has none, so a store whose reads are the
+writer's pays for a structure it cannot read. The suite is exactly that
+store in one phase and its opposite in another, and one `quick` row
+prices both from within itself, against the arm that maintains at every
+commit but builds no form (`supdb-settle`):
+
+| | 10k | 30k | 100k | 300k |
+|---|---|---|---|---|
+| ycsb-E, `supdb-settle` over `supdb` | 1.23x | 1.18x | 1.10x | 1.06x |
+| scan-mixed 4t, the same pair | 0.74x | 0.70x | 0.57x | 0.75x |
+
+ycsb-E reads through the writer -- the mix driver holds `&mut dyn
+Engine` and never opens a handle -- so every form built during it is
+cost. The threaded scan mix reads through handles, and every form it
+takes was built by the last commits of the mixes before it, because the
+mix phase is the only one that commits: the scan phases write nothing.
+So the phase that cannot use the forms is the phase that builds them,
+and the phase that uses them cannot.
+
+The obvious repair is to let the writer read what it maintains, and it
+does not work. `supdb-wforms` admits the writer's handle when nothing
+has been written past the commit the forms were settled at, which is the
+only window in which a form is what a read honouring no watermark must
+see. Eleven pairs at a hundred thousand keys: the writer takes them --
+`form_takes` 24,225 against 51,113, `canon_hit` 6,000 against 19,862,
+blocks built by the engine 2,801 against 2,653 -- and **ycsb-E reads
+0.981x, one win in eleven, p=0.012**. So what `supdb-settle` measures is
+the building and publishing, not the not-reading, and the arm stays off.
+
+The regime cannot repair it either, for a reason worth writing down:
+gating maintenance on reader scans *since the last commit* rather than
+on any ever would stop it through the mixes, where no handle scans, and
+the scan phase that follows issues no commit to start it again. It would
+hand the threaded mix the settle arm's 0.57x-0.75x to buy ycsb-E's
+1.06x-1.23x. The default picks the threaded mix, and that is a choice
+rather than an oversight.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and

@@ -480,6 +480,23 @@ pub struct Options {
     /// which is where the builder started before. A builder already
     /// running is left alone.
     pub build_ahead_on_commit: usize,
+    /// EXPERIMENT: the writer's own handle takes the canonical forms it
+    /// maintains, instead of building its own. Without this the
+    /// maintenance is pure cost wherever the reads are the writer's: a
+    /// form is taken only by a handle with a slot, and the writer's has
+    /// none, so the suite's ycsb-E -- whose scans go through the writer
+    /// -- pays for a structure it cannot read, and the arm that builds
+    /// no form at commit reads 1.06x-1.23x of the one that does.
+    ///
+    /// What the slot stood for is two things, and neither needs it. The
+    /// epoch: a form is freed past every pinned reader, and the writer
+    /// is the only thread that frees one and frees none while it reads,
+    /// which `canonical` already says. The watermark: a form is settled
+    /// at the last commit and the writer's reads honour none, so a form
+    /// is what the writer must read only while nothing has been written
+    /// past that commit. That is a comparison rather than a rule, so the
+    /// scan makes it and builds its own where it has staged writes.
+    pub forms_to_writer: bool,
     /// EXPERIMENT: overlay keys in a block from which the writer's
     /// canonical form is a merged copy rather than resolved deltas; zero
     /// is `CACHE_DENSE`, the threshold a handle building for itself
@@ -534,6 +551,7 @@ impl Default for Options {
             snapshot_adopt_behind: 0,
             promote_entries: 0,
             build_ahead_on_commit: 0,
+            forms_to_writer: false,
             form_dense_from: 0,
             scan_snapshot_arena: true,
         }
@@ -6093,6 +6111,24 @@ impl Reader {
 
     /// EXPERIMENT: the canonical form of block `b` of partition `p`, for a
     /// reader at the table's position; none where the slot is empty.
+    /// EXPERIMENT: the log position a canonical form must have been
+    /// settled at for this handle to read it, or none where the handle
+    /// may not read one at all. A handle with a slot holds the position
+    /// of the commit its watermark names. The writer's own honours no
+    /// watermark, so it holds the log's whole length: equal to
+    /// `forms_at`, nothing has been written past the commit the forms
+    /// were settled at and they are exactly what it must read; short of
+    /// it, it has staged writes they do not carry and it builds its own.
+    /// `forms_at` before the first maintenance is `usize::MAX`, which no
+    /// log length equals, so an unmaintained table is never taken.
+    fn forms_bound(&self) -> Option<usize> {
+        match self.slot {
+            Some(_) => Some(self.log_bound.get()),
+            None if self.opts.forms_to_writer => Some(self.mem().log_len()),
+            None => None,
+        }
+    }
+
     fn canonical(&self, p: usize, b: usize) -> Option<&Cached> {
         let st = self.state();
         let e = st.forms.get(p)?.get(b)?.load(AtomicOrdering::Acquire);
@@ -7052,9 +7088,10 @@ impl Reader {
             }
         }
         let canonical = self.opts.commit_forms
-            && self.slot.is_some()
-            && st.forms_at.load(AtomicOrdering::Acquire) == self.log_bound.get();
-        if self.opts.commit_forms && self.slot.is_some() {
+            && self
+                .forms_bound()
+                .is_some_and(|n| st.forms_at.load(AtomicOrdering::Acquire) == n);
+        if self.opts.commit_forms && self.forms_bound().is_some() {
             self.shared
                 .canon_tried
                 .fetch_add(1, AtomicOrdering::Relaxed);

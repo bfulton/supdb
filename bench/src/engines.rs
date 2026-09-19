@@ -346,6 +346,8 @@ pub struct Supdb {
     snap: bool,
     /// Whether a commit's maintenance stops after settling; `supdb-settle`.
     settle: bool,
+    /// Whether the writer reads the forms it maintains; `supdb-wforms`.
+    wforms: bool,
 }
 
 /// What an arm differs from `supdb` by. One struct rather than a row of
@@ -362,6 +364,9 @@ struct Policy {
     /// Maintain at every commit but settle only: no form built for an
     /// overlaid block, nothing published. `supdb-settle`.
     settle: bool,
+    /// The writer's own handle reads the forms it maintains rather than
+    /// building its own. `supdb-wforms`.
+    wforms: bool,
 }
 
 impl Default for Policy {
@@ -377,6 +382,7 @@ impl Default for Policy {
             forms: false,
             snap: true,
             settle: false,
+            wforms: false,
         }
     }
 }
@@ -428,6 +434,20 @@ impl Supdb {
             Policy {
                 forms: true,
                 settle: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the writer reading the canonical forms it maintains.
+    /// Against `supdb` it prices the half of the mechanism the shipping
+    /// arm cannot use: a form is taken only by a handle with a slot, and
+    /// the writer's has none.
+    pub fn create_wforms(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                wforms: true,
                 ..Policy::default()
             },
         )
@@ -505,6 +525,7 @@ impl Supdb {
             forms,
             snap,
             settle,
+            wforms,
         } = policy;
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         // Checksums off in the segments, because LMDB has none and the axis
@@ -554,6 +575,11 @@ impl Supdb {
             // reading; the engine's default waits for a caller's handle.
             forms_from_reader_scans: if forms { 0 } else { 1 },
             commit_forms_build: !settle,
+            // The writer's own reads take the forms it maintains. Off in
+            // the shipping arm until the pair is measured: the suite's
+            // ycsb-E reads through the writer, so it pays for the
+            // maintenance and today cannot read it.
+            forms_to_writer: wforms,
             // The guarantee the arm's row names, not the engine's default:
             // durable per batch, or frames written per commit and fsynced
             // at `sync`, which is how `lmdb-nosync` and `rocksdb-nosync`
@@ -585,6 +611,7 @@ impl Supdb {
             forms,
             snap,
             settle,
+            wforms,
         })
     }
 }
@@ -621,6 +648,9 @@ impl Engine for Supdb {
         }
         if self.settle {
             return "supdb-settle";
+        }
+        if self.wforms {
+            return "supdb-wforms";
         }
         if self.forms {
             return "supdb-forms";
@@ -1139,8 +1169,10 @@ pub const ARMS: [&str; 12] = [
 
 pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
-        "supdb" | "supdb-forms" | "supdb-settle" | "supdb-nosnap" | "supdb-noadvice"
-        | "supdb-nocache" | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
+        "supdb" | "supdb-forms" | "supdb-settle" | "supdb-wforms" | "supdb-nosnap"
+        | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => {
+            Guarantee::Durable
+        }
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
     })
@@ -1153,6 +1185,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb" => Box::new(Supdb::create(dir)?),
         "supdb-forms" => Box::new(Supdb::create_forms(dir)?),
         "supdb-settle" => Box::new(Supdb::create_settle(dir)?),
+        "supdb-wforms" => Box::new(Supdb::create_wforms(dir)?),
         "supdb-nosnap" => Box::new(Supdb::create_nosnap(dir)?),
         "supdb-noadvice" => Box::new(Supdb::create_noadvice(dir)?),
         "supdb-nocache" => Box::new(Supdb::create_nocache(dir)?),
