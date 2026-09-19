@@ -387,24 +387,37 @@ reads 1.69x behind and of ten 1.98x -- and an unsealed key at 6.91 ns
 against this engine's own 3.99 on a drained store. At a length of a
 hundred those are 167 ns and 290 ns of a 993 ns scan.
 
-Callgrind over twenty thousand scans of one entry, which is almost all
-fixed cost, puts 2,569 instructions in a scan and attributes them:
+Callgrind over scans of one entry, which is almost all fixed cost, puts
+about 1,285 instructions in a scan and attributes them:
 
 | | instructions a scan | share |
 |---|---|---|
-| `OrdIndex::seek_exact` and `lower_bound` | 837 | 33% |
-| `Reader::scan`'s own body | ~510 | 20% |
-| `Blob::scan_at`, the one entry | 242 | 9% |
-| the preamble: `enter`, `sync_log`, `build_ctx`, `refresh_snapshot`, `install_ahead`, `start_ahead` | ~272 | 11% |
-| `first_reaching` | 72 | 3% |
+| `OrdIndex::seek_exact` and `lower_bound` | 418 | 33% |
+| `Reader::scan`'s own body | ~255 | 20% |
+| `Blob::scan_at`, the one entry | 121 | 9% |
+| the preamble: `enter`, `sync_log`, `build_ctx`, `refresh_snapshot`, `install_ahead`, `start_ahead` | ~136 | 11% |
+| `first_reaching` | 36 | 3% |
 
 So a third of a short scan is the seek, and the preamble -- where the
 cost was assumed to be before this was run -- is a ninth of it. The
-binary search is 278 of those instructions over about fifteen probes,
-eighteen instructions a probe, which is a branchless search already; what
+binary search is 139 of those instructions over about fifteen probes,
+nine instructions a probe, which is a branchless search already; what
 would cut it is fewer probes, not a cheaper one, and that is an index
 layout question rather than a loop to tighten. `read_advice`'s prefetch
 plan does not appear in the profile at all.
+
+Count what the probe collects and not what it measures: the loop that
+warms the handle before the timed one is inside the toggle too, so the
+first reading of this was every figure doubled. The shares were right
+and the totals were not.
+
+Under the cache model a scan of one entry takes about 10.7 first-level
+data misses and 0.3 that reach memory, on a partition of thirty thousand
+keys that is entirely resident. The seek is instruction-bound at this
+size, so a layout that only improves locality -- Eytzinger over the
+samples, say -- has little to take; fewer probes is the lever. There is
+no `perf` on this machine, so that is a model and not the hardware, and
+the per-entry work is where the difference would start to matter.
 
 Two things it told us not to do. `prefetch_lines` sizes its hint to the
 block rather than to the scan, which looks like waste on a scan of one
