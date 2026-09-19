@@ -617,6 +617,13 @@ fn one_pass(
         }
         scan_mixed_threaded.push((threads, (ops * plan.scan_len as u64) as f64 / secs));
     }
+    // A pass opens two stores -- this one, and a fresh one below for the
+    // shuffled load and the lag sweep -- so the counts of the first are
+    // taken before it goes. Read from the second alone they described the
+    // lag store and nothing else: no reader handle scans there, so they
+    // said no read ever took a canonical form when the question had not
+    // been asked of the store where the reads happen.
+    let mut counters = e.counters();
     drop(e);
     let _ = std::fs::remove_dir_all(dir);
 
@@ -665,7 +672,12 @@ fn one_pass(
         let secs = t.elapsed().as_secs_f64();
         scan_lag.push((pct, (scans * plan.scan_len as u64) as f64 / secs));
     }
-    let counters = e.counters();
+    for (name, v) in e.counters() {
+        match counters.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, had)) => *had += v,
+            None => counters.push((name, v)),
+        }
+    }
     drop(e);
 
     Ok(OnePass {

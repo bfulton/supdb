@@ -407,21 +407,21 @@ pub struct Options {
     /// store. One such scan is the evidence that the first case is the
     /// one this store is in.
     ///
-    /// One, settled by `bench ab` over fifteen pairs at a hundred
-    /// thousand keys. Maintaining regardless reads 0.866x on `scan-lag`
-    /// at full lag with every one of the fifteen pairs agreeing, and is
-    /// detectably better nowhere: the threaded scan mix comes out 0.880x
-    /// on five pairs of fifteen, which is a coin, and ycsb-E 0.979x on
-    /// eight of fifteen, so the cost this gate was built for has indeed
-    /// expired but nothing has replaced it. Three rows of the series had
-    /// said 1.156x, 1.186x and then 1.247x the other way on that mix; a
-    /// ratio with no consistency under it is what a row shows and a
-    /// paired run does not.
+    /// One, and it is a trade rather than a win. `bench ab` over fifteen
+    /// pairs at a hundred thousand keys: maintaining regardless reads
+    /// 1.075x on the threaded scan mix, thirteen pairs of fifteen, p
+    /// 0.007, and 0.859x on `scan-lag` at full lag, fourteen of fifteen,
+    /// p 0.001, with ycsb-E a wash. One stands because the loss is the
+    /// larger and comes with twice the memory: 3,099 forms and 2.8 MB
+    /// held at the end of a pass against 1,537 and 1.3 MB.
     ///
-    /// What the counts say is plainer than any of it: maintaining
-    /// regardless holds 1,562 forms and 1.5 MB at that size and walks
-    /// none of them. The forms are being built and not read, which is
-    /// where to look before this setting is worth revisiting.
+    /// The counts say where the 1.075x does not come from. Reads take a
+    /// form 24,225 times on 6,000 of 12,000 scans through a caller's
+    /// handle, the same in both arms, so maintaining at commit doubles
+    /// what is held and changes adoption not at all -- the forms a read
+    /// takes are the builder's. Whatever that 1.075x is, it is the
+    /// settling and not the forms, and finding out is worth more than
+    /// this setting is.
     pub forms_from_reader_scans: usize,
     /// Publish the scan snapshot in the state, where every handle adopts
     /// it instead of sorting the unsealed keys again. Off is the shape
@@ -4383,6 +4383,21 @@ struct Shared {
     /// EXPERIMENT: scan snapshots built over this store's life, which is
     /// what publishing one is meant to bring down; for a test.
     snap_builds: AtomicU64,
+    /// Reads that took a canonical form, over this store's life. The
+    /// count beside it on `State` is that state's and is zero again at
+    /// every publish, so reading it at the end of a pass says what
+    /// happened since the last seal and nothing about the pass: it read
+    /// zero where a pass had taken forms all along, and this exists so a
+    /// measurement cannot make that mistake.
+    form_takes: AtomicU64,
+    /// Scans that reached the test for walking the forms, and the ones
+    /// that passed it. A mechanism that holds 1,562 forms and is taken
+    /// by no read is not slow, it is off, and these say which clause
+    /// turns it off.
+    canon_tried: AtomicU64,
+    canon_hit: AtomicU64,
+    rd_scans: AtomicU64,
+    rd_blocks: AtomicU64,
     /// EXPERIMENT: snapshots carried forward by merging a batch into the
     /// run rather than sorting everything again; the count that should
     /// rise where `snap_builds` stops.
@@ -5687,6 +5702,12 @@ impl Reader {
         // on: before the first partitioning it stands aside.
         let use_cache =
             self.opts.scan_block_cache && self.segs().first().is_some_and(|s| s.level > 0);
+        if self.counted {
+            self.shared.rd_scans.fetch_add(1, AtomicOrdering::Relaxed);
+            if use_cache {
+                self.shared.rd_blocks.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
         // Nothing written or published since the last scan: nothing to
         // settle, and the snapshot that stood then stands. Every scan paid
         // the checks below, four cell borrows and a snapshot's length,
@@ -6053,6 +6074,7 @@ impl Reader {
         // the writer's own, which frees nothing while it reads.
         let e = unsafe { &*e };
         st.forms_takes.fetch_add(1, AtomicOrdering::Relaxed);
+        self.shared.form_takes.fetch_add(1, AtomicOrdering::Relaxed);
         Some(&e.form)
     }
 
@@ -6987,6 +7009,14 @@ impl Reader {
         let canonical = self.opts.commit_forms
             && self.slot.is_some()
             && st.forms_at.load(AtomicOrdering::Acquire) == self.log_bound.get();
+        if self.opts.commit_forms && self.slot.is_some() {
+            self.shared
+                .canon_tried
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            if canonical {
+                self.shared.canon_hit.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
         let complete = canonical && st.forms_complete.load(AtomicOrdering::Acquire);
         // One context for the scan: its tombstone flag is a walk over every
         // segment, which a context per block paid on every sparse walk.
@@ -7978,6 +8008,11 @@ impl Db {
             retired_forms: std::sync::Mutex::new(Vec::new()),
             retired_snaps: std::sync::Mutex::new(Vec::new()),
             snap_builds: AtomicU64::new(0),
+            form_takes: AtomicU64::new(0),
+            canon_tried: AtomicU64::new(0),
+            canon_hit: AtomicU64::new(0),
+            rd_scans: AtomicU64::new(0),
+            rd_blocks: AtomicU64::new(0),
             snap_extends: AtomicU64::new(0),
         });
         let r = Reader {
@@ -8259,6 +8294,11 @@ impl Db {
             retired_forms: std::sync::Mutex::new(Vec::new()),
             retired_snaps: std::sync::Mutex::new(Vec::new()),
             snap_builds: AtomicU64::new(0),
+            form_takes: AtomicU64::new(0),
+            canon_tried: AtomicU64::new(0),
+            canon_hit: AtomicU64::new(0),
+            rd_scans: AtomicU64::new(0),
+            rd_blocks: AtomicU64::new(0),
             snap_extends: AtomicU64::new(0),
         });
         let r = Reader {
@@ -9081,6 +9121,32 @@ impl Db {
     /// sort of everything; see `Snapshot::extend`.
     pub fn snapshot_extends(&self) -> u64 {
         self.shared.snap_extends.load(AtomicOrdering::Relaxed)
+    }
+
+    /// EXPERIMENT: reads that took a canonical form over this store's
+    /// life, as against `canonical_forms`'s third field, which is the
+    /// current state's alone and zero again after every publish.
+    pub fn form_takes(&self) -> u64 {
+        self.shared.form_takes.load(AtomicOrdering::Relaxed)
+    }
+
+    /// EXPERIMENT: scans through a caller's handle that reached the test
+    /// for walking the forms, and the ones where the forms were current
+    /// to the log position the handle holds.
+    pub fn canonical_tries(&self) -> (u64, u64) {
+        (
+            self.shared.canon_tried.load(AtomicOrdering::Relaxed),
+            self.shared.canon_hit.load(AtomicOrdering::Relaxed),
+        )
+    }
+
+    /// EXPERIMENT: scans through a caller's handle, and those of them
+    /// that took the block path at all.
+    pub fn reader_scans(&self) -> (u64, u64) {
+        (
+            self.shared.rd_scans.load(AtomicOrdering::Relaxed),
+            self.shared.rd_blocks.load(AtomicOrdering::Relaxed),
+        )
     }
 
     /// PROTOTYPE: how many states a publish replaced are still held for a

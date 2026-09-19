@@ -656,13 +656,23 @@ impl Engine for Supdb {
         let Some(db) = self.db.as_ref() else {
             return Vec::new();
         };
-        let (forms, form_bytes, form_walks, _) = db.canonical_forms();
+        // `canonical_forms` answers for the state standing now, which a
+        // publish resets: its held count and bytes are what the store
+        // carries at the end of the pass, which is the question for
+        // memory, but its takes would say what happened since the last
+        // seal and be read as the pass's. The pass's takes come from the
+        // store's own life instead.
+        let (forms, form_bytes, _, _) = db.canonical_forms();
         vec![
             ("snapshot_builds", db.snapshot_builds() as f64),
             ("snapshot_extends", db.snapshot_extends() as f64),
-            ("forms_held", forms as f64),
-            ("form_walks", form_walks as f64),
-            ("form_bytes", form_bytes as f64),
+            ("form_takes", db.form_takes() as f64),
+            ("rd_scans", db.reader_scans().0 as f64),
+            ("rd_blockpath", db.reader_scans().1 as f64),
+            ("canon_tried", db.canonical_tries().0 as f64),
+            ("canon_hit", db.canonical_tries().1 as f64),
+            ("forms_held_at_end", forms as f64),
+            ("form_bytes_at_end", form_bytes as f64),
         ]
     }
     fn thread_reader(&self) -> Res<ReaderOpener> {

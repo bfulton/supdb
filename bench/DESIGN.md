@@ -175,12 +175,25 @@ the pairs rather than two medians. It also reports what the engine counts
 exact where a whole-pass throughput is not. The first question put to it
 had defeated three rows of this series: maintaining the canonical forms
 regardless read 1.156x, then 1.186x, then 1.247x the other way on the
-threaded scan mix, and fifteen pairs answered 0.880x on five pairs of
-fifteen, which is a coin, while `scan-lag` at full lag came out 0.866x on
-fifteen of fifteen. The counts settled what the timings could not:
-maintaining regardless holds 1,562 forms and 1.5 MB at a hundred thousand
-keys and walks none of them. Use `ab` for an option; use the series for a
-commit.
+threaded scan mix. Fifteen pairs give it as 1.075x on thirteen of fifteen
+(p 0.007) and `scan-lag` at full lag as 0.859x on fourteen of fifteen
+(p 0.001) -- a real trade rather than a coin, and neither sign is the one
+a single row happened to show.
+
+The counts are the half that no timing gives. Maintaining regardless
+holds 3,099 forms and 2.8 MB at the end of a pass against 1,537 and
+1.3 MB, twice the memory; and reads take a form 24,225 times either way,
+on 6,000 of 12,000 scans through a caller's handle, *identically* in both
+arms. So the maintenance at commit doubles what is held and changes not
+at all how often a read adopts one -- the forms that get taken are the
+builder's, and whatever the 1.075x is, it is not adoption. That is the
+kind of thing a throughput column cannot say.
+
+A counter has to be read where the thing happens. These said no read ever
+took a form until the instrument was fixed: a pass opens two stores, the
+loaded one and a fresh one for the shuffled load and the lag sweep, and
+the counters were read from the second, where no reader handle scans at
+all. Use `ab` for an option; use the series for a commit.
 
 **The arm order is the same in every rep, and the arm that goes first pays
 for it.** Interleaving was meant to spread a drifting machine across the
