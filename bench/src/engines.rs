@@ -344,6 +344,8 @@ pub struct Supdb {
     /// Whether the sorted unsealed keys are the state's, built once and
     /// carried forward, or each handle's own sorted afresh; `supdb-snap`.
     snap: bool,
+    /// Whether a commit's maintenance stops after settling; `supdb-settle`.
+    settle: bool,
 }
 
 /// What an arm differs from `supdb` by. One struct rather than a row of
@@ -357,6 +359,9 @@ struct Policy {
     budget: usize,
     forms: bool,
     snap: bool,
+    /// Maintain at every commit but settle only: no form built for an
+    /// overlaid block, nothing published. `supdb-settle`.
+    settle: bool,
 }
 
 impl Default for Policy {
@@ -371,6 +376,7 @@ impl Default for Policy {
             budget: 0,
             forms: false,
             snap: true,
+            settle: false,
         }
     }
 }
@@ -411,6 +417,22 @@ impl Supdb {
     /// each handle's own, sorted from nothing whenever it goes stale,
     /// which is the shape before they were published in the state. The
     /// pair differs by one option and needs no matching.
+    /// `supdb` maintaining at every commit as `supdb-forms` does, but
+    /// settling only: no form built for an overlaid block and nothing
+    /// published. Between the two it says whether that arm's gain on the
+    /// threaded scan mix is the settling or the forms, which the counts
+    /// say cannot be adoption.
+    pub fn create_settle(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                forms: true,
+                settle: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     pub fn create_nosnap(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
@@ -482,6 +504,7 @@ impl Supdb {
             budget,
             forms,
             snap,
+            settle,
         } = policy;
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         // Checksums off in the segments, because LMDB has none and the axis
@@ -530,6 +553,7 @@ impl Supdb {
             // Zero maintains the forms at every commit whoever is
             // reading; the engine's default waits for a caller's handle.
             forms_from_reader_scans: if forms { 0 } else { 1 },
+            commit_forms_build: !settle,
             // The guarantee the arm's row names, not the engine's default:
             // durable per batch, or frames written per commit and fsynced
             // at `sync`, which is how `lmdb-nosync` and `rocksdb-nosync`
@@ -560,6 +584,7 @@ impl Supdb {
             budget,
             forms,
             snap,
+            settle,
         })
     }
 }
@@ -593,6 +618,9 @@ impl Engine for Supdb {
     fn name(&self) -> &'static str {
         if self.budget > 0 {
             return "supdb-cache256";
+        }
+        if self.settle {
+            return "supdb-settle";
         }
         if self.forms {
             return "supdb-forms";
@@ -1092,9 +1120,10 @@ use crate::row::Guarantee;
 /// Every arm a run measures, in the order they are interleaved. Each is a
 /// shipping supdb configuration or the comparator a user would otherwise
 /// pick. Comparisons are made within a guarantee, never across one.
-pub const ARMS: [&str; 11] = [
+pub const ARMS: [&str; 12] = [
     "supdb",
     "supdb-forms",
+    "supdb-settle",
     "supdb-nosnap",
     "supdb-noadvice",
     "supdb-nocache",
@@ -1108,8 +1137,8 @@ pub const ARMS: [&str; 11] = [
 
 pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
-        "supdb" | "supdb-forms" | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache"
-        | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
+        "supdb" | "supdb-forms" | "supdb-settle" | "supdb-nosnap" | "supdb-noadvice"
+        | "supdb-nocache" | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
     })
@@ -1121,6 +1150,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
     Ok(match arm {
         "supdb" => Box::new(Supdb::create(dir)?),
         "supdb-forms" => Box::new(Supdb::create_forms(dir)?),
+        "supdb-settle" => Box::new(Supdb::create_settle(dir)?),
         "supdb-nosnap" => Box::new(Supdb::create_nosnap(dir)?),
         "supdb-noadvice" => Box::new(Supdb::create_noadvice(dir)?),
         "supdb-nocache" => Box::new(Supdb::create_nocache(dir)?),

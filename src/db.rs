@@ -415,14 +415,32 @@ pub struct Options {
     /// larger and comes with twice the memory: 3,099 forms and 2.8 MB
     /// held at the end of a pass against 1,537 and 1.3 MB.
     ///
-    /// The counts say where the 1.075x does not come from. Reads take a
-    /// form 24,225 times on 6,000 of 12,000 scans through a caller's
-    /// handle, the same in both arms, so maintaining at commit doubles
-    /// what is held and changes adoption not at all -- the forms a read
-    /// takes are the builder's. Whatever that 1.075x is, it is the
-    /// settling and not the forms, and finding out is worth more than
-    /// this setting is.
+    /// Reads take a form 24,225 times over a pass, on 6,000 of the
+    /// 12,000 scans through a caller's handle, and the same in both
+    /// arms -- which is not evidence that maintaining is idle, though it
+    /// was read that way here once. Both arms maintain by the end of a
+    /// pass; the gate moves when that starts, not whether. What settles
+    /// it is `supdb-settle`, which keeps the settle and builds no form:
+    /// takes fall to zero and the threaded scan mix to 0.585x on four
+    /// threads, fifteen pairs of fifteen. The forms built at a commit
+    /// are the forms a read takes, and they are worth 1.71x on that
+    /// workload against not building them at all.
     pub forms_from_reader_scans: usize,
+    /// Whether the writer, having settled its batch into the blocks it
+    /// landed in, also builds a form for every block an unsealed key
+    /// overlays and publishes what it touched. Off keeps the settle and
+    /// the install of the builder ahead's forms and stops there.
+    ///
+    /// It was added to test a wrong guess -- that the forms built here
+    /// are not the ones read, since adoption did not move between the
+    /// gated arm and the ungated one -- and it refuted it: off, a read
+    /// takes no form at all (24,225 to none) and the threaded scan mix
+    /// falls to 0.585x on four threads and 0.638x on two, fifteen pairs
+    /// of fifteen. It is kept because it prices the whole mechanism in
+    /// one option: what the forms at a commit are worth is 1.71x there,
+    /// against 1.172x on `scan-lag` at full lag and 1.130x on ycsb-E for
+    /// not paying for them.
+    pub commit_forms_build: bool,
     /// Publish the scan snapshot in the state, where every handle adopts
     /// it instead of sorting the unsealed keys again. Off is the shape
     /// before it, kept as the comparison arm: measured against it over
@@ -511,6 +529,7 @@ impl Default for Options {
             scan_cache_ahead_min_blocks: 1024,
             commit_forms: true,
             forms_from_reader_scans: 1,
+            commit_forms_build: true,
             share_snapshot: true,
             snapshot_adopt_behind: 0,
             promote_entries: 0,
@@ -6479,7 +6498,10 @@ impl Reader {
         // filled read 1.01x-1.33x. The builder declines a store too
         // small for one, and there the commit fills it, which at ten
         // thousand keys is a few hundred blocks.
-        if self.opts.scan_cache_bytes == 0 && !st.forms_complete.load(AtomicOrdering::Relaxed) {
+        if self.opts.commit_forms_build
+            && self.opts.scan_cache_bytes == 0
+            && !st.forms_complete.load(AtomicOrdering::Relaxed)
+        {
             if self.opts.scan_cache_ahead && self.ahead.borrow().is_none() {
                 self.start_ahead();
             }
@@ -6493,7 +6515,7 @@ impl Reader {
             }
         }
         let touched = std::mem::take(&mut *self.to_publish.borrow_mut());
-        {
+        if self.opts.commit_forms_build {
             let tables = self.tables.borrow();
             for (p, b) in touched {
                 let (p, b) = (p as usize, b as usize);

@@ -180,14 +180,19 @@ threaded scan mix. Fifteen pairs give it as 1.075x on thirteen of fifteen
 (p 0.001) -- a real trade rather than a coin, and neither sign is the one
 a single row happened to show.
 
-The counts are the half that no timing gives. Maintaining regardless
-holds 3,099 forms and 2.8 MB at the end of a pass against 1,537 and
-1.3 MB, twice the memory; and reads take a form 24,225 times either way,
-on 6,000 of 12,000 scans through a caller's handle, *identically* in both
-arms. So the maintenance at commit doubles what is held and changes not
-at all how often a read adopts one -- the forms that get taken are the
-builder's, and whatever the 1.075x is, it is not adoption. That is the
-kind of thing a throughput column cannot say.
+The counts are the half that no timing gives, and they have to be read
+as carefully as a timing. Maintaining regardless holds 3,099 forms and
+2.8 MB at the end of a pass against 1,537 and 1.3 MB, twice the memory,
+while reads take a form 24,225 times either way, on 6,000 of 12,000
+scans through a caller's handle. That equality was read here as "the
+forms built at a commit are not the ones read", and it is not: both arms
+maintain by the end of a pass, since the gate moves when maintenance
+starts and not whether it happens. The arm that actually separates them
+is `supdb-settle`, which settles at a commit and builds no form -- takes
+fall to zero and the threaded scan mix to 0.585x on four threads, all
+fifteen pairs. Forms at a commit are worth 1.71x there and cost 1.172x
+on `scan-lag` and 1.130x on ycsb-E. A count says what happened; which
+two things to put beside it is still the hard part.
 
 A counter has to be read where the thing happens. These said no read ever
 took a form until the instrument was fixed: a pass opens two stores, the
