@@ -413,11 +413,31 @@ and the totals were not.
 
 Under the cache model a scan of one entry takes about 10.7 first-level
 data misses and 0.3 that reach memory, on a partition of thirty thousand
-keys that is entirely resident. The seek is instruction-bound at this
-size, so a layout that only improves locality -- Eytzinger over the
-samples, say -- has little to take; fewer probes is the lever. There is
-no `perf` on this machine, so that is a model and not the hardware, and
-the per-entry work is where the difference would start to matter.
+keys that is entirely resident.
+
+Then the same scan sampled for wall time rather than counted for
+instructions, and it does not agree. Two million scans, `cpu-clock` at
+5 kHz, keys formatted before the loop rather than in it:
+
+| | wall time, len 1 | instructions, len 1 | wall time, len 100 |
+|---|---|---|---|
+| `Blob::scan_at` | **33.1%** | 9% | **77.6%** |
+| `seek_exact` + `lower_bound` | 33.7% | 33% | 11.3% |
+| `Reader::scan` | 13.6% | 20% | 4.2% |
+
+`scan_at` takes three to four times the share of the time that it takes
+of the instructions, which is what a stall looks like and what counting
+instructions cannot see. So "a third of a short scan is the seek" was
+half the story: in time the seek and the walk of a single entry cost
+about the same, and by a hundred entries the walk is three quarters of
+everything. The per-entry cost is the target, not the index's layout,
+and `scan_at` is where the 6.91 ns an unsealed key costs against this
+engine's own 3.99 on a drained store has to be.
+
+The lesson is about the instrument. Callgrind is exact and deterministic
+and says what a processor was asked to do; it says nothing about waiting,
+and this read path waits. Both belong, and where they disagree the clock
+is the one that pays.
 
 Two things it told us not to do. `prefetch_lines` sizes its hint to the
 block rather than to the scan, which looks like waste on a scan of one

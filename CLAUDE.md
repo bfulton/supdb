@@ -66,6 +66,32 @@ release profile because the checks cost code size there and time in a
 measurement. A second definition of "the checks" is how the next one of
 those starts.
 
+## Profiling
+
+Two instruments, and they disagree where it matters. Callgrind
+(`valgrind --tool=callgrind --collect-atstart=no --toggle-collect='*supdb*Reader*scan*'`)
+counts instructions exactly and attributes them without sampling noise,
+which is what a fixed cost of a few hundred nanoseconds needs. It is
+blind to waiting: on the scan path `Blob::scan_at` is 9% of the
+instructions and a third of the time. Count what the toggle collects and
+not what the probe times -- a warmup loop inside the toggle doubled every
+figure once.
+
+For time, `perf record -e cpu-clock`. There are no hardware counters
+here: this is a Firecracker guest, `/sys/bus/event_source/devices/` has
+no `cpu` and the CPU flags have no `arch_perfmon`, so cycles, cache
+misses and branch misses cannot be had at all, and a container cannot
+add them -- a container shares this kernel. Software sampling needs no
+PMU and works. There is no `linux-perf` package for this kernel;
+`apt-get install linux-tools-6.8.0-31` puts a 6.8 binary at
+`/usr/lib/linux-tools-6.8.0-31/perf`, which samples fine against a newer
+kernel. Callgrind's `--cache-sim=yes` is a model of a cache, not this
+machine's, and is worth only what a model is worth.
+
+Profile a probe that does one thing. The scan probe's own `format!` per
+iteration was 8% of its samples until the keys were built before the
+loop.
+
 ## The suite lives in bench/, and it gates this repository
 
 `bench/` is a time series. `bench run` measures every arm -- supdb's
