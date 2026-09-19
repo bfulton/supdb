@@ -7066,6 +7066,14 @@ impl Reader {
         // One context for the scan: its tombstone flag is a walk over every
         // segment, which a context per block paid on every sparse walk.
         let ctx = self.build_ctx();
+        // EXPERIMENT: the per-block bookkeeping is dead under the default
+        // options -- the shed that reads `touched` returns at once with
+        // no budget, and `dense` is written only by a promotion -- and
+        // each of those is an array as long as the partition's blocks in
+        // an allocation of its own, so reading one is a cold line of its
+        // own on a scan that streams past the cache.
+        let bookkeep = self.opts.scan_cache_bytes > 0;
+        let promoting = self.opts.promote_entries > 0;
         let mut seen = 0usize;
         let mut cursor: &[u8] = from;
         // The partitions tile the key space in order, so the first that
@@ -7156,7 +7164,7 @@ impl Reader {
                     self.list_built_bytes(pi, b, table, bytes);
                     self.shed(pi, b, table);
                 }
-                if canon.is_none() {
+                if bookkeep && canon.is_none() {
                     table.touched[b] = tick;
                 }
                 if let (None, Some(Cached::Wide(w))) =
@@ -7199,12 +7207,14 @@ impl Reader {
                     Some(f) => f,
                     None => table.slots[b].as_deref().expect("just built"),
                 };
-                let form: &Cached = match table.dense[b].as_deref() {
-                    Some(d) => d,
-                    None => cheap,
+                let dense: Option<&Cached> = if promoting {
+                    table.dense[b].as_deref()
+                } else {
+                    None
                 };
+                let form: &Cached = dense.unwrap_or(cheap);
                 let mut c = self.choices.get();
-                c[if table.dense[b].is_some() { 2 } else { 3 }] += 1;
+                c[if dense.is_some() { 2 } else { 3 }] += 1;
                 self.choices.set(c);
                 let took_from = seen;
                 prefetch_block(&seg.blob, form, start, ahead);
@@ -7244,7 +7254,7 @@ impl Reader {
                         };
                         while b + 1 < nblocks && run_hi - start < limit - seen && clean_at(b + 1) {
                             b += 1;
-                            if !canonical {
+                            if bookkeep && !canonical {
                                 table.touched[b] = tick;
                             }
                             run_hi = ((b + 1) * CACHE_BLOCK).min(keys);

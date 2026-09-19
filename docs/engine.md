@@ -446,6 +446,87 @@ entry: with it off, three runs of twenty thousand scans read 673, 673 and
 there. A single run had said the opposite by 57 ns, which is what a
 single run is worth at this scale.
 
+#### What the overlay costs, and where
+
+The table above prices an unsealed key at 6.91 ns against 3.99 on a
+drained store, which reads as a walk that got slower. It is not. A probe
+of one handle over a hundred thousand keys, sixteen-byte keys and
+forty-byte values, scanning at random start keys, drained against a store
+where every key has been written again and left unsealed:
+
+| entries a scan | drained | overlaid |
+|---|---|---|
+| 1 | 393 ns | 785 ns |
+| 16 | 609 | 1,040 |
+| 64 | 1,229 | 1,510 |
+| 256 | 3,636 | 3,715 |
+
+Fitted over 64 to 256 the overlaid walk costs **11.5 ns an entry against
+the drained walk's 12.5**, and at 256 entries the two are two percent
+apart. The whole of the overlay's cost is about 390 ns paid before the
+first entry, and a scan of one entry is where all of it shows.
+
+Shrinking how many distinct keys the loop asks for holds the whole access
+chain in cache and separates what the path computes from what it waits
+for:
+
+| distinct start keys | drained | overlaid | gap |
+|---|---|---|---|
+| 1 | 162 ns | 245 ns | 83 |
+| 64 | 265 | 365 | 100 |
+| 512 | 279 | 504 | 225 |
+| 8,192 | 356 | 718 | **362** |
+
+So about 83 ns of the overlay is instructions and the rest is waiting,
+and the overlaid path is two and a half times as sensitive to the working
+set as the drained one (+473 ns against +194). That is the shape of a
+deeper chain of dependent loads, not of more work: a walk reaches its
+block through the slot, the `Arc`, and the copy's three buffers, where
+the drained walk reaches the partition's records through a mapping the
+seek has just touched. Asking in key order rather than at random is worth
+about 130 ns to **both** paths and closes none of the gap, so it is the
+depth of the chain and not the order the blocks are met in.
+
+The cost arrives with the density of the overlay, and it arrives as a
+cliff. Scans of one entry against the same partition with the unsealed
+keys spread through it: none 394 ns, a thousand 414, five thousand 417,
+twenty-five thousand 610, a hundred thousand 711. Up to a few percent
+unsealed the block path costs what the bulk walk costs; past that the
+blocks stop being clean, every one of them is materialised, and the
+copies are a second heap the size of the partition they shadow --
+1,552 blocks of three separately allocated buffers, about 7.8 MB beside
+a 6 MB mapping.
+
+Four things this says not to do, each measured and each refuted:
+
+- **Scope the block prefetch to the scan's length.** It looks like pure
+  waste to pull a block's entries, keys and a kilobyte of values to read
+  one entry, and `prefetch_block` is 14.6% of an overlaid scan of one.
+  With it off that scan costs 802 ns against 611; entries and keys
+  without the values, 624. It is absorbing the walk's latency, which is
+  what a prefetch high in a sampled profile usually means.
+- **Stop taking `Arc::make_mut` per block to ask whether a form is
+  wide.** Four alternating pairs: 651 ns against 661 at one entry, 975
+  against 943 at sixteen, 1,851 against 1,853 at a hundred. The slot is
+  uniquely held, so the call is one uncontended compare-exchange.
+- **Prefetch the slot early.** The slot's address is known a few hundred
+  instructions before the walk reads it, but one level of a five-deep
+  chain is not worth hiding: three wins in four pairs at one entry, two
+  in four at sixty-four, about one percent.
+- **Walk the partition against the snapshot instead of copying.** The
+  merge has no copy to chase, so it should win at short scans. It loses
+  everywhere -- 1,391 ns against 686 at one entry, 38,068 against 3,701
+  at 256 -- because it pays a binary search over every unsealed key on
+  every scan, which is what the block path was changed to stop paying.
+
+What did pay was removing work rather than adding it. `touched` is read
+only by the shed, which returns at once with no budget, and `dense` is
+written only by a promotion; both default off, and both were a cold line
+apiece on every block walked. Skipping them took a scan of one entry from
+678 ns to 650, three wins in four pairs, and nothing measurable at
+sixteen entries or sixty-four. That is the size of a bookkeeping array
+that stays resident: the 280 ns of waiting is the copies themselves.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and
