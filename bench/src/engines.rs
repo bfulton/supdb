@@ -348,6 +348,8 @@ pub struct Supdb {
     settle: bool,
     /// Whether the writer reads the forms it maintains; `supdb-wforms`.
     wforms: bool,
+    /// The unsealed share past which a commit stops; `supdb-regime`.
+    lagcap: usize,
 }
 
 /// What an arm differs from `supdb` by. One struct rather than a row of
@@ -367,6 +369,9 @@ struct Policy {
     /// The writer's own handle reads the forms it maintains rather than
     /// building its own. `supdb-wforms`.
     wforms: bool,
+    /// The share of the store that may be unsealed before a commit
+    /// stops maintaining; zero is no bound. `supdb-regime`.
+    lagcap: usize,
 }
 
 impl Default for Policy {
@@ -383,6 +388,7 @@ impl Default for Policy {
             snap: true,
             settle: false,
             wforms: false,
+            lagcap: 0,
         }
     }
 }
@@ -434,6 +440,24 @@ impl Supdb {
             Policy {
                 forms: true,
                 settle: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` maintaining the forms whoever is reading, as `supdb-forms`
+    /// does, but stopping where too much of the store is unsealed. The pair
+    /// against `supdb` says whether the regime's 3.19x on the lag sweep can
+    /// be had without its loss at the deepest lag.
+    pub fn create_regime(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                forms: true,
+                lagcap: std::env::var("LAGCAP")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(25),
                 ..Policy::default()
             },
         )
@@ -526,6 +550,7 @@ impl Supdb {
             snap,
             settle,
             wforms,
+            lagcap,
         } = policy;
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         // Checksums off in the segments, because LMDB has none and the axis
@@ -580,6 +605,10 @@ impl Supdb {
             // ycsb-E reads through the writer, so it pays for the
             // maintenance and today cannot read it.
             forms_to_writer: wforms,
+            // The unsealed share past which the maintenance stops, so an
+            // arm can maintain whoever is reading without paying for it
+            // on a store that is nearly all unmerged.
+            forms_max_unsealed_pct: lagcap,
             // The guarantee the arm's row names, not the engine's default:
             // durable per batch, or frames written per commit and fsynced
             // at `sync`, which is how `lmdb-nosync` and `rocksdb-nosync`
@@ -612,6 +641,7 @@ impl Supdb {
             snap,
             settle,
             wforms,
+            lagcap,
         })
     }
 }
@@ -648,6 +678,9 @@ impl Engine for Supdb {
         }
         if self.settle {
             return "supdb-settle";
+        }
+        if self.lagcap > 0 {
+            return "supdb-regime";
         }
         if self.wforms {
             return "supdb-wforms";
@@ -1169,10 +1202,9 @@ pub const ARMS: [&str; 12] = [
 
 pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
-        "supdb" | "supdb-forms" | "supdb-settle" | "supdb-wforms" | "supdb-nosnap"
-        | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => {
-            Guarantee::Durable
-        }
+        "supdb" | "supdb-forms" | "supdb-settle" | "supdb-wforms" | "supdb-regime"
+        | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb"
+        | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
     })
@@ -1185,6 +1217,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb" => Box::new(Supdb::create(dir)?),
         "supdb-forms" => Box::new(Supdb::create_forms(dir)?),
         "supdb-settle" => Box::new(Supdb::create_settle(dir)?),
+        "supdb-regime" => Box::new(Supdb::create_regime(dir)?),
         "supdb-wforms" => Box::new(Supdb::create_wforms(dir)?),
         "supdb-nosnap" => Box::new(Supdb::create_nosnap(dir)?),
         "supdb-noadvice" => Box::new(Supdb::create_noadvice(dir)?),

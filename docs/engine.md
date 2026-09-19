@@ -587,6 +587,49 @@ ran the lag shape at about 51M entries/s, which is the *settle* arm's
 44M and not the shipping arm's 10.6M, because none of them loaded the
 keys shuffled.
 
+#### Where the engine actually loses to LMDB: unmerged writes
+
+The lag sweep is the whole story and it was being read one point at a
+time. Scan throughput against LMDB's, over the depth of unmerged writes,
+with `supdb-forms` -- the arm that maintains the forms whoever is
+reading -- beside it:
+
+| unmerged | 10k | 30k | 100k | 300k |
+|---|---|---|---|---|
+| none | 1.35 / 1.40 | 1.49 / 1.47 | 1.48 / 1.50 | 1.64 / 1.53 |
+| 1% | 0.67 / 0.91 | 0.83 / 1.16 | 1.22 / 1.46 | 1.10 / 1.16 |
+| 10% | 0.24 / 0.81 | 0.35 / 0.38 | 0.32 / 0.29 | 0.28 / 0.25 |
+| all | 0.04 | 0.04 | 0.03 | 0.12 |
+
+Drained the engine reads 1.35x-1.64x of LMDB at every rung. A tenth of
+the store unmerged and it reads a quarter to a third of it; all of it
+unmerged and a thirtieth. A B-tree has no unmerged state -- every write
+goes into the tree and is paid for there -- so LMDB's scan is flat in
+this variable and this engine's is not. Every workload that reads a
+store with unsealed keys is a point on this curve, ycsb-E and the
+threaded scan mix among them, and every other axis in the suite sits
+between 0.7x and 1.6x. This one is the gap.
+
+The regime moves the shallow end of it. Maintaining the forms whoever is
+reading, rather than waiting for a handle the caller made, takes 1%
+unmerged from 0.67x to 0.91x at ten thousand keys, 0.83x to 1.16x at
+thirty, and 1.22x to 1.46x at a hundred -- paired, 1.314x (15/15,
+p=0.000) and 1.358x (11/11, p=0.001) -- and 10% unmerged from 0.24x to
+0.81x at ten thousand alone. It does nothing at 10% above that rung and
+costs 0.869x-0.880x where the store is entirely unmerged, for 2.0x the
+forms held and 2.18x their bytes.
+
+`forms_max_unsealed_pct` was added to buy that back by stopping the
+maintenance where the store is mostly unsealed, and it does not work.
+At 25 it never fires usefully: the sweep's depth rises through the
+write phase, so the forms are built before the bound trips and holding
+them is what costs. Measured at the same rung, entirely unmerged reads
+0.963x unbounded, 0.936x bounded at 25 and 0.954x bounded at 1 -- the
+loss barely moves with how much maintenance happened, so it is not the
+maintenance. The option and `supdb-regime` stay as the vehicle for the
+next attempt, and at 1 they do bound: forms held 157 against 103 and
+their bytes 0.185x, with the 10% win given up for it.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and

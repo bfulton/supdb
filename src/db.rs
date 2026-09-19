@@ -480,6 +480,22 @@ pub struct Options {
     /// which is where the builder started before. A builder already
     /// running is left alone.
     pub build_ahead_on_commit: usize,
+    /// EXPERIMENT: the share of the store, as a percentage of the keys
+    /// its partitions hold, that may be unsealed before a commit stops
+    /// maintaining the forms; zero is no bound, which is what the
+    /// maintenance had before this.
+    ///
+    /// The bound exists because maintaining regardless of who reads is
+    /// worth 3.19x on the lag sweep at ten thousand keys with a tenth of
+    /// the store unmerged, and costs 0.869x at a hundred thousand with
+    /// *all* of it unmerged -- the one rung where it loses. At that depth
+    /// every block is overlaid, every form is a merged copy rather than
+    /// resolved deltas, and the scans are an order of magnitude slower
+    /// anyway, so the forms are rebuilt wholesale for reads that cannot
+    /// repay them. The store is also about to seal. Stopping is safe at
+    /// any commit: `forms_at` stops advancing and a reader trusts a form
+    /// only where it matches the log position it holds.
+    pub forms_max_unsealed_pct: usize,
     /// EXPERIMENT: the writer's own handle takes the canonical forms it
     /// maintains, instead of building its own. Without this the
     /// maintenance is pure cost wherever the reads are the writer's: a
@@ -551,6 +567,7 @@ impl Default for Options {
             snapshot_adopt_behind: 0,
             promote_entries: 0,
             build_ahead_on_commit: 0,
+            forms_max_unsealed_pct: 0,
             forms_to_writer: false,
             form_dense_from: 0,
             scan_snapshot_arena: true,
@@ -6507,6 +6524,17 @@ impl Reader {
         }
         if st.forms.is_empty() || self.segs().first().is_none_or(|s| s.level == 0) {
             return Ok(());
+        }
+        // Too much of the store unsealed to be worth organising: see
+        // `Options::forms_max_unsealed_pct`. The unsealed count is the
+        // memtables' own, and the store's is what the partitions hold,
+        // which is a load a segment and there are few.
+        if self.opts.forms_max_unsealed_pct > 0 {
+            let unsealed = st.mem.committed_len() + st.frozen.as_ref().map_or(0, |f| f.len());
+            let keys: usize = self.segs().iter().map(|s| s.blob.keys()).sum();
+            if keys > 0 && unsealed * 100 > keys * self.opts.forms_max_unsealed_pct {
+                return Ok(());
+            }
         }
         // Nothing to maintain where nothing has been scanned since the
         // last commit: the structure is for range reads, and a run of
