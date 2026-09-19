@@ -369,6 +369,50 @@ arena, the slots radix-ordered by key offset so the copy is sequential, a
 What remains for an undrained scan is the memtable's own 2.3x, which
 sealing sooner would remove and a faster walk would not.
 
+### Where a scan's time goes
+
+Measured rather than guessed, and the guesses were wrong twice. `bench ab
+--len` swept over scan lengths 1, 10, 100 and 1000, four threads at a
+hundred thousand keys, seven pairs a point, fits microseconds per scan as
+a fixed cost plus a per-entry one:
+
+| | fixed per scan | per entry |
+|---|---|---|
+| `scan`, drained | 232 ns vs LMDB 126 (1.84x) | 3.99 ns vs 4.81 (**0.83x**) |
+| `scan-mixed`, unsealed keys | 301 ns vs LMDB 134 (2.24x) | 6.91 ns vs 5.84 (1.18x) |
+
+The walk is faster than LMDB's. What is lost is a fixed cost of about
+230-300 ns a scan against its 130 -- the whole of why a scan of one entry
+reads 1.69x behind and of ten 1.98x -- and an unsealed key at 6.91 ns
+against this engine's own 3.99 on a drained store. At a length of a
+hundred those are 167 ns and 290 ns of a 993 ns scan.
+
+Callgrind over twenty thousand scans of one entry, which is almost all
+fixed cost, puts 2,569 instructions in a scan and attributes them:
+
+| | instructions a scan | share |
+|---|---|---|
+| `OrdIndex::seek_exact` and `lower_bound` | 837 | 33% |
+| `Reader::scan`'s own body | ~510 | 20% |
+| `Blob::scan_at`, the one entry | 242 | 9% |
+| the preamble: `enter`, `sync_log`, `build_ctx`, `refresh_snapshot`, `install_ahead`, `start_ahead` | ~272 | 11% |
+| `first_reaching` | 72 | 3% |
+
+So a third of a short scan is the seek, and the preamble -- where the
+cost was assumed to be before this was run -- is a ninth of it. The
+binary search is 278 of those instructions over about fifteen probes,
+eighteen instructions a probe, which is a branchless search already; what
+would cut it is fewer probes, not a cheaper one, and that is an index
+layout question rather than a loop to tighten. `read_advice`'s prefetch
+plan does not appear in the profile at all.
+
+Two things it told us not to do. `prefetch_lines` sizes its hint to the
+block rather than to the scan, which looks like waste on a scan of one
+entry: with it off, three runs of twenty thousand scans read 673, 673 and
+669 ns against 654, 642 and 599 with it on, so it earns its place even
+there. A single run had said the opposite by 57 ns, which is what a
+single run is worth at this scale.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and
