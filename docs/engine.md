@@ -639,24 +639,29 @@ why every point of the lag sweep sat unsealed and why the engine read
 0.03x-0.35x of LMDB there. `seal_max_pct` caps the threshold at a share
 of the store instead, ten percent, floored at a megabyte.
 
-Paired against the arm that keeps the old shape, eleven pairs at a
-hundred thousand keys:
+Paired against the arm that keeps the old shape, over the whole ladder
+(15, 11, 11 and 7 pairs):
 
-| | capped over uncapped |
-|---|---|
-| scan-lag, all of it unmerged | **5.68x** (11/11, p=0.001) |
-| ycsb-E | **1.31x** (11/11, p=0.001) |
-| ycsb-F | 0.81x (10/11, p=0.012) |
-| load ops/s | 0.94x (ns) |
-| bytes on disk, device bytes | identical |
+| capped over uncapped | 10k | 30k | 100k | 300k |
+|---|---|---|---|---|
+| scan-lag, all of it unmerged | **1.76x** | **2.51x** | **5.68x** | **2.23x** |
+| ycsb-E | 1.02x (ns) | 1.02x (ns) | **1.31x** | **1.28x** |
+| ycsb-F | 1.00x (ns) | 1.04x (ns) | 0.81x | 0.92x |
+| load ops/s | ns | ns | ns | ns |
+| bytes on disk, device bytes | identical | identical | identical | identical |
+
+Every starred figure is 0/n or n/n on the sign test at p<=0.016. The lag
+point moves at every rung; ycsb-E moves at the two where the mixes write
+more than the floor, since below that the cap never binds during them --
+thirty thousand keys write about 150 KB through A and F against a floor
+of a megabyte.
 
 The trade is one-sided on the ladder, which is the whole reason to take
 it. ycsb-E is the only mix this engine loses to LMDB -- 0.76x, 0.74x,
 0.78x, 0.87x across the rungs, against 1.46x-6.39x on A, B, C, D and F
--- so 1.31x at a hundred thousand puts E at about 1.02x and leaves F,
-which the cap costs, at about 3.3x instead of 4.08x. Nine reps at ten
-thousand keys move nothing either way except the fully unmerged lag
-point, at 1.755x. Thirty and three hundred thousand are not measured.
+-- so this puts E at about 1.02x at a hundred thousand and 1.11x at
+three hundred, and leaves F, which the cap costs, at about 3.3x and
+5.8x instead of 4.08x and 6.27x.
 
 The cap engages only once something has been sealed, because a store of
 no bytes has no share to take. That is why the load axis does not move
