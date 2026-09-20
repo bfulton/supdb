@@ -428,6 +428,23 @@ every few hundred puts met it in their first minute. The pieces over one
 fence now order by the sequence their names carry, and a read's
 "oldest to newest" is a property of that order and not of the names.
 
+**A form dropped by its writer stayed published.** The writer keeps
+its own copy of every block form and publishes a clone for readers to
+take; a reader takes a published form as the block and, with the table
+complete, an empty slot as clean. When a block's overlay outgrew every
+form but the wide one, the writer dropped its copy and built the block
+wide, a form it never publishes, so the block's published slot kept
+the form from before it went wide, and a reader handle read the last
+block of a store short of three hundred of the five hundred keys
+inserted past the end. No test read a block gone wide through a
+handle; the writer's own reads walk its own tables and were right. The
+slot now carries a mark whenever the writer drops a block's form or
+holds it wide, and a debug assertion at the settle holds the rule: a
+block the writer has no form for has none published as the block. The
+shape is general: two copies of a structure, one kept current and one
+handed out, drift the first time the current one is dropped rather
+than replaced, and the handed-out copy needs a tombstone for that.
+
 **A sentinel that crosses the wasm boundary changes sign.** A wasm `u32`
 arrives in JavaScript as a signed i32, so a failure sentinel of `u32::MAX`
 arrives as -1 and a comparison against 4294967295 can never match. Every

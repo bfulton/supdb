@@ -845,6 +845,70 @@ survived a seal -- its content is unchanged by one, only the slots it
 was resolved against move -- would make A's filing E's to read and
 give the fully-unmerged point something to walk.
 
+#### A form dropped by its writer stayed published
+
+Reading for the carry below found a bug on the canonical path that has
+been there since the forms went into the state. A reader takes a
+published form as the block, and with the table complete takes an
+empty slot as clean. The writer drops its own form for a block whose
+overlay outgrows every form but the wide one -- the last block of the
+last partition, which collects every key inserted past the end -- and
+builds it wide, a form it never publishes. So the block's slot kept
+whatever was published before it went wide, or nothing, and a handle
+taking the forms read the last block short of every key inserted past
+the end since: three hundred of five hundred in the test that found
+it, and the suite's threaded scans after the mixes, which read through
+handles over a store D and E have inserted into, were reading it that
+way. The slot now carries a mark -- an empty wide form, which a reader
+already treats as "build your own" -- whenever the writer drops a
+block's form or holds it wide, and a debug assertion at the settle
+holds that a block the writer has no form for has none published as
+the block.
+
+#### Forms across a seal: correct, and not worth it
+
+The section above ends by pointing at the seal's discard, and this one
+is what came of building the thing it pointed at. A form's content is
+unchanged by a seal, so the writer can file its backlog at the freeze,
+move the state's pointers into the state the freeze publishes and
+again into the two the piece's join publishes, keep its own tables'
+forms and remake only what named the old memtable: the pieces' bounds,
+the snapshot's, the lists of keys filed since, the wide forms. It is
+built, behind `forms_carry`, and held to the model through two seals,
+a block gone wide and the merge that finally drops it.
+
+It does not pay. `bench ab` over eleven pairs at a hundred thousand
+keys reads ycsb-F at 0.83x (0/11, p=0.001) and ycsb-E at 0.89x (1/11,
+p=0.012), A and D at 0.90x and 0.89x within noise, the fully-unmerged
+lag point at 1.39x (9/11, p=0.065), and eighteen snapshot builds
+against eleven; nothing else moved. The two probes say why. ycsb-E
+inherits F's forms and does not read faster for them: the builder
+ahead fills E's table on a spare core within E's first millisecond
+whether or not the seal emptied it, and E's own settles now patch
+carried forms -- a copy per touched block, since each was published --
+where over an emptied table they patched nothing. The fully-unmerged
+lag point scans with an empty
+table under both arms, and the probe's partition and piece counts say
+what emptied it: three to seven pieces still standing at the scans,
+out of the dozen the burst sealed. The store merges during the burst,
+a merge rewrites the partition, and no old form maps onto the blocks
+of a rewritten partition. So the discard there is the merge's, the
+forms are legitimately absent, and the scans build nine hundred blocks
+from three to seven pieces at 13-18 µs each; carrying forms into
+merges that drop them made that burst's writes 2.3x slower for
+nothing. F pays the same way, at each of its two seals and every
+settle after them: a settle over a table the seal emptied patches no
+block, and that is what the carry takes away.
+
+That last clause is a cost the carry did not create and made visible.
+The writer patches its own copy of a form and publishes it by an `Arc`
+clone, so every patch after a publish copies the block first, and a
+zipfian batch of five thousand writes touches about a thousand blocks:
+with publishing switched off through a temporary flag, a settle in the
+mixes ran 25-30% cheaper and F read 1.10x-1.20x, while E read
+0.91x-0.95x, which has no mechanism yet. Publishing for readers that
+hold no handle is the lead this leaves.
+
 #### Which half of the lag gap, by rung
 
 The build and the walk split by size, and the arms say which is which

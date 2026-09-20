@@ -4518,6 +4518,192 @@ fn a_write_burst_is_settled_once_its_backlog_passes_the_bound() {
     m1.check(&db1, "bounded, after the burst");
 }
 
+/// A block whose overlay outgrows every form but the wide one -- the
+/// last block of the last partition, which collects every key inserted
+/// past the end -- read through the canonical forms by a handle the
+/// caller made. The writer drops its own form for such a block and
+/// builds it wide, a form it never publishes, so what the reader finds
+/// in the table for that block is whatever was published before or
+/// nothing; either must send it to build for itself, never to walk the
+/// block as clean.
+#[test]
+fn a_reader_meets_a_block_gone_wide_through_the_forms() {
+    let d = dir("forms-wide");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        forms_settle_backlog_pct: 0,
+        commit_forms: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 1, "several partitions");
+    let mut sink = 0usize;
+    // A handle's scan, so the writer maintains the forms from here on.
+    let r = db.reader().unwrap();
+    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    // A few keys in the last block first, so it has a published form to
+    // go stale, then keys past the end until the block is wide, a
+    // handle scanning between the commits so each one maintains.
+    for k in (1400..1500u32).step_by(10) {
+        m.append(&mut db, &key(k), "v1");
+    }
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    r.scan(key(1400).as_bytes(), 100, |_k, v| sink += v.len())
+        .unwrap();
+    for batch in 0..5u32 {
+        for k in 0..100u32 {
+            m.append(&mut db, &key(2000 + batch * 100 + k), "past");
+        }
+        db.commit().unwrap();
+        let r = db.reader().unwrap();
+        r.scan(key(1400).as_bytes(), 50, |_k, v| sink += v.len())
+            .unwrap();
+    }
+    db.commit().unwrap();
+    std::hint::black_box(sink);
+    let (forms, _, _, _) = db.canonical_forms();
+    assert!(forms > 0, "the forms are maintained");
+    let r = db.reader().unwrap();
+    m.check(&r, "a reader through the forms, the last block wide");
+    m.check(&db, "the writer over its own forms");
+}
+
+/// EXPERIMENT: the canonical forms survive a seal. A form's content is
+/// the merged block, which a seal does not change; what the seal changes
+/// is what the form was resolved against, and that is remade. Held to
+/// the model with a burst the forms were not settled to before the seal,
+/// a delete, a block gone wide, a handle taking the carried forms, the
+/// writer over its carried tables, writes settled into them after the
+/// seal, and the merge that finally drops them.
+#[test]
+fn the_forms_survive_a_seal() {
+    let d = dir("forms-carry");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        forms_settle_backlog_pct: 0,
+        commit_forms: true,
+        forms_carry: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 1, "several partitions");
+    let mut sink = 0usize;
+    // Overlay in most blocks and keys past the end enough to make the
+    // last block wide, a handle's scan so the forms are maintained.
+    for k in (0..1500u32).step_by(5) {
+        m.append(&mut db, &key(k), "v1");
+    }
+    for k in 0..300u32 {
+        m.append(&mut db, &key(2000 + k), "past");
+    }
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    r.scan(key(0).as_bytes(), 2000, |_k, v| sink += v.len())
+        .unwrap();
+    db.commit().unwrap();
+    let (forms, _, _, _) = db.canonical_forms();
+    assert!(forms > 0, "maintained");
+    // A burst the forms are not settled to -- no scan between these
+    // commits and the bound is off -- then the seal, which files it.
+    for k in (2..1500u32).step_by(7) {
+        m.append(&mut db, &key(k), "burst");
+    }
+    db.commit().unwrap();
+    m.delete(&mut db, &key(10));
+    db.commit().unwrap();
+    assert_ne!(
+        db.forms_position(),
+        usize::MAX,
+        "maintained before the seal"
+    );
+    db.seal().unwrap();
+    db.settle().unwrap();
+    assert!(db.levels().1 > 0, "the seal left a piece");
+    let (after, _, _, _) = db.canonical_forms();
+    assert!(after > 0, "the forms survived the seal: {after}");
+    assert_eq!(
+        db.forms_position(),
+        0,
+        "current to the new log, which holds nothing yet"
+    );
+    // A handle takes them, and finds the burst and the delete in them.
+    let r = db.reader().unwrap();
+    let (_, hit0) = db.canonical_tries();
+    m.check(&r, "a reader over the carried forms");
+    let (_, hit1) = db.canonical_tries();
+    assert!(hit1 > hit0, "the reader took the carried forms");
+    m.check(&db, "the writer over its carried tables");
+    // Writes after the seal land in the new memtable and are settled
+    // into the carried forms at the commit a scan precedes.
+    for k in (3..1500u32).step_by(11) {
+        m.append(&mut db, &key(k), "after");
+    }
+    m.delete(&mut db, &key(2005));
+    for k in 300..320u32 {
+        m.append(&mut db, &key(2000 + k), "past");
+    }
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    r.scan(key(0).as_bytes(), 10, |_k, v| sink += v.len())
+        .unwrap();
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    m.check(&r, "a reader after writes into the carried forms");
+    m.check(&db, "the writer after them");
+    // A second seal, from a store with a piece already.
+    for k in (4..1500u32).step_by(13) {
+        m.append(&mut db, &key(k), "again");
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    assert!(db.levels().1 > 1, "two pieces");
+    let (twice, _, _, _) = db.canonical_forms();
+    assert!(twice > 0, "carried again: {twice}");
+    let r = db.reader().unwrap();
+    m.check(&r, "a reader after the second seal");
+    m.check(&db, "the writer after the second seal");
+    std::hint::black_box(sink);
+    // A merge changes the partitions: the table starts afresh.
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert_eq!(
+        db.forms_position(),
+        usize::MAX,
+        "a merge starts the table afresh"
+    );
+    m.check(&db, "after the merge");
+}
+
 /// EXPERIMENT: the backlog bound settles a burst only while the store
 /// was scanned within `forms_settle_recent_pct` of its keys written
 /// since. Filing costs the same at the commit and at the next read, and

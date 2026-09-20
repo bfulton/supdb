@@ -358,6 +358,8 @@ pub struct Supdb {
     /// The recency window this arm pins, or none for the engine's own.
     /// `supdb-recency`.
     recent: Option<usize>,
+    /// Whether the forms are carried across a seal. `supdb-carry`.
+    carry: bool,
     /// The partitions' blocks below which no builder starts, or none for
     /// the engine's own. `supdb-ahead`.
     aheadmin: Option<usize>,
@@ -395,6 +397,8 @@ struct Policy {
     /// The recency window this arm pins, or none for the engine's own.
     /// `supdb-recency`.
     recent: Option<usize>,
+    /// Whether the forms are carried across a seal. `supdb-carry`.
+    carry: bool,
     /// The builder's minimum blocks, or none for the engine's own.
     /// `supdb-ahead`.
     aheadmin: Option<usize>,
@@ -423,6 +427,7 @@ impl Default for Policy {
             lazyforms: false,
             eager: None,
             recent: None,
+            carry: false,
         }
     }
 }
@@ -501,6 +506,20 @@ impl Supdb {
     /// Against `supdb` it prices the recency window: what a burst's
     /// filing costs the mixes when nothing reads it before the next seal,
     /// and what leaving it costs the first read after the burst.
+    /// `supdb` with the canonical forms carried across a seal. Against
+    /// `supdb` it prices the carry: what filing the backlog at the freeze
+    /// costs the mixes, and what a table that survives the seal is worth
+    /// to the reads after it.
+    pub fn create_carry(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                carry: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     pub fn create_recency(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
@@ -693,6 +712,7 @@ impl Supdb {
             lazyforms,
             eager,
             recent,
+            carry,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -764,6 +784,9 @@ impl Supdb {
             // last scan, as a share of the store's keys written.
             forms_settle_recent_pct: recent
                 .unwrap_or(supdb::Options::default().forms_settle_recent_pct),
+            // The forms carried across a seal, or the table started
+            // afresh at every publish as it was.
+            forms_carry: carry,
             // The unsealed share past which the maintenance stops, so an
             // arm can maintain whoever is reading without paying for it
             // on a store that is nearly all unmerged.
@@ -814,6 +837,7 @@ impl Supdb {
             lazyforms,
             eager,
             recent,
+            carry,
         })
     }
 }
@@ -850,6 +874,9 @@ impl Engine for Supdb {
         }
         if self.settle {
             return "supdb-settle";
+        }
+        if self.carry {
+            return "supdb-carry";
         }
         if self.recent.is_some() {
             return "supdb-recency";
@@ -1393,7 +1420,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
         "supdb" | "supdb-forms" | "supdb-settle" | "supdb-wforms" | "supdb-regime"
         | "supdb-noseal" | "supdb-ahead" | "supdb-lazyforms" | "supdb-eager" | "supdb-nosettle"
-        | "supdb-recency" | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache"
+        | "supdb-recency" | "supdb-carry" | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache"
         | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
@@ -1410,6 +1437,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nosettle" => Box::new(Supdb::create_nosettle(dir)?),
         "supdb-eager" => Box::new(Supdb::create_eager(dir)?),
         "supdb-recency" => Box::new(Supdb::create_recency(dir)?),
+        "supdb-carry" => Box::new(Supdb::create_carry(dir)?),
         "supdb-lazyforms" => Box::new(Supdb::create_lazyforms(dir)?),
         "supdb-ahead" => Box::new(Supdb::create_ahead(dir)?),
         "supdb-noseal" => Box::new(Supdb::create_noseal(dir)?),
