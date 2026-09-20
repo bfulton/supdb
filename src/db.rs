@@ -598,8 +598,23 @@ pub struct Options {
     /// (11/11, p=0.001) with every mix within noise, and it is a sixtieth
     /// of three hundred thousand, where the same count reads the lag
     /// point at 3.59x and ycsb-A at 0.66x and F at 0.80x (0/7), because
-    /// the mixes there write five times over it. Five percent is the
-    /// default.
+    /// the mixes there write five times over it. Five percent was the
+    /// default while a settle copied every published block it touched.
+    ///
+    /// Two percent is the default now that a settle publishes nothing
+    /// for readers that are not there. Against five, eleven pairs at a
+    /// hundred thousand keys read the lag point at 2.31x (11/11,
+    /// p=0.001) and ycsb-D at 0.86x (1/11, p=0.012), A, E and F within
+    /// noise; seven at three hundred thousand read 2.11x (7/7, p=0.016)
+    /// and D at 0.82x (0/7). D's loss is not a slower read: it is the
+    /// one commit of its twenty-five where the backlog crosses the bound
+    /// -- six thousand writes at three hundred thousand keys, most of
+    /// them F's tail, 5 ms against 0.4 for every other commit -- while
+    /// the reads on either side of it take what they took. The bound
+    /// decides who files a burst's tail, the mix that commits when it
+    /// crosses or the first read after it, and the point that reads
+    /// after a tenth of the store rewritten was at half of LMDB either
+    /// way this engine charged it to the reads.
     pub forms_settle_backlog_pct: usize,
     /// EXPERIMENT: the writes since the last scan over the store, as a
     /// share of the partitions' keys, within which the backlog bound
@@ -741,7 +756,7 @@ impl Default for Options {
             build_ahead_on_publish: false,
             forms_publish_lazily: true,
             forms_max_unsealed_pct: 0,
-            forms_settle_backlog_pct: 5,
+            forms_settle_backlog_pct: 2,
             forms_settle_recent_pct: 0,
             forms_carry: false,
             forms_to_writer: false,

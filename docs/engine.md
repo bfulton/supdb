@@ -767,7 +767,25 @@ there write five times over it, and it reads the lag point at 3.59x for
 ycsb-A at 0.66x and F at 0.80x (0/7). Five percent is the default, and
 as a share it holds at that rung: seven pairs at three hundred thousand
 read the point at 1.86x (7/7, p=0.016) with A at 0.95x and F at 0.89x,
-neither significant, and nothing else moved. What a settled write costs was then taken apart with both instruments,
+neither significant, and nothing else moved.
+
+Two percent became the default once a settle stopped publishing for
+readers that are not there (see "Publishing for readers that exist"),
+which took the copy out of every patch. Priced against five with that
+in place: eleven pairs at a hundred thousand keys read the point at
+2.31x (11/11, p=0.001) for ycsb-D at 0.86x (1/11, p=0.012), A, E and F
+within noise and the two-thread scan mix at 0.97x (1/11, p=0.012);
+seven pairs at three hundred thousand, 2.11x (7/7, p=0.016) for D at
+0.82x (0/7). The probe with every one of D's commits and read windows
+timed says what D pays: not the reads, which take 440-500 ns before and
+after, but the one commit of twenty-five where the backlog crosses the
+bound, 5.2-5.4 ms against 0.3-0.6 for every other, filing six thousand
+writes that are mostly F's tail, and one window of reads at 550 ns
+while the cache refills. The bound decides which mix files a burst's
+tail, and D is the one committing when it crosses; under five percent
+the same tail waited for E's first scan.
+
+What a settled write costs was then taken apart with both instruments,
 and they disagreed the way the profiling notes say they will. Callgrind
 put a write at about 3,000 instructions: two fifths in `malloc`,
 `realloc` and `free` -- a `run` buffer built from empty per write, and a

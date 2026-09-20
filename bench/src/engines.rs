@@ -510,16 +510,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` settling past a pinned backlog, `BACKLOG` percent of the
-    /// store's keys. Against `supdb` it
-    /// prices moving a write burst's filing from the first read after it
-    /// onto the commits themselves.
-    /// `supdb` settling by its backlog only within `RECENT` percent of
-    /// the store's keys written since the last scan (ten unless set), at
-    /// `BACKLOG` percent of the store's keys or the engine's own bound.
-    /// Against `supdb` it prices the recency window: what a burst's
-    /// filing costs the mixes when nothing reads it before the next seal,
-    /// and what leaving it costs the first read after the burst.
     /// `supdb` with the canonical forms carried across a seal. Against
     /// `supdb` it prices the carry: what filing the backlog at the freeze
     /// costs the mixes, and what a table that survives the seal is worth
@@ -562,6 +552,12 @@ impl Supdb {
         )
     }
 
+    /// `supdb` settling by its backlog only within `RECENT` percent of
+    /// the store's keys written since the last scan (ten unless set), at
+    /// `BACKLOG` percent of the store's keys or the engine's own bound.
+    /// Against `supdb` it prices the recency window: what a burst's
+    /// filing costs the mixes when nothing reads it before the next seal,
+    /// and what leaving it costs the first read after the burst.
     pub fn create_recency(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
@@ -578,6 +574,10 @@ impl Supdb {
         )
     }
 
+    /// `supdb` settling past a pinned backlog, `BACKLOG` percent of the
+    /// store's keys (one unless set). Against `supdb` it prices moving a
+    /// write burst's filing from the first read after it onto the
+    /// commits themselves, at a bound other than the engine's own.
     pub fn create_eager(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
@@ -586,7 +586,7 @@ impl Supdb {
                     std::env::var("BACKLOG")
                         .ok()
                         .and_then(|v| v.parse().ok())
-                        .unwrap_or(2),
+                        .unwrap_or(1),
                 ),
                 ..Policy::default()
             },
