@@ -413,7 +413,12 @@ with threaded reads showed four threads at 2.5x one, and the probe with
 the suite's shape showed 1.0x. A slot per line reads 3.8x. The rule: a
 word one thread writes on every operation lives on a line no other
 thread writes, and adjacent words, the layout nobody chose, are the bug
-until the layout is chosen.
+until the layout is chosen. It came back once as counters: every scan
+through a handle bumped seven to thirteen shared statistics, and four
+handles read the threaded scan mix at ten thousand keys at 0.46x of
+LMDB, 0.91x with the counters off. A handle's statistics live on its
+slot's line now, and the one word the writer must see, the regime's
+scan signal, a handle bumps once per commit and not once per scan.
 
 **An order that held by name.** The live segments sort partitions first and
 then the level-0 pieces, and the pieces sorted by fence and then by name.

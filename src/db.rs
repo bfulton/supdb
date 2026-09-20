@@ -2988,7 +2988,36 @@ pub(crate) struct Readers {
 /// 33.7M with each on a line; at thirty thousand, 7.2M and 6.9M against
 /// 7.7M and 29.1M. 128 bytes covers a machine whose lines are that wide.
 #[repr(align(128))]
-struct Slot(AtomicU64);
+struct Slot {
+    epoch: AtomicU64,
+    /// The handle's statistics, on this line rather than on the store's
+    /// shared words: every scan through a handle bumped seven to
+    /// thirteen shared counters and every form it took two more, and
+    /// four handles on four cores bumping the same lines read the
+    /// threaded scan mix at ten thousand keys at 0.46x of LMDB, 0.91x
+    /// with the counters off. Written by the slot's handle alone, read
+    /// by the accessors, which sum the slots.
+    scans: AtomicU64,
+    blockpath: AtomicU64,
+    takes: AtomicU64,
+    tried: AtomicU64,
+    hit: AtomicU64,
+    built: AtomicU64,
+}
+
+impl Slot {
+    const fn new() -> Slot {
+        Slot {
+            epoch: AtomicU64::new(0),
+            scans: AtomicU64::new(0),
+            blockpath: AtomicU64::new(0),
+            takes: AtomicU64::new(0),
+            tried: AtomicU64::new(0),
+            hit: AtomicU64::new(0),
+            built: AtomicU64::new(0),
+        }
+    }
+}
 
 const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::<Slot>() >= 128);
 
@@ -2998,7 +3027,7 @@ impl Readers {
     fn new() -> Readers {
         Readers {
             epoch: AtomicU64::new(1),
-            slots: (0..READER_SLOTS).map(|_| Slot(AtomicU64::new(0))).collect(),
+            slots: (0..READER_SLOTS).map(|_| Slot::new()).collect(),
         }
     }
 
@@ -3011,7 +3040,7 @@ impl Readers {
     /// retired at `epoch` can still be walked.
     fn none_before(&self, epoch: u64) -> bool {
         self.slots.iter().all(|s| {
-            let v = s.0.load(AtomicOrdering::SeqCst);
+            let v = s.epoch.load(AtomicOrdering::SeqCst);
             v == 0 || v >= epoch
         })
     }
@@ -3021,14 +3050,22 @@ impl Readers {
     fn claim(&self) -> Option<usize> {
         (0..READER_SLOTS).find(|&i| {
             self.slots[i]
-                .0
+                .epoch
                 .compare_exchange(0, u64::MAX, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst)
                 .is_ok()
         })
     }
 
     fn release(&self, slot: usize) {
-        self.slots[slot].0.store(0, AtomicOrdering::SeqCst);
+        self.slots[slot].epoch.store(0, AtomicOrdering::SeqCst);
+    }
+
+    /// One handle statistic, summed over the slots.
+    fn stat(&self, pick: impl Fn(&Slot) -> &AtomicU64) -> u64 {
+        self.slots
+            .iter()
+            .map(|s| pick(s).load(AtomicOrdering::Relaxed))
+            .sum()
     }
 
     /// Pin the current epoch in `slot`: a load, a store, and the load
@@ -3038,7 +3075,7 @@ impl Readers {
     fn pin(&self, slot: usize) {
         loop {
             let e = self.epoch.load(AtomicOrdering::SeqCst);
-            self.slots[slot].0.store(e, AtomicOrdering::SeqCst);
+            self.slots[slot].epoch.store(e, AtomicOrdering::SeqCst);
             if self.epoch.load(AtomicOrdering::SeqCst) == e {
                 return;
             }
@@ -3048,7 +3085,9 @@ impl Readers {
     /// Release suffices: the writer's `none_before` wants the unpin to
     /// come after the reads it ends, and nothing here waits on it.
     fn unpin(&self, slot: usize) {
-        self.slots[slot].0.store(u64::MAX, AtomicOrdering::Release);
+        self.slots[slot]
+            .epoch
+            .store(u64::MAX, AtomicOrdering::Release);
     }
 }
 
@@ -4557,7 +4596,6 @@ struct State {
     /// paid 30% and 43% for forms nothing read.
     scans: AtomicU64,
     forms_bytes: AtomicUsize,
-    forms_takes: AtomicUsize,
 }
 
 /// EXPERIMENT: a block form the writer keeps current at every commit,
@@ -4781,6 +4819,9 @@ pub struct Reader {
     /// maintained the canonical forms at; a commit with the count
     /// unmoved maintains nothing.
     scans_seen: std::cell::Cell<u64>,
+    /// The commit -- generation and committed log length -- this handle
+    /// last signalled a scan at, so it signals once per commit.
+    signalled: std::cell::Cell<(u64, usize)>,
     /// EXPERIMENT: for `forms_settle_recent_pct`: the store's scan count
     /// as this handle last saw it at a commit, the writes it has counted
     /// over the store's life (the log's growth, summed across
@@ -6011,10 +6052,11 @@ impl Reader {
         // on: before the first partitioning it stands aside.
         let use_cache =
             self.opts.scan_block_cache && self.segs().first().is_some_and(|s| s.level > 0);
-        if self.counted {
-            self.shared.rd_scans.fetch_add(1, AtomicOrdering::Relaxed);
+        if let (true, Some(slot)) = (self.counted, self.slot) {
+            let s = &self.shared.readers.slots[slot];
+            s.scans.fetch_add(1, AtomicOrdering::Relaxed);
             if use_cache {
-                self.shared.rd_blocks.fetch_add(1, AtomicOrdering::Relaxed);
+                s.blockpath.fetch_add(1, AtomicOrdering::Relaxed);
             }
         }
         // Nothing written or published since the last scan: nothing to
@@ -6199,6 +6241,15 @@ impl Reader {
             return moved;
         }
         let file = self.cache_used.get();
+        // A handle with no snapshot and no tables has nothing to file: the
+        // snapshot it builds or adopts next covers every entry there is,
+        // and the keys created since it is exactly what this loop lists.
+        // Read in full, the log's two thousand entries at ten thousand
+        // keys were twenty microseconds of a handle's first scan.
+        if !file && self.scan_keys.borrow().is_none() && self.ahead.borrow().is_none() {
+            self.log_seen.set(n);
+            return true;
+        }
         let covered = self.snap_entries.get();
         let mut added = self.snap_added.borrow_mut();
         let mut pending = self.pending.borrow_mut();
@@ -6405,8 +6456,16 @@ impl Reader {
         // replacement, and this handle is pinned for the operation or is
         // the writer's own, which frees nothing while it reads.
         let e = unsafe { &*e };
-        st.forms_takes.fetch_add(1, AtomicOrdering::Relaxed);
-        self.shared.form_takes.fetch_add(1, AtomicOrdering::Relaxed);
+        match self.slot {
+            Some(slot) => {
+                self.shared.readers.slots[slot]
+                    .takes
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            None => {
+                self.shared.form_takes.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
         Some(&e.form)
     }
 
@@ -6532,12 +6591,16 @@ impl Reader {
 
     /// One block materialised, charged to whoever built it.
     fn count_built(&self) {
-        let c = if self.counted {
-            &self.shared.blk_reader
-        } else {
-            &self.shared.blk_engine
-        };
-        c.fetch_add(1, AtomicOrdering::Relaxed);
+        match (self.counted, self.slot) {
+            (true, Some(slot)) => {
+                self.shared.readers.slots[slot]
+                    .built
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            _ => {
+                self.shared.blk_engine.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
     }
 
     /// EXPERIMENT: the mark, in a block's canonical slot, that the block
@@ -6618,20 +6681,28 @@ impl Reader {
     /// scans settle staged writes into its tables, and a handle must not
     /// find those -- and otherwise at the next commit.
     fn publish_for_handle(&self) {
-        if self.slot.is_some() || !self.opts.commit_forms || !self.dirty_any.get() {
+        if self.slot.is_some() || !self.opts.scan_block_cache {
             return;
         }
         let st = self.state();
-        if self.log_gen.get() != st.gen {
-            return;
-        }
         let mem = self.mem();
         if mem.log_len() != mem.committed_log() {
-            self.publish_due.set(true);
+            if self.opts.commit_forms && self.dirty_any.get() {
+                self.publish_due.set(true);
+            }
             return;
         }
-        self.sync_log();
-        if self.settle_pending().is_err() {
+        // The log read and the batch settled first, which is the order a
+        // snapshot may move in; then the snapshot brought current and
+        // published, so the handle adopts it.
+        let moved = self.sync_log();
+        if moved && self.settle_pending().is_err() {
+            return;
+        }
+        if self.segs().first().is_some_and(|s| s.level > 0) {
+            self.refresh_snapshot_to(st.gen, true, moved, true);
+        }
+        if !self.opts.commit_forms || !self.dirty_any.get() || self.log_gen.get() != st.gen {
             return;
         }
         if self.publish_dirty(true) {
@@ -6715,7 +6786,8 @@ impl Reader {
         (
             forms,
             st.forms_bytes.load(AtomicOrdering::Relaxed),
-            st.forms_takes.load(AtomicOrdering::Relaxed),
+            (self.shared.form_takes.load(AtomicOrdering::Relaxed)
+                + self.shared.readers.stat(|s| &s.takes)) as usize,
             st.forms_complete.load(AtomicOrdering::Relaxed),
         )
     }
@@ -6743,10 +6815,33 @@ impl Reader {
     /// before a commit needed the same. `gen` is the state's, `moved`
     /// whether the log or the state has moved since this handle looked.
     fn refresh_snapshot(&self, gen: u64, use_cache: bool, moved: bool) {
-        if !moved {
+        self.refresh_snapshot_to(gen, use_cache, moved, false)
+    }
+
+    /// `refresh_snapshot`, and with `current` a snapshot short of the live
+    /// memtable is stale whatever the rule below says: what the writer
+    /// does at a handle's claim, so the handle adopts a snapshot instead
+    /// of building one. The writer's own rule keeps a snapshot until the
+    /// keys since outnumber it, filing them by block meanwhile, and that
+    /// is right for the writer, whose tables carry those keys; a handle
+    /// has no such tables and could only build. At ten thousand keys the
+    /// published snapshot was the empty one the drained scan pass built,
+    /// and every handle claimed after the mixes built its own from
+    /// nothing: 70 µs of a first scan of 120, in a pass of a hundred
+    /// scans that take two each.
+    fn refresh_snapshot_to(&self, gen: u64, use_cache: bool, moved: bool, current: bool) {
+        if !moved && !current {
             return;
         }
         let mut cache = self.scan_keys.borrow_mut();
+        if current {
+            let short = cache
+                .as_ref()
+                .is_none_or(|(g, s)| *g != gen || s.live_len < self.mem().len());
+            if !short {
+                return;
+            }
+        }
         // What a snapshot may lack before it is worth building again:
         // the keys created since it was built, against the keys it has.
         let behind = |held: usize, added: usize| {
@@ -6756,7 +6851,7 @@ impl Reader {
                 added > (held / 8).max(4096)
             }
         };
-        let mut stale = cache.as_ref().is_none_or(|(g, _)| *g != gen);
+        let mut stale = current || cache.as_ref().is_none_or(|(g, _)| *g != gen);
         if !stale {
             let held = cache.as_ref().map_or(0, |(_, s)| s.len());
             let added = self.snap_added.borrow().len();
@@ -7539,11 +7634,20 @@ impl Reader {
         // clean. The writer's own handle holds those forms already, with
         // whatever it has staged since settled into them.
         let st = self.state();
+        // The regime's signal: a scan happened over this state since the
+        // last commit. The writer's own handle says so at every scan; a
+        // handle says so once per commit -- the count is compared, not
+        // read -- so four handles scanning do not bump one line a
+        // thousand times a millisecond.
         if self.opts.commit_forms {
-            st.scans.fetch_add(1, AtomicOrdering::Relaxed);
-            self.shared.scans_life.fetch_add(1, AtomicOrdering::Relaxed);
-            if self.counted {
-                st.reader_scans.fetch_add(1, AtomicOrdering::Relaxed);
+            let now = (st.gen, self.mem().committed_log());
+            let signal = self.slot.is_none() || self.signalled.replace(now) != now;
+            if signal {
+                st.scans.fetch_add(1, AtomicOrdering::Relaxed);
+                self.shared.scans_life.fetch_add(1, AtomicOrdering::Relaxed);
+                if self.counted {
+                    st.reader_scans.fetch_add(1, AtomicOrdering::Relaxed);
+                }
             }
         }
         let canonical = self.opts.commit_forms
@@ -7551,11 +7655,22 @@ impl Reader {
                 .forms_bound()
                 .is_some_and(|n| st.forms_at.load(AtomicOrdering::Acquire) == n);
         if self.opts.commit_forms && self.forms_bound().is_some() {
-            self.shared
-                .canon_tried
-                .fetch_add(1, AtomicOrdering::Relaxed);
-            if canonical {
-                self.shared.canon_hit.fetch_add(1, AtomicOrdering::Relaxed);
+            match self.slot {
+                Some(slot) => {
+                    let s = &self.shared.readers.slots[slot];
+                    s.tried.fetch_add(1, AtomicOrdering::Relaxed);
+                    if canonical {
+                        s.hit.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                }
+                None => {
+                    self.shared
+                        .canon_tried
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    if canonical {
+                        self.shared.canon_hit.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                }
             }
         }
         let complete = canonical && st.forms_complete.load(AtomicOrdering::Acquire);
@@ -8543,7 +8658,6 @@ impl Db {
             forms_complete: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
             forms_bytes: AtomicUsize::new(0),
-            forms_takes: AtomicUsize::new(0),
             segs,
             mem: std::sync::Arc::new(MemTable::new()),
             frozen: None,
@@ -8593,6 +8707,7 @@ impl Db {
             tables_complete: std::cell::Cell::new(false),
             publish_due: std::cell::Cell::new(false),
             scans_seen: std::cell::Cell::new(0),
+            signalled: std::cell::Cell::new((0, usize::MAX)),
             scans_life_seen: std::cell::Cell::new(0),
             writes_seen: std::cell::Cell::new(0),
             writes_at_scan: std::cell::Cell::new(0),
@@ -8841,7 +8956,6 @@ impl Db {
             forms_complete: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
             forms_bytes: AtomicUsize::new(0),
-            forms_takes: AtomicUsize::new(0),
             segs,
             mem: std::sync::Arc::new(mem),
             frozen: None,
@@ -8891,6 +9005,7 @@ impl Db {
             tables_complete: std::cell::Cell::new(false),
             publish_due: std::cell::Cell::new(false),
             scans_seen: std::cell::Cell::new(0),
+            signalled: std::cell::Cell::new((0, usize::MAX)),
             scans_life_seen: std::cell::Cell::new(0),
             writes_seen: std::cell::Cell::new(0),
             writes_at_scan: std::cell::Cell::new(0),
@@ -9620,7 +9735,6 @@ impl Db {
             forms_complete: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
             forms_bytes: AtomicUsize::new(0),
-            forms_takes: AtomicUsize::new(0),
             segs,
             mem: cur.mem.clone(),
             frozen: cur.frozen.clone(),
@@ -9706,6 +9820,7 @@ impl Db {
     /// current state's alone and zero again after every publish.
     pub fn form_takes(&self) -> u64 {
         self.shared.form_takes.load(AtomicOrdering::Relaxed)
+            + self.shared.readers.stat(|s| &s.takes)
     }
 
     /// EXPERIMENT: scans through a caller's handle that reached the test
@@ -9713,8 +9828,10 @@ impl Db {
     /// to the log position the handle holds.
     pub fn canonical_tries(&self) -> (u64, u64) {
         (
-            self.shared.canon_tried.load(AtomicOrdering::Relaxed),
-            self.shared.canon_hit.load(AtomicOrdering::Relaxed),
+            self.shared.canon_tried.load(AtomicOrdering::Relaxed)
+                + self.shared.readers.stat(|s| &s.tried),
+            self.shared.canon_hit.load(AtomicOrdering::Relaxed)
+                + self.shared.readers.stat(|s| &s.hit),
         )
     }
 
@@ -9724,15 +9841,18 @@ impl Db {
     /// engine's own; see `Shared::blk_reader`.
     pub fn blocks_built(&self) -> (u64, u64) {
         (
-            self.shared.blk_reader.load(AtomicOrdering::Relaxed),
+            self.shared.blk_reader.load(AtomicOrdering::Relaxed)
+                + self.shared.readers.stat(|s| &s.built),
             self.shared.blk_engine.load(AtomicOrdering::Relaxed),
         )
     }
 
     pub fn reader_scans(&self) -> (u64, u64) {
         (
-            self.shared.rd_scans.load(AtomicOrdering::Relaxed),
-            self.shared.rd_blocks.load(AtomicOrdering::Relaxed),
+            self.shared.rd_scans.load(AtomicOrdering::Relaxed)
+                + self.shared.readers.stat(|s| &s.scans),
+            self.shared.rd_blocks.load(AtomicOrdering::Relaxed)
+                + self.shared.readers.stat(|s| &s.blockpath),
         )
     }
 
@@ -9797,6 +9917,7 @@ impl Reader {
             tables_complete: std::cell::Cell::new(false),
             publish_due: std::cell::Cell::new(false),
             scans_seen: std::cell::Cell::new(0),
+            signalled: std::cell::Cell::new((0, usize::MAX)),
             scans_life_seen: std::cell::Cell::new(0),
             writes_seen: std::cell::Cell::new(0),
             writes_at_scan: std::cell::Cell::new(0),
@@ -9826,7 +9947,6 @@ impl Db {
             forms_complete: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
             forms_bytes: AtomicUsize::new(0),
-            forms_takes: AtomicUsize::new(0),
             segs: cur.segs.clone(),
             mem,
             frozen: cur.frozen.clone(),
@@ -9851,7 +9971,6 @@ impl Db {
             forms_complete: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
             forms_bytes: AtomicUsize::new(0),
-            forms_takes: AtomicUsize::new(0),
             segs: cur.segs.clone(),
             mem: cur.mem.clone(),
             frozen,
@@ -9993,7 +10112,6 @@ impl Db {
             forms_complete: std::sync::atomic::AtomicBool::new(false),
             scans: AtomicU64::new(0),
             forms_bytes: AtomicUsize::new(0),
-            forms_takes: AtomicUsize::new(0),
             segs: cur.segs.clone(),
             mem: std::sync::Arc::new(MemTable::new()),
             frozen: Some(frozen.clone()),

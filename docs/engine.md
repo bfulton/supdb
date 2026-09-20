@@ -937,6 +937,45 @@ survives a merge -- one keyed to content rather than to a partition's
 block -- or a cheaper build changes it, and the first is not the shape
 of this cache.
 
+#### The threaded scan mix at ten thousand keys
+
+Starting on ycsb-E at the small rungs found the target had moved. In
+one process against LMDB at ten thousand keys, eleven pairs: E at
+0.96x within noise, the single-thread scan at 1.10x (p=0.012), the lag
+points at 1.19x-1.27x, and the one loss the threaded scans after the
+mixes, 0.54x on two threads and 0.46x on four (11/11). Those go
+through handles the caller made, a hundred scans of a hundred entries
+each per thread, over the store the mixes leave. A probe in that shape
+with every scan timed said where: a handle's first scan cost 120-150
+µs against 1.7 µs for every scan after, and every scan bumped shared
+counters that four cores contended for.
+
+The first scan was three things. The handle read the whole write log,
+two thousand entries, into its list of keys created since a snapshot
+it did not yet have: 20 µs. It then built its own snapshot of the
+unsealed keys, 70 µs, because the published one was the empty
+snapshot the drained scan pass had built: the writer keeps a snapshot
+until the keys since outnumber it and files them by block meanwhile,
+which is right for the writer, whose tables carry those keys, and
+useless to a handle. And it made its block table and walked two cold
+blocks, 25 µs. Now a claim brings the writer's snapshot current and
+publishes it, so a handle adopts, and a handle with no snapshot files
+nothing from the log. The first scan reads 15-40 µs.
+
+The counters were the slot table's bug a second time. A scan through
+a handle bumped seven to thirteen shared words -- the scan counts, the
+regime's signal, the canonical tries and hits, two per form taken --
+and four handles on four cores bumping the same lines read the mix at
+0.46x; with the counters switched off through a temporary flag, 0.91x.
+Each handle's statistics now live on its slot's own line, summed by the
+accessors, and a handle signals the regime once per commit rather than
+once per scan, since the writer compares the count and never reads it.
+Against LMDB after both, the mix reads 0.89x on two threads (8/11, ns)
+and 0.78x on four (10/11, p=0.012), from 0.54x and 0.46x, with E, the
+single-thread scans and the lag points where they were. What remains
+is the first scan's cold blocks and the table it makes, some 20 µs
+against a steady scan of 1.6.
+
 #### Publishing for readers that exist
 
 The copy the carry made visible is the publish's: a canonical form is

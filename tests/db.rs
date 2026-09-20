@@ -4925,6 +4925,83 @@ fn a_table_the_commit_filled_takes_the_writes_after_it() {
     std::hint::black_box(sink);
 }
 
+/// A handle claimed after a write burst adopts the writer's snapshot
+/// rather than building one, and its first read files nothing from the
+/// log: the claim brings the writer's snapshot current and publishes
+/// it. Before this the published snapshot was whatever the writer last
+/// built -- at ten thousand keys the empty one the drained scan pass
+/// made -- and every handle claimed after the mixes sorted the unsealed
+/// keys itself, 70 µs of a first scan whose steady successors take two.
+#[test]
+fn a_handle_claimed_after_a_burst_adopts_the_writers_snapshot() {
+    let d = dir("adopt-at-claim");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        commit_forms: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 1, "several partitions");
+    let mut sink = 0usize;
+    // The writer scans the drained store, then a burst: its snapshot is
+    // the empty one and the burst's keys are filed by block.
+    db.scan(key(0).as_bytes(), 10, |_k, v| sink += v.len())
+        .unwrap();
+    for k in (0..1500u32).step_by(3) {
+        m.append(&mut db, &key(k), "burst");
+    }
+    db.commit().unwrap();
+    let builds = db.snapshot_builds();
+    // The claim brings the writer's snapshot current; the handle's scans
+    // build none of their own.
+    let r = db.reader().unwrap();
+    let at_claim = db.snapshot_builds() + db.snapshot_extends();
+    assert!(at_claim > builds, "the claim brought the snapshot current");
+    r.scan(key(0).as_bytes(), 200, |_k, v| sink += v.len())
+        .unwrap();
+    r.scan(key(700).as_bytes(), 200, |_k, v| sink += v.len())
+        .unwrap();
+    assert_eq!(
+        db.snapshot_builds() + db.snapshot_extends(),
+        at_claim,
+        "the handle adopted the writer's snapshot"
+    );
+    m.check(&r, "a handle over the adopted snapshot");
+    m.check(&db, "the writer");
+    // Staged writes at a claim: the snapshot is not moved past them, and
+    // the handle before the commit sees none of them.
+    for k in (1..1500u32).step_by(7) {
+        m.append(&mut db, &key(k), "staged");
+    }
+    let r2 = db.reader().unwrap();
+    let mut got = Vec::new();
+    r2.scan(key(1).as_bytes(), 1, |k, v| {
+        if k == key(1).as_bytes() {
+            got.push(v.to_vec());
+        }
+    })
+    .unwrap();
+    assert_eq!(got, vec![b"v0".to_vec()], "a handle sees nothing staged");
+    db.commit().unwrap();
+    let r3 = db.reader().unwrap();
+    m.check(&r3, "a handle after the commit");
+    m.check(&db, "the writer after the commit");
+    std::hint::black_box(sink);
+}
+
 /// EXPERIMENT: the backlog bound settles a burst only while the store
 /// was scanned within `forms_settle_recent_pct` of its keys written
 /// since. Filing costs the same at the commit and at the next read, and
