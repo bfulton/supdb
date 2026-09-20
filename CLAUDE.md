@@ -92,6 +92,17 @@ Profile a probe that does one thing. The scan probe's own `format!` per
 iteration was 8% of its samples until the keys were built before the
 loop.
 
+Give the probe the suite's shape before believing it disagrees with the
+suite. Four probes in one day failed to reproduce a figure from the lag
+sweep and each was read as a refutation before it was read as a bad
+model: one amortised the block builds over a hundred thousand scans
+where the sweep does `size / scan_len` of them, one buffered its writes
+differently from the mix driver, and all of them used forty-byte values
+against the suite's hundred (`VALUE_SIZE`) and sixteen-byte keys. The
+suite's own arms answer most of these questions without a probe at all,
+and `bench ab` prices two of them in one process; reach for a probe only
+when no pair of arms isolates what you are asking.
+
 ## The suite lives in bench/, and it gates this repository
 
 `bench/` is a time series. `bench run` measures every arm -- supdb's

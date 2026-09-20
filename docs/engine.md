@@ -728,6 +728,23 @@ quarter in the seek, a fifth in the walk of the first entry, an eighth
 in the preamble, an eighth in the prefetch. Closing it is a fixed-cost
 problem, not a policy one.
 
+#### Which half of the lag gap, by rung
+
+The build and the walk split by size, and the arms say which is which
+without a probe. `supdb` against `supdb-lazyforms` -- the same engine
+with the forms built at commit or left to the read -- reads the tenth-
+unmerged point at **3.79x** at ten thousand keys and **0.97x** at a
+hundred thousand. So prebuilding is the whole story at the small rung
+and nothing at all above it: at ten thousand the lag gap is form
+construction, and at a hundred thousand and above it is the walk over
+the forms, 119 ns an entry against LMDB's 29.
+
+That is the split the next attempt starts from, and the two halves want
+opposite things: the small rung wants the build cheaper or skipped, the
+large rungs want the sparse walk faster. A change aimed at one should be
+priced at both rungs, because today's measurements have the effect
+inverting between them three separate times.
+
 #### The lag gap is a build cost, and the two defaults compound
 
 What the lag sweep measures is mostly not scanning. The same store and
