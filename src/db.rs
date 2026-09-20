@@ -4636,7 +4636,12 @@ pub struct Reader {
     /// ycsb-A, which follows a scan phase, paid that seek twice an update
     /// and lost a fifth. The next scan drops and files the distinct keys
     /// at once, and a mix that never scans never pays.
-    pending: std::cell::RefCell<Vec<(u32, u32, bool)>>,
+    pending: std::cell::RefCell<Vec<(u32, u32, bool, u32)>>,
+    /// A settled write's resolved run, built here and spliced into the
+    /// block: one buffer for every write of a settle, where a `Vec` built
+    /// from empty per write was a malloc, a realloc and a free apiece,
+    /// two fifths of a settle's instructions.
+    settle_run: std::cell::RefCell<Vec<u8>>,
     /// EXPERIMENT: blocks whose form this handle built or patched since
     /// the last commit, to publish as canonical at the next; the
     /// writer's own handle alone fills it.
@@ -6069,7 +6074,7 @@ impl Reader {
                 let e = mem.entry(id);
                 match pending.last_mut() {
                     Some(last) if last.0 == e.key_off => last.2 |= new,
-                    _ => pending.push((e.key_off, e.key_len, new)),
+                    _ => pending.push((e.key_off, e.key_len, new, id as u32)),
                 }
             }
             if let Some((from, since)) = since.as_mut() {
@@ -6186,7 +6191,10 @@ impl Reader {
                     for i in since.range(lo, hi) {
                         let k = since.at(i);
                         let cut = BuildCtx::owner_of(seg, k).1;
-                        self.patch_block(pi, b, table, k, cut)?;
+                        // The list carries keys and not slots, so this
+                        // path probes for the one the settle carries.
+                        let slot = self.mem().slot_of(k).map_or(u32::MAX, |i| i as u32);
+                        self.patch_block(pi, b, table, k, cut, slot)?;
                     }
                 }
             }
@@ -6907,7 +6915,11 @@ impl Reader {
         if pending.is_empty() {
             return Ok(());
         }
-        pending.sort_unstable_by_key(|&(off, _, new)| (off, !new));
+        // Grouped by key with the write that created it first: that one
+        // files the key into its block's list and the rest are skipped as
+        // duplicates, so the order is a correctness order. One integer key,
+        // since a tuple compared through a closure was a quarter of a settle.
+        pending.sort_unstable_by_key(|&(off, _, new, _)| ((off as u64) << 1) | u64::from(!new));
         // A write that could not be settled leaves the block it landed in
         // stale, so an error drops every table rather than leave one.
         let settled = self.settle_each(&pending);
@@ -6919,10 +6931,19 @@ impl Reader {
         settled
     }
 
-    fn settle_each(&self, pending: &[(u32, u32, bool)]) -> Result<()> {
+    fn settle_each(&self, pending: &[(u32, u32, bool, u32)]) -> Result<()> {
         let np = self.segs().partition_point(|s| s.level > 0);
+        // Resolved first, applied in the partition's order. A write's
+        // position is one seek, but applying it reads the partition's
+        // record at that position and the block's own buffers, and in
+        // the log's order those are one cold line each per write: about
+        // half of a settle waited on `Blob::key_at`. Sorted by position
+        // the reads run through the partition once, the way a B-tree
+        // applies a batch.
         let mut last = u32::MAX;
-        for &(off, len, new) in pending {
+        let mut resolved: Vec<(u32, u32, u32, u32, u32, bool, u32)> =
+            Vec::with_capacity(pending.len());
+        for &(off, len, new, slot) in pending {
             if off == last {
                 continue;
             }
@@ -6936,12 +6957,18 @@ impl Reader {
             if seg.blob.keys() == 0 {
                 continue;
             }
+            let (b, cut) = BuildCtx::owner_of(seg, key);
+            resolved.push((at as u32, b as u32, cut, off, len, new, slot));
+        }
+        resolved.sort_unstable_by_key(|r| (u64::from(r.0) << 32) | u64::from(r.2));
+        for &(at, b, cut, off, len, new, slot) in &resolved {
+            let (at, b) = (at as usize, b as usize);
+            let key = self.mem().key_at(off, len);
             let tables = self.tables.borrow();
             let mut held = tables[at].borrow_mut();
             let Some(table) = held.as_mut() else {
                 continue;
             };
-            let (b, cut) = BuildCtx::owner_of(seg, key);
             if b < table.slots.len() {
                 // The copy this block was also held as is the writes'
                 // to drop: patching two forms for one write is what the
@@ -6971,12 +6998,11 @@ impl Reader {
                         .forms_complete
                         .store(false, AtomicOrdering::Release);
                 }
-                self.patch_block(at, b, table, key, cut)?;
+                self.patch_block(at, b, table, key, cut, slot)?;
             }
             if new {
-                if let (Some(slot), Some(list)) = (self.mem().slot_of(key), table.added.get_mut(b))
-                {
-                    list.push((slot as u32, cut));
+                if let Some(list) = table.added.get_mut(b) {
+                    list.push((slot, cut));
                     table.filed += 1;
                 }
             }
@@ -7011,6 +7037,7 @@ impl Reader {
         table: &mut BlockTable,
         key: &[u8],
         cut: u32,
+        slot: u32,
     ) -> Result<()> {
         if matches!(table.slots[b].as_deref(), None | Some(Cached::Wide(_))) {
             return Ok(());
@@ -7037,7 +7064,7 @@ impl Reader {
         let sk = SnapKey {
             off: 0,
             len: 0,
-            mem: slot_in(self.mem()),
+            mem: slot,
             frozen: self.frozen().as_ref().map_or(u32::MAX, |fr| slot_in(fr)),
         };
         let ov = Overlay {
@@ -7055,7 +7082,9 @@ impl Reader {
             tombs: self.has_tombstones(),
             scratch: Vec::new(),
         };
-        let mut run: Vec<u8> = Vec::new();
+        let mut run_scratch = self.settle_run.borrow_mut();
+        let run: &mut Vec<u8> = &mut run_scratch;
+        run.clear();
         self.build_ctx().emit_over(
             &mut |_, v: &[u8]| {
                 run.extend_from_slice(&(v.len() as u32).to_le_bytes());
@@ -7074,7 +7103,7 @@ impl Reader {
             Cached::Block(blk) => {
                 let i = blk.lower_bound(key);
                 let at_run = blk.vals.len() as u32;
-                blk.vals.extend_from_slice(&run);
+                blk.vals.extend_from_slice(&run[..]);
                 if i < blk.ents.len() && blk.key(&blk.ents[i]) == key {
                     blk.ents[i][2] = at_run;
                     blk.ents[i][3] = run.len() as u32;
@@ -7090,7 +7119,7 @@ impl Reader {
             Cached::Sparse(sb) => {
                 let i = sb.ents.partition_point(|e| sb.key(e) < key);
                 let at_run = sb.vals.len() as u32;
-                sb.vals.extend_from_slice(&run);
+                sb.vals.extend_from_slice(&run[..]);
                 if i < sb.ents.len() && sb.key(&sb.ents[i]) == key {
                     sb.ents[i].run = (at_run, run.len() as u32);
                 } else {
@@ -7118,7 +7147,7 @@ impl Reader {
                         same,
                         run: (0, run.len() as u32),
                     }],
-                    vals: run,
+                    vals: std::mem::take(run),
                 });
             }
             Cached::Wide(_) => unreachable!("a wide block is left alone above"),
@@ -8259,6 +8288,7 @@ impl Db {
             scan_tick: std::cell::Cell::new(0),
             shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
             pending: std::cell::RefCell::new(Vec::new()),
+            settle_run: std::cell::RefCell::new(Vec::new()),
             built: std::cell::RefCell::new(Vec::new()),
             to_publish: std::cell::RefCell::new(Vec::new()),
             scans_seen: std::cell::Cell::new(0),
@@ -8547,6 +8577,7 @@ impl Db {
             scan_tick: std::cell::Cell::new(0),
             shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
             pending: std::cell::RefCell::new(Vec::new()),
+            settle_run: std::cell::RefCell::new(Vec::new()),
             built: std::cell::RefCell::new(Vec::new()),
             to_publish: std::cell::RefCell::new(Vec::new()),
             scans_seen: std::cell::Cell::new(0),
@@ -9438,6 +9469,7 @@ impl Reader {
             scan_tick: std::cell::Cell::new(0),
             shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
             pending: std::cell::RefCell::new(Vec::new()),
+            settle_run: std::cell::RefCell::new(Vec::new()),
             built: std::cell::RefCell::new(Vec::new()),
             to_publish: std::cell::RefCell::new(Vec::new()),
             scans_seen: std::cell::Cell::new(0),

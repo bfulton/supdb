@@ -767,13 +767,28 @@ there write five times over it, and it reads the lag point at 3.59x for
 ycsb-A at 0.66x and F at 0.80x (0/7). Five percent is the default, and
 as a share it holds at that rung: seven pairs at three hundred thousand
 read the point at 1.86x (7/7, p=0.016) with A at 0.95x and F at 0.89x,
-neither significant, and nothing else moved. What
-a settled write costs -- about 0.75 µs, the same bill either way --
-is `patch_block`: a `build_ctx` per write, a one-element `Overlay`
-allocated per write, a fresh `run` buffer per write, and on a dense
-copy an `ents.insert` memmove plus an O(block) sum for the bloat
-check. That is the next thing to make cheaper, and it moves the whole
-curve rather than a point on it.
+neither significant, and nothing else moved. What a settled write costs was then taken apart with both instruments,
+and they disagreed the way the profiling notes say they will. Callgrind
+put a write at about 3,000 instructions: two fifths in `malloc`,
+`realloc` and `free` -- a `run` buffer built from empty per write, and a
+one-element `Overlay` -- a quarter in the sort that groups the batch's
+duplicates through a tuple-and-closure key, an eighth in the seek, a
+tenth in three hash probes for a slot the log had already named. A
+reusable `run` buffer, the slot carried in `pending`, and a single
+integer sort key took that to about 2,300 instructions, a quarter
+fewer, and a write settled in the same 665 ns: the path waits, and what
+it waits on is `Blob::key_at`, the partition's record at the write's
+position, one cold line per write because `pending` is ordered by arena
+offset and consecutive writes land nowhere near each other in the
+partition. Resolving every write's position first, sorting by it, and
+applying in that order -- a B-tree's bulk update -- reads 600 ns a
+write: 10%, and not the half the profile's share suggested, since the
+seek that finds the position is itself a random read and stays one.
+Two thousand three hundred instructions in 600 ns at 2.1 GHz is an IPC
+near two, so neither instrument's half is the whole cost now; the rest
+is the work itself, a seek, a record read and a splice per write.
+Splicing a block's writes together, now that they arrive adjacent, is
+the next cut and a larger one.
 
 #### Which half of the lag gap, by rung
 
