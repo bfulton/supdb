@@ -453,6 +453,22 @@ taken once and kept with one of them under the other's identity; and a
 structure a pass needs once is built where the pass is not timed -- at
 open, by the seal that made the segment -- or not at all.
 
+**Two merges over one range that did not take pieces by age.** Level
+0 is newer than the level below it, every piece of it, so a merge that
+writes the level below may take only a prefix of a range's pieces by
+age. A piece merge held a range's pieces as inputs; a partition merge
+started beside it excluded those inputs and took the piece sealed
+after them, and folded the newer piece under the older ones. A key's
+values came back out of order, and a key whose older values a
+tombstone had masked lost them when the partition merge dropped the
+tombstone as one that had nothing older left to mask. The crash oracle
+found it in its first run: nothing raised, every file was well-formed.
+No partition merge starts while a piece merge runs; a piece merge may
+start beside a partition merge because that merge's inputs are the
+range's oldest pieces. The rule: two writers of one level order must
+agree on which of them takes the old end, and an exclusion by name is
+not an ordering by age.
+
 **An order that held by name.** The live segments sort partitions first and
 then the level-0 pieces, and the pieces sorted by fence and then by name.
 Every piece a seal makes after the first partitioning is named `pcs-` with

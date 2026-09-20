@@ -2261,6 +2261,8 @@ fn a_key_held_by_many_pieces_counts_once_toward_a_wide_block() {
         partition_bytes: Some(2 << 10),
         l0_trigger: 64,
         scan_block_cache: true,
+        // The premise is sixteen pieces over every range, so none merge.
+        tier_pieces: 0,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -2591,6 +2593,8 @@ fn an_ordered_load_goes_straight_into_segments() {
             seal_bytes: 32 << 10,
             partition_bytes: Some(256 << 10),
             scan_block_cache: block_cache,
+            // The segments as the threshold left them, none merged.
+            tier_pieces: 0,
             ..Options::default()
         };
         let mut db = Db::create(&d, opts.clone()).unwrap();
@@ -5078,4 +5082,100 @@ fn a_burst_is_settled_by_its_backlog_only_near_a_scan() {
         "the read after the burst files it"
     );
     m.check(&db, "after the burst");
+}
+
+/// Pieces over one partition's range are merged into one piece beside the
+/// partition merge, carrying their tombstones: a store that tiers and one
+/// that does not, driven identically -- a load, then rounds of appends and
+/// deletes each sealed with no partition merge due -- answer every key and
+/// every scan alike, the tiering store holds fewer pieces, and a reopen of
+/// it answers the same.
+#[test]
+fn pieces_merge_into_a_piece_and_carry_their_tombstones() {
+    // Once with the partition merge out of the way, so every seal's piece
+    // waits for the piece merge, and once with both merges due every few
+    // seals, since a partition merge that took a piece sealed after a
+    // piece merge's inputs folded newer values under older ones.
+    for (tier, l0) in [(2usize, 1000usize), (2, 3)] {
+        pieces_merge_case(tier, l0);
+    }
+}
+
+fn pieces_merge_case(tier_pieces: usize, l0_trigger: usize) {
+    let opts = |tier: usize, l0: usize| Options {
+        seal_bytes: 1 << 20,
+        partition_on_flush: true,
+        l0_trigger: l0,
+        tier_pieces: tier,
+        scan_block_cache: true,
+        commit_forms: true,
+        ..Options::default()
+    };
+    let key = |i: u64| format!("{i:016}");
+    let (da, dbd) = (
+        dir(&format!("tier-a-{l0_trigger}")),
+        dir(&format!("tier-b-{l0_trigger}")),
+    );
+    let mut a = Db::create(&da, opts(tier_pieces, l0_trigger)).unwrap();
+    let mut b = Db::create(&dbd, opts(0, 1000)).unwrap();
+    let n = 3000u64;
+    for db in [&mut a, &mut b] {
+        for i in 0..n {
+            db.append(key(i).as_bytes(), format!("v0-{i}").as_bytes());
+        }
+        db.flush().unwrap();
+        assert_eq!(db.levels(), (1, 0));
+    }
+    // The rounds' operations decided once, applied to both.
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    for round in 1..=6 {
+        let ops: Vec<(u64, bool)> = (0..400).map(|j| (next() % n, j % 5 == 0)).collect();
+        for db in [&mut a, &mut b] {
+            for &(k, delete) in &ops {
+                if delete {
+                    db.delete(key(k).as_bytes());
+                } else {
+                    db.append(key(k).as_bytes(), format!("v{round}-{k}").as_bytes());
+                }
+            }
+            db.seal().unwrap();
+        }
+    }
+    a.settle().unwrap();
+    b.settle().unwrap();
+    assert_eq!(b.levels(), (1, 6), "every seal left a piece");
+    assert!(a.levels().1 < 6, "the pieces were merged: {:?}", a.levels());
+    let opts = |tier: usize| opts(tier, l0_trigger);
+    let scan_all = |db: &Db| {
+        let mut out = Vec::new();
+        db.scan(b"", usize::MAX, |k, v| out.push((k.to_vec(), v.to_vec())))
+            .unwrap();
+        out
+    };
+    let want = scan_all(&b);
+    assert!(want.len() > n as usize, "appends kept: {}", want.len());
+    assert_eq!(scan_all(&a), want);
+    for i in 0..n {
+        assert_eq!(
+            read_vec(&a, key(i).as_bytes()),
+            read_vec(&b, key(i).as_bytes()),
+            "key {i}"
+        );
+    }
+    drop(a);
+    let a = Db::open(&da, opts(2)).unwrap();
+    assert_eq!(scan_all(&a), want, "after a reopen");
+    for i in 0..n {
+        assert_eq!(
+            read_vec(&a, key(i).as_bytes()),
+            read_vec(&b, key(i).as_bytes()),
+            "key {i} after a reopen"
+        );
+    }
 }

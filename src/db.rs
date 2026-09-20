@@ -281,6 +281,23 @@ pub struct Options {
     /// merge. The brief's open "partitioned compaction policy" question in
     /// one number; it was chosen by sweeping it.
     pub l0_trigger: usize,
+    /// EXPERIMENT: aligned pieces over one partition's range at which they
+    /// are merged into one piece on a thread of their own, so a read meets
+    /// fewer pieces while the partition merge lags; zero, the default,
+    /// leaves the pieces for the partition merge. `supdb-tier` prices it
+    /// at three. What a read pays over an unmerged range is the pieces --
+    /// a block's build at the sweep's fully-unmerged point is 74,000
+    /// instructions at seven or eight pieces and 18,000 at two -- and the
+    /// merge takes them from seven or eight to one or two there, but the
+    /// point reads 1.11x-1.13x for it and nothing else on the ladder
+    /// moves, and the pieces it makes count one each toward `l0_trigger`,
+    /// so a range that keeps folding never reaches it and the partition
+    /// merge waits for a flush while the merged piece is rewritten every
+    /// few seals; `docs/engine.md` has the measurement and what a version
+    /// worth turning on would count. A piece merge carries the tombstones
+    /// its inputs held, since the partition below still holds what they
+    /// mask, and no partition merge starts while one runs.
+    pub tier_pieces: usize,
     /// The measurement instrument: false keeps every segment in the
     /// unrouted L0 fan, which is milestone 3's behaviour exactly.
     pub compact: bool,
@@ -729,6 +746,7 @@ impl Default for Options {
             direct_ingest: true,
             segment: SegmentOptions::default(),
             l0_trigger: 4,
+            tier_pieces: 0,
             compact: true,
             partition_on_flush: true,
             cursor_merge: true,
@@ -3931,13 +3949,24 @@ impl Emitter<'_> {
     }
 
     fn key(&mut self, k: &[u8], pull: impl FnOnce(&mut PieceWriter) -> Result<()>) -> Result<()> {
+        // A partition merge writes the bottom level, so no output extent
+        // carries the tombstone flag: there is nothing older left for it
+        // to mask. A piece merge carries it, since the partition below
+        // still holds what it masks.
+        self.key_with(k, false, pull)
+    }
+
+    fn key_with(
+        &mut self,
+        k: &[u8],
+        tombstone: bool,
+        pull: impl FnOnce(&mut PieceWriter) -> Result<()>,
+    ) -> Result<()> {
         let to = self.enter(Some(k))?;
         let w = self.w.as_mut().ok_or_else(|| err("merge piece not open"))?;
         w.begin(k)?;
         pull(w)?;
-        // Merges write the bottom level, so no output extent carries the
-        // tombstone flag: there is nothing older left for it to mask.
-        w.end_with(false)?;
+        w.end_with(tombstone)?;
         self.leave(to)
     }
 
@@ -4210,6 +4239,228 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     let out = em.finish(keys.len())?;
     File::open(&dir)?.sync_all()?;
     Ok(out)
+}
+
+/// A piece merge: the aligned pieces over one partition's range, oldest
+/// first, into one piece over the same range.
+struct TierPlan {
+    dir: PathBuf,
+    inputs: Vec<String>,
+    id: u64,
+    end_seq: u64,
+    lo: Vec<u8>,
+    hi: Option<Vec<u8>>,
+    opts: SegmentOptions,
+    background_io: BackgroundIo,
+    sync_every: usize,
+    inline_max: usize,
+}
+
+/// The piece merge's body: the inputs' keys walked once for their count
+/// and once for their values, as the partition merge walks them, into one
+/// piece named by a fresh id and the newest input's covered sequence, so
+/// it sorts among the range's pieces where that input did. For each key
+/// the inputs older than its newest flagged extent are dropped as the
+/// partition merge drops them, and the flag is carried when any input
+/// held it: the partition below, and pieces older than the inputs, still
+/// hold what it masks. A key whose inputs hold nothing live and a
+/// tombstone is written as the tombstone alone, which is what a seal
+/// writes for a deleted key.
+fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
+    let TierPlan {
+        dir,
+        inputs,
+        id,
+        end_seq,
+        lo,
+        hi,
+        opts,
+        background_io,
+        sync_every,
+        inline_max,
+    } = plan;
+    if background_io == BackgroundIo::Idle {
+        idle_io_priority();
+    }
+    let mut blobs = Vec::with_capacity(inputs.len());
+    for name in &inputs {
+        blobs.push(
+            Blob::open_with(
+                MmapBytes::open(&dir.join(name))?,
+                crate::blob::BlobOptions {
+                    verify_checksums: opts.checksums,
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| err(&format!("tier input {name}: {e}")))?,
+        );
+    }
+    let mut total = 0usize;
+    merge_ranks(&blobs, |_, _| {
+        total += 1;
+        Ok(())
+    })?;
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+    let name = format!(
+        "pcs-{id:08}-{end_seq:016}-{}-{}.sup",
+        hex(&lo),
+        hi.as_deref().map(hex).unwrap_or_default()
+    );
+    let tmp = dir.join(format!("tier-{id:08}.tmp"));
+    let mut em = Emitter {
+        dir: &dir,
+        opts: &opts,
+        sync_every,
+        inline_max,
+        pieces: vec![Piece {
+            from: 0,
+            to: total,
+            lo,
+            hi,
+            name,
+            tmp,
+        }],
+        pi: 0,
+        r: 0,
+        w: None,
+        out: Vec::new(),
+    };
+    merge_ranks(&blobs, |k, tied| {
+        let mut start = 0usize;
+        let mut live = 0u64;
+        let mut tomb = false;
+        for (j, &(i, rank)) in tied.iter().enumerate() {
+            let Some((_, exts)) = blobs[i].exts_at(rank) else {
+                return Err(err("segment key walk: a rank the index does not have"));
+            };
+            if exts.iter().any(|e| e.is_tombstone()) {
+                start = j;
+                live = 0;
+                tomb = true;
+            }
+            live += exts.iter().map(|e| u64::from(e.records())).sum::<u64>();
+        }
+        if live == 0 && !tomb {
+            return em.skip();
+        }
+        em.key_with(k, tomb, |w| {
+            for &(i, rank) in &tied[start..] {
+                blobs[i]
+                    .values_at(rank, |v| w.value(v))
+                    .map_err(|e| err(&format!("tier read: {e}")))?;
+            }
+            Ok(())
+        })
+    })?;
+    let out = em.finish(total)?;
+    File::open(&dir)?.sync_all()?;
+    Ok(out)
+}
+
+impl Db {
+    /// Start a piece merge where a partition's range holds `tier_pieces`
+    /// aligned pieces that no partition merge holds as inputs, one range
+    /// at a time; collect a finished one first, since the pieces it
+    /// replaced are what the decision counts.
+    fn maybe_tier(&mut self) -> Result<()> {
+        let n = self.opts.tier_pieces;
+        if n == 0 {
+            return Ok(());
+        }
+        if let Some((_, h)) = &self.tiering {
+            if !h.is_finished() {
+                return Ok(());
+            }
+            self.join_tier()?;
+        }
+        let busy: Vec<String> = self
+            .compacting
+            .as_ref()
+            .map(|(i, _)| i.clone())
+            .unwrap_or_default();
+        let parts: Vec<Fence> = self
+            .segs()
+            .iter()
+            .filter(|s| s.level > 0)
+            .map(|s| (s.lo.clone(), s.hi.clone()))
+            .collect();
+        for (lo, hi) in parts {
+            let pieces: Vec<String> = self
+                .segs()
+                .iter()
+                .filter(|s| s.level == 0 && s.lo == lo && s.hi == hi && !busy.contains(&s.name))
+                .map(|s| s.name.clone())
+                .collect();
+            if pieces.len() >= n {
+                return self.start_tier(lo, hi, pieces);
+            }
+        }
+        Ok(())
+    }
+
+    /// `inputs` are the range's pieces oldest first, as the live set
+    /// orders them; the output takes the newest one's covered sequence.
+    fn start_tier(&mut self, lo: Vec<u8>, hi: Option<Vec<u8>>, inputs: Vec<String>) -> Result<()> {
+        let end_seq = inputs
+            .iter()
+            .filter_map(|n| Db::name_end_seq(n))
+            .max()
+            .unwrap_or(self.covered_seq);
+        let id = self.next_seg;
+        self.next_seg += 1;
+        let plan = TierPlan {
+            dir: self.dir.clone(),
+            inputs: inputs.clone(),
+            id,
+            end_seq,
+            lo,
+            hi,
+            opts: Db::segment_opts(&self.opts),
+            background_io: self.opts.background_io,
+            sync_every: self.opts.seal_sync_every,
+            inline_max: self.opts.inline_bytes,
+        };
+        let handle = std::thread::spawn(move || tier_run(plan));
+        self.tiering = Some((inputs, handle));
+        Ok(())
+    }
+
+    /// Collect a piece merge as a partition merge is collected: the
+    /// output in for the inputs, the manifest naming it, then the inputs
+    /// deleted; a crash on either side of the manifest leaves one
+    /// complete set and an orphan the open sweeps.
+    fn join_tier(&mut self) -> Result<()> {
+        let Some((inputs, handle)) = self.tiering.take() else {
+            return Ok(());
+        };
+        let outputs = handle.join().map_err(|_| err("tier thread panicked"))??;
+        let mut merged: Vec<std::sync::Arc<Seg>> = self
+            .segs()
+            .iter()
+            .filter(|seg| !inputs.contains(&seg.name))
+            .cloned()
+            .collect();
+        for name in &outputs {
+            merged.push(std::sync::Arc::new(Seg::open(
+                &self.dir,
+                name,
+                self.advice_random(),
+                self.opts.read_advice != ReadAdvice::Normal,
+                self.opts.segment.checksums,
+            )?));
+        }
+        self.publish_segs_with(merged, true);
+        if self.opts.scan_block_cache {
+            self.build_ctx().rank_pieces()?;
+        }
+        self.publish()?;
+        for name in &inputs {
+            self.retire_seg(name);
+        }
+        Ok(())
+    }
 }
 
 /// Where the commit thread's seal time goes. `phase_ns().1` is the sum of
@@ -5074,6 +5325,10 @@ pub struct Db {
     /// until the manifest names its outputs instead, which is what makes
     /// the swap atomic across a crash.
     compacting: Option<Compaction>,
+    /// A piece merge in flight: its inputs' names and its thread. Its
+    /// inputs and a partition merge's are disjoint, each excluding the
+    /// other's at its start, so the two run beside each other.
+    tiering: Option<Compaction>,
     sealing: Option<std::thread::JoinHandle<Result<Vec<String>>>>,
 }
 
@@ -8889,6 +9144,7 @@ impl Db {
             next_seg: 0,
             sealing: None,
             compacting: None,
+            tiering: None,
             unsynced: 0,
             phase_ns: [0; 3],
             retiring_wals: Vec::new(),
@@ -9187,6 +9443,7 @@ impl Db {
             next_seg,
             sealing: None,
             compacting: None,
+            tiering: None,
             unsynced: 0,
             phase_ns: [0; 3],
             retiring_wals: retiring,
@@ -9723,6 +9980,7 @@ impl Db {
     pub fn settle(&mut self) -> Result<()> {
         self.join_seal()?;
         self.join_compact()?;
+        self.join_tier()?;
         self.join_ahead();
         Ok(())
     }
@@ -9753,6 +10011,7 @@ impl Db {
         self.draining = false;
         sealed?;
         self.join_compact()?;
+        self.join_tier()?;
         // Leave the store routed. A flush is a caller saying it has
         // stopped writing, and what it leaves behind otherwise is a set of
         // OVERLAPPING full-range segments -- each one costing every
@@ -9795,6 +10054,7 @@ impl Db {
                 }
             }
             self.join_compact()?;
+            self.join_tier()?;
             rounds += 1;
             if rounds > 64 {
                 return Err(err("flush: level 0 did not drain in 64 merge rounds"));
@@ -9861,6 +10121,7 @@ impl Db {
         self.phase_ns[1] += t.elapsed().as_nanos() as u64;
         if self.opts.compact {
             self.maybe_compact()?;
+            self.maybe_tier()?;
         }
         Ok(())
     }
@@ -9871,7 +10132,16 @@ impl Db {
     /// The segment set `segs`, sorted, its derived quantities refreshed,
     /// published as the state: the writer's one way to change the
     /// segments. Every block table is dropped with it.
-    fn publish_segs(&mut self, mut segs: Vec<std::sync::Arc<Seg>>) {
+    fn publish_segs(&mut self, segs: Vec<std::sync::Arc<Seg>>) {
+        self.publish_segs_with(segs, false)
+    }
+
+    /// `publish_segs`, and with `tier` the publish of a piece merge: the
+    /// partitions, the memtables and every key's values are what they
+    /// were, only the files some of them sit in have changed, so the forms
+    /// and the writer's tables are carried across it whatever
+    /// `forms_carry` says, and the pieces' bounds alone are walked again.
+    fn publish_segs_with(&mut self, mut segs: Vec<std::sync::Arc<Seg>>, tier: bool) {
         segs.sort_by(|a, b| seg_order(a, b));
         let mean_key_bytes = Db::mean_key_bytes_of(&segs);
         let store_bytes = Db::store_bytes_of(&self.dir, &segs);
@@ -9897,7 +10167,7 @@ impl Db {
             segs_tombs,
         };
         let mut next = next;
-        if !self.carry_forms(&mut next) {
+        if !self.carry_forms(&mut next, tier) {
             self.drop_blocks();
             *self.tables.borrow_mut() = Db::tables_for(next.segs.len());
         }
@@ -10133,7 +10403,7 @@ impl Db {
             segs_tombs: cur.segs_tombs,
         };
         let mut next = next;
-        if !self.carry_forms(&mut next) {
+        if !self.carry_forms(&mut next, false) {
             self.drop_blocks();
         }
         self.publish_and_organise(next);
@@ -10150,8 +10420,15 @@ impl Db {
     /// against `next`'s pieces. Returns whether it was done; when not,
     /// the caller starts the table afresh and drops the writer's own, as
     /// every publish did before.
-    fn carry_forms(&mut self, next: &mut State) -> bool {
-        if !(self.opts.forms_carry && self.opts.commit_forms && self.opts.scan_block_cache) {
+    /// With `tier`, the carry a piece merge's publish makes whatever
+    /// `forms_carry` says: the memtable is the one it was, so the keys
+    /// filed since the snapshot, the snapshot and this handle's log
+    /// position all stand, and only the pieces' bounds are walked again.
+    fn carry_forms(&mut self, next: &mut State, tier: bool) -> bool {
+        if !((self.opts.forms_carry || tier)
+            && self.opts.commit_forms
+            && self.opts.scan_block_cache)
+        {
             return false;
         }
         let cur = self.state();
@@ -10212,6 +10489,9 @@ impl Db {
             }
             t.pieces = pieces;
             t.piece_ranks = piece_ranks;
+            if tier {
+                continue;
+            }
             t.snap_at = snap_at;
             t.snap_gen = u64::MAX;
             t.reads.fill(0);
@@ -10238,9 +10518,18 @@ impl Db {
         next.forms_at = AtomicUsize::new(0);
         next.forms_complete = std::sync::atomic::AtomicBool::new(self.tables_complete.get());
         next.forms_bytes = AtomicUsize::new(bytes);
-        // This handle's log and snapshot bookkeeping, for `next`: the log
-        // is read from its start, the snapshot built again.
+        // This handle's log and snapshot bookkeeping, for `next`: across a
+        // seal the log is read from its start and the snapshot built
+        // again; across a piece merge the memtable is the same one, so
+        // the position, the snapshot and the lists stand and only the
+        // generation they are keyed by moves.
         self.log_gen.set(next.gen);
+        if tier {
+            if let Some((g, _)) = self.scan_keys.borrow_mut().as_mut() {
+                *g = next.gen;
+            }
+            return true;
+        }
         self.log_seen.set(0);
         self.scans_seen.set(0);
         self.snap_entries.set(0);
@@ -10274,7 +10563,7 @@ impl Db {
             segs_tombs: cur.segs_tombs,
         };
         let mut next = next;
-        if !self.carry_forms(&mut next) {
+        if !self.carry_forms(&mut next, false) {
             // The scan snapshot names the live memtable's slots, and the
             // live memtable is new: a write's bookkeeping renumbers the
             // snapshot at every rehash, and the fresh table's first
@@ -10354,6 +10643,23 @@ impl Db {
             .is_some_and(|(_, h)| h.is_finished())
         {
             self.join_compact()?;
+        }
+        // Level 0 is newer than the level below it, every piece of it, so
+        // a partition merge may take only a prefix of a range's pieces by
+        // age: the pieces present when it starts. A piece merge in flight
+        // holds some of them, and a partition merge started beside it took
+        // the piece sealed after them and folded it under them -- the
+        // oracle read a key's values out of order, and lost a deleted
+        // key's older values to a tombstone the merge had dropped. So no
+        // partition merge starts while a piece merge runs; a finished one
+        // is collected first, since the piece it made is what the count
+        // below sees. The other way round is safe: a partition merge's
+        // inputs are the range's oldest pieces, so the pieces a merge
+        // beside it takes are all newer.
+        match &self.tiering {
+            Some((_, h)) if h.is_finished() => self.join_tier()?,
+            Some(_) => return Ok(()),
+            None => {}
         }
         // One selection rule for both schedulers, so they cannot drift: a
         // range is due when it holds `l0_trigger` pieces, a piece not
@@ -10584,6 +10890,12 @@ impl Db {
             }
             self.join_compact()?;
         }
+        // No piece merge runs when a partition merge starts, so the pieces
+        // taken here are every piece of the ranges, the oldest included.
+        debug_assert!(
+            self.tiering.is_none(),
+            "a partition merge started beside a piece merge"
+        );
         let inputs: Vec<String> = match &fences {
             None => self.live_names(),
             Some(fs) => self
@@ -12172,6 +12484,9 @@ impl Drop for Db {
             let _ = h.join();
         }
         if let Some((_, h)) = self.compacting.take() {
+            let _ = h.join();
+        }
+        if let Some((_, h)) = self.tiering.take() {
             let _ = h.join();
         }
     }

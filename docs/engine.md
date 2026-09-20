@@ -1206,6 +1206,56 @@ a partition merge runs -- merging pieces into a piece, which is cheap
 where a partition rewrite is not -- is the structural answer this point
 asks for, and it is a compaction policy and not a read path.
 
+#### Piece merges beside the partition merge: correct, and not enough
+
+The structural answer above was built and measured: `tier_pieces`,
+off by default, and the `supdb-tier` arm at three. When a partition's
+range holds that many aligned pieces that no partition merge holds as
+inputs, a thread of its own merges them into one piece over the same
+range, named by a fresh id and the newest input's covered sequence so it
+sorts where that input did; for each key the inputs older than its
+newest flagged extent are dropped as the partition merge drops them,
+and the flag is carried, since the partition below still holds what it
+masks. The forms and the writer's tables are carried across its
+publish whatever `forms_carry` says: no key or value moved, only the
+file some of them sit in, so only the pieces' bounds are walked again.
+A test drives a store that merges and one that does not through the
+same appends, deletes and seals and holds them to the same answers,
+before and after a reopen.
+
+The crash oracle found the ordering hazard in the first version. Level
+0 is newer than the level below it, every piece of it, so a partition
+merge may take only a prefix of a range's pieces by age. One started
+beside a piece merge excluded that merge's inputs and took the piece
+sealed after them, folding newer values under older ones: a key's
+values came back out of order, and a key whose older values a dropped
+tombstone had masked lost them. No partition merge starts while a piece
+merge runs now; the other way round is safe, since a partition merge's
+inputs are the range's oldest pieces.
+
+What it buys: the sweep's fully-unmerged point holds one or two pieces
+instead of seven or eight, the probe's scans there read 21 µs against
+22-25, and paired against the arm without it, six pairs each way, the
+point reads 1.11x at a hundred thousand keys and 1.13x at three hundred
+thousand (0/6, p=0.031); nothing else on the ladder moves. That is a
+tenth of the point's cost where the piece count said three or four
+times, because the pass's cost is not the pieces alone: the merge's
+completion races the write phase, so the same configuration read 13.5
+µs a scan in one run and 24 in the next, and the build of a block over
+one piece and the memtable is still ten microseconds.
+
+What it costs, and why it is off: a merged piece counts one toward
+`l0_trigger`, so a range that keeps folding three pieces into one never
+reaches four, the partition merge waits for a flush, and the merged
+piece is rewritten every few seals -- the probe's settle after the
+point left one or two pieces where the arm without it left none, and
+the write phase ran 15-35% longer. A version worth turning on would
+count what a merged piece absorbed, or trigger the partition merge by
+the pieces' bytes against the partition's, and would take only pieces
+newer than a running partition merge's inputs so the two could run
+beside each other. The mechanism, the test and the arm are here for
+that version.
+
 #### Which half of the lag gap, by rung
 
 The build and the walk split by size, and the arms say which is which
