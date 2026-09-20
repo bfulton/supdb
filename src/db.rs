@@ -562,6 +562,39 @@ pub struct Options {
     /// the mixes there write five times over it. Five percent is the
     /// default.
     pub forms_settle_backlog_pct: usize,
+    /// EXPERIMENT: the writes since the last scan over the store, as a
+    /// share of the partitions' keys, within which the backlog bound
+    /// above settles at all; zero, the default, settles by the bound
+    /// whenever it is passed.
+    ///
+    /// Filing a write into a block form costs the same whoever does it,
+    /// about 0.7 us at a hundred thousand keys, on the commit path or in
+    /// the first scan after the burst; the bound only moves it. What
+    /// makes the move a loss is that the forms belong to one memtable
+    /// generation and a seal discards them: a burst with no scan between
+    /// its commits and the next seal was filed for nobody. Over the
+    /// suite's mixes at a hundred thousand keys, ycsb-A's settles under
+    /// a bound of two percent built a thousand forms in four commits
+    /// and ycsb-F's two seals threw every one away, while the lag
+    /// sweep's same-sized burst is scanned a thousand times before any
+    /// seal. This window was the bet that a scan within the last tenth
+    /// of the store written says the reads are near, a share and not a
+    /// count of commits since the same burst is nine commits at a
+    /// hundred thousand keys and 270 at three million.
+    ///
+    /// Measured in the suite's shape at a hundred thousand keys, the bet
+    /// does not pay where it was meant to. Both bursts are nine percent
+    /// of the store written after a scan pass, so the window cannot
+    /// tell A's from the sweep's at the commit that decides: A settles
+    /// four times either way. What the window does is leave F's tail
+    /// and D's inserts unfiled, which spares F about a tenth and D
+    /// nothing and charges ycsb-E, the first reader after them, the
+    /// filing of eight thousand writes it inherited: about a tenth of
+    /// E. The lag sweep reads as the bound alone reads. Zero is the
+    /// default; `supdb-recency` prices it. What the measurement says
+    /// instead is that the loss is the seal's discard, not the bound's
+    /// timing.
+    pub forms_settle_recent_pct: usize,
     /// EXPERIMENT: the writer's own handle takes the canonical forms it
     /// maintains, instead of building its own. Without this the
     /// maintenance is pure cost wherever the reads are the writer's: a
@@ -636,6 +669,7 @@ impl Default for Options {
             build_ahead_on_commit: 0,
             forms_max_unsealed_pct: 0,
             forms_settle_backlog_pct: 5,
+            forms_settle_recent_pct: 0,
             forms_to_writer: false,
             form_dense_from: 0,
             scan_snapshot_arena: true,
@@ -4520,6 +4554,10 @@ struct Shared {
     canon_hit: AtomicU64,
     rd_scans: AtomicU64,
     rd_blocks: AtomicU64,
+    /// Scans over the store through any handle, for the writer to tell
+    /// how long ago the last one was; the state's own count restarts at
+    /// every publish.
+    scans_life: AtomicU64,
     /// Blocks materialised, by a handle the caller made and by the
     /// engine's own. These were added to size what sharing the block
     /// tables between handles would be worth, the last structure thought
@@ -4650,6 +4688,15 @@ pub struct Reader {
     /// maintained the canonical forms at; a commit with the count
     /// unmoved maintains nothing.
     scans_seen: std::cell::Cell<u64>,
+    /// EXPERIMENT: for `forms_settle_recent_pct`: the store's scan count
+    /// as this handle last saw it at a commit, the writes it has counted
+    /// over the store's life (the log's growth, summed across
+    /// generations, from the generation and length it last counted at),
+    /// and the count at the last scan it saw.
+    scans_life_seen: std::cell::Cell<u64>,
+    writes_seen: std::cell::Cell<u64>,
+    writes_at_scan: std::cell::Cell<u64>,
+    log_counted: std::cell::Cell<(u64, usize)>,
     /// EXPERIMENT: what the reads chose, for a run to report:
     /// promotions, drops by a write, walks over a copy, walks over the
     /// cheap form, and the copies' bytes.
@@ -6646,17 +6693,41 @@ impl Reader {
         let scans = st.scans.load(AtomicOrdering::Relaxed);
         // The writes not yet filed into the forms: everything the log holds
         // past the position this handle last read it to.
-        let backlog = self.mem().log_len().saturating_sub(self.log_seen.get());
+        let log_len = self.mem().log_len();
+        let backlog = log_len.saturating_sub(self.log_seen.get());
+        let keys: usize = self.segs().iter().map(|s| s.blob.keys()).sum();
         // The bound is a share of the store's keys and not a count, for
         // the reason the seal cap's floor is: a count that is free at one
         // rung is five settles at the next.
         let bound = if self.opts.forms_settle_backlog_pct == 0 {
             usize::MAX
         } else {
-            let keys: usize = self.segs().iter().map(|s| s.blob.keys()).sum();
             (keys / 100 * self.opts.forms_settle_backlog_pct).max(1)
         };
-        let due = scans != self.scans_seen.get() || backlog >= bound;
+        // The writes since the last scan over the store, through whichever
+        // handle: the log's growth since this handle last counted it, the
+        // whole log where the generation has changed since.
+        let (gen_counted, len_counted) = self.log_counted.get();
+        let grew = if gen_counted == st.gen {
+            log_len.saturating_sub(len_counted)
+        } else {
+            log_len
+        };
+        self.log_counted.set((st.gen, log_len));
+        let writes = self.writes_seen.get() + grew as u64;
+        self.writes_seen.set(writes);
+        let life = self.shared.scans_life.load(AtomicOrdering::Relaxed);
+        if life != self.scans_life_seen.get() {
+            self.scans_life_seen.set(life);
+            self.writes_at_scan.set(writes);
+        }
+        // A burst is settled by its backlog only near a scan, see
+        // `Options::forms_settle_recent_pct`: far from one, what it would
+        // file is more likely discarded at the next seal than read.
+        let recent = self.opts.forms_settle_recent_pct == 0
+            || writes - self.writes_at_scan.get()
+                <= (keys / 100 * self.opts.forms_settle_recent_pct) as u64;
+        let due = scans != self.scans_seen.get() || (backlog >= bound && recent);
         if !due {
             return Ok(());
         }
@@ -7246,6 +7317,7 @@ impl Reader {
         let st = self.state();
         if self.opts.commit_forms {
             st.scans.fetch_add(1, AtomicOrdering::Relaxed);
+            self.shared.scans_life.fetch_add(1, AtomicOrdering::Relaxed);
             if self.counted {
                 st.reader_scans.fetch_add(1, AtomicOrdering::Relaxed);
             }
@@ -8269,6 +8341,7 @@ impl Db {
             canon_hit: AtomicU64::new(0),
             rd_scans: AtomicU64::new(0),
             rd_blocks: AtomicU64::new(0),
+            scans_life: AtomicU64::new(0),
             blk_reader: AtomicU64::new(0),
             blk_engine: AtomicU64::new(0),
             snap_extends: AtomicU64::new(0),
@@ -8292,6 +8365,10 @@ impl Db {
             built: std::cell::RefCell::new(Vec::new()),
             to_publish: std::cell::RefCell::new(Vec::new()),
             scans_seen: std::cell::Cell::new(0),
+            scans_life_seen: std::cell::Cell::new(0),
+            writes_seen: std::cell::Cell::new(0),
+            writes_at_scan: std::cell::Cell::new(0),
+            log_counted: std::cell::Cell::new((0, 0)),
             choices: std::cell::Cell::new([0; 5]),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),
@@ -8558,6 +8635,7 @@ impl Db {
             canon_hit: AtomicU64::new(0),
             rd_scans: AtomicU64::new(0),
             rd_blocks: AtomicU64::new(0),
+            scans_life: AtomicU64::new(0),
             blk_reader: AtomicU64::new(0),
             blk_engine: AtomicU64::new(0),
             snap_extends: AtomicU64::new(0),
@@ -8581,6 +8659,10 @@ impl Db {
             built: std::cell::RefCell::new(Vec::new()),
             to_publish: std::cell::RefCell::new(Vec::new()),
             scans_seen: std::cell::Cell::new(0),
+            scans_life_seen: std::cell::Cell::new(0),
+            writes_seen: std::cell::Cell::new(0),
+            writes_at_scan: std::cell::Cell::new(0),
+            log_counted: std::cell::Cell::new((0, 0)),
             choices: std::cell::Cell::new([0; 5]),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),
@@ -9473,6 +9555,10 @@ impl Reader {
             built: std::cell::RefCell::new(Vec::new()),
             to_publish: std::cell::RefCell::new(Vec::new()),
             scans_seen: std::cell::Cell::new(0),
+            scans_life_seen: std::cell::Cell::new(0),
+            writes_seen: std::cell::Cell::new(0),
+            writes_at_scan: std::cell::Cell::new(0),
+            log_counted: std::cell::Cell::new((0, 0)),
             choices: std::cell::Cell::new([0; 5]),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),

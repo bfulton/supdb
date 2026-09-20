@@ -790,6 +790,61 @@ is the work itself, a seek, a record read and a splice per write.
 Splicing a block's writes together, now that they arrive adjacent, is
 the next cut and a larger one.
 
+#### What the bound moves, and where the loss actually is
+
+A bound of two percent reads the tenth-unmerged point at 2.04x the
+five-percent default at a hundred thousand keys and ycsb-E at 1.16x,
+for ycsb-A and D at 0.84x. Two probes in the suite's exact shape --
+its generators, seeds, batches and pass order, one for the mixes and
+one for the sweep -- reproduce those ratios and say what each one is.
+
+Filing a write into a block form costs the same whoever does it. On
+the commit path the settle phase ran at 0.64-0.82 µs a write over
+batches of six to nine thousand; on the first scan after a deferred
+burst it ran at 0.68-0.93 µs over three to eight thousand. Same code,
+same price, so the bound only moves the work. At the tenth-unmerged
+point the five-percent default files at the first commit after the
+previous point's scans and again at the bound, and leaves three
+thousand writes for the first scan: 2.1-2.5 ms, charged to a window
+of a thousand scans that takes 2 ms. Two percent leaves none, and the
+first scan takes 6 µs. That is the whole of the 2.04x: a relocation,
+not a speedup. At three hundred thousand keys five percent leaves nine
+thousand writes and two percent leaves two thousand, the same shape.
+
+What makes the move a loss elsewhere is that the forms belong to one
+memtable generation and a seal discards them. Under two percent, A's
+four settles build about a thousand forms in 4 ms, and F's two seals
+throw every one away before any scan; the forms table holds zero at
+the end of F under either bound. D's one settle under two percent
+files F's tail and its own inserts, 1.3 ms in a 6.5 ms mix, which E
+then reads: D pays and E gains less than D paid. Smaller batches also
+fold fewer of a zipfian mix's duplicate keys, 210 ns a write in one
+batch of five thousand against 385 ns over four of two thousand. And
+the fully-unmerged point, at a tenth to a fifth of LMDB, is the same
+discard at scale: ninety commits with two or three seals leave the
+table empty at the scan under every bound, and the thousand scans
+build nine hundred blocks at 17-22 µs each while the maintenance done
+during the writes -- 25 ms of settle and install at a hundred thousand
+keys under two percent, 45 ms at three hundred thousand -- was thrown
+away.
+
+`forms_settle_recent_pct` was the adaptive bet: settle by the backlog
+only within that share of the store written since the last scan, on
+the reasoning that a recent scan says the reads are near and a distant
+one says the seal is nearer. It cannot tell the two bursts apart. A's
+writes and the sweep's are each nine percent of the store after a scan
+pass, so at the commit that decides they look the same, and A settles
+four times under the window as without it. What the window changes is
+F, whose tail it leaves unfiled, and D; F reads about 1.1x and D
+unchanged, and E, the first reader after them, inherits eight thousand
+writes to file instead of two and a half and reads about 0.9x. The
+sweep reads as the bound alone does. The window is off, and
+`supdb-recency` prices it. The loss the bound trades against is not
+the timing of the filing but its discard at the seal, and a form that
+survived a seal -- its content is unchanged by one, only the slots it
+was resolved against move -- would make A's filing E's to read and
+give the fully-unmerged point something to walk.
+
 #### Which half of the lag gap, by rung
 
 The build and the walk split by size, and the arms say which is which

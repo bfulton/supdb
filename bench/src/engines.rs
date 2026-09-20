@@ -355,6 +355,9 @@ pub struct Supdb {
     /// The settle backlog this arm pins, or none for the engine's own;
     /// `supdb-nosettle` pins zero. `supdb-eager`.
     eager: Option<usize>,
+    /// The recency window this arm pins, or none for the engine's own.
+    /// `supdb-recency`.
+    recent: Option<usize>,
     /// The partitions' blocks below which no builder starts, or none for
     /// the engine's own. `supdb-ahead`.
     aheadmin: Option<usize>,
@@ -389,6 +392,9 @@ struct Policy {
     lazyforms: bool,
     /// The settle backlog this arm pins, or none for the engine's own.
     eager: Option<usize>,
+    /// The recency window this arm pins, or none for the engine's own.
+    /// `supdb-recency`.
+    recent: Option<usize>,
     /// The builder's minimum blocks, or none for the engine's own.
     /// `supdb-ahead`.
     aheadmin: Option<usize>,
@@ -416,6 +422,7 @@ impl Default for Policy {
             aheadmin: None,
             lazyforms: false,
             eager: None,
+            recent: None,
         }
     }
 }
@@ -488,6 +495,28 @@ impl Supdb {
     /// store's keys. Against `supdb` it
     /// prices moving a write burst's filing from the first read after it
     /// onto the commits themselves.
+    /// `supdb` settling by its backlog only within `RECENT` percent of
+    /// the store's keys written since the last scan (ten unless set), at
+    /// `BACKLOG` percent of the store's keys or the engine's own bound.
+    /// Against `supdb` it prices the recency window: what a burst's
+    /// filing costs the mixes when nothing reads it before the next seal,
+    /// and what leaving it costs the first read after the burst.
+    pub fn create_recency(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                recent: Some(
+                    std::env::var("RECENT")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(10),
+                ),
+                eager: std::env::var("BACKLOG").ok().and_then(|v| v.parse().ok()),
+                ..Policy::default()
+            },
+        )
+    }
+
     pub fn create_eager(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
@@ -663,6 +692,7 @@ impl Supdb {
             aheadmin,
             lazyforms,
             eager,
+            recent,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -730,6 +760,10 @@ impl Supdb {
             // filing to the first read after it.
             forms_settle_backlog_pct: eager
                 .unwrap_or(supdb::Options::default().forms_settle_backlog_pct),
+            // The window within which the bound settles at all: since the
+            // last scan, as a share of the store's keys written.
+            forms_settle_recent_pct: recent
+                .unwrap_or(supdb::Options::default().forms_settle_recent_pct),
             // The unsealed share past which the maintenance stops, so an
             // arm can maintain whoever is reading without paying for it
             // on a store that is nearly all unmerged.
@@ -779,6 +813,7 @@ impl Supdb {
             aheadmin,
             lazyforms,
             eager,
+            recent,
         })
     }
 }
@@ -815,6 +850,9 @@ impl Engine for Supdb {
         }
         if self.settle {
             return "supdb-settle";
+        }
+        if self.recent.is_some() {
+            return "supdb-recency";
         }
         match self.eager {
             Some(0) => return "supdb-nosettle",
@@ -1355,8 +1393,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
         "supdb" | "supdb-forms" | "supdb-settle" | "supdb-wforms" | "supdb-regime"
         | "supdb-noseal" | "supdb-ahead" | "supdb-lazyforms" | "supdb-eager" | "supdb-nosettle"
-        | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb"
-        | "rocksdb-tuned" => Guarantee::Durable,
+        | "supdb-recency" | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache"
+        | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
     })
@@ -1371,6 +1409,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-settle" => Box::new(Supdb::create_settle(dir)?),
         "supdb-nosettle" => Box::new(Supdb::create_nosettle(dir)?),
         "supdb-eager" => Box::new(Supdb::create_eager(dir)?),
+        "supdb-recency" => Box::new(Supdb::create_recency(dir)?),
         "supdb-lazyforms" => Box::new(Supdb::create_lazyforms(dir)?),
         "supdb-ahead" => Box::new(Supdb::create_ahead(dir)?),
         "supdb-noseal" => Box::new(Supdb::create_noseal(dir)?),

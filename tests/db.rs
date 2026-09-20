@@ -4471,6 +4471,8 @@ fn a_write_burst_is_settled_once_its_backlog_passes_the_bound() {
             scan_cache_ahead: false,
             forms_from_reader_scans: 0,
             forms_settle_backlog_pct: pct,
+            // The bound alone: the recency window is the next test's.
+            forms_settle_recent_pct: 0,
             ..Options::default()
         };
         let mut db = Db::create(&d, opts).unwrap();
@@ -4514,4 +4516,80 @@ fn a_write_burst_is_settled_once_its_backlog_passes_the_bound() {
         "past the bound, the burst's commits settle as they go"
     );
     m1.check(&db1, "bounded, after the burst");
+}
+
+/// EXPERIMENT: the backlog bound settles a burst only while the store
+/// was scanned within `forms_settle_recent_pct` of its keys written
+/// since. Filing costs the same at the commit and at the next read, and
+/// the forms are discarded at the next seal, so a burst far from any
+/// scan is left for the read that wants it and a burst near one is filed
+/// as it goes. `forms_position` is the log position the forms are
+/// settled to: a commit that maintained them moves it.
+#[test]
+fn a_burst_is_settled_by_its_backlog_only_near_a_scan() {
+    let d = dir("settle-recent");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        forms_from_reader_scans: 0,
+        // Five percent of 1,500 keys is 75 writes, a tenth is 150.
+        forms_settle_backlog_pct: 5,
+        forms_settle_recent_pct: 10,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 1, "several partitions");
+    let scan = |db: &Db| {
+        let mut sink = 0usize;
+        db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+            .unwrap();
+        std::hint::black_box(sink);
+    };
+    // One scan and a commit, so the forms exist and are current.
+    scan(&db);
+    db.commit().unwrap();
+    let at_scan = db.forms_position();
+    assert_ne!(at_scan, usize::MAX, "maintained once");
+    // A hundred writes, within a tenth of the store of that scan and past
+    // the bound: filed at their commit.
+    for k in (0..1500u32).step_by(15).take(100) {
+        m.append(&mut db, &key(k), "near");
+    }
+    db.commit().unwrap();
+    let near = db.forms_position();
+    assert!(
+        near > at_scan,
+        "near a scan, a batch past the bound is filed at its commit: {near} <= {at_scan}"
+    );
+    // A hundred more, two hundred since the scan: past the window, left
+    // where they are.
+    for k in (1..1500u32).step_by(15).take(100) {
+        m.append(&mut db, &key(k), "far");
+    }
+    db.commit().unwrap();
+    let far = db.forms_position();
+    assert_eq!(
+        far, near,
+        "far from a scan, a batch past the bound is left for the next read"
+    );
+    // The next read files it, as it always did.
+    scan(&db);
+    db.commit().unwrap();
+    assert!(
+        db.forms_position() > far,
+        "the read after the burst files it"
+    );
+    m.check(&db, "after the burst");
 }
