@@ -1121,6 +1121,64 @@ thread's pass in the probe: 165-186 µs at ten thousand keys from
 193-203, 1.8-1.9 ms at a hundred thousand from 2.3-2.5, and 6.6-7.1 ms
 at three hundred thousand from 7.3-8.8.
 
+#### The steady scan through a handle at the small rungs
+
+With the first scan's setup gone, the threaded scan mix at ten and
+thirty thousand keys still read 0.86x-0.93x of LMDB on two threads,
+and ycsb-E at ten thousand 0.97x. There a pass is a hundred scans, so
+the first scan and the per-scan cost are shares of the same size, and
+the per-scan cost is the whole story: 1.6-2.1 µs a scan through a
+handle on the store the mixes leave, against 1.28 on the store as
+loaded, with LMDB at 1.83 on the same store. Phase timers in the
+probe, in the suite's shape, said the pass builds nothing at all -- a
+handle walks the forms the writer published at its commits -- and
+that the whole surcharge is the walk of a sparse block: 620-890 ns for
+about forty entries, 3.4 deltas and 3.5 separate record walks, where
+the clean walk of the same entries is 480. The seek is 200 ns a scan
+on either store. The record prefetch a block walk issues is worth a
+quarter of the pass at three hundred thousand keys (3.2-3.4 µs a scan
+with it against 4.2 without, three rounds) and is not measurable at
+ten thousand.
+
+Callgrind over one handle's pass, which this machine's noise cannot
+resolve by timing, put about twelve thousand instructions in a scan of
+a hundred entries: 62% in the record walk at 73 an entry, 13% in the
+prefetch bursts, 7% in the scan's own body, 4% in the seek, and the
+table's make, once per pass, 6%. The record walk runs at about three
+instructions a cycle, so it is instruction-bound, and it is what every
+scan quantity walks.
+
+Holding every overlaid block as a merged copy was the obvious lever
+and is not one: E, whose Zipfian scans keep their blocks in the first
+cache level, read 20% faster with copies, and the handle's uniform pass
+did not move -- a copy walked at 515-635 ns a block against the sparse
+form's 620-700, since a block is a stream to the prefetcher either
+way, and a copy is three of them.
+
+Three changes, each held by pairing the probe's binaries over fifteen
+passes with fresh handles and taking the minimum, three rounds:
+
+- The walk divided twice an entry, `elen / records` for the stride and
+  once more inside `chunks_exact` for the remainder, a dependent chain
+  of two 32-bit divides in a loop of twenty-five cycles an entry, for a
+  quantity that is one in the common record. One value is emitted
+  without a divide now: 73 instructions an entry to 57, the clean scan
+  through a handle 1.18 µs to 0.96, the mixed 1.85 to 1.65, E 5%.
+- The snapshot's block bounds are taken at the first build that needs
+  them and not when the table is made. A handle over complete
+  canonical forms builds nothing, so it never needs them, and the walk
+  of the run against every boundary was 16 µs of the first scan at ten
+  thousand keys and 47 at thirty, a tenth of the pass, on every fresh
+  snapshot; what `clean_throughout` asks of the bounds is their two
+  ends, which are two searches.
+- The next block's prefetch was issued twice: once as the next block
+  when the scan would cross into it, and again as the block when the
+  scan did, 147 of the 394 prefetch calls in a hundred scans.
+
+Together the mixed scan on two threads at ten thousand keys reads 1.85
+µs to 1.57 in the probe and the pass 189 µs to 160. The suite's figures
+are in the pull request.
+
 #### Address translation over a 46 MB partition
 
 What is left of the scan at three hundred thousand keys grows with the

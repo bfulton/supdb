@@ -515,6 +515,17 @@ now. The rule: a flag that means "this structure exists" is set by the
 code that makes the structure, never by a caller that expects to, and
 a reset on one path is a reset on every path that shares it.
 
+**A divide an entry in a walk that needed none.** The record walk
+divided a run's length by its count for the stride, and `chunks_exact`
+divided again for the remainder: a dependent chain of two 32-bit
+divides, in a loop of twenty-five cycles an entry, for a quantity that
+is one in the common record. Callgrind showed it as five instructions
+on one line; the divider's latency is what it cost. The rule: in a
+loop measured in cycles an entry, read the assembly for the
+instructions whose cost is not their count -- a divide, a call through
+a pointer, a store the next load depends on -- and give the common
+shape a path without them.
+
 **A sentinel that crosses the wasm boundary changes sign.** A wasm `u32`
 arrives in JavaScript as a signed i32, so a failure sentinel of `u32::MAX`
 arrives as -1 and a comparison against 4294967295 can never match. Every

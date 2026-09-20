@@ -4808,8 +4808,16 @@ struct BlockTable {
     /// it and the cut is searched for instead.
     piece_ranks: Vec<Option<std::sync::Arc<Vec<u32>>>>,
     /// The same over the snapshot of unsealed keys, for the snapshot
-    /// `snap_gen` names; walked again when a rebuild replaces it.
-    snap_at: std::sync::Arc<Vec<u32>>,
+    /// `snap_gen` names; walked again when a rebuild replaces it. Taken
+    /// at the first build that needs it and not when the table is made:
+    /// a handle over complete canonical forms builds nothing, and the
+    /// walk of the run against every boundary was the whole of its
+    /// first scan's setup -- 16 us at ten thousand keys, 47 at thirty,
+    /// a tenth of the threaded scan pass after the mixes at both.
+    snap_at: std::cell::OnceCell<std::sync::Arc<Vec<u32>>>,
+    /// The snapshot's positions at the partition's two fences, which is
+    /// what `clean_throughout` asks of the bounds: two searches.
+    snap_span: (u32, u32),
     snap_gen: u64,
     /// Live slots created since that snapshot, under the block their key
     /// falls in, in creation order, each with the cut the write's seek
@@ -4825,7 +4833,26 @@ impl BlockTable {
     /// was filed since. A scan then walks the partition's records as the
     /// bulk walk does, with no block touched.
     fn clean_throughout(&self) -> bool {
-        self.pieces.is_empty() && self.filed == 0 && self.snap_at.first() == self.snap_at.last()
+        self.pieces.is_empty() && self.filed == 0 && self.snap_span.0 == self.snap_span.1
+    }
+
+    /// The snapshot's bounds, walked now if this table has not yet.
+    fn snap_at(&self, seg: &Seg, unsealed: &Snapshot) -> Result<&[u32]> {
+        if let Some(at) = self.snap_at.get() {
+            return Ok(at);
+        }
+        let at = BuildCtx::snap_bounds(seg, self.slots.len(), unsealed)?;
+        let _ = self.snap_at.set(at);
+        Ok(self.snap_at.get().expect("just set"))
+    }
+
+    /// The bounds dropped for a snapshot that replaced the one they
+    /// were walked over: the span taken again, the bounds at the next
+    /// build.
+    fn resnap(&mut self, seg: &Seg, unsealed: &Snapshot, gen: u64) {
+        self.snap_at = std::cell::OnceCell::new();
+        self.snap_span = BuildCtx::snap_span(seg, unsealed);
+        self.snap_gen = gen;
     }
 }
 
@@ -6751,9 +6778,9 @@ impl Reader {
             }
             let table = held.as_mut().expect("just made");
             if table.snap_gen != self.snap_gen.get() {
-                table.snap_at = BuildCtx::snap_bounds(seg, table.slots.len(), unsealed)?;
-                table.snap_gen = self.snap_gen.get();
+                table.resnap(seg, unsealed, self.snap_gen.get());
             }
+            table.snap_at(seg, unsealed)?;
             for (b, bytes, form) in built.forms {
                 let b = b as usize;
                 if b >= table.slots.len()
@@ -7536,12 +7563,12 @@ impl Reader {
             }
             let table = held.as_mut().expect("just made");
             if table.snap_gen != self.snap_gen.get() {
-                table.snap_at = BuildCtx::snap_bounds(seg, table.slots.len(), unsealed)?;
-                table.snap_gen = self.snap_gen.get();
+                table.resnap(seg, unsealed, self.snap_gen.get());
             }
             if table.clean_throughout() {
                 continue;
             }
+            table.snap_at(seg, unsealed)?;
             let src = Sources { seg, l0 };
             for b in 0..table.slots.len() {
                 if table.slots[b].is_some() || BuildCtx::overlay_count(table, b) == 0 {
@@ -7981,7 +8008,7 @@ impl Reader {
         let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
         let ctx = self.build_ctx();
         ctx.rank_pieces()?;
-        let (pieces, piece_ranks, snap_at) = ctx.table_bounds(seg, l0, unsealed)?;
+        let (pieces, piece_ranks) = ctx.table_bounds(seg, l0)?;
         let mut added: Vec<Vec<(u32, u32)>> = (0..nblocks).map(|_| Vec::new()).collect();
         if nblocks > 0 {
             for &slot in self.snap_added.borrow().iter() {
@@ -8008,7 +8035,8 @@ impl Reader {
                 .map_or_else(Vec::new, <[u8]>::to_vec),
             pieces,
             piece_ranks,
-            snap_at,
+            snap_at: std::cell::OnceCell::new(),
+            snap_span: BuildCtx::snap_span(seg, unsealed),
             snap_gen: self.snap_gen.get(),
             added,
             filed,
@@ -8128,8 +8156,7 @@ impl Reader {
             }
             let table = held.as_mut().expect("just made");
             if table.snap_gen != self.snap_gen.get() {
-                table.snap_at = BuildCtx::snap_bounds(seg, nblocks, unsealed)?;
-                table.snap_gen = self.snap_gen.get();
+                table.resnap(seg, unsealed, self.snap_gen.get());
             }
             if table.clean_throughout() && !canonical {
                 // The suite's scan workload, and any store between a flush
@@ -8159,6 +8186,10 @@ impl Reader {
             }
             let mut b = owner / CACHE_BLOCK;
             let mut first = true;
+            // Whether the block this iteration walks was fetched by the
+            // one before, as the next block it would cross into: the
+            // same span from the same rank, issued twice.
+            let mut fetched = false;
             while seen < limit && b < nblocks {
                 let lo = b * CACHE_BLOCK;
                 let hi = ((b + 1) * CACHE_BLOCK).min(keys);
@@ -8235,7 +8266,10 @@ impl Reader {
                 c[if dense.is_some() { 2 } else { 3 }] += 1;
                 self.choices.set(c);
                 let took_from = seen;
-                prefetch_block(&seg.blob, form, start, ahead);
+                if !fetched {
+                    prefetch_block(&seg.blob, form, start, ahead);
+                }
+                fetched = false;
                 if hi - start < ahead && b + 1 < nblocks {
                     let next = match canonical.then(|| self.canonical(pi, b + 1)).flatten() {
                         Some(f) => Some(f),
@@ -8244,6 +8278,7 @@ impl Reader {
                     };
                     if let Some(next) = next {
                         prefetch_block(&seg.blob, next, hi, ahead - (hi - start));
+                        fetched = true;
                     }
                 }
                 match form {
@@ -8272,6 +8307,10 @@ impl Reader {
                         };
                         while b + 1 < nblocks && run_hi - start < limit - seen && clean_at(b + 1) {
                             b += 1;
+                            // The run took the block the next-block
+                            // fetch was for; the block after it was not
+                            // fetched.
+                            fetched = false;
                             if bookkeep && !canonical {
                                 table.touched[b] = tick;
                             }
@@ -10460,10 +10499,9 @@ impl Db {
         // walked again. A failure here leaves nothing carried.
         let l0 = &next.segs[np..];
         let ctx = self.build_ctx();
-        let empty = Snapshot::default();
         let mut bounds = Vec::with_capacity(np);
         for seg in &next.segs[..np] {
-            match ctx.table_bounds(seg, l0, &empty) {
+            match ctx.table_bounds(seg, l0) {
                 Ok(b) => bounds.push(b),
                 Err(_) => return false,
             }
@@ -10471,7 +10509,7 @@ impl Db {
         self.tables
             .borrow_mut()
             .resize_with(next.segs.len(), || std::cell::RefCell::new(None));
-        for (p, (pieces, piece_ranks, snap_at)) in bounds.into_iter().enumerate() {
+        for (p, (pieces, piece_ranks)) in bounds.into_iter().enumerate() {
             let tables = self.tables.borrow();
             let mut held = tables[p].borrow_mut();
             let Some(t) = held.as_mut() else { continue };
@@ -10492,7 +10530,8 @@ impl Db {
             if tier {
                 continue;
             }
-            t.snap_at = snap_at;
+            t.snap_at = std::cell::OnceCell::new();
+            t.snap_span = (0, 0);
             t.snap_gen = u64::MAX;
             t.reads.fill(0);
             t.touched.fill(0);
@@ -11516,7 +11555,7 @@ impl Reader {
         let l0 = &self.segs()[np..];
         for (pi, seg) in self.segs()[..np].iter().enumerate() {
             let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
-            let (pieces, piece_ranks, snap_at) = ctx.table_bounds(seg, l0, &unsealed)?;
+            let (pieces, piece_ranks) = ctx.table_bounds(seg, l0)?;
             let table = BlockTable {
                 slots: (0..nblocks).map(|_| None).collect(),
                 dense: (0..nblocks).map(|_| None).collect(),
@@ -11526,7 +11565,8 @@ impl Reader {
                 last_key: Vec::new(),
                 pieces,
                 piece_ranks,
-                snap_at,
+                snap_at: std::cell::OnceCell::new(),
+                snap_span: BuildCtx::snap_span(seg, &unsealed),
                 snap_gen: 0,
                 added: (0..nblocks).map(|_| Vec::new()).collect(),
                 filed: 0,
@@ -11535,6 +11575,7 @@ impl Reader {
             if table.clean_throughout() {
                 continue;
             }
+            table.snap_at(seg, &unsealed)?;
             let src = Sources { seg, l0 };
             let mut forms: Vec<(u32, usize, Cached)> = Vec::with_capacity(AHEAD_BATCH);
             for b in 0..=nblocks {
@@ -11618,8 +11659,7 @@ impl<'s> BuildCtx<'s> {
         &self,
         seg: &Seg,
         l0: &[std::sync::Arc<Seg>],
-        unsealed: &Snapshot,
-    ) -> Result<(PieceBounds, PieceRanks, std::sync::Arc<Vec<u32>>)> {
+    ) -> Result<(PieceBounds, PieceRanks)> {
         let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
         let against = seg.blob.id();
         let mut pieces = Vec::new();
@@ -11674,8 +11714,21 @@ impl<'s> BuildCtx<'s> {
                     .map(|(_, v)| v.clone()),
             );
         }
-        let snap_at = Self::snap_bounds(seg, nblocks, unsealed)?;
-        Ok((pieces, ranks, snap_at))
+        Ok((pieces, ranks))
+    }
+    /// The snapshot's positions at a partition's fences: what the bounds
+    /// hold at their two ends, without the walk between.
+    fn snap_span(seg: &Seg, unsealed: &Snapshot) -> (u32, u32) {
+        let lo = if seg.lo.is_empty() {
+            0
+        } else {
+            unsealed.seek(&seg.lo)
+        };
+        let hi = match &seg.hi {
+            Some(h) => unsealed.seek(h).max(lo),
+            None => unsealed.len(),
+        };
+        (lo as u32, hi as u32)
     }
 
     /// PROTOTYPE: the block whose key range holds `key`.
@@ -11958,7 +12011,8 @@ impl<'s> BuildCtx<'s> {
         b: usize,
         unsealed: &'a Snapshot,
     ) -> Result<Overlay<'a>> {
-        let snap = table.snap_at[b] as usize..table.snap_at[b + 1] as usize;
+        let at = table.snap_at(src.seg, unsealed)?;
+        let snap = at[b] as usize..at[b + 1] as usize;
         let mem = self.overlay_mem(unsealed, snap, &table.added[b], false)?;
         let pieces: Vec<PieceRun<'_>> = table
             .pieces
@@ -11984,7 +12038,13 @@ impl<'s> BuildCtx<'s> {
     /// floor; a block can hold more than the floor, spread thin across
     /// its sources, and the merge at `l0_trigger` bounds how thin.
     fn overlay_count(table: &BlockTable, b: usize) -> usize {
-        let snap = (table.snap_at[b + 1] - table.snap_at[b]) as usize;
+        // A table without its bounds has built nothing, and the one
+        // caller that asks before a build unlists, which on an unbuilt
+        // block is nothing.
+        let snap = table
+            .snap_at
+            .get()
+            .map_or(0, |at| (at[b + 1] - at[b]) as usize);
         let pieces = table
             .pieces
             .iter()
@@ -12007,7 +12067,8 @@ impl<'s> BuildCtx<'s> {
         window: (&[u8], usize),
     ) -> Result<Overlay<'a>> {
         let (cursor, limit) = window;
-        let (s0, s1) = (table.snap_at[b] as usize, table.snap_at[b + 1] as usize);
+        let at = table.snap_at(src.seg, unsealed)?;
+        let (s0, s1) = (at[b] as usize, at[b + 1] as usize);
         let key_at = |i: usize| unsealed.get(i).map(|(k, _)| k);
         let mut lo = s0;
         let mut hi = s1;
@@ -12237,6 +12298,7 @@ impl<'s> BuildCtx<'s> {
         let keys = src.seg.blob.keys();
         let lo = b * CACHE_BLOCK;
         let hi = ((b + 1) * CACHE_BLOCK).min(keys);
+        table.snap_at(src.seg, unsealed)?;
         if BuildCtx::overlay_count(table, b) > WIDE {
             return Ok(Cached::Wide(WideBlock {
                 sorted: self.sorted_filed(&table.added[b]),

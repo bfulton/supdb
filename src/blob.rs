@@ -1677,10 +1677,9 @@ impl<B: Bytes> Blob<B> {
                 let eoff = u32::from_le_bytes([eb[4], eb[5], eb[6], eb[7]]) as usize;
                 let elen = u32::from_le_bytes([eb[8], eb[9], eb[10], eb[11]]) as usize;
                 let records = (count & !(Ext::TOMBSTONE | Ext::FIXED)) as usize;
-                if records == 0 || elen == 0 || !elen.is_multiple_of(records) {
+                if records == 0 || elen == 0 {
                     return Err(corrupt("fixed run's length is not a multiple of its count"));
                 }
-                let w = elen / records;
                 let a = e_at + 20 + eoff;
                 let Some(run) = recs.get(a..a + elen) else {
                     return Err(corrupt("inline run runs past its record"));
@@ -1688,8 +1687,24 @@ impl<B: Bytes> Blob<B> {
                 let Some(k) = recs.get(key_at..key_at + klen) else {
                     break;
                 };
-                for v in run.chunks_exact(w) {
-                    f(k, v);
+                // One value is the common record, and it is emitted
+                // without a division: the general run below divided
+                // twice an entry, once for the stride and once inside
+                // `chunks_exact` for the remainder, and the two were a
+                // dependent chain of two 32-bit divides in a loop of
+                // twenty-five cycles an entry.
+                if records == 1 {
+                    f(k, run);
+                } else {
+                    if !elen.is_multiple_of(records) {
+                        return Err(corrupt("fixed run's length is not a multiple of its count"));
+                    }
+                    let w = elen / records;
+                    let mut p = 0usize;
+                    while let Some(v) = run.get(p..p + w) {
+                        f(k, v);
+                        p += w;
+                    }
                 }
                 seen += 1;
                 rank += 1;
