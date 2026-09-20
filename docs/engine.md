@@ -1161,6 +1161,51 @@ backs them is not visible from inside. A question of ten percent about
 translation or folio size is not answerable on this machine, and a
 figure for the writer's change waits for one where it is.
 
+#### The fully-unmerged point is the build, and the build is the pieces
+
+The sweep's last point reads 0.10x-0.16x of LMDB at every rung, and
+the probe in its shape says where. At a hundred thousand keys the point
+holds one partition, seven pieces and the last commits unsealed; the
+pass's scans read 22-25 µs each and build 850 blocks. The same scans
+run again over the forms the pass built read 1.6-2.0 µs, and a third
+time 1.5: the walk over a built form costs what a drained scan costs,
+and every microsecond above it is the build, about 24 µs a block at
+seven or eight pieces, at a hundred thousand keys and at three hundred
+thousand alike. Callgrind puts a build at 74,000 instructions for
+sixty-four partition records and forty overlay keys held across fifty
+piece entries; the same shape with two pieces is 18,000. What grows
+with the pieces is everything per overlay key: the piece keys read and
+sorted, the record resolved once for the tombstone rule and once for
+the values, the memtable's chunk chased, the copy's pushes, and thirty
+allocations.
+
+Three tweaks were tried against that and each was a wash by instruction
+count, which is the one measure this machine reports exactly. A cursor
+over the partition's records in place of a walk re-entered per overlay
+gap costs the same per record once it has the walk's own fast path and
+more without it; sorting the piece keys through two words of the key
+rather than `memcmp` saves the compare and spends it on the order it
+builds; and prefetching the pieces' runs and the block's records ahead
+of the build changes nothing, because the build is instruction-bound
+and not waiting. A rewrite that merges the sources' cursors straight
+into the copy, resolving each record once, is the remaining lever on
+the build itself, worth two to three times at seven pieces by its
+instruction budget and nothing at two, where the current build is
+already near that shape.
+
+The pieces are the merge scheduler's. A merge starts when a range holds
+`l0_trigger` pieces and absorbs the pieces present when it starts, one
+merge at a time; at the point's write rate four seal while one runs,
+so the reads meet seven or eight. Joined after the pass, the merge in
+flight finishes in 60 ms at a hundred thousand keys and 100 at three
+hundred thousand and leaves four or five pieces, over which the same
+scans read 12-13 µs. A workload that scans after a burst meets the
+merges catching up within a tenth of a second; the sweep's point, by
+its definition, does not wait. Bounding the pieces a read meets while
+a partition merge runs -- merging pieces into a piece, which is cheap
+where a partition rewrite is not -- is the structural answer this point
+asks for, and it is a compaction policy and not a read path.
+
 #### Which half of the lag gap, by rung
 
 The build and the walk split by size, and the arms say which is which
