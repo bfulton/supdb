@@ -1308,6 +1308,89 @@ fn seg_order(a: &Seg, b: &Seg) -> Ordering {
 
 // ------------------------------------------------------- the segment writer --
 
+/// The segment file's output, written in 2 MB pieces at 2 MB offsets.
+///
+/// The page cache sizes a folio by the write that creates it, at that
+/// write's alignment: a file written in pieces of a few hundred kilobytes
+/// is cached in folios of that size, and a mapping of it costs a page
+/// table entry and a TLB entry per 4 KB page, where a file written in
+/// 2 MB pieces at 2 MB offsets is cached in PMD-sized folios that the
+/// mapping takes with one entry each. The difference is the address
+/// translation a scan pays over a partition of 46 MB: 12% of the scan
+/// through the blob, paired window by window against the same bytes
+/// rewritten in one write, and nothing over a partition of 16 MB. The
+/// WAL recycler met the same rule from the other side, a folio sized by
+/// a write far larger than the commits after it (`CLAUDE.md`). A
+/// `BufWriter` of a megabyte flushed wherever it filled. This buffers to
+/// the next boundary of the file and writes the piece there whole; a
+/// flush before the boundary writes what there is, and the direct
+/// segment's commits do that by design.
+struct AlignedWriter {
+    file: File,
+    buf: Vec<u8>,
+    /// Bytes on the file so far: where the buffer's contents land.
+    written: u64,
+}
+
+/// The piece: the PMD size on x86-64 and on arm64 with 4 KB pages, and a
+/// harmless write size anywhere else.
+const WRITE_PIECE: u64 = 2 << 20;
+
+impl AlignedWriter {
+    fn new(file: File) -> AlignedWriter {
+        AlignedWriter {
+            file,
+            buf: Vec::with_capacity(WRITE_PIECE as usize),
+            written: 0,
+        }
+    }
+
+    fn get_ref(&self) -> &File {
+        &self.file
+    }
+
+    fn into_inner(mut self) -> std::io::Result<File> {
+        std::io::Write::flush(&mut self)?;
+        Ok(self.file)
+    }
+
+    /// Bytes from the file's end to the next boundary: what the buffer
+    /// holds before it is written.
+    fn to_boundary(&self) -> usize {
+        (WRITE_PIECE - self.written % WRITE_PIECE) as usize
+    }
+
+    fn write_buf(&mut self) -> std::io::Result<()> {
+        std::io::Write::write_all(&mut self.file, &self.buf)?;
+        self.written += self.buf.len() as u64;
+        self.buf.clear();
+        Ok(())
+    }
+}
+
+impl std::io::Write for AlignedWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let mut rest = data;
+        while !rest.is_empty() {
+            let room = self.to_boundary() - self.buf.len();
+            let take = room.min(rest.len());
+            self.buf.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if self.buf.len() == self.to_boundary() {
+                self.write_buf()?;
+            }
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if !self.buf.is_empty() {
+            self.write_buf()?;
+        }
+        self.file.flush()
+    }
+}
+
 /// Writes an immutable segment in one forward pass, for input that arrives
 /// sorted by key with each key's values together.
 ///
@@ -1330,7 +1413,7 @@ fn seg_order(a: &Seg, b: &Seg) -> Ordering {
 /// because that is the reader's inverse, and the test corrupts a block to
 /// prove the checksum recorded is the one the reader checks.
 pub struct SegmentWriter {
-    out: std::io::BufWriter<File>,
+    out: AlignedWriter,
     /// File offset the next write lands at. Data starts after the header
     /// region, which holds the two superblock slots and is written last.
     pos: u64,
@@ -1566,7 +1649,7 @@ impl SegmentWriter {
             .write(true)
             .truncate(true)
             .open(path)?;
-        let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+        let mut out = AlignedWriter::new(file);
         // The header region stays zero until `finish`, so a segment that
         // was never finished is a file no reader accepts rather than a
         // segment with some of its keys.
@@ -2165,7 +2248,7 @@ impl SegmentWriter {
             (key_off, key_len, hb)
         };
 
-        let file = self.out.into_inner().map_err(|e| e.into_error())?;
+        let file = self.out.into_inner()?;
         use std::os::unix::fs::FileExt;
         if let Some(h) = &header {
             file.write_all_at(h, key_off)?;

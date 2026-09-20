@@ -96,6 +96,15 @@ PMU and works. There is no `linux-perf` package for this kernel;
 kernel. Callgrind's `--cache-sim=yes` is a model of a cache, not this
 machine's, and is worth only what a model is worth.
 
+Memory placement is a hidden variable here. The same bytes in a fresh
+anonymous copy read 20% faster than the file mapping of them in three
+runs and 20% slower in the fourth, paired window by window with the
+same keys, and the engine's scan over the store paired at the blob's
+own speed. The guest's pages land somewhere different each run and how
+the host backs them cannot be seen from inside, so a question of ten
+percent about translation, huge pages or folio size is not one this
+machine can answer; `docs/engine.md` has the probe and both outcomes.
+
 Profile a probe that does one thing. The scan probe's own `format!` per
 iteration was 8% of its samples until the keys were built before the
 loop.

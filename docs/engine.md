@@ -1079,6 +1079,46 @@ and 0.65x at three hundred thousand, the binary after 1.08x and 0.94x;
 two runs of the same binary on this machine differ by a fifth, so the
 timed first scan is the measurement and the pairs are what it predicts.
 
+#### Address translation over a 46 MB partition
+
+What is left of the scan at three hundred thousand keys grows with the
+store: the fixed cost per scan from about 240 ns at ten thousand keys
+to 450 at three hundred thousand, the cost per entry from 6 ns to 10,
+and LMDB's grows too. A partition there is 46 MB mapped in 4 KB pages,
+far past what the TLB reaches, so every distinct page a scan touches is
+a page walk, two-dimensional under a hypervisor. This machine has no
+hardware counters, so a probe took translation away instead: the same
+bytes as the seal wrote them, as one write to a new file, as an
+anonymous copy with huge pages, and as an anonymous copy without, each
+behind the same slice source, scanned with the same hundred start keys
+window by window so drift lands on all alike.
+
+The kernel's side is settled. The page cache sizes a folio by the write
+that creates it, at that write's alignment, and a mapping takes a
+PMD-sized folio with one page-table entry: the file written in one
+write shows 45 MB of `FilePmdMapped` in `smaps`, the seal-written one 4
+MB. `MADV_COLLAPSE` on a file mapping is `EINVAL` here (the kernel is
+built without collapse for files), and a cold file read back by one
+readahead gets small folios, so a file has its huge folios from the
+write that made it or not at all. The segment writer writes 2 MB
+pieces at 2 MB offsets now, where a `BufWriter` of a megabyte flushed
+wherever it filled; every segment a seal, a partition or a merge
+rewrites is cached in PMD folios. The one that is not is the direct
+segment the ordered load appends to, whose pieces are its commits, each
+flushed and synced: a folio larger than the commits into it is the WAL
+recycler's write amplification, so that segment stays as it is, and it
+is the one the suite's scan pass reads.
+
+The time is not settled, and cannot be here. Three runs read the huge
+folios 12% faster than the seal-written file and both anonymous copies
+20% faster, the copy without huge pages as fast as the one with; the
+fourth run read every copy 20% slower than the file, and the engine's
+own scan over the same store at the blob's speed. The one thing that
+changes between runs is where the guest's pages land, and how the host
+backs them is not visible from inside. A question of ten percent about
+translation or folio size is not answerable on this machine, and a
+figure for the writer's change waits for one where it is.
+
 #### Which half of the lag gap, by rung
 
 The build and the walk split by size, and the arms say which is which
