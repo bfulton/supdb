@@ -452,6 +452,21 @@ pub struct Options {
     /// threads, fifteen pairs of fifteen. The forms built at a commit
     /// are the forms a read takes, and they are worth 1.71x on that
     /// workload against not building them at all.
+    ///
+    /// Zero now, where it was one. One waits for a handle the caller made
+    /// to have scanned, on the reasoning that the forms lose where the
+    /// writer reads its own store; measured against the seal cap that is
+    /// no longer true. Eleven pairs each: at ten thousand keys the lag
+    /// sweep reads 1.369x at a hundredth unmerged, 3.352x at a tenth and
+    /// 5.643x at all of it (10/11 and 11/11, p<=0.012), and at a hundred
+    /// thousand 1.398x at a hundredth (11/11, p=0.001), with every mix
+    /// and the load within noise and the forms' bytes unchanged there.
+    /// Before the cap the same flip lost 0.869x at the fully unmerged
+    /// point and cost 2.18x those bytes: capping the seal leaves less
+    /// unsealed, so the fill it pays for is smaller and the reads that
+    /// use it are the same. The cost that is left is memory on a small
+    /// store -- 162 KB of forms against 1.52 MB at ten thousand keys --
+    /// and `scan_cache_bytes` is the bound for a caller who minds.
     pub forms_from_reader_scans: usize,
     /// Whether the writer, having settled its batch into the blocks it
     /// landed in, also builds a form for every block an unsealed key
@@ -589,7 +604,7 @@ impl Default for Options {
             scan_cache_ahead: true,
             scan_cache_ahead_min_blocks: 1024,
             commit_forms: true,
-            forms_from_reader_scans: 1,
+            forms_from_reader_scans: 0,
             commit_forms_build: true,
             share_snapshot: true,
             snapshot_adopt_behind: 0,

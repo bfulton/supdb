@@ -350,6 +350,8 @@ pub struct Supdb {
     wforms: bool,
     /// The unsealed share past which a commit stops; `supdb-regime`.
     lagcap: usize,
+    /// Whether the forms wait for a caller's handle; `supdb-lazyforms`.
+    lazyforms: bool,
     /// The partitions' blocks below which no builder starts, or none for
     /// the engine's own. `supdb-ahead`.
     aheadmin: Option<usize>,
@@ -379,6 +381,9 @@ struct Policy {
     /// The share of the store that may be unsealed before a commit
     /// stops maintaining; zero is no bound. `supdb-regime`.
     lagcap: usize,
+    /// Whether the forms wait for a caller's handle to have scanned, as
+    /// they did before the seal cap. `supdb-lazyforms`.
+    lazyforms: bool,
     /// The builder's minimum blocks, or none for the engine's own.
     /// `supdb-ahead`.
     aheadmin: Option<usize>,
@@ -404,6 +409,7 @@ impl Default for Policy {
             lagcap: 0,
             sealcap: None,
             aheadmin: None,
+            lazyforms: false,
         }
     }
 }
@@ -455,6 +461,19 @@ impl Supdb {
             Policy {
                 forms: true,
                 settle: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the forms waiting for a handle the caller made to
+    /// have scanned, which is what the engine did before the seal cap made
+    /// the fill cheap enough to stop waiting.
+    pub fn create_lazyforms(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                lazyforms: true,
                 ..Policy::default()
             },
         )
@@ -605,6 +624,7 @@ impl Supdb {
             lagcap,
             sealcap,
             aheadmin,
+            lazyforms,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -655,7 +675,13 @@ impl Supdb {
             share_snapshot: snap,
             // Zero maintains the forms at every commit whoever is
             // reading; the engine's default waits for a caller's handle.
-            forms_from_reader_scans: if forms { 0 } else { 1 },
+            // `supdb` inherits what the engine ships; `supdb-lazyforms`
+            // pins the one that waited for a caller's handle.
+            forms_from_reader_scans: match (forms, lazyforms) {
+                (_, true) => 1,
+                (true, _) => 0,
+                _ => supdb::Options::default().forms_from_reader_scans,
+            },
             commit_forms_build: !settle,
             // The writer's own reads take the forms it maintains. Off in
             // the shipping arm until the pair is measured: the suite's
@@ -709,6 +735,7 @@ impl Supdb {
             lagcap,
             sealcap,
             aheadmin,
+            lazyforms,
         })
     }
 }
@@ -745,6 +772,9 @@ impl Engine for Supdb {
         }
         if self.settle {
             return "supdb-settle";
+        }
+        if self.lazyforms {
+            return "supdb-lazyforms";
         }
         if self.aheadmin.is_some() {
             return "supdb-ahead";
@@ -1276,8 +1306,10 @@ pub const ARMS: [&str; 12] = [
 pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
         "supdb" | "supdb-forms" | "supdb-settle" | "supdb-wforms" | "supdb-regime"
-        | "supdb-noseal" | "supdb-ahead" | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache"
-        | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
+        | "supdb-noseal" | "supdb-ahead" | "supdb-lazyforms" | "supdb-nosnap"
+        | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => {
+            Guarantee::Durable
+        }
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
     })
@@ -1290,6 +1322,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb" => Box::new(Supdb::create(dir)?),
         "supdb-forms" => Box::new(Supdb::create_forms(dir)?),
         "supdb-settle" => Box::new(Supdb::create_settle(dir)?),
+        "supdb-lazyforms" => Box::new(Supdb::create_lazyforms(dir)?),
         "supdb-ahead" => Box::new(Supdb::create_ahead(dir)?),
         "supdb-noseal" => Box::new(Supdb::create_noseal(dir)?),
         "supdb-regime" => Box::new(Supdb::create_regime(dir)?),

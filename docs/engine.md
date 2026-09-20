@@ -728,6 +728,47 @@ quarter in the seek, a fifth in the walk of the first entry, an eighth
 in the preamble, an eighth in the prefetch. Closing it is a fixed-cost
 problem, not a policy one.
 
+#### The lag gap is a build cost, and the two defaults compound
+
+What the lag sweep measures is mostly not scanning. The same store and
+the same scans, varying only how many of them, a tenth of a hundred
+thousand keys unmerged and a hundred entries a scan:
+
+| scans | ns a scan |
+|---|---|
+| 1,000 | 4,372 / 4,317 |
+| 4,000 | 2,010 / 2,329 |
+| 20,000 | 1,913 / 1,892 |
+| 80,000 | 1,413 / 1,713 |
+
+The sweep does `size / scan_len`, which is a thousand scans over 1,563
+blocks, so most of them meet a block for the first time and build its
+form: about 2.9 µs of the 4.3 is construction. That is why the arm that
+builds the forms at commit wins the sweep, why capping the seal wins it
+(fewer blocks need a form at all), and why three probes written against
+this failed to reproduce any of it -- each reused a few thousand start
+keys over a hundred thousand scans and amortised every build away.
+
+Which makes the two defaults complementary rather than alternatives.
+Before the seal cap, maintaining the forms whoever is reading lost
+0.869x at the fully unmerged point and cost 2.18x the forms' bytes at a
+hundred thousand keys, and that is why it was left off. With the cap in,
+less stays unsealed, the fill is smaller, and the same flip measures
+against the arm that keeps the old shape, eleven pairs each:
+
+| | 10k | 100k |
+|---|---|---|
+| scan-lag, all of it unmerged | **6.03x** | 0.96x (ns) |
+| scan-lag, a tenth | **3.79x** | 0.97x (ns) |
+| scan-lag, a hundredth | **1.43x** | **1.34x** |
+| every mix, the load, the reads | ns | ns |
+| the forms' bytes | 9.35x | unchanged |
+
+Starred figures are 11/11 at p=0.001. What is left to pay is memory on a
+small store, 162 KB of forms against 1.52 MB at ten thousand keys, and
+`scan_cache_bytes` bounds it for a caller who minds. Nothing else on the
+ladder moved either way.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and
