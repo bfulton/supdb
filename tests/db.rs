@@ -4503,9 +4503,15 @@ fn a_write_burst_is_settled_once_its_backlog_passes_the_bound() {
         (db.forms_position() != before, m, db)
     };
     let (moved, m0, db0) = run(0);
-    assert!(!moved, "with no bound, the forms stay where the last read left them");
+    assert!(
+        !moved,
+        "with no bound, the forms stay where the last read left them"
+    );
     m0.check(&db0, "unbounded, after the burst");
     let (moved, m1, db1) = run(5);
-    assert!(moved, "past the bound, the burst's commits settle as they go");
+    assert!(
+        moved,
+        "past the bound, the burst's commits settle as they go"
+    );
     m1.check(&db1, "bounded, after the burst");
 }

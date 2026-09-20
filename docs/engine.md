@@ -764,7 +764,10 @@ thousand costs nothing the sign test can see. It is a share and not a
 count, for the reason the seal cap's floor is: the same five thousand
 at three hundred thousand keys is a sixtieth of the store, the mixes
 there write five times over it, and it reads the lag point at 3.59x for
-ycsb-A at 0.66x and F at 0.80x (0/7). Five percent is the default. What
+ycsb-A at 0.66x and F at 0.80x (0/7). Five percent is the default, and
+as a share it holds at that rung: seven pairs at three hundred thousand
+read the point at 1.86x (7/7, p=0.016) with A at 0.95x and F at 0.89x,
+neither significant, and nothing else moved. What
 a settled write costs -- about 0.75 µs, the same bill either way --
 is `patch_block`: a `build_ctx` per write, a one-element `Overlay`
 allocated per write, a fresh `run` buffer per write, and on a dense

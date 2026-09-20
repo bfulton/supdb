@@ -66,6 +66,14 @@ release profile because the checks cost code size there and time in a
 measurement. A second definition of "the checks" is how the next one of
 those starts.
 
+The same failure has a shell-script form, and this environment invites
+it: `set -e` does nothing here -- a subshell walks straight past a
+failed `grep -q` with status 0 -- so a chain of `checks; then commit;
+then push` that relied on it committed and pushed a tree the format gate
+had just rejected. Gate on `&&`, on the verdict line and not on a `|
+tail` that swallows the exit status, and prove the gate fires on a
+known-red input before trusting it with a push.
+
 ## Profiling
 
 Two instruments, and they disagree where it matters. Callgrind
