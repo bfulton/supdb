@@ -1256,6 +1256,17 @@ struct Seg {
     /// build and piece bounced its word between a builder's thread and
     /// the scan's, twenty-two pieces a block at three million keys.
     ranks: std::sync::RwLock<Option<(u64, std::sync::Arc<Vec<u32>>)>>,
+    /// Where this piece's positions fall against a partition's block
+    /// boundaries, by the partition's blob id: a function of two sealed
+    /// files, so taken once and shared by every table made over the
+    /// pair. Every table -- the writer's at each state a seal or a merge
+    /// published, the builder's, and each handle's at its first scan --
+    /// walked the piece against the boundaries again: a handle's first
+    /// scan after the mixes at three hundred thousand keys walked one
+    /// piece for 360 us of a pass of 7 ms, and the writer walked every
+    /// piece for each new one. Keyed by the partition's identity for the
+    /// reason `ranks` is.
+    bounds: std::sync::RwLock<BoundsById>,
     level: u8,
     /// The WAL sequence the segment's name carries: what orders the
     /// level-0 pieces over one fence oldest to newest, which a read's
@@ -2581,6 +2592,7 @@ impl Seg {
                 blob,
                 name: name.to_string(),
                 ranks: std::sync::RwLock::new(None),
+                bounds: std::sync::RwLock::new(Vec::new()),
                 level: 0,
                 seq: Db::name_end_seq(name).unwrap_or(0),
                 lo,
@@ -2611,6 +2623,7 @@ impl Seg {
                 blob,
                 name: name.to_string(),
                 ranks: std::sync::RwLock::new(None),
+                bounds: std::sync::RwLock::new(Vec::new()),
                 level: 1,
                 seq: Db::name_end_seq(name).unwrap_or(0),
                 lo,
@@ -2629,6 +2642,7 @@ impl Seg {
             blob,
             name: name.to_string(),
             ranks: std::sync::RwLock::new(None),
+            bounds: std::sync::RwLock::new(Vec::new()),
             level: 0,
             seq: Db::name_end_seq(name).unwrap_or(0),
             lo: Vec::new(),
@@ -4537,14 +4551,14 @@ struct BlockTable {
     /// level, and the first rank not below each block's lower bound, one
     /// more for the partition's upper fence, so block `b` holds the
     /// piece's ranks `at[b]..at[b + 1]`.
-    pieces: Vec<(usize, Vec<u32>)>,
+    pieces: PieceBounds,
     /// Per entry of `pieces`, the piece's ranks against this partition,
     /// taken when the table was made, or none when it has none against
     /// it and the cut is searched for instead.
     piece_ranks: Vec<Option<std::sync::Arc<Vec<u32>>>>,
     /// The same over the snapshot of unsealed keys, for the snapshot
     /// `snap_gen` names; walked again when a rebuild replaces it.
-    snap_at: Vec<u32>,
+    snap_at: std::sync::Arc<Vec<u32>>,
     snap_gen: u64,
     /// Live slots created since that snapshot, under the block their key
     /// falls in, in creation order, each with the cut the write's seek
@@ -4569,7 +4583,8 @@ impl BlockTable {
 /// block's lower bound, and last the first not below the partition's
 /// upper fence, so block `b` holds positions `at[b]..at[b + 1]`. The two
 /// fences are answered by `seek`; between them the source is walked with
-/// `below`, reading each boundary key of the partition once. An open
+/// `advance`, the first position at or past the given one not below a
+/// boundary key, reading each boundary key of the partition once. An open
 /// fence is the source's start or end, never a compare against an empty
 /// slice.
 fn block_bounds_of(
@@ -4577,11 +4592,12 @@ fn block_bounds_of(
     nblocks: usize,
     len: usize,
     seek: impl Fn(&[u8]) -> usize,
-    below: impl Fn(usize, &[u8]) -> bool,
+    advance: impl Fn(usize, &[u8]) -> usize,
 ) -> Result<Vec<u32>> {
     let mut at = Vec::with_capacity(nblocks + 1);
     let mut i = if seg.lo.is_empty() { 0 } else { seek(&seg.lo) };
     at.push(i as u32);
+    let mut kbuf = Vec::new();
     for b in 1..nblocks {
         // Past the source's end no bound moves, and the boundary key is
         // read only to move one: reading it anyway was a cold line per
@@ -4591,13 +4607,19 @@ fn block_bounds_of(
         // the suite's scan pass, and the builder ahead read the same
         // lines again on its thread.
         if i < len {
-            let bound = seg
-                .blob
-                .key_at(b * CACHE_BLOCK)
-                .ok_or_else(|| err("block cache: a rank did not resolve"))?;
-            while i < len && below(i, bound) {
-                i += 1;
-            }
+            let rank = b * CACHE_BLOCK;
+            // The boundary key from the ordered index's top level where a
+            // head is a whole key, and from the record where it is not:
+            // the record is a cold line per block for every source the
+            // table maps, the top level is in memory.
+            let bound = match seg.ord.whole_key_at(rank, &mut kbuf) {
+                Some(k) => k,
+                None => seg
+                    .blob
+                    .key_at(rank)
+                    .ok_or_else(|| err("block cache: a rank did not resolve"))?,
+            };
+            i = advance(i, bound).min(len);
         }
         at.push(i as u32);
     }
@@ -5128,6 +5150,16 @@ struct Snapshot {
     fresh: Vec<SnapKey>,
     /// How many of `snap_added` are filed.
     filed: usize,
+    /// Where the main run's positions fall against a partition's block
+    /// boundaries, by the partition's blob id. The main run is fixed
+    /// once built -- a filing goes to the side runs -- so the bounds
+    /// are a function of the run and the partition, taken once and
+    /// shared: by the writer's table and every handle that adopts the
+    /// snapshot, and across the copy a filing makes of a shared one,
+    /// whose run is the same. A handle's first scan after the mixes
+    /// walked the run against every boundary for 280 us at three
+    /// hundred thousand keys.
+    bounds: std::sync::Arc<std::sync::RwLock<BoundsById>>,
 }
 
 /// Entries a filing may leave in `fresh` before it is folded into `side`.
@@ -5318,6 +5350,19 @@ impl Snapshot {
         self.ents
             .get(i)
             .map(|e| (&self.keys[e.off as usize..(e.off + e.len) as usize], e))
+    }
+    /// The first index at or past `from` whose key is not below `key`, or
+    /// the length: a table's walk over the main run against a partition's
+    /// block boundaries, a few keys per boundary.
+    fn advance_below(&self, from: usize, key: &[u8]) -> usize {
+        let mut i = from;
+        while let Some(e) = self.ents.get(i) {
+            if self.keys[e.off as usize..(e.off + e.len) as usize] >= *key {
+                break;
+            }
+            i += 1;
+        }
+        i
     }
     /// First index whose key is not below `from`.
     ///
@@ -10950,11 +10995,16 @@ impl Txn<'_> {
 /// PROTOTYPE: per level-0 piece meeting a partition's range, its index in
 /// the level and the first rank not below each block's lower bound, as
 /// `BlockTable::pieces` holds them.
-type PieceBounds = Vec<(usize, Vec<u32>)>;
+type PieceBounds = Vec<(usize, std::sync::Arc<Vec<u32>>)>;
 /// PROTOTYPE: a piece's run over one block, as a build merges it: the
 /// piece's index in the level, the run of its ranks, and its ranks
 /// against the partition when it has them.
 type PieceRun<'a> = (usize, std::ops::Range<usize>, Option<&'a [u32]>);
+/// Where a sorted source's positions fall against a partition's block
+/// boundaries, by the partition's blob id: what a piece keeps against
+/// each partition it meets and a snapshot keeps for its main run.
+type BoundsById = Vec<(u64, std::sync::Arc<Vec<u32>>)>;
+
 /// PROTOTYPE: per entry of a `PieceBounds`, the piece's ranks against the
 /// partition, as `BlockTable::piece_ranks` holds them.
 type PieceRanks = Vec<Option<std::sync::Arc<Vec<u32>>>>;
@@ -11257,7 +11307,7 @@ impl<'s> BuildCtx<'s> {
         seg: &Seg,
         l0: &[std::sync::Arc<Seg>],
         unsealed: &Snapshot,
-    ) -> Result<(PieceBounds, PieceRanks, Vec<u32>)> {
+    ) -> Result<(PieceBounds, PieceRanks, std::sync::Arc<Vec<u32>>)> {
         let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
         let against = seg.blob.id();
         let mut pieces = Vec::new();
@@ -11277,13 +11327,30 @@ impl<'s> BuildCtx<'s> {
             {
                 continue;
             }
-            let at = block_bounds_of(
-                seg,
-                nblocks,
-                p.blob.keys(),
-                |k| p.ord.seek(p.cursor_from(k), |i| p.blob.key_at(i)),
-                |i, bound| p.blob.key_at(i).is_some_and(|k| k < bound),
-            )?;
+            let cached = p
+                .bounds
+                .read()
+                .expect("a piece's bounds")
+                .iter()
+                .find(|(id, _)| *id == against)
+                .map(|(_, at)| at.clone());
+            let at = match cached {
+                Some(at) => at,
+                None => {
+                    let at = std::sync::Arc::new(block_bounds_of(
+                        seg,
+                        nblocks,
+                        p.blob.keys(),
+                        |k| p.ord.seek(p.cursor_from(k), |i| p.blob.key_at(i)),
+                        |i, bound| p.ord.advance_below(i, bound, |r| p.blob.key_at(r)),
+                    )?);
+                    p.bounds
+                        .write()
+                        .expect("a piece's bounds")
+                        .push((against, at.clone()));
+                    at
+                }
+            };
             pieces.push((j, at));
             // Ranks against another partition are no ranks.
             ranks.push(
@@ -11394,14 +11461,35 @@ impl<'s> BuildCtx<'s> {
     }
     /// PROTOTYPE: where the snapshot's keys fall against the partition's
     /// block boundaries.
-    fn snap_bounds(seg: &Seg, nblocks: usize, unsealed: &Snapshot) -> Result<Vec<u32>> {
-        block_bounds_of(
+    fn snap_bounds(
+        seg: &Seg,
+        nblocks: usize,
+        unsealed: &Snapshot,
+    ) -> Result<std::sync::Arc<Vec<u32>>> {
+        let against = seg.blob.id();
+        let cached = unsealed
+            .bounds
+            .read()
+            .expect("a snapshot's bounds")
+            .iter()
+            .find(|(id, _)| *id == against)
+            .map(|(_, at)| at.clone());
+        if let Some(at) = cached {
+            return Ok(at);
+        }
+        let at = std::sync::Arc::new(block_bounds_of(
             seg,
             nblocks,
             unsealed.len(),
             |k| unsealed.seek(k),
-            |i, bound| unsealed.get(i).is_some_and(|(k, _)| k < bound),
-        )
+            |i, bound| unsealed.advance_below(i, bound),
+        )?);
+        unsealed
+            .bounds
+            .write()
+            .expect("a snapshot's bounds")
+            .push((against, at.clone()));
+        Ok(at)
     }
     /// PROTOTYPE: the memtables' keys of a block, in order: a run of the
     /// snapshot and the filed keys, merged. The filed keys are put in key

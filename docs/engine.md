@@ -1079,6 +1079,48 @@ and 0.65x at three hundred thousand, the binary after 1.08x and 0.94x;
 two runs of the same binary on this machine differ by a fifth, so the
 timed first scan is the measurement and the pairs are what it predicts.
 
+#### A handle's first scan after the mixes
+
+The threaded scan mix claims a handle per thread over the store the
+mixes leave -- a partition or two, a piece or two, and the unsealed
+keys -- and each thread scans a hundred entries `size / 100` times.
+Timed one scan at a time through the probe in that shape, a handle's
+first scan cost 30 µs at ten thousand keys, 270-310 at a hundred
+thousand and 1.2 ms at three hundred thousand, against 1.6-2.3 µs for
+every scan after: an eighth of each thread's pass at every rung. It
+was the block table's two walks, and the table made them for every
+handle and for the writer at every state a seal or a merge published.
+
+A table maps where each source's positions fall against the
+partition's block boundaries: every level-0 piece meeting the range,
+and the snapshot's main run. Each walk read the boundary key from the
+partition's record, a cold line per block, and the piece's keys from
+the piece's records, a record read per key. At three hundred thousand
+keys the piece walk was 640 µs and the snapshot walk 290. Three things
+changed. The boundary key comes from the ordered index's top level
+where a head is a whole key, which for keys of one length no longer
+than the common prefix plus eight bytes it is, so a boundary costs no
+record; a piece is walked along its own index's heads, one sequential
+word per key, with the prefix's verdict and the boundary's head taken
+once per boundary; and the bounds are cached where they belong. A
+piece's bounds against a partition are a function of two sealed files,
+so they live in the piece, keyed by the partition's blob id as its
+ranks are, and a snapshot's bounds against a partition are a function
+of its main run, which a filing never changes, so they live in the
+snapshot and follow the copy a filing makes of a shared one. The
+writer's table takes them at its first scan over a state; every handle
+that adopts the snapshot finds them, and a new piece costs the walk
+once and not once per table.
+
+A handle's first scan reads 11-17 µs at ten thousand keys, 17-19 at a
+hundred thousand and 60 at three hundred thousand when the bounds are
+there, and the thread that finds them missing computes the snapshot's
+over a fresh publish: 34, 100 and 320 µs. What is left is the table's
+arrays, one per block, and the faults on a fresh thread's heap. Each
+thread's pass in the probe: 165-186 µs at ten thousand keys from
+193-203, 1.8-1.9 ms at a hundred thousand from 2.3-2.5, and 6.6-7.1 ms
+at three hundred thousand from 7.3-8.8.
+
 #### Address translation over a 46 MB partition
 
 What is left of the scan at three hundred thousand keys grows with the

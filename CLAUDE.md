@@ -441,10 +441,17 @@ up, and nothing raised because every bound was right. The suite's own
 rule found it -- time the pass's first operation on its own -- and the
 same scan carried two more costs of the kind: the ordered index's top
 level built at the first seek, and a builder thread spawned to find
-nothing to build. The rule: a walk over two sorted sides costs the side
-the loop runs over, so it stops the moment the other side is spent, and
-a structure a pass needs once is built where the pass is not timed --
-at open, by the seal that made the segment -- or not at all.
+nothing to build. It came back at once for the store the mixes leave:
+the same walks with sources that have keys, a record read per boundary
+and per piece key, made again by every handle and by the writer at
+every published state, an eighth of each thread's pass in the threaded
+scan mix. The rule: a walk over two sorted sides costs the side the
+loop runs over, so it stops the moment the other side is spent, reads
+the cheapest form each side has (the index's heads before the
+records), and its answer, a function of two immutable objects, is
+taken once and kept with one of them under the other's identity; and a
+structure a pass needs once is built where the pass is not timed -- at
+open, by the seal that made the segment -- or not at all.
 
 **An order that held by name.** The live segments sort partitions first and
 then the level-0 pieces, and the pieces sorted by fence and then by name.

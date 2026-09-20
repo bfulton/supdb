@@ -405,6 +405,83 @@ impl OrdIndex {
         self.prefix = Some(first_key[..m].to_vec());
     }
 
+    /// The key at `rank` from its head alone, written into `buf`: `Some`
+    /// when every key is one length no longer than a head, so a head is a
+    /// whole key, and the prefix is learned, which is what a segment's
+    /// index has after `Seg::open`. `None` where the records would have
+    /// to say, and the caller reads the record. A block boundary's key
+    /// read this way touches no record: the boundary ranks are the top
+    /// level's, in memory. A table's walk over a partition's boundaries
+    /// read the record instead, a cold line per block for each source it
+    /// mapped: 640 us for one piece and 290 for the snapshot in a handle's
+    /// first scan at three hundred thousand keys, an eighth of the
+    /// suite's threaded scan pass, and the writer paid the same at its
+    /// first scan over every state a seal or a merge published.
+    pub fn whole_key_at<'b>(&self, rank: usize, buf: &'b mut Vec<u8>) -> Option<&'b [u8]> {
+        let len = self.uniform_len?;
+        let prefix = self.prefix.as_deref()?;
+        if rank >= self.n || prefix.len() != self.pfx {
+            return None;
+        }
+        let h = if rank.is_multiple_of(TOP_STRIDE) {
+            self.top[rank / TOP_STRIDE]
+        } else {
+            self.head(rank)
+        };
+        buf.clear();
+        buf.extend_from_slice(prefix);
+        buf.extend_from_slice(&h.to_be_bytes()[..len - self.pfx]);
+        Some(&buf[..])
+    }
+
+    /// The first rank at or past `from` whose key is not below `key`, or
+    /// `n`: `rank_below` run along the heads, with the prefix's verdict
+    /// and the query's head taken once. A table walks every key of a
+    /// piece against a partition's block boundaries when it is made, a
+    /// few keys per boundary; per key this is one sequential word.
+    pub fn advance_below<'a>(
+        &self,
+        from: usize,
+        key: &[u8],
+        key_at: impl Fn(usize) -> Option<&'a [u8]>,
+    ) -> usize {
+        let Some(prefix) = self.prefix.as_deref() else {
+            let mut r = from;
+            while r < self.n && key_at(r).is_some_and(|k| k < key) {
+                r += 1;
+            }
+            return r;
+        };
+        if self.pfx > 0 {
+            let m = self.pfx.min(key.len()).min(prefix.len());
+            match key[..m].cmp(&prefix[..m]) {
+                std::cmp::Ordering::Less => return from,
+                std::cmp::Ordering::Greater => return self.n,
+                std::cmp::Ordering::Equal if m < self.pfx => return from,
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+        let hk = head_of(key, self.pfx);
+        let mut r = from;
+        while r < self.n {
+            let h = self.head(r);
+            if h > hk {
+                break;
+            }
+            if h == hk {
+                let below = match self.uniform_len {
+                    Some(len) => key.len() > len,
+                    None => key_at(r).is_some_and(|k| k < key),
+                };
+                if !below {
+                    break;
+                }
+            }
+            r += 1;
+        }
+        r
+    }
+
     /// `MADV_RANDOM` for the heads.
     ///
     /// Every access to them is `seek`'s binary search, so this mapping is
@@ -990,5 +1067,101 @@ mod tests {
         let p = write(&build(&keys), "wrongseg");
         assert!(OrdIndex::open(&p, keys.len() + 1).is_err());
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// `whole_key_at` is the key from the heads where a head is a whole
+    /// key and nothing where it is not, and `advance_below` from any rank
+    /// against any query is what walking the records would answer: over
+    /// keys of one length, over keys of one length that tie on the head,
+    /// over keys of many lengths that tie on the head, and with no prefix
+    /// learned, where only the records can say.
+    #[test]
+    fn a_walk_along_the_heads_answers_as_the_records_do() {
+        let uniform: Vec<Vec<u8>> = (0u32..700)
+            .map(|i| format!("{i:016}").into_bytes())
+            .collect();
+        let tied: Vec<Vec<u8>> = (0u32..300)
+            .map(|i| {
+                let mut k = vec![b'x'; 40];
+                k.extend_from_slice(format!("{i:06}").as_bytes());
+                k
+            })
+            .collect();
+        let ragged: Vec<Vec<u8>> = (0u32..600)
+            .map(|i| {
+                let mut k = format!("pp{:08}", i / 3).into_bytes();
+                k.extend(std::iter::repeat_n(b'a', (i % 3) as usize));
+                k
+            })
+            .collect();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for (name, owned, learn) in [
+            ("uniform", &uniform, true),
+            ("tied", &tied, true),
+            ("ragged", &ragged, true),
+            ("unlearned", &ragged, false),
+        ] {
+            let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+            let p = write(&build(&keys), &format!("walk-{name}"));
+            let mut idx = OrdIndex::open(&p, keys.len()).expect("opens");
+            if learn {
+                idx.learn_prefix(keys[0]);
+            }
+            let mut buf = Vec::new();
+            for (r, k) in keys.iter().enumerate() {
+                let got = idx.whole_key_at(r, &mut buf);
+                if learn && idx.uniform() {
+                    assert_eq!(got, Some(*k), "{name}: whole key at {r}");
+                } else {
+                    assert_eq!(got, None, "{name}: no whole key at {r}");
+                }
+            }
+            // Probes: every key, each key with a byte more and one less,
+            // and queries off the prefix on either side.
+            let mut probes: Vec<Vec<u8>> = Vec::new();
+            for k in &keys {
+                probes.push(k.to_vec());
+                let mut longer = k.to_vec();
+                longer.push(b'0');
+                probes.push(longer);
+                probes.push(k[..k.len() - 1].to_vec());
+            }
+            for p in [
+                "",
+                "a",
+                "zzz",
+                "pp",
+                "p",
+                "q",
+                "xxxx",
+                "00000000000",
+                "0000000000999999",
+            ] {
+                probes.push(p.as_bytes().to_vec());
+            }
+            let naive = |from: usize, q: &[u8]| {
+                (from..keys.len())
+                    .find(|&i| keys[i] >= q)
+                    .unwrap_or(keys.len())
+            };
+            for q in &probes {
+                for _ in 0..4 {
+                    let from = (next() % (keys.len() as u64 + 1)) as usize;
+                    assert_eq!(
+                        idx.advance_below(from, q, resolver(&keys)),
+                        naive(from, q),
+                        "{name}: from {from} query {:?}",
+                        String::from_utf8_lossy(q)
+                    );
+                }
+            }
+            let _ = std::fs::remove_file(&p);
+        }
     }
 }
