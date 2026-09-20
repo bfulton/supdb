@@ -352,6 +352,9 @@ pub struct Supdb {
     lagcap: usize,
     /// Whether the forms wait for a caller's handle; `supdb-lazyforms`.
     lazyforms: bool,
+    /// The settle backlog this arm pins, or none for the engine's own;
+    /// `supdb-nosettle` pins zero. `supdb-eager`.
+    eager: Option<usize>,
     /// The partitions' blocks below which no builder starts, or none for
     /// the engine's own. `supdb-ahead`.
     aheadmin: Option<usize>,
@@ -384,6 +387,8 @@ struct Policy {
     /// Whether the forms wait for a caller's handle to have scanned, as
     /// they did before the seal cap. `supdb-lazyforms`.
     lazyforms: bool,
+    /// The settle backlog this arm pins, or none for the engine's own.
+    eager: Option<usize>,
     /// The builder's minimum blocks, or none for the engine's own.
     /// `supdb-ahead`.
     aheadmin: Option<usize>,
@@ -410,6 +415,7 @@ impl Default for Policy {
             sealcap: None,
             aheadmin: None,
             lazyforms: false,
+            eager: None,
         }
     }
 }
@@ -461,6 +467,37 @@ impl Supdb {
             Policy {
                 forms: true,
                 settle: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with no settle backlog at all: a write burst's filing waits
+    /// for the first read after it, which is the shape before the bound.
+    pub fn create_nosettle(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                eager: Some(0),
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` settling past a pinned backlog, `BACKLOG` percent of the
+    /// store's keys. Against `supdb` it
+    /// prices moving a write burst's filing from the first read after it
+    /// onto the commits themselves.
+    pub fn create_eager(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                eager: Some(
+                    std::env::var("BACKLOG")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(2),
+                ),
                 ..Policy::default()
             },
         )
@@ -625,6 +662,7 @@ impl Supdb {
             sealcap,
             aheadmin,
             lazyforms,
+            eager,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -688,6 +726,10 @@ impl Supdb {
             // ycsb-E reads through the writer, so it pays for the
             // maintenance and today cannot read it.
             forms_to_writer: wforms,
+            // Settle every commit, so a write burst never leaves its
+            // filing to the first read after it.
+            forms_settle_backlog_pct: eager
+                .unwrap_or(supdb::Options::default().forms_settle_backlog_pct),
             // The unsealed share past which the maintenance stops, so an
             // arm can maintain whoever is reading without paying for it
             // on a store that is nearly all unmerged.
@@ -736,6 +778,7 @@ impl Supdb {
             sealcap,
             aheadmin,
             lazyforms,
+            eager,
         })
     }
 }
@@ -772,6 +815,11 @@ impl Engine for Supdb {
         }
         if self.settle {
             return "supdb-settle";
+        }
+        match self.eager {
+            Some(0) => return "supdb-nosettle",
+            Some(_) => return "supdb-eager",
+            None => {}
         }
         if self.lazyforms {
             return "supdb-lazyforms";
@@ -1306,10 +1354,9 @@ pub const ARMS: [&str; 12] = [
 pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
         "supdb" | "supdb-forms" | "supdb-settle" | "supdb-wforms" | "supdb-regime"
-        | "supdb-noseal" | "supdb-ahead" | "supdb-lazyforms" | "supdb-nosnap"
-        | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => {
-            Guarantee::Durable
-        }
+        | "supdb-noseal" | "supdb-ahead" | "supdb-lazyforms" | "supdb-eager" | "supdb-nosettle"
+        | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb"
+        | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
     })
@@ -1322,6 +1369,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb" => Box::new(Supdb::create(dir)?),
         "supdb-forms" => Box::new(Supdb::create_forms(dir)?),
         "supdb-settle" => Box::new(Supdb::create_settle(dir)?),
+        "supdb-nosettle" => Box::new(Supdb::create_nosettle(dir)?),
+        "supdb-eager" => Box::new(Supdb::create_eager(dir)?),
         "supdb-lazyforms" => Box::new(Supdb::create_lazyforms(dir)?),
         "supdb-ahead" => Box::new(Supdb::create_ahead(dir)?),
         "supdb-noseal" => Box::new(Supdb::create_noseal(dir)?),

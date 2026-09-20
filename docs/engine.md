@@ -728,6 +728,50 @@ quarter in the seek, a fifth in the walk of the first entry, an eighth
 in the preamble, an eighth in the prefetch. Closing it is a fixed-cost
 problem, not a policy one.
 
+#### The lag sweep measured a deferred settle
+
+Three probes, four value sizes and a shuffled load later, the sweep's
+figure at a tenth unmerged came from none of those. It came from a
+warmup. The probe that finally matched it ran the suite's thousand cold
+scans with no warmup before them, and read 17 µs a scan against 4 with
+two hundred warm scans first: about 13 ms that the warmup had been
+absorbing, charged to the first scans after the writes.
+
+That 13 ms is the writes themselves. `maintain_forms` settles a commit's
+batch into the forms only when a scan has happened since the last
+commit, on the reasoning that a run of writes with no read between them
+should pay nothing for a structure nobody is reading. So a burst settles
+its first batch and defers the rest, and the first read after it files
+every batch since -- nine thousand writes on the sweep at a hundred
+thousand keys, on the first of a thousand scans. LMDB pays that at the
+write. This engine was charging it to the reader, and the sweep was
+measuring the bill.
+
+`forms_settle_backlog_pct` bounds it: past that share of the store's
+keys in unfiled writes, a commit settles whether or not a scan preceded
+it. The trade against the arm that never does, eleven pairs at a hundred
+thousand keys, the bound given as the count it was at that rung:
+
+| backlog | scan-lag, a tenth | ycsb-A | ycsb-F |
+|---|---|---|---|
+| every commit | 3.56x | 0.68x | 0.67x |
+| 2,000 | 3.51x | 0.81x (2/11) | 0.79x (1/11) |
+| 5,000 | **1.90x** (11/11) | 1.07x (ns) | 0.88x (ns) |
+
+Every commit rebuilds the sorted snapshot in a write-heavy mix
+(`snapshot_builds` 9 against 24) and costs A and F a third; five
+thousand costs nothing the sign test can see. It is a share and not a
+count, for the reason the seal cap's floor is: the same five thousand
+at three hundred thousand keys is a sixtieth of the store, the mixes
+there write five times over it, and it reads the lag point at 3.59x for
+ycsb-A at 0.66x and F at 0.80x (0/7). Five percent is the default. What
+a settled write costs -- about 0.75 µs, the same bill either way --
+is `patch_block`: a `build_ctx` per write, a one-element `Overlay`
+allocated per write, a fresh `run` buffer per write, and on a dense
+copy an `ents.insert` memmove plus an O(block) sum for the bloat
+check. That is the next thing to make cheaper, and it moves the whole
+curve rather than a point on it.
+
 #### Which half of the lag gap, by rung
 
 The build and the walk split by size, and the arms say which is which

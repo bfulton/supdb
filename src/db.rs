@@ -538,6 +538,30 @@ pub struct Options {
     /// any commit: `forms_at` stops advancing and a reader trusts a form
     /// only where it matches the log position it holds.
     pub forms_max_unsealed_pct: usize,
+    /// EXPERIMENT: unfiled writes, as a share of the partitions' keys,
+    /// past which a commit settles into the forms whether or not a scan
+    /// has preceded it; zero never does.
+    ///
+    /// A run of writes with no read between them settles only its first
+    /// batch, and the first read after the run files every batch since:
+    /// on the lag sweep at a hundred thousand keys that is nine thousand
+    /// writes filed by the first of a thousand scans, about 13 ms charged
+    /// to the scans, and it is what the sweep measures at a tenth
+    /// unmerged. A B-tree pays that at the write. Settling at every
+    /// commit instead reads that point at 3.56x and ycsb-E at 1.14x
+    /// (11/11, p=0.001) and costs ycsb-A 0.68x and ycsb-F 0.67x (0/11),
+    /// because a commit in a write-heavy mix then rebuilds the sorted
+    /// snapshot every time. A bound on the backlog caps what the first
+    /// read pays without paying at every commit.
+    ///
+    /// A share and not a count: five thousand writes is a twentieth of a
+    /// hundred thousand keys and there it reads the lag point at 1.90x
+    /// (11/11, p=0.001) with every mix within noise, and it is a sixtieth
+    /// of three hundred thousand, where the same count reads the lag
+    /// point at 3.59x and ycsb-A at 0.66x and F at 0.80x (0/7), because
+    /// the mixes there write five times over it. Five percent is the
+    /// default.
+    pub forms_settle_backlog_pct: usize,
     /// EXPERIMENT: the writer's own handle takes the canonical forms it
     /// maintains, instead of building its own. Without this the
     /// maintenance is pure cost wherever the reads are the writer's: a
@@ -611,6 +635,7 @@ impl Default for Options {
             promote_entries: 0,
             build_ahead_on_commit: 0,
             forms_max_unsealed_pct: 0,
+            forms_settle_backlog_pct: 5,
             forms_to_writer: false,
             form_dense_from: 0,
             scan_snapshot_arena: true,
@@ -6611,7 +6636,20 @@ impl Reader {
         // own, and the blocks touched meanwhile are published by the
         // first commit a scan precedes.
         let scans = st.scans.load(AtomicOrdering::Relaxed);
-        if scans == self.scans_seen.get() {
+        // The writes not yet filed into the forms: everything the log holds
+        // past the position this handle last read it to.
+        let backlog = self.mem().log_len().saturating_sub(self.log_seen.get());
+        // The bound is a share of the store's keys and not a count, for
+        // the reason the seal cap's floor is: a count that is free at one
+        // rung is five settles at the next.
+        let bound = if self.opts.forms_settle_backlog_pct == 0 {
+            usize::MAX
+        } else {
+            let keys: usize = self.segs().iter().map(|s| s.blob.keys()).sum();
+            (keys / 100 * self.opts.forms_settle_backlog_pct).max(1)
+        };
+        let due = scans != self.scans_seen.get() || backlog >= bound;
+        if !due {
             return Ok(());
         }
         self.scans_seen.set(scans);
@@ -9349,6 +9387,14 @@ impl Db {
             self.shared.rd_scans.load(AtomicOrdering::Relaxed),
             self.shared.rd_blocks.load(AtomicOrdering::Relaxed),
         )
+    }
+
+    /// EXPERIMENT: the log position the canonical forms are settled to,
+    /// or `usize::MAX` before the first maintenance: a commit that
+    /// maintained them moves it to the commit's own position, one that
+    /// did not leaves it where it was.
+    pub fn forms_position(&self) -> usize {
+        self.state().forms_at.load(AtomicOrdering::Acquire)
     }
 
     /// PROTOTYPE: how many states a publish replaced are still held for a

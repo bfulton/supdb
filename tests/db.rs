@@ -3535,6 +3535,10 @@ fn a_reader_walks_the_forms_the_writer_maintains_at_commit() {
         l0_trigger: 64,
         scan_block_cache: true,
         scan_cache_ahead: false,
+        // This test is about the scan-gated regime -- nothing maintained before a
+        // scan -- so the backlog bound, which maintains past a share of the
+        // store's writes with no scan at all, is off here.
+        forms_settle_backlog_pct: 0,
         commit_forms: true,
         ..Options::default()
     };
@@ -4049,6 +4053,9 @@ fn every_handle_after_the_first_adopts_the_snapshot_it_published() {
         l0_trigger: 64,
         scan_block_cache: true,
         scan_cache_ahead: false,
+        // The count of builds below assumes no commit refreshes the snapshot on
+        // its own; the backlog bound would, so it is off here.
+        forms_settle_backlog_pct: 0,
         share_snapshot: true,
         ..Options::default()
     };
@@ -4444,4 +4451,61 @@ fn a_store_below_the_seal_floor_still_seals_once_it_has_bytes() {
         capped > 0,
         "capped, the updates seal once they pass a share of the store; got {capped}"
     );
+}
+
+/// EXPERIMENT: a write burst with no read between its commits is settled
+/// into the forms once its unfiled backlog passes `forms_settle_backlog_pct`
+/// of the store's keys, so the first read after the burst does not file
+/// the whole of it. `forms_position` is the log position the forms are
+/// settled to: a commit that maintained them moves it, one that did not
+/// leaves it where it was.
+#[test]
+fn a_write_burst_is_settled_once_its_backlog_passes_the_bound() {
+    let run = |pct: usize| -> (bool, ScanModel, Db) {
+        let d = dir(&format!("settle-backlog-{pct}"));
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(2 << 10),
+            l0_trigger: 64,
+            scan_block_cache: true,
+            scan_cache_ahead: false,
+            forms_from_reader_scans: 0,
+            forms_settle_backlog_pct: pct,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..1500u32 {
+            m.append(&mut db, &key(k), "v0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        assert!(db.levels().0 > 1, "several partitions");
+        // One scan and a commit, so the forms exist and are current.
+        let mut sink = 0usize;
+        db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+            .unwrap();
+        db.commit().unwrap();
+        let before = db.forms_position();
+        assert_ne!(before, usize::MAX, "maintained once");
+        // The burst: three batches of 400 writes, committed, with no read
+        // between them. Five percent of 1,500 keys is 75, so every batch
+        // is past the bound.
+        for batch in 0..3u32 {
+            for k in (batch..1500u32).step_by(4).take(400) {
+                m.append(&mut db, &key(k), "burst");
+            }
+            db.commit().unwrap();
+        }
+        (db.forms_position() != before, m, db)
+    };
+    let (moved, m0, db0) = run(0);
+    assert!(!moved, "with no bound, the forms stay where the last read left them");
+    m0.check(&db0, "unbounded, after the burst");
+    let (moved, m1, db1) = run(5);
+    assert!(moved, "past the bound, the burst's commits settle as they go");
+    m1.check(&db1, "bounded, after the burst");
 }
