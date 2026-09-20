@@ -1031,6 +1031,54 @@ flag is set where a table is made now, and a test holds a handle's
 scan, the commit's fill, a staged write and the scans after it to the
 model.
 
+#### The first scan over a store just flushed
+
+The suite's scan pass is a thousand scans at a hundred thousand keys
+and three thousand at three hundred thousand, over the store the load
+left: partitioned, nothing unsealed, every read before it a point read.
+Timed one scan at a time, the pass's first scan cost 200 µs at a
+hundred thousand keys and 700 at three hundred thousand against 2 µs
+for every scan after, a tenth of the pass at both rungs, and a fresh
+open of the same store paid the same, so it was the store's and not
+the process's. Page faults were not it: the first scan took two. It
+was three things, each once per state.
+
+The largest was a walk over the partition's block boundaries for a
+source with no keys. A block table maps where each source's positions
+fall against the partition's blocks -- every level-0 piece meeting the
+range, and the snapshot of unsealed keys -- by walking the source and
+reading each block's first key once. The read came before the check
+that the source had any position left, so a snapshot of no keys, which
+is what every scan over a flushed store starts from, cost a cold line
+per block: 4,500 of them at three hundred thousand keys, 500 µs, and
+the builder ahead read the same lines again on its own thread to find
+every block clean. The walk reads a boundary only while the source has
+positions below it, which is the same answer for every source and no
+read for an empty one.
+
+The ordered index's top level, every sixty-fourth head, was built at
+the first seek: one line in eight of the index file, 60 µs at three
+hundred thousand keys. It is built at open, where the seal or the merge
+that made the segment pays it off every read's path.
+
+And the builder ahead started at the first scan whatever there was to
+build: a thread spawned to find every block clean and exit, 60 µs on
+this machine. With no piece and no unsealed key the scan records the
+state's one run as spent and spawns nothing. Spent, and not skipped:
+the first version left the record empty for a later scan to start the
+builder, and the lag sweep's first point with unsealed keys, which had
+never had a builder beside its scans, got one and read 0.71x of what it
+had read.
+
+The first scan reads 40-65 µs at a hundred thousand keys and 100 at
+three hundred thousand now, most of it the table's arrays, one per
+block, and the pass is two to three percent of that scan rather than a
+tenth. Against LMDB in one process, six pairs a run, the binary before
+read 0.88x of LMDB's single-thread scan pass at a hundred thousand keys
+and 0.65x at three hundred thousand, the binary after 1.08x and 0.94x;
+two runs of the same binary on this machine differ by a fifth, so the
+timed first scan is the measurement and the pairs are what it predicts.
+
 #### Which half of the lag gap, by rung
 
 The build and the walk split by size, and the arms say which is which

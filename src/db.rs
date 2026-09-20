@@ -4500,12 +4500,21 @@ fn block_bounds_of(
     let mut i = if seg.lo.is_empty() { 0 } else { seek(&seg.lo) };
     at.push(i as u32);
     for b in 1..nblocks {
-        let bound = seg
-            .blob
-            .key_at(b * CACHE_BLOCK)
-            .ok_or_else(|| err("block cache: a rank did not resolve"))?;
-        while i < len && below(i, bound) {
-            i += 1;
+        // Past the source's end no bound moves, and the boundary key is
+        // read only to move one: reading it anyway was a cold line per
+        // block for a source with no keys, which is what a scan's first
+        // table over a store just flushed makes over the snapshot of
+        // unsealed keys -- 500 us of the first scan at 300k, a tenth of
+        // the suite's scan pass, and the builder ahead read the same
+        // lines again on its thread.
+        if i < len {
+            let bound = seg
+                .blob
+                .key_at(b * CACHE_BLOCK)
+                .ok_or_else(|| err("block cache: a rank did not resolve"))?;
+            while i < len && below(i, bound) {
+                i += 1;
+            }
         }
         at.push(i as u32);
     }
@@ -10606,10 +10615,36 @@ impl Reader {
         if blocks < self.opts.scan_cache_ahead_min_blocks {
             return;
         }
+        let gen = self.state().gen;
+        // Nothing to build: with no piece and no unsealed key every block
+        // is clean, and the job would spawn a thread to find so -- 60 us
+        // of the first scan over a store just flushed, a third of that
+        // scan at three hundred thousand keys, and the same walk over
+        // every partition's blocks on the thread. The state's one run is
+        // spent all the same, as a builder that found nothing would
+        // leave it: the writes after this scan are the commit's to
+        // settle, not a builder's, and a builder started at the first
+        // scan with something unsealed instead ran beside the scans of
+        // the lag sweep's first point, which had never had one.
+        if self.segs().iter().all(|s| s.level > 0)
+            && self.mem().is_empty()
+            && self.frozen().is_none()
+        {
+            let (_tx, rx) = std::sync::mpsc::channel();
+            *self.ahead.borrow_mut() = Some(Ahead {
+                handle: None,
+                rx,
+                stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                from: self.mem().committed_log(),
+                since: std::cell::RefCell::new(Since::default()),
+                done: std::cell::Cell::new(true),
+                posted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            });
+            return;
+        }
         let Ok(r) = self.new_reader(false) else {
             return;
         };
-        let gen = self.state().gen;
         let mem = self.mem();
         // The log's length first and the watermark last, the order a
         // commit stores them in reversed, so the length and the count

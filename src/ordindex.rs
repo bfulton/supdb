@@ -310,13 +310,18 @@ pub struct OrdIndex {
     /// open, so the seek's prefix check reads no record. Absent until
     /// `learn_prefix`; the seek then reads the first key itself.
     prefix: Option<Vec<u8>>,
-    /// Every `TOP_STRIDE`th head, built at the first seek and held in
-    /// memory: a sixty-fourth of the file, hot after a few seeks, so the
-    /// search's probes into the mapping are confined to one run of heads.
-    /// Without it a seek over a partition of seven hundred thousand keys
-    /// was twenty probes, the lower ten of them cache misses into a 5 MB
-    /// file, 0.4 us of a 2.6 us scan at thirty million keys.
-    top: std::sync::OnceLock<Vec<u64>>,
+    /// Every `TOP_STRIDE`th head, built at open and held in memory: a
+    /// sixty-fourth of the file, hot after a few seeks, so the search's
+    /// probes into the mapping are confined to one run of heads. Without
+    /// it a seek over a partition of seven hundred thousand keys was
+    /// twenty probes, the lower ten of them cache misses into a 5 MB
+    /// file, 0.4 us of a 2.6 us scan at thirty million keys. Built at
+    /// open and not at the first seek: a segment is opened by the seal
+    /// or the merge that made it, off every read's path, and the first
+    /// seek is the first scan of a pass, which paid the build's walk over
+    /// every eighth line of the file -- 60 us at three hundred thousand
+    /// keys, a third of that scan.
+    top: Vec<u64>,
 }
 
 impl OrdIndex {
@@ -366,6 +371,13 @@ impl OrdIndex {
         if heads_at != HEADER || heads_at.checked_add(want) != Some(body) {
             return Err(bad("heads do not fill the file"));
         }
+        let top = (0..n)
+            .step_by(TOP_STRIDE)
+            .map(|i| {
+                let at = HEADER + i * HEAD;
+                u64::from_be_bytes(b[at..at + HEAD].try_into().expect("eight bytes"))
+            })
+            .collect();
         Ok(OrdIndex {
             map,
             n,
@@ -373,7 +385,7 @@ impl OrdIndex {
             uniform_len,
             prefix: None,
             advised: std::sync::atomic::AtomicBool::new(false),
-            top: std::sync::OnceLock::new(),
+            top,
         })
     }
 
@@ -587,17 +599,11 @@ impl OrdIndex {
         // The samples below the query: the answer lies past the last of
         // them and no further than the next, so the search over the heads
         // runs within one stride.
-        let top = self.top.get_or_init(|| {
-            (0..self.n)
-                .step_by(TOP_STRIDE)
-                .map(|i| self.head(i))
-                .collect()
-        });
         // A binary search whose step is a select and not a branch: the
         // branch form mispredicted about half its eleven steps over the
         // 2,300 samples of a partition at 300k keys, and each miss cost
         // what a step costs three times over.
-        let t = lower_bound(top, h);
+        let t = lower_bound(&self.top, h);
         // No sample below the query is the first head at or above it. Past
         // the last sample below it, the search runs to the next sample and
         // lands on it when every head between is below.

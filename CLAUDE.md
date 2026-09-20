@@ -420,6 +420,23 @@ LMDB, 0.91x with the counters off. A handle's statistics live on its
 slot's line now, and the one word the writer must see, the regime's
 scan signal, a handle bumps once per commit and not once per scan.
 
+**A join that walked the long side for an empty short one.** A block
+table maps a source's positions against a partition's block boundaries
+by walking the source and reading each boundary key once, and read the
+boundary before asking whether the source had a position left. A
+snapshot of no unsealed keys is what every scan pass over a store just
+flushed starts from, so the first scan read a cold line per block for
+nothing: 500 µs of a first scan of 700 at three hundred thousand keys,
+a tenth of the suite's scan pass at every rung from a hundred thousand
+up, and nothing raised because every bound was right. The suite's own
+rule found it -- time the pass's first operation on its own -- and the
+same scan carried two more costs of the kind: the ordered index's top
+level built at the first seek, and a builder thread spawned to find
+nothing to build. The rule: a walk over two sorted sides costs the side
+the loop runs over, so it stops the moment the other side is spent, and
+a structure a pass needs once is built where the pass is not timed --
+at open, by the seal that made the segment -- or not at all.
+
 **An order that held by name.** The live segments sort partitions first and
 then the level-0 pieces, and the pieces sorted by fence and then by name.
 Every piece a seal makes after the first partitioning is named `pcs-` with
