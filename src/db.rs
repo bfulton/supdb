@@ -522,6 +522,28 @@ pub struct Options {
     /// which is where the builder started before. A builder already
     /// running is left alone.
     pub build_ahead_on_commit: usize,
+    /// EXPERIMENT: a builder started at the first commit after a publish
+    /// -- a seal, a join, a merge -- whether or not a scan has asked,
+    /// and its forms installed at the commits they arrive at rather than
+    /// at the first scan after; a commit a builder has posted forms to
+    /// installs them and settles its batch as a scan-preceded commit
+    /// does. Built for the fully-unmerged lag point, where a publish
+    /// empties the table and the first reads after the burst build every
+    /// block they walk: nine hundred blocks at 13-20 µs each across a
+    /// thousand scans at a hundred thousand keys, a tenth of LMDB.
+    ///
+    /// Off, because the burst outruns the builder. That point seals a
+    /// dozen times and merges between, every publish restarts the
+    /// builder over the whole overlay, and the commits it posts to file
+    /// their batches: 63,000 of the burst's 100,000 writes were filed at
+    /// the commits, the writes ran 2.7x slower, and the scans still met
+    /// an empty table, since the last seal restarted the builder just
+    /// before them -- the point read 1.16x at a hundred thousand keys
+    /// and 0.92x at three hundred thousand. In the mixes the builder
+    /// restarted at each of F's seals reads ycsb-E at 0.84x-0.87x and F
+    /// at 0.80x-0.97x. `supdb-aheadpub` prices it. The count above,
+    /// which restarts by writes, is the other trigger and is also off.
+    pub build_ahead_on_publish: bool,
     /// EXPERIMENT: the share of the store, as a percentage of the keys
     /// its partitions hold, that may be unsealed before a commit stops
     /// maintaining the forms; zero is no bound, which is what the
@@ -699,6 +721,7 @@ impl Default for Options {
             snapshot_adopt_behind: 0,
             promote_entries: 0,
             build_ahead_on_commit: 0,
+            build_ahead_on_publish: false,
             forms_max_unsealed_pct: 0,
             forms_settle_backlog_pct: 5,
             forms_settle_recent_pct: 0,
@@ -6818,7 +6841,14 @@ impl Reader {
         let recent = self.opts.forms_settle_recent_pct == 0
             || writes - self.writes_at_scan.get()
                 <= (keys / 100 * self.opts.forms_settle_recent_pct) as u64;
-        let due = scans != self.scans_seen.get() || (backlog >= bound && recent);
+        // Forms the builder has posted are installed now, and the batch
+        // settled with them, so the first read after finds them in
+        // place; see `Options::build_ahead_on_publish`.
+        let posted =
+            self.ahead.borrow().as_ref().is_some_and(|a| {
+                !a.done.get() && a.posted.load(std::sync::atomic::Ordering::Acquire)
+            });
+        let due = scans != self.scans_seen.get() || (backlog >= bound && recent) || posted;
         if !due {
             return Ok(());
         }
@@ -9265,7 +9295,8 @@ impl Db {
     /// one over.
     fn build_ahead_if_due(&mut self) {
         let due = self.opts.build_ahead_on_commit;
-        if due == 0 || !self.opts.scan_block_cache {
+        let on_publish = self.opts.build_ahead_on_publish;
+        if (due == 0 && !on_publish) || !self.opts.scan_block_cache {
             return;
         }
         let running = self
@@ -9290,7 +9321,13 @@ impl Db {
         // with a hundred pieces reached its reads with one block built.
         let gen = self.state().gen;
         let fresh = gen != self.built_ahead_gen;
-        if !fresh && len - self.built_ahead_len < due {
+        if fresh && !on_publish && self.built_ahead_gen != 0 {
+            // Restarted by the count alone: the publish only resets it.
+            self.built_ahead_gen = gen;
+            self.built_ahead_len = len;
+            return;
+        }
+        if !fresh && (due == 0 || len - self.built_ahead_len < due) {
             return;
         }
         self.built_ahead_gen = gen;

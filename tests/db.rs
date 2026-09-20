@@ -4437,6 +4437,10 @@ fn a_store_below_the_seal_floor_still_seals_once_it_has_bytes() {
             }
         }
         db.commit().unwrap();
+        // The seal runs on its own thread and is published when a commit
+        // finds it finished: counted before it is joined, the piece was
+        // there or not by the disk's timing, one run in three.
+        db.settle().unwrap();
         let sealed = db.levels().1;
         assert!(after_load > 0, "cap {cap}: the load left partitions");
         (after_load, sealed)
@@ -4702,6 +4706,61 @@ fn the_forms_survive_a_seal() {
         "a merge starts the table afresh"
     );
     m.check(&db, "after the merge");
+}
+
+/// EXPERIMENT: a publish starts the builder and the next commit installs
+/// what it posted, with no scan asking: after a seal the table is empty,
+/// and with `build_ahead_on_publish` a commit with no scan before it
+/// fills it. Held to the model through a handle and the writer.
+#[test]
+fn a_publish_starts_the_builder_and_a_commit_installs_its_forms() {
+    let d = dir("ahead-publish");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        // The builder on a store this small.
+        scan_cache_ahead_min_blocks: 0,
+        forms_settle_backlog_pct: 0,
+        commit_forms: true,
+        build_ahead_on_publish: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 1, "several partitions");
+    for k in (0..1500u32).step_by(5) {
+        m.append(&mut db, &key(k), "v1");
+    }
+    db.commit().unwrap();
+    // The seal: a publish, and `settle` joins the builder it started.
+    db.seal().unwrap();
+    db.settle().unwrap();
+    assert_eq!(db.canonical_forms().0, 0, "the seal emptied the table");
+    // A commit with no scan before it: the builder's forms installed and
+    // published, the batch settled into them.
+    for k in (1..1500u32).step_by(11) {
+        m.append(&mut db, &key(k), "v2");
+    }
+    db.commit().unwrap();
+    let (forms, _, _, _) = db.canonical_forms();
+    assert!(
+        forms > 0,
+        "the commit installed the builder's forms: {forms}"
+    );
+    assert_ne!(db.forms_position(), usize::MAX, "and published them");
+    let r = db.reader().unwrap();
+    m.check(&r, "a reader over the installed forms");
+    m.check(&db, "the writer over its own");
 }
 
 /// EXPERIMENT: the backlog bound settles a burst only while the store

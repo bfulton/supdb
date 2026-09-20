@@ -909,6 +909,34 @@ mixes ran 25-30% cheaper and F read 1.10x-1.20x, while E read
 0.91x-0.95x, which has no mechanism yet. Publishing for readers that
 hold no handle is the lead this leaves.
 
+#### The builder from the publish, at the fully-unmerged point
+
+With the carry refuted, the same point was tried from the other side:
+the builder ahead, which already makes exactly the forms those scans
+build, started at the first commit after every publish instead of at
+the first scan, and its forms installed at the commits they arrive at
+rather than at that first scan, which had been paying 6-8 ms to splice
+in eight commits' writes. The burst outruns it. The point seals a
+dozen times and merges between, every publish restarts the builder
+over the whole overlay, and a commit the builder has posted to files
+its batch: 63,000 of the burst's 100,000 writes were filed at the
+commits, the writes ran 2.7x slower, and the scans still met an empty
+table, the last seal having restarted the builder just before them.
+The point read 1.16x at a hundred thousand keys and 0.92x at three
+hundred thousand, and in the mixes the builder restarted at each of
+F's seals read ycsb-E at 0.84x-0.87x and F at 0.80x-0.97x. It is off,
+`supdb-aheadpub` prices it, and a test holds the mechanism.
+
+What the point measures is now clear enough to state as a limitation
+rather than a bug. A burst that rewrites the store seals and merges as
+it goes and ends with several pieces standing; the scans that follow
+immediately walk blocks with four to eight sources each, and either
+they build the forms, at 13-20 µs a block, or something built them
+during the burst and the next publish dropped them. Only a form that
+survives a merge -- one keyed to content rather than to a partition's
+block -- or a cheaper build changes it, and the first is not the shape
+of this cache.
+
 #### Which half of the lag gap, by rung
 
 The build and the walk split by size, and the arms say which is which
