@@ -363,6 +363,9 @@ pub struct Supdb {
     /// Whether a publish starts the builder and a commit installs its
     /// forms. `supdb-aheadpub`.
     aheadpub: bool,
+    /// Whether the forms are published at every maintained commit, as
+    /// they were before they waited for a handle. `supdb-pubalways`.
+    pubalways: bool,
     /// The partitions' blocks below which no builder starts, or none for
     /// the engine's own. `supdb-ahead`.
     aheadmin: Option<usize>,
@@ -405,6 +408,9 @@ struct Policy {
     /// Whether a publish starts the builder and a commit installs its
     /// forms. `supdb-aheadpub`.
     aheadpub: bool,
+    /// Whether the forms are published at every maintained commit, as
+    /// they were before they waited for a handle. `supdb-pubalways`.
+    pubalways: bool,
     /// The builder's minimum blocks, or none for the engine's own.
     /// `supdb-ahead`.
     aheadmin: Option<usize>,
@@ -435,6 +441,7 @@ impl Default for Policy {
             recent: None,
             carry: false,
             aheadpub: false,
+            pubalways: false,
         }
     }
 }
@@ -536,6 +543,20 @@ impl Supdb {
             path,
             Policy {
                 aheadpub: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` publishing the forms at every maintained commit whether
+    /// or not a handle is live to take them, as it did before. Against
+    /// `supdb` it prices the copy every publish forces on the next patch
+    /// of the block, over the mixes and the sweep, where no handle is.
+    pub fn create_pubalways(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                pubalways: true,
                 ..Policy::default()
             },
         )
@@ -735,6 +756,7 @@ impl Supdb {
             recent,
             carry,
             aheadpub,
+            pubalways,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -812,6 +834,9 @@ impl Supdb {
             // The builder started by a publish and installed by a commit,
             // or started by a scan as it is.
             build_ahead_on_publish: aheadpub,
+            // The forms published for a handle, or at every maintained
+            // commit as they were.
+            forms_publish_lazily: !pubalways,
             // The unsealed share past which the maintenance stops, so an
             // arm can maintain whoever is reading without paying for it
             // on a store that is nearly all unmerged.
@@ -864,6 +889,7 @@ impl Supdb {
             recent,
             carry,
             aheadpub,
+            pubalways,
         })
     }
 }
@@ -906,6 +932,9 @@ impl Engine for Supdb {
         }
         if self.aheadpub {
             return "supdb-aheadpub";
+        }
+        if self.pubalways {
+            return "supdb-pubalways";
         }
         if self.recent.is_some() {
             return "supdb-recency";
@@ -1449,10 +1478,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
         "supdb" | "supdb-forms" | "supdb-settle" | "supdb-wforms" | "supdb-regime"
         | "supdb-noseal" | "supdb-ahead" | "supdb-lazyforms" | "supdb-eager" | "supdb-nosettle"
-        | "supdb-recency" | "supdb-carry" | "supdb-aheadpub" | "supdb-nosnap"
-        | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => {
-            Guarantee::Durable
-        }
+        | "supdb-recency" | "supdb-carry" | "supdb-aheadpub" | "supdb-pubalways"
+        | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb"
+        | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
     })
@@ -1470,6 +1498,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-recency" => Box::new(Supdb::create_recency(dir)?),
         "supdb-carry" => Box::new(Supdb::create_carry(dir)?),
         "supdb-aheadpub" => Box::new(Supdb::create_aheadpub(dir)?),
+        "supdb-pubalways" => Box::new(Supdb::create_pubalways(dir)?),
         "supdb-lazyforms" => Box::new(Supdb::create_lazyforms(dir)?),
         "supdb-ahead" => Box::new(Supdb::create_ahead(dir)?),
         "supdb-noseal" => Box::new(Supdb::create_noseal(dir)?),

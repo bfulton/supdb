@@ -445,6 +445,22 @@ shape is general: two copies of a structure, one kept current and one
 handed out, drift the first time the current one is dropped rather
 than replaced, and the handed-out copy needs a tombstone for that.
 
+**A flag set before the call that resets it.** `maintain_forms` set
+"the writes are filed into the tables" and then read the log, and the
+log read, finding the generation moved, dropped the tables and cleared
+the flag. Nothing set it again when the commit's own fill made the
+tables, because the two paths that had always made them, the scan and
+the install, set it themselves beside their call. So a writer whose
+first table over a state was the commit's fill -- a handle's scan asked
+for the maintenance, not the writer's own -- filed nothing into its
+forms for the rest of the state, and its scans answered a key's values
+short of every write since while the point read beside them answered
+right. Every test scanned through the writer before it wrote, which
+made the tables the other way. The flag is set where the table is made
+now. The rule: a flag that means "this structure exists" is set by the
+code that makes the structure, never by a caller that expects to, and
+a reset on one path is a reset on every path that shares it.
+
 **A sentinel that crosses the wasm boundary changes sign.** A wasm `u32`
 arrives in JavaScript as a signed i32, so a failure sentinel of `u32::MAX`
 arrives as -1 and a comparison against 4294967295 can never match. Every

@@ -937,6 +937,43 @@ survives a merge -- one keyed to content rather than to a partition's
 block -- or a cheaper build changes it, and the first is not the shape
 of this cache.
 
+#### Publishing for readers that exist
+
+The copy the carry made visible is the publish's: a canonical form is
+an `Arc` clone of the writer's own, so the next patch of that block
+copies it first, and the suite's mixes and its lag sweep hold no
+handle, so every publish there was for nobody. The forms are now
+published only while a handle the caller made is live, and all at once
+when one is claimed: the claim files the backlog and publishes every
+block left dirty, at the log's length when nothing is staged and at
+the next commit otherwise. The table's position and completeness move
+only when it publishes, which is what keeps a handle at an older
+commit finding the forms of that commit; `forms_to_writer` publishes
+regardless, since the writer is then a taker too. The builder ahead
+now skips the blocks the writer holds, whether published or not, since
+it used to learn that only from the published table. Against the arm
+that publishes at every maintained commit, `supdb-pubalways`, eleven
+pairs at a hundred thousand keys read the tenth-unmerged lag point at
+1.11x (10/11, p=0.012) and every mix within noise: the probe's F gain
+of a tenth to a fifth with publishing switched off did not survive
+pairing, and what remains is the first scan after a burst filing
+three thousand writes without copying a thousand blocks first.
+
+Writing the test for it found a fault older than any of this. The
+writer's first block table over a state was made by its own scan until
+the forms were maintained at commit; made by the commit's fill
+instead, because a handle's scan and not the writer's had asked for
+the maintenance, the flag that files writes into the tables stayed
+off. `maintain_forms` sets it before reading the log, and the log
+read resets it when the generation has moved, and the fill made the
+tables without setting it again, so from then to the next generation
+every write went unfiled: the writer's own scan answered a key short
+of the value it had just written while the point read beside it
+answered it, and the forms it published carried the same hole. The
+flag is set where a table is made now, and a test holds a handle's
+scan, the commit's fill, a staged write and the scans after it to the
+model.
+
 #### Which half of the lag gap, by rung
 
 The build and the walk split by size, and the arms say which is which

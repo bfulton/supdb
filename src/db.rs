@@ -544,6 +544,23 @@ pub struct Options {
     /// at 0.80x-0.97x. `supdb-aheadpub` prices it. The count above,
     /// which restarts by writes, is the other trigger and is also off.
     pub build_ahead_on_publish: bool,
+    /// EXPERIMENT: the canonical forms published only while a handle the
+    /// caller made is live to take them, and all at once when one is
+    /// claimed. A publish is an `Arc` clone of the writer's own form, so
+    /// every patch after it copies the block first, and a zipfian batch
+    /// of five thousand writes touches about a thousand blocks; the
+    /// suite's mixes and its lag sweep hold no handle, so every publish
+    /// there was for nobody. With no handle live the writer settles as
+    /// before and leaves the forms dirty; a claim files the backlog and
+    /// publishes every dirty form, at the log's length when nothing is
+    /// staged and at the next commit otherwise, and the table's position
+    /// and completeness move only when it publishes, so a handle at an
+    /// older commit still finds the forms of that commit. `false`
+    /// publishes at every maintained commit as before; `forms_to_writer`
+    /// publishes regardless, since the writer is then a taker too.
+    /// Eleven pairs at a hundred thousand keys: the tenth-unmerged lag
+    /// point at 1.11x (10/11, p=0.012), every mix within noise.
+    pub forms_publish_lazily: bool,
     /// EXPERIMENT: the share of the store, as a percentage of the keys
     /// its partitions hold, that may be unsealed before a commit stops
     /// maintaining the forms; zero is no bound, which is what the
@@ -722,6 +739,7 @@ impl Default for Options {
             promote_entries: 0,
             build_ahead_on_commit: 0,
             build_ahead_on_publish: false,
+            forms_publish_lazily: true,
             forms_max_unsealed_pct: 0,
             forms_settle_backlog_pct: 5,
             forms_settle_recent_pct: 0,
@@ -4395,6 +4413,8 @@ struct BlockTable {
     /// falls in, in creation order, each with the cut the write's seek
     /// found.
     added: Vec<Vec<(u32, u32)>>,
+    /// EXPERIMENT: blocks built or patched since the last publish.
+    dirty: Vec<bool>,
 }
 
 impl BlockTable {
@@ -4622,6 +4642,9 @@ struct Shared {
     /// how long ago the last one was; the state's own count restarts at
     /// every publish.
     scans_life: AtomicU64,
+    /// Handles the caller made and still holds: who the forms are
+    /// published for.
+    live_handles: AtomicUsize,
     /// Blocks materialised, by a handle the caller made and by the
     /// engine's own. These were added to size what sharing the block
     /// tables between handles would be worth, the last structure thought
@@ -4744,10 +4767,16 @@ pub struct Reader {
     /// from empty per write was a malloc, a realloc and a free apiece,
     /// two fifths of a settle's instructions.
     settle_run: std::cell::RefCell<Vec<u8>>,
-    /// EXPERIMENT: blocks whose form this handle built or patched since
-    /// the last commit, to publish as canonical at the next; the
-    /// writer's own handle alone fills it.
-    to_publish: std::cell::RefCell<Vec<(u32, u32)>>,
+    /// EXPERIMENT: whether any table holds a block built or patched
+    /// since the last publish; the writer's own handle alone sets it.
+    dirty_any: std::cell::Cell<bool>,
+    /// EXPERIMENT: whether every block an unsealed key overlays has a
+    /// form in this handle's tables, which the state's `forms_complete`
+    /// takes at each publish.
+    tables_complete: std::cell::Cell<bool>,
+    /// EXPERIMENT: a handle was claimed while writes were staged, so
+    /// the next commit publishes whether or not a scan preceded it.
+    publish_due: std::cell::Cell<bool>,
     /// EXPERIMENT: the state's scan count at the last commit this handle
     /// maintained the canonical forms at; a commit with the count
     /// unmoved maintains nothing.
@@ -4892,6 +4921,11 @@ impl Drop for Entered<'_> {
 impl Drop for Reader {
     fn drop(&mut self) {
         if let Some(slot) = self.slot {
+            if self.counted {
+                self.shared
+                    .live_handles
+                    .fetch_sub(1, AtomicOrdering::Relaxed);
+            }
             self.shared.readers.release(slot);
         }
     }
@@ -6203,7 +6237,8 @@ impl Reader {
         for t in self.tables.borrow().iter() {
             *t.borrow_mut() = None;
         }
-        self.to_publish.borrow_mut().clear();
+        self.dirty_any.set(false);
+        self.tables_complete.set(false);
         self.cache_used.set(false);
         self.cache_bytes.set(0);
         self.built.borrow_mut().clear();
@@ -6533,24 +6568,77 @@ impl Reader {
         self.publish_form(p, b, &marker);
     }
 
+    /// EXPERIMENT: whether the forms are published now: always when
+    /// `force`d or published eagerly, else only for a handle the caller
+    /// holds; see `Options::forms_publish_lazily`.
+    fn publishing(&self, force: bool) -> bool {
+        force
+            || !self.opts.forms_publish_lazily
+            || self.opts.forms_to_writer
+            || self.shared.live_handles.load(AtomicOrdering::Relaxed) > 0
+    }
+
     /// EXPERIMENT: every block this handle built or patched since the
     /// last publish, published: its form, or the mark for a block it
-    /// holds wide or no longer holds.
-    fn publish_touched(&self) {
-        let touched = std::mem::take(&mut *self.to_publish.borrow_mut());
-        if !self.opts.commit_forms_build {
-            return;
+    /// holds wide or no longer holds. Returns whether the table is
+    /// current to this handle's tables afterwards, which it is not when
+    /// nobody is publishing for and the blocks are left dirty.
+    fn publish_dirty(&self, force: bool) -> bool {
+        if !self.publishing(force) {
+            return false;
+        }
+        if !self.opts.commit_forms_build || !self.dirty_any.get() {
+            return true;
         }
         let tables = self.tables.borrow();
-        for (p, b) in touched {
-            let (p, b) = (p as usize, b as usize);
-            let Some(cell) = tables.get(p) else { continue };
-            let held = cell.borrow();
-            let Some(t) = held.as_ref() else { continue };
-            match t.slots.get(b).and_then(|s| s.as_ref()) {
-                Some(form) if !matches!(**form, Cached::Wide(_)) => self.publish_form(p, b, form),
-                _ => self.publish_marker(p, b),
+        for (p, cell) in tables.iter().enumerate() {
+            let mut held = cell.borrow_mut();
+            let Some(t) = held.as_mut() else { continue };
+            for b in 0..t.dirty.len() {
+                if !t.dirty[b] {
+                    continue;
+                }
+                t.dirty[b] = false;
+                match t.slots[b].as_ref() {
+                    Some(form) if !matches!(**form, Cached::Wide(_)) => {
+                        self.publish_form(p, b, form)
+                    }
+                    _ => self.publish_marker(p, b),
+                }
             }
+        }
+        self.dirty_any.set(false);
+        true
+    }
+
+    /// EXPERIMENT: the forms published for a handle just claimed, when
+    /// they were left dirty for want of one: the backlog filed so they
+    /// are current to the whole log, and every dirty block published at
+    /// the log's length. Only when nothing is staged -- the writer's own
+    /// scans settle staged writes into its tables, and a handle must not
+    /// find those -- and otherwise at the next commit.
+    fn publish_for_handle(&self) {
+        if self.slot.is_some() || !self.opts.commit_forms || !self.dirty_any.get() {
+            return;
+        }
+        let st = self.state();
+        if self.log_gen.get() != st.gen {
+            return;
+        }
+        let mem = self.mem();
+        if mem.log_len() != mem.committed_log() {
+            self.publish_due.set(true);
+            return;
+        }
+        self.sync_log();
+        if self.settle_pending().is_err() {
+            return;
+        }
+        if self.publish_dirty(true) {
+            st.forms_complete
+                .store(self.tables_complete.get(), AtomicOrdering::Release);
+            st.forms_at
+                .store(mem.committed_log(), AtomicOrdering::Release);
         }
     }
 
@@ -6848,7 +6936,10 @@ impl Reader {
             self.ahead.borrow().as_ref().is_some_and(|a| {
                 !a.done.get() && a.posted.load(std::sync::atomic::Ordering::Acquire)
             });
-        let due = scans != self.scans_seen.get() || (backlog >= bound && recent) || posted;
+        let due = scans != self.scans_seen.get()
+            || (backlog >= bound && recent)
+            || posted
+            || self.publish_due.replace(false);
         if !due {
             return Ok(());
         }
@@ -6892,7 +6983,7 @@ impl Reader {
         // thousand keys is a few hundred blocks.
         if self.opts.commit_forms_build
             && self.opts.scan_cache_bytes == 0
-            && !st.forms_complete.load(AtomicOrdering::Relaxed)
+            && !self.tables_complete.get()
         {
             if self.opts.scan_cache_ahead && self.ahead.borrow().is_none() {
                 self.start_ahead();
@@ -6903,12 +6994,18 @@ impl Reader {
                 let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
                 self.complete_forms(unsealed)?;
                 drop(cache);
-                st.forms_complete.store(true, AtomicOrdering::Release);
+                self.tables_complete.set(true);
             }
         }
-        self.publish_touched();
-        st.forms_at
-            .store(self.mem().committed_log(), AtomicOrdering::Release);
+        // The table's position and completeness move with a publish and
+        // only then: a handle at an older commit finds the forms of that
+        // commit until someone is here to take newer ones.
+        if self.publish_dirty(false) {
+            st.forms_complete
+                .store(self.tables_complete.get(), AtomicOrdering::Release);
+            st.forms_at
+                .store(self.mem().committed_log(), AtomicOrdering::Release);
+        }
         Ok(())
     }
 
@@ -6966,7 +7063,8 @@ impl Reader {
     /// `list_built` for a form whose size is known already.
     fn list_built_bytes(&self, p: usize, b: usize, table: &mut BlockTable, bytes: usize) {
         if self.opts.commit_forms && self.slot.is_none() {
-            self.to_publish.borrow_mut().push((p as u32, b as u32));
+            table.dirty[b] = true;
+            self.dirty_any.set(true);
         }
         self.cache_bytes.set(self.cache_bytes.get() + bytes);
         if bytes > 0 {
@@ -7181,9 +7279,7 @@ impl Reader {
                             .is_none_or(|f| matches!(f, Cached::Wide(_))),
                         "a block the writer holds no form for has none published as the block"
                     );
-                    self.state()
-                        .forms_complete
-                        .store(false, AtomicOrdering::Release);
+                    self.tables_complete.set(false);
                 }
                 self.patch_block(at, b, table, key, cut, slot)?;
             }
@@ -7230,7 +7326,8 @@ impl Reader {
             return Ok(());
         }
         if self.opts.commit_forms && self.slot.is_none() {
-            self.to_publish.borrow_mut().push((at as u32, b as u32));
+            table.dirty[b] = true;
+            self.dirty_any.set(true);
         }
         let np = self.segs().partition_point(|s| s.level > 0);
         let seg = &self.segs()[at];
@@ -7369,6 +7466,16 @@ impl Reader {
         l0: &[std::sync::Arc<Seg>],
         unsealed: &Snapshot,
     ) -> Result<BlockTable> {
+        // From here the writes are filed into the tables, whoever made
+        // this one. The scan path and the install set this beside their
+        // call and the commit's fill did not, and `sync_log` resets it
+        // when the generation moves -- after `maintain_forms` had set it
+        // -- so a writer whose first table over a state was the commit's
+        // fill, because a handle's scan and not its own asked for the
+        // maintenance, filed nothing into its forms for the rest of the
+        // state: its scans answered a key's values short of every write
+        // since, and so did the forms it published.
+        self.cache_used.set(true);
         let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
         let ctx = self.build_ctx();
         ctx.rank_pieces()?;
@@ -7403,6 +7510,7 @@ impl Reader {
             snap_gen: self.snap_gen.get(),
             added,
             filed,
+            dirty: vec![false; nblocks],
         })
     }
 
@@ -8459,6 +8567,7 @@ impl Db {
             rd_scans: AtomicU64::new(0),
             rd_blocks: AtomicU64::new(0),
             scans_life: AtomicU64::new(0),
+            live_handles: AtomicUsize::new(0),
             blk_reader: AtomicU64::new(0),
             blk_engine: AtomicU64::new(0),
             snap_extends: AtomicU64::new(0),
@@ -8480,7 +8589,9 @@ impl Db {
             pending: std::cell::RefCell::new(Vec::new()),
             settle_run: std::cell::RefCell::new(Vec::new()),
             built: std::cell::RefCell::new(Vec::new()),
-            to_publish: std::cell::RefCell::new(Vec::new()),
+            dirty_any: std::cell::Cell::new(false),
+            tables_complete: std::cell::Cell::new(false),
+            publish_due: std::cell::Cell::new(false),
             scans_seen: std::cell::Cell::new(0),
             scans_life_seen: std::cell::Cell::new(0),
             writes_seen: std::cell::Cell::new(0),
@@ -8754,6 +8865,7 @@ impl Db {
             rd_scans: AtomicU64::new(0),
             rd_blocks: AtomicU64::new(0),
             scans_life: AtomicU64::new(0),
+            live_handles: AtomicUsize::new(0),
             blk_reader: AtomicU64::new(0),
             blk_engine: AtomicU64::new(0),
             snap_extends: AtomicU64::new(0),
@@ -8775,7 +8887,9 @@ impl Db {
             pending: std::cell::RefCell::new(Vec::new()),
             settle_run: std::cell::RefCell::new(Vec::new()),
             built: std::cell::RefCell::new(Vec::new()),
-            to_publish: std::cell::RefCell::new(Vec::new()),
+            dirty_any: std::cell::Cell::new(false),
+            tables_complete: std::cell::Cell::new(false),
+            publish_due: std::cell::Cell::new(false),
             scans_seen: std::cell::Cell::new(0),
             scans_life_seen: std::cell::Cell::new(0),
             writes_seen: std::cell::Cell::new(0),
@@ -9656,6 +9770,12 @@ impl Reader {
             .readers
             .claim()
             .ok_or_else(|| err("reader table: every slot is taken"))?;
+        if counted {
+            self.shared
+                .live_handles
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            self.publish_for_handle();
+        }
         Ok(Reader {
             shared: self.shared.clone(),
             counted,
@@ -9673,7 +9793,9 @@ impl Reader {
             pending: std::cell::RefCell::new(Vec::new()),
             settle_run: std::cell::RefCell::new(Vec::new()),
             built: std::cell::RefCell::new(Vec::new()),
-            to_publish: std::cell::RefCell::new(Vec::new()),
+            dirty_any: std::cell::Cell::new(false),
+            tables_complete: std::cell::Cell::new(false),
+            publish_due: std::cell::Cell::new(false),
             scans_seen: std::cell::Cell::new(0),
             scans_life_seen: std::cell::Cell::new(0),
             writes_seen: std::cell::Cell::new(0),
@@ -9785,7 +9907,7 @@ impl Db {
         if self.settle_pending().is_err() {
             return false;
         }
-        self.publish_touched();
+        self.publish_dirty(true);
         // The writer's tables, remade for `next`: forms kept, the rest
         // walked again. A failure here leaves nothing carried.
         let l0 = &next.segs[np..];
@@ -9843,8 +9965,7 @@ impl Db {
         }
         cur.forms_moved.store(true, AtomicOrdering::Release);
         next.forms_at = AtomicUsize::new(0);
-        next.forms_complete =
-            std::sync::atomic::AtomicBool::new(cur.forms_complete.load(AtomicOrdering::Acquire));
+        next.forms_complete = std::sync::atomic::AtomicBool::new(self.tables_complete.get());
         next.forms_bytes = AtomicUsize::new(bytes);
         // This handle's log and snapshot bookkeeping, for `next`: the log
         // is read from its start, the snapshot built again.
@@ -10377,6 +10498,19 @@ impl Reader {
                 since.file(mem, e.key_off, e.key_len);
             }
         }
+        // The blocks this handle holds a form for: the builder has nothing
+        // to build for them, whether or not they are published.
+        let held: Vec<Vec<bool>> = self
+            .tables
+            .borrow()
+            .iter()
+            .map(|cell| {
+                cell.borrow()
+                    .as_ref()
+                    .map(|t| t.slots.iter().map(Option::is_some).collect())
+                    .unwrap_or_default()
+            })
+            .collect();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let posted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -10389,7 +10523,7 @@ impl Reader {
                 log: from,
                 len: live_len,
             };
-            let _ = r.build_ahead_job(at, &flag, &tx, &post);
+            let _ = r.build_ahead_job(at, &flag, &tx, &post, &held);
             drop(tx);
             post.store(true, std::sync::atomic::Ordering::Release);
         });
@@ -10745,6 +10879,7 @@ impl Reader {
         stop: &std::sync::atomic::AtomicBool,
         tx: &std::sync::mpsc::Sender<Built>,
         posted: &std::sync::atomic::AtomicBool,
+        held: &[Vec<bool>],
     ) -> Result<()> {
         let AtCommit { gen, wm, log, len } = at;
         if !self.pin_at(gen, wm, log) {
@@ -10782,6 +10917,7 @@ impl Reader {
                 snap_gen: 0,
                 added: (0..nblocks).map(|_| Vec::new()).collect(),
                 filed: 0,
+                dirty: vec![false; nblocks],
             };
             if table.clean_throughout() {
                 continue;
@@ -10807,15 +10943,21 @@ impl Reader {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     return Ok(());
                 }
-                // A block with a form published already -- carried across
-                // a seal -- has nothing to build for.
+                // A block the writer holds a form for, or one published
+                // already, has nothing to build for.
                 let published = self
                     .state()
                     .forms
                     .get(pi)
                     .and_then(|f| f.get(b))
                     .is_some_and(|s| !s.load(AtomicOrdering::Acquire).is_null());
-                if published {
+                if published
+                    || held
+                        .get(pi)
+                        .and_then(|h| h.get(b))
+                        .copied()
+                        .unwrap_or(false)
+                {
                     continue;
                 }
                 let n = BuildCtx::overlay_count(&table, b);

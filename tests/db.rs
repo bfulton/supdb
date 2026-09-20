@@ -4363,8 +4363,10 @@ fn the_writers_own_handle_takes_the_forms_it_maintains() {
         db.settle().unwrap();
         assert!(db.levels().0 > 1, "several partitions");
         let mut sink = 0usize;
-        // A scan over the state, so the commit after it has something to
-        // maintain for, then writes, then the commit that maintains.
+        // A handle the forms are published for, a scan over the state so
+        // the commit after it has something to maintain for, then writes,
+        // then the commit that maintains.
+        let _handle = db.reader().unwrap();
         db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
             .unwrap();
         for k in (0..1500u32).step_by(5) {
@@ -4490,7 +4492,9 @@ fn a_write_burst_is_settled_once_its_backlog_passes_the_bound() {
         m.flushed();
         db.settle().unwrap();
         assert!(db.levels().0 > 1, "several partitions");
-        // One scan and a commit, so the forms exist and are current.
+        // A handle the forms are published for, and one scan and a
+        // commit, so the forms exist and are current.
+        let _handle = db.reader().unwrap();
         let mut sink = 0usize;
         db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
             .unwrap();
@@ -4742,7 +4746,9 @@ fn a_publish_starts_the_builder_and_a_commit_installs_its_forms() {
         m.append(&mut db, &key(k), "v1");
     }
     db.commit().unwrap();
-    // The seal: a publish, and `settle` joins the builder it started.
+    // A handle the forms are published for. The seal: a publish, and
+    // `settle` joins the builder it started.
+    let _handle = db.reader().unwrap();
     db.seal().unwrap();
     db.settle().unwrap();
     assert_eq!(db.canonical_forms().0, 0, "the seal emptied the table");
@@ -4761,6 +4767,162 @@ fn a_publish_starts_the_builder_and_a_commit_installs_its_forms() {
     let r = db.reader().unwrap();
     m.check(&r, "a reader over the installed forms");
     m.check(&db, "the writer over its own");
+}
+
+/// EXPERIMENT: the forms are published for a handle and not before.
+/// Commits with no handle live leave the table where it was, so a
+/// handle at that commit still finds its forms; a claim files the
+/// backlog and publishes everything dirty, at once when nothing is
+/// staged and at the next commit otherwise. Held to the model through
+/// the handle and the writer at each step.
+#[test]
+fn the_forms_are_published_when_a_handle_asks() {
+    let d = dir("publish-lazily");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        forms_settle_backlog_pct: 0,
+        commit_forms: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 1, "several partitions");
+    let mut sink = 0usize;
+    for k in (0..1500u32).step_by(5) {
+        m.append(&mut db, &key(k), "v1");
+    }
+    db.commit().unwrap();
+    // A handle's scan and a commit: maintained and, with the handle
+    // live, published.
+    let r = db.reader().unwrap();
+    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    db.commit().unwrap();
+    let at_first = db.forms_position();
+    assert_ne!(at_first, usize::MAX, "published for the handle");
+    assert!(db.canonical_forms().0 > 0);
+    drop(r);
+    // Writes and commits with no handle live: settled at the commits a
+    // scan precedes, published for nobody, the table left where it was.
+    for round in 0..3u32 {
+        for k in (round..1500u32).step_by(7) {
+            m.append(&mut db, &key(k), "quiet");
+        }
+        db.scan(key(0).as_bytes(), 10, |_k, v| sink += v.len())
+            .unwrap();
+        db.commit().unwrap();
+    }
+    assert_eq!(
+        db.forms_position(),
+        at_first,
+        "nothing published with no handle to publish for"
+    );
+    m.check(&db, "the writer over its own forms, unpublished");
+    // A claim: the backlog filed and the forms published at the log's
+    // length, which the handle reads at.
+    let r = db.reader().unwrap();
+    let published = db.forms_position();
+    assert!(
+        published != usize::MAX && published > at_first,
+        "published at the claim: {published} after {at_first}"
+    );
+    let (_, hit0) = db.canonical_tries();
+    m.check(&r, "a handle over the forms published at its claim");
+    let (_, hit1) = db.canonical_tries();
+    assert!(hit1 > hit0, "the handle took them");
+    m.check(&db, "the writer beside it");
+    drop(r);
+    // Staged writes when a handle is claimed: nothing published until
+    // the commit, which then publishes whether or not a scan preceded.
+    for k in (3..1500u32).step_by(11) {
+        m.append(&mut db, &key(k), "staged");
+    }
+    db.scan(key(0).as_bytes(), 10, |_k, v| sink += v.len())
+        .unwrap();
+    let r = db.reader().unwrap();
+    assert_eq!(
+        db.forms_position(),
+        published,
+        "staged writes: not published at the claim"
+    );
+    db.commit().unwrap();
+    assert!(
+        db.forms_position() > published,
+        "published at the commit after the claim"
+    );
+    let r2 = db.reader().unwrap();
+    m.check(&r2, "a handle after the commit, over the forms");
+    m.check(&r, "the earlier handle, after the commit");
+    m.check(&db, "the writer");
+    std::hint::black_box(sink);
+}
+
+/// A table the commit's fill made is one the writes after it are filed
+/// into. The writer's first table over a state was made by its own scan
+/// until the forms were maintained at commit; made by the commit's fill
+/// instead -- a handle's scan asked for the maintenance, not the
+/// writer's -- the flag that files writes into the tables stayed off,
+/// and every write after went unfiled for the rest of the state: the
+/// writer's own scan answered key 0 short of the value it had just
+/// written, while the point read beside it answered it, and the forms
+/// it published carried the same hole.
+#[test]
+fn a_table_the_commit_filled_takes_the_writes_after_it() {
+    let d = dir("commit-filled-table");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        forms_settle_backlog_pct: 0,
+        commit_forms: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 1, "several partitions");
+    let mut sink = 0usize;
+    for k in (0..1500u32).step_by(5) {
+        m.append(&mut db, &key(k), "v1");
+    }
+    db.commit().unwrap();
+    // A handle's scan, not the writer's, and the commit that maintains:
+    // the writer's tables are the commit's fill.
+    let r = db.reader().unwrap();
+    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    db.commit().unwrap();
+    assert!(db.canonical_forms().0 > 0, "maintained");
+    // A write staged, the writer's own scan, and the commit: the scan
+    // and the read agree at each step, and a handle after the commit.
+    m.append(&mut db, &key(0), "after");
+    m.check(&db, "the writer with a write staged past the fill");
+    db.commit().unwrap();
+    m.check(&db, "the writer after the commit");
+    let r = db.reader().unwrap();
+    m.check(&r, "a handle over the forms after the commit");
+    std::hint::black_box(sink);
 }
 
 /// EXPERIMENT: the backlog bound settles a burst only while the store
@@ -4802,7 +4964,9 @@ fn a_burst_is_settled_by_its_backlog_only_near_a_scan() {
             .unwrap();
         std::hint::black_box(sink);
     };
-    // One scan and a commit, so the forms exist and are current.
+    // A handle the forms are published for, and one scan and a commit,
+    // so the forms exist and are current.
+    let _handle = db.reader().unwrap();
     scan(&db);
     db.commit().unwrap();
     let at_scan = db.forms_position();
