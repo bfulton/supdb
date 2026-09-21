@@ -454,7 +454,7 @@ impl OrdIndex {
         };
         if self.pfx > 0 {
             let m = self.pfx.min(key.len()).min(prefix.len());
-            match key[..m].cmp(&prefix[..m]) {
+            match cmp_short(&key[..m], &prefix[..m]) {
                 std::cmp::Ordering::Less => return from,
                 std::cmp::Ordering::Greater => return self.n,
                 std::cmp::Ordering::Equal if m < self.pfx => return from,
@@ -547,7 +547,7 @@ impl OrdIndex {
                 },
             };
             let m = m.min(first.len());
-            match key[..m].cmp(&first[..m]) {
+            match cmp_short(&key[..m], &first[..m]) {
                 std::cmp::Ordering::Less => return lo,
                 std::cmp::Ordering::Greater => return hi,
                 std::cmp::Ordering::Equal if m < self.pfx => return lo,
@@ -665,7 +665,7 @@ impl OrdIndex {
                 },
             };
             let m = m.min(first.len());
-            match key[..m].cmp(&first[..m]) {
+            match cmp_short(&key[..m], &first[..m]) {
                 std::cmp::Ordering::Less => return (0, Some(false)),
                 std::cmp::Ordering::Greater => return (self.n, Some(false)),
                 std::cmp::Ordering::Equal if m < self.pfx => return (0, Some(false)),
@@ -732,6 +732,44 @@ impl OrdIndex {
     }
 }
 
+/// Two slices of one short length compared in place, a word at a time
+/// and then a byte: the prefix compare at every seek is of a dozen bytes,
+/// and `<[u8]>::cmp` answered it through `memcmp`, a hundred instructions
+/// of call and dispatch for one word compare.
+fn cmp_short(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len().min(b.len());
+    let word =
+        |s: &[u8], i: usize| u64::from_be_bytes(s[i..i + 8].try_into().expect("eight bytes"));
+    let mut i = 0usize;
+    while i + 8 <= n {
+        let (x, y) = (word(a, i), word(b, i));
+        if x != y {
+            return x.cmp(&y);
+        }
+        i += 8;
+    }
+    if i < n {
+        if n >= 8 {
+            // The tail as the last word, overlapping bytes already equal:
+            // the first byte that differs is past them, so the word's
+            // order is the tail's.
+            let (x, y) = (word(a, n - 8), word(b, n - 8));
+            if x != y {
+                return x.cmp(&y);
+            }
+        } else {
+            while i < n {
+                if a[i] != b[i] {
+                    return a[i].cmp(&b[i]);
+                }
+                i += 1;
+            }
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
 /// The first index in `a`, sorted, whose value is not below `h`, or
 /// `a.len()`: `partition_point(|&s| s < h)`, with the step a select.
 fn lower_bound(a: &[u64], h: u64) -> usize {
@@ -741,6 +779,32 @@ fn lower_bound(a: &[u64], h: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_short_compare_answers_as_the_slice_compare_does() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for n in [0usize, 1, 3, 7, 8, 9, 12, 15, 16, 17, 24, 31] {
+            for _ in 0..300 {
+                let a: Vec<u8> = (0..n).map(|_| (next() % 3) as u8).collect();
+                let mut b = a.clone();
+                if n > 0 && next() % 2 == 0 {
+                    let i = (next() as usize) % n;
+                    b[i] = (next() % 3) as u8;
+                }
+                assert_eq!(
+                    cmp_short(&a, &b),
+                    a.as_slice().cmp(b.as_slice()),
+                    "{a:?} {b:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn the_select_search_answers_as_partition_point_does() {

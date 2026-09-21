@@ -1652,12 +1652,25 @@ impl<B: Bytes> Blob<B> {
         // 37-44M to 45-50M at three hundred thousand.
         if let Some((idx, recs, dir)) = walk {
             let nkeys = idx.len();
-            while seen < limit && rank < nkeys {
-                let Some(off) = crate::flatindex::rd_u32(dir, rank * 4) else {
+            // The directory words from `rank` on, as many as the scan may
+            // take, through an iterator whose end is the loop's one test:
+            // a bounds check on the word, a compare of the rank against
+            // the key count and one of the count against the limit were
+            // seven of the loop's fifty-six instructions an entry. Each
+            // region of a record is read as an array of its exact size,
+            // so a word read is one load: the count word was read as four
+            // bytes and reassembled, nine instructions for one.
+            let want = limit.saturating_sub(seen).min(nkeys.saturating_sub(rank));
+            let words = dir
+                .get(rank * 4..(rank + want) * 4)
+                .unwrap_or(&[])
+                .chunks_exact(4);
+            for w in words {
+                let off = u32::from_le_bytes([w[0], w[1], w[2], w[3]]) as usize;
+                let Some(h) = recs.get(off..off + 4) else {
                     break;
                 };
-                let off = off as usize;
-                let Some(h) = recs.get(off..off + 4) else {
+                let Ok(h) = <&[u8; 4]>::try_from(h) else {
                     break;
                 };
                 let klen = u16::from_le_bytes([h[0], h[1]]) as usize;
@@ -1669,13 +1682,17 @@ impl<B: Bytes> Blob<B> {
                 let Some(eb) = recs.get(e_at..e_at + 20) else {
                     break;
                 };
-                let block = u32::from_le_bytes([eb[0], eb[1], eb[2], eb[3]]);
-                let count = u32::from_le_bytes([eb[16], eb[17], eb[18], eb[19]]);
+                let Ok(eb) = <&[u8; 20]>::try_from(eb) else {
+                    break;
+                };
+                let word = |i: usize| u32::from_le_bytes([eb[i], eb[i + 1], eb[i + 2], eb[i + 3]]);
+                let block = word(0);
+                let count = word(16);
                 if block != Ext::INLINE || count & Ext::FIXED == 0 {
                     break;
                 }
-                let eoff = u32::from_le_bytes([eb[4], eb[5], eb[6], eb[7]]) as usize;
-                let elen = u32::from_le_bytes([eb[8], eb[9], eb[10], eb[11]]) as usize;
+                let eoff = word(4) as usize;
+                let elen = word(8) as usize;
                 let records = (count & !(Ext::TOMBSTONE | Ext::FIXED)) as usize;
                 if records == 0 || elen == 0 {
                     return Err(corrupt("fixed run's length is not a multiple of its count"));

@@ -4550,10 +4550,22 @@ pub(crate) fn prefetch_lines(ptr: *const u8, bytes: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        // Four lines a step: the loop's compare and add per line were
+        // twice the prefetch itself, over the sixty-four lines of a
+        // block walk's span, on every block a scan crosses.
+        // SAFETY: a prefetch is a hint that faults on no address, and
+        // every address here is inside the buffer.
         let mut off = 0usize;
+        while off + 256 <= bytes {
+            unsafe {
+                _mm_prefetch(ptr.add(off) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(ptr.add(off + 64) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(ptr.add(off + 128) as *const i8, _MM_HINT_T0);
+                _mm_prefetch(ptr.add(off + 192) as *const i8, _MM_HINT_T0);
+            }
+            off += 256;
+        }
         while off < bytes {
-            // SAFETY: a prefetch is a hint that faults on no address, and
-            // every address here is inside the buffer.
             unsafe { _mm_prefetch(ptr.add(off) as *const i8, _MM_HINT_T0) };
             off += 64;
         }
@@ -6890,17 +6902,25 @@ impl Reader {
         // replacement, and this handle is pinned for the operation or is
         // the writer's own, which frees nothing while it reads.
         let e = unsafe { &*e };
+        Some(&e.form)
+    }
+
+    /// The forms a scan took, counted once at its end: counted at each
+    /// take it was an atomic add per block on a scan of two or three.
+    fn count_takes(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
         match self.slot {
             Some(slot) => {
                 self.shared.readers.slots[slot]
                     .takes
-                    .fetch_add(1, AtomicOrdering::Relaxed);
+                    .fetch_add(n, AtomicOrdering::Relaxed);
             }
             None => {
-                self.shared.form_takes.fetch_add(1, AtomicOrdering::Relaxed);
+                self.shared.form_takes.fetch_add(n, AtomicOrdering::Relaxed);
             }
         }
-        Some(&e.form)
     }
 
     /// EXPERIMENT: the writer installs `form` as block `b` of partition
@@ -8190,6 +8210,7 @@ impl Reader {
             // one before, as the next block it would cross into: the
             // same span from the same rank, issued twice.
             let mut fetched = false;
+            let mut takes = 0u64;
             while seen < limit && b < nblocks {
                 let lo = b * CACHE_BLOCK;
                 let hi = ((b + 1) * CACHE_BLOCK).min(keys);
@@ -8201,7 +8222,10 @@ impl Reader {
                 let canon: Option<&Cached> =
                     match canonical.then(|| self.canonical(pi, b)).flatten() {
                         Some(Cached::Wide(_)) => None,
-                        Some(f) => Some(f),
+                        Some(f) => {
+                            takes += 1;
+                            Some(f)
+                        }
                         None if complete => Some(&Cached::Clean),
                         None => None,
                     };
@@ -8272,7 +8296,10 @@ impl Reader {
                 fetched = false;
                 if hi - start < ahead && b + 1 < nblocks {
                     let next = match canonical.then(|| self.canonical(pi, b + 1)).flatten() {
-                        Some(f) => Some(f),
+                        Some(f) => {
+                            takes += 1;
+                            Some(f)
+                        }
                         None if complete => Some(&Cached::Clean),
                         None => table.slots[b + 1].as_deref(),
                     };
@@ -8377,6 +8404,7 @@ impl Reader {
                 b += 1;
                 first = false;
             }
+            self.count_takes(takes);
             match &seg.hi {
                 Some(h) => cursor = h.as_slice(),
                 None => break,
@@ -12389,7 +12417,14 @@ impl<'s> BuildCtx<'s> {
         let hi = ranks.end;
         let mut seen = 0usize;
         let mut rank = ranks.start;
-        let di = select_lower_bound(blk.ents.len(), |i| blk.key(&blk.ents[i]) < cursor);
+        // Every block after a scan's first is walked from its start, and
+        // the search below answered zero for each of them at the cost of
+        // a search.
+        let di = if cursor.is_empty() {
+            0
+        } else {
+            select_lower_bound(blk.ents.len(), |i| blk.key(&blk.ents[i]) < cursor)
+        };
         for e in &blk.ents[di..] {
             let cut = (e.cut as usize).max(rank);
             if cut > rank && seen < limit {

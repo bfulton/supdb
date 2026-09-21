@@ -1179,6 +1179,38 @@ Together the mixed scan on two threads at ten thousand keys reads 1.85
 µs to 1.57 in the probe and the pass 189 µs to 160. The suite's figures
 are in the pull request.
 
+A second round over the same profile, at 9,240 instructions a scan of
+a hundred entries after the first. The record walk's loop compiled to
+fifty-six instructions an entry, and the assembly said where nine of
+them went: the `count` word read as four bytes and reassembled, and the
+directory word's bounds check with the loop's two tests. Read as arrays
+of exact size every word is one load; walked through `chunks_exact`
+over the exact span the scan may take, the iterator's end is the
+loop's one test -- and through `take` on an open span it was not, the
+adapter costing what the checks it replaced had cost, which is worth
+knowing before reaching for one. Four bounds checks an entry remain,
+one of them on the key slice that the extent's check already implies,
+and they stay: the check that makes it unnecessary is on arithmetic
+that wraps on a 32-bit target with a directory word an untrusted file
+supplies. The seek compared the query's first dozen bytes against the
+common prefix through `memcmp`, a hundred instructions of call and
+dispatch for two word compares, and compares them in place now. The
+sparse walk searched its deltas for the scan's cursor on every block,
+when every block after the first is walked from its start. A handle
+bumped its slot's take counter once per block, an atomic add on a scan
+of two or three; it counts once at the scan's end. The prefetch loop's
+compare and add per line were twice the prefetch itself, and it steps
+four lines.
+
+Together 8,300 instructions a scan, ten percent fewer, and the probe
+paired against the first round's head, fifteen passes with fresh
+handles and the minimum, three rounds: at ten thousand keys the mixed
+scan through a handle 1.04 µs to 0.85 and the clean 0.65 to 0.57, E 12%
+faster; at thirty thousand the mixed 1.28 to 1.18, the clean 0.81 to
+0.75, E 6%. (The machine had changed under the session between the
+rounds, and every figure here is faster than the round before for that
+reason; the pairs are what hold.)
+
 #### Address translation over a 46 MB partition
 
 What is left of the scan at three hundred thousand keys grows with the
