@@ -520,17 +520,39 @@ pub struct Options {
     /// quarters of its keys or more, counting every source's run over
     /// it -- is walked on a read's first touch rather than copied,
     /// since every partition record under such a run is masked by its
-    /// update's tombstone and the copy would be a copy of the run.
+    /// update's tombstone and the copy would be a copy of the run, and
+    /// copied on its second, since a block read over and over wants
+    /// the copy.
     /// `docs/engine.md` has the pricing: on the lag sweep's last point at
     /// ten thousand keys the handle passes read 8.0 µs a scan against
     /// 9.7 without, level at thirty thousand where the pieces' keys are
     /// read per window either way, and the writer's own pass reads
     /// slower by the copy, which lands in the first scan after a burst
     /// -- at ten thousand keys 1.5 ms over ten thousand chains, half the
-    /// pass. Off, and `supdb-runs` prices it; a version that pays the
-    /// copy at the commit, from the batch's own slots, is the write-time
-    /// structure this is the read half of.
+    /// pass. Off, and `supdb-runs` prices it; `snapshot_keeper` pays the
+    /// copy at the commit instead, on a thread of the store's own, and
+    /// is the write-time structure this is the read half of.
     pub snapshot_runs: bool,
+    /// EXPERIMENT: the run keeper, a thread of the store's own at idle
+    /// priority that keeps the published scan snapshot current to the
+    /// commits. Polling them once a scan has happened over the store,
+    /// it appends the batches' keys and runs to the snapshot's shared
+    /// arena and publishes the extended version, so the first scan
+    /// after a burst adopts a snapshot that has the burst instead of
+    /// sorting it and copying its runs -- the copy that landed in the
+    /// writer's first scan under `snapshot_runs` alone, or inline at
+    /// each commit where the forms are maintained there. It carries the
+    /// snapshot across a seal, the live entries becoming frozen ones at
+    /// the freeze and leaving when the seal lands, and across a merge
+    /// unchanged. Off, and `supdb-keeper` prices it beside `supdb-runs`;
+    /// `docs/engine.md` has the figures.
+    pub snapshot_keeper: bool,
+    /// EXPERIMENT: how far past the last scan over the store the keeper
+    /// follows the writes, as a percentage of the store's sealed keys,
+    /// before it waits for a scan: its copy is a copy of every value
+    /// written, and a load with no read in sight is not worth doubling
+    /// in memory. Zero follows every write.
+    pub snapshot_keeper_recent_pct: usize,
     /// EXPERIMENT: entries reads must have taken from a block before the
     /// store holds it a second way, as a merged copy beside the cheap
     /// form, so that the reads ask for the shape rather than the writes
@@ -788,6 +810,8 @@ impl Default for Options {
             share_snapshot: true,
             snapshot_adopt_behind: 0,
             snapshot_runs: false,
+            snapshot_keeper: false,
+            snapshot_keeper_recent_pct: 100,
             promote_entries: 0,
             build_ahead_on_commit: 0,
             build_ahead_on_publish: false,
@@ -3321,6 +3345,10 @@ impl MemTable {
         self.keys.used()
     }
 
+    fn value_bytes(&self) -> usize {
+        self.vals.used()
+    }
+
     fn tombs(&self) -> usize {
         self.tombs.load(AtomicOrdering::Relaxed)
     }
@@ -4666,6 +4694,10 @@ enum Cached {
 struct WideBlock {
     sorted: Vec<(u32, u32)>,
     seen: usize,
+    /// PROTOTYPE: wide by the covered rule rather than by its count of
+    /// keys, so a second touch copies it; and the touches so far.
+    covered: bool,
+    walks: u32,
 }
 
 /// PROTOTYPE: keys above the partition, as `overlay_count` counts them,
@@ -5141,6 +5173,20 @@ struct Shared {
     /// run rather than sorting everything again; the count that should
     /// rise where `snap_builds` stops.
     snap_extends: AtomicU64,
+    /// PROTOTYPE: the run keeper's thread, for a publish and a settle
+    /// to wake; a commit and a scan wake nothing, since the keeper
+    /// polls for those -- see `Reader::keep`. The flush sequence a
+    /// settle raises and the keeper answers once the snapshot is
+    /// current; and what the keeper has published, for a test: versions
+    /// extended, and versions carried across a publish.
+    keeper_thread: std::sync::OnceLock<std::thread::Thread>,
+    keeper_seq: AtomicU64,
+    keeper_done: AtomicU64,
+    snap_kept: AtomicU64,
+    snap_carried: AtomicU64,
+    /// PROTOTYPE: handles that took the published snapshot over their
+    /// own under the keeper's rule; for a test.
+    snap_switched: AtomicU64,
 }
 
 /// EXPERIMENT: a replaced canonical form on its way to being freed. A
@@ -5396,6 +5442,8 @@ pub struct Db {
     /// other's at its start, so the two run beside each other.
     tiering: Option<Compaction>,
     sealing: Option<std::thread::JoinHandle<Result<Vec<String>>>>,
+    /// PROTOTYPE: the run keeper, once the first commit has started it.
+    keeper: Option<Keeper>,
 }
 
 /// A read in progress on a handle; dropping it ends the read.
@@ -5459,28 +5507,244 @@ const NO_RUN: u32 = u32::MAX;
 /// stands in, and nothing reads a run from it.
 static NO_SNAPSHOT: std::sync::LazyLock<Snapshot> = std::sync::LazyLock::new(Snapshot::default);
 
+/// PROTOTYPE: the arena a snapshot's key bytes and copied runs live in,
+/// shared by every version of one snapshot and appended to by whichever
+/// thread extends or files into one: the run keeper on its own thread, a
+/// handle carrying a published snapshot forward at a scan, a handle
+/// filing its own keys. A version names bytes by offset, and an offset
+/// once written never moves or changes, so a version is a set of entries
+/// over an arena that outlives it -- which is what lets an extension
+/// append the batch alone where the version before it copied every key
+/// and every run of the base into a fresh pair of vectors first, 1.4 MB
+/// at ten thousand keys, for every batch.
+///
+/// Blocks double from a base sized at the build, so the block an offset
+/// falls in is arithmetic and not a search. A reservation is one
+/// fetch-add on the tail, retried past a block's end, and the first
+/// reservation into a block allocates it: no thread waits on another,
+/// which matters because the keeper runs at idle priority and a lock it
+/// held while descheduled would hold a scan at that priority too. Bytes
+/// are read only through an entry published after they were written.
+struct SnapArena {
+    /// Block `b` holds `1 << (base_shift + b)` bytes and starts at
+    /// offset `((1 << b) - 1) << base_shift`.
+    base_shift: u32,
+    blocks: [AtomicPtr<u8>; SNAP_BLOCKS],
+    tail: AtomicUsize,
+}
+
+const SNAP_BLOCKS: usize = 32;
+/// The smallest base block, for a snapshot over a handful of keys.
+const SNAP_BASE_SHIFT: u32 = 12;
+
+impl Default for SnapArena {
+    fn default() -> SnapArena {
+        SnapArena::with_capacity(0)
+    }
+}
+
+impl SnapArena {
+    /// An arena whose first block holds `bytes`, so a build of that many
+    /// allocates once.
+    fn with_capacity(bytes: usize) -> SnapArena {
+        let base_shift = bytes
+            .next_power_of_two()
+            .trailing_zeros()
+            .max(SNAP_BASE_SHIFT);
+        SnapArena {
+            base_shift,
+            blocks: std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut())),
+            tail: AtomicUsize::new(0),
+        }
+    }
+
+    /// The block an offset falls in, and the offset within it.
+    #[inline]
+    fn locate(&self, off: usize) -> (usize, usize) {
+        let q = (off >> self.base_shift) + 1;
+        let b = (usize::BITS - 1 - q.leading_zeros()) as usize;
+        let start = ((1usize << b) - 1) << self.base_shift;
+        (b, off - start)
+    }
+
+    #[inline]
+    fn cap(&self, b: usize) -> usize {
+        1usize << (self.base_shift + b as u32)
+    }
+
+    /// `n` contiguous bytes, at the offset returned. Any thread.
+    fn reserve(&self, n: usize) -> u32 {
+        loop {
+            let off = self.tail.fetch_add(n, AtomicOrdering::Relaxed);
+            assert!(
+                off + n <= u32::MAX as usize,
+                "snapshot arena: more bytes than it addresses"
+            );
+            let (b, w) = self.locate(off);
+            let cap = self.cap(b);
+            if w + n > cap {
+                // Past this block's end: what is left of the block is
+                // left, and the next try lands in the one after.
+                continue;
+            }
+            assert!(b < SNAP_BLOCKS, "snapshot arena: more blocks than it has");
+            if self.blocks[b].load(AtomicOrdering::Acquire).is_null() {
+                let layout =
+                    std::alloc::Layout::from_size_align(cap, 64).expect("arena block layout");
+                // Not zeroed: a byte is read only past a write that
+                // covered it. SAFETY: a non-zero layout; the block is
+                // freed by `Drop`, or below when another thread's won.
+                let p = unsafe { std::alloc::alloc(layout) };
+                assert!(!p.is_null(), "snapshot arena: out of memory");
+                if self.blocks[b]
+                    .compare_exchange(
+                        std::ptr::null_mut(),
+                        p,
+                        AtomicOrdering::AcqRel,
+                        AtomicOrdering::Acquire,
+                    )
+                    .is_err()
+                {
+                    // SAFETY: allocated just above with this layout, and
+                    // published nowhere.
+                    unsafe { std::alloc::dealloc(p, layout) };
+                }
+            }
+            return off as u32;
+        }
+    }
+
+    fn block(&self, off: usize, len: usize) -> (*mut u8, usize) {
+        let (b, w) = self.locate(off);
+        let p = self.blocks[b].load(AtomicOrdering::Acquire);
+        assert!(
+            !p.is_null(),
+            "snapshot arena: an offset past what was written"
+        );
+        assert!(
+            w + len <= self.cap(b),
+            "snapshot arena: a read past its block"
+        );
+        (p, w)
+    }
+
+    /// `bytes` into a reserved range at `off`.
+    fn write(&self, off: u32, bytes: &[u8]) {
+        let (p, w) = self.block(off as usize, bytes.len());
+        // SAFETY: inside the block, a range this thread reserved and no
+        // reader can reach until an entry naming it is published.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.add(w), bytes.len()) };
+    }
+
+    fn append(&self, bytes: &[u8]) -> u32 {
+        let off = self.reserve(bytes.len());
+        self.write(off, bytes);
+        off
+    }
+
+    /// Published bytes at `off`.
+    #[inline]
+    fn slice(&self, off: u32, len: u32) -> &[u8] {
+        let (p, w) = self.block(off as usize, len as usize);
+        // SAFETY: inside a block that lives as long as the arena, bytes
+        // written before the entry that names them was published.
+        unsafe { std::slice::from_raw_parts(p.add(w), len as usize) }
+    }
+
+    /// Bytes reserved so far, the left-over tails of blocks included.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.tail.load(AtomicOrdering::Relaxed)
+    }
+
+    /// PROTOTYPE: the whole chain of `e` appended, oldest chunk first,
+    /// as a count and then each chunk's memtable offset, its length and,
+    /// for a value, its bytes, in one contiguous reservation. Returns
+    /// where the run starts.
+    fn copy_run(&self, mem: &MemTable, e: &MemEntry, scratch: &mut Vec<(u64, u32)>) -> u32 {
+        scratch.clear();
+        let mut at = MemTable::head(e);
+        let mut bytes = 4usize;
+        while at != NO_CHUNK {
+            let len = mem.chunk_len(at);
+            bytes += 12 + if len == TOMB_LEN { 0 } else { len as usize };
+            scratch.push((at, len));
+            at = mem.chunk_prev(at);
+        }
+        let off = self.reserve(bytes);
+        let mut p = off;
+        self.write(p, &(scratch.len() as u32).to_le_bytes());
+        p += 4;
+        for &(at, len) in scratch.iter().rev() {
+            self.write(p, &at.to_le_bytes());
+            self.write(p + 8, &len.to_le_bytes());
+            p += 12;
+            if len != TOMB_LEN {
+                self.write(p, mem.value_at(at as usize));
+                p += len;
+            }
+        }
+        off
+    }
+
+    /// The bytes a run at `off` takes.
+    fn run_len(&self, off: u32) -> u32 {
+        let n = self.word(off);
+        let mut p = off + 4;
+        for _ in 0..n {
+            let len = self.word(p + 8);
+            p += 12 + if len == TOMB_LEN { 0 } else { len };
+        }
+        p - off
+    }
+
+    fn word(&self, off: u32) -> u32 {
+        u32::from_le_bytes(self.slice(off, 4).try_into().expect("four bytes"))
+    }
+
+    fn wide(&self, off: u32) -> u64 {
+        u64::from_le_bytes(self.slice(off, 8).try_into().expect("eight bytes"))
+    }
+}
+
+impl Drop for SnapArena {
+    fn drop(&mut self) {
+        for (b, slot) in self.blocks.iter().enumerate() {
+            let p = slot.load(AtomicOrdering::Relaxed);
+            if !p.is_null() {
+                let layout = std::alloc::Layout::from_size_align(self.cap(b), 64)
+                    .expect("arena block layout");
+                // SAFETY: allocated by `reserve` with this layout.
+                unsafe { std::alloc::dealloc(p, layout) };
+            }
+        }
+    }
+}
+
 /// The sorted keys of the unsealed sources, built lazily by `Db::scan` and
 /// kept until the next commit or seal. Keys live in one arena rather than
 /// one allocation each, which is what makes the build a sort of small
 /// records instead of a pointer chase.
 #[derive(Clone, Default)]
 struct Snapshot {
-    keys: Vec<u8>,
+    /// The keys' bytes, and the runs. PROTOTYPE, the runs: each key's
+    /// whole chain from the live table and from the frozen one, copied
+    /// here when the snapshot is built or extended -- oldest chunk
+    /// first, each with the arena offset it has in the memtable and its
+    /// length, a tombstone by `TOMB_LEN` -- so a read of an overlaid key
+    /// streams the copy instead of chasing the entry, the chain and the
+    /// value through the memtable's own layout, two or three dependent
+    /// misses a key that were a third of a block's build and of a wide
+    /// walk on the store the lag sweep's last point leaves. A reader
+    /// under a watermark honours it here as it does on the chain, by
+    /// the chunk offsets; a key written again after the copy is found
+    /// through the handle's stale set, fed from the write log past
+    /// `log_at`, and read from the chain as before.
+    arena: std::sync::Arc<SnapArena>,
+    /// PROTOTYPE: whether the runs were copied at all; a filed key has
+    /// none either way.
+    runs: bool,
     ents: Vec<SnapKey>,
-    /// PROTOTYPE: the unsealed run. Each key's whole chain from the live
-    /// table and from the frozen one, copied here in key order when the
-    /// snapshot is built or extended -- oldest chunk first, each with
-    /// the arena offset it has in the memtable and its length, a
-    /// tombstone by `TOMB_LEN` -- so a read of an overlaid key streams
-    /// this arena instead of chasing the entry, the chain and the value
-    /// through the memtable's own layout, two or three dependent misses
-    /// a key that were a third of a block's build and of a wide walk on
-    /// the store the lag sweep's last point leaves. A reader under a
-    /// watermark honours it here as it does on the chain, by the chunk
-    /// offsets; a key written again after the copy is found through the
-    /// handle's stale set, fed from the write log past `log_at`, and
-    /// read from the chain as before.
-    vals: Vec<u8>,
     /// The write log's length when the runs were copied: every log entry
     /// from here on may have moved a chain past its copy.
     log_at: usize,
@@ -5531,7 +5795,7 @@ impl Snapshot {
         self.ents.len()
     }
     fn key_of(&self, e: &SnapKey) -> &[u8] {
-        &self.keys[e.off as usize..(e.off + e.len) as usize]
+        self.arena.slice(e.off, e.len)
     }
     fn seek_in(&self, run: &[SnapKey], from: &[u8]) -> usize {
         run.partition_point(|e| self.key_of(e) < from)
@@ -5600,10 +5864,8 @@ impl Snapshot {
         for &slot in slots {
             let e = mem.entry(slot as usize);
             let key = mem.key_of(e);
-            let off = self.keys.len() as u32;
-            self.keys.extend_from_slice(key);
             batch.push(SnapKey {
-                off,
+                off: self.arena.append(key),
                 len: key.len() as u32,
                 mem: slot,
                 frozen: u32::MAX,
@@ -5623,47 +5885,36 @@ impl Snapshot {
         }
     }
     /// This snapshot with the live slots from where it stops up to `to`
-    /// folded in: their keys copied after the run's, so the run's offsets
-    /// stand, that batch sorted on its own, and the two merged. A
-    /// committed batch cannot change, so its order is settled once and
-    /// the run it joins never has to be sorted again -- the build it
-    /// replaces sorts every unsealed key afresh, which at 63,242 of them
-    /// is 9 ms, and the organiser paid that fifteen times over one burst
-    /// of writes. Only for a run with nothing filed into it: a handle's
-    /// side runs are that handle's own and are not what gets published.
-    fn extend(
-        &self,
-        mem: &MemTable,
-        to: usize,
-        stale: &std::collections::HashSet<u32>,
-        runs: bool,
-    ) -> Snapshot {
+    /// folded in: their keys and runs appended to the shared arena, that
+    /// batch sorted on its own, the two runs merged by a search and a
+    /// block copy per batch key, and every run written again since this
+    /// snapshot's copy -- the write log from `log_at` to the mark taken
+    /// here names their slots -- copied again from its chain as it
+    /// stands now. A committed batch cannot change, so its order is
+    /// settled once and the run it joins never has to be sorted again --
+    /// the build it replaces sorts every unsealed key afresh, which at
+    /// 63,242 of them is 9 ms, and the organiser paid that fifteen times
+    /// over one burst of writes. Only for a run with nothing filed into
+    /// it: a handle's side runs are that handle's own and are not what
+    /// gets published.
+    fn extend(&self, mem: &MemTable, to: usize, runs: bool) -> Snapshot {
         let from = self.live_len;
         // The log's length first, then the chains: a write that lands
         // between is logged past this mark and read from its chain.
         let log_at = mem.log_len();
-        let mut out = Snapshot {
-            keys: self.keys.clone(),
-            vals: self.vals.clone(),
-            log_at,
-            ents: Vec::with_capacity(self.ents.len() + (to - from)),
-            live_len: to,
-            ..Default::default()
-        };
+        let arena = self.arena.clone();
         let mut rscratch: Vec<(u64, u32)> = Vec::new();
         let mut batch: Vec<SnapKey> = Vec::with_capacity(to - from);
         for i in from..to {
             let e = mem.entry(i);
             let key = mem.key_of(e);
-            let off = out.keys.len() as u32;
-            out.keys.extend_from_slice(key);
             let lrun = if runs {
-                out.copy_run(mem, e, &mut rscratch)
+                arena.copy_run(mem, e, &mut rscratch)
             } else {
                 NO_RUN
             };
             batch.push(SnapKey {
-                off,
+                off: arena.append(key),
                 len: key.len() as u32,
                 mem: i as u32,
                 frozen: u32::MAX,
@@ -5671,45 +5922,60 @@ impl Snapshot {
                 frun: NO_RUN,
             });
         }
-        let keys = &out.keys;
-        let key_at = |e: &SnapKey| &keys[e.off as usize..(e.off + e.len) as usize];
+        let key_at = |e: &SnapKey| arena.slice(e.off, e.len);
         batch.sort_unstable_by(|a, b| key_at(a).cmp(key_at(b)));
-        let (mut i, mut j) = (0usize, 0usize);
-        let mut merged: Vec<SnapKey> = Vec::with_capacity(self.ents.len() + batch.len());
-        while i < self.ents.len() || j < batch.len() {
-            // The run first where the keys are equal, as the build pushes
-            // the frozen table's entries before the live ones. Which of
-            // the two is kept does not decide the fold -- `push_sorted`
-            // takes both slots onto whichever it kept and the key bytes
-            // are the same -- and reversing this passes every check; it
-            // is the build's order, and it leaves the kept entry's bytes
-            // in the older part of the arena. Only two can meet: the run
-            // holds one entry a key and the memtable gives a key one
-            // slot, so a slot past `from` is a key the run has from the
-            // frozen table alone.
-            let run_first = match (self.ents.get(i), batch.get(j)) {
-                (Some(a), Some(b)) => self.key_of(a) <= key_at(b),
-                (Some(_), None) => true,
-                _ => false,
-            };
-            merged.push(if run_first {
-                i += 1;
-                self.ents[i - 1]
-            } else {
-                j += 1;
-                batch[j - 1]
-            });
+        let mut out = Snapshot {
+            arena: self.arena.clone(),
+            runs,
+            ents: Vec::with_capacity(self.ents.len() + batch.len()),
+            log_at,
+            live_len: to,
+            side: Vec::new(),
+            fresh: Vec::new(),
+            filed: 0,
+            bounds: Default::default(),
+        };
+        // The run first where the keys are equal, as the build pushes
+        // the frozen table's entries before the live ones: `push_sorted`
+        // folds the batch's slot onto the run's entry, whose bytes are
+        // the same. Only two can meet: the run holds one entry a key and
+        // the memtable gives a key one slot, so a slot past `from` is a
+        // key the run has from the frozen table alone. The run between
+        // two batch keys is sorted and folded already, and is copied
+        // whole: the merge that compared every pair was a compare an
+        // entry for a batch of a hundred.
+        let mut i = 0usize;
+        for b in &batch {
+            let key = key_at(b);
+            let at = i + self.ents[i..].partition_point(|a| self.key_of(a) <= key);
+            out.ents.extend_from_slice(&self.ents[i..at]);
+            i = at;
+            out.push_sorted(*b);
         }
-        // A run written again since the base was copied: copied again,
-        // from the chain as it stands now.
-        for e in merged.iter_mut() {
-            if e.mem != u32::MAX && e.lrun != NO_RUN && stale.contains(&e.mem) {
-                e.lrun = out.copy_run(mem, mem.entry(e.mem as usize), &mut rscratch);
+        out.ents.extend_from_slice(&self.ents[i..]);
+        // A run written again since this snapshot copied it, found by
+        // its key; a slot in the batch was copied above. The set is the
+        // log's, not a handle's: a handle's stale set is relative to the
+        // snapshot it holds, and the base here may be one it adopted.
+        if runs {
+            let mut again: Vec<u32> = (self.log_at..log_at)
+                .map(|i| mem.log_at(i).0 as u32)
+                .filter(|&id| (id as usize) < from)
+                .collect();
+            again.sort_unstable();
+            again.dedup();
+            for id in again {
+                let e = mem.entry(id as usize);
+                let key = mem.key_of(e);
+                let at = out.ents.partition_point(|a| key_at(a) < key);
+                if out
+                    .ents
+                    .get(at)
+                    .is_some_and(|a| a.mem == id && a.lrun != NO_RUN)
+                {
+                    out.ents[at].lrun = arena.copy_run(mem, e, &mut rscratch);
+                }
             }
-        }
-        out.ents = Vec::with_capacity(merged.len());
-        for e in merged {
-            out.push_sorted(e);
         }
         out
     }
@@ -5733,7 +5999,7 @@ impl Snapshot {
     fn get(&self, i: usize) -> Option<(&[u8], &SnapKey)> {
         self.ents
             .get(i)
-            .map(|e| (&self.keys[e.off as usize..(e.off + e.len) as usize], e))
+            .map(|e| (self.arena.slice(e.off, e.len), e))
     }
     /// The first index at or past `from` whose key is not below `key`, or
     /// the length: a table's walk over the main run against a partition's
@@ -5741,7 +6007,7 @@ impl Snapshot {
     fn advance_below(&self, from: usize, key: &[u8]) -> usize {
         let mut i = from;
         while let Some(e) = self.ents.get(i) {
-            if self.keys[e.off as usize..(e.off + e.len) as usize] >= *key {
+            if self.arena.slice(e.off, e.len) >= key {
                 break;
             }
             i += 1;
@@ -5756,7 +6022,7 @@ impl Snapshot {
     /// and a start above them all by two. A start inside the range pays
     /// those two compares on top of the search.
     fn seek(&self, from: &[u8]) -> usize {
-        let key = |e: &SnapKey| &self.keys[e.off as usize..(e.off + e.len) as usize];
+        let key = |e: &SnapKey| self.arena.slice(e.off, e.len);
         match self.ents.first() {
             None => return 0,
             Some(e) if from <= key(e) => return 0,
@@ -5771,8 +6037,7 @@ impl Snapshot {
     /// present in both tables into one entry carrying both indices.
     fn push_sorted(&mut self, e: SnapKey) {
         if let Some(last) = self.ents.last_mut() {
-            let same = self.keys[last.off as usize..(last.off + last.len) as usize]
-                == self.keys[e.off as usize..(e.off + e.len) as usize];
+            let same = self.arena.slice(last.off, last.len) == self.arena.slice(e.off, e.len);
             if same {
                 if e.mem != u32::MAX {
                     last.mem = e.mem;
@@ -5788,54 +6053,33 @@ impl Snapshot {
         self.ents.push(e);
     }
 
-    /// PROTOTYPE: the whole chain of `e` appended to the run arena,
-    /// oldest chunk first, as a count and then each chunk's memtable
-    /// offset, its length and, for a value, its bytes. Returns where the
-    /// run starts.
-    fn copy_run(&mut self, mem: &MemTable, e: &MemEntry, scratch: &mut Vec<(u64, u32)>) -> u32 {
-        scratch.clear();
-        let mut at = MemTable::head(e);
-        while at != NO_CHUNK {
-            scratch.push((at, mem.chunk_len(at)));
-            at = mem.chunk_prev(at);
-        }
-        let off = self.vals.len() as u32;
-        self.vals
-            .extend_from_slice(&(scratch.len() as u32).to_le_bytes());
-        for &(at, len) in scratch.iter().rev() {
-            self.vals.extend_from_slice(&at.to_le_bytes());
-            self.vals.extend_from_slice(&len.to_le_bytes());
-            if len != TOMB_LEN {
-                self.vals.extend_from_slice(mem.value_at(at as usize));
-            }
-        }
-        off
+    fn copy_run(&self, mem: &MemTable, e: &MemEntry, scratch: &mut Vec<(u64, u32)>) -> u32 {
+        self.arena.copy_run(mem, e, scratch)
     }
 
     /// PROTOTYPE: the run at `off` as a read under `wm` sees it, the way
     /// `MemTable::live_offs_into` sees a chain: chunks at or past the
     /// mark are not there, and everything older than the newest visible
-    /// tombstone is dead. Returns the byte range of the live values'
+    /// tombstone is dead. Returns the arena range of the live values'
     /// records and whether a visible tombstone was met.
-    fn run_visible(&self, off: u32, wm: u64) -> (std::ops::Range<usize>, bool) {
-        let v = &self.vals;
-        let mut p = off as usize;
-        let n = u32::from_le_bytes(v[p..p + 4].try_into().expect("four bytes")) as usize;
-        p += 4;
+    fn run_visible(&self, off: u32, wm: u64) -> (std::ops::Range<u32>, bool) {
+        let v = &self.arena;
+        let n = v.word(off);
+        let mut p = off + 4;
         let mut start = p;
         let mut tomb = false;
         for _ in 0..n {
-            let at = u64::from_le_bytes(v[p..p + 8].try_into().expect("eight bytes"));
+            let at = v.wide(p);
             if at >= wm {
                 break;
             }
-            let len = u32::from_le_bytes(v[p + 8..p + 12].try_into().expect("four bytes"));
+            let len = v.word(p + 8);
             p += 12;
             if len == TOMB_LEN {
                 tomb = true;
                 start = p;
             } else {
-                p += len as usize;
+                p += len;
             }
         }
         (start..p, tomb)
@@ -5843,12 +6087,12 @@ impl Snapshot {
 
     fn run_values<F: FnMut(&[u8])>(&self, off: u32, wm: u64, mut f: F) {
         let (range, _) = self.run_visible(off, wm);
-        let v = &self.vals;
+        let v = &self.arena;
         let mut p = range.start;
         while p < range.end {
-            let len = u32::from_le_bytes(v[p + 8..p + 12].try_into().expect("four bytes")) as usize;
+            let len = v.word(p + 8);
             p += 12;
-            f(&v[p..p + len]);
+            f(v.slice(p, len));
             p += len;
         }
     }
@@ -6528,18 +6772,29 @@ impl Reader {
             .snap_builds
             .fetch_add(1, AtomicOrdering::Relaxed);
         let n = live_len + self.frozen().as_ref().map_or(0, |f| f.len());
+        let runs = self.opts.snapshot_runs;
+        // The arena's first block sized to what the build appends: the
+        // keys, and with the runs the values and sixteen bytes a chunk.
+        let mut bytes =
+            self.mem().key_bytes() + self.frozen().as_ref().map_or(0, |f| f.key_bytes());
+        if runs {
+            bytes += self.mem().value_bytes()
+                + self.frozen().as_ref().map_or(0, |f| f.value_bytes())
+                + 16 * n;
+        }
         let mut snap = Snapshot {
             live_len,
             // The log's length before any chain is read: see `extend`.
             log_at: self.mem().log_len(),
-            keys: Vec::with_capacity(
-                self.mem().key_bytes() + self.frozen().as_ref().map_or(0, |f| f.key_bytes()),
-            ),
+            arena: std::sync::Arc::new(SnapArena::with_capacity(bytes)),
+            runs,
             ents: Vec::with_capacity(n),
-            ..Default::default()
+            side: Vec::new(),
+            fresh: Vec::new(),
+            filed: 0,
+            bounds: Default::default(),
         };
         let mut rscratch: Vec<(u64, u32)> = Vec::new();
-        let runs = self.opts.snapshot_runs;
         if self.opts.scan_snapshot_arena {
             // Arena build. The hash table is walked in slot order, which
             // visits the key bytes in random order -- one cache miss a key,
@@ -6572,22 +6827,21 @@ impl Reader {
                         NO_RUN
                     };
                     pending.push(SnapKey {
-                        off: snap.keys.len() as u32,
+                        off: snap.arena.append(k),
                         len: k.len() as u32,
                         mem: if live { i } else { u32::MAX },
                         frozen: if live { u32::MAX } else { i },
                         lrun: if live { run } else { NO_RUN },
                         frun: if live { NO_RUN } else { run },
                     });
-                    snap.keys.extend_from_slice(k);
                 }
             };
             if let Some(fr) = self.frozen() {
                 take(fr, false);
             }
             take(self.mem(), true);
-            let keys = &snap.keys;
-            let key_of = |e: &SnapKey| &keys[e.off as usize..(e.off + e.len) as usize];
+            let arena = &snap.arena;
+            let key_of = |e: &SnapKey| arena.slice(e.off, e.len);
             recs.sort_unstable_by(|x, y| {
                 (x.0, x.1).cmp(&(y.0, y.1)).then_with(|| {
                     key_of(&pending[x.2 as usize])
@@ -6631,10 +6885,8 @@ impl Reader {
             take(self.mem(), true);
             all.sort_by(|a, b| a.key.cmp(&b.key));
             for o in all {
-                let off = snap.keys.len() as u32;
-                snap.keys.extend_from_slice(&o.key);
                 snap.push_sorted(SnapKey {
-                    off,
+                    off: snap.arena.append(&o.key),
                     len: o.key.len() as u32,
                     mem: o.mem,
                     frozen: o.frozen,
@@ -7130,21 +7382,14 @@ impl Reader {
         to: usize,
         have: Option<std::sync::Arc<Snapshot>>,
     ) -> std::sync::Arc<Snapshot> {
-        let carry = have.filter(|s| {
-            s.live_len <= to && s.side.is_empty() && s.fresh.is_empty() && s.live_len > 0
-        });
+        let carry = have.filter(|s| s.live_len <= to && s.side.is_empty() && s.fresh.is_empty());
         let snap = match carry {
             Some(s) if s.live_len == to => return s,
             Some(s) => {
                 self.shared
                     .snap_extends
                     .fetch_add(1, AtomicOrdering::Relaxed);
-                std::sync::Arc::new(s.extend(
-                    self.mem(),
-                    to,
-                    &self.snap_stale.borrow(),
-                    self.opts.snapshot_runs,
-                ))
+                std::sync::Arc::new(s.extend(self.mem(), to, self.opts.snapshot_runs))
             }
             None => std::sync::Arc::new(self.build_snapshot(to)),
         };
@@ -7170,8 +7415,9 @@ impl Reader {
 
     /// EXPERIMENT: offer a snapshot to the state for the handles that
     /// come after. Kept only when it covers more of the live memtable
-    /// than the one there, so the pointer only moves forward and two
-    /// handles racing cannot leave the shorter one published.
+    /// than the one there, or as much with its runs copied at a later
+    /// log position, so the pointer only moves forward and two handles
+    /// racing cannot leave the shorter one published.
     fn publish_snapshot(&self, snap: &std::sync::Arc<Snapshot>) {
         if !self.opts.share_snapshot {
             return;
@@ -7179,9 +7425,12 @@ impl Reader {
         let st = self.state();
         let mut cur = st.snap.load(AtomicOrdering::Acquire);
         loop {
-            // SAFETY: as in `adopt_snapshot`.
-            if !cur.is_null() && unsafe { &*cur }.live_len >= snap.live_len {
-                return;
+            if !cur.is_null() {
+                // SAFETY: as in `adopt_snapshot`.
+                let c = unsafe { &*cur };
+                if (c.live_len, c.log_at) >= (snap.live_len, snap.log_at) {
+                    return;
+                }
             }
             let new = std::sync::Arc::into_raw(snap.clone()) as *mut Snapshot;
             match st.snap.compare_exchange_weak(
@@ -7198,6 +7447,14 @@ impl Reader {
                             .lock()
                             .expect("the retired snapshots")
                             .push((epoch, RetiredSnap(cur)));
+                        // The epoch moved past the retirement, so a
+                        // handle that pins from here on is not one that
+                        // could hold the replaced snapshot, and the
+                        // sweep can free it once the ones before leave.
+                        // Left to the writer's own bumps, the keeper's
+                        // versions between two seals were freed by none
+                        // of them and held every run they had copied.
+                        self.shared.readers.bump();
                         self.sweep_retired_snaps();
                     }
                     return;
@@ -7215,9 +7472,9 @@ impl Reader {
     /// reader pinned before the swap, as the canonical forms are. Called
     /// by whichever handle retired one rather than by the writer alone:
     /// a store between seals never reaches the writer's sweep, and a
-    /// retired snapshot holds the key bytes of everything unsealed. It
-    /// does not bump the epoch -- that is the writer's -- so a sweep
-    /// before every reader has left simply leaves them for the next.
+    /// retired snapshot holds the key bytes of everything unsealed. A
+    /// sweep before every reader has left simply leaves them for the
+    /// next.
     fn sweep_retired_snaps(&self) {
         let mut retired = self
             .shared
@@ -7278,6 +7535,8 @@ impl Reader {
         let marker = std::sync::Arc::new(Cached::Wide(WideBlock {
             sorted: Vec::new(),
             seen: 0,
+            covered: false,
+            walks: 0,
         }));
         self.publish_form(p, b, &marker);
     }
@@ -7509,6 +7768,28 @@ impl Reader {
             let held = cache.as_ref().map_or(0, |(_, s)| s.len());
             let added = self.snap_added.borrow().len();
             stale = behind(held, added);
+        }
+        // PROTOTYPE: the published snapshot ahead of this handle's own
+        // by a share of what the handle holds -- the keeper has absorbed
+        // that many writes this one still reads from their chains, or
+        // holds in its added list -- is taken instead: the switch costs
+        // a merge of the run and the bounds walked again, and the share
+        // is where that is repaid by the reads.
+        if !stale && self.opts.snapshot_keeper {
+            if let Some((_, mine)) = cache.as_ref() {
+                let p = self.state().snap.load(AtomicOrdering::Acquire);
+                if !p.is_null() {
+                    // SAFETY: as in `adopt_snapshot`.
+                    let published = unsafe { &*p };
+                    let ahead = published.log_at.saturating_sub(mine.log_at);
+                    stale = ahead >= (mine.len() / 8).max(1024);
+                    if stale {
+                        self.shared
+                            .snap_switched
+                            .fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                }
+            }
         }
         if !stale && !use_cache {
             let (_, snap) = cache.as_mut().expect("not stale");
@@ -8312,7 +8593,7 @@ impl Reader {
         // handle says so once per commit -- the count is compared, not
         // read -- so four handles scanning do not bump one line a
         // thousand times a millisecond.
-        if self.opts.commit_forms {
+        if self.opts.commit_forms || self.opts.snapshot_keeper {
             let now = (st.gen, self.mem().committed_log());
             let signal = self.slot.is_none() || self.signalled.replace(now) != now;
             if signal {
@@ -8457,6 +8738,35 @@ impl Reader {
                 }
                 if bookkeep && canon.is_none() {
                     table.touched[b] = tick;
+                }
+                // A block wide by the covered rule is walked on its first
+                // touch and copied on its second: the rule saves the copy
+                // where a block is met once, which is the pass after a
+                // burst, and a copy of the run is what a block read again
+                // and again wants -- ycsb-E at a hundred thousand keys
+                // read 0.58x with every touch assembling the window.
+                let mut recopy = false;
+                if let (None, Some(Cached::Wide(w))) =
+                    (canon, table.slots[b].as_mut().map(std::sync::Arc::make_mut))
+                {
+                    w.walks = w.walks.saturating_add(1);
+                    recopy = w.covered && w.walks >= 2;
+                }
+                if recopy {
+                    self.unlist(pi, b, table);
+                    let built = std::sync::Arc::new(
+                        BuildCtx {
+                            dense_from: 1,
+                            copy_dense: true,
+                            ..self.build_ctx()
+                        }
+                        .materialize(src, table, b, unsealed)?,
+                    );
+                    self.count_built();
+                    let bytes = built.bytes();
+                    table.slots[b] = Some(built);
+                    self.list_built_bytes(pi, b, table, bytes);
+                    self.shed(pi, b, table);
                 }
                 if let (None, Some(Cached::Wide(w))) =
                     (canon, table.slots[b].as_mut().map(std::sync::Arc::make_mut))
@@ -9407,6 +9717,12 @@ impl Db {
             blk_reader: AtomicU64::new(0),
             blk_engine: AtomicU64::new(0),
             snap_extends: AtomicU64::new(0),
+            keeper_thread: std::sync::OnceLock::new(),
+            keeper_seq: AtomicU64::new(0),
+            keeper_done: AtomicU64::new(0),
+            snap_kept: AtomicU64::new(0),
+            snap_carried: AtomicU64::new(0),
+            snap_switched: AtomicU64::new(0),
         });
         let r = Reader {
             shared,
@@ -9459,6 +9775,7 @@ impl Db {
             pending_err: None,
             next_seg: 0,
             sealing: None,
+            keeper: None,
             compacting: None,
             tiering: None,
             unsynced: 0,
@@ -9707,6 +10024,12 @@ impl Db {
             blk_reader: AtomicU64::new(0),
             blk_engine: AtomicU64::new(0),
             snap_extends: AtomicU64::new(0),
+            keeper_thread: std::sync::OnceLock::new(),
+            keeper_seq: AtomicU64::new(0),
+            keeper_done: AtomicU64::new(0),
+            snap_kept: AtomicU64::new(0),
+            snap_carried: AtomicU64::new(0),
+            snap_switched: AtomicU64::new(0),
         });
         let r = Reader {
             shared,
@@ -9759,6 +10082,7 @@ impl Db {
             pending_err: None,
             next_seg,
             sealing: None,
+            keeper: None,
             compacting: None,
             tiering: None,
             unsynced: 0,
@@ -9947,6 +10271,7 @@ impl Db {
         }
         self.maintain_forms()?;
         self.build_ahead_if_due();
+        self.start_keeper();
         self.sweep_retired_forms();
         self.phase_ns[0] += t.elapsed().as_nanos() as u64;
         if self.sealing.as_ref().is_some_and(|h| h.is_finished()) {
@@ -10299,6 +10624,7 @@ impl Db {
         self.join_compact()?;
         self.join_tier()?;
         self.join_ahead();
+        self.settle_keeper();
         Ok(())
     }
 
@@ -10515,6 +10841,7 @@ impl Db {
         retired.retain(|(t, _)| !readers.none_before(*t));
         drop(retired);
         self.sweep_retired_forms();
+        self.wake_keeper();
     }
 
     /// EXPERIMENT: free the replaced canonical forms no pinned reader can
@@ -11929,6 +12256,429 @@ impl Reader {
     }
 }
 
+/// PROTOTYPE: the run keeper in flight: its thread, and the flag that
+/// stops it.
+struct Keeper {
+    handle: Option<std::thread::JoinHandle<()>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// How long the keeper sleeps between looks at the commits, from the
+/// shortest after a tick that did something, doubling while nothing is
+/// due, to the longest, which is also how often a dormant keeper looks
+/// for a scan.
+const KEEPER_POLL_MIN: std::time::Duration = std::time::Duration::from_micros(100);
+const KEEPER_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(20);
+/// Retired snapshot versions still held by a pinned reader past which
+/// the keeper stops publishing; see `keep_tick`.
+const KEEPER_RETIRED_MAX: usize = 8;
+/// The fewest writes an extension is made for, below a sixteenth of
+/// the version's entries; see `keep_tick`.
+const KEEPER_MIN_BATCH: usize = 256;
+
+/// What the keeper holds between ticks: the version it last published,
+/// the generation and the memtables it is over, the committed log
+/// position it was extended to, and the store's scan count as it last
+/// saw it with the commit that count was seen at.
+#[derive(Default)]
+struct Kept {
+    snap: Option<std::sync::Arc<Snapshot>>,
+    gen: u64,
+    live: Option<std::sync::Arc<MemTable>>,
+    frozen: Option<std::sync::Arc<MemTable>>,
+    seen_log: usize,
+    scans_seen: u64,
+    scan_at: (u64, usize),
+}
+
+/// What a keeper's tick asks for next.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Want {
+    /// Look again at once: something was done and more may have landed.
+    More,
+    /// Nothing until a commit.
+    Commit,
+    /// Nothing until a scan over the store, or a publish.
+    Scan,
+}
+
+/// Put the calling thread in the idle scheduling class, which runs only
+/// when nothing else wants the core. Linux only; elsewhere a no-op, and
+/// a failure is ignored on purpose, as `idle_io_priority` ignores its.
+fn idle_cpu_priority() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let param: libc::sched_param = std::mem::zeroed();
+        let _ = libc::sched_setscheduler(0, libc::SCHED_IDLE, &param);
+    }
+}
+
+impl Reader {
+    /// PROTOTYPE: the run keeper's loop, on a handle of its own. Each
+    /// tick pins the state, carries the snapshot across a publish if one
+    /// happened, extends it to the last commit once enough has landed
+    /// and publishes the result; then the keeper sleeps and looks again,
+    /// for as short as `KEEPER_POLL_MIN` after a tick that did
+    /// something and doubling while nothing is due, to
+    /// `KEEPER_POLL_MAX`, which is also how often a dormant keeper looks
+    /// for a scan. Nothing on the commit path or the read path wakes it:
+    /// the version before this one was unparked by every commit, and
+    /// the wake is a futex call and an interrupt to an idle core, on
+    /// this guest a VM exit paid by the thread that woke it -- ycsb-A's
+    /// commits at a hundred thousand keys read 12-23% slower for it. A
+    /// publish and a settle wake it at once, and a settle's tick brings
+    /// the snapshot current whatever the regime or the batch bound says,
+    /// and answers on `keeper_done`.
+    fn keep(&self, stop: &std::sync::atomic::AtomicBool) {
+        let _ = self.shared.keeper_thread.set(std::thread::current());
+        let mut k = Kept::default();
+        let mut idle = KEEPER_POLL_MIN;
+        loop {
+            if stop.load(AtomicOrdering::SeqCst) {
+                break;
+            }
+            let flush = self.shared.keeper_seq.load(AtomicOrdering::SeqCst);
+            let forced = flush != self.shared.keeper_done.load(AtomicOrdering::Relaxed);
+            let want = self.keep_tick(&mut k, forced);
+            if forced && want != Want::More {
+                self.shared.keeper_done.store(flush, AtomicOrdering::SeqCst);
+            }
+            match want {
+                Want::More => idle = KEEPER_POLL_MIN,
+                Want::Commit => {
+                    std::thread::park_timeout(idle);
+                    idle = (idle * 2).min(KEEPER_POLL_MAX);
+                }
+                Want::Scan => std::thread::park_timeout(KEEPER_POLL_MAX),
+            }
+        }
+    }
+
+    /// One tick of the keeper: see `keep`.
+    fn keep_tick(&self, k: &mut Kept, forced: bool) -> Want {
+        let Some(slot) = self.slot else {
+            return Want::Scan;
+        };
+        if self.isolation.get() == Isolation::Snapshot {
+            self.release();
+        }
+        self.shared.readers.pin(slot);
+        let p = self.shared.state.load(AtomicOrdering::Acquire);
+        self.held.store(p, AtomicOrdering::Relaxed);
+        self.isolation.set(Isolation::Snapshot);
+        // SAFETY: pinned above, so not freed under this handle.
+        let st = unsafe { &*p };
+        let mem = &st.mem;
+        // A publish since the last tick: the snapshot carried across it
+        // where the memtables allow, and dropped otherwise.
+        if st.gen != k.gen {
+            let carried = k.snap.take().and_then(|s| self.carry_snapshot(s, k, st));
+            k.gen = st.gen;
+            k.live = Some(mem.clone());
+            k.frozen = st.frozen.clone();
+            // The carried version's mark, so the next tick extends only
+            // for the commits past it; none, where nothing carried.
+            k.seen_log = carried.as_ref().map_or(0, |s| s.log_at);
+            if let Some(s) = &carried {
+                self.shared
+                    .snap_carried
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                self.publish_snapshot(s);
+            }
+            k.snap = carried;
+        }
+        // The regime: nothing before the first scan over the store, and
+        // past the bound of writes since the last one, nothing until the
+        // next. The scan's position is taken as the commit it was seen
+        // at, which is at or past where it happened.
+        let life = self.shared.scans_life.load(AtomicOrdering::SeqCst);
+        if life != k.scans_seen {
+            k.scans_seen = life;
+            k.scan_at = (st.gen, mem.committed_log());
+        }
+        if !forced {
+            let pct = self.opts.snapshot_keeper_recent_pct;
+            let far = life == 0
+                || (pct > 0 && {
+                    let keys: usize = st.segs.iter().map(|s| s.blob.keys()).sum();
+                    let since = if k.scan_at.0 == st.gen {
+                        mem.committed_log().saturating_sub(k.scan_at.1)
+                    } else {
+                        mem.committed_log()
+                    };
+                    since > keys / 100 * pct
+                });
+            if far {
+                self.release();
+                return Want::Scan;
+            }
+        }
+        // The log's position first and the count after it, the order a
+        // commit stores them in, so the position belongs to the count's
+        // commit or an earlier one and the next commit moves it.
+        let log = mem.committed_log();
+        let len = mem.committed_len();
+        // Current, or behind by less than a sixteenth of what the version
+        // holds: an extension merges the whole entry run, so one per
+        // commit over a mix of small batches is a copy of the run per
+        // hundred writes -- ycsb-A at a hundred thousand keys read 0.82x
+        // beside the runs with the keeper streaming that much -- and
+        // what a scan then finds behind is a sixteenth's copy, which it
+        // makes for itself. A settle brings it current whatever the lag.
+        let behind = k.snap.as_ref().map_or(usize::MAX, |s| {
+            len.saturating_sub(s.live_len) + log.saturating_sub(k.seen_log)
+        });
+        let held = k.snap.as_ref().map_or(0, |s| s.len());
+        let current = behind == 0 || (!forced && behind < (held / 16).max(KEEPER_MIN_BATCH));
+        if current {
+            self.release();
+            return Want::Commit;
+        }
+        // The base: the keeper's own version, or the published one when
+        // a scan carried it further and it stops at or before this
+        // commit -- the writer's own reads cover what it has staged, and
+        // a version past the commit is no base for one at it.
+        let published = self
+            .adopt_snapshot()
+            .filter(|s| s.live_len <= len && s.side.is_empty() && s.fresh.is_empty());
+        let base = match (k.snap.take(), published) {
+            (Some(a), Some(b)) if (b.live_len, b.log_at) > (a.live_len, a.log_at) => Some(b),
+            (Some(a), _) => Some(a),
+            (None, b) => b,
+        };
+        let next = match base {
+            Some(s) => {
+                self.shared
+                    .snap_extends
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                std::sync::Arc::new(s.extend(mem, len, self.opts.snapshot_runs))
+            }
+            None => std::sync::Arc::new(self.build_snapshot(len)),
+        };
+        self.shared.snap_kept.fetch_add(1, AtomicOrdering::Relaxed);
+        // A version is published only while the ones it replaced are
+        // being freed: a handle pinned under `Snapshot` across a burst
+        // holds every version retired since it pinned, a copy of the run
+        // per commit, and the keeper's own version is dropped here at
+        // the next tick instead. Whoever adopts the last published one
+        // carries it forward, so nothing is wrong, only later.
+        let retired = self
+            .shared
+            .retired_snaps
+            .lock()
+            .expect("the retired snapshots")
+            .len();
+        if retired < KEEPER_RETIRED_MAX {
+            self.publish_snapshot(&next);
+        }
+        k.snap = Some(next);
+        k.seen_log = log;
+        self.release();
+        Want::More
+    }
+
+    /// PROTOTYPE: the keeper's snapshot, over the memtables `k` names,
+    /// carried into the state `st`: unchanged where the memtables are
+    /// the same, which is a merge; at a freeze, brought current to the
+    /// old live table's end -- a frozen table is complete -- and its live
+    /// entries made frozen ones, the run's order and so its bounds the
+    /// same; when the seal lands, its frozen entries dropped and the
+    /// live keys and runs moved to an arena of their own, so the old
+    /// arena and the values it copied go with the frozen table. Nothing
+    /// else carries.
+    fn carry_snapshot(
+        &self,
+        s: std::sync::Arc<Snapshot>,
+        k: &Kept,
+        st: &State,
+    ) -> Option<std::sync::Arc<Snapshot>> {
+        let live = k.live.as_ref()?;
+        let same_mem = std::sync::Arc::ptr_eq(&st.mem, live);
+        let same_frozen = match (&st.frozen, &k.frozen) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if same_mem && same_frozen {
+            return Some(s);
+        }
+        if same_mem && st.frozen.is_none() && k.frozen.is_some() {
+            let live_ents = s.ents.iter().filter(|e| e.mem != u32::MAX);
+            let bytes: usize = live_ents
+                .clone()
+                .map(|e| {
+                    e.len as usize
+                        + if e.lrun != NO_RUN {
+                            s.arena.run_len(e.lrun) as usize
+                        } else {
+                            0
+                        }
+                })
+                .sum();
+            let mut out = Snapshot {
+                arena: std::sync::Arc::new(SnapArena::with_capacity(bytes)),
+                runs: s.runs,
+                ents: Vec::with_capacity(live_ents.clone().count()),
+                log_at: s.log_at,
+                live_len: s.live_len,
+                side: Vec::new(),
+                fresh: Vec::new(),
+                filed: 0,
+                bounds: Default::default(),
+            };
+            for e in live_ents {
+                let lrun = if e.lrun != NO_RUN {
+                    out.arena
+                        .append(s.arena.slice(e.lrun, s.arena.run_len(e.lrun)))
+                } else {
+                    NO_RUN
+                };
+                out.ents.push(SnapKey {
+                    off: out.arena.append(s.key_of(e)),
+                    len: e.len,
+                    mem: e.mem,
+                    frozen: u32::MAX,
+                    lrun,
+                    frun: NO_RUN,
+                });
+            }
+            return Some(std::sync::Arc::new(out));
+        }
+        let froze = k.frozen.is_none()
+            && st
+                .frozen
+                .as_ref()
+                .is_some_and(|f| std::sync::Arc::ptr_eq(f, live));
+        if froze {
+            let s = if s.live_len < live.len() || s.log_at < live.log_len() {
+                self.shared
+                    .snap_extends
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                std::sync::Arc::new(s.extend(live, live.len(), s.runs))
+            } else {
+                s
+            };
+            let mut out = Snapshot {
+                arena: s.arena.clone(),
+                runs: s.runs,
+                ents: Vec::with_capacity(s.ents.len()),
+                log_at: 0,
+                live_len: 0,
+                side: Vec::new(),
+                fresh: Vec::new(),
+                filed: 0,
+                bounds: s.bounds.clone(),
+            };
+            for e in &s.ents {
+                debug_assert_eq!(e.frozen, u32::MAX, "a freeze finds no frozen table");
+                out.ents.push(SnapKey {
+                    off: e.off,
+                    len: e.len,
+                    mem: u32::MAX,
+                    frozen: e.mem,
+                    lrun: NO_RUN,
+                    frun: e.lrun,
+                });
+            }
+            return Some(std::sync::Arc::new(out));
+        }
+        None
+    }
+}
+
+impl Db {
+    /// PROTOTYPE: the run keeper started, on a handle of its own, if the
+    /// option asks and it is not running.
+    fn start_keeper(&mut self) {
+        if self.keeper.is_some() || !self.opts.snapshot_keeper {
+            return;
+        }
+        let Ok(r) = self.new_reader(false) else {
+            return;
+        };
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let spawned = std::thread::Builder::new()
+            .name("supdb-keeper".into())
+            .spawn(move || {
+                idle_cpu_priority();
+                r.keep(&flag);
+            });
+        if let Ok(handle) = spawned {
+            self.keeper = Some(Keeper {
+                handle: Some(handle),
+                stop,
+            });
+        }
+    }
+
+    /// The keeper woken by a publish, so the snapshot is carried into
+    /// the new state before its first scan where it can be; a commit
+    /// wakes nothing, see `Reader::keep`.
+    fn wake_keeper(&self) {
+        if self.keeper.is_none() {
+            return;
+        }
+        if let Some(t) = self.shared.keeper_thread.get() {
+            t.unpark();
+        }
+    }
+
+    /// PROTOTYPE: the keeper's snapshot brought current to the last
+    /// commit and published, whatever its regime says, and waited for.
+    /// What `settle` does; for a test or an experiment that wants the
+    /// published snapshot as the keeper leaves it.
+    #[doc(hidden)]
+    pub fn settle_keeper(&mut self) {
+        let Some(k) = self.keeper.as_ref() else {
+            return;
+        };
+        if k.handle.as_ref().is_none_or(|h| h.is_finished()) {
+            return;
+        }
+        let seq = self.shared.keeper_seq.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+        while self.shared.keeper_done.load(AtomicOrdering::SeqCst) < seq {
+            if let Some(t) = self.shared.keeper_thread.get() {
+                t.unpark();
+            }
+            if k.handle.as_ref().is_none_or(|h| h.is_finished()) {
+                return;
+            }
+            // A sleep and not a yield: the keeper runs at idle priority,
+            // and a spinning waiter is what keeps it off the core.
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+    }
+
+    fn stop_keeper(&mut self) {
+        if let Some(mut k) = self.keeper.take() {
+            k.stop.store(true, AtomicOrdering::SeqCst);
+            if let Some(t) = self.shared.keeper_thread.get() {
+                t.unpark();
+            }
+            if let Some(h) = k.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// PROTOTYPE: what the keeper has published over this store's life:
+    /// versions extended or built, and versions carried across a
+    /// publish. For a test.
+    #[doc(hidden)]
+    pub fn snapshot_switches(&self) -> u64 {
+        self.shared.snap_switched.load(AtomicOrdering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn snapshot_kept(&self) -> (u64, u64) {
+        (
+            self.shared.snap_kept.load(AtomicOrdering::Relaxed),
+            self.shared.snap_carried.load(AtomicOrdering::Relaxed),
+        )
+    }
+}
+
 /// PROTOTYPE: what building a cached block reads, and nothing the cache
 /// keeps: the segments, the live and the frozen memtable, and whether any
 /// source holds a tombstone. A handle makes one over the state it holds
@@ -12687,11 +13437,13 @@ impl<'s> BuildCtx<'s> {
                 .iter()
                 .map(|(_, at)| (at[b + 1] - at[b]) as usize)
                 .sum::<usize>();
-        let covered = !self.copy_dense && !unsealed.vals.is_empty() && over * 4 >= (hi - lo) * 3;
+        let covered = !self.copy_dense && unsealed.runs && over * 4 >= (hi - lo) * 3;
         if floor > WIDE || covered {
             return Ok(Cached::Wide(WideBlock {
                 sorted: self.sorted_filed(&table.added[b]),
                 seen: table.added[b].len(),
+                covered: floor <= WIDE,
+                walks: 0,
             }));
         }
         let ov = self.overlay_all(src, table, b, unsealed)?;
@@ -12955,6 +13707,7 @@ impl<'s> BuildCtx<'s> {
 
 impl Drop for Db {
     fn drop(&mut self) {
+        self.stop_keeper();
         self.stop_ahead();
         if let Some(h) = self.sealing.take() {
             let _ = h.join();
@@ -12964,6 +13717,56 @@ impl Drop for Db {
         }
         if let Some((_, h)) = self.tiering.take() {
             let _ = h.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod snap_arena {
+    use super::*;
+
+    #[test]
+    fn offsets_cross_blocks_and_two_threads_append_without_overlap() {
+        let a = std::sync::Arc::new(SnapArena::with_capacity(100));
+        assert_eq!(a.base_shift, SNAP_BASE_SHIFT);
+        // Block edges: a reservation that would cross one moves whole
+        // into the next block, and every offset locates back to it.
+        let mut got: Vec<(u32, Vec<u8>)> = Vec::new();
+        for i in 0..2000u32 {
+            let bytes: Vec<u8> = (0..(i % 37 + 1) as u8)
+                .map(|b| b.wrapping_mul(i as u8))
+                .collect();
+            got.push((a.append(&bytes), bytes));
+        }
+        for (off, bytes) in &got {
+            assert_eq!(a.slice(*off, bytes.len() as u32), &bytes[..]);
+        }
+        assert!(
+            a.len() > (1 << SNAP_BASE_SHIFT),
+            "the base block was outgrown"
+        );
+        let (b, w) = a.locate((1 << SNAP_BASE_SHIFT) + 5);
+        assert_eq!((b, w), (1, 5));
+        let (b, w) = a.locate(3 << SNAP_BASE_SHIFT);
+        assert_eq!((b, w), (2, 0));
+        // Two threads appending at once: nothing overlaps, everything
+        // reads back.
+        let mut hs = Vec::new();
+        for t in 0..2u8 {
+            let a = a.clone();
+            hs.push(std::thread::spawn(move || {
+                let mut mine = Vec::new();
+                for i in 0..20_000u32 {
+                    let bytes = [t, (i & 0xff) as u8, (i >> 8) as u8, 7];
+                    mine.push((a.append(&bytes), bytes));
+                }
+                mine
+            }));
+        }
+        for h in hs {
+            for (off, bytes) in h.join().unwrap() {
+                assert_eq!(a.slice(off, 4), &bytes[..]);
+            }
         }
     }
 }

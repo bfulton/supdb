@@ -120,6 +120,16 @@ suite's own arms answer most of these questions without a probe at all,
 and `bench ab` prices two of them in one process; reach for a probe only
 when no pair of arms isolates what you are asking.
 
+A pass that reads bimodal across rounds is two shapes, not noise. The
+run keeper's lag pass at ten thousand keys read 2 µs a scan in four
+rounds and 15-36 in three, and the rounds split on the probe's own
+counters -- blocks built, the forms' bytes -- before they split on
+time: the seal the burst triggers at that rung landed at its last
+commit in the slow rounds, the writer's tables went with the publish,
+and the pass built every block it met. Find the count that separates
+the rounds before averaging them, and read the slow shape as a
+measurement of its own.
+
 ## The suite lives in bench/, and it gates this repository
 
 `bench/` is a time series. `bench run` measures every arm -- supdb's

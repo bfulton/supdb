@@ -1439,7 +1439,9 @@ kept with its block bounds, so a build seeks nothing. And a block the
 runs cover, three quarters of its keys counting every source's run
 over it, is walked on a read's first touch and not copied: every
 partition record under such a run is masked by its update's
-tombstone, and the copy would have been a copy of the run. A test
+tombstone, and the copy would have been a copy of the run; a block met
+a second time is copied then, since a block a mix reads over and over
+wants the copy (the keeper's section below has that finding). A test
 holds the runs to the chains on both scan paths, through the writer
 and a handle under `Latest`, across a seal left in flight and a
 reopen.
@@ -1470,12 +1472,124 @@ assembles the window's overlay per scan and dispatches per key, and
 that, not the chase, is now most of it.
 
 So the option is off and `supdb-runs` prices it. Two things would make
-it the structure it is meant to be, and both are the next work: the
-copy paid at the commit from the batch's own slots, which is
-write-time proper and takes the first scan's 1.5 ms off the pass; and
-a walk that streams the runs and the pieces' records through cursors
-without assembling a window, at which point a block the runs cover
-reads at the run's speed.
+it the structure it is meant to be: the copy paid at the commit, which
+is write-time proper and takes the first scan's copy off the pass, and
+is the keeper below; and a walk that streams the runs and the pieces'
+records through cursors without assembling a window, at which point a
+block the runs cover reads at the run's speed, which is the next work.
+
+#### The run keeper: the copy paid at the commit, on a thread of its own
+
+The write half of the unsealed run. `snapshot_keeper` gives the store
+a thread at idle priority (`SCHED_IDLE` on Linux) that keeps the
+published scan snapshot current to the commits, so the first scan after
+a burst adopts a snapshot that has the burst, runs and all, and sorts
+and copies nothing. Three things make that cheap enough to do at every
+commit:
+
+- The snapshot's key bytes and runs live in an arena shared by every
+  version of one snapshot -- append-only, its blocks doubling from a
+  base sized at the build, a reservation one fetch-add on the tail so
+  no thread waits on the keeper for it -- and a version is a set of
+  entries over it. An extension appends the batch's keys and runs and
+  merges the entry run by a search and a block copy per batch key; the
+  version before it copied every key and every run of the base into
+  fresh vectors first, 1.4 MB at ten thousand keys, for every batch.
+  The runs written again since the base's copy are the log's business
+  and not a handle's: the extension reads the write log from the base's
+  mark to its own and copies those again, so any handle can carry any
+  published version forward.
+- The keeper polls: it sleeps between looks at the commits, a hundred
+  microseconds after a tick that did something and doubling to twenty
+  milliseconds while nothing is due, and extends once the commits
+  since its version amount to a sixteenth of what it holds, so a burst
+  that outruns it is covered by fewer and larger extensions and never
+  by a queue, and a mix of small batches does not buy a copy of the
+  entry run per hundred writes. Nothing on the commit path or the read
+  path touches it: the version before this one was unparked by every
+  commit, and the wake is a futex call and an interrupt to an idle
+  core, on this guest a VM exit paid by the thread that woke it, which
+  read as 12-23% on ycsb-A's commits at a hundred thousand keys and as
+  a tenth of the drained scan pass at ten thousand when a scan did the
+  waking; polling, A's commits read level, 540-670 µs against 570-680.
+  A publish and a settle wake it at once. It publishes each
+  version into the state as a scan would, and stops publishing while a
+  reader pinned across the burst holds the retired versions alive.
+- It carries the snapshot across a publish: unchanged across a merge,
+  whose memtables are the same; at a freeze the live entries become
+  frozen ones, the run's order and so its block bounds intact; when the
+  seal lands the frozen entries leave and the live keys and runs move
+  to an arena of their own, so the old arena and the values it holds go
+  with the frozen table.
+
+The regime is the forms' own: nothing before the first scan over the
+store, and past `snapshot_keeper_recent_pct` of the sealed keys written
+since the last scan, nothing until the next, since the copy is a copy
+of every value written and a load with no read in sight is not worth
+doubling in memory; a dormant keeper looks for a scan at the long poll.
+A writer whose own snapshot the published one has left
+behind by an eighth of what it holds, or a thousand writes, takes the
+published one; below that it keeps its own and files as before. A test
+drives a burst against the keeper with a seal left in flight and a
+handle claimed before it, holds every scan to the model through the
+writer and the handle, and asserts that the writer sorted nothing after
+the burst.
+
+What it measures, paired binaries alternated three rounds at ten
+thousand keys. With the forms maintained at commit, the default regime,
+the burst's write time comes back to the shape without runs: the
+writer's nine commits read 26-29 ms without runs, 33-48 with them and
+the copy paid inline at each commit, 28-36 with the keeper paying it
+beside; and the pass after reads 2.2-2.4 µs a scan against 21-23, the
+snapshot current and the blocks walked over their runs. With the forms
+off, which isolates the snapshot: the first scan after the burst falls
+from 4.4-5.2 ms with the runs copied there to 1.4-2.9, the writer
+builds no snapshot at all, and the pass reads 45-62 µs a scan against
+44-53 without runs and 72-79 with them. The copy is gone from the read
+path, and what is left of the pass is the walk, the other half.
+
+Two things it found. The covered rule as first landed walked a covered
+block on every touch, and ycsb-E at a hundred thousand keys read 0.58x
+with the keeper beside the runs: its fresher snapshots made more blocks
+covered, and E touches a block two hundred times a pass. A covered
+block is now walked on its first touch and copied on its second, which
+puts E level and costs the pass after a burst the copies of the blocks
+it meets twice. And a pass that read bimodal across rounds, 2 µs a scan
+in one and 15-36 in the next, was two shapes and not noise: at this
+rung the burst seals once, at its seventh commit of nine, and whether
+the seal has landed by the eighth commit's check decides whether the
+ninth refills the writer's tables the landing dropped. The probe's
+counters split the rounds -- the tables at the pass's start, 157
+blocks or none -- before any average could hide them, and they say
+what the 8x this point read for `supdb-runs` was: the runs' copy paid
+inline made the eighth commit 8 ms instead of 4, long enough for the
+landing to be caught there, so the ninth refilled the tables and the
+pass walked them. The default arm's quick commits catch the landing at
+the ninth and start the pass with no tables every round, and the
+keeper gives the writer its quick commit back and that shape with it.
+The pass that decides this point is a walk over a store whose tables a
+publish just emptied, and what it costs is the walk, the other half.
+
+The suite, paired rep by rep. At ten thousand keys over twelve pairs,
+the fully-unmerged lag point reads 1.21x against the default arm,
+twelve of twelve -- the walk and the second-touch copy over empty
+tables against a copy per block -- and the four-thread scan mix 0.87x
+on two pairs of twelve; nothing else separates. At a hundred thousand
+over six pairs, against the default arm: A 0.84x, none of six the
+other way; B, C and D 1.06-1.10x on four of six and the four-thread
+scan pass 1.09x on five; the rest inside the noise. Against
+`supdb-runs`, the read half alone: D 1.26x six of six, F 1.12x on
+five, the two-thread scan pass 0.94x on none of six, A 0.92x on two.
+The run before this one, with the keeper woken by every commit, read
+the hundred-thousand scan passes 1.15x and 1.24x, the lag point 1.44x
+and the four-thread mix 1.66x, six of six each, and this one reads
+them level: on this machine the sign test inside a run is not the
+spread between runs, and a figure a run gives six of six is a figure
+until the next run. What the keeper costs where it costs is the
+extension itself, a copy of the entry run per tick on a core beside
+the writer's, which A's shape at a hundred thousand meets a hundred and
+sixty times over five hundred commits; an entry run that extends in
+place, without the copy, is the next work beside the walk.
 
 #### Which half of the lag gap, by rung
 
