@@ -1346,6 +1346,82 @@ newer than a running partition merge's inputs so the two could run
 beside each other. The mechanism, the test and the arm are here for
 that version.
 
+#### The fully-unmerged point, a third look: memory-bound, and the LSM's own
+
+With the steady scan through a handle ahead of LMDB at every rung, the
+one place the ladder is behind by a wide margin is this point, at a
+seventh to a ninth of LMDB at ten and thirty thousand keys. Reopened
+with the lag sweep's probe in the suite's shape, from the instruction
+count up.
+
+Callgrind over the point's pass alone at ten thousand keys, zeroed at a
+marker before the scans, put 7,250 instructions in a scan of a hundred
+entries: the same as a scan over the drained store, though the pass
+builds a copy of every block it touches. Natively the same scan takes
+13 µs against one. So the point is not doing work; it is waiting, and
+the instrument that counts cannot see on what. Phase timers said the
+wait is the build: 5-8 µs a copy over sixty-four partition records and
+as many overlay keys, with the walk over a built copy 0.3 µs, and
+`cpu-clock` samples over three hundred handle passes said what the
+build waits on: a seek into the partition's index for every snapshot
+key of the block, to find where the key cuts the walk (a third of the
+samples, with the key reads and compares it makes); the copy's own
+`memmove` (a fifth); the chase into the memtable for each key -- the
+entry, the chain's tombstone check, the value (a third); and thirty
+allocations.
+
+Two of those were tried and neither moves the pass.
+
+The seeks were removed. A snapshot's key cuts the partition where
+`owner_of` would put it, a function of the snapshot's run and the
+partition, so the cuts were walked once along the partition's index
+heads when the snapshot's block bounds are taken and kept beside them;
+the pieces already carry theirs. The seeks left the profile entirely.
+Paired against the head that seeks, the same probe alternated three
+rounds at ten, thirty and a hundred thousand keys, the minimum of each
+did not move: 9.05 against 8.94 µs a scan, 11.3 against 11.7, 11.7
+against 14.1, inside a sitting whose noise on one binary was 11.7 to
+21.4. Instructions that overlap a memory stall cost nothing to remove.
+It is not landed: it costs a walk over the run at every fresh snapshot,
+which the first scan after a burst would pay, for a gain no pairing
+could see.
+
+The copies were skipped. A dense block on a read's first touch was
+walked through its sources, as a wide block is, and copied only once
+its reads had repaid a copy, the promotion `promote_entries` already
+makes for a sparse block. In isolation, on repeated handle passes at
+ten thousand keys, the walk reads 4.5 µs a scan against 9-15 for the
+copy; at thirty thousand, with three pieces standing, the two are
+level, since a walk reads and sorts each piece's keys over the window
+at every scan where a copy reads them once; and ycsb-E loses 25-50% at
+every threshold tried, because one wide walk of a hot block costs what
+the copy it defers costs, and E touches its blocks fifteen times. The
+wide walk's own profile: a quarter of it is the tombstone check on
+each key's chain, which the suite's updates put there -- an update is
+a delete and an append -- and which is the chain's first touch, a miss
+the copy's build prefetches ahead in two sweeps and the walk does not.
+Not landed either; the mechanism is a line in `materialize` and a
+match arm at the promotion, and the numbers are here.
+
+What the point costs, then, is the chase into the memtable for every
+overlaid key and, above thirty thousand keys, the pieces per block:
+memory latency paid at read time, in place of the write-time sort a
+B-tree pays. LMDB's updates run at a third of this engine's, ycsb-A
+0.29x-0.37x and the shuffled load 0.22x-0.55x in this sitting, and its
+scans after them at full speed; a burst of N updates followed by N
+entries scanned costs this engine less in total at every rung, and the
+sweep's point, by its definition, times the second half alone. Against
+the other engine that defers the sort, RocksDB tuned, in one process
+at ten thousand and a hundred thousand keys: this engine reads the
+point at 1.5x and 1.8x, every other scan quantity at 5x-20x, and E at
+13x-23x; RocksDB loads 1.03x-1.39x faster.
+
+The ground left at this point is write-time structure that survives
+the burst's merges -- forms the merge itself would make over the frozen
+snapshot, or an unsealed run kept in key order -- and each earlier
+attempt at it, the carry and the builder from the publish, is priced
+above. Neither is a read path, and neither is small.
+
 #### Which half of the lag gap, by rung
 
 The build and the walk split by size, and the arms say which is which
