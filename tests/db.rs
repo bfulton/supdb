@@ -5179,3 +5179,136 @@ fn pieces_merge_case(tier_pieces: usize, l0_trigger: usize) {
         );
     }
 }
+
+/// The scan snapshot carries each unsealed key's chain as a run in key
+/// order, and a read of a run answers as a read of the chain does: a
+/// tombstone in it cuts every older source, a chunk past a handle's
+/// commit is not there, a frozen table's run is whole, and a key written
+/// again after the copy is read from its chain. Held on the block path
+/// and on the merge path, through the writer and through a handle under
+/// `Latest`, across a seal left in flight.
+#[test]
+fn the_snapshots_runs_answer_as_the_chains_do() {
+    for block_cache in [true, false] {
+        let d = dir(&format!("snap-runs-{block_cache}"));
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(2 << 10),
+            scan_block_cache: block_cache,
+            scan_cache_ahead: false,
+            share_snapshot: true,
+            snapshot_runs: true,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:06}");
+        for k in 0..3000u32 {
+            m.append(&mut db, &key(k), "p");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        assert!(db.levels().0 > 1, "several partitions");
+        // Updates as the suite makes them, a delete and an append; then a
+        // seal left in flight, so the runs are copied from a frozen table
+        // and a live one both.
+        for k in (0..3000u32).step_by(2) {
+            m.delete(&mut db, &key(k));
+            m.append(&mut db, &key(k), "u1");
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        for k in (0..3000u32).step_by(4) {
+            m.delete(&mut db, &key(k));
+            m.append(&mut db, &key(k), "u2");
+        }
+        for k in (1..3000u32).step_by(8) {
+            m.append(&mut db, &key(k), "a2");
+        }
+        db.commit().unwrap();
+        let reader = db.reader().unwrap();
+        let mut sink = 0usize;
+        db.scan(key(0).as_bytes(), 3000, |_k, v| sink += v.len())
+            .unwrap();
+        m.check(
+            &db,
+            &format!("cache {block_cache}: the writer over the runs"),
+        );
+        m.check(
+            &reader,
+            &format!("cache {block_cache}: a handle over the runs"),
+        );
+        // Writes after the copy, over keys the runs hold and over new
+        // ones, staged: the handle at its commit sees none of them and
+        // the writer sees them all, from the chains.
+        let scan_one = |r: &supdb::Reader, k: u32| -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            let want = key(k);
+            r.scan(want.as_bytes(), 1, |kk, v| {
+                if kk == want.as_bytes() {
+                    out.push(v.to_vec());
+                }
+            })
+            .unwrap();
+            out
+        };
+        let before_12 = scan_one(&reader, 12);
+        let before_17 = scan_one(&reader, 17);
+        assert_eq!(before_12, vec![b"u2".to_vec()]);
+        assert_eq!(before_17, vec![b"p".to_vec(), b"a2".to_vec()]);
+        for k in (0..3000u32).step_by(6) {
+            m.delete(&mut db, &key(k));
+            m.append(&mut db, &key(k), "u3");
+        }
+        for k in (1..3000u32).step_by(16) {
+            m.append(&mut db, &key(k), "a3");
+        }
+        assert_eq!(
+            scan_one(&db, 12),
+            vec![b"u3".to_vec()],
+            "the writer sees its staged delete"
+        );
+        assert_eq!(
+            scan_one(&db, 17),
+            vec![b"p".to_vec(), b"a2".to_vec(), b"a3".to_vec()],
+            "the writer sees its staged append"
+        );
+        assert_eq!(
+            scan_one(&reader, 12),
+            before_12,
+            "staged, so unseen under Latest"
+        );
+        assert_eq!(
+            scan_one(&reader, 17),
+            before_17,
+            "staged, so unseen under Latest"
+        );
+        db.commit().unwrap();
+        m.check(
+            &db,
+            &format!("cache {block_cache}: the writer after writes over copied runs"),
+        );
+        m.check(
+            &reader,
+            &format!("cache {block_cache}: a handle after the commit of writes over copied runs"),
+        );
+        // A handle claimed now adopts the writer's snapshot, runs and all.
+        let later = db.reader().unwrap();
+        m.check(
+            &later,
+            &format!("cache {block_cache}: a handle claimed after"),
+        );
+        db.settle().unwrap();
+        m.check(&db, &format!("cache {block_cache}: after the seal lands"));
+        m.check(
+            &reader,
+            &format!("cache {block_cache}: a handle after the seal lands"),
+        );
+        drop(reader);
+        drop(later);
+        drop(db);
+        let db = Db::open(&d, Options::default()).unwrap();
+        m.check(&db, &format!("cache {block_cache}: reopened"));
+    }
+}

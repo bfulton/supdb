@@ -1422,6 +1422,61 @@ snapshot, or an unsealed run kept in key order -- and each earlier
 attempt at it, the carry and the builder from the publish, is priced
 above. Neither is a read path, and neither is small.
 
+#### The unsealed run: the snapshot carries the values
+
+The write-time structure the point asks for, built as the read half
+first. The scan snapshot already keeps the unsealed keys sorted in one
+arena; `snapshot_runs` has it copy each key's whole chain beside them
+when it is built or extended -- oldest chunk first, each with its
+memtable offset and length, a tombstone by its mark -- so a read of an
+overlaid key streams the copy under its own watermark instead of
+chasing the entry, the chain and the value. A key written again after
+the copy is found through a per-handle stale set fed from the write
+log past the snapshot's log position and read from its chain; a key
+filed since the snapshot carries no run. The cuts of the snapshot's
+keys against the partition are walked once along the index heads and
+kept with its block bounds, so a build seeks nothing. And a block the
+runs cover, three quarters of its keys counting every source's run
+over it, is walked on a read's first touch and not copied: every
+partition record under such a run is masked by its update's
+tombstone, and the copy would have been a copy of the run. A test
+holds the runs to the chains on both scan paths, through the writer
+and a handle under `Latest`, across a seal left in flight and a
+reopen.
+
+What the simulator says the copy costs, and why no one cut moved it:
+callgrind with its cache and branch models over three handle passes at
+ten thousand keys puts, per block built, about 440 mispredicted
+branches (a quarter of them the per-key seek, a tenth the run parse),
+a hundred cold-line writes for the copy's own destination and several
+hundred first-level read misses. Three costs of the same size that
+overlap, so removing any one of them stayed inside this machine's
+noise, which on one binary ran 11.7 to 21.4 µs a scan across a
+sitting.
+
+What it measures, paired binaries alternated three rounds. On the
+handle passes over the point's store, which build without the snapshot
+copy in the timed region: at ten thousand keys 8.0 µs a scan against
+9.7, every round; at thirty thousand level, 13.3-13.9 against
+12.9-13.4, since the walk reads and sorts each piece's keys over the
+window at every scan where a copy read them once; at a hundred
+thousand level. On the writer's own pass, which is the suite's shape,
+slower: 41-49 µs a scan against 28-31 at ten thousand keys, the copy
+of ten thousand chains landing in the pass's first scan, and 19-25
+against 18-20 at thirty thousand. E and the threaded scan mix do not
+move. The walk over the runs at ten thousand keys, all its keys read
+from runs and no copy made, still reads 8 µs a scan: the wide walk
+assembles the window's overlay per scan and dispatches per key, and
+that, not the chase, is now most of it.
+
+So the option is off and `supdb-runs` prices it. Two things would make
+it the structure it is meant to be, and both are the next work: the
+copy paid at the commit from the batch's own slots, which is
+write-time proper and takes the first scan's 1.5 ms off the pass; and
+a walk that streams the runs and the pieces' records through cursors
+without assembling a window, at which point a block the runs cover
+reads at the run's speed.
+
 #### Which half of the lag gap, by rung
 
 The build and the walk split by size, and the arms say which is which

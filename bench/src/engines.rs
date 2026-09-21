@@ -364,6 +364,9 @@ pub struct Supdb {
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
     tier: Option<usize>,
+    /// The scan snapshot carries each unsealed key's chain, and a block
+    /// the runs cover is walked rather than copied. `supdb-runs`.
+    runs: bool,
     /// Whether a publish starts the builder and a commit installs its
     /// forms. `supdb-aheadpub`.
     aheadpub: bool,
@@ -413,6 +416,9 @@ struct Policy {
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
     tier: Option<usize>,
+    /// The scan snapshot carries each unsealed key's chain, and a block
+    /// the runs cover is walked rather than copied. `supdb-runs`.
+    runs: bool,
     /// Whether a publish starts the builder and a commit installs its
     /// forms. `supdb-aheadpub`.
     aheadpub: bool,
@@ -449,6 +455,7 @@ impl Default for Policy {
             recent: None,
             carry: false,
             tier: None,
+            runs: false,
             aheadpub: false,
             pubalways: false,
         }
@@ -525,6 +532,16 @@ impl Supdb {
     /// to the reads after it.
     /// `supdb` with the piece merge on at three pieces, so a range's
     /// pieces fold into one beside the partition merge: what prices it.
+    pub fn create_runs(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                runs: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     pub fn create_tier(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
@@ -777,6 +794,7 @@ impl Supdb {
             recent,
             carry,
             tier,
+            runs,
             aheadpub,
             pubalways,
         } = policy;
@@ -856,6 +874,7 @@ impl Supdb {
             // The pieces over a range merged into one piece beside the
             // partition merge, or left for it as the engine has it.
             tier_pieces: tier.unwrap_or(supdb::Options::default().tier_pieces),
+            snapshot_runs: runs,
             // The builder started by a publish and installed by a commit,
             // or started by a scan as it is.
             build_ahead_on_publish: aheadpub,
@@ -914,6 +933,7 @@ impl Supdb {
             recent,
             carry,
             tier,
+            runs,
             aheadpub,
             pubalways,
         })
@@ -958,6 +978,9 @@ impl Engine for Supdb {
         }
         if self.tier.is_some_and(|t| t > 0) {
             return "supdb-tier";
+        }
+        if self.runs {
+            return "supdb-runs";
         }
         if self.aheadpub {
             return "supdb-aheadpub";
@@ -1507,9 +1530,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
         "supdb" | "supdb-forms" | "supdb-settle" | "supdb-wforms" | "supdb-regime"
         | "supdb-noseal" | "supdb-ahead" | "supdb-lazyforms" | "supdb-eager" | "supdb-nosettle"
-        | "supdb-recency" | "supdb-carry" | "supdb-tier" | "supdb-aheadpub" | "supdb-pubalways"
-        | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb"
-        | "rocksdb-tuned" => Guarantee::Durable,
+        | "supdb-recency" | "supdb-carry" | "supdb-tier" | "supdb-runs" | "supdb-aheadpub"
+        | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache"
+        | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
     })
@@ -1527,6 +1550,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-recency" => Box::new(Supdb::create_recency(dir)?),
         "supdb-carry" => Box::new(Supdb::create_carry(dir)?),
         "supdb-tier" => Box::new(Supdb::create_tier(dir)?),
+        "supdb-runs" => Box::new(Supdb::create_runs(dir)?),
         "supdb-aheadpub" => Box::new(Supdb::create_aheadpub(dir)?),
         "supdb-pubalways" => Box::new(Supdb::create_pubalways(dir)?),
         "supdb-lazyforms" => Box::new(Supdb::create_lazyforms(dir)?),

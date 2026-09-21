@@ -513,6 +513,24 @@ pub struct Options {
     /// into the block it overlays: adopting saves the sort and buys that
     /// list. See the sweep in the pull request for where the two cross.
     pub snapshot_adopt_behind: usize,
+    /// EXPERIMENT: the scan snapshot carries each unsealed key's chain,
+    /// copied in key order when the snapshot is built, so a read of an
+    /// overlaid key streams the copy instead of chasing the memtable's
+    /// entry, chain and value; and a block those runs cover -- three
+    /// quarters of its keys or more, counting every source's run over
+    /// it -- is walked on a read's first touch rather than copied,
+    /// since every partition record under such a run is masked by its
+    /// update's tombstone and the copy would be a copy of the run.
+    /// `docs/engine.md` has the pricing: on the lag sweep's last point at
+    /// ten thousand keys the handle passes read 8.0 µs a scan against
+    /// 9.7 without, level at thirty thousand where the pieces' keys are
+    /// read per window either way, and the writer's own pass reads
+    /// slower by the copy, which lands in the first scan after a burst
+    /// -- at ten thousand keys 1.5 ms over ten thousand chains, half the
+    /// pass. Off, and `supdb-runs` prices it; a version that pays the
+    /// copy at the commit, from the batch's own slots, is the write-time
+    /// structure this is the read half of.
+    pub snapshot_runs: bool,
     /// EXPERIMENT: entries reads must have taken from a block before the
     /// store holds it a second way, as a merged copy beside the cheap
     /// form, so that the reads ask for the shape rather than the writes
@@ -769,6 +787,7 @@ impl Default for Options {
             commit_forms_build: true,
             share_snapshot: true,
             snapshot_adopt_behind: 0,
+            snapshot_runs: false,
             promote_entries: 0,
             build_ahead_on_commit: 0,
             build_ahead_on_publish: false,
@@ -4763,6 +4782,10 @@ struct Overlay<'a> {
     /// Key, piece index, rank in the piece, and the key's cut from the
     /// piece's ranks or `u32::MAX`.
     held: Vec<(&'a [u8], usize, usize, u32)>,
+    /// The snapshot whose runs the keys' `SnapKey`s name, and the slots
+    /// written since its copy, whose runs are not read.
+    snap: &'a Snapshot,
+    stale: &'a std::collections::HashSet<u32>,
 }
 
 /// PROTOTYPE: what emitting an overlay key needs beyond the key: whether
@@ -4826,7 +4849,7 @@ struct BlockTable {
     /// walk of the run against every boundary was the whole of its
     /// first scan's setup -- 16 us at ten thousand keys, 47 at thirty,
     /// a tenth of the threaded scan pass after the mixes at both.
-    snap_at: std::cell::OnceCell<std::sync::Arc<Vec<u32>>>,
+    snap_at: std::cell::OnceCell<std::sync::Arc<SnapBounds>>,
     /// The snapshot's positions at the partition's two fences, which is
     /// what `clean_throughout` asks of the bounds: two searches.
     snap_span: (u32, u32),
@@ -4849,7 +4872,7 @@ impl BlockTable {
     }
 
     /// The snapshot's bounds, walked now if this table has not yet.
-    fn snap_at(&self, seg: &Seg, unsealed: &Snapshot) -> Result<&[u32]> {
+    fn snap_at(&self, seg: &Seg, unsealed: &Snapshot) -> Result<&SnapBounds> {
         if let Some(at) = self.snap_at.get() {
             return Ok(at);
         }
@@ -5269,6 +5292,10 @@ pub struct Reader {
     /// scan snapshot was built, sorted by key, so a commit does not force
     /// a rebuild: materialization merges these with the snapshot's keys.
     snap_added: std::cell::RefCell<Vec<u32>>,
+    /// PROTOTYPE: live slots written since the scan snapshot's runs were
+    /// copied, by the write log from the snapshot's `log_at`: a key here
+    /// is read from its chain, not its run. See `Snapshot::vals`.
+    snap_stale: std::cell::RefCell<std::collections::HashSet<u32>>,
     /// How far into the memtable's write log this handle has looked, and
     /// the generation it looked in: a new generation is a new memtable
     /// or a new segment set, and the log is read from the start again.
@@ -5418,7 +5445,19 @@ struct SnapKey {
     len: u32,
     mem: u32,
     frozen: u32,
+    /// The key's live and frozen chains copied into `Snapshot::vals` when
+    /// the snapshot was built, or `NO_RUN`: a filed key carries none, and
+    /// a key written again since the copy is read from its chain.
+    lrun: u32,
+    frun: u32,
 }
+
+/// No copied run for a snapshot key.
+const NO_RUN: u32 = u32::MAX;
+
+/// An overlay assembled from a chain alone names no snapshot; this one
+/// stands in, and nothing reads a run from it.
+static NO_SNAPSHOT: std::sync::LazyLock<Snapshot> = std::sync::LazyLock::new(Snapshot::default);
 
 /// The sorted keys of the unsealed sources, built lazily by `Db::scan` and
 /// kept until the next commit or seal. Keys live in one arena rather than
@@ -5428,6 +5467,23 @@ struct SnapKey {
 struct Snapshot {
     keys: Vec<u8>,
     ents: Vec<SnapKey>,
+    /// PROTOTYPE: the unsealed run. Each key's whole chain from the live
+    /// table and from the frozen one, copied here in key order when the
+    /// snapshot is built or extended -- oldest chunk first, each with
+    /// the arena offset it has in the memtable and its length, a
+    /// tombstone by `TOMB_LEN` -- so a read of an overlaid key streams
+    /// this arena instead of chasing the entry, the chain and the value
+    /// through the memtable's own layout, two or three dependent misses
+    /// a key that were a third of a block's build and of a wide walk on
+    /// the store the lag sweep's last point leaves. A reader under a
+    /// watermark honours it here as it does on the chain, by the chunk
+    /// offsets; a key written again after the copy is found through the
+    /// handle's stale set, fed from the write log past `log_at`, and
+    /// read from the chain as before.
+    vals: Vec<u8>,
+    /// The write log's length when the runs were copied: every log entry
+    /// from here on may have moved a chain past its copy.
+    log_at: usize,
     /// The live memtable prefix `ents` was built over, which with the
     /// frozen table is everything it holds. A handle that adopts this
     /// snapshot rather than building its own reads it to know which of
@@ -5453,7 +5509,7 @@ struct Snapshot {
     /// whose run is the same. A handle's first scan after the mixes
     /// walked the run against every boundary for 280 us at three
     /// hundred thousand keys.
-    bounds: std::sync::Arc<std::sync::RwLock<BoundsById>>,
+    bounds: std::sync::Arc<std::sync::RwLock<SnapById>>,
 }
 
 /// Entries a filing may leave in `fresh` before it is folded into `side`.
@@ -5500,10 +5556,16 @@ impl Snapshot {
                     bk,
                     SnapKey {
                         mem: if e.mem != u32::MAX { e.mem } else { be.mem },
+                        lrun: if e.mem != u32::MAX { e.lrun } else { be.lrun },
                         frozen: if e.frozen != u32::MAX {
                             e.frozen
                         } else {
                             be.frozen
+                        },
+                        frun: if e.frozen != u32::MAX {
+                            e.frun
+                        } else {
+                            be.frun
                         },
                         ..be
                     },
@@ -5545,6 +5607,8 @@ impl Snapshot {
                 len: key.len() as u32,
                 mem: slot,
                 frozen: u32::MAX,
+                lrun: NO_RUN,
+                frun: NO_RUN,
             });
         }
         batch.sort_by(|a, b| self.key_of(a).cmp(self.key_of(b)));
@@ -5567,25 +5631,44 @@ impl Snapshot {
     /// is 9 ms, and the organiser paid that fifteen times over one burst
     /// of writes. Only for a run with nothing filed into it: a handle's
     /// side runs are that handle's own and are not what gets published.
-    fn extend(&self, mem: &MemTable, to: usize) -> Snapshot {
+    fn extend(
+        &self,
+        mem: &MemTable,
+        to: usize,
+        stale: &std::collections::HashSet<u32>,
+        runs: bool,
+    ) -> Snapshot {
         let from = self.live_len;
+        // The log's length first, then the chains: a write that lands
+        // between is logged past this mark and read from its chain.
+        let log_at = mem.log_len();
         let mut out = Snapshot {
             keys: self.keys.clone(),
+            vals: self.vals.clone(),
+            log_at,
             ents: Vec::with_capacity(self.ents.len() + (to - from)),
             live_len: to,
             ..Default::default()
         };
+        let mut rscratch: Vec<(u64, u32)> = Vec::new();
         let mut batch: Vec<SnapKey> = Vec::with_capacity(to - from);
         for i in from..to {
             let e = mem.entry(i);
             let key = mem.key_of(e);
             let off = out.keys.len() as u32;
             out.keys.extend_from_slice(key);
+            let lrun = if runs {
+                out.copy_run(mem, e, &mut rscratch)
+            } else {
+                NO_RUN
+            };
             batch.push(SnapKey {
                 off,
                 len: key.len() as u32,
                 mem: i as u32,
                 frozen: u32::MAX,
+                lrun,
+                frun: NO_RUN,
             });
         }
         let keys = &out.keys;
@@ -5616,6 +5699,13 @@ impl Snapshot {
                 j += 1;
                 batch[j - 1]
             });
+        }
+        // A run written again since the base was copied: copied again,
+        // from the chain as it stands now.
+        for e in merged.iter_mut() {
+            if e.mem != u32::MAX && e.lrun != NO_RUN && stale.contains(&e.mem) {
+                e.lrun = out.copy_run(mem, mem.entry(e.mem as usize), &mut rscratch);
+            }
         }
         out.ents = Vec::with_capacity(merged.len());
         for e in merged {
@@ -5686,14 +5776,85 @@ impl Snapshot {
             if same {
                 if e.mem != u32::MAX {
                     last.mem = e.mem;
+                    last.lrun = e.lrun;
                 }
                 if e.frozen != u32::MAX {
                     last.frozen = e.frozen;
+                    last.frun = e.frun;
                 }
                 return;
             }
         }
         self.ents.push(e);
+    }
+
+    /// PROTOTYPE: the whole chain of `e` appended to the run arena,
+    /// oldest chunk first, as a count and then each chunk's memtable
+    /// offset, its length and, for a value, its bytes. Returns where the
+    /// run starts.
+    fn copy_run(&mut self, mem: &MemTable, e: &MemEntry, scratch: &mut Vec<(u64, u32)>) -> u32 {
+        scratch.clear();
+        let mut at = MemTable::head(e);
+        while at != NO_CHUNK {
+            scratch.push((at, mem.chunk_len(at)));
+            at = mem.chunk_prev(at);
+        }
+        let off = self.vals.len() as u32;
+        self.vals
+            .extend_from_slice(&(scratch.len() as u32).to_le_bytes());
+        for &(at, len) in scratch.iter().rev() {
+            self.vals.extend_from_slice(&at.to_le_bytes());
+            self.vals.extend_from_slice(&len.to_le_bytes());
+            if len != TOMB_LEN {
+                self.vals.extend_from_slice(mem.value_at(at as usize));
+            }
+        }
+        off
+    }
+
+    /// PROTOTYPE: the run at `off` as a read under `wm` sees it, the way
+    /// `MemTable::live_offs_into` sees a chain: chunks at or past the
+    /// mark are not there, and everything older than the newest visible
+    /// tombstone is dead. Returns the byte range of the live values'
+    /// records and whether a visible tombstone was met.
+    fn run_visible(&self, off: u32, wm: u64) -> (std::ops::Range<usize>, bool) {
+        let v = &self.vals;
+        let mut p = off as usize;
+        let n = u32::from_le_bytes(v[p..p + 4].try_into().expect("four bytes")) as usize;
+        p += 4;
+        let mut start = p;
+        let mut tomb = false;
+        for _ in 0..n {
+            let at = u64::from_le_bytes(v[p..p + 8].try_into().expect("eight bytes"));
+            if at >= wm {
+                break;
+            }
+            let len = u32::from_le_bytes(v[p + 8..p + 12].try_into().expect("four bytes"));
+            p += 12;
+            if len == TOMB_LEN {
+                tomb = true;
+                start = p;
+            } else {
+                p += len as usize;
+            }
+        }
+        (start..p, tomb)
+    }
+
+    fn run_values<F: FnMut(&[u8])>(&self, off: u32, wm: u64, mut f: F) {
+        let (range, _) = self.run_visible(off, wm);
+        let v = &self.vals;
+        let mut p = range.start;
+        while p < range.end {
+            let len = u32::from_le_bytes(v[p + 8..p + 12].try_into().expect("four bytes")) as usize;
+            p += 12;
+            f(&v[p..p + len]);
+            p += len;
+        }
+    }
+
+    fn run_has_tomb(&self, off: u32, wm: u64) -> bool {
+        self.run_visible(off, wm).1
     }
 }
 
@@ -6369,12 +6530,16 @@ impl Reader {
         let n = live_len + self.frozen().as_ref().map_or(0, |f| f.len());
         let mut snap = Snapshot {
             live_len,
+            // The log's length before any chain is read: see `extend`.
+            log_at: self.mem().log_len(),
             keys: Vec::with_capacity(
                 self.mem().key_bytes() + self.frozen().as_ref().map_or(0, |f| f.key_bytes()),
             ),
             ents: Vec::with_capacity(n),
             ..Default::default()
         };
+        let mut rscratch: Vec<(u64, u32)> = Vec::new();
+        let runs = self.opts.snapshot_runs;
         if self.opts.scan_snapshot_arena {
             // Arena build. The hash table is walked in slot order, which
             // visits the key bytes in random order -- one cache miss a key,
@@ -6401,11 +6566,18 @@ impl Reader {
                     let k = mem.key_at(off, len);
                     let (a, b) = key_prefix(k);
                     recs.push((a, b, pending.len() as u32));
+                    let run = if runs {
+                        snap.copy_run(mem, mem.entry(i as usize), &mut rscratch)
+                    } else {
+                        NO_RUN
+                    };
                     pending.push(SnapKey {
                         off: snap.keys.len() as u32,
                         len: k.len() as u32,
                         mem: if live { i } else { u32::MAX },
                         frozen: if live { u32::MAX } else { i },
+                        lrun: if live { run } else { NO_RUN },
+                        frun: if live { NO_RUN } else { run },
                     });
                     snap.keys.extend_from_slice(k);
                 }
@@ -6435,6 +6607,7 @@ impl Reader {
                 key: Vec<u8>,
                 mem: u32,
                 frozen: u32,
+                run: u32,
             }
             let mut all: Vec<Old> = Vec::with_capacity(n);
             let mut take = |mem: &MemTable, live: bool| {
@@ -6444,6 +6617,11 @@ impl Reader {
                         key: mem.key_of(e).to_vec(),
                         mem: if live { i as u32 } else { u32::MAX },
                         frozen: if live { u32::MAX } else { i as u32 },
+                        run: if runs {
+                            snap.copy_run(mem, e, &mut rscratch)
+                        } else {
+                            NO_RUN
+                        },
                     });
                 }
             };
@@ -6460,6 +6638,8 @@ impl Reader {
                     len: o.key.len() as u32,
                     mem: o.mem,
                     frozen: o.frozen,
+                    lrun: if o.mem != u32::MAX { o.run } else { NO_RUN },
+                    frun: if o.frozen != u32::MAX { o.run } else { NO_RUN },
                 });
             }
         }
@@ -6674,6 +6854,7 @@ impl Reader {
             self.snap_entries.set(0);
             *self.scan_keys.borrow_mut() = None;
             self.snap_added.borrow_mut().clear();
+            self.snap_stale.borrow_mut().clear();
             self.pending.borrow_mut().clear();
             self.drop_blocks();
             if self.tables.borrow().len() != st.segs.len() {
@@ -6704,8 +6885,19 @@ impl Reader {
             .as_ref()
             .filter(|a| !a.done.get())
             .map(|a| (a.from, a.since.borrow_mut()));
+        // Every write logged past the snapshot's copy may have moved a
+        // chain past its run: the slot is read from the chain from here.
+        let run_at = self
+            .scan_keys
+            .borrow()
+            .as_ref()
+            .map_or(usize::MAX, |(_, s)| s.log_at);
+        let mut stale = self.snap_stale.borrow_mut();
         for i in seen..n {
             let (id, new) = mem.log_at(i);
+            if i >= run_at {
+                stale.insert(id as u32);
+            }
             // Created since the snapshot: a key the snapshot holds already
             // was created below its count, however late the log says so.
             let new = new && id >= covered;
@@ -6947,7 +7139,12 @@ impl Reader {
                 self.shared
                     .snap_extends
                     .fetch_add(1, AtomicOrdering::Relaxed);
-                std::sync::Arc::new(s.extend(self.mem(), to))
+                std::sync::Arc::new(s.extend(
+                    self.mem(),
+                    to,
+                    &self.snap_stale.borrow(),
+                    self.opts.snapshot_runs,
+                ))
             }
             None => std::sync::Arc::new(self.build_snapshot(to)),
         };
@@ -7262,6 +7459,8 @@ impl Reader {
             } else {
                 CACHE_DENSE
             },
+            stale: self.snap_stale.borrow(),
+            copy_dense: false,
         }
     }
 
@@ -7367,6 +7566,16 @@ impl Reader {
             self.snap_added
                 .borrow_mut()
                 .retain(|&slot| slot as usize >= snap.live_len);
+            // The stale set is the log from the runs' copy to where this
+            // handle has read it; what it reads on is added as it goes.
+            {
+                let mem = self.mem();
+                let mut stale = self.snap_stale.borrow_mut();
+                stale.clear();
+                for i in snap.log_at..self.log_seen.get().min(mem.log_len()) {
+                    stale.insert(mem.log_at(i).0 as u32);
+                }
+            }
             *cache = Some((gen, snap));
             // Every key created since the old snapshot is in the new one:
             // the lists that held them are emptied, and the bounds each
@@ -7590,6 +7799,10 @@ impl Reader {
             }
             table.snap_at(seg, unsealed)?;
             let src = Sources { seg, l0 };
+            let ctx = BuildCtx {
+                copy_dense: true,
+                ..self.build_ctx()
+            };
             for b in 0..table.slots.len() {
                 if table.slots[b].is_some() || BuildCtx::overlay_count(table, b) == 0 {
                     continue;
@@ -7899,7 +8112,10 @@ impl Reader {
             len: 0,
             mem: slot,
             frozen: self.frozen().as_ref().map_or(u32::MAX, |fr| slot_in(fr)),
+            lrun: NO_RUN,
+            frun: NO_RUN,
         };
+        let ctx = self.build_ctx();
         let ov = Overlay {
             over: vec![Over {
                 key,
@@ -7908,6 +8124,8 @@ impl Reader {
                 pieces: 0..held.len() as u32,
             }],
             held,
+            snap: &NO_SNAPSHOT,
+            stale: &ctx.stale,
         };
         let (c, at_eq) = BuildCtx::cut_known(cut, lo, hi);
         let same = c < hi && at_eq == Ordering::Equal;
@@ -7918,7 +8136,7 @@ impl Reader {
         let mut run_scratch = self.settle_run.borrow_mut();
         let run: &mut Vec<u8> = &mut run_scratch;
         run.clear();
-        self.build_ctx().emit_over(
+        ctx.emit_over(
             &mut |_, v: &[u8]| {
                 run.extend_from_slice(&(v.len() as u32).to_le_bytes());
                 run.extend_from_slice(v);
@@ -8382,11 +8600,17 @@ impl Reader {
                 if promote > 0 && table.dense[b].is_none() {
                     let took = (seen - took_from) as u32;
                     table.reads[b] = table.reads[b].saturating_add(took);
-                    if table.reads[b] as usize >= promote
-                        && matches!(table.slots[b].as_deref(), Some(Cached::Sparse(_)))
-                    {
+                    // A walked block is copied only below the wide bound:
+                    // past it the block holds more than a copy should.
+                    let repays = match table.slots[b].as_deref() {
+                        Some(Cached::Sparse(_)) => true,
+                        Some(Cached::Wide(_)) => BuildCtx::overlay_count(table, b) <= WIDE,
+                        _ => false,
+                    };
+                    if table.reads[b] as usize >= promote && repays {
                         let copied = BuildCtx {
                             dense_from: 1,
+                            copy_dense: true,
                             ..self.build_ctx()
                         }
                         .materialize(src, table, b, unsealed)?;
@@ -8605,9 +8829,9 @@ impl Reader {
                     &mut f,
                     &mut scratch,
                     tombs,
-                    uk,
-                    &sk,
+                    (uk, &sk),
                     same.then_some((seg, rank)),
+                    unsealed,
                 )?;
                 if same {
                     rank += 1;
@@ -8626,7 +8850,7 @@ impl Reader {
                 break;
             };
             let tombs = *tombs.get_or_insert_with(|| self.has_tombstones());
-            self.emit_unsealed(&mut f, &mut scratch, tombs, uk, &sk, None)?;
+            self.emit_unsealed(&mut f, &mut scratch, tombs, (uk, &sk), None, unsealed)?;
             unsealed.advance(&mut mc);
             seen += 1;
         }
@@ -8644,24 +8868,38 @@ impl Reader {
         f: &mut F,
         scratch: &mut Vec<usize>,
         tombs: bool,
-        key: &[u8],
-        sk: &SnapKey,
+        entry: (&[u8], &SnapKey),
         part: Option<(&Seg, usize)>,
+        snap: &Snapshot,
     ) -> Result<()> {
+        let (key, sk) = entry;
+        let stale = self.snap_stale.borrow();
+        let live_run = sk.mem != u32::MAX && sk.lrun != NO_RUN && !stale.contains(&sk.mem);
+        let frozen_run = sk.frozen != u32::MAX && sk.frun != NO_RUN;
         let mut start = 0usize;
         if tombs {
-            if sk.mem != u32::MAX
-                && self
-                    .mem()
+            let live_tomb = if sk.mem == u32::MAX {
+                false
+            } else if live_run {
+                snap.run_has_tomb(sk.lrun, self.wm())
+            } else {
+                self.mem()
                     .has_tomb(self.mem().entry(sk.mem as usize), self.wm())
-            {
+            };
+            let frozen_tomb = || {
+                if sk.frozen == u32::MAX {
+                    false
+                } else if frozen_run {
+                    snap.run_has_tomb(sk.frun, SEE_ALL)
+                } else {
+                    self.frozen()
+                        .as_ref()
+                        .is_some_and(|fr| fr.has_tomb(fr.entry(sk.frozen as usize), SEE_ALL))
+                }
+            };
+            if live_tomb {
                 start = 2;
-            } else if sk.frozen != u32::MAX
-                && self
-                    .frozen()
-                    .as_ref()
-                    .is_some_and(|fr| fr.has_tomb(fr.entry(sk.frozen as usize), SEE_ALL))
-            {
+            } else if frozen_tomb() {
                 start = 1;
             }
         }
@@ -8673,7 +8911,9 @@ impl Reader {
             }
         }
         if sk.frozen != u32::MAX && start <= 1 {
-            if let Some(fr) = self.frozen() {
+            if frozen_run {
+                snap.run_values(sk.frun, SEE_ALL, |v| f(key, v));
+            } else if let Some(fr) = self.frozen() {
                 let e = fr.entry(sk.frozen as usize);
                 fr.live_offs_into(e, scratch, SEE_ALL);
                 for &off in scratch.iter() {
@@ -8682,10 +8922,14 @@ impl Reader {
             }
         }
         if sk.mem != u32::MAX {
-            let e = self.mem().entry(sk.mem as usize);
-            self.mem().live_offs_into(e, scratch, self.wm());
-            for &off in scratch.iter() {
-                f(key, self.mem().value_at(off));
+            if live_run {
+                snap.run_values(sk.lrun, self.wm(), |v| f(key, v));
+            } else {
+                let e = self.mem().entry(sk.mem as usize);
+                self.mem().live_offs_into(e, scratch, self.wm());
+                for &off in scratch.iter() {
+                    f(key, self.mem().value_at(off));
+                }
             }
         }
         Ok(())
@@ -8965,6 +9209,10 @@ impl Reader {
     /// Live segment count by level: (partitioned, L0). The compaction
     /// experiment reports both, because "how many segments does a read
     /// touch" is the whole question.
+    #[doc(hidden)]
+    pub fn state_gen(&self) -> u64 {
+        self.state().gen
+    }
     pub fn levels(&self) -> (usize, usize) {
         let _entered = self.enter();
         (self.segs().len() - self.l0_len(), self.l0_len())
@@ -9189,6 +9437,7 @@ impl Db {
             choices: std::cell::Cell::new([0; 5]),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),
+            snap_stale: std::cell::RefCell::new(std::collections::HashSet::new()),
             log_seen: std::cell::Cell::new(0),
             log_gen: std::cell::Cell::new(0),
             log_bound: std::cell::Cell::new(usize::MAX),
@@ -9488,6 +9737,7 @@ impl Db {
             choices: std::cell::Cell::new([0; 5]),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),
+            snap_stale: std::cell::RefCell::new(std::collections::HashSet::new()),
             log_seen: std::cell::Cell::new(0),
             log_gen: std::cell::Cell::new(0),
             log_bound: std::cell::Cell::new(usize::MAX),
@@ -10414,6 +10664,7 @@ impl Reader {
             choices: std::cell::Cell::new([0; 5]),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),
+            snap_stale: std::cell::RefCell::new(std::collections::HashSet::new()),
             log_seen: std::cell::Cell::new(0),
             log_gen: std::cell::Cell::new(0),
             log_bound: std::cell::Cell::new(usize::MAX),
@@ -10640,6 +10891,7 @@ impl Db {
             // that scan were enough to index past the map.
             *self.scan_keys.borrow_mut() = None;
             self.snap_added.borrow_mut().clear();
+            self.snap_stale.borrow_mut().clear();
             self.drop_blocks();
         }
         self.publish_and_organise(next);
@@ -11384,6 +11636,21 @@ type PieceRun<'a> = (usize, std::ops::Range<usize>, Option<&'a [u32]>);
 /// each partition it meets and a snapshot keeps for its main run.
 type BoundsById = Vec<(u64, std::sync::Arc<Vec<u32>>)>;
 
+/// PROTOTYPE: a snapshot's main run against one partition: where the
+/// run's positions fall against the partition's block boundaries, and
+/// where each key of the run cuts the partition's walk, encoded as
+/// `owner_of` encodes a cut. Both are functions of the run and the
+/// partition, taken once in one forward walk along the partition's index
+/// heads and kept with the snapshot under the partition's blob id. The
+/// cuts were searched for at every build instead, a binary search over
+/// the block's heads per snapshot key, six mispredicted branches a key
+/// by the simulator's count and a quarter of a build's.
+struct SnapBounds {
+    at: Vec<u32>,
+    cuts: Vec<u32>,
+}
+type SnapById = Vec<(u64, std::sync::Arc<SnapBounds>)>;
+
 /// PROTOTYPE: per entry of a `PieceBounds`, the piece's ranks against the
 /// partition, as `BlockTable::piece_ranks` holds them.
 type PieceRanks = Vec<Option<std::sync::Arc<Vec<u32>>>>;
@@ -11573,7 +11840,10 @@ impl Reader {
         // a core the reads are not using, and a handle that reads the
         // state after takes these keys instead of sorting them again.
         let unsealed = self.snapshot_to(len, self.adopt_snapshot().filter(|s| s.live_len <= len));
-        let ctx = self.build_ctx();
+        let ctx = BuildCtx {
+            copy_dense: true,
+            ..self.build_ctx()
+        };
         // Under a budget, the forms queued for the install are bounded
         // by it too: the store sheds past the budget only as it installs.
         let budget = self.opts.scan_cache_bytes;
@@ -11677,6 +11947,16 @@ struct BuildCtx<'s> {
     /// under canonical forms, whose readers walk a form as the one
     /// structure over the block and never merge it with a source.
     dense_from: usize,
+    /// The handle's stale set, held for the build: see `Snapshot::vals`.
+    stale: std::cell::Ref<'s, std::collections::HashSet<u32>>,
+    /// PROTOTYPE: whether a block the unsealed run covers is copied now
+    /// or walked. A read's first touch walks it: every partition record
+    /// under a run that covers the block is masked by its update's
+    /// tombstone, so a copy of such a block is a copy of the run, and
+    /// the walk streams the run itself. The writer's fill at a commit,
+    /// the builder ahead and a promotion copy, since they run where no
+    /// read waits or for a block whose reads have repaid it.
+    copy_dense: bool,
 }
 
 impl<'s> BuildCtx<'s> {
@@ -11858,7 +12138,7 @@ impl<'s> BuildCtx<'s> {
         seg: &Seg,
         nblocks: usize,
         unsealed: &Snapshot,
-    ) -> Result<std::sync::Arc<Vec<u32>>> {
+    ) -> Result<std::sync::Arc<SnapBounds>> {
         let against = seg.blob.id();
         let cached = unsealed
             .bounds
@@ -11870,19 +12150,51 @@ impl<'s> BuildCtx<'s> {
         if let Some(at) = cached {
             return Ok(at);
         }
-        let at = std::sync::Arc::new(block_bounds_of(
+        let at = block_bounds_of(
             seg,
             nblocks,
             unsealed.len(),
             |k| unsealed.seek(k),
             |i, bound| unsealed.advance_below(i, bound),
-        )?);
+        )?;
+        let (lo, hi) = (
+            at.first().copied().unwrap_or(0) as usize,
+            at.last().copied().unwrap_or(0) as usize,
+        );
+        let cuts = Self::snap_cuts(seg, unsealed, lo, hi)?;
+        let sb = std::sync::Arc::new(SnapBounds { at, cuts });
         unsealed
             .bounds
             .write()
             .expect("a snapshot's bounds")
-            .push((against, at.clone()));
-        Ok(at)
+            .push((against, sb.clone()));
+        Ok(sb)
+    }
+    /// PROTOTYPE: where each key of the snapshot's run over `lo..hi` cuts
+    /// the partition's walk, from one forward walk along the index heads:
+    /// the run is sorted, so each key's rank is at or past the last one's.
+    /// Entries outside the range carry no cut, and a build meeting one
+    /// searches as it did.
+    fn snap_cuts(seg: &Seg, unsealed: &Snapshot, lo: usize, hi: usize) -> Result<Vec<u32>> {
+        let n = unsealed.len();
+        let mut cuts = vec![u32::MAX; n];
+        let keys = seg.blob.keys();
+        let mut r = 0usize;
+        let mut kbuf = Vec::new();
+        let hi = hi.min(n);
+        for (i, cut) in cuts.iter_mut().enumerate().take(hi).skip(lo) {
+            let (k, _) = unsealed
+                .get(i)
+                .ok_or_else(|| err("block cache: a snapshot bound did not resolve"))?;
+            r = seg.ord.advance_below(r, k, |j| seg.blob.key_at(j));
+            let same = r < keys
+                && match seg.ord.whole_key_at(r, &mut kbuf) {
+                    Some(w) => w == k,
+                    None => seg.blob.key_at(r) == Some(k),
+                };
+            *cut = ((r as u32) << 1) | same as u32;
+        }
+        Ok(cuts)
     }
     /// PROTOTYPE: the memtables' keys of a block, in order: a run of the
     /// snapshot and the filed keys, merged. The filed keys are put in key
@@ -11895,6 +12207,7 @@ impl<'s> BuildCtx<'s> {
         snap: std::ops::Range<usize>,
         filed: &[(u32, u32)],
         sorted: bool,
+        cuts: &[u32],
     ) -> Result<Vec<Over<'a>>> {
         let mut out: Vec<Over> = Vec::with_capacity(snap.len() + filed.len());
         for i in snap {
@@ -11904,7 +12217,7 @@ impl<'s> BuildCtx<'s> {
             out.push(Over {
                 key: k,
                 sk: Some(*sk),
-                cut: u32::MAX,
+                cut: cuts.get(i).copied().unwrap_or(u32::MAX),
                 pieces: 0..0,
             });
         }
@@ -11921,6 +12234,8 @@ impl<'s> BuildCtx<'s> {
                     len: 0,
                     mem: i,
                     frozen: u32::MAX,
+                    lrun: NO_RUN,
+                    frun: NO_RUN,
                 }),
                 cut,
                 pieces: 0..0,
@@ -11953,7 +12268,11 @@ impl<'s> BuildCtx<'s> {
                         debug_assert_eq!(xs.mem, u32::MAX, "a live key was created twice");
                         merged.push(Over {
                             key: x.key,
-                            sk: Some(SnapKey { mem: ys.mem, ..xs }),
+                            sk: Some(SnapKey {
+                                mem: ys.mem,
+                                lrun: NO_RUN,
+                                ..xs
+                            }),
                             cut: y.cut,
                             pieces: 0..0,
                         });
@@ -11977,7 +12296,9 @@ impl<'s> BuildCtx<'s> {
         src: Sources<'a>,
         mem: Vec<Over<'a>>,
         pieces: &[PieceRun<'_>],
+        snap: &'a Snapshot,
     ) -> Result<Overlay<'a>> {
+        let stale: &'a std::collections::HashSet<u32> = &self.stale;
         let mut held: Vec<(&[u8], usize, usize, u32)> = Vec::new();
         for (j, run, ranks) in pieces {
             let p = &src.l0[*j];
@@ -11991,7 +12312,12 @@ impl<'s> BuildCtx<'s> {
             }
         }
         if held.is_empty() {
-            return Ok(Overlay { over: mem, held });
+            return Ok(Overlay {
+                over: mem,
+                held,
+                snap,
+                stale,
+            });
         }
         held.sort_by(|x, y| x.0.cmp(y.0).then(x.1.cmp(&y.1)));
         let mut over: Vec<Over> = Vec::with_capacity(mem.len() + held.len());
@@ -12028,7 +12354,12 @@ impl<'s> BuildCtx<'s> {
                 pieces: from as u32..h as u32,
             });
         }
-        Ok(Overlay { over, held })
+        Ok(Overlay {
+            over,
+            held,
+            snap,
+            stale,
+        })
     }
     /// PROTOTYPE: every key above the partition in block `b`, from the
     /// table's bounds; nothing is seeked.
@@ -12039,9 +12370,9 @@ impl<'s> BuildCtx<'s> {
         b: usize,
         unsealed: &'a Snapshot,
     ) -> Result<Overlay<'a>> {
-        let at = table.snap_at(src.seg, unsealed)?;
-        let snap = at[b] as usize..at[b + 1] as usize;
-        let mem = self.overlay_mem(unsealed, snap, &table.added[b], false)?;
+        let sb = table.snap_at(src.seg, unsealed)?;
+        let snap = sb.at[b] as usize..sb.at[b + 1] as usize;
+        let mem = self.overlay_mem(unsealed, snap, &table.added[b], false, &sb.cuts)?;
         let pieces: Vec<PieceRun<'_>> = table
             .pieces
             .iter()
@@ -12054,7 +12385,7 @@ impl<'s> BuildCtx<'s> {
                 )
             })
             .collect();
-        self.overlay_runs(src, mem, &pieces)
+        self.overlay_runs(src, mem, &pieces, unsealed)
     }
     /// PROTOTYPE: a floor under how many keys above the partition block
     /// `b` has, from the table's bounds alone: its largest source's run
@@ -12072,7 +12403,7 @@ impl<'s> BuildCtx<'s> {
         let snap = table
             .snap_at
             .get()
-            .map_or(0, |at| (at[b + 1] - at[b]) as usize);
+            .map_or(0, |sb| (sb.at[b + 1] - sb.at[b]) as usize);
         let pieces = table
             .pieces
             .iter()
@@ -12095,8 +12426,8 @@ impl<'s> BuildCtx<'s> {
         window: (&[u8], usize),
     ) -> Result<Overlay<'a>> {
         let (cursor, limit) = window;
-        let at = table.snap_at(src.seg, unsealed)?;
-        let (s0, s1) = (at[b] as usize, at[b + 1] as usize);
+        let sb = table.snap_at(src.seg, unsealed)?;
+        let (s0, s1) = (sb.at[b] as usize, sb.at[b + 1] as usize);
         let key_at = |i: usize| unsealed.get(i).map(|(k, _)| k);
         let mut lo = s0;
         let mut hi = s1;
@@ -12112,7 +12443,7 @@ impl<'s> BuildCtx<'s> {
         let key_of = |slot: u32| self.mem.key_of(self.mem.entry(slot as usize));
         let f0 = wide.sorted.partition_point(|&(i, _)| key_of(i) < cursor);
         let filed = &wide.sorted[f0..wide.sorted.len().min(f0.saturating_add(limit))];
-        let mem = self.overlay_mem(unsealed, snap, filed, true)?;
+        let mem = self.overlay_mem(unsealed, snap, filed, true, &sb.cuts)?;
         let pieces: Vec<PieceRun<'_>> = table
             .pieces
             .iter()
@@ -12131,7 +12462,7 @@ impl<'s> BuildCtx<'s> {
                 )
             })
             .collect();
-        self.overlay_runs(src, mem, &pieces)
+        self.overlay_runs(src, mem, &pieces, unsealed)
     }
     /// PROTOTYPE: the oldest source whose values for an overlay key are
     /// live: 0 with no tombstone in the way, else one past the newest
@@ -12141,6 +12472,7 @@ impl<'s> BuildCtx<'s> {
     fn oldest_live(
         &self,
         em: &Emit,
+        ov: &Overlay,
         o: &Over,
         held: &[(&[u8], usize, usize, u32)],
         src: Sources,
@@ -12149,15 +12481,27 @@ impl<'s> BuildCtx<'s> {
         let mut start = 0usize;
         if em.tombs {
             if let Some(sk) = o.sk {
-                if sk.mem != u32::MAX && self.mem.has_tomb(self.mem.entry(sk.mem as usize), self.wm)
-                {
+                let live_tomb = if sk.mem == u32::MAX {
+                    false
+                } else if sk.lrun != NO_RUN && !ov.stale.contains(&sk.mem) {
+                    ov.snap.run_has_tomb(sk.lrun, self.wm)
+                } else {
+                    self.mem.has_tomb(self.mem.entry(sk.mem as usize), self.wm)
+                };
+                let frozen_tomb = || {
+                    if sk.frozen == u32::MAX {
+                        false
+                    } else if sk.frun != NO_RUN {
+                        ov.snap.run_has_tomb(sk.frun, SEE_ALL)
+                    } else {
+                        self.frozen
+                            .as_ref()
+                            .is_some_and(|fr| fr.has_tomb(fr.entry(sk.frozen as usize), SEE_ALL))
+                    }
+                };
+                if live_tomb {
                     start = nc + 2;
-                } else if sk.frozen != u32::MAX
-                    && self
-                        .frozen
-                        .as_ref()
-                        .is_some_and(|fr| fr.has_tomb(fr.entry(sk.frozen as usize), SEE_ALL))
-                {
+                } else if frozen_tomb() {
                     start = nc + 1;
                 }
             }
@@ -12198,7 +12542,7 @@ impl<'s> BuildCtx<'s> {
         let nc = src.l0.len();
         let key = o.key;
         let read = |e: std::io::Error| err(&format!("block cache read: {e}"));
-        let start = self.oldest_live(em, o, held, src);
+        let start = self.oldest_live(em, ov, o, held, src);
         if start == 0 {
             if let Some(r) = part_rank {
                 src.seg.blob.values_at(r, |v| f(key, v)).map_err(read)?;
@@ -12214,7 +12558,9 @@ impl<'s> BuildCtx<'s> {
         }
         if let Some(sk) = o.sk {
             if sk.frozen != u32::MAX && nc + 1 >= start {
-                if let Some(fr) = self.frozen {
+                if sk.frun != NO_RUN {
+                    ov.snap.run_values(sk.frun, SEE_ALL, |v| f(key, v));
+                } else if let Some(fr) = self.frozen {
                     let e = fr.entry(sk.frozen as usize);
                     fr.live_offs_into(e, &mut em.scratch, SEE_ALL);
                     for &off in em.scratch.iter() {
@@ -12223,10 +12569,14 @@ impl<'s> BuildCtx<'s> {
                 }
             }
             if sk.mem != u32::MAX {
-                let e = self.mem.entry(sk.mem as usize);
-                self.mem.live_offs_into(e, &mut em.scratch, self.wm);
-                for &off in em.scratch.iter() {
-                    f(key, self.mem.value_at(off));
+                if sk.lrun != NO_RUN && !ov.stale.contains(&sk.mem) {
+                    ov.snap.run_values(sk.lrun, self.wm, |v| f(key, v));
+                } else {
+                    let e = self.mem.entry(sk.mem as usize);
+                    self.mem.live_offs_into(e, &mut em.scratch, self.wm);
+                    for &off in em.scratch.iter() {
+                        f(key, self.mem.value_at(off));
+                    }
                 }
             }
         }
@@ -12326,8 +12676,19 @@ impl<'s> BuildCtx<'s> {
         let keys = src.seg.blob.keys();
         let lo = b * CACHE_BLOCK;
         let hi = ((b + 1) * CACHE_BLOCK).min(keys);
-        table.snap_at(src.seg, unsealed)?;
-        if BuildCtx::overlay_count(table, b) > WIDE {
+        let sb = table.snap_at(src.seg, unsealed)?;
+        let floor = BuildCtx::overlay_count(table, b);
+        // The run covers the block when its entries over it are most of
+        // its keys: three quarters, a fraction the walk-against-copy
+        // pricing in `docs/engine.md` puts between.
+        let over: usize = (sb.at[b + 1] - sb.at[b]) as usize
+            + table
+                .pieces
+                .iter()
+                .map(|(_, at)| (at[b + 1] - at[b]) as usize)
+                .sum::<usize>();
+        let covered = !self.copy_dense && !unsealed.vals.is_empty() && over * 4 >= (hi - lo) * 3;
+        if floor > WIDE || covered {
             return Ok(Cached::Wide(WideBlock {
                 sorted: self.sorted_filed(&table.added[b]),
                 seen: table.added[b].len(),
@@ -12476,9 +12837,26 @@ impl<'s> BuildCtx<'s> {
     /// 5 MB arena.
     fn prefetch_overlay(&self, ov: &Overlay) {
         let tables: [Option<&MemTable>; 2] = [Some(self.mem), self.frozen];
+        // A key read from its run streams the snapshot's arena; only the
+        // chains are chased.
+        let chased = |sk: &SnapKey| -> (u32, u32) {
+            (
+                if sk.lrun != NO_RUN && !ov.stale.contains(&sk.mem) {
+                    u32::MAX
+                } else {
+                    sk.mem
+                },
+                if sk.frun != NO_RUN {
+                    u32::MAX
+                } else {
+                    sk.frozen
+                },
+            )
+        };
         for o in &ov.over {
             let Some(sk) = o.sk else { continue };
-            for (t, slot) in [(tables[0], sk.mem), (tables[1], sk.frozen)] {
+            let (m, fz) = chased(&sk);
+            for (t, slot) in [(tables[0], m), (tables[1], fz)] {
                 if let Some(t) = t {
                     if slot != u32::MAX && (slot as usize) < t.len() {
                         let e = t.entry(slot as usize);
@@ -12492,7 +12870,8 @@ impl<'s> BuildCtx<'s> {
         }
         for o in &ov.over {
             let Some(sk) = o.sk else { continue };
-            for (t, slot) in [(tables[0], sk.mem), (tables[1], sk.frozen)] {
+            let (m, fz) = chased(&sk);
+            for (t, slot) in [(tables[0], m), (tables[1], fz)] {
                 if let Some(t) = t {
                     if slot != u32::MAX && (slot as usize) < t.len() {
                         let head = MemTable::head(t.entry(slot as usize));
