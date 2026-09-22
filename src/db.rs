@@ -673,6 +673,21 @@ pub struct Options {
     /// after a tenth of the store rewritten was at half of LMDB either
     /// way this engine charged it to the reads.
     pub forms_settle_backlog_pct: usize,
+    /// EXPERIMENT: keys of one block in a settle's backlog from which
+    /// the block is dropped and built once rather than patched key by
+    /// key. A patch resolves one key's run against every source and
+    /// splices it into the form; a build resolves the whole block once.
+    /// So the patch is priced per key and the build per block, and the
+    /// backlog's density -- keys per block it touches -- says which is
+    /// cheaper. `settle_density` reports that density: 1.8-1.9 keys a
+    /// block at a hundred thousand keys and at three hundred thousand,
+    /// 6.1 at ten thousand, so a bound of six is reached by a block in
+    /// a hundred at the larger rungs and by three in five at the
+    /// smallest. Where it is reached it loses -- six pairs at ten
+    /// thousand read the threaded scan mix at 0.77x for 2.7x the blocks
+    /// built, the rebuilt block being the one the reads want -- so zero
+    /// is the default and `supdb-rebuild` prices it.
+    pub forms_settle_rebuild_from: usize,
     /// EXPERIMENT: the writes since the last scan over the store, as a
     /// share of the partitions' keys, within which the backlog bound
     /// above settles at all; zero, the default, settles by the bound
@@ -705,6 +720,19 @@ pub struct Options {
     /// default; `supdb-recency` prices it. What the measurement says
     /// instead is that the loss is the seal's discard, not the bound's
     /// timing.
+    ///
+    /// Tried again with the forms carried across a seal, which is what
+    /// made the discard's cost go away, it still does not pay and the
+    /// reason is now in this code rather than in the seal: a closed
+    /// window returns from the maintenance before the fill, so the
+    /// blocks nothing has filed are also blocks nothing has built, and
+    /// the pass after the burst builds them all. At ten percent it cut
+    /// the fully-unmerged point's writes to 366-432 ms from 467-518 and
+    /// read the pass at 22-27 µs a scan against 3.5, while the burst's
+    /// seals filed the backlog anyway, a carry having to leave the
+    /// forms current to the whole log. Deferring the filing and
+    /// rebuilding the dense blocks together wrote in 270-311 ms and
+    /// read 22-57 µs, which is the trade of carrying nothing.
     pub forms_settle_recent_pct: usize,
     /// EXPERIMENT: the canonical forms carried across a seal. A form is
     /// the merged content of a partition's block and everything unsealed
@@ -818,6 +846,7 @@ impl Default for Options {
             forms_publish_lazily: true,
             forms_max_unsealed_pct: 0,
             forms_settle_backlog_pct: 2,
+            forms_settle_rebuild_from: 0,
             forms_settle_recent_pct: 0,
             forms_carry: true,
             forms_to_writer: false,
@@ -3341,6 +3370,11 @@ impl MemTable {
         self.keys.slice(off as usize, len as usize)
     }
 
+    /// A hint to fetch a key's bytes; nothing is read.
+    fn prefetch_key(&self, off: u32, len: u32) {
+        self.keys.prefetch(off as usize, len as usize);
+    }
+
     fn key_bytes(&self) -> usize {
         self.keys.used()
     }
@@ -4646,6 +4680,18 @@ pub(crate) fn select_lower_bound(n: usize, below: impl Fn(usize) -> bool) -> usi
 /// block's buffers, and the partition's records a sparse or clean walk
 /// streams. Nothing is waited for, and a block not yet built has nothing
 /// to fetch.
+/// PROTOTYPE: a form's own buffers pulled toward the core, without the
+/// partition's records a walk would also want: what a splice needs,
+/// whose lower bound over the entries and the keys is six dependent
+/// misses into two cold allocations.
+fn prefetch_form(form: &Cached) {
+    match form {
+        Cached::Block(blk) => blk.prefetch(),
+        Cached::Sparse(sb) => sb.prefetch(),
+        Cached::Clean | Cached::Wide(_) => {}
+    }
+}
+
 fn prefetch_block(blob: &Blob<MmapBytes>, form: &Cached, from: usize, n: usize) {
     match form {
         Cached::Block(blk) => blk.prefetch(),
@@ -5293,6 +5339,9 @@ pub struct Reader {
     /// from empty per write was a malloc, a realloc and a free apiece,
     /// two fifths of a settle's instructions.
     settle_run: std::cell::RefCell<Vec<u8>>,
+    /// The live offsets of one settled key's chain, for the same reason
+    /// `settle_run` is one buffer.
+    settle_offs: std::cell::RefCell<Vec<usize>>,
     /// EXPERIMENT: whether any table holds a block built or patched
     /// since the last publish; the writer's own handle alone sets it.
     dirty_any: std::cell::Cell<bool>,
@@ -5323,6 +5372,10 @@ pub struct Reader {
     /// promotions, drops by a write, walks over a copy, walks over the
     /// cheap form, and the copies' bytes.
     choices: std::cell::Cell<[u64; 5]>,
+    /// EXPERIMENT: what the settles met, for a measurement of the
+    /// backlog's density: settles, keys, blocks those keys fall in, and
+    /// blocks at or past `Options::forms_settle_rebuild_from`.
+    settle_density: std::cell::Cell<[u64; 4]>,
     /// PROTOTYPE: every built block holding bytes, as (partition index,
     /// block), so the sampler draws from blocks and never from empty
     /// slots. Sampling slots was tried: with a tenth of them built, a
@@ -7686,6 +7739,15 @@ impl Reader {
         self.choices.get()
     }
 
+    /// EXPERIMENT: the settles' backlog density: settles, keys, the
+    /// blocks those keys fall in, and the blocks at or past
+    /// `Options::forms_settle_rebuild_from`. Keys over blocks is what
+    /// decides a patch against a build.
+    #[doc(hidden)]
+    pub fn settle_density(&self) -> [u64; 4] {
+        self.settle_density.get()
+    }
+
     /// EXPERIMENT: the canonical forms table's size: forms held, their
     /// bytes, how many walks took one, and whether the table is complete.
     pub fn canonical_forms(&self) -> (usize, usize, usize, bool) {
@@ -8295,7 +8357,45 @@ impl Reader {
             resolved.push((at as u32, b as u32, cut, off, len, new, slot));
         }
         resolved.sort_unstable_by_key(|r| (u64::from(r.0) << 32) | u64::from(r.2));
-        for &(at, b, cut, off, len, new, slot) in &resolved {
+        // The backlog by block, which is what decides a patch against a
+        // build: a cut packs the rank it is taken at, so the sort above
+        // leaves one block's keys contiguous and the count is this
+        // loop's own. See `Options::forms_settle_rebuild_from`.
+        let from = self.opts.forms_settle_rebuild_from;
+        let mut density = self.settle_density.get();
+        density[0] += 1;
+        let mut group_end = 0usize;
+        let mut rebuild = false;
+        let mut ahead: Option<(u32, u32)> = None;
+        for (i, &(at, b, cut, off, len, new, slot)) in resolved.iter().enumerate() {
+            if i == group_end {
+                group_end = resolved[i..]
+                    .iter()
+                    .position(|r| (r.0, r.1) != (at, b))
+                    .map_or(resolved.len(), |n| i + n);
+                let keys = group_end - i;
+                density[1] += keys as u64;
+                density[2] += 1;
+                rebuild = from > 0 && keys >= from;
+                if rebuild {
+                    density[3] += 1;
+                }
+                // The block the next group patches, fetched while this
+                // group is patched: a splice's lower bound is six
+                // dependent misses into the form's entries and its keys,
+                // about 0.9 µs a key at a hundred thousand and half of a
+                // settle's time, and the keys are grouped by block here,
+                // so the next block's buffers have this group's patches
+                // to arrive in.
+                ahead = resolved.get(group_end).map(|r| (r.0, r.1));
+            }
+            // The keys two ahead, whose bytes this loop reads in key
+            // order where the log wrote them in arrival order: a miss
+            // each otherwise, and at three hundred thousand keys the
+            // loop's cost beyond the splice was mostly those.
+            if let Some(&(_, _, _, off2, len2, _, _)) = resolved.get(i + 2) {
+                self.mem().prefetch_key(off2, len2);
+            }
             let (at, b) = (at as usize, b as usize);
             let key = self.mem().key_at(off, len);
             let tables = self.tables.borrow();
@@ -8303,7 +8403,22 @@ impl Reader {
             let Some(table) = held.as_mut() else {
                 continue;
             };
+            if let Some((at2, b2)) = ahead.take() {
+                if at2 == at as u32 {
+                    if let Some(form) = table.slots.get(b2 as usize).and_then(|s| s.as_deref()) {
+                        prefetch_form(form);
+                    }
+                }
+            }
             if b < table.slots.len() {
+                // Dropped for the backlog's density, at the first of the
+                // block's keys: what follows patches nothing, since a
+                // block with no form has nothing to patch, and the fill
+                // builds it once. The published form goes with it, as a
+                // marker `unlist` publishes.
+                if rebuild && table.slots[b].is_some() {
+                    self.unlist(at, b, table);
+                }
                 // The copy this block was also held as is the writes'
                 // to drop: patching two forms for one write is what the
                 // promotion is paid out of, and the halved count is
@@ -8353,6 +8468,7 @@ impl Reader {
                 self.unlist(at, b, table);
             }
         }
+        self.settle_density.set(density);
         Ok(())
     }
 
@@ -8390,55 +8506,90 @@ impl Reader {
         let keys = seg.blob.keys();
         let lo = b * CACHE_BLOCK;
         let hi = ((b + 1) * CACHE_BLOCK).min(keys);
-        let mut held: Vec<(&[u8], usize, usize, u32)> = Vec::new();
-        for &(j, _) in &table.pieces {
-            let p = &l0[j];
-            let r = p.ord.seek(key, |i| p.blob.key_at(i));
-            if r < p.blob.keys() && p.blob.key_at(r) == Some(key) {
-                held.push((key, j, r, u32::MAX));
-            }
-        }
-        let slot_in = |t: &MemTable| t.slot_of(key).map_or(u32::MAX, |i| i as u32);
-        let sk = SnapKey {
-            off: 0,
-            len: 0,
-            mem: slot,
-            frozen: self.frozen().as_ref().map_or(u32::MAX, |fr| slot_in(fr)),
-            lrun: NO_RUN,
-            frun: NO_RUN,
-        };
-        let ctx = self.build_ctx();
-        let ov = Overlay {
-            over: vec![Over {
-                key,
-                sk: Some(sk),
-                cut,
-                pieces: 0..held.len() as u32,
-            }],
-            held,
-            snap: &NO_SNAPSHOT,
-            stale: &ctx.stale,
-        };
+        // A tombstone in the key's own chain masks every source older
+        // than the live memtable -- `oldest_live` starts the emission
+        // past the pieces and the frozen table -- so the pieces hold
+        // nothing this run emits and seeking them is work for nothing.
+        // A `put` is a delete and an append, so that is every replacing
+        // write: the lag point's settles seeked each of the three to
+        // seven pieces standing, and every mix that updates pays the
+        // same per key.
+        let tombs = self.has_tombstones();
+        let masked = tombs
+            && slot != u32::MAX
+            && self
+                .mem()
+                .has_tomb(self.mem().entry(slot as usize), self.wm());
         let (c, at_eq) = BuildCtx::cut_known(cut, lo, hi);
         let same = c < hi && at_eq == Ordering::Equal;
-        let mut em = Emit {
-            tombs: self.has_tombstones(),
-            scratch: Vec::new(),
-        };
         let mut run_scratch = self.settle_run.borrow_mut();
         let run: &mut Vec<u8> = &mut run_scratch;
         run.clear();
-        ctx.emit_over(
-            &mut |_, v: &[u8]| {
+        if masked {
+            // The masked key's run, written from its chain: every older
+            // source is masked, so this is the whole run and none of the
+            // machinery the general path needs -- an `Over` allocated
+            // and freed per key, `emit_over`'s walk over the sources and
+            // `oldest_live`'s second walk of this same chain -- answers
+            // anything here. The general path cost about 2,200
+            // instructions to file one hundred-byte run, a third of them
+            // in that machinery, and an update mix takes this path for
+            // every key: 88,742 of the lag point's 88,744.
+            let mem = self.mem();
+            let mut offs = self.settle_offs.borrow_mut();
+            mem.live_offs_into(mem.entry(slot as usize), &mut offs, self.wm());
+            for &off in offs.iter() {
+                let v = mem.value_at(off);
                 run.extend_from_slice(&(v.len() as u32).to_le_bytes());
                 run.extend_from_slice(v);
-            },
-            &mut em,
-            &ov,
-            0,
-            same.then_some(c),
-            src,
-        )?;
+            }
+        } else {
+            let mut held: Vec<(&[u8], usize, usize, u32)> = Vec::new();
+            for &(j, _) in &table.pieces {
+                let p = &l0[j];
+                let r = p.ord.seek(key, |i| p.blob.key_at(i));
+                if r < p.blob.keys() && p.blob.key_at(r) == Some(key) {
+                    held.push((key, j, r, u32::MAX));
+                }
+            }
+            let slot_in = |t: &MemTable| t.slot_of(key).map_or(u32::MAX, |i| i as u32);
+            let sk = SnapKey {
+                off: 0,
+                len: 0,
+                mem: slot,
+                frozen: self.frozen().as_ref().map_or(u32::MAX, |fr| slot_in(fr)),
+                lrun: NO_RUN,
+                frun: NO_RUN,
+            };
+            let ctx = self.build_ctx();
+            let ov = Overlay {
+                over: vec![Over {
+                    key,
+                    sk: Some(sk),
+                    cut,
+                    pieces: 0..held.len() as u32,
+                }],
+                held,
+                snap: &NO_SNAPSHOT,
+                stale: &ctx.stale,
+            };
+            let mut em = Emit {
+                tombs,
+                scratch: std::mem::take(&mut *self.settle_offs.borrow_mut()),
+            };
+            ctx.emit_over(
+                &mut |_, v: &[u8]| {
+                    run.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    run.extend_from_slice(v);
+                },
+                &mut em,
+                &ov,
+                0,
+                same.then_some(c),
+                src,
+            )?;
+            *self.settle_offs.borrow_mut() = em.scratch;
+        }
         let before = table.slots[b].as_ref().map_or(0, |c| c.bytes());
         let was_clean = matches!(table.slots[b].as_deref(), Some(Cached::Clean));
         let mut bloated = false;
@@ -9837,6 +9988,7 @@ impl Db {
             shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
             pending: std::cell::RefCell::new(Vec::new()),
             settle_run: std::cell::RefCell::new(Vec::new()),
+            settle_offs: std::cell::RefCell::new(Vec::new()),
             built: std::cell::RefCell::new(Vec::new()),
             dirty_any: std::cell::Cell::new(false),
             tables_complete: std::cell::Cell::new(false),
@@ -9848,6 +10000,7 @@ impl Db {
             writes_at_scan: std::cell::Cell::new(0),
             log_counted: std::cell::Cell::new((0, 0)),
             choices: std::cell::Cell::new([0; 5]),
+            settle_density: std::cell::Cell::new([0; 4]),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),
             snap_stale: std::cell::RefCell::new(std::collections::HashSet::new()),
@@ -10144,6 +10297,7 @@ impl Db {
             shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
             pending: std::cell::RefCell::new(Vec::new()),
             settle_run: std::cell::RefCell::new(Vec::new()),
+            settle_offs: std::cell::RefCell::new(Vec::new()),
             built: std::cell::RefCell::new(Vec::new()),
             dirty_any: std::cell::Cell::new(false),
             tables_complete: std::cell::Cell::new(false),
@@ -10155,6 +10309,7 @@ impl Db {
             writes_at_scan: std::cell::Cell::new(0),
             log_counted: std::cell::Cell::new((0, 0)),
             choices: std::cell::Cell::new([0; 5]),
+            settle_density: std::cell::Cell::new([0; 4]),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),
             snap_stale: std::cell::RefCell::new(std::collections::HashSet::new()),
@@ -11086,6 +11241,7 @@ impl Reader {
             shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
             pending: std::cell::RefCell::new(Vec::new()),
             settle_run: std::cell::RefCell::new(Vec::new()),
+            settle_offs: std::cell::RefCell::new(Vec::new()),
             built: std::cell::RefCell::new(Vec::new()),
             dirty_any: std::cell::Cell::new(false),
             tables_complete: std::cell::Cell::new(false),
@@ -11097,6 +11253,7 @@ impl Reader {
             writes_at_scan: std::cell::Cell::new(0),
             log_counted: std::cell::Cell::new((0, 0)),
             choices: std::cell::Cell::new([0; 5]),
+            settle_density: std::cell::Cell::new([0; 4]),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),
             snap_stale: std::cell::RefCell::new(std::collections::HashSet::new()),

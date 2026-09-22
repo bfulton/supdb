@@ -102,6 +102,25 @@ not. The arm now sets the policy its row names, `Features` reports it from
 the options the arm was opened with, and the check compares every axis
 within a group.
 
+**A red gate reads its own control first, and the control is the
+comparators.** A quick row taken here failed with 121 of 1,106
+quantities worse than every row in the window, and the row carried the
+reason inside it: LMDB's scan at three hundred thousand keys, code no
+engine change can touch, read 18.7M entries a second against 30.3-51.6M
+in the ten priors of its class, its load 557k ops a second against
+733-789k, and RocksDB's read 748k against 798k-1.05M. Ten of the eleven
+workloads had a comparator among their regressions; the eleventh was
+ycsb-C, which only reads. The comparators' median row-top against
+window-floor was 0.92 and the default supdb arm's 0.86 on six
+quantities, the fewest of any arm. The class is keyed on the CPU model,
+the core count, the memory and virtualisation, which does not pin the
+host a guest lands on, and the engine's own probes see the same
+host-to-host spread (`docs/engine.md` on memory placement). So a row
+whose comparators moved is a row about the machine: it cannot adjudicate
+the change beside it, whichever way it reads, and the change is priced
+within one sitting instead. Do not bank such a row as history and do not
+read its verdict as the change's.
+
 **A one-sided bound passes a broken measurement.** A one-sided bound,
 `ratio >= 0.90`, recorded a pass on a run where the ratio came out 8.5x --
 on a store where the mechanism says the policy can only lose. A row whose

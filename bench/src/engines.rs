@@ -360,6 +360,9 @@ pub struct Supdb {
     recent: Option<usize>,
     /// Whether the forms are carried across a seal; off is `supdb-nocarry`.
     carry: bool,
+    /// Keys of one block in a settle's backlog from which the block is
+    /// rebuilt rather than patched key by key. `supdb-rebuild`.
+    rebuild: usize,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -415,6 +418,9 @@ struct Policy {
     recent: Option<usize>,
     /// Whether the forms are carried across a seal; off is `supdb-nocarry`.
     carry: bool,
+    /// Keys of one block in a settle's backlog from which the block is
+    /// rebuilt rather than patched key by key. `supdb-rebuild`.
+    rebuild: usize,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -460,6 +466,7 @@ impl Default for Policy {
             eager: None,
             recent: None,
             carry: true,
+            rebuild: 0,
             tier: None,
             runs: false,
             keeper: false,
@@ -571,6 +578,21 @@ impl Supdb {
     /// what a table that survives the seal is worth to the reads after
     /// it, and what keeping it whole through a write-only burst costs
     /// the writes.
+    /// `supdb` with a block rebuilt instead of patched once a settle's
+    /// backlog holds six of its keys. Against `supdb` it prices a cost
+    /// per key against a cost per block: six is near where the two met
+    /// when the patch was timed, and the density the settles meet says
+    /// how often the bound is reached at all.
+    pub fn create_rebuild(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                rebuild: 6,
+                ..Policy::default()
+            },
+        )
+    }
+
     pub fn create_nocarry(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
@@ -812,6 +834,7 @@ impl Supdb {
             eager,
             recent,
             carry,
+            rebuild,
             tier,
             runs,
             keeper,
@@ -891,6 +914,7 @@ impl Supdb {
             // The forms carried across a seal, or the table started
             // afresh at every publish as it was.
             forms_carry: carry,
+            forms_settle_rebuild_from: rebuild,
             // The pieces over a range merged into one piece beside the
             // partition merge, or left for it as the engine has it.
             tier_pieces: tier.unwrap_or(supdb::Options::default().tier_pieces),
@@ -953,6 +977,7 @@ impl Supdb {
             eager,
             recent,
             carry,
+            rebuild,
             tier,
             runs,
             keeper,
@@ -997,6 +1022,9 @@ impl Engine for Supdb {
         }
         if !self.carry {
             return "supdb-nocarry";
+        }
+        if self.rebuild > 0 {
+            return "supdb-rebuild";
         }
         if self.tier.is_some_and(|t| t > 0) {
             return "supdb-tier";
@@ -1555,9 +1583,11 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
         "supdb" | "supdb-forms" | "supdb-settle" | "supdb-wforms" | "supdb-regime"
         | "supdb-noseal" | "supdb-ahead" | "supdb-lazyforms" | "supdb-eager" | "supdb-nosettle"
-        | "supdb-recency" | "supdb-nocarry" | "supdb-tier" | "supdb-runs" | "supdb-keeper"
-        | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice"
-        | "supdb-nocache" | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
+        | "supdb-recency" | "supdb-nocarry" | "supdb-rebuild" | "supdb-tier" | "supdb-runs"
+        | "supdb-keeper" | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap"
+        | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => {
+            Guarantee::Durable
+        }
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
     })
@@ -1574,6 +1604,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-eager" => Box::new(Supdb::create_eager(dir)?),
         "supdb-recency" => Box::new(Supdb::create_recency(dir)?),
         "supdb-nocarry" => Box::new(Supdb::create_nocarry(dir)?),
+        "supdb-rebuild" => Box::new(Supdb::create_rebuild(dir)?),
         "supdb-tier" => Box::new(Supdb::create_tier(dir)?),
         "supdb-runs" => Box::new(Supdb::create_runs(dir)?),
         "supdb-keeper" => Box::new(Supdb::create_keeper(dir)?),

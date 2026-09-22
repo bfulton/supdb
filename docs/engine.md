@@ -1729,6 +1729,81 @@ run it could have written from the memtable alone. And the refill
 after a merge's rewrite lands a few hundred blocks a commit, so a pass
 that begins within three commits of one builds the rest itself.
 
+#### What the filing costs, asked of the settle rather than of a policy
+
+The carry leaves one price: the writer files every commit's batch into
+the forms, and the fully-unmerged point's burst pays about 250 ms of its
+500 at a hundred thousand keys for filing nobody has yet read. Two
+policies were tried against it and both are refuted; the price turned
+out to be stalls rather than a decision.
+
+The first was to spend per block instead of per key. A patch resolves
+one key's run and splices it; a build resolves a whole block. So the
+backlog's density -- keys per block it touches -- says which is cheaper,
+and the settle now counts it (`settle_density`, and
+`Options::forms_settle_rebuild_from` is a bound over it). The density
+is 1.8-1.9 keys a block at a hundred thousand and three hundred
+thousand, and 6.1 at ten thousand, where a batch is a tenth of the
+store: a bound of six is reached by about one block in a hundred at the
+larger rungs and by three in five at the smallest. Where it is reached
+it loses. Six pairs at ten thousand keys read the threaded scan mix at
+0.77x (0/6, p=0.031) and 0.58x on four threads, ycsb-D at 0.88x and A
+at 0.92x, for 2.7x the blocks built by the engine (6/6): the rebuilds
+replace patches the reads had already paid for and land on the reads
+themselves. At a hundred thousand, where the bound is rarely reached,
+the burst's writes and the pass read as they do without it. So the
+choice is not between a cost per key and a cost per block -- the block
+the backlog rewrites is the block the reads want -- and
+`supdb-rebuild` prices it with the default at zero.
+
+The second was to defer the filing while no scan is near, which is what
+`forms_settle_recent_pct` does. At ten percent of the store the burst's
+writes fell only to 366-432 ms from 467-518 and the pass read 22-27 µs
+a scan against 3.5: the window gates the whole maintenance, the fill
+included, so the pass builds every block like the arm that carries
+nothing, while the seals file the backlog anyway -- a carry must leave
+the forms current to the whole log, and the burst seals a dozen times.
+Deferral and the rebuild bound together wrote in 270-311 ms, near the
+226-240 of carrying nothing, and read 22-57 µs a scan, which is that
+arm's trade back again.
+
+So the filing was timed instead, by phase, over the burst at a hundred
+thousand keys: resolving the batch's keys to their blocks 44-53 ms,
+applying them 116-133, of which the run's emission was 15 and the
+splice into the form 67-91. Callgrind put the patch at about 2,200
+instructions, and three suspects in it were refuted by measurement. The
+piece seeks are not the cost: a `put` is a delete and an append, so a
+tombstone in the key's chain masks every older source and the pieces
+hold nothing the run emits -- 88,742 of the point's 88,744 keys -- and
+skipping the seeks entirely moved nothing. The live-byte sum the bloat
+test takes over every entry is not the cost: a counter the patch
+maintains instead moved nothing. The emission's machinery is a tenth of
+it: an `Over` allocated and freed per key, `emit_over`'s walk over the
+sources and `oldest_live`'s second walk of the same chain, all of which
+a masked key can skip by writing its run straight from the chain, which
+took the emission from 15-18 ms to 12-14.
+
+The splice is the lower bound's misses. It is a binary search over the
+form's entries and its keys, six dependent loads into two cold
+allocations, about 0.9 µs a key -- and the settle's keys are grouped by
+block, so the next group's form can be fetched while this group is
+patched. With that one prefetch the splice reads 21-25 ms at a hundred
+thousand against 67-91, and 65-85 at three hundred thousand against
+292-300. The apply loop reads its keys in key order where the log wrote
+them in arrival order, so the keys two ahead are fetched too, which
+took the apply from 337-346 ms to 290-318 at three hundred thousand.
+Asking the wide bound once a block rather than once a key was tried
+beside them and moved nothing, its words being warm from the blocks
+before.
+
+End to end, three rounds at a hundred thousand and two at the others:
+the burst's writes read 401-412 ms against 464-568, 1245-1389 against
+1572-1755 at three hundred thousand, and 22.1-22.2 against 24.0-25.0 at
+ten thousand. The rule the two prefetches are an instance of: a batch
+applied to a structure keyed by position knows every position before it
+applies the first, so a stall it pays per key is a stall it need not
+pay at all.
+
 #### Which half of the lag gap, by rung
 
 The build and the walk split by size, and the arms say which is which
