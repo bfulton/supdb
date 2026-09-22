@@ -1615,11 +1615,45 @@ tried in the same sitting and moved nothing, so it is not here.
 
 So the pass over emptied tables is a block build per block touched,
 and the build is what stands between this point and LMDB's leaf walk.
-Two ways to not pay it at the pass are already arms: the forms carried
-across the publish that empties the tables, and a builder started at
-that publish, which with the keeper's snapshot current has no sort to
-do first; both were measured as losses before the keeper existed, and
-are the next thing to price beside it.
+
+#### The commit joined its seal after filling the tables the join empties
+
+Why the tables were empty at the pass in every round of the default
+arm was in the commit's order. A commit maintained the forms first --
+the batch settled into the writer's tables, a form built for every
+block it touched -- and joined a finished seal after, and the join's
+publish drops the tables, so it dropped what the maintenance had just
+filled; the next commit's maintenance was due only past the settle
+bound, two batches at a hundred thousand keys, and a burst's last
+commits are where the seals land. The commit joins first now, so the
+commit that lands a seal fills the new tables from its own batch when
+that batch reaches the settle bound, under the maintenance's own
+regime; a publish makes nothing due that a scan has not, which is what
+the regime's tests hold, and a version that marked every publish due
+failed four of them and cost the hundred-thousand burst's writes 2.5x
+in rebuilds. With the order alone, at ten thousand keys the lag point's
+pass reads 0.95-1.46 µs a scan against 14, three of three, the tables
+in place every round and the burst's writes unchanged; at a hundred
+thousand nothing moves either way, since a batch of a thousand is half
+the settle bound there and the landing's commit fills only when it is
+a due one, and a freeze at the last commit leaves the pass building
+whatever the order -- a freeze's batch is in the frozen table, the
+pending list goes with the generation, and nothing rebuilds those
+blocks until a write touches them. Filing the frozen batch after the
+freeze was tried for that and does nothing.
+
+Two arms would spare the pass the builds a freeze leaves it, and both
+were priced beside the keeper with the forms on, three rounds. The
+forms carried across the publish (`supdb-carry`) read 2.1-2.3 µs a
+scan at a hundred thousand keys, every block in place, for a burst that
+wrote in 400 ms instead of 130 -- and 21-41 µs a scan at ten thousand,
+worse than not carrying, with the carried tables short of six blocks
+and the pass building through them. A builder started at the publish
+(`supdb-aheadpub`) read 8.6-13.7 at a hundred thousand for the same
+write cost, its forms installed at the commits behind it, and level at
+ten thousand. Neither is the default: the pass's gain is bought with
+the burst's writes both times, and the join-first commit takes most of
+what the builder gets for nothing.
 
 #### Which half of the lag gap, by rung
 

@@ -10272,14 +10272,25 @@ impl Db {
                 self.unsynced = 0;
             }
         }
+        // A finished seal is joined before the maintenance, not after
+        // it: its publish empties the writer's tables, and joined after
+        // the maintenance it emptied what the maintenance had just
+        // filled, so a pass that followed the burst's last commit met a
+        // store with no forms and built every block it walked -- the
+        // fully-unmerged lag point at ten thousand keys read 14 µs a
+        // scan for it against 1.0 with the tables in place, and which
+        // it read turned on whether the seal had landed by the eighth
+        // commit's check or the ninth. The fill is the maintenance's
+        // own, under its regime: a batch at the settle bound fills, and
+        // a publish makes nothing due that a scan has not.
+        if self.sealing.as_ref().is_some_and(|h| h.is_finished()) {
+            self.join_seal()?;
+        }
         self.maintain_forms()?;
         self.build_ahead_if_due();
         self.start_keeper();
         self.sweep_retired_forms();
         self.phase_ns[0] += t.elapsed().as_nanos() as u64;
-        if self.sealing.as_ref().is_some_and(|h| h.is_finished()) {
-            self.join_seal()?;
-        }
         // A direct run closes when a seal would: it joins whole, as a
         // seal's piece does by promotion, so the two paths leave one shape.
         if self.mem_bytes >= self.seal_threshold() {
