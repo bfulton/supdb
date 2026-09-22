@@ -5664,17 +5664,21 @@ impl SnapArena {
     fn copy_run(&self, mem: &MemTable, e: &MemEntry, scratch: &mut Vec<(u64, u32)>) -> u32 {
         scratch.clear();
         let mut at = MemTable::head(e);
-        let mut bytes = 4usize;
+        let mut bytes = 0usize;
         while at != NO_CHUNK {
             let len = mem.chunk_len(at);
             bytes += 12 + if len == TOMB_LEN { 0 } else { len as usize };
             scratch.push((at, len));
             at = mem.chunk_prev(at);
         }
-        let off = self.reserve(bytes);
-        let mut p = off;
-        self.write(p, &(scratch.len() as u32).to_le_bytes());
-        p += 4;
+        // The count and then the records' length, so a read slices the
+        // run once and parses plain bytes: a copy that read every word
+        // through the block lookup and its bounds checks, twice a key,
+        // cost 11 µs a block against 8 from the chains.
+        let off = self.reserve(8 + bytes);
+        self.write(off, &(scratch.len() as u32).to_le_bytes());
+        self.write(off + 4, &(bytes as u32).to_le_bytes());
+        let mut p = off + 8;
         for &(at, len) in scratch.iter().rev() {
             self.write(p, &at.to_le_bytes());
             self.write(p + 8, &len.to_le_bytes());
@@ -5689,21 +5693,20 @@ impl SnapArena {
 
     /// The bytes a run at `off` takes.
     fn run_len(&self, off: u32) -> u32 {
-        let n = self.word(off);
-        let mut p = off + 4;
-        for _ in 0..n {
-            let len = self.word(p + 8);
-            p += 12 + if len == TOMB_LEN { 0 } else { len };
-        }
-        p - off
+        8 + self.word(off + 4)
+    }
+
+    /// The run at `off`: its chunk count and its records.
+    #[inline]
+    fn run(&self, off: u32) -> (u32, &[u8]) {
+        let head = self.slice(off, 8);
+        let n = u32::from_le_bytes(head[..4].try_into().expect("four bytes"));
+        let bytes = u32::from_le_bytes(head[4..].try_into().expect("four bytes"));
+        (n, self.slice(off + 8, bytes))
     }
 
     fn word(&self, off: u32) -> u32 {
         u32::from_le_bytes(self.slice(off, 4).try_into().expect("four bytes"))
-    }
-
-    fn wide(&self, off: u32) -> u64 {
-        u64::from_le_bytes(self.slice(off, 8).try_into().expect("eight bytes"))
     }
 }
 
@@ -6062,20 +6065,19 @@ impl Snapshot {
     /// mark are not there, and everything older than the newest visible
     /// tombstone is dead. Returns the arena range of the live values'
     /// records and whether a visible tombstone was met.
-    fn run_visible(&self, off: u32, wm: u64) -> (std::ops::Range<u32>, bool) {
-        let v = &self.arena;
-        let n = v.word(off);
-        let mut p = off + 4;
-        let mut start = p;
+    fn run_visible(n: u32, v: &[u8], wm: u64) -> (std::ops::Range<usize>, bool) {
+        let word = |p: usize| u32::from_le_bytes(v[p..p + 4].try_into().expect("four bytes"));
+        let mut p = 0usize;
+        let mut start = 0usize;
         let mut tomb = false;
         for _ in 0..n {
-            let at = v.wide(p);
+            let at = u64::from_le_bytes(v[p..p + 8].try_into().expect("eight bytes"));
             if at >= wm {
                 break;
             }
-            let len = v.word(p + 8);
+            let len = word(p + 8) as usize;
             p += 12;
-            if len == TOMB_LEN {
+            if len == TOMB_LEN as usize {
                 tomb = true;
                 start = p;
             } else {
@@ -6086,19 +6088,20 @@ impl Snapshot {
     }
 
     fn run_values<F: FnMut(&[u8])>(&self, off: u32, wm: u64, mut f: F) {
-        let (range, _) = self.run_visible(off, wm);
-        let v = &self.arena;
+        let (n, v) = self.arena.run(off);
+        let (range, _) = Snapshot::run_visible(n, v, wm);
         let mut p = range.start;
         while p < range.end {
-            let len = v.word(p + 8);
+            let len = u32::from_le_bytes(v[p + 8..p + 12].try_into().expect("four bytes")) as usize;
             p += 12;
-            f(v.slice(p, len));
+            f(&v[p..p + len]);
             p += len;
         }
     }
 
     fn run_has_tomb(&self, off: u32, wm: u64) -> bool {
-        self.run_visible(off, wm).1
+        let (n, v) = self.arena.run(off);
+        Snapshot::run_visible(n, v, wm).1
     }
 }
 
@@ -13590,7 +13593,10 @@ impl<'s> BuildCtx<'s> {
     fn prefetch_overlay(&self, ov: &Overlay) {
         let tables: [Option<&MemTable>; 2] = [Some(self.mem), self.frozen];
         // A key read from its run streams the snapshot's arena; only the
-        // chains are chased.
+        // chains are chased. Fetching the runs and the pieces' records
+        // ahead as well was measured on the pass over emptied tables at
+        // ten thousand keys, timers on the builds, and moved nothing:
+        // the run's cost there was its parse, see `SnapArena::copy_run`.
         let chased = |sk: &SnapKey| -> (u32, u32) {
             (
                 if sk.lrun != NO_RUN && !ov.stale.contains(&sk.mem) {

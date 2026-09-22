@@ -1586,10 +1586,40 @@ and the four-thread mix 1.66x, six of six each, and this one reads
 them level: on this machine the sign test inside a run is not the
 spread between runs, and a figure a run gives six of six is a figure
 until the next run. What the keeper costs where it costs is the
-extension itself, a copy of the entry run per tick on a core beside
-the writer's, which A's shape at a hundred thousand meets a hundred and
-sixty times over five hundred commits; an entry run that extends in
-place, without the copy, is the next work beside the walk.
+extension itself, and mostly the runs' copy rather than the entry run's:
+every value written is copied once more, on a core beside the writer's,
+which A's shape at a hundred thousand meets a hundred and sixty times
+over five hundred commits.
+
+#### What the pass over emptied tables costs, timed a call at a time
+
+The walk that was to be the other half was measured before it was
+built, with timers on the wide walk, the second-touch copy and the
+first-touch build, over the handles' passes on the lag point's store at
+ten thousand keys with the forms off. Callgrind first: the wide walk is
+6,500 instructions a scan, 2 µs at this clock, where the pass measured
+16-30 a scan, so whatever it costs is not instructions. Then the
+timers: over two passes of a hundred scans the wide walk ran eight
+times, at 2.7 µs a call. The covered rule barely fires on this store,
+because the burst's seal has moved most of it into a piece and the
+snapshot holds a tenth of a block's keys; the blocks are copied on
+their first touch in every arm, 264 builds a pass, and those builds are
+the pass -- 8-9 µs each from the chains, 11-12 from the runs. The
+runs' three microseconds were their parse: every word read went
+through the arena's block lookup and its bounds checks, and a run was
+parsed twice a key, once for the tombstone and once for the values. A
+run carries its records' length now and is sliced once, and a copy
+from the runs reads 7.8-8.4 µs a block against 8.3-9.2 from the chains.
+Prefetching the runs and the pieces' records ahead of the walk was
+tried in the same sitting and moved nothing, so it is not here.
+
+So the pass over emptied tables is a block build per block touched,
+and the build is what stands between this point and LMDB's leaf walk.
+Two ways to not pay it at the pass are already arms: the forms carried
+across the publish that empties the tables, and a builder started at
+that publish, which with the keeper's snapshot current has no sort to
+do first; both were measured as losses before the keeper existed, and
+are the next thing to price beside it.
 
 #### Which half of the lag gap, by rung
 
