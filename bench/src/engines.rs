@@ -358,7 +358,7 @@ pub struct Supdb {
     /// The recency window this arm pins, or none for the engine's own.
     /// `supdb-recency`.
     recent: Option<usize>,
-    /// Whether the forms are carried across a seal. `supdb-carry`.
+    /// Whether the forms are carried across a seal; off is `supdb-nocarry`.
     carry: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
@@ -413,7 +413,7 @@ struct Policy {
     /// The recency window this arm pins, or none for the engine's own.
     /// `supdb-recency`.
     recent: Option<usize>,
-    /// Whether the forms are carried across a seal. `supdb-carry`.
+    /// Whether the forms are carried across a seal; off is `supdb-nocarry`.
     carry: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
@@ -459,7 +459,7 @@ impl Default for Policy {
             lazyforms: false,
             eager: None,
             recent: None,
-            carry: false,
+            carry: true,
             tier: None,
             runs: false,
             keeper: false,
@@ -533,10 +533,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with the canonical forms carried across a seal. Against
-    /// `supdb` it prices the carry: what filing the backlog at the freeze
-    /// costs the mixes, and what a table that survives the seal is worth
-    /// to the reads after it.
     /// `supdb` with the piece merge on at three pieces, so a range's
     /// pieces fold into one beside the partition merge: what prices it.
     pub fn create_runs(path: &Path) -> Res<Supdb> {
@@ -570,11 +566,16 @@ impl Supdb {
         )
     }
 
-    pub fn create_carry(path: &Path) -> Res<Supdb> {
+    /// `supdb` with the canonical forms dropped at every seal, the shape
+    /// before they were carried. Against `supdb` it prices the carry:
+    /// what a table that survives the seal is worth to the reads after
+    /// it, and what keeping it whole through a write-only burst costs
+    /// the writes.
+    pub fn create_nocarry(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                carry: true,
+                carry: false,
                 ..Policy::default()
             },
         )
@@ -994,8 +995,8 @@ impl Engine for Supdb {
         if self.settle {
             return "supdb-settle";
         }
-        if self.carry {
-            return "supdb-carry";
+        if !self.carry {
+            return "supdb-nocarry";
         }
         if self.tier.is_some_and(|t| t > 0) {
             return "supdb-tier";
@@ -1554,7 +1555,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
         "supdb" | "supdb-forms" | "supdb-settle" | "supdb-wforms" | "supdb-regime"
         | "supdb-noseal" | "supdb-ahead" | "supdb-lazyforms" | "supdb-eager" | "supdb-nosettle"
-        | "supdb-recency" | "supdb-carry" | "supdb-tier" | "supdb-runs" | "supdb-keeper"
+        | "supdb-recency" | "supdb-nocarry" | "supdb-tier" | "supdb-runs" | "supdb-keeper"
         | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice"
         | "supdb-nocache" | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
@@ -1572,7 +1573,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nosettle" => Box::new(Supdb::create_nosettle(dir)?),
         "supdb-eager" => Box::new(Supdb::create_eager(dir)?),
         "supdb-recency" => Box::new(Supdb::create_recency(dir)?),
-        "supdb-carry" => Box::new(Supdb::create_carry(dir)?),
+        "supdb-nocarry" => Box::new(Supdb::create_nocarry(dir)?),
         "supdb-tier" => Box::new(Supdb::create_tier(dir)?),
         "supdb-runs" => Box::new(Supdb::create_runs(dir)?),
         "supdb-keeper" => Box::new(Supdb::create_keeper(dir)?),

@@ -5488,3 +5488,75 @@ fn the_run_keeper_keeps_the_published_snapshot_current() {
         m.check(&db, &format!("{block_cache} {pct}: reopened"));
     }
 }
+
+/// A run no longer than the one it replaces is written over it in the
+/// writer's copy of a form, so a burst that rewrites every key leaves the
+/// copies the size a build makes them. Appended instead, half of every
+/// copy's bytes were pointed at by nothing after such a burst, and the
+/// blocks past twice their live bytes were unlisted and built again in
+/// the scans that followed.
+#[test]
+fn a_replacing_write_patches_a_copy_in_place() {
+    let d = dir("inplace");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        forms_from_reader_scans: 0,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v0000");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 1, "several partitions");
+    let _handle = db.reader().unwrap();
+    let mut sink = 0usize;
+    // Every key replaced once: each block's deltas grow past the dense
+    // bound and the commit's fill builds the block as a copy.
+    let mut replace = |db: &mut Db, m: &mut ScanModel, val: &str| {
+        db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+            .unwrap();
+        for k in 0..1500u32 {
+            m.delete(db, &key(k));
+            m.append(db, &key(k), val);
+        }
+        db.commit().unwrap();
+    };
+    replace(&mut db, &mut m, "v0001");
+    let (_, _, copies, _) = db.block_cache_kinds();
+    assert!(copies > 0, "the rewritten blocks are copies");
+    let (blocks, bytes) = db.block_cache_size();
+    m.check(&db, "copies built from the first rewrite");
+    // The same again, at the same length and then shorter: nothing grows.
+    replace(&mut db, &mut m, "v0002");
+    assert_eq!(
+        db.block_cache_size(),
+        (blocks, bytes),
+        "a run of the same length is written over the one it replaces"
+    );
+    m.check(&db, "copies patched in place at the same length");
+    replace(&mut db, &mut m, "v3");
+    assert_eq!(
+        db.block_cache_size(),
+        (blocks, bytes),
+        "a shorter run is written over the one it replaces"
+    );
+    m.check(&db, "copies patched in place with a shorter run");
+    // Longer: appended, as every run was before.
+    replace(&mut db, &mut m, "v0004-longer");
+    let (blocks2, bytes2) = db.block_cache_size();
+    assert!(
+        blocks2 == blocks && bytes2 > bytes,
+        "a longer run is appended: {blocks2} blocks {bytes2} bytes from {blocks} {bytes}"
+    );
+    m.check(&db, "copies patched with a longer run");
+}

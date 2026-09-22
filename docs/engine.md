@@ -895,8 +895,12 @@ the snapshot's, the lists of keys filed since, the wide forms. It is
 built, behind `forms_carry`, and held to the model through two seals,
 a block gone wide and the merge that finally drops it.
 
-It does not pay. `bench ab` over eleven pairs at a hundred thousand
-keys reads ycsb-F at 0.83x (0/11, p=0.001) and ycsb-E at 0.89x (1/11,
+As first built it did not pay, and the loss was the arm's own: "The
+carry, priced with its own costs taken out" below has the four costs
+and the pricing without them, and it is the default now. What follows
+is the first measurement, kept for what it read into a loss that was
+not the seal's. `bench ab` over eleven pairs at a hundred thousand
+keys read ycsb-F at 0.83x (0/11, p=0.001) and ycsb-E at 0.89x (1/11,
 p=0.012), A and D at 0.90x and 0.89x within noise, the fully-unmerged
 lag point at 1.39x (9/11, p=0.065), and eighteen snapshot builds
 against eleven; nothing else moved. The two probes say why. ycsb-E
@@ -1651,9 +1655,79 @@ worse than not carrying, with the carried tables short of six blocks
 and the pass building through them. A builder started at the publish
 (`supdb-aheadpub`) read 8.6-13.7 at a hundred thousand for the same
 write cost, its forms installed at the commits behind it, and level at
-ten thousand. Neither is the default: the pass's gain is bought with
-the burst's writes both times, and the join-first commit takes most of
-what the builder gets for nothing.
+ten thousand. Neither was made the default on that: the pass's gain
+was bought with the burst's writes both times, and the join-first
+commit took most of what the builder gets for nothing. The carry's
+price was then read commit by commit, and most of it was its own.
+
+#### The carry, priced with its own costs taken out
+
+Four costs in the carry arm were the arm's and not the carry's, each
+found in the lag probe's commit-by-commit profile with the forms on.
+The carry published the forms it moved, whether or not a handle was
+there to read them, so every patch after it cloned its block before
+writing: the hundred-thousand burst's 400 ms against 130. It reset the
+log position across a landing, where the memtable is the one it was,
+so the landing's commit settled the whole log a second time. A form the
+patches alone had made -- clean at its build, a delta a write -- stayed
+deltas for the store's life, and with the tables carried across the
+seals every block of the lag point's store was sixty-four deltas walked
+per scan, 2-4 µs against 1 over the copies a rebuild makes; a sparse
+form grown past the dense bound is rebuilt as a copy by the next fill
+now. And the carried tables took the new piece's bounds before its
+ranks -- the carry runs inside the publish, and the ranks were taken
+after it -- so a build through them sought the partition once per
+piece key, where a build through a fresh table cuts at the rank.
+
+The copies themselves grew under the burst. A patch appended the key's
+new run and repointed the entry, so a burst that rewrote every key left
+half of every copy's bytes pointed at by nothing -- at ten thousand keys
+the carried copies held 2.0 MB where a fill makes 1.36, 660 KB dead and
+seven of ten runs out of key order; at a hundred thousand, 18 MB from
+13 -- and the blocks past twice their live bytes were unlisted and
+built again in the pass that followed, half of them in one round. The
+pass after the burst read 1.5-1.7 µs a scan over those copies against
+1.0-1.15 over refilled ones; the same pass again, warm, read the same
+over either (0.78-0.87 against 0.73-0.75), and again over the copies
+refilled in place, so the layout costs the pass whose caches the burst
+just left and not the walk. A run no longer than the one it replaces is
+written over it now, in the copy and in the sparse form alike, and the
+carried copies are a fill's size to the byte: the pass reads 1.12-1.15
+against 0.99-1.05, the last tenth unexplained. `tests/db.rs` holds the
+rule with a store rewritten at the same length, shorter, and longer.
+
+With those out, the price that is left is the maintenance the carry
+keeps alive. The profile of the default arm at a hundred thousand keys
+reads the burst's ninety commits at 0.4-0.6 ms each from the fourteenth
+on, with no tables at all: a freeze drops them, the builder ahead
+cannot rebuild fifteen hundred blocks in the half-millisecond commits
+between one landing and the next freeze, and the regime files nothing
+without a scan, so the burst writes as if the forms did not exist and
+the pass builds through three to seven pieces at 12-30 µs a scan. The
+carry arm's tables are whole throughout, its maintenance files four
+batches at every fourth commit for 5-8 ms, and the burst writes in
+275 ms against 110 for a pass at 2.2-2.6 µs a scan -- or 5.8 when the
+burst's last merge rewrote the partition and the refill was still
+landing a few hundred blocks a commit when the pass began. That is the
+trade, and the suite takes it: `bench ab` over eight pairs at a hundred
+thousand keys reads the fully-unmerged lag point at 7.8x and ycsb-E at
+1.07x, eight of eight both, with nothing lost (F 0.96x, three of eight);
+five pairs at three hundred thousand read the point at 3.3x, the
+drained scan pass at 1.15x, A, D, E and F at 1.06-1.18x and the point
+reads at 1.07x, five of five each; eight at ten thousand read level on
+every mix and lag point, the four-thread scan the one quantity leaning
+the other way (one of eight, p=0.07). The carry is the default and
+`supdb-nocarry` is the shape before it.
+
+Three leads it leaves. The carry resets the tables' snapshot bounds
+and the first scan after a landing rebuilds the snapshot, 170 µs at ten
+thousand keys and 400 at a hundred thousand, which is a fifth of a
+hundred-scan pass and could be built at the carry, or by the keeper.
+A replacing write's patch seeks every piece for the key and then masks
+what it finds, so a patch under seven pieces pays seven seeks for a
+run it could have written from the memtable alone. And the refill
+after a merge's rewrite lands a few hundred blocks a commit, so a pass
+that begins within three commits of one builds the rest itself.
 
 #### Which half of the lag gap, by rung
 

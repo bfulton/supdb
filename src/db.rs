@@ -721,22 +721,22 @@ pub struct Options {
     /// their bookkeeping. A merge changes the partitions and starts
     /// afresh as before.
     ///
-    /// Off, because it is correct and does not pay: eleven pairs at a
-    /// hundred thousand keys read ycsb-F at 0.83x (0/11) and ycsb-E at
-    /// 0.89x (1/11, p=0.012). It was built for two losses that looked
-    /// like the seal's discard, and measured in the suite's shape
-    /// neither was. ycsb-E inherits F's forms and reads slower: the
-    /// builder ahead fills E's table on a spare core within its first
-    /// millisecond either way, and E's own settles now patch carried
-    /// forms, a copy per touched block, where over an emptied table they
-    /// patched nothing. The fully-unmerged lag point reads with an empty
-    /// table under both arms, three to seven pieces still standing at
-    /// its scans: what empties the table there is the merges during the
-    /// burst, whose rewritten partition no old form maps onto, and the
-    /// writes there run 2.3x slower carrying forms the next merge drops.
-    /// F pays the same way at its two seals. `supdb-carry` prices it,
-    /// and the test holds it to the model through two seals and a
-    /// merge.
+    /// On. As first built it lost the mixes, and the loss was the arm's
+    /// own, four costs found in the commit-by-commit profile and taken
+    /// out: it published the carried forms whether or not a handle was
+    /// there to read them, so every patch after a carry cloned its
+    /// block first; it read the log from its start again across a
+    /// landing and settled the whole log twice; a form the patches alone
+    /// had made stayed deltas past the dense bound, where a build makes
+    /// a copy; and the carried tables took the new piece's bounds before
+    /// its ranks, so a build through them sought the partition once per
+    /// piece key. What it costs is the burst's writes: the forms stay
+    /// whole through a write-only stretch, so its commits file every
+    /// batch, where the default regime had dropped the tables at each
+    /// freeze and, between one landing and the next freeze, never
+    /// refilled them. `supdb-nocarry` prices it, `docs/engine.md` has
+    /// the rows, and the test holds it to the model through two seals
+    /// and a merge.
     pub forms_carry: bool,
     /// EXPERIMENT: the writer's own handle takes the canonical forms it
     /// maintains, instead of building its own. Without this the
@@ -819,7 +819,7 @@ impl Default for Options {
             forms_max_unsealed_pct: 0,
             forms_settle_backlog_pct: 2,
             forms_settle_recent_pct: 0,
-            forms_carry: false,
+            forms_carry: true,
             forms_to_writer: false,
             form_dense_from: 0,
             scan_snapshot_arena: true,
@@ -8088,7 +8088,15 @@ impl Reader {
                 ..self.build_ctx()
             };
             for b in 0..table.slots.len() {
-                if table.slots[b].is_some() || BuildCtx::overlay_count(table, b) == 0 {
+                // An empty slot with an overlay, or a form the patches
+                // grew to what a build would have copied.
+                let dense = matches!(
+                    table.slots[b].as_deref(),
+                    Some(Cached::Sparse(sb)) if sb.ents.len() >= CACHE_DENSE
+                );
+                if dense {
+                    self.unlist(pi, b, table);
+                } else if table.slots[b].is_some() || BuildCtx::overlay_count(table, b) == 0 {
                     continue;
                 }
                 let built = std::sync::Arc::new(ctx.materialize(src, table, b, unsealed)?);
@@ -8434,15 +8442,31 @@ impl Reader {
         let before = table.slots[b].as_ref().map_or(0, |c| c.bytes());
         let was_clean = matches!(table.slots[b].as_deref(), Some(Cached::Clean));
         let mut bloated = false;
+        let mut dense = false;
         match std::sync::Arc::make_mut(table.slots[b].as_mut().expect("checked above")) {
             Cached::Block(blk) => {
                 let i = blk.lower_bound(key);
-                let at_run = blk.vals.len() as u32;
-                blk.vals.extend_from_slice(&run[..]);
-                if i < blk.ents.len() && blk.key(&blk.ents[i]) == key {
+                let found = i < blk.ents.len() && blk.key(&blk.ents[i]) == key;
+                // A run no longer than the one it replaces is written
+                // over it: the values stay where a build laid them and
+                // the array does not grow. Appended, a burst that
+                // rewrote every key left half of every copy's bytes
+                // pointed at by nothing, the copies at 18 MB where a
+                // build makes 13, and the blocks past twice their live
+                // bytes unlisted and built again in the pass that
+                // followed, half of them in one round.
+                if found && run.len() <= blk.ents[i][3] as usize {
+                    let at = blk.ents[i][2] as usize;
+                    blk.vals[at..at + run.len()].copy_from_slice(&run[..]);
+                    blk.ents[i][3] = run.len() as u32;
+                } else if found {
+                    let at_run = blk.vals.len() as u32;
+                    blk.vals.extend_from_slice(&run[..]);
                     blk.ents[i][2] = at_run;
                     blk.ents[i][3] = run.len() as u32;
                 } else {
+                    let at_run = blk.vals.len() as u32;
+                    blk.vals.extend_from_slice(&run[..]);
                     let key_at = blk.keys.len() as u32;
                     blk.keys.extend_from_slice(key);
                     blk.ents
@@ -8453,11 +8477,18 @@ impl Reader {
             }
             Cached::Sparse(sb) => {
                 let i = sb.ents.partition_point(|e| sb.key(e) < key);
-                let at_run = sb.vals.len() as u32;
-                sb.vals.extend_from_slice(&run[..]);
-                if i < sb.ents.len() && sb.key(&sb.ents[i]) == key {
+                let found = i < sb.ents.len() && sb.key(&sb.ents[i]) == key;
+                if found && run.len() <= sb.ents[i].run.1 as usize {
+                    let at = sb.ents[i].run.0 as usize;
+                    sb.vals[at..at + run.len()].copy_from_slice(&run[..]);
+                    sb.ents[i].run.1 = run.len() as u32;
+                } else if found {
+                    let at_run = sb.vals.len() as u32;
+                    sb.vals.extend_from_slice(&run[..]);
                     sb.ents[i].run = (at_run, run.len() as u32);
                 } else {
+                    let at_run = sb.vals.len() as u32;
+                    sb.vals.extend_from_slice(&run[..]);
                     let key_at = sb.keys.len() as u32;
                     sb.keys.extend_from_slice(key);
                     sb.ents.insert(
@@ -8472,6 +8503,14 @@ impl Reader {
                 }
                 let live: usize = sb.ents.iter().map(|e| e.run.1 as usize).sum();
                 bloated = sb.vals.len() > 2 * live.max(4096);
+                // Grown to what a build would have copied: the fill
+                // rebuilds it as a copy, see `complete_forms`. A form the
+                // patches alone had made -- clean at its build, a delta
+                // a write -- stayed deltas for the store's life, and with
+                // the tables carried across the seals every block of the
+                // lag point's store was sixty-four deltas walked per scan,
+                // 2-4 µs against 1 over the copies a rebuild makes.
+                dense = sb.ents.len() >= CACHE_DENSE;
             }
             slot @ Cached::Clean => {
                 *slot = Cached::Sparse(SparseBlock {
@@ -8493,6 +8532,9 @@ impl Reader {
             let after = table.slots[b].as_ref().map_or(0, |c| c.bytes());
             self.cache_bytes
                 .set(self.cache_bytes.get() + after - before);
+        }
+        if dense && self.opts.commit_forms && self.slot.is_none() {
+            self.tables_complete.set(false);
         }
         if bloated {
             self.unlist(at, b, table);
@@ -8948,6 +8990,58 @@ impl Reader {
             }
         }
         Ok(seen)
+    }
+
+    /// PROTOTYPE: the cache's blocks by kind, for a measurement: clean,
+    /// sparse, copies, wide.
+    #[doc(hidden)]
+    pub fn block_cache_kinds(&self) -> (usize, usize, usize, usize) {
+        let (mut clean, mut sparse, mut copies, mut wide) = (0usize, 0usize, 0usize, 0usize);
+        for t in self.tables.borrow().iter() {
+            for c in t.borrow().iter().flat_map(|t| t.slots.iter()).flatten() {
+                match &**c {
+                    Cached::Clean => clean += 1,
+                    Cached::Sparse(_) => sparse += 1,
+                    Cached::Block(_) => copies += 1,
+                    Cached::Wide(_) => wide += 1,
+                }
+            }
+        }
+        (clean, sparse, copies, wide)
+    }
+
+    /// PROTOTYPE: the copies' layout, for a measurement: bytes of their
+    /// value arrays no entry points at, and entries whose run does not
+    /// start where the entry before it ends -- runs a patch appended
+    /// rather than laid in key order.
+    #[doc(hidden)]
+    pub fn block_cache_layout(&self) -> (usize, usize, usize) {
+        let (mut dead, mut scattered, mut ents) = (0usize, 0usize, 0usize);
+        for t in self.tables.borrow().iter() {
+            for c in t.borrow().iter().flat_map(|t| t.slots.iter()).flatten() {
+                if let Cached::Block(b) = &**c {
+                    let live: usize = b.ents.iter().map(|e| e[3] as usize).sum();
+                    dead += b.vals.len() - live;
+                    ents += b.ents.len();
+                    scattered += b
+                        .ents
+                        .windows(2)
+                        .filter(|w| w[1][2] != w[0][2] + w[0][3])
+                        .count();
+                }
+            }
+        }
+        (dead, scattered, ents)
+    }
+
+    /// PROTOTYPE: the writer's tables dropped and made again from the
+    /// store as it stands, for a measurement of a form's layout: the
+    /// same content laid out by a build rather than by the patches.
+    #[doc(hidden)]
+    pub fn refill_forms(&mut self) -> Result<()> {
+        self.drop_blocks();
+        self.publish_due.set(true);
+        self.maintain_forms()
     }
 
     /// PROTOTYPE: the cache's size, for a measurement: blocks held and
@@ -11109,16 +11203,35 @@ impl Db {
         if !self.cache_used.get() || self.log_gen.get() != cur.gen {
             return false;
         }
-        // Everything logged, filed and published.
+        // Everything logged and filed, and published where someone is
+        // publishing for. Published regardless, every form the writer
+        // held became a shared one, and every patch after the carry
+        // cloned its block before writing it: the lag sweep's burst at a
+        // hundred thousand keys wrote in 400 ms against 130 with the
+        // forms carried, most of it those clones. The pointers moved
+        // below are the last published forms, current to no commit
+        // (`forms_at`), which is what a reader trusts nothing past.
         self.sync_log();
         if self.settle_pending().is_err() {
             return false;
         }
-        self.publish_dirty(true);
+        self.publish_dirty(false);
         // The writer's tables, remade for `next`: forms kept, the rest
-        // walked again. A failure here leaves nothing carried.
+        // walked again. A failure here leaves nothing carried. The new
+        // piece's ranks against the partition first, as a fresh table's
+        // maker takes them: this runs inside the publish and the ranks
+        // were taken after it, so the carried tables held none for the
+        // new piece, and a build through them cut the partition by a
+        // seek per piece key (`cut_at`) where a fresh table's cuts at
+        // the rank.
         let l0 = &next.segs[np..];
-        let ctx = self.build_ctx();
+        let ctx = BuildCtx {
+            segs: &next.segs,
+            ..self.build_ctx()
+        };
+        if ctx.rank_pieces().is_err() {
+            return false;
+        }
         let mut bounds = Vec::with_capacity(np);
         for seg in &next.segs[..np] {
             match ctx.table_bounds(seg, l0) {
@@ -11126,6 +11239,7 @@ impl Db {
                 Err(_) => return false,
             }
         }
+
         self.tables
             .borrow_mut()
             .resize_with(next.segs.len(), || std::cell::RefCell::new(None));
@@ -11178,10 +11292,16 @@ impl Db {
         next.forms_complete = std::sync::atomic::AtomicBool::new(self.tables_complete.get());
         next.forms_bytes = AtomicUsize::new(bytes);
         // This handle's log and snapshot bookkeeping, for `next`: across a
-        // seal the log is read from its start and the snapshot built
-        // again; across a piece merge the memtable is the same one, so
-        // the position, the snapshot and the lists stand and only the
+        // freeze the log is a new table's and is read from its start;
+        // across a landing the memtable is the same one and the position
+        // stands -- read from its start again, the landing's commit
+        // settled the whole log a second time, two thousand patches at
+        // ten thousand keys -- and the snapshot, which named the frozen
+        // table's slots, is built again; across a piece merge the
+        // memtable and the frozen table are the same ones, so the
+        // position, the snapshot and the lists stand and only the
         // generation they are keyed by moves.
+        let same_mem = std::sync::Arc::ptr_eq(&next.mem, &cur.mem);
         self.log_gen.set(next.gen);
         if tier {
             if let Some((g, _)) = self.scan_keys.borrow_mut().as_mut() {
@@ -11189,7 +11309,9 @@ impl Db {
             }
             return true;
         }
-        self.log_seen.set(0);
+        if !same_mem {
+            self.log_seen.set(0);
+        }
         self.scans_seen.set(0);
         self.snap_entries.set(0);
         *self.scan_keys.borrow_mut() = None;
