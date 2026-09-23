@@ -124,6 +124,13 @@ const LAG_PCT: [u64; 4] = [0, 1, 10, 100];
 const SCAN_FLOOR_CAP: u64 = 4 << 30;
 const WAL_FLOOR_BATCHES: u64 = 100;
 
+/// The memory floor's buffer and how many dependent loads it makes. The
+/// buffer is past every L2 this suite runs on and small enough to cost
+/// milliseconds; the chase length is what makes the figure a rate rather
+/// than one sample of a latency.
+const MEM_FLOOR_BYTES: usize = 64 << 20;
+const MEM_FLOOR_CHASES: usize = 1 << 20;
+
 type Key = (String, Option<u64>, String, String); // workload, size, arm, quantity
 
 struct Samples {
@@ -205,6 +212,7 @@ pub fn run(
     for rep in 0..=plan.reps {
         let wal = wal_floor(&root, plan, &payload)?;
         let scan = scan_floor(&root, floor_bytes)?;
+        let mem = mem_floor();
         if rep > 0 {
             s.push(
                 "wal-floor",
@@ -224,12 +232,21 @@ pub fn run(
                 ("bytes_per_s", "B/s"),
                 scan,
             );
+            s.push(
+                "mem-floor",
+                None,
+                FLOOR_ARM,
+                Guarantee::Buffered,
+                ("ops_per_s", "chases/s"),
+                mem,
+            );
         }
         log(&format!(
-            "{:>7}s  floors rep {rep}{}  wal {wal:>10.0} ops/s  mmap {:>8.2} GB/s",
+            "{:>7}s  floors rep {rep}{}  wal {wal:>10.0} ops/s  mmap {:>8.2} GB/s  chase {:>9.0}/s",
             started.elapsed().as_secs(),
             if rep == 0 { " (warmup)" } else { "" },
             scan / 1e9,
+            mem,
         ));
     }
     // The scan floor's file is dead weight from here: it is the top rung's
@@ -1088,6 +1105,42 @@ fn scan_floor(root: &Path, bytes: u64) -> Result<f64, String> {
     let secs = t.elapsed().as_secs_f64();
     std::hint::black_box(acc);
     Ok(bytes as f64 / secs)
+}
+
+/// The random-access floor: one dependent load at a time around a
+/// permutation of the buffer's cache lines, which is the shape every cost
+/// this engine pays in a block table, a piece's index and a memtable
+/// chain. Chases per second. It is here because the other two floors are
+/// both sequential and neither sees a host whose memory latency has
+/// moved: a row where the engine's rates fall and the floors do not is
+/// the engine's, and telling those apart is the gate's whole job.
+fn mem_floor() -> f64 {
+    let lines = MEM_FLOOR_BYTES / 64;
+    // A permutation of the lines as one cycle, so no prefetcher can
+    // guess the next address and every load waits for the one before.
+    let mut next: Vec<u32> = (0..lines as u32).collect();
+    let mut rng = Rng::new(0xF30);
+    for i in (1..lines).rev() {
+        let j = (rng.next() % (i as u64 + 1)) as usize;
+        next.swap(i, j);
+    }
+    // `next[i]` holds a permutation; walk it as a cycle by writing each
+    // line's successor into the line itself.
+    let mut buf: Vec<u32> = vec![0; lines * 16];
+    let mut at = 0usize;
+    for _ in 0..lines {
+        let to = next[at] as usize;
+        buf[at * 16] = to as u32;
+        at = to;
+    }
+    let t = Instant::now();
+    let mut at = 0usize;
+    for _ in 0..MEM_FLOOR_CHASES {
+        at = buf[at * 16] as usize;
+    }
+    let secs = t.elapsed().as_secs_f64();
+    std::hint::black_box(at);
+    MEM_FLOOR_CHASES as f64 / secs
 }
 
 /// LMDB needs its map sized up front. Three times the raw payload, at least

@@ -121,6 +121,15 @@ the change beside it, whichever way it reads, and the change is priced
 within one sitting instead. Do not bank such a row as history and do not
 read its verdict as the change's.
 
+The gate does that reading itself now: the floors are its control, a floor
+below every row in the window withholds the verdict on every quantity that
+moves with the machine, and the byte ratios are judged anyway. A third
+floor went in with it, a pointer chase around a 64 MiB buffer, because the
+other two are sequential and a host whose memory latency has moved shows in
+neither. Both directions were held to the row that produced the rule: as
+measured it reads "host: OUT OF BAND" and gives no verdict on 133
+quantities, and with the floors raised by hand it fails on the same 133.
+
 **A one-sided bound passes a broken measurement.** A one-sided bound,
 `ratio >= 0.90`, recorded a pass on a run where the ratio came out 8.5x --
 on a store where the mechanism says the policy can only lose. A row whose

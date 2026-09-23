@@ -10,7 +10,7 @@ row outside the error bars its neighbours drew.
 
 ## Workloads
 
-Five, plus two floors. Each yields one or more quantities.
+Five, plus three floors. Each yields one or more quantities.
 
 | workload | shape | quantities |
 |---|---|---|
@@ -21,6 +21,7 @@ Five, plus two floors. Each yields one or more quantities.
 | `ycsb` | core A–F on the loaded store, zipfian, a sixth of the keys in operations per mix | ops/s per mix |
 | `wal-floor` | framed 1,000-record batches appended to one file, one `fdatasync` each, no engine | ops/s |
 | `scan-floor` | one `mmap` sequential walk of a file the top rung's size (capped at 4 GiB), no engine | bytes/s |
+| `mem-floor` | one dependent load at a time around a permutation of a 64 MiB buffer's cache lines, no engine | chases/s |
 
 Every workload runs at a ladder of store sizes, not one: keys at 1, 3, 10,
 30 ... × 10⁴ up to the scale's cap. A number is a point on a curve, and the
@@ -39,7 +40,11 @@ points still land in the series beside every other run's.
 
 The floors are per-machine constants, not per-engine and not per-size. They
 are what "as fast as possible" means on that host; an engine's distance from
-them is the headroom left. The scan floor's file fits in memory at `quick`
+them is the headroom left, and they are the gate's control over the host
+(below). Three, because a host moves in three ways this suite feels: the
+device's sync rate, the mapped sequential read, and the latency of a load
+that nothing can predict, which is the shape of every table, index and
+chain the engine walks and the one the other two floors cannot see. The scan floor's file fits in memory at `quick`
 and is served from the page cache after its first walk, which is also what a
 store that fits in memory sees; at `full` neither fits.
 
@@ -344,6 +349,26 @@ regression fails. A row better than every prior CI is flagged, not failed:
 it is either a win or a broken measurement, and a person should know which.
 
 Fewer than three prior rows: no band, and the gate says so.
+
+### The machine is judged first
+
+A class is the architecture, the CPU model, the core count, memory and
+whether the host is virtualised — which does not pin the host a guest lands
+on. So the floors are read before the engine's quantities: when a floor's
+CI is below every row in the window, this is not the host the window was
+measured on, and every quantity that moves with the machine gets **no
+verdict** instead of a regression. The quantities that do not move with it
+— `device_bytes_per_byte` and `bytes_on_disk_per_byte`, arithmetic on what
+the engine stored — are judged as always. A floor below its window is never
+itself a failure: it is the machine, and the run did not choose it.
+
+The case this answers cost a day. A quick row failed with 121 of 1,106
+quantities regressed; LMDB's scan at three hundred thousand keys, code no
+engine change can touch, read a third of its window, ten of eleven
+workloads had a comparator among their regressions, and the row's own wal
+floor stood at 0.74 of the window's lowest. The reading took a day and the
+row still could not say anything about the change beside it. The control
+makes that reading the gate's, not a person's.
 
 That is the whole rule. The window is the only parameter and it is stated
 once, here.

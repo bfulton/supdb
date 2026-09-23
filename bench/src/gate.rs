@@ -7,6 +7,19 @@
 //! either a win or a broken measurement, and a person should know which.
 //! Fewer than `MIN_HISTORY` prior rows: no band, and the gate says so.
 //!
+//! One thing stands between that rule and a verdict: the machine. A row
+//! is compared to rows of its class, and the class is the CPU model, the
+//! core count, the memory and virtualisation -- which does not pin the
+//! host a guest lands on. So every row measures the machine with no
+//! engine in the way, in the floors, and the floors are this gate's
+//! control: when a floor is below every row in the window, the quantities
+//! that depend on the machine get no verdict rather than a regression,
+//! and the ones that do not -- the byte ratios, which are arithmetic on
+//! what was stored -- are judged as always. A quick row here failed with
+//! 121 of 1,106 quantities regressed while LMDB's own scan, code no
+//! engine change can touch, ran a third of its window: that row cost a
+//! day to read and the reading is what this control is.
+//!
 //! That is the whole rule. The window is the only parameter and it is
 //! stated once, in DESIGN.md; this is the code for it.
 
@@ -35,10 +48,30 @@ pub fn higher_is_better(quantity: &str) -> Option<bool> {
     })
 }
 
+/// The workloads that measure the machine rather than an engine: the
+/// device's sync rate, the mapped sequential read, and the random-access
+/// chase. Named here, never guessed, so a floor added in `run` is added
+/// here or it is not a control.
+pub fn is_floor(workload: &str) -> bool {
+    matches!(workload, "wal-floor" | "scan-floor" | "mem-floor")
+}
+
+/// Whether a quantity moves with the machine. The byte ratios are
+/// arithmetic on what the engine stored -- they came back identical to
+/// three decimals across hosts that moved every rate by half -- so they
+/// are judged whatever the floors say. Everything else is a rate or a
+/// latency.
+pub fn machine_dependent(quantity: &str) -> bool {
+    !matches!(quantity, "device_bytes_per_byte" | "bytes_on_disk_per_byte")
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Verdict {
     /// Entirely on the worse side of every prior CI.
     Regressed,
+    /// Worse than every prior CI, on a machine whose floors are too: the
+    /// row cannot say whether the change or the host did it.
+    NoVerdict,
     /// Entirely on the better side of every prior CI.
     Flagged,
     Within,
@@ -71,10 +104,20 @@ pub struct Report {
 }
 
 impl Report {
+    /// A floor below its window is the machine, never the engine, so it
+    /// is reported and never failed on.
     pub fn regressed(&self) -> bool {
         self.findings
             .iter()
-            .any(|f| f.verdict == Verdict::Regressed)
+            .any(|f| f.verdict == Verdict::Regressed && !is_floor(&f.workload))
+    }
+
+    /// The floors that came in below every row in the window.
+    pub fn host_out_of_band(&self) -> Vec<&Finding> {
+        self.findings
+            .iter()
+            .filter(|f| is_floor(&f.workload) && f.verdict == Verdict::Regressed)
+            .collect()
     }
 
     fn count(&self, pred: impl Fn(&Verdict) -> bool) -> usize {
@@ -90,9 +133,63 @@ impl Report {
             self.prior_rows,
             if self.prior_rows == 1 { "" } else { "s" },
         ));
+        let floors: Vec<&Finding> = self
+            .findings
+            .iter()
+            .filter(|f| is_floor(&f.workload))
+            .collect();
+        let banded = floors
+            .iter()
+            .filter(|f| !matches!(f.verdict, Verdict::InsufficientHistory(_)))
+            .count();
+        let low = self.host_out_of_band();
+        if banded == 0 {
+            out.push_str(&format!(
+                "host: no floor in band yet ({} floor quantities); the verdict stands on the engine's alone\n",
+                floors.len()
+            ));
+        } else if low.is_empty() {
+            let above = floors
+                .iter()
+                .filter(|f| f.verdict == Verdict::Flagged)
+                .count();
+            out.push_str(&format!(
+                "host: floors within the window ({banded} of {}){}\n",
+                floors.len(),
+                if above > 0 {
+                    format!(", {above} above it -- a quantity flagged better may be the machine")
+                } else {
+                    String::new()
+                }
+            ));
+        } else {
+            let which: Vec<String> = low
+                .iter()
+                .map(|f| {
+                    let (lo, hi) = f.prior.unwrap_or((f64::NAN, f64::NAN));
+                    format!(
+                        "{} {} [{}, {}] against the window's [{}, {}]",
+                        f.workload,
+                        f.quantity,
+                        fmt(f.ci.0),
+                        fmt(f.ci.1),
+                        fmt(lo),
+                        fmt(hi)
+                    )
+                })
+                .collect();
+            out.push_str(&format!(
+                "host: OUT OF BAND -- {}. Every quantity that moves with the machine gets no verdict.\n",
+                which.join("; ")
+            ));
+        }
         for f in &self.findings {
             let (tag, note) = match &f.verdict {
                 Verdict::Regressed => ("REGRESSED", String::new()),
+                Verdict::NoVerdict => (
+                    "no verdict",
+                    " (worse than the window, and so are the floors)".into(),
+                ),
                 Verdict::Flagged => (
                     "flagged",
                     " (better than every prior row -- a win or a broken measurement)".into(),
@@ -116,7 +213,12 @@ impl Report {
         }
         let total = self.findings.len();
         let insufficient = self.count(|v| matches!(v, Verdict::InsufficientHistory(_)));
-        let regressed = self.count(|v| *v == Verdict::Regressed);
+        let regressed = self
+            .findings
+            .iter()
+            .filter(|f| f.verdict == Verdict::Regressed && !is_floor(&f.workload))
+            .count();
+        let no_verdict = self.count(|v| *v == Verdict::NoVerdict);
         let flagged = self.count(|v| *v == Verdict::Flagged);
         if insufficient == total {
             out.push_str(&format!(
@@ -129,6 +231,10 @@ impl Report {
         }
         out.push_str(&if regressed > 0 {
             format!("REGRESSED: {regressed} of {total} quantities are worse than every row in the window\n")
+        } else if no_verdict > 0 {
+            format!(
+                "no verdict: {no_verdict} of {total} quantities are worse than the window on a machine whose floors are too; nothing the engine's own ({flagged} flagged)\n"
+            )
         } else {
             format!("ok: nothing worse than the window ({flagged} flagged)\n")
         });
@@ -237,6 +343,24 @@ pub fn gate(row: &Row, runs: &Path) -> io::Result<Report> {
         });
     }
 
+    // The machine's own verdict, taken before the engine's: a floor below
+    // every row in the window means this host is not the host the window
+    // was measured on, so a quantity that moves with the machine cannot
+    // say which of the two moved it. The byte ratios still can.
+    let host_low = findings
+        .iter()
+        .any(|f| is_floor(&f.workload) && f.verdict == Verdict::Regressed);
+    if host_low {
+        for f in &mut findings {
+            if f.verdict == Verdict::Regressed
+                && !is_floor(&f.workload)
+                && machine_dependent(&f.quantity)
+            {
+                f.verdict = Verdict::NoVerdict;
+            }
+        }
+    }
+
     Ok(Report {
         class: row.class(),
         scale: row.scale.as_str(),
@@ -318,6 +442,182 @@ mod tests {
             priors.push(r);
         }
         (dir, priors)
+    }
+
+    fn floor(workload: &str, quantity: &str, unit: &str, v: f64) -> Measurement {
+        Measurement {
+            workload: workload.into(),
+            arm: crate::run::FLOOR_ARM.into(),
+            guarantee: Guarantee::Buffered,
+            size: None,
+            quantity: quantity.into(),
+            unit: unit.into(),
+            samples: vec![v, v * 1.01, v * 0.99, v, v * 1.005],
+        }
+    }
+
+    /// The three floors and a byte ratio on a row: what the gate's control
+    /// reads, and one quantity the machine cannot move.
+    fn with_control(mut r: Row, wal: f64, scan: f64, mem: f64, ratio: f64) -> Row {
+        r.measurements
+            .push(floor("wal-floor", "ops_per_s", "ops/s", wal));
+        r.measurements
+            .push(floor("scan-floor", "bytes_per_s", "B/s", scan));
+        r.measurements
+            .push(floor("mem-floor", "ops_per_s", "chases/s", mem));
+        r.measurements.push(Measurement {
+            workload: "load".into(),
+            arm: "supdb".into(),
+            guarantee: Guarantee::Durable,
+            size: Some(10_000),
+            quantity: "bytes_on_disk_per_byte".into(),
+            unit: "B/B".into(),
+            samples: vec![ratio; 5],
+        });
+        r
+    }
+
+    fn fixture_with_control(n_prior: usize) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "supdb-bench-gate-ctl-{}-{n_prior}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        for i in 0..n_prior {
+            let jitter = (i % 3) as f64 * 0.5;
+            let r = row(
+                &format!("2026010{}T000000Z", i + 1),
+                4,
+                [100.0 + jitter, 101.0, 99.0 + jitter, 100.5, 100.0],
+                [5.0, 5.2, 4.9 + jitter * 0.1, 5.1, 5.0],
+            );
+            with_control(r, 1_000_000.0, 9.0e9, 3_000_000.0, 1.44)
+                .write(&dir)
+                .unwrap();
+        }
+        dir
+    }
+
+    /// The row that cost a day: every rate below the window, and the
+    /// machine's own floors below it too.
+    #[test]
+    fn a_floor_below_the_window_withholds_every_machine_verdict() {
+        let dir = fixture_with_control(6);
+        let new = with_control(
+            row(
+                "20260201T000000Z",
+                4,
+                [70.0, 71.0, 69.5, 70.2, 70.8],
+                [9.0, 9.1, 9.0, 9.2, 8.9],
+            ),
+            600_000.0,
+            6.0e9,
+            1_800_000.0,
+            1.44,
+        );
+        let rep = gate(&new, &dir).unwrap();
+        let text = rep.render();
+        assert!(!rep.regressed(), "{text}");
+        assert_eq!(rep.host_out_of_band().len(), 3, "{text}");
+        for f in &rep.findings {
+            if f.workload == "read" {
+                assert_eq!(f.verdict, Verdict::NoVerdict, "{text}");
+            }
+        }
+        assert!(text.contains("host: OUT OF BAND"), "{text}");
+        assert!(text.contains("no verdict:"), "{text}");
+    }
+
+    /// A ratio of bytes is arithmetic on what was stored, so the machine
+    /// cannot excuse it.
+    #[test]
+    fn a_byte_ratio_is_judged_whatever_the_floors_say() {
+        let dir = fixture_with_control(6);
+        let new = with_control(
+            row(
+                "20260201T000000Z",
+                4,
+                [70.0, 71.0, 69.5, 70.2, 70.8],
+                [9.0, 9.1, 9.0, 9.2, 8.9],
+            ),
+            600_000.0,
+            6.0e9,
+            1_800_000.0,
+            1.90,
+        );
+        let rep = gate(&new, &dir).unwrap();
+        let text = rep.render();
+        assert!(rep.regressed(), "{text}");
+        let ratio = rep
+            .findings
+            .iter()
+            .find(|f| f.quantity == "bytes_on_disk_per_byte")
+            .expect("the ratio is a finding");
+        assert_eq!(ratio.verdict, Verdict::Regressed, "{text}");
+    }
+
+    /// The control in band is the case the gate exists for.
+    #[test]
+    fn a_regression_on_a_machine_in_band_still_fails() {
+        let dir = fixture_with_control(6);
+        let new = with_control(
+            row(
+                "20260201T000000Z",
+                4,
+                [70.0, 71.0, 69.5, 70.2, 70.8],
+                [9.0, 9.1, 9.0, 9.2, 8.9],
+            ),
+            1_000_000.0,
+            9.0e9,
+            3_000_000.0,
+            1.44,
+        );
+        let rep = gate(&new, &dir).unwrap();
+        let text = rep.render();
+        assert!(rep.regressed(), "{text}");
+        assert!(rep.host_out_of_band().is_empty(), "{text}");
+        assert!(text.contains("host: floors within the window"), "{text}");
+    }
+
+    /// A floor is the machine's, so it is reported and never failed on.
+    #[test]
+    fn a_floor_alone_never_fails_the_gate() {
+        let dir = fixture_with_control(6);
+        let new = with_control(
+            row(
+                "20260201T000000Z",
+                4,
+                [100.0, 101.0, 99.5, 100.2, 100.8],
+                [5.0, 5.1, 5.0, 5.2, 4.9],
+            ),
+            600_000.0,
+            6.0e9,
+            1_800_000.0,
+            1.44,
+        );
+        let rep = gate(&new, &dir).unwrap();
+        let text = rep.render();
+        assert!(!rep.regressed(), "{text}");
+        assert_eq!(rep.host_out_of_band().len(), 3, "{text}");
+    }
+
+    /// A window from before a floor existed cannot control for it, and the
+    /// gate says so rather than passing everything.
+    #[test]
+    fn a_window_without_floors_says_it_has_no_control() {
+        let (dir, _) = fixture(6);
+        let new = row(
+            "20260201T000000Z",
+            4,
+            [70.0, 71.0, 69.5, 70.2, 70.8],
+            [9.0, 9.1, 9.0, 9.2, 8.9],
+        );
+        let rep = gate(&new, &dir).unwrap();
+        let text = rep.render();
+        assert!(rep.regressed(), "{text}");
+        assert!(text.contains("host: no floor in band yet"), "{text}");
     }
 
     #[test]
