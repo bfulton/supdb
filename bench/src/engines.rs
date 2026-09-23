@@ -363,6 +363,9 @@ pub struct Supdb {
     /// Keys of one block in a settle's backlog from which the block is
     /// rebuilt rather than patched key by key. `supdb-rebuild`.
     rebuild: usize,
+    /// The writer's scan snapshot carried across a publish rather than
+    /// dropped. `supdb-snapcarry`.
+    snapcarry: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -421,6 +424,9 @@ struct Policy {
     /// Keys of one block in a settle's backlog from which the block is
     /// rebuilt rather than patched key by key. `supdb-rebuild`.
     rebuild: usize,
+    /// The writer's scan snapshot carried across a publish rather than
+    /// dropped. `supdb-snapcarry`.
+    snapcarry: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -467,6 +473,7 @@ impl Default for Policy {
             recent: None,
             carry: true,
             rebuild: 0,
+            snapcarry: false,
             tier: None,
             runs: false,
             keeper: false,
@@ -588,6 +595,20 @@ impl Supdb {
             path,
             Policy {
                 rebuild: 6,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the writer's scan snapshot carried across a publish
+    /// rather than dropped and sorted again at the next commit due.
+    /// Against `supdb` it prices where that work lands: the pass after a
+    /// burst, or the burst's own commits.
+    pub fn create_snapcarry(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                snapcarry: true,
                 ..Policy::default()
             },
         )
@@ -835,6 +856,7 @@ impl Supdb {
             recent,
             carry,
             rebuild,
+            snapcarry,
             tier,
             runs,
             keeper,
@@ -915,6 +937,7 @@ impl Supdb {
             // afresh at every publish as it was.
             forms_carry: carry,
             forms_settle_rebuild_from: rebuild,
+            snapshot_carry: snapcarry,
             // The pieces over a range merged into one piece beside the
             // partition merge, or left for it as the engine has it.
             tier_pieces: tier.unwrap_or(supdb::Options::default().tier_pieces),
@@ -978,6 +1001,7 @@ impl Supdb {
             recent,
             carry,
             rebuild,
+            snapcarry,
             tier,
             runs,
             keeper,
@@ -1025,6 +1049,9 @@ impl Engine for Supdb {
         }
         if self.rebuild > 0 {
             return "supdb-rebuild";
+        }
+        if self.snapcarry {
+            return "supdb-snapcarry";
         }
         if self.tier.is_some_and(|t| t > 0) {
             return "supdb-tier";
@@ -1583,11 +1610,10 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
         "supdb" | "supdb-forms" | "supdb-settle" | "supdb-wforms" | "supdb-regime"
         | "supdb-noseal" | "supdb-ahead" | "supdb-lazyforms" | "supdb-eager" | "supdb-nosettle"
-        | "supdb-recency" | "supdb-nocarry" | "supdb-rebuild" | "supdb-tier" | "supdb-runs"
-        | "supdb-keeper" | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap"
-        | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => {
-            Guarantee::Durable
-        }
+        | "supdb-recency" | "supdb-nocarry" | "supdb-rebuild" | "supdb-snapcarry"
+        | "supdb-tier" | "supdb-runs" | "supdb-keeper" | "supdb-aheadpub" | "supdb-pubalways"
+        | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb"
+        | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
     })
@@ -1605,6 +1631,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-recency" => Box::new(Supdb::create_recency(dir)?),
         "supdb-nocarry" => Box::new(Supdb::create_nocarry(dir)?),
         "supdb-rebuild" => Box::new(Supdb::create_rebuild(dir)?),
+        "supdb-snapcarry" => Box::new(Supdb::create_snapcarry(dir)?),
         "supdb-tier" => Box::new(Supdb::create_tier(dir)?),
         "supdb-runs" => Box::new(Supdb::create_runs(dir)?),
         "supdb-keeper" => Box::new(Supdb::create_keeper(dir)?),

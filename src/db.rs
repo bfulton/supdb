@@ -673,6 +673,21 @@ pub struct Options {
     /// after a tenth of the store rewritten was at half of LMDB either
     /// way this engine charged it to the reads.
     pub forms_settle_backlog_pct: usize,
+    /// EXPERIMENT: the writer's scan snapshot carried across a publish
+    /// rather than dropped, by the cases `carry_snapshot` knows: whole
+    /// across a merge, and its live entries made frozen ones across a
+    /// freeze, which keeps the bounds every partition was walked
+    /// against. The landing's filter, which drops entries and the bounds
+    /// with them, is the keeper's alone.
+    ///
+    /// Dropped, the next commit due sorts every unsealed key again:
+    /// fifteen builds over the hundred-thousand lag burst at about 2 ms
+    /// each, eight at three hundred thousand at 4-7 ms. What the carry
+    /// moves is where the work lands -- a snapshot in hand at a commit
+    /// is one the fill walks its bounds against there rather than at the
+    /// first scan after -- so what it buys is the pass and what it costs
+    /// is the burst. `supdb-snapcarry` prices it.
+    pub snapshot_carry: bool,
     /// EXPERIMENT: keys of one block in a settle's backlog from which
     /// the block is dropped and built once rather than patched key by
     /// key. A patch resolves one key's run against every source and
@@ -846,6 +861,7 @@ impl Default for Options {
             forms_publish_lazily: true,
             forms_max_unsealed_pct: 0,
             forms_settle_backlog_pct: 2,
+            snapshot_carry: false,
             forms_settle_rebuild_from: 0,
             forms_settle_recent_pct: 0,
             forms_carry: true,
@@ -11396,7 +11412,29 @@ impl Db {
                 Err(_) => return false,
             }
         }
+        // The context holds this handle's stale set borrowed; what
+        // follows takes it mutably where the memtable has changed.
+        drop(ctx);
 
+        // The snapshot carried rather than dropped, by the three cases
+        // the keeper's own carry knows (`carry_snapshot`): whole across a
+        // merge, its live entries made frozen ones across a freeze, its
+        // frozen entries dropped and its runs moved to an arena of their
+        // own when the seal lands. Dropped, as this did, the next commit
+        // due sorted every unsealed key again -- fifteen builds at about
+        // 2 ms over the hundred-thousand lag burst, 30 ms of its 400 --
+        // and a pass that began before that commit paid one itself.
+        let same_mem = std::sync::Arc::ptr_eq(&next.mem, &cur.mem);
+        let held = self.scan_keys.borrow_mut().take();
+        let carried = held
+            .filter(|_| self.opts.snapshot_carry)
+            .and_then(|(_, s)| self.carry_snapshot(s, &cur.mem, cur.frozen.as_ref(), next, false));
+        // A key past the snapshot's end is in the tables' lists and
+        // nowhere else. Across a freeze the snapshot takes every key of
+        // the table it froze, and the lists and `snap_added`, which name
+        // that table's slots, go; across a merge or a landing the live
+        // table is the one it was and they stand.
+        let keep_added = carried.is_some() && same_mem;
         self.tables
             .borrow_mut()
             .resize_with(next.segs.len(), || std::cell::RefCell::new(None));
@@ -11426,10 +11464,15 @@ impl Db {
             t.snap_gen = u64::MAX;
             t.reads.fill(0);
             t.touched.fill(0);
-            for list in &mut t.added {
-                list.clear();
+            // A key past the snapshot's end is in the table's list and
+            // nowhere else, so the lists are emptied only where the
+            // snapshot that covers the rest is emptied too.
+            if !keep_added {
+                for list in &mut t.added {
+                    list.clear();
+                }
+                t.filed = 0;
             }
-            t.filed = 0;
         }
         // The pointers, `next`'s from its publish; `cur` frees none.
         let mut bytes = 0usize;
@@ -11453,12 +11496,9 @@ impl Db {
         // across a landing the memtable is the same one and the position
         // stands -- read from its start again, the landing's commit
         // settled the whole log a second time, two thousand patches at
-        // ten thousand keys -- and the snapshot, which named the frozen
-        // table's slots, is built again; across a piece merge the
-        // memtable and the frozen table are the same ones, so the
-        // position, the snapshot and the lists stand and only the
-        // generation they are keyed by moves.
-        let same_mem = std::sync::Arc::ptr_eq(&next.mem, &cur.mem);
+        // ten thousand keys; across a piece merge the memtable and the
+        // frozen table are the same ones, so the position and the lists
+        // stand and only the generation they are keyed by moves.
         self.log_gen.set(next.gen);
         if tier {
             if let Some((g, _)) = self.scan_keys.borrow_mut().as_mut() {
@@ -11468,11 +11508,22 @@ impl Db {
         }
         if !same_mem {
             self.log_seen.set(0);
+            self.snap_stale.borrow_mut().clear();
         }
         self.scans_seen.set(0);
-        self.snap_entries.set(0);
-        *self.scan_keys.borrow_mut() = None;
-        self.snap_added.borrow_mut().clear();
+        match carried {
+            Some(s) => {
+                self.snap_entries.set(s.live_len);
+                *self.scan_keys.borrow_mut() = Some((next.gen, s));
+            }
+            None => {
+                self.snap_entries.set(0);
+                *self.scan_keys.borrow_mut() = None;
+            }
+        }
+        if !keep_added {
+            self.snap_added.borrow_mut().clear();
+        }
         self.pending.borrow_mut().clear();
         true
     }
@@ -12665,7 +12716,10 @@ impl Reader {
         // A publish since the last tick: the snapshot carried across it
         // where the memtables allow, and dropped otherwise.
         if st.gen != k.gen {
-            let carried = k.snap.take().and_then(|s| self.carry_snapshot(s, k, st));
+            let carried = k.snap.take().and_then(|s| {
+                let live = k.live.clone()?;
+                self.carry_snapshot(s, &live, k.frozen.as_ref(), st, true)
+            });
             k.gen = st.gen;
             k.live = Some(mem.clone());
             k.frozen = st.frozen.clone();
@@ -12782,12 +12836,13 @@ impl Reader {
     fn carry_snapshot(
         &self,
         s: std::sync::Arc<Snapshot>,
-        k: &Kept,
+        live: &std::sync::Arc<MemTable>,
+        frozen: Option<&std::sync::Arc<MemTable>>,
         st: &State,
+        landing: bool,
     ) -> Option<std::sync::Arc<Snapshot>> {
-        let live = k.live.as_ref()?;
         let same_mem = std::sync::Arc::ptr_eq(&st.mem, live);
-        let same_frozen = match (&st.frozen, &k.frozen) {
+        let same_frozen = match (&st.frozen, &frozen) {
             (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
             (None, None) => true,
             _ => false,
@@ -12795,7 +12850,15 @@ impl Reader {
         if same_mem && same_frozen {
             return Some(s);
         }
-        if same_mem && st.frozen.is_none() && k.frozen.is_some() {
+        // The landing's filter drops entries, so the bounds every
+        // partition was walked against go with them -- their positions
+        // are positions in the run. For a caller whose next reads want
+        // those bounds that is a bad trade: at three hundred thousand
+        // keys the burst's five walks cost 20 ms against the 17 ms of
+        // builds the carry saved, and the writes ran 7-11% slower. The
+        // keeper walks them on its own thread and asks for this; the
+        // writer does not.
+        if landing && same_mem && st.frozen.is_none() && frozen.is_some() {
             let live_ents = s.ents.iter().filter(|e| e.mem != u32::MAX);
             let bytes: usize = live_ents
                 .clone()
@@ -12837,7 +12900,7 @@ impl Reader {
             }
             return Some(std::sync::Arc::new(out));
         }
-        let froze = k.frozen.is_none()
+        let froze = frozen.is_none()
             && st
                 .frozen
                 .as_ref()

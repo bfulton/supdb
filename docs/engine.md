@@ -1807,6 +1807,40 @@ applied to a structure keyed by position knows every position before it
 applies the first, so a stall it pays per key is a stall it need not
 pay at all.
 
+#### The snapshot dropped at a publish, and what carrying it moves
+
+The writer drops its scan snapshot at every publish, so the next commit
+due sorts every unsealed key again. Timed at the burst, that is fifteen
+builds at about 2 ms over the hundred-thousand lag point and eight at
+4-7 ms over the three-hundred-thousand one -- 30 and 50 ms of bursts of
+400 ms and 1.4 s -- while the snapshot's bounds walk, cached by the
+partition's blob id, costs nothing there at all.
+
+The keeper already carries its own snapshot by three cases
+(`carry_snapshot`): whole across a merge, its live entries made frozen
+ones across a freeze, which keeps the bounds since the run's order does
+not change, and at a landing its frozen entries dropped and its runs
+moved to an arena of their own, which does not. Wiring the writer into
+the first two (`snapshot_carry`, `supdb-snapcarry`) does what it says:
+at a hundred thousand keys the builds fall from eighteen to sixteen over
+a pair, six of six, and the extends rise from three to twelve, six of
+six; at three hundred thousand, twenty to eighteen, five of five. The
+landing's case is the keeper's alone -- for the writer it dropped the
+bounds and the burst then walked them, 20 ms against the 17 ms of builds
+it had saved.
+
+No timing quantity moves. Eleven pairs over the two rungs read every
+mix, the point reads, the scans and the four lag points within noise,
+the largest leaning being a load at 1.15-1.16x on three and five of six.
+The probe read the three-hundred-thousand lag pass at 6.0-9.1 µs a scan
+against 10-26 over four rounds each, which looked like the mechanism and
+was not: two binaries alternated across processes is the shape
+`bench/CLAUDE.md` warns about, and the in-process pair refuted it. What
+the carry moves is where the work lands rather than how much there is --
+a snapshot in hand at a commit is one the fill walks its bounds against
+there instead of at the first scan after -- and at these rungs the two
+places cost the same. It is off, and the arm prices it.
+
 #### Which half of the lag gap, by rung
 
 The build and the walk split by size, and the arms say which is which

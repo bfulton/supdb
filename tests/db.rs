@@ -4604,7 +4604,23 @@ fn a_reader_meets_a_block_gone_wide_through_the_forms() {
 /// seal, and the merge that finally drops them.
 #[test]
 fn the_forms_survive_a_seal() {
-    let d = dir("forms-carry");
+    // And with `snapshot_carry`, which carries the scan snapshot across
+    // the same publishes rather than dropping it: the merge's snapshot
+    // whole and the freeze's live entries made frozen ones. A snapshot
+    // carried wrong answers a scan with keys the seal has taken, or
+    // loses the ones its lists held, so the model check below is what
+    // holds it.
+    for snapshot_carry in [false, true] {
+        the_forms_survive_a_seal_with(snapshot_carry);
+    }
+}
+
+fn the_forms_survive_a_seal_with(snapshot_carry: bool) {
+    let d = dir(if snapshot_carry {
+        "forms-carry-snap"
+    } else {
+        "forms-carry"
+    });
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(2 << 10),
@@ -4614,6 +4630,7 @@ fn the_forms_survive_a_seal() {
         forms_settle_backlog_pct: 0,
         commit_forms: true,
         forms_carry: true,
+        snapshot_carry,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
