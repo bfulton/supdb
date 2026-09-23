@@ -1799,7 +1799,10 @@ before.
 End to end, three rounds at a hundred thousand and two at the others:
 the burst's writes read 401-412 ms against 464-568, 1245-1389 against
 1572-1755 at three hundred thousand, and 22.1-22.2 against 24.0-25.0 at
-ten thousand. The rule the two prefetches are an instance of: a batch
+ten thousand. A second sitting on another host, which is what this suite
+asks of a margin before it is a result, read 342-407 ms against 444-531
+at a hundred thousand, three of three, and 1205-1335 against 1766-1795
+at three hundred thousand. The rule the two prefetches are an instance of: a batch
 applied to a structure keyed by position knows every position before it
 applies the first, so a stall it pays per key is a stall it need not
 pay at all.

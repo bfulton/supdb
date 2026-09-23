@@ -118,8 +118,18 @@ host a guest lands on, and the engine's own probes see the same
 host-to-host spread (`docs/engine.md` on memory placement). So a row
 whose comparators moved is a row about the machine: it cannot adjudicate
 the change beside it, whichever way it reads, and the change is priced
-within one sitting instead. Do not bank such a row as history and do not
-read its verdict as the change's.
+within one sitting instead, and do not read its verdict as the change's.
+
+Whether to bank it is a different question from whether to believe it. A
+row from a machine that was *disturbed* -- its floors dipping while its
+comparators stand -- is not history and is not banked. A row from a machine
+that is what the fleet *is* now is banked, because the alternative is a
+window that fossilises: three hosts in one day, on two classes, all came in
+below a window measured six days earlier with every comparator below its
+band too, and a gate whose control withholds every verdict is as useless as
+one that cries regression. The evidence for the second case is the
+comparators on independent hosts across several rows, never one row's
+floors.
 
 The gate does that reading itself now, from two controls the row carries.
 The comparators are the exact one: their code is untouchable by an engine
@@ -140,6 +150,21 @@ is not just the gate switched off. Its price, over the twenty-six rows
 banked in this class: the floors call the machine out of band on five, and
 in one of those it withholds a verdict that would otherwise have been
 given.
+
+**The ratio to the comparator is not more stable than the rate, so it
+cannot stand in for it.** The obvious answer to a fleet that has moved is
+to gate the ratio of an arm to the comparator beside it in the same row,
+since a machine both arms run on cancels. It does not. Over the
+twenty-five rows banked in one class, the coefficient of variation of
+supdb's rate against that of supdb over LMDB: point reads at a hundred
+thousand keys 18.3% against 13.2%, scans at three hundred thousand 10.9%
+against 14.6%, ycsb-E 35.7% against 38.3%, the load at three hundred
+thousand 22.8% against 23.2%, ycsb-D 10.5% against 8.7%. Two better, two
+worse, one level -- because the two engines do not respond to a host the
+same way, so a ratio carries both their noise instead of cancelling
+either. Every engine quantity in a row does have a comparator of its own
+guarantee to pair with, so the coverage was there; the stability was not.
+This was checked before it was built.
 
 **A one-sided bound passes a broken measurement.** A one-sided bound,
 `ratio >= 0.90`, recorded a pass on a run where the ratio came out 8.5x --
