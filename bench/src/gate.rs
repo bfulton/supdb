@@ -56,6 +56,20 @@ pub fn is_floor(workload: &str) -> bool {
     matches!(workload, "wal-floor" | "scan-floor" | "mem-floor")
 }
 
+/// The arms an engine change cannot touch: the comparators a user would
+/// otherwise pick. They are measured in the same process as the arms,
+/// interleaved within a rep, over the same data -- so a comparator below
+/// its window is this row's own statement that the machine moved, exact
+/// and needing no statistic. Named, never inferred from the name, and
+/// `every_arm_is_named_as_engine_or_comparator` fails if an arm is added
+/// to `engines::ARMS` without a side.
+pub fn is_comparator(arm: &str) -> bool {
+    matches!(
+        arm,
+        "lmdb" | "lmdb-nosync" | "rocksdb-tuned" | "rocksdb-nosync"
+    )
+}
+
 /// Whether a quantity moves with the machine. The byte ratios are
 /// arithmetic on what the engine stored -- they came back identical to
 /// three decimals across hosts that moved every rate by half -- so they
@@ -89,6 +103,10 @@ pub struct Finding {
     pub verdict: Verdict,
     /// The new row's CI of the median.
     pub ci: (f64, f64),
+    /// The new row's median, and the envelope of the prior rows' medians.
+    /// A floor is judged on these rather than on the CIs: see `gate`.
+    pub median: f64,
+    pub prior_medians: Option<(f64, f64)>,
     /// The envelope of the prior CIs: (lowest lo, highest hi).
     pub prior: Option<(f64, f64)>,
     pub prior_rows: usize,
@@ -104,12 +122,12 @@ pub struct Report {
 }
 
 impl Report {
-    /// A floor below its window is the machine, never the engine, so it
-    /// is reported and never failed on.
+    /// A floor or a comparator below its window is the machine, never the
+    /// engine, so both are reported and neither is failed on.
     pub fn regressed(&self) -> bool {
-        self.findings
-            .iter()
-            .any(|f| f.verdict == Verdict::Regressed && !is_floor(&f.workload))
+        self.findings.iter().any(|f| {
+            f.verdict == Verdict::Regressed && !is_floor(&f.workload) && !is_comparator(&f.arm)
+        })
     }
 
     /// The floors that came in below every row in the window.
@@ -117,6 +135,15 @@ impl Report {
         self.findings
             .iter()
             .filter(|f| is_floor(&f.workload) && f.verdict == Verdict::Regressed)
+            .collect()
+    }
+
+    /// The comparators that came in below their window: what an engine
+    /// change cannot have done, so the machine did it.
+    pub fn comparators_low(&self) -> Vec<&Finding> {
+        self.findings
+            .iter()
+            .filter(|f| is_comparator(&f.arm) && f.verdict == Verdict::Regressed)
             .collect()
     }
 
@@ -166,13 +193,12 @@ impl Report {
             let which: Vec<String> = low
                 .iter()
                 .map(|f| {
-                    let (lo, hi) = f.prior.unwrap_or((f64::NAN, f64::NAN));
+                    let (lo, hi) = f.prior_medians.unwrap_or((f64::NAN, f64::NAN));
                     format!(
-                        "{} {} [{}, {}] against the window's [{}, {}]",
+                        "{} {} median {} against the window's medians [{}, {}]",
                         f.workload,
                         f.quantity,
-                        fmt(f.ci.0),
-                        fmt(f.ci.1),
+                        fmt(f.median),
                         fmt(lo),
                         fmt(hi)
                     )
@@ -181,6 +207,24 @@ impl Report {
             out.push_str(&format!(
                 "host: OUT OF BAND -- {}. Every quantity that moves with the machine gets no verdict.\n",
                 which.join("; ")
+            ));
+        }
+        let comparators = self.comparators_low();
+        if comparators.is_empty() {
+            out.push_str("comparators: none below their window\n");
+        } else {
+            let mut where_: Vec<String> = comparators
+                .iter()
+                .map(|f| format!("{} {} {}", f.arm, f.workload, f.quantity))
+                .collect();
+            where_.sort();
+            where_.dedup();
+            let shown = where_.len().min(6);
+            out.push_str(&format!(
+                "comparators: {} below their window ({}{}); an arm's regression in those workloads gets no verdict\n",
+                comparators.len(),
+                where_[..shown].join(", "),
+                if where_.len() > shown { ", ..." } else { "" }
             ));
         }
         for f in &self.findings {
@@ -213,10 +257,15 @@ impl Report {
         }
         let total = self.findings.len();
         let insufficient = self.count(|v| matches!(v, Verdict::InsufficientHistory(_)));
+        // The engine's own, which is what a verdict is about: a floor or a
+        // comparator below its window is the machine's and is reported
+        // above.
         let regressed = self
             .findings
             .iter()
-            .filter(|f| f.verdict == Verdict::Regressed && !is_floor(&f.workload))
+            .filter(|f| {
+                f.verdict == Verdict::Regressed && !is_floor(&f.workload) && !is_comparator(&f.arm)
+            })
             .count();
         let no_verdict = self.count(|v| *v == Verdict::NoVerdict);
         let flagged = self.count(|v| *v == Verdict::Flagged);
@@ -229,14 +278,19 @@ impl Report {
                 "  no band yet for {insufficient} of {total} quantities (fewer than {MIN_HISTORY} prior rows)\n"
             ));
         }
+        let withheld = if no_verdict > 0 {
+            format!("; {no_verdict} withheld from the machine")
+        } else {
+            String::new()
+        };
         out.push_str(&if regressed > 0 {
-            format!("REGRESSED: {regressed} of {total} quantities are worse than every row in the window\n")
+            format!("REGRESSED: {regressed} of {total} quantities are worse than every row in the window{withheld}\n")
         } else if no_verdict > 0 {
             format!(
-                "no verdict: {no_verdict} of {total} quantities are worse than the window on a machine whose floors are too; nothing the engine's own ({flagged} flagged)\n"
+                "no verdict: {no_verdict} of {total} quantities are worse than the window and so is the machine under them; nothing the engine's own ({flagged} flagged)\n"
             )
         } else {
-            format!("ok: nothing worse than the window ({flagged} flagged)\n")
+            format!("ok: nothing worse than the window ({flagged} flagged{withheld})\n")
         });
         out
     }
@@ -278,9 +332,10 @@ pub fn gate(row: &Row, runs: &Path) -> io::Result<Report> {
     let all = history(row, runs)?;
     let window: Vec<&Row> = all.iter().rev().take(WINDOW).collect();
 
-    // Prior CIs by key.
+    // Prior CIs and medians by key.
     type Key = (String, String, Option<u64>, String);
     let mut prior: HashMap<Key, Vec<(f64, f64)>> = HashMap::new();
+    let mut prior_med: HashMap<Key, Vec<f64>> = HashMap::new();
     for r in &window {
         for m in &r.measurements {
             let k = (
@@ -289,10 +344,12 @@ pub fn gate(row: &Row, runs: &Path) -> io::Result<Report> {
                 m.size,
                 m.quantity.clone(),
             );
+            let s = Samples::new(m.samples.clone());
             prior
-                .entry(k)
+                .entry(k.clone())
                 .or_default()
-                .push(Samples::new(m.samples.clone()).median_ci(CI_CONF, CI_RESAMPLES));
+                .push(s.median_ci(CI_CONF, CI_RESAMPLES));
+            prior_med.entry(k).or_default().push(s.median());
         }
     }
 
@@ -304,7 +361,9 @@ pub fn gate(row: &Row, runs: &Path) -> io::Result<Report> {
                 m.quantity
             )));
         };
-        let ci = Samples::new(m.samples.clone()).median_ci(CI_CONF, CI_RESAMPLES);
+        let samples = Samples::new(m.samples.clone());
+        let ci = samples.median_ci(CI_CONF, CI_RESAMPLES);
+        let med = samples.median();
         let k = (
             m.workload.clone(),
             m.arm.clone(),
@@ -312,8 +371,37 @@ pub fn gate(row: &Row, runs: &Path) -> io::Result<Report> {
             m.quantity.clone(),
         );
         let priors = prior.get(&k).map(Vec::as_slice).unwrap_or(&[]);
+        let meds = prior_med.get(&k).map(Vec::as_slice).unwrap_or(&[]);
+        let med_envelope = (meds.len() >= MIN_HISTORY).then(|| {
+            (
+                meds.iter().copied().fold(f64::INFINITY, f64::min),
+                meds.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            )
+        });
         let (verdict, envelope) = if priors.len() < MIN_HISTORY {
             (Verdict::InsufficientHistory(priors.len()), None)
+        } else if is_floor(&m.workload) {
+            // A floor is the control, and a control is judged on its
+            // median against every prior median rather than on disjoint
+            // CIs. The two rules answer different questions and the
+            // asymmetry is deliberate: a regression claim costs a day of
+            // investigation when it is wrong, so it must survive the
+            // noise; a control costs a rerun, so it must survive a bad
+            // machine. The CI rule proved useless here -- a floor's
+            // samples range over a factor of two within one run, so its
+            // CI overlaps the window even on a host where LMDB's own scan
+            // ran at a third of its band.
+            let (lo, hi) = med_envelope.expect("history counted above");
+            let worse = if up { med < lo } else { med > hi };
+            let better = if up { med > hi } else { med < lo };
+            let v = if worse {
+                Verdict::Regressed
+            } else if better {
+                Verdict::Flagged
+            } else {
+                Verdict::Within
+            };
+            (v, Some((lo, hi)))
         } else {
             let lo_min = priors.iter().map(|c| c.0).fold(f64::INFINITY, f64::min);
             let hi_max = priors.iter().map(|c| c.1).fold(f64::NEG_INFINITY, f64::max);
@@ -338,26 +426,39 @@ pub fn gate(row: &Row, runs: &Path) -> io::Result<Report> {
             unit: m.unit.clone(),
             verdict,
             ci,
+            median: med,
+            prior_medians: med_envelope,
             prior: envelope,
             prior_rows: priors.len(),
         });
     }
 
-    // The machine's own verdict, taken before the engine's: a floor below
-    // every row in the window means this host is not the host the window
-    // was measured on, so a quantity that moves with the machine cannot
-    // say which of the two moved it. The byte ratios still can.
+    // The machine's verdict, taken before the engine's, from two
+    // controls the row carries. The comparators are the exact one: a
+    // quantity where an arm no engine change can touch came in below its
+    // own window is a quantity this machine is slower at, so an arm's
+    // regression there says nothing about the arm. The floors are the
+    // coarse one, for a machine slow in a way no comparator happened to
+    // show. Either way the byte ratios keep their verdict: they are
+    // arithmetic on what was stored.
+    let shadowed: std::collections::HashSet<(String, String)> = findings
+        .iter()
+        .filter(|f| is_comparator(&f.arm) && f.verdict == Verdict::Regressed)
+        .map(|f| (f.workload.clone(), f.quantity.clone()))
+        .collect();
     let host_low = findings
         .iter()
         .any(|f| is_floor(&f.workload) && f.verdict == Verdict::Regressed);
-    if host_low {
-        for f in &mut findings {
-            if f.verdict == Verdict::Regressed
-                && !is_floor(&f.workload)
-                && machine_dependent(&f.quantity)
-            {
-                f.verdict = Verdict::NoVerdict;
-            }
+    for f in &mut findings {
+        if f.verdict != Verdict::Regressed
+            || is_floor(&f.workload)
+            || is_comparator(&f.arm)
+            || !machine_dependent(&f.quantity)
+        {
+            continue;
+        }
+        if host_low || shadowed.contains(&(f.workload.clone(), f.quantity.clone())) {
+            f.verdict = Verdict::NoVerdict;
         }
     }
 
@@ -502,6 +603,136 @@ mod tests {
 
     /// The row that cost a day: every rate below the window, and the
     /// machine's own floors below it too.
+    /// The exact control: a comparator below its window in the same
+    /// workload and quantity is this machine, so an arm's regression
+    /// there says nothing about the arm -- while an arm's regression
+    /// where no comparator moved is still the arm's.
+    #[test]
+    fn a_comparator_below_its_window_withholds_the_arms_verdict_there() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "supdb-bench-gate-cmp-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Two workloads, an arm and a comparator in each, and floors that
+        // stay in band so this test is about the comparators alone.
+        let build = |utc: &str, scan_supdb: f64, scan_lmdb: f64, read_supdb: f64| {
+            let q = |wl: &str, arm: &str, quantity: &str, unit: &str, v: f64| Measurement {
+                workload: wl.into(),
+                arm: arm.into(),
+                guarantee: Guarantee::Durable,
+                size: Some(10_000),
+                quantity: quantity.into(),
+                unit: unit.into(),
+                samples: vec![v, v * 1.01, v * 0.99, v, v * 1.005],
+            };
+            let mut r = Row {
+                utc: utc.into(),
+                sha: format!("sha-{utc}"),
+                rustc: "r".into(),
+                scale: Scale::Quick,
+                machine: machine(4),
+                measurements: vec![
+                    q("scan", "supdb", "entries_per_s", "entries/s", scan_supdb),
+                    q("scan", "lmdb", "entries_per_s", "entries/s", scan_lmdb),
+                    q("read", "supdb", "reads_per_s", "reads/s", read_supdb),
+                    q("read", "lmdb", "reads_per_s", "reads/s", 50.0),
+                ],
+            };
+            r.measurements
+                .push(floor("wal-floor", "ops_per_s", "ops/s", 1_000_000.0));
+            r.measurements
+                .push(floor("scan-floor", "bytes_per_s", "B/s", 9.0e9));
+            r.measurements
+                .push(floor("mem-floor", "ops_per_s", "chases/s", 3_000_000.0));
+            r
+        };
+        for i in 0..6 {
+            build(&format!("2026010{}T000000Z", i + 1), 100.0, 80.0, 40.0)
+                .write(&dir)
+                .unwrap();
+        }
+        // The scans fall for both, the reads for the arm alone.
+        let new = build("20260201T000000Z", 60.0, 50.0, 25.0);
+        let rep = gate(&new, &dir).unwrap();
+        let text = rep.render();
+        let find = |wl: &str, arm: &str| {
+            rep.findings
+                .iter()
+                .find(|f| f.workload == wl && f.arm == arm)
+                .unwrap_or_else(|| panic!("{wl}/{arm} is a finding:\n{text}"))
+        };
+        assert_eq!(find("scan", "supdb").verdict, Verdict::NoVerdict, "{text}");
+        assert_eq!(find("scan", "lmdb").verdict, Verdict::Regressed, "{text}");
+        assert_eq!(find("read", "supdb").verdict, Verdict::Regressed, "{text}");
+        assert!(
+            rep.regressed(),
+            "the arm's own regression still fails\n{text}"
+        );
+        assert_eq!(rep.comparators_low().len(), 1, "{text}");
+        assert!(text.contains("comparators: 1 below their window"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A comparator below its window never fails the gate by itself: the
+    /// run did not choose its machine.
+    #[test]
+    fn a_comparator_alone_never_fails_the_gate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "supdb-bench-gate-cmp2-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let build = |utc: &str, lmdb: f64| {
+            let q = |arm: &str, v: f64| Measurement {
+                workload: "read".into(),
+                arm: arm.into(),
+                guarantee: Guarantee::Durable,
+                size: Some(10_000),
+                quantity: "reads_per_s".into(),
+                unit: "reads/s".into(),
+                samples: vec![v, v * 1.01, v * 0.99, v, v * 1.005],
+            };
+            Row {
+                utc: utc.into(),
+                sha: format!("sha-{utc}"),
+                rustc: "r".into(),
+                scale: Scale::Quick,
+                machine: machine(4),
+                measurements: vec![q("supdb", 100.0), q("lmdb", lmdb)],
+            }
+        };
+        for i in 0..6 {
+            build(&format!("2026010{}T000000Z", i + 1), 80.0)
+                .write(&dir)
+                .unwrap();
+        }
+        let rep = gate(&build("20260201T000000Z", 40.0), &dir).unwrap();
+        let text = rep.render();
+        assert!(!rep.regressed(), "{text}");
+        assert_eq!(rep.comparators_low().len(), 1, "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every arm the suite runs is on one side of the control or the
+    /// other: an arm added without a side would be a control nobody
+    /// declared, or an engine nobody judges.
+    #[test]
+    fn every_arm_is_named_as_engine_or_comparator() {
+        for arm in crate::engines::ARMS {
+            let engine = arm.starts_with("supdb");
+            assert_ne!(
+                engine,
+                is_comparator(arm),
+                "arm {arm:?} is neither an engine nor a comparator, or both"
+            );
+        }
+    }
+
     #[test]
     fn a_floor_below_the_window_withholds_every_machine_verdict() {
         let dir = fixture_with_control(6);

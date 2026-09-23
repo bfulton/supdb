@@ -354,21 +354,46 @@ Fewer than three prior rows: no band, and the gate says so.
 
 A class is the architecture, the CPU model, the core count, memory and
 whether the host is virtualised — which does not pin the host a guest lands
-on. So the floors are read before the engine's quantities: when a floor's
-CI is below every row in the window, this is not the host the window was
-measured on, and every quantity that moves with the machine gets **no
-verdict** instead of a regression. The quantities that do not move with it
-— `device_bytes_per_byte` and `bytes_on_disk_per_byte`, arithmetic on what
-the engine stored — are judged as always. A floor below its window is never
-itself a failure: it is the machine, and the run did not choose it.
+on. So a row is read for its machine before it is read for its engine, from
+two controls the row already carries.
+
+**The comparators**, which are exact. LMDB and RocksDB are measured in the
+same process as the arms, interleaved within a rep, over the same data, and
+no engine change can touch their code. So a comparator below its own window
+is this row's own statement that this machine is slower at that workload
+and quantity, and an arm's regression there gets **no verdict**. It is a
+statement about a workload and a quantity, not about the row.
+
+**The floors**, which are coarse and global. When a floor's median is below
+every prior median in the window, every quantity that moves with the
+machine gets no verdict. A floor is judged on medians where an engine's
+quantity is judged on disjoint CIs, and the asymmetry is deliberate: a
+regression claim costs a day when it is wrong, so it must survive the
+noise; a control costs a rerun, so it must survive a bad machine. The CI
+rule was tried first and is useless here — a floor's samples range over a
+factor of two inside one run, so its CI overlaps the window on a host where
+LMDB's own scan ran at a third of its band.
+
+Either control withholds; neither ever fails. A floor or a comparator below
+its window is the machine, and the run did not choose its machine. What
+keeps its verdict whatever they say is `device_bytes_per_byte` and
+`bytes_on_disk_per_byte`: arithmetic on what the engine stored, which came
+back identical to three decimals across hosts that moved every rate by
+half.
 
 The case this answers cost a day. A quick row failed with 121 of 1,106
-quantities regressed; LMDB's scan at three hundred thousand keys, code no
-engine change can touch, read a third of its window, ten of eleven
-workloads had a comparator among their regressions, and the row's own wal
-floor stood at 0.74 of the window's lowest. The reading took a day and the
-row still could not say anything about the change beside it. The control
-makes that reading the gate's, not a person's.
+quantities regressed; LMDB's scan at three hundred thousand keys read a
+third of its window, ten of eleven workloads had a comparator among their
+regressions, and the row's own wal floor stood at 0.74 of the window's
+lowest. A second row on the same host repeated it. Both now read "no
+verdict", and the same rows with their floors raised by hand still fail on
+what the comparators do not explain, which is the check that the control
+did not simply switch the gate off.
+
+The price is a verdict withheld when the machine dips and the engine is
+fine. Over the twenty-six rows banked in this class, the floors call the
+machine out of band on five, and in only one of those does that withhold a
+verdict that would otherwise have been given.
 
 That is the whole rule. The window is the only parameter and it is stated
 once, here.

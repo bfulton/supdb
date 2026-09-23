@@ -121,14 +121,25 @@ the change beside it, whichever way it reads, and the change is priced
 within one sitting instead. Do not bank such a row as history and do not
 read its verdict as the change's.
 
-The gate does that reading itself now: the floors are its control, a floor
-below every row in the window withholds the verdict on every quantity that
-moves with the machine, and the byte ratios are judged anyway. A third
-floor went in with it, a pointer chase around a 64 MiB buffer, because the
-other two are sequential and a host whose memory latency has moved shows in
-neither. Both directions were held to the row that produced the rule: as
-measured it reads "host: OUT OF BAND" and gives no verdict on 133
-quantities, and with the floors raised by hand it fails on the same 133.
+The gate does that reading itself now, from two controls the row carries.
+The comparators are the exact one: their code is untouchable by an engine
+change, so one below its own window withholds the arms' verdict in that
+workload and quantity. The floors are the coarse one, global and judged on
+medians rather than CIs -- a floor's samples range over a factor of two
+within one run, so the CI rule fired on neither of the two rows that
+produced this entry. A third floor went in with them, a pointer chase
+around a 64 MiB buffer, because the other two are sequential and a host
+whose memory latency has moved shows in neither. Neither control ever
+fails a row: the run did not choose its machine.
+
+Held to the rows that produced the rule, in both directions: as measured
+they read "host: OUT OF BAND" and give no verdict, and with their floors
+raised by hand the comparator control still withholds 72 and the gate
+fails on the 4 it does not explain -- which is the check that a control
+is not just the gate switched off. Its price, over the twenty-six rows
+banked in this class: the floors call the machine out of band on five, and
+in one of those it withholds a verdict that would otherwise have been
+given.
 
 **A one-sided bound passes a broken measurement.** A one-sided bound,
 `ratio >= 0.90`, recorded a pass on a run where the ratio came out 8.5x --
