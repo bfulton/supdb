@@ -810,17 +810,14 @@ pub struct Options {
     /// the rows, and the test holds it to the model through two seals
     /// and a merge.
     pub forms_carry: bool,
-    /// EXPERIMENT: the carry across a merge that rewrote a partition over
-    /// the same keys -- the same fences, key count and key at every
-    /// block's first rank -- keeps the partition's copies and drops its
-    /// sparse forms, where it drops every form. The partition merge that
-    /// folds a burst of updates is that merge, and whether it published
-    /// during the burst decides the fully-unmerged lag point: the pass
-    /// after it rebuilds every block. With this on, the pass at three
-    /// hundred thousand keys never collapses -- four reps of twelve read
-    /// 3-8x slower without it -- and at a hundred thousand it reads
-    /// 2.0x; but where no merge lands the rep reads 10-20% slower, since
-    /// twice the forms are kept to maintain. Off; `supdb-rebase` prices it.
+    /// The carry across a merge that rewrote a partition over the same
+    /// keys -- the same fences, key count and key at every block's first
+    /// rank -- keeps the partition's copies and drops its sparse forms,
+    /// where it drops every form. The partition merge that folds a burst
+    /// of updates is that merge, and whether it published during the
+    /// burst decided the fully-unmerged lag point: the pass after it
+    /// rebuilt every block. On by default; `supdb-norebase` is the carry
+    /// that drops them, and `docs/engine.md` has the figures.
     pub forms_rebase: bool,
     /// EXPERIMENT: the writer's own handle takes the canonical forms it
     /// maintains, instead of building its own. Without this the
@@ -908,7 +905,7 @@ impl Default for Options {
             forms_settle_rebuild_from: 0,
             forms_settle_recent_pct: 0,
             forms_carry: true,
-            forms_rebase: false,
+            forms_rebase: true,
             forms_to_writer: false,
             form_dense_from: 0,
             scan_snapshot_arena: true,

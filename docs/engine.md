@@ -1962,14 +1962,34 @@ copies across a merge whose partition has the same fences, key count and
 key at every block's first rank, and drops the sparse forms, whose deltas
 splice at ranks in the old partition's records. In the probe the slow
 shape went away, twelve runs of twelve at 3.8-4.6 us a scan whether the
-merge had landed or not. `bench ab` against the arm without it: at a
-hundred thousand keys the point read 2.02x (10/12); at three hundred
-thousand the arm without it collapsed in four reps of twelve, to 4-12.6M
-against 25-37M, and with it none did -- but in the reps where both took
-the fast shape it read 0.61-0.97x, and the median came out at 0.95x
-(4/12). It keeps twice the forms (9,254 against 5,068 at the end of a
-pass), and what it keeps is maintained. It is off until the typical rep
-costs nothing; `supdb-rebase` prices it.
+merge had landed or not.
+
+`bench ab` against the arm without it, first under the file-sized seal:
+at a hundred thousand keys the point read 2.02x (10/12); at three
+hundred thousand the arm without it collapsed in four reps of twelve,
+and in the reps where both took the fast shape the rebase read
+0.61-0.97x, which kept it off. With the seal sized by the data and the
+compact record on, sixteen pairs a rung:
+
+| rebase over none | 10k | 30k | 100k | 300k |
+|---|---|---|---|---|
+| scan-lag, all of it unmerged | never fires | never fires | **2.62x** | **2.55x** |
+| every other quantity | ns | ns | ns | ns |
+| forms held at the end | same | same | 2.0x | 2.0x |
+
+Both starred figures are 15/16 at p=0.001 and hold under Holm. The arm
+without it collapsed in fourteen reps of sixteen at three hundred
+thousand, to 4.8-13.7M against 18.6-25.0M, and in the two where it did
+not the rebase read 0.76x and 1.13x: the cost seen in the first pricing
+did not come back. Nor did the probe find one. The second pass over
+carried copies, which builds nothing, read 1.65-2.49 us a scan against
+1.71-2.54 over copies built fresh, one batch of rounds each way, which
+is the machine's placement of the bytes rather than the copies. Below a
+hundred thousand keys no partition merge rewrites a partition over the
+same keys during a pass, so the blocks built and the forms held are
+identical with it and without. The forms it holds at the end are the
+copies of the burst's blocks, which the arm without it holds too until
+the merge's publish drops them. It is on; `supdb-norebase` prices it.
 
 #### The compact record, and the seal it moved
 

@@ -372,9 +372,9 @@ pub struct Supdb {
     /// Every record written with its extent, as before the compact
     /// record. `supdb-fullrec`.
     fullrec: bool,
-    /// A partition's copies carried across a merge that rewrote it over
-    /// the same keys. `supdb-rebase`.
-    rebase: bool,
+    /// A partition's copies dropped at a merge that rewrote it over the
+    /// same keys, as before the rebase. `supdb-norebase`.
+    norebase: bool,
     /// The seal sized by the partitions' file bytes rather than the key
     /// and value bytes they hold. `supdb-sealfile`.
     sealfile: bool,
@@ -445,9 +445,9 @@ struct Policy {
     /// Every record written with its extent, as before the compact
     /// record. `supdb-fullrec`.
     fullrec: bool,
-    /// A partition's copies carried across a merge that rewrote it over
-    /// the same keys. `supdb-rebase`.
-    rebase: bool,
+    /// A partition's copies dropped at a merge that rewrote it over the
+    /// same keys, as before the rebase. `supdb-norebase`.
+    norebase: bool,
     /// The seal sized by the partitions' file bytes rather than the key
     /// and value bytes they hold. `supdb-sealfile`.
     sealfile: bool,
@@ -500,7 +500,7 @@ impl Default for Policy {
             snapcarry: false,
             lazysnap: false,
             fullrec: false,
-            rebase: false,
+            norebase: false,
             sealfile: false,
             tier: None,
             runs: false,
@@ -684,14 +684,14 @@ impl Supdb {
         )
     }
 
-    /// `supdb` carrying a partition's copies across a merge that rewrote
-    /// it over the same keys. Against `supdb` it prices the rebase: the
+    /// `supdb` dropping a partition's copies at a merge that rewrote it
+    /// over the same keys. Against `supdb` it prices the rebase: the
     /// fully-unmerged lag point's pass after the burst's partition merge.
-    pub fn create_rebase(path: &Path) -> Res<Supdb> {
+    pub fn create_norebase(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                rebase: true,
+                norebase: true,
                 ..Policy::default()
             },
         )
@@ -942,7 +942,7 @@ impl Supdb {
             snapcarry,
             lazysnap,
             fullrec,
-            rebase,
+            norebase,
             sealfile,
             tier,
             runs,
@@ -1024,7 +1024,7 @@ impl Supdb {
             // The forms carried across a seal, or the table started
             // afresh at every publish as it was.
             forms_carry: carry,
-            forms_rebase: rebase,
+            forms_rebase: !norebase,
             // The seal sized by the file, as it was before the store's
             // payload was recorded.
             seal_on_file: sealfile,
@@ -1097,7 +1097,7 @@ impl Supdb {
             snapcarry,
             lazysnap,
             fullrec,
-            rebase,
+            norebase,
             sealfile,
             tier,
             runs,
@@ -1156,8 +1156,8 @@ impl Engine for Supdb {
         if self.fullrec {
             return "supdb-fullrec";
         }
-        if self.rebase {
-            return "supdb-rebase";
+        if self.norebase {
+            return "supdb-norebase";
         }
         if self.sealfile {
             return "supdb-sealfile";
@@ -1722,11 +1722,10 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         "supdb" | "supdb-forms" | "supdb-settle" | "supdb-wforms" | "supdb-regime"
         | "supdb-noseal" | "supdb-ahead" | "supdb-lazyforms" | "supdb-eager" | "supdb-nosettle"
         | "supdb-recency" | "supdb-nocarry" | "supdb-rebuild" | "supdb-snapcarry"
-        | "supdb-lazysnap" | "supdb-fullrec" | "supdb-rebase" | "supdb-sealfile" | "supdb-tier"
-        | "supdb-runs" | "supdb-keeper" | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap"
-        | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => {
-            Guarantee::Durable
-        }
+        | "supdb-lazysnap" | "supdb-fullrec" | "supdb-norebase" | "supdb-sealfile"
+        | "supdb-tier" | "supdb-runs" | "supdb-keeper" | "supdb-aheadpub" | "supdb-pubalways"
+        | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb"
+        | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
     })
@@ -1747,7 +1746,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-snapcarry" => Box::new(Supdb::create_snapcarry(dir)?),
         "supdb-lazysnap" => Box::new(Supdb::create_lazysnap(dir)?),
         "supdb-fullrec" => Box::new(Supdb::create_fullrec(dir)?),
-        "supdb-rebase" => Box::new(Supdb::create_rebase(dir)?),
+        "supdb-norebase" => Box::new(Supdb::create_norebase(dir)?),
         "supdb-sealfile" => Box::new(Supdb::create_sealfile(dir)?),
         "supdb-tier" => Box::new(Supdb::create_tier(dir)?),
         "supdb-runs" => Box::new(Supdb::create_runs(dir)?),
