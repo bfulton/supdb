@@ -13463,10 +13463,16 @@ impl<'s> BuildCtx<'s> {
     }
 
     /// PROTOTYPE: the block whose key range holds `key`.
+    ///
+    /// Whether the key at the rank is `key` comes from the heads where
+    /// they can say, as it does at a scan's start: asked of the record,
+    /// it was a cold line in the record region for every write a settle
+    /// filed, and the record parse was the largest leaf of the settle's
+    /// samples after the lag burst at three hundred thousand keys.
     fn owner_of(seg: &Seg, key: &[u8]) -> (usize, u32) {
         let keys = seg.blob.keys();
-        let rank = seg.ord.seek(key, |r| seg.blob.key_at(r));
-        let same = rank < keys && seg.blob.key_at(rank) == Some(key);
+        let (rank, exact) = seg.ord.seek_exact(key, |r| seg.blob.key_at(r));
+        let same = rank < keys && exact.unwrap_or_else(|| seg.blob.key_at(rank) == Some(key));
         let owner = if same { rank } else { rank.saturating_sub(1) };
         (owner / CACHE_BLOCK, ((rank as u32) << 1) | same as u32)
     }

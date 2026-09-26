@@ -1917,6 +1917,19 @@ key's block through the ordered index (a fifth of it), parsing the block's
 records, the memtable's tombstone check and the patch copies -- and is the
 next thing to take.
 
+The record parse was the settle's largest leaf, and one of its sources
+needed no record at all. Finding a write's block asked the ordered index
+for the rank and then read the partition's record at that rank to learn
+whether the key was there, a cold line in the record region for every key
+filed; the heads say so themselves wherever the keys have one length, and
+a scan's start had already been moved onto `seek_exact` for the same read.
+`owner_of` takes it too. The probe built before and after, alternated over
+six rounds in one sitting, put the first scan after the one-percent burst
+at 1.0-1.5 ms against 1.4-1.8 and after the ten-percent one at 1.7-2.5
+against 2.2-3.7, lower in six pairs of six each, and the ten-percent
+burst's commits at 0.91x, five of six. Two binaries is a probe and not a
+result; the hundred-percent point sat under its own bimodality in both.
+
 #### Which half of the lag gap, by rung
 
 The build and the walk split by size, and the arms say which is which
