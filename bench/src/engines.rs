@@ -369,12 +369,15 @@ pub struct Supdb {
     /// A scan builds the snapshot only at a block that needs it rather
     /// than before it walks anything. `supdb-lazysnap`.
     lazysnap: bool,
-    /// A record whose one run is inline and short written compact.
-    /// `supdb-compact`.
-    compact: bool,
+    /// Every record written with its extent, as before the compact
+    /// record. `supdb-fullrec`.
+    fullrec: bool,
     /// A partition's copies carried across a merge that rewrote it over
     /// the same keys. `supdb-rebase`.
     rebase: bool,
+    /// The seal sized by the partitions' file bytes rather than the key
+    /// and value bytes they hold. `supdb-sealfile`.
+    sealfile: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -439,12 +442,15 @@ struct Policy {
     /// A scan builds the snapshot only at a block that needs it rather
     /// than before it walks anything. `supdb-lazysnap`.
     lazysnap: bool,
-    /// A record whose one run is inline and short written compact.
-    /// `supdb-compact`.
-    compact: bool,
+    /// Every record written with its extent, as before the compact
+    /// record. `supdb-fullrec`.
+    fullrec: bool,
     /// A partition's copies carried across a merge that rewrote it over
     /// the same keys. `supdb-rebase`.
     rebase: bool,
+    /// The seal sized by the partitions' file bytes rather than the key
+    /// and value bytes they hold. `supdb-sealfile`.
+    sealfile: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -493,8 +499,9 @@ impl Default for Policy {
             rebuild: 0,
             snapcarry: false,
             lazysnap: false,
-            compact: false,
+            fullrec: false,
             rebase: false,
+            sealfile: false,
             tier: None,
             runs: false,
             keeper: false,
@@ -649,14 +656,29 @@ impl Supdb {
         )
     }
 
-    /// `supdb` writing compact records. Against `supdb` it prices them:
-    /// sixteen bytes a key of file, what a scan saves in not reading them,
-    /// and the seals a denser file brings on sooner.
-    pub fn create_compact(path: &Path) -> Res<Supdb> {
+    /// `supdb` writing every record with its extent. Against `supdb` it
+    /// prices the compact record: sixteen bytes a key of file and what a
+    /// scan saves in not reading them. The seal is sized by the data, so
+    /// the cadence is not in it.
+    pub fn create_fullrec(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                compact: true,
+                fullrec: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` sizing the seal by the partitions' file bytes, the rule
+    /// before the store's payload was recorded. Against `supdb` it prices
+    /// the calibration that carries the file rule's cadence over to the
+    /// data; beside `supdb-fullrec` it is what the format priced before.
+    pub fn create_sealfile(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                sealfile: true,
                 ..Policy::default()
             },
         )
@@ -919,8 +941,9 @@ impl Supdb {
             rebuild,
             snapcarry,
             lazysnap,
-            compact,
+            fullrec,
             rebase,
+            sealfile,
             tier,
             runs,
             keeper,
@@ -937,7 +960,7 @@ impl Supdb {
         let opts = supdb::Options {
             segment: supdb::SegmentOptions {
                 checksums: false,
-                compact_records: compact,
+                compact_records: !fullrec,
                 ..Default::default()
             },
             // The engine's own defaults: 32 MB seals over 64 MB partitions,
@@ -1002,6 +1025,9 @@ impl Supdb {
             // afresh at every publish as it was.
             forms_carry: carry,
             forms_rebase: rebase,
+            // The seal sized by the file, as it was before the store's
+            // payload was recorded.
+            seal_on_file: sealfile,
             forms_settle_rebuild_from: rebuild,
             snapshot_carry: snapcarry,
             scan_lazy_snapshot: lazysnap,
@@ -1070,8 +1096,9 @@ impl Supdb {
             rebuild,
             snapcarry,
             lazysnap,
-            compact,
+            fullrec,
             rebase,
+            sealfile,
             tier,
             runs,
             keeper,
@@ -1126,11 +1153,14 @@ impl Engine for Supdb {
         if self.lazysnap {
             return "supdb-lazysnap";
         }
-        if self.compact {
-            return "supdb-compact";
+        if self.fullrec {
+            return "supdb-fullrec";
         }
         if self.rebase {
             return "supdb-rebase";
+        }
+        if self.sealfile {
+            return "supdb-sealfile";
         }
         if self.tier.is_some_and(|t| t > 0) {
             return "supdb-tier";
@@ -1692,8 +1722,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         "supdb" | "supdb-forms" | "supdb-settle" | "supdb-wforms" | "supdb-regime"
         | "supdb-noseal" | "supdb-ahead" | "supdb-lazyforms" | "supdb-eager" | "supdb-nosettle"
         | "supdb-recency" | "supdb-nocarry" | "supdb-rebuild" | "supdb-snapcarry"
-        | "supdb-lazysnap" | "supdb-compact" | "supdb-rebase" | "supdb-tier" | "supdb-runs"
-        | "supdb-keeper" | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap"
+        | "supdb-lazysnap" | "supdb-fullrec" | "supdb-rebase" | "supdb-sealfile" | "supdb-tier"
+        | "supdb-runs" | "supdb-keeper" | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap"
         | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => {
             Guarantee::Durable
         }
@@ -1716,8 +1746,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-rebuild" => Box::new(Supdb::create_rebuild(dir)?),
         "supdb-snapcarry" => Box::new(Supdb::create_snapcarry(dir)?),
         "supdb-lazysnap" => Box::new(Supdb::create_lazysnap(dir)?),
-        "supdb-compact" => Box::new(Supdb::create_compact(dir)?),
+        "supdb-fullrec" => Box::new(Supdb::create_fullrec(dir)?),
         "supdb-rebase" => Box::new(Supdb::create_rebase(dir)?),
+        "supdb-sealfile" => Box::new(Supdb::create_sealfile(dir)?),
         "supdb-tier" => Box::new(Supdb::create_tier(dir)?),
         "supdb-runs" => Box::new(Supdb::create_runs(dir)?),
         "supdb-keeper" => Box::new(Supdb::create_keeper(dir)?),

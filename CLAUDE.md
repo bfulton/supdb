@@ -235,8 +235,10 @@ reader takes for 32,768 extents and may find bytes enough to read as them.
 The inline extension did not move it, because a reader
 from before it errors on `Ext::INLINE` as an impossible block id; nor did the
 key-section checksum row, whose header words are zero in every older file
-and unread by every older reader. Decide which case a change is before
-writing it.
+and unread by every older reader, nor the segment's payload in a spare word
+of the superblock extension, for the same reason: a zero there reads as
+"not recorded" and the engine estimates it. Decide which case a change is
+before writing it.
 
 **A checksum that cannot see a corruption is not a checksum for it.** Block
 checksums cannot see a flipped bit in an index record -- a flipped `FIXED`

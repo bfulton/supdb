@@ -107,6 +107,11 @@ fn cut(staged: &mut usize, n: usize, block_size: usize) -> usize {
 /// overflows, not the length.
 const MAX_RUN: usize = (u32::MAX as usize) - 8;
 
+/// Whether a writer writes compact records unless told otherwise:
+/// `SegmentOptions::compact_records`'s default, kept here because the
+/// planner is built for wasm and the writer's options are not.
+pub(crate) const COMPACT_RECORDS: bool = true;
+
 /// The reserve, accumulated one key at a time.
 ///
 /// This is the shape a caller wants who will not hold their records: the
@@ -136,7 +141,8 @@ pub struct Planner {
     /// Cleared when the input cannot be a segment, so `finish` says so.
     viable: bool,
     /// Whether a short inline run's record is compact, as the writer's
-    /// `SegmentOptions::compact_records` says.
+    /// `SegmentOptions::compact_records` says; the writer's default until
+    /// `compact_records` says otherwise.
     compact: bool,
 }
 
@@ -158,7 +164,7 @@ impl Planner {
             // of these.
             sample_stride: flatindex::fence_stride(0),
             viable: true,
-            compact: false,
+            compact: COMPACT_RECORDS,
         }
     }
 
@@ -335,11 +341,11 @@ pub fn for_lengths(
     block_size: usize,
     inline_max: usize,
 ) -> Option<Reserve> {
-    for_lengths_as(keys, block_size, inline_max, false)
+    for_lengths_as(keys, block_size, inline_max, COMPACT_RECORDS)
 }
 
 /// `for_lengths` for a writer with `SegmentOptions::compact_records` as
-/// given.
+/// given; `for_lengths` takes the writer's default.
 pub fn for_lengths_as(
     keys: &[(usize, usize)],
     block_size: usize,
@@ -380,7 +386,9 @@ pub fn from_totals(
     // long as the longest, runs as long as the longest, as many of both as
     // the totals allow.
     let per_key_run = run_bytes.div_ceil(keys).max(1).min(max_run_len);
-    let mut p = Planner::new(block_size, inline_max);
+    // Full records, which are never shorter than compact ones, so the
+    // bound holds for a writer of either.
+    let mut p = Planner::new(block_size, inline_max).compact_records(false);
     for _ in 0..keys {
         p.push(max_key_len, per_key_run);
     }

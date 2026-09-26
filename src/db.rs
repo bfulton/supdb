@@ -259,6 +259,14 @@ pub struct Options {
     /// one-sided on the ladder: ycsb-E is the only mix this engine loses
     /// to LMDB, at 0.74x-0.87x, and ycsb-F it wins by 2.84x-6.27x.
     pub seal_max_pct: usize,
+    /// Size the store for `seal_grows` and `seal_max_pct` by its
+    /// partitions' file bytes (`true`, the rule before) rather than by the
+    /// key and value bytes they hold (`false`). The file's length moves
+    /// with the record format -- compact records cut a tenth of it at the
+    /// suite's shape -- so under the file rule a denser format seals more
+    /// often, and pricing the format priced the cadence with it. Kept as
+    /// the comparison arm.
+    pub seal_on_file: bool,
     /// Ordered ingest goes straight into a segment. Keys arriving above the
     /// store's greatest, with values the record holds inline
     /// (`inline_bytes`), while the memtable is empty, fill an ordered
@@ -858,6 +866,7 @@ impl Default for Options {
             // bytes.
             seal_bytes: 32 << 20,
             seal_max_pct: 10,
+            seal_on_file: false,
             seal_grows: true,
             direct_ingest: true,
             segment: SegmentOptions::default(),
@@ -1441,6 +1450,10 @@ struct Seg {
     /// have bought is the reclaim, which is why `promote_unpartitioned`
     /// leaves a lone piece holding one to the merge.
     tombs: bool,
+    /// The key and value bytes the segment holds, as its writer recorded
+    /// them; for a segment that recorded none, two thirds of its file,
+    /// the ratio `seal_threshold` is calibrated at.
+    data: u64,
 }
 
 /// The order the live segments hold: partitions first, disjoint and by
@@ -1619,6 +1632,9 @@ pub struct SegmentWriter {
     head_reserve: usize,
     /// `SegmentOptions::compact_records`.
     compact_records: bool,
+    /// The key and value bytes taken in, counted as the memtable counts
+    /// them, for `SuperExt::payload`.
+    payload: u64,
     reserve_off: u64,
     /// The inline runs, concatenated, with each key's span in it (empty for
     /// a key whose run went to a block). Blocks-first mode only; the
@@ -1840,6 +1856,7 @@ impl SegmentWriter {
             chunk_rows: Vec::new(),
             head_reserve: 0,
             compact_records: opts.compact_records,
+            payload: 0,
             reserve_off: 0,
             tails: Vec::new(),
             tail_spans: Vec::new(),
@@ -2084,6 +2101,12 @@ impl SegmentWriter {
             .ok_or_else(|| err("segment writer: end without begin"))?;
         let (last, flag) = crate::index::encode_run(&self.raw, &self.lens, &mut self.run);
         self.last = last as usize;
+        // A put is its key and value and a delete its key and sixteen, as
+        // the memtable counts them, so a sealed memtable's payload and the
+        // segment's agree.
+        self.payload += (len * self.records as usize
+            + self.raw.len()
+            + if tombstone { len + 16 } else { 0 }) as u64;
         self.raw.clear();
         self.lens.clear();
         let n = self.run.len();
@@ -2477,6 +2500,7 @@ impl SegmentWriter {
             fence_copy,
             row_copy,
             dir_copy,
+            payload: Some(self.payload).filter(|&p| p > 0),
             header: header_bytes,
         };
 
@@ -2581,15 +2605,13 @@ pub struct SegmentOptions {
     /// because `rec_offs` is a prefix sum, and the hash claims slots with
     /// compare-exchange.
     pub parallel_index: bool,
-    /// EXPERIMENT: a record whose one run is inline and short written
-    /// compact, a four-byte header in place of its twenty-byte extent
-    /// (`flatindex::COMPACT`). Readers take either form. Off: the record is
-    /// sixteen bytes smaller and a segment's scan reads it 1.12x faster at
-    /// three hundred thousand keys, but the seal cap is a share of the
-    /// store's bytes on disk, so the same data seals a tenth sooner in a
-    /// denser file -- at a hundred thousand keys one more seal across the
-    /// mixes, ycsb-A at 0.74x and the fully-unmerged lag point at 0.71x.
-    /// `docs/engine.md` has the figures; `supdb-compact` prices it.
+    /// A record whose one run is inline and short written compact, a
+    /// four-byte header in place of its twenty-byte extent
+    /// (`flatindex::COMPACT`). Readers take either form. On by default:
+    /// the suite's record is sixteen bytes smaller, its store a tenth, and
+    /// a scan walks fewer bytes a key; off writes every record with its
+    /// extent, as before format 0007. `docs/engine.md` has the figures;
+    /// `supdb-fullrec` prices it.
     pub compact_records: bool,
 }
 
@@ -2599,7 +2621,7 @@ impl Default for SegmentOptions {
             block_size: 64 * 1024,
             checksums: true,
             parallel_index: true,
-            compact_records: false,
+            compact_records: crate::reserve::COMPACT_RECORDS,
         }
     }
 }
@@ -2707,6 +2729,7 @@ impl Seg {
                 "the manifest names segment {name}, which is not in the store: {e}"
             ))
         })?;
+        let file_len = crate::bytes::Bytes::len(&src);
         let blob = Blob::open_with(
             src,
             crate::blob::BlobOptions {
@@ -2718,6 +2741,9 @@ impl Seg {
         if random {
             blob.advise_random();
         }
+        let data = blob
+            .payload_bytes()
+            .unwrap_or(file_len / DATA_PER_FILE.1 * DATA_PER_FILE.0);
         let oname = Db::ord_name_for(name).ok_or_else(|| err("segment name is malformed"))?;
         let mut ord = crate::ordindex::OrdIndex::open(&dir.join(&oname), blob.keys())
             .map_err(|e| err(&format!("segment {name}: {e}")))?;
@@ -2766,6 +2792,7 @@ impl Seg {
                 bloom: Some(bloom),
                 ord,
                 tombs,
+                data,
             });
         }
         if let Some(rest) = name
@@ -2797,6 +2824,7 @@ impl Seg {
                 bloom: None,
                 ord,
                 tombs: false,
+                data,
             });
         }
         // L0: build the Bloom by walking the segment's keys. That walk is
@@ -2816,6 +2844,7 @@ impl Seg {
             bloom: Some(bloom),
             ord,
             tombs,
+            data,
         })
     }
 
@@ -5124,8 +5153,13 @@ struct State {
     /// `sort_segs`, which every mutation of `segs` already ends with.
     mean_key_bytes: usize,
     /// The partitions' bytes on disk, refreshed with the segment set: what
-    /// a merge rewrites, and so what the seal is sized against.
+    /// a merge rewrites, and what the seal was sized against before
+    /// `data_bytes` (`Options::seal_on_file`).
     store_bytes: u64,
+    /// The partitions' key and value bytes (`Seg::data`), refreshed with
+    /// the segment set: what the seal is sized against, so the cadence
+    /// does not move when the record format changes the file's density.
+    data_bytes: u64,
     /// Whether every level-0 piece is aligned to a partition -- its fence
     /// one partition's -- so a read finds the pieces over its key by
     /// binary search instead of a walk over all of them; see
@@ -6735,15 +6769,40 @@ impl State {
 /// cap a no-op on a store too small to have a lag problem.
 const SEAL_CAP_FLOOR: usize = 1 << 20;
 
+/// Data bytes per file byte, as a fraction, at the shape the seal rules
+/// were tuned in: the store's size in their terms is its key and value
+/// bytes scaled by the inverse, so the cadence stays where the tuning left
+/// it for the records it was tuned with and does not move with the format.
+/// Also the estimate for a segment that recorded no payload.
+///
+/// The suite's partitions in full records weigh 1.37-1.43 times the key
+/// and value bytes they hold, ordered load or shuffled; the spread is the
+/// index's hash capacity, which steps with the key count. Seven fifths
+/// sits inside it, so at the rungs where the cap binds the threshold is
+/// within a few percent of the file rule's. The whole directory's bytes
+/// per byte, WAL and ordered index included, run higher: that is a
+/// different quantity, and three halves taken from it moved the full
+/// records' seal by a tenth at three hundred thousand keys.
+const DATA_PER_FILE: (u64, u64) = (5, 7);
+
 impl Reader {
     /// The memtable bytes at which the next commit seals: `seal_bytes`, or
-    /// with `seal_grows` the larger of that and the partitions' bytes over
-    /// four times `l0_trigger`.
+    /// with `seal_grows` the larger of that and the store's size over four
+    /// times `l0_trigger`, capped by `seal_max_pct` of the store's size.
+    /// The store's size is its partitions' key and value bytes in file
+    /// bytes at the calibrated ratio (`DATA_PER_FILE`), or their file bytes
+    /// themselves under `seal_on_file`.
     pub fn seal_threshold(&self) -> usize {
+        let st = self.state();
+        let sized = if self.opts.seal_on_file {
+            st.store_bytes
+        } else {
+            st.data_bytes.saturating_mul(DATA_PER_FILE.1) / DATA_PER_FILE.0
+        };
         let base = if !self.opts.seal_grows {
             self.opts.seal_bytes
         } else {
-            let grown = self.state().store_bytes / (4 * self.opts.l0_trigger.max(1)) as u64;
+            let grown = sized / (4 * self.opts.l0_trigger.max(1)) as u64;
             self.opts
                 .seal_bytes
                 .max(usize::try_from(grown).unwrap_or(usize::MAX))
@@ -6751,13 +6810,21 @@ impl Reader {
         if self.opts.seal_max_pct == 0 {
             return base;
         }
-        let store = usize::try_from(self.state().store_bytes).unwrap_or(usize::MAX);
+        let store = usize::try_from(sized).unwrap_or(usize::MAX);
         // Nothing sealed yet is nothing to take a share of, and the floor
         // keeps a store of a few kilobytes off a seal a commit.
         match store / 100 * self.opts.seal_max_pct {
             0 => base,
             cap => base.min(cap.max(SEAL_CAP_FLOOR)),
         }
+    }
+
+    /// The partitions' file bytes and their key and value bytes: the two
+    /// sizes `seal_threshold` can take the store by.
+    #[doc(hidden)]
+    pub fn sized_bytes(&self) -> (u64, u64) {
+        let st = self.state();
+        (st.store_bytes, st.data_bytes)
     }
 
     /// Order `pieces` by first key and check the chain: every piece's first
@@ -10299,6 +10366,7 @@ impl Db {
         let segs: Vec<std::sync::Arc<Seg>> = Vec::new();
         let mean_key_bytes = 0;
         let store_bytes = 0;
+        let data_bytes = 0;
         let l0_aligned = false;
         let segs_tombs = false;
         let state = State {
@@ -10316,6 +10384,7 @@ impl Db {
             gen: 1,
             mean_key_bytes,
             store_bytes,
+            data_bytes,
             l0_aligned,
             segs_tombs,
         };
@@ -10608,6 +10677,7 @@ impl Db {
         let segs: Vec<std::sync::Arc<Seg>> = segs.into_iter().map(std::sync::Arc::new).collect();
         let mean_key_bytes = Db::mean_key_bytes_of(&segs);
         let store_bytes = Db::store_bytes_of(dir, &segs);
+        let data_bytes = Db::data_bytes_of(&segs);
         let l0_aligned = Db::l0_aligned_of(&segs);
         let segs_tombs = segs.iter().any(|s| s.tombs);
         let max_key = Db::max_key_of(&segs, &mem);
@@ -10627,6 +10697,7 @@ impl Db {
             gen: 1,
             mean_key_bytes,
             store_bytes,
+            data_bytes,
             l0_aligned,
             segs_tombs,
         };
@@ -11427,6 +11498,7 @@ impl Db {
         segs.sort_by(|a, b| seg_order(a, b));
         let mean_key_bytes = Db::mean_key_bytes_of(&segs);
         let store_bytes = Db::store_bytes_of(&self.dir, &segs);
+        let data_bytes = Db::data_bytes_of(&segs);
         let l0_aligned = Db::l0_aligned_of(&segs);
         let segs_tombs = segs.iter().any(|s| s.tombs);
         let cur = self.state();
@@ -11445,6 +11517,7 @@ impl Db {
             gen: cur.gen + 1,
             mean_key_bytes,
             store_bytes,
+            data_bytes,
             l0_aligned,
             segs_tombs,
         };
@@ -11669,6 +11742,7 @@ impl Db {
             gen: cur.gen + 1,
             mean_key_bytes: cur.mean_key_bytes,
             store_bytes: cur.store_bytes,
+            data_bytes: cur.data_bytes,
             l0_aligned: cur.l0_aligned,
             segs_tombs: cur.segs_tombs,
         };
@@ -11693,6 +11767,7 @@ impl Db {
             gen: cur.gen + 1,
             mean_key_bytes: cur.mean_key_bytes,
             store_bytes: cur.store_bytes,
+            data_bytes: cur.data_bytes,
             l0_aligned: cur.l0_aligned,
             segs_tombs: cur.segs_tombs,
         };
@@ -11959,6 +12034,7 @@ impl Db {
             gen: cur.gen + 1,
             mean_key_bytes: cur.mean_key_bytes,
             store_bytes: cur.store_bytes,
+            data_bytes: cur.data_bytes,
             l0_aligned: cur.l0_aligned,
             segs_tombs: cur.segs_tombs,
         };
@@ -12018,6 +12094,11 @@ impl Db {
             .filter_map(|s| std::fs::metadata(dir.join(&s.name)).ok())
             .map(|m| m.len())
             .sum()
+    }
+
+    /// `store_bytes_of` in key and value bytes rather than file bytes.
+    fn data_bytes_of(segs: &[std::sync::Arc<Seg>]) -> u64 {
+        segs.iter().filter(|s| s.level > 0).map(|s| s.data).sum()
     }
 
     /// What a key costs on disk, averaged over the live segments.

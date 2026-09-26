@@ -693,6 +693,16 @@ have a lag problem is one the cap should not touch. Sweeping the share
 instead -- a tenth, a quarter, a half -- moved the lag point around and
 never recovered ycsb-E at the rungs where the floor was binding.
 
+The store's size, for the cap and for `seal_grows` both, is its
+partitions' key and value bytes -- which every segment records in its
+superblock, counted as the memtable counts them -- taken in file bytes at
+seven fifths. The rules above were measured against the partitions' file
+bytes, which the suite's full records put at 1.37-1.43 times the data
+(the hash capacity steps with the key count), so the full record's
+thresholds sit within a few percent of where those measurements had them,
+and a denser record format no longer seals sooner. `seal_on_file` keeps
+the file rule; `supdb-sealfile` prices it.
+
 #### The small rungs, where ycsb-E still loses
 
 The seal cap closed ycsb-E at a hundred thousand keys and above. At ten
@@ -1961,7 +1971,7 @@ the fast shape it read 0.61-0.97x, and the median came out at 0.95x
 pass), and what it keeps is maintained. It is off until the typical rep
 costs nothing; `supdb-rebase` prices it.
 
-#### The compact record, and the seal cap it moves
+#### The compact record, and the seal it moved
 
 A record whose one run is inline carried a twenty-byte extent that said
 nothing its position did not: the run is inline, starts at the tail and
@@ -1976,18 +1986,43 @@ device bytes of the ten-thousand-key load from 1.592 to below LMDB's
 Priced first at the Blob, the same keys at both record sizes and rounds
 alternated: a segment's scan read 0.86-0.98x the time from a hundred
 thousand keys to three million, 29 rounds of 36 faster, with point reads
-level. In the engine, against the full record in one process: at three
-hundred thousand keys the scan read 1.12x (9/12) and the fully-unmerged
-point 1.47x (11/12). At a hundred thousand, the point read 0.71x (0/12),
-ycsb-A 0.74x (1/12) and ycsb-B 0.86x (2/12) -- and ycsb-A never scans, so
-no read of a record explains it. The seal cap does: it is a share of the
-store's bytes on disk, and the same data in a denser file seals a tenth
-sooner, 1.50 MB against 1.66 at a hundred thousand keys. Over the suite's
-mixes, run back to back on one store, that is one more seal -- twenty
-snapshot builds against eighteen, twelve pairs of twelve -- landing inside
-the mixes. The record is faster wherever it is read and slower wherever
-the seal it brings on lands, so it is off until the cap is taken on the
-data rather than the file; `supdb-compact` prices it.
+level. In the engine it first priced as a loss: at a hundred thousand
+keys the point read 0.71x (0/12), ycsb-A 0.74x (1/12) and ycsb-B 0.86x
+(2/12) -- and ycsb-A never scans, so no read of a record explains it.
+The seal cap did: it was a share of the store's bytes on disk, and the
+same data in a denser file sealed a tenth sooner, 1.50 MB against 1.66.
+Over the suite's mixes, run back to back on one store, that was one more
+seal -- twenty snapshot builds against eighteen, twelve pairs of twelve
+-- landing inside the mixes.
+
+With the seal sized by the data (the seal cap's section), both records
+seal at one threshold, and against the full record in one process
+(`supdb-fullrec`, twelve pairs a rung) the compact record is a record
+size and nothing else:
+
+| compact over full | 10k | 100k | 300k |
+|---|---|---|---|
+| bytes on disk | **0.90x** | **0.91x** | **0.90x** |
+| drained scan | 1.02x (10/12) | 1.01x (ns) | 1.06x (8/12) |
+| scan, a hundredth unmerged | 0.96x (ns) | 0.96x (ns) | 1.09x (10/12) |
+| ycsb-A, ycsb-B | level | level | level |
+| snapshot builds | 3 and 3 | 20 and 20 | 19 and 20 |
+
+Every quantity marked on the sign test at any rung favours the compact
+record, the drained scan is faster in 25 pairs of 36 across the three
+rungs, and nothing reads slower. It is on.
+
+Sizing the seal by the data moved the full record's cadence where the
+calibration is not exact. Against `supdb-sealfile` at a hundred thousand
+keys, whose partitions weigh 1.434 times their data where the rule takes
+1.4, the threshold is 1.62 MB against 1.66 and the mixes take one more
+seal, twenty snapshot builds against eighteen (11/12): ycsb-B read 1.12x
+(10/12) and the fully-unmerged lag point took its slow shape in more reps
+(ns). At three hundred thousand no quantity of 36 moved, and below a
+hundred thousand the floor binds under both rules. A rung is on a knife
+edge wherever the mixes' writes land near a multiple of the threshold,
+and a few percent either way moves one seal and whichever pass it lands
+in; the slow shape of the lag point is what `forms_rebase` removes.
 
 #### Which half of the lag gap, by rung
 

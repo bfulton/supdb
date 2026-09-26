@@ -125,13 +125,14 @@ const SB_FIELDS: usize = 16;
 
 /// The superblock page's extension: what a write-once segment adds after
 /// the two slots so a sparse open can plan itself from the probe alone.
-/// Sixteen words -- magic, generation, then the
-/// absolute offset and length of the fence, the directory, the hash region
-/// and the checksum row, a copy of the block table and a copy of the fence
-/// when the writer placed them in a head reserve, and the fence copy's
-/// CRC -- then a copy of the key section's 192-byte header, then the FNV of
-/// all of it. A store writes none of this; the page is zero there and the
-/// magic says so.
+/// Twenty words -- magic, generation, then the absolute offset and length
+/// of the fence, the directory, the hash region and the checksum row, a
+/// copy of the block table and a copy of the fence when the writer placed
+/// them in a head reserve, the fence copy's CRC, the row copy's offset,
+/// the directory copy's offset and CRC, the segment's payload, and one
+/// spare -- then a copy of the key section's 192-byte header, then the FNV
+/// of all of it. A store writes none of this; the page is zero there and
+/// the magic says so.
 const SX_OFF: usize = 1024;
 const SX_MAGIC: u64 = 0x5355_5044_4253_5831;
 const SX_WORDS: usize = 20;
@@ -156,6 +157,12 @@ pub struct SuperExt {
     /// its CRC32C, so a directory-resident open needs nothing from the
     /// section either.
     pub dir_copy: Option<(u64, u32)>,
+    /// The key and value bytes the writer took in, counted as a store's
+    /// memtable counts them: what the store's seal is sized against, since
+    /// the file's own length moves with the record format and the payload
+    /// does not. A reader from before the word ignores it and a segment
+    /// from before it wrote zero there, which reads as `None`.
+    pub payload: Option<u64>,
     pub header: [u8; flatindex::HEADER_BYTES],
 }
 
@@ -191,7 +198,7 @@ pub fn encode_super_ext(x: &SuperExt, generation: u64) -> Vec<u8> {
         x.row_copy.unwrap_or(0),
         x.dir_copy.map_or(0, |d| d.0),
         x.dir_copy.map_or(0, |d| d.1 as u64),
-        0,
+        x.payload.unwrap_or(0),
         0,
     ];
     let mut out = Vec::with_capacity(SX_BYTES);
@@ -241,6 +248,7 @@ pub fn decode_super_ext(page: &[u8], generation: u64) -> Option<SuperExt> {
         } else {
             None
         },
+        payload: if w(18) > 0 { Some(w(18)) } else { None },
         header,
     })
 }
@@ -778,6 +786,16 @@ impl<B: Bytes> Blob<B> {
     /// (generation, milliseconds) of the checkpoint this reader opened.
     pub fn version(&self) -> (u64, u64) {
         (self.generation, self.timestamp)
+    }
+
+    /// The key and value bytes the segment's writer recorded
+    /// (`SuperExt::payload`), or `None` for a file that records none: a
+    /// store's, or a segment from before the word. One read of the
+    /// superblock page, so asked once per open rather than per read.
+    pub fn payload_bytes(&self) -> Option<u64> {
+        let mut page = vec![0u8; SUPER as usize];
+        self.src.read_at(0, &mut page).ok()?;
+        decode_super_ext(&page, self.generation)?.payload
     }
 
     /// Tell the byte source that this reader's access pattern is random.

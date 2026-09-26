@@ -4490,6 +4490,85 @@ fn a_store_below_the_seal_floor_still_seals_once_it_has_bytes() {
     );
 }
 
+/// The seal is sized by the key and value bytes the store holds, which
+/// every segment records in its superblock, and not by the partitions'
+/// file bytes, which move with the record format: the same writes in
+/// compact records and in full ones seal at one threshold, and a reopened
+/// store reads the recorded payload back rather than estimating it. The
+/// load goes through ordered ingest's segment and the updates through the
+/// WAL, a seal and a merge, so each writer of a partition is asked.
+#[test]
+fn the_seal_is_sized_by_the_data_and_not_by_the_file() {
+    let val = "v".repeat(100);
+    let key = |k: u32| format!("{k:016}");
+    // Enough that a tenth of the store clears `SEAL_CAP_FLOOR`, so the
+    // threshold is the cap's and moves with the size it is taken from.
+    let n = 80_000u32;
+    let run = |compact: bool, on_file: bool| -> (u64, u64, usize) {
+        let d = dir(&format!("sealdata-{compact}-{on_file}"));
+        let opts = Options {
+            segment: supdb::SegmentOptions {
+                compact_records: compact,
+                ..Default::default()
+            },
+            seal_on_file: on_file,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        for k in 0..n {
+            db.append(key(k).as_bytes(), val.as_bytes());
+            if k % 1000 == 999 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        for k in (0..n).step_by(4) {
+            db.append(key(k).as_bytes(), val.as_bytes());
+            if k % 1000 == 996 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        db.settle().unwrap();
+        let (file, data) = db.sized_bytes();
+        let threshold = db.seal_threshold();
+        drop(db);
+        let db = Db::open(&d, opts).unwrap();
+        assert_eq!(
+            db.sized_bytes(),
+            (file, data),
+            "compact {compact}, file rule {on_file}: a reopened store reads the sizes back"
+        );
+        assert_eq!(db.seal_threshold(), threshold);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&d);
+        (file, data, threshold)
+    };
+    let (full_file, full_data, full_t) = run(false, false);
+    let (compact_file, compact_data, compact_t) = run(true, false);
+    let (_, _, full_on_file) = run(false, true);
+    let (_, _, compact_on_file) = run(true, true);
+    let per = (16 + val.len()) as u64;
+    let want = n as u64 * per + (n as u64).div_ceil(4) * per;
+    assert_eq!(full_data, want, "the payload is every key and value put");
+    assert_eq!(compact_data, want);
+    assert!(
+        compact_file < full_file,
+        "compact records are the smaller file: {compact_file} against {full_file}"
+    );
+    assert_eq!(
+        compact_t, full_t,
+        "sized by the data, the format does not move the seal"
+    );
+    assert!(
+        compact_on_file < full_on_file,
+        "sized by the file, the denser format seals sooner: {compact_on_file} against {full_on_file}"
+    );
+}
+
 /// EXPERIMENT: a write burst with no read between its commits is settled
 /// into the forms once its unfiled backlog passes `forms_settle_backlog_pct`
 /// of the store's keys, so the first read after the burst does not file
