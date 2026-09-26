@@ -230,7 +230,9 @@ varint length prefixes it claimed to exclude.
 than error.** The question is never "did the format change" but "what does an
 old reader do with the new file". The per-extent count word and the `FIXED`
 flag each re-decode a run under the wrong encoding in an old reader, so the
-magic moved for both. The inline extension did not move it, because a reader
+magic moved for both, and so did the compact record, whose flag bit an old
+reader takes for 32,768 extents and may find bytes enough to read as them.
+The inline extension did not move it, because a reader
 from before it errors on `Ext::INLINE` as an impossible block id; nor did the
 key-section checksum row, whose header words are zero in every older file
 and unread by every older reader. Decide which case a change is before

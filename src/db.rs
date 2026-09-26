@@ -802,6 +802,18 @@ pub struct Options {
     /// the rows, and the test holds it to the model through two seals
     /// and a merge.
     pub forms_carry: bool,
+    /// EXPERIMENT: the carry across a merge that rewrote a partition over
+    /// the same keys -- the same fences, key count and key at every
+    /// block's first rank -- keeps the partition's copies and drops its
+    /// sparse forms, where it drops every form. The partition merge that
+    /// folds a burst of updates is that merge, and whether it published
+    /// during the burst decides the fully-unmerged lag point: the pass
+    /// after it rebuilds every block. With this on, the pass at three
+    /// hundred thousand keys never collapses -- four reps of twelve read
+    /// 3-8x slower without it -- and at a hundred thousand it reads
+    /// 2.0x; but where no merge lands the rep reads 10-20% slower, since
+    /// twice the forms are kept to maintain. Off; `supdb-rebase` prices it.
+    pub forms_rebase: bool,
     /// EXPERIMENT: the writer's own handle takes the canonical forms it
     /// maintains, instead of building its own. Without this the
     /// maintenance is pure cost wherever the reads are the writer's: a
@@ -887,6 +899,7 @@ impl Default for Options {
             forms_settle_rebuild_from: 0,
             forms_settle_recent_pct: 0,
             forms_carry: true,
+            forms_rebase: false,
             forms_to_writer: false,
             form_dense_from: 0,
             scan_snapshot_arena: true,
@@ -1604,6 +1617,8 @@ pub struct SegmentWriter {
     /// whose first probe covers the reserve opens in one round trip. Zero
     /// for none; laid down at the first key.
     head_reserve: usize,
+    /// `SegmentOptions::compact_records`.
+    compact_records: bool,
     reserve_off: u64,
     /// The inline runs, concatenated, with each key's span in it (empty for
     /// a key whose run went to a block). Blocks-first mode only; the
@@ -1756,9 +1771,14 @@ impl SegmentWriter {
         // block count -- and the table sized by it -- is the same either way.
         // What compression moves is where the key section lands, and the row
         // is already taken at its worst alignment.
-        let reserve = crate::reserve::for_lengths(&lengths, opts.block_size, write.inline_max)
-            .ok_or_else(|| err("segment writer: this input cannot be a segment"))?
-            .bytes();
+        let reserve = crate::reserve::for_lengths_as(
+            &lengths,
+            opts.block_size,
+            write.inline_max,
+            opts.compact_records,
+        )
+        .ok_or_else(|| err("segment writer: this input cannot be a segment"))?
+        .bytes();
 
         let mut w = SegmentWriter::create_with(path, opts, write, reserve)?;
         for (k, vals) in items {
@@ -1819,6 +1839,7 @@ impl SegmentWriter {
             compress: false,
             chunk_rows: Vec::new(),
             head_reserve: 0,
+            compact_records: opts.compact_records,
             reserve_off: 0,
             tails: Vec::new(),
             tail_spans: Vec::new(),
@@ -1910,7 +1931,7 @@ impl SegmentWriter {
             let Some((key, exts, tail, len)) = flatindex::parse_record(&buf, p) else {
                 break;
             };
-            let [e] = exts else { break };
+            let [e] = *exts else { break };
             if !e.is_inline() || e.is_tombstone() {
                 break;
             }
@@ -2115,8 +2136,14 @@ impl SegmentWriter {
                 let key = &self.key_arena[start..start + len];
                 let tail: &[u8] = if inline { &self.run } else { &[] };
                 self.rec_buf.clear();
-                let wrote = flatindex::stream_record(&mut self.rec_buf, key, &[ext], tail)
-                    .ok_or_else(|| err("segment writer: record exceeds the flat index's limits"))?;
+                let wrote = flatindex::stream_record_as(
+                    &mut self.rec_buf,
+                    key,
+                    &[ext],
+                    tail,
+                    self.compact_records,
+                )
+                .ok_or_else(|| err("segment writer: record exceeds the flat index's limits"))?;
                 self.out.write_all(&self.rec_buf)?;
                 if self.marks {
                     self.mark_crc = block::crc32_resume(self.mark_crc, &self.rec_buf);
@@ -2554,6 +2581,16 @@ pub struct SegmentOptions {
     /// because `rec_offs` is a prefix sum, and the hash claims slots with
     /// compare-exchange.
     pub parallel_index: bool,
+    /// EXPERIMENT: a record whose one run is inline and short written
+    /// compact, a four-byte header in place of its twenty-byte extent
+    /// (`flatindex::COMPACT`). Readers take either form. Off: the record is
+    /// sixteen bytes smaller and a segment's scan reads it 1.12x faster at
+    /// three hundred thousand keys, but the seal cap is a share of the
+    /// store's bytes on disk, so the same data seals a tenth sooner in a
+    /// denser file -- at a hundred thousand keys one more seal across the
+    /// mixes, ycsb-A at 0.74x and the fully-unmerged lag point at 0.71x.
+    /// `docs/engine.md` has the figures; `supdb-compact` prices it.
+    pub compact_records: bool,
 }
 
 impl Default for SegmentOptions {
@@ -2562,6 +2599,7 @@ impl Default for SegmentOptions {
             block_size: 64 * 1024,
             checksums: true,
             parallel_index: true,
+            compact_records: false,
         }
     }
 }
@@ -4328,7 +4366,8 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
     } else {
         for r in 0..keys.len() {
             let k = keys.get(r);
-            let mut found: Vec<(usize, &[Ext], &[u8])> = Vec::with_capacity(blobs.len());
+            let mut found: Vec<(usize, crate::index::Exts<'_>, &[u8])> =
+                Vec::with_capacity(blobs.len());
             let mut start = 0usize;
             let mut live = 0u64;
             for (i, b) in blobs.iter().enumerate() {
@@ -4348,7 +4387,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
             em.key(k, |w| {
                 for &(i, exts, tail) in &found[start..] {
                     blobs[i]
-                        .read_exts(exts, tail, |v| w.value(v))
+                        .read_exts(&exts, tail, |v| w.value(v))
                         .map_err(|e| err(&format!("compact read: {e}")))?;
                 }
                 Ok(())
@@ -5226,6 +5265,9 @@ struct Shared {
     /// zero where a pass had taken forms all along, and this exists so a
     /// measurement cannot make that mistake.
     form_takes: AtomicU64,
+    /// Partitions whose forms were carried across a merge that rewrote
+    /// them over the same keys; see `carry_forms`.
+    forms_rebased: AtomicU64,
     /// Scans that reached the test for walking the forms, and the ones
     /// that passed it. A mechanism that holds 1,562 forms and is taken
     /// by no read is not slow, it is off, and these say which clause
@@ -10286,6 +10328,7 @@ impl Db {
             retired_snaps: std::sync::Mutex::new(Vec::new()),
             snap_builds: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
+            forms_rebased: AtomicU64::new(0),
             canon_tried: AtomicU64::new(0),
             canon_hit: AtomicU64::new(0),
             rd_scans: AtomicU64::new(0),
@@ -10596,6 +10639,7 @@ impl Db {
             retired_snaps: std::sync::Mutex::new(Vec::new()),
             snap_builds: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
+            forms_rebased: AtomicU64::new(0),
             canon_tried: AtomicU64::new(0),
             canon_hit: AtomicU64::new(0),
             rd_scans: AtomicU64::new(0),
@@ -11463,6 +11507,13 @@ impl Db {
         });
     }
 
+    /// EXPERIMENT: partitions whose copies were carried across a merge
+    /// that rewrote them over the same keys, rather than dropped.
+    #[doc(hidden)]
+    pub fn forms_rebased(&self) -> u64 {
+        self.shared.forms_rebased.load(AtomicOrdering::Relaxed)
+    }
+
     /// EXPERIMENT: scan snapshots built over this store's life. Sharing
     /// one is meant to hold this at one per state however many handles
     /// read it, which is what a test asks.
@@ -11679,13 +11730,30 @@ impl Db {
         if np == 0 || cur.forms.len() < np {
             return false;
         }
-        let same = next.segs.partition_point(|s| s.level > 0) == np
-            && cur.segs[..np]
-                .iter()
-                .zip(&next.segs[..np])
-                .all(|(a, b)| std::sync::Arc::ptr_eq(a, b));
-        if !same {
+        if next.segs.partition_point(|s| s.level > 0) != np {
             return false;
+        }
+        // Each partition the same object, or one a merge rewrote over the
+        // same keys: the partition merge that folds a burst of updates
+        // into its range changes values and no key, and dropping every
+        // form at its publish was the slow half of the fully-unmerged lag
+        // point -- the pass that followed rebuilt every block, 850-1,500
+        // copies at about 14 us each at a hundred thousand keys, and read
+        // a third of the pass that met a merge still in flight. A copy is
+        // the block's range merged and owns every byte of it, so over the
+        // same range it is the new partition's block as it was the old
+        // one's; a sparse form splices deltas at ranks in the old
+        // partition's records and a clean block has no form, so the first
+        // goes and the second stays clean.
+        let mut rebased = vec![false; np];
+        for (p, (a, b)) in cur.segs[..np].iter().zip(&next.segs[..np]).enumerate() {
+            if std::sync::Arc::ptr_eq(a, b) {
+                continue;
+            }
+            if tier || !self.opts.forms_rebase || !Db::same_blocks(a, b) {
+                return false;
+            }
+            rebased[p] = true;
         }
         // The forms were published from this handle's tables: none, or
         // tables of another generation, and nothing current is here to
@@ -11760,7 +11828,12 @@ impl Db {
             let mut held = tables[p].borrow_mut();
             let Some(t) = held.as_mut() else { continue };
             for b in 0..t.slots.len() {
-                if matches!(t.slots[b].as_deref(), Some(Cached::Wide(_))) {
+                let rebase_drops =
+                    rebased[p] && matches!(t.slots[b].as_deref(), Some(Cached::Sparse(_)));
+                if rebase_drops {
+                    self.tables_complete.set(false);
+                }
+                if rebase_drops || matches!(t.slots[b].as_deref(), Some(Cached::Wide(_))) {
                     self.unlist(p, b, t);
                 }
                 if let Some(old) = t.dense[b].take() {
@@ -11773,6 +11846,11 @@ impl Db {
             }
             t.pieces = pieces;
             t.piece_ranks = piece_ranks;
+            if rebased[p] {
+                self.shared
+                    .forms_rebased
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
             if tier {
                 continue;
             }
@@ -11789,6 +11867,22 @@ impl Db {
                     list.clear();
                 }
                 t.filed = 0;
+            }
+        }
+        // What a rebased partition published as a sparse form is marked,
+        // as its table's were above, including where this handle holds no
+        // table for it: a reader builds those blocks for itself.
+        for (p, rebased) in rebased.iter().enumerate() {
+            if !*rebased {
+                continue;
+            }
+            for b in 0..cur.forms[p].len() {
+                let ptr = cur.forms[p][b].load(AtomicOrdering::Acquire);
+                // SAFETY: as in `canonical`.
+                if !ptr.is_null() && matches!(*unsafe { &*ptr }.form, Cached::Sparse(_)) {
+                    self.tables_complete.set(false);
+                    self.publish_marker(p, b);
+                }
             }
         }
         // The pointers, `next`'s from its publish; `cur` frees none.
@@ -11902,6 +11996,22 @@ impl Db {
     /// The partitions' bytes on disk. A free function over the segments,
     /// like `mean_key_bytes_of`, because `open` needs it before there is a
     /// `Db` to ask.
+    /// Whether `b` cuts into the same blocks as `a`: the same fences and
+    /// key count, and the same key at every block's first rank and at the
+    /// last, so each block covers the same range of keys in both. What a
+    /// merge that folds updates into a partition leaves, and what lets a
+    /// block's copy outlive the partition it was built over.
+    fn same_blocks(a: &Seg, b: &Seg) -> bool {
+        let n = a.blob.keys();
+        if n != b.blob.keys() || a.level != b.level || a.lo != b.lo || a.hi != b.hi {
+            return false;
+        }
+        (0..n)
+            .step_by(CACHE_BLOCK)
+            .chain(n.checked_sub(1))
+            .all(|r| matches!((a.blob.key_at(r), b.blob.key_at(r)), (Some(x), Some(y)) if x == y))
+    }
+
     fn store_bytes_of(dir: &Path, segs: &[std::sync::Arc<Seg>]) -> u64 {
         segs.iter()
             .filter(|s| s.level > 0)

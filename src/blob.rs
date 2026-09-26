@@ -30,7 +30,7 @@
 use crate::block::{self, BlockLoc};
 use crate::bytes::{short, take, Bytes};
 use crate::flatindex::{self, FlatIndex, MappedBlocks};
-use crate::index::Ext;
+use crate::index::{Ext, Exts};
 use std::cell::Cell;
 use std::io::{Error, ErrorKind, Result};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -117,7 +117,7 @@ fn fixed_count(exts: &[Ext], stride: u64, width: u64) -> Option<u64> {
 /// the constants below are asserted equal to `store.rs`'s at compile time on
 /// every native build, which says *why* in one line instead of six stack
 /// traces.
-const MAGIC: u64 = 0x5355_5044_4200_0006;
+const MAGIC: u64 = 0x5355_5044_4200_0007;
 const SUPER: u64 = 4096;
 const SLOT: u64 = 512;
 const SB_BYTES: usize = 144;
@@ -822,20 +822,20 @@ impl<B: Bytes> Blob<B> {
     /// The extents of a key, borrowed out of the index. No allocation, no
     /// decode -- this is the borrow `flatindex` exists to make possible, and
     /// it survives the byte-source abstraction on any source that can lend.
-    pub fn lookup(&self, key: &[u8]) -> Option<&[Ext]> {
+    pub fn lookup(&self, key: &[u8]) -> Option<Exts<'_>> {
         let (sec, idx) = self.flat()?;
         idx.lookup(sec, key, flatindex::key_hash)
     }
 
     /// `lookup`, with the record's tail: the bytes of any inline runs, which
     /// `read_exts` needs to serve an extent that names `Ext::INLINE`.
-    pub fn lookup_full(&self, key: &[u8]) -> Option<(&[Ext], &[u8])> {
+    pub fn lookup_full(&self, key: &[u8]) -> Option<(Exts<'_>, &[u8])> {
         let (sec, idx) = self.flat()?;
         idx.lookup_full(sec, key, flatindex::key_hash)
     }
 
     /// `exts_at`, with the record's tail of inline runs.
-    pub fn exts_at_full(&self, rank: usize) -> Option<(&[u8], &[Ext], &[u8])> {
+    pub fn exts_at_full(&self, rank: usize) -> Option<(&[u8], Exts<'_>, &[u8])> {
         let (sec, idx) = self.flat()?;
         idx.at_full(sec, rank)
     }
@@ -878,7 +878,7 @@ impl<B: Bytes> Blob<B> {
 
     /// The key and extents at `rank`, borrowed from the mapping: the flags
     /// on the extents are how `db::Db` sees a tombstone without a probe.
-    pub fn exts_at(&self, rank: usize) -> Option<(&[u8], &[Ext])> {
+    pub fn exts_at(&self, rank: usize) -> Option<(&[u8], Exts<'_>)> {
         let (sec, idx) = self.flat()?;
         idx.at(sec, rank)
     }
@@ -895,7 +895,7 @@ impl<B: Bytes> Blob<B> {
             return Ok(0);
         };
         let mut n = 0u64;
-        for e in exts {
+        for e in exts.iter() {
             n += self.with_run(*e, tail, |run| {
                 crate::index::each_value(run, e, &mut |v| f(v)).map_err(corrupt)
             })?;
@@ -962,7 +962,7 @@ impl<B: Bytes> Blob<B> {
         let Some(exts) = self.lookup(key) else {
             return Ok(());
         };
-        self.plan_exts(exts, out)
+        self.plan_exts(&exts, out)
     }
 
     /// The data ranges these extents reach: every block a non-inline one
@@ -1237,7 +1237,7 @@ impl<B: Bytes> Blob<B> {
         let Some((exts, tail)) = self.lookup_full(key) else {
             return Ok(0);
         };
-        self.read_exts(exts, tail, f)
+        self.read_exts(&exts, tail, f)
     }
 
     /// Every value in `exts`, in order -- the extents and tail a
@@ -1277,14 +1277,14 @@ impl<B: Bytes> Blob<B> {
         };
         let (ra, rb) = match (
             width,
-            self.fixed_runs(ea, ta, width)?,
-            self.fixed_runs(eb, tb, width)?,
+            self.fixed_runs(&ea, ta, width)?,
+            self.fixed_runs(&eb, tb, width)?,
         ) {
             (w, Some(ra), Some(rb)) if w > 0 => (ra, rb),
             _ => {
                 let (mut va, mut vb) = (Vec::new(), Vec::new());
-                self.read_exts(ea, ta, |v| va.push(v.to_vec()))?;
-                self.read_exts(eb, tb, |v| vb.push(v.to_vec()))?;
+                self.read_exts(&ea, ta, |v| va.push(v.to_vec()))?;
+                self.read_exts(&eb, tb, |v| vb.push(v.to_vec()))?;
                 let (mut i, mut j, mut n) = (0, 0, 0u64);
                 while i < va.len() && j < vb.len() {
                     match va[i].cmp(&vb[j]) {
@@ -1446,7 +1446,7 @@ impl<B: Bytes> Blob<B> {
     pub fn count_fixed(&self, key: &[u8], width: u32) -> Option<u64> {
         let stride = width as u64 + varint_len(width as u64);
         match self.lookup(key) {
-            Some(exts) => fixed_count(exts, stride, width as u64),
+            Some(exts) => fixed_count(&exts, stride, width as u64),
             // A key that is not there holds no values, which is a count.
             None => Some(0),
         }
@@ -1521,7 +1521,7 @@ impl<B: Bytes> Blob<B> {
             }) else {
                 break;
             };
-            let n = fixed_count(exts, stride, width as u64);
+            let n = fixed_count(&exts, stride, width as u64);
             seen += 1;
             rank += 1;
             if !f(k, n) {
@@ -1572,7 +1572,7 @@ impl<B: Bytes> Blob<B> {
             let Some((_k, exts, _tail)) = self.exts_at_full(rank) else {
                 break;
             };
-            self.plan_exts(exts, &mut ranges)?;
+            self.plan_exts(&exts, &mut ranges)?;
             seen += 1;
             rank += 1;
         }
@@ -1674,30 +1674,52 @@ impl<B: Bytes> Blob<B> {
                     break;
                 };
                 let klen = u16::from_le_bytes([h[0], h[1]]) as usize;
-                if u16::from_le_bytes([h[2], h[3]]) != 1 {
-                    break;
-                }
+                let n = u16::from_le_bytes([h[2], h[3]]);
                 let key_at = off + 4;
                 let e_at = (key_at + klen + 3) & !3;
-                let Some(eb) = recs.get(e_at..e_at + 20) else {
+                // The compact record: a four-byte header where the full
+                // record has its extent, and the run straight after it.
+                let (a, elen, records) = if n == flatindex::COMPACT {
+                    let Some(cb) = recs.get(e_at..e_at + 4) else {
+                        break;
+                    };
+                    let Ok(cb) = <&[u8; 4]>::try_from(cb) else {
+                        break;
+                    };
+                    let c = u16::from_le_bytes([cb[2], cb[3]]);
+                    if c & flatindex::C_FIXED == 0 {
+                        break;
+                    }
+                    (
+                        e_at + 4,
+                        u16::from_le_bytes([cb[0], cb[1]]) as usize,
+                        (c & !(flatindex::C_FIXED | flatindex::C_TOMB)) as usize,
+                    )
+                } else if n == 1 {
+                    let Some(eb) = recs.get(e_at..e_at + 20) else {
+                        break;
+                    };
+                    let Ok(eb) = <&[u8; 20]>::try_from(eb) else {
+                        break;
+                    };
+                    let word =
+                        |i: usize| u32::from_le_bytes([eb[i], eb[i + 1], eb[i + 2], eb[i + 3]]);
+                    let block = word(0);
+                    let count = word(16);
+                    if block != Ext::INLINE || count & Ext::FIXED == 0 {
+                        break;
+                    }
+                    (
+                        e_at + 20 + word(4) as usize,
+                        word(8) as usize,
+                        (count & !(Ext::TOMBSTONE | Ext::FIXED)) as usize,
+                    )
+                } else {
                     break;
                 };
-                let Ok(eb) = <&[u8; 20]>::try_from(eb) else {
-                    break;
-                };
-                let word = |i: usize| u32::from_le_bytes([eb[i], eb[i + 1], eb[i + 2], eb[i + 3]]);
-                let block = word(0);
-                let count = word(16);
-                if block != Ext::INLINE || count & Ext::FIXED == 0 {
-                    break;
-                }
-                let eoff = word(4) as usize;
-                let elen = word(8) as usize;
-                let records = (count & !(Ext::TOMBSTONE | Ext::FIXED)) as usize;
                 if records == 0 || elen == 0 {
                     return Err(corrupt("fixed run's length is not a multiple of its count"));
                 }
-                let a = e_at + 20 + eoff;
                 let Some(run) = recs.get(a..a + elen) else {
                     return Err(corrupt("inline run runs past its record"));
                 };
@@ -1734,7 +1756,7 @@ impl<B: Bytes> Blob<B> {
             }) else {
                 break;
             };
-            for e in exts {
+            for e in exts.iter() {
                 // An inline run is right here in the record the walk is
                 // already on: no block, no cache, no fetch.
                 if e.is_inline() {
@@ -2423,7 +2445,7 @@ impl<B: Bytes> SparseBlob<B> {
                 break;
             }
             out += 1;
-            if !f(key, exts, tail) {
+            if !f(key, &exts, tail) {
                 break;
             }
         }

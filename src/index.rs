@@ -93,6 +93,39 @@ impl Ext {
     }
 }
 
+/// A record's extents as a reader finds them: borrowed from the mapping
+/// where the record carries them, or the one rebuilt from a compact
+/// record's header, which carries none (see `flatindex::parse_record`).
+/// Either reads as `[Ext]`.
+#[derive(Clone, Copy, Debug)]
+pub enum Exts<'a> {
+    Borrowed(&'a [Ext]),
+    One(Ext),
+}
+
+impl std::ops::Deref for Exts<'_> {
+    type Target = [Ext];
+    #[inline]
+    fn deref(&self) -> &[Ext] {
+        match self {
+            Exts::Borrowed(s) => s,
+            Exts::One(e) => std::slice::from_ref(e),
+        }
+    }
+}
+
+impl PartialEq<[Ext]> for Exts<'_> {
+    fn eq(&self, other: &[Ext]) -> bool {
+        **self == *other
+    }
+}
+
+impl PartialEq<&[Ext]> for Exts<'_> {
+    fn eq(&self, other: &&[Ext]) -> bool {
+        **self == **other
+    }
+}
+
 /// Extents of a single key. Inline until the key needs more than one.
 #[derive(Clone, Debug)]
 pub enum Extents {

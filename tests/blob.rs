@@ -45,7 +45,21 @@ fn build_with(
     compress: bool,
     inline_max: usize,
 ) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
-    let mut w = SegmentWriter::create(path, &SegmentOptions::default()).expect("create");
+    build_opts(path, keys, compress, inline_max, false)
+}
+
+fn build_opts(
+    path: &Path,
+    keys: usize,
+    compress: bool,
+    inline_max: usize,
+    compact: bool,
+) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+    let opts = SegmentOptions {
+        compact_records: compact,
+        ..SegmentOptions::default()
+    };
+    let mut w = SegmentWriter::create(path, &opts).expect("create");
     w.set_compress(compress);
     w.set_inline_max(inline_max);
     let mut want = Vec::new();
@@ -177,6 +191,33 @@ fn a_source_that_cannot_lend_answers_the_same() {
         "this source has nothing to lend, and the test is worthless if it does"
     );
     reads_what_was_written(&blob, &want);
+}
+
+/// Compact records, through a source that lends and one that copies: the
+/// same answers as each other and as what was written, and the lending one
+/// still copies nothing. The fixture's runs straddle the inline bound, so
+/// the segment holds compact records, full ones for runs in blocks, and
+/// both kinds of fixed and prefixed run.
+#[test]
+fn compact_records_read_the_same_through_both_sources() {
+    let path = scratch("compact-agree");
+    let want = build_opts(&path, 700, false, 256, true);
+    let full = scratch("compact-agree-full");
+    build_opts(&full, 700, false, 256, false);
+    let (a, b) = (
+        std::fs::metadata(&path).unwrap().len(),
+        std::fs::metadata(&full).unwrap().len(),
+    );
+    assert!(
+        a < b,
+        "compact records make the file smaller: {a} against {b}"
+    );
+    let lending = Blob::open(MmapBytes::open(&path).unwrap()).expect("blob open");
+    assert!(lending.zero_copy(), "the native path must not copy");
+    reads_what_was_written(&lending, &want);
+    let copying = Blob::open(Copying(std::fs::read(&path).unwrap())).expect("copying open");
+    assert!(!copying.zero_copy());
+    reads_what_was_written(&copying, &want);
 }
 
 #[test]

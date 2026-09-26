@@ -4629,6 +4629,121 @@ fn a_reader_meets_a_block_gone_wide_through_the_forms() {
 /// a delete, a block gone wide, a handle taking the carried forms, the
 /// writer over its carried tables, writes settled into them after the
 /// seal, and the merge that finally drops them.
+/// A merge that folds updates into a partition rewrites it over the same
+/// keys, and the copies built over the old partition are the new one's
+/// blocks as they were the old one's: carried rather than dropped, which
+/// was a pass that rebuilt every block after the fully-unmerged burst.
+/// The sparse forms splice deltas at the old partition's ranks and are
+/// dropped. Every answer is held to the model, through a reader handle
+/// and through the writer, before and after writes into the carried
+/// copies; and the path is asserted taken.
+#[test]
+fn the_copies_survive_a_merge_that_keeps_every_key() {
+    // Over both record forms: the merge rewrites the partition, and a
+    // compact record's extent is rebuilt at every read of it.
+    for compact in [false, true] {
+        the_copies_survive_a_merge_with(compact);
+    }
+}
+
+fn the_copies_survive_a_merge_with(compact: bool) {
+    let d = dir(if compact {
+        "forms-rebase-compact"
+    } else {
+        "forms-rebase"
+    });
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(4 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        forms_settle_backlog_pct: 0,
+        commit_forms: true,
+        forms_carry: true,
+        forms_rebase: true,
+        segment: supdb::SegmentOptions {
+            compact_records: compact,
+            ..Default::default()
+        },
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..3000u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    let parts = db.levels().0;
+    assert!(parts > 1, "several partitions");
+    let mut sink = 0usize;
+    // Every key of the first half updated, so its blocks are copies, and
+    // a few of the second half, so those are sparse; a handle's scan so
+    // the forms are maintained, and the pieces the seal leaves.
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v1");
+    }
+    for k in (1500..3000u32).step_by(40) {
+        m.append(&mut db, &key(k), "v1");
+    }
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    r.scan(key(0).as_bytes(), 3000, |_k, v| sink += v.len())
+        .unwrap();
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    let (held, _, _, _) = db.canonical_forms();
+    assert!(held > 0, "forms held before the merge: {held}");
+    // The merge: the flush folds the pieces into their partitions, and
+    // no key comes or goes.
+    let rebased0 = db.forms_rebased();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert_eq!(db.levels(), (parts, 0), "the pieces merged");
+    assert!(
+        db.forms_rebased() > rebased0,
+        "the forms were carried across the merge"
+    );
+    let (after, _, _, _) = db.canonical_forms();
+    assert!(after > 0, "copies survived the merge: {after}");
+    let r = db.reader().unwrap();
+    m.check(&r, "a reader over copies carried across a merge");
+    m.check(&db, "the writer over them");
+    // Writes into the carried copies, a scan so they are settled, and a
+    // delete, which a copy must drop.
+    for k in (0..3000u32).step_by(9) {
+        m.append(&mut db, &key(k), "after");
+    }
+    m.delete(&mut db, &key(33));
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    r.scan(key(0).as_bytes(), 10, |_k, v| sink += v.len())
+        .unwrap();
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    m.check(&r, "a reader after writes into the carried copies");
+    m.check(&db, "the writer after them");
+    // A merge that loses a key cuts different blocks, and the table
+    // starts afresh.
+    let rebased1 = db.forms_rebased();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert_eq!(
+        db.forms_rebased(),
+        rebased1,
+        "a merge that deleted a key is not carried"
+    );
+    m.check(&db, "after a merge that deleted a key");
+    std::hint::black_box(sink);
+}
+
 #[test]
 fn the_forms_survive_a_seal() {
     // And with `snapshot_carry`, which carries the scan snapshot across

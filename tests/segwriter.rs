@@ -501,11 +501,28 @@ fn a_run_of_one_width_is_stored_without_prefixes_and_reads_the_same() {
 /// misread: a flipped FIXED bit re-decodes a run under the other encoding.
 #[test]
 fn every_flip_in_the_key_section_fails_the_open() {
+    for compact in [false, true] {
+        every_flip_in_the_key_section_fails_the_open_with(compact);
+    }
+}
+
+fn every_flip_in_the_key_section_fails_the_open_with(compact: bool) {
     let _g = serial();
-    let dir = scratch("segwriter-indexsum");
+    let dir = scratch(if compact {
+        "segwriter-indexsum-compact"
+    } else {
+        "segwriter-indexsum"
+    });
     let path = dir.join("seg.sup");
     let data = fixed(1500, 4, 0x1D5);
-    write_bulk(&path, &data, opts());
+    write_bulk(
+        &path,
+        &data,
+        SegmentOptions {
+            compact_records: compact,
+            ..opts()
+        },
+    );
     let clean = std::fs::read(&path).unwrap();
     let (key_off, key_len) = {
         let b = open(&path);
@@ -1067,10 +1084,36 @@ fn the_computed_reserve_is_the_smallest_one_that_works() {
 /// sizes the reserve itself.
 #[test]
 fn write_sorted_matches_the_streaming_writer_and_reserves_exactly() {
+    // And with compact records, whose length the planner takes from the
+    // same rule the writer applies: a reserve short by sixteen bytes a key
+    // would fail the equality below.
+    for compact in [false, true] {
+        write_sorted_matches_with(compact);
+    }
+    // A varying width, whose compact record rebuilds `last` from the
+    // prefixes, through the same two writers.
+    write_sorted_matches_on(varlen(900, 0xBA8), true, "segwriter-batch-varlen");
+}
+
+fn write_sorted_matches_with(compact: bool) {
+    write_sorted_matches_on(
+        fixed(1500, 4, 0xBA7),
+        compact,
+        if compact {
+            "segwriter-batch-compact"
+        } else {
+            "segwriter-batch"
+        },
+    );
+}
+
+fn write_sorted_matches_on(data: Vec<(Vec<u8>, Vec<Vec<u8>>)>, compact: bool, name: &str) {
     let _g = serial();
-    let dir = scratch("segwriter-batch");
-    let o = opts();
-    let data = fixed(1500, 4, 0xBA7);
+    let dir = scratch(name);
+    let o = SegmentOptions {
+        compact_records: compact,
+        ..opts()
+    };
 
     let streamed = dir.join("streamed.sup");
     let batched = dir.join("batched.sup");
@@ -1082,7 +1125,7 @@ fn write_sorted_matches_the_streaming_writer_and_reserves_exactly() {
             (k.len(), supdb::reserve::run_len(&lens))
         })
         .collect();
-    let want = supdb::reserve::for_lengths(&lengths, o.block_size, INLINE)
+    let want = supdb::reserve::for_lengths_as(&lengths, o.block_size, INLINE, compact)
         .expect("plannable")
         .bytes();
     let write = supdb::SegmentWrite {

@@ -28,8 +28,10 @@
 /// kind byte; 0005 when an extent's byte length became a count and the top bit
 /// became the tombstone flag, which also brought inline runs; 0006 when bit 30
 /// of that word became `FIXED` and a run of one width lost its per-value
-/// length prefixes.
-pub(crate) const MAGIC: u64 = 0x5355_5044_4200_0006;
+/// length prefixes; 0007 when a record holding one inline run became compact,
+/// a four-byte header in place of its extent, flagged by the top bit of the
+/// extent count -- which an older reader would take for 32,768 extents.
+pub(crate) const MAGIC: u64 = 0x5355_5044_4200_0007;
 
 /// The superblock page: two slots in the first sector-pair of the file, which
 /// a writer alternates between.

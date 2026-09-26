@@ -1930,6 +1930,65 @@ against 2.2-3.7, lower in six pairs of six each, and the ten-percent
 burst's commits at 0.91x, five of six. Two binaries is a probe and not a
 result; the hundred-percent point sat under its own bimodality in both.
 
+#### The fully-unmerged point's two shapes, and the merge between them
+
+The hundred-percent lag point has been bimodal at every rung that seals
+during its burst, and the shapes are named now. Counted across the pass
+at a hundred thousand keys: the fast pass starts with every block's form
+held -- 1,563 of 1,563 -- builds nothing and reads 25-45M entries a
+second; the slow one starts with none published and 0-1,088 in the
+writer's tables, builds 850-1,500 copies at about 14 us each, and reads
+6-12M. A carry refused for a replaced partition separated them exactly,
+one in every slow run and none in any fast one: the partition merge that
+folds the burst's pieces had published during the burst, and the carry,
+which keeps forms only over the same partition objects, dropped them all.
+Whether that merge lands before the pass is timing, which is why the
+same binary took either shape run to run, and why a change to the
+store's size alone could move a rung from one to the other.
+
+A merge that folds updates rewrites a partition over the same keys, and a
+block's copy owns every byte of its range. `forms_rebase` carries the
+copies across a merge whose partition has the same fences, key count and
+key at every block's first rank, and drops the sparse forms, whose deltas
+splice at ranks in the old partition's records. In the probe the slow
+shape went away, twelve runs of twelve at 3.8-4.6 us a scan whether the
+merge had landed or not. `bench ab` against the arm without it: at a
+hundred thousand keys the point read 2.02x (10/12); at three hundred
+thousand the arm without it collapsed in four reps of twelve, to 4-12.6M
+against 25-37M, and with it none did -- but in the reps where both took
+the fast shape it read 0.61-0.97x, and the median came out at 0.95x
+(4/12). It keeps twice the forms (9,254 against 5,068 at the end of a
+pass), and what it keeps is maintained. It is off until the typical rep
+costs nothing; `supdb-rebase` prices it.
+
+#### The compact record, and the seal cap it moves
+
+A record whose one run is inline carried a twenty-byte extent that said
+nothing its position did not: the run is inline, starts at the tail and
+ends where the tail does. `compact_records` writes a four-byte header in
+its place -- the run's length, and its count with the fixed and tombstone
+flags above it -- from which the reader rebuilds the extent (format
+0007). The suite's record goes from 140 bytes to 124, the store from
+1.504 bytes a stored byte to 1.366 at a hundred thousand keys, and the
+device bytes of the ten-thousand-key load from 1.592 to below LMDB's
+1.494.
+
+Priced first at the Blob, the same keys at both record sizes and rounds
+alternated: a segment's scan read 0.86-0.98x the time from a hundred
+thousand keys to three million, 29 rounds of 36 faster, with point reads
+level. In the engine, against the full record in one process: at three
+hundred thousand keys the scan read 1.12x (9/12) and the fully-unmerged
+point 1.47x (11/12). At a hundred thousand, the point read 0.71x (0/12),
+ycsb-A 0.74x (1/12) and ycsb-B 0.86x (2/12) -- and ycsb-A never scans, so
+no read of a record explains it. The seal cap does: it is a share of the
+store's bytes on disk, and the same data in a denser file seals a tenth
+sooner, 1.50 MB against 1.66 at a hundred thousand keys. Over the suite's
+mixes, run back to back on one store, that is one more seal -- twenty
+snapshot builds against eighteen, twelve pairs of twelve -- landing inside
+the mixes. The record is faster wherever it is read and slower wherever
+the seal it brings on lands, so it is off until the cap is taken on the
+data rather than the file; `supdb-compact` prices it.
+
 #### Which half of the lag gap, by rung
 
 The build and the walk split by size, and the arms say which is which
