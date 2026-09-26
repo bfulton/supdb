@@ -225,6 +225,20 @@ loaded one and a fresh one for the shuffled load and the lag sweep, and
 the counters were read from the second, where no reader handle scans at
 all. Use `ab` for an option; use the series for a commit.
 
+**`ab` has a control, and it is an arm against itself.** `--arms
+supdb,supdb` runs one arm twice under the same alternation, so every
+difference it reports is the instrument's. Over three dozen quantities a
+sign test at one in twenty marks one or two by chance, and the control
+did: two runs at a hundred thousand keys marked ycsb-F ten of ten at
+p=0.002, and then the load and the scan two of twelve at p=0.039 with
+ycsb-F back at five of twelve. So `ab` marks a quantity once at p<0.05
+and twice only where Holm's step-down holds it for the whole table, and
+its last line says how many a coin would have marked. A single mark is
+a place to look, and `--pairs` prints the pairs rep by rep to look with;
+it is not a result. The order is the rep's parity, not the name: by name
+an arm against itself was always A, and the control measured standing
+first instead.
+
 **The arm order is the same in every rep, and the arm that goes first pays
 for it.** Interleaving was meant to spread a drifting machine across the
 arms, and it does, but position is not drift: `plan.arms[0]` is first in

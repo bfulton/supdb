@@ -748,19 +748,21 @@ pub fn ab(
     for rep in 0..=reps {
         // Alternate which arm goes first, so the cost of standing first
         // falls on each of them equally instead of on one of them always.
-        let order = if rep % 2 == 0 {
+        // Which one is A is the order's, not the name's: an arm set
+        // against itself is the control that says what a verdict looks
+        // like when nothing differs, and by name it would always be A.
+        let first_is_a = rep % 2 == 0;
+        let order = if first_is_a {
             [arms.0, arms.1]
         } else {
             [arms.1, arms.0]
         };
         let mut got: Vec<(String, f64)> = Vec::new();
-        let mut first_is_a = true;
         for (i, arm) in order.iter().enumerate() {
             let dir = root.join(format!("{arm}-{rep}-{i}"));
             let one = one_pass(arm, &dir, size, map_gb, plan, &payload)?;
             let _ = std::fs::remove_dir_all(&dir);
             if i == 0 {
-                first_is_a = *arm == arms.0;
                 got = one.flat();
             } else if rep > 0 {
                 // Rep zero is the warmup, as it is for a row.
@@ -801,6 +803,8 @@ pub struct AbQuantity {
     pub n: usize,
     /// Two-sided sign test over those pairs.
     pub p: f64,
+    /// The pairs themselves, (A, B), in rep order.
+    pub pairs: Vec<(f64, f64)>,
 }
 
 impl AbQuantity {
@@ -823,8 +827,27 @@ impl AbQuantity {
             up,
             n,
             p: sign_p(up, n),
+            pairs: v,
         }
     }
+}
+
+/// Which of `ps` hold at `alpha` for the family as a whole, by Holm's
+/// step-down: the smallest against `alpha / m`, the next against
+/// `alpha / (m - 1)`, and so on until one fails, which is valid however
+/// the quantities depend on each other -- and a pass's quantities do.
+pub fn holm(ps: &[f64], alpha: f64) -> Vec<bool> {
+    let mut order: Vec<usize> = (0..ps.len()).collect();
+    order.sort_by(|&i, &j| ps[i].total_cmp(&ps[j]));
+    let m = ps.len();
+    let mut held = vec![false; m];
+    for (k, &i) in order.iter().enumerate() {
+        if ps[i] > alpha / (m - k) as f64 {
+            break;
+        }
+        held[i] = true;
+    }
+    held
 }
 
 /// Two-sided sign test: the chance of a split at least this lopsided from
@@ -1175,6 +1198,29 @@ pub fn full_top(mem_total_kb: u64, value_size: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Holm's step-down against hand-worked cases: it stops at the first
+    /// failure even when a later p would clear its own, looser bound, and
+    /// a family of one is the plain test.
+    #[test]
+    fn holm_holds_what_the_family_supports_and_stops_at_the_first_miss() {
+        // Sorted: 0.001 against 0.05/4, 0.01 against 0.05/3, 0.03 against
+        // 0.05/2 fails, so 0.04 is not reached though it clears 0.05/1.
+        assert_eq!(
+            holm(&[0.03, 0.001, 0.04, 0.01], 0.05),
+            vec![false, true, false, true]
+        );
+        assert_eq!(holm(&[0.04], 0.05), vec![true]);
+        assert_eq!(holm(&[0.06], 0.05), vec![false]);
+        assert!(holm(&[], 0.05).is_empty());
+        // Thirty-six quantities at the sign test's floor for six pairs,
+        // which is what an arm against itself marks once a run: none holds.
+        let p6 = sign_p(6, 6);
+        assert!((p6 - 0.03125).abs() < 1e-12);
+        let mut ps = vec![0.5; 36];
+        ps[7] = p6;
+        assert!(holm(&ps, 0.05).iter().all(|h| !h));
+    }
 
     /// The guard in `Samples::push` is the whole reason a quantity cannot be
     /// recorded without a direction, so it is held to firing. Written after

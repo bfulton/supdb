@@ -1841,6 +1841,46 @@ a snapshot in hand at a commit is one the fill walks its bounds against
 there instead of at the first scan after -- and at these rungs the two
 places cost the same. It is off, and the arm prices it.
 
+#### The snapshot built where a block needs it
+
+A scan that finds no snapshot of the state in hand -- dropped at the
+publish before it, not yet rebuilt by a commit -- built one before it
+walked anything, and the first scan after the lag burst at three hundred
+thousand keys spent 4.4-6.5 ms of its 7-10 on it over a pass that built
+no block. `scan_lazy_snapshot` walks without one and stops at the first
+block that reads it -- a block to build, a wide form, a table to make,
+the builder's forms to install -- builds it there and goes on from that
+block's first key, which is exact: everything emitted is below that key
+and everything after is at or above it.
+
+It needed two fixes before it could be priced at all, and each was found
+by a count rather than a time. With nothing unsealed the lazy walk ran
+every scan of the drained pass at three hundred thousand keys, block by
+block, where the eager one takes a clean partition's one walk: 0.92x,
+0 of 6. An empty snapshot costs nothing to build, so the walk is lazy
+only while something is unsealed. And the walk started the builder
+ahead before it held a snapshot, so the builder sorted every unsealed
+key itself where it would have adopted the writer's: a histogram of the
+build sites over four passes read 79 builds for the eager arm and 82 for
+the lazy one, which saved two builds on the scan path and added four on
+the builder's core. The builder starts once the walk holds a snapshot
+now, and the same histogram reads 73.
+
+Then it is flat. Ten pairs at three hundred thousand keys mark nothing
+that holds for the table, the builds over a pass level at twenty, and at
+a hundred thousand the lazy walk almost never runs. The scan path makes
+a tenth of a pass's builds; the commits' maintenance makes the rest
+whichever way the scan goes. It is off, and `supdb-lazysnap` prices it.
+
+The first pricing, before either fix, read wins at a hundred thousand
+keys -- the drained scan 1.11x and ycsb-A 1.10x, each six of six at
+p=0.031 -- on a rung where the fixed path later ran no lazy walk at all,
+and ycsb-A runs no scan. Six of six is the sign test's floor for six
+pairs, and a table of three dozen quantities marks one or two at that
+floor by chance: an arm set against itself did so twice
+(`bench/CLAUDE.md`, the ab control). `bench ab` marks a quantity twice
+now only where it holds for the table as a whole.
+
 #### Which half of the lag gap, by rung
 
 The build and the walk split by size, and the arms say which is which

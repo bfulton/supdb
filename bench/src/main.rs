@@ -7,7 +7,7 @@ use supdb_bench::{engines, env, figures, gate, row, run, Scale};
 const USAGE: &str = "\
 usage:
   bench run --scale quick|full [--out DIR] [--arms a,b,...] [--top KEYS] [--bottom KEYS] [--reps N]
-  bench ab --arms A,B [--size KEYS] [--reps N] [--len ENTRIES]
+  bench ab --arms A,B [--size KEYS] [--reps N] [--len ENTRIES] [--pairs TEXT]
   bench gate ROW.json [--runs DIR]
   bench figures [--runs DIR] [--out DIR] [--scale quick|full]
   bench machine
@@ -25,6 +25,9 @@ ab     two arms in one process, alternating and paired rep by rep, for choosing
        --size  keys (default 100000)   --reps  pairs after the warmup (default 12)
        --len   entries a scan takes (default 100). Swept, it separates what a
                scan pays once from what it pays per entry.
+       --pairs every pair, rep by rep, of each quantity whose name holds TEXT.
+       An arm against itself (--arms supdb,supdb) is the control: what a
+       verdict looks like when nothing differs.
 gate   compares ROW to the last ten rows of its class and scale under runs/ (--runs, default runs);
        exits 1 if any quantity is worse than every one of them
 figures draws every figure for the latest row of each class at --scale (default full) into
@@ -181,10 +184,13 @@ fn cmd_ab(a: Args) -> i32 {
         "\n{:<34} {:>13} {:>13} {:>8} {:>9} {:>8}",
         "quantity", a0, b0, "B/A", "B above A", "sign p"
     );
-    for q in &got {
+    let held = run::holm(&got.iter().map(|q| q.p).collect::<Vec<_>>(), 0.05);
+    for (q, held) in got.iter().zip(&held) {
         // A ratio is only the size of the thing; the sign test is whether
         // there is a thing. Marked where a coin would give this or worse
-        // less than one time in twenty.
+        // less than one time in twenty, and marked twice where that holds
+        // for the table as a whole: an arm against itself marks one or
+        // two of its three dozen quantities once.
         let ratio = if q.a != 0.0 { q.b / q.a } else { f64::NAN };
         println!(
             "{:<34} {:>13.4} {:>13.4} {:>7.3}x {:>5}/{:<3} {:>8.3}{}",
@@ -195,8 +201,29 @@ fn cmd_ab(a: Args) -> i32 {
             q.up,
             q.n,
             q.p,
-            if q.p < 0.05 { "  *" } else { "" }
+            match (held, q.p < 0.05) {
+                (true, _) => "  **",
+                (false, true) => "  *",
+                _ => "",
+            }
         );
+    }
+    let marked = got.iter().filter(|q| q.p < 0.05).count();
+    println!(
+        "\n{} quantities: {marked} marked *, where a coin marks about {:.1}; {} marked **, \
+         which holds for the table as a whole (Holm)",
+        got.len(),
+        got.len() as f64 * 0.05,
+        held.iter().filter(|h| **h).count()
+    );
+    if let Some(text) = a.get("--pairs") {
+        for q in got.iter().filter(|q| q.quantity.contains(text)) {
+            println!("\n{} by rep (A first on even reps):", q.quantity);
+            for (i, (x, y)) in q.pairs.iter().enumerate() {
+                let r = if *x != 0.0 { y / x } else { f64::NAN };
+                println!("  rep {:>3}  {:>15.2} {:>15.2}  {:>7.3}x", i + 1, x, y, r);
+            }
+        }
     }
     0
 }

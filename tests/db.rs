@@ -1723,6 +1723,33 @@ impl ScanModel {
             .map(|(k, _)| k.as_slice())
             .collect()
     }
+    /// One scan against the model, stream and count.
+    fn check_one(&self, db: &Reader, from: &[u8], limit: usize, state: &str) {
+        let mut want: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut want_n = 0usize;
+        for k in self.visited().iter().filter(|k| **k >= from).take(limit) {
+            want_n += 1;
+            for v in &self.vals[*k] {
+                want.push((k.to_vec(), v.clone()));
+            }
+        }
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let n = db
+            .scan(from, limit, |k, v| got.push((k.to_vec(), v.to_vec())))
+            .unwrap();
+        assert_eq!(
+            got,
+            want,
+            "{state}: scan from {:?} limit {limit}",
+            String::from_utf8_lossy(from)
+        );
+        assert_eq!(
+            n,
+            want_n,
+            "{state}: count from {:?} limit {limit}",
+            String::from_utf8_lossy(from)
+        );
+    }
     /// Every scan the store can be asked for, against the model: from every
     /// visited key, from between them, from below and from past the end,
     /// at limits from one to unbounded. Both the stream and the count.
@@ -5576,4 +5603,124 @@ fn a_replacing_write_patches_a_copy_in_place() {
         "a longer run is appended: {blocks2} blocks {bytes2} bytes from {blocks} {bytes}"
     );
     m.check(&db, "copies patched with a longer run");
+}
+
+/// A scan that finds no snapshot of its state -- dropped at the publish
+/// before it -- walks the forms it holds without building one, and at the
+/// first block that needs one builds it and goes on from that block's
+/// first key. Both halves against the model, and each held to having taken
+/// the path it is about: a scan over held forms alone, which builds
+/// nothing, and one that runs from held blocks into blocks with no form,
+/// which builds once and must answer what one uninterrupted walk would.
+#[test]
+fn a_scan_builds_the_snapshot_only_where_a_block_needs_it() {
+    for lazy in [true, false] {
+        let d = dir(if lazy { "lazysnap" } else { "lazysnap-off" });
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(4 << 10),
+            l0_trigger: 64,
+            scan_block_cache: true,
+            scan_cache_ahead: false,
+            forms_settle_backlog_pct: 0,
+            forms_from_reader_scans: 0,
+            commit_forms: true,
+            forms_carry: true,
+            scan_lazy_snapshot: lazy,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..3000u32 {
+            m.append(&mut db, &key(k), "v0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        assert!(db.levels().0 > 1, "several partitions");
+        let mut sink = 0usize;
+        // The first half overlaid, so its blocks get forms from the fill;
+        // the second half's blocks stay without one.
+        db.scan(key(0).as_bytes(), 3000, |_k, v| sink += v.len())
+            .unwrap();
+        for k in (0..1500u32).step_by(3) {
+            m.append(&mut db, &key(k), "v1");
+        }
+        db.commit().unwrap();
+        db.scan(key(0).as_bytes(), 10, |_k, v| sink += v.len())
+            .unwrap();
+        db.commit().unwrap();
+        // More overlay, then the seal, whose landing drops the snapshot.
+        for k in (1..1500u32).step_by(7) {
+            m.append(&mut db, &key(k), "v2");
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        db.settle().unwrap();
+        assert!(db.levels().1 > 0, "the seal left a piece");
+        // A write inside the store and past every scan below, so
+        // something is unsealed: with nothing unsealed the snapshot is
+        // empty and the scan builds it. Above the store's greatest key
+        // it would open an ordered run instead.
+        m.append(&mut db, &key(2500), "v9");
+        db.commit().unwrap();
+
+        let (done0, resumed0) = db.lazy_scans();
+        let built0 = db.snapshot_builds();
+        m.check_one(&db, key(100).as_bytes(), 200, "held forms only");
+        let (done1, resumed1) = db.lazy_scans();
+        if lazy {
+            assert_eq!(
+                (done1 - done0, resumed1 - resumed0),
+                (1, 0),
+                "the first scan walked held forms without a snapshot"
+            );
+            assert_eq!(db.snapshot_builds(), built0, "and built none");
+        }
+        let built1 = db.snapshot_builds();
+        m.check_one(
+            &db,
+            key(1400).as_bytes(),
+            500,
+            "held forms into bare blocks",
+        );
+        let (done2, resumed2) = db.lazy_scans();
+        if lazy {
+            assert_eq!(
+                (done2 - done1, resumed2 - resumed1),
+                (0, 1),
+                "the second scan stopped at a block with no form"
+            );
+            assert_eq!(
+                db.snapshot_builds(),
+                built1 + 1,
+                "and built the snapshot once"
+            );
+        }
+        // A second landing, and a scan whose very first block has no form:
+        // the walk stops before emitting anything and goes on from the
+        // scan's own start.
+        for k in (2..1500u32).step_by(11) {
+            m.append(&mut db, &key(k), "v3");
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        db.settle().unwrap();
+        m.append(&mut db, &key(2600), "v9");
+        db.commit().unwrap();
+        let (done3, resumed3) = db.lazy_scans();
+        m.check_one(&db, key(2100).as_bytes(), 50, "a bare first block");
+        let (done4, resumed4) = db.lazy_scans();
+        if lazy {
+            assert_eq!(
+                (done4 - done3, resumed4 - resumed3),
+                (0, 1),
+                "the scan stopped at its first block"
+            );
+        }
+        // Everything, now that the snapshot stands.
+        m.check(&db, if lazy { "lazy, after" } else { "eager, after" });
+    }
 }

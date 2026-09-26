@@ -366,6 +366,9 @@ pub struct Supdb {
     /// The writer's scan snapshot carried across a publish rather than
     /// dropped. `supdb-snapcarry`.
     snapcarry: bool,
+    /// A scan builds the snapshot only at a block that needs it rather
+    /// than before it walks anything. `supdb-lazysnap`.
+    lazysnap: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -427,6 +430,9 @@ struct Policy {
     /// The writer's scan snapshot carried across a publish rather than
     /// dropped. `supdb-snapcarry`.
     snapcarry: bool,
+    /// A scan builds the snapshot only at a block that needs it rather
+    /// than before it walks anything. `supdb-lazysnap`.
+    lazysnap: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -474,6 +480,7 @@ impl Default for Policy {
             carry: true,
             rebuild: 0,
             snapcarry: false,
+            lazysnap: false,
             tier: None,
             runs: false,
             keeper: false,
@@ -609,6 +616,20 @@ impl Supdb {
             path,
             Policy {
                 snapcarry: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the scan snapshot built only at a block that needs
+    /// it, rather than before a scan walks anything. Against `supdb` it
+    /// prices the lazy snapshot: the first scan after a publish over forms
+    /// the writer holds.
+    pub fn create_lazysnap(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                lazysnap: true,
                 ..Policy::default()
             },
         )
@@ -857,6 +878,7 @@ impl Supdb {
             carry,
             rebuild,
             snapcarry,
+            lazysnap,
             tier,
             runs,
             keeper,
@@ -938,6 +960,7 @@ impl Supdb {
             forms_carry: carry,
             forms_settle_rebuild_from: rebuild,
             snapshot_carry: snapcarry,
+            scan_lazy_snapshot: lazysnap,
             // The pieces over a range merged into one piece beside the
             // partition merge, or left for it as the engine has it.
             tier_pieces: tier.unwrap_or(supdb::Options::default().tier_pieces),
@@ -1002,6 +1025,7 @@ impl Supdb {
             carry,
             rebuild,
             snapcarry,
+            lazysnap,
             tier,
             runs,
             keeper,
@@ -1052,6 +1076,9 @@ impl Engine for Supdb {
         }
         if self.snapcarry {
             return "supdb-snapcarry";
+        }
+        if self.lazysnap {
+            return "supdb-lazysnap";
         }
         if self.tier.is_some_and(|t| t > 0) {
             return "supdb-tier";
@@ -1172,6 +1199,8 @@ impl Engine for Supdb {
             ("canon_hit", db.canonical_tries().1 as f64),
             ("forms_held_at_end", forms as f64),
             ("form_bytes_at_end", form_bytes as f64),
+            ("lazy_scans_done", db.lazy_scans().0 as f64),
+            ("lazy_scans_resumed", db.lazy_scans().1 as f64),
         ]
     }
     fn thread_reader(&self) -> Res<ReaderOpener> {
@@ -1611,9 +1640,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         "supdb" | "supdb-forms" | "supdb-settle" | "supdb-wforms" | "supdb-regime"
         | "supdb-noseal" | "supdb-ahead" | "supdb-lazyforms" | "supdb-eager" | "supdb-nosettle"
         | "supdb-recency" | "supdb-nocarry" | "supdb-rebuild" | "supdb-snapcarry"
-        | "supdb-tier" | "supdb-runs" | "supdb-keeper" | "supdb-aheadpub" | "supdb-pubalways"
-        | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb"
-        | "rocksdb-tuned" => Guarantee::Durable,
+        | "supdb-lazysnap" | "supdb-tier" | "supdb-runs" | "supdb-keeper" | "supdb-aheadpub"
+        | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache"
+        | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
     })
@@ -1632,6 +1661,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocarry" => Box::new(Supdb::create_nocarry(dir)?),
         "supdb-rebuild" => Box::new(Supdb::create_rebuild(dir)?),
         "supdb-snapcarry" => Box::new(Supdb::create_snapcarry(dir)?),
+        "supdb-lazysnap" => Box::new(Supdb::create_lazysnap(dir)?),
         "supdb-tier" => Box::new(Supdb::create_tier(dir)?),
         "supdb-runs" => Box::new(Supdb::create_runs(dir)?),
         "supdb-keeper" => Box::new(Supdb::create_keeper(dir)?),

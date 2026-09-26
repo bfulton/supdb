@@ -673,6 +673,27 @@ pub struct Options {
     /// after a tenth of the store rewritten was at half of LMDB either
     /// way this engine charged it to the reads.
     pub forms_settle_backlog_pct: usize,
+    /// EXPERIMENT: a scan builds the snapshot only when a block it
+    /// reaches needs one. A block held as a sparse form, a copy or a
+    /// clean one is walked from the form and the partition alone; only a
+    /// block to be built, a wide form, a table to be made or the
+    /// builder's forms to be installed read the snapshot. So a scan that
+    /// finds the snapshot gone -- dropped at the publish before it, and
+    /// not yet rebuilt by a commit -- walks what it can without one and,
+    /// at the first block that needs it, builds it and goes on from that
+    /// block's first key, which is exact: everything it emitted is below
+    /// that key and everything after is at or above it.
+    ///
+    /// The first scan after the lag burst at three hundred thousand keys
+    /// rebuilt the snapshot for 4.4-6.5 ms of its 7-10 over a pass that
+    /// built no block, and so never read what it had built. In the suite
+    /// it prices flat: `bench ab` against `supdb-lazysnap` at a hundred
+    /// thousand and three hundred thousand keys marks nothing that holds
+    /// for the table, and the snapshots built over a pass come out level
+    /// -- the scan's builds are a tenth of a pass's, and the commits'
+    /// maintenance makes the rest either way. Off until a measurement
+    /// says otherwise; `docs/engine.md` has the two fixes it needed first.
+    pub scan_lazy_snapshot: bool,
     /// EXPERIMENT: the writer's scan snapshot carried across a publish
     /// rather than dropped, by the cases `carry_snapshot` knows: whole
     /// across a merge, and its live entries made frozen ones across a
@@ -862,6 +883,7 @@ impl Default for Options {
             forms_max_unsealed_pct: 0,
             forms_settle_backlog_pct: 2,
             snapshot_carry: false,
+            scan_lazy_snapshot: false,
             forms_settle_rebuild_from: 0,
             forms_settle_recent_pct: 0,
             forms_carry: true,
@@ -5388,6 +5410,10 @@ pub struct Reader {
     /// promotions, drops by a write, walks over a copy, walks over the
     /// cheap form, and the copies' bytes.
     choices: std::cell::Cell<[u64; 5]>,
+    /// What the lazy snapshot did, for a measurement and for the test
+    /// that must know the path was taken: scans that finished without a
+    /// snapshot, and scans that stopped to build one and went on.
+    lazy_scans: std::cell::Cell<[u64; 2]>,
     /// EXPERIMENT: what the settles met, for a measurement of the
     /// backlog's density: settles, keys, blocks those keys fall in, and
     /// blocks at or past `Options::forms_settle_rebuild_from`.
@@ -5846,6 +5872,14 @@ struct Snapshot {
     /// walked the run against every boundary for 280 us at three
     /// hundred thousand keys.
     bounds: std::sync::Arc<std::sync::RwLock<SnapById>>,
+}
+
+/// What `scan_blocks` did: walked to the limit or the store's end, or
+/// stopped at a block that needs the snapshot it was not given, with the
+/// entries emitted so far and the key the walk goes on from.
+enum Walk {
+    Done(usize),
+    Resume { seen: usize, from: Vec<u8> },
 }
 
 /// Entries a filing may leave in `fresh` before it is folded into `side`.
@@ -7018,6 +7052,39 @@ impl Reader {
         if use_cache && moved {
             self.settle_pending()?;
         }
+        // No snapshot of this state in hand: walk without one, and build
+        // it at the first block that needs it. See
+        // `Options::scan_lazy_snapshot`.
+        // With nothing unsealed the snapshot is empty and costs nothing to
+        // build, and walking without one gives up the clean partition's
+        // one walk: the drained scan pass at three hundred thousand keys
+        // ran lazily every scan, block by block, and read 0.92x.
+        let absent = self
+            .scan_keys
+            .borrow()
+            .as_ref()
+            .is_none_or(|(g, _)| *g != gen);
+        let unsealed_any = !self.mem().is_empty() || self.frozen().is_some();
+        if use_cache && absent && unsealed_any && self.opts.scan_lazy_snapshot {
+            let mut counts = self.lazy_scans.get();
+            let (seen, from) = match self.scan_blocks(from, limit, None, false, &mut f)? {
+                Walk::Done(n) => {
+                    counts[0] += 1;
+                    self.lazy_scans.set(counts);
+                    return Ok(n);
+                }
+                Walk::Resume { seen, from } => (seen, from),
+            };
+            counts[1] += 1;
+            self.lazy_scans.set(counts);
+            self.refresh_snapshot(gen, use_cache, true);
+            let cache = self.scan_keys.borrow();
+            let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
+            return match self.scan_blocks(&from, limit - seen, Some(unsealed), true, &mut f)? {
+                Walk::Done(n) => Ok(seen + n),
+                Walk::Resume { .. } => Err(err("block scan: resumed without a snapshot")),
+            };
+        }
         self.refresh_snapshot(gen, use_cache, moved);
         let cache = self.scan_keys.borrow();
         let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
@@ -7028,7 +7095,10 @@ impl Reader {
         // store of three million keys, half a microsecond of a far scan's
         // three, for a number nothing read.
         if use_cache {
-            return self.scan_blocks(from, limit, unsealed, f);
+            return match self.scan_blocks(from, limit, Some(unsealed), false, &mut f)? {
+                Walk::Done(n) => Ok(n),
+                Walk::Resume { .. } => Err(err("block scan: stopped with a snapshot in hand")),
+            };
         }
         let mut mc = unsealed.cursor(from);
 
@@ -7265,6 +7335,15 @@ impl Reader {
     /// over the block spliced in -- the snapshot's run over it and the
     /// keys filed since, which is what a build here would have merged --
     /// so the installed block equals one built here.
+    /// Whether the builder ahead has forms waiting to be installed, which
+    /// `install_ahead` would take; nothing is taken here.
+    fn ahead_posted(&self) -> bool {
+        self.ahead
+            .borrow()
+            .as_ref()
+            .is_some_and(|a| !a.done.get() && a.posted.load(std::sync::atomic::Ordering::Acquire))
+    }
+
     fn install_ahead(&self, unsealed: &Snapshot) -> Result<()> {
         let mut ahead = self.ahead.borrow_mut();
         let Some(a) = ahead.as_mut() else {
@@ -7759,6 +7838,15 @@ impl Reader {
     /// blocks those keys fall in, and the blocks at or past
     /// `Options::forms_settle_rebuild_from`. Keys over blocks is what
     /// decides a patch against a build.
+    /// Scans that finished without building the snapshot, and scans
+    /// that built it at a block that needed it and went on; see
+    /// `Options::scan_lazy_snapshot`.
+    #[doc(hidden)]
+    pub fn lazy_scans(&self) -> (u64, u64) {
+        let v = self.lazy_scans.get();
+        (v[0], v[1])
+    }
+
     #[doc(hidden)]
     pub fn settle_density(&self) -> [u64; 4] {
         self.settle_density.get()
@@ -8779,21 +8867,48 @@ impl Reader {
     /// block by block: a cached copy is walked, a clean block is walked in
     /// the partition, a sparse one with its deltas, and a block not yet
     /// seen is built first.
+    /// With `unsealed` absent the walk goes as far as it can without the
+    /// snapshot and returns `Walk::Resume` at the first block that needs
+    /// it, before emitting anything from that block; `resumed` is the
+    /// same scan going on, which counts nothing twice.
     fn scan_blocks<F: FnMut(&[u8], &[u8])>(
         &self,
         from: &[u8],
         limit: usize,
-        unsealed: &Snapshot,
-        mut f: F,
-    ) -> Result<usize> {
+        unsealed: Option<&Snapshot>,
+        resumed: bool,
+        f: &mut F,
+    ) -> Result<Walk> {
+        let lazy = unsealed.is_none();
         let np = self.segs().partition_point(|s| s.level > 0);
         let l0 = &self.segs()[np..];
-        let tick = self.scan_tick.get().wrapping_add(1);
-        self.scan_tick.set(tick);
-        if self.opts.scan_cache_ahead && self.ahead.borrow().is_none() {
+        let tick = if resumed {
+            self.scan_tick.get()
+        } else {
+            let t = self.scan_tick.get().wrapping_add(1);
+            self.scan_tick.set(t);
+            t
+        };
+        // The builder adopts the snapshot this walk holds, and started
+        // without one it sorts every unsealed key itself: a lazy walk
+        // that started it made four builds on the builder's core over
+        // four passes at three hundred thousand keys that the eager
+        // scan never made, twice what the lazy scans saved.
+        if self.opts.scan_cache_ahead && self.ahead.borrow().is_none() && !lazy {
             self.start_ahead();
         }
-        self.install_ahead(unsealed)?;
+        match unsealed {
+            Some(unsealed) => self.install_ahead(unsealed)?,
+            // The builder's forms are spliced against the snapshot, so a
+            // scan with forms waiting starts from the snapshot.
+            None if self.ahead_posted() => {
+                return Ok(Walk::Resume {
+                    seen: 0,
+                    from: from.to_vec(),
+                });
+            }
+            None => {}
+        }
         // EXPERIMENT: a reader handle whose watermark is the commit the
         // canonical forms were maintained at walks them and builds
         // nothing; with the table complete, a block with no form is
@@ -8805,7 +8920,7 @@ impl Reader {
         // handle says so once per commit -- the count is compared, not
         // read -- so four handles scanning do not bump one line a
         // thousand times a millisecond.
-        if self.opts.commit_forms || self.opts.snapshot_keeper {
+        if (self.opts.commit_forms || self.opts.snapshot_keeper) && !resumed {
             let now = (st.gen, self.mem().committed_log());
             let signal = self.slot.is_none() || self.signalled.replace(now) != now;
             if signal {
@@ -8820,7 +8935,7 @@ impl Reader {
             && self
                 .forms_bound()
                 .is_some_and(|n| st.forms_at.load(AtomicOrdering::Acquire) == n);
-        if self.opts.commit_forms && self.forms_bound().is_some() {
+        if self.opts.commit_forms && self.forms_bound().is_some() && !resumed {
             match self.slot {
                 Some(slot) => {
                     let s = &self.shared.readers.slots[slot];
@@ -8882,14 +8997,29 @@ impl Reader {
             let tables = self.tables.borrow();
             let mut held = tables[pi].borrow_mut();
             if held.is_none() {
+                // A table is made against the snapshot's bounds.
+                let Some(unsealed) = unsealed else {
+                    return Ok(Walk::Resume {
+                        seen,
+                        from: cursor.to_vec(),
+                    });
+                };
                 *held = Some(self.make_table(seg, l0, unsealed)?);
                 self.cache_used.set(true);
             }
             let table = held.as_mut().expect("just made");
-            if table.snap_gen != self.snap_gen.get() {
-                table.resnap(seg, unsealed, self.snap_gen.get());
+            if let Some(unsealed) = unsealed {
+                if table.snap_gen != self.snap_gen.get() {
+                    table.resnap(seg, unsealed, self.snap_gen.get());
+                }
             }
-            if table.clean_throughout() && !canonical {
+            // Clean throughout is a statement about the snapshot's span
+            // over the partition, which is re-taken above only with a
+            // snapshot in hand: a carry leaves the span empty, so without
+            // one the shortcut would walk the partition past every
+            // unsealed key over it. The blocks below answer rightly
+            // either way.
+            if unsealed.is_some() && table.clean_throughout() && !canonical {
                 // The suite's scan workload, and any store between a flush
                 // and its next write: one walk from the seek, as the bulk
                 // walk makes it. Measured through the blocks it was a
@@ -8898,7 +9028,7 @@ impl Reader {
                     let want = (keys - rank).min(limit - seen);
                     let got = seg
                         .blob
-                        .scan_at(rank, want, &mut f)
+                        .scan_at(rank, want, &mut *f)
                         .map_err(|e| err(&format!("segment scan: {e}")))?;
                     if got < want {
                         return Err(err(
@@ -8940,6 +9070,36 @@ impl Reader {
                         None if complete => Some(&Cached::Clean),
                         None => None,
                     };
+                // A block to build, or one held wide, reads the
+                // snapshot: without one the walk stops here, before this
+                // block emits anything, and goes on from the block's
+                // first key -- the scan's own start for its first block,
+                // the partition's record at the block's first rank for
+                // any after, since every key a block holds is at or
+                // above that record and every key before it belongs to
+                // a block already walked.
+                let wants_snapshot = canon.is_none()
+                    && matches!(table.slots[b].as_deref(), None | Some(Cached::Wide(_)));
+                let unsealed = match unsealed {
+                    Some(u) => u,
+                    None if wants_snapshot => {
+                        self.count_takes(takes);
+                        let from = if first {
+                            cursor.to_vec()
+                        } else {
+                            seg.blob
+                                .key_at(lo)
+                                .ok_or_else(|| {
+                                    err("block scan: a block's first rank did not resolve")
+                                })?
+                                .to_vec()
+                        };
+                        return Ok(Walk::Resume { seen, from });
+                    }
+                    // Nothing below reads it for a block held as another
+                    // form; the empty one stands in.
+                    None => &NO_SNAPSHOT,
+                };
                 if canon.is_none() && table.slots[b].is_none() {
                     let built = std::sync::Arc::new(ctx.materialize(src, table, b, unsealed)?);
                     self.count_built();
@@ -9056,7 +9216,7 @@ impl Reader {
                             deltas,
                             from_key,
                             limit - seen,
-                            &mut f,
+                            &mut *f,
                         )?;
                     }
                     Cached::Clean => {
@@ -9087,7 +9247,7 @@ impl Reader {
                             let want = (run_hi - start).min(limit - seen);
                             let got = seg
                                 .blob
-                                .scan_at(start, want, &mut f)
+                                .scan_at(start, want, &mut *f)
                                 .map_err(|e| err(&format!("segment scan: {e}")))?;
                             if got < want {
                                 return Err(err("segment scan: a partition's walk stopped short of its key count"));
@@ -9110,7 +9270,7 @@ impl Reader {
                         let window = (from_key, limit - seen);
                         let ov = ctx.overlay_window(src, table, b, unsealed, w, window)?;
                         seen +=
-                            ctx.walk_block(src, start..hi, &ov, limit - seen, |_k| {}, &mut f)?;
+                            ctx.walk_block(src, start..hi, &ov, limit - seen, |_k| {}, &mut *f)?;
                     }
                 }
                 // What this read took from the block is what pays for a
@@ -9119,7 +9279,9 @@ impl Reader {
                 // anything to gain: a clean one is already the bulk
                 // walk's, and a dense cheap form is a copy already.
                 let promote = self.opts.promote_entries;
-                if promote > 0 && table.dense[b].is_none() {
+                // A copy is built from the snapshot; a walk without one
+                // leaves the promotion to the next.
+                if promote > 0 && !lazy && table.dense[b].is_none() {
                     let took = (seen - took_from) as u32;
                     table.reads[b] = table.reads[b].saturating_add(took);
                     // A walked block is copied only below the wide bound:
@@ -9156,7 +9318,7 @@ impl Reader {
                 None => break,
             }
         }
-        Ok(seen)
+        Ok(Walk::Done(seen))
     }
 
     /// PROTOTYPE: the cache's blocks by kind, for a measurement: clean,
@@ -10017,6 +10179,7 @@ impl Db {
             log_counted: std::cell::Cell::new((0, 0)),
             choices: std::cell::Cell::new([0; 5]),
             settle_density: std::cell::Cell::new([0; 4]),
+            lazy_scans: std::cell::Cell::new([0; 2]),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),
             snap_stale: std::cell::RefCell::new(std::collections::HashSet::new()),
@@ -10326,6 +10489,7 @@ impl Db {
             log_counted: std::cell::Cell::new((0, 0)),
             choices: std::cell::Cell::new([0; 5]),
             settle_density: std::cell::Cell::new([0; 4]),
+            lazy_scans: std::cell::Cell::new([0; 2]),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),
             snap_stale: std::cell::RefCell::new(std::collections::HashSet::new()),
@@ -11270,6 +11434,7 @@ impl Reader {
             log_counted: std::cell::Cell::new((0, 0)),
             choices: std::cell::Cell::new([0; 5]),
             settle_density: std::cell::Cell::new([0; 4]),
+            lazy_scans: std::cell::Cell::new([0; 2]),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),
             snap_stale: std::cell::RefCell::new(std::collections::HashSet::new()),
