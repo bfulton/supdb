@@ -1881,6 +1881,42 @@ floor by chance: an arm set against itself did so twice
 (`bench/CLAUDE.md`, the ab control). `bench ab` marks a quantity twice
 now only where it holds for the table as a whole.
 
+#### The snapshot's build, a sort and two gathers
+
+The first scan after the hundred-percent lag burst at three hundred
+thousand keys spent 8.6 ms before it walked anything: 3.7 ms settling the
+burst's backlog into the forms and 4.8 ms building the scan snapshot over
+34,203 unsealed keys, 31,211 of them in the frozen table of a seal still in
+flight. The same build ran about sixteen times inside the burst, at the
+commits that maintain the forms. Timed by phase in the probe, a build over
+34-42 thousand keys was a third walking the tables, 2.1-4.3 ms in the
+comparison sort of the prefix records, and 0.9-2.9 ms laying the sorted
+entries down.
+
+Nothing in it needed a comparison sort. The records are two big-endian
+prefix words and an index, so an LSD radix over only the bytes that vary
+among them orders them exactly as the comparator did, stably, and the rare
+run of equal prefixes -- keys sharing sixteen bytes -- is sorted by its
+keys afterwards; the suite's keys vary in six of the sixteen bytes and take
+six passes. Alone, on the suite's key shape, it is 0.69 ms against 1.98 at
+34,000 records and 2.9-4.2x faster from three thousand to three hundred
+thousand. The fold that laid the entries down compared each key with the
+last through the arena, two scattered reads a record, where the prefixes it
+already held say whether two keys of sixteen bytes or less are the same.
+And the walk took an atomic reservation in the arena for every key, where
+the keys are the only bytes it appends and can take one between them.
+
+Over three runs of the probe the first scan's build went from 4.4-4.7 ms to
+2.3-3.4, the sort to 1.0-1.3 ms, the fold to 0.4-0.8 and the frozen table's
+walk from 1.3-1.5 to 0.8-1.2. That is a phase measured inside one binary,
+not a pass priced against another, and the pass it sits in is bimodal, so
+no figure for the lag point rests on it. The settle beside it is the larger
+cost over the whole run -- twelve percent of the probe's samples against the
+build's two, over a microsecond a key filed, spread across locating each
+key's block through the ordered index (a fifth of it), parsing the block's
+records, the memtable's tombstone check and the patch copies -- and is the
+next thing to take.
+
 #### Which half of the lag gap, by rung
 
 The build and the walk split by size, and the arms say which is which

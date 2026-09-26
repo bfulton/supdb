@@ -5736,6 +5736,21 @@ impl SnapArena {
         self.write(off, bytes);
         off
     }
+    /// `n` contiguous bytes reserved at once: the offset of the first,
+    /// and the range to write them into. For a build that appends many
+    /// keys at a time, one atomic where `append` takes one a key.
+    #[allow(clippy::mut_from_ref)]
+    fn reserve_bytes(&self, n: usize) -> (u32, &mut [u8]) {
+        if n == 0 {
+            return (self.tail.load(AtomicOrdering::Relaxed) as u32, &mut []);
+        }
+        let off = self.reserve(n);
+        let (p, w) = self.block(off as usize, n);
+        // SAFETY: as in `write`: inside the block, a range this thread
+        // reserved and no reader can reach until an entry naming it is
+        // published; the caller writes it before publishing any.
+        (off, unsafe { std::slice::from_raw_parts_mut(p.add(w), n) })
+    }
 
     /// Published bytes at `off`.
     #[inline]
@@ -6142,19 +6157,25 @@ impl Snapshot {
     /// Merge a run of entries sorted by key into `ents`, folding a key
     /// present in both tables into one entry carrying both indices.
     fn push_sorted(&mut self, e: SnapKey) {
-        if let Some(last) = self.ents.last_mut() {
-            let same = self.arena.slice(last.off, last.len) == self.arena.slice(e.off, e.len);
-            if same {
-                if e.mem != u32::MAX {
-                    last.mem = e.mem;
-                    last.lrun = e.lrun;
-                }
-                if e.frozen != u32::MAX {
-                    last.frozen = e.frozen;
-                    last.frun = e.frun;
-                }
-                return;
+        let same = self.ents.last().is_some_and(|last| {
+            self.arena.slice(last.off, last.len) == self.arena.slice(e.off, e.len)
+        });
+        self.push_folded(e, same);
+    }
+
+    /// `push_sorted` with the comparison against the last entry made by
+    /// the caller: `same` folds `e` into it.
+    fn push_folded(&mut self, e: SnapKey, same: bool) {
+        if let (true, Some(last)) = (same, self.ents.last_mut()) {
+            if e.mem != u32::MAX {
+                last.mem = e.mem;
+                last.lrun = e.lrun;
             }
+            if e.frozen != u32::MAX {
+                last.frozen = e.frozen;
+                last.frun = e.frun;
+            }
+            return;
         }
         self.ents.push(e);
     }
@@ -6278,6 +6299,86 @@ mod radix {
             let mut scratch = Vec::new();
             super::radix_by_first(&mut v, &mut scratch);
             assert_eq!(v, want, "{n} keys of {bits} bits");
+        }
+    }
+
+    /// The prefix radix orders as a stable sort by both words does: over
+    /// prefixes that vary in a few low bytes (the suite's digits), in
+    /// every byte, in the first word only, with ties, and over nothing.
+    #[test]
+    fn the_prefix_radix_orders_as_a_stable_sort_by_both_words_does() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rng = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let digits = |x: u64| {
+            let (a, b) = super::key_prefix(format!("{x:016}").as_bytes());
+            (a, b)
+        };
+        for n in [0usize, 1, 2, 17, 1000, 34_000] {
+            for shape in 0..4 {
+                let mut v: Vec<(u64, u64, u32)> = (0..n)
+                    .map(|i| {
+                        let (a, b) = match shape {
+                            0 => digits(rng() % 300_000),
+                            1 => (rng(), rng()),
+                            2 => (rng() & 0xFF00_0000_0000_00FF, 7),
+                            _ => (3, rng() % 8),
+                        };
+                        (a, b, i as u32)
+                    })
+                    .collect();
+                let mut want = v.clone();
+                want.sort_by_key(|t| (t.0, t.1));
+                let mut scratch = Vec::new();
+                super::radix_by_prefix(&mut v, &mut scratch);
+                assert_eq!(v, want, "{n} records of shape {shape}");
+            }
+        }
+    }
+}
+
+/// Records ordered by their two prefix words as `(a, b)` compare, stably:
+/// an LSD radix over only the bytes that differ somewhere among them, so
+/// keys sharing a long prefix -- the suite's are sixteen digits whose
+/// first ten are the same -- take a pass per byte that varies and none
+/// for the rest.
+fn radix_by_prefix(v: &mut Vec<(u64, u64, u32)>, scratch: &mut Vec<(u64, u64, u32)>) {
+    let (mut and_a, mut or_a, mut and_b, mut or_b) = (u64::MAX, 0u64, u64::MAX, 0u64);
+    for r in v.iter() {
+        and_a &= r.0;
+        or_a |= r.0;
+        and_b &= r.1;
+        or_b |= r.1;
+    }
+    let varying = [and_b ^ or_b, and_a ^ or_a];
+    scratch.clear();
+    scratch.resize(v.len(), (0, 0, 0));
+    for (word, vary) in varying.into_iter().enumerate() {
+        let pick = |r: &(u64, u64, u32)| if word == 0 { r.1 } else { r.0 };
+        for shift in (0..64).step_by(8) {
+            if (vary >> shift) & 0xFF == 0 {
+                continue;
+            }
+            let mut counts = [0usize; 256];
+            for r in v.iter() {
+                counts[((pick(r) >> shift) & 0xFF) as usize] += 1;
+            }
+            let mut sum = 0usize;
+            for c in counts.iter_mut() {
+                let n = *c;
+                *c = sum;
+                sum += n;
+            }
+            for &r in v.iter() {
+                let b = ((pick(&r) >> shift) & 0xFF) as usize;
+                scratch[counts[b]] = r;
+                counts[b] += 1;
+            }
+            std::mem::swap(v, scratch);
         }
     }
 }
@@ -6923,17 +7024,35 @@ impl Reader {
                     (e.key_off, e.key_len, i as u32)
                 }));
                 radix_by_first(&mut order, &mut scratch);
+                // Without runs the keys are the arena's only bytes here,
+                // so they take one reservation between them and are
+                // copied in back to back; with runs each key's chain
+                // follows it, and each takes its own.
+                let (mut at, mut room) = if runs {
+                    (0, &mut [][..])
+                } else {
+                    let total: usize = order.iter().map(|t| t.1 as usize).sum();
+                    snap.arena.reserve_bytes(total)
+                };
                 for &(off, len, i) in &order {
                     let k = mem.key_at(off, len);
                     let (a, b) = key_prefix(k);
                     recs.push((a, b, pending.len() as u32));
-                    let run = if runs {
-                        snap.copy_run(mem, mem.entry(i as usize), &mut rscratch)
+                    let (run, koff) = if runs {
+                        let koff = snap.arena.append(k);
+                        (
+                            snap.copy_run(mem, mem.entry(i as usize), &mut rscratch),
+                            koff,
+                        )
                     } else {
-                        NO_RUN
+                        let (head, rest) = std::mem::take(&mut room).split_at_mut(k.len());
+                        head.copy_from_slice(k);
+                        room = rest;
+                        at += k.len() as u32;
+                        (NO_RUN, at - k.len() as u32)
                     };
                     pending.push(SnapKey {
-                        off: snap.arena.append(k),
+                        off: koff,
                         len: k.len() as u32,
                         mem: if live { i } else { u32::MAX },
                         frozen: if live { u32::MAX } else { i },
@@ -6948,17 +7067,50 @@ impl Reader {
             take(self.mem(), true);
             let arena = &snap.arena;
             let key_of = |e: &SnapKey| arena.slice(e.off, e.len);
-            recs.sort_unstable_by(|x, y| {
-                (x.0, x.1).cmp(&(y.0, y.1)).then_with(|| {
-                    key_of(&pending[x.2 as usize])
-                        .cmp(key_of(&pending[y.2 as usize]))
-                        // Frozen entries were pushed first; on a tie the
-                        // live one must come later so the fold sees it.
-                        .then(x.2.cmp(&y.2))
-                })
-            });
+            // Ordered by prefix, then key, then index -- frozen entries
+            // were pushed first, and on a tie the live one must come later
+            // so the fold sees it. A radix pass over the prefix bytes that
+            // vary is stable, which keeps the index order among equal
+            // prefixes; only a run of equal prefixes is then sorted by its
+            // keys. The comparison sort it replaced was most of a build:
+            // 2-4 ms of 4.4-10 over 34-42 thousand keys after the lag
+            // burst at three hundred thousand, where the radix takes a
+            // third of that.
+            let mut rscratch2: Vec<(u64, u64, u32)> = Vec::new();
+            radix_by_prefix(&mut recs, &mut rscratch2);
+            drop(rscratch2);
+            let mut i = 0;
+            while i < recs.len() {
+                let mut j = i + 1;
+                while j < recs.len() && (recs[j].0, recs[j].1) == (recs[i].0, recs[i].1) {
+                    j += 1;
+                }
+                if j - i > 1 {
+                    recs[i..j].sort_by(|x, y| {
+                        key_of(&pending[x.2 as usize])
+                            .cmp(key_of(&pending[y.2 as usize]))
+                            .then(x.2.cmp(&y.2))
+                    });
+                }
+                i = j;
+            }
+            // Two records with different prefixes hold different keys, and
+            // two whose prefixes and lengths agree hold the same key when
+            // it fits the prefix, so the fold reads the arena only for a
+            // longer key: the key-by-key compare `push_sorted` makes read
+            // two scattered arena slices a record.
+            let mut last: Option<(u64, u64, u32)> = None;
             for r in recs {
-                snap.push_sorted(pending[r.2 as usize]);
+                let e = pending[r.2 as usize];
+                let same = last.is_some_and(|(a, b, len)| {
+                    (a, b, len) == (r.0, r.1, e.len)
+                        && (len <= 16
+                            || snap.ents.last().is_some_and(|l| {
+                                snap.arena.slice(l.off, l.len) == snap.arena.slice(e.off, e.len)
+                            }))
+                });
+                snap.push_folded(e, same);
+                last = Some((r.0, r.1, e.len));
             }
         } else {
             // The build before it: one allocation per key, sorted through

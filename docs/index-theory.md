@@ -276,6 +276,29 @@ TLB pressure to relieve than the reach calculation implied.
 The practical reading: huge pages are worth having and cost nothing to enable,
 but they are a few percent, not a redesign.
 
+**The hash's capacity is a sawtooth, and flattening it is a trade, not a
+saving.** A segment's hash takes the smallest power of two that keeps it at
+most three quarters full, so its load is anywhere from three eighths to
+three quarters by where the key count falls: a hundred thousand keys take
+262,144 slots, 21 bytes a key, and the suite's store there weighs 1.504
+bytes a byte stored against 1.409 at three hundred thousand. Sizing the
+table exactly at three quarters -- the slot reduced by Lemire's two
+multiplies where the capacity is not a power of two, masked as before where
+it is, so a reader from before it refuses the new tables and reads the old
+ones unchanged -- flattens the curve to 1.41-1.43 at every rung. Priced at
+the Blob in one process, both shapes rebuilt every round from the same keys,
+eleven rounds: point hits read 1.02x and 1.10x the time at a hundred and
+three hundred thousand keys, within a spread of a fifth either way, and
+misses 1.54x and 1.22x, none of eleven faster. Linear probing at three
+quarters walks about eight slots to prove a key absent where three eighths
+walks two, and the misses are every level-0 piece a read passes on its way
+to a key. Averaged over key counts the power of two is about 52% full,
+fifteen bytes a key, so the exact table saves about five bytes a key -- 3%
+of the file -- for probes a read-optimized store does not want to pay. It
+was not taken. A table that gets both needs a probe that ends a miss early
+(Robin Hood, with the displacement in the slot's spare bits), which is a
+format change.
+
 ## Is one implementation enough for every machine?
 
 The tuning constants are the only part of the design that is plausibly
