@@ -2286,6 +2286,20 @@ commits are small and follow scans, so they never hold; ycsb-A's before
 it do, with the scan pass earlier still counting as reads around, and
 E then scans forms the thread patched.
 
+A sitting with the lazy start read the fully unmerged point at 1.02x,
+1.09x, **1.90x** and **1.71x**, the hundredth and tenth at three hundred
+thousand at 1.36x (15/16) and 1.13x (14/16), nothing at the small rungs
+marked -- and ycsb-E at a hundred thousand at 0.935x (2/16), its first
+mark. Over the six sittings E has read below even in ten of the twelve
+rung-sittings at a hundred and three hundred thousand, by 2-8%. That is
+a cost, small and repeatable, and it is why the default stays `Inline`:
+the window that makes the lag sweep's bursts "reads around" also makes
+ycsb-A's updates hold for a scan that comes three mixes later. A
+narrower window would stop A holding, and would stop the fully
+unmerged burst holding past the same number of writes; whether the
+burst keeps its win then is the next thing to price, not a thing this
+section knows.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and
