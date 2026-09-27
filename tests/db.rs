@@ -4636,6 +4636,80 @@ fn a_write_burst_is_settled_once_its_backlog_passes_the_bound() {
     m1.check(&db1, "bounded, after the burst");
 }
 
+/// The settle bound is a share of the partitions' keys. A level-0 piece
+/// sealed from updates holds keys a partition holds already, and summed
+/// with them the bound grew with every seal, until a batch past the share
+/// the bound meant no longer crossed it and was left for the first read
+/// to file. `forms_settle_keys_all` is the old sum.
+#[test]
+fn the_settle_bound_is_a_share_of_the_partitions_keys() {
+    let run = |all: bool| -> (bool, ScanModel, Db) {
+        let d = dir(&format!("settle-keys-{all}"));
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(2 << 10),
+            l0_trigger: 64,
+            scan_block_cache: true,
+            scan_cache_ahead: false,
+            forms_from_reader_scans: 0,
+            forms_settle_backlog_pct: 5,
+            forms_settle_recent_pct: 0,
+            forms_settle_keys_all: all,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        let key = |k: u32| format!("key-{k:05}");
+        for k in 0..1500u32 {
+            m.append(&mut db, &key(k), "v0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        db.settle().unwrap();
+        // Every key written again and sealed into pieces the partitions
+        // keep beside them: the store still holds 1,500 keys, and its
+        // segments 3,000.
+        for k in 0..1500u32 {
+            m.append(&mut db, &key(k), "v1");
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        db.settle().unwrap();
+        let (parts, pieces) = db.levels();
+        assert!(
+            parts > 1 && pieces > 0,
+            "partitions and pieces: {parts}, {pieces}"
+        );
+        let _handle = db.reader().unwrap();
+        let mut sink = 0usize;
+        db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+            .unwrap();
+        db.commit().unwrap();
+        let before = db.forms_position();
+        assert_ne!(before, usize::MAX, "maintained once");
+        // One batch of 100 writes and no read: past five percent of the
+        // partitions' 1,500 keys, short of five percent of 3,000.
+        for k in (0..1500u32).step_by(15) {
+            m.append(&mut db, &key(k), "burst");
+        }
+        db.commit().unwrap();
+        (db.forms_position() != before, m, db)
+    };
+    let (moved, m, db) = run(false);
+    assert!(
+        moved,
+        "a batch past the share of the store's keys settles at its commit"
+    );
+    m.check(&db, "the bound on the partitions' keys");
+    let (moved, m, db) = run(true);
+    assert!(
+        !moved,
+        "summed over the pieces too, the same batch falls short of the bound"
+    );
+    m.check(&db, "the bound on every segment's keys");
+}
+
 /// A block whose overlay outgrows every form but the wide one -- the
 /// last block of the last partition, which collects every key inserted
 /// past the end -- read through the canonical forms by a handle the

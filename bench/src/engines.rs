@@ -378,6 +378,9 @@ pub struct Supdb {
     /// The seal sized by the partitions' file bytes rather than the key
     /// and value bytes they hold. `supdb-sealfile`.
     sealfile: bool,
+    /// The settle bound taken on every segment's keys, level-0 pieces
+    /// included, rather than the partitions'. `supdb-settleall`.
+    settleall: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -451,6 +454,9 @@ struct Policy {
     /// The seal sized by the partitions' file bytes rather than the key
     /// and value bytes they hold. `supdb-sealfile`.
     sealfile: bool,
+    /// The settle bound taken on every segment's keys, level-0 pieces
+    /// included, rather than the partitions'. `supdb-settleall`.
+    settleall: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -502,6 +508,7 @@ impl Default for Policy {
             fullrec: false,
             norebase: false,
             sealfile: false,
+            settleall: false,
             tier: None,
             runs: false,
             keeper: false,
@@ -679,6 +686,20 @@ impl Supdb {
             path,
             Policy {
                 sealfile: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` taking the settle bound on every segment's keys, level-0
+    /// pieces included, as before. Against `supdb` it prices the bound on
+    /// the partitions': the lag sweep's pass after a burst, and the mixes'
+    /// commits, which settle more often where pieces stand.
+    pub fn create_settleall(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                settleall: true,
                 ..Policy::default()
             },
         )
@@ -944,6 +965,7 @@ impl Supdb {
             fullrec,
             norebase,
             sealfile,
+            settleall,
             tier,
             runs,
             keeper,
@@ -1028,6 +1050,8 @@ impl Supdb {
             // The seal sized by the file, as it was before the store's
             // payload was recorded.
             seal_on_file: sealfile,
+            // The settle bound on every segment's keys, as it was.
+            forms_settle_keys_all: settleall,
             forms_settle_rebuild_from: rebuild,
             snapshot_carry: snapcarry,
             scan_lazy_snapshot: lazysnap,
@@ -1099,6 +1123,7 @@ impl Supdb {
             fullrec,
             norebase,
             sealfile,
+            settleall,
             tier,
             runs,
             keeper,
@@ -1161,6 +1186,9 @@ impl Engine for Supdb {
         }
         if self.sealfile {
             return "supdb-sealfile";
+        }
+        if self.settleall {
+            return "supdb-settleall";
         }
         if self.tier.is_some_and(|t| t > 0) {
             return "supdb-tier";
@@ -1723,9 +1751,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-noseal" | "supdb-ahead" | "supdb-lazyforms" | "supdb-eager" | "supdb-nosettle"
         | "supdb-recency" | "supdb-nocarry" | "supdb-rebuild" | "supdb-snapcarry"
         | "supdb-lazysnap" | "supdb-fullrec" | "supdb-norebase" | "supdb-sealfile"
-        | "supdb-tier" | "supdb-runs" | "supdb-keeper" | "supdb-aheadpub" | "supdb-pubalways"
-        | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache" | "supdb-cache256" | "lmdb"
-        | "rocksdb-tuned" => Guarantee::Durable,
+        | "supdb-settleall" | "supdb-tier" | "supdb-runs" | "supdb-keeper" | "supdb-aheadpub"
+        | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice" | "supdb-nocache"
+        | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
     })
@@ -1748,6 +1776,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-fullrec" => Box::new(Supdb::create_fullrec(dir)?),
         "supdb-norebase" => Box::new(Supdb::create_norebase(dir)?),
         "supdb-sealfile" => Box::new(Supdb::create_sealfile(dir)?),
+        "supdb-settleall" => Box::new(Supdb::create_settleall(dir)?),
         "supdb-tier" => Box::new(Supdb::create_tier(dir)?),
         "supdb-runs" => Box::new(Supdb::create_runs(dir)?),
         "supdb-keeper" => Box::new(Supdb::create_keeper(dir)?),

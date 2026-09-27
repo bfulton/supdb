@@ -529,6 +529,20 @@ now. The rule: a flag that means "this structure exists" is set by the
 code that makes the structure, never by a caller that expects to, and
 a reset on one path is a reset on every path that shares it.
 
+**A share taken of a sum that counts one thing twice.** The settle
+bound is a share of the store's keys, and it summed every live segment:
+a level-0 piece sealed from a burst of updates holds keys a partition
+holds already, so each seal grew the bound, a commit's batch stopped
+crossing it, and the commits after a seal's publish settled every other
+time. Which of them was the burst's last came down to the seal thread's
+timing, and the lag pass at thirty thousand keys read two shapes, one
+in three reps at half speed, with every count the probe kept identical
+in both; the first scan was filing a thousand writes no counter
+counted. The rule: a share of the store is taken of its distinct keys,
+the partitions', never of a sum over versions of them; and a pass that
+reads two shapes while its counters agree is paying for something no
+counter counts, so time its phases.
+
 **A divide an entry in a walk that needed none.** The record walk
 divided a run's length by its count for the stride, and `chunks_exact`
 divided again for the remainder: a dependent chain of two 32-bit

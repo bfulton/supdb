@@ -681,6 +681,18 @@ pub struct Options {
     /// after a tenth of the store rewritten was at half of LMDB either
     /// way this engine charged it to the reads.
     pub forms_settle_backlog_pct: usize,
+    /// Take the store's keys for `forms_settle_backlog_pct` and
+    /// `forms_settle_recent_pct` as every live segment's (`true`, as they
+    /// were) rather than the partitions'. A level-0 piece sealed from a
+    /// burst of updates holds keys a partition holds already, so counting
+    /// the pieces grew the bound with every seal: at thirty thousand keys,
+    /// three pieces into the lag sweep's burst, 2% of the store was 1,040
+    /// writes against the 600 it meant, a commit of a thousand stopped
+    /// crossing it, and the commits after the seal's publish settled every
+    /// other time. Whether the last one did came down to where the seal
+    /// published, and when it did not, the first scan filed its thousand
+    /// writes -- 0.5-0.8 ms of a pass of 0.45. Kept as the comparison arm.
+    pub forms_settle_keys_all: bool,
     /// EXPERIMENT: a scan builds the snapshot only when a block it
     /// reaches needs one. A block held as a sparse form, a copy or a
     /// clean one is walked from the form and the partition alone; only a
@@ -900,6 +912,7 @@ impl Default for Options {
             forms_publish_lazily: true,
             forms_max_unsealed_pct: 0,
             forms_settle_backlog_pct: 2,
+            forms_settle_keys_all: false,
             snapshot_carry: false,
             scan_lazy_snapshot: false,
             forms_settle_rebuild_from: 0,
@@ -8363,7 +8376,16 @@ impl Reader {
         // past the position this handle last read it to.
         let log_len = self.mem().log_len();
         let backlog = log_len.saturating_sub(self.log_seen.get());
-        let keys: usize = self.segs().iter().map(|s| s.blob.keys()).sum();
+        // The store's keys are the partitions': a level-0 piece sealed
+        // from a burst of updates holds keys a partition holds already,
+        // and counted again the bound grew with every seal. See
+        // `Options::forms_settle_keys_all`.
+        let keys: usize = self
+            .segs()
+            .iter()
+            .filter(|s| s.level > 0 || self.opts.forms_settle_keys_all)
+            .map(|s| s.blob.keys())
+            .sum();
         // The bound is a share of the store's keys and not a count, for
         // the reason the seal cap's floor is: a count that is free at one
         // rung is five settles at the next.

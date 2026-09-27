@@ -795,6 +795,24 @@ while the cache refills. The bound decides which mix files a burst's
 tail, and D is the one committing when it crosses; under five percent
 the same tail waited for E's first scan.
 
+The store's keys are the partitions'. The bound first summed every live
+segment, and a level-0 piece sealed from a burst of updates holds keys
+a partition holds already, so each seal of the lag sweep's burst grew
+the bound: at thirty thousand keys, three pieces in, 2% was 1,040
+writes against the 600 meant, a commit of a thousand stopped crossing
+it, and the commits after the seal's publish settled every other time.
+Whether the burst's last commit was one that settled came down to where
+the seal published, which is the seal thread's timing, and when it was
+not, the first scan filed the thousand writes: 0.5-0.8 ms of a pass of
+0.45. The pass read two shapes, 22-33M entries a second in six reps of
+sixteen and 55-85M in the rest, and every count the probe kept was the
+same in both until the settle was timed on its own. Taken on the
+partitions (`forms_settle_keys_all` is the old sum), sixteen pairs at
+thirty thousand keys read the point at 1.17x (14/16, p=0.004) and never
+took the slow shape; at ten thousand no piece stands when the bound is
+asked and the arms are the same store; at a hundred and three hundred
+thousand nothing the sign test sees moved, mixes included.
+
 What a settled write costs was then taken apart with both instruments,
 and they disagreed the way the profiling notes say they will. Callgrind
 put a write at about 3,000 instructions: two fifths in `malloc`,
