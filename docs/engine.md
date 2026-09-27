@@ -2151,8 +2151,10 @@ rules that keep one structure on two threads correct:
   state is the writer's publish.
 - The forms it publishes are stamped with the commit it was named, not
   the writer's latest: stamped later, a handle at that later commit
-  takes forms without the writes between. The threaded test kills that
-  mutant in every run.
+  takes forms without the writes between. The threaded test at level 1
+  kills that mutant in every run; under a hold the writer has committed
+  nothing past the named commit, the two stamps agree, and the test at
+  level 3 cannot tell them apart.
 - Retired forms and snapshots are swept only by whoever holds the
   upkeep: swept by the writer while it is lent, a form the thread had
   just replaced could go under the thread's own read.
@@ -2164,8 +2166,8 @@ rules that keep one structure on two threads correct:
   thread untouched. The first version joined it last, and a test that
   asked for the thread's work after a settle found it had never run.
 
-A commit wakes the thread only for a batch of 256 writes or more; a
-smaller one waits for its poll, a hundred microseconds after a pass and
+A commit that does not hold wakes the thread only for a batch of 256
+writes or more; a smaller one waits for its poll, a hundred microseconds after a pass and
 doubling to twenty milliseconds while nothing is lent, or for the read
 that takes the upkeep back and files it itself. A wake is a futex call
 and an interrupt to an idle core, which on this guest is a VM exit the
@@ -2180,8 +2182,46 @@ Testing it found a defect older than it: a handle took the log length
 it settles to and the watermark it reads under as two loads of words
 the commit stored in turn, and could hold one commit's length with the
 watermark before it ("Read and write concurrency" below has the marks
-that fixed it). It is off until priced; `supdb-upkeep` is level 2 against the
-default.
+that fixed it).
+
+Priced first with every commit lending and none waiting, `supdb-upkeep`
+(level 2) against the default, sixteen pairs a rung, won the fully
+unmerged lag point at a hundred and three hundred thousand keys, 1.28x
+and 1.33x, and ycsb-D and F at three hundred thousand, and lost the
+tenth-unmerged point at every rung, 0.38x at ten thousand to 0.79x at
+thirty, and most of the small rungs' lag points besides. The probe
+with the sweep's shape said why, and it was not the scans: at a hundred
+thousand keys and a tenth unmerged, the burst took 10-13 ms against
+20-24 inline, because the writer no longer settled, and the thread was
+a commit or two behind when it ended, so the first scan waited 0.3-0.7
+ms for the pass in flight and filed the rest itself, 0.4-1.6 ms against
+10 µs inline, whose burst's last commit had filed everything. The
+thread had moved the bill from the burst, which the sweep does not
+time, to the first scan, which it does.
+
+So with reads around, a commit holds: it wakes the thread, and returns
+only once the thread has filed it, which costs the longer of the
+barrier and the pass instead of their sum; at level 2 a batch too small
+to wake the thread for is filed by the commit itself, where level 3
+holds for it too; and with no reads around the thread still takes the
+burst without anyone waiting for it. The
+probe's first scan came back to inline's 6-17 µs at the tenth point,
+and to 56-62 µs against 1.8-1.9 ms at the fully unmerged one, whose
+snapshot the thread had extended during the burst. Priced again,
+sixteen pairs a rung:
+
+| | 10k | 30k | 100k | 300k |
+|---|---|---|---|---|
+| scan-lag, all of it unmerged | 0.76x (ns) | 0.89x (ns) | **1.59x** | **1.75x** |
+| scan-lag, a tenth | 0.89x (ns) | 0.99x | 0.98x | 1.23x (ns) |
+| scan-lag, a hundredth | 0.98x | 1.00x | 1.01x | 1.28x (14/16) |
+| ycsb-D | 0.97x | 1.13x (13/16) | 1.00x | 1.08x (ns) |
+| ycsb-B | 0.85x (3/16) | 1.08x | 0.92x (ns) | 1.04x |
+
+Bold is 16/16 and holds under Holm; nothing else in the four tables
+does, and no quantity loses by a margin that does. At a hundred
+thousand the mixes and the drained scans lean 5-8% slower without the
+sign test seeing it, and a default is not flipped on one sitting.
 
 ### Arrival order
 

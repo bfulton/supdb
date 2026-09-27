@@ -3772,6 +3772,21 @@ fn reader_threads_over_forms_the_upkeep_thread_maintains() {
     reader_threads_over_blocks(true, supdb::Upkeep::Background(3));
 }
 
+/// The same at level 2, which files a batch of fifty itself and holds a
+/// commit of four hundred for the thread's pass.
+#[test]
+fn reader_threads_over_forms_the_adaptive_upkeep_maintains() {
+    reader_threads_over_blocks(true, supdb::Upkeep::Background(2));
+}
+
+/// The same at level 1, where no commit holds: the thread's passes run
+/// while the writer commits past them, so the forms a pass publishes
+/// must carry the commit it was named and not the writer's latest.
+#[test]
+fn reader_threads_over_forms_a_lagging_upkeep_maintains() {
+    reader_threads_over_blocks(true, supdb::Upkeep::Background(1));
+}
+
 fn reader_threads_over_blocks(commit_forms: bool, upkeep: supdb::Upkeep) {
     let d = dir(&format!("commit-forms-threads-{commit_forms}-{upkeep:?}"));
     let opts = Options {

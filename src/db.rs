@@ -156,8 +156,13 @@ pub enum Upkeep {
     /// - 2: everything, at every commit, while reads are around -- a scan
     ///   over the store within the last two stores' worth of writes --
     ///   and level 1's rules otherwise, so a long stretch of writes
-    ///   nobody reads pays nothing for a structure nobody walks.
-    /// - 3: everything, at every commit, whoever reads.
+    ///   nobody reads pays nothing for a structure nobody walks. While
+    ///   reads are around a commit also returns only once the thread has
+    ///   filed it, so the read after it finds nothing left, and files a
+    ///   batch too small to wake the thread for itself.
+    /// - 3: everything, at every commit, whoever reads; and while reads
+    ///   are around a commit holds for every batch, however small, where
+    ///   level 2 files a small one itself.
     ///
     /// Whatever the level, the thread takes the latest commit at each
     /// pass rather than one pass per commit, is woken only for a batch
@@ -5781,6 +5786,24 @@ pub struct Db {
     upkeep_log: (u64, usize),
     upkeep_life: u64,
     upkeep_since_scan: u64,
+    /// What the commit in progress does with its batch, decided when it
+    /// hands the upkeep over: see `Hand`.
+    upkeep_hand: Hand,
+}
+
+/// What a commit does with its batch under `Upkeep::Background`.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Hand {
+    /// Lent to the thread, which files it when it gets to it.
+    #[default]
+    Lend,
+    /// Lent, the thread woken, and the commit returns once the thread
+    /// has filed it.
+    Hold,
+    /// Filed by the commit itself: at level 2, a batch too small to wake
+    /// the thread for, with reads around to want it filed; or no thread
+    /// to lend it to.
+    Inline,
 }
 
 /// A read in progress on a handle; dropping it ends the read.
@@ -10747,6 +10770,7 @@ impl Db {
             upkeep_log: (0, 0),
             upkeep_life: 0,
             upkeep_since_scan: 0,
+            upkeep_hand: Hand::Lend,
             compacting: None,
             tiering: None,
             unsynced: 0,
@@ -11040,6 +11064,7 @@ impl Db {
             upkeep_log: (0, 0),
             upkeep_life: 0,
             upkeep_since_scan: 0,
+            upkeep_hand: Hand::Lend,
             compacting: None,
             tiering: None,
             unsynced: 0,
@@ -11252,9 +11277,7 @@ impl Db {
                 return Err(e);
             }
             self.start_upkeep();
-            if self.fs_home() {
-                self.hand_over_upkeep();
-            }
+            self.finish_hand()?;
         } else {
             self.maintain_forms()?;
         }
@@ -11274,8 +11297,8 @@ impl Db {
             // The freeze's publish took the upkeep back, and a burst's
             // last commit that seals would leave the new state's upkeep
             // to the first read after it.
-            if background && self.fs_home() {
-                self.hand_over_upkeep();
+            if background {
+                self.finish_hand()?;
             }
         }
         Ok(())
@@ -13724,6 +13747,9 @@ struct Lend {
     takes: AtomicU64,
     waits: AtomicU64,
     wait_ns: AtomicU64,
+    /// Commits that held for their pass, and the nanoseconds they held.
+    holds: AtomicU64,
+    hold_ns: AtomicU64,
 }
 
 #[derive(Default)]
@@ -13818,6 +13844,18 @@ impl Lend {
     fn caught_up(&self) -> bool {
         let g = self.lock();
         !g.busy && g.to.is_none()
+    }
+
+    /// Whether the thread has brought the upkeep to the last commit
+    /// named, or does not have it; if neither, `waiter` is woken at the
+    /// end of the pass.
+    fn caught_up_or_home(&self, waiter: std::thread::Thread) -> bool {
+        let mut g = self.lock();
+        if !g.busy && (g.to.is_none() || g.fs.is_none()) {
+            return true;
+        }
+        g.waiter = Some(waiter);
+        false
     }
 
     fn take_err(&self) -> Option<std::io::Error> {
@@ -13953,18 +13991,20 @@ impl Db {
     }
 
     /// The upkeep handed to the thread, or the thread told of a later
-    /// commit while it has it, and woken for a batch worth waking it for.
-    /// Nothing while the thread is not running: a lent upkeep nobody
-    /// works on is only one the next read takes back.
+    /// commit while it has it, and woken for a batch worth waking it for;
+    /// and what the commit does after its barrier decided: see `Hand`.
     fn hand_over_upkeep(&mut self) {
         let Upkeep::Background(level) = self.opts.upkeep else {
             return;
         };
+        // No thread to lend it to -- before the first commit starts one,
+        // or one that could not be spawned: the commit files its own.
         if self
             .upkeeper
             .as_ref()
             .is_none_or(|u| u.handle.as_ref().is_none_or(|h| h.is_finished()))
         {
+            self.upkeep_hand = Hand::Inline;
             return;
         }
         // The commit's three quantities and the store's keys, read
@@ -14003,6 +14043,23 @@ impl Db {
             2 => reads_around,
             _ => true,
         };
+        // With reads around, a read is likely to follow the commit, and
+        // whatever the thread has not filed by then that read waits for
+        // and files: after a burst, the thread a commit or two behind
+        // made the lag sweep's first scan wait up to 1.6 ms where the
+        // commits filing inline had left it nothing. So the commit holds
+        // until the thread has filed it, which costs the longer of the
+        // barrier and the pass rather than both; and at level 2 a batch
+        // too small to wake the thread for is the commit's own to file,
+        // where level 3 wakes the thread for it too.
+        self.upkeep_hand = match (level >= 2 && reads_around, batch) {
+            (false, _) | (true, 0) => Hand::Lend,
+            (true, b) if level == 2 && b < UPKEEP_WAKE_WRITES => Hand::Inline,
+            (true, _) => Hand::Hold,
+        };
+        if self.upkeep_hand == Hand::Inline {
+            return;
+        }
         let to = UpkeepTo {
             gen,
             log,
@@ -14017,6 +14074,44 @@ impl Db {
         if batch >= UPKEEP_WAKE_WRITES {
             self.shared.upkeep.wake();
         }
+    }
+
+    /// The end of a commit's upkeep: handed over if it came home since
+    /// the barrier, then what the hand-over decided -- filed here, or
+    /// held for until the thread has filed it.
+    fn finish_hand(&mut self) -> Result<()> {
+        if self.fs_home() && self.upkeep_hand != Hand::Inline {
+            self.hand_over_upkeep();
+        }
+        match std::mem::take(&mut self.upkeep_hand) {
+            Hand::Lend => Ok(()),
+            Hand::Inline => self.maintain_forms(),
+            Hand::Hold => {
+                self.hold_for_upkeep();
+                Ok(())
+            }
+        }
+    }
+
+    /// Wait for the thread to bring the lent upkeep to the last commit
+    /// named, leaving it lent.
+    fn hold_for_upkeep(&mut self) {
+        let t = std::time::Instant::now();
+        let lend = &self.shared.upkeep;
+        while !lend.caught_up_or_home(std::thread::current()) {
+            if self
+                .upkeeper
+                .as_ref()
+                .is_none_or(|u| u.handle.as_ref().is_none_or(|h| h.is_finished()))
+            {
+                break;
+            }
+            lend.wake();
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
+        }
+        lend.holds.fetch_add(1, AtomicOrdering::Relaxed);
+        lend.hold_ns
+            .fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
     }
 
     /// The upkeep home, once the thread has brought it to the last commit
@@ -14061,15 +14156,18 @@ impl Db {
 
     /// EXPERIMENT: what the upkeep thread did over this store's life:
     /// passes, the times the writer took the upkeep back, the times it
-    /// waited for a pass in flight, and the microseconds it waited.
+    /// waited for a pass in flight, the microseconds it waited, the
+    /// commits that held for their pass, and the microseconds they held.
     #[doc(hidden)]
-    pub fn upkeep_counts(&self) -> [u64; 4] {
+    pub fn upkeep_counts(&self) -> [u64; 6] {
         let l = &self.shared.upkeep;
         [
             l.passes.load(AtomicOrdering::Relaxed),
             l.takes.load(AtomicOrdering::Relaxed),
             l.waits.load(AtomicOrdering::Relaxed),
             l.wait_ns.load(AtomicOrdering::Relaxed) / 1000,
+            l.holds.load(AtomicOrdering::Relaxed),
+            l.hold_ns.load(AtomicOrdering::Relaxed) / 1000,
         ]
     }
 }
