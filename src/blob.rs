@@ -891,7 +891,7 @@ impl<B: Bytes> Blob<B> {
     /// The key at `rank` in key order.
     pub fn key_at(&self, rank: usize) -> Option<&[u8]> {
         let (sec, idx) = self.flat()?;
-        idx.at(sec, rank).map(|(k, _)| k)
+        idx.key_at(sec, rank)
     }
 
     /// The key and extents at `rank`, borrowed from the mapping: the flags
@@ -909,16 +909,19 @@ impl<B: Bytes> Blob<B> {
     /// read must not pay, and it is the whole difference between a scan
     /// and a sequence of lookups.
     pub fn values_at<F: FnMut(&[u8])>(&self, rank: usize, mut f: F) -> Result<u64> {
-        let Some((_, exts, tail)) = self.exts_at_full(rank) else {
+        let Some((sec, idx)) = self.flat() else {
             return Ok(0);
         };
-        let mut n = 0u64;
-        for e in exts.iter() {
-            n += self.with_run(*e, tail, |run| {
-                crate::index::each_value(run, e, &mut |v| f(v)).map_err(corrupt)
-            })?;
-        }
-        Ok(n)
+        let read = idx.with_record_at(sec, rank, |exts, tail| -> Result<u64> {
+            let mut n = 0u64;
+            for e in exts {
+                n += self.with_run(*e, tail, |run| {
+                    crate::index::each_value(run, e, &mut |v| f(v)).map_err(corrupt)
+                })?;
+            }
+            Ok(n)
+        });
+        read.unwrap_or(Ok(0))
     }
 
     // ------------------------------------------------------------ planning --

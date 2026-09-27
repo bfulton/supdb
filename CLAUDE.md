@@ -597,6 +597,21 @@ writer commits nothing past the commit it named, so a pass stamping its
 forms with the writer's latest commit instead of the named one is
 invisible there, and only the level that never holds catches it.
 
+**A format change priced on the path that reads it in bulk.** The
+compact record was priced against `supdb`, whose scans walk a
+partition's records in one loop that reads the compact form in place,
+and read faster there. The buffered arm keeps its level-0 piece a
+piece, so its scans take the merge path, which asks each source for a
+key and then for its values, and `key_at` decoded the whole record for
+the key: every key compared rebuilt the compact extent, twice with the
+values read after, and those scans ran at half their rate for a week
+with no row taken to show it. The quick row's gate named the arm; a
+bisect in one sitting against its comparator named the two commits.
+The rule: a change to what a record holds is priced on every path that
+reads one -- the bulk walk, the merge's per-key calls, the point read
+-- and an accessor answers only what it is asked, since a key read is
+the most frequent call a merge or a seek makes.
+
 **A sentinel that crosses the wasm boundary changes sign.** A wasm `u32`
 arrives in JavaScript as a signed i32, so a failure sentinel of `u32::MAX`
 arrives as -1 and a comparison against 4294967295 can never match. Every

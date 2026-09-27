@@ -392,6 +392,26 @@ impl Header {
 /// as bytes is; a `Vec<u8>` is not promised to be).
 pub type ParsedRecord<'a> = (&'a [u8], Exts<'a>, &'a [u8], usize);
 
+/// The key of the record at `off`, read without its extents: what a seek
+/// and a cursor compare. It refuses what `parse_record` refuses in the
+/// words it reads -- a count word carrying the compact bit beside any
+/// other -- and leaves the extents and the tail to the reader that wants
+/// them, which is where a compact header its run contradicts is found:
+/// such a record has a key here and no values there, and a segment's
+/// checksum row refuses it at open before either. Decoded in full, a record's compact extent was rebuilt for every
+/// key a merge compared, twice a key with the values read after, and the
+/// buffered arm's scans over one level-0 piece ran at 0.6x.
+#[inline]
+pub fn record_key(buf: &[u8], off: usize) -> Option<&[u8]> {
+    let klen = rd_u16(buf, off)? as usize;
+    let n = rd_u16(buf, off + 2)?;
+    if n & COMPACT != 0 && n != COMPACT {
+        return None;
+    }
+    buf.get(off + 4..off + 4 + klen)
+}
+
+#[inline]
 pub fn parse_record(buf: &[u8], off: usize) -> Option<ParsedRecord<'_>> {
     let klen = rd_u16(buf, off)? as usize;
     let n = rd_u16(buf, off + 2)?;
@@ -642,6 +662,7 @@ fn compact_header(e: &Ext) -> [u8; 4] {
 /// which is zero for one record, `(n - 1) * width` for a fixed run, and for
 /// a prefixed one the offset its prefixes walk to -- what `encode_run`
 /// computed as it wrote them. `None` for a header the run contradicts.
+#[inline]
 fn compact_ext(h: [u8; 4], run: &[u8]) -> Option<Ext> {
     let len = u16::from_le_bytes([h[0], h[1]]) as usize;
     let c = u16::from_le_bytes([h[2], h[3]]);
@@ -1626,9 +1647,47 @@ impl FlatIndex {
     /// Byte offset of the publish word within the section.
     pub const DIR_STATE_AT: usize = 152;
 
-    /// The record at `rank` in key order.    /// The record at `rank` in key order.
+    /// The record at `rank` in key order.
     pub fn at<'a>(&self, sec: &'a [u8], rank: usize) -> Option<(&'a [u8], Exts<'a>)> {
         self.at_full(sec, rank).map(|(k, e, _)| (k, e))
+    }
+
+    /// The extents and tail of the record at `rank`, handed to `f` rather
+    /// than returned: a compact record's extent is rebuilt on this frame
+    /// and lent, where `at_full` returns it by value through every layer
+    /// above. Returned, the rebuilt extent left the buffered arm's scans
+    /// over one level-0 piece at 0.88x of the same scans over full
+    /// records, with the instructions level.
+    #[inline]
+    pub fn with_record_at<'a, R>(
+        &self,
+        sec: &'a [u8],
+        rank: usize,
+        f: impl FnOnce(&[Ext], &'a [u8]) -> R,
+    ) -> Option<R> {
+        if rank >= self.nkeys {
+            return None;
+        }
+        let recs = sec.get(self.recs.0..self.recs.1)?;
+        let dir = sec.get(self.dir.0..self.dir.1)?;
+        let off = rd_u32(dir, rank * 4)? as usize;
+        let (_, exts, tail, _) = parse_record(recs, off)?;
+        Some(match exts {
+            Exts::One(e) => f(std::slice::from_ref(&e), tail),
+            Exts::Borrowed(exts) => f(exts, tail),
+        })
+    }
+
+    /// The key at `rank` alone; see `record_key`.
+    #[inline]
+    pub fn key_at<'a>(&self, sec: &'a [u8], rank: usize) -> Option<&'a [u8]> {
+        if rank >= self.nkeys {
+            return None;
+        }
+        let recs = sec.get(self.recs.0..self.recs.1)?;
+        let dir = sec.get(self.dir.0..self.dir.1)?;
+        let off = rd_u32(dir, rank * 4)? as usize;
+        record_key(recs, off)
     }
 
     /// `at`, with the record's tail of inline runs.
@@ -1759,7 +1818,7 @@ impl FlatIndex {
         if rank >= self.nkeys {
             return None;
         }
-        let (k, _) = self.at(sec, rank)?;
+        let k = self.key_at(sec, rank)?;
         if k != key {
             return None;
         }
@@ -1957,13 +2016,13 @@ impl FlatIndex {
             return false;
         }
         if r > 0 {
-            match self.at(sec, r - 1).map(|(k, _)| k.cmp(key)) {
+            match self.key_at(sec, r - 1).map(|k| k.cmp(key)) {
                 Some(std::cmp::Ordering::Less) => {}
                 _ => return false,
             }
         }
         if r < self.nkeys {
-            match self.at(sec, r).map(|(k, _)| k.cmp(key)) {
+            match self.key_at(sec, r).map(|k| k.cmp(key)) {
                 Some(std::cmp::Ordering::Less) => return false,
                 None => return false,
                 _ => {}
@@ -1975,7 +2034,7 @@ impl FlatIndex {
     fn search(&self, sec: &[u8], key: &[u8], mut lo: usize, mut hi: usize) -> usize {
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            match self.at(sec, mid).map(|(k, _)| k.cmp(key)) {
+            match self.key_at(sec, mid).map(|k| k.cmp(key)) {
                 Some(std::cmp::Ordering::Less) => lo = mid + 1,
                 // A record that will not decode sorts as "not less", which
                 // keeps the search terminating on damaged input.
@@ -2098,6 +2157,7 @@ mod compact_tests {
                 assert_eq!(rd_u16(&out, 2) == Some(COMPACT), compact, "{lens:?}");
                 let (k, exts, tail, len) = parse_record(&out, 0).expect("it parses");
                 assert_eq!(k, key);
+                assert_eq!(record_key(&out, 0), Some(k), "the key read alone");
                 assert_eq!(&*exts, &[e][..], "{lens:?} tomb {tomb}");
                 assert_eq!(tail, &run[..]);
                 assert_eq!(len, wrote);
@@ -2147,9 +2207,15 @@ mod compact_tests {
         assert!(parse_record(&set(40), 0).is_none());
         // Claimed fixed, and 221 bytes are not four equal widths.
         assert!(parse_record(&set(4 | C_FIXED), 0).is_none());
+        // The key read alone does not look at the run, and keeps its key.
+        assert_eq!(record_key(&set(40), 0), Some(&b"key"[..]));
         let mut bad = good.clone();
         bad[2..4].copy_from_slice(&(COMPACT | 1).to_le_bytes());
         assert!(parse_record(&bad, 0).is_none());
+        assert!(
+            record_key(&bad, 0).is_none(),
+            "the count word is its to refuse"
+        );
         assert!(parse_record(&good, 0).is_some());
     }
 }
@@ -2243,8 +2309,13 @@ mod tests {
             let (gk, ge) = ix.at(&sec, i).expect("rank present");
             assert_eq!(gk, k.as_slice());
             assert_eq!(ge, e.as_slice());
+            assert_eq!(ix.key_at(&sec, i), Some(k.as_slice()));
+            let lent = ix.with_record_at(&sec, i, |exts, _| exts.to_vec());
+            assert_eq!(lent.as_deref(), Some(e.as_slice()));
         }
         assert!(ix.at(&sec, all.len()).is_none());
+        assert!(ix.key_at(&sec, all.len()).is_none());
+        assert!(ix.with_record_at(&sec, all.len(), |_, _| ()).is_none());
     }
 
     /// The fence is an optimisation, so the only thing that makes it safe is
