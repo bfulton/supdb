@@ -2919,6 +2919,15 @@ impl Seg {
     }
 }
 
+/// One commit's write-log length, entry count and watermark, which a
+/// reader on another thread takes as one: see `MemTable::committed_at`.
+#[derive(Default)]
+struct CommitMark {
+    log: AtomicUsize,
+    len: AtomicUsize,
+    wm: AtomicU64,
+}
+
 /// The memtable, built so that an append allocates nothing per key or per
 /// value: a decomposition priced the HashMap<Box<[u8]>, Vec> version at
 /// 456k ops/s of the gap to the floor, more than the seal itself. Keys
@@ -2941,7 +2950,7 @@ impl Seg {
 /// before the head moved.
 ///
 /// The value arena's offset is also the version: chunks are appended in
-/// time order, so `committed`, the arena's tail at the last commit,
+/// time order, so the watermark, the arena's tail at the last commit,
 /// divides every chain into an uncommitted prefix and a committed rest,
 /// and a reader that honours it walks past the prefix. The store's own
 /// reads pass no watermark and see their own uncommitted writes, the
@@ -2964,15 +2973,13 @@ struct MemTable {
     /// this memtable can end a key's older values; zero lets it skip the
     /// check entirely.
     tombs: AtomicUsize,
-    /// The value arena's tail at the last commit: a chunk at or past it
-    /// is a write no commit has covered.
-    committed: AtomicU64,
-    /// The write log's length and the entry count at the last commit:
-    /// what a builder ahead of the reader takes its watermark with, so
-    /// the writes it lacks are exactly the log from that length on and
-    /// the entries its snapshot covers are exactly the committed ones.
-    committed_log: AtomicUsize,
-    committed_len: AtomicUsize,
+    /// The last commit's three quantities: the write log's length, the
+    /// entry count, and the value arena's tail, a chunk at or past which
+    /// is a write no commit has covered. Two marks written in turn, and
+    /// `mark` counting the commits and so naming the one written last:
+    /// see `commit` and `committed_at`.
+    marks: [CommitMark; 2],
+    mark: AtomicU64,
     /// Indexes a rebuild replaced, each with the epoch it was retired at,
     /// freed once no reader is pinned before that epoch. Writer-only.
     retired: UnsafeCell<Vec<(u64, Box<Index>)>>,
@@ -3417,9 +3424,8 @@ impl MemTable {
             keys: ByteArena::new(),
             vals: ByteArena::new(),
             tombs: AtomicUsize::new(0),
-            committed: AtomicU64::new(0),
-            committed_log: AtomicUsize::new(0),
-            committed_len: AtomicUsize::new(0),
+            marks: Default::default(),
+            mark: AtomicU64::new(0),
             retired: UnsafeCell::new(Vec::new()),
             log: Slab::new(),
         }
@@ -3434,9 +3440,8 @@ impl MemTable {
             keys: ByteArena::new(),
             vals: ByteArena::new(),
             tombs: AtomicUsize::new(0),
-            committed: AtomicU64::new(0),
-            committed_log: AtomicUsize::new(0),
-            committed_len: AtomicUsize::new(0),
+            marks: Default::default(),
+            mark: AtomicU64::new(0),
             retired: UnsafeCell::new(Vec::new()),
             log: Slab::new(),
         }
@@ -3515,29 +3520,51 @@ impl MemTable {
         self.entries.truncate(n);
     }
 
-    /// Writer: what is written is committed.
+    /// Writer: what is written is committed. The quantities go into the
+    /// mark the last commit did not write, and only then does `mark` name
+    /// it.
     fn commit(&self) {
-        self.committed_log
-            .store(self.log.len(), AtomicOrdering::Release);
-        self.committed_len
-            .store(self.entries.len(), AtomicOrdering::Release);
-        self.committed
-            .store(self.vals.tail() as u64, AtomicOrdering::Release);
+        let n = self.mark.load(AtomicOrdering::Relaxed) + 1;
+        let m = &self.marks[(n & 1) as usize];
+        m.log.store(self.log.len(), AtomicOrdering::Release);
+        m.len.store(self.entries.len(), AtomicOrdering::Release);
+        m.wm.store(self.vals.tail() as u64, AtomicOrdering::Release);
+        self.mark.store(n, AtomicOrdering::Release);
     }
 
-    /// The watermark a reader honours to see committed chunks only.
-    fn committed(&self) -> u64 {
-        self.committed.load(AtomicOrdering::Acquire)
+    /// The last commit's log length, entry count and watermark, all three
+    /// of one commit. Three words stored one after another are not read
+    /// as one by another thread, in whichever order either side takes
+    /// them: a handle that took a commit's log length and the watermark
+    /// before it settled that commit's writes into its blocks under a
+    /// watermark that hid them, read on past them in the log, and kept
+    /// the old values for the rest of the state. The mark `mark` names
+    /// was finished before it was named, and it is written again only
+    /// by the commit after next, which names the other one first: so a
+    /// read that finds `mark` unmoved across its loads read one commit.
+    /// A reader never waits on the writer; it goes round again only when
+    /// two commits landed inside its three loads.
+    fn committed_at(&self) -> (usize, usize, u64) {
+        loop {
+            let n = self.mark.load(AtomicOrdering::Acquire);
+            let m = &self.marks[(n & 1) as usize];
+            let log = m.log.load(AtomicOrdering::Acquire);
+            let len = m.len.load(AtomicOrdering::Acquire);
+            let wm = m.wm.load(AtomicOrdering::Acquire);
+            if self.mark.load(AtomicOrdering::Relaxed) == n {
+                return (log, len, wm);
+            }
+        }
     }
 
     /// The write log's length at the last commit.
     fn committed_log(&self) -> usize {
-        self.committed_log.load(AtomicOrdering::Acquire)
+        self.committed_at().0
     }
 
     /// The entry count at the last commit.
     fn committed_len(&self) -> usize {
-        self.committed_len.load(AtomicOrdering::Acquire)
+        self.committed_at().1
     }
 
     /// Writer: the entry for `key`, made if the table lacks it -- its key
@@ -6599,11 +6626,11 @@ impl Reader {
                     self.held.store(p, AtomicOrdering::Relaxed);
                     // SAFETY: pinned above, so not freed under this handle.
                     let mem = &unsafe { &*p }.mem;
-                    // The log's length first: a commit stores it before
-                    // the watermark, so a length read first belongs to
-                    // the watermark's commit or an earlier one.
-                    self.log_bound.set(mem.committed_log());
-                    self.wm.set(mem.committed());
+                    // The log's length and the watermark of one commit:
+                    // see `MemTable::committed_at`.
+                    let (log, _, wm) = mem.committed_at();
+                    self.log_bound.set(log);
+                    self.wm.set(wm);
                 }
                 Isolation::Dirty => {
                     self.shared.readers.pin(slot);
@@ -6658,8 +6685,9 @@ impl Reader {
         self.held.store(p, AtomicOrdering::Relaxed);
         // SAFETY: pinned above, so not freed under this handle.
         let mem = &unsafe { &*p }.mem;
-        self.log_bound.set(mem.committed_log());
-        self.wm.set(mem.committed());
+        let (log, _, wm) = mem.committed_at();
+        self.log_bound.set(log);
+        self.wm.set(wm);
         self.isolation.set(Isolation::Snapshot);
     }
 
@@ -12630,14 +12658,11 @@ impl Reader {
             return;
         };
         let mem = self.mem();
-        // The log's length first and the watermark last, the order a
-        // commit stores them in reversed, so the length and the count
-        // belong to the watermark's commit or an earlier one: a length
-        // from a later commit would leave the keys logged between the
-        // two outside the builder's forms and outside the splice.
-        let from = mem.committed_log();
-        let live_len = mem.committed_len();
-        let wm = mem.committed();
+        // The length, the count and the watermark of one commit: a
+        // length from a later commit than the watermark would leave the
+        // keys logged between the two outside the builder's forms and
+        // outside the splice.
+        let (from, live_len, wm) = mem.committed_at();
         // Writes logged past the commit that this handle has read already
         // -- a batch staged and not committed, which the writer's own
         // scans see -- are filed now; the log is read on from where it
@@ -13028,7 +13053,7 @@ const AHEAD_BATCH: usize = 64;
 
 /// PROTOTYPE: a commit as the builder ahead holds it: the state's
 /// generation, the watermark, the write log's length and the entry
-/// count, read in the order the commit stores them reversed.
+/// count, all of one commit.
 struct AtCommit {
     gen: u64,
     wm: u64,
@@ -13315,11 +13340,8 @@ impl Reader {
                 return Want::Scan;
             }
         }
-        // The log's position first and the count after it, the order a
-        // commit stores them in, so the position belongs to the count's
-        // commit or an earlier one and the next commit moves it.
-        let log = mem.committed_log();
-        let len = mem.committed_len();
+        // The position and the count of one commit.
+        let (log, len, _) = mem.committed_at();
         // Current, or behind by less than a sixteenth of what the version
         // holds: an extension merges the whole entry run, so one per
         // commit over a mix of small batches is a copy of the run per
@@ -14703,5 +14725,65 @@ mod threading {
         shared::<super::State>();
         shared::<super::Shared>();
         sent::<super::Reader>();
+    }
+
+    /// A reader on another thread takes a commit's log length, entry
+    /// count and watermark as one commit's while the writer commits as
+    /// fast as it can. The writes are replayed first on a table of their
+    /// own, which names the count and the watermark every log length
+    /// belongs to; a batch updates keys as well as making them, so the
+    /// three quantities move apart.
+    #[test]
+    fn a_reader_takes_a_commit_whole() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        let rd = super::Readers::new();
+        let key = |i: u64| format!("k{:06}", i % 5000).into_bytes();
+        let fill = |mem: &super::MemTable, mut on_commit: Box<dyn FnMut(&super::MemTable) + '_>| {
+            let mut i = 0u64;
+            for batch in 0..100_000u64 {
+                for _ in 0..(batch % 3 + 1) {
+                    let k = key(i);
+                    let v = vec![b'v'; (i % 7) as usize + 1];
+                    mem.append(super::BlockedBloom::hash(&k), &k, &v, &rd);
+                    i += 1;
+                }
+                mem.commit();
+                on_commit(mem);
+            }
+        };
+        let mut want = std::collections::HashMap::new();
+        want.insert(0usize, (0usize, 0u64));
+        let dry = super::MemTable::new();
+        fill(
+            &dry,
+            Box::new(|m: &super::MemTable| {
+                let (log, len, wm) = m.committed_at();
+                want.insert(log, (len, wm));
+            }),
+        );
+        let mem = super::MemTable::new();
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let reader = s.spawn(|| {
+                let mut reads = 0u64;
+                let mut last = 0usize;
+                while !stop.load(Relaxed) {
+                    let (log, len, wm) = mem.committed_at();
+                    assert_eq!(
+                        want.get(&log),
+                        Some(&(len, wm)),
+                        "log length {log} read with entry count {len} and watermark {wm}"
+                    );
+                    assert!(log >= last, "the commit went backwards");
+                    last = log;
+                    reads += 1;
+                }
+                reads
+            });
+            fill(&mem, Box::new(|_| {}));
+            stop.store(true, Relaxed);
+            let reads = reader.join().unwrap();
+            assert!(reads > 1000, "the reader read beside the writer: {reads}");
+        });
     }
 }

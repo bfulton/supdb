@@ -420,11 +420,21 @@ beside it, through the memtable, answered the new value. Every test
 read a written key through the writer's own handle, which honours no
 mark, or through a handle that had not cached the block. The handle
 reads the log only to the length it had at the commit whose watermark
-it holds, taken before the watermark since a commit stores the length
-first, and the builder ahead takes its three quantities in that order
-too. The rule: a structure kept current by a log is current to a
-position in it, and the position a handle may read to is the one its
-isolation names, never the log's end.
+it holds. The first version of that took the length and then the
+watermark, two loads of words the commit stored in that same order,
+and a load that sees a store learns nothing of the stores after it: a
+handle took one commit's length with the watermark before it, settled
+that commit's writes under a watermark that hid them, read on past
+them, and kept the old values for the rest of the state -- the same
+failure, one commit wide. A test that reads a key and then scans from
+it found it in about one run in two. A commit now writes its three
+quantities into the mark the last commit did not write and then names
+it, and a reader takes a mark only while it stays named. The rule: a
+structure kept current by a log is current to a position in it, and
+the position a handle may read to is the one its isolation names,
+never the log's end; and quantities a reader must take together are
+published as one, because no order of separate stores and loads makes
+them one.
 
 **A slot table whose slots share a line.** The reader table's slots
 were adjacent words, eight to a cache line, and every read stores its

@@ -2722,9 +2722,15 @@ per-commit path.
   honours none reads dirty, which is what the store's own reads have
   always done and keep doing. The write log a handle settles its cached
   blocks from is read to the same mark: the length it had at the
-  watermark's commit, taken before the watermark. Read to its end, a
-  handle settled a staged write under the committed watermark and kept
-  the old run after the commit, since the log had not moved.
+  watermark's commit. Read to its end, a handle settled a staged write
+  under the committed watermark and kept the old run after the commit,
+  since the log had not moved. The length and the watermark are taken
+  as one commit's: a commit writes its log length, entry count and
+  watermark into the one of two marks the commit before it did not
+  write, and then names it, and a reader takes a mark only while it
+  stays named, so it never waits on the writer. Taken as two loads, a
+  handle could hold a commit's length with the watermark before it and
+  keep the old run the same way.
 
   *The memtable* is the first part, built: nothing in it moves once
   published. Keys and values live in arenas of blocks that are never

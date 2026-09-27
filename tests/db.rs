@@ -3713,16 +3713,27 @@ fn a_reader_walks_the_forms_the_writer_maintains_at_commit() {
 
 /// Three reader threads and a writer that seals and merges under
 /// `commit_forms`: every version a thread reads is one the writer wrote,
-/// no scan comes back out of order, and no key holds two values.
+/// no scan comes back out of order or older than a read before it, and
+/// no key holds two values.
 #[test]
 fn reader_threads_over_maintained_forms_keep_answering() {
-    let d = dir("commit-forms-threads");
+    reader_threads_over_blocks(true);
+}
+
+/// The same threads over blocks each handle builds and settles itself.
+#[test]
+fn reader_threads_over_their_own_blocks_keep_answering() {
+    reader_threads_over_blocks(false);
+}
+
+fn reader_threads_over_blocks(commit_forms: bool) {
+    let d = dir(&format!("commit-forms-threads-{commit_forms}"));
     let opts = Options {
         seal_bytes: 32 << 10,
         partition_bytes: Some(64 << 10),
         l0_trigger: 2,
         scan_block_cache: true,
-        commit_forms: true,
+        commit_forms,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -3748,6 +3759,16 @@ fn reader_threads_over_maintained_forms_keep_answering() {
                 x ^= x << 17;
                 let k = (x % keys as u64) as u32;
                 if x.is_multiple_of(4) {
+                    // A point read and then a scan from the same key: the
+                    // scan walks cached blocks -- the writer's forms or
+                    // the handle's own -- and the point read the
+                    // memtable, so a block settled short of a commit it
+                    // claims shows the key older than the read before it.
+                    if let Some(v) = read_vec(&r, &key(k)).first() {
+                        let ver: u64 = std::str::from_utf8(v).unwrap().parse().unwrap();
+                        let prev = seen.entry(k).or_insert(0);
+                        *prev = (*prev).max(ver);
+                    }
                     let mut last: Option<Vec<u8>> = None;
                     r.scan(&key(k), 30, |kk, v| {
                         if let Some(l) = &last {
@@ -3755,10 +3776,16 @@ fn reader_threads_over_maintained_forms_keep_answering() {
                         }
                         last = Some(kk.to_vec());
                         let s = std::str::from_utf8(v).unwrap();
+                        let ver: u64 = s
+                            .parse()
+                            .unwrap_or_else(|_| panic!("a scanned value that is no version: {s}"));
+                        let kn: u32 = std::str::from_utf8(&kk[4..]).unwrap().parse().unwrap();
+                        let prev = seen.entry(kn).or_insert(0);
                         assert!(
-                            s.parse::<u64>().is_ok(),
-                            "a scanned value that is no version: {s}"
+                            ver >= *prev,
+                            "a scan went backwards: key {kn} scanned {ver} after {prev}"
                         );
+                        *prev = ver;
                     })
                     .unwrap();
                 } else {
@@ -3797,6 +3824,9 @@ fn reader_threads_over_maintained_forms_keep_answering() {
         total += t.join().unwrap();
     }
     assert!(total > 100, "the threads did some work: {total}");
+    if !commit_forms {
+        return;
+    }
     // The forms are current to a commit, so a reader only walks them
     // while the writer is between commits: under the writer above, which
     // commits every fifty puts, a reader is behind the table and builds
