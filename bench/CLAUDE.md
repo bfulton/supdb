@@ -204,6 +204,27 @@ and the smallest rung's scans were tens of microseconds, a few times the
 scheduler's skew; every thread runs the whole pass now, and a pass on
 four threads is as long as the pass on one.
 
+**A library's cache of handles is a store the runner did not drop.**
+heed keeps every environment it opens in a registry of its own and
+closes one only once `prepare_for_closing` has taken the registry's
+handle; the LMDB arm never called it. A pass opens two stores at one
+path -- the ordered load's, then, after dropping it and removing the
+directory, a fresh one for the shuffled load and the lag sweep -- and
+heed answered the second open with the first environment, still mapped
+over its removed file. So LMDB's shuffled load overwrote its ordered
+load's keys in place and its lag sweep scanned the ordered load's tree,
+while every other arm loaded and scanned a fresh store. Nothing raised:
+the key set was the same, so the byte checks held, and the rates were
+plausible. The full run found it by filling the disk: every LMDB store
+opened since the start was still held, 4.5 GB of removed files when the
+3M rung began, which its eight reps would have tripled. Every row
+before the fix carries LMDB's `load-shuffled` and `scan-lag` from that
+store. `a_store_reopened_where_its_predecessor_was_is_a_fresh_store`
+holds every arm to the runner's sequence -- the first store's key gone
+from the second, and nothing under the path still open. The rule: an
+arm's drop closes everything its open made, and a store that was
+removed and is still readable is the check that says it did not.
+
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`

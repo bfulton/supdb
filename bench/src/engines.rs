@@ -1651,6 +1651,21 @@ impl Lmdb {
     }
 }
 
+/// heed keeps every environment it opens in a registry of its own, and an
+/// environment closes only once `prepare_for_closing` has taken the
+/// registry's handle and every other handle is gone. Dropping the arm alone
+/// closed nothing: every store a run opened stayed mapped until the process
+/// exited, holding its disk after its directory was removed, and the second
+/// store a pass opens at the first one's path was handed the first one back.
+impl Drop for Lmdb {
+    fn drop(&mut self) {
+        // The held transaction owns a handle; the last one, in `env`, drops
+        // after this and closes the environment.
+        self.txn = None;
+        let _ = self.env.clone().prepare_for_closing();
+    }
+}
+
 type LmdbDb = heed::Database<heed::types::Bytes, heed::types::Bytes>;
 
 /// One read under whichever transaction: the arm's held one or a thread's.
@@ -1884,5 +1899,46 @@ mod tests {
         };
         assert_eq!(durable.unmatched(&buffered), vec!["durable_commit"]);
         assert!(buffered.unmatched(&buffered).is_empty());
+    }
+
+    /// A pass drops its first store, removes the directory and opens a
+    /// second at the same path, so every arm's drop must close what it
+    /// opened. heed keeps each environment in a registry of its own until
+    /// asked to close it, and the LMDB arm never asked: its second open got
+    /// the first store back, deleted from the directory and still mapped, so
+    /// LMDB's shuffled load and lag sweep ran over its ordered load's tree,
+    /// and every store it opened held its disk until the run exited.
+    #[test]
+    fn a_store_reopened_where_its_predecessor_was_is_a_fresh_store() {
+        let root = std::env::temp_dir().join(format!("supdb-bench-reopen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (k, v) = (b"k0000000000000001".as_slice(), [7u8; 100]);
+        for arm in ARMS {
+            let dir = root.join(arm);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut e = open(arm, &dir, 1).unwrap();
+            e.write_batch(&[(k, &v)]).unwrap();
+            e.sync().unwrap();
+            assert_eq!(e.get(k).unwrap(), v.len(), "{arm}: the first store");
+            drop(e);
+            std::fs::remove_dir_all(&dir).unwrap();
+            #[cfg(target_os = "linux")]
+            {
+                let held: Vec<_> = std::fs::read_dir("/proc/self/fd")
+                    .unwrap()
+                    .filter_map(|f| std::fs::read_link(f.ok()?.path()).ok())
+                    .filter(|p| p.starts_with(&dir))
+                    .collect();
+                assert!(held.is_empty(), "{arm}: dropped and still open: {held:?}");
+            }
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut e = open(arm, &dir, 1).unwrap();
+            assert_eq!(
+                e.get(k).unwrap(),
+                0,
+                "{arm}: the second store read the first's key"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
