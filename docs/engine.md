@@ -2062,6 +2062,28 @@ edge wherever the mixes' writes land near a multiple of the threshold,
 and a few percent either way moves one seal and whichever pass it lands
 in; the slow shape of the lag point is what `forms_rebase` removes.
 
+"Nothing reads slower" held for every path `supdb-fullrec` prices, and
+it prices the partition path. The buffered arm, `supdb-ingest`, keeps its
+level-0 piece a piece, so its scans walk the merge path, which asks each
+source for a key and then for that key's values, and `Blob::key_at`
+decoded the whole record for the key: every key a merge compared rebuilt
+the compact extent, and the values read after decoded it again. The next
+quick row found the arm's drained scan at half its rate; bisected in one
+sitting against `lmdb-nosync`, the drop came in two steps, at the commit
+that gave the read path its `Exts` type (compact records still off) and
+at the one that turned them on. Callgrind put the pass at 80.4M
+instructions against 63.9M before either. The key is read alone now
+(`flatindex::record_key`, which refuses what the full decode refuses in
+the words it reads), by `key_at` and by the index's own seek, and
+`values_at` takes a record's extents lent from the frame that rebuilt
+them (`FlatIndex::with_record_at`) rather than returned through three
+layers, which with the instructions level still cost a sixth in time.
+The pass is 62.4M instructions; the probe with the arm's shape reads
+17.4M entries a second against 19.9M before the compact record and 19.5M
+writing full records, where it read 11-14M. What is left is the
+extent's rebuild per key, which the partition path's in-place loop
+never pays.
+
 #### Which half of the lag gap, by rung
 
 The build and the walk split by size, and the arms say which is which
