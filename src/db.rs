@@ -134,6 +134,38 @@ fn idle_io_priority() {
     }
 }
 
+/// Who keeps the writer's upkeep current: the block forms its range
+/// reads walk and the scan snapshot of the unsealed keys, both filed with
+/// every commit's writes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Upkeep {
+    /// The writer, on its own thread: a commit files its writes when a
+    /// scan preceded it or the backlog passes `forms_settle_backlog_pct`,
+    /// and the first read after a burst files what the last commits left.
+    #[default]
+    Inline,
+    /// A thread of the store's own, while the writer is elsewhere. A
+    /// commit hands the upkeep over, before its barrier so the work runs
+    /// while the device syncs, and the writer takes it back at the next
+    /// thing that needs it -- a scan through the writer, a publish, a
+    /// handle -- waiting only for a pass in flight. Puts, point reads and
+    /// commits do not take it back, so the thread works beside the next
+    /// batch. The level is how eagerly it files:
+    ///
+    /// - 1: what a commit would have filed, by the same rules.
+    /// - 2: everything, at every commit, while reads are around -- a scan
+    ///   over the store within the last two stores' worth of writes --
+    ///   and level 1's rules otherwise, so a long stretch of writes
+    ///   nobody reads pays nothing for a structure nobody walks.
+    /// - 3: everything, at every commit, whoever reads.
+    ///
+    /// Whatever the level, the thread takes the latest commit at each
+    /// pass rather than one pass per commit, is woken only for a batch
+    /// worth waking it for, and a read that arrives before it has begun
+    /// takes the upkeep back untouched.
+    Background(u8),
+}
+
 /// How a store advises the kernel about its segment mappings.
 ///
 /// Once a store outgrows the page cache the kernel's default readahead is
@@ -693,6 +725,9 @@ pub struct Options {
     /// published, and when it did not, the first scan filed its thousand
     /// writes -- 0.5-0.8 ms of a pass of 0.45. Kept as the comparison arm.
     pub forms_settle_keys_all: bool,
+    /// EXPERIMENT: who keeps the writer's upkeep current; see `Upkeep`.
+    /// `Inline`, and `supdb-upkeep` prices the thread.
+    pub upkeep: Upkeep,
     /// EXPERIMENT: a scan builds the snapshot only when a block it
     /// reaches needs one. A block held as a sparse form, a copy or a
     /// clean one is walked from the form and the partition alone; only a
@@ -913,6 +948,7 @@ impl Default for Options {
             forms_max_unsealed_pct: 0,
             forms_settle_backlog_pct: 2,
             forms_settle_keys_all: false,
+            upkeep: Upkeep::Inline,
             snapshot_carry: false,
             scan_lazy_snapshot: false,
             forms_settle_rebuild_from: 0,
@@ -5384,6 +5420,9 @@ struct Shared {
     /// PROTOTYPE: handles that took the published snapshot over their
     /// own under the keeper's rule; for a test.
     snap_switched: AtomicU64,
+    /// The writer's upkeep while it is lent to the upkeep thread; see
+    /// `Upkeep::Background`.
+    upkeep: Lend,
 }
 
 /// EXPERIMENT: a replaced canonical form on its way to being freed. A
@@ -5468,6 +5507,14 @@ pub struct Reader {
     /// as long as it was cached; the point read beside it, through the
     /// memtable, answered the new value.
     log_bound: std::cell::Cell<usize>,
+    /// How many of the live memtable's entries this handle's upkeep may
+    /// take: unbounded, except on the upkeep thread, which brings the
+    /// writer's upkeep to a commit named by the writer while the writer
+    /// goes on appending past it.
+    len_bound: std::cell::Cell<usize>,
+    /// The upkeep thread's pass files everything whatever the commit's
+    /// own rules say; see `Upkeep::Background`.
+    force_due: std::cell::Cell<bool>,
     /// The upkeep this handle keeps for its range reads: the block
     /// tables, the scan snapshot, and the log position both are
     /// current to. See `FormsState`.
@@ -5621,13 +5668,21 @@ impl FormsState {
     }
 }
 
-/// Where a `Reader` keeps its `FormsState`. Every handle's is always
-/// here.
+/// Where a `Reader` keeps its `FormsState`. A handle's is always here.
+/// The writer's is away while it is lent to the upkeep thread, and the
+/// first access that needs it takes it back (`Reader::fs`); the thread
+/// works on it through a `Reader` of its own, so no two threads ever
+/// touch it at once and no field of it needs to be `Sync`.
 struct FormsCell(std::cell::UnsafeCell<Option<FormsState>>);
 
 impl FormsCell {
     fn new() -> FormsCell {
         FormsCell(std::cell::UnsafeCell::new(Some(FormsState::new())))
+    }
+
+    /// Nothing here yet: the upkeep thread's, between passes.
+    fn empty() -> FormsCell {
+        FormsCell(std::cell::UnsafeCell::new(None))
     }
 
     /// With the block tables made for `tables`' segments already.
@@ -5716,6 +5771,16 @@ pub struct Db {
     sealing: Option<std::thread::JoinHandle<Result<Vec<String>>>>,
     /// PROTOTYPE: the run keeper, once the first commit has started it.
     keeper: Option<Keeper>,
+    /// EXPERIMENT: the upkeep thread, once the first commit has started
+    /// it; see `Upkeep::Background`.
+    upkeeper: Option<Upkeeper>,
+    /// The upkeep thread's regime, kept by the writer since the upkeep
+    /// itself may be lent: the generation and committed log length at
+    /// the last hand-over, the store's scan count as last seen, and the
+    /// writes committed since it last moved.
+    upkeep_log: (u64, usize),
+    upkeep_life: u64,
+    upkeep_since_scan: u64,
 }
 
 /// A read in progress on a handle; dropping it ends the read.
@@ -5743,15 +5808,65 @@ impl Drop for Reader {
 }
 
 impl Reader {
-    /// This handle's upkeep.
+    /// This handle's upkeep, taken back from the upkeep thread first
+    /// when it is lent.
     #[inline]
     fn fs(&self) -> &FormsState {
-        // SAFETY: the cell is written only through `&mut self`, so no
-        // reference handed out here is alive while it changes.
+        // SAFETY: the cell is emptied only through `&mut self`, so no
+        // reference handed out here is alive when it changes, and it is
+        // filled through `&self` only while empty, when there is none.
         match unsafe { &*self.fs.0.get() } {
             Some(f) => f,
-            None => unreachable!("a handle's upkeep is always here"),
+            None => self.take_back_fs(),
         }
+    }
+
+    #[cold]
+    fn take_back_fs(&self) -> &FormsState {
+        let fs = self.shared.upkeep.take_back();
+        // SAFETY: as in `fs`: the cell is empty, so nothing borrows it.
+        unsafe {
+            *self.fs.0.get() = Some(fs);
+            (*self.fs.0.get()).as_ref().expect("just put back")
+        }
+    }
+
+    /// Whether this handle holds its upkeep: false only for the writer's
+    /// while it is lent.
+    fn fs_home(&self) -> bool {
+        // SAFETY: a read of the discriminant, on the one thread that
+        // writes the cell.
+        unsafe { (*self.fs.0.get()).is_some() }
+    }
+
+    /// The upkeep out of the cell, for the upkeep thread; see `Lend`.
+    fn lend_fs(&mut self) -> Option<FormsState> {
+        self.fs.0.get_mut().take()
+    }
+
+    /// The live memtable's write log as far as this handle's upkeep may
+    /// read it: all of it for the writer, to the named commit on the
+    /// upkeep thread.
+    fn log_end(&self) -> usize {
+        self.mem().log_len().min(self.log_bound.get())
+    }
+
+    /// The live memtable's entries as far as this handle's upkeep may
+    /// take them; as `log_end`.
+    fn mem_len(&self) -> usize {
+        self.mem().len().min(self.len_bound.get())
+    }
+
+    /// The commit this handle's upkeep is at -- log length, entries and
+    /// watermark, all of one commit -- which on the upkeep thread is the
+    /// one the writer named and otherwise the last. The writer's commits go on while the thread works,
+    /// and a builder the thread starts at a later commit than the tables
+    /// are filed to builds forms with writes the tables file again.
+    fn commit_at(&self) -> (usize, usize, u64) {
+        if self.slot.is_none() && self.log_bound.get() != usize::MAX {
+            return (self.log_bound.get(), self.len_bound.get(), self.wm.get());
+        }
+        self.mem().committed_at()
     }
 }
 
@@ -7216,7 +7331,7 @@ impl Reader {
         let mut snap = Snapshot {
             live_len,
             // The log's length before any chain is read: see `extend`.
-            log_at: self.mem().log_len(),
+            log_at: self.log_end(),
             arena: std::sync::Arc::new(SnapArena::with_capacity(bytes)),
             runs,
             ents: Vec::with_capacity(n),
@@ -8027,6 +8142,30 @@ impl Reader {
         });
     }
 
+    /// EXPERIMENT: free the replaced canonical forms no pinned reader can
+    /// still be walking: those retired at an epoch every pinned slot is
+    /// past. The epoch is bumped first, so a form retired under the
+    /// current epoch can be freed once its readers leave.
+    fn sweep_retired_forms(&self) {
+        self.sweep_retired_snaps();
+        let mut retired = self.shared.retired_forms.lock().expect("the retired forms");
+        if retired.is_empty() {
+            return;
+        }
+        self.shared.readers.bump();
+        let readers = &self.shared.readers;
+        retired.retain(|(t, f)| {
+            if readers.none_before(t + 1) {
+                // SAFETY: replaced by the writer, unreachable since, and
+                // every reader that could hold it has left.
+                drop(unsafe { Box::from_raw(f.0) });
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     /// One block materialised, charged to whoever built it.
     fn count_built(&self) {
         match (self.counted, self.slot) {
@@ -8300,7 +8439,7 @@ impl Reader {
         if current {
             let short = cache
                 .as_ref()
-                .is_none_or(|(g, s)| *g != gen || s.live_len < self.mem().len());
+                .is_none_or(|(g, s)| *g != gen || s.live_len < self.mem_len());
             if !short {
                 return;
             }
@@ -8355,7 +8494,7 @@ impl Reader {
             }
         }
         if stale {
-            let live_len = self.mem().len();
+            let live_len = self.mem_len();
             // The state's, when it covers enough of the memtable, and
             // this handle's own otherwise. Adopting is the whole of the
             // saving: the sort is of every unsealed key, and a handle
@@ -8488,7 +8627,7 @@ impl Reader {
         let scans = st.scans.load(AtomicOrdering::Relaxed);
         // The writes not yet filed into the forms: everything the log holds
         // past the position this handle last read it to.
-        let log_len = self.mem().log_len();
+        let log_len = self.log_end();
         let backlog = log_len.saturating_sub(self.fs().log_seen.get());
         // The store's keys are the partitions': a level-0 piece sealed
         // from a burst of updates holds keys a partition holds already,
@@ -8538,7 +8677,8 @@ impl Reader {
             self.fs().ahead.borrow().as_ref().is_some_and(|a| {
                 !a.done.get() && a.posted.load(std::sync::atomic::Ordering::Acquire)
             });
-        let due = scans != self.fs().scans_seen.get()
+        let due = self.force_due.get()
+            || scans != self.fs().scans_seen.get()
             || (backlog >= bound && recent)
             || posted
             || self.fs().publish_due.replace(false);
@@ -8607,11 +8747,17 @@ impl Reader {
         // The table's position and completeness move with a publish and
         // only then: a handle at an older commit finds the forms of that
         // commit until someone is here to take newer ones.
+        // On the upkeep thread, the commit it was named: the writer may
+        // have committed past it meanwhile, and forms stamped with a
+        // later position would be taken by a reader there without the
+        // writes between.
         if self.publish_dirty(false) {
             st.forms_complete
                 .store(self.fs().tables_complete.get(), AtomicOrdering::Release);
-            st.forms_at
-                .store(self.mem().committed_log(), AtomicOrdering::Release);
+            st.forms_at.store(
+                self.mem().committed_log().min(self.log_bound.get()),
+                AtomicOrdering::Release,
+            );
         }
         Ok(())
     }
@@ -10565,6 +10711,7 @@ impl Db {
             snap_kept: AtomicU64::new(0),
             snap_carried: AtomicU64::new(0),
             snap_switched: AtomicU64::new(0),
+            upkeep: Lend::default(),
         });
         let r = Reader {
             shared,
@@ -10577,6 +10724,8 @@ impl Db {
             fs: FormsCell::new(),
             signalled: std::cell::Cell::new((0, usize::MAX)),
             log_bound: std::cell::Cell::new(usize::MAX),
+            len_bound: std::cell::Cell::new(usize::MAX),
+            force_due: std::cell::Cell::new(false),
         };
         Ok(Db {
             r,
@@ -10594,6 +10743,10 @@ impl Db {
             next_seg: 0,
             sealing: None,
             keeper: None,
+            upkeeper: None,
+            upkeep_log: (0, 0),
+            upkeep_life: 0,
+            upkeep_since_scan: 0,
             compacting: None,
             tiering: None,
             unsynced: 0,
@@ -10851,6 +11004,7 @@ impl Db {
             snap_kept: AtomicU64::new(0),
             snap_carried: AtomicU64::new(0),
             snap_switched: AtomicU64::new(0),
+            upkeep: Lend::default(),
         });
         let r = Reader {
             shared,
@@ -10863,6 +11017,8 @@ impl Db {
             fs: FormsCell::with_tables(Db::tables_for(ntables)),
             signalled: std::cell::Cell::new((0, usize::MAX)),
             log_bound: std::cell::Cell::new(usize::MAX),
+            len_bound: std::cell::Cell::new(usize::MAX),
+            force_due: std::cell::Cell::new(false),
         };
         Ok(Db {
             r,
@@ -10880,6 +11036,10 @@ impl Db {
             next_seg,
             sealing: None,
             keeper: None,
+            upkeeper: None,
+            upkeep_log: (0, 0),
+            upkeep_life: 0,
+            upkeep_since_scan: 0,
             compacting: None,
             tiering: None,
             unsynced: 0,
@@ -11050,12 +11210,19 @@ impl Db {
             return Err(e);
         }
         let t = std::time::Instant::now();
+        let background = matches!(self.opts.upkeep, Upkeep::Background(_));
         if self.mem().ordered {
             self.commit_direct()?;
         } else {
             self.wal.mark_commit();
             self.wal.write()?;
             self.mem().commit();
+            // The upkeep handed over before the barrier, so the thread
+            // works while the device syncs -- unless a seal is to be
+            // joined, whose publish would take it straight back.
+            if background && !self.sealing.as_ref().is_some_and(|h| h.is_finished()) {
+                self.hand_over_upkeep();
+            }
             self.unsynced += 1;
             let due = match self.opts.sync {
                 SyncPolicy::Always => true,
@@ -11080,15 +11247,36 @@ impl Db {
         if self.sealing.as_ref().is_some_and(|h| h.is_finished()) {
             self.join_seal()?;
         }
-        self.maintain_forms()?;
+        if background {
+            if let Some(e) = self.shared.upkeep.take_err() {
+                return Err(e);
+            }
+            self.start_upkeep();
+            if self.fs_home() {
+                self.hand_over_upkeep();
+            }
+        } else {
+            self.maintain_forms()?;
+        }
         self.build_ahead_if_due();
         self.start_keeper();
-        self.sweep_retired_forms();
+        // The thread frees what it replaced at its own passes: freed here
+        // while it is lent, a form it had just replaced could go under a
+        // read of its own.
+        if self.fs_home() {
+            self.sweep_retired_forms();
+        }
         self.phase_ns[0] += t.elapsed().as_nanos() as u64;
         // A direct run closes when a seal would: it joins whole, as a
         // seal's piece does by promotion, so the two paths leave one shape.
         if self.mem_bytes >= self.seal_threshold() {
             self.seal()?;
+            // The freeze's publish took the upkeep back, and a burst's
+            // last commit that seals would leave the new state's upkeep
+            // to the first read after it.
+            if background && self.fs_home() {
+                self.hand_over_upkeep();
+            }
         }
         Ok(())
     }
@@ -11429,6 +11617,9 @@ impl Db {
     /// the level-0 count says so). For an experiment that wants a store in a
     /// known shape before it measures.
     pub fn settle(&mut self) -> Result<()> {
+        // The upkeep first: every join after it touches the writer's
+        // upkeep, and a touch takes it back from the thread untouched.
+        self.join_upkeep();
         self.join_seal()?;
         self.join_compact()?;
         self.join_tier()?;
@@ -11638,6 +11829,9 @@ impl Db {
     }
 
     fn publish_state(&mut self, next: State) {
+        // The upkeep thread reads the state it was lent over and pins
+        // nothing, so it is home before the state is swapped and freed.
+        self.take_back_upkeep();
         // The builder holds the state it builds over, and its forms are
         // of that state: stopped before the swap, so its handle is gone
         // before the state it pinned is retired.
@@ -11653,30 +11847,6 @@ impl Db {
         drop(retired);
         self.sweep_retired_forms();
         self.wake_keeper();
-    }
-
-    /// EXPERIMENT: free the replaced canonical forms no pinned reader can
-    /// still be walking: those retired at an epoch every pinned slot is
-    /// past. The epoch is bumped first, so a form retired under the
-    /// current epoch can be freed once its readers leave.
-    fn sweep_retired_forms(&self) {
-        self.sweep_retired_snaps();
-        let mut retired = self.shared.retired_forms.lock().expect("the retired forms");
-        if retired.is_empty() {
-            return;
-        }
-        self.shared.readers.bump();
-        let readers = &self.shared.readers;
-        retired.retain(|(t, f)| {
-            if readers.none_before(t + 1) {
-                // SAFETY: replaced by the writer, unreachable since, and
-                // every reader that could hold it has left.
-                drop(unsafe { Box::from_raw(f.0) });
-                false
-            } else {
-                true
-            }
-        });
     }
 
     /// EXPERIMENT: partitions whose copies were carried across a merge
@@ -11791,6 +11961,8 @@ impl Reader {
             fs: FormsCell::new(),
             signalled: std::cell::Cell::new((0, usize::MAX)),
             log_bound: std::cell::Cell::new(usize::MAX),
+            len_bound: std::cell::Cell::new(usize::MAX),
+            force_due: std::cell::Cell::new(false),
         })
     }
 }
@@ -12647,7 +12819,7 @@ impl Reader {
                 handle: None,
                 rx,
                 stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-                from: self.mem().committed_log(),
+                from: self.commit_at().0,
                 since: std::cell::RefCell::new(Since::default()),
                 done: std::cell::Cell::new(true),
                 posted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -12662,7 +12834,7 @@ impl Reader {
         // length from a later commit than the watermark would leave the
         // keys logged between the two outside the builder's forms and
         // outside the splice.
-        let (from, live_len, wm) = mem.committed_at();
+        let (from, live_len, wm) = self.commit_at();
         // Writes logged past the commit that this handle has read already
         // -- a batch staged and not committed, which the writer's own
         // scans see -- are filed now; the log is read on from where it
@@ -13516,6 +13688,389 @@ impl Reader {
             return Some(std::sync::Arc::new(out));
         }
         None
+    }
+}
+
+/// A commit the writer's upkeep is to be brought to, named by the writer
+/// at the commit: the state's generation, the log's length, the live
+/// memtable's entries and the watermark, all of that one commit. A
+/// structure filed to a log position under a watermark past it holds
+/// writes no reader at that position may see.
+#[derive(Clone, Copy)]
+struct UpkeepTo {
+    gen: u64,
+    log: usize,
+    len: usize,
+    wm: u64,
+    /// File everything whatever the commit's own rules say.
+    force: bool,
+}
+
+/// The writer's upkeep while it is away from the writer, and the thread
+/// it is lent to. The writer lends it at a commit and names later commits
+/// while it is away; the thread takes it out, brings it to the last
+/// commit named, and puts it back; the writer takes it back whenever
+/// something of its own needs it, waiting only while a pass is in
+/// flight, and whatever the thread has not begun is the writer's again,
+/// untouched.
+#[derive(Default)]
+struct Lend {
+    inner: std::sync::Mutex<LendInner>,
+    thread: std::sync::OnceLock<std::thread::Thread>,
+    /// For a measurement: passes the thread made, the times the writer
+    /// took the upkeep back, the times it waited for a pass in flight,
+    /// and the nanoseconds it waited.
+    passes: AtomicU64,
+    takes: AtomicU64,
+    waits: AtomicU64,
+    wait_ns: AtomicU64,
+}
+
+#[derive(Default)]
+struct LendInner {
+    /// The upkeep, when it is lent and not in the thread's hands.
+    fs: Option<FormsState>,
+    /// The thread has it out.
+    busy: bool,
+    /// The commit it is to be brought to next.
+    to: Option<UpkeepTo>,
+    /// The writer, waiting for it back: the thread begins nothing new.
+    want: bool,
+    waiter: Option<std::thread::Thread>,
+    /// A pass's failure, for the writer's next commit to return.
+    err: Option<std::io::Error>,
+    /// A pass that panicked -- a debug assertion in the maintenance, in
+    /// the checked profile -- for the writer to raise when it takes the
+    /// upkeep back, rather than wait on a thread that has none to give.
+    panic: Option<Box<dyn std::any::Any + Send>>,
+}
+
+/// How long the upkeep thread sleeps between looks, from the shortest
+/// after a pass to the longest, doubling while nothing is lent. A commit
+/// wakes it only for a batch of `UPKEEP_WAKE_WRITES` or more: a wake is
+/// a futex call and an interrupt to an idle core, on this guest a VM exit
+/// paid by the waking thread, and the keeper's commits paid 12-23% of
+/// ycsb-A for one each. A batch smaller than that waits for the poll, or
+/// for the read that takes the upkeep back and files it itself.
+const UPKEEP_POLL_MIN: std::time::Duration = std::time::Duration::from_micros(100);
+const UPKEEP_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(20);
+const UPKEEP_WAKE_WRITES: usize = 256;
+
+impl Lend {
+    fn lock(&self) -> std::sync::MutexGuard<'_, LendInner> {
+        self.inner.lock().expect("the writer's upkeep")
+    }
+
+    /// `fs` handed over, to be brought to `to`.
+    fn lend(&self, fs: FormsState, to: UpkeepTo) {
+        let mut g = self.lock();
+        debug_assert!(g.fs.is_none() && !g.busy, "the upkeep is lent once");
+        g.fs = Some(fs);
+        g.to = Some(to);
+    }
+
+    /// A later commit to bring the lent upkeep to.
+    fn post(&self, to: UpkeepTo) {
+        self.lock().to = Some(to);
+    }
+
+    fn wake(&self) {
+        if let Some(t) = self.thread.get() {
+            t.unpark();
+        }
+    }
+
+    /// The upkeep back from the thread, after the pass in flight if one
+    /// is. Called only while it is lent.
+    fn take_back(&self) -> FormsState {
+        self.takes.fetch_add(1, AtomicOrdering::Relaxed);
+        let mut waited: Option<std::time::Instant> = None;
+        let mut g = self.lock();
+        loop {
+            if !g.busy {
+                if let Some(p) = g.panic.take() {
+                    drop(g);
+                    std::panic::resume_unwind(p);
+                }
+                let fs = g.fs.take().expect("the writer's upkeep is lent");
+                g.to = None;
+                g.want = false;
+                g.waiter = None;
+                drop(g);
+                if let Some(t) = waited {
+                    self.waits.fetch_add(1, AtomicOrdering::Relaxed);
+                    self.wait_ns
+                        .fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+                }
+                return fs;
+            }
+            g.want = true;
+            waited.get_or_insert_with(std::time::Instant::now);
+            g.waiter = Some(std::thread::current());
+            drop(g);
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
+            g = self.lock();
+        }
+    }
+
+    /// Whether the thread has brought the upkeep to the last commit
+    /// named.
+    fn caught_up(&self) -> bool {
+        let g = self.lock();
+        !g.busy && g.to.is_none()
+    }
+
+    fn take_err(&self) -> Option<std::io::Error> {
+        self.lock().err.take()
+    }
+}
+
+impl Reader {
+    /// A handle with the writer's view and none of its own upkeep, for the
+    /// upkeep thread to run the writer's through: the writer's reads and
+    /// publishes, bounded at each pass to the commit the writer named.
+    /// It pins nothing, as the writer's own handle pins nothing: while the
+    /// upkeep is lent the writer publishes and frees nothing, since every
+    /// publish takes the upkeep back first.
+    fn understudy(&self) -> Reader {
+        Reader {
+            shared: self.shared.clone(),
+            counted: false,
+            slot: None,
+            isolation: std::cell::Cell::new(Isolation::Dirty),
+            held: AtomicPtr::new(std::ptr::null_mut()),
+            wm: std::cell::Cell::new(SEE_ALL),
+            opts: self.opts.clone(),
+            signalled: std::cell::Cell::new((0, usize::MAX)),
+            log_bound: std::cell::Cell::new(usize::MAX),
+            len_bound: std::cell::Cell::new(usize::MAX),
+            force_due: std::cell::Cell::new(false),
+            fs: FormsCell::empty(),
+        }
+    }
+
+    /// The upkeep thread's loop, on an understudy: see `Lend`.
+    fn keep_upkeep(&mut self, stop: &std::sync::atomic::AtomicBool) {
+        let shared = self.shared.clone();
+        let lend = &shared.upkeep;
+        let _ = lend.thread.set(std::thread::current());
+        let mut idle = UPKEEP_POLL_MIN;
+        loop {
+            if stop.load(AtomicOrdering::SeqCst) {
+                break;
+            }
+            let job = {
+                let mut g = lend.lock();
+                match (g.busy, g.want, g.to) {
+                    (false, false, Some(to)) if g.fs.is_some() => {
+                        g.busy = true;
+                        g.to = None;
+                        g.fs.take().map(|fs| (fs, to))
+                    }
+                    _ => None,
+                }
+            };
+            let Some((fs, to)) = job else {
+                std::thread::park_timeout(idle);
+                idle = (idle * 2).min(UPKEEP_POLL_MAX);
+                continue;
+            };
+            let pass =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.upkeep_pass(fs, to)));
+            lend.passes.fetch_add(1, AtomicOrdering::Relaxed);
+            let mut g = lend.lock();
+            match pass {
+                Ok((fs, done)) => {
+                    g.fs = Some(fs);
+                    if let Err(e) = done {
+                        g.err.get_or_insert(e);
+                    }
+                }
+                Err(p) => {
+                    // The upkeep is whatever the pass left in the cell;
+                    // the writer raises the panic before it could use it.
+                    g.fs = self.lend_fs();
+                    g.panic = Some(p);
+                }
+            }
+            g.busy = false;
+            if let Some(w) = g.waiter.take() {
+                w.unpark();
+            }
+            idle = UPKEEP_POLL_MIN;
+        }
+    }
+
+    /// One pass: the writer's upkeep brought to `to` by the commit's own
+    /// maintenance, bounded to what `to` names, and the forms and
+    /// snapshots it replaced freed where no reader holds them.
+    fn upkeep_pass(&mut self, fs: FormsState, to: UpkeepTo) -> (FormsState, Result<()>) {
+        *self.fs.0.get_mut() = Some(fs);
+        // A publish takes the upkeep back before it swaps the state, so
+        // the state is the commit's; were it not, the work is the next
+        // pass's.
+        let done = if self.state().gen == to.gen {
+            self.log_bound.set(to.log);
+            self.len_bound.set(to.len);
+            self.wm.set(to.wm);
+            self.force_due.set(to.force);
+            let done = self.maintain_forms();
+            self.sweep_retired_forms();
+            done
+        } else {
+            Ok(())
+        };
+        let fs = self.lend_fs().expect("the pass holds the upkeep");
+        (fs, done)
+    }
+}
+
+/// The upkeep thread in flight: its handle and the flag that stops it.
+struct Upkeeper {
+    handle: Option<std::thread::JoinHandle<()>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Db {
+    /// The upkeep thread started, if the option asks and it is not
+    /// running.
+    fn start_upkeep(&mut self) {
+        if self.upkeeper.is_some() || !matches!(self.opts.upkeep, Upkeep::Background(_)) {
+            return;
+        }
+        let mut r = self.understudy();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = stop.clone();
+        let spawned = std::thread::Builder::new()
+            .name("supdb-upkeep".into())
+            .spawn(move || r.keep_upkeep(&flag));
+        if let Ok(handle) = spawned {
+            self.upkeeper = Some(Upkeeper {
+                handle: Some(handle),
+                stop,
+            });
+        }
+    }
+
+    /// The upkeep handed to the thread, or the thread told of a later
+    /// commit while it has it, and woken for a batch worth waking it for.
+    /// Nothing while the thread is not running: a lent upkeep nobody
+    /// works on is only one the next read takes back.
+    fn hand_over_upkeep(&mut self) {
+        let Upkeep::Background(level) = self.opts.upkeep else {
+            return;
+        };
+        if self
+            .upkeeper
+            .as_ref()
+            .is_none_or(|u| u.handle.as_ref().is_none_or(|h| h.is_finished()))
+        {
+            return;
+        }
+        // The commit's three quantities and the store's keys, read
+        // before any field of the writer's moves.
+        let (gen, log, len, wm, keys) = {
+            let st = self.state();
+            let mem = &st.mem;
+            let keys: usize = st
+                .segs
+                .iter()
+                .filter(|s| s.level > 0)
+                .map(|s| s.blob.keys())
+                .sum();
+            let (log, len, wm) = mem.committed_at();
+            (st.gen, log, len, wm, keys)
+        };
+        let batch = if self.upkeep_log.0 == gen {
+            log.saturating_sub(self.upkeep_log.1)
+        } else {
+            log
+        };
+        self.upkeep_log = (gen, log);
+        // Reads around: a scan over the store since the last two stores'
+        // worth of writes. The writer's own scans say so at every scan,
+        // a handle's once per commit.
+        let life = self.shared.scans_life.load(AtomicOrdering::Relaxed);
+        if life != self.upkeep_life {
+            self.upkeep_life = life;
+            self.upkeep_since_scan = 0;
+        } else {
+            self.upkeep_since_scan += batch as u64;
+        }
+        let reads_around = life > 0 && self.upkeep_since_scan <= 2 * keys as u64;
+        let force = match level {
+            0 | 1 => false,
+            2 => reads_around,
+            _ => true,
+        };
+        let to = UpkeepTo {
+            gen,
+            log,
+            len,
+            wm,
+            force,
+        };
+        match self.r.lend_fs() {
+            Some(fs) => self.shared.upkeep.lend(fs, to),
+            None => self.shared.upkeep.post(to),
+        }
+        if batch >= UPKEEP_WAKE_WRITES {
+            self.shared.upkeep.wake();
+        }
+    }
+
+    /// The upkeep home, once the thread has brought it to the last commit
+    /// named: what `settle` does, so a caller that settles reads what the
+    /// thread leaves rather than racing it.
+    fn join_upkeep(&mut self) {
+        if self.fs_home() {
+            return;
+        }
+        while !self.shared.upkeep.caught_up() {
+            if self
+                .upkeeper
+                .as_ref()
+                .is_none_or(|u| u.handle.as_ref().is_none_or(|h| h.is_finished()))
+            {
+                break;
+            }
+            self.shared.upkeep.wake();
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        self.take_back_upkeep();
+    }
+
+    /// The upkeep home, after the pass in flight: what every publish does
+    /// before it swaps the state.
+    fn take_back_upkeep(&self) {
+        if !self.fs_home() {
+            let _ = self.fs();
+        }
+    }
+
+    fn stop_upkeep(&mut self) {
+        self.take_back_upkeep();
+        if let Some(mut u) = self.upkeeper.take() {
+            u.stop.store(true, AtomicOrdering::SeqCst);
+            self.shared.upkeep.wake();
+            if let Some(h) = u.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// EXPERIMENT: what the upkeep thread did over this store's life:
+    /// passes, the times the writer took the upkeep back, the times it
+    /// waited for a pass in flight, and the microseconds it waited.
+    #[doc(hidden)]
+    pub fn upkeep_counts(&self) -> [u64; 4] {
+        let l = &self.shared.upkeep;
+        [
+            l.passes.load(AtomicOrdering::Relaxed),
+            l.takes.load(AtomicOrdering::Relaxed),
+            l.waits.load(AtomicOrdering::Relaxed),
+            l.wait_ns.load(AtomicOrdering::Relaxed) / 1000,
+        ]
     }
 }
 
@@ -14649,6 +15204,7 @@ impl<'s> BuildCtx<'s> {
 
 impl Drop for Db {
     fn drop(&mut self) {
+        self.stop_upkeep();
         self.stop_keeper();
         self.stop_ahead();
         if let Some(h) = self.sealing.take() {

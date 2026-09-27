@@ -2120,6 +2120,69 @@ small store, 162 KB of forms against 1.52 MB at ten thousand keys, and
 `scan_cache_bytes` bounds it for a caller who minds. Nothing else on the
 ladder moved either way.
 
+#### The writer's upkeep on a thread of its own
+
+The deferred settle is a bill, and the settle bound only chooses which
+operation pays it: a commit that crosses the bound, or the first scan
+after a burst whose last commits did not. `Options::upkeep` gives the
+work to a thread of the store's own instead (`Upkeep::Background`), so
+it runs while the writer is elsewhere -- during the commit's own
+barrier, and beside the next batch.
+
+What moves is the writer's `FormsState`: the block tables, the scan
+snapshot and the log position both are current to. A commit lends it,
+before its fdatasync so the pass overlaps the device, and names the
+commit the pass is to bring it to -- the generation, the log length,
+the entry count and the watermark, taken on the writer's thread, where
+they are one commit's by construction. The thread runs the commit's own
+`maintain_forms` through a `Reader` of its own, bounded to what the
+writer named, since the writer goes on appending past it. The writer
+takes the upkeep back at the first thing of its own that needs it -- a
+scan through the writer, a publish, a handle's claim -- and waits only
+for a pass in flight; puts, point reads and commits leave it lent. The
+rules that keep one structure on two threads correct:
+
+- Only one thread holds it. The cell is emptied through `&mut` and
+  refilled through `&self` only while empty, so no field of it needs to
+  be `Sync`.
+- Every publish takes it back before the swap. The thread pins
+  nothing, as the writer's own handle pins nothing, so the state it
+  reads must not be retired under it, and the only thing that retires a
+  state is the writer's publish.
+- The forms it publishes are stamped with the commit it was named, not
+  the writer's latest: stamped later, a handle at that later commit
+  takes forms without the writes between. The threaded test kills that
+  mutant in every run.
+- Retired forms and snapshots are swept only by whoever holds the
+  upkeep: swept by the writer while it is lent, a form the thread had
+  just replaced could go under the thread's own read.
+- A pass that panics -- a debug assertion in the checked profile -- is
+  raised on the writer when it takes the upkeep back, rather than
+  leaving the writer waiting on a thread that has nothing to give.
+- `settle` joins the upkeep before anything else, because every other
+  join touches the writer's upkeep and a touch takes it back from the
+  thread untouched. The first version joined it last, and a test that
+  asked for the thread's work after a settle found it had never run.
+
+A commit wakes the thread only for a batch of 256 writes or more; a
+smaller one waits for its poll, a hundred microseconds after a pass and
+doubling to twenty milliseconds while nothing is lent, or for the read
+that takes the upkeep back and files it itself. A wake is a futex call
+and an interrupt to an idle core, which on this guest is a VM exit the
+waking thread pays, and a wake at every commit cost the keeper 12-23%
+of ycsb-A. The level is how eagerly a pass files: 1 by the commit's own
+rules, 3 everything at every commit, and 2 everything while reads are
+around -- a scan over the store within the last two stores' worth of
+writes -- and the commit's rules otherwise, so a long run of writes
+nobody reads pays nothing for a structure nobody walks.
+
+Testing it found a defect older than it: a handle took the log length
+it settles to and the watermark it reads under as two loads of words
+the commit stored in turn, and could hold one commit's length with the
+watermark before it ("Read and write concurrency" below has the marks
+that fixed it). It is off until priced; `supdb-upkeep` is level 2 against the
+default.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and

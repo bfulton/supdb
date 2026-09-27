@@ -268,17 +268,18 @@ fn reopen_after_seal_serves_both_old_and_new_writes() {
     );
 }
 
-fn oracle(cursors: bool) {
+fn oracle(cursors: bool, upkeep: supdb::Upkeep) {
     // The differential model oracle: random appends, commits, seals, and
     // crash-reopens, checked against a HashMap after every reopen.
     // Uncommitted writes are trimmed from the model at a crash, which is the
     // durability contract.
     let d = dir(&format!(
-        "oracle-{}",
+        "oracle-{}-{upkeep:?}",
         if cursors { "cursors" } else { "probes" }
     ));
     let opts = Options {
         cursor_merge: cursors,
+        upkeep,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts.clone()).unwrap();
@@ -366,14 +367,21 @@ fn apply(model: &mut HashMap<Vec<u8>, Vec<Vec<u8>>>, batch: &mut Vec<(Vec<u8>, O
 
 #[test]
 fn model_oracle_over_random_ops_and_crashes() {
-    oracle(true)
+    oracle(true, supdb::Upkeep::Inline)
+}
+
+/// The same oracle with the writer's upkeep on a thread: every reopen is
+/// a drop, which stops the thread with the upkeep lent or home.
+#[test]
+fn the_oracle_holds_with_the_upkeep_on_a_thread() {
+    oracle(true, supdb::Upkeep::Background(3))
 }
 
 /// The probe merge stays behind `cursor_merge` as the comparison arm -- and
 /// a path only one arm exercises is a path nothing tests.
 #[test]
 fn the_probe_merge_arm_passes_the_same_oracle() {
-    oracle(false)
+    oracle(false, supdb::Upkeep::Inline)
 }
 
 /// The names of the live segment files, sorted. A promoted piece keeps the
@@ -1849,6 +1857,14 @@ fn the_block_cache_answers_the_same_model() {
     overlay_model("overlay-cache", true, 0);
 }
 
+/// The same model with the writer's upkeep on a thread: every check reads
+/// through the writer, which takes the upkeep back from wherever the
+/// thread has brought it.
+#[test]
+fn the_block_cache_answers_the_same_model_with_the_upkeep_on_a_thread() {
+    overlay_model_with("overlay-upkeep", true, 0, supdb::Upkeep::Background(3));
+}
+
 /// Under a budget of a couple of blocks, every build sheds another, and
 /// a scan finds blocks dropped since its last visit; the answers must not
 /// change, and the bytes the cache counts must be the bytes it holds.
@@ -2926,17 +2942,31 @@ fn held(db: &Db, budget: usize) {
 }
 
 fn overlay_model(name: &str, block_cache: bool, budget: usize) {
+    overlay_model_with(name, block_cache, budget, supdb::Upkeep::Inline)
+}
+
+fn overlay_model_with(name: &str, block_cache: bool, budget: usize, upkeep: supdb::Upkeep) {
     let d = dir(name);
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(2 << 10),
         scan_block_cache: block_cache,
         scan_cache_bytes: budget,
+        upkeep,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
     let key = |k: u32| format!("key-{k:05}");
+    // On a thread, a commit of a few writes wakes nothing and the next
+    // scan takes the upkeep back untouched; `settle` waits for the
+    // thread's pass instead, so the check after it reads what the thread
+    // filed.
+    let pass = |db: &mut Db| {
+        if upkeep != supdb::Upkeep::Inline {
+            db.settle().unwrap();
+        }
+    };
     for k in (0..600).step_by(3) {
         m.append(&mut db, &key(k), &format!("p{k}"));
     }
@@ -2958,6 +2988,7 @@ fn overlay_model(name: &str, block_cache: bool, budget: usize) {
     m.delete(&mut db, &key(306));
     m.append(&mut db, &key(310), "s-between");
     db.commit().unwrap();
+    pass(&mut db);
     m.check(&db, "a few unsealed keys in one partition");
     held(&db, budget);
 
@@ -3035,9 +3066,16 @@ fn overlay_model(name: &str, block_cache: bool, budget: usize) {
         m.append(&mut db, &key(k), &format!("e{k}"));
     }
     db.commit().unwrap();
+    pass(&mut db);
     assert_eq!(db.levels().1, 0);
     m.check(&db, "live inserts past the end, after the merge");
     held(&db, budget);
+    if upkeep != supdb::Upkeep::Inline {
+        assert!(
+            db.upkeep_counts()[0] > 0,
+            "the thread made no pass, so nothing above tested it"
+        );
+    }
     db.close().unwrap();
 }
 
@@ -3717,18 +3755,27 @@ fn a_reader_walks_the_forms_the_writer_maintains_at_commit() {
 /// no key holds two values.
 #[test]
 fn reader_threads_over_maintained_forms_keep_answering() {
-    reader_threads_over_blocks(true);
+    reader_threads_over_blocks(true, supdb::Upkeep::Inline);
 }
 
 /// The same threads over blocks each handle builds and settles itself.
 #[test]
 fn reader_threads_over_their_own_blocks_keep_answering() {
-    reader_threads_over_blocks(false);
+    reader_threads_over_blocks(false, supdb::Upkeep::Inline);
 }
 
-fn reader_threads_over_blocks(commit_forms: bool) {
-    let d = dir(&format!("commit-forms-threads-{commit_forms}"));
+/// The same threads with the writer's upkeep on a thread of its own: the
+/// forms they walk are the ones the upkeep thread published, at the
+/// commits the writer named for it.
+#[test]
+fn reader_threads_over_forms_the_upkeep_thread_maintains() {
+    reader_threads_over_blocks(true, supdb::Upkeep::Background(3));
+}
+
+fn reader_threads_over_blocks(commit_forms: bool, upkeep: supdb::Upkeep) {
+    let d = dir(&format!("commit-forms-threads-{commit_forms}-{upkeep:?}"));
     let opts = Options {
+        upkeep,
         seal_bytes: 32 << 10,
         partition_bytes: Some(64 << 10),
         l0_trigger: 2,
@@ -3808,7 +3855,10 @@ fn reader_threads_over_blocks(commit_forms: bool) {
     }
     let mut x = 42u64;
     for round in 1..=200u64 {
-        for _ in 0..50 {
+        // Every tenth batch large enough to wake an upkeep thread, so its
+        // passes run while the commits after them land.
+        let batch = if round % 10 == 0 { 400 } else { 50 };
+        for _ in 0..batch {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
@@ -3832,10 +3882,18 @@ fn reader_threads_over_blocks(commit_forms: bool) {
     // commits every fifty puts, a reader is behind the table and builds
     // its own, which is what the invariants held. With the writer quiet
     // the same handle takes them.
+    // On a thread, the forms of a commit are published once its pass has
+    // run: `settle` waits for that, as a quiet writer would.
+    let quiet = |db: &mut Db| {
+        if upkeep != supdb::Upkeep::Inline {
+            db.settle().unwrap();
+        }
+    };
     for k in (0..keys).step_by(9) {
         db.put(&key(k), b"901");
     }
     db.commit().unwrap();
+    quiet(&mut db);
     let r = db.reader().unwrap();
     let mut sink = 0usize;
     r.scan(&key(0), 500, |_k, v| sink += v.len()).unwrap();
@@ -3843,6 +3901,7 @@ fn reader_threads_over_blocks(commit_forms: bool) {
         db.put(&key(k), b"902");
     }
     db.commit().unwrap();
+    quiet(&mut db);
     let before = db.canonical_forms().2;
     r.scan(&key(0), 500, |_k, v| sink += v.len()).unwrap();
     let (forms, _, takes, _) = db.canonical_forms();
@@ -3851,6 +3910,12 @@ fn reader_threads_over_blocks(commit_forms: bool) {
         takes > before,
         "a reader over a quiet store walks them: {takes} against {before}"
     );
+    if upkeep != supdb::Upkeep::Inline {
+        assert!(
+            db.upkeep_counts()[0] > 0,
+            "the thread made no pass, so nothing above tested it"
+        );
+    }
     std::hint::black_box(sink);
 }
 
