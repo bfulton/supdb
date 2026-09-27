@@ -2245,6 +2245,28 @@ is where it shows. The thread's own cost here is real to a caller
 too, since a background seal after a burst competes with the reads
 after it whoever leaves it running.
 
+What the small rungs did say is that the hold took nothing off their
+reads. Their settle bound is 200 and 600 writes against the sweep's
+commits of a thousand, so the inline commits filed every batch
+themselves and left the first scan nothing; the thread only moved that
+work to another core and let the burst end sooner. So level 2 now
+holds only where the commit's own rules would leave the batch to the
+next read -- no scan since the last commit and the backlog under the
+bound -- and otherwise does exactly what `Inline` does, asking the
+rules through the one function the maintenance asks (`settle_due`,
+without consuming its one-shot reasons). Sixteen pairs a rung:
+
+| | 10k | 30k | 100k | 300k |
+|---|---|---|---|---|
+| scan-lag, all of it unmerged | 0.99x | 1.06x | **1.56x** | **1.66x** |
+| scan-lag, a tenth | 0.99x | 1.16x | 1.04x | **1.31x** |
+| scan-lag, a hundredth | 0.98x | 1.05x | 1.05x | 1.27x (14/16) |
+
+Bold is 16/16. Nothing at the small rungs is marked. Against LMDB,
+twelve pairs a rung, the arm wins every lag point at every rung: at
+the fully unmerged one 2.10x, 1.70x, 1.09x and 1.28x up the ladder,
+where the inline default reads 1.75x, 1.60x, 0.75x and 0.66x.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and

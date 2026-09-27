@@ -3925,13 +3925,81 @@ fn reader_threads_over_blocks(commit_forms: bool, upkeep: supdb::Upkeep) {
         takes > before,
         "a reader over a quiet store walks them: {takes} against {before}"
     );
-    if upkeep != supdb::Upkeep::Inline {
+    // At level 2 every commit above followed a scan, which the commit's
+    // own rules file, so the thread is not asked to.
+    if matches!(upkeep, supdb::Upkeep::Background(l) if l != 2) {
         assert!(
             db.upkeep_counts()[0] > 0,
             "the thread made no pass, so nothing above tested it"
         );
     }
     std::hint::black_box(sink);
+}
+
+/// Level 2 hands the thread only what a commit's own rules would leave
+/// to the next read: a commit a scan preceded files its batch itself, as
+/// does a batch too small to wake the thread for, and a batch under the
+/// settle bound with no scan since holds for the thread's pass. Every
+/// write reads back through the scan after.
+#[test]
+fn the_adaptive_upkeep_holds_only_for_what_a_commit_leaves_to_a_read() {
+    let d = dir("upkeep-adaptive");
+    let opts = Options {
+        upkeep: supdb::Upkeep::Background(2),
+        partition_bytes: Some(256 << 10),
+        // The plain seal, so the few hundred writes below seal nothing.
+        seal_max_pct: 0,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    // The settle bound is 2% of the partitions' keys: 400.
+    let keys = 20_000u32;
+    let key = |k: u32| format!("key-{k:06}").into_bytes();
+    for k in 0..keys {
+        db.append(&key(k), b"0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+    let mut want: HashMap<u32, String> = HashMap::new();
+    let check = |db: &Db, want: &HashMap<u32, String>, when: &str| {
+        let mut seen = 0u32;
+        db.scan(&key(0), keys as usize, |k, v| {
+            let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+            let got = std::str::from_utf8(v).unwrap();
+            let expect = want.get(&kn).map_or("0", |s| s.as_str());
+            assert_eq!(got, expect, "key {kn} {when}");
+            seen += 1;
+        })
+        .unwrap();
+        assert_eq!(seen, keys, "every key {when}");
+    };
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    let mut write = |db: &mut Db, want: &mut HashMap<u32, String>, n: usize, v: &str| {
+        for _ in 0..n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % keys as u64) as u32;
+            db.put(&key(k), v.as_bytes());
+            want.insert(k, v.to_string());
+        }
+        db.commit().unwrap();
+    };
+    let holds = |db: &Db| db.upkeep_counts()[4];
+    check(&db, &want, "before any write");
+    let h = holds(&db);
+    write(&mut db, &mut want, 300, "a");
+    assert_eq!(
+        holds(&db),
+        h,
+        "a commit a scan preceded files its own batch"
+    );
+    write(&mut db, &mut want, 300, "b");
+    assert_eq!(holds(&db), h + 1, "a batch left to the next read holds");
+    write(&mut db, &mut want, 100, "c");
+    assert_eq!(holds(&db), h + 1, "a batch too small to wake for does not");
+    check(&db, &want, "after the three commits");
 }
 
 /// A block held two ways at once, and the read choosing: with

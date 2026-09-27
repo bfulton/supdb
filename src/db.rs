@@ -157,9 +157,10 @@ pub enum Upkeep {
     ///   over the store within the last two stores' worth of writes --
     ///   and level 1's rules otherwise, so a long stretch of writes
     ///   nobody reads pays nothing for a structure nobody walks. While
-    ///   reads are around a commit also returns only once the thread has
-    ///   filed it, so the read after it finds nothing left, and files a
-    ///   batch too small to wake the thread for itself.
+    ///   reads are around, a commit whose own rules would leave its batch
+    ///   to the next read holds until the thread has filed it, so that
+    ///   read finds nothing left; any other commit does what `Inline`
+    ///   does.
     /// - 3: everything, at every commit, whoever reads; and while reads
     ///   are around a commit holds for every batch, however small, where
     ///   level 2 files a small one itself.
@@ -5800,9 +5801,10 @@ enum Hand {
     /// Lent, the thread woken, and the commit returns once the thread
     /// has filed it.
     Hold,
-    /// Filed by the commit itself: at level 2, a batch too small to wake
-    /// the thread for, with reads around to want it filed; or no thread
-    /// to lend it to.
+    /// The commit's own maintenance, as `Upkeep::Inline` runs it: at
+    /// level 2 with reads around, a batch the commit's rules file at the
+    /// commit or one too small to wake the thread for; or no thread to
+    /// lend it to.
     Inline,
 }
 
@@ -8611,8 +8613,20 @@ impl Reader {
     /// lands in. Under a cache budget it is never complete, since a form
     /// may be shed.
     fn maintain_forms(&self) -> Result<()> {
-        if !(self.opts.commit_forms && self.opts.scan_block_cache) {
+        if self.settle_due(true) != Some(true) {
             return Ok(());
+        }
+        self.fill_forms()
+    }
+
+    /// Whether this commit's maintenance files its writes, by the rules
+    /// below; none where the store keeps no forms to file them into.
+    /// `consume` takes the one-shot reasons with the answer, which only
+    /// the maintenance that acts on it does: the upkeep's hand-over asks
+    /// the same question without acting.
+    fn settle_due(&self, consume: bool) -> Option<bool> {
+        if !(self.opts.commit_forms && self.opts.scan_block_cache) {
+            return None;
         }
         // The regime, asked of the store rather than set for it: the
         // forms cost the writer at every commit and are read by whoever
@@ -8625,10 +8639,10 @@ impl Reader {
         let st = self.state();
         if st.reader_scans.load(AtomicOrdering::Relaxed) < self.opts.forms_from_reader_scans as u64
         {
-            return Ok(());
+            return None;
         }
         if st.forms.is_empty() || self.segs().first().is_none_or(|s| s.level == 0) {
-            return Ok(());
+            return None;
         }
         // Too much of the store unsealed to be worth organising: see
         // `Options::forms_max_unsealed_pct`. The unsealed count is the
@@ -8638,7 +8652,7 @@ impl Reader {
             let unsealed = st.mem.committed_len() + st.frozen.as_ref().map_or(0, |f| f.len());
             let keys: usize = self.segs().iter().map(|s| s.blob.keys()).sum();
             if keys > 0 && unsealed * 100 > keys * self.opts.forms_max_unsealed_pct {
-                return Ok(());
+                return None;
             }
         }
         // Nothing to maintain where nothing has been scanned since the
@@ -8700,14 +8714,24 @@ impl Reader {
             self.fs().ahead.borrow().as_ref().is_some_and(|a| {
                 !a.done.get() && a.posted.load(std::sync::atomic::Ordering::Acquire)
             });
-        let due = self.force_due.get()
-            || scans != self.fs().scans_seen.get()
-            || (backlog >= bound && recent)
-            || posted
-            || self.fs().publish_due.replace(false);
-        if !due {
-            return Ok(());
-        }
+        let publish_due = if consume {
+            self.fs().publish_due.replace(false)
+        } else {
+            self.fs().publish_due.get()
+        };
+        Some(
+            self.force_due.get()
+                || scans != self.fs().scans_seen.get()
+                || (backlog >= bound && recent)
+                || posted
+                || publish_due,
+        )
+    }
+
+    /// The commit's maintenance, once `settle_due` says it files.
+    fn fill_forms(&self) -> Result<()> {
+        let st = self.state();
+        let scans = st.scans.load(AtomicOrdering::Relaxed);
         self.fs().scans_seen.set(scans);
         self.fs().cache_used.set(true);
         let gen = st.gen;
@@ -14049,13 +14073,24 @@ impl Db {
         // made the lag sweep's first scan wait up to 1.6 ms where the
         // commits filing inline had left it nothing. So the commit holds
         // until the thread has filed it, which costs the longer of the
-        // barrier and the pass rather than both; and at level 2 a batch
-        // too small to wake the thread for is the commit's own to file,
-        // where level 3 wakes the thread for it too.
-        self.upkeep_hand = match (level >= 2 && reads_around, batch) {
-            (false, _) | (true, 0) => Hand::Lend,
-            (true, b) if level == 2 && b < UPKEEP_WAKE_WRITES => Hand::Inline,
-            (true, _) => Hand::Hold,
+        // barrier and the pass rather than both. Level 3 holds for every
+        // batch. Level 2 holds only for what the commit's own rules would
+        // leave to the next read, and otherwise does what they say: files
+        // a batch they file at the commit, and leaves one too small to
+        // wake the thread for. Holding where the commit files anyway took
+        // nothing off the reads and cost the small stores' lag point a
+        // fifth, through a writer parked on its hold and a burst that
+        // ended with its seal still writing.
+        self.upkeep_hand = match (level, reads_around, batch) {
+            (_, _, 0) | (0 | 1, _, _) | (_, false, _) => Hand::Lend,
+            (2, true, b) => {
+                if b < UPKEEP_WAKE_WRITES || self.commit_files_it() {
+                    Hand::Inline
+                } else {
+                    Hand::Hold
+                }
+            }
+            (_, true, _) => Hand::Hold,
         };
         if self.upkeep_hand == Hand::Inline {
             return;
@@ -14074,6 +14109,14 @@ impl Db {
         if batch >= UPKEEP_WAKE_WRITES {
             self.shared.upkeep.wake();
         }
+    }
+
+    /// Whether the commit's own maintenance files its batch at this
+    /// commit rather than leaving it to the next read; the upkeep taken
+    /// home to ask, since the question reads its position.
+    fn commit_files_it(&mut self) -> bool {
+        self.take_back_upkeep();
+        self.settle_due(false) != Some(false)
     }
 
     /// The end of a commit's upkeep: handed over if it came home since
