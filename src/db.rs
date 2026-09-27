@@ -5428,6 +5428,31 @@ pub struct Reader {
     /// `Snapshot`, none under `Dirty` and for the writer's own handle.
     wm: std::cell::Cell<u64>,
     opts: Options,
+    /// The commit -- generation and committed log length -- this handle
+    /// last signalled a scan at, so it signals once per commit.
+    signalled: std::cell::Cell<(u64, usize)>,
+    /// How far into the write log this handle may look: the log's length
+    /// at the commit whose watermark it reads under, taken before the
+    /// watermark so it never runs ahead of it, or unbounded under `Dirty`
+    /// and for the writer's own handle. A handle that read the log to
+    /// its end settled a key's uncommitted write under the committed
+    /// watermark, leaving the value out as it must, and when the commit
+    /// landed the log had not moved, so the block kept the old run for
+    /// as long as it was cached; the point read beside it, through the
+    /// memtable, answered the new value.
+    log_bound: std::cell::Cell<usize>,
+    /// The upkeep this handle keeps for its range reads: the block
+    /// tables, the scan snapshot, and the log position both are
+    /// current to. See `FormsState`.
+    fs: FormsCell,
+}
+
+/// A handle's upkeep for its range reads: its block tables, its scan
+/// snapshot, the writes it has read from the log and not yet filed,
+/// and the positions all of them are current to. Apart from the
+/// `Reader` that holds it because the writer's can be lent: see
+/// `FormsCell`.
+struct FormsState {
     /// PROTOTYPE: the block cache's table for each segment, by position
     /// in `segs`, made on first use and dropped whenever the segments
     /// change. One load finds a block; nothing is hashed. This handle's
@@ -5480,9 +5505,6 @@ pub struct Reader {
     /// maintained the canonical forms at; a commit with the count
     /// unmoved maintains nothing.
     scans_seen: std::cell::Cell<u64>,
-    /// The commit -- generation and committed log length -- this handle
-    /// last signalled a scan at, so it signals once per commit.
-    signalled: std::cell::Cell<(u64, usize)>,
     /// EXPERIMENT: for `forms_settle_recent_pct`: the store's scan count
     /// as this handle last saw it at a commit, the writes it has counted
     /// over the store's life (the log's growth, summed across
@@ -5528,16 +5550,6 @@ pub struct Reader {
     /// or a new segment set, and the log is read from the start again.
     log_seen: std::cell::Cell<usize>,
     log_gen: std::cell::Cell<u64>,
-    /// How far into the write log this handle may look: the log's length
-    /// at the commit whose watermark it reads under, taken before the
-    /// watermark so it never runs ahead of it, or unbounded under `Dirty`
-    /// and for the writer's own handle. A handle that read the log to
-    /// its end settled a key's uncommitted write under the committed
-    /// watermark, leaving the value out as it must, and when the commit
-    /// landed the log had not moved, so the block kept the old run for
-    /// as long as it was cached; the point read beside it, through the
-    /// memtable, answered the new value.
-    log_bound: std::cell::Cell<usize>,
     /// How many of the live memtable's entries the scan snapshot covers:
     /// a key the log says was created at a number below it is in the
     /// snapshot already, not a key to file.
@@ -5545,6 +5557,58 @@ pub struct Reader {
     /// PROTOTYPE: the builder ahead of the reader, while one is running
     /// or has forms still to install. The writer's handle alone has one.
     ahead: std::cell::RefCell<Option<Ahead>>,
+}
+
+impl FormsState {
+    fn new() -> FormsState {
+        FormsState {
+            tables: std::cell::RefCell::new(Vec::new()),
+            scan_keys: std::cell::RefCell::new(None),
+            cache_used: std::cell::Cell::new(false),
+            cache_bytes: std::cell::Cell::new(0),
+            scan_tick: std::cell::Cell::new(0),
+            shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
+            pending: std::cell::RefCell::new(Vec::new()),
+            settle_run: std::cell::RefCell::new(Vec::new()),
+            settle_offs: std::cell::RefCell::new(Vec::new()),
+            dirty_any: std::cell::Cell::new(false),
+            tables_complete: std::cell::Cell::new(false),
+            publish_due: std::cell::Cell::new(false),
+            scans_seen: std::cell::Cell::new(0),
+            scans_life_seen: std::cell::Cell::new(0),
+            writes_seen: std::cell::Cell::new(0),
+            writes_at_scan: std::cell::Cell::new(0),
+            log_counted: std::cell::Cell::new((0, 0)),
+            choices: std::cell::Cell::new([0; 5]),
+            lazy_scans: std::cell::Cell::new([0; 2]),
+            settle_density: std::cell::Cell::new([0; 4]),
+            built: std::cell::RefCell::new(Vec::new()),
+            snap_gen: std::cell::Cell::new(0),
+            snap_added: std::cell::RefCell::new(Vec::new()),
+            snap_stale: std::cell::RefCell::new(std::collections::HashSet::new()),
+            log_seen: std::cell::Cell::new(0),
+            log_gen: std::cell::Cell::new(0),
+            snap_entries: std::cell::Cell::new(0),
+            ahead: std::cell::RefCell::new(None),
+        }
+    }
+}
+
+/// Where a `Reader` keeps its `FormsState`. Every handle's is always
+/// here.
+struct FormsCell(std::cell::UnsafeCell<Option<FormsState>>);
+
+impl FormsCell {
+    fn new() -> FormsCell {
+        FormsCell(std::cell::UnsafeCell::new(Some(FormsState::new())))
+    }
+
+    /// With the block tables made for `tables`' segments already.
+    fn with_tables(tables: Vec<std::cell::RefCell<Option<BlockTable>>>) -> FormsCell {
+        let fs = FormsState::new();
+        *fs.tables.borrow_mut() = tables;
+        FormsCell(std::cell::UnsafeCell::new(Some(fs)))
+    }
 }
 
 pub struct Db {
@@ -5647,6 +5711,19 @@ impl Drop for Reader {
                     .fetch_sub(1, AtomicOrdering::Relaxed);
             }
             self.shared.readers.release(slot);
+        }
+    }
+}
+
+impl Reader {
+    /// This handle's upkeep.
+    #[inline]
+    fn fs(&self) -> &FormsState {
+        // SAFETY: the cell is written only through `&mut self`, so no
+        // reference handed out here is alive while it changes.
+        match unsafe { &*self.fs.0.get() } {
+            Some(f) => f,
+            None => unreachable!("a handle's upkeep is always here"),
         }
     }
 }
@@ -7319,7 +7396,7 @@ impl Reader {
         // the checks below, four cell borrows and a snapshot's length,
         // seventy nanoseconds of a scan of a microsecond at 300k keys, on
         // a mix that writes once in twenty operations.
-        let moved = self.sync_log() || self.scan_keys.borrow().is_none();
+        let moved = self.sync_log() || self.fs().scan_keys.borrow().is_none();
         if use_cache && moved {
             self.settle_pending()?;
         }
@@ -7331,25 +7408,26 @@ impl Reader {
         // one walk: the drained scan pass at three hundred thousand keys
         // ran lazily every scan, block by block, and read 0.92x.
         let absent = self
+            .fs()
             .scan_keys
             .borrow()
             .as_ref()
             .is_none_or(|(g, _)| *g != gen);
         let unsealed_any = !self.mem().is_empty() || self.frozen().is_some();
         if use_cache && absent && unsealed_any && self.opts.scan_lazy_snapshot {
-            let mut counts = self.lazy_scans.get();
+            let mut counts = self.fs().lazy_scans.get();
             let (seen, from) = match self.scan_blocks(from, limit, None, false, &mut f)? {
                 Walk::Done(n) => {
                     counts[0] += 1;
-                    self.lazy_scans.set(counts);
+                    self.fs().lazy_scans.set(counts);
                     return Ok(n);
                 }
                 Walk::Resume { seen, from } => (seen, from),
             };
             counts[1] += 1;
-            self.lazy_scans.set(counts);
+            self.fs().lazy_scans.set(counts);
             self.refresh_snapshot(gen, use_cache, true);
-            let cache = self.scan_keys.borrow();
+            let cache = self.fs().scan_keys.borrow();
             let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
             return match self.scan_blocks(&from, limit - seen, Some(unsealed), true, &mut f)? {
                 Walk::Done(n) => Ok(seen + n),
@@ -7357,7 +7435,7 @@ impl Reader {
             };
         }
         self.refresh_snapshot(gen, use_cache, moved);
-        let cache = self.scan_keys.borrow();
+        let cache = self.fs().scan_keys.borrow();
         let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
         // The block path finds the unsealed keys a block needs when it
         // builds the block, from the block's own bounds, and never from
@@ -7509,43 +7587,43 @@ impl Reader {
     fn sync_log(&self) -> bool {
         let st = self.state();
         let mut moved = false;
-        if self.log_gen.get() != st.gen {
+        if self.fs().log_gen.get() != st.gen {
             moved = true;
-            self.log_gen.set(st.gen);
-            self.log_seen.set(0);
+            self.fs().log_gen.set(st.gen);
+            self.fs().log_seen.set(0);
             // A new state counts its own scans from zero, so the count
             // this handle last maintained at belongs to the old one.
-            self.scans_seen.set(0);
-            self.snap_entries.set(0);
-            *self.scan_keys.borrow_mut() = None;
-            self.snap_added.borrow_mut().clear();
-            self.snap_stale.borrow_mut().clear();
-            self.pending.borrow_mut().clear();
+            self.fs().scans_seen.set(0);
+            self.fs().snap_entries.set(0);
+            *self.fs().scan_keys.borrow_mut() = None;
+            self.fs().snap_added.borrow_mut().clear();
+            self.fs().snap_stale.borrow_mut().clear();
+            self.fs().pending.borrow_mut().clear();
             self.drop_blocks();
-            if self.tables.borrow().len() != st.segs.len() {
-                *self.tables.borrow_mut() = Db::tables_for(st.segs.len());
+            if self.fs().tables.borrow().len() != st.segs.len() {
+                *self.fs().tables.borrow_mut() = Db::tables_for(st.segs.len());
             }
         }
         let mem = &st.mem;
         let n = mem.log_len().min(self.log_bound.get());
-        let seen = self.log_seen.get();
+        let seen = self.fs().log_seen.get();
         if seen >= n {
             return moved;
         }
-        let file = self.cache_used.get();
+        let file = self.fs().cache_used.get();
         // A handle with no snapshot and no tables has nothing to file: the
         // snapshot it builds or adopts next covers every entry there is,
         // and the keys created since it is exactly what this loop lists.
         // Read in full, the log's two thousand entries at ten thousand
         // keys were twenty microseconds of a handle's first scan.
-        if !file && self.scan_keys.borrow().is_none() && self.ahead.borrow().is_none() {
-            self.log_seen.set(n);
+        if !file && self.fs().scan_keys.borrow().is_none() && self.fs().ahead.borrow().is_none() {
+            self.fs().log_seen.set(n);
             return true;
         }
-        let covered = self.snap_entries.get();
-        let mut added = self.snap_added.borrow_mut();
-        let mut pending = self.pending.borrow_mut();
-        let ahead = self.ahead.borrow();
+        let covered = self.fs().snap_entries.get();
+        let mut added = self.fs().snap_added.borrow_mut();
+        let mut pending = self.fs().pending.borrow_mut();
+        let ahead = self.fs().ahead.borrow();
         let mut since = ahead
             .as_ref()
             .filter(|a| !a.done.get())
@@ -7553,11 +7631,12 @@ impl Reader {
         // Every write logged past the snapshot's copy may have moved a
         // chain past its run: the slot is read from the chain from here.
         let run_at = self
+            .fs()
             .scan_keys
             .borrow()
             .as_ref()
             .map_or(usize::MAX, |(_, s)| s.log_at);
-        let mut stale = self.snap_stale.borrow_mut();
+        let mut stale = self.fs().snap_stale.borrow_mut();
         for i in seen..n {
             let (id, new) = mem.log_at(i);
             if i >= run_at {
@@ -7583,20 +7662,20 @@ impl Reader {
                 }
             }
         }
-        self.log_seen.set(n);
+        self.fs().log_seen.set(n);
         true
     }
 
     fn drop_blocks(&self) {
-        for t in self.tables.borrow().iter() {
+        for t in self.fs().tables.borrow().iter() {
             *t.borrow_mut() = None;
         }
-        self.dirty_any.set(false);
-        self.tables_complete.set(false);
-        self.cache_used.set(false);
-        self.cache_bytes.set(0);
-        self.built.borrow_mut().clear();
-        self.pending.borrow_mut().clear();
+        self.fs().dirty_any.set(false);
+        self.fs().tables_complete.set(false);
+        self.fs().cache_used.set(false);
+        self.fs().cache_bytes.set(0);
+        self.fs().built.borrow_mut().clear();
+        self.fs().pending.borrow_mut().clear();
     }
 
     /// PROTOTYPE: the forms the builder ahead has sent, installed: each
@@ -7609,14 +7688,15 @@ impl Reader {
     /// Whether the builder ahead has forms waiting to be installed, which
     /// `install_ahead` would take; nothing is taken here.
     fn ahead_posted(&self) -> bool {
-        self.ahead
+        self.fs()
+            .ahead
             .borrow()
             .as_ref()
             .is_some_and(|a| !a.done.get() && a.posted.load(std::sync::atomic::Ordering::Acquire))
     }
 
     fn install_ahead(&self, unsealed: &Snapshot) -> Result<()> {
-        let mut ahead = self.ahead.borrow_mut();
+        let mut ahead = self.fs().ahead.borrow_mut();
         let Some(a) = ahead.as_mut() else {
             return Ok(());
         };
@@ -7648,15 +7728,15 @@ impl Reader {
                 continue;
             };
             let seg = &self.segs()[pi];
-            let tables = self.tables.borrow();
+            let tables = self.fs().tables.borrow();
             let mut held = tables[pi].borrow_mut();
             if held.is_none() {
                 *held = Some(self.make_table(seg, l0, unsealed)?);
-                self.cache_used.set(true);
+                self.fs().cache_used.set(true);
             }
             let table = held.as_mut().expect("just made");
-            if table.snap_gen != self.snap_gen.get() {
-                table.resnap(seg, unsealed, self.snap_gen.get());
+            if table.snap_gen != self.fs().snap_gen.get() {
+                table.resnap(seg, unsealed, self.fs().snap_gen.get());
             }
             table.snap_at(seg, unsealed)?;
             for (b, bytes, form) in built.forms {
@@ -7982,10 +8062,10 @@ impl Reader {
         if !self.publishing(force) {
             return false;
         }
-        if !self.opts.commit_forms_build || !self.dirty_any.get() {
+        if !self.opts.commit_forms_build || !self.fs().dirty_any.get() {
             return true;
         }
-        let tables = self.tables.borrow();
+        let tables = self.fs().tables.borrow();
         for (p, cell) in tables.iter().enumerate() {
             let mut held = cell.borrow_mut();
             let Some(t) = held.as_mut() else { continue };
@@ -8002,7 +8082,7 @@ impl Reader {
                 }
             }
         }
-        self.dirty_any.set(false);
+        self.fs().dirty_any.set(false);
         true
     }
 
@@ -8019,8 +8099,8 @@ impl Reader {
         let st = self.state();
         let mem = self.mem();
         if mem.log_len() != mem.committed_log() {
-            if self.opts.commit_forms && self.dirty_any.get() {
-                self.publish_due.set(true);
+            if self.opts.commit_forms && self.fs().dirty_any.get() {
+                self.fs().publish_due.set(true);
             }
             return;
         }
@@ -8034,12 +8114,15 @@ impl Reader {
         if self.segs().first().is_some_and(|s| s.level > 0) {
             self.refresh_snapshot_to(st.gen, true, moved, true);
         }
-        if !self.opts.commit_forms || !self.dirty_any.get() || self.log_gen.get() != st.gen {
+        if !self.opts.commit_forms
+            || !self.fs().dirty_any.get()
+            || self.fs().log_gen.get() != st.gen
+        {
             return;
         }
         if self.publish_dirty(true) {
             st.forms_complete
-                .store(self.tables_complete.get(), AtomicOrdering::Release);
+                .store(self.fs().tables_complete.get(), AtomicOrdering::Release);
             st.forms_at
                 .store(mem.committed_log(), AtomicOrdering::Release);
         }
@@ -8081,7 +8164,7 @@ impl Reader {
             .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
         let seg = self.segs()[..np].get(at)?;
         let (b, _) = BuildCtx::owner_of(seg, key);
-        let tables = self.tables.borrow();
+        let tables = self.fs().tables.borrow();
         let held = tables.get(at)?.borrow();
         let t = held.as_ref()?;
         if b >= t.slots.len() {
@@ -8102,7 +8185,7 @@ impl Reader {
     /// over a copy, block walks over the cheap form, and the bytes the
     /// copies hold now.
     pub fn form_choices(&self) -> [u64; 5] {
-        self.choices.get()
+        self.fs().choices.get()
     }
 
     /// EXPERIMENT: the settles' backlog density: settles, keys, the
@@ -8114,13 +8197,13 @@ impl Reader {
     /// `Options::scan_lazy_snapshot`.
     #[doc(hidden)]
     pub fn lazy_scans(&self) -> (u64, u64) {
-        let v = self.lazy_scans.get();
+        let v = self.fs().lazy_scans.get();
         (v[0], v[1])
     }
 
     #[doc(hidden)]
     pub fn settle_density(&self) -> [u64; 4] {
-        self.settle_density.get()
+        self.fs().settle_density.get()
     }
 
     /// EXPERIMENT: the canonical forms table's size: forms held, their
@@ -8158,7 +8241,7 @@ impl Reader {
             } else {
                 CACHE_DENSE
             },
-            stale: self.snap_stale.borrow(),
+            stale: self.fs().snap_stale.borrow(),
             copy_dense: false,
         }
     }
@@ -8185,7 +8268,7 @@ impl Reader {
         if !moved && !current {
             return;
         }
-        let mut cache = self.scan_keys.borrow_mut();
+        let mut cache = self.fs().scan_keys.borrow_mut();
         if current {
             let short = cache
                 .as_ref()
@@ -8206,7 +8289,7 @@ impl Reader {
         let mut stale = current || cache.as_ref().is_none_or(|(g, _)| *g != gen);
         if !stale {
             let held = cache.as_ref().map_or(0, |(_, s)| s.len());
-            let added = self.snap_added.borrow().len();
+            let added = self.fs().snap_added.borrow().len();
             stale = behind(held, added);
         }
         // PROTOTYPE: the published snapshot ahead of this handle's own
@@ -8233,7 +8316,7 @@ impl Reader {
         }
         if !stale && !use_cache {
             let (_, snap) = cache.as_mut().expect("not stale");
-            let added = self.snap_added.borrow();
+            let added = self.fs().snap_added.borrow();
             if added.len() > snap.filed {
                 // A snapshot this handle adopted is shared, and filing
                 // its own keys into it is the handle's business alone:
@@ -8283,17 +8366,18 @@ impl Reader {
             // The keys the snapshot has are not added keys; an adopted
             // one may stop short of the memtable's end, and the slots
             // past where it stops stay in the list for the tables.
-            self.snap_entries.set(snap.live_len);
-            self.snap_added
+            self.fs().snap_entries.set(snap.live_len);
+            self.fs()
+                .snap_added
                 .borrow_mut()
                 .retain(|&slot| slot as usize >= snap.live_len);
             // The stale set is the log from the runs' copy to where this
             // handle has read it; what it reads on is added as it goes.
             {
                 let mem = self.mem();
-                let mut stale = self.snap_stale.borrow_mut();
+                let mut stale = self.fs().snap_stale.borrow_mut();
                 stale.clear();
-                for i in snap.log_at..self.log_seen.get().min(mem.log_len()) {
+                for i in snap.log_at..self.fs().log_seen.get().min(mem.log_len()) {
                     stale.insert(mem.log_at(i).0 as u32);
                 }
             }
@@ -8301,9 +8385,11 @@ impl Reader {
             // Every key created since the old snapshot is in the new one:
             // the lists that held them are emptied, and the bounds each
             // table walked are walked again on its next touch.
-            self.snap_gen.set(self.snap_gen.get().wrapping_add(1));
+            self.fs()
+                .snap_gen
+                .set(self.fs().snap_gen.get().wrapping_add(1));
             let np = self.segs().partition_point(|s| s.level > 0);
-            let tables = self.tables.borrow();
+            let tables = self.fs().tables.borrow();
             for p in 0..np {
                 if let Some(t) = tables[p].borrow_mut().as_mut() {
                     for list in &mut t.added {
@@ -8375,7 +8461,7 @@ impl Reader {
         // The writes not yet filed into the forms: everything the log holds
         // past the position this handle last read it to.
         let log_len = self.mem().log_len();
-        let backlog = log_len.saturating_sub(self.log_seen.get());
+        let backlog = log_len.saturating_sub(self.fs().log_seen.get());
         // The store's keys are the partitions': a level-0 piece sealed
         // from a burst of updates holds keys a partition holds already,
         // and counted again the bound grew with every seal. See
@@ -8397,44 +8483,44 @@ impl Reader {
         // The writes since the last scan over the store, through whichever
         // handle: the log's growth since this handle last counted it, the
         // whole log where the generation has changed since.
-        let (gen_counted, len_counted) = self.log_counted.get();
+        let (gen_counted, len_counted) = self.fs().log_counted.get();
         let grew = if gen_counted == st.gen {
             log_len.saturating_sub(len_counted)
         } else {
             log_len
         };
-        self.log_counted.set((st.gen, log_len));
-        let writes = self.writes_seen.get() + grew as u64;
-        self.writes_seen.set(writes);
+        self.fs().log_counted.set((st.gen, log_len));
+        let writes = self.fs().writes_seen.get() + grew as u64;
+        self.fs().writes_seen.set(writes);
         let life = self.shared.scans_life.load(AtomicOrdering::Relaxed);
-        if life != self.scans_life_seen.get() {
-            self.scans_life_seen.set(life);
-            self.writes_at_scan.set(writes);
+        if life != self.fs().scans_life_seen.get() {
+            self.fs().scans_life_seen.set(life);
+            self.fs().writes_at_scan.set(writes);
         }
         // A burst is settled by its backlog only near a scan, see
         // `Options::forms_settle_recent_pct`: far from one, what it would
         // file is more likely discarded at the next seal than read.
         let recent = self.opts.forms_settle_recent_pct == 0
-            || writes - self.writes_at_scan.get()
+            || writes - self.fs().writes_at_scan.get()
                 <= (keys / 100 * self.opts.forms_settle_recent_pct) as u64;
         // Forms the builder has posted are installed now, and the batch
         // settled with them, so the first read after finds them in
         // place; see `Options::build_ahead_on_publish`.
         let posted =
-            self.ahead.borrow().as_ref().is_some_and(|a| {
+            self.fs().ahead.borrow().as_ref().is_some_and(|a| {
                 !a.done.get() && a.posted.load(std::sync::atomic::Ordering::Acquire)
             });
-        let due = scans != self.scans_seen.get()
+        let due = scans != self.fs().scans_seen.get()
             || (backlog >= bound && recent)
             || posted
-            || self.publish_due.replace(false);
+            || self.fs().publish_due.replace(false);
         if !due {
             return Ok(());
         }
-        self.scans_seen.set(scans);
-        self.cache_used.set(true);
+        self.fs().scans_seen.set(scans);
+        self.fs().cache_used.set(true);
         let gen = st.gen;
-        let moved = self.sync_log() || self.scan_keys.borrow().is_none();
+        let moved = self.sync_log() || self.fs().scan_keys.borrow().is_none();
         // Settle before the snapshot moves, which is the order the scan
         // path takes and the reason it was never wrong. A pending write
         // carries the flag `sync_log` gave it -- created since the
@@ -8453,7 +8539,7 @@ impl Reader {
         }
         self.refresh_snapshot(gen, true, moved);
         {
-            let cache = self.scan_keys.borrow();
+            let cache = self.fs().scan_keys.borrow();
             let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
             self.install_ahead(unsealed)?;
         }
@@ -8471,18 +8557,23 @@ impl Reader {
         // thousand keys is a few hundred blocks.
         if self.opts.commit_forms_build
             && self.opts.scan_cache_bytes == 0
-            && !self.tables_complete.get()
+            && !self.fs().tables_complete.get()
         {
-            if self.opts.scan_cache_ahead && self.ahead.borrow().is_none() {
+            if self.opts.scan_cache_ahead && self.fs().ahead.borrow().is_none() {
                 self.start_ahead();
             }
-            let filling = self.ahead.borrow().as_ref().is_some_and(|a| !a.done.get());
+            let filling = self
+                .fs()
+                .ahead
+                .borrow()
+                .as_ref()
+                .is_some_and(|a| !a.done.get());
             if !filling {
-                let cache = self.scan_keys.borrow();
+                let cache = self.fs().scan_keys.borrow();
                 let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
                 self.complete_forms(unsealed)?;
                 drop(cache);
-                self.tables_complete.set(true);
+                self.fs().tables_complete.set(true);
             }
         }
         // The table's position and completeness move with a publish and
@@ -8490,7 +8581,7 @@ impl Reader {
         // commit until someone is here to take newer ones.
         if self.publish_dirty(false) {
             st.forms_complete
-                .store(self.tables_complete.get(), AtomicOrdering::Release);
+                .store(self.fs().tables_complete.get(), AtomicOrdering::Release);
             st.forms_at
                 .store(self.mem().committed_log(), AtomicOrdering::Release);
         }
@@ -8515,14 +8606,14 @@ impl Reader {
             if seg.blob.keys() == 0 {
                 continue;
             }
-            let tables = self.tables.borrow();
+            let tables = self.fs().tables.borrow();
             let mut held = tables[pi].borrow_mut();
             if held.is_none() {
                 *held = Some(self.make_table(seg, l0, unsealed)?);
             }
             let table = held.as_mut().expect("just made");
-            if table.snap_gen != self.snap_gen.get() {
-                table.resnap(seg, unsealed, self.snap_gen.get());
+            if table.snap_gen != self.fs().snap_gen.get() {
+                table.resnap(seg, unsealed, self.fs().snap_gen.get());
             }
             if table.clean_throughout() {
                 continue;
@@ -8564,11 +8655,13 @@ impl Reader {
     fn list_built_bytes(&self, p: usize, b: usize, table: &mut BlockTable, bytes: usize) {
         if self.opts.commit_forms && self.slot.is_none() {
             table.dirty[b] = true;
-            self.dirty_any.set(true);
+            self.fs().dirty_any.set(true);
         }
-        self.cache_bytes.set(self.cache_bytes.get() + bytes);
+        self.fs()
+            .cache_bytes
+            .set(self.fs().cache_bytes.get() + bytes);
         if bytes > 0 {
-            let mut built = self.built.borrow_mut();
+            let mut built = self.fs().built.borrow_mut();
             table.listed[b] = built.len() as u32;
             built.push((p as u32, b as u32));
         }
@@ -8587,17 +8680,19 @@ impl Reader {
             self.publish_marker(p, b);
         }
         let bytes = c.bytes();
-        self.cache_bytes.set(self.cache_bytes.get() - bytes);
+        self.fs()
+            .cache_bytes
+            .set(self.fs().cache_bytes.get() - bytes);
         let at = std::mem::replace(&mut table.listed[b], u32::MAX);
         if at != u32::MAX {
-            let mut built = self.built.borrow_mut();
+            let mut built = self.fs().built.borrow_mut();
             let last = built.pop().expect("a listed block is in the list");
             if (at as usize) < built.len() {
                 built[at as usize] = last;
                 let (lp, lb) = (last.0 as usize, last.1 as usize);
                 if lp == p {
                     table.listed[lb] = at;
-                } else if let Some(t) = self.tables.borrow()[lp].borrow_mut().as_mut() {
+                } else if let Some(t) = self.fs().tables.borrow()[lp].borrow_mut().as_mut() {
                     t.listed[lb] = at;
                 }
             }
@@ -8616,20 +8711,20 @@ impl Reader {
         if budget == 0 {
             return;
         }
-        let tick = self.scan_tick.get();
-        while self.cache_bytes.get() > budget {
+        let tick = self.fs().scan_tick.get();
+        while self.fs().cache_bytes.get() > budget {
             let mut best: Option<(usize, usize, u32)> = None;
             {
-                let built = self.built.borrow();
+                let built = self.fs().built.borrow();
                 if built.is_empty() {
                     break;
                 }
                 for _ in 0..8 {
-                    let mut x = self.shed_seed.get();
+                    let mut x = self.fs().shed_seed.get();
                     x ^= x << 13;
                     x ^= x >> 7;
                     x ^= x << 17;
-                    self.shed_seed.set(x);
+                    self.fs().shed_seed.set(x);
                     let (p, b) = built[(x as usize) % built.len()];
                     let (p, b) = (p as usize, b as usize);
                     if p == cur && b == keep {
@@ -8638,7 +8733,7 @@ impl Reader {
                     let touched = if p == cur {
                         table.touched[b]
                     } else {
-                        match self.tables.borrow()[p].borrow().as_ref() {
+                        match self.fs().tables.borrow()[p].borrow().as_ref() {
                             Some(t) => t.touched[b],
                             None => continue,
                         }
@@ -8656,7 +8751,7 @@ impl Reader {
                 // The other table's borrow must end before `unlist`
                 // borrows a third table to fix the moved entry, so the
                 // block is taken out through a short borrow of its own.
-                let tables = self.tables.borrow();
+                let tables = self.fs().tables.borrow();
                 let mut held = tables[p].borrow_mut();
                 let Some(t) = held.as_mut() else { break };
                 if t.slots[b].is_none() {
@@ -8664,18 +8759,21 @@ impl Reader {
                 }
                 let c = t.slots[b].take().expect("checked");
                 let bytes = c.bytes();
-                self.cache_bytes.set(self.cache_bytes.get() - bytes);
+                self.fs()
+                    .cache_bytes
+                    .set(self.fs().cache_bytes.get() - bytes);
                 let at = std::mem::replace(&mut t.listed[b], u32::MAX);
                 drop(held);
                 if at != u32::MAX {
-                    let mut built = self.built.borrow_mut();
+                    let mut built = self.fs().built.borrow_mut();
                     let last = built.pop().expect("a listed block is in the list");
                     if (at as usize) < built.len() {
                         built[at as usize] = last;
                         let (lp, lb) = (last.0 as usize, last.1 as usize);
                         if lp == cur {
                             table.listed[lb] = at;
-                        } else if let Some(t) = self.tables.borrow()[lp].borrow_mut().as_mut() {
+                        } else if let Some(t) = self.fs().tables.borrow()[lp].borrow_mut().as_mut()
+                        {
                             t.listed[lb] = at;
                         }
                     }
@@ -8691,7 +8789,7 @@ impl Reader {
     /// times costs one seek, the created one's record first so the flag
     /// survives the fold.
     fn settle_pending(&self) -> Result<()> {
-        let mut pending = std::mem::take(&mut *self.pending.borrow_mut());
+        let mut pending = std::mem::take(&mut *self.fs().pending.borrow_mut());
         if pending.is_empty() {
             return Ok(());
         }
@@ -8707,7 +8805,7 @@ impl Reader {
             self.drop_blocks();
         }
         pending.clear();
-        *self.pending.borrow_mut() = pending;
+        *self.fs().pending.borrow_mut() = pending;
         settled
     }
 
@@ -8746,7 +8844,7 @@ impl Reader {
         // leaves one block's keys contiguous and the count is this
         // loop's own. See `Options::forms_settle_rebuild_from`.
         let from = self.opts.forms_settle_rebuild_from;
-        let mut density = self.settle_density.get();
+        let mut density = self.fs().settle_density.get();
         density[0] += 1;
         let mut group_end = 0usize;
         let mut rebuild = false;
@@ -8782,7 +8880,7 @@ impl Reader {
             }
             let (at, b) = (at as usize, b as usize);
             let key = self.mem().key_at(off, len);
-            let tables = self.tables.borrow();
+            let tables = self.fs().tables.borrow();
             let mut held = tables[at].borrow_mut();
             let Some(table) = held.as_mut() else {
                 continue;
@@ -8809,12 +8907,13 @@ impl Reader {
                 // what brings the copy back for a block the reads still
                 // own.
                 if let Some(old) = table.dense[b].take() {
-                    self.cache_bytes
-                        .set(self.cache_bytes.get().saturating_sub(old.bytes()));
-                    let mut c = self.choices.get();
+                    self.fs()
+                        .cache_bytes
+                        .set(self.fs().cache_bytes.get().saturating_sub(old.bytes()));
+                    let mut c = self.fs().choices.get();
                     c[1] += 1;
                     c[4] = c[4].saturating_sub(old.bytes() as u64);
-                    self.choices.set(c);
+                    self.fs().choices.set(c);
                 }
                 table.reads[b] /= 2;
                 // A write into a block the writer holds no form for
@@ -8832,7 +8931,7 @@ impl Reader {
                             .is_none_or(|f| matches!(f, Cached::Wide(_))),
                         "a block the writer holds no form for has none published as the block"
                     );
-                    self.tables_complete.set(false);
+                    self.fs().tables_complete.set(false);
                 }
                 self.patch_block(at, b, table, key, cut, slot)?;
             }
@@ -8852,7 +8951,7 @@ impl Reader {
                 self.unlist(at, b, table);
             }
         }
-        self.settle_density.set(density);
+        self.fs().settle_density.set(density);
         Ok(())
     }
 
@@ -8881,7 +8980,7 @@ impl Reader {
         }
         if self.opts.commit_forms && self.slot.is_none() {
             table.dirty[b] = true;
-            self.dirty_any.set(true);
+            self.fs().dirty_any.set(true);
         }
         let np = self.segs().partition_point(|s| s.level > 0);
         let seg = &self.segs()[at];
@@ -8906,7 +9005,7 @@ impl Reader {
                 .has_tomb(self.mem().entry(slot as usize), self.wm());
         let (c, at_eq) = BuildCtx::cut_known(cut, lo, hi);
         let same = c < hi && at_eq == Ordering::Equal;
-        let mut run_scratch = self.settle_run.borrow_mut();
+        let mut run_scratch = self.fs().settle_run.borrow_mut();
         let run: &mut Vec<u8> = &mut run_scratch;
         run.clear();
         if masked {
@@ -8920,7 +9019,7 @@ impl Reader {
             // in that machinery, and an update mix takes this path for
             // every key: 88,742 of the lag point's 88,744.
             let mem = self.mem();
-            let mut offs = self.settle_offs.borrow_mut();
+            let mut offs = self.fs().settle_offs.borrow_mut();
             mem.live_offs_into(mem.entry(slot as usize), &mut offs, self.wm());
             for &off in offs.iter() {
                 let v = mem.value_at(off);
@@ -8959,7 +9058,7 @@ impl Reader {
             };
             let mut em = Emit {
                 tombs,
-                scratch: std::mem::take(&mut *self.settle_offs.borrow_mut()),
+                scratch: std::mem::take(&mut *self.fs().settle_offs.borrow_mut()),
             };
             ctx.emit_over(
                 &mut |_, v: &[u8]| {
@@ -8972,7 +9071,7 @@ impl Reader {
                 same.then_some(c),
                 src,
             )?;
-            *self.settle_offs.borrow_mut() = em.scratch;
+            *self.fs().settle_offs.borrow_mut() = em.scratch;
         }
         let before = table.slots[b].as_ref().map_or(0, |c| c.bytes());
         let was_clean = matches!(table.slots[b].as_deref(), Some(Cached::Clean));
@@ -9065,11 +9164,12 @@ impl Reader {
             self.list_built(at, b, table);
         } else {
             let after = table.slots[b].as_ref().map_or(0, |c| c.bytes());
-            self.cache_bytes
-                .set(self.cache_bytes.get() + after - before);
+            self.fs()
+                .cache_bytes
+                .set(self.fs().cache_bytes.get() + after - before);
         }
         if dense && self.opts.commit_forms && self.slot.is_none() {
-            self.tables_complete.set(false);
+            self.fs().tables_complete.set(false);
         }
         if bloated {
             self.unlist(at, b, table);
@@ -9103,14 +9203,14 @@ impl Reader {
         // maintenance, filed nothing into its forms for the rest of the
         // state: its scans answered a key's values short of every write
         // since, and so did the forms it published.
-        self.cache_used.set(true);
+        self.fs().cache_used.set(true);
         let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
         let ctx = self.build_ctx();
         ctx.rank_pieces()?;
         let (pieces, piece_ranks) = ctx.table_bounds(seg, l0)?;
         let mut added: Vec<Vec<(u32, u32)>> = (0..nblocks).map(|_| Vec::new()).collect();
         if nblocks > 0 {
-            for &slot in self.snap_added.borrow().iter() {
+            for &slot in self.fs().snap_added.borrow().iter() {
                 let key = self.mem().key_of(self.mem().entry(slot as usize));
                 if seg.below_lo(key) || seg.hi.as_ref().is_some_and(|h| key >= h.as_slice()) {
                     continue;
@@ -9136,7 +9236,7 @@ impl Reader {
             piece_ranks,
             snap_at: std::cell::OnceCell::new(),
             snap_span: BuildCtx::snap_span(seg, unsealed),
-            snap_gen: self.snap_gen.get(),
+            snap_gen: self.fs().snap_gen.get(),
             added,
             filed,
             dirty: vec![false; nblocks],
@@ -9163,10 +9263,10 @@ impl Reader {
         let np = self.segs().partition_point(|s| s.level > 0);
         let l0 = &self.segs()[np..];
         let tick = if resumed {
-            self.scan_tick.get()
+            self.fs().scan_tick.get()
         } else {
-            let t = self.scan_tick.get().wrapping_add(1);
-            self.scan_tick.set(t);
+            let t = self.fs().scan_tick.get().wrapping_add(1);
+            self.fs().scan_tick.set(t);
             t
         };
         // The builder adopts the snapshot this walk holds, and started
@@ -9174,7 +9274,7 @@ impl Reader {
         // that started it made four builds on the builder's core over
         // four passes at three hundred thousand keys that the eager
         // scan never made, twice what the lazy scans saved.
-        if self.opts.scan_cache_ahead && self.ahead.borrow().is_none() && !lazy {
+        if self.opts.scan_cache_ahead && self.fs().ahead.borrow().is_none() && !lazy {
             self.start_ahead();
         }
         match unsealed {
@@ -9274,7 +9374,7 @@ impl Reader {
                 rank < keys && exact.unwrap_or_else(|| seg.blob.key_at(rank) == Some(cursor));
             let owner = if same { rank } else { rank.saturating_sub(1) };
             let nblocks = keys.div_ceil(CACHE_BLOCK);
-            let tables = self.tables.borrow();
+            let tables = self.fs().tables.borrow();
             let mut held = tables[pi].borrow_mut();
             if held.is_none() {
                 // A table is made against the snapshot's bounds.
@@ -9285,12 +9385,12 @@ impl Reader {
                     });
                 };
                 *held = Some(self.make_table(seg, l0, unsealed)?);
-                self.cache_used.set(true);
+                self.fs().cache_used.set(true);
             }
             let table = held.as_mut().expect("just made");
             if let Some(unsealed) = unsealed {
-                if table.snap_gen != self.snap_gen.get() {
-                    table.resnap(seg, unsealed, self.snap_gen.get());
+                if table.snap_gen != self.fs().snap_gen.get() {
+                    table.resnap(seg, unsealed, self.fs().snap_gen.get());
                 }
             }
             // Clean throughout is a statement about the snapshot's span
@@ -9445,7 +9545,9 @@ impl Reader {
                         let grew = (merged.len() - w.sorted.len()) * 8;
                         w.sorted = merged;
                         w.seen = filed.len();
-                        self.cache_bytes.set(self.cache_bytes.get() + grew);
+                        self.fs()
+                            .cache_bytes
+                            .set(self.fs().cache_bytes.get() + grew);
                     }
                 }
                 // This block's cold lines, and the next block's when the
@@ -9466,9 +9568,9 @@ impl Reader {
                     None
                 };
                 let form: &Cached = dense.unwrap_or(cheap);
-                let mut c = self.choices.get();
+                let mut c = self.fs().choices.get();
                 c[if dense.is_some() { 2 } else { 3 }] += 1;
-                self.choices.set(c);
+                self.fs().choices.set(c);
                 let took_from = seen;
                 if !fetched {
                     prefetch_block(&seg.blob, form, start, ahead);
@@ -9579,12 +9681,13 @@ impl Reader {
                         }
                         .materialize(src, table, b, unsealed)?;
                         if matches!(copied, Cached::Block(_)) {
-                            let mut c = self.choices.get();
+                            let mut c = self.fs().choices.get();
                             c[0] += 1;
                             c[4] += copied.bytes() as u64;
-                            self.choices.set(c);
-                            self.cache_bytes
-                                .set(self.cache_bytes.get() + copied.bytes());
+                            self.fs().choices.set(c);
+                            self.fs()
+                                .cache_bytes
+                                .set(self.fs().cache_bytes.get() + copied.bytes());
                             table.dense[b] = Some(std::sync::Arc::new(copied));
                         }
                     }
@@ -9606,7 +9709,7 @@ impl Reader {
     #[doc(hidden)]
     pub fn block_cache_kinds(&self) -> (usize, usize, usize, usize) {
         let (mut clean, mut sparse, mut copies, mut wide) = (0usize, 0usize, 0usize, 0usize);
-        for t in self.tables.borrow().iter() {
+        for t in self.fs().tables.borrow().iter() {
             for c in t.borrow().iter().flat_map(|t| t.slots.iter()).flatten() {
                 match &**c {
                     Cached::Clean => clean += 1,
@@ -9626,7 +9729,7 @@ impl Reader {
     #[doc(hidden)]
     pub fn block_cache_layout(&self) -> (usize, usize, usize) {
         let (mut dead, mut scattered, mut ents) = (0usize, 0usize, 0usize);
-        for t in self.tables.borrow().iter() {
+        for t in self.fs().tables.borrow().iter() {
             for c in t.borrow().iter().flat_map(|t| t.slots.iter()).flatten() {
                 if let Cached::Block(b) = &**c {
                     let live: usize = b.ents.iter().map(|e| e[3] as usize).sum();
@@ -9649,7 +9752,7 @@ impl Reader {
     #[doc(hidden)]
     pub fn refill_forms(&mut self) -> Result<()> {
         self.drop_blocks();
-        self.publish_due.set(true);
+        self.fs().publish_due.set(true);
         self.maintain_forms()
     }
 
@@ -9658,7 +9761,7 @@ impl Reader {
     pub fn block_cache_size(&self) -> (usize, usize) {
         let (mut clean, mut sparse, mut copies, mut wide, mut bytes) =
             (0usize, 0usize, 0usize, 0usize, 0usize);
-        for t in self.tables.borrow().iter() {
+        for t in self.fs().tables.borrow().iter() {
             for c in t.borrow().iter().flat_map(|t| t.slots.iter()).flatten() {
                 match &**c {
                     Cached::Clean => clean += 1,
@@ -9679,7 +9782,7 @@ impl Reader {
         }
         eprintln!(
             "  cache: {clean} clean, {sparse} sparse, {copies} copies, {wide} wide; {bytes} B walked, {} B counted",
-            self.cache_bytes.get()
+            self.fs().cache_bytes.get()
         );
         (clean + sparse + copies + wide, bytes)
     }
@@ -9687,13 +9790,14 @@ impl Reader {
     /// PROTOTYPE: the bytes the cache counts itself holding, for a test
     /// to hold against a walk of it.
     pub fn block_cache_bytes(&self) -> usize {
-        self.cache_bytes.get()
+        self.fs().cache_bytes.get()
     }
 
     /// PROTOTYPE: the most bytes any one built block holds, the slack a
     /// budget allows since the block in hand is never shed.
     pub fn block_cache_largest(&self) -> usize {
-        self.tables
+        self.fs()
+            .tables
             .borrow()
             .iter()
             .map(|t| {
@@ -9713,7 +9817,8 @@ impl Reader {
     /// PROTOTYPE: how many blocks the cache holds as wide, for a test to
     /// hold the count that makes one to its definition.
     pub fn block_cache_wide(&self) -> usize {
-        self.tables
+        self.fs()
+            .tables
             .borrow()
             .iter()
             .map(|t| {
@@ -9889,7 +9994,7 @@ impl Reader {
         snap: &Snapshot,
     ) -> Result<()> {
         let (key, sk) = entry;
-        let stale = self.snap_stale.borrow();
+        let stale = self.fs().snap_stale.borrow();
         let live_run = sk.mem != u32::MAX && sk.lrun != NO_RUN && !stale.contains(&sk.mem);
         let frozen_run = sk.frozen != u32::MAX && sk.frun != NO_RUN;
         let mut start = 0usize;
@@ -10441,36 +10546,9 @@ impl Db {
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts,
-            tables: std::cell::RefCell::new(Vec::new()),
-            scan_keys: std::cell::RefCell::new(None),
-            cache_used: std::cell::Cell::new(false),
-            cache_bytes: std::cell::Cell::new(0),
-            scan_tick: std::cell::Cell::new(0),
-            shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
-            pending: std::cell::RefCell::new(Vec::new()),
-            settle_run: std::cell::RefCell::new(Vec::new()),
-            settle_offs: std::cell::RefCell::new(Vec::new()),
-            built: std::cell::RefCell::new(Vec::new()),
-            dirty_any: std::cell::Cell::new(false),
-            tables_complete: std::cell::Cell::new(false),
-            publish_due: std::cell::Cell::new(false),
-            scans_seen: std::cell::Cell::new(0),
+            fs: FormsCell::new(),
             signalled: std::cell::Cell::new((0, usize::MAX)),
-            scans_life_seen: std::cell::Cell::new(0),
-            writes_seen: std::cell::Cell::new(0),
-            writes_at_scan: std::cell::Cell::new(0),
-            log_counted: std::cell::Cell::new((0, 0)),
-            choices: std::cell::Cell::new([0; 5]),
-            settle_density: std::cell::Cell::new([0; 4]),
-            lazy_scans: std::cell::Cell::new([0; 2]),
-            snap_gen: std::cell::Cell::new(0),
-            snap_added: std::cell::RefCell::new(Vec::new()),
-            snap_stale: std::cell::RefCell::new(std::collections::HashSet::new()),
-            log_seen: std::cell::Cell::new(0),
-            log_gen: std::cell::Cell::new(0),
             log_bound: std::cell::Cell::new(usize::MAX),
-            snap_entries: std::cell::Cell::new(0),
-            ahead: std::cell::RefCell::new(None),
         };
         Ok(Db {
             r,
@@ -10754,36 +10832,9 @@ impl Db {
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts,
-            tables: std::cell::RefCell::new(Db::tables_for(ntables)),
-            scan_keys: std::cell::RefCell::new(None),
-            cache_used: std::cell::Cell::new(false),
-            cache_bytes: std::cell::Cell::new(0),
-            scan_tick: std::cell::Cell::new(0),
-            shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
-            pending: std::cell::RefCell::new(Vec::new()),
-            settle_run: std::cell::RefCell::new(Vec::new()),
-            settle_offs: std::cell::RefCell::new(Vec::new()),
-            built: std::cell::RefCell::new(Vec::new()),
-            dirty_any: std::cell::Cell::new(false),
-            tables_complete: std::cell::Cell::new(false),
-            publish_due: std::cell::Cell::new(false),
-            scans_seen: std::cell::Cell::new(0),
+            fs: FormsCell::with_tables(Db::tables_for(ntables)),
             signalled: std::cell::Cell::new((0, usize::MAX)),
-            scans_life_seen: std::cell::Cell::new(0),
-            writes_seen: std::cell::Cell::new(0),
-            writes_at_scan: std::cell::Cell::new(0),
-            log_counted: std::cell::Cell::new((0, 0)),
-            choices: std::cell::Cell::new([0; 5]),
-            settle_density: std::cell::Cell::new([0; 4]),
-            lazy_scans: std::cell::Cell::new([0; 2]),
-            snap_gen: std::cell::Cell::new(0),
-            snap_added: std::cell::RefCell::new(Vec::new()),
-            snap_stale: std::cell::RefCell::new(std::collections::HashSet::new()),
-            log_seen: std::cell::Cell::new(0),
-            log_gen: std::cell::Cell::new(0),
             log_bound: std::cell::Cell::new(usize::MAX),
-            snap_entries: std::cell::Cell::new(0),
-            ahead: std::cell::RefCell::new(None),
         };
         Ok(Db {
             r,
@@ -11093,8 +11144,8 @@ impl Db {
     /// no WAL frames, and its name covers the sequence so far so that the
     /// frames of what follows replay.
     fn close_direct(&mut self) -> Result<()> {
-        *self.scan_keys.borrow_mut() = None;
-        self.snap_added.borrow_mut().clear();
+        *self.fs().scan_keys.borrow_mut() = None;
+        self.fs().snap_added.borrow_mut().clear();
         self.drop_blocks();
         self.mem_bytes = 0;
         let Some(d) = self.direct.take() else {
@@ -11309,6 +11360,7 @@ impl Db {
             return;
         }
         let running = self
+            .fs()
             .ahead
             .borrow()
             .as_ref()
@@ -11543,7 +11595,7 @@ impl Db {
         let mut next = next;
         if !self.carry_forms(&mut next, tier) {
             self.drop_blocks();
-            *self.tables.borrow_mut() = Db::tables_for(next.segs.len());
+            *self.fs().tables.borrow_mut() = Db::tables_for(next.segs.len());
         }
         self.publish_and_organise(next);
     }
@@ -11708,36 +11760,9 @@ impl Reader {
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
             opts: self.opts.clone(),
-            tables: std::cell::RefCell::new(Vec::new()),
-            scan_keys: std::cell::RefCell::new(None),
-            cache_used: std::cell::Cell::new(false),
-            cache_bytes: std::cell::Cell::new(0),
-            scan_tick: std::cell::Cell::new(0),
-            shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
-            pending: std::cell::RefCell::new(Vec::new()),
-            settle_run: std::cell::RefCell::new(Vec::new()),
-            settle_offs: std::cell::RefCell::new(Vec::new()),
-            built: std::cell::RefCell::new(Vec::new()),
-            dirty_any: std::cell::Cell::new(false),
-            tables_complete: std::cell::Cell::new(false),
-            publish_due: std::cell::Cell::new(false),
-            scans_seen: std::cell::Cell::new(0),
+            fs: FormsCell::new(),
             signalled: std::cell::Cell::new((0, usize::MAX)),
-            scans_life_seen: std::cell::Cell::new(0),
-            writes_seen: std::cell::Cell::new(0),
-            writes_at_scan: std::cell::Cell::new(0),
-            log_counted: std::cell::Cell::new((0, 0)),
-            choices: std::cell::Cell::new([0; 5]),
-            settle_density: std::cell::Cell::new([0; 4]),
-            lazy_scans: std::cell::Cell::new([0; 2]),
-            snap_gen: std::cell::Cell::new(0),
-            snap_added: std::cell::RefCell::new(Vec::new()),
-            snap_stale: std::cell::RefCell::new(std::collections::HashSet::new()),
-            log_seen: std::cell::Cell::new(0),
-            log_gen: std::cell::Cell::new(0),
             log_bound: std::cell::Cell::new(usize::MAX),
-            snap_entries: std::cell::Cell::new(0),
-            ahead: std::cell::RefCell::new(None),
         })
     }
 }
@@ -11852,7 +11877,7 @@ impl Db {
         // The forms were published from this handle's tables: none, or
         // tables of another generation, and nothing current is here to
         // carry.
-        if !self.cache_used.get() || self.log_gen.get() != cur.gen {
+        if !self.fs().cache_used.get() || self.fs().log_gen.get() != cur.gen {
             return false;
         }
         // Everything logged and filed, and published where someone is
@@ -11904,7 +11929,7 @@ impl Db {
         // 2 ms over the hundred-thousand lag burst, 30 ms of its 400 --
         // and a pass that began before that commit paid one itself.
         let same_mem = std::sync::Arc::ptr_eq(&next.mem, &cur.mem);
-        let held = self.scan_keys.borrow_mut().take();
+        let held = self.fs().scan_keys.borrow_mut().take();
         let carried = held
             .filter(|_| self.opts.snapshot_carry)
             .and_then(|(_, s)| self.carry_snapshot(s, &cur.mem, cur.frozen.as_ref(), next, false));
@@ -11914,28 +11939,30 @@ impl Db {
         // that table's slots, go; across a merge or a landing the live
         // table is the one it was and they stand.
         let keep_added = carried.is_some() && same_mem;
-        self.tables
+        self.fs()
+            .tables
             .borrow_mut()
             .resize_with(next.segs.len(), || std::cell::RefCell::new(None));
         for (p, (pieces, piece_ranks)) in bounds.into_iter().enumerate() {
-            let tables = self.tables.borrow();
+            let tables = self.fs().tables.borrow();
             let mut held = tables[p].borrow_mut();
             let Some(t) = held.as_mut() else { continue };
             for b in 0..t.slots.len() {
                 let rebase_drops =
                     rebased[p] && matches!(t.slots[b].as_deref(), Some(Cached::Sparse(_)));
                 if rebase_drops {
-                    self.tables_complete.set(false);
+                    self.fs().tables_complete.set(false);
                 }
                 if rebase_drops || matches!(t.slots[b].as_deref(), Some(Cached::Wide(_))) {
                     self.unlist(p, b, t);
                 }
                 if let Some(old) = t.dense[b].take() {
-                    self.cache_bytes
-                        .set(self.cache_bytes.get().saturating_sub(old.bytes()));
-                    let mut c = self.choices.get();
+                    self.fs()
+                        .cache_bytes
+                        .set(self.fs().cache_bytes.get().saturating_sub(old.bytes()));
+                    let mut c = self.fs().choices.get();
                     c[4] = c[4].saturating_sub(old.bytes() as u64);
-                    self.choices.set(c);
+                    self.fs().choices.set(c);
                 }
             }
             t.pieces = pieces;
@@ -11974,7 +12001,7 @@ impl Db {
                 let ptr = cur.forms[p][b].load(AtomicOrdering::Acquire);
                 // SAFETY: as in `canonical`.
                 if !ptr.is_null() && matches!(*unsafe { &*ptr }.form, Cached::Sparse(_)) {
-                    self.tables_complete.set(false);
+                    self.fs().tables_complete.set(false);
                     self.publish_marker(p, b);
                 }
             }
@@ -11994,7 +12021,7 @@ impl Db {
         }
         cur.forms_moved.store(true, AtomicOrdering::Release);
         next.forms_at = AtomicUsize::new(0);
-        next.forms_complete = std::sync::atomic::AtomicBool::new(self.tables_complete.get());
+        next.forms_complete = std::sync::atomic::AtomicBool::new(self.fs().tables_complete.get());
         next.forms_bytes = AtomicUsize::new(bytes);
         // This handle's log and snapshot bookkeeping, for `next`: across a
         // freeze the log is a new table's and is read from its start;
@@ -12004,32 +12031,32 @@ impl Db {
         // ten thousand keys; across a piece merge the memtable and the
         // frozen table are the same ones, so the position and the lists
         // stand and only the generation they are keyed by moves.
-        self.log_gen.set(next.gen);
+        self.fs().log_gen.set(next.gen);
         if tier {
-            if let Some((g, _)) = self.scan_keys.borrow_mut().as_mut() {
+            if let Some((g, _)) = self.fs().scan_keys.borrow_mut().as_mut() {
                 *g = next.gen;
             }
             return true;
         }
         if !same_mem {
-            self.log_seen.set(0);
-            self.snap_stale.borrow_mut().clear();
+            self.fs().log_seen.set(0);
+            self.fs().snap_stale.borrow_mut().clear();
         }
-        self.scans_seen.set(0);
+        self.fs().scans_seen.set(0);
         match carried {
             Some(s) => {
-                self.snap_entries.set(s.live_len);
-                *self.scan_keys.borrow_mut() = Some((next.gen, s));
+                self.fs().snap_entries.set(s.live_len);
+                *self.fs().scan_keys.borrow_mut() = Some((next.gen, s));
             }
             None => {
-                self.snap_entries.set(0);
-                *self.scan_keys.borrow_mut() = None;
+                self.fs().snap_entries.set(0);
+                *self.fs().scan_keys.borrow_mut() = None;
             }
         }
         if !keep_added {
-            self.snap_added.borrow_mut().clear();
+            self.fs().snap_added.borrow_mut().clear();
         }
-        self.pending.borrow_mut().clear();
+        self.fs().pending.borrow_mut().clear();
         true
     }
 
@@ -12066,9 +12093,9 @@ impl Db {
             // hundreds of thousands. It stood stale until the next scan
             // rebuilt it, and six hundred inserts between a seal and
             // that scan were enough to index past the map.
-            *self.scan_keys.borrow_mut() = None;
-            self.snap_added.borrow_mut().clear();
-            self.snap_stale.borrow_mut().clear();
+            *self.fs().scan_keys.borrow_mut() = None;
+            self.fs().snap_added.borrow_mut().clear();
+            self.fs().snap_stale.borrow_mut().clear();
             self.drop_blocks();
         }
         self.publish_and_organise(next);
@@ -12588,7 +12615,7 @@ impl Reader {
             && self.frozen().is_none()
         {
             let (_tx, rx) = std::sync::mpsc::channel();
-            *self.ahead.borrow_mut() = Some(Ahead {
+            *self.fs().ahead.borrow_mut() = Some(Ahead {
                 handle: None,
                 rx,
                 stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -12616,8 +12643,8 @@ impl Reader {
         // scans see -- are filed now; the log is read on from where it
         // was, so nothing is filed twice.
         let mut since = Since::default();
-        if self.log_gen.get() == gen {
-            for i in from..self.log_seen.get() {
+        if self.fs().log_gen.get() == gen {
+            for i in from..self.fs().log_seen.get() {
                 let (id, _) = mem.log_at(i);
                 let e = mem.entry(id);
                 since.file(mem, e.key_off, e.key_len);
@@ -12626,6 +12653,7 @@ impl Reader {
         // The blocks this handle holds a form for: the builder has nothing
         // to build for them, whether or not they are published.
         let held: Vec<Vec<bool>> = self
+            .fs()
             .tables
             .borrow()
             .iter()
@@ -12652,7 +12680,7 @@ impl Reader {
             drop(tx);
             post.store(true, std::sync::atomic::Ordering::Release);
         });
-        *self.ahead.borrow_mut() = Some(Ahead {
+        *self.fs().ahead.borrow_mut() = Some(Ahead {
             handle: Some(handle),
             rx,
             stop,
@@ -12665,7 +12693,7 @@ impl Reader {
 
     /// PROTOTYPE: the builder told to stop and joined, its forms dropped.
     fn stop_ahead(&self) {
-        if let Some(mut a) = self.ahead.borrow_mut().take() {
+        if let Some(mut a) = self.fs().ahead.borrow_mut().take() {
             a.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             if let Some(h) = a.handle.take() {
                 let _ = h.join();
@@ -12677,7 +12705,7 @@ impl Reader {
     /// scan to install. What `settle` does, for a test or an experiment
     /// that wants the cache as the builder leaves it.
     fn join_ahead(&self) {
-        if let Some(a) = self.ahead.borrow_mut().as_mut() {
+        if let Some(a) = self.fs().ahead.borrow_mut().as_mut() {
             if let Some(h) = a.handle.take() {
                 let _ = h.join();
             }
