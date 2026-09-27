@@ -601,6 +601,16 @@ reading -- beside it:
 | 10% | 0.24 / 0.81 | 0.35 / 0.38 | 0.32 / 0.29 | 0.28 / 0.25 |
 | all | 0.04 | 0.04 | 0.03 | 0.12 |
 
+LMDB's side of this table, and of every lag and shuffled-load figure
+in the rows before 260c09d, is not the store the engine's side read:
+the arm never closed its environment, so a pass's second open handed
+it the first store back, and its lag sweep scanned the ordered load's
+tree after an overwrite of every key rather than a tree its shuffled
+load built (`bench/CLAUDE.md`). The first row after the fix read
+LMDB's drained point at 0.38-0.58 of its own ordered-store scan, where
+the rows before read 0.37-1.01: lower, and inside what the host alone
+moves it, so these ratios stand as measured until rows say otherwise.
+
 Drained the engine reads 1.35x-1.64x of LMDB at every rung. A tenth of
 the store unmerged and it reads a quarter to a third of it; all of it
 unmerged and a thirtieth. A B-tree has no unmerged state -- every write
