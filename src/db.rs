@@ -153,14 +153,11 @@ pub enum Upkeep {
     /// batch. The level is how eagerly it files:
     ///
     /// - 1: what a commit would have filed, by the same rules.
-    /// - 2: everything, at every commit, while reads are around -- a scan
-    ///   over the store within the last two stores' worth of writes --
-    ///   and level 1's rules otherwise, so a long stretch of writes
-    ///   nobody reads pays nothing for a structure nobody walks. While
-    ///   reads are around, a commit whose own rules would leave its batch
-    ///   to the next read holds until the thread has filed it, so that
-    ///   read finds nothing left; any other commit does what `Inline`
-    ///   does.
+    /// - 2: what `Inline` does, except that while reads are around -- a
+    ///   scan over the store within the last two stores' worth of writes
+    ///   -- a commit whose own rules would leave its batch to the next
+    ///   read hands it to the thread and holds until the thread has filed
+    ///   everything, so that read finds nothing left.
     /// - 3: everything, at every commit, whoever reads; and while reads
     ///   are around a commit holds for every batch, however small, where
     ///   level 2 files a small one itself.
@@ -5777,8 +5774,8 @@ pub struct Db {
     sealing: Option<std::thread::JoinHandle<Result<Vec<String>>>>,
     /// PROTOTYPE: the run keeper, once the first commit has started it.
     keeper: Option<Keeper>,
-    /// EXPERIMENT: the upkeep thread, once the first commit has started
-    /// it; see `Upkeep::Background`.
+    /// EXPERIMENT: the upkeep thread, once a commit has had something
+    /// for it; see `Upkeep::Background`.
     upkeeper: Option<Upkeeper>,
     /// The upkeep thread's regime, kept by the writer since the upkeep
     /// itself may be lent: the generation and committed log length at
@@ -5802,9 +5799,7 @@ enum Hand {
     /// has filed it.
     Hold,
     /// The commit's own maintenance, as `Upkeep::Inline` runs it: at
-    /// level 2 with reads around, a batch the commit's rules file at the
-    /// commit or one too small to wake the thread for; or no thread to
-    /// lend it to.
+    /// level 2, every commit it does not hold; or no thread to lend to.
     Inline,
 }
 
@@ -11300,7 +11295,6 @@ impl Db {
             if let Some(e) = self.shared.upkeep.take_err() {
                 return Err(e);
             }
-            self.start_upkeep();
             self.finish_hand()?;
         } else {
             self.maintain_forms()?;
@@ -13994,8 +13988,7 @@ struct Upkeeper {
 }
 
 impl Db {
-    /// The upkeep thread started, if the option asks and it is not
-    /// running.
+    /// The upkeep thread started, if the option asks and none has been.
     fn start_upkeep(&mut self) {
         if self.upkeeper.is_some() || !matches!(self.opts.upkeep, Upkeep::Background(_)) {
             return;
@@ -14021,16 +14014,6 @@ impl Db {
         let Upkeep::Background(level) = self.opts.upkeep else {
             return;
         };
-        // No thread to lend it to -- before the first commit starts one,
-        // or one that could not be spawned: the commit files its own.
-        if self
-            .upkeeper
-            .as_ref()
-            .is_none_or(|u| u.handle.as_ref().is_none_or(|h| h.is_finished()))
-        {
-            self.upkeep_hand = Hand::Inline;
-            return;
-        }
         // The commit's three quantities and the store's keys, read
         // before any field of the writer's moves.
         let (gen, log, len, wm, keys) = {
@@ -14081,18 +14064,29 @@ impl Db {
         // nothing off the reads and cost the small stores' lag point a
         // fifth, through a writer parked on its hold and a burst that
         // ended with its seal still writing.
+        // Nor does level 2 lend with nobody reading: the passes a load
+        // lent the thread bought it nothing the suite could see, 0.95-
+        // 1.06x, and left the drained scans after it reading forms the
+        // thread had built, 0.79x at ten thousand keys in one sitting.
         self.upkeep_hand = match (level, reads_around, batch) {
+            (2, true, b) if b >= UPKEEP_WAKE_WRITES && !self.commit_files_it() => Hand::Hold,
+            (2, _, _) => Hand::Inline,
             (_, _, 0) | (0 | 1, _, _) | (_, false, _) => Hand::Lend,
-            (2, true, b) => {
-                if b < UPKEEP_WAKE_WRITES || self.commit_files_it() {
-                    Hand::Inline
-                } else {
-                    Hand::Hold
-                }
-            }
             (_, true, _) => Hand::Hold,
         };
         if self.upkeep_hand == Hand::Inline {
+            return;
+        }
+        // The thread started by the first commit that has something for
+        // it, so a store whose commits never do runs none; one that could
+        // not be spawned, or has stopped, leaves the commit its own.
+        self.start_upkeep();
+        if self
+            .upkeeper
+            .as_ref()
+            .is_none_or(|u| u.handle.as_ref().is_none_or(|h| h.is_finished()))
+        {
+            self.upkeep_hand = Hand::Inline;
             return;
         }
         let to = UpkeepTo {

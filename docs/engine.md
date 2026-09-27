@@ -2267,6 +2267,25 @@ twelve pairs a rung, the arm wins every lag point at every rung: at
 the fully unmerged one 2.10x, 1.70x, 1.09x and 1.28x up the ladder,
 where the inline default reads 1.75x, 1.60x, 0.75x and 0.66x.
 
+A second sitting of that rule read the tenth point at ten thousand keys
+at 0.78x (1/16, holding under Holm) and the drained point before any
+burst at 0.79x, where the rule holds nothing -- but it still lent the
+thread the load's commits, with nobody reading, and the drained scans
+read forms the thread had built. That lending bought the load nothing
+the suite could see (0.95-1.06x), so level 2 no longer lends at all:
+it is `Inline` but for the hold, and the thread starts at the first
+commit that has something for it, so a store whose commits never hold
+runs no thread. Priced once more, with the lending gone and the thread
+still started at the first commit, the fully unmerged point reads 1.04x,
+1.07x, **1.67x** and **1.63x**, the tenth at three hundred thousand
+1.22x (14/16); the small rungs' lag points lean 0.83-0.86x at ten
+thousand with nothing marked, in a table whose other quantities lean
+0.88x and 1.14x as far. One quantity to watch: ycsb-E at three hundred
+thousand has read 0.82-0.98x over five sittings, never marked. Its
+commits are small and follow scans, so they never hold; ycsb-A's before
+it do, with the scan pass earlier still counting as reads around, and
+E then scans forms the thread patched.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and
