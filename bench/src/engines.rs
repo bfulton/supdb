@@ -381,9 +381,9 @@ pub struct Supdb {
     /// The settle bound taken on every segment's keys, level-0 pieces
     /// included, rather than the partitions'. `supdb-settleall`.
     settleall: bool,
-    /// The writer's upkeep kept by a thread of the store's own at this
-    /// level, rather than by the writer. `supdb-upkeep`.
-    upkeep: Option<u8>,
+    /// Who keeps the writer's upkeep, where not the engine's own choice:
+    /// the writer itself, as before the thread. `supdb-inline`.
+    upkeep: Option<supdb::Upkeep>,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -460,9 +460,9 @@ struct Policy {
     /// The settle bound taken on every segment's keys, level-0 pieces
     /// included, rather than the partitions'. `supdb-settleall`.
     settleall: bool,
-    /// The writer's upkeep kept by a thread of the store's own at this
-    /// level, rather than by the writer. `supdb-upkeep`.
-    upkeep: Option<u8>,
+    /// Who keeps the writer's upkeep, where not the engine's own choice:
+    /// the writer itself, as before the thread. `supdb-inline`.
+    upkeep: Option<supdb::Upkeep>,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -712,18 +712,16 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with the writer's upkeep -- the forms and the snapshot a
-    /// commit files its writes into -- on a thread of its own at level
-    /// 2: everything at every commit while reads are around, the
-    /// commit's own rules otherwise. Against `supdb` it prices the
-    /// thread: the lag sweep's first scan after a burst, which files
-    /// what the burst's commits left, and the mixes' commits and reads,
-    /// which share the machine with it.
-    pub fn create_upkeep(path: &Path) -> Res<Supdb> {
+    /// `supdb` with the writer keeping its own upkeep -- the forms and
+    /// the snapshot a commit files its writes into -- as before the
+    /// thread. Against `supdb` it prices the thread: the lag sweep's pass
+    /// after a burst, which the thread files ahead of, and the mixes'
+    /// commits and reads, which share the machine with it.
+    pub fn create_inline(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                upkeep: Some(2),
+                upkeep: Some(supdb::Upkeep::Inline),
                 ..Policy::default()
             },
         )
@@ -1077,9 +1075,8 @@ impl Supdb {
             seal_on_file: sealfile,
             // The settle bound on every segment's keys, as it was.
             forms_settle_keys_all: settleall,
-            // The upkeep on a thread at the level, or where the engine
-            // keeps it.
-            upkeep: upkeep.map_or(supdb::Options::default().upkeep, supdb::Upkeep::Background),
+            // The upkeep where the arm puts it, or where the engine does.
+            upkeep: upkeep.unwrap_or(supdb::Options::default().upkeep),
             forms_settle_rebuild_from: rebuild,
             snapshot_carry: snapcarry,
             scan_lazy_snapshot: lazysnap,
@@ -1220,7 +1217,7 @@ impl Engine for Supdb {
             return "supdb-settleall";
         }
         if self.upkeep.is_some() {
-            return "supdb-upkeep";
+            return "supdb-inline";
         }
         if self.tier.is_some_and(|t| t > 0) {
             return "supdb-tier";
@@ -1783,7 +1780,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-noseal" | "supdb-ahead" | "supdb-lazyforms" | "supdb-eager" | "supdb-nosettle"
         | "supdb-recency" | "supdb-nocarry" | "supdb-rebuild" | "supdb-snapcarry"
         | "supdb-lazysnap" | "supdb-fullrec" | "supdb-norebase" | "supdb-sealfile"
-        | "supdb-settleall" | "supdb-upkeep" | "supdb-tier" | "supdb-runs" | "supdb-keeper"
+        | "supdb-settleall" | "supdb-inline" | "supdb-tier" | "supdb-runs" | "supdb-keeper"
         | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice"
         | "supdb-nocache" | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
@@ -1809,7 +1806,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-norebase" => Box::new(Supdb::create_norebase(dir)?),
         "supdb-sealfile" => Box::new(Supdb::create_sealfile(dir)?),
         "supdb-settleall" => Box::new(Supdb::create_settleall(dir)?),
-        "supdb-upkeep" => Box::new(Supdb::create_upkeep(dir)?),
+        "supdb-inline" => Box::new(Supdb::create_inline(dir)?),
         "supdb-tier" => Box::new(Supdb::create_tier(dir)?),
         "supdb-runs" => Box::new(Supdb::create_runs(dir)?),
         "supdb-keeper" => Box::new(Supdb::create_keeper(dir)?),

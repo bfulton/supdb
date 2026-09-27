@@ -4767,6 +4767,9 @@ fn a_write_burst_is_settled_once_its_backlog_passes_the_bound() {
             forms_settle_backlog_pct: pct,
             // The bound alone: the recency window is the next test's.
             forms_settle_recent_pct: 0,
+            // The commit's own rules, whose deferred burst the upkeep
+            // thread would file ahead of the read.
+            upkeep: supdb::Upkeep::Inline,
             ..Options::default()
         };
         let mut db = Db::create(&d, opts).unwrap();
@@ -4833,6 +4836,8 @@ fn the_settle_bound_is_a_share_of_the_partitions_keys() {
             forms_settle_backlog_pct: 5,
             forms_settle_recent_pct: 0,
             forms_settle_keys_all: all,
+            // The commit's own rules; see the test above.
+            upkeep: supdb::Upkeep::Inline,
             ..Options::default()
         };
         let mut db = Db::create(&d, opts).unwrap();
@@ -5516,6 +5521,9 @@ fn a_burst_is_settled_by_its_backlog_only_near_a_scan() {
         // Five percent of 1,500 keys is 75 writes, a tenth is 150.
         forms_settle_backlog_pct: 5,
         forms_settle_recent_pct: 10,
+        // The commit's own rules, whose deferred burst the upkeep thread
+        // would file ahead of the read.
+        upkeep: supdb::Upkeep::Inline,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();

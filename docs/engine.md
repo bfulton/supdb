@@ -2127,7 +2127,8 @@ operation pays it: a commit that crosses the bound, or the first scan
 after a burst whose last commits did not. `Options::upkeep` gives the
 work to a thread of the store's own instead (`Upkeep::Background`), so
 it runs while the writer is elsewhere -- during the commit's own
-barrier, and beside the next batch.
+barrier, and beside the next batch. It is the default at level 2;
+`supdb-inline` is the arm that keeps the writer doing it.
 
 What moves is the writer's `FormsState`: the block tables, the scan
 snapshot and the log position both are current to. A commit lends it,
@@ -2292,8 +2293,9 @@ thousand at 1.36x (15/16) and 1.13x (14/16), nothing at the small rungs
 marked -- and ycsb-E at a hundred thousand at 0.935x (2/16), its first
 mark. Over the six sittings E has read below even in ten of the twelve
 rung-sittings at a hundred and three hundred thousand, by 2-8%. That is
-a cost, small and repeatable, and it is why the default stays `Inline`:
-the window that makes the lag sweep's bursts "reads around" also makes
+a cost, small and repeatable, and the default took it with the win:
+level 2 is the default, against a pure-win rule it does not meet. The
+window that makes the lag sweep's bursts "reads around" also makes
 ycsb-A's updates hold for a scan that comes three mixes later. A
 narrower window would stop A holding, and would stop the fully
 unmerged burst holding past the same number of writes; whether the

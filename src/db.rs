@@ -136,13 +136,12 @@ fn idle_io_priority() {
 
 /// Who keeps the writer's upkeep current: the block forms its range
 /// reads walk and the scan snapshot of the unsealed keys, both filed with
-/// every commit's writes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+/// every commit's writes. `Background(2)` by default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Upkeep {
     /// The writer, on its own thread: a commit files its writes when a
     /// scan preceded it or the backlog passes `forms_settle_backlog_pct`,
     /// and the first read after a burst files what the last commits left.
-    #[default]
     Inline,
     /// A thread of the store's own, while the writer is elsewhere. A
     /// commit hands the upkeep over, before its barrier so the work runs
@@ -157,16 +156,23 @@ pub enum Upkeep {
     ///   scan over the store within the last two stores' worth of writes
     ///   -- a commit whose own rules would leave its batch to the next
     ///   read hands it to the thread and holds until the thread has filed
-    ///   everything, so that read finds nothing left.
+    ///   everything, so that read finds nothing left. It lends nothing
+    ///   else, and a store whose commits never hold runs no thread.
     /// - 3: everything, at every commit, whoever reads; and while reads
     ///   are around a commit holds for every batch, however small, where
     ///   level 2 files a small one itself.
     ///
     /// Whatever the level, the thread takes the latest commit at each
     /// pass rather than one pass per commit, is woken only for a batch
-    /// worth waking it for, and a read that arrives before it has begun
-    /// takes the upkeep back untouched.
+    /// worth waking it for or a commit that holds, and a read that arrives
+    /// before it has begun takes the upkeep back untouched.
     Background(u8),
+}
+
+impl Default for Upkeep {
+    fn default() -> Upkeep {
+        Upkeep::Background(2)
+    }
 }
 
 /// How a store advises the kernel about its segment mappings.
@@ -728,8 +734,12 @@ pub struct Options {
     /// published, and when it did not, the first scan filed its thousand
     /// writes -- 0.5-0.8 ms of a pass of 0.45. Kept as the comparison arm.
     pub forms_settle_keys_all: bool,
-    /// EXPERIMENT: who keeps the writer's upkeep current; see `Upkeep`.
-    /// `Inline`, and `supdb-upkeep` prices the thread.
+    /// Who keeps the writer's upkeep current; see `Upkeep`. A thread at
+    /// level 2, which holds a commit for its pass only where the commit
+    /// would leave its batch to the next read: the fully-unmerged lag
+    /// point at a hundred and three hundred thousand keys read 1.6-1.9x
+    /// over six sittings, and ycsb-E there 2-8% slower. `supdb-inline`
+    /// prices the writer keeping it.
     pub upkeep: Upkeep,
     /// EXPERIMENT: a scan builds the snapshot only when a block it
     /// reaches needs one. A block held as a sparse form, a copy or a
@@ -951,7 +961,7 @@ impl Default for Options {
             forms_max_unsealed_pct: 0,
             forms_settle_backlog_pct: 2,
             forms_settle_keys_all: false,
-            upkeep: Upkeep::Inline,
+            upkeep: Upkeep::default(),
             snapshot_carry: false,
             scan_lazy_snapshot: false,
             forms_settle_rebuild_from: 0,

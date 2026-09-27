@@ -208,6 +208,22 @@ compiler that `State` is `Send + Sync` and `Reader` is `Send`; that is what
 keeps a cell out of a segment, a blob or a memtable, since a raw pointer
 behind an atomic would let one in unasked.
 
+**The writer's upkeep is lent, never shared.** By default
+(`Upkeep::Background(2)`) a commit that would leave its batch to the
+next scan lends the writer's `FormsState` -- its block tables and scan
+snapshot -- to a thread of the store's own, and returns once the thread
+has filed it. One thread holds it at a time: the cell is emptied only
+through `&mut` and refilled only while empty, so nothing in it needs to
+be `Sync`, and a writer's touch of it takes it back, waiting only for a
+pass in flight. The thread pins nothing, so every publish takes the
+upkeep back before swapping the state; the forms a pass publishes
+carry the commit the writer named, never the latest, or a handle at
+the latest takes forms without the writes between; retired forms are
+swept only by whoever holds it; and `settle` joins it before anything
+else, because every other join touches it. The threaded test runs at
+each level, since a level that holds hides what a level that lends
+exposes.
+
 **`Blob::zero_copy()` stays true on the native path.** `Bytes` has two halves
 for one reason: `read_at` copies and every source can answer it; `slice_at`
 lends and only a source backed by memory can. Native takes the second for
