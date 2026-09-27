@@ -2219,9 +2219,31 @@ sixteen pairs a rung:
 | ycsb-B | 0.85x (3/16) | 1.08x | 0.92x (ns) | 1.04x |
 
 Bold is 16/16 and holds under Holm; nothing else in the four tables
-does, and no quantity loses by a margin that does. At a hundred
-thousand the mixes and the drained scans lean 5-8% slower without the
-sign test seeing it, and a default is not flipped on one sitting.
+does, and no quantity loses by a margin that does. A second sitting
+read the fully unmerged point at 0.78x, 0.75x, **1.77x** and **1.69x**
+up the ladder, the two small rungs 3/16 and 2/16, and at three hundred
+thousand the tenth and hundredth points at 1.20x (14/16) and 1.38x
+(13/16). The large rungs' win holds across sittings; so does the small
+rungs' loss at that one point, and that is what keeps the default
+inline.
+
+The small rungs' loss is not the engine's work. Callgrind over the
+pass after the burst at ten thousand keys, 99 scans, counts 784,961
+instructions inline and 784,886 with the thread; the forms by kind and
+their layout are identical, and so is every count the suite keeps. Two
+things the probe did separate: the thread's burst ends 5-10 ms sooner,
+so the seal it started is still writing through the timed pass where
+the inline burst's had finished, and on this guest a core just back
+from idle runs the same pass at 1.2-3.1 µs a scan against 0.9 back to
+back, which a writer parked on its hold is. Neither closes the gap
+alone: waiting out the seal, spinning the writer awake, a single malloc
+arena (0.85x and 0.88x) and forms rebuilt on the writer's thread each
+narrowed it in some rounds and not others. What is left is below what
+this machine can show -- no counters, and pages placed where the host
+puts them -- and a pass of a hundred scans, two hundred microseconds,
+is where it shows. The thread's own cost here is real to a caller
+too, since a background seal after a burst competes with the reads
+after it whoever leaves it running.
 
 ### Arrival order
 

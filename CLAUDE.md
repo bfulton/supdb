@@ -564,6 +564,23 @@ instructions whose cost is not their count -- a divide, a call through
 a pointer, a store the next load depends on -- and give the common
 shape a path without them.
 
+**A join that took back what it was about to wait for.** Under
+`Upkeep::Background` the writer's upkeep is lent to a thread, and any
+touch of it by the writer takes it back, waiting only for a pass in
+flight and taking whatever the thread has not begun untouched. `settle`
+joined the seal, the merges and the builder first and the upkeep last,
+and each of those joins touches the upkeep, so by the time `settle`
+asked the thread to finish, the writer already held it and nothing had
+run. A model test that asked for the thread's work after a settle found
+no pass at all. The rule: when joining several workers and joining one
+resets another, join the one that would be reset first; and a test of
+a background worker asserts that the worker did something, since every
+check is green on work that was never handed over. The same test found
+the converse once the commits held for their pass: under a hold the
+writer commits nothing past the commit it named, so a pass stamping its
+forms with the writer's latest commit instead of the named one is
+invisible there, and only the level that never holds catches it.
+
 **A sentinel that crosses the wasm boundary changes sign.** A wasm `u32`
 arrives in JavaScript as a signed i32, so a failure sentinel of `u32::MAX`
 arrives as -1 and a comparison against 4294967295 can never match. Every
