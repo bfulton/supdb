@@ -219,7 +219,13 @@ plausible. The full run found it by filling the disk: every LMDB store
 opened since the start was still held, 4.5 GB of removed files when the
 3M rung began, which its eight reps would have tripled. Every row
 before the fix carries LMDB's `load-shuffled` and `scan-lag` from that
-store. `a_store_reopened_where_its_predecessor_was_is_a_fresh_store`
+store, and it flattered the lag sweep: rows of one engine either side
+of the fix read LMDB's lag scans at 0.6-0.8x of the old figures from
+30k up, its plain scan steady. The first reading of the fix compared
+the new row to the window, where hosts and engine changes move the
+lag points by more than that, and called the shift unresolvable; the
+row of the same engine before the fix was already banked and resolved
+it. `a_store_reopened_where_its_predecessor_was_is_a_fresh_store`
 holds every arm to the runner's sequence -- the first store's key gone
 from the second, and nothing under the path still open. The rule: an
 arm's drop closes everything its open made, and a store that was

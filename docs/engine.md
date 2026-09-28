@@ -606,10 +606,14 @@ in the rows before 260c09d, is not the store the engine's side read:
 the arm never closed its environment, so a pass's second open handed
 it the first store back, and its lag sweep scanned the ordered load's
 tree after an overwrite of every key rather than a tree its shuffled
-load built (`bench/CLAUDE.md`). The first row after the fix read
-LMDB's drained point at 0.38-0.58 of its own ordered-store scan, where
-the rows before read 0.37-1.01: lower, and inside what the host alone
-moves it, so these ratios stand as measured until rows say otherwise.
+load built (`bench/CLAUDE.md`). Rows of one engine on either side of
+the fix -- f87b394 and 260c09d, a quick row and a full row each -- put
+LMDB's lag scans at 0.6-0.8x of what the old store gave them, at every
+depth and every rung from 30k up, while its plain scan moved 0.87-1.01x
+and the engine's lag scans held. So every lag ratio against LMDB here
+and in the rows before understates the engine's by about half again;
+LMDB's shuffled load, an insert into an empty tree now rather than an
+overwrite, is 1.2-1.4x faster at 10k and 30k and level from 300k up.
 
 Drained the engine reads 1.35x-1.64x of LMDB at every rung. A tenth of
 the store unmerged and it reads a quarter to a third of it; all of it
