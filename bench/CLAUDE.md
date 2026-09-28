@@ -246,9 +246,17 @@ store a pass drops, and the pass line prints what the process holds as
 the next pass opens, so a climb shows while it is happening.
 `a_dropped_stores_freed_memory_is_returned_before_the_next_pass`
 reproduces the shape and released 0 of its 300 MB without the release.
-The rule: what one pass leaves in the process is a variable of every
-pass after it, and a run is only as interleaved as its passes are
-independent.
+The release has a price, and it is the load's: a store that opens in
+memory just handed back faults its pages in where it used to be given
+the passes before it, warm. In one process releasing only before the
+odd reps, the default arm's ordered load read slower in all eight
+pairs (0.70-0.98, about 0.9), the other supdb arms in 18 of 24, and
+LMDB, which allocates next to nothing, in 9 of 16; reads, scans and the
+mixes showed no direction. So the rows before the release flattered
+every loading arm that allocates, and the first full row after it
+failed its gate on the load alone, the engine unchanged. The rule:
+what one pass leaves in the process is a variable of every pass after
+it, and a run is only as interleaved as its passes are independent.
 
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
