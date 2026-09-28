@@ -622,7 +622,10 @@ hundred forms and a snapshot waiting -- a pass's closing threaded
 scans republish the blocks the mixes dirtied, and nothing sweeps after
 them -- and `tests/leak.rs`, which counts every allocation, kept a
 quarter of a megabyte per closed store until the wrappers were given a
-`Drop` that frees. The rule: whatever owns a pointer it will free is a
+`Drop` that frees. It was the suite's runner that showed it: with
+freed memory returned between passes, what the process still held
+climbed about 35 MB a rep at a million keys over every arm, and held
+level once the wrappers freed. The rule: whatever owns a pointer it will free is a
 type with a `Drop`, so the owner's end frees it, not only the path
 that remembered to.
 
