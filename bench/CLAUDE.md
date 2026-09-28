@@ -231,6 +231,25 @@ from the second, and nothing under the path still open. The rule: an
 arm's drop closes everything its open made, and a store that was
 removed and is still readable is the check that says it did not.
 
+**A runner that opens hundreds of stores keeps what each one freed.**
+glibc keeps what a thread frees in that thread's arena and gives a heap
+back to the system only from its top, so a store dropped at the end of
+a pass stayed resident, and the stores after it opened in what was
+left. At the full run's 10M rung the arenas held 13 GB taken from the
+system with 1.8 GB of it in use; the store's own files were down to a
+tenth of a gigabyte of page cache, and from the rung's third rep every
+pass read at a tenth to a twentieth of the reps before, faulting on
+every page. Nothing raised, and the rungs below it fit in what was
+left. `malloc_trim(0)` in the live process took it from 12.9 GB
+resident to 2.1 GB. The runner now releases freed memory after every
+store a pass drops, and the pass line prints what the process holds as
+the next pass opens, so a climb shows while it is happening.
+`a_dropped_stores_freed_memory_is_returned_before_the_next_pass`
+reproduces the shape and released 0 of its 300 MB without the release.
+The rule: what one pass leaves in the process is a variable of every
+pass after it, and a run is only as interleaved as its passes are
+independent.
+
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`

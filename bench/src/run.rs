@@ -370,8 +370,14 @@ pub fn run(
                         .map(|(_, v)| *v)
                         .unwrap_or(0.0)
                 };
+                // What the process holds as the next pass opens: a figure
+                // that climbs from pass to pass is memory the passes before
+                // left behind, and it comes out of the next store's cache.
+                let rss = resident_bytes()
+                    .map(|b| format!("{:.2} GB", b as f64 / 1e9))
+                    .unwrap_or_else(|| "-".into());
                 log(&format!(
-                    "{:>7}s  size {size:>9}  rep {rep}{}  {arm:<15} load {:>10.0} ops/s  read {:>10.0}/s  {top}t {:>10.0}/s  scan {:>11.0}/s  {top}t {:>11.0}/s  ycsb-A {:>9.0}/s",
+                    "{:>7}s  size {size:>9}  rep {rep}{}  {arm:<15} load {:>10.0} ops/s  read {:>10.0}/s  {top}t {:>10.0}/s  scan {:>11.0}/s  {top}t {:>11.0}/s  ycsb-A {:>9.0}/s  rss {rss}",
                     started.elapsed().as_secs(),
                     if rep == 0 { " (warmup)" } else { "" },
                     one.load_ops_s,
@@ -642,6 +648,7 @@ fn one_pass(
     // been asked of the store where the reads happen.
     let mut counters = e.counters();
     drop(e);
+    release_freed_memory();
     let _ = std::fs::remove_dir_all(dir);
 
     // The same keys in a shuffled order, on a fresh store.
@@ -696,6 +703,7 @@ fn one_pass(
         }
     }
     drop(e);
+    release_freed_memory();
 
     Ok(OnePass {
         load_ops_s: size as f64 / load_s,
@@ -1173,6 +1181,33 @@ fn lmdb_map_gb(size: u64, value_size: usize) -> usize {
     ((raw * 3.0 / 1073741824.0).ceil() as usize).max(8)
 }
 
+/// Hand back to the system what the store just dropped had freed, so the
+/// next one opens in the memory a fresh process would give it. glibc keeps
+/// what a thread frees in that thread's arena and returns only the top of
+/// a heap, so every store a run had opened stayed resident after its drop:
+/// at the full run's 10M rung the arenas held 13 GB taken from the system
+/// with 1.8 GB of it in use, the store's own files had the page cache that
+/// was left, and from its third rep the rung read at a tenth to a twentieth
+/// of the reps before, faulting on every page. `malloc_trim(0)` took that
+/// process from 12.9 GB resident to 2.1 GB.
+fn release_freed_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: takes and returns plain integers; releasing free pages is
+    // what it is for, and it takes the allocator's own locks.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+/// This process's resident bytes, where the platform says (Linux).
+fn resident_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    // SAFETY: sysconf reads a constant of the system.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    Some(pages * u64::try_from(page).ok()?)
+}
+
 /// The top rung for `full` on this machine: the store at least 1.5x memory.
 /// Free bytes on the filesystem holding `dir`, or None if it cannot be read.
 fn free_bytes(dir: &Path) -> Option<u64> {
@@ -1198,6 +1233,45 @@ pub fn full_top(mem_total_kb: u64, value_size: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shape that filled the full run's memory: a thread allocates
+    /// small blocks in its own arena, frees them, and exits, with one block
+    /// allocated last still live so the arena cannot give its heap back from
+    /// the top. The freed memory stays resident until the runner releases
+    /// it -- the first assertion is that the test reached that case at all,
+    /// the second that the release returns most of it.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn a_dropped_stores_freed_memory_is_returned_before_the_next_pass() {
+        const BLOCKS: usize = 3_000_000;
+        const SIZE: usize = 100;
+        let held = BLOCKS * SIZE;
+        let pin = std::thread::spawn(|| {
+            let mut v: Vec<Box<[u8; SIZE]>> = Vec::with_capacity(BLOCKS);
+            for i in 0..BLOCKS {
+                v.push(Box::new([i as u8; SIZE]));
+            }
+            let pin = Box::new([1u8; SIZE]);
+            std::hint::black_box(&v);
+            drop(v);
+            pin
+        })
+        .join()
+        .unwrap();
+        let before = resident_bytes().unwrap();
+        release_freed_memory();
+        let after = resident_bytes().unwrap();
+        assert!(
+            before >= held as u64,
+            "the freed blocks were not resident to begin with: {before} bytes, {held} allocated"
+        );
+        assert!(
+            before - after >= held as u64 / 2,
+            "released {} of the {held} bytes freed ({before} -> {after})",
+            before.saturating_sub(after)
+        );
+        drop(pin);
+    }
 
     /// Holm's step-down against hand-worked cases: it stops at the first
     /// failure even when a later p would clear its own, looser bound, and
