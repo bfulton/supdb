@@ -5441,11 +5441,34 @@ struct Shared {
 /// EXPERIMENT: a replaced canonical form on its way to being freed. A
 /// raw pointer, since a reader that loaded it before the replacement may
 /// still be walking it; `Send` because the writer frees it from its own
-/// thread once every such reader has left.
+/// thread once every such reader has left. Dropping it frees the form:
+/// the sweep drops it past every such reader, and the store drops what
+/// is left when its last handle goes. The sweeps once freed the pointee
+/// by hand and the lists dropped only the pointers, so every form still
+/// waiting when a store closed was never freed: a store the suite closed
+/// at three hundred thousand keys left two hundred.
 struct RetiredForm(*mut CanonicalForm);
 
-/// EXPERIMENT: a snapshot a publish replaced, as `RetiredForm`.
+/// EXPERIMENT: a snapshot a publish replaced, as `RetiredForm`; it holds
+/// one reference, taken by `Arc::into_raw` when it was published.
 struct RetiredSnap(*const Snapshot);
+
+impl Drop for RetiredForm {
+    fn drop(&mut self) {
+        // SAFETY: made by `Box::into_raw` at the publish, replaced in the
+        // state since, and dropped only by a sweep past every reader that
+        // could hold it or with the store, which no handle holds.
+        drop(unsafe { Box::from_raw(self.0) });
+    }
+}
+
+impl Drop for RetiredSnap {
+    fn drop(&mut self) {
+        // SAFETY: the reference the publish took, given up once, when no
+        // handle can be between loading the pointer and cloning it.
+        drop(unsafe { std::sync::Arc::from_raw(self.0) });
+    }
+}
 // SAFETY: see the type's doc; the pointee is never touched through this
 // wrapper except to free it past every pinned reader.
 unsafe impl Send for RetiredForm {}
@@ -8160,16 +8183,9 @@ impl Reader {
             return;
         }
         let readers = &self.shared.readers;
-        retired.retain(|(t, s)| {
-            if readers.none_before(t + 1) {
-                // SAFETY: replaced in the state, and every handle that
-                // could be between the load and the clone has left.
-                drop(unsafe { std::sync::Arc::from_raw(s.0) });
-                false
-            } else {
-                true
-            }
-        });
+        // Replaced in the state; one is dropped, and so freed, once every
+        // handle that could be between the load and the clone has left.
+        retired.retain(|(t, _)| !readers.none_before(t + 1));
     }
 
     /// EXPERIMENT: free the replaced canonical forms no pinned reader can
@@ -8184,16 +8200,9 @@ impl Reader {
         }
         self.shared.readers.bump();
         let readers = &self.shared.readers;
-        retired.retain(|(t, f)| {
-            if readers.none_before(t + 1) {
-                // SAFETY: replaced by the writer, unreachable since, and
-                // every reader that could hold it has left.
-                drop(unsafe { Box::from_raw(f.0) });
-                false
-            } else {
-                true
-            }
-        });
+        // Replaced by the writer and unreachable since; one is dropped,
+        // and so freed, once every reader that could hold it has left.
+        retired.retain(|(t, _)| !readers.none_before(t + 1));
     }
 
     /// One block materialised, charged to whoever built it.

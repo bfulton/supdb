@@ -612,6 +612,20 @@ reads one -- the bulk walk, the merge's per-key calls, the point read
 -- and an accessor answers only what it is asked, since a key read is
 the most frequent call a merge or a seek makes.
 
+**A list of raw pointers drops the pointers.** A replaced canonical
+form and a replaced scan snapshot wait in lists until every reader
+that could hold them has left, and the sweep freed each by hand as it
+removed it. Nothing freed what was still waiting when the store
+closed: the lists dropped their wrappers, and a wrapper of a raw
+pointer frees nothing. The suite's stores closed with up to two
+hundred forms and a snapshot waiting -- a pass's closing threaded
+scans republish the blocks the mixes dirtied, and nothing sweeps after
+them -- and `tests/leak.rs`, which counts every allocation, kept a
+quarter of a megabyte per closed store until the wrappers were given a
+`Drop` that frees. The rule: whatever owns a pointer it will free is a
+type with a `Drop`, so the owner's end frees it, not only the path
+that remembered to.
+
 **A sentinel that crosses the wasm boundary changes sign.** A wasm `u32`
 arrives in JavaScript as a signed i32, so a failure sentinel of `u32::MAX`
 arrives as -1 and a comparison against 4294967295 can never match. Every
