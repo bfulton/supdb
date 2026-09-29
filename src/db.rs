@@ -397,15 +397,6 @@ pub struct Options {
     /// without freeing or swapping a state under the writer. `false` is
     /// the shape before it, kept to price it.
     pub writer_pins: bool,
-    /// EXPERIMENT: a publish over the same memtables -- a seal's landing,
-    /// a merge, a promotion -- copies the published forms into the new
-    /// state (`State::carry_published`) and leaves the writer's own
-    /// tables to be carried at its next look at the log
-    /// (`Reader::rebase_tables`), partition by partition. That is what a
-    /// publish from a thread other than the writer's can do. `false` is
-    /// the carry before it: the writer's tables and the published forms
-    /// moved together inside the publish, all or nothing.
-    pub forms_carry_lazily: bool,
     /// How a flush drains level 0 once partitions exist: merge only the
     /// ranges that hold pieces, under the live fences (`true`), or
     /// re-partition everything from every key (`false`, the original), kept
@@ -969,7 +960,6 @@ impl Default for Options {
             promote: true,
             flush_schedules: true,
             writer_pins: true,
-            forms_carry_lazily: true,
             recycle_wal: false,
             read_advice: ReadAdvice::default(),
             scan_readahead_bytes: 256 << 10,
@@ -3429,10 +3419,10 @@ const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::
 const READER_SLOTS: usize = 256;
 
 /// Slots the engine keeps for itself ahead of the callers' 256: the
-/// writer's, which its operations pin, and the upkeep thread's, which its
-/// passes pin. Apart, so a caller holding every handle it may have
+/// writer's, which its operations pin, the upkeep thread's, which its
+/// passes pin, and the segment work's (`Maint`). Apart, so a caller holding every handle it may have
 /// cannot leave the engine without one.
-const ENGINE_SLOTS: usize = 2;
+const ENGINE_SLOTS: usize = 3;
 
 impl Readers {
     fn new() -> Readers {
@@ -4681,109 +4671,7 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
     Ok(out)
 }
 
-impl Db {
-    /// Start a piece merge where a partition's range holds `tier_pieces`
-    /// aligned pieces that no partition merge holds as inputs, one range
-    /// at a time; collect a finished one first, since the pieces it
-    /// replaced are what the decision counts.
-    fn maybe_tier(&mut self) -> Result<()> {
-        let n = self.opts.tier_pieces;
-        if n == 0 {
-            return Ok(());
-        }
-        if let Some((_, h)) = &self.tiering {
-            if !h.is_finished() {
-                return Ok(());
-            }
-            self.join_tier()?;
-        }
-        let busy: Vec<String> = self
-            .compacting
-            .as_ref()
-            .map(|(i, _)| i.clone())
-            .unwrap_or_default();
-        let parts: Vec<Fence> = self
-            .segs()
-            .iter()
-            .filter(|s| s.level > 0)
-            .map(|s| (s.lo.clone(), s.hi.clone()))
-            .collect();
-        for (lo, hi) in parts {
-            let pieces: Vec<String> = self
-                .segs()
-                .iter()
-                .filter(|s| s.level == 0 && s.lo == lo && s.hi == hi && !busy.contains(&s.name))
-                .map(|s| s.name.clone())
-                .collect();
-            if pieces.len() >= n {
-                return self.start_tier(lo, hi, pieces);
-            }
-        }
-        Ok(())
-    }
-
-    /// `inputs` are the range's pieces oldest first, as the live set
-    /// orders them; the output takes the newest one's covered sequence.
-    fn start_tier(&mut self, lo: Vec<u8>, hi: Option<Vec<u8>>, inputs: Vec<String>) -> Result<()> {
-        let end_seq = inputs
-            .iter()
-            .filter_map(|n| Db::name_end_seq(n))
-            .max()
-            .unwrap_or(self.covered_seq);
-        let id = self.next_seg;
-        self.next_seg += 1;
-        let plan = TierPlan {
-            dir: self.dir.clone(),
-            inputs: inputs.clone(),
-            id,
-            end_seq,
-            lo,
-            hi,
-            opts: Db::segment_opts(&self.opts),
-            background_io: self.opts.background_io,
-            sync_every: self.opts.seal_sync_every,
-            inline_max: self.opts.inline_bytes,
-        };
-        let handle = std::thread::spawn(move || tier_run(plan));
-        self.tiering = Some((inputs, handle));
-        Ok(())
-    }
-
-    /// Collect a piece merge as a partition merge is collected: the
-    /// output in for the inputs, the manifest naming it, then the inputs
-    /// deleted; a crash on either side of the manifest leaves one
-    /// complete set and an orphan the open sweeps.
-    fn join_tier(&mut self) -> Result<()> {
-        let Some((inputs, handle)) = self.tiering.take() else {
-            return Ok(());
-        };
-        let outputs = handle.join().map_err(|_| err("tier thread panicked"))??;
-        let mut merged: Vec<std::sync::Arc<Seg>> = self
-            .segs()
-            .iter()
-            .filter(|seg| !inputs.contains(&seg.name))
-            .cloned()
-            .collect();
-        for name in &outputs {
-            merged.push(std::sync::Arc::new(Seg::open(
-                &self.dir,
-                name,
-                self.advice_random(),
-                self.opts.read_advice != ReadAdvice::Normal,
-                self.opts.segment.checksums,
-            )?));
-        }
-        self.publish_segs_with(merged, true);
-        if self.opts.scan_block_cache {
-            self.build_ctx().rank_pieces()?;
-        }
-        self.publish()?;
-        for name in &inputs {
-            self.retire_seg(name);
-        }
-        Ok(())
-    }
-}
+impl Db {}
 
 /// Where the commit thread's seal time goes. `phase_ns().1` is the sum of
 /// everything `join_seal` does; this says how much of it was waiting for a
@@ -5562,6 +5450,14 @@ struct Shared {
     /// current; and what the keeper has published, for a test: versions
     /// extended, and versions carried across a publish.
     keeper_thread: std::sync::OnceLock<std::thread::Thread>,
+    /// The next segment id: the writer's seals and the segment work's
+    /// merges draw from one counter.
+    next_seg: AtomicU64,
+    /// A retired WAL renamed to a spare for the writer's next rotation
+    /// (`Options::recycle_wal`), or null: offered by the segment work once
+    /// the manifest covers the WAL, taken by the writer. One slot and a
+    /// swap each way, since one spare is enough.
+    spare_wal: AtomicPtr<PathBuf>,
     keeper_seq: AtomicU64,
     keeper_done: AtomicU64,
     snap_kept: AtomicU64,
@@ -5619,6 +5515,39 @@ impl Drop for Shared {
             // SAFETY: published by the writer, owned here.
             drop(unsafe { Box::from_raw(p) });
         }
+        drop(self.take_spare());
+    }
+}
+
+impl Shared {
+    /// `spare` offered for the writer's next rotation; a spare already
+    /// waiting keeps its place and this one is removed.
+    fn offer_spare(&self, spare: PathBuf) {
+        let p = Box::into_raw(Box::new(spare));
+        if self
+            .spare_wal
+            .compare_exchange(
+                std::ptr::null_mut(),
+                p,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .is_err()
+        {
+            // SAFETY: never published, still this call's.
+            let spare = unsafe { Box::from_raw(p) };
+            let _ = std::fs::remove_file(*spare);
+        }
+    }
+
+    /// The spare waiting, if one is.
+    fn take_spare(&self) -> Option<PathBuf> {
+        let p = self
+            .spare_wal
+            .swap(std::ptr::null_mut(), AtomicOrdering::AcqRel);
+        // SAFETY: offered by `offer_spare`, and the swap made it this
+        // call's alone.
+        (!p.is_null()).then(|| *unsafe { Box::from_raw(p) })
     }
 }
 
@@ -5892,6 +5821,8 @@ impl FormsCell {
 
 pub struct Db {
     r: Reader,
+    /// The store's segment work, driven from here; see `Maint`.
+    maint: Maint,
     dir: PathBuf,
     wal: Wal,
     wal_id: u64,
@@ -5905,9 +5836,6 @@ pub struct Db {
     /// Scratch for the run a value would encode as, measured at `append`
     /// against the inline limit.
     run_scratch: Vec<u8>,
-    /// Direct segments' temp names, unlinked once the manifest names the
-    /// segment; until then the temp name is what recovery reads.
-    retiring_tmps: Vec<PathBuf>,
     /// EXPERIMENT: the memtable's entry count when the last builder was
     /// started from a commit, so the next starts a burst later and not a
     /// batch later, and the state's generation then, since a publish
@@ -5917,7 +5845,6 @@ pub struct Db {
     /// An error from leaving order mid-batch, which `append` and `delete`
     /// cannot return: the next `commit` does.
     pending_err: Option<std::io::Error>,
-    next_seg: u64,
     /// Commits written since the last barrier, for `SyncPolicy::EveryN`.
     unsynced: u32,
     /// Nanoseconds spent in each phase of a load, accumulated so an
@@ -5926,51 +5853,9 @@ pub struct Db {
     /// the commit path; `seal` is writing a memtable out as a segment;
     /// `merge` is compaction, counted where the caller waits for it.
     phase_ns: [u64; 3],
-    /// The seal phase decomposed: how long the commit thread blocked on a
-    /// seal still running mid-load, how long the final drain took, how long
-    /// publishing (the manifest and its barriers) took, and how often a
-    /// join found the seal unfinished, so it can be said which of these the
-    /// 14% of the durable load in `phase_ns[1]` is.
-    seal_wait: SealWaits,
-    /// A merge a flush that does not partition started in the background:
-    /// collected at the first commit after it finishes, where a merge the
-    /// seals start waits for the next seal, since a store that has stopped
-    /// sealing would otherwise never see it.
-    flush_merge: bool,
     /// Set by `flush` while it waits for the last seal, so that wait is
     /// booked as the drain and not as backpressure.
     draining: bool,
-    /// WAL files whose records no segment has been *named* as covering
-    /// yet. One rule governs every one of them: a WAL may be deleted only
-    /// after the manifest names a segment that covers its records. The
-    /// model oracle found this twice in one afternoon -- the seal thread
-    /// deleting the rotated WAL on rename, before the publish that made its
-    /// segment reachable, and `open` deleting older WALs once it had
-    /// replayed them into a memtable that lives only in memory. Both were
-    /// the same mistake: treating "the data is somewhere" as "the data is
-    /// durable somewhere a reopen can find".
-    retiring_wals: Vec<PathBuf>,
-    /// Retired WAL files kept for the next rotation (`recycle_wal`), under
-    /// `spare-` names so `open` never replays them. One is enough: a
-    /// retiring WAL is released at `join_seal`, and a seal joins the one
-    /// before it before rotating.
-    spare_wals: Vec<PathBuf>,
-    /// The WAL sequence every live segment covers between them. Kept as a
-    /// monotone field rather than derived from segment names: a compaction
-    /// renames the whole live set, and deriving the bound from the names it
-    /// happens to produce let it move BACKWARDS -- caught by the model
-    /// oracle as "wal sequence gap: a durable record is missing" on the
-    /// reopen after a merge. A durability bound may only ever rise.
-    covered_seq: u64,
-    /// A partitioning merge in flight. Its inputs stay live and readable
-    /// until the manifest names its outputs instead, which is what makes
-    /// the swap atomic across a crash.
-    compacting: Option<Compaction>,
-    /// A piece merge in flight: its inputs' names and its thread. Its
-    /// inputs and a partition merge's are disjoint, each excluding the
-    /// other's at its start, so the two run beside each other.
-    tiering: Option<Compaction>,
-    sealing: Option<std::thread::JoinHandle<Result<Vec<String>>>>,
     /// PROTOTYPE: the run keeper, once the first commit has started it.
     keeper: Option<Keeper>,
     /// EXPERIMENT: the upkeep thread, once a commit has had something
@@ -11042,7 +10927,7 @@ impl Db {
     fn next_wal(&mut self, id: u64) -> Result<Wal> {
         let path = Db::wal_path(&self.dir, id);
         if self.opts.recycle_wal {
-            if let Some(spare) = self.spare_wals.pop() {
+            if let Some(spare) = self.shared.take_spare() {
                 return Wal::recycle(&spare, &path, id);
             }
             let mut wal = Wal::create(&path, id)?;
@@ -11122,36 +11007,6 @@ impl Db {
         Db::name_field(name, 1)
     }
 
-    /// Unlink a retired segment, and the ordered index named after it when
-    /// no live segment still claims that index.
-    ///
-    /// The index has to go here rather than wait for the sweep at open. That
-    /// sweep is the backstop for a crash window; a merge is not a crash
-    /// window, it is the steady state, so a process that merges for hours
-    /// leaked one index per input it retired and nothing reclaimed them
-    /// until the store was reopened -- a run at a hundred million keys was
-    /// found with 53,596 files in one store directory, most of them indexes
-    /// whose segments were long gone.
-    ///
-    /// The liveness check is not defensive. A promotion renames a segment
-    /// and keeps the id and end-sequence its index is named by, so the
-    /// retired name and the live one address the SAME index file; unlinking
-    /// it by name alone took the index of a segment that was still open, and
-    /// seven tests said so.
-    fn retire_seg(&self, name: &str) {
-        let _ = std::fs::remove_file(self.dir.join(name));
-        let Some(ord) = Db::ord_name_for(name) else {
-            return;
-        };
-        let claimed = self
-            .segs()
-            .iter()
-            .any(|s| Db::ord_name_for(&s.name).as_deref() == Some(ord.as_str()));
-        if !claimed {
-            let _ = std::fs::remove_file(self.dir.join(&ord));
-        }
-    }
-
     fn segment_opts(opts: &Options) -> SegmentOptions {
         opts.segment.clone()
     }
@@ -11160,7 +11015,8 @@ impl Db {
         let starts_random = opts.read_advice.starts_random();
         std::fs::create_dir_all(dir)?;
         let mut wal = Wal::create(&Db::wal_path(dir, 0), 0)?;
-        let mut spare_wals = Vec::new();
+        let mut spare_wal: *mut PathBuf = std::ptr::null_mut();
+        let next_seg = 0u64;
         if opts.recycle_wal {
             // The live file and one spare, both written through, so the
             // first rotation recycles too and no rotation ever pays the
@@ -11168,7 +11024,7 @@ impl Db {
             wal.prefill(opts.seal_bytes as u64)?;
             let spare = Db::spare_path(dir, 0);
             Wal::create(&spare, 0)?.prefill(opts.seal_bytes as u64)?;
-            spare_wals.push(spare);
+            spare_wal = Box::into_raw(Box::new(spare));
             File::open(dir)?.sync_all()?;
         }
         let segs: Vec<std::sync::Arc<Seg>> = Vec::new();
@@ -11223,6 +11079,8 @@ impl Db {
             blk_engine: AtomicU64::new(0),
             snap_extends: AtomicU64::new(0),
             keeper_thread: std::sync::OnceLock::new(),
+            next_seg: AtomicU64::new(next_seg),
+            spare_wal: AtomicPtr::new(spare_wal),
             keeper_seq: AtomicU64::new(0),
             keeper_done: AtomicU64::new(0),
             snap_kept: AtomicU64::new(0),
@@ -11252,8 +11110,10 @@ impl Db {
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
         };
+        let maint = Maint::new(r.maint_reader()?, dir, 0, Vec::new());
         Ok(Db {
             r,
+            maint,
             dir: dir.to_path_buf(),
             wal,
             wal_id: 0,
@@ -11261,27 +11121,17 @@ impl Db {
             direct: None,
             max_key: Vec::new(),
             run_scratch: Vec::new(),
-            retiring_tmps: Vec::new(),
             built_ahead_len: 0,
             built_ahead_gen: 0,
             pending_err: None,
-            next_seg: 0,
-            sealing: None,
             keeper: None,
             upkeeper: None,
             upkeep_log: (0, 0),
             upkeep_life: 0,
             upkeep_since_scan: 0,
             upkeep_hand: Hand::Lend,
-            compacting: None,
-            tiering: None,
             unsynced: 0,
             phase_ns: [0; 3],
-            retiring_wals: Vec::new(),
-            spare_wals,
-            covered_seq: 0,
-            seal_wait: SealWaits::default(),
-            flush_merge: false,
             draining: false,
         })
     }
@@ -11479,6 +11329,10 @@ impl Db {
         }
         let wal = Wal::open_append(&wal_path, wal_id, from)?;
         let next_seg = seg_ids.iter().map(|&(n, _)| n + 1).max().unwrap_or(0);
+        let spare_wal = spare_wals
+            .into_iter()
+            .next()
+            .map_or(std::ptr::null_mut(), |p| Box::into_raw(Box::new(p)));
         let segs: Vec<std::sync::Arc<Seg>> = segs.into_iter().map(std::sync::Arc::new).collect();
         let mean_key_bytes = Db::mean_key_bytes_of(&segs);
         let store_bytes = Db::store_bytes_of(dir, &segs);
@@ -11533,6 +11387,8 @@ impl Db {
             blk_engine: AtomicU64::new(0),
             snap_extends: AtomicU64::new(0),
             keeper_thread: std::sync::OnceLock::new(),
+            next_seg: AtomicU64::new(next_seg),
+            spare_wal: AtomicPtr::new(spare_wal),
             keeper_seq: AtomicU64::new(0),
             keeper_done: AtomicU64::new(0),
             snap_kept: AtomicU64::new(0),
@@ -11562,8 +11418,10 @@ impl Db {
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
         };
+        let maint = Maint::new(r.maint_reader()?, dir, sealed, retiring);
         Ok(Db {
             r,
+            maint,
             dir: dir.to_path_buf(),
             wal,
             wal_id,
@@ -11571,27 +11429,17 @@ impl Db {
             direct: None,
             max_key,
             run_scratch: Vec::new(),
-            retiring_tmps: Vec::new(),
             built_ahead_len: 0,
             built_ahead_gen: 0,
             pending_err: None,
-            next_seg,
-            sealing: None,
             keeper: None,
             upkeeper: None,
             upkeep_log: (0, 0),
             upkeep_life: 0,
             upkeep_since_scan: 0,
             upkeep_hand: Hand::Lend,
-            compacting: None,
-            tiering: None,
             unsynced: 0,
             phase_ns: [0; 3],
-            retiring_wals: retiring,
-            spare_wals,
-            covered_seq: sealed,
-            seal_wait: SealWaits::default(),
-            flush_merge: false,
             draining: false,
         })
     }
@@ -11768,7 +11616,7 @@ impl Db {
             // The upkeep handed over before the barrier, so the thread
             // works while the device syncs -- unless a seal is to be
             // joined, whose publish would take it straight back.
-            if background && !self.sealing.as_ref().is_some_and(|h| h.is_finished()) {
+            if background && !self.maint.sealing.as_ref().is_some_and(|h| h.is_finished()) {
                 self.hand_over_upkeep();
             }
             self.unsynced += 1;
@@ -11792,19 +11640,20 @@ impl Db {
         // commit's check or the ninth. The fill is the maintenance's
         // own, under its regime: a batch at the settle bound fills, and
         // a publish makes nothing due that a scan has not.
-        if self.sealing.as_ref().is_some_and(|h| h.is_finished()) {
-            self.join_seal()?;
+        if self.maint.sealing.as_ref().is_some_and(|h| h.is_finished()) {
+            self.with_maint(|m| m.join_seal(false))?;
         }
         // The merge a flush handed to the background, published at the
         // first commit after it finishes, and before the maintenance for
         // the seal's reason above.
-        if self.flush_merge
+        if self.maint.flush_merge
             && self
+                .maint
                 .compacting
                 .as_ref()
                 .is_some_and(|(_, h)| h.is_finished())
         {
-            self.join_compact()?;
+            self.with_maint(|m| m.join_compact())?;
         }
         if background {
             if let Some(e) = self.shared.upkeep.take_err() {
@@ -11862,8 +11711,7 @@ impl Db {
             return Ok(());
         }
         if self.direct.is_none() {
-            let id = self.next_seg;
-            self.next_seg += 1;
+            let id = self.maint.alloc_segs(1);
             let tmp = self.dir.join(format!("direct-{id:08}.tmp"));
             let _ = std::fs::remove_file(&tmp);
             let opts = Db::segment_opts(&self.opts);
@@ -11925,7 +11773,8 @@ impl Db {
             self.set_mem(std::sync::Arc::new(MemTable::new()));
             return Ok(());
         };
-        self.join_seal()?;
+        let draining = self.draining;
+        self.with_maint(|m| m.join_seal(draining))?;
         debug_assert_eq!(
             self.mem().len(),
             d.committed,
@@ -11950,8 +11799,8 @@ impl Db {
         let first_partition = self.seals_first_partition();
         let limit = self.partition_limit();
         let (id, seq) = (d.id, end_seq);
-        self.retiring_tmps.push(tmp.clone());
-        self.sealing = Some(std::thread::spawn(move || {
+        self.maint.retiring_tmps.push(tmp.clone());
+        self.maint.sealing = Some(std::thread::spawn(move || {
             let tombs = w.tombs();
             let ord = w
                 .finish()
@@ -11996,7 +11845,8 @@ impl Db {
         if self.mem().is_empty() {
             return Ok(());
         }
-        self.join_seal()?;
+        let draining = self.draining;
+        self.with_maint(|m| m.join_seal(draining))?;
         let frozen = self.freeze();
         self.mem_bytes = 0;
         let new_wal = self.next_wal(self.wal_id + 1)?;
@@ -12019,20 +11869,19 @@ impl Db {
             .filter(|s| s.level > 0)
             .map(|s| (s.lo.clone(), s.hi.clone()))
             .collect();
-        let first_id = self.next_seg;
-        self.next_seg += fences.len().max(1) as u64;
+        let first_id = self.maint.alloc_segs(fences.len().max(1) as u64);
         let dir = self.dir.clone();
         let opts = Db::segment_opts(&self.opts);
         let background_io = self.opts.background_io;
         let sync_every = self.opts.seal_sync_every;
         let inline_max = self.opts.inline_bytes;
         let end_seq = old_wal.seq;
-        self.retiring_wals.push(old_wal.path.clone());
+        self.maint.retiring_wals.push(old_wal.path.clone());
         drop(old_wal);
         let first_partition = self.seals_first_partition();
         let limit = self.partition_limit();
         let mem = frozen.clone();
-        self.sealing = Some(std::thread::spawn(move || {
+        self.maint.sealing = Some(std::thread::spawn(move || {
             if background_io == BackgroundIo::Idle {
                 idle_io_priority();
             }
@@ -12178,9 +12027,11 @@ impl Db {
         // The upkeep first: every join after it touches the writer's
         // upkeep, and a touch takes it back from the thread untouched.
         self.join_upkeep();
-        self.join_seal()?;
-        self.join_compact()?;
-        self.join_tier()?;
+        self.with_maint(|m| {
+            m.join_seal(false)?;
+            m.join_compact()?;
+            m.join_tier()
+        })?;
         self.join_ahead();
         self.settle_keeper();
         Ok(())
@@ -12210,210 +12061,12 @@ impl Db {
         self.commit_staged()?;
         self.unsynced = 0;
         self.draining = true;
-        let sealed = self.seal().and_then(|_| self.join_seal());
+        let sealed = self
+            .seal()
+            .and_then(|_| self.with_maint(|m| m.join_seal(true)));
         self.draining = false;
         sealed?;
-        self.join_compact()?;
-        self.join_tier()?;
-        // Leave the store routed. A flush is a caller saying it has
-        // stopped writing, and what it leaves behind otherwise is a set of
-        // OVERLAPPING full-range segments -- each one costing every
-        // subsequent read a Bloom check, because nothing tells them apart.
-        // Partitioning them costs one merge now and makes every later read
-        // touch exactly one segment, which is the arrangement the read
-        // lead was measured in.
-        if !(self.opts.compact && self.opts.partition_on_flush) {
-            // Not partitioning here leaves the partitioning to the
-            // background, and the background waits for `l0_trigger`
-            // pieces first; so what promotion alone makes partitions is
-            // done now, for the price of a link, and a merge is started
-            // for the rest.
-            if self.opts.compact && self.opts.flush_schedules {
-                if self.opts.promote && self.segs().iter().all(|s| s.level == 0) {
-                    self.promote_unpartitioned()?;
-                }
-                if self.segs().iter().any(|s| s.level == 0) {
-                    match self.merge_due(1) {
-                        None => self.start_compact(None)?,
-                        Some(due) if !due.is_empty() => {
-                            let due = if self.opts.promote {
-                                self.promote_ranges(due)?
-                            } else {
-                                due
-                            };
-                            if !due.is_empty() {
-                                self.start_compact(Some(due))?;
-                            }
-                        }
-                        Some(_) => {}
-                    }
-                    self.flush_merge = self.compacting.is_some();
-                }
-            }
-            return Ok(());
-        }
-        // With `flush_ranges`, each round merges only the ranges that hold
-        // pieces, under the live fences -- one piece is enough to be due
-        // here, where the background trigger waits for several -- so a
-        // flush after an ordered or skewed load rewrites the partitions it
-        // touched and not the store. Without it, or before the first
-        // partitioning, everything is re-partitioned from every key.
-        let mut rounds = 0usize;
-        while self.segs().iter().any(|s| s.level == 0) {
-            let plan = if self.opts.flush_ranges {
-                self.merge_due(1)
-            } else {
-                None
-            };
-            match plan {
-                Some(fences) if !fences.is_empty() => {
-                    let fences = if self.opts.promote {
-                        self.promote_ranges(fences)?
-                    } else {
-                        fences
-                    };
-                    if !fences.is_empty() {
-                        self.start_compact(Some(fences))?;
-                    }
-                }
-                Some(_) => {}
-                None => {
-                    if !(self.opts.promote && self.promote_unpartitioned()?) {
-                        self.start_compact(None)?;
-                    }
-                }
-            }
-            self.join_compact()?;
-            self.join_tier()?;
-            rounds += 1;
-            if rounds > 64 {
-                return Err(err("flush: level 0 did not drain in 64 merge rounds"));
-            }
-        }
-        Ok(())
-    }
-
-    /// Collect a finished (or in-flight) seal: join the thread, open its
-    /// segment, retire the frozen memtable.
-    fn join_seal(&mut self) -> Result<()> {
-        let Some(handle) = self.sealing.take() else {
-            return Ok(());
-        };
-        let t = std::time::Instant::now();
-        let blocked = !handle.is_finished();
-        let names = handle.join().map_err(|_| err("seal thread panicked"))??;
-        let waited = t.elapsed().as_nanos() as u64;
-        self.seal_wait.joins += 1;
-        if self.draining {
-            self.seal_wait.drain_wait_ns += waited;
-        } else if blocked {
-            self.seal_wait.join_wait_ns += waited;
-            self.seal_wait.blocked_joins += 1;
-        }
-        let mut segs = self.segs().to_vec();
-        for name in &names {
-            self.covered_seq = self.covered_seq.max(Db::name_end_seq(name).unwrap_or(0));
-            segs.push(std::sync::Arc::new(Seg::open(
-                &self.dir,
-                name,
-                self.advice_random(),
-                self.opts.read_advice != ReadAdvice::Normal,
-                self.opts.segment.checksums,
-            )?));
-        }
-        self.publish_segs(segs);
-        self.set_frozen(None);
-        if self.opts.scan_block_cache {
-            self.build_ctx().rank_pieces()?;
-        }
-        let tp = std::time::Instant::now();
-        self.publish()?;
-        self.seal_wait.publish_ns += tp.elapsed().as_nanos() as u64;
-        for old in std::mem::take(&mut self.retiring_wals) {
-            if self.opts.recycle_wal && self.spare_wals.is_empty() {
-                let id = old
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .and_then(|n| n.strip_prefix("wal-"))
-                    .and_then(|n| n.parse::<u64>().ok())
-                    .unwrap_or(0);
-                let spare = Db::spare_path(&self.dir, id);
-                if std::fs::rename(&old, &spare).is_ok() {
-                    self.spare_wals.push(spare);
-                    continue;
-                }
-            }
-            let _ = std::fs::remove_file(old);
-        }
-        for tmp in std::mem::take(&mut self.retiring_tmps) {
-            let _ = std::fs::remove_file(tmp);
-        }
-        self.phase_ns[1] += t.elapsed().as_nanos() as u64;
-        if self.opts.compact {
-            self.maybe_compact()?;
-            self.maybe_tier()?;
-        }
-        Ok(())
-    }
-
-    /// Partitions first in key order, then L0 by (range, age). `read_all`
-    /// binary-searches the first group and walks a contiguous run of the
-    /// second, so both depend on this order.
-    /// The segment set `segs`, sorted, its derived quantities refreshed,
-    /// published as the state: the writer's one way to change the
-    /// segments. Every block table is dropped with it.
-    fn publish_segs(&mut self, segs: Vec<std::sync::Arc<Seg>>) {
-        self.publish_segs_with(segs, false)
-    }
-
-    /// `publish_segs`, and with `tier` the publish of a piece merge: the
-    /// partitions, the memtables and every key's values are what they
-    /// were, only the files some of them sit in have changed, so the forms
-    /// and the writer's tables are carried across it whatever
-    /// `forms_carry` says, and the pieces' bounds alone are walked again.
-    fn publish_segs_with(&mut self, mut segs: Vec<std::sync::Arc<Seg>>, tier: bool) {
-        segs.sort_by(|a, b| seg_order(a, b));
-        let mean_key_bytes = Db::mean_key_bytes_of(&segs);
-        let store_bytes = Db::store_bytes_of(&self.dir, &segs);
-        let data_bytes = Db::data_bytes_of(&segs);
-        let l0_aligned = Db::l0_aligned_of(&segs);
-        let segs_tombs = segs.iter().any(|s| s.tombs);
-        let cur = self.state();
-        let layout = Db::layout_of(cur, &segs, !tier && self.opts.forms_rebase);
-        let next = State {
-            layout,
-            forms: Reader::forms_for(&segs),
-            forms_moved: std::sync::atomic::AtomicBool::new(false),
-            snap: AtomicPtr::new(std::ptr::null_mut()),
-            reader_scans: AtomicU64::new(cur.reader_scans.load(AtomicOrdering::Relaxed)),
-            forms_at: AtomicUsize::new(usize::MAX),
-            forms_complete: std::sync::atomic::AtomicBool::new(false),
-            scans: AtomicU64::new(0),
-            forms_bytes: AtomicUsize::new(0),
-            segs,
-            mem: cur.mem.clone(),
-            frozen: cur.frozen.clone(),
-            gen: cur.gen + 1,
-            mean_key_bytes,
-            store_bytes,
-            data_bytes,
-            l0_aligned,
-            segs_tombs,
-        };
-        let mut next = next;
-        if self.opts.forms_carry_lazily {
-            let rebases = cur.carry_published(&mut next);
-            self.shared
-                .forms_rebased
-                .fetch_add(rebases, AtomicOrdering::Relaxed);
-            self.publish_lazily(next);
-            return;
-        }
-        if !self.carry_forms(&mut next, tier) {
-            self.drop_blocks();
-            *self.fs().tables.borrow_mut() = Db::tables_for(next.segs.len());
-        }
-        self.publish_and_organise(next);
+        self.with_maint(|m| m.drain())
     }
 
     /// `next` becomes the state; the one before it is retired at the
@@ -12436,23 +12089,6 @@ impl Db {
         self.swap_state(next);
     }
 
-    /// `next`, a state over the same memtables, published without the
-    /// writer's upkeep: its forms were carried by the publish itself
-    /// (`State::carry_published`), the writer's own copies are carried at
-    /// its next look at the log (`Reader::rebase_tables`), and the upkeep
-    /// thread and the builder pin what they read, so neither is brought
-    /// home first -- which is what lets a thread other than the writer's
-    /// make this publish. Without the writer's pins
-    /// (`Options::writer_pins`) the upkeep and the builder are brought home
-    /// as every publish brought them.
-    fn publish_lazily(&mut self, next: State) {
-        if !self.opts.writer_pins {
-            self.take_back_upkeep();
-            self.stop_ahead();
-        }
-        self.swap_state(next);
-    }
-
     fn swap_state(&mut self, next: State) {
         let p = Box::into_raw(Box::new(next));
         let old = self.shared.state.swap(p, AtomicOrdering::AcqRel);
@@ -12461,16 +12097,7 @@ impl Db {
         if !self.r.held.load(AtomicOrdering::Relaxed).is_null() {
             self.r.held.store(p, AtomicOrdering::Relaxed);
         }
-        let tag = self.shared.readers.bump();
-        let mut retired = self.shared.retired.lock().expect("the retired list");
-        // SAFETY: published by this writer, owned by it until freed.
-        retired.push((tag, unsafe { Box::from_raw(old) }));
-        let readers = &self.shared.readers;
-        retired.retain(|(t, _)| !readers.none_before(*t));
-        self.shared
-            .retired_len
-            .store(retired.len(), AtomicOrdering::Relaxed);
-        drop(retired);
+        retire_state(&self.shared, old);
         self.sweep_retired_forms();
         self.wake_keeper();
     }
@@ -12563,6 +12190,33 @@ impl Reader {
         self.new_reader(true)
     }
 
+    /// A handle for the store's segment work (`Maint`): the writer's view,
+    /// read under an engine slot of its own, with tables it never fills.
+    fn maint_reader(&self) -> Result<Reader> {
+        let pin_slot = Some(
+            self.shared
+                .readers
+                .claim_engine()
+                .ok_or_else(|| err("reader table: the engine's slots are taken"))?,
+        );
+        Ok(Reader {
+            shared: self.shared.clone(),
+            counted: false,
+            slot: None,
+            pin_slot,
+            depth: std::cell::Cell::new(0),
+            isolation: std::cell::Cell::new(Isolation::Dirty),
+            held: AtomicPtr::new(std::ptr::null_mut()),
+            wm: std::cell::Cell::new(SEE_ALL),
+            opts: self.opts.clone(),
+            fs: FormsCell::new(),
+            signalled: std::cell::Cell::new((0, usize::MAX)),
+            log_bound: std::cell::Cell::new(usize::MAX),
+            len_bound: std::cell::Cell::new(usize::MAX),
+            force_due: std::cell::Cell::new(false),
+        })
+    }
+
     /// A handle for the engine's own use -- the builder ahead's -- which
     /// claims a slot like any other but is not one of the caller's, so it
     /// cannot be what turns the maintenance regime on for itself.
@@ -12621,44 +12275,6 @@ impl Db {
             segs_tombs: cur.segs_tombs,
             layout: cur.layout.clone(),
         };
-        self.publish_and_organise(next);
-    }
-
-    /// The state with `frozen` as the frozen memtable.
-    fn set_frozen(&mut self, frozen: Option<std::sync::Arc<MemTable>>) {
-        let cur = self.state();
-        let next = State {
-            forms: Reader::forms_for(&cur.segs),
-            forms_moved: std::sync::atomic::AtomicBool::new(false),
-            snap: AtomicPtr::new(std::ptr::null_mut()),
-            reader_scans: AtomicU64::new(cur.reader_scans.load(AtomicOrdering::Relaxed)),
-            forms_at: AtomicUsize::new(usize::MAX),
-            forms_complete: std::sync::atomic::AtomicBool::new(false),
-            scans: AtomicU64::new(0),
-            forms_bytes: AtomicUsize::new(0),
-            segs: cur.segs.clone(),
-            mem: cur.mem.clone(),
-            frozen,
-            gen: cur.gen + 1,
-            mean_key_bytes: cur.mean_key_bytes,
-            store_bytes: cur.store_bytes,
-            data_bytes: cur.data_bytes,
-            l0_aligned: cur.l0_aligned,
-            segs_tombs: cur.segs_tombs,
-            layout: cur.layout.clone(),
-        };
-        let mut next = next;
-        if self.opts.forms_carry_lazily {
-            let rebases = cur.carry_published(&mut next);
-            self.shared
-                .forms_rebased
-                .fetch_add(rebases, AtomicOrdering::Relaxed);
-            self.publish_lazily(next);
-            return;
-        }
-        if !self.carry_forms(&mut next, false) {
-            self.drop_blocks();
-        }
         self.publish_and_organise(next);
     }
 
@@ -13034,398 +12650,6 @@ impl Db {
         }
     }
 
-    /// A merge is due when any one range has accumulated `l0_trigger`
-    /// aligned pieces -- or, before the first partitioning, when that many
-    /// full-range segments have piled up.
-    fn maybe_compact(&mut self) -> Result<()> {
-        // Collect a finished merge BEFORE deciding. Its outputs are the
-        // partitions the decision depends on, and deciding first meant
-        // deciding against a store that still looked unpartitioned: every
-        // merge then took the full re-partitioning path and the
-        // incremental one never ran once in a whole load.
-        if self
-            .compacting
-            .as_ref()
-            .is_some_and(|(_, h)| h.is_finished())
-        {
-            self.join_compact()?;
-        }
-        // Level 0 is newer than the level below it, every piece of it, so
-        // a partition merge may take only a prefix of a range's pieces by
-        // age: the pieces present when it starts. A piece merge in flight
-        // holds some of them, and a partition merge started beside it took
-        // the piece sealed after them and folded it under them -- the
-        // oracle read a key's values out of order, and lost a deleted
-        // key's older values to a tombstone the merge had dropped. So no
-        // partition merge starts while a piece merge runs; a finished one
-        // is collected first, since the piece it made is what the count
-        // below sees. The other way round is safe: a partition merge's
-        // inputs are the range's oldest pieces, so the pieces a merge
-        // beside it takes are all newer.
-        match &self.tiering {
-            Some((_, h)) if h.is_finished() => self.join_tier()?,
-            Some(_) => return Ok(()),
-            None => {}
-        }
-        // One selection rule for both schedulers, so they cannot drift: a
-        // range is due when it holds `l0_trigger` pieces, a piece not
-        // aligned to the live ranges selects every range it overlaps, and
-        // before the first partitioning the trigger counts every piece.
-        match self.merge_due(self.opts.l0_trigger) {
-            None => {
-                if self.l0_len() >= self.opts.l0_trigger {
-                    if self.opts.promote && self.promote_unpartitioned()? {
-                        return Ok(());
-                    }
-                    return self.start_compact(None);
-                }
-                Ok(())
-            }
-            Some(due) if !due.is_empty() => {
-                let due = if self.opts.promote {
-                    self.promote_ranges(due)?
-                } else {
-                    due
-                };
-                if due.is_empty() {
-                    return Ok(());
-                }
-                self.start_compact(Some(due))
-            }
-            Some(_) => Ok(()),
-        }
-    }
-
-    /// Try to promote the aligned pieces of each of `due`'s ranges instead
-    /// of merging them; return the ranges that still need a merge.
-    ///
-    /// A range qualifies when its partition's last key lies below every
-    /// piece's first key and the pieces are disjoint in key order. Then the
-    /// partition keeps its data and its fence closes at the first piece's
-    /// first key, and each piece becomes a partition running to the next
-    /// piece's first key, the last inheriting the range's upper fence. A
-    /// piece and a partition are the same file from the same writer; only
-    /// the name and the level differ, so this is hard links, one manifest
-    /// write, and the old names unlinked -- in that order, so a crash on
-    /// either side of the manifest leaves exactly one complete set for the
-    /// orphan sweep to reconcile.
-    fn promote_ranges(&mut self, due: Vec<Fence>) -> Result<Vec<Fence>> {
-        let mut rest = Vec::new();
-        for f in due {
-            let part = self
-                .segs()
-                .iter()
-                .position(|s| s.level > 0 && s.lo == f.0 && s.hi == f.1);
-            let mut pieces: Vec<usize> = self
-                .segs()
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.level == 0 && s.lo == f.0 && s.hi == f.1)
-                .map(|(i, _)| i)
-                .collect();
-            let Some(pi) = part else {
-                rest.push(f);
-                continue;
-            };
-            // The partition's last key, or nothing if it is empty.
-            let floor: Option<Vec<u8>> = {
-                let b = &self.segs()[pi].blob;
-                if b.keys() == 0 {
-                    None
-                } else {
-                    b.key_at(b.keys() - 1).map(|k| k.to_vec())
-                }
-            };
-            match self.promotion_chain(&f, floor, &mut pieces) {
-                Some(bounds) => {
-                    // Piece i takes (bounds[i], bounds[i+1]); the partition
-                    // keeps its low fence and closes at bounds[0].
-                    let mut renames: Vec<(usize, Fence)> = Vec::with_capacity(pieces.len() + 1);
-                    renames.push((pi, (f.0.clone(), Some(bounds[0].clone()))));
-                    for (j, &si) in pieces.iter().enumerate() {
-                        let hi = if j + 1 < pieces.len() {
-                            Some(bounds[j + 1].clone())
-                        } else {
-                            f.1.clone()
-                        };
-                        renames.push((si, (bounds[j].clone(), hi)));
-                    }
-                    self.apply_promotion(renames)?;
-                }
-                None => rest.push(f),
-            }
-        }
-        Ok(rest)
-    }
-
-    /// Before the first partitioning: if the full-range segments are
-    /// disjoint in key order, they become the first partitions as they
-    /// are, tiling the space from the bottom.
-    ///
-    /// One piece qualifies too, and refusing it was expensive. A flush that
-    /// leaves a single full-range piece -- every store up to about one seal,
-    /// which is every rung of the suite's `quick` ladder below 300k keys --
-    /// fell through to a merge that read that piece back and wrote it out
-    /// again as one partition covering the same range. Measured at 100k keys:
-    /// a quarter of the load window, and 4.06 device bytes a stored byte
-    /// against 2.63 without it, where 300k keys -- two pieces, so promotion
-    /// already fired -- spent nothing and wrote 2.69.
-    ///
-    /// Two conditions keep the promoted store the shape the merge would have
-    /// left. The piece must fit a partition, or a merge would have cut it
-    /// into several and promotion would not be the same store; and it must
-    /// carry no tombstone, because a merge writes the bottom level and drops
-    /// them, and a promotion keeps the file exactly as it is.
-    fn promote_unpartitioned(&mut self) -> Result<bool> {
-        let mut pieces: Vec<usize> = self
-            .segs()
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.level == 0)
-            .map(|(i, _)| i)
-            .collect();
-        if pieces.is_empty() {
-            return Ok(false);
-        }
-        if pieces.len() == 1 {
-            let s = &self.segs()[pieces[0]];
-            if s.tombs {
-                return Ok(false);
-            }
-            let pb = self
-                .opts
-                .partition_bytes
-                .unwrap_or(self.opts.seal_bytes)
-                .max(1) as u64;
-            match std::fs::metadata(self.dir.join(&s.name)) {
-                Ok(m) if m.len() <= pb => {}
-                _ => return Ok(false),
-            }
-        }
-        let whole: Fence = (Vec::new(), None);
-        let Some(bounds) = self.promotion_chain(&whole, None, &mut pieces) else {
-            return Ok(false);
-        };
-        let mut renames: Vec<(usize, Fence)> = Vec::with_capacity(pieces.len());
-        for (j, &si) in pieces.iter().enumerate() {
-            let lo = if j == 0 {
-                Vec::new()
-            } else {
-                bounds[j].clone()
-            };
-            let hi = if j + 1 < pieces.len() {
-                Some(bounds[j + 1].clone())
-            } else {
-                None
-            };
-            renames.push((si, (lo, hi)));
-        }
-        self.apply_promotion(renames)?;
-        Ok(true)
-    }
-
-    /// Give each segment its new fence and level by hard link, publish,
-    /// then unlink the old names.
-    fn apply_promotion(&mut self, renames: Vec<(usize, Fence)>) -> Result<()> {
-        let mut old_names = Vec::with_capacity(renames.len());
-        let mut segs = self.segs().to_vec();
-        for (si, (lo, hi)) in renames {
-            let old = segs[si].name.clone();
-            // Keep the id and covered-sequence fields verbatim; only the
-            // prefix and the fences change.
-            let stem = old.trim_end_matches(".sup");
-            let fields: Vec<&str> = stem.split('-').collect();
-            if fields.len() < 3 {
-                return Err(err("promotion: segment name is malformed"));
-            }
-            let new = format!(
-                "par-{}-{}-{}-{}.sup",
-                fields[1],
-                fields[2],
-                hex(&lo),
-                hi.as_deref().map(hex).unwrap_or_default()
-            );
-            if new == old {
-                continue;
-            }
-            std::fs::hard_link(self.dir.join(&old), self.dir.join(&new))?;
-            // A segment is immutable once open, so the promoted one is
-            // opened again under its new name: the partition's fences and
-            // level come from the name.
-            segs[si] = std::sync::Arc::new(Seg::open(
-                &self.dir,
-                &new,
-                self.advice_random(),
-                self.opts.read_advice != ReadAdvice::Normal,
-                self.opts.segment.checksums,
-            )?);
-            old_names.push(old);
-        }
-        File::open(&self.dir)?.sync_all()?;
-        self.publish_segs(segs);
-        self.publish()?;
-        for old in old_names {
-            self.retire_seg(&old);
-        }
-        Ok(())
-    }
-
-    /// Name the live set durably. Everything before this call is a file on
-    /// disk that nothing reaches; everything after it is the store.
-    fn publish(&mut self) -> Result<()> {
-        self.seal_wait.publishes += 1;
-        manifest_write(&self.dir, self.covered_seq, &self.live_names())
-    }
-
-    /// Merge the L0 tail and every partition it overlaps into a new
-    /// disjoint set. Inputs stay live until `join_compact` publishes the
-    /// outputs, so a reader during the merge sees the old set and a crash
-    /// during it leaves the old set.
-    /// `fence: None` is the initial partitioning -- everything live, split
-    /// into partitions by size. `Some(range)` is the incremental merge: one
-    /// partition and the pieces aligned to it, rewritten as one partition
-    /// with the same fence. The second reads and writes O(range) where the
-    /// first is O(store), which is what the merge measurements convicted.
-    fn start_compact(&mut self, fences: Option<Vec<Fence>>) -> Result<()> {
-        if let Some((_, h)) = &self.compacting {
-            if !h.is_finished() {
-                // A merge is still running. Deferring rather than blocking
-                // keeps it off the commit path; the range it would have
-                // merged waits for the next seal.
-                return Ok(());
-            }
-            self.join_compact()?;
-        }
-        // No piece merge runs when a partition merge starts, so the pieces
-        // taken here are every piece of the ranges, the oldest included.
-        debug_assert!(
-            self.tiering.is_none(),
-            "a partition merge started beside a piece merge"
-        );
-        let inputs: Vec<String> = match &fences {
-            None => self.live_names(),
-            Some(fs) => self
-                .segs()
-                .iter()
-                .filter(|s| {
-                    // Everything the output fences will cover: the
-                    // partitions being rewritten, and any level-0 segment
-                    // whose own range overlaps one of them.
-                    fs.iter().any(|(lo, hi)| {
-                        let below = hi.as_ref().is_some_and(|h| &s.lo >= h);
-                        let above = s.hi.as_ref().is_some_and(|h| h <= lo);
-                        !below && !above
-                    })
-                })
-                .map(|s| s.name.clone())
-                .collect(),
-        };
-        if inputs.is_empty() {
-            return Ok(());
-        }
-        let pb = self
-            .opts
-            .partition_bytes
-            .unwrap_or(self.opts.seal_bytes)
-            .max(1);
-        let parts = match &fences {
-            Some(f) => f.len(),
-            None => {
-                let b: u64 = inputs
-                    .iter()
-                    .filter_map(|n| std::fs::metadata(self.dir.join(n)).ok())
-                    .map(|m| m.len())
-                    .sum();
-                (b as usize).div_ceil(pb).max(1)
-            }
-        };
-        let bytes: u64 = inputs
-            .iter()
-            .filter_map(|n| std::fs::metadata(self.dir.join(n)).ok())
-            .map(|m| m.len())
-            .sum();
-        let live_keys: usize = self
-            .segs()
-            .iter()
-            .filter(|s| inputs.contains(&s.name))
-            .map(|s| s.blob.keys())
-            .sum();
-        let per_key = (bytes as f64 / live_keys.max(1) as f64).max(1.0);
-        let max_keys = ((pb as f64 / per_key) as usize).max(1_000);
-        let end_seq = self.covered_seq;
-        let first_id = self.next_seg;
-        // A split can turn one fence into several, so ids are reserved
-        // generously; gaps in the sequence cost nothing.
-        self.next_seg += (parts * 4).max(8) as u64;
-        let dir = self.dir.clone();
-        let opts = Db::segment_opts(&self.opts);
-        let cursors = self.opts.cursor_merge;
-        let background_io = self.opts.background_io;
-        let sync_every = self.opts.seal_sync_every;
-        let inline_max = self.opts.inline_bytes;
-        let job_inputs = inputs.clone();
-        let handle = std::thread::spawn(move || {
-            compact_job(MergePlan {
-                dir,
-                inputs: job_inputs,
-                first_id,
-                end_seq,
-                parts,
-                fences,
-                max_keys,
-                opts,
-                cursors,
-                background_io,
-                sync_every,
-                inline_max,
-            })
-        });
-        self.compacting = Some((inputs, handle));
-        Ok(())
-    }
-
-    /// Collect a merge: swap its outputs in, name them in the manifest --
-    /// the atomic instant -- and only then delete the inputs.
-    fn join_compact(&mut self) -> Result<()> {
-        let Some((inputs, handle)) = self.compacting.take() else {
-            return Ok(());
-        };
-        self.flush_merge = false;
-        let t = std::time::Instant::now();
-        let outputs = handle
-            .join()
-            .map_err(|_| err("compaction thread panicked"))??;
-        let kept: Vec<std::sync::Arc<Seg>> = self
-            .segs()
-            .iter()
-            .filter(|seg| !inputs.contains(&seg.name))
-            .cloned()
-            .collect();
-        let mut merged = Vec::with_capacity(outputs.len() + kept.len());
-        for name in &outputs {
-            merged.push(std::sync::Arc::new(Seg::open(
-                &self.dir,
-                name,
-                self.advice_random(),
-                self.opts.read_advice != ReadAdvice::Normal,
-                self.opts.segment.checksums,
-            )?));
-        }
-        // Partitions first (older, disjoint), then whatever L0 arrived
-        // while the merge ran, oldest to newest.
-        merged.extend(kept);
-        self.publish_segs(merged);
-        if self.opts.scan_block_cache {
-            self.build_ctx().rank_pieces()?;
-        }
-        self.publish()?;
-        for name in &inputs {
-            self.retire_seg(name);
-        }
-        self.phase_ns[2] += t.elapsed().as_nanos() as u64;
-        Ok(())
-    }
-
     /// One empty table cell per segment.
     fn tables_for(n: usize) -> Vec<std::cell::RefCell<Option<BlockTable>>> {
         (0..n).map(|_| std::cell::RefCell::new(None)).collect()
@@ -13580,24 +12804,47 @@ impl Db {
         Op(&self.r)
     }
 
+    /// `f` run on the store's segment work, inline: the writer's upkeep
+    /// and builder brought home first where the writer does not pin
+    /// (`Options::writer_pins`), since without its pins every publish had
+    /// them home, and the state the writer's operation holds moved to
+    /// whatever `f` published, as the writer's own publishes move it.
+    fn with_maint<T>(&mut self, f: impl FnOnce(&mut Maint) -> T) -> T {
+        if !self.opts.writer_pins {
+            self.take_back_upkeep();
+            self.stop_ahead();
+        }
+        let op = self.maint.op();
+        let out = f(&mut self.maint);
+        drop(op);
+        if !self.r.held.load(AtomicOrdering::Relaxed).is_null() {
+            let p = self.shared.state.load(AtomicOrdering::Acquire);
+            self.r.held.store(p, AtomicOrdering::Relaxed);
+        }
+        out
+    }
+
     pub fn phase_ns(&self) -> (u64, u64, u64) {
-        (self.phase_ns[0], self.phase_ns[1], self.phase_ns[2])
+        (self.phase_ns[0], self.maint.seal_ns, self.maint.merge_ns)
     }
 
     /// The seal phase decomposed; see `SealWaits`.
     pub fn seal_waits(&self) -> SealWaits {
-        self.seal_wait
+        self.maint.seal_wait
     }
 
     pub fn segments(&self) -> usize {
         let _op = self.op();
-        self.segs().len() + usize::from(self.sealing.is_some())
+        self.segs().len() + usize::from(self.maint.sealing.is_some())
     }
 
     /// Whether a seal and a merge are running right now. A crash experiment
     /// records the state it died in with these.
     pub fn in_flight(&self) -> (bool, bool) {
-        (self.sealing.is_some(), self.compacting.is_some())
+        (
+            self.maint.sealing.is_some(),
+            self.maint.compacting.is_some(),
+        )
     }
 
     /// The live WAL: its path, the bytes of it behind a barrier, and the
@@ -13618,7 +12865,7 @@ impl Db {
     fn close_inner(&mut self) -> Result<()> {
         self.flush()?;
         // Nothing will rotate into a spare again.
-        for spare in std::mem::take(&mut self.spare_wals) {
+        if let Some(spare) = self.shared.take_spare() {
             let _ = std::fs::remove_file(spare);
         }
         Ok(())
@@ -15978,19 +15225,885 @@ impl<'s> BuildCtx<'s> {
     }
 }
 
+/// The store's segment work: a seal's landing, a merge's and a piece
+/// merge's, a promotion, the manifest that names what is live, and the WAL
+/// files and temp names retired once the manifest covers what they held.
+/// Every change it makes to the live set is published by a
+/// compare-and-swap of the state pointer against whatever is current,
+/// made again over a state another thread published first -- the
+/// writer's publishes change the memtables and nothing this holds -- and
+/// its own handle pins what it reads, so the writer need not be the thread
+/// that runs it.
+struct Maint {
+    /// Its view of the store: a slot of the engine's own, pinned for each
+    /// of its operations as the writer's is, and tables of its own it
+    /// never fills.
+    r: Reader,
+    dir: PathBuf,
+    /// Direct segments' temp names, unlinked once the manifest names the
+    /// segment; until then the temp name is what recovery reads.
+    retiring_tmps: Vec<PathBuf>,
+    /// A merge a flush that does not partition started in the background:
+    /// collected at the first commit after it finishes, where a merge the
+    /// seals start waits for the next seal, since a store that has stopped
+    /// sealing would otherwise never see it.
+    flush_merge: bool,
+    /// WAL files whose records no segment has been *named* as covering
+    /// yet. One rule governs every one of them: a WAL may be deleted only
+    /// after the manifest names a segment that covers its records. The
+    /// model oracle found this twice in one afternoon -- the seal thread
+    /// deleting the rotated WAL on rename, before the publish that made its
+    /// segment reachable, and `open` deleting older WALs once it had
+    /// replayed them into a memtable that lives only in memory. Both were
+    /// the same mistake: treating "the data is somewhere" as "the data is
+    /// durable somewhere a reopen can find".
+    retiring_wals: Vec<PathBuf>,
+    /// The WAL sequence every live segment covers between them. Kept as a
+    /// monotone field rather than derived from segment names: a compaction
+    /// renames the whole live set, and deriving the bound from the names it
+    /// happens to produce let it move BACKWARDS -- caught by the model
+    /// oracle as "wal sequence gap: a durable record is missing" on the
+    /// reopen after a merge. A durability bound may only ever rise.
+    covered_seq: u64,
+    /// A partitioning merge in flight. Its inputs stay live and readable
+    /// until the manifest names its outputs instead, which is what makes
+    /// the swap atomic across a crash.
+    compacting: Option<Compaction>,
+    /// A piece merge in flight: its inputs' names and its thread. Its
+    /// inputs and a partition merge's are disjoint, each excluding the
+    /// other's at its start, so the two run beside each other.
+    tiering: Option<Compaction>,
+    sealing: Option<std::thread::JoinHandle<Result<Vec<String>>>>,
+    /// The seal phase decomposed: how long the commit thread blocked on a
+    /// seal still running mid-load, how long the final drain took, how long
+    /// publishing (the manifest and its barriers) took, and how often a
+    /// join found the seal unfinished, so it can be said which of these the
+    /// 14% of the durable load in `phase_ns[1]` is.
+    seal_wait: SealWaits,
+    /// Nanoseconds in each landing and each merge's landing, for
+    /// `Db::phase_ns`.
+    seal_ns: u64,
+    merge_ns: u64,
+}
+
+impl std::ops::Deref for Maint {
+    type Target = Reader;
+    fn deref(&self) -> &Reader {
+        &self.r
+    }
+}
+
+/// `old`, replaced in the state pointer by its caller, retired at an epoch
+/// the bump makes and freed once no reader is pinned before it.
+fn retire_state(shared: &Shared, old: *mut State) {
+    let tag = shared.readers.bump();
+    let mut retired = shared.retired.lock().expect("the retired list");
+    // SAFETY: the caller swapped it out of the state pointer and owns it.
+    retired.push((tag, unsafe { Box::from_raw(old) }));
+    let readers = &shared.readers;
+    retired.retain(|(t, _)| !readers.none_before(*t));
+    shared
+        .retired_len
+        .store(retired.len(), AtomicOrdering::Relaxed);
+}
+
+impl Maint {
+    fn new(r: Reader, dir: &Path, covered_seq: u64, retiring_wals: Vec<PathBuf>) -> Maint {
+        Maint {
+            r,
+            dir: dir.to_path_buf(),
+            covered_seq,
+            retiring_wals,
+            retiring_tmps: Vec::new(),
+            compacting: None,
+            tiering: None,
+            sealing: None,
+            flush_merge: false,
+            seal_wait: SealWaits::default(),
+            seal_ns: 0,
+            merge_ns: 0,
+        }
+    }
+
+    /// `n` segment ids, the first returned: one counter for the writer's
+    /// seals and this work's merges alike.
+    fn alloc_segs(&self, n: u64) -> u64 {
+        self.shared.next_seg.fetch_add(n, AtomicOrdering::Relaxed)
+    }
+
+    /// The guard of one of this handle's operations: see `Op`.
+    fn op(&self) -> Op {
+        std::mem::forget(self.r.enter());
+        Op(&self.r)
+    }
+
+    /// Collect a finished (or in-flight) seal: join the thread, open its
+    /// segments, and publish them and the frozen memtable's retirement as
+    /// one state -- two publishes, as the writer made them, left a state
+    /// between with the frozen table's keys in the piece and the table
+    /// alike. `draining` books the wait as a flush's.
+    fn join_seal(&mut self, draining: bool) -> Result<()> {
+        let Some(handle) = self.sealing.take() else {
+            return Ok(());
+        };
+        let t = std::time::Instant::now();
+        let blocked = !handle.is_finished();
+        let names = handle.join().map_err(|_| err("seal thread panicked"))??;
+        let waited = t.elapsed().as_nanos() as u64;
+        self.seal_wait.joins += 1;
+        if draining {
+            self.seal_wait.drain_wait_ns += waited;
+        } else if blocked {
+            self.seal_wait.join_wait_ns += waited;
+            self.seal_wait.blocked_joins += 1;
+        }
+        let mut segs = self.segs().to_vec();
+        for name in &names {
+            self.covered_seq = self.covered_seq.max(Db::name_end_seq(name).unwrap_or(0));
+            segs.push(std::sync::Arc::new(Seg::open(
+                &self.dir,
+                name,
+                self.advice_random(),
+                self.opts.read_advice != ReadAdvice::Normal,
+                self.opts.segment.checksums,
+            )?));
+        }
+        self.publish_segs_with(segs, false, true);
+        if self.opts.scan_block_cache {
+            self.build_ctx().rank_pieces()?;
+        }
+        let tp = std::time::Instant::now();
+        self.publish()?;
+        self.seal_wait.publish_ns += tp.elapsed().as_nanos() as u64;
+        for old in std::mem::take(&mut self.retiring_wals) {
+            // One spare is enough: the writer takes it at its next
+            // rotation, and a seal lands before the next one rotates.
+            if self.opts.recycle_wal
+                && self
+                    .shared
+                    .spare_wal
+                    .load(AtomicOrdering::Acquire)
+                    .is_null()
+            {
+                let id = old
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_prefix("wal-"))
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or(0);
+                let spare = Db::spare_path(&self.dir, id);
+                if std::fs::rename(&old, &spare).is_ok() {
+                    self.shared.offer_spare(spare);
+                    continue;
+                }
+            }
+            let _ = std::fs::remove_file(old);
+        }
+        for tmp in std::mem::take(&mut self.retiring_tmps) {
+            let _ = std::fs::remove_file(tmp);
+        }
+        self.seal_ns += t.elapsed().as_nanos() as u64;
+        if self.opts.compact {
+            self.maybe_compact()?;
+            self.maybe_tier()?;
+        }
+        Ok(())
+    }
+
+    fn publish_segs(&mut self, segs: Vec<std::sync::Arc<Seg>>) {
+        self.publish_segs_with(segs, false, false)
+    }
+
+    /// What a flush does once its seal has landed: the merges in flight
+    /// collected, then the store left partitioned, or the partitioning
+    /// scheduled where the flush does not partition; see `Db::flush`.
+    fn drain(&mut self) -> Result<()> {
+        self.join_compact()?;
+        self.join_tier()?;
+        // Leave the store routed. A flush is a caller saying it has
+        // stopped writing, and what it leaves behind otherwise is a set of
+        // OVERLAPPING full-range segments -- each one costing every
+        // subsequent read a Bloom check, because nothing tells them apart.
+        // Partitioning them costs one merge now and makes every later read
+        // touch exactly one segment, which is the arrangement the read
+        // lead was measured in.
+        if !(self.opts.compact && self.opts.partition_on_flush) {
+            // Not partitioning here leaves the partitioning to the
+            // background, and the background waits for `l0_trigger`
+            // pieces first; so what promotion alone makes partitions is
+            // done now, for the price of a link, and a merge is started
+            // for the rest.
+            if self.opts.compact && self.opts.flush_schedules {
+                if self.opts.promote && self.segs().iter().all(|s| s.level == 0) {
+                    self.promote_unpartitioned()?;
+                }
+                if self.segs().iter().any(|s| s.level == 0) {
+                    match self.merge_due(1) {
+                        None => self.start_compact(None)?,
+                        Some(due) if !due.is_empty() => {
+                            let due = if self.opts.promote {
+                                self.promote_ranges(due)?
+                            } else {
+                                due
+                            };
+                            if !due.is_empty() {
+                                self.start_compact(Some(due))?;
+                            }
+                        }
+                        Some(_) => {}
+                    }
+                    self.flush_merge = self.compacting.is_some();
+                }
+            }
+            return Ok(());
+        }
+        // With `flush_ranges`, each round merges only the ranges that hold
+        // pieces, under the live fences -- one piece is enough to be due
+        // here, where the background trigger waits for several -- so a
+        // flush after an ordered or skewed load rewrites the partitions it
+        // touched and not the store. Without it, or before the first
+        // partitioning, everything is re-partitioned from every key.
+        let mut rounds = 0usize;
+        while self.segs().iter().any(|s| s.level == 0) {
+            let plan = if self.opts.flush_ranges {
+                self.merge_due(1)
+            } else {
+                None
+            };
+            match plan {
+                Some(fences) if !fences.is_empty() => {
+                    let fences = if self.opts.promote {
+                        self.promote_ranges(fences)?
+                    } else {
+                        fences
+                    };
+                    if !fences.is_empty() {
+                        self.start_compact(Some(fences))?;
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    if !(self.opts.promote && self.promote_unpartitioned()?) {
+                        self.start_compact(None)?;
+                    }
+                }
+            }
+            self.join_compact()?;
+            self.join_tier()?;
+            rounds += 1;
+            if rounds > 64 {
+                return Err(err("flush: level 0 did not drain in 64 merge rounds"));
+            }
+        }
+        Ok(())
+    }
+
+    /// `segs` published as the live set, with the frozen memtable retired
+    /// in the same state where `land`. The segments are this work's alone
+    /// to change, so a publish another thread made first -- the writer's
+    /// freeze or its switch of memtable -- changes nothing here but the
+    /// memtables, which are taken again from the state that won and the
+    /// swap tried once more. The published forms are carried by the
+    /// publish (`State::carry_published`), and the writer carries its own
+    /// at its next look at the log (`Reader::rebase_tables`); with
+    /// `tier`, a piece merge's, no partition is rewritten.
+    fn publish_segs_with(&mut self, mut segs: Vec<std::sync::Arc<Seg>>, tier: bool, land: bool) {
+        segs.sort_by(|a, b| seg_order(a, b));
+        let mean_key_bytes = Db::mean_key_bytes_of(&segs);
+        let store_bytes = Db::store_bytes_of(&self.dir, &segs);
+        let data_bytes = Db::data_bytes_of(&segs);
+        let l0_aligned = Db::l0_aligned_of(&segs);
+        let segs_tombs = segs.iter().any(|s| s.tombs);
+        loop {
+            let cur_p = self.shared.state.load(AtomicOrdering::Acquire);
+            // SAFETY: this handle is pinned for its operation, and a state
+            // is freed only past every pinned slot.
+            let cur = unsafe { &*cur_p };
+            let layout = Db::layout_of(cur, &segs, !tier && self.opts.forms_rebase);
+            let mut next = State {
+                layout,
+                forms: Reader::forms_for(&segs),
+                forms_moved: std::sync::atomic::AtomicBool::new(false),
+                snap: AtomicPtr::new(std::ptr::null_mut()),
+                reader_scans: AtomicU64::new(cur.reader_scans.load(AtomicOrdering::Relaxed)),
+                forms_at: AtomicUsize::new(usize::MAX),
+                forms_complete: std::sync::atomic::AtomicBool::new(false),
+                scans: AtomicU64::new(0),
+                forms_bytes: AtomicUsize::new(0),
+                segs: segs.clone(),
+                mem: cur.mem.clone(),
+                frozen: if land { None } else { cur.frozen.clone() },
+                gen: cur.gen + 1,
+                mean_key_bytes,
+                store_bytes,
+                data_bytes,
+                l0_aligned,
+                segs_tombs,
+            };
+            let rebases = cur.carry_published(&mut next);
+            let p = Box::into_raw(Box::new(next));
+            if self
+                .shared
+                .state
+                .compare_exchange(cur_p, p, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+                .is_err()
+            {
+                // SAFETY: never published, still this call's.
+                drop(unsafe { Box::from_raw(p) });
+                continue;
+            }
+            self.shared
+                .forms_rebased
+                .fetch_add(rebases, AtomicOrdering::Relaxed);
+            // This operation reads what it published from here on.
+            if !self.r.held.load(AtomicOrdering::Relaxed).is_null() {
+                self.r.held.store(p, AtomicOrdering::Relaxed);
+            }
+            retire_state(&self.shared, cur_p);
+            break;
+        }
+        self.sweep_retired_forms();
+        if let Some(t) = self.shared.keeper_thread.get() {
+            t.unpark();
+        }
+    }
+
+    /// Start a piece merge where a partition's range holds `tier_pieces`
+    /// aligned pieces that no partition merge holds as inputs, one range
+    /// at a time; collect a finished one first, since the pieces it
+    /// replaced are what the decision counts.
+    fn maybe_tier(&mut self) -> Result<()> {
+        let n = self.opts.tier_pieces;
+        if n == 0 {
+            return Ok(());
+        }
+        if let Some((_, h)) = &self.tiering {
+            if !h.is_finished() {
+                return Ok(());
+            }
+            self.join_tier()?;
+        }
+        let busy: Vec<String> = self
+            .compacting
+            .as_ref()
+            .map(|(i, _)| i.clone())
+            .unwrap_or_default();
+        let parts: Vec<Fence> = self
+            .segs()
+            .iter()
+            .filter(|s| s.level > 0)
+            .map(|s| (s.lo.clone(), s.hi.clone()))
+            .collect();
+        for (lo, hi) in parts {
+            let pieces: Vec<String> = self
+                .segs()
+                .iter()
+                .filter(|s| s.level == 0 && s.lo == lo && s.hi == hi && !busy.contains(&s.name))
+                .map(|s| s.name.clone())
+                .collect();
+            if pieces.len() >= n {
+                return self.start_tier(lo, hi, pieces);
+            }
+        }
+        Ok(())
+    }
+
+    /// `inputs` are the range's pieces oldest first, as the live set
+    /// orders them; the output takes the newest one's covered sequence.
+    fn start_tier(&mut self, lo: Vec<u8>, hi: Option<Vec<u8>>, inputs: Vec<String>) -> Result<()> {
+        let end_seq = inputs
+            .iter()
+            .filter_map(|n| Db::name_end_seq(n))
+            .max()
+            .unwrap_or(self.covered_seq);
+        let id = self.alloc_segs(1);
+        let plan = TierPlan {
+            dir: self.dir.clone(),
+            inputs: inputs.clone(),
+            id,
+            end_seq,
+            lo,
+            hi,
+            opts: Db::segment_opts(&self.opts),
+            background_io: self.opts.background_io,
+            sync_every: self.opts.seal_sync_every,
+            inline_max: self.opts.inline_bytes,
+        };
+        let handle = std::thread::spawn(move || tier_run(plan));
+        self.tiering = Some((inputs, handle));
+        Ok(())
+    }
+
+    /// Collect a piece merge as a partition merge is collected: the
+    /// output in for the inputs, the manifest naming it, then the inputs
+    /// deleted; a crash on either side of the manifest leaves one
+    /// complete set and an orphan the open sweeps.
+    fn join_tier(&mut self) -> Result<()> {
+        let Some((inputs, handle)) = self.tiering.take() else {
+            return Ok(());
+        };
+        let outputs = handle.join().map_err(|_| err("tier thread panicked"))??;
+        let mut merged: Vec<std::sync::Arc<Seg>> = self
+            .segs()
+            .iter()
+            .filter(|seg| !inputs.contains(&seg.name))
+            .cloned()
+            .collect();
+        for name in &outputs {
+            merged.push(std::sync::Arc::new(Seg::open(
+                &self.dir,
+                name,
+                self.advice_random(),
+                self.opts.read_advice != ReadAdvice::Normal,
+                self.opts.segment.checksums,
+            )?));
+        }
+        self.publish_segs_with(merged, true, false);
+        if self.opts.scan_block_cache {
+            self.build_ctx().rank_pieces()?;
+        }
+        self.publish()?;
+        for name in &inputs {
+            self.retire_seg(name);
+        }
+        Ok(())
+    }
+
+    /// Unlink a retired segment, and the ordered index named after it when
+    /// no live segment still claims that index.
+    ///
+    /// The index has to go here rather than wait for the sweep at open. That
+    /// sweep is the backstop for a crash window; a merge is not a crash
+    /// window, it is the steady state, so a process that merges for hours
+    /// leaked one index per input it retired and nothing reclaimed them
+    /// until the store was reopened -- a run at a hundred million keys was
+    /// found with 53,596 files in one store directory, most of them indexes
+    /// whose segments were long gone.
+    ///
+    /// The liveness check is not defensive. A promotion renames a segment
+    /// and keeps the id and end-sequence its index is named by, so the
+    /// retired name and the live one address the SAME index file; unlinking
+    /// it by name alone took the index of a segment that was still open, and
+    /// seven tests said so.
+    fn retire_seg(&self, name: &str) {
+        let _ = std::fs::remove_file(self.dir.join(name));
+        let Some(ord) = Db::ord_name_for(name) else {
+            return;
+        };
+        let claimed = self
+            .segs()
+            .iter()
+            .any(|s| Db::ord_name_for(&s.name).as_deref() == Some(ord.as_str()));
+        if !claimed {
+            let _ = std::fs::remove_file(self.dir.join(&ord));
+        }
+    }
+
+    /// A merge is due when any one range has accumulated `l0_trigger`
+    /// aligned pieces -- or, before the first partitioning, when that many
+    /// full-range segments have piled up.
+    fn maybe_compact(&mut self) -> Result<()> {
+        // Collect a finished merge BEFORE deciding. Its outputs are the
+        // partitions the decision depends on, and deciding first meant
+        // deciding against a store that still looked unpartitioned: every
+        // merge then took the full re-partitioning path and the
+        // incremental one never ran once in a whole load.
+        if self
+            .compacting
+            .as_ref()
+            .is_some_and(|(_, h)| h.is_finished())
+        {
+            self.join_compact()?;
+        }
+        // Level 0 is newer than the level below it, every piece of it, so
+        // a partition merge may take only a prefix of a range's pieces by
+        // age: the pieces present when it starts. A piece merge in flight
+        // holds some of them, and a partition merge started beside it took
+        // the piece sealed after them and folded it under them -- the
+        // oracle read a key's values out of order, and lost a deleted
+        // key's older values to a tombstone the merge had dropped. So no
+        // partition merge starts while a piece merge runs; a finished one
+        // is collected first, since the piece it made is what the count
+        // below sees. The other way round is safe: a partition merge's
+        // inputs are the range's oldest pieces, so the pieces a merge
+        // beside it takes are all newer.
+        match &self.tiering {
+            Some((_, h)) if h.is_finished() => self.join_tier()?,
+            Some(_) => return Ok(()),
+            None => {}
+        }
+        // One selection rule for both schedulers, so they cannot drift: a
+        // range is due when it holds `l0_trigger` pieces, a piece not
+        // aligned to the live ranges selects every range it overlaps, and
+        // before the first partitioning the trigger counts every piece.
+        match self.merge_due(self.opts.l0_trigger) {
+            None => {
+                if self.l0_len() >= self.opts.l0_trigger {
+                    if self.opts.promote && self.promote_unpartitioned()? {
+                        return Ok(());
+                    }
+                    return self.start_compact(None);
+                }
+                Ok(())
+            }
+            Some(due) if !due.is_empty() => {
+                let due = if self.opts.promote {
+                    self.promote_ranges(due)?
+                } else {
+                    due
+                };
+                if due.is_empty() {
+                    return Ok(());
+                }
+                self.start_compact(Some(due))
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Try to promote the aligned pieces of each of `due`'s ranges instead
+    /// of merging them; return the ranges that still need a merge.
+    ///
+    /// A range qualifies when its partition's last key lies below every
+    /// piece's first key and the pieces are disjoint in key order. Then the
+    /// partition keeps its data and its fence closes at the first piece's
+    /// first key, and each piece becomes a partition running to the next
+    /// piece's first key, the last inheriting the range's upper fence. A
+    /// piece and a partition are the same file from the same writer; only
+    /// the name and the level differ, so this is hard links, one manifest
+    /// write, and the old names unlinked -- in that order, so a crash on
+    /// either side of the manifest leaves exactly one complete set for the
+    /// orphan sweep to reconcile.
+    fn promote_ranges(&mut self, due: Vec<Fence>) -> Result<Vec<Fence>> {
+        let mut rest = Vec::new();
+        for f in due {
+            let part = self
+                .segs()
+                .iter()
+                .position(|s| s.level > 0 && s.lo == f.0 && s.hi == f.1);
+            let mut pieces: Vec<usize> = self
+                .segs()
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.level == 0 && s.lo == f.0 && s.hi == f.1)
+                .map(|(i, _)| i)
+                .collect();
+            let Some(pi) = part else {
+                rest.push(f);
+                continue;
+            };
+            // The partition's last key, or nothing if it is empty.
+            let floor: Option<Vec<u8>> = {
+                let b = &self.segs()[pi].blob;
+                if b.keys() == 0 {
+                    None
+                } else {
+                    b.key_at(b.keys() - 1).map(|k| k.to_vec())
+                }
+            };
+            match self.promotion_chain(&f, floor, &mut pieces) {
+                Some(bounds) => {
+                    // Piece i takes (bounds[i], bounds[i+1]); the partition
+                    // keeps its low fence and closes at bounds[0].
+                    let mut renames: Vec<(usize, Fence)> = Vec::with_capacity(pieces.len() + 1);
+                    renames.push((pi, (f.0.clone(), Some(bounds[0].clone()))));
+                    for (j, &si) in pieces.iter().enumerate() {
+                        let hi = if j + 1 < pieces.len() {
+                            Some(bounds[j + 1].clone())
+                        } else {
+                            f.1.clone()
+                        };
+                        renames.push((si, (bounds[j].clone(), hi)));
+                    }
+                    self.apply_promotion(renames)?;
+                }
+                None => rest.push(f),
+            }
+        }
+        Ok(rest)
+    }
+
+    /// Before the first partitioning: if the full-range segments are
+    /// disjoint in key order, they become the first partitions as they
+    /// are, tiling the space from the bottom.
+    ///
+    /// One piece qualifies too, and refusing it was expensive. A flush that
+    /// leaves a single full-range piece -- every store up to about one seal,
+    /// which is every rung of the suite's `quick` ladder below 300k keys --
+    /// fell through to a merge that read that piece back and wrote it out
+    /// again as one partition covering the same range. Measured at 100k keys:
+    /// a quarter of the load window, and 4.06 device bytes a stored byte
+    /// against 2.63 without it, where 300k keys -- two pieces, so promotion
+    /// already fired -- spent nothing and wrote 2.69.
+    ///
+    /// Two conditions keep the promoted store the shape the merge would have
+    /// left. The piece must fit a partition, or a merge would have cut it
+    /// into several and promotion would not be the same store; and it must
+    /// carry no tombstone, because a merge writes the bottom level and drops
+    /// them, and a promotion keeps the file exactly as it is.
+    fn promote_unpartitioned(&mut self) -> Result<bool> {
+        let mut pieces: Vec<usize> = self
+            .segs()
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.level == 0)
+            .map(|(i, _)| i)
+            .collect();
+        if pieces.is_empty() {
+            return Ok(false);
+        }
+        if pieces.len() == 1 {
+            let s = &self.segs()[pieces[0]];
+            if s.tombs {
+                return Ok(false);
+            }
+            let pb = self
+                .opts
+                .partition_bytes
+                .unwrap_or(self.opts.seal_bytes)
+                .max(1) as u64;
+            match std::fs::metadata(self.dir.join(&s.name)) {
+                Ok(m) if m.len() <= pb => {}
+                _ => return Ok(false),
+            }
+        }
+        let whole: Fence = (Vec::new(), None);
+        let Some(bounds) = self.promotion_chain(&whole, None, &mut pieces) else {
+            return Ok(false);
+        };
+        let mut renames: Vec<(usize, Fence)> = Vec::with_capacity(pieces.len());
+        for (j, &si) in pieces.iter().enumerate() {
+            let lo = if j == 0 {
+                Vec::new()
+            } else {
+                bounds[j].clone()
+            };
+            let hi = if j + 1 < pieces.len() {
+                Some(bounds[j + 1].clone())
+            } else {
+                None
+            };
+            renames.push((si, (lo, hi)));
+        }
+        self.apply_promotion(renames)?;
+        Ok(true)
+    }
+
+    /// Give each segment its new fence and level by hard link, publish,
+    /// then unlink the old names.
+    fn apply_promotion(&mut self, renames: Vec<(usize, Fence)>) -> Result<()> {
+        let mut old_names = Vec::with_capacity(renames.len());
+        let mut segs = self.segs().to_vec();
+        for (si, (lo, hi)) in renames {
+            let old = segs[si].name.clone();
+            // Keep the id and covered-sequence fields verbatim; only the
+            // prefix and the fences change.
+            let stem = old.trim_end_matches(".sup");
+            let fields: Vec<&str> = stem.split('-').collect();
+            if fields.len() < 3 {
+                return Err(err("promotion: segment name is malformed"));
+            }
+            let new = format!(
+                "par-{}-{}-{}-{}.sup",
+                fields[1],
+                fields[2],
+                hex(&lo),
+                hi.as_deref().map(hex).unwrap_or_default()
+            );
+            if new == old {
+                continue;
+            }
+            std::fs::hard_link(self.dir.join(&old), self.dir.join(&new))?;
+            // A segment is immutable once open, so the promoted one is
+            // opened again under its new name: the partition's fences and
+            // level come from the name.
+            segs[si] = std::sync::Arc::new(Seg::open(
+                &self.dir,
+                &new,
+                self.advice_random(),
+                self.opts.read_advice != ReadAdvice::Normal,
+                self.opts.segment.checksums,
+            )?);
+            old_names.push(old);
+        }
+        File::open(&self.dir)?.sync_all()?;
+        self.publish_segs(segs);
+        self.publish()?;
+        for old in old_names {
+            self.retire_seg(&old);
+        }
+        Ok(())
+    }
+
+    /// Name the live set durably. Everything before this call is a file on
+    /// disk that nothing reaches; everything after it is the store.
+    fn publish(&mut self) -> Result<()> {
+        self.seal_wait.publishes += 1;
+        manifest_write(&self.dir, self.covered_seq, &self.live_names())
+    }
+
+    /// Merge the L0 tail and every partition it overlaps into a new
+    /// disjoint set. Inputs stay live until `join_compact` publishes the
+    /// outputs, so a reader during the merge sees the old set and a crash
+    /// during it leaves the old set.
+    /// `fence: None` is the initial partitioning -- everything live, split
+    /// into partitions by size. `Some(range)` is the incremental merge: one
+    /// partition and the pieces aligned to it, rewritten as one partition
+    /// with the same fence. The second reads and writes O(range) where the
+    /// first is O(store), which is what the merge measurements convicted.
+    fn start_compact(&mut self, fences: Option<Vec<Fence>>) -> Result<()> {
+        if let Some((_, h)) = &self.compacting {
+            if !h.is_finished() {
+                // A merge is still running. Deferring rather than blocking
+                // keeps it off the commit path; the range it would have
+                // merged waits for the next seal.
+                return Ok(());
+            }
+            self.join_compact()?;
+        }
+        // No piece merge runs when a partition merge starts, so the pieces
+        // taken here are every piece of the ranges, the oldest included.
+        debug_assert!(
+            self.tiering.is_none(),
+            "a partition merge started beside a piece merge"
+        );
+        let inputs: Vec<String> = match &fences {
+            None => self.live_names(),
+            Some(fs) => self
+                .segs()
+                .iter()
+                .filter(|s| {
+                    // Everything the output fences will cover: the
+                    // partitions being rewritten, and any level-0 segment
+                    // whose own range overlaps one of them.
+                    fs.iter().any(|(lo, hi)| {
+                        let below = hi.as_ref().is_some_and(|h| &s.lo >= h);
+                        let above = s.hi.as_ref().is_some_and(|h| h <= lo);
+                        !below && !above
+                    })
+                })
+                .map(|s| s.name.clone())
+                .collect(),
+        };
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        let pb = self
+            .opts
+            .partition_bytes
+            .unwrap_or(self.opts.seal_bytes)
+            .max(1);
+        let parts = match &fences {
+            Some(f) => f.len(),
+            None => {
+                let b: u64 = inputs
+                    .iter()
+                    .filter_map(|n| std::fs::metadata(self.dir.join(n)).ok())
+                    .map(|m| m.len())
+                    .sum();
+                (b as usize).div_ceil(pb).max(1)
+            }
+        };
+        let bytes: u64 = inputs
+            .iter()
+            .filter_map(|n| std::fs::metadata(self.dir.join(n)).ok())
+            .map(|m| m.len())
+            .sum();
+        let live_keys: usize = self
+            .segs()
+            .iter()
+            .filter(|s| inputs.contains(&s.name))
+            .map(|s| s.blob.keys())
+            .sum();
+        let per_key = (bytes as f64 / live_keys.max(1) as f64).max(1.0);
+        let max_keys = ((pb as f64 / per_key) as usize).max(1_000);
+        let end_seq = self.covered_seq;
+        // A split can turn one fence into several, so ids are reserved
+        // generously; gaps in the sequence cost nothing.
+        let first_id = self.alloc_segs((parts * 4).max(8) as u64);
+        let dir = self.dir.clone();
+        let opts = Db::segment_opts(&self.opts);
+        let cursors = self.opts.cursor_merge;
+        let background_io = self.opts.background_io;
+        let sync_every = self.opts.seal_sync_every;
+        let inline_max = self.opts.inline_bytes;
+        let job_inputs = inputs.clone();
+        let handle = std::thread::spawn(move || {
+            compact_job(MergePlan {
+                dir,
+                inputs: job_inputs,
+                first_id,
+                end_seq,
+                parts,
+                fences,
+                max_keys,
+                opts,
+                cursors,
+                background_io,
+                sync_every,
+                inline_max,
+            })
+        });
+        self.compacting = Some((inputs, handle));
+        Ok(())
+    }
+
+    /// Collect a merge: swap its outputs in, name them in the manifest --
+    /// the atomic instant -- and only then delete the inputs.
+    fn join_compact(&mut self) -> Result<()> {
+        let Some((inputs, handle)) = self.compacting.take() else {
+            return Ok(());
+        };
+        self.flush_merge = false;
+        let t = std::time::Instant::now();
+        let outputs = handle
+            .join()
+            .map_err(|_| err("compaction thread panicked"))??;
+        let kept: Vec<std::sync::Arc<Seg>> = self
+            .segs()
+            .iter()
+            .filter(|seg| !inputs.contains(&seg.name))
+            .cloned()
+            .collect();
+        let mut merged = Vec::with_capacity(outputs.len() + kept.len());
+        for name in &outputs {
+            merged.push(std::sync::Arc::new(Seg::open(
+                &self.dir,
+                name,
+                self.advice_random(),
+                self.opts.read_advice != ReadAdvice::Normal,
+                self.opts.segment.checksums,
+            )?));
+        }
+        // Partitions first (older, disjoint), then whatever L0 arrived
+        // while the merge ran, oldest to newest.
+        merged.extend(kept);
+        self.publish_segs(merged);
+        if self.opts.scan_block_cache {
+            self.build_ctx().rank_pieces()?;
+        }
+        self.publish()?;
+        for name in &inputs {
+            self.retire_seg(name);
+        }
+        self.merge_ns += t.elapsed().as_nanos() as u64;
+        Ok(())
+    }
+}
+
 impl Drop for Db {
     fn drop(&mut self) {
         let _op = self.op();
         self.stop_upkeep();
         self.stop_keeper();
         self.stop_ahead();
-        if let Some(h) = self.sealing.take() {
+        if let Some(h) = self.maint.sealing.take() {
             let _ = h.join();
         }
-        if let Some((_, h)) = self.compacting.take() {
+        if let Some((_, h)) = self.maint.compacting.take() {
             let _ = h.join();
         }
-        if let Some((_, h)) = self.tiering.take() {
+        if let Some((_, h)) = self.maint.tiering.take() {
             let _ = h.join();
         }
     }

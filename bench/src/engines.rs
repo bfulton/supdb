@@ -417,9 +417,6 @@ pub struct Supdb {
     /// The writer's operations pin nothing and hold no state, as before
     /// `Options::writer_pins`. `supdb-nopin`.
     nopin: bool,
-    /// The forms carried inside the publish, all or nothing, as before
-    /// `Options::forms_carry_lazily`. `supdb-eagercarry`.
-    eagercarry: bool,
 }
 
 /// What an arm differs from `supdb` by. One struct rather than a row of
@@ -507,9 +504,6 @@ struct Policy {
     /// The writer's operations pin nothing and hold no state, as before
     /// `Options::writer_pins`. `supdb-nopin`.
     nopin: bool,
-    /// The forms carried inside the publish, all or nothing, as before
-    /// `Options::forms_carry_lazily`. `supdb-eagercarry`.
-    eagercarry: bool,
 }
 
 impl Default for Policy {
@@ -530,7 +524,6 @@ impl Default for Policy {
             sealcap: None,
             l0: None,
             nopin: false,
-            eagercarry: false,
             aheadmin: None,
             lazyforms: false,
             eager: None,
@@ -973,19 +966,6 @@ impl Supdb {
         )
     }
 
-    /// `supdb` with the forms carried inside a publish, all or nothing, as
-    /// before `Options::forms_carry_lazily`: against `supdb` it prices the
-    /// lazy carry a publish from another thread needs.
-    pub fn create_eagercarry(path: &Path) -> Res<Supdb> {
-        Supdb::with_policy(
-            path,
-            Policy {
-                eagercarry: true,
-                ..Policy::default()
-            },
-        )
-    }
-
     /// `supdb` maintaining the forms whoever is reading, as `supdb-forms`
     /// does, but stopping where too much of the store is unsealed. The pair
     /// against `supdb` says whether the regime's 3.19x on the lag sweep can
@@ -1095,7 +1075,6 @@ impl Supdb {
             sealcap,
             l0,
             nopin,
-            eagercarry,
             aheadmin,
             lazyforms,
             eager,
@@ -1222,7 +1201,6 @@ impl Supdb {
             seal_max_pct: sealcap.unwrap_or(base_seal_max_pct),
             l0_trigger: l0.unwrap_or(supdb::Options::default().l0_trigger),
             writer_pins: !nopin,
-            forms_carry_lazily: !eagercarry,
             // Below this the builder declines and the writer fills the
             // forms inline on the commit path instead, which is the
             // comparison the threshold was never measured against.
@@ -1264,7 +1242,6 @@ impl Supdb {
             sealcap,
             l0,
             nopin,
-            eagercarry,
             aheadmin,
             lazyforms,
             eager,
@@ -1417,9 +1394,6 @@ impl Engine for Supdb {
         }
         if self.nopin {
             return "supdb-nopin";
-        }
-        if self.eagercarry {
-            return "supdb-eagercarry";
         }
         if self.sealcap.is_some() && !self.partition {
             return "supdb-ingestnoseal";
@@ -1978,8 +1952,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-lazysnap" | "supdb-fullrec" | "supdb-norebase" | "supdb-sealfile"
         | "supdb-settleall" | "supdb-inline" | "supdb-tier" | "supdb-runs" | "supdb-keeper"
         | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice"
-        | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "supdb-eagercarry"
-        | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
+        | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "lmdb"
+        | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "supdb-ingestleave" | "supdb-ingestnoseal" | "supdb-ingestsync"
         | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
@@ -2023,7 +1997,6 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestleave" => Box::new(Supdb::create_ingest_leave(dir)?),
         "supdb-l0" => Box::new(Supdb::create_l0(dir)?),
         "supdb-nopin" => Box::new(Supdb::create_nopin(dir)?),
-        "supdb-eagercarry" => Box::new(Supdb::create_eagercarry(dir)?),
         "supdb-ingestsync" => Box::new(Supdb::create_ingest_sync(dir)?),
         "supdb-ingestnoseal" => Box::new(Supdb::create_ingest_noseal(dir)?),
         "lmdb" => Box::new(Lmdb::create(dir, map_gb)?),
