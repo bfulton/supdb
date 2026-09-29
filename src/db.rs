@@ -12069,37 +12069,277 @@ impl Db {
         self.with_maint(|m| m.drain())
     }
 
-    /// `next` becomes the state; the one before it is retired at the
-    /// epoch this bumps and freed once no reader is pinned before it.
-    /// EXPERIMENT: after a publish, which stopped the builder and
-    /// retired its forms, organise the state that replaced it.
-    fn publish_and_organise(&mut self, next: State) {
-        self.publish_state(next);
+    /// The state the writer's operation holds moved to whatever is
+    /// current: another thread may have published since the operation
+    /// began, and what the writer publishes next is made over the store as
+    /// it is. Pinned since the operation began, the writer is safe to hold
+    /// anything published after.
+    fn rehold(&self) {
+        if !self.r.held.load(AtomicOrdering::Relaxed).is_null() {
+            let p = self.shared.state.load(AtomicOrdering::Acquire);
+            self.r.held.store(p, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// `make(cur)` published by the writer over whatever state is current,
+    /// made again over one another thread published first: what the
+    /// writer changes is the memtables, and the segments are taken from
+    /// the state that won. The upkeep and the builder are brought home
+    /// first, the writer's own publish being the one that retires what
+    /// they read without a pin of their own. Returns the state replaced,
+    /// retired and still readable for the rest of the operation.
+    fn publish_writer(&mut self, make: impl Fn(&State) -> State) -> *const State {
+        self.take_back_upkeep();
+        self.stop_ahead();
+        loop {
+            let cur_p = self.shared.state.load(AtomicOrdering::Acquire);
+            // SAFETY: the writer is pinned for its operation, and a state
+            // is freed only past every pinned slot.
+            let next = make(unsafe { &*cur_p });
+            let p = Box::into_raw(Box::new(next));
+            if self
+                .shared
+                .state
+                .compare_exchange(cur_p, p, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+                .is_err()
+            {
+                // SAFETY: never published, still this call's.
+                drop(unsafe { Box::from_raw(p) });
+                continue;
+            }
+            // The writer holds the state for its operation, and what it
+            // has just published is what it reads from here on.
+            if !self.r.held.load(AtomicOrdering::Relaxed).is_null() {
+                self.r.held.store(p, AtomicOrdering::Relaxed);
+            }
+            return cur_p;
+        }
+    }
+
+    /// The end of the writer's publish: `old` retired, the forms it
+    /// replaced swept, the keeper told, and the state organised.
+    fn published(&mut self, old: *const State) {
+        retire_state(&self.shared, old as *mut State);
+        self.sweep_retired_forms();
+        self.wake_keeper();
         self.build_ahead_if_due();
     }
 
-    fn publish_state(&mut self, next: State) {
-        // The upkeep thread reads the state it was lent over and pins
-        // nothing, so it is home before the state is swapped and freed.
-        self.take_back_upkeep();
-        // The builder holds the state it builds over, and its forms are
-        // of that state: stopped before the swap, so its handle is gone
-        // before the state it pinned is retired.
-        self.stop_ahead();
-        self.swap_state(next);
+    /// The live memtable frozen and a fresh one live, in one publish;
+    /// the frozen one returned for the seal.
+    ///
+    /// The forms go with it where they can: the writer's backlog is
+    /// filed and published into the state the freeze replaces, so every
+    /// form there is current to the frozen table's whole log, and the new
+    /// state takes copies of them current to its own log's start -- what
+    /// lets a reader at the new log's first position take them. Only over
+    /// that state: a publish another thread made in between copied its
+    /// forms before the writer's last ones reached it, so the freeze then
+    /// carries nothing, and the writer's tables start afresh.
+    fn freeze(&mut self) -> std::sync::Arc<MemTable> {
+        self.rehold();
+        let settled = self.freeze_prepare();
+        let settled_at = self.state() as *const State;
+        let complete = self.fs().tables_complete.get();
+        let fresh = std::sync::Arc::new(MemTable::new());
+        let carried = std::cell::Cell::new(false);
+        let old = self.publish_writer(|cur| {
+            let carry = settled && std::ptr::eq(cur, settled_at);
+            carried.set(carry);
+            let mut next = State {
+                forms: Reader::forms_for(&cur.segs),
+                forms_moved: std::sync::atomic::AtomicBool::new(false),
+                snap: AtomicPtr::new(std::ptr::null_mut()),
+                reader_scans: AtomicU64::new(cur.reader_scans.load(AtomicOrdering::Relaxed)),
+                forms_at: AtomicUsize::new(usize::MAX),
+                forms_complete: std::sync::atomic::AtomicBool::new(false),
+                scans: AtomicU64::new(0),
+                forms_bytes: AtomicUsize::new(0),
+                segs: cur.segs.clone(),
+                mem: fresh.clone(),
+                frozen: Some(cur.mem.clone()),
+                gen: cur.gen + 1,
+                mean_key_bytes: cur.mean_key_bytes,
+                store_bytes: cur.store_bytes,
+                data_bytes: cur.data_bytes,
+                l0_aligned: cur.l0_aligned,
+                segs_tombs: cur.segs_tombs,
+                layout: cur.layout.clone(),
+            };
+            if carry {
+                cur.carry_published(&mut next);
+                next.forms_at = AtomicUsize::new(0);
+                next.forms_complete = std::sync::atomic::AtomicBool::new(complete);
+            }
+            next
+        });
+        // SAFETY: retired by `published` below, and the writer is pinned.
+        let cur = unsafe { &*old };
+        let frozen = cur.mem.clone();
+        if carried.get() {
+            self.freeze_carry(cur);
+        } else {
+            // The scan snapshot names the live memtable's slots, and the
+            // live memtable is new: a write's bookkeeping renumbers the
+            // snapshot at every rehash, and the fresh table's first
+            // rehash has a thousand slots where the snapshot names
+            // hundreds of thousands. It stood stale until the next scan
+            // rebuilt it, and six hundred inserts between a seal and
+            // that scan were enough to index past the map.
+            *self.fs().scan_keys.borrow_mut() = None;
+            self.fs().snap_added.borrow_mut().clear();
+            self.fs().snap_stale.borrow_mut().clear();
+            self.drop_blocks();
+        }
+        self.published(old);
+        frozen
     }
 
-    fn swap_state(&mut self, next: State) {
-        let p = Box::into_raw(Box::new(next));
-        let old = self.shared.state.swap(p, AtomicOrdering::AcqRel);
-        // The writer holds the state for its operation, and what it has
-        // just published is what it reads from here on.
-        if !self.r.held.load(AtomicOrdering::Relaxed).is_null() {
-            self.r.held.store(p, AtomicOrdering::Relaxed);
+    /// Whether the freeze carries the forms (`Options::forms_carry`), with
+    /// what it needs done first: the log read, which carries the writer's
+    /// tables to the state it holds, then the backlog settled and every
+    /// dirty form published into it.
+    fn freeze_prepare(&self) -> bool {
+        if !(self.opts.forms_carry && self.opts.commit_forms && self.opts.scan_block_cache) {
+            return false;
         }
-        retire_state(&self.shared, old);
-        self.sweep_retired_forms();
-        self.wake_keeper();
+        let cur = self.state();
+        let np = cur.segs.partition_point(|s| s.level > 0);
+        if np == 0 || cur.forms.len() < np {
+            return false;
+        }
+        self.sync_log();
+        // The forms were published from this handle's tables: none, or
+        // tables of another generation, and nothing current is here to
+        // carry.
+        if !self.fs().cache_used.get() || self.fs().log_gen.get() != cur.gen {
+            return false;
+        }
+        if self.settle_pending().is_err() {
+            return false;
+        }
+        // Published regardless, every form the writer held became a
+        // shared one, and every patch after the carry cloned its block
+        // before writing it: the lag sweep's burst at a hundred thousand
+        // keys wrote in 400 ms against 130 with the forms carried, most
+        // of it those clones.
+        self.publish_dirty(false);
+        true
+    }
+
+    /// The writer's own tables and snapshot carried across its freeze from
+    /// `cur`, the state it replaced, to the state it holds: the tables keep
+    /// their forms and drop what named the old live table's slots -- the
+    /// wide forms, the copies, the lists of keys filed since the snapshot
+    /// -- and walk the pieces' bounds again; the snapshot's live entries
+    /// become frozen ones (`carry_snapshot`); the log is the new table's,
+    /// read from its start.
+    fn freeze_carry(&self, cur: &State) {
+        let next = self.state();
+        let np = next.segs.partition_point(|s| s.level > 0);
+        let l0 = &next.segs[np..];
+        let ctx = self.build_ctx();
+        let bounds: Option<Vec<_>> = if ctx.rank_pieces().is_err() {
+            None
+        } else {
+            next.segs[..np]
+                .iter()
+                .map(|seg| ctx.table_bounds(seg, l0).ok())
+                .collect()
+        };
+        drop(ctx);
+        let Some(bounds) = bounds else {
+            *self.fs().scan_keys.borrow_mut() = None;
+            self.fs().snap_added.borrow_mut().clear();
+            self.fs().snap_stale.borrow_mut().clear();
+            self.drop_blocks();
+            return;
+        };
+        // The snapshot carried rather than dropped: its live entries made
+        // frozen ones. Dropped, as this did, the next commit due sorted
+        // every unsealed key again, and a pass that began before that
+        // commit paid one itself.
+        let held = self.fs().scan_keys.borrow_mut().take();
+        let carried = held
+            .filter(|_| self.opts.snapshot_carry)
+            .and_then(|(_, s)| self.carry_snapshot(s, &cur.mem, cur.frozen.as_ref(), next, false));
+        self.fs()
+            .tables
+            .borrow_mut()
+            .resize_with(next.segs.len(), || std::cell::RefCell::new(None));
+        for (p, (pieces, piece_ranks)) in bounds.into_iter().enumerate() {
+            let tables = self.fs().tables.borrow();
+            let mut held = tables[p].borrow_mut();
+            let Some(t) = held.as_mut() else { continue };
+            for b in 0..t.slots.len() {
+                if matches!(t.slots[b].as_deref(), Some(Cached::Wide(_))) {
+                    self.unlist(p, b, t);
+                }
+                if let Some(old) = t.dense[b].take() {
+                    self.fs()
+                        .cache_bytes
+                        .set(self.fs().cache_bytes.get().saturating_sub(old.bytes()));
+                    let mut c = self.fs().choices.get();
+                    c[4] = c[4].saturating_sub(old.bytes() as u64);
+                    self.fs().choices.set(c);
+                }
+            }
+            t.pieces = pieces;
+            t.piece_ranks = piece_ranks;
+            t.snap_at = std::cell::OnceCell::new();
+            t.snap_span = (0, 0);
+            t.snap_gen = u64::MAX;
+            t.reads.fill(0);
+            t.touched.fill(0);
+            // Across a freeze the snapshot takes every key of the table it
+            // froze, and the lists, which name that table's slots, go.
+            for list in &mut t.added {
+                list.clear();
+            }
+            t.filed = 0;
+        }
+        self.fs().log_gen.set(next.gen);
+        self.note_over(next);
+        self.fs().log_seen.set(0);
+        self.fs().snap_stale.borrow_mut().clear();
+        self.fs().scans_seen.set(0);
+        match carried {
+            Some(s) => {
+                self.fs().snap_entries.set(s.live_len);
+                *self.fs().scan_keys.borrow_mut() = Some((next.gen, s));
+            }
+            None => {
+                self.fs().snap_entries.set(0);
+                *self.fs().scan_keys.borrow_mut() = None;
+            }
+        }
+        self.fs().snap_added.borrow_mut().clear();
+        self.fs().pending.borrow_mut().clear();
+    }
+
+    /// The state with `mem` as the live memtable.
+    fn set_mem(&mut self, mem: std::sync::Arc<MemTable>) {
+        let old = self.publish_writer(|cur| State {
+            forms: Reader::forms_for(&cur.segs),
+            forms_moved: std::sync::atomic::AtomicBool::new(false),
+            snap: AtomicPtr::new(std::ptr::null_mut()),
+            reader_scans: AtomicU64::new(cur.reader_scans.load(AtomicOrdering::Relaxed)),
+            forms_at: AtomicUsize::new(usize::MAX),
+            forms_complete: std::sync::atomic::AtomicBool::new(false),
+            scans: AtomicU64::new(0),
+            forms_bytes: AtomicUsize::new(0),
+            segs: cur.segs.clone(),
+            mem: mem.clone(),
+            frozen: cur.frozen.clone(),
+            gen: cur.gen + 1,
+            mean_key_bytes: cur.mean_key_bytes,
+            store_bytes: cur.store_bytes,
+            data_bytes: cur.data_bytes,
+            l0_aligned: cur.l0_aligned,
+            segs_tombs: cur.segs_tombs,
+            layout: cur.layout.clone(),
+        });
+        self.published(old);
     }
 
     /// EXPERIMENT: partitions whose copies were carried across a merge
@@ -12252,314 +12492,6 @@ impl Reader {
 }
 
 impl Db {
-    /// The state with `mem` as the live memtable.
-    fn set_mem(&mut self, mem: std::sync::Arc<MemTable>) {
-        let cur = self.state();
-        let next = State {
-            forms: Reader::forms_for(&cur.segs),
-            forms_moved: std::sync::atomic::AtomicBool::new(false),
-            snap: AtomicPtr::new(std::ptr::null_mut()),
-            reader_scans: AtomicU64::new(cur.reader_scans.load(AtomicOrdering::Relaxed)),
-            forms_at: AtomicUsize::new(usize::MAX),
-            forms_complete: std::sync::atomic::AtomicBool::new(false),
-            scans: AtomicU64::new(0),
-            forms_bytes: AtomicUsize::new(0),
-            segs: cur.segs.clone(),
-            mem,
-            frozen: cur.frozen.clone(),
-            gen: cur.gen + 1,
-            mean_key_bytes: cur.mean_key_bytes,
-            store_bytes: cur.store_bytes,
-            data_bytes: cur.data_bytes,
-            l0_aligned: cur.l0_aligned,
-            segs_tombs: cur.segs_tombs,
-            layout: cur.layout.clone(),
-        };
-        self.publish_and_organise(next);
-    }
-
-    /// EXPERIMENT: the canonical forms and the writer's own tables
-    /// carried into `next`, a state over the same partitions; see
-    /// `Options::forms_carry`. The backlog is filed and published first,
-    /// so every form is current to the whole log, and the state's
-    /// pointers move to `next`, which owns them from its publish; the
-    /// writer's tables keep their forms, drop what named the old
-    /// memtable's slots -- the wide forms, the copies, the lists of keys
-    /// filed since the snapshot -- and walk the pieces' bounds again
-    /// against `next`'s pieces. Returns whether it was done; when not,
-    /// the caller starts the table afresh and drops the writer's own, as
-    /// every publish did before.
-    /// With `tier`, the carry a piece merge's publish makes whatever
-    /// `forms_carry` says: the memtable is the one it was, so the keys
-    /// filed since the snapshot, the snapshot and this handle's log
-    /// position all stand, and only the pieces' bounds are walked again.
-    fn carry_forms(&mut self, next: &mut State, tier: bool) -> bool {
-        if !((self.opts.forms_carry || tier)
-            && self.opts.commit_forms
-            && self.opts.scan_block_cache)
-        {
-            return false;
-        }
-        let cur = self.state();
-        let np = cur.segs.partition_point(|s| s.level > 0);
-        if np == 0 || cur.forms.len() < np {
-            return false;
-        }
-        if next.segs.partition_point(|s| s.level > 0) != np {
-            return false;
-        }
-        // Each partition the same object, or one a merge rewrote over the
-        // same keys: the partition merge that folds a burst of updates
-        // into its range changes values and no key, and dropping every
-        // form at its publish was the slow half of the fully-unmerged lag
-        // point -- the pass that followed rebuilt every block, 850-1,500
-        // copies at about 14 us each at a hundred thousand keys, and read
-        // a third of the pass that met a merge still in flight. A copy is
-        // the block's range merged and owns every byte of it, so over the
-        // same range it is the new partition's block as it was the old
-        // one's; a sparse form splices deltas at ranks in the old
-        // partition's records and a clean block has no form, so the first
-        // goes and the second stays clean.
-        let mut rebased = vec![false; np];
-        for (p, (a, b)) in cur.segs[..np].iter().zip(&next.segs[..np]).enumerate() {
-            if std::sync::Arc::ptr_eq(a, b) {
-                continue;
-            }
-            if tier || !self.opts.forms_rebase || !Db::same_blocks(a, b) {
-                return false;
-            }
-            rebased[p] = true;
-        }
-        // The forms were published from this handle's tables: none, or
-        // tables of another generation, and nothing current is here to
-        // carry.
-        if !self.fs().cache_used.get() || self.fs().log_gen.get() != cur.gen {
-            return false;
-        }
-        // Everything logged and filed, and published where someone is
-        // publishing for. Published regardless, every form the writer
-        // held became a shared one, and every patch after the carry
-        // cloned its block before writing it: the lag sweep's burst at a
-        // hundred thousand keys wrote in 400 ms against 130 with the
-        // forms carried, most of it those clones. The pointers moved
-        // below are the last published forms, current to no commit
-        // (`forms_at`), which is what a reader trusts nothing past.
-        self.sync_log();
-        if self.settle_pending().is_err() {
-            return false;
-        }
-        self.publish_dirty(false);
-        // The writer's tables, remade for `next`: forms kept, the rest
-        // walked again. A failure here leaves nothing carried. The new
-        // piece's ranks against the partition first, as a fresh table's
-        // maker takes them: this runs inside the publish and the ranks
-        // were taken after it, so the carried tables held none for the
-        // new piece, and a build through them cut the partition by a
-        // seek per piece key (`cut_at`) where a fresh table's cuts at
-        // the rank.
-        let l0 = &next.segs[np..];
-        let ctx = BuildCtx {
-            segs: &next.segs,
-            ..self.build_ctx()
-        };
-        if ctx.rank_pieces().is_err() {
-            return false;
-        }
-        let mut bounds = Vec::with_capacity(np);
-        for seg in &next.segs[..np] {
-            match ctx.table_bounds(seg, l0) {
-                Ok(b) => bounds.push(b),
-                Err(_) => return false,
-            }
-        }
-        // The context holds this handle's stale set borrowed; what
-        // follows takes it mutably where the memtable has changed.
-        drop(ctx);
-
-        // The snapshot carried rather than dropped, by the three cases
-        // the keeper's own carry knows (`carry_snapshot`): whole across a
-        // merge, its live entries made frozen ones across a freeze, its
-        // frozen entries dropped and its runs moved to an arena of their
-        // own when the seal lands. Dropped, as this did, the next commit
-        // due sorted every unsealed key again -- fifteen builds at about
-        // 2 ms over the hundred-thousand lag burst, 30 ms of its 400 --
-        // and a pass that began before that commit paid one itself.
-        let same_mem = std::sync::Arc::ptr_eq(&next.mem, &cur.mem);
-        let held = self.fs().scan_keys.borrow_mut().take();
-        let carried = held
-            .filter(|_| self.opts.snapshot_carry)
-            .and_then(|(_, s)| self.carry_snapshot(s, &cur.mem, cur.frozen.as_ref(), next, false));
-        // A key past the snapshot's end is in the tables' lists and
-        // nowhere else. Across a freeze the snapshot takes every key of
-        // the table it froze, and the lists and `snap_added`, which name
-        // that table's slots, go; across a merge or a landing the live
-        // table is the one it was and they stand.
-        let keep_added = carried.is_some() && same_mem;
-        self.fs()
-            .tables
-            .borrow_mut()
-            .resize_with(next.segs.len(), || std::cell::RefCell::new(None));
-        for (p, (pieces, piece_ranks)) in bounds.into_iter().enumerate() {
-            let tables = self.fs().tables.borrow();
-            let mut held = tables[p].borrow_mut();
-            let Some(t) = held.as_mut() else { continue };
-            for b in 0..t.slots.len() {
-                let rebase_drops =
-                    rebased[p] && matches!(t.slots[b].as_deref(), Some(Cached::Sparse(_)));
-                if rebase_drops {
-                    self.fs().tables_complete.set(false);
-                }
-                if rebase_drops || matches!(t.slots[b].as_deref(), Some(Cached::Wide(_))) {
-                    self.unlist(p, b, t);
-                }
-                if let Some(old) = t.dense[b].take() {
-                    self.fs()
-                        .cache_bytes
-                        .set(self.fs().cache_bytes.get().saturating_sub(old.bytes()));
-                    let mut c = self.fs().choices.get();
-                    c[4] = c[4].saturating_sub(old.bytes() as u64);
-                    self.fs().choices.set(c);
-                }
-            }
-            t.pieces = pieces;
-            t.piece_ranks = piece_ranks;
-            if rebased[p] {
-                self.shared
-                    .forms_rebased
-                    .fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            if tier {
-                continue;
-            }
-            t.snap_at = std::cell::OnceCell::new();
-            t.snap_span = (0, 0);
-            t.snap_gen = u64::MAX;
-            t.reads.fill(0);
-            t.touched.fill(0);
-            // A key past the snapshot's end is in the table's list and
-            // nowhere else, so the lists are emptied only where the
-            // snapshot that covers the rest is emptied too.
-            if !keep_added {
-                for list in &mut t.added {
-                    list.clear();
-                }
-                t.filed = 0;
-            }
-        }
-        // What a rebased partition published as a sparse form is marked,
-        // as its table's were above, including where this handle holds no
-        // table for it: a reader builds those blocks for itself.
-        for (p, rebased) in rebased.iter().enumerate() {
-            if !*rebased {
-                continue;
-            }
-            for b in 0..cur.forms[p].len() {
-                let ptr = cur.forms[p][b].load(AtomicOrdering::Acquire);
-                // SAFETY: as in `canonical`.
-                if !ptr.is_null() && matches!(*unsafe { &*ptr }.form, Cached::Sparse(_)) {
-                    self.fs().tables_complete.set(false);
-                    self.publish_marker(p, b);
-                }
-            }
-        }
-        // The pointers, `next`'s from its publish; `cur` frees none.
-        let mut bytes = 0usize;
-        for p in 0..np {
-            for (b, slot) in cur.forms[p].iter().enumerate() {
-                let ptr = slot.load(AtomicOrdering::Acquire);
-                if ptr.is_null() {
-                    continue;
-                }
-                // SAFETY: as in `canonical`; owned by `next` from here.
-                bytes += unsafe { &*ptr }.bytes;
-                next.forms[p][b].store(ptr, AtomicOrdering::Relaxed);
-            }
-        }
-        cur.forms_moved.store(true, AtomicOrdering::Release);
-        next.forms_at = AtomicUsize::new(0);
-        next.forms_complete = std::sync::atomic::AtomicBool::new(self.fs().tables_complete.get());
-        next.forms_bytes = AtomicUsize::new(bytes);
-        // This handle's log and snapshot bookkeeping, for `next`: across a
-        // freeze the log is a new table's and is read from its start;
-        // across a landing the memtable is the same one and the position
-        // stands -- read from its start again, the landing's commit
-        // settled the whole log a second time, two thousand patches at
-        // ten thousand keys; across a piece merge the memtable and the
-        // frozen table are the same ones, so the position and the lists
-        // stand and only the generation they are keyed by moves.
-        self.fs().log_gen.set(next.gen);
-        self.note_over(next);
-        if tier {
-            if let Some((g, _)) = self.fs().scan_keys.borrow_mut().as_mut() {
-                *g = next.gen;
-            }
-            return true;
-        }
-        if !same_mem {
-            self.fs().log_seen.set(0);
-            self.fs().snap_stale.borrow_mut().clear();
-        }
-        self.fs().scans_seen.set(0);
-        match carried {
-            Some(s) => {
-                self.fs().snap_entries.set(s.live_len);
-                *self.fs().scan_keys.borrow_mut() = Some((next.gen, s));
-            }
-            None => {
-                self.fs().snap_entries.set(0);
-                *self.fs().scan_keys.borrow_mut() = None;
-            }
-        }
-        if !keep_added {
-            self.fs().snap_added.borrow_mut().clear();
-        }
-        self.fs().pending.borrow_mut().clear();
-        true
-    }
-
-    /// The live memtable frozen and a fresh one live, in one publish;
-    /// the frozen one returned for the seal.
-    fn freeze(&mut self) -> std::sync::Arc<MemTable> {
-        let cur = self.state();
-        let frozen = cur.mem.clone();
-        let next = State {
-            forms: Reader::forms_for(&cur.segs),
-            forms_moved: std::sync::atomic::AtomicBool::new(false),
-            snap: AtomicPtr::new(std::ptr::null_mut()),
-            reader_scans: AtomicU64::new(cur.reader_scans.load(AtomicOrdering::Relaxed)),
-            forms_at: AtomicUsize::new(usize::MAX),
-            forms_complete: std::sync::atomic::AtomicBool::new(false),
-            scans: AtomicU64::new(0),
-            forms_bytes: AtomicUsize::new(0),
-            segs: cur.segs.clone(),
-            mem: std::sync::Arc::new(MemTable::new()),
-            frozen: Some(frozen.clone()),
-            gen: cur.gen + 1,
-            mean_key_bytes: cur.mean_key_bytes,
-            store_bytes: cur.store_bytes,
-            data_bytes: cur.data_bytes,
-            l0_aligned: cur.l0_aligned,
-            segs_tombs: cur.segs_tombs,
-            layout: cur.layout.clone(),
-        };
-        let mut next = next;
-        if !self.carry_forms(&mut next, false) {
-            // The scan snapshot names the live memtable's slots, and the
-            // live memtable is new: a write's bookkeeping renumbers the
-            // snapshot at every rehash, and the fresh table's first
-            // rehash has a thousand slots where the snapshot names
-            // hundreds of thousands. It stood stale until the next scan
-            // rebuilt it, and six hundred inserts between a seal and
-            // that scan were enough to index past the map.
-            *self.fs().scan_keys.borrow_mut() = None;
-            self.fs().snap_added.borrow_mut().clear();
-            self.fs().snap_stale.borrow_mut().clear();
-            self.drop_blocks();
-        }
-        self.publish_and_organise(next);
-        frozen
-    }
-
     /// Whether every level-0 piece's fence is some partition's, over a
     /// segment list `sort_segs` has ordered. Nothing to align to is not
     /// aligned: before the first partitioning every piece spans the whole
