@@ -1215,18 +1215,50 @@ impl Supdb {
     }
 }
 
+thread_local! {
+    /// Where a read puts the value it consumes: one per thread, reused
+    /// across calls, so a threaded pass copies into buffers no other
+    /// thread writes and no call allocates once the first has grown it.
+    static SINK: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Consume a value as a caller does: every byte copied out, into this
+/// thread's buffer, where `black_box` keeps the copy from being dropped.
+/// Every read and scan of every arm goes through it.
+///
+/// The reads once summed the lengths of the values they were lent and
+/// never read a byte of one, which priced finding a value and not using
+/// it, and no caller gets a value to leave it unread. It also priced the
+/// layouts unevenly: an LMDB leaf keeps a key beside its value, so the
+/// first touch of the value lands on lines the lookup already loaded,
+/// while supdb keeps its values in blocks apart from the index, where
+/// that touch is a miss of its own -- measured outside the suite, a
+/// point read that consumed the value at a hundred bytes read 1.6x of
+/// LMDB where the row's read said 2x. The copy is the same bytes on every
+/// arm, so what it adds to one arm and not another is where they lay.
+#[inline]
+fn consume(v: &[u8]) -> usize {
+    SINK.with(|s| {
+        let mut s = s.borrow_mut();
+        s.clear();
+        s.extend_from_slice(v);
+        std::hint::black_box(s.as_slice());
+    });
+    v.len()
+}
+
 /// One read, whichever handle answers it: the writer's own in `Engine`,
 /// under its read-your-writes isolation, or a thread's from `Db::reader`.
 fn supdb_get(r: &supdb::Reader, key: &[u8]) -> Res<usize> {
     let mut n = 0usize;
-    r.read_all(key, |v| n += v.len())
+    r.read_all(key, |v| n += consume(v))
         .map_err(|e| e.to_string())?;
     Ok(n)
 }
 
 fn supdb_range(r: &supdb::Reader, from: &[u8], n: usize) -> Res<usize> {
     let mut bytes = 0usize;
-    r.scan(from, n, |_k, v| bytes += v.len())
+    r.scan(from, n, |_k, v| bytes += consume(v))
         .map_err(|e| e.to_string())?;
     Ok(bytes)
 }
@@ -1526,13 +1558,13 @@ impl Rocks {
 
 /// One read through whichever handle: the arm's own or a thread's.
 fn rocks_get(db: &rocksdb::DB, read: &rocksdb::ReadOptions, key: &[u8]) -> Res<usize> {
-    // Pinned: the value is borrowed from the block cache, not copied out,
-    // which is the cheapest read RocksDB offers and the fair one against
-    // engines that hand back a borrow.
+    // Pinned: the value is lent from the block cache rather than copied
+    // into an allocation of RocksDB's making, the same lend the other
+    // engines give; the caller's copy is `consume`, as theirs is.
     Ok(db
         .get_pinned_opt(key, read)
         .map_err(|e| e.to_string())?
-        .map(|v| v.len())
+        .map(|v| consume(&v))
         .unwrap_or(0))
 }
 
@@ -1546,7 +1578,7 @@ fn rocks_range(db: &rocksdb::DB, from: &[u8], n: usize) -> Res<usize> {
     let mut bytes = 0usize;
     let mut seen = 0usize;
     while it.valid() && seen < n {
-        bytes += it.value().map(|v| v.len()).unwrap_or(0);
+        bytes += it.value().map(consume).unwrap_or(0);
         seen += 1;
         it.next();
     }
@@ -1737,11 +1769,11 @@ type LmdbDb = heed::Database<heed::types::Bytes, heed::types::Bytes>;
 
 /// One read under whichever transaction: the arm's held one or a thread's.
 fn lmdb_get(db: LmdbDb, r: &heed::RoTxn<'_>, key: &[u8]) -> Res<usize> {
-    // Values are borrowed from the mapping, never copied.
+    // Lent from the mapping; the caller's copy is `consume`.
     Ok(db
         .get(r, key)
         .map_err(|e| e.to_string())?
-        .map(|v| v.len())
+        .map(consume)
         .unwrap_or(0))
 }
 
@@ -1750,7 +1782,7 @@ fn lmdb_range(db: LmdbDb, r: &heed::RoTxn<'_>, from: &[u8], n: usize) -> Res<usi
     let range = (std::ops::Bound::Included(from), std::ops::Bound::Unbounded);
     for row in db.range(r, &range).map_err(|e| e.to_string())?.take(n) {
         let (_, v) = row.map_err(|e| e.to_string())?;
-        bytes += v.len();
+        bytes += consume(v);
     }
     Ok(bytes)
 }

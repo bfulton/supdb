@@ -23,6 +23,11 @@ Five, plus three floors. Each yields one or more quantities.
 | `scan-floor` | one `mmap` sequential walk of a file the top rung's size (capped at 4 GiB), no engine | bytes/s |
 | `mem-floor` | one dependent load at a time around a permutation of a 64 MiB buffer's cache lines, no engine | chases/s |
 
+A read or a scan consumes what it returns: every value is copied out, into
+the reading thread's own buffer, on every arm, in the workloads above and in
+the mixes. A caller gets a value to use it, and a read that only measured the
+length of what it was lent priced the lookup and nothing after it.
+
 Every workload runs at a ladder of store sizes, not one: keys at 1, 3, 10,
 30 ... × 10⁴ up to the scale's cap. A number is a point on a curve, and the
 curve is what shows where an engine's behaviour changes — most importantly

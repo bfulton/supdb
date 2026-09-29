@@ -258,6 +258,21 @@ failed its gate on the load alone, the engine unchanged. The rule:
 what one pass leaves in the process is a variable of every pass after
 it, and a run is only as interleaved as its passes are independent.
 
+**A read that never read the value priced the lookup alone.** Every
+arm's point read and scan summed the lengths of the values it was lent
+-- a pinned slice, a slice of the mapping, a borrow through a callback --
+and read no byte of one. No caller gets a value to leave it unread, and
+the omission was not even: an LMDB leaf keeps the key beside its value,
+so the first touch of the value lands on lines the lookup loaded, while
+supdb keeps values in blocks apart from its index, where that touch is a
+miss the suite never charged. Measured outside the suite, a point read
+that consumed its hundred bytes read 1.6x of LMDB where the row said 2x.
+Every read and scan now copies each value into its thread's own buffer
+(`consume`), and the read and scan series stepped at that commit on
+every arm, comparators included. The rule: a workload does what its
+caller would with the answer, or it measures something the caller never
+sees.
+
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`
