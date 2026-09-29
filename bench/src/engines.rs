@@ -411,6 +411,9 @@ pub struct Supdb {
     /// `supdb-noseal` pins zero. `Option` and not a number, because the
     /// shipping arm must inherit a default rather than restate it.
     sealcap: Option<usize>,
+    /// The merge trigger this arm pins, or none for the engine's own.
+    /// `supdb-l0`.
+    l0: Option<usize>,
 }
 
 /// What an arm differs from `supdb` by. One struct rather than a row of
@@ -492,6 +495,9 @@ struct Policy {
     /// The seal cap this arm pins, or none for the engine's own.
     /// `supdb-noseal`.
     sealcap: Option<usize>,
+    /// The merge trigger this arm pins, or none for the engine's own.
+    /// `supdb-l0`.
+    l0: Option<usize>,
 }
 
 impl Default for Policy {
@@ -510,6 +516,7 @@ impl Default for Policy {
             wforms: false,
             lagcap: 0,
             sealcap: None,
+            l0: None,
             aheadmin: None,
             lazyforms: false,
             eager: None,
@@ -922,6 +929,24 @@ impl Supdb {
         )
     }
 
+    /// EXPERIMENT: `supdb` with the merge trigger pinned by `L0TRIG`
+    /// (the engine's own when unset): the pieces a range holds before
+    /// they are merged into its partition, swept against `supdb`.
+    pub fn create_l0(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                l0: Some(
+                    std::env::var("L0TRIG")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(supdb::Options::default().l0_trigger),
+                ),
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` maintaining the forms whoever is reading, as `supdb-forms`
     /// does, but stopping where too much of the store is unsealed. The pair
     /// against `supdb` says whether the regime's 3.19x on the lag sweep can
@@ -1029,6 +1054,7 @@ impl Supdb {
             wforms,
             lagcap,
             sealcap,
+            l0,
             aheadmin,
             lazyforms,
             eager,
@@ -1153,6 +1179,7 @@ impl Supdb {
             // The seal capped by a share of the store, so the memtable
             // cannot hold the whole of a store smaller than the floor.
             seal_max_pct: sealcap.unwrap_or(base_seal_max_pct),
+            l0_trigger: l0.unwrap_or(supdb::Options::default().l0_trigger),
             // Below this the builder declines and the writer fills the
             // forms inline on the commit path instead, which is the
             // comparison the threshold was never measured against.
@@ -1192,6 +1219,7 @@ impl Supdb {
             wforms,
             lagcap,
             sealcap,
+            l0,
             aheadmin,
             lazyforms,
             eager,
@@ -1338,6 +1366,9 @@ impl Engine for Supdb {
         }
         if self.aheadmin.is_some() {
             return "supdb-ahead";
+        }
+        if self.l0.is_some() {
+            return "supdb-l0";
         }
         if self.sealcap.is_some() && !self.partition {
             return "supdb-ingestnoseal";
@@ -1896,7 +1927,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-lazysnap" | "supdb-fullrec" | "supdb-norebase" | "supdb-sealfile"
         | "supdb-settleall" | "supdb-inline" | "supdb-tier" | "supdb-runs" | "supdb-keeper"
         | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice"
-        | "supdb-nocache" | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
+        | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "lmdb" | "rocksdb-tuned" => {
+            Guarantee::Durable
+        }
         "supdb-ingest" | "supdb-ingestleave" | "supdb-ingestnoseal" | "supdb-ingestsync"
         | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
@@ -1938,6 +1971,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-cache256" => Box::new(Supdb::create_cache256(dir)?),
         "supdb-ingest" => Box::new(Supdb::create_ingest(dir)?),
         "supdb-ingestleave" => Box::new(Supdb::create_ingest_leave(dir)?),
+        "supdb-l0" => Box::new(Supdb::create_l0(dir)?),
         "supdb-ingestsync" => Box::new(Supdb::create_ingest_sync(dir)?),
         "supdb-ingestnoseal" => Box::new(Supdb::create_ingest_noseal(dir)?),
         "lmdb" => Box::new(Lmdb::create(dir, map_gb)?),
