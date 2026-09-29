@@ -377,6 +377,19 @@ pub struct Options {
     /// fence closes below them. Nothing is rewritten. Ordered ingest -- a
     /// log -- is all promotion; uniform keys never qualify.
     pub promote: bool,
+    /// Whether a flush that does not partition (`partition_on_flush`
+    /// false) schedules the partitioning it skipped: what promotion alone
+    /// turns into partitions -- a lone tombstone-free piece that fits one,
+    /// or pieces that tile the space -- at once, since promotion rewrites
+    /// nothing and is not the second pass the option defers, and the rest
+    /// by a merge started in the background, which the writer publishes
+    /// at its first commit after the merge finishes. Without it the
+    /// background never got there: before the first partitioning a merge
+    /// waits for `l0_trigger` pieces, so a store of fewer seals stayed
+    /// pieces for good, its every scan took the merge path, and the block
+    /// cache, which caches partition blocks, had nothing to hold. `false`
+    /// is that shape, kept as an arm.
+    pub flush_schedules: bool,
     /// How a flush drains level 0 once partitions exist: merge only the
     /// ranges that hold pieces, under the live fences (`true`), or
     /// re-partition everything from every key (`false`, the original), kept
@@ -938,6 +951,7 @@ impl Default for Options {
             partition_bytes: Some(64 << 20),
             flush_ranges: true,
             promote: true,
+            flush_schedules: true,
             recycle_wal: false,
             read_advice: ReadAdvice::default(),
             scan_readahead_bytes: 256 << 10,
@@ -5771,6 +5785,11 @@ pub struct Db {
     /// join found the seal unfinished, so it can be said which of these the
     /// 14% of the durable load in `phase_ns[1]` is.
     seal_wait: SealWaits,
+    /// A merge a flush that does not partition started in the background:
+    /// collected at the first commit after it finishes, where a merge the
+    /// seals start waits for the next seal, since a store that has stopped
+    /// sealing would otherwise never see it.
+    flush_merge: bool,
     /// Set by `flush` while it waits for the last seal, so that wait is
     /// booked as the drain and not as backpressure.
     draining: bool,
@@ -10817,6 +10836,7 @@ impl Db {
             spare_wals,
             covered_seq: 0,
             seal_wait: SealWaits::default(),
+            flush_merge: false,
             draining: false,
         })
     }
@@ -11111,6 +11131,7 @@ impl Db {
             spare_wals,
             covered_seq: sealed,
             seal_wait: SealWaits::default(),
+            flush_merge: false,
             draining: false,
         })
     }
@@ -11309,6 +11330,17 @@ impl Db {
         // a publish makes nothing due that a scan has not.
         if self.sealing.as_ref().is_some_and(|h| h.is_finished()) {
             self.join_seal()?;
+        }
+        // The merge a flush handed to the background, published at the
+        // first commit after it finishes, and before the maintenance for
+        // the seal's reason above.
+        if self.flush_merge
+            && self
+                .compacting
+                .as_ref()
+                .is_some_and(|(_, h)| h.is_finished())
+        {
+            self.join_compact()?;
         }
         if background {
             if let Some(e) = self.shared.upkeep.take_err() {
@@ -11723,6 +11755,33 @@ impl Db {
         // touch exactly one segment, which is the arrangement the read
         // lead was measured in.
         if !(self.opts.compact && self.opts.partition_on_flush) {
+            // Not partitioning here leaves the partitioning to the
+            // background, and the background waits for `l0_trigger`
+            // pieces first; so what promotion alone makes partitions is
+            // done now, for the price of a link, and a merge is started
+            // for the rest.
+            if self.opts.compact && self.opts.flush_schedules {
+                if self.opts.promote && self.segs().iter().all(|s| s.level == 0) {
+                    self.promote_unpartitioned()?;
+                }
+                if self.segs().iter().any(|s| s.level == 0) {
+                    match self.merge_due(1) {
+                        None => self.start_compact(None)?,
+                        Some(due) if !due.is_empty() => {
+                            let due = if self.opts.promote {
+                                self.promote_ranges(due)?
+                            } else {
+                                due
+                            };
+                            if !due.is_empty() {
+                                self.start_compact(Some(due))?;
+                            }
+                        }
+                        Some(_) => {}
+                    }
+                    self.flush_merge = self.compacting.is_some();
+                }
+            }
             return Ok(());
         }
         // With `flush_ranges`, each round merges only the ranges that hold
@@ -12788,6 +12847,7 @@ impl Db {
         let Some((inputs, handle)) = self.compacting.take() else {
             return Ok(());
         };
+        self.flush_merge = false;
         let t = std::time::Instant::now();
         let outputs = handle
             .join()

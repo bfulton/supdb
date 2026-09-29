@@ -295,7 +295,12 @@ that partitions writes the partition's name directly when the piece is
 tombstone-free and fits one, since that is what the flush's promotion would
 link it as under a second publish; the first version named it so for a
 store that does not partition on flush too, and the suite's ingest arm,
-which keeps its piece a piece, scanned three times faster for one row.
+whose seal must leave a piece, scanned three times faster for one row.
+Such a flush now promotes the piece itself, by link, and hands what
+promotion cannot tile to a background merge the writer publishes at its
+next commit (`flush_schedules`): before it the background waited for
+`l0_trigger` pieces, a store of fewer stayed pieces for good, every scan
+took the merge path, and the block cache had no partition to cache.
 Replay applies the frames between commit frames whole or not at all -- a
 partial batch used to replay as whole, and the first test written against
 the contract found it. `settle` is what joins an in-flight seal; `sync` does

@@ -298,7 +298,8 @@ pub struct Supdb {
     db: Option<supdb::Db>,
     path: PathBuf,
     /// False for the ingest-first arm: a flush stops partitioning what it
-    /// sealed and leaves that to background compaction. Both arms exist so
+    /// sealed and leaves that to the background -- promotion at once, a
+    /// merge for the rest (`Options::flush_schedules`). Both arms exist so
     /// the trade is measured in ONE interleaved run rather than compared
     /// across two, which is the whole reason this suite interleaves.
     partition: bool,
@@ -400,6 +401,9 @@ pub struct Supdb {
     /// Whether the forms are published at every maintained commit, as
     /// they were before they waited for a handle. `supdb-pubalways`.
     pubalways: bool,
+    /// A flush that does not partition leaves its pieces as they are,
+    /// as before `Options::flush_schedules`. `supdb-ingestleave`.
+    leave: bool,
     /// The partitions' blocks below which no builder starts, or none for
     /// the engine's own. `supdb-ahead`.
     aheadmin: Option<usize>,
@@ -479,6 +483,9 @@ struct Policy {
     /// Whether the forms are published at every maintained commit, as
     /// they were before they waited for a handle. `supdb-pubalways`.
     pubalways: bool,
+    /// A flush that does not partition leaves its pieces as they are,
+    /// as before `Options::flush_schedules`. `supdb-ingestleave`.
+    leave: bool,
     /// The builder's minimum blocks, or none for the engine's own.
     /// `supdb-ahead`.
     aheadmin: Option<usize>,
@@ -521,6 +528,7 @@ impl Default for Policy {
             keeper: false,
             aheadpub: false,
             pubalways: false,
+            leave: false,
         }
     }
 }
@@ -535,8 +543,53 @@ impl Supdb {
             path,
             Policy {
                 partition: false,
-                block_cache: false,
                 durable: false,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// EXPERIMENT: `supdb-ingest` whose `sync` is the durable write
+    /// and nothing more -- the WAL's frames written and synced, the
+    /// memtable left where it is -- with the seal and the partitioning
+    /// left to the background.
+    pub fn create_ingest_sync(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                drain: false,
+                durable: false,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` with its flush leaving the pieces as they are, the
+    /// shape before `Options::flush_schedules`, priced against the arm in
+    /// one process.
+    pub fn create_ingest_leave(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                leave: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// EXPERIMENT: `supdb-ingest` with the seal cap off: its memtable
+    /// seals at `seal_bytes` whatever the store holds, as it did while the
+    /// store stayed one piece and the cap had nothing to take a share of.
+    pub fn create_ingest_noseal(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                sealcap: Some(0),
                 ..Policy::default()
             },
         )
@@ -994,6 +1047,7 @@ impl Supdb {
             keeper,
             aheadpub,
             pubalways,
+            leave,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -1091,6 +1145,7 @@ impl Supdb {
             // The forms published for a handle, or at every maintained
             // commit as they were.
             forms_publish_lazily: !pubalways,
+            flush_schedules: !leave,
             // The unsealed share past which the maintenance stops, so an
             // arm can maintain whoever is reading without paying for it
             // on a store that is nearly all unmerged.
@@ -1155,6 +1210,7 @@ impl Supdb {
             keeper,
             aheadpub,
             pubalways,
+            leave,
         })
     }
 }
@@ -1231,6 +1287,9 @@ impl Engine for Supdb {
         if self.aheadpub {
             return "supdb-aheadpub";
         }
+        if self.leave {
+            return "supdb-ingestleave";
+        }
         if self.pubalways {
             return "supdb-pubalways";
         }
@@ -1248,6 +1307,9 @@ impl Engine for Supdb {
         if self.aheadmin.is_some() {
             return "supdb-ahead";
         }
+        if self.sealcap.is_some() && !self.partition {
+            return "supdb-ingestnoseal";
+        }
         if self.sealcap.is_some() {
             return "supdb-noseal";
         }
@@ -1262,6 +1324,9 @@ impl Engine for Supdb {
         }
         if !self.snap {
             return "supdb-nosnap";
+        }
+        if !self.partition && !self.drain {
+            return "supdb-ingestsync";
         }
         match (
             self.partition,
@@ -1340,6 +1405,8 @@ impl Engine for Supdb {
             ("form_bytes_at_end", form_bytes as f64),
             ("lazy_scans_done", db.lazy_scans().0 as f64),
             ("lazy_scans_resumed", db.lazy_scans().1 as f64),
+            ("seals", db.seal_waits().joins as f64),
+            ("publishes", db.seal_waits().publishes as f64),
         ]
     }
     fn thread_reader(&self) -> Res<ReaderOpener> {
@@ -1798,7 +1865,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settleall" | "supdb-inline" | "supdb-tier" | "supdb-runs" | "supdb-keeper"
         | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice"
         | "supdb-nocache" | "supdb-cache256" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
-        "supdb-ingest" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
+        "supdb-ingest" | "supdb-ingestleave" | "supdb-ingestnoseal" | "supdb-ingestsync"
+        | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
     })
 }
@@ -1837,6 +1905,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nocache" => Box::new(Supdb::create_nocache(dir)?),
         "supdb-cache256" => Box::new(Supdb::create_cache256(dir)?),
         "supdb-ingest" => Box::new(Supdb::create_ingest(dir)?),
+        "supdb-ingestleave" => Box::new(Supdb::create_ingest_leave(dir)?),
+        "supdb-ingestsync" => Box::new(Supdb::create_ingest_sync(dir)?),
+        "supdb-ingestnoseal" => Box::new(Supdb::create_ingest_noseal(dir)?),
         "lmdb" => Box::new(Lmdb::create(dir, map_gb)?),
         "lmdb-nosync" => Box::new(Lmdb::create_nosync(dir, map_gb)?),
         "rocksdb-tuned" => Box::new(Rocks::create_tuned(dir)?),

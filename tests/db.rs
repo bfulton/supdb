@@ -3560,13 +3560,15 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
         "a piece with a tombstone is not a partition as it is"
     );
     assert_eq!(read_vec(&db, &key(5)), Vec::<Vec<u8>>::new());
-    // A store that does not partition on flush keeps its piece a piece:
-    // the seal names only what the flush would have promoted.
+    // A store that does not partition on flush seals its piece a piece --
+    // the seal names only what a partitioning flush would have promoted --
+    // and with `flush_schedules` off the flush leaves it one.
     let d = dir("first-partition-unpartitioned");
     let mut db = Db::create(
         &d,
         Options {
             partition_on_flush: false,
+            flush_schedules: false,
             ..Options::default()
         },
     )
@@ -3587,6 +3589,127 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
         "the piece keeps its name: {names:?}"
     );
     assert_eq!(read_vec(&db, &key(7)), vec![b"v".to_vec()]);
+    // With it on, the default, the flush promotes the piece it sealed:
+    // a partition by link, under the partition's name, nothing rewritten.
+    let d = dir("first-partition-scheduled");
+    let mut db = Db::create(
+        &d,
+        Options {
+            partition_on_flush: false,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    for i in 0..3000u32 {
+        db.append(&key(i), b"v");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.levels(), (1, 0), "the lone piece promoted");
+    let names = files(&d);
+    assert!(
+        names.len() == 1 && names[0].starts_with("par-") && names[0].ends_with("--.sup"),
+        "the promoted file carries the partition's name: {names:?}"
+    );
+    assert_eq!(read_vec(&db, &key(7)), vec![b"v".to_vec()]);
+    let mut n = 0usize;
+    db.scan(&key(0), 5000, |_k, _v| n += 1).unwrap();
+    assert_eq!(n, 3000);
+}
+
+/// A flush that does not partition leaves what promotion cannot make
+/// partitions -- pieces that overlap -- to a merge it starts in the
+/// background, and the writer publishes that merge at its first commit
+/// after it finishes. Before `flush_schedules` nothing ever did: the
+/// background waits for `l0_trigger` pieces, and a store of fewer stayed
+/// pieces, every scan on the merge path. Held against the same store with
+/// the option off, which is the check that the test reaches the path.
+#[test]
+fn a_flush_that_does_not_partition_merges_the_rest_in_the_background() {
+    let key = |k: u32| format!("key-{k:06}").into_bytes();
+    // A hundred-byte value, the suite's, so the load seals several times.
+    let val = |k: u32| format!("v{k:06}-{}", "x".repeat(92)).into_bytes();
+    let keys = 4000u32;
+    let mut order: Vec<u32> = (0..keys).collect();
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    for i in (1..order.len()).rev() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        order.swap(i, (x % (i as u64 + 1)) as usize);
+    }
+    for schedules in [false, true] {
+        let d = dir(&format!("flush-schedules-{schedules}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                partition_on_flush: false,
+                flush_schedules: schedules,
+                seal_bytes: 64 << 10,
+                // No merge of the seals' own: the pieces the flush leaves
+                // are the whole of what happens to the store.
+                l0_trigger: 100,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        for (i, &k) in order.iter().enumerate() {
+            db.append(&key(k), &val(k));
+            if i % 100 == 99 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        let (parts, pieces) = db.levels();
+        assert_eq!(
+            parts, 0,
+            "schedules {schedules}: nothing partitioned in the flush"
+        );
+        assert!(
+            pieces >= 2,
+            "schedules {schedules}: overlapping pieces, which no promotion tiles: {pieces}"
+        );
+        for k in [0, 1234, keys - 1] {
+            assert_eq!(
+                read_vec(&db, &key(k)),
+                vec![val(k)],
+                "schedules {schedules}"
+            );
+        }
+        let t = std::time::Instant::now();
+        loop {
+            db.commit().unwrap();
+            if db.levels().1 == 0
+                || t.elapsed() > std::time::Duration::from_secs(if schedules { 30 } else { 1 })
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (parts, pieces) = db.levels();
+        if schedules {
+            assert!(
+                parts >= 1 && pieces == 0,
+                "the merge the flush started was published at a commit: {parts} partitions, {pieces} pieces"
+            );
+        } else {
+            assert_eq!(parts, 0, "without the option the store stays pieces");
+        }
+        let mut n = 0usize;
+        let mut last: Option<Vec<u8>> = None;
+        db.scan(&key(0), keys as usize + 10, |k, v| {
+            if let Some(l) = &last {
+                assert!(l.as_slice() < k, "a scan out of key order");
+            }
+            let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+            assert_eq!(v, val(kn).as_slice());
+            last = Some(k.to_vec());
+            n += 1;
+        })
+        .unwrap();
+        assert_eq!(n, keys as usize, "schedules {schedules}: every key, once");
+    }
 }
 
 /// The range-read structure written at ingest: with `commit_forms` the
