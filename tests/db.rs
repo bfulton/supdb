@@ -5165,10 +5165,8 @@ fn the_copies_survive_a_merge_with(compact: bool) {
     m.flushed();
     db.settle().unwrap();
     assert_eq!(db.levels(), (parts, 0), "the pieces merged");
-    assert!(
-        db.forms_rebased() > rebased0,
-        "the forms were carried across the merge"
-    );
+    let carried0 = db.forms_rebased() - rebased0;
+    assert!(carried0 > 0, "the forms were carried across the merge");
     let (after, _, _, _) = db.canonical_forms();
     assert!(after > 0, "copies survived the merge: {after}");
     let r = db.reader().unwrap();
@@ -5188,16 +5186,17 @@ fn the_copies_survive_a_merge_with(compact: bool) {
     let r = db.reader().unwrap();
     m.check(&r, "a reader after writes into the carried copies");
     m.check(&db, "the writer after them");
-    // A merge that loses a key cuts different blocks, and the table
-    // starts afresh.
+    // A merge that loses a key cuts different blocks, and that
+    // partition's forms start afresh; the others, rewritten over the same
+    // keys by the same merge, are carried each on its own.
     let rebased1 = db.forms_rebased();
     db.flush().unwrap();
     m.flushed();
     db.settle().unwrap();
     assert_eq!(
-        db.forms_rebased(),
-        rebased1,
-        "a merge that deleted a key is not carried"
+        db.forms_rebased() - rebased1,
+        carried0 - 1,
+        "the partition that deleted a key is not carried, and only it"
     );
     m.check(&db, "after a merge that deleted a key");
     std::hint::black_box(sink);
@@ -5279,13 +5278,21 @@ fn the_forms_survive_a_seal_with(snapshot_carry: bool) {
     assert!(db.levels().1 > 0, "the seal left a piece");
     let (after, _, _, _) = db.canonical_forms();
     assert!(after > 0, "the forms survived the seal: {after}");
+    // The publish carried them and vouches for no commit: the writer
+    // does, when it next publishes into the new state -- here for the
+    // handle it is asked for.
+    assert_eq!(
+        db.forms_position(),
+        usize::MAX,
+        "carried, and current to no commit until the writer says so"
+    );
+    // A handle takes them, and finds the burst and the delete in them.
+    let r = db.reader().unwrap();
     assert_eq!(
         db.forms_position(),
         0,
         "current to the new log, which holds nothing yet"
     );
-    // A handle takes them, and finds the burst and the delete in them.
-    let r = db.reader().unwrap();
     let (_, hit0) = db.canonical_tries();
     m.check(&r, "a reader over the carried forms");
     let (_, hit1) = db.canonical_tries();

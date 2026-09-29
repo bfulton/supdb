@@ -397,6 +397,15 @@ pub struct Options {
     /// without freeing or swapping a state under the writer. `false` is
     /// the shape before it, kept to price it.
     pub writer_pins: bool,
+    /// EXPERIMENT: a publish over the same memtables -- a seal's landing,
+    /// a merge, a promotion -- copies the published forms into the new
+    /// state (`State::carry_published`) and leaves the writer's own
+    /// tables to be carried at its next look at the log
+    /// (`Reader::rebase_tables`), partition by partition. That is what a
+    /// publish from a thread other than the writer's can do. `false` is
+    /// the carry before it: the writer's tables and the published forms
+    /// moved together inside the publish, all or nothing.
+    pub forms_carry_lazily: bool,
     /// How a flush drains level 0 once partitions exist: merge only the
     /// ranges that hold pieces, under the live fences (`true`), or
     /// re-partition everything from every key (`false`, the original), kept
@@ -960,6 +969,7 @@ impl Default for Options {
             promote: true,
             flush_schedules: true,
             writer_pins: true,
+            forms_carry_lazily: true,
             recycle_wal: false,
             read_advice: ReadAdvice::default(),
             scan_readahead_bytes: 256 << 10,
@@ -5169,6 +5179,13 @@ struct BlockTable {
     added: Vec<Vec<(u32, u32)>>,
     /// EXPERIMENT: blocks built or patched since the last publish.
     dirty: Vec<bool>,
+    /// The layout (`State::layout`) and the blob this table was built
+    /// over: carried to a later state's partition of the same layout, and
+    /// rebased where the blob is another -- a merge's rewrite over the
+    /// same blocks -- since a sparse form splices at ranks in the records
+    /// it was built against.
+    layout: u64,
+    blob: u64,
 }
 
 impl BlockTable {
@@ -5294,6 +5311,15 @@ struct State {
     /// read asked it of every segment, forty-one pointer chases a read
     /// at thirty million keys.
     segs_tombs: bool,
+    /// Per partition, the id of the blob whose block boundaries it
+    /// shares: its own for a partition that met none to share them with,
+    /// its predecessor's for one a publish kept or rewrote over the same
+    /// keys. What a cache of a partition's blocks is keyed by, so a table
+    /// built over one partition is carried to the next wherever the
+    /// blocks are the same ones, across however many publishes it missed
+    /// and wherever the partition now stands; the segment it was built
+    /// over may be gone by then, and a position says nothing.
+    layout: Vec<u64>,
     /// EXPERIMENT: the canonical block forms of this state, a slot per
     /// block of every partition, null where none is installed; see
     /// `CanonicalForm`.
@@ -5363,6 +5389,74 @@ struct State {
 struct CanonicalForm {
     form: std::sync::Arc<Cached>,
     bytes: usize,
+}
+
+impl State {
+    /// The published forms carried from this state into `next`, a state
+    /// over the same memtables: each partition's slots copied where `next`
+    /// shares its blocks (`State::layout`), each a form of its own around
+    /// the same block, so this state keeps and frees its own and nothing
+    /// is moved from under a writer publishing into it meanwhile. A
+    /// sparse form of a partition rewritten under the same blocks splices
+    /// at ranks in the old records, so it is carried as a marker -- not
+    /// clean, build it -- since with the table complete an empty slot
+    /// reads as clean. `next` stays current to no commit (`forms_at`)
+    /// until the writer publishes into it, and a form published here after
+    /// its slot was copied is this state's alone: the writer finds so at
+    /// its next look at the log (`Reader::rebase_tables`). It needs no
+    /// writer's state, so whichever thread publishes may call it, pinned,
+    /// since a slot it reads may be replaced and retired under it.
+    fn carry_published(&self, next: &mut State) -> u64 {
+        let np_cur = self.segs.partition_point(|s| s.level > 0);
+        let np = next.segs.partition_point(|s| s.level > 0);
+        if self.forms.len() < np_cur
+            || self.layout.len() != np_cur
+            || next.forms.len() < np
+            || next.layout.len() != np
+        {
+            return 0;
+        }
+        let mut bytes = 0usize;
+        let mut rebases = 0u64;
+        for p in 0..np {
+            let Some(q) = (0..np_cur).find(|&q| self.layout[q] == next.layout[p]) else {
+                continue;
+            };
+            if self.forms[q].len() != next.forms[p].len() {
+                continue;
+            }
+            let rebased = !std::sync::Arc::ptr_eq(&self.segs[q], &next.segs[p]);
+            rebases += u64::from(rebased);
+            for (b, slot) in self.forms[q].iter().enumerate() {
+                let ptr = slot.load(AtomicOrdering::Acquire);
+                if ptr.is_null() {
+                    continue;
+                }
+                // SAFETY: the caller is pinned, and a form retired from a
+                // slot is freed only past every pinned reader.
+                let form = &unsafe { &*ptr }.form;
+                let form = if rebased && matches!(**form, Cached::Sparse(_)) {
+                    std::sync::Arc::new(Cached::Wide(WideBlock {
+                        sorted: Vec::new(),
+                        seen: 0,
+                        covered: false,
+                        walks: 0,
+                    }))
+                } else {
+                    form.clone()
+                };
+                let form_bytes = form.bytes();
+                bytes += form_bytes;
+                let carried = Box::into_raw(Box::new(CanonicalForm {
+                    form,
+                    bytes: form_bytes,
+                }));
+                next.forms[p][b].store(carried, AtomicOrdering::Relaxed);
+            }
+        }
+        next.forms_bytes = AtomicUsize::new(bytes);
+        rebases
+    }
 }
 
 impl Drop for State {
@@ -5720,6 +5814,19 @@ struct FormsState {
     /// PROTOTYPE: the builder ahead of the reader, while one is running
     /// or has forms still to install. The writer's handle alone has one.
     ahead: std::cell::RefCell<Option<Ahead>>,
+    /// The memtables of the state this handle's log position and
+    /// snapshot are of (`log_gen`), by identity: what a state published
+    /// by someone else is compared against when the writer's tables are
+    /// carried to it (`rebase_tables`). Weak, so a table sealed and
+    /// replaced is not kept alive by a writer that has not looked since.
+    over: std::cell::RefCell<Option<SyncedOver>>,
+}
+
+/// The live and the frozen memtable a handle's upkeep was last current
+/// over; see `FormsState::over`.
+struct SyncedOver {
+    mem: std::sync::Weak<MemTable>,
+    frozen: Option<std::sync::Weak<MemTable>>,
 }
 
 impl FormsState {
@@ -5753,6 +5860,7 @@ impl FormsState {
             log_gen: std::cell::Cell::new(0),
             snap_entries: std::cell::Cell::new(0),
             ahead: std::cell::RefCell::new(None),
+            over: std::cell::RefCell::new(None),
         }
     }
 }
@@ -7892,8 +8000,11 @@ impl Reader {
     fn sync_log(&self) -> bool {
         let st = self.state();
         let mut moved = false;
-        if self.fs().log_gen.get() != st.gen {
+        if self.fs().log_gen.get() != st.gen && self.rebase_tables(st) {
             moved = true;
+        } else if self.fs().log_gen.get() != st.gen {
+            moved = true;
+            self.note_over(st);
             self.fs().log_gen.set(st.gen);
             self.fs().log_seen.set(0);
             // A new state counts its own scans from zero, so the count
@@ -7968,6 +8079,199 @@ impl Reader {
             }
         }
         self.fs().log_seen.set(n);
+        true
+    }
+
+    /// The memtables of `st` noted as the ones this handle's upkeep is
+    /// now current over; see `FormsState::over`.
+    fn note_over(&self, st: &State) {
+        *self.fs().over.borrow_mut() = Some(SyncedOver {
+            mem: std::sync::Arc::downgrade(&st.mem),
+            frozen: st.frozen.as_ref().map(std::sync::Arc::downgrade),
+        });
+    }
+
+    /// The writer's tables carried to `st`, a state published over the
+    /// same live memtable since this handle last read its log -- a
+    /// seal's landing, a merge, a promotion, a piece merge -- where a
+    /// handle drops them. A publish no longer carries them itself, since
+    /// the thread that publishes may not be the writer's: the forms it
+    /// published are copied into the new state by the publish
+    /// (`State::carry_published`), and the writer's own copies, which it
+    /// alone may touch, are carried here, at its first look at the log
+    /// after it, whenever that is and however many publishes it missed.
+    ///
+    /// Each table goes to the partition of its layout (`State::layout`)
+    /// wherever that partition now stands, and a table whose layout is
+    /// gone goes with it. Across a rewrite over the same blocks -- a new
+    /// blob under the same layout -- a sparse form splices at ranks in
+    /// the old records and goes, as does every wide form, which names
+    /// slots of a snapshot that may be gone. The pieces' bounds are
+    /// walked again against `st`'s pieces. The snapshot stands where the
+    /// frozen table does, and goes where it landed, as the writer's own
+    /// carry drops it there; the lists of keys past it go with it. The
+    /// writes read from the log and not yet settled stay, to settle into
+    /// the carried tables under `st`, whose sources resolve them.
+    ///
+    /// The writer's "published" marks named the old state's slots, and a
+    /// pass may have published into it after the publish copied them: a
+    /// block is marked dirty unless `st`'s slot holds the very form this
+    /// table does. Returns whether it was done; when not, the caller
+    /// drops everything as a handle does.
+    fn rebase_tables(&self, st: &State) -> bool {
+        if self.slot.is_some()
+            || !(self.opts.forms_carry && self.opts.commit_forms && self.opts.scan_block_cache)
+            || !self.fs().cache_used.get()
+        {
+            return false;
+        }
+        let Some(over) = self.fs().over.borrow_mut().take() else {
+            return false;
+        };
+        // The live table is the one the log position is of; another is a
+        // freeze, which the writer makes itself and carries at once.
+        if !std::ptr::eq(over.mem.as_ptr(), std::sync::Arc::as_ptr(&st.mem)) {
+            return false;
+        }
+        let same_frozen = match (&over.frozen, &st.frozen) {
+            (Some(a), Some(b)) => std::ptr::eq(a.as_ptr(), std::sync::Arc::as_ptr(b)),
+            (None, None) => true,
+            _ => false,
+        };
+        let landed = over.frozen.is_some() && st.frozen.is_none();
+        if !same_frozen && !landed {
+            return false;
+        }
+        let np = st.segs.partition_point(|s| s.level > 0);
+        if np == 0 || st.layout.len() != np || st.forms.len() < np {
+            return false;
+        }
+        // Everything that can fail first, so a failure leaves the tables
+        // as they were for the caller to drop.
+        let l0 = &st.segs[np..];
+        let ctx = self.build_ctx();
+        if ctx.rank_pieces().is_err() {
+            return false;
+        }
+        let mut bounds = Vec::with_capacity(np);
+        for seg in &st.segs[..np] {
+            match ctx.table_bounds(seg, l0) {
+                Ok(b) => bounds.push(b),
+                Err(_) => return false,
+            }
+        }
+        drop(ctx);
+
+        // The snapshot stands with the frozen table it names.
+        let keep_snap = same_frozen;
+        if !keep_snap {
+            *self.fs().scan_keys.borrow_mut() = None;
+            self.fs().snap_entries.set(0);
+            self.fs().snap_added.borrow_mut().clear();
+        } else if let Some((g, _)) = self.fs().scan_keys.borrow_mut().as_mut() {
+            *g = st.gen;
+        }
+
+        let mut old = std::mem::take(&mut *self.fs().tables.borrow_mut());
+        let tables = Db::tables_for(st.segs.len());
+        for (p, cell) in tables.iter().take(np).enumerate() {
+            let want = st.layout[p];
+            if let Some(from) = old
+                .iter_mut()
+                .find(|c| c.borrow().as_ref().is_some_and(|t| t.layout == want))
+            {
+                *cell.borrow_mut() = from.borrow_mut().take();
+            }
+        }
+        drop(old);
+
+        // Every overlaid block holds a form only where every partition has
+        // a table: one a publish added -- a promotion's -- has none yet.
+        let mut complete =
+            self.fs().tables_complete.get() && tables.iter().take(np).all(|c| c.borrow().is_some());
+        let mut dirty_any = false;
+        let mut cache_bytes = 0usize;
+        let mut dense_bytes = 0u64;
+        let mut built = Vec::new();
+        for (p, (pieces, piece_ranks)) in bounds.into_iter().enumerate() {
+            let mut held = tables[p].borrow_mut();
+            let Some(t) = held.as_mut() else { continue };
+            let seg = &st.segs[p];
+            let rebased = t.blob != seg.blob.id();
+            for b in 0..t.slots.len() {
+                let sparse = matches!(t.slots[b].as_deref(), Some(Cached::Sparse(_)));
+                let wide = matches!(t.slots[b].as_deref(), Some(Cached::Wide(_)));
+                if (rebased && sparse) || wide {
+                    if sparse {
+                        complete = false;
+                    }
+                    t.slots[b] = None;
+                    t.dirty[b] = false;
+                    self.publish_marker(p, b);
+                }
+                if let Some(d) = t.dense[b].take() {
+                    dense_bytes += d.bytes() as u64;
+                }
+                t.listed[b] = u32::MAX;
+                let published = st.forms[p][b].load(AtomicOrdering::Acquire);
+                // SAFETY: the caller's state is held and pinned, and a
+                // form retired from it is freed only past every pin.
+                let published = (!published.is_null()).then(|| &unsafe { &*published }.form);
+                match (t.slots[b].as_ref(), published) {
+                    (Some(form), published) => {
+                        cache_bytes += form.bytes();
+                        t.listed[b] = built.len() as u32;
+                        built.push((p as u32, b as u32));
+                        if !published.is_some_and(|f| std::sync::Arc::ptr_eq(f, form)) {
+                            t.dirty[b] = true;
+                        }
+                    }
+                    // A form this table dropped after the publish copied
+                    // it -- a pass shedding or widening the block over
+                    // the old state -- stands in the new one as the
+                    // block, where the table vouches for none: marked, so
+                    // the next publish replaces it with a marker.
+                    (None, Some(f)) if !matches!(**f, Cached::Wide(_)) => t.dirty[b] = true,
+                    (None, _) => {}
+                }
+                dirty_any |= t.dirty[b];
+            }
+            t.pieces = pieces;
+            t.piece_ranks = piece_ranks;
+            if rebased {
+                t.blob = seg.blob.id();
+            }
+            if keep_snap && !rebased {
+                continue;
+            }
+            t.snap_at = std::cell::OnceCell::new();
+            t.snap_span = (0, 0);
+            t.snap_gen = u64::MAX;
+            t.reads.fill(0);
+            t.touched.fill(0);
+            if !keep_snap {
+                for list in &mut t.added {
+                    list.clear();
+                }
+                t.filed = 0;
+            }
+        }
+        // Dirty whatever was marked: `st` vouches for no commit until
+        // this handle publishes into it, and a publish with nothing
+        // marked dirty stamps nothing.
+        let any = tables.iter().any(|c| c.borrow().is_some());
+        *self.fs().tables.borrow_mut() = tables;
+        *self.fs().built.borrow_mut() = built;
+        self.fs().cache_bytes.set(cache_bytes);
+        self.fs().dirty_any.set(dirty_any || any);
+        self.fs().tables_complete.set(complete);
+        let mut c = self.fs().choices.get();
+        c[4] = c[4].saturating_sub(dense_bytes);
+        self.fs().choices.set(c);
+        // The log position stands: the live table is the one it is of.
+        self.fs().log_gen.set(st.gen);
+        self.fs().scans_seen.set(0);
+        self.note_over(st);
         true
     }
 
@@ -9543,6 +9847,18 @@ impl Reader {
     /// the snapshot filed by block. Before this every block's build
     /// seeked each of those sources from scratch: on one store of three
     /// million keys, three microseconds of a seven microsecond build.
+    /// The layout of the state's partition `seg` is, or its own blob id
+    /// for a segment the state does not hold as a partition.
+    fn layout_of_seg(&self, seg: &Seg) -> u64 {
+        let st = self.state();
+        st.segs
+            .iter()
+            .take_while(|s| s.level > 0)
+            .position(|s| std::ptr::eq(s.as_ref(), seg))
+            .and_then(|p| st.layout.get(p).copied())
+            .unwrap_or_else(|| seg.blob.id())
+    }
+
     fn make_table(
         &self,
         seg: &Seg,
@@ -9595,6 +9911,8 @@ impl Reader {
             added,
             filed,
             dirty: vec![false; nblocks],
+            layout: self.layout_of_seg(seg),
+            blob: seg.blob.id(),
         })
     }
 
@@ -10859,6 +11177,11 @@ impl Db {
         let data_bytes = 0;
         let l0_aligned = false;
         let segs_tombs = false;
+        let layout = segs
+            .iter()
+            .take_while(|s| s.level > 0)
+            .map(|s| s.blob.id())
+            .collect();
         let state = State {
             forms: Reader::forms_for(&segs),
             forms_moved: std::sync::atomic::AtomicBool::new(false),
@@ -10877,6 +11200,7 @@ impl Db {
             data_bytes,
             l0_aligned,
             segs_tombs,
+            layout,
         };
         let shared = std::sync::Arc::new(Shared {
             state: AtomicPtr::new(Box::into_raw(Box::new(state))),
@@ -11163,6 +11487,11 @@ impl Db {
         let segs_tombs = segs.iter().any(|s| s.tombs);
         let max_key = Db::max_key_of(&segs, &mem);
         let ntables = segs.len();
+        let layout = segs
+            .iter()
+            .take_while(|s| s.level > 0)
+            .map(|s| s.blob.id())
+            .collect();
         let state = State {
             forms: Reader::forms_for(&segs),
             forms_moved: std::sync::atomic::AtomicBool::new(false),
@@ -11181,6 +11510,7 @@ impl Db {
             data_bytes,
             l0_aligned,
             segs_tombs,
+            layout,
         };
         let shared = std::sync::Arc::new(Shared {
             state: AtomicPtr::new(Box::into_raw(Box::new(state))),
@@ -12049,7 +12379,9 @@ impl Db {
         let l0_aligned = Db::l0_aligned_of(&segs);
         let segs_tombs = segs.iter().any(|s| s.tombs);
         let cur = self.state();
+        let layout = Db::layout_of(cur, &segs, !tier && self.opts.forms_rebase);
         let next = State {
+            layout,
             forms: Reader::forms_for(&segs),
             forms_moved: std::sync::atomic::AtomicBool::new(false),
             snap: AtomicPtr::new(std::ptr::null_mut()),
@@ -12069,6 +12401,14 @@ impl Db {
             segs_tombs,
         };
         let mut next = next;
+        if self.opts.forms_carry_lazily {
+            let rebases = cur.carry_published(&mut next);
+            self.shared
+                .forms_rebased
+                .fetch_add(rebases, AtomicOrdering::Relaxed);
+            self.publish_lazily(next);
+            return;
+        }
         if !self.carry_forms(&mut next, tier) {
             self.drop_blocks();
             *self.fs().tables.borrow_mut() = Db::tables_for(next.segs.len());
@@ -12093,6 +12433,27 @@ impl Db {
         // of that state: stopped before the swap, so its handle is gone
         // before the state it pinned is retired.
         self.stop_ahead();
+        self.swap_state(next);
+    }
+
+    /// `next`, a state over the same memtables, published without the
+    /// writer's upkeep: its forms were carried by the publish itself
+    /// (`State::carry_published`), the writer's own copies are carried at
+    /// its next look at the log (`Reader::rebase_tables`), and the upkeep
+    /// thread and the builder pin what they read, so neither is brought
+    /// home first -- which is what lets a thread other than the writer's
+    /// make this publish. Without the writer's pins
+    /// (`Options::writer_pins`) the upkeep and the builder are brought home
+    /// as every publish brought them.
+    fn publish_lazily(&mut self, next: State) {
+        if !self.opts.writer_pins {
+            self.take_back_upkeep();
+            self.stop_ahead();
+        }
+        self.swap_state(next);
+    }
+
+    fn swap_state(&mut self, next: State) {
         let p = Box::into_raw(Box::new(next));
         let old = self.shared.state.swap(p, AtomicOrdering::AcqRel);
         // The writer holds the state for its operation, and what it has
@@ -12258,6 +12619,7 @@ impl Db {
             data_bytes: cur.data_bytes,
             l0_aligned: cur.l0_aligned,
             segs_tombs: cur.segs_tombs,
+            layout: cur.layout.clone(),
         };
         self.publish_and_organise(next);
     }
@@ -12283,8 +12645,17 @@ impl Db {
             data_bytes: cur.data_bytes,
             l0_aligned: cur.l0_aligned,
             segs_tombs: cur.segs_tombs,
+            layout: cur.layout.clone(),
         };
         let mut next = next;
+        if self.opts.forms_carry_lazily {
+            let rebases = cur.carry_published(&mut next);
+            self.shared
+                .forms_rebased
+                .fetch_add(rebases, AtomicOrdering::Relaxed);
+            self.publish_lazily(next);
+            return;
+        }
         if !self.carry_forms(&mut next, false) {
             self.drop_blocks();
         }
@@ -12501,6 +12872,7 @@ impl Db {
         // frozen table are the same ones, so the position and the lists
         // stand and only the generation they are keyed by moves.
         self.fs().log_gen.set(next.gen);
+        self.note_over(next);
         if tier {
             if let Some((g, _)) = self.fs().scan_keys.borrow_mut().as_mut() {
                 *g = next.gen;
@@ -12552,6 +12924,7 @@ impl Db {
             data_bytes: cur.data_bytes,
             l0_aligned: cur.l0_aligned,
             segs_tombs: cur.segs_tombs,
+            layout: cur.layout.clone(),
         };
         let mut next = next;
         if !self.carry_forms(&mut next, false) {
@@ -12575,6 +12948,26 @@ impl Db {
     /// segment list `sort_segs` has ordered. Nothing to align to is not
     /// aligned: before the first partitioning every piece spans the whole
     /// key space.
+    /// The layout of `segs` (`State::layout`) as a publish over `cur`
+    /// makes it: a partition keeps its predecessor's -- the one at the
+    /// same fences -- when it is that partition, or, where `rebase`, one
+    /// a merge rewrote over the same blocks; any other takes its own.
+    fn layout_of(cur: &State, segs: &[std::sync::Arc<Seg>], rebase: bool) -> Vec<u64> {
+        let np_cur = cur.segs.partition_point(|s| s.level > 0);
+        let parts = &cur.segs[..np_cur];
+        segs.iter()
+            .take_while(|s| s.level > 0)
+            .map(|seg| {
+                let was = parts.iter().position(|q| q.lo == seg.lo && q.hi == seg.hi);
+                match was {
+                    Some(q) if std::sync::Arc::ptr_eq(&parts[q], seg) => cur.layout[q],
+                    Some(q) if rebase && Db::same_blocks(&parts[q], seg) => cur.layout[q],
+                    _ => seg.blob.id(),
+                }
+            })
+            .collect()
+    }
+
     fn l0_aligned_of(segs: &[std::sync::Arc<Seg>]) -> bool {
         let np = segs.partition_point(|s| s.level > 0);
         let (parts, l0) = segs.split_at(np);
@@ -13569,6 +13962,8 @@ impl Reader {
                 added: (0..nblocks).map(|_| Vec::new()).collect(),
                 filed: 0,
                 dirty: vec![false; nblocks],
+                layout: 0,
+                blob: seg.blob.id(),
             };
             if table.clean_throughout() {
                 continue;
