@@ -404,6 +404,16 @@ pub struct Options {
     /// thread. `false` is the shape before it: the writer drives the same
     /// work inline, at its commits, seals and flushes.
     pub publish_in_background: bool,
+    /// EXPERIMENT: a store with pieces and no partition is partitioned as
+    /// soon as anything reads it, rather than when `l0_trigger` pieces
+    /// have piled up: every scan over it takes the merge path and every
+    /// read consults every piece, and a partitioning happens once in a
+    /// store's life, so nothing is gained by waiting while it is read and
+    /// nothing is spent while it is not. A `sync` over such a store hands
+    /// its tail to a seal as well, so what it leaves in memory is
+    /// partitioned with the rest; everything but the durable write is the
+    /// segment work's, which is why this wants `publish_in_background`.
+    pub adaptive_shape: bool,
     /// How a flush drains level 0 once partitions exist: merge only the
     /// ranges that hold pieces, under the live fences (`true`), or
     /// re-partition everything from every key (`false`, the original), kept
@@ -968,6 +978,7 @@ impl Default for Options {
             flush_schedules: true,
             writer_pins: true,
             publish_in_background: true,
+            adaptive_shape: false,
             recycle_wal: false,
             read_advice: ReadAdvice::default(),
             scan_readahead_bytes: 256 << 10,
@@ -3414,6 +3425,9 @@ struct Slot {
     /// by the accessors, which sum the slots.
     scans: AtomicU64,
     blockpath: AtomicU64,
+    /// Reads and scans this handle made over a store with pieces and no
+    /// partition (`Options::adaptive_shape`).
+    unshaped: AtomicU64,
     takes: AtomicU64,
     tried: AtomicU64,
     hit: AtomicU64,
@@ -3426,6 +3440,7 @@ impl Slot {
             epoch: AtomicU64::new(0),
             scans: AtomicU64::new(0),
             blockpath: AtomicU64::new(0),
+            unshaped: AtomicU64::new(0),
             takes: AtomicU64::new(0),
             tried: AtomicU64::new(0),
             hit: AtomicU64::new(0),
@@ -4717,6 +4732,9 @@ impl Db {}
 /// writer's thread, and the time of each landing and each merge's.
 #[derive(Default)]
 struct SealCounts {
+    /// Reads and scans over a store with pieces and no partition made
+    /// through no handle of a caller's: the writer's own.
+    unshaped: AtomicU64,
     join_wait_ns: AtomicU64,
     drain_wait_ns: AtomicU64,
     publish_ns: AtomicU64,
@@ -7600,6 +7618,9 @@ impl Reader {
         let at = segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
         let part = segs[..np].get(at).filter(|s| s.may_hold(key));
         let l0 = st.pieces_over(np, at);
+        if np == 0 && !segs.is_empty() {
+            self.count_unshaped();
+        }
         // Sources oldest to newest: the partition (0), the level-0 pieces
         // (1..), the frozen memtable, the live one. `start` is the source
         // live values begin at: 0 unless a newer source holds a tombstone
@@ -7901,6 +7922,9 @@ impl Reader {
         // on: before the first partitioning it stands aside.
         let use_cache =
             self.opts.scan_block_cache && self.segs().first().is_some_and(|s| s.level > 0);
+        if self.segs().first().is_some_and(|s| s.level == 0) {
+            self.count_unshaped();
+        }
         if let (true, Some(slot)) = (self.counted, self.slot) {
             let s = &self.shared.readers.slots[slot];
             s.scans.fetch_add(1, AtomicOrdering::Relaxed);
@@ -8719,6 +8743,24 @@ impl Reader {
         self.shared
             .retired_forms
             .sweep(self.shared.readers.oldest_pinned());
+    }
+
+    /// A read or a scan over a store with pieces and no partition, for the
+    /// segment work to partition it by (`Options::adaptive_shape`): on the
+    /// handle's own line, as its other statistics are, and nothing at all
+    /// without the option.
+    fn count_unshaped(&self) {
+        if !self.opts.adaptive_shape {
+            return;
+        }
+        match (self.counted, self.slot) {
+            (true, Some(slot)) => {
+                self.shared.readers.slots[slot]
+                    .unshaped
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            _ => SealCounts::add(&self.shared.seal_counts.unshaped, 1),
+        }
     }
 
     /// One block materialised, charged to whoever built it.
@@ -12265,6 +12307,23 @@ impl Db {
         let _op = self.op();
         self.commit_staged()?;
         self.unsynced = 0;
+        // A store with no partition is one no read path is built for, so
+        // its tail goes to a seal too, and the sync does not wait for the
+        // seal; the segment work partitions what lands as soon as anything
+        // reads it (`Options::adaptive_shape`). With a seal still in
+        // flight the tail stays, since the store has one frozen table: the
+        // sync waited for that seal once, and lost the load most of what
+        // not flushing had won, and the tail it then sealed overlapped the
+        // seal before it, so a merge had to partition what a promotion of
+        // the one piece would have.
+        if self.opts.adaptive_shape
+            && matches!(self.maint, MaintHome::Away(_))
+            && !self.shared.in_seal.load(AtomicOrdering::Acquire)
+            && !self.mem().is_empty()
+            && self.segs().iter().all(|s| s.level == 0)
+        {
+            self.seal()?;
+        }
         Ok(())
     }
 
@@ -15844,6 +15903,9 @@ struct Maint {
     /// and merge threads wake it when they finish, so a finished one is
     /// landed at once rather than at the next seal.
     wake: Option<std::thread::Thread>,
+    /// The reads over an unshaped store counted when the store was last
+    /// shaped (`Options::adaptive_shape`).
+    shaped_at: u64,
 }
 
 impl std::ops::Deref for Maint {
@@ -15880,6 +15942,7 @@ impl Maint {
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
             self.collect();
+            self.shape_if_read();
             std::thread::park_timeout(MAINT_POLL);
         }
         // Closing: whatever was handed over and not landed is joined, as
@@ -15961,6 +16024,45 @@ impl Maint {
         drop(op);
     }
 
+    /// Partition a store with pieces and no partition once anything has
+    /// read it; see `Options::adaptive_shape`. Nothing is in flight when it
+    /// decides, so the pieces it takes are every piece the store has: a
+    /// promotion where they are disjoint, a merge of all of them where not.
+    fn shape_if_read(&mut self) {
+        if !(self.opts.adaptive_shape && self.opts.compact)
+            || self.sealing.is_some()
+            || self.compacting.is_some()
+            || self.tiering.is_some()
+        {
+            return;
+        }
+        let read = self.shared.readers.stat(|s| &s.unshaped)
+            + self
+                .shared
+                .seal_counts
+                .unshaped
+                .load(AtomicOrdering::Relaxed);
+        if read == self.shaped_at {
+            return;
+        }
+        let op = self.op();
+        let segs = self.segs();
+        if segs.is_empty() || segs.iter().any(|s| s.level > 0) {
+            drop(op);
+            return;
+        }
+        let done = match self.promote_unpartitioned() {
+            Ok(true) => Ok(()),
+            Ok(false) => self.start_compact(None),
+            Err(e) => Err(e),
+        };
+        match done {
+            Ok(()) => self.shaped_at = read,
+            Err(e) => self.shared.put_maint_err(e),
+        }
+        drop(op);
+    }
+
     /// Every thread in flight joined and nothing landed: the store is
     /// being dropped, and a seal thread left running would go on mutating
     /// the directory under whoever reopens it.
@@ -15988,6 +16090,7 @@ impl Maint {
             sealing: None,
             flush_merge: false,
             wake: None,
+            shaped_at: 0,
         }
     }
 

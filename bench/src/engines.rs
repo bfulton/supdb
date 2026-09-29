@@ -420,6 +420,9 @@ pub struct Supdb {
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
+    /// A store with no partitions partitioned once it is read,
+    /// `Options::adaptive_shape`. `supdb-ingestshape`.
+    shape: bool,
 }
 
 /// What an arm differs from `supdb` by. One struct rather than a row of
@@ -510,6 +513,9 @@ struct Policy {
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
+    /// A store with no partitions partitioned once it is read,
+    /// `Options::adaptive_shape`. `supdb-ingestshape`.
+    shape: bool,
 }
 
 impl Default for Policy {
@@ -531,6 +537,7 @@ impl Default for Policy {
             l0: None,
             nopin: false,
             inlinemaint: false,
+            shape: false,
             aheadmin: None,
             lazyforms: false,
             eager: None,
@@ -610,6 +617,23 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 inlinemaint: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// EXPERIMENT: `supdb-ingestsync` -- `sync` the durable write, with
+    /// the tail of a store no partition was made for handed to a seal it
+    /// does not wait for -- and the store partitioned by the segment work
+    /// once anything reads it (`Options::adaptive_shape`).
+    pub fn create_ingest_shape(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                drain: false,
+                durable: false,
+                shape: true,
                 ..Policy::default()
             },
         )
@@ -1110,6 +1134,7 @@ impl Supdb {
             l0,
             nopin,
             inlinemaint,
+            shape,
             aheadmin,
             lazyforms,
             eager,
@@ -1237,6 +1262,7 @@ impl Supdb {
             l0_trigger: l0.unwrap_or(supdb::Options::default().l0_trigger),
             writer_pins: !nopin,
             publish_in_background: !inlinemaint,
+            adaptive_shape: shape,
             // Below this the builder declines and the writer fills the
             // forms inline on the commit path instead, which is the
             // comparison the threshold was never measured against.
@@ -1279,6 +1305,7 @@ impl Supdb {
             l0,
             nopin,
             inlinemaint,
+            shape,
             aheadmin,
             lazyforms,
             eager,
@@ -1431,6 +1458,9 @@ impl Engine for Supdb {
         }
         if self.nopin {
             return "supdb-nopin";
+        }
+        if self.shape {
+            return "supdb-ingestshape";
         }
         if self.inlinemaint {
             return if self.partition {
@@ -1999,7 +2029,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "supdb-inlinemaint"
         | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "supdb-ingestleave" | "supdb-ingestnoseal" | "supdb-ingestsync"
-        | "supdb-ingestinline" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
+        | "supdb-ingestinline" | "supdb-ingestshape" | "lmdb-nosync" | "rocksdb-nosync" => {
+            Guarantee::Buffered
+        }
         _ => return None,
     })
 }
@@ -2044,6 +2076,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-inlinemaint" => Box::new(Supdb::create_inlinemaint(dir)?),
         "supdb-ingestinline" => Box::new(Supdb::create_ingest_inline(dir)?),
         "supdb-ingestsync" => Box::new(Supdb::create_ingest_sync(dir)?),
+        "supdb-ingestshape" => Box::new(Supdb::create_ingest_shape(dir)?),
         "supdb-ingestnoseal" => Box::new(Supdb::create_ingest_noseal(dir)?),
         "lmdb" => Box::new(Lmdb::create(dir, map_gb)?),
         "lmdb-nosync" => Box::new(Lmdb::create_nosync(dir, map_gb)?),

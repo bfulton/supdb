@@ -3669,6 +3669,117 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
     assert_eq!(n, 3000);
 }
 
+/// An ordered load a `sync` only makes durable is left in its direct run,
+/// unpartitioned; with `Options::adaptive_shape` the sync hands the run to
+/// a seal as well, and the first scans through a handle have the piece
+/// promoted to a partition while the writer makes no call at all.
+#[test]
+fn a_durable_only_sync_leaves_an_unpartitioned_store_a_partition() {
+    let d = dir("adaptive-shape-sync");
+    let mut db = Db::create(
+        &d,
+        Options {
+            adaptive_shape: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let n = 30_000u32;
+    let val = |i: u32| {
+        let mut v = i.to_le_bytes().to_vec();
+        v.extend_from_slice(&[b'x'; 100]);
+        v
+    };
+    for i in 0..n {
+        db.append(format!("k{i:08}").as_bytes(), &val(i));
+        if i % 1000 == 999 {
+            db.commit().unwrap();
+        }
+    }
+    db.sync().unwrap();
+    db.settle().unwrap();
+    assert_eq!(db.levels(), (0, 1), "the sync sealed the run as one piece");
+    let r = db.reader().unwrap();
+    let t = std::time::Instant::now();
+    let mut scans = 0u64;
+    while db.levels().0 == 0 && t.elapsed() < std::time::Duration::from_secs(20) {
+        let from = format!("k{:08}", (scans * 131) % n as u64);
+        r.scan(from.as_bytes(), 100, |_, _| {}).unwrap();
+        scans += 1;
+    }
+    assert_eq!(
+        db.levels(),
+        (1, 0),
+        "{scans} scans and the piece was not promoted"
+    );
+    for i in (0..n).step_by(97) {
+        assert_eq!(read_vec(&r, format!("k{i:08}").as_bytes()), vec![val(i)]);
+    }
+    drop(r);
+    db.close().unwrap();
+}
+
+/// Overlapping pieces a promotion cannot partition are merged once the
+/// store is read, and not before: left unread, the store stays as it is.
+#[test]
+fn overlapping_pieces_are_merged_once_the_store_is_read() {
+    let d = dir("adaptive-shape-merge");
+    // Seals small enough to leave several pieces, and a trigger that
+    // never fires, so only the reads start the merge.
+    let mut db = Db::create(
+        &d,
+        Options {
+            adaptive_shape: true,
+            seal_bytes: 512 << 10,
+            l0_trigger: 100,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let n = 20_000u64;
+    let val = |i: u64| {
+        let mut v = i.to_le_bytes().to_vec();
+        v.extend_from_slice(&[b'x'; 100]);
+        v
+    };
+    // Shuffled, so every piece spans the key space.
+    let key = |i: u64| format!("k{:08}", (i * 7919) % n);
+    for i in 0..n {
+        db.append(key(i).as_bytes(), &val((i * 7919) % n));
+        if i % 1000 == 999 {
+            db.commit().unwrap();
+        }
+    }
+    db.sync().unwrap();
+    db.settle().unwrap();
+    let pieces = db.levels().1;
+    assert!(
+        pieces >= 2,
+        "the load leaves {pieces} pieces; the test wants several"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(
+        db.levels().0,
+        0,
+        "nothing was read, and the store was merged anyway"
+    );
+    let r = db.reader().unwrap();
+    let t = std::time::Instant::now();
+    let mut scans = 0u64;
+    while db.levels().0 == 0 && t.elapsed() < std::time::Duration::from_secs(20) {
+        let from = format!("k{:08}", (scans * 131) % n);
+        r.scan(from.as_bytes(), 100, |_, _| {}).unwrap();
+        scans += 1;
+    }
+    assert!(db.levels().0 > 0, "{scans} scans and nothing was merged");
+    db.settle().unwrap();
+    for i in (0..n).step_by(97) {
+        assert_eq!(read_vec(&r, format!("k{i:08}").as_bytes()), vec![val(i)]);
+    }
+    drop(r);
+    db.close().unwrap();
+}
+
 /// A seal lands without the writer: with the segment work on a thread of
 /// its own, the frozen table's segment is published, and a handle reads
 /// it, while the writer makes no call at all. Before it, a finished seal

@@ -2338,6 +2338,96 @@ unmerged burst holding past the same number of writes; whether the
 burst keeps its win then is the next thing to price, not a thing this
 section knows.
 
+#### The segment work on a thread of its own
+
+A seal's landing, the merges and piece merges, the promotions, the
+manifest and the WAL's retirement run on a thread of the store's own
+(`Options::publish_in_background`), publishing by compare-and-swap
+beside the writer's freezes; `supdb-inlinemaint` and
+`supdb-ingestinline` keep the writer driving them. The writer hands a
+seal over and returns, and waits only when it would seal again before
+the last seal had landed.
+
+Priced in one process, twelve pairs a rung at ten thousand, a hundred
+thousand and three hundred thousand keys, on both the durable arm and
+the buffered one, nothing timed moved: no quantity held under Holm in
+any of the six tables, and the marks that fell below it were fewer than
+a coin's. The buffered arm at three hundred thousand read the
+four-thread scan pass at 0.76x on two of twelve pairs; twenty-four pairs
+read it at 1.14x the other way, on sixteen. The seal and publish counts
+match to the pair. The move buys the writer nothing the suite can see,
+because the landing it took off the writer's thread was never where the
+writer's time went: the buffered arm's ycsb-F, the mix the cadence sweep
+found paying for seals, read the same with the landing moved. What it
+buys is the store's: a seal that finishes while the writer is away is
+published, where before it waited for the writer's next commit, seal or
+flush.
+
+One count separated the arms on every pair: the forms held at the end of
+a pass, about one in a hundred fewer with the thread, at identical
+bytes. Counted by kind, every one of the difference was a marker -- the
+empty wide form that tells a reader to build the block itself -- on a
+table trusted and complete in both arms, over the same partitions and
+pieces. A null slot there reads as a clean block, so the question was
+whether the thread left a clean reading where a build was owed. It did
+not: a fresh handle's scan of the whole store at the pass's end took
+three thousand published forms, built one block, and matched the
+writer's own scan entry for entry, in both arms, at both rungs checked.
+The blocks the thread leaves null are clean; inline carries about a
+hundred markers on clean blocks, which ask a reader for more than those
+blocks need and lose nothing. What leaves them there inline is not
+traced.
+
+#### A sync that is only the durable write
+
+The suite's supdb arms flush at `sync`: the tail sealed, the seal waited
+for, the store partitioned, all inside the load window, so the read
+passes after it answer from routed segments. `supdb-ingestsync` makes
+`sync` the durable write and nothing more. With the landing on a thread
+of its own a finished seal no longer waits for the writer, so the
+question is what else a store left that way lacks. Against the flushing
+buffered arm, twelve pairs a rung: the ordered load 1.6-2.4x and the
+shuffled one 2.6-3.1x, ycsb-F up to 2.4x, and every read pass behind --
+point reads 0.5-0.78x, scans 0.1-0.32x, the lag sweep 0.03-0.14x, ycsb-E
+0.13-0.19x. The counts say why: after such a sync the store has no
+partition at any rung, so no scan takes the block path at all, and what
+pieces it has sit under the merge trigger; an ordered load is often not
+even pieces, but one direct run still open, which only the writer can
+close.
+
+`Options::adaptive_shape` (`supdb-ingestshape`) gives that store two
+things, neither of which the caller waits for. A sync over a store with
+no partition hands its tail to a seal; and the segment work partitions a
+store that has pieces and no partition as soon as anything reads it --
+by promotion where the pieces are disjoint, by a merge of all of them
+where not. A partitioning happens once in a store's life, so waiting
+while the store is read gains nothing, and a store no one reads still
+waits for the trigger. A first version priced the merge against the
+scans' merge-path time at the store's measured write rate, and bought it
+too late for any pass to see; a second let the sync wait for a seal
+already in flight so as to seal the tail behind it, which gave the load
+back most of what not flushing had won, and made the tail a second piece
+overlapping the first, so that what one promotion would have partitioned
+took a merge. A sync that finds a seal in flight leaves the tail.
+
+The load keeps its gain -- 1.6-2.4x ordered, 2.5-3.7x shuffled -- and
+the passes over the ordered store come most of the way back: the first
+point-read pass 0.63-0.81x, the scan passes 0.72-1.06x, the mixes level
+at a hundred thousand. The lag sweep does not: 0.03-0.1x at every rung.
+Timed, most of that is one seal. The shuffled load's last threshold
+seal, most of the store at three hundred thousand keys, is in flight
+when the load's sync and the sweep's first sync both run; it takes 0.75
+s, and until it lands the sweep scans a frozen memtable on the merge
+path, about 100 us a scan of a hundred where the block path takes 3. The
+flushing arm pays the same seal inside its load window, which is its
+shuffled load's 3.7x. The sweep's last point runs after the store is
+partitioned and reads 0.08-0.09x at ten and three hundred thousand keys
+all the same, where a hundred thousand reads 0.85x; that is not
+explained here. That is the trade a sync that only makes the store
+durable offers, stated in this suite's terms: the load is faster by the
+work it no longer waits for, and the reads that follow within that
+work's duration pay for it instead.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and
