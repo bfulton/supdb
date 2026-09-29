@@ -417,6 +417,9 @@ pub struct Supdb {
     /// The writer's operations pin nothing and hold no state, as before
     /// `Options::writer_pins`. `supdb-nopin`.
     nopin: bool,
+    /// The segment work driven inline by the writer, as before
+    /// `Options::publish_in_background`. `supdb-inlinemaint`.
+    inlinemaint: bool,
 }
 
 /// What an arm differs from `supdb` by. One struct rather than a row of
@@ -504,6 +507,9 @@ struct Policy {
     /// The writer's operations pin nothing and hold no state, as before
     /// `Options::writer_pins`. `supdb-nopin`.
     nopin: bool,
+    /// The segment work driven inline by the writer, as before
+    /// `Options::publish_in_background`. `supdb-inlinemaint`.
+    inlinemaint: bool,
 }
 
 impl Default for Policy {
@@ -524,6 +530,7 @@ impl Default for Policy {
             sealcap: None,
             l0: None,
             nopin: false,
+            inlinemaint: false,
             aheadmin: None,
             lazyforms: false,
             eager: None,
@@ -589,6 +596,20 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 leave: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` with the segment work driven inline by the writer,
+    /// as before `Options::publish_in_background`.
+    pub fn create_ingest_inline(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                inlinemaint: true,
                 ..Policy::default()
             },
         )
@@ -966,6 +987,19 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with the segment work driven inline by the writer, as
+    /// before `Options::publish_in_background`: against `supdb` it prices
+    /// the thread that lands the seals and merges.
+    pub fn create_inlinemaint(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                inlinemaint: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` maintaining the forms whoever is reading, as `supdb-forms`
     /// does, but stopping where too much of the store is unsealed. The pair
     /// against `supdb` says whether the regime's 3.19x on the lag sweep can
@@ -1075,6 +1109,7 @@ impl Supdb {
             sealcap,
             l0,
             nopin,
+            inlinemaint,
             aheadmin,
             lazyforms,
             eager,
@@ -1201,6 +1236,7 @@ impl Supdb {
             seal_max_pct: sealcap.unwrap_or(base_seal_max_pct),
             l0_trigger: l0.unwrap_or(supdb::Options::default().l0_trigger),
             writer_pins: !nopin,
+            publish_in_background: !inlinemaint,
             // Below this the builder declines and the writer fills the
             // forms inline on the commit path instead, which is the
             // comparison the threshold was never measured against.
@@ -1242,6 +1278,7 @@ impl Supdb {
             sealcap,
             l0,
             nopin,
+            inlinemaint,
             aheadmin,
             lazyforms,
             eager,
@@ -1394,6 +1431,13 @@ impl Engine for Supdb {
         }
         if self.nopin {
             return "supdb-nopin";
+        }
+        if self.inlinemaint {
+            return if self.partition {
+                "supdb-inlinemaint"
+            } else {
+                "supdb-ingestinline"
+            };
         }
         if self.sealcap.is_some() && !self.partition {
             return "supdb-ingestnoseal";
@@ -1952,10 +1996,10 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-lazysnap" | "supdb-fullrec" | "supdb-norebase" | "supdb-sealfile"
         | "supdb-settleall" | "supdb-inline" | "supdb-tier" | "supdb-runs" | "supdb-keeper"
         | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice"
-        | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "lmdb"
-        | "rocksdb-tuned" => Guarantee::Durable,
+        | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "supdb-inlinemaint"
+        | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest" | "supdb-ingestleave" | "supdb-ingestnoseal" | "supdb-ingestsync"
-        | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
+        | "supdb-ingestinline" | "lmdb-nosync" | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
     })
 }
@@ -1997,6 +2041,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestleave" => Box::new(Supdb::create_ingest_leave(dir)?),
         "supdb-l0" => Box::new(Supdb::create_l0(dir)?),
         "supdb-nopin" => Box::new(Supdb::create_nopin(dir)?),
+        "supdb-inlinemaint" => Box::new(Supdb::create_inlinemaint(dir)?),
+        "supdb-ingestinline" => Box::new(Supdb::create_ingest_inline(dir)?),
         "supdb-ingestsync" => Box::new(Supdb::create_ingest_sync(dir)?),
         "supdb-ingestnoseal" => Box::new(Supdb::create_ingest_noseal(dir)?),
         "lmdb" => Box::new(Lmdb::create(dir, map_gb)?),

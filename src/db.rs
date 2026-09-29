@@ -397,6 +397,13 @@ pub struct Options {
     /// without freeing or swapping a state under the writer. `false` is
     /// the shape before it, kept to price it.
     pub writer_pins: bool,
+    /// EXPERIMENT: the store's segment work (`Maint`) -- a seal's
+    /// landing, the merges, the promotions, the manifest and the WAL
+    /// retirement -- runs on a thread of its own and publishes from there,
+    /// so a commit joins nothing and a seal's publish is off the writer's
+    /// thread. `false` is the shape before it: the writer drives the same
+    /// work inline, at its commits, seals and flushes.
+    pub publish_in_background: bool,
     /// How a flush drains level 0 once partitions exist: merge only the
     /// ranges that hold pieces, under the live fences (`true`), or
     /// re-partition everything from every key (`false`, the original), kept
@@ -960,6 +967,7 @@ impl Default for Options {
             promote: true,
             flush_schedules: true,
             writer_pins: true,
+            publish_in_background: true,
             recycle_wal: false,
             read_advice: ReadAdvice::default(),
             scan_readahead_bytes: 256 << 10,
@@ -1544,6 +1552,18 @@ struct Seg {
 /// sealed before the first partitioning has the empty fence, as the
 /// pieces aligned to the first partition do, and it is the sequence that
 /// puts it before them.
+/// Whether the range `[a_lo, a_hi)` meets `[b_lo, b_hi)`; `None` is open.
+fn fences_overlap(
+    a_lo: &[u8],
+    a_hi: &Option<Vec<u8>>,
+    b_lo: &[u8],
+    b_hi: &Option<Vec<u8>>,
+) -> bool {
+    let below = b_hi.as_ref().is_some_and(|h| a_lo >= h.as_slice());
+    let above = a_hi.as_ref().is_some_and(|h| h.as_slice() <= b_lo);
+    !below && !above
+}
+
 fn seg_order(a: &Seg, b: &Seg) -> Ordering {
     b.level
         .cmp(&a.level)
@@ -4680,6 +4700,38 @@ impl Db {}
 /// final drain a `flush` performs (`drain_wait_ns`), and how much was
 /// publishing the manifest with its two barriers (`publish_ns`). `joins`
 /// counts seals joined.
+/// `SealWaits` counted where the segment work runs, which may not be the
+/// writer's thread, and the time of each landing and each merge's.
+#[derive(Default)]
+struct SealCounts {
+    join_wait_ns: AtomicU64,
+    drain_wait_ns: AtomicU64,
+    publish_ns: AtomicU64,
+    blocked_joins: AtomicU64,
+    joins: AtomicU64,
+    publishes: AtomicU64,
+    seal_ns: AtomicU64,
+    merge_ns: AtomicU64,
+}
+
+impl SealCounts {
+    fn waits(&self) -> SealWaits {
+        let get = |a: &AtomicU64| a.load(AtomicOrdering::Relaxed);
+        SealWaits {
+            join_wait_ns: get(&self.join_wait_ns),
+            drain_wait_ns: get(&self.drain_wait_ns),
+            publish_ns: get(&self.publish_ns),
+            blocked_joins: get(&self.blocked_joins),
+            joins: get(&self.joins),
+            publishes: get(&self.publishes),
+        }
+    }
+
+    fn add(a: &AtomicU64, v: u64) {
+        a.fetch_add(v, AtomicOrdering::Relaxed);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SealWaits {
     pub join_wait_ns: u64,
@@ -5453,6 +5505,20 @@ struct Shared {
     /// The next segment id: the writer's seals and the segment work's
     /// merges draw from one counter.
     next_seg: AtomicU64,
+    /// What the segment work did, wherever it runs: see `SealWaits`, and
+    /// the nanoseconds of each landing and each merge's landing.
+    seal_counts: SealCounts,
+    /// A seal handed to the segment work and not yet landed, and a merge
+    /// in flight: what `Db::in_flight` answers, and what the writer waits
+    /// on before its next freeze.
+    in_seal: std::sync::atomic::AtomicBool,
+    in_merge: std::sync::atomic::AtomicBool,
+    /// An error of the segment work's, for the writer's next commit to
+    /// return: one slot, the first error kept.
+    maint_err: AtomicPtr<std::io::Error>,
+    /// The store is closing: the segment work's thread joins what is in
+    /// flight and lands nothing more, as a writer dropped mid-seal did.
+    maint_stop: std::sync::atomic::AtomicBool,
     /// A retired WAL renamed to a spare for the writer's next rotation
     /// (`Options::recycle_wal`), or null: offered by the segment work once
     /// the manifest covers the WAL, taken by the writer. One slot and a
@@ -5516,6 +5582,7 @@ impl Drop for Shared {
             drop(unsafe { Box::from_raw(p) });
         }
         drop(self.take_spare());
+        drop(self.take_maint_err());
     }
 }
 
@@ -5538,6 +5605,33 @@ impl Shared {
             let spare = unsafe { Box::from_raw(p) };
             let _ = std::fs::remove_file(*spare);
         }
+    }
+
+    /// `e` kept for the writer's next commit, unless an error is waiting.
+    fn put_maint_err(&self, e: std::io::Error) {
+        let p = Box::into_raw(Box::new(e));
+        if self
+            .maint_err
+            .compare_exchange(
+                std::ptr::null_mut(),
+                p,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            )
+            .is_err()
+        {
+            // SAFETY: never published, still this call's.
+            drop(unsafe { Box::from_raw(p) });
+        }
+    }
+
+    /// The segment work's error, if one is waiting.
+    fn take_maint_err(&self) -> Option<std::io::Error> {
+        let p = self
+            .maint_err
+            .swap(std::ptr::null_mut(), AtomicOrdering::AcqRel);
+        // SAFETY: put by `put_maint_err`, and the swap made it this call's.
+        (!p.is_null()).then(|| *unsafe { Box::from_raw(p) })
     }
 
     /// The spare waiting, if one is.
@@ -5821,8 +5915,9 @@ impl FormsCell {
 
 pub struct Db {
     r: Reader,
-    /// The store's segment work, driven from here; see `Maint`.
-    maint: Maint,
+    /// The store's segment work, driven from here or on its own thread;
+    /// see `Maint`.
+    maint: MaintHome,
     dir: PathBuf,
     wal: Wal,
     wal_id: u64,
@@ -11080,6 +11175,11 @@ impl Db {
             snap_extends: AtomicU64::new(0),
             keeper_thread: std::sync::OnceLock::new(),
             next_seg: AtomicU64::new(next_seg),
+            seal_counts: SealCounts::default(),
+            in_seal: std::sync::atomic::AtomicBool::new(false),
+            in_merge: std::sync::atomic::AtomicBool::new(false),
+            maint_err: AtomicPtr::new(std::ptr::null_mut()),
+            maint_stop: std::sync::atomic::AtomicBool::new(false),
             spare_wal: AtomicPtr::new(spare_wal),
             keeper_seq: AtomicU64::new(0),
             keeper_done: AtomicU64::new(0),
@@ -11110,8 +11210,8 @@ impl Db {
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
         };
-        let maint = Maint::new(r.maint_reader()?, dir, 0, Vec::new());
-        Ok(Db {
+        let maint = MaintHome::Here(Box::new(Maint::new(r.maint_reader()?, dir, 0, Vec::new())));
+        let mut db = Db {
             r,
             maint,
             dir: dir.to_path_buf(),
@@ -11133,7 +11233,9 @@ impl Db {
             unsynced: 0,
             phase_ns: [0; 3],
             draining: false,
-        })
+        };
+        db.go_away()?;
+        Ok(db)
     }
 
     /// Open from the directory alone. Segments are complete by construction
@@ -11388,6 +11490,11 @@ impl Db {
             snap_extends: AtomicU64::new(0),
             keeper_thread: std::sync::OnceLock::new(),
             next_seg: AtomicU64::new(next_seg),
+            seal_counts: SealCounts::default(),
+            in_seal: std::sync::atomic::AtomicBool::new(false),
+            in_merge: std::sync::atomic::AtomicBool::new(false),
+            maint_err: AtomicPtr::new(std::ptr::null_mut()),
+            maint_stop: std::sync::atomic::AtomicBool::new(false),
             spare_wal: AtomicPtr::new(spare_wal),
             keeper_seq: AtomicU64::new(0),
             keeper_done: AtomicU64::new(0),
@@ -11418,8 +11525,13 @@ impl Db {
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
         };
-        let maint = Maint::new(r.maint_reader()?, dir, sealed, retiring);
-        Ok(Db {
+        let maint = MaintHome::Here(Box::new(Maint::new(
+            r.maint_reader()?,
+            dir,
+            sealed,
+            retiring,
+        )));
+        let mut db = Db {
             r,
             maint,
             dir: dir.to_path_buf(),
@@ -11441,7 +11553,9 @@ impl Db {
             unsynced: 0,
             phase_ns: [0; 3],
             draining: false,
-        })
+        };
+        db.go_away()?;
+        Ok(db)
     }
 
     /// Buffered until `commit`; visible to this handle's reads immediately,
@@ -11605,6 +11719,9 @@ impl Db {
         if let Some(e) = self.pending_err.take() {
             return Err(e);
         }
+        if let Some(e) = self.shared.take_maint_err() {
+            return Err(e);
+        }
         let t = std::time::Instant::now();
         let background = matches!(self.opts.upkeep, Upkeep::Background(_));
         if self.mem().ordered {
@@ -11616,7 +11733,7 @@ impl Db {
             // The upkeep handed over before the barrier, so the thread
             // works while the device syncs -- unless a seal is to be
             // joined, whose publish would take it straight back.
-            if background && !self.maint.sealing.as_ref().is_some_and(|h| h.is_finished()) {
+            if background && !self.seal_finished() {
                 self.hand_over_upkeep();
             }
             self.unsynced += 1;
@@ -11640,19 +11757,13 @@ impl Db {
         // commit's check or the ninth. The fill is the maintenance's
         // own, under its regime: a batch at the settle bound fills, and
         // a publish makes nothing due that a scan has not.
-        if self.maint.sealing.as_ref().is_some_and(|h| h.is_finished()) {
+        if self.seal_finished() {
             self.with_maint(|m| m.join_seal(false))?;
         }
         // The merge a flush handed to the background, published at the
         // first commit after it finishes, and before the maintenance for
         // the seal's reason above.
-        if self.maint.flush_merge
-            && self
-                .maint
-                .compacting
-                .as_ref()
-                .is_some_and(|(_, h)| h.is_finished())
-        {
+        if self.flush_merge_finished() {
             self.with_maint(|m| m.join_compact())?;
         }
         if background {
@@ -11711,7 +11822,7 @@ impl Db {
             return Ok(());
         }
         if self.direct.is_none() {
-            let id = self.maint.alloc_segs(1);
+            let id = self.shared.next_seg.fetch_add(1, AtomicOrdering::Relaxed);
             let tmp = self.dir.join(format!("direct-{id:08}.tmp"));
             let _ = std::fs::remove_file(&tmp);
             let opts = Db::segment_opts(&self.opts);
@@ -11773,8 +11884,7 @@ impl Db {
             self.set_mem(std::sync::Arc::new(MemTable::new()));
             return Ok(());
         };
-        let draining = self.draining;
-        self.with_maint(|m| m.join_seal(draining))?;
+        self.land_seal()?;
         debug_assert_eq!(
             self.mem().len(),
             d.committed,
@@ -11799,8 +11909,8 @@ impl Db {
         let first_partition = self.seals_first_partition();
         let limit = self.partition_limit();
         let (id, seq) = (d.id, end_seq);
-        self.maint.retiring_tmps.push(tmp.clone());
-        self.maint.sealing = Some(std::thread::spawn(move || {
+        let retiring = tmp.clone();
+        let job = move || -> Result<Vec<String>> {
             let tombs = w.tombs();
             let ord = w
                 .finish()
@@ -11817,7 +11927,8 @@ impl Db {
             // sync here as well was one more device round trip a drain
             // waited for.
             Ok(vec![name])
-        }));
+        };
+        self.hand_seal(job, None, Some(retiring));
         Ok(())
     }
 
@@ -11845,8 +11956,7 @@ impl Db {
         if self.mem().is_empty() {
             return Ok(());
         }
-        let draining = self.draining;
-        self.with_maint(|m| m.join_seal(draining))?;
+        self.land_seal()?;
         let frozen = self.freeze();
         self.mem_bytes = 0;
         let new_wal = self.next_wal(self.wal_id + 1)?;
@@ -11869,19 +11979,22 @@ impl Db {
             .filter(|s| s.level > 0)
             .map(|s| (s.lo.clone(), s.hi.clone()))
             .collect();
-        let first_id = self.maint.alloc_segs(fences.len().max(1) as u64);
+        let first_id = self
+            .shared
+            .next_seg
+            .fetch_add(fences.len().max(1) as u64, AtomicOrdering::Relaxed);
         let dir = self.dir.clone();
         let opts = Db::segment_opts(&self.opts);
         let background_io = self.opts.background_io;
         let sync_every = self.opts.seal_sync_every;
         let inline_max = self.opts.inline_bytes;
         let end_seq = old_wal.seq;
-        self.maint.retiring_wals.push(old_wal.path.clone());
+        let retiring = old_wal.path.clone();
         drop(old_wal);
         let first_partition = self.seals_first_partition();
         let limit = self.partition_limit();
         let mem = frozen.clone();
-        self.maint.sealing = Some(std::thread::spawn(move || {
+        let job = move || -> Result<Vec<String>> {
             if background_io == BackgroundIo::Idle {
                 idle_io_priority();
             }
@@ -11964,7 +12077,8 @@ impl Db {
             // The directory's entries are made durable by the publish that
             // names the segments in the manifest, before the WAL retires.
             Ok(names)
-        }));
+        };
+        self.hand_seal(job, Some(retiring), None);
         Ok(())
     }
 
@@ -12027,11 +12141,7 @@ impl Db {
         // The upkeep first: every join after it touches the writer's
         // upkeep, and a touch takes it back from the thread untouched.
         self.join_upkeep();
-        self.with_maint(|m| {
-            m.join_seal(false)?;
-            m.join_compact()?;
-            m.join_tier()
-        })?;
+        self.maint_request(MaintAsk::Settle)?;
         self.join_ahead();
         self.settle_keeper();
         Ok(())
@@ -12063,10 +12173,9 @@ impl Db {
         self.draining = true;
         let sealed = self
             .seal()
-            .and_then(|_| self.with_maint(|m| m.join_seal(true)));
+            .and_then(|_| self.maint_request(MaintAsk::Drain));
         self.draining = false;
-        sealed?;
-        self.with_maint(|m| m.drain())
+        sealed
     }
 
     /// The state the writer's operation holds moved to whatever is
@@ -12736,6 +12845,160 @@ impl Db {
         Op(&self.r)
     }
 
+    /// The segment work moved to a thread of its own where the options
+    /// ask (`Options::publish_in_background`).
+    fn go_away(&mut self) -> Result<()> {
+        if !self.opts.publish_in_background || !matches!(self.maint, MaintHome::Here(_)) {
+            return Ok(());
+        }
+        let home = std::mem::replace(
+            &mut self.maint,
+            MaintHome::Away(MaintAway {
+                tx: None,
+                thread: None,
+                handle: None,
+            }),
+        );
+        let MaintHome::Here(m) = home else {
+            unreachable!("checked above")
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("supdb-maint".into())
+            .spawn(move || m.run(rx))?;
+        self.maint = MaintHome::Away(MaintAway {
+            tx: Some(tx),
+            thread: Some(handle.thread().clone()),
+            handle: Some(handle),
+        });
+        Ok(())
+    }
+
+    /// Whether an inline seal has finished and waits to be landed; the
+    /// thread of its own lands its seals itself.
+    fn seal_finished(&self) -> bool {
+        match &self.maint {
+            MaintHome::Here(m) => m.sealing.as_ref().is_some_and(|h| h.is_finished()),
+            MaintHome::Away(_) => false,
+        }
+    }
+
+    /// Whether the merge an inline flush scheduled has finished and waits
+    /// to be landed; see `Maint::drain`.
+    fn flush_merge_finished(&self) -> bool {
+        match &self.maint {
+            MaintHome::Here(m) => {
+                m.flush_merge && m.compacting.as_ref().is_some_and(|(_, h)| h.is_finished())
+            }
+            MaintHome::Away(_) => false,
+        }
+    }
+
+    /// The seal in flight landed before the next freeze, which needs the
+    /// frozen slot empty: joined inline, or waited for where the segment
+    /// work is away -- the writer's backpressure, as the join was.
+    fn land_seal(&mut self) -> Result<()> {
+        let draining = self.draining;
+        if matches!(self.maint, MaintHome::Here(_)) {
+            return self.with_maint(|m| m.join_seal(draining));
+        }
+        let t = std::time::Instant::now();
+        let mut waited = false;
+        while self.shared.in_seal.load(AtomicOrdering::Acquire) {
+            if let Some(e) = self.shared.take_maint_err() {
+                return Err(e);
+            }
+            waited = true;
+            std::thread::park_timeout(MAINT_LAND_POLL);
+        }
+        if let Some(e) = self.shared.take_maint_err() {
+            return Err(e);
+        }
+        if waited {
+            let c = &self.shared.seal_counts;
+            let ns = t.elapsed().as_nanos() as u64;
+            if draining {
+                SealCounts::add(&c.drain_wait_ns, ns);
+            } else {
+                SealCounts::add(&c.join_wait_ns, ns);
+                SealCounts::add(&c.blocked_joins, 1);
+            }
+        }
+        self.rehold();
+        Ok(())
+    }
+
+    /// A seal's work started on a thread of its own and handed to the
+    /// segment work to land, with the WAL and the temp name its landing
+    /// retires.
+    fn hand_seal(
+        &mut self,
+        job: impl FnOnce() -> Result<Vec<String>> + Send + 'static,
+        wal: Option<PathBuf>,
+        tmp: Option<PathBuf>,
+    ) {
+        let draining = self.draining;
+        let wake = match &self.maint {
+            MaintHome::Away(a) => a.thread.clone(),
+            MaintHome::Here(_) => None,
+        };
+        let handle = std::thread::spawn(move || {
+            let out = job();
+            if let Some(t) = wake {
+                t.unpark();
+            }
+            out
+        });
+        self.shared.in_seal.store(true, AtomicOrdering::Release);
+        match &mut self.maint {
+            MaintHome::Here(m) => {
+                m.sealing = Some(handle);
+                m.retiring_wals.extend(wal);
+                m.retiring_tmps.extend(tmp);
+            }
+            MaintHome::Away(a) => {
+                if let Some(tx) = &a.tx {
+                    let _ = tx.send(MaintJob::Seal {
+                        handle,
+                        wal,
+                        tmp,
+                        draining,
+                    });
+                }
+                if let Some(t) = &a.thread {
+                    t.unpark();
+                }
+            }
+        }
+    }
+
+    /// `ask` answered by the segment work, inline or on its thread, and
+    /// the writer's held state moved to what it published.
+    fn maint_request(&mut self, ask: MaintAsk) -> Result<()> {
+        let rx = match &mut self.maint {
+            MaintHome::Here(_) => return self.with_maint(|m| m.answer(ask)),
+            MaintHome::Away(a) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                if let Some(jobs) = &a.tx {
+                    let _ = jobs.send(MaintJob::Ask(ask, tx));
+                }
+                if let Some(t) = &a.thread {
+                    t.unpark();
+                }
+                rx
+            }
+        };
+        let answered = rx
+            .recv()
+            .unwrap_or_else(|_| Err(err("the store's segment work has stopped")));
+        self.rehold();
+        if let Some(e) = self.shared.take_maint_err() {
+            answered?;
+            return Err(e);
+        }
+        answered
+    }
+
     /// `f` run on the store's segment work, inline: the writer's upkeep
     /// and builder brought home first where the writer does not pin
     /// (`Options::writer_pins`), since without its pins every publish had
@@ -12746,8 +13009,11 @@ impl Db {
             self.take_back_upkeep();
             self.stop_ahead();
         }
-        let op = self.maint.op();
-        let out = f(&mut self.maint);
+        let MaintHome::Here(m) = &mut self.maint else {
+            unreachable!("the segment work is inline where the writer drives it")
+        };
+        let op = m.op();
+        let out = f(m);
         drop(op);
         if !self.r.held.load(AtomicOrdering::Relaxed).is_null() {
             let p = self.shared.state.load(AtomicOrdering::Acquire);
@@ -12757,25 +13023,30 @@ impl Db {
     }
 
     pub fn phase_ns(&self) -> (u64, u64, u64) {
-        (self.phase_ns[0], self.maint.seal_ns, self.maint.merge_ns)
+        let c = &self.shared.seal_counts;
+        (
+            self.phase_ns[0],
+            c.seal_ns.load(AtomicOrdering::Relaxed),
+            c.merge_ns.load(AtomicOrdering::Relaxed),
+        )
     }
 
     /// The seal phase decomposed; see `SealWaits`.
     pub fn seal_waits(&self) -> SealWaits {
-        self.maint.seal_wait
+        self.shared.seal_counts.waits()
     }
 
     pub fn segments(&self) -> usize {
         let _op = self.op();
-        self.segs().len() + usize::from(self.maint.sealing.is_some())
+        self.segs().len() + usize::from(self.shared.in_seal.load(AtomicOrdering::Acquire))
     }
 
     /// Whether a seal and a merge are running right now. A crash experiment
     /// records the state it died in with these.
     pub fn in_flight(&self) -> (bool, bool) {
         (
-            self.maint.sealing.is_some(),
-            self.maint.compacting.is_some(),
+            self.shared.in_seal.load(AtomicOrdering::Acquire),
+            self.shared.in_merge.load(AtomicOrdering::Acquire),
         )
     }
 
@@ -15157,6 +15428,52 @@ impl<'s> BuildCtx<'s> {
     }
 }
 
+/// Where the store's segment work runs: inline, driven by the writer's
+/// commits, seals and flushes, or on a thread of its own
+/// (`Options::publish_in_background`).
+enum MaintHome {
+    Here(Box<Maint>),
+    Away(MaintAway),
+}
+
+/// The segment work's own thread, and the channel its jobs go down.
+struct MaintAway {
+    tx: Option<std::sync::mpsc::Sender<MaintJob>>,
+    thread: Option<std::thread::Thread>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// What the writer hands the segment work.
+enum MaintJob {
+    /// A seal's thread, to join and land, with the WAL and the temp name
+    /// its landing retires; `draining` books the wait as a flush's.
+    Seal {
+        handle: std::thread::JoinHandle<Result<Vec<String>>>,
+        wal: Option<PathBuf>,
+        tmp: Option<PathBuf>,
+        draining: bool,
+    },
+    /// Something the writer waits for, answered down the sender.
+    Ask(MaintAsk, std::sync::mpsc::Sender<Result<()>>),
+}
+
+/// What the writer waits for.
+#[derive(Clone, Copy)]
+enum MaintAsk {
+    /// A flush's: the seal landed, then the store left partitioned or its
+    /// partitioning scheduled (`Maint::drain`).
+    Drain,
+    /// A settle's: the seal and every merge in flight landed.
+    Settle,
+}
+
+/// How long the segment work's thread sleeps with nothing to do, and how
+/// long the writer sleeps between looks while it waits for a landing.
+/// Both are woken early -- the thread by a job, a seal's or a merge's end
+/// -- and the timeouts are the floor under a missed wake.
+const MAINT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+const MAINT_LAND_POLL: std::time::Duration = std::time::Duration::from_micros(100);
+
 /// The store's segment work: a seal's landing, a merge's and a piece
 /// merge's, a promotion, the manifest that names what is live, and the WAL
 /// files and temp names retired once the manifest covers what they held.
@@ -15206,16 +15523,10 @@ struct Maint {
     /// other's at its start, so the two run beside each other.
     tiering: Option<Compaction>,
     sealing: Option<std::thread::JoinHandle<Result<Vec<String>>>>,
-    /// The seal phase decomposed: how long the commit thread blocked on a
-    /// seal still running mid-load, how long the final drain took, how long
-    /// publishing (the manifest and its barriers) took, and how often a
-    /// join found the seal unfinished, so it can be said which of these the
-    /// 14% of the durable load in `phase_ns[1]` is.
-    seal_wait: SealWaits,
-    /// Nanoseconds in each landing and each merge's landing, for
-    /// `Db::phase_ns`.
-    seal_ns: u64,
-    merge_ns: u64,
+    /// The thread this work runs on, when it has one of its own: the seal
+    /// and merge threads wake it when they finish, so a finished one is
+    /// landed at once rather than at the next seal.
+    wake: Option<std::thread::Thread>,
 }
 
 impl std::ops::Deref for Maint {
@@ -15240,6 +15551,119 @@ fn retire_state(shared: &Shared, old: *mut State) {
 }
 
 impl Maint {
+    /// The segment work's own thread: every job in the order it came,
+    /// then whatever finished meanwhile landed, then asleep until woken.
+    fn run(mut self: Box<Self>, rx: std::sync::mpsc::Receiver<MaintJob>) {
+        self.wake = Some(std::thread::current());
+        loop {
+            if self.shared.maint_stop.load(AtomicOrdering::Acquire) {
+                break;
+            }
+            match rx.try_recv() {
+                Ok(job) => {
+                    self.handle(job);
+                    continue;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            self.collect();
+            std::thread::park_timeout(MAINT_POLL);
+        }
+        // Closing: whatever was handed over and not landed is joined, as
+        // the writer's own drop joined its seal, and landed by no one.
+        while let Ok(job) = rx.try_recv() {
+            match job {
+                MaintJob::Seal { handle, .. } => {
+                    let _ = handle.join();
+                }
+                MaintJob::Ask(_, reply) => {
+                    let _ = reply.send(Err(err("the store is closing")));
+                }
+            }
+        }
+        self.stop();
+    }
+
+    fn handle(&mut self, job: MaintJob) {
+        let op = self.op();
+        match job {
+            MaintJob::Seal {
+                handle,
+                wal,
+                tmp,
+                draining,
+            } => {
+                self.sealing = Some(handle);
+                self.retiring_wals.extend(wal);
+                self.retiring_tmps.extend(tmp);
+                if let Err(e) = self.join_seal(draining) {
+                    self.shared.in_seal.store(false, AtomicOrdering::Release);
+                    self.shared.put_maint_err(e);
+                }
+            }
+            MaintJob::Ask(ask, reply) => {
+                let _ = reply.send(self.answer(ask));
+            }
+        }
+        drop(op);
+    }
+
+    /// What the writer waits for; see `MaintAsk`.
+    fn answer(&mut self, ask: MaintAsk) -> Result<()> {
+        match ask {
+            MaintAsk::Drain => {
+                self.join_seal(true)?;
+                self.drain()
+            }
+            MaintAsk::Settle => {
+                self.join_seal(false)?;
+                self.join_compact()?;
+                self.join_tier()
+            }
+        }
+    }
+
+    /// A merge or a piece merge that finished, landed: on the thread of its
+    /// own, nothing else would, where inline the next seal did.
+    fn collect(&mut self) {
+        let merged = self
+            .compacting
+            .as_ref()
+            .is_some_and(|(_, h)| h.is_finished());
+        let tiered = self.tiering.as_ref().is_some_and(|(_, h)| h.is_finished());
+        if !(merged || tiered) {
+            return;
+        }
+        let op = self.op();
+        let mut done = Ok(());
+        if merged {
+            done = self.join_compact();
+        }
+        if tiered && done.is_ok() {
+            done = self.join_tier();
+        }
+        if let Err(e) = done {
+            self.shared.put_maint_err(e);
+        }
+        drop(op);
+    }
+
+    /// Every thread in flight joined and nothing landed: the store is
+    /// being dropped, and a seal thread left running would go on mutating
+    /// the directory under whoever reopens it.
+    fn stop(&mut self) {
+        if let Some(h) = self.sealing.take() {
+            let _ = h.join();
+        }
+        if let Some((_, h)) = self.compacting.take() {
+            let _ = h.join();
+        }
+        if let Some((_, h)) = self.tiering.take() {
+            let _ = h.join();
+        }
+    }
+
     fn new(r: Reader, dir: &Path, covered_seq: u64, retiring_wals: Vec<PathBuf>) -> Maint {
         Maint {
             r,
@@ -15251,10 +15675,84 @@ impl Maint {
             tiering: None,
             sealing: None,
             flush_merge: false,
-            seal_wait: SealWaits::default(),
-            seal_ns: 0,
-            merge_ns: 0,
+            wake: None,
         }
+    }
+
+    /// `fences` grown to every partition range that a level-0 segment over
+    /// them also overlaps, until none reaches outside, in key order. A
+    /// piece is cut at the fences of the partitions standing when its
+    /// table froze, and a merge landing before it lands leaves it over
+    /// ranges it was not cut at: taken as an input of a merge over some of
+    /// them, its keys past them belonged to no output, and the merge
+    /// refused ("merge slices leave a key unassigned"). Partitions tile
+    /// the key space, so the grown fences hold every key of every input.
+    fn cover_inputs(&self, mut fences: Vec<Fence>) -> Vec<Fence> {
+        let parts: Vec<Fence> = self
+            .segs()
+            .iter()
+            .filter(|s| s.level > 0)
+            .map(|s| (s.lo.clone(), s.hi.clone()))
+            .collect();
+        loop {
+            let mut grew = false;
+            for s in self.segs().iter().filter(|s| s.level == 0) {
+                if !fences
+                    .iter()
+                    .any(|(lo, hi)| fences_overlap(&s.lo, &s.hi, lo, hi))
+                {
+                    continue;
+                }
+                for p in &parts {
+                    if fences_overlap(&s.lo, &s.hi, &p.0, &p.1) && !fences.contains(p) {
+                        fences.push(p.clone());
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        fences.sort_by(|a, b| a.0.cmp(&b.0));
+        fences
+    }
+
+    /// Whether the partitions of `segs`, in the live order, tile the key
+    /// space: the first open below, each opening where the last closed, the
+    /// last open above. A read routes by that and nothing else, so a set
+    /// that breaks it loses keys without raising.
+    fn partitions_tile(segs: &[std::sync::Arc<Seg>]) -> bool {
+        let mut parts = segs.iter().filter(|s| s.level > 0);
+        let Some(first) = parts.next() else {
+            return true;
+        };
+        let mut hi = &first.hi;
+        if !first.lo.is_empty() {
+            return false;
+        }
+        for p in parts {
+            if hi.as_ref() != Some(&p.lo) {
+                return false;
+            }
+            hi = &p.hi;
+        }
+        hi.is_none()
+    }
+
+    /// Whether `name` is an input of the merge or the piece merge in
+    /// flight. A promotion renames what it promotes, and a merge's landing
+    /// replaces its inputs by name, so a partition promoted under a merge
+    /// survived its landing beside the outputs that replaced it: two
+    /// generations of partitions over one range, and the next merge over
+    /// them found keys outside every fence it was given. The ranges it
+    /// holds wait for it instead.
+    fn in_flight_input(&self, name: &str) -> bool {
+        let holds = |c: &Option<Compaction>| {
+            c.as_ref()
+                .is_some_and(|(inputs, _)| inputs.iter().any(|n| n == name))
+        };
+        holds(&self.compacting) || holds(&self.tiering)
     }
 
     /// `n` segment ids, the first returned: one counter for the writer's
@@ -15282,12 +15780,13 @@ impl Maint {
         let blocked = !handle.is_finished();
         let names = handle.join().map_err(|_| err("seal thread panicked"))??;
         let waited = t.elapsed().as_nanos() as u64;
-        self.seal_wait.joins += 1;
+        let counts = &self.shared.seal_counts;
+        SealCounts::add(&counts.joins, 1);
         if draining {
-            self.seal_wait.drain_wait_ns += waited;
+            SealCounts::add(&counts.drain_wait_ns, waited);
         } else if blocked {
-            self.seal_wait.join_wait_ns += waited;
-            self.seal_wait.blocked_joins += 1;
+            SealCounts::add(&counts.join_wait_ns, waited);
+            SealCounts::add(&counts.blocked_joins, 1);
         }
         let mut segs = self.segs().to_vec();
         for name in &names {
@@ -15306,7 +15805,10 @@ impl Maint {
         }
         let tp = std::time::Instant::now();
         self.publish()?;
-        self.seal_wait.publish_ns += tp.elapsed().as_nanos() as u64;
+        SealCounts::add(
+            &self.shared.seal_counts.publish_ns,
+            tp.elapsed().as_nanos() as u64,
+        );
         for old in std::mem::take(&mut self.retiring_wals) {
             // One spare is enough: the writer takes it at its next
             // rotation, and a seal lands before the next one rotates.
@@ -15334,7 +15836,11 @@ impl Maint {
         for tmp in std::mem::take(&mut self.retiring_tmps) {
             let _ = std::fs::remove_file(tmp);
         }
-        self.seal_ns += t.elapsed().as_nanos() as u64;
+        SealCounts::add(
+            &self.shared.seal_counts.seal_ns,
+            t.elapsed().as_nanos() as u64,
+        );
+        self.shared.in_seal.store(false, AtomicOrdering::Release);
         if self.opts.compact {
             self.maybe_compact()?;
             self.maybe_tier()?;
@@ -15441,6 +15947,10 @@ impl Maint {
     /// `tier`, a piece merge's, no partition is rewritten.
     fn publish_segs_with(&mut self, mut segs: Vec<std::sync::Arc<Seg>>, tier: bool, land: bool) {
         segs.sort_by(|a, b| seg_order(a, b));
+        debug_assert!(
+            Self::partitions_tile(&segs),
+            "a segment publish left partitions that do not tile the key space"
+        );
         let mean_key_bytes = Db::mean_key_bytes_of(&segs);
         let store_bytes = Db::store_bytes_of(&self.dir, &segs);
         let data_bytes = Db::data_bytes_of(&segs);
@@ -15561,7 +16071,14 @@ impl Maint {
             sync_every: self.opts.seal_sync_every,
             inline_max: self.opts.inline_bytes,
         };
-        let handle = std::thread::spawn(move || tier_run(plan));
+        let wake = self.wake.clone();
+        let handle = std::thread::spawn(move || {
+            let out = tier_run(plan);
+            if let Some(t) = wake {
+                t.unpark();
+            }
+            out
+        });
         self.tiering = Some((inputs, handle));
         Ok(())
     }
@@ -15724,6 +16241,28 @@ impl Maint {
                 rest.push(f);
                 continue;
             };
+            if self.in_flight_input(&self.segs()[pi].name)
+                || pieces
+                    .iter()
+                    .any(|&i| self.in_flight_input(&self.segs()[i].name))
+            {
+                rest.push(f);
+                continue;
+            }
+            // A piece over the range and not cut at its fences -- one a
+            // merge's landing left over ranges it was not cut at -- may be
+            // older than the pieces promoted, and a promoted piece becomes
+            // a partition, older than every piece: that piece's values
+            // would read as newer than theirs. The range is merged instead.
+            let unaligned = self.segs().iter().any(|s| {
+                s.level == 0
+                    && !(s.lo == f.0 && s.hi == f.1)
+                    && fences_overlap(&s.lo, &s.hi, &f.0, &f.1)
+            });
+            if unaligned {
+                rest.push(f);
+                continue;
+            }
             // The partition's last key, or nothing if it is empty.
             let floor: Option<Vec<u8>> = {
                 let b = &self.segs()[pi].blob;
@@ -15773,7 +16312,16 @@ impl Maint {
     /// into several and promotion would not be the same store; and it must
     /// carry no tombstone, because a merge writes the bottom level and drops
     /// them, and a promotion keeps the file exactly as it is.
+    ///
+    /// A partitioned store answers false here, whoever asks. The full flush
+    /// asked on every round, partitioned or not, and pieces that happened to
+    /// be disjoint became partitions from the bottom over ranges partitions
+    /// already held; it took a merge in flight holding pieces back for a
+    /// flush to meet more than one of them.
     fn promote_unpartitioned(&mut self) -> Result<bool> {
+        if self.segs().iter().any(|s| s.level > 0) {
+            return Ok(false);
+        }
         let mut pieces: Vec<usize> = self
             .segs()
             .iter()
@@ -15781,7 +16329,11 @@ impl Maint {
             .filter(|(_, s)| s.level == 0)
             .map(|(i, _)| i)
             .collect();
-        if pieces.is_empty() {
+        if pieces.is_empty()
+            || pieces
+                .iter()
+                .any(|&i| self.in_flight_input(&self.segs()[i].name))
+        {
             return Ok(false);
         }
         if pieces.len() == 1 {
@@ -15870,7 +16422,7 @@ impl Maint {
     /// Name the live set durably. Everything before this call is a file on
     /// disk that nothing reaches; everything after it is the store.
     fn publish(&mut self) -> Result<()> {
-        self.seal_wait.publishes += 1;
+        SealCounts::add(&self.shared.seal_counts.publishes, 1);
         manifest_write(&self.dir, self.covered_seq, &self.live_names())
     }
 
@@ -15899,6 +16451,7 @@ impl Maint {
             self.tiering.is_none(),
             "a partition merge started beside a piece merge"
         );
+        let fences = fences.map(|fs| self.cover_inputs(fs));
         let inputs: Vec<String> = match &fences {
             None => self.live_names(),
             Some(fs) => self
@@ -15960,8 +16513,9 @@ impl Maint {
         let sync_every = self.opts.seal_sync_every;
         let inline_max = self.opts.inline_bytes;
         let job_inputs = inputs.clone();
+        let wake = self.wake.clone();
         let handle = std::thread::spawn(move || {
-            compact_job(MergePlan {
+            let out = compact_job(MergePlan {
                 dir,
                 inputs: job_inputs,
                 first_id,
@@ -15974,9 +16528,14 @@ impl Maint {
                 background_io,
                 sync_every,
                 inline_max,
-            })
+            });
+            if let Some(t) = wake {
+                t.unpark();
+            }
+            out
         });
         self.compacting = Some((inputs, handle));
+        self.shared.in_merge.store(true, AtomicOrdering::Release);
         Ok(())
     }
 
@@ -15986,6 +16545,7 @@ impl Maint {
         let Some((inputs, handle)) = self.compacting.take() else {
             return Ok(());
         };
+        self.shared.in_merge.store(false, AtomicOrdering::Release);
         self.flush_merge = false;
         let t = std::time::Instant::now();
         let outputs = handle
@@ -16018,7 +16578,10 @@ impl Maint {
         for name in &inputs {
             self.retire_seg(name);
         }
-        self.merge_ns += t.elapsed().as_nanos() as u64;
+        self.shared
+            .seal_counts
+            .merge_ns
+            .fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
         Ok(())
     }
 }
@@ -16029,14 +16592,21 @@ impl Drop for Db {
         self.stop_upkeep();
         self.stop_keeper();
         self.stop_ahead();
-        if let Some(h) = self.maint.sealing.take() {
-            let _ = h.join();
-        }
-        if let Some((_, h)) = self.maint.compacting.take() {
-            let _ = h.join();
-        }
-        if let Some((_, h)) = self.maint.tiering.take() {
-            let _ = h.join();
+        match &mut self.maint {
+            MaintHome::Here(m) => m.stop(),
+            MaintHome::Away(a) => {
+                self.r
+                    .shared
+                    .maint_stop
+                    .store(true, AtomicOrdering::Release);
+                drop(a.tx.take());
+                if let Some(t) = &a.thread {
+                    t.unpark();
+                }
+                if let Some(h) = a.handle.take() {
+                    let _ = h.join();
+                }
+            }
         }
     }
 }

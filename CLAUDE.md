@@ -189,18 +189,29 @@ against a module size that is budgeted. Format knowledge stays in Rust for the
 same reason a plan is computed there: a superblock constant hand-copied into
 the JS side has drifted once already.
 
-**One writer, any readers, and nothing a reader follows moves.** A `Db` is
-the writer and one thread's; a `Reader` from `Db::reader` is another
-thread's, `Send` and not `Sync`, with the scan snapshot and the block tables
-of its own. What they share is published whole: the segment set and the two
-memtables as one `State` behind one pointer that a seal, a join, a merge or
-a freeze swaps, and a memtable whose arenas, entries and index never move
-once published. A reader pins the epoch it reads in through its slot in the
-reader table, and the writer frees a replaced state or index only past
-every pinned slot; it never waits for a reader. A read takes the state once,
-at its start, and holds it: a read that loaded the state twice took an
-entry from one memtable to the chains of another when a freeze landed
-between, and three reader threads found it in their first minute. The
+**Two publishers, one pointer, and nothing a reader follows moves.** A
+`Db` is the writer and one thread's; its segment work (`Maint`) -- a
+seal's landing, the merges, the promotions, the manifest and the WAL
+retirement -- runs on a thread of its own (`publish_in_background`), or
+inline where the writer drives it; a `Reader` from `Db::reader` is
+another thread's, `Send` and not `Sync`, with the scan snapshot and the
+block tables of its own. What they share is published whole: the segment
+set and the two memtables as one `State` behind one pointer, swapped by a
+compare-and-swap against the state it was made from and made again over
+whichever won. The writer changes only the memtables (a freeze, a switch
+of memtable) and the segment work only the segments, so a retry takes the
+other's half afresh and nobody holds anybody off. A memtable's arenas,
+entries and index never move once published. Everyone who reads a state
+pins the epoch it reads in through a slot in the reader table -- a handle
+for each read, the writer for each of its operations, the segment work
+and the upkeep thread for each of theirs -- and whoever replaces a state
+frees it only past every pinned slot; nobody waits for a reader. A read
+takes the state once, at its start, and holds it: a read that loaded the
+state twice took an entry from one memtable to the chains of another when
+a freeze landed between, and three reader threads found it in their
+first minute. An operation that publishes moves what it holds to what it
+published, and the writer's operations hold one state each: what the
+segment work publishes meanwhile, the writer sees at its next. The
 isolation is the reader's: `Latest` honours the memtable's watermark at the
 last commit, `Snapshot` pins a state and a watermark, `Dirty` honours none,
 which is what the writer's own reads do. A `#[cfg(test)]` module asks the
@@ -215,8 +226,11 @@ snapshot -- to a thread of the store's own, and returns once the thread
 has filed it. One thread holds it at a time: the cell is emptied only
 through `&mut` and refilled only while empty, so nothing in it needs to
 be `Sync`, and a writer's touch of it takes it back, waiting only for a
-pass in flight. The thread pins nothing, so every publish takes the
-upkeep back before swapping the state; the forms a pass publishes
+pass in flight. The thread pins a slot for each pass, so a publish from
+the segment work needs nothing of it: the forms go across as copies the
+publish makes (`State::carry_published`) and the writer's own tables
+follow at its next look at the log (`Reader::rebase_tables`); the
+writer's own publishes still take it back first. The forms a pass publishes
 carry the commit the writer named, never the latest, or a handle at
 the latest takes forms without the writes between; retired forms are
 swept only by whoever holds it; and `settle` joins it before anything
@@ -633,6 +647,52 @@ climbed about 35 MB a rep at a million keys over every arm, and held
 level once the wrappers freed. The rule: whatever owns a pointer it will free is a
 type with a `Drop`, so the owner's end frees it, not only the path
 that remembered to.
+
+**A form dropped after the copy stood as the block.** A publish from
+the segment work copies the old state's published forms into the new one,
+and the writer marks a block dirty at its next look unless the new state
+holds the very form its table does. The first version compared only the
+blocks the table held a form for: a pass that shed or widened a block over
+the old state after the copy left the old form standing as the block in
+the new one, and three reader-thread tests read a key's older value after
+its newer one. The rule is the one "a form dropped by its writer stayed
+published" already gave -- a copy handed out needs a tombstone when the
+kept copy is dropped -- and it applies to every copy, however it was made.
+
+**A rename under a merge.** A promotion hard-links a partition under a
+new name to close its fence, and a merge's landing removes its inputs by
+name. A promotion decided while a merge held that partition left it live
+beside the outputs that replaced it: two generations of partitions over
+one range, and the next merge over them found keys outside every fence it
+was given. Inline it needed a merge still running at the next landing;
+with the landings on a thread of their own it happened in the first run.
+Nothing a merge in flight holds is promoted now. The rule: an identity a
+job holds by name is not renamed under it, and a check that the job's
+inputs are still what it took is the job's to make, not the reader's.
+
+**A piece cut at fences a merge replaced before it landed.** A seal cuts
+its table at the partitions' fences as they stand at the freeze, and a
+merge may land before the seal does. Reads were ready for a piece over
+ranges it was not cut at -- a store with one consults every piece -- and
+merges and promotions were not: a merge over some of the ranges such a
+piece covers took it as an input and refused its keys past them, and a
+promotion beside it would have made pieces younger than it into
+partitions, which read as older than every piece. A merge's fences are
+grown to cover every input now, and a range such a piece overlaps is
+merged, never promoted. The rule: when two jobs cut one space and either
+may land first, whatever reads the result must take either order.
+
+**A precondition left to the callers.** Promotion without a merge is for
+a store with no partitions yet, and two of its three callers asked
+first. The full flush asked on every round, and it stayed latent inline;
+with the merges collected on a thread of their own, a flush met five
+pieces a merge in flight had held back, disjoint in key order, and made
+them partitions from the bottom over ranges partitions already held.
+Nothing raised, and a quarter of the keys read back empty. The function
+asks now, and every segment publish asserts that the partitions tile the
+key space. The rule: a function correct only in some state checks that
+state itself, and an invariant reads route by is asserted where it is
+published, not found where it is read.
 
 **A sentinel that crosses the wasm boundary changes sign.** A wasm `u32`
 arrives in JavaScript as a signed i32, so a failure sentinel of `u32::MAX`

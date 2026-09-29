@@ -777,6 +777,58 @@ fn every_key_survives_the_full_flush_too() {
     scale(false)
 }
 
+/// Promotion without a merge is for a store with no partitions yet: every
+/// piece becomes one, the first open below. The full flush asked for it on
+/// a partitioned store too, and pieces that happened to be disjoint became
+/// partitions over ranges partitions already held -- nothing raised, and
+/// the reads routed past the keys. Pieces piled up over a partitioned store
+/// are what a flush meets after a merge in flight held them back; here the
+/// trigger holds them back.
+#[test]
+fn a_full_flush_over_partitions_does_not_promote_its_pieces() {
+    let d = dir("fullflush-promote");
+    let mut db = Db::create(
+        &d,
+        Options {
+            seal_bytes: 64 << 10,
+            l0_trigger: 1000,
+            partition_bytes: None,
+            flush_ranges: false,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let n = 20_000u32;
+    let val = |i: u32| {
+        let mut v = i.to_le_bytes().to_vec();
+        v.extend_from_slice(&[b'x'; 100]);
+        v
+    };
+    for i in 0..n {
+        db.append(format!("k{i:08}").as_bytes(), &val(i));
+        if i % 500 == 499 {
+            db.commit().unwrap();
+        }
+        if i == n / 2 - 1 {
+            db.flush().unwrap();
+            assert!(db.levels().0 > 1, "the first flush partitions");
+        }
+    }
+    db.settle().unwrap();
+    assert!(db.levels().1 > 1, "pieces held back over the partitions");
+    db.flush().unwrap();
+    let wrong: Vec<u32> = (0..n)
+        .filter(|&i| read_vec(&db, format!("k{i:08}").as_bytes()) != vec![val(i)])
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "{} keys wrong, first {:?} ({:?})",
+        wrong.len(),
+        &wrong[..wrong.len().min(5)],
+        db.levels()
+    );
+}
+
 fn scale(flush_ranges: bool) {
     // The contract tests above use stores too small to make a partition
     // boundary interesting. This one loads enough to force the initial
@@ -3617,6 +3669,46 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
     assert_eq!(n, 3000);
 }
 
+/// A seal lands without the writer: with the segment work on a thread of
+/// its own, the frozen table's segment is published, and a handle reads
+/// it, while the writer makes no call at all. Before it, a finished seal
+/// waited for the writer's next commit, seal or flush to be published.
+#[test]
+fn a_seal_lands_while_the_writer_is_away() {
+    let d = dir("seal-lands-away");
+    let opts = Options {
+        publish_in_background: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let key = |k: u32| format!("key-{k:06}");
+    for k in 0..2000u32 {
+        db.append(key(k).as_bytes(), format!("v{k}").as_bytes());
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    let r = db.reader().unwrap();
+    // No call on the writer from here on.
+    let t = std::time::Instant::now();
+    while r.unsealed_keys() > 0 {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(20),
+            "the seal did not land without the writer"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(r.levels().1 > 0, "a piece landed: {:?}", r.levels());
+    for k in (0..2000u32).step_by(37) {
+        assert_eq!(
+            read_vec(&r, key(k).as_bytes()),
+            vec![format!("v{k}").into_bytes()],
+            "key {k}"
+        );
+    }
+    drop(r);
+    db.close().unwrap();
+}
+
 /// A flush that does not partition leaves what promotion cannot make
 /// partitions -- pieces that overlap -- to a merge it starts in the
 /// background, and the writer publishes that merge at its first commit
@@ -5963,6 +6055,12 @@ fn the_run_keeper_keeps_the_published_snapshot_current() {
             snapshot_runs: true,
             snapshot_keeper: true,
             snapshot_keeper_recent_pct: pct,
+            // The seal below is held in flight across a burst of writes,
+            // which only the writer driving its own landings can promise:
+            // on a thread of its own the landing may fall between the
+            // keeper's settle and the scan after it, and the landing's
+            // carry is checked apart, after the settle that lands it.
+            publish_in_background: false,
             ..Options::default()
         };
         let mut db = Db::create(&d, opts).unwrap();
