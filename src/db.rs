@@ -390,6 +390,13 @@ pub struct Options {
     /// cache, which caches partition blocks, had nothing to hold. `false`
     /// is that shape, kept as an arm.
     pub flush_schedules: bool,
+    /// EXPERIMENT: the writer pins its slot in the reader table and holds
+    /// the state for the length of each of its operations, as a handle
+    /// does for each read. Nothing needs it while the writer is the only
+    /// thread that publishes; it is what lets another thread publish
+    /// without freeing or swapping a state under the writer. `false` is
+    /// the shape before it, kept to price it.
+    pub writer_pins: bool,
     /// How a flush drains level 0 once partitions exist: merge only the
     /// ranges that hold pieces, under the live fences (`true`), or
     /// re-partition everything from every key (`false`, the original), kept
@@ -952,6 +959,7 @@ impl Default for Options {
             flush_ranges: true,
             promote: true,
             flush_schedules: true,
+            writer_pins: true,
             recycle_wal: false,
             read_advice: ReadAdvice::default(),
             scan_readahead_bytes: 256 << 10,
@@ -3410,11 +3418,19 @@ const _: () = assert!(std::mem::align_of::<Slot>() >= 128 && std::mem::size_of::
 
 const READER_SLOTS: usize = 256;
 
+/// Slots the engine keeps for itself ahead of the callers' 256: the
+/// writer's, which its operations pin, and the upkeep thread's, which its
+/// passes pin. Apart, so a caller holding every handle it may have
+/// cannot leave the engine without one.
+const ENGINE_SLOTS: usize = 2;
+
 impl Readers {
     fn new() -> Readers {
         Readers {
             epoch: AtomicU64::new(1),
-            slots: (0..READER_SLOTS).map(|_| Slot::new()).collect(),
+            slots: (0..ENGINE_SLOTS + READER_SLOTS)
+                .map(|_| Slot::new())
+                .collect(),
         }
     }
 
@@ -3435,7 +3451,16 @@ impl Readers {
     /// A slot for a reader handle's life, or none when every slot is
     /// taken.
     fn claim(&self) -> Option<usize> {
-        (0..READER_SLOTS).find(|&i| {
+        self.claim_in(ENGINE_SLOTS..ENGINE_SLOTS + READER_SLOTS)
+    }
+
+    /// One of the engine's own slots, for the writer or the upkeep thread.
+    fn claim_engine(&self) -> Option<usize> {
+        self.claim_in(0..ENGINE_SLOTS)
+    }
+
+    fn claim_in(&self, range: std::ops::Range<usize>) -> Option<usize> {
+        range.into_iter().find(|&i| {
             self.slots[i]
                 .epoch
                 .compare_exchange(0, u64::MAX, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst)
@@ -5376,6 +5401,9 @@ struct Shared {
     /// lock only because the shared struct must be `Sync`; it is never
     /// contended.
     retired: std::sync::Mutex<Vec<(u64, Box<State>)>>,
+    /// How many states wait in `retired`, so the writer's end of an
+    /// operation can tell there is nothing to sweep without the lock.
+    retired_len: AtomicUsize,
     /// Which mode the segment mappings are in: `true` is `MADV_RANDOM`.
     /// One flag for the whole store rather than one per segment, because
     /// the phase is a property of what the caller is doing and not of
@@ -5534,6 +5562,17 @@ pub struct Reader {
     /// This handle's slot in the reader table, or none for the writer's
     /// own handle, under which nothing is ever freed.
     slot: Option<usize>,
+    /// The writer's own slot in the reader table, apart from `slot`
+    /// because everything that asks whether a handle is the writer asks
+    /// `slot`: pinned, and the state held, for the length of each of the
+    /// writer's operations, so a state another thread replaces is neither
+    /// freed under it nor swapped from under it midway. None for a handle,
+    /// which pins through `slot`.
+    pin_slot: Option<usize>,
+    /// How deep in `enter` this handle is: the outermost call pins and
+    /// the rest nest, so an operation that calls another does not leave
+    /// the first unpinned when the second ends.
+    depth: std::cell::Cell<u32>,
     isolation: std::cell::Cell<Isolation>,
     /// The state pinned by `snapshot`, or null: what `state` answers
     /// instead of the writer's latest while it is held. An atomic only
@@ -5860,6 +5899,19 @@ struct Entered<'a> {
     r: &'a Reader,
 }
 
+/// One of the writer's operations in progress: its slot pinned and the
+/// state held from here until the guard drops. A pointer and not a
+/// borrow, so the operation keeps `&mut` of the store; the store outlives
+/// the guard, which is made and dropped inside one of its methods.
+struct Op(*const Reader);
+
+impl Drop for Op {
+    fn drop(&mut self) {
+        // SAFETY: see the type.
+        unsafe { &*self.0 }.leave();
+    }
+}
+
 impl Drop for Entered<'_> {
     fn drop(&mut self) {
         self.r.leave();
@@ -5868,6 +5920,9 @@ impl Drop for Entered<'_> {
 
 impl Drop for Reader {
     fn drop(&mut self) {
+        if let Some(slot) = self.pin_slot {
+            self.shared.readers.release(slot);
+        }
         if let Some(slot) = self.slot {
             if self.counted {
                 self.shared
@@ -6778,6 +6833,10 @@ impl Reader {
     /// borrow of this handle: the writer frees a state only past every
     /// pinned reader, and never under its own handle.
     fn state(&self) -> &State {
+        debug_assert!(
+            self.pin_slot.is_none() || self.depth.get() > 0,
+            "the writer reads the state only inside an operation"
+        );
         let held = self.held.load(AtomicOrdering::Relaxed);
         let p = if held.is_null() {
             self.shared.state.load(AtomicOrdering::Acquire)
@@ -6804,6 +6863,18 @@ impl Reader {
     /// and holds nothing: it publishes nothing while a borrow of itself
     /// is out. The guard ends the read.
     fn enter(&self) -> Entered<'_> {
+        let depth = self.depth.get();
+        self.depth.set(depth + 1);
+        if depth > 0 {
+            return Entered { r: self };
+        }
+        if let Some(slot) = self.pin_slot.filter(|_| self.opts.writer_pins) {
+            // The writer's own: pinned and held, and read as its latest,
+            // with no watermark and no log bound.
+            self.shared.readers.pin(slot);
+            let p = self.shared.state.load(AtomicOrdering::Acquire);
+            self.held.store(p, AtomicOrdering::Relaxed);
+        }
         if let Some(slot) = self.slot {
             match self.isolation.get() {
                 Isolation::Snapshot => {}
@@ -6832,6 +6903,23 @@ impl Reader {
     }
 
     fn leave(&self) {
+        let depth = self.depth.get() - 1;
+        self.depth.set(depth);
+        if depth > 0 {
+            return;
+        }
+        if let Some(slot) = self.pin_slot.filter(|_| self.opts.writer_pins) {
+            self.held
+                .store(std::ptr::null_mut(), AtomicOrdering::Relaxed);
+            self.shared.readers.unpin(slot);
+            // The states this operation replaced waited for its own pin;
+            // swept now rather than at the next publish, which a writer
+            // gone quiet may never make, and which left the frozen
+            // memtable a landing replaced held until then.
+            if self.shared.retired_len.load(AtomicOrdering::Relaxed) > 0 {
+                self.sweep_retired_states();
+            }
+        }
         if let Some(slot) = self.slot {
             if self.isolation.get() != Isolation::Snapshot {
                 self.held
@@ -7095,6 +7183,7 @@ impl Reader {
     /// bytes at the calibrated ratio (`DATA_PER_FILE`), or their file bytes
     /// themselves under `seal_on_file`.
     pub fn seal_threshold(&self) -> usize {
+        let _e = self.enter();
         let st = self.state();
         let sized = if self.opts.seal_on_file {
             st.store_bytes
@@ -7125,6 +7214,7 @@ impl Reader {
     /// sizes `seal_threshold` can take the store by.
     #[doc(hidden)]
     pub fn sized_bytes(&self) -> (u64, u64) {
+        let _e = self.enter();
         let st = self.state();
         (st.store_bytes, st.data_bytes)
     }
@@ -8207,6 +8297,16 @@ impl Reader {
         retired.retain(|(t, _)| !readers.none_before(t + 1));
     }
 
+    /// The replaced states no pinned reader can still be walking.
+    fn sweep_retired_states(&self) {
+        let mut retired = self.shared.retired.lock().expect("the retired list");
+        let readers = &self.shared.readers;
+        retired.retain(|(t, _)| !readers.none_before(*t));
+        self.shared
+            .retired_len
+            .store(retired.len(), AtomicOrdering::Relaxed);
+    }
+
     /// EXPERIMENT: free the replaced canonical forms no pinned reader can
     /// still be walking: those retired at an epoch every pinned slot is
     /// past. The epoch is bumped first, so a form retired under the
@@ -8434,6 +8534,7 @@ impl Reader {
     /// EXPERIMENT: the canonical forms table's size: forms held, their
     /// bytes, how many walks took one, and whether the table is complete.
     pub fn canonical_forms(&self) -> (usize, usize, usize, bool) {
+        let _e = self.enter();
         let st = self.state();
         let forms = st
             .forms
@@ -9962,6 +10063,7 @@ impl Reader {
     /// sparse, copies, wide.
     #[doc(hidden)]
     pub fn block_cache_kinds(&self) -> (usize, usize, usize, usize) {
+        let _e = self.enter();
         let (mut clean, mut sparse, mut copies, mut wide) = (0usize, 0usize, 0usize, 0usize);
         for t in self.fs().tables.borrow().iter() {
             for c in t.borrow().iter().flat_map(|t| t.slots.iter()).flatten() {
@@ -9982,6 +10084,7 @@ impl Reader {
     /// rather than laid in key order.
     #[doc(hidden)]
     pub fn block_cache_layout(&self) -> (usize, usize, usize) {
+        let _e = self.enter();
         let (mut dead, mut scattered, mut ents) = (0usize, 0usize, 0usize);
         for t in self.fs().tables.borrow().iter() {
             for c in t.borrow().iter().flat_map(|t| t.slots.iter()).flatten() {
@@ -10005,14 +10108,19 @@ impl Reader {
     /// same content laid out by a build rather than by the patches.
     #[doc(hidden)]
     pub fn refill_forms(&mut self) -> Result<()> {
+        std::mem::forget(self.enter());
+        let op = Op(self);
         self.drop_blocks();
         self.fs().publish_due.set(true);
-        self.maintain_forms()
+        let done = self.maintain_forms();
+        drop(op);
+        done
     }
 
     /// PROTOTYPE: the cache's size, for a measurement: blocks held and
     /// bytes of keys and values in them.
     pub fn block_cache_size(&self) -> (usize, usize) {
+        let _e = self.enter();
         let (mut clean, mut sparse, mut copies, mut wide, mut bytes) =
             (0usize, 0usize, 0usize, 0usize, 0usize);
         for t in self.fs().tables.borrow().iter() {
@@ -10044,12 +10152,14 @@ impl Reader {
     /// PROTOTYPE: the bytes the cache counts itself holding, for a test
     /// to hold against a walk of it.
     pub fn block_cache_bytes(&self) -> usize {
+        let _e = self.enter();
         self.fs().cache_bytes.get()
     }
 
     /// PROTOTYPE: the most bytes any one built block holds, the slack a
     /// budget allows since the block in hand is never shed.
     pub fn block_cache_largest(&self) -> usize {
+        let _e = self.enter();
         self.fs()
             .tables
             .borrow()
@@ -10071,6 +10181,7 @@ impl Reader {
     /// PROTOTYPE: how many blocks the cache holds as wide, for a test to
     /// hold the count that makes one to its definition.
     pub fn block_cache_wide(&self) -> usize {
+        let _e = self.enter();
         self.fs()
             .tables
             .borrow()
@@ -10586,6 +10697,7 @@ impl Reader {
     /// touch" is the whole question.
     #[doc(hidden)]
     pub fn state_gen(&self) -> u64 {
+        let _e = self.enter();
         self.state().gen
     }
     pub fn levels(&self) -> (usize, usize) {
@@ -10770,6 +10882,7 @@ impl Db {
             state: AtomicPtr::new(Box::into_raw(Box::new(state))),
             readers: Readers::new(),
             retired: std::sync::Mutex::new(Vec::new()),
+            retired_len: AtomicUsize::new(0),
             advice_random: std::sync::atomic::AtomicBool::new(starts_random),
             retired_forms: std::sync::Mutex::new(Vec::new()),
             retired_snaps: std::sync::Mutex::new(Vec::new()),
@@ -10793,10 +10906,18 @@ impl Db {
             snap_switched: AtomicU64::new(0),
             upkeep: Lend::default(),
         });
+        let pin_slot = Some(
+            shared
+                .readers
+                .claim_engine()
+                .ok_or_else(|| err("reader table: the engine's slots are taken"))?,
+        );
         let r = Reader {
             shared,
             counted: false,
             slot: None,
+            pin_slot,
+            depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Dirty),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
@@ -11065,6 +11186,7 @@ impl Db {
             state: AtomicPtr::new(Box::into_raw(Box::new(state))),
             readers,
             retired: std::sync::Mutex::new(Vec::new()),
+            retired_len: AtomicUsize::new(0),
             advice_random: std::sync::atomic::AtomicBool::new(starts_random),
             retired_forms: std::sync::Mutex::new(Vec::new()),
             retired_snaps: std::sync::Mutex::new(Vec::new()),
@@ -11088,10 +11210,18 @@ impl Db {
             snap_switched: AtomicU64::new(0),
             upkeep: Lend::default(),
         });
+        let pin_slot = Some(
+            shared
+                .readers
+                .claim_engine()
+                .ok_or_else(|| err("reader table: the engine's slots are taken"))?,
+        );
         let r = Reader {
             shared,
             counted: false,
             slot: None,
+            pin_slot,
+            depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Dirty),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
@@ -11139,6 +11269,7 @@ impl Db {
     /// Buffered until `commit`; visible to this handle's reads immediately,
     /// which is the read-your-writes contract `Store::read_all` set.
     pub fn append(&mut self, key: &[u8], value: &[u8]) {
+        let _op = self.op();
         if self.mem().ordered || self.direct_can_open() {
             if self.goes_direct(key, value) {
                 if !self.mem().ordered {
@@ -11247,6 +11378,7 @@ impl Db {
     /// other verb, and using it for an update piled every Zipfian rewrite
     /// onto its key until each read walked the pile.
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
+        let _op = self.op();
         if self.mem().ordered {
             self.leave_direct();
         }
@@ -11265,6 +11397,7 @@ impl Db {
     /// start fresh. Durable at the next `commit`, exactly like an append,
     /// and reclaimed by the next merge that reaches the key.
     pub fn delete(&mut self, key: &[u8]) {
+        let _op = self.op();
         if self.mem().ordered {
             self.leave_direct();
         }
@@ -11290,6 +11423,7 @@ impl Db {
     /// commit -- after, so the batch's durability never waits on a segment
     /// write.
     pub fn commit(&mut self) -> Result<()> {
+        let _op = self.op();
         if let Some(e) = self.pending_err.take() {
             return Err(e);
         }
@@ -11516,6 +11650,7 @@ impl Db {
     /// Commits continue into the new WAL while it runs; at most one seal is
     /// in flight, so a second trigger joins the first (backpressure).
     pub fn seal(&mut self) -> Result<()> {
+        let _op = self.op();
         if let Some(e) = self.pending_err.take() {
             return Err(e);
         }
@@ -11709,6 +11844,7 @@ impl Db {
     /// the level-0 count says so). For an experiment that wants a store in a
     /// known shape before it measures.
     pub fn settle(&mut self) -> Result<()> {
+        let _op = self.op();
         // The upkeep first: every join after it touches the writer's
         // upkeep, and a touch takes it back from the thread untouched.
         self.join_upkeep();
@@ -11726,6 +11862,7 @@ impl Db {
     /// tail out of memory; `flush` is the other answer, and the difference
     /// was priced at 11% of a canonical load window.
     pub fn sync(&mut self) -> Result<()> {
+        let _op = self.op();
         self.commit_staged()?;
         self.unsynced = 0;
         Ok(())
@@ -11739,6 +11876,7 @@ impl Db {
     /// table for the rest of the phase -- the same artifact the seal was
     /// supposed to remove, back through the side door.
     pub fn flush(&mut self) -> Result<()> {
+        let _op = self.op();
         self.commit_staged()?;
         self.unsynced = 0;
         self.draining = true;
@@ -11957,12 +12095,20 @@ impl Db {
         self.stop_ahead();
         let p = Box::into_raw(Box::new(next));
         let old = self.shared.state.swap(p, AtomicOrdering::AcqRel);
+        // The writer holds the state for its operation, and what it has
+        // just published is what it reads from here on.
+        if !self.r.held.load(AtomicOrdering::Relaxed).is_null() {
+            self.r.held.store(p, AtomicOrdering::Relaxed);
+        }
         let tag = self.shared.readers.bump();
         let mut retired = self.shared.retired.lock().expect("the retired list");
         // SAFETY: published by this writer, owned by it until freed.
         retired.push((tag, unsafe { Box::from_raw(old) }));
         let readers = &self.shared.readers;
         retired.retain(|(t, _)| !readers.none_before(*t));
+        self.shared
+            .retired_len
+            .store(retired.len(), AtomicOrdering::Relaxed);
         drop(retired);
         self.sweep_retired_forms();
         self.wake_keeper();
@@ -12034,6 +12180,7 @@ impl Db {
     /// maintained them moves it to the commit's own position, one that
     /// did not leaves it where it was.
     pub fn forms_position(&self) -> usize {
+        let _op = self.op();
         self.state().forms_at.load(AtomicOrdering::Acquire)
     }
 
@@ -12051,6 +12198,7 @@ impl Reader {
     /// thread reads through it at a time, and a thread that wants its
     /// own asks for its own. Fails when every slot is taken.
     pub fn reader(&self) -> Result<Reader> {
+        let _e = self.enter();
         self.new_reader(true)
     }
 
@@ -12073,6 +12221,8 @@ impl Reader {
             shared: self.shared.clone(),
             counted,
             slot: Some(slot),
+            pin_slot: None,
+            depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Latest),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
@@ -13031,6 +13181,12 @@ impl Reader {
 }
 
 impl Db {
+    /// The guard of one of the writer's operations: see `Op`.
+    fn op(&self) -> Op {
+        std::mem::forget(self.r.enter());
+        Op(&self.r)
+    }
+
     pub fn phase_ns(&self) -> (u64, u64, u64) {
         (self.phase_ns[0], self.phase_ns[1], self.phase_ns[2])
     }
@@ -13041,6 +13197,7 @@ impl Db {
     }
 
     pub fn segments(&self) -> usize {
+        let _op = self.op();
         self.segs().len() + usize::from(self.sealing.is_some())
     }
 
@@ -13972,6 +14129,10 @@ impl Reader {
             shared: self.shared.clone(),
             counted: false,
             slot: None,
+            // A slot of its own for the passes, which pin it as the
+            // writer's operations pin the writer's.
+            pin_slot: self.shared.readers.claim_engine(),
+            depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Dirty),
             held: AtomicPtr::new(std::ptr::null_mut()),
             wm: std::cell::Cell::new(SEE_ALL),
@@ -14041,6 +14202,10 @@ impl Reader {
     /// snapshots it replaced freed where no reader holds them.
     fn upkeep_pass(&mut self, fs: FormsState, to: UpkeepTo) -> (FormsState, Result<()>) {
         *self.fs.0.get_mut() = Some(fs);
+        // Pinned, and the state held, for the pass: what it walks is not
+        // freed under it, and one state answers for all of it.
+        std::mem::forget(self.enter());
+        let op = Op(self);
         // A publish takes the upkeep back before it swaps the state, so
         // the state is the commit's; were it not, the work is the next
         // pass's.
@@ -14055,6 +14220,7 @@ impl Reader {
         } else {
             Ok(())
         };
+        drop(op);
         let fs = self.lend_fs().expect("the pass holds the upkeep");
         (fs, done)
     }
@@ -14332,6 +14498,7 @@ impl Db {
     /// published snapshot as the keeper leaves it.
     #[doc(hidden)]
     pub fn settle_keeper(&mut self) {
+        let _op = self.op();
         let Some(k) = self.keeper.as_ref() else {
             return;
         };
@@ -15418,6 +15585,7 @@ impl<'s> BuildCtx<'s> {
 
 impl Drop for Db {
     fn drop(&mut self) {
+        let _op = self.op();
         self.stop_upkeep();
         self.stop_keeper();
         self.stop_ahead();
