@@ -1489,12 +1489,12 @@ struct Seg {
     /// partition's blob id: a piece sealed while a merge of its range ran
     /// is kept across the merge's publish, under a new partition, and
     /// ranks taken against the old one are behind by every key the merge
-    /// folded in below. A lock rather than a once-cell for that reason,
-    /// taken once per table made, which clones the shared vector and
-    /// reads it lock-free at every block build after: a lock per block
-    /// build and piece bounced its word between a builder's thread and
-    /// the scan's, twenty-two pieces a block at three million keys.
-    ranks: std::sync::RwLock<Option<(u64, std::sync::Arc<Vec<u32>>)>>,
+    /// folded in below. Taken once per table made, which clones the
+    /// shared vector and reads it at every block build after: a lookup
+    /// per block build and piece, when it was a lock, bounced the lock's
+    /// word between a builder's thread and the scan's, twenty-two pieces
+    /// a block at three million keys.
+    ranks: IdCache<Vec<u32>>,
     /// Where this piece's positions fall against a partition's block
     /// boundaries, by the partition's blob id: a function of two sealed
     /// files, so taken once and shared by every table made over the
@@ -1505,7 +1505,7 @@ struct Seg {
     /// piece for 360 us of a pass of 7 ms, and the writer walked every
     /// piece for each new one. Keyed by the partition's identity for the
     /// reason `ranks` is.
-    bounds: std::sync::RwLock<BoundsById>,
+    bounds: BoundsById,
     level: u8,
     /// The WAL sequence the segment's name carries: what orders the
     /// level-0 pieces over one fence oldest to newest, which a read's
@@ -2884,8 +2884,8 @@ impl Seg {
             return Ok(Seg {
                 blob,
                 name: name.to_string(),
-                ranks: std::sync::RwLock::new(None),
-                bounds: std::sync::RwLock::new(Vec::new()),
+                ranks: IdCache::default(),
+                bounds: IdCache::default(),
                 level: 0,
                 seq: Db::name_end_seq(name).unwrap_or(0),
                 lo,
@@ -2916,8 +2916,8 @@ impl Seg {
             return Ok(Seg {
                 blob,
                 name: name.to_string(),
-                ranks: std::sync::RwLock::new(None),
-                bounds: std::sync::RwLock::new(Vec::new()),
+                ranks: IdCache::default(),
+                bounds: IdCache::default(),
                 level: 1,
                 seq: Db::name_end_seq(name).unwrap_or(0),
                 lo,
@@ -2936,8 +2936,8 @@ impl Seg {
         Ok(Seg {
             blob,
             name: name.to_string(),
-            ranks: std::sync::RwLock::new(None),
-            bounds: std::sync::RwLock::new(Vec::new()),
+            ranks: IdCache::default(),
+            bounds: IdCache::default(),
             level: 0,
             seq: Db::name_end_seq(name).unwrap_or(0),
             lo: Vec::new(),
@@ -3457,6 +3457,19 @@ impl Readers {
     /// The writer: a new epoch, after publishing what it replaces.
     fn bump(&self) -> u64 {
         self.epoch.fetch_add(1, AtomicOrdering::SeqCst) + 1
+    }
+
+    /// The oldest epoch a reader is pinned at, or `u64::MAX` when none
+    /// is: `none_before(e)` is `e <= oldest_pinned()`, in one walk of the
+    /// table for a whole sweep, where asking `none_before` of every item
+    /// walked it once an item.
+    fn oldest_pinned(&self) -> u64 {
+        self.slots
+            .iter()
+            .map(|s| s.epoch.load(AtomicOrdering::SeqCst))
+            .filter(|&v| v != 0)
+            .min()
+            .unwrap_or(u64::MAX)
     }
 
     /// Whether every pinned reader pinned at or after `epoch`, so nothing
@@ -5430,14 +5443,10 @@ struct Shared {
     /// The reader table: slots for reader handles, and the epoch the
     /// writer bumps at each publish.
     readers: Readers,
-    /// States a publish replaced, each with the epoch it was retired at,
-    /// freed once no reader is pinned before it. The writer's, behind a
-    /// lock only because the shared struct must be `Sync`; it is never
-    /// contended.
-    retired: std::sync::Mutex<Vec<(u64, Box<State>)>>,
-    /// How many states wait in `retired`, so the writer's end of an
-    /// operation can tell there is nothing to sweep without the lock.
-    retired_len: AtomicUsize,
+    /// States a publish replaced, freed once no reader is pinned before
+    /// the epoch each was retired at. The writer and the segment work
+    /// both publish, so both push.
+    retired: RetireList<Box<State>>,
     /// Which mode the segment mappings are in: `true` is `MADV_RANDOM`.
     /// One flag for the whole store rather than one per segment, because
     /// the phase is a property of what the caller is doing and not of
@@ -5446,11 +5455,10 @@ struct Shared {
     /// EXPERIMENT: canonical forms the writer replaced, each with the
     /// epoch it was replaced at, freed once no reader is pinned at or
     /// before that epoch.
-    retired_forms: std::sync::Mutex<Vec<(u64, RetiredForm)>>,
+    retired_forms: RetireList<RetiredForm>,
     /// EXPERIMENT: snapshots a publish replaced, freed past every pinned
-    /// reader as the forms beside them are. Any handle may push here, so
-    /// unlike the forms' list this one is contended.
-    retired_snaps: std::sync::Mutex<Vec<(u64, RetiredSnap)>>,
+    /// reader as the forms beside them are. Any handle may push here.
+    retired_snaps: RetireList<RetiredSnap>,
     /// EXPERIMENT: scan snapshots built over this store's life, which is
     /// what publishing one is meant to bring down; for a test.
     snap_builds: AtomicU64,
@@ -5550,6 +5558,122 @@ struct RetiredForm(*mut CanonicalForm);
 /// EXPERIMENT: a snapshot a publish replaced, as `RetiredForm`; it holds
 /// one reference, taken by `Arc::into_raw` when it was published.
 struct RetiredSnap(*const Snapshot);
+
+/// Things replaced in what readers follow, each with the first epoch no
+/// reader pinned at or after can reach it by, freed once every pinned
+/// reader is at or past that epoch. Any thread
+/// pushes and any thread sweeps, and none of them waits: a push is one
+/// compare-and-swap onto the head, and a sweep takes the whole list with
+/// one swap, drops what no pinned reader can reach and puts the rest back
+/// the same way. Two sweeps at once split the list between them, and what
+/// one holds the other simply does not see until the next; nothing is
+/// freed early, because only a sweep that took an item decides it.
+struct RetireList<T> {
+    head: AtomicPtr<RetireNode<T>>,
+    /// Items in the list or in a sweep's hands: for a caller to tell
+    /// there is nothing to sweep without taking the list.
+    len: AtomicUsize,
+}
+
+struct RetireNode<T> {
+    epoch: u64,
+    /// Never read: held to be dropped.
+    _item: T,
+    next: *mut RetireNode<T>,
+}
+
+impl<T> RetireList<T> {
+    fn new() -> RetireList<T> {
+        RetireList {
+            head: AtomicPtr::new(std::ptr::null_mut()),
+            len: AtomicUsize::new(0),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len.load(AtomicOrdering::Relaxed)
+    }
+
+    /// `item`, which no reader pinned at `epoch` or later can reach.
+    fn push(&self, epoch: u64, item: T) {
+        let node = Box::into_raw(Box::new(RetireNode {
+            epoch,
+            _item: item,
+            next: std::ptr::null_mut(),
+        }));
+        self.len.fetch_add(1, AtomicOrdering::Relaxed);
+        self.splice(node, node);
+    }
+
+    /// The chain `first..=last` put on the front of the list.
+    fn splice(&self, first: *mut RetireNode<T>, last: *mut RetireNode<T>) {
+        let mut head = self.head.load(AtomicOrdering::Relaxed);
+        loop {
+            // SAFETY: the chain is this call's until the swap below
+            // publishes it.
+            unsafe { (*last).next = head };
+            match self.head.compare_exchange_weak(
+                head,
+                first,
+                AtomicOrdering::Release,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(now) => head = now,
+            }
+        }
+    }
+
+    /// Drop every item no reader pinned at `oldest` or later can reach --
+    /// `oldest` being the oldest epoch a reader is pinned at -- and keep
+    /// the rest.
+    fn sweep(&self, oldest: u64) {
+        if self.head.load(AtomicOrdering::Relaxed).is_null() {
+            return;
+        }
+        let mut p = self
+            .head
+            .swap(std::ptr::null_mut(), AtomicOrdering::Acquire);
+        let (mut first, mut last) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let mut freed = 0;
+        while !p.is_null() {
+            // SAFETY: taken off the list by the swap, so this sweep's alone.
+            let next = unsafe { (*p).next };
+            if unsafe { (*p).epoch } <= oldest {
+                drop(unsafe { Box::from_raw(p) });
+                freed += 1;
+            } else {
+                unsafe { (*p).next = first };
+                if first.is_null() {
+                    last = p;
+                }
+                first = p;
+            }
+            p = next;
+        }
+        self.len.fetch_sub(freed, AtomicOrdering::Relaxed);
+        if !first.is_null() {
+            self.splice(first, last);
+        }
+    }
+}
+
+impl<T> Drop for RetireList<T> {
+    fn drop(&mut self) {
+        let mut p = *self.head.get_mut();
+        while !p.is_null() {
+            // SAFETY: the list's own, and no handle is left to reach it.
+            let node = unsafe { Box::from_raw(p) };
+            p = node.next;
+        }
+    }
+}
+
+// SAFETY: the nodes are reached only through the head, which the atomic
+// operations above hand from thread to thread whole; an item is touched
+// only to drop it, by the one sweep that took it.
+unsafe impl<T: Send> Send for RetireList<T> {}
+unsafe impl<T: Send> Sync for RetireList<T> {}
 
 impl Drop for RetiredForm {
     fn drop(&mut self) {
@@ -6406,7 +6530,7 @@ struct Snapshot {
     /// whose run is the same. A handle's first scan after the mixes
     /// walked the run against every boundary for 280 us at three
     /// hundred thousand keys.
-    bounds: std::sync::Arc<std::sync::RwLock<SnapById>>,
+    bounds: std::sync::Arc<SnapById>,
 }
 
 /// What `scan_blocks` did: walked to the limit or the store's end, or
@@ -7004,7 +7128,7 @@ impl Reader {
             // swept now rather than at the next publish, which a writer
             // gone quiet may never make, and which left the frozen
             // memtable a landing replaced held until then.
-            if self.shared.retired_len.load(AtomicOrdering::Relaxed) > 0 {
+            if self.shared.retired.len() > 0 {
                 self.sweep_retired_states();
             }
         }
@@ -8533,11 +8657,7 @@ impl Reader {
                 Ok(_) => {
                     if !cur.is_null() {
                         let epoch = self.shared.readers.epoch.load(AtomicOrdering::SeqCst);
-                        self.shared
-                            .retired_snaps
-                            .lock()
-                            .expect("the retired snapshots")
-                            .push((epoch, RetiredSnap(cur)));
+                        self.shared.retired_snaps.push(epoch + 1, RetiredSnap(cur));
                         // The epoch moved past the retirement, so a
                         // handle that pins from here on is not one that
                         // could hold the replaced snapshot, and the
@@ -8567,28 +8687,21 @@ impl Reader {
     /// sweep before every reader has left simply leaves them for the
     /// next.
     fn sweep_retired_snaps(&self) {
-        let mut retired = self
-            .shared
-            .retired_snaps
-            .lock()
-            .expect("the retired snapshots");
-        if retired.is_empty() {
+        if self.shared.retired_snaps.len() == 0 {
             return;
         }
-        let readers = &self.shared.readers;
         // Replaced in the state; one is dropped, and so freed, once every
         // handle that could be between the load and the clone has left.
-        retired.retain(|(t, _)| !readers.none_before(t + 1));
+        self.shared
+            .retired_snaps
+            .sweep(self.shared.readers.oldest_pinned());
     }
 
     /// The replaced states no pinned reader can still be walking.
     fn sweep_retired_states(&self) {
-        let mut retired = self.shared.retired.lock().expect("the retired list");
-        let readers = &self.shared.readers;
-        retired.retain(|(t, _)| !readers.none_before(*t));
         self.shared
-            .retired_len
-            .store(retired.len(), AtomicOrdering::Relaxed);
+            .retired
+            .sweep(self.shared.readers.oldest_pinned());
     }
 
     /// EXPERIMENT: free the replaced canonical forms no pinned reader can
@@ -8597,15 +8710,15 @@ impl Reader {
     /// current epoch can be freed once its readers leave.
     fn sweep_retired_forms(&self) {
         self.sweep_retired_snaps();
-        let mut retired = self.shared.retired_forms.lock().expect("the retired forms");
-        if retired.is_empty() {
+        if self.shared.retired_forms.len() == 0 {
             return;
         }
         self.shared.readers.bump();
-        let readers = &self.shared.readers;
         // Replaced by the writer and unreachable since; one is dropped,
         // and so freed, once every reader that could hold it has left.
-        retired.retain(|(t, _)| !readers.none_before(t + 1));
+        self.shared
+            .retired_forms
+            .sweep(self.shared.readers.oldest_pinned());
     }
 
     /// One block materialised, charged to whoever built it.
@@ -8754,12 +8867,10 @@ impl Reader {
             // count its bytes out, and freed past every pinned reader.
             let old_bytes = unsafe { &*old }.bytes;
             st.forms_bytes.fetch_sub(old_bytes, AtomicOrdering::Relaxed);
+            // A reader pinned at this epoch may have loaded it before the
+            // swap; one pinned after cannot.
             let epoch = self.shared.readers.epoch.load(AtomicOrdering::SeqCst);
-            self.shared
-                .retired_forms
-                .lock()
-                .expect("the retired forms")
-                .push((epoch, RetiredForm(old)));
+            self.shared.retired_forms.push(epoch + 1, RetiredForm(old));
         }
     }
 
@@ -11156,11 +11267,10 @@ impl Db {
         let shared = std::sync::Arc::new(Shared {
             state: AtomicPtr::new(Box::into_raw(Box::new(state))),
             readers: Readers::new(),
-            retired: std::sync::Mutex::new(Vec::new()),
-            retired_len: AtomicUsize::new(0),
+            retired: RetireList::new(),
             advice_random: std::sync::atomic::AtomicBool::new(starts_random),
-            retired_forms: std::sync::Mutex::new(Vec::new()),
-            retired_snaps: std::sync::Mutex::new(Vec::new()),
+            retired_forms: RetireList::new(),
+            retired_snaps: RetireList::new(),
             snap_builds: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
@@ -11471,11 +11581,10 @@ impl Db {
         let shared = std::sync::Arc::new(Shared {
             state: AtomicPtr::new(Box::into_raw(Box::new(state))),
             readers,
-            retired: std::sync::Mutex::new(Vec::new()),
-            retired_len: AtomicUsize::new(0),
+            retired: RetireList::new(),
             advice_random: std::sync::atomic::AtomicBool::new(starts_random),
-            retired_forms: std::sync::Mutex::new(Vec::new()),
-            retired_snaps: std::sync::Mutex::new(Vec::new()),
+            retired_forms: RetireList::new(),
+            retired_snaps: RetireList::new(),
             snap_builds: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
@@ -12524,7 +12633,7 @@ impl Db {
     /// PROTOTYPE: how many states a publish replaced are still held for a
     /// reader, for a test to hold the reader table to its word.
     pub fn retired_states(&self) -> usize {
-        self.shared.retired.lock().expect("the retired list").len()
+        self.shared.retired.len()
     }
 }
 
@@ -13177,7 +13286,86 @@ type PieceRun<'a> = (usize, std::ops::Range<usize>, Option<&'a [u32]>);
 /// Where a sorted source's positions fall against a partition's block
 /// boundaries, by the partition's blob id: what a piece keeps against
 /// each partition it meets and a snapshot keeps for its main run.
-type BoundsById = Vec<(u64, std::sync::Arc<Vec<u32>>)>;
+type BoundsById = IdCache<Vec<u32>>;
+
+/// Values keyed by a partition's blob id that only ever gain entries:
+/// functions of two immutable things, taken once and read by every table
+/// made over the pair. A read walks the entries with no lock and a miss
+/// is filled with one compare-and-swap at the head; two threads that
+/// miss together both compute and both insert, and either answer is the
+/// same answer. Nothing is removed before the cache is dropped, so no
+/// reader can be holding an entry when it goes.
+struct IdCache<T> {
+    head: AtomicPtr<IdNode<T>>,
+}
+
+struct IdNode<T> {
+    id: u64,
+    val: std::sync::Arc<T>,
+    next: *mut IdNode<T>,
+}
+
+impl<T> Default for IdCache<T> {
+    fn default() -> IdCache<T> {
+        IdCache {
+            head: AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
+}
+
+impl<T> IdCache<T> {
+    fn get(&self, id: u64) -> Option<std::sync::Arc<T>> {
+        let mut p = self.head.load(AtomicOrdering::Acquire);
+        while !p.is_null() {
+            // SAFETY: published whole by `put` and freed only with the
+            // cache.
+            let n = unsafe { &*p };
+            if n.id == id {
+                return Some(n.val.clone());
+            }
+            p = n.next;
+        }
+        None
+    }
+
+    fn put(&self, id: u64, val: std::sync::Arc<T>) {
+        let node = Box::into_raw(Box::new(IdNode {
+            id,
+            val,
+            next: std::ptr::null_mut(),
+        }));
+        let mut head = self.head.load(AtomicOrdering::Relaxed);
+        loop {
+            // SAFETY: this call's until the swap publishes it.
+            unsafe { (*node).next = head };
+            match self.head.compare_exchange_weak(
+                head,
+                node,
+                AtomicOrdering::Release,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(now) => head = now,
+            }
+        }
+    }
+}
+
+impl<T> Drop for IdCache<T> {
+    fn drop(&mut self) {
+        let mut p = *self.head.get_mut();
+        while !p.is_null() {
+            // SAFETY: the cache's own, and nothing reaches it any more.
+            let n = unsafe { Box::from_raw(p) };
+            p = n.next;
+        }
+    }
+}
+
+// SAFETY: the entries are immutable once published and shared as `Arc`s,
+// which is what `Send + Sync` of `T` covers.
+unsafe impl<T: Send + Sync> Send for IdCache<T> {}
+unsafe impl<T: Send + Sync> Sync for IdCache<T> {}
 
 /// PROTOTYPE: a snapshot's main run against one partition: where the
 /// run's positions fall against the partition's block boundaries, and
@@ -13192,7 +13380,7 @@ struct SnapBounds {
     at: Vec<u32>,
     cuts: Vec<u32>,
 }
-type SnapById = Vec<(u64, std::sync::Arc<SnapBounds>)>;
+type SnapById = IdCache<SnapBounds>;
 
 /// PROTOTYPE: per entry of a `PieceBounds`, the piece's ranks against the
 /// partition, as `BlockTable::piece_ranks` holds them.
@@ -13680,12 +13868,7 @@ impl Reader {
         // per commit, and the keeper's own version is dropped here at
         // the next tick instead. Whoever adopts the last published one
         // carries it forward, so nothing is wrong, only later.
-        let retired = self
-            .shared
-            .retired_snaps
-            .lock()
-            .expect("the retired snapshots")
-            .len();
+        let retired = self.shared.retired_snaps.len();
         if retired < KEEPER_RETIRED_MAX {
             self.publish_snapshot(&next);
         }
@@ -13837,8 +14020,29 @@ struct UpkeepTo {
 /// untouched.
 #[derive(Default)]
 struct Lend {
-    inner: std::sync::Mutex<LendInner>,
+    /// Who holds the upkeep, in the `LEND_*` bits: the writer while none
+    /// is set; the cell while `LEND_LENT` is and `LEND_BUSY` is not; the
+    /// thread while `LEND_BUSY` is. Every hand-over is one operation on
+    /// this word, so nothing waits on anything but a pass in flight: the
+    /// thread is niced, and a lock the writer took at every commit was a
+    /// lock the thread could be preempted holding.
+    state: std::sync::atomic::AtomicU32,
+    /// The upkeep while it is lent and not out: filled by the writer
+    /// before it sets `LEND_LENT` and by the thread before it clears
+    /// `LEND_BUSY`, emptied by whoever the word hands it to.
+    cell: std::cell::UnsafeCell<Option<FormsState>>,
+    /// The commit named last; only the writer writes it.
+    to: SeqTo,
     thread: std::sync::OnceLock<std::thread::Thread>,
+    /// Whoever waits for the end of a pass, woken by the thread when it
+    /// puts the upkeep back.
+    waiter: AtomicPtr<std::thread::Thread>,
+    /// A pass's failure, for the writer's next commit to return.
+    err: AtomicPtr<std::io::Error>,
+    /// A pass that panicked -- a debug assertion in the maintenance, in
+    /// the checked profile -- for the writer to raise when it takes the
+    /// upkeep back, rather than wait on a thread that has none to give.
+    panic: AtomicPtr<Box<dyn std::any::Any + Send>>,
     /// For a measurement: passes the thread made, the times the writer
     /// took the upkeep back, the times it waited for a pass in flight,
     /// and the nanoseconds it waited.
@@ -13851,23 +14055,86 @@ struct Lend {
     hold_ns: AtomicU64,
 }
 
+/// The upkeep is away from the writer: in the cell, or out with the
+/// thread.
+const LEND_LENT: u32 = 1;
+/// The thread has it out for a pass.
+const LEND_BUSY: u32 = 2;
+/// The writer waits for it back: the thread begins nothing new.
+const LEND_WANT: u32 = 4;
+/// A commit is named that no pass has begun on.
+const LEND_POSTED: u32 = 8;
+
+// SAFETY: the cell is reached only by the holder the state word names,
+// and each hand-over is a release by the one side and an acquire by the
+// other on that word; `FormsState` is `Send`, which is all a hand-over
+// between threads asks of it.
+unsafe impl Sync for Lend {}
+
+impl Drop for Lend {
+    fn drop(&mut self) {
+        drop(self.take_waiter());
+        drop(self.take_err());
+        drop(self.take_panic());
+    }
+}
+
+/// A commit named for the upkeep, as a sequence lock: the writer, its
+/// only writer, makes the count odd, stores the fields and makes it even
+/// again; the thread takes the fields only between two equal even
+/// counts. The writer never waits, and the thread retries only across
+/// the few stores of a commit's naming.
 #[derive(Default)]
-struct LendInner {
-    /// The upkeep, when it is lent and not in the thread's hands.
-    fs: Option<FormsState>,
-    /// The thread has it out.
-    busy: bool,
-    /// The commit it is to be brought to next.
-    to: Option<UpkeepTo>,
-    /// The writer, waiting for it back: the thread begins nothing new.
-    want: bool,
-    waiter: Option<std::thread::Thread>,
-    /// A pass's failure, for the writer's next commit to return.
-    err: Option<std::io::Error>,
-    /// A pass that panicked -- a debug assertion in the maintenance, in
-    /// the checked profile -- for the writer to raise when it takes the
-    /// upkeep back, rather than wait on a thread that has none to give.
-    panic: Option<Box<dyn std::any::Any + Send>>,
+struct SeqTo {
+    seq: AtomicU64,
+    gen: AtomicU64,
+    log: AtomicUsize,
+    len: AtomicUsize,
+    wm: AtomicU64,
+    force: std::sync::atomic::AtomicBool,
+}
+
+impl SeqTo {
+    /// The writer's alone.
+    fn store(&self, to: UpkeepTo) {
+        let n = self.seq.load(AtomicOrdering::Relaxed);
+        self.seq.store(n + 1, AtomicOrdering::Relaxed);
+        std::sync::atomic::fence(AtomicOrdering::Release);
+        self.gen.store(to.gen, AtomicOrdering::Relaxed);
+        self.log.store(to.log, AtomicOrdering::Relaxed);
+        self.len.store(to.len, AtomicOrdering::Relaxed);
+        self.wm.store(to.wm, AtomicOrdering::Relaxed);
+        self.force.store(to.force, AtomicOrdering::Relaxed);
+        self.seq.store(n + 2, AtomicOrdering::Release);
+    }
+
+    fn load(&self) -> UpkeepTo {
+        let mut spins = 0u32;
+        loop {
+            let n = self.seq.load(AtomicOrdering::Acquire);
+            if n & 1 == 0 {
+                let to = UpkeepTo {
+                    gen: self.gen.load(AtomicOrdering::Relaxed),
+                    log: self.log.load(AtomicOrdering::Relaxed),
+                    len: self.len.load(AtomicOrdering::Relaxed),
+                    wm: self.wm.load(AtomicOrdering::Relaxed),
+                    force: self.force.load(AtomicOrdering::Relaxed),
+                };
+                std::sync::atomic::fence(AtomicOrdering::Acquire);
+                if self.seq.load(AtomicOrdering::Relaxed) == n {
+                    return to;
+                }
+            }
+            // The writer is between its stores; preempted there, it is
+            // given the core rather than spun against.
+            spins += 1;
+            if spins.is_multiple_of(64) {
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+    }
 }
 
 /// How long the upkeep thread sleeps between looks, from the shortest
@@ -13882,21 +14149,24 @@ const UPKEEP_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(20
 const UPKEEP_WAKE_WRITES: usize = 256;
 
 impl Lend {
-    fn lock(&self) -> std::sync::MutexGuard<'_, LendInner> {
-        self.inner.lock().expect("the writer's upkeep")
-    }
-
     /// `fs` handed over, to be brought to `to`.
     fn lend(&self, fs: FormsState, to: UpkeepTo) {
-        let mut g = self.lock();
-        debug_assert!(g.fs.is_none() && !g.busy, "the upkeep is lent once");
-        g.fs = Some(fs);
-        g.to = Some(to);
+        debug_assert_eq!(
+            self.state.load(AtomicOrdering::Relaxed),
+            0,
+            "the upkeep is lent once"
+        );
+        // SAFETY: the state is clear, so the cell is the writer's.
+        unsafe { *self.cell.get() = Some(fs) };
+        self.to.store(to);
+        self.state
+            .store(LEND_LENT | LEND_POSTED, AtomicOrdering::Release);
     }
 
     /// A later commit to bring the lent upkeep to.
     fn post(&self, to: UpkeepTo) {
-        self.lock().to = Some(to);
+        self.to.store(to);
+        self.state.fetch_or(LEND_POSTED, AtomicOrdering::Release);
     }
 
     fn wake(&self) {
@@ -13905,23 +14175,56 @@ impl Lend {
         }
     }
 
+    fn set_waiter(&self, t: std::thread::Thread) {
+        let old = self
+            .waiter
+            .swap(Box::into_raw(Box::new(t)), AtomicOrdering::AcqRel);
+        if !old.is_null() {
+            // SAFETY: made by `Box::into_raw` here, and swapped out once.
+            drop(unsafe { Box::from_raw(old) });
+        }
+    }
+
+    fn take_waiter(&self) -> Option<std::thread::Thread> {
+        let p = self
+            .waiter
+            .swap(std::ptr::null_mut(), AtomicOrdering::AcqRel);
+        // SAFETY: as in `set_waiter`.
+        (!p.is_null()).then(|| *unsafe { Box::from_raw(p) })
+    }
+
+    fn take_panic(&self) -> Option<Box<dyn std::any::Any + Send>> {
+        let p = self
+            .panic
+            .swap(std::ptr::null_mut(), AtomicOrdering::AcqRel);
+        // SAFETY: made by `Box::into_raw` in `put_back`, swapped out once.
+        (!p.is_null()).then(|| *unsafe { Box::from_raw(p) })
+    }
+
     /// The upkeep back from the thread, after the pass in flight if one
     /// is. Called only while it is lent.
     fn take_back(&self) -> FormsState {
         self.takes.fetch_add(1, AtomicOrdering::Relaxed);
         let mut waited: Option<std::time::Instant> = None;
-        let mut g = self.lock();
         loop {
-            if !g.busy {
-                if let Some(p) = g.panic.take() {
-                    drop(g);
+            let s = self.state.load(AtomicOrdering::Acquire);
+            debug_assert!(s & LEND_LENT != 0, "the writer's upkeep is lent");
+            if s & LEND_BUSY == 0 {
+                // In the cell: taken by clearing the word, which also
+                // drops whatever commit no pass has begun on.
+                if self
+                    .state
+                    .compare_exchange(s, 0, AtomicOrdering::Acquire, AtomicOrdering::Relaxed)
+                    .is_err()
+                {
+                    continue;
+                }
+                if let Some(p) = self.take_panic() {
                     std::panic::resume_unwind(p);
                 }
-                let fs = g.fs.take().expect("the writer's upkeep is lent");
-                g.to = None;
-                g.want = false;
-                g.waiter = None;
-                drop(g);
+                drop(self.take_waiter());
+                // SAFETY: the word is clear, so the cell is the writer's.
+                let fs = unsafe { (*self.cell.get()).take() }.expect("the writer's upkeep is lent");
                 if let Some(t) = waited {
                     self.waits.fetch_add(1, AtomicOrdering::Relaxed);
                     self.wait_ns
@@ -13929,36 +14232,108 @@ impl Lend {
                 }
                 return fs;
             }
-            g.want = true;
+            // A pass in flight: the thread begins nothing after it, and
+            // wakes whoever waits when it puts the upkeep back. The waiter
+            // is named before the ask, so a pass that ends after the ask
+            // finds it; one that ended before shows here as no pass.
             waited.get_or_insert_with(std::time::Instant::now);
-            g.waiter = Some(std::thread::current());
-            drop(g);
+            self.set_waiter(std::thread::current());
+            if self.state.fetch_or(LEND_WANT, AtomicOrdering::AcqRel) & LEND_BUSY == 0 {
+                continue;
+            }
             std::thread::park_timeout(std::time::Duration::from_millis(1));
-            g = self.lock();
+        }
+    }
+
+    /// The thread's: the upkeep out of the cell and the commit to bring
+    /// it to, when a commit is named, nothing is out, and the writer is
+    /// not waiting for it.
+    fn take_out(&self) -> Option<(FormsState, UpkeepTo)> {
+        let s = self.state.load(AtomicOrdering::Acquire);
+        if s != LEND_LENT | LEND_POSTED {
+            return None;
+        }
+        self.state
+            .compare_exchange(
+                s,
+                LEND_LENT | LEND_BUSY,
+                AtomicOrdering::Acquire,
+                AtomicOrdering::Relaxed,
+            )
+            .ok()?;
+        // SAFETY: the word names the thread as the holder.
+        let fs = unsafe { (*self.cell.get()).take() }.expect("a lent upkeep is in the cell");
+        // Taken after the post was consumed, so it is that commit or one
+        // the writer named since: a named commit either way.
+        Some((fs, self.to.load()))
+    }
+
+    /// The thread's: the upkeep put back after a pass, with what the pass
+    /// ended in, and whoever waits woken.
+    fn put_back(
+        &self,
+        fs: Option<FormsState>,
+        err: Option<std::io::Error>,
+        panic: Option<Box<dyn std::any::Any + Send>>,
+    ) {
+        // SAFETY: the word names the thread as the holder until the
+        // release below hands the cell on.
+        unsafe { *self.cell.get() = fs };
+        if let Some(e) = err {
+            let p = Box::into_raw(Box::new(e));
+            if self
+                .err
+                .compare_exchange(
+                    std::ptr::null_mut(),
+                    p,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                )
+                .is_err()
+            {
+                // SAFETY: never published; the first failure is the one
+                // kept.
+                drop(unsafe { Box::from_raw(p) });
+            }
+        }
+        if let Some(p) = panic {
+            let old = self
+                .panic
+                .swap(Box::into_raw(Box::new(p)), AtomicOrdering::AcqRel);
+            if !old.is_null() {
+                // SAFETY: made by `Box::into_raw` here, swapped out once.
+                drop(unsafe { Box::from_raw(old) });
+            }
+        }
+        self.state.fetch_and(!LEND_BUSY, AtomicOrdering::AcqRel);
+        if let Some(w) = self.take_waiter() {
+            w.unpark();
         }
     }
 
     /// Whether the thread has brought the upkeep to the last commit
     /// named.
     fn caught_up(&self) -> bool {
-        let g = self.lock();
-        !g.busy && g.to.is_none()
+        self.state.load(AtomicOrdering::Acquire) & (LEND_BUSY | LEND_POSTED) == 0
     }
 
     /// Whether the thread has brought the upkeep to the last commit
     /// named, or does not have it; if neither, `waiter` is woken at the
     /// end of the pass.
     fn caught_up_or_home(&self, waiter: std::thread::Thread) -> bool {
-        let mut g = self.lock();
-        if !g.busy && (g.to.is_none() || g.fs.is_none()) {
+        let done = |s: u32| s & LEND_BUSY == 0 && (s & LEND_POSTED == 0 || s & LEND_LENT == 0);
+        if done(self.state.load(AtomicOrdering::Acquire)) {
             return true;
         }
-        g.waiter = Some(waiter);
-        false
+        self.set_waiter(waiter);
+        // A pass that ended before the waiter was named woke nobody.
+        done(self.state.load(AtomicOrdering::Acquire))
     }
 
     fn take_err(&self) -> Option<std::io::Error> {
-        self.lock().err.take()
+        let p = self.err.swap(std::ptr::null_mut(), AtomicOrdering::AcqRel);
+        // SAFETY: made by `Box::into_raw` in `put_back`, swapped out once.
+        (!p.is_null()).then(|| *unsafe { Box::from_raw(p) })
     }
 }
 
@@ -13966,9 +14341,8 @@ impl Reader {
     /// A handle with the writer's view and none of its own upkeep, for the
     /// upkeep thread to run the writer's through: the writer's reads and
     /// publishes, bounded at each pass to the commit the writer named.
-    /// It pins nothing, as the writer's own handle pins nothing: while the
-    /// upkeep is lent the writer publishes and frees nothing, since every
-    /// publish takes the upkeep back first.
+    /// It pins an engine slot of its own for each pass, so what a pass
+    /// walks is not freed under it whoever publishes meanwhile.
     fn understudy(&self) -> Reader {
         Reader {
             shared: self.shared.clone(),
@@ -14000,18 +14374,7 @@ impl Reader {
             if stop.load(AtomicOrdering::SeqCst) {
                 break;
             }
-            let job = {
-                let mut g = lend.lock();
-                match (g.busy, g.want, g.to) {
-                    (false, false, Some(to)) if g.fs.is_some() => {
-                        g.busy = true;
-                        g.to = None;
-                        g.fs.take().map(|fs| (fs, to))
-                    }
-                    _ => None,
-                }
-            };
-            let Some((fs, to)) = job else {
+            let Some((fs, to)) = lend.take_out() else {
                 std::thread::park_timeout(idle);
                 idle = (idle * 2).min(UPKEEP_POLL_MAX);
                 continue;
@@ -14019,24 +14382,11 @@ impl Reader {
             let pass =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.upkeep_pass(fs, to)));
             lend.passes.fetch_add(1, AtomicOrdering::Relaxed);
-            let mut g = lend.lock();
             match pass {
-                Ok((fs, done)) => {
-                    g.fs = Some(fs);
-                    if let Err(e) = done {
-                        g.err.get_or_insert(e);
-                    }
-                }
-                Err(p) => {
-                    // The upkeep is whatever the pass left in the cell;
-                    // the writer raises the panic before it could use it.
-                    g.fs = self.lend_fs();
-                    g.panic = Some(p);
-                }
-            }
-            g.busy = false;
-            if let Some(w) = g.waiter.take() {
-                w.unpark();
+                Ok((fs, done)) => lend.put_back(Some(fs), done.err(), None),
+                // The upkeep is whatever the pass left in the cell; the
+                // writer raises the panic before it could use it.
+                Err(p) => lend.put_back(self.lend_fs(), None, Some(p)),
             }
             idle = UPKEEP_POLL_MIN;
         }
@@ -14262,8 +14612,8 @@ impl Db {
         self.take_back_upkeep();
     }
 
-    /// The upkeep home, after the pass in flight: what every publish does
-    /// before it swaps the state.
+    /// The upkeep home, after the pass in flight: what the writer's own
+    /// publishes do before they swap the state.
     fn take_back_upkeep(&self) {
         if !self.fs_home() {
             let _ = self.fs();
@@ -14451,14 +14801,7 @@ impl<'s> BuildCtx<'s> {
             {
                 continue;
             }
-            let cached = p
-                .bounds
-                .read()
-                .expect("a piece's bounds")
-                .iter()
-                .find(|(id, _)| *id == against)
-                .map(|(_, at)| at.clone());
-            let at = match cached {
+            let at = match p.bounds.get(against) {
                 Some(at) => at,
                 None => {
                     let at = std::sync::Arc::new(block_bounds_of(
@@ -14468,23 +14811,13 @@ impl<'s> BuildCtx<'s> {
                         |k| p.ord.seek(p.cursor_from(k), |i| p.blob.key_at(i)),
                         |i, bound| p.ord.advance_below(i, bound, |r| p.blob.key_at(r)),
                     )?);
-                    p.bounds
-                        .write()
-                        .expect("a piece's bounds")
-                        .push((against, at.clone()));
+                    p.bounds.put(against, at.clone());
                     at
                 }
             };
             pieces.push((j, at));
             // Ranks against another partition are no ranks.
-            ranks.push(
-                p.ranks
-                    .read()
-                    .expect("a piece's ranks")
-                    .as_ref()
-                    .filter(|(id, _)| *id == against)
-                    .map(|(_, v)| v.clone()),
-            );
+            ranks.push(p.ranks.get(against));
         }
         Ok((pieces, ranks))
     }
@@ -14589,16 +14922,11 @@ impl<'s> BuildCtx<'s> {
                 continue;
             };
             let id = part.blob.id();
-            if p.ranks
-                .read()
-                .expect("a piece's ranks")
-                .as_ref()
-                .is_some_and(|(against, _)| *against == id)
-            {
+            if p.ranks.get(id).is_some() {
                 continue;
             }
-            let ranks = std::sync::Arc::new(BuildCtx::ranks_over(part, p)?);
-            *p.ranks.write().expect("a piece's ranks") = Some((id, ranks));
+            p.ranks
+                .put(id, std::sync::Arc::new(BuildCtx::ranks_over(part, p)?));
         }
         Ok(())
     }
@@ -14610,14 +14938,7 @@ impl<'s> BuildCtx<'s> {
         unsealed: &Snapshot,
     ) -> Result<std::sync::Arc<SnapBounds>> {
         let against = seg.blob.id();
-        let cached = unsealed
-            .bounds
-            .read()
-            .expect("a snapshot's bounds")
-            .iter()
-            .find(|(id, _)| *id == against)
-            .map(|(_, at)| at.clone());
-        if let Some(at) = cached {
+        if let Some(at) = unsealed.bounds.get(against) {
             return Ok(at);
         }
         let at = block_bounds_of(
@@ -14633,11 +14954,7 @@ impl<'s> BuildCtx<'s> {
         );
         let cuts = Self::snap_cuts(seg, unsealed, lo, hi)?;
         let sb = std::sync::Arc::new(SnapBounds { at, cuts });
-        unsealed
-            .bounds
-            .write()
-            .expect("a snapshot's bounds")
-            .push((against, sb.clone()));
+        unsealed.bounds.put(against, sb.clone());
         Ok(sb)
     }
     /// PROTOTYPE: where each key of the snapshot's run over `lo..hi` cuts
@@ -15540,14 +15857,9 @@ impl std::ops::Deref for Maint {
 /// the bump makes and freed once no reader is pinned before it.
 fn retire_state(shared: &Shared, old: *mut State) {
     let tag = shared.readers.bump();
-    let mut retired = shared.retired.lock().expect("the retired list");
     // SAFETY: the caller swapped it out of the state pointer and owns it.
-    retired.push((tag, unsafe { Box::from_raw(old) }));
-    let readers = &shared.readers;
-    retired.retain(|(t, _)| !readers.none_before(*t));
-    shared
-        .retired_len
-        .store(retired.len(), AtomicOrdering::Relaxed);
+    shared.retired.push(tag, unsafe { Box::from_raw(old) });
+    shared.retired.sweep(shared.readers.oldest_pinned());
 }
 
 impl Maint {
@@ -16733,5 +17045,124 @@ mod threading {
             let reads = reader.join().unwrap();
             assert!(reads > 1000, "the reader read beside the writer: {reads}");
         });
+    }
+}
+
+#[cfg(test)]
+mod lockfree {
+    use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
+    use std::sync::Arc;
+
+    /// An item that records its own drop, so a double free or a leak is a
+    /// count that is not one.
+    struct Tracked(Arc<Vec<AtomicU8>>, usize);
+
+    impl Drop for Tracked {
+        fn drop(&mut self) {
+            self.0[self.1].fetch_add(1, SeqCst);
+        }
+    }
+
+    /// Four threads push while two sweep with an oldest epoch that moves
+    /// forward: nothing is dropped before the epoch passes it, nothing
+    /// twice, and everything by the last sweep or the list's own drop.
+    #[test]
+    fn a_retire_list_frees_each_item_once_and_never_early() {
+        const PER: usize = 20_000;
+        let drops: Arc<Vec<AtomicU8>> = Arc::new((0..4 * PER).map(|_| AtomicU8::new(0)).collect());
+        let list = Arc::new(super::RetireList::<Tracked>::new());
+        let oldest = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut pushers = Vec::new();
+        for t in 0..4 {
+            let (list, drops) = (list.clone(), drops.clone());
+            pushers.push(std::thread::spawn(move || {
+                for i in 0..PER {
+                    let id = t * PER + i;
+                    // Epochs from 1 up, so the item for `id` may go once
+                    // the oldest pinned epoch reaches `i + 1`.
+                    list.push(i as u64 + 1, Tracked(drops.clone(), id));
+                }
+            }));
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut sweepers = Vec::new();
+        for _ in 0..2 {
+            let (list, drops, oldest, stop) =
+                (list.clone(), drops.clone(), oldest.clone(), stop.clone());
+            sweepers.push(std::thread::spawn(move || {
+                while !stop.load(SeqCst) {
+                    let o = oldest.load(SeqCst);
+                    list.sweep(o);
+                    // Nothing retired past what this sweep was told is
+                    // dropped, by it or by another sweep told less.
+                    for (id, d) in drops.iter().enumerate() {
+                        let epoch = (id % PER) as u64 + 1;
+                        let n = d.load(SeqCst);
+                        assert!(n <= 1, "item {id} dropped {n} times");
+                        if epoch > oldest.load(SeqCst) {
+                            assert_eq!(n, 0, "item {id} dropped before its epoch");
+                        }
+                    }
+                }
+            }));
+        }
+        for e in (0..=PER as u64).step_by(997) {
+            oldest.store(e, SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        for p in pushers {
+            p.join().unwrap();
+        }
+        stop.store(true, SeqCst);
+        for s in sweepers {
+            s.join().unwrap();
+        }
+        list.sweep(PER as u64 / 2);
+        let live = list.len();
+        let dropped = drops.iter().filter(|d| d.load(SeqCst) == 1).count();
+        assert_eq!(
+            live + dropped,
+            4 * PER,
+            "every item is in the list or dropped"
+        );
+        drop(list);
+        assert!(
+            drops.iter().all(|d| d.load(SeqCst) == 1),
+            "the list's drop frees the rest, once each"
+        );
+    }
+
+    /// Four threads look up and fill the same ids at once: every lookup
+    /// that finds an entry finds that id's value, and the cache's drop
+    /// frees every entry, the duplicates two misses made included.
+    #[test]
+    fn an_id_cache_answers_each_id_with_its_own_value() {
+        let cache = Arc::new(super::IdCache::<(u64, Vec<u8>)>::default());
+        let mut hs = Vec::new();
+        for t in 0..4u64 {
+            let cache = cache.clone();
+            hs.push(std::thread::spawn(move || {
+                for round in 0..2000u64 {
+                    let id = (round * 7 + t) % 97;
+                    match cache.get(id) {
+                        Some(v) => assert_eq!(v.0, id, "id {id} answered with {}", v.0),
+                        None => cache.put(id, Arc::new((id, vec![id as u8; 16]))),
+                    }
+                }
+            }));
+        }
+        for h in hs {
+            h.join().unwrap();
+        }
+        for id in 0..97 {
+            assert_eq!(cache.get(id).map(|v| v.0), Some(id));
+        }
+        let probe = cache.get(3).unwrap();
+        drop(cache);
+        assert_eq!(
+            Arc::strong_count(&probe),
+            1,
+            "the cache's drop gave up its references"
+        );
     }
 }

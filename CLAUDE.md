@@ -223,20 +223,22 @@ behind an atomic would let one in unasked.
 (`Upkeep::Background(2)`) a commit that would leave its batch to the
 next scan lends the writer's `FormsState` -- its block tables and scan
 snapshot -- to a thread of the store's own, and returns once the thread
-has filed it. One thread holds it at a time: the cell is emptied only
-through `&mut` and refilled only while empty, so nothing in it needs to
-be `Sync`, and a writer's touch of it takes it back, waiting only for a
-pass in flight. The thread pins a slot for each pass, so a publish from
-the segment work needs nothing of it: the forms go across as copies the
-publish makes (`State::carry_published`) and the writer's own tables
-follow at its next look at the log (`Reader::rebase_tables`); the
-writer's own publishes still take it back first. The forms a pass publishes
-carry the commit the writer named, never the latest, or a handle at
-the latest takes forms without the writes between; retired forms are
-swept only by whoever holds it; and `settle` joins it before anything
-else, because every other join touches it. The threaded test runs at
-each level, since a level that holds hides what a level that lends
-exposes.
+has filed it. One thread holds it at a time, and one word says which:
+every hand-over is a single operation on that word, the side giving it
+up fills the cell before it and the side taking it empties the cell
+after, so nothing in it needs to be `Sync`. A writer's touch of it takes
+it back, waiting only for a pass in flight, and never on a lock: the
+thread is niced, and a lock the writer took at every commit was one the
+thread could be preempted holding. The thread pins a slot for each pass,
+so a publish from the segment work needs nothing of it: the forms go
+across as copies the publish makes (`State::carry_published`) and the
+writer's own tables follow at its next look at the log
+(`Reader::rebase_tables`); the writer's own publishes still take it back
+first. The forms a pass publishes carry the commit the writer named,
+never the latest, or a handle at the latest takes forms without the
+writes between; and `settle` joins it before anything else, because
+every other join touches it. The threaded test runs at each level, since
+a level that holds hides what a level that lends exposes.
 
 **`Blob::zero_copy()` stays true on the native path.** `Bytes` has two halves
 for one reason: `read_at` copies and every source can answer it; `slice_at`
