@@ -1896,9 +1896,9 @@ impl ScanModel {
 /// reached. Now the walk runs whenever there is no level-0 piece, and this
 /// holds it to a model through every source an unsealed key can come from:
 /// the live memtable alone (the YCSB shape, inserts past the end), then the
-/// frozen memtable under a seal that has not been joined -- deterministic,
-/// because only a `&mut` call joins one -- with the live table written over
-/// it: a key in all three sources, tombstones in each memtable cutting the
+/// frozen memtable under a seal held short of its landing
+/// (`hold_seal_landing`, since the segment work lands one on its own) with
+/// the live table written over it: a key in all three sources, tombstones in each memtable cutting the
 /// older ones, a delete followed by an append in one table and across the
 /// two, keys below the first partition key, between existing keys, and past
 /// the last. The same model then checks the merge after `settle` publishes
@@ -3076,16 +3076,14 @@ fn overlay_model_with(name: &str, block_cache: bool, budget: usize, upkeep: supd
     m.delete(&mut db, &key(1)); // a key no source holds
     m.append(&mut db, "kex-below", "f-below");
     db.commit().unwrap();
+    // Held before its landing: the segment work lands a seal on its own
+    // thread as soon as the seal thread names its segments, which is
+    // before the checks below could run, and the frozen table is what
+    // they are about.
+    db.hold_seal_landing(true);
     db.seal().unwrap();
-    assert!(
-        db.in_flight().0,
-        "the seal is not joined until a &mut call joins it"
-    );
-    assert_eq!(
-        db.levels(),
-        (parts, 0),
-        "an unjoined seal publishes no piece"
-    );
+    assert!(db.in_flight().0, "the seal is in flight, held");
+    assert_eq!(db.levels(), (parts, 0), "a held seal publishes no piece");
 
     // The live memtable over it, uncommitted so nothing joins the seal.
     for k in (0..600).step_by(3) {
@@ -3109,6 +3107,7 @@ fn overlay_model_with(name: &str, block_cache: bool, budget: usize, upkeep: supd
     m.check(&db, "frozen and live over the partitions");
     held(&db, budget);
 
+    db.hold_seal_landing(false);
     db.settle().unwrap();
     assert!(db.levels().1 > 0, "settle publishes the sealed pieces");
     m.check(&db, "level-0 pieces and live over the partitions");
@@ -4805,6 +4804,21 @@ fn carry_model(block_cache: bool) {
     db.hold_seal_landing(true);
     db.seal().unwrap();
     assert!(db.in_flight().0, "a seal in flight");
+    // The seal's own snapshot published before anything here makes one
+    // (`Options::seal_snapshot`), so the first snapshot below is that
+    // one extended over the live keys, or sorted from nothing where the
+    // seal has landed already -- one either way. Left to race, a
+    // snapshot sorted before the seal's publish was switched for the
+    // seal's at the scan after, and counted twice.
+    let t = std::time::Instant::now();
+    while db.seal_snapshots() == 0 && db.in_flight().0 {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(30),
+            "the seal published no snapshot"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let (b0, e0) = (db.snapshot_builds(), db.snapshot_extends());
     for k in (0..6000u32).step_by(12) {
         m.append(&mut db, &key(k), "l0");
     }
@@ -4813,7 +4827,12 @@ fn carry_model(block_cache: bool) {
     db.scan(key(0).as_bytes(), 6000, |_k, v| sink += v.len())
         .unwrap();
     let built = db.snapshot_builds();
-    assert_eq!(db.snapshot_extends(), 0, "the first one is sorted");
+    let extended = db.snapshot_extends();
+    assert_eq!(
+        (built - b0) + (extended - e0),
+        1,
+        "the first one is sorted, or extends the seal's"
+    );
     // More new slots than a snapshot may lack before a scan renews it.
     // Half of these are live writes onto keys only the frozen table
     // holds, which is the fold; the rest are keys nothing holds yet.
@@ -4832,7 +4851,7 @@ fn carry_model(block_cache: bool) {
         built,
         "the second is carried forward, not sorted again"
     );
-    assert_eq!(db.snapshot_extends(), 1, "by one merge");
+    assert_eq!(db.snapshot_extends(), extended + 1, "by one merge");
     m.check(&db, "a snapshot carried forward over a frozen memtable");
     db.hold_seal_landing(false);
 }
@@ -6973,4 +6992,173 @@ fn reader_handles_across_seals_see_every_value_once_and_in_order() {
     let db = Db::open(&d, opts).unwrap();
     assert_eq!(db.levels(), (0, pieces), "every seal's manifest landed");
     check(&db, "reopened");
+}
+
+/// A store for the seal-snapshot tests: keys with several values each,
+/// deletes that end a chain, deletes followed by values again, and a key
+/// created only to be deleted, all committed and none sealed. The seal
+/// is landed by nothing but the settle, since the segment work is
+/// inline, so the reads below are made while it runs; and the table has
+/// a few megabytes of values and the seal syncs at every block, so the
+/// seal outlasts the writer's commits below by a wide margin -- only a
+/// writer's commit could land a finished seal under them. A table of a
+/// few hundred kilobytes did not: this disk's syncs are fast, and the
+/// seal was landed by a commit two milliseconds after its publish.
+fn seal_snapshot_store(name: &str) -> (Db, ScanModel) {
+    let d = dir(name);
+    let opts = Options {
+        seal_bytes: 1 << 30,
+        publish_in_background: false,
+        seal_sync_every: 1024,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    let val = |k: u32, v: &str| format!("{v}-{k}-{}", "x".repeat(1000));
+    for k in 0..3000u32 {
+        m.append(&mut db, &key(k), &val(k, "v0"));
+        if k % 3 == 0 {
+            m.append(&mut db, &key(k), &val(k, "v1"));
+        }
+        if k % 5 == 0 {
+            m.append(&mut db, &key(k), &val(k, "v2"));
+        }
+    }
+    for k in (0..3000u32).step_by(7) {
+        m.delete(&mut db, &key(k));
+    }
+    for k in (0..3000u32).step_by(14) {
+        m.append(&mut db, &key(k), &val(k, "v3"));
+    }
+    m.append(&mut db, "key-01500x", "gone");
+    m.delete(&mut db, "key-01500x");
+    db.commit().unwrap();
+    (db, m)
+}
+
+/// Wait for the seal thread to publish its snapshot; the seal itself
+/// stays in flight until the settle.
+fn await_seal_snapshot(db: &Db) {
+    let t = std::time::Instant::now();
+    while db.seal_snapshots() == 0 {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(30),
+            "the seal did not publish its snapshot"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(db.in_flight().0, "the seal is still in flight");
+}
+
+/// The seal thread publishes the frozen table's snapshot, every chain
+/// copied beside its key in key order, into the state the freeze made,
+/// and a handle that scans while the seal runs adopts it instead of
+/// sorting the table itself: every value in order, the tombstones
+/// cutting what they cut, through the snapshot's runs first and then
+/// through the piece the seal wrote from the same runs. The counters say
+/// the arm was reached, since a handle that built its own would answer
+/// the same.
+#[test]
+fn a_handle_reads_the_seals_snapshot_while_the_seal_runs() {
+    let (mut db, m) = seal_snapshot_store("seal-snapshot-reads");
+    db.seal().unwrap();
+    await_seal_snapshot(&db);
+    let r = db.reader().unwrap();
+    m.check(&r, "a handle during the seal");
+    assert_eq!(
+        (db.snapshot_builds(), db.snapshot_extends()),
+        (0, 0),
+        "the handle adopted the seal's snapshot as it stood"
+    );
+    m.check(&db, "the writer during the seal");
+    assert_eq!(db.snapshot_builds(), 0, "and so did the writer");
+    assert!(db.in_flight().0, "nothing landed the seal");
+    db.settle().unwrap();
+    assert_eq!(db.levels(), (0, 1), "the piece landed");
+    m.check(&r, "a handle after the landing");
+    m.check(&db, "the writer after the landing");
+    assert_eq!(db.seal_snapshots(), 1);
+    drop(r);
+    db.close().unwrap();
+}
+
+/// Keys written into the fresh live table while the seal runs: past the
+/// frozen keys, between them, and over them -- an append, a delete, a
+/// delete and then an append. A handle's scan extends the published
+/// snapshot with them rather than sorting everything, and the frozen
+/// runs come along; a second batch is carried onto that extension. Only
+/// a writer operation lands the seal inline, so the commits come within
+/// milliseconds of the publish, before the seal thread can have
+/// finished, and the model checks, which take long, come after them.
+#[test]
+fn a_handle_extends_the_seals_snapshot_with_the_keys_written_after_it() {
+    let (mut db, mut m) = seal_snapshot_store("seal-snapshot-extends");
+    let key = |k: u32| format!("key-{k:05}");
+    db.seal().unwrap();
+    for k in 3000..3200u32 {
+        m.append(&mut db, &key(k), "live");
+    }
+    for k in (1..3000u32).step_by(11) {
+        m.append(&mut db, &key(k), "live-over-frozen");
+    }
+    for k in (2..3000u32).step_by(13) {
+        m.delete(&mut db, &key(k));
+    }
+    for k in (4..3000u32).step_by(26) {
+        m.append(&mut db, &key(k), "live-after-delete");
+    }
+    m.append(&mut db, "key-01000x", "between");
+    db.commit().unwrap();
+    assert!(
+        db.in_flight().0,
+        "the seal is still in flight after the first commit"
+    );
+    await_seal_snapshot(&db);
+    let r = db.reader().unwrap();
+    // One scan brings the handle's snapshot current: an extension of the
+    // seal's, not a build.
+    m.check_one(
+        &r,
+        key(0).as_bytes(),
+        5,
+        "a handle's first scan during the seal",
+    );
+    assert_eq!(db.snapshot_builds(), 0, "the handle built no snapshot");
+    assert!(
+        db.snapshot_extends() >= 1,
+        "the handle extended the seal's snapshot"
+    );
+    // A second batch, committed at once: the handle files it into the
+    // extension it holds, or carries that forward, and builds nothing.
+    for k in (5..3000u32).step_by(17) {
+        m.append(&mut db, &key(k), "live-again");
+    }
+    m.delete(&mut db, &key(3100));
+    db.commit().unwrap();
+    assert!(
+        db.in_flight().0,
+        "the seal is still in flight after the second commit"
+    );
+    m.check_one(
+        &r,
+        key(0).as_bytes(),
+        5,
+        "a handle's scan after the second batch",
+    );
+    assert_eq!(db.snapshot_builds(), 0, "still no build");
+    // The full checks, on handles only: nothing lands the seal under them.
+    m.check(
+        &r,
+        "a handle during the seal, over the keys written after it",
+    );
+    m.check(&db, "the writer during the seal");
+    assert_eq!(db.snapshot_builds(), 0, "the writer extended too");
+    assert!(db.in_flight().0, "the seal is still in flight");
+    db.settle().unwrap();
+    assert_eq!(db.levels(), (0, 1), "the piece landed");
+    m.check(&r, "a handle after the landing");
+    m.check(&db, "the writer after the landing");
+    drop(r);
+    db.close().unwrap();
 }

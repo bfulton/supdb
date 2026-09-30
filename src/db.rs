@@ -642,6 +642,25 @@ pub struct Options {
     /// copy at the commit instead, on a thread of the store's own, and
     /// is the write-time structure this is the read half of.
     pub snapshot_runs: bool,
+    /// The seal thread publishes the frozen table's scan snapshot, with
+    /// every key's chain copied beside it in key order, into the state
+    /// the freeze made, as soon as it has sorted the table: a store whose
+    /// only content is the table being sealed is read on the merge path
+    /// for the seal's whole run, and without this the first handle to
+    /// scan sorted the same table again and every scan after chased each
+    /// key's entry, chain and value through the memtable. A handle's
+    /// extension of the published snapshot carries the frozen runs with
+    /// it, and a handle holding a snapshot without them switches to the
+    /// seal's at its next scan. The copy is about the table's key and
+    /// value bytes, held until the seal lands. Off is the shape before
+    /// it, kept to price it.
+    pub seal_snapshot: bool,
+    /// The seal writes its records from that snapshot's arena -- the keys
+    /// and the copied chains in key order, one sequential read -- instead
+    /// of walking each entry's chain through the memtable, three dependent
+    /// misses a key. Nothing without `seal_snapshot`. Off is the walk,
+    /// kept to price it.
+    pub seal_from_snapshot: bool,
     /// EXPERIMENT: the run keeper, a thread of the store's own at idle
     /// priority that keeps the published scan snapshot current to the
     /// commits. Polling them once a scan has happened over the store,
@@ -1016,6 +1035,8 @@ impl Default for Options {
             share_snapshot: true,
             snapshot_adopt_behind: 0,
             snapshot_runs: false,
+            seal_snapshot: true,
+            seal_from_snapshot: true,
             snapshot_keeper: false,
             snapshot_keeper_recent_pct: 100,
             promote_entries: 0,
@@ -3494,9 +3515,12 @@ const READER_SLOTS: usize = 256;
 
 /// Slots the engine keeps for itself ahead of the callers' 256: the
 /// writer's, which its operations pin, the upkeep thread's, which its
-/// passes pin, and the segment work's (`Maint`). Apart, so a caller holding every handle it may have
-/// cannot leave the engine without one.
-const ENGINE_SLOTS: usize = 3;
+/// passes pin, the segment work's (`Maint`), and the seal thread's, which
+/// it pins to publish the frozen table's snapshot (`Options::seal_snapshot`;
+/// one seal is in flight at a time), and one spare, so a claimant added
+/// next does not take the seal's. Apart, so a caller holding every handle
+/// it may have cannot leave the engine without one.
+const ENGINE_SLOTS: usize = 5;
 
 impl Readers {
     fn new() -> Readers {
@@ -3668,6 +3692,20 @@ impl MemTable {
     /// A hint to fetch a key's bytes; nothing is read.
     fn prefetch_key(&self, off: u32, len: u32) {
         self.keys.prefetch(off as usize, len as usize);
+    }
+
+    /// A hint to fetch an entry's line; nothing is read.
+    fn prefetch_entry(&self, id: usize) {
+        let e: *const MemEntry = self.entry(id);
+        prefetch_lines(e as *const u8, std::mem::size_of::<MemEntry>());
+    }
+
+    /// A hint to fetch the first `bytes` of the chunk at `off` -- its
+    /// header and the start of its value; nothing is read.
+    fn prefetch_chunk(&self, off: u64, bytes: usize) {
+        if off != NO_CHUNK {
+            self.vals.prefetch(off as usize, bytes);
+        }
     }
 
     fn key_bytes(&self) -> usize {
@@ -3933,7 +3971,7 @@ impl MemTable {
     /// suite's keys never have. The comparison sort of the whole table
     /// read two arena keys a compare, five million compares at three
     /// hundred thousand keys, and was a fifth of the seal.
-    fn entries_in_key_order(&self) -> Vec<&MemEntry> {
+    fn slots_in_key_order(&self) -> Vec<u32> {
         let n = self.len();
         let mut recs: Vec<(u64, u64, u32)> = Vec::with_capacity(n);
         for i in 0..n {
@@ -3956,7 +3994,7 @@ impl MemTable {
             }
             i = j;
         }
-        recs.iter().map(|r| self.entry(r.2 as usize)).collect()
+        recs.iter().map(|r| r.2).collect()
     }
 
     /// The key's live values, oldest first, and whether a tombstone ends
@@ -4815,6 +4853,12 @@ struct SealCounts {
     seal_ns: AtomicU64,
     merge_ns: AtomicU64,
     held_landings: AtomicU64,
+    /// The seal thread's phases, summed over seals: the sort of the frozen
+    /// table, the snapshot's build and publish, and the record loop.
+    seal_sort_ns: AtomicU64,
+    seal_snap_ns: AtomicU64,
+    seal_records_ns: AtomicU64,
+    seal_thread_ns: AtomicU64,
 }
 
 impl SealCounts {
@@ -4828,6 +4872,10 @@ impl SealCounts {
             joins: get(&self.joins),
             publishes: get(&self.publishes),
             held_landings: get(&self.held_landings),
+            seal_sort_ns: get(&self.seal_sort_ns),
+            seal_snap_ns: get(&self.seal_snap_ns),
+            seal_records_ns: get(&self.seal_records_ns),
+            seal_thread_ns: get(&self.seal_thread_ns),
         }
     }
 
@@ -4851,6 +4899,13 @@ pub struct SealWaits {
     /// landing writes the manifest. One per look, so a merge held across
     /// several polls counts several.
     pub held_landings: u64,
+    /// The seal thread's phases, summed over seals: sorting the frozen
+    /// table, building and publishing its snapshot (`Options::seal_snapshot`),
+    /// writing the records, and the thread's whole run.
+    pub seal_sort_ns: u64,
+    pub seal_snap_ns: u64,
+    pub seal_records_ns: u64,
+    pub seal_thread_ns: u64,
 }
 
 /// PROTOTYPE: records of one partition block a scan reads over unsealed
@@ -5652,6 +5707,9 @@ struct Shared {
     /// PROTOTYPE: handles that took the published snapshot over their
     /// own under the keeper's rule; for a test.
     snap_switched: AtomicU64,
+    /// Snapshots the seal thread published over the frozen table it was
+    /// writing (`Options::seal_snapshot`); for a test.
+    snap_sealed: AtomicU64,
     /// The writer's upkeep while it is lent to the upkeep thread; see
     /// `Upkeep::Background`.
     upkeep: Lend,
@@ -6355,6 +6413,14 @@ struct SnapKey {
 /// No copied run for a snapshot key.
 const NO_RUN: u32 = u32::MAX;
 
+/// How far ahead of the seal's copy (`Snapshot::from_frozen`) the entry
+/// lines are prefetched, how far ahead the key and chunk lines are once
+/// the entry is in, and how many bytes of the chunk: its twelve-byte
+/// header and the first lines of its value.
+const SEAL_AHEAD_ENTRY: usize = 32;
+const SEAL_AHEAD_CHAIN: usize = 12;
+const SEAL_AHEAD_CHUNK_BYTES: usize = 128;
+
 /// An overlay assembled from a chain alone names no snapshot; this one
 /// stands in, and nothing reads a run from it.
 static NO_SNAPSHOT: std::sync::LazyLock<Snapshot> = std::sync::LazyLock::new(Snapshot::default);
@@ -6558,6 +6624,45 @@ impl SnapArena {
         off
     }
 
+    /// The key of `e` and then its whole chain, laid out as `copy_run`
+    /// lays a run out, written at the start of `buf`: the bytes written.
+    /// For the seal's build over a whole table, which reserves the arena
+    /// once and writes it through, where `append` and `copy_run` reserve
+    /// per key and `copy_run` looks the block up for every word.
+    fn write_key_run(
+        mem: &MemTable,
+        e: &MemEntry,
+        scratch: &mut Vec<(u64, u32)>,
+        buf: &mut [u8],
+    ) -> usize {
+        scratch.clear();
+        let key = mem.key_of(e);
+        let mut at = MemTable::head(e);
+        let mut bytes = 0usize;
+        while at != NO_CHUNK {
+            let len = mem.chunk_len(at);
+            bytes += 12 + if len == TOMB_LEN { 0 } else { len as usize };
+            scratch.push((at, len));
+            at = mem.chunk_prev(at);
+        }
+        let (kb, run) = buf.split_at_mut(key.len());
+        kb.copy_from_slice(key);
+        run[0..4].copy_from_slice(&(scratch.len() as u32).to_le_bytes());
+        run[4..8].copy_from_slice(&(bytes as u32).to_le_bytes());
+        let mut p = 8usize;
+        for &(at, len) in scratch.iter().rev() {
+            run[p..p + 8].copy_from_slice(&at.to_le_bytes());
+            run[p + 8..p + 12].copy_from_slice(&len.to_le_bytes());
+            p += 12;
+            if len != TOMB_LEN {
+                let v = mem.value_at(at as usize);
+                run[p..p + v.len()].copy_from_slice(v);
+                p += v.len();
+            }
+        }
+        key.len() + p
+    }
+
     /// The bytes a run at `off` takes.
     fn run_len(&self, off: u32) -> u32 {
         8 + self.word(off + 4)
@@ -6614,6 +6719,15 @@ struct Snapshot {
     /// PROTOTYPE: whether the runs were copied at all; a filed key has
     /// none either way.
     runs: bool,
+    /// Whether every frozen entry carries its run: set by a build with
+    /// the runs on and by the seal's build over the frozen table, and
+    /// kept by an extension, whose live entries may carry none. What a
+    /// publish ranks first (`rank`): a snapshot without the frozen runs
+    /// reads each frozen key through the memtable's chains for as long
+    /// as the seal runs, and the seal's snapshot must not be refused in
+    /// favour of one such over the same state, whatever its live length,
+    /// while a handle's extension of the seal's still wins.
+    frozen_runs: bool,
     ents: Vec<SnapKey>,
     /// The write log's length when the runs were copied: every log entry
     /// from here on may have moved a chain past its copy.
@@ -6674,6 +6788,86 @@ impl Snapshot {
     }
     fn key_of(&self, e: &SnapKey) -> &[u8] {
         self.arena.slice(e.off, e.len)
+    }
+    /// What a publish and a handle's choice of base compare: the frozen
+    /// runs first, then how much of the live memtable the snapshot
+    /// covers, then how late its runs were copied. Two snapshots over one
+    /// state with the frozen runs alike order as they did before the
+    /// seal published one; the seal's, with no live entry, outranks any
+    /// without them, and an extension of the seal's outranks the seal's.
+    fn rank(&self) -> (bool, usize, usize) {
+        (self.frozen_runs, self.live_len, self.log_at)
+    }
+    /// The seal's snapshot over the frozen table it is writing: every
+    /// entry of `mem` in the key order `order` gives, its key and then
+    /// its whole chain appended to an arena of its own in that order, so
+    /// the arena reads sequentially in key order -- for the records the
+    /// seal writes from it and for every scan over the store while the
+    /// seal runs, where the walk through the entry, the chain and the
+    /// value was three dependent misses a key. No live entry and a log
+    /// position of zero: the live table is the fresh one the freeze made,
+    /// so a handle's extension files every key written since the freeze
+    /// and marks none of these stale.
+    ///
+    /// None for a table the arena cannot address: it addresses `u32`, and
+    /// a table past that seals from its chains as before, a cost and not
+    /// a fault.
+    fn from_frozen(mem: &MemTable, order: &[u32]) -> Option<Snapshot> {
+        let n = order.len();
+        // The keys, the values with their chunk headers, and a run
+        // header a key: exactly what the copy writes, since every chunk
+        // in the table is in one chain -- or more, where a chunk was
+        // reserved and never linked -- so the arena is reserved once and
+        // written through, and its first block holds it all.
+        let bytes = mem.key_bytes() + mem.value_bytes() + 8 * n;
+        if bytes > u32::MAX as usize {
+            return None;
+        }
+        let arena = SnapArena::with_capacity(bytes);
+        let (base, buf) = arena.reserve_bytes(bytes);
+        let mut p = 0usize;
+        let mut ents: Vec<SnapKey> = Vec::with_capacity(n);
+        let mut scratch: Vec<(u64, u32)> = Vec::new();
+        for (at, &i) in order.iter().enumerate() {
+            // The order is known, so the misses are issued ahead of the
+            // copy that would take them one at a time: an entry's line
+            // well ahead, and once that line is in, its key's line and
+            // its newest chunk's header and first value bytes. The
+            // older chunks of a chain are found through the header and
+            // are not prefetched; the common chain is one chunk.
+            if let Some(&j) = order.get(at + SEAL_AHEAD_ENTRY) {
+                mem.prefetch_entry(j as usize);
+            }
+            if let Some(&j) = order.get(at + SEAL_AHEAD_CHAIN) {
+                let f = mem.entry(j as usize);
+                mem.prefetch_key(f.key_off, f.key_len);
+                mem.prefetch_chunk(MemTable::head(f), SEAL_AHEAD_CHUNK_BYTES);
+            }
+            let e = mem.entry(i as usize);
+            let wrote = SnapArena::write_key_run(mem, e, &mut scratch, &mut buf[p..]);
+            ents.push(SnapKey {
+                off: base + p as u32,
+                len: e.key_len,
+                mem: u32::MAX,
+                frozen: i,
+                lrun: NO_RUN,
+                frun: base + p as u32 + e.key_len,
+            });
+            p += wrote;
+        }
+        debug_assert!(p <= bytes, "the seal's copy outgrew its reservation");
+        Some(Snapshot {
+            arena: std::sync::Arc::new(arena),
+            runs: true,
+            frozen_runs: true,
+            ents,
+            log_at: 0,
+            live_len: 0,
+            side: Vec::new(),
+            fresh: Vec::new(),
+            filed: 0,
+            bounds: Default::default(),
+        })
     }
     fn seek_in(&self, run: &[SnapKey], from: &[u8]) -> usize {
         run.partition_point(|e| self.key_of(e) < from)
@@ -6805,6 +6999,7 @@ impl Snapshot {
         let mut out = Snapshot {
             arena: self.arena.clone(),
             runs,
+            frozen_runs: self.frozen_runs,
             ents: Vec::with_capacity(self.ents.len() + batch.len()),
             log_at,
             live_len: to,
@@ -7824,6 +8019,7 @@ impl Reader {
             log_at: self.log_end(),
             arena: std::sync::Arc::new(SnapArena::with_capacity(bytes)),
             runs,
+            frozen_runs: runs,
             ents: Vec::with_capacity(n),
             side: Vec::new(),
             fresh: Vec::new(),
@@ -8748,13 +8944,15 @@ impl Reader {
     }
 
     /// EXPERIMENT: offer a snapshot to the state for the handles that
-    /// come after. Kept only when it covers more of the live memtable
-    /// than the one there, or as much with its runs copied at a later
-    /// log position, so the pointer only moves forward and two handles
-    /// racing cannot leave the shorter one published.
-    fn publish_snapshot(&self, snap: &std::sync::Arc<Snapshot>) {
+    /// come after. Kept only when it ranks above the one there
+    /// (`Snapshot::rank`): with the frozen runs where that one lacks
+    /// them, or else covering more of the live memtable, or as much with
+    /// its runs copied at a later log position, so the pointer only moves
+    /// forward and two handles racing cannot leave the shorter one
+    /// published.
+    fn publish_snapshot(&self, snap: &std::sync::Arc<Snapshot>) -> bool {
         if !self.opts.share_snapshot {
-            return;
+            return false;
         }
         let st = self.state();
         let mut cur = st.snap.load(AtomicOrdering::Acquire);
@@ -8762,8 +8960,8 @@ impl Reader {
             if !cur.is_null() {
                 // SAFETY: as in `adopt_snapshot`.
                 let c = unsafe { &*cur };
-                if (c.live_len, c.log_at) >= (snap.live_len, snap.log_at) {
-                    return;
+                if c.rank() >= snap.rank() {
+                    return false;
                 }
             }
             let new = std::sync::Arc::into_raw(snap.clone()) as *mut Snapshot;
@@ -8787,7 +8985,7 @@ impl Reader {
                         self.shared.readers.bump();
                         self.sweep_retired_snaps();
                     }
-                    return;
+                    return true;
                 }
                 Err(now) => {
                     // SAFETY: ours, and no other handle was given it.
@@ -9122,6 +9320,37 @@ impl Reader {
         self.refresh_snapshot_to(gen, use_cache, moved, false)
     }
 
+    /// Whether the state's published snapshot carries the frozen table's
+    /// runs (`Options::seal_snapshot`) while this handle's own over the
+    /// same state, `mine` with the generation it was made at, does not:
+    /// then the handle's is stale whatever else says, since every scan
+    /// through it reads each frozen key through the memtable's chains.
+    /// Asked at every scan, so the common answers are cheap: no seal in
+    /// flight, or a snapshot that has them already.
+    fn seal_snapshot_ahead(
+        &self,
+        gen: u64,
+        mine: Option<&(u64, std::sync::Arc<Snapshot>)>,
+    ) -> bool {
+        if !self.opts.seal_snapshot {
+            return false;
+        }
+        let st = self.state();
+        if st.frozen.is_none() {
+            return false;
+        }
+        let Some((g, mine)) = mine else {
+            return false;
+        };
+        if *g != gen || mine.frozen_runs {
+            return false;
+        }
+        let p = st.snap.load(AtomicOrdering::Acquire);
+        // SAFETY: as in `adopt_snapshot`: published into the state this
+        // handle has pinned, and freed only past every reader pinned then.
+        !p.is_null() && unsafe { &*p }.frozen_runs
+    }
+
     /// `refresh_snapshot`, and with `current` a snapshot short of the live
     /// memtable is stale whatever the rule below says: what the writer
     /// does at a handle's claim, so the handle adopts a snapshot instead
@@ -9134,7 +9363,14 @@ impl Reader {
     /// nothing: 70 µs of a first scan of 120, in a pass of a hundred
     /// scans that take two each.
     fn refresh_snapshot_to(&self, gen: u64, use_cache: bool, moved: bool, current: bool) {
-        if !moved && !current {
+        // Nothing moved, but the seal has published the frozen table's
+        // snapshot with its runs since this handle built or carried one
+        // without them: switch, or every scan for the rest of the seal
+        // reads each frozen key through the memtable's chains.
+        let switch = !moved
+            && !current
+            && self.seal_snapshot_ahead(gen, self.fs().scan_keys.borrow().as_ref());
+        if !moved && !current && !switch {
             return;
         }
         let mut cache = self.fs().scan_keys.borrow_mut();
@@ -9155,11 +9391,16 @@ impl Reader {
                 added > (held / 8).max(4096)
             }
         };
-        let mut stale = current || cache.as_ref().is_none_or(|(g, _)| *g != gen);
+        let mut stale = current || switch || cache.as_ref().is_none_or(|(g, _)| *g != gen);
         if !stale {
             let held = cache.as_ref().map_or(0, |(_, s)| s.len());
             let added = self.fs().snap_added.borrow().len();
             stale = behind(held, added);
+        }
+        if !stale && moved && self.opts.seal_snapshot {
+            // The log moved and the seal's snapshot is published: the
+            // switch above asks only when nothing moved.
+            stale = self.seal_snapshot_ahead(gen, cache.as_ref());
         }
         // PROTOTYPE: the published snapshot ahead of this handle's own
         // by a share of what the handle holds -- the keeper has absorbed
@@ -9225,7 +9466,7 @@ impl Reader {
                 // merge costs 2.
                 published => {
                     let base = match (have, published) {
-                        (Some(a), Some(b)) if b.live_len > a.live_len => Some(b),
+                        (Some(a), Some(b)) if b.rank() > a.rank() => Some(b),
                         (Some(a), _) => Some(a),
                         (None, b) => b,
                     };
@@ -11458,6 +11699,7 @@ impl Db {
             snap_kept: AtomicU64::new(0),
             snap_carried: AtomicU64::new(0),
             snap_switched: AtomicU64::new(0),
+            snap_sealed: AtomicU64::new(0),
             upkeep: Lend::default(),
         });
         let pin_slot = Some(
@@ -11510,11 +11752,13 @@ impl Db {
         Ok(db)
     }
 
-    /// Open from the directory alone. Segments are complete by construction
-    /// (they were renamed into place after their fsync); the WAL replays
-    /// whatever outlived the last seal, torn tail tolerated. A directory
-    /// with no segments and only a WAL is a store killed before its first
-    /// seal, and it opens -- the brief's P-E.
+    /// Open from the directory alone. A segment the manifest names is
+    /// complete: the manifest is written after the segment's fsync, and a
+    /// segment under its final name that the manifest does not name may be
+    /// one a seal renamed into place and never synced, swept here. The WAL
+    /// replays whatever outlived the last seal, torn tail tolerated. A
+    /// directory with no segments and only a WAL is a store killed before
+    /// its first seal, and it opens -- the brief's P-E.
     pub fn open(dir: &Path, opts: Options) -> Result<Db> {
         // The manifest is the truth when it exists, and every store made
         // by `create` has one from birth. Without one the directory is
@@ -11531,7 +11775,9 @@ impl Db {
                 on_disk.push(name);
             }
         }
-        let (sealed, mut live) = match manifest_read(dir)? {
+        let manifest = manifest_read(dir)?;
+        let had_manifest = manifest.is_some();
+        let (sealed, mut live) = match manifest {
             Some((covered, names)) => (covered, names),
             None => {
                 let mut names: Vec<String> = on_disk
@@ -11551,6 +11797,14 @@ impl Db {
             if !live.contains(name) {
                 let _ = std::fs::remove_file(dir.join(name));
             }
+        }
+        // A store from before manifests gets one here, naming what the
+        // scan found: its next seal renames a segment into place before
+        // the fsync, and a crash between would otherwise leave a `seg-`
+        // file the scan above trusts, skipping the WAL that holds the
+        // same writes.
+        if !had_manifest {
+            manifest_write(dir, sealed, &live)?;
         }
         // A direct segment a crash left open: its records up to the last
         // commit marker are the batches that were acknowledged, rewritten
@@ -11778,6 +12032,7 @@ impl Db {
             snap_kept: AtomicU64::new(0),
             snap_carried: AtomicU64::new(0),
             snap_switched: AtomicU64::new(0),
+            snap_sealed: AtomicU64::new(0),
             upkeep: Lend::default(),
         });
         let pin_slot = Some(
@@ -12289,11 +12544,33 @@ impl Db {
         let limit = self.partition_limit();
         let mem = frozen.clone();
         let shared = self.shared.clone();
+        // The handle the seal thread publishes the table's snapshot
+        // through, pinned for that touch of the state and nothing else:
+        // the build reads only the frozen table, which the job holds.
+        // Only where the writer pins: without its pins the writer's own
+        // handle adopts a published snapshot under no pin, and a swap
+        // from another thread between its load and its clone would free
+        // what it took.
+        let snap_reader = if self.opts.seal_snapshot && self.opts.writer_pins {
+            let r = self.seal_reader();
+            // Every engine slot has a claimant by name, and a fifth would
+            // take the seal's silently: the fast path would go, and no
+            // count would say so.
+            debug_assert!(
+                r.is_some(),
+                "the seal found no engine slot for its snapshot"
+            );
+            r
+        } else {
+            None
+        };
+        let from_snapshot = self.opts.seal_from_snapshot;
         let job = move |readable: &SealReadable| -> Result<Vec<String>> {
-            seal_hold_wait(&shared, SEAL_HOLD_LANDING);
             if background_io == BackgroundIo::Idle {
                 idle_io_priority();
             }
+            let counts = &shared.seal_counts;
+            let t_job = std::time::Instant::now();
             // In KEY order, not hash order. A segment written in the
             // memtable's iteration order scatters each key's values across
             // blocks by hash, so an ordered scan walks the file randomly;
@@ -12303,7 +12580,53 @@ impl Db {
             // costs -- and the sort is affordable because a seal is off the
             // commit path. The same sort is what makes splitting at the
             // fences a matter of slicing.
-            let order = mem.entries_in_key_order();
+            let order = mem.slots_in_key_order();
+            SealCounts::add(&counts.seal_sort_ns, t_job.elapsed().as_nanos() as u64);
+
+            // The table's snapshot, with every chain copied in key order,
+            // published into the state the freeze made -- or the state
+            // that replaced it, when it still holds this table -- so the
+            // scans over the store while the seal runs walk the copy
+            // instead of sorting the table again and chasing its chains.
+            // A state that has dropped the table is past this seal, and
+            // gets nothing. Pinned for the publish alone.
+            let t_snap = std::time::Instant::now();
+            let snap = snap_reader.as_ref().and_then(|r| {
+                let snap = std::sync::Arc::new(Snapshot::from_frozen(&mem, &order)?);
+                let entered = r.enter();
+                let st = r.state();
+                if st
+                    .frozen
+                    .as_ref()
+                    .is_some_and(|f| std::sync::Arc::ptr_eq(f, &mem))
+                    && r.publish_snapshot(&snap)
+                {
+                    shared.snap_sealed.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                drop(entered);
+                Some(snap)
+            });
+            // The slot goes back before the records are written.
+            drop(snap_reader);
+            if snap.is_some() {
+                SealCounts::add(&counts.seal_snap_ns, t_snap.elapsed().as_nanos() as u64);
+            }
+            // A test's hold takes effect here, with the snapshot published
+            // and nothing written: held before the sort, the seal
+            // published no snapshot, and a test that waited for one
+            // waited forever.
+            seal_hold_wait(&shared, SEAL_HOLD_LANDING);
+            // The records stream from the snapshot's arena where there is
+            // one: the keys and the chains in key order, one sequential
+            // read, where the walk through the memtable was the entry,
+            // the chain and the value, three dependent misses a key.
+            let stream = snap.as_ref().filter(|_| from_snapshot);
+            let key_at = |at: usize| -> &[u8] {
+                match stream {
+                    Some(s) => s.key_of(&s.ents[at]),
+                    None => mem.key_of(mem.entry(order[at] as usize)),
+                }
+            };
 
             let ranges: Vec<Fence> = if fences.is_empty() {
                 vec![(Vec::new(), None)]
@@ -12317,7 +12640,7 @@ impl Db {
             for (ri, (lo, hi)) in ranges.iter().enumerate() {
                 let start = at;
                 while at < order.len() {
-                    let k = mem.key_of(order[at]);
+                    let k = key_at(at);
                     if hi.as_ref().is_some_and(|h| k >= h.as_slice()) {
                         break;
                     }
@@ -12335,19 +12658,47 @@ impl Db {
                 {
                     let mut w = PieceWriter::create(&tmp, &opts, sync_every, inline_max)
                         .map_err(|e| err(&format!("seal create: {e}")))?;
-                    let mut offs = Vec::new();
-                    for e in &order[start..at] {
-                        let key = mem.key_of(e);
-                        // Only what is live after the newest tombstone, and
-                        // the flag if there was one: the segment carries the
-                        // delete forward for the sources older than it.
-                        let tomb = mem.live_offs_into(e, &mut offs, SEE_ALL);
-                        w.begin(key)?;
-                        for &off in &offs {
-                            w.value(mem.value_at(off));
+                    let t_recs = std::time::Instant::now();
+                    match stream {
+                        Some(s) => {
+                            for e in &s.ents[start..at] {
+                                // The run as `run_values` reads it: the
+                                // values after the newest tombstone, and
+                                // the flag if there was one, so the segment
+                                // carries the delete forward for the
+                                // sources older than it.
+                                let (n, v) = s.arena.run(e.frun);
+                                let (range, tomb) = Snapshot::run_visible(n, v, SEE_ALL);
+                                w.begin(s.key_of(e))?;
+                                let mut p = range.start;
+                                while p < range.end {
+                                    let len = u32::from_le_bytes(
+                                        v[p + 8..p + 12].try_into().expect("four bytes"),
+                                    ) as usize;
+                                    p += 12;
+                                    w.value(&v[p..p + len]);
+                                    p += len;
+                                }
+                                w.end_with(tomb)?;
+                            }
                         }
-                        w.end_with(tomb)?;
+                        None => {
+                            let mut offs = Vec::new();
+                            for &i in &order[start..at] {
+                                let e = mem.entry(i as usize);
+                                let key = mem.key_of(e);
+                                // Only what is live after the newest
+                                // tombstone, and the flag if there was one.
+                                let tomb = mem.live_offs_into(e, &mut offs, SEE_ALL);
+                                w.begin(key)?;
+                                for &off in &offs {
+                                    w.value(mem.value_at(off));
+                                }
+                                w.end_with(tomb)?;
+                            }
+                        }
                     }
+                    SealCounts::add(&counts.seal_records_ns, t_recs.elapsed().as_nanos() as u64);
                     tombs = w.tombs();
                     (seg, ord) = w
                         .finish_unsynced()
@@ -12384,6 +12735,7 @@ impl Db {
                 seg.sync_all()?;
                 ordf.sync_all()?;
             }
+            SealCounts::add(&counts.seal_thread_ns, t_job.elapsed().as_nanos() as u64);
             // The directory's entries are made durable by the publish that
             // names the segments in the manifest, before the WAL retires.
             Ok(names)
@@ -12880,6 +13232,32 @@ impl Reader {
             counted: false,
             slot: None,
             pin_slot,
+            depth: std::cell::Cell::new(0),
+            isolation: std::cell::Cell::new(Isolation::Dirty),
+            held: AtomicPtr::new(std::ptr::null_mut()),
+            wm: std::cell::Cell::new(SEE_ALL),
+            opts: self.opts.clone(),
+            fs: FormsCell::new(),
+            signalled: std::cell::Cell::new((0, usize::MAX)),
+            log_bound: std::cell::Cell::new(usize::MAX),
+            len_bound: std::cell::Cell::new(usize::MAX),
+            force_due: std::cell::Cell::new(false),
+        })
+    }
+
+    /// A handle for the seal thread, which publishes the frozen table's
+    /// snapshot into the state (`Options::seal_snapshot`): a caller's
+    /// handle in shape -- it pins through its slot under `Dirty`,
+    /// whatever `Options::writer_pins` says of the engine's own -- on an
+    /// engine slot, counted as nobody's. None when the engine's slots
+    /// are taken, and the seal publishes nothing.
+    fn seal_reader(&self) -> Option<Reader> {
+        let slot = self.shared.readers.claim_engine()?;
+        Some(Reader {
+            shared: self.shared.clone(),
+            counted: false,
+            slot: Some(slot),
+            pin_slot: None,
             depth: std::cell::Cell::new(0),
             isolation: std::cell::Cell::new(Isolation::Dirty),
             held: AtomicPtr::new(std::ptr::null_mut()),
@@ -13402,14 +13780,18 @@ impl Db {
     /// window and ask what lands in it. A `settle`, a `flush` or the next
     /// seal waits for the release, so the caller lifts it before any of
     /// those.
+    #[doc(hidden)]
     pub fn hold_seal_durable(&self, on: bool) {
         self.set_seal_hold(SEAL_HOLD_DURABLE, on);
     }
 
-    /// A test's: while `on`, every seal thread waits before it writes and
-    /// publishes anything, so the frozen table stays what reads see for
-    /// as long as the test wants a seal in flight. Lifted before a
-    /// `settle`, a `flush` or the next seal, as `hold_seal_durable` is.
+    /// A test's: while `on`, every seal thread waits before it writes
+    /// anything -- after it has published the frozen table's snapshot,
+    /// where it does (`Options::seal_snapshot`) -- so the frozen table
+    /// stays what reads see for as long as the test wants a seal in
+    /// flight. Lifted before a `settle`, a `flush` or the next seal, as
+    /// `hold_seal_durable` is.
+    #[doc(hidden)]
     pub fn hold_seal_landing(&self, on: bool) {
         self.set_seal_hold(SEAL_HOLD_LANDING, on);
     }
@@ -14202,6 +14584,7 @@ impl Reader {
             let mut out = Snapshot {
                 arena: std::sync::Arc::new(SnapArena::with_capacity(bytes)),
                 runs: s.runs,
+                frozen_runs: s.runs,
                 ents: Vec::with_capacity(live_ents.clone().count()),
                 log_at: s.log_at,
                 live_len: s.live_len,
@@ -14245,6 +14628,7 @@ impl Reader {
             let mut out = Snapshot {
                 arena: s.arena.clone(),
                 runs: s.runs,
+                frozen_runs: s.runs,
                 ents: Vec::with_capacity(s.ents.len()),
                 log_at: 0,
                 live_len: 0,
@@ -15006,6 +15390,14 @@ impl Db {
     #[doc(hidden)]
     pub fn snapshot_switches(&self) -> u64 {
         self.shared.snap_switched.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Snapshots the seal thread published over the table it was writing
+    /// (`Options::seal_snapshot`), over this store's life. For a test:
+    /// a read during a seal that adopts one builds none of its own.
+    #[doc(hidden)]
+    pub fn seal_snapshots(&self) -> u64 {
+        self.shared.snap_sealed.load(AtomicOrdering::Relaxed)
     }
 
     #[doc(hidden)]
@@ -16149,12 +16541,15 @@ struct Maint {
     /// the same mistake: treating "the data is somewhere" as "the data is
     /// durable somewhere a reopen can find".
     retiring_wals: Vec<PathBuf>,
-    /// The WAL sequence every live segment covers between them. Kept as a
-    /// monotone field rather than derived from segment names: a compaction
-    /// renames the whole live set, and deriving the bound from the names it
-    /// happens to produce let it move BACKWARDS -- caught by the model
-    /// oracle as "wal sequence gap: a durable record is missing" on the
-    /// reopen after a merge. A durability bound may only ever rise.
+    /// The WAL sequence every live segment covers between them: the live
+    /// set's bound, raised when a seal's segments are published to readers
+    /// and persisted by the manifest once they are durable, so for the
+    /// width of a seal's window it stands above what the manifest says.
+    /// Kept as a monotone field rather than derived from segment names: a
+    /// compaction renames the whole live set, and deriving the bound from
+    /// the names it happens to produce let it move BACKWARDS -- caught by
+    /// the model oracle as "wal sequence gap: a durable record is missing"
+    /// on the reopen after a merge. A durability bound may only ever rise.
     covered_seq: u64,
     /// A partitioning merge in flight. Its inputs stay live and readable
     /// until the manifest names its outputs instead, which is what makes
