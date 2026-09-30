@@ -33,9 +33,10 @@ Two writers produce the format -- `Db` when it seals or compacts, and
 either produced: `Blob` over a mapped file, `Blob` over a copying source, and
 `SparseBlob` over ranges. That is why `format.rs` belongs to none of them.
 
-`block` and `index` carry a scoped `#[allow(clippy::all, dead_code)]`: style
-not yet paid down, rather than code anyone may not touch. Nothing is exempt
-from the format gate, and everything else holds to `-D warnings`.
+No module carries a blanket lint allowance; `block` and `flatindex` allow
+`dead_code` on the wasm target only, where their writer halves have no
+caller. Nothing is exempt from the format gate, and everything holds to
+`-D warnings`.
 
 ## Running the checks
 

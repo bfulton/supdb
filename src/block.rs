@@ -5,10 +5,6 @@
 //! roughly a kilobyte and one of tens of kilobytes -- the measured difference
 //! between no compression at all and 2.7-3.6x on realistic event data.
 
-use std::collections::HashMap;
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-
 /// CRC-32C (Castagnoli) over stored bytes.
 ///
 /// Nothing outside the 120-byte superblock used to be checksummed, so a bit
@@ -246,76 +242,8 @@ impl BlockBuilder {
         off
     }
 
-    /// The bytes staged so far.
-    ///
-    /// A writer that wants to read its own writes has to see extents that are
-    /// in the builder but not yet in a block, because their block id does not
-    /// exist until the builder is flushed. Exposing the buffer is what lets
-    /// `Store::read_all` answer without sealing anything.
-    pub fn staged(&self) -> &[u8] {
-        &self.buf
-    }
-
     pub fn take(&mut self) -> Vec<u8> {
         std::mem::replace(&mut self.buf, Vec::with_capacity(self.cap))
-    }
-}
-
-/// A bounded cache of decompressed blocks.
-///
-/// Without this, a compressed store pays decompression on every read and warm
-/// reads collapse -- the measured tradeoff that forced Uppend to choose
-/// between 407 MB at 16,988 reads/s and 1,065 MB at 53,507 reads/s.
-pub struct BlockCache {
-    shards: Vec<Mutex<Shard>>,
-    mask: usize,
-}
-
-struct Shard {
-    map: HashMap<u32, Arc<Vec<u8>>>,
-    order: VecDeque<u32>,
-    cap: usize,
-}
-
-impl BlockCache {
-    pub fn new(total_blocks: usize) -> Self {
-        let shard_count = 16;
-        let per = (total_blocks / shard_count).max(4);
-        BlockCache {
-            shards: (0..shard_count)
-                .map(|_| {
-                    Mutex::new(Shard {
-                        map: HashMap::with_capacity(per),
-                        order: VecDeque::with_capacity(per),
-                        cap: per,
-                    })
-                })
-                .collect(),
-            mask: shard_count - 1,
-        }
-    }
-
-    fn shard(&self, id: u32) -> &Mutex<Shard> {
-        &self.shards[(id as usize) & self.mask]
-    }
-
-    pub fn get(&self, id: u32) -> Option<Arc<Vec<u8>>> {
-        let s = self.shard(id).lock().unwrap();
-        s.map.get(&id).map(Arc::clone)
-    }
-
-    pub fn put(&self, id: u32, bytes: Arc<Vec<u8>>) {
-        let mut s = self.shard(id).lock().unwrap();
-        if s.map.contains_key(&id) {
-            return;
-        }
-        if s.map.len() >= s.cap {
-            if let Some(old) = s.order.pop_front() {
-                s.map.remove(&old);
-            }
-        }
-        s.order.push_back(id);
-        s.map.insert(id, bytes);
     }
 }
 
@@ -326,11 +254,6 @@ pub fn compress(src: &[u8]) -> Option<Vec<u8>> {
     } else {
         None
     }
-}
-
-pub fn decompress(src: &[u8], uncompressed: usize) -> std::io::Result<Vec<u8>> {
-    lz4_flex::decompress(src, uncompressed)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// Decompress into a caller-owned buffer, allocating nothing.
@@ -356,6 +279,12 @@ pub fn decompress_into(src: &[u8], dst: &mut Vec<u8>, uncompressed: usize) -> st
 /// `start_n` is the end. `crc_i` covers the *stored* bytes of chunk `i`, so a
 /// point read verifies only the chunk it decodes rather than the whole block --
 /// which is the whole reason the chunking exists.
+///
+/// The chunk size is the read-amplification dial. A wide key holds under a
+/// kilobyte, so a 4 KiB chunk inflates 4 KiB to hand back 960 bytes. Smaller
+/// chunks decompress less per read and compress slightly worse; the reader
+/// takes the size from the block header, so this is a write-time choice and
+/// old blocks stay readable.
 pub const CHUNK: usize = 4096;
 
 /// How many chunk checksums a block may carry beside it.
@@ -387,11 +316,6 @@ pub fn chunk_crcs(bytes: &[u8]) -> Option<[u32; MAX_CHUNK_CRCS]> {
     Some(out)
 }
 
-/// The chunk size is the read-amplification dial. A wide key holds under a
-/// kilobyte, so a 4 KiB chunk inflates 4 KiB to hand back 960 bytes. Smaller
-/// chunks decompress less per read and compress slightly worse; the reader
-/// takes the size from the block header, so this is a write-time choice and
-/// old blocks stay readable.
 /// When false, chunk checksums are written as zero. Set once at store
 /// creation; this is a measurement knob, not a per-call switch, and it is
 /// WRITE time only. Whether a reader verifies is the reader's own
@@ -449,97 +373,6 @@ pub fn write_chunked_sz(src: &[u8], chunk: usize) -> Vec<u8> {
 #[inline]
 pub fn chunk_header_len(n: usize) -> usize {
     8 + 4 * (n + 1) + 4 * n
-}
-
-pub fn write_chunked(src: &[u8]) -> Vec<u8> {
-    write_chunked_sz(src, CHUNK)
-}
-
-/// Populate `dst[a..b]` from a chunked block, touching only the chunks that
-/// cover that range. `dst` must already be sized to the uncompressed length.
-/// Chunk size and count of a chunked block, without decoding anything.
-pub fn chunk_geometry(blk: &[u8]) -> Option<(usize, usize)> {
-    if blk.len() < 8 {
-        return None;
-    }
-    let cs = u32::from_le_bytes(blk[0..4].try_into().unwrap()) as usize;
-    let n = u32::from_le_bytes(blk[4..8].try_into().unwrap()) as usize;
-    if cs == 0 || n == 0 || n > (1 << 20) {
-        return None;
-    }
-    Some((cs, n))
-}
-
-/// Decode only the chunks covering `a..b` that `have` does not already mark as
-/// decoded, setting their bits.
-///
-/// A scan revisits a block many times as it walks keys in order, but a key may
-/// need only one chunk of it. Decoding the whole block on first touch suits a
-/// block holding hundreds of single-value keys and wastes sixty-fold on one
-/// holding a few keys with many values each. Tracking which chunks are already
-/// decoded serves both.
-pub fn read_chunks_into(
-    blk: &[u8],
-    uncompressed: usize,
-    a: usize,
-    b: usize,
-    dst: &mut [u8],
-    have: &mut [u64],
-    verify: bool,
-) -> std::io::Result<()> {
-    let Some((cs, n)) = chunk_geometry(blk) else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "not a valid chunked block; its space may have been reused",
-        ));
-    };
-    let header = chunk_header_len(n);
-    if blk.len() < header {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "chunk directory extends past the block",
-        ));
-    }
-    let start = |i: usize| -> usize {
-        u32::from_le_bytes(blk[8 + 4 * i..12 + 4 * i].try_into().unwrap()) as usize
-    };
-    let crc_base = 8 + 4 * (n + 1);
-    let stored_crc = |i: usize| {
-        u32::from_le_bytes(
-            blk[crc_base + 4 * i..crc_base + 4 * i + 4]
-                .try_into()
-                .unwrap(),
-        )
-    };
-    for i in (a / cs)..=((b.saturating_sub(1)) / cs).min(n - 1) {
-        let (w, bit) = (i / 64, 1u64 << (i % 64));
-        if have[w] & bit != 0 {
-            continue;
-        }
-        let (s0, s1) = (start(i), start(i + 1));
-        if s1 < s0 || header + s1 > blk.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "chunk offsets out of range",
-            ));
-        }
-        let raw = &blk[header + s0..header + s1];
-        if verify && crc32(raw) != stored_crc(i) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "chunk checksum mismatch: these bytes are not what was written",
-            ));
-        }
-        let (lo, hi) = (i * cs, ((i + 1) * cs).min(uncompressed));
-        if raw.len() == hi - lo {
-            dst[lo..hi].copy_from_slice(raw);
-        } else {
-            lz4_flex::block::decompress_into(raw, &mut dst[lo..hi])
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        }
-        have[w] |= bit;
-    }
-    Ok(())
 }
 
 pub fn read_chunked_range(
@@ -650,7 +483,7 @@ mod checksum_tests {
         let src = payload();
         let blk = write_chunked_sz(&src, 1024);
         let header = {
-            let (_, n) = chunk_geometry(&blk).unwrap();
+            let n = u32::from_le_bytes(blk[4..8].try_into().unwrap()) as usize;
             chunk_header_len(n)
         };
         let mut caught = 0;

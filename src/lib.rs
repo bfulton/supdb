@@ -37,23 +37,23 @@
 //! ordered scans will need later, at close to no cost.
 
 // The format modules below came from the design artifact rather than being
-// written here. `block` and `index` still have their style lints scoped off
-// rather than paid down, which is all that is left of the distinction: they
-// are formatted by the same gate as every other file, and everything else
-// holds to -D warnings.
+// written here; every one holds to -D warnings now, `block` and `flatindex`
+// with `dead_code` allowed on the wasm target alone, where their writer
+// halves have no caller.
 /// The on-disk format's fixed quantities: the superblock magic and geometry.
 /// Not owned by any writer -- two of them exist and three readers parse what
 /// either produced.
 mod format;
 
-#[allow(clippy::all, dead_code)]
+/// Blocks: the unit a segment's values are packed and checksummed in. On
+/// wasm its writer half (`BlockBuilder`, `compress`, the chunk writer and
+/// the checksum row) has no caller, because `db` is not compiled there.
+#[cfg_attr(target_family = "wasm", allow(dead_code))]
 mod block;
-#[allow(clippy::all, dead_code)]
 /// The extent types the index is built from. Public because a writer needs
 /// to name what it is writing; the format is otherwise reached through
 /// `Blob`.
 pub mod index;
-// Not vendored -- written here, so it holds to -D warnings like the harness.
 // On wasm its writer half (`plan`, `encode`, the slack and fence arithmetic)
 // has no caller, because there is no writer there. Allowed on that target
 // only, so the native build keeps telling the truth about dead code.

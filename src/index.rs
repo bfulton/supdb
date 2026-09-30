@@ -127,8 +127,9 @@ impl PartialEq<&[Ext]> for Exts<'_> {
 }
 
 /// Extents of a single key. Inline until the key needs more than one.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum Extents {
+    #[default]
     None,
     One(Ext),
     Many(Vec<Ext>),
@@ -149,20 +150,6 @@ impl Extents {
             Extents::One(e) => std::slice::from_ref(e),
             Extents::Many(v) => v.as_slice(),
         }
-    }
-
-    pub fn first(&self) -> Option<Ext> {
-        self.as_slice().first().copied()
-    }
-
-    pub fn last(&self) -> Option<Ext> {
-        self.as_slice().last().copied()
-    }
-}
-
-impl Default for Extents {
-    fn default() -> Self {
-        Extents::None
     }
 }
 
@@ -270,39 +257,4 @@ pub fn encode_run(values: &[u8], lens: &[u32], out: &mut Vec<u8>) -> (u32, u32) 
         at += l as usize;
     }
     (last, 0)
-}
-
-/// The width a prefixed run's values share, if they all share one and it
-/// is not zero; `None` for a mixed or empty run. For a writer deciding how
-/// to seal a run it holds already prefixed.
-pub fn uniform_width(prefixed: &[u8]) -> Option<usize> {
-    let mut p = 0usize;
-    let mut w: Option<usize> = None;
-    while p < prefixed.len() {
-        let len = get_uvarint(prefixed, &mut p) as usize;
-        if len == 0 || p.checked_add(len)? > prefixed.len() {
-            return None;
-        }
-        match w {
-            None => w = Some(len),
-            Some(x) if x != len => return None,
-            _ => {}
-        }
-        p += len;
-    }
-    w
-}
-
-/// Strip the prefixes off a run `uniform_width` accepted, into `out`.
-pub fn strip_prefixes(prefixed: &[u8], out: &mut Vec<u8>) -> u32 {
-    out.clear();
-    let mut p = 0usize;
-    let mut n = 0u32;
-    while p < prefixed.len() {
-        let len = get_uvarint(prefixed, &mut p) as usize;
-        out.extend_from_slice(&prefixed[p..p + len]);
-        p += len;
-        n += 1;
-    }
-    n
 }
