@@ -96,6 +96,83 @@ fn hash_cap_for(keys: usize) -> Option<usize> {
     Some(cap.max(16))
 }
 
+/// Keys from which the hash table is filled in home-slot order rather
+/// than key order; see `fill_hash`.
+const HASH_FILL_SORTED_FROM: usize = 1 << 16;
+
+/// The hash table `t` -- `mask + 1` slots of `SLOT` bytes, zeroed --
+/// filled with the `n` keys `at` gives as (hash, record offset), each
+/// placed by linear probing from its hash's home slot: in key order, or
+/// from `HASH_FILL_SORTED_FROM` keys up in home-slot order, after a radix
+/// pass over (slot, packed slot word), so the writes walk the table
+/// forward instead of landing at random -- three hundred thousand
+/// eight-byte writes into a four-megabyte table were most of a trailer's
+/// build. Either order leaves every key on the probe chain from its home
+/// slot with no empty slot before it, which is all a lookup relies on;
+/// which slot a colliding key takes differs between the two, as it
+/// already does between one thread's fill and several. The two writers
+/// of a section call this one function, so their bytes agree.
+fn fill_hash(t: &mut [u8], mask: usize, n: usize, mut at: impl FnMut(usize) -> (u64, u32)) {
+    let place = |t: &mut [u8], slot: usize, packed: u64| {
+        let mut s = slot;
+        loop {
+            let a = s * SLOT;
+            if t[a..a + 8] == [0u8; 8] {
+                t[a..a + 8].copy_from_slice(&packed.to_le_bytes());
+                return;
+            }
+            s = (s + 1) & mask;
+        }
+    };
+    // The tag is forced non-zero so an occupied slot is never all zero,
+    // which is what marks a slot empty.
+    let entry = |h: u64, off: u32| {
+        let tag = ((h >> 56) | 1) & 0xff;
+        ((h as usize) & mask, (tag << 56) | off as u64)
+    };
+    if n < HASH_FILL_SORTED_FROM {
+        for i in 0..n {
+            let (h, off) = at(i);
+            let (s, packed) = entry(h, off);
+            place(t, s, packed);
+        }
+        return;
+    }
+    let mut recs: Vec<(u32, u64)> = (0..n)
+        .map(|i| {
+            let (h, off) = at(i);
+            let (s, packed) = entry(h, off);
+            (s as u32, packed)
+        })
+        .collect();
+    // LSD radix over the slot's bits, a byte a pass, stable.
+    let bits = usize::BITS - mask.leading_zeros();
+    let mut scratch: Vec<(u32, u64)> = vec![(0, 0); n];
+    let mut shift = 0u32;
+    while shift < bits {
+        let mut counts = [0usize; 256];
+        for &(s, _) in recs.iter() {
+            counts[((s >> shift) & 0xFF) as usize] += 1;
+        }
+        let mut sum = 0usize;
+        for c in counts.iter_mut() {
+            let k = *c;
+            *c = sum;
+            sum += k;
+        }
+        for &r in recs.iter() {
+            let b = ((r.0 >> shift) & 0xFF) as usize;
+            scratch[counts[b]] = r;
+            counts[b] += 1;
+        }
+        std::mem::swap(&mut recs, &mut scratch);
+        shift += 8;
+    }
+    for &(s, packed) in &recs {
+        place(t, s as usize, packed);
+    }
+}
+
 /// Spare room left at the end of the record region, as a fraction of it.
 ///
 /// This is what makes a checkpoint incremental. Growing a key's extent list
@@ -821,24 +898,13 @@ pub fn stream_trailer<'a>(
         t.extend_from_slice(&o.to_le_bytes());
     }
     at += n * 4;
-    // Hash slots: 8-aligned, `encode`'s probe and tag, byte for byte.
+    // Hash slots: 8-aligned, filled as `encode` fills its own, byte for
+    // byte.
     pad_to(&mut t, &mut at, 8);
     let hash_off = at;
     let hash_start = t.len();
     t.resize(hash_start + cap * SLOT, 0);
-    for (i, &h) in hashes.iter().enumerate() {
-        let tag = ((h >> 56) | 1) & 0xff;
-        let packed = (tag << 56) | rec_offs[i] as u64;
-        let mut s = (h as usize) & mask;
-        loop {
-            let a = hash_start + s * SLOT;
-            if t[a..a + 8] == [0u8; 8] {
-                t[a..a + 8].copy_from_slice(&packed.to_le_bytes());
-                break;
-            }
-            s = (s + 1) & mask;
-        }
-    }
+    fill_hash(&mut t[hash_start..], mask, n, |i| (hashes[i], rec_offs[i]));
     at += cap * SLOT;
     let total = at;
 
@@ -1252,22 +1318,13 @@ pub fn encode_inline(
     // currently relies on.
     let aligned = (out.as_ptr() as usize + hash_off).is_multiple_of(8);
     if !parallel || threads < 2 || all.len() < 64 * 1024 || !aligned {
-        for (i, (k, _)) in all.iter().enumerate() {
-            let h = hash_of(k);
-            // The tag is forced non-zero so an occupied slot is never all zero,
-            // which is what marks a slot empty.
-            let tag = ((h >> 56) | 1) & 0xff;
-            let packed = (tag << 56) | p.rec_offs[i] as u64;
-            let mut s = (h as usize) & mask;
-            loop {
-                let at = hash_off + s * SLOT;
-                if rd_u64(&out, at) == Some(0) {
-                    out[at..at + 8].copy_from_slice(&packed.to_le_bytes());
-                    break;
-                }
-                s = (s + 1) & mask;
-            }
-        }
+        let n = all.len();
+        fill_hash(
+            &mut out[hash_off..hash_off + p.hash_cap * SLOT],
+            mask,
+            n,
+            |i| (hash_of(all[i].0), p.rec_offs[i]),
+        );
     } else {
         use std::sync::atomic::{AtomicU64, Ordering};
         /// The slot array, shared across the scope. Every write is a
