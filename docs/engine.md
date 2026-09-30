@@ -2493,6 +2493,73 @@ stated in this suite's terms: the load is faster by the work it no
 longer waits for, and the reads that follow within that work's duration
 pay for it instead, at the merge path's price rather than the flush's.
 
+#### A landing priced where the reads are
+
+The round that made a `sync` the durable write alone -- the segment
+work on its thread, the two-phase landing, the seal-published snapshot,
+the handed tail -- was priced against the shape arm in one process, and
+the shape arm kept up. The flush arm's own numbers fell meanwhile, and
+the quick row could not say so: the host was out of band that day and
+the gate gave no verdict. Read again beside the round's first head, the
+flush arm's fully-unmerged lag point stood at 0.3x of what it had at ten
+thousand keys, 0.46x at a hundred thousand, 0.56x at three hundred
+thousand, its ten-percent point at 0.7x at the two larger rungs. A bisect
+of the round's four heads against LMDB in one process each -- the
+comparator does not move between processes, the arm does -- put the fall
+at ten thousand keys on the two-phase landing and at a hundred thousand
+on the seal's snapshot, and a probe of the suite's sweep timing every
+scan of every point beside the store's counters showed one shape behind
+both: a pass of two-microsecond scans with one scan of 0.6-0.9 ms in it
+at ten thousand keys, 2-17 ms at a hundred thousand, at the scan where a
+publish landed -- a seal's piece, the switch to the seal's snapshot, a
+merge's partitions. Before the round a seal landed after its fsyncs,
+which put every landing after the pass; the round put them inside it.
+Timers in the scan's phases named the cost: the writer's rebase of its
+tables at a new state took the new piece's ranks against its partition
+(`BuildCtx::rank_pieces`), 0.6 ms at ten thousand keys and 4.4 at a
+hundred thousand, 17 for every piece over a partition a merge had
+rewritten, because the segment work took them only after it published
+and the writer's scan got there first; and the snapshot's extension,
+which every point's first scan and every switch to the seal's snapshot
+makes, found each new key's place by a binary search over the run,
+fourteen cold lines a key, 1-2 ms for a thousand keys over ten thousand,
+and sorted the batch through the arena, a millisecond for five thousand.
+
+The segment work takes the ranks and the pieces' bounds before it
+publishes now (`Maint::rank_before_publish`), at a seal's landing, a
+merge's, a piece merge's and a promotion's, and the extension orders its
+batch by prefix words and walks the run where the batch is dense in it,
+galloping where it is sparse. Through the probe, the landing's scan at
+ten thousand keys fell from 560-885 us to 173-248, a landing at a
+hundred thousand from 4.5 ms to 0.46, and the switch's extension from
+1.2-1.6 ms to 0.5-0.7; the ten-percent point's first scan at a hundred
+thousand, an extension of five thousand keys, from 2.4 ms to 15 us.
+Priced in one process against LMDB, the round's last head and this one
+on the same day, twelve pairs a rung and six at the largest: the flush
+arm's fully-unmerged lag point 1.98x of LMDB's to 2.69x at ten thousand
+keys, 0.96x to 1.56x at a hundred thousand, 0.69x to 2.02x at three
+hundred thousand; its ten-percent point 1.46x to 1.75x at three hundred
+thousand; the point-read pass at ten thousand keys 1.02x to 1.80x; the
+drained scan pass and the other lag points within noise. Against the
+round's first head, again on the same day, the fully-unmerged point
+stands at 0.9x of it at ten thousand keys and 1.2x at a hundred
+thousand. Beside the shape arm, twelve pairs a rung, that arm's
+fully-unmerged point reads 0.90x, 0.85x and 0.76x of the flush arm's,
+where in the morning it read 1.61x, 1.01x and 1.61x of a flush arm that
+was slow; its first two points stay at 0.04-0.1x, the merge path over
+the frozen table while the seal runs, which is that arm's own question.
+
+What the probe leaves: the switch to the seal's snapshot still costs
+its first scan 0.7 ms at a hundred thousand keys and 2.8 at three
+hundred thousand, once a seal; the writer's snapshot is dropped at its
+own freeze (`Options::snapshot_carry` is off) and the first scan after
+rebuilds it over the frozen table and the live one, 47-59 ms at three
+hundred thousand, before the seal's own snapshot is there to switch to;
+and the builder ahead's forms, installed by the scan that finds them
+posted, are 3.5 ms of one scan at a hundred thousand. The carry was
+priced once and found to move no timing quantity, before the segment
+work had a thread and the seal a snapshot; it is due another pricing.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and
