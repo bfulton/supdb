@@ -696,6 +696,39 @@ key space. The rule: a function correct only in some state checks that
 state itself, and an invariant reads route by is asserted where it is
 published, not found where it is read.
 
+**A join that blocked the thread everything lands through.** The
+segment work's thread took each seal as it was handed over and joined
+its thread at once, so for the seal's whole run -- 700 ms at three
+hundred thousand keys -- it landed nothing else: a merge that finished
+waited, and a piece that could have been promoted was not, while every
+read took the merge path. Nothing raised, and the writer never waited,
+since it waits only on the flag the landing clears. The thread polls
+the seal as it polls the merges now. The rule: a thread that serialises
+several publishes blocks on none of them; it waits on the set, and a
+join is for a caller that asked for that one thing.
+
+**A count that began only once there was something to count.** Shaping
+waited for a read that had counted, and a read counted only when it saw
+a piece, so a store read while its first seal was in flight -- no
+segment at all -- had nothing counted when the piece landed, and the
+shaping waited for the next read and the poll after it; at ten thousand
+keys the sweep was over first. Any read the block path cannot serve
+counts now, and a promotion, which rewrites nothing, waits for no count
+at all. The rule: a signal that gates a decision is raised by the
+condition the decision is about -- here, a read the shape made slow --
+and not by a proxy for it that happens to be easy to test.
+
+**A sort priced by its compares.** The seal sorted the frozen table's
+entries with a comparison sort keyed on the arena's keys, two random
+reads a compare and five million compares at three hundred thousand
+keys: 147 ms of a 715 ms seal, a fifth, while the scan snapshot over the
+same keys sorted them by radix over their sixteen-byte prefixes in 30.
+Nothing pointed at it; the seal was off the writer's path and its time
+was nobody's until the reads waited on it. The rule: a sort over keys
+that live behind a pointer is priced by its misses, not its compares,
+and when one structure already sorts the same keys the way that costs
+less, the other takes that way.
+
 **A sentinel that crosses the wasm boundary changes sign.** A wasm `u32`
 arrives in JavaScript as a signed i32, so a failure sentinel of `u32::MAX`
 arrives as -1 and a comparison against 4294967295 can never match. Every

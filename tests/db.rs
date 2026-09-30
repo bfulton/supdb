@@ -3671,10 +3671,11 @@ fn a_first_flush_seals_the_partition_in_one_publish() {
 
 /// An ordered load a `sync` only makes durable is left in its direct run,
 /// unpartitioned; with `Options::adaptive_shape` the sync hands the run to
-/// a seal as well, and the first scans through a handle have the piece
-/// promoted to a partition while the writer makes no call at all.
+/// a seal as well, and the seal, over a store with no segment, names the
+/// first partition itself, so no promotion follows and the first read
+/// after the landing routes by fence.
 #[test]
-fn a_durable_only_sync_leaves_an_unpartitioned_store_a_partition() {
+fn a_durable_only_sync_seals_an_ordered_load_as_its_first_partition() {
     let d = dir("adaptive-shape-sync");
     let mut db = Db::create(
         &d,
@@ -3698,20 +3699,12 @@ fn a_durable_only_sync_leaves_an_unpartitioned_store_a_partition() {
     }
     db.sync().unwrap();
     db.settle().unwrap();
-    assert_eq!(db.levels(), (0, 1), "the sync sealed the run as one piece");
-    let r = db.reader().unwrap();
-    let t = std::time::Instant::now();
-    let mut scans = 0u64;
-    while db.levels().0 == 0 && t.elapsed() < std::time::Duration::from_secs(20) {
-        let from = format!("k{:08}", (scans * 131) % n as u64);
-        r.scan(from.as_bytes(), 100, |_, _| {}).unwrap();
-        scans += 1;
-    }
     assert_eq!(
         db.levels(),
         (1, 0),
-        "{scans} scans and the piece was not promoted"
+        "the sync's seal is the first partition"
     );
+    let r = db.reader().unwrap();
     for i in (0..n).step_by(97) {
         assert_eq!(read_vec(&r, format!("k{i:08}").as_bytes()), vec![val(i)]);
     }
@@ -3719,48 +3712,103 @@ fn a_durable_only_sync_leaves_an_unpartitioned_store_a_partition() {
     db.close().unwrap();
 }
 
+/// A store reopened with one piece and no partition is promoted by the
+/// segment work at once, with nothing reading it: a promotion rewrites
+/// nothing, so it waits for nobody.
+#[test]
+fn a_lone_piece_is_promoted_at_open_without_a_read() {
+    let d = dir("adaptive-shape-open");
+    let val = |i: u32| {
+        let mut v = i.to_le_bytes().to_vec();
+        v.extend_from_slice(&[b'x'; 100]);
+        v
+    };
+    let n = 20_000u32;
+    {
+        // Without the shaping, a seal that is not a flush's leaves a piece.
+        let mut db = Db::create(&d, Options::default()).unwrap();
+        for i in 0..n {
+            db.append(format!("k{i:08}").as_bytes(), &val(i));
+            if i % 1000 == 999 {
+                db.commit().unwrap();
+            }
+        }
+        db.seal().unwrap();
+        db.settle().unwrap();
+        assert_eq!(db.levels(), (0, 1), "a seal leaves a piece");
+        // Dropped, not closed: a close flushes, and a flush partitions.
+    }
+    let db = Db::open(
+        &d,
+        Options {
+            adaptive_shape: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let t = std::time::Instant::now();
+    while db.levels().0 == 0 && t.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(db.levels(), (1, 0), "the open promoted the piece");
+    for i in (0..n).step_by(97) {
+        assert_eq!(read_vec(&db, format!("k{i:08}").as_bytes()), vec![val(i)]);
+    }
+}
+
 /// Overlapping pieces a promotion cannot partition are merged once the
 /// store is read, and not before: left unread, the store stays as it is.
 #[test]
 fn overlapping_pieces_are_merged_once_the_store_is_read() {
     let d = dir("adaptive-shape-merge");
-    // Seals small enough to leave several pieces, and a trigger that
-    // never fires, so only the reads start the merge.
-    let mut db = Db::create(
-        &d,
-        Options {
-            adaptive_shape: true,
-            seal_bytes: 512 << 10,
-            l0_trigger: 100,
-            ..Options::default()
-        },
-    )
-    .unwrap();
     let n = 20_000u64;
     let val = |i: u64| {
         let mut v = i.to_le_bytes().to_vec();
         v.extend_from_slice(&[b'x'; 100]);
         v
     };
-    // Shuffled, so every piece spans the key space.
+    // Shuffled, so every piece spans the key space; seals small enough
+    // to leave several, and a trigger that never fires.
     let key = |i: u64| format!("k{:08}", (i * 7919) % n);
-    for i in 0..n {
-        db.append(key(i).as_bytes(), &val((i * 7919) % n));
-        if i % 1000 == 999 {
-            db.commit().unwrap();
+    let pieces = {
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 512 << 10,
+                l0_trigger: 100,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        for i in 0..n {
+            db.append(key(i).as_bytes(), &val((i * 7919) % n));
+            if i % 1000 == 999 {
+                db.commit().unwrap();
+            }
         }
-    }
-    db.sync().unwrap();
-    db.settle().unwrap();
-    let pieces = db.levels().1;
-    assert!(
-        pieces >= 2,
-        "the load leaves {pieces} pieces; the test wants several"
-    );
+        db.seal().unwrap();
+        db.settle().unwrap();
+        let (parts, pieces) = db.levels();
+        assert_eq!(parts, 0);
+        assert!(
+            pieces >= 2,
+            "the load leaves {pieces} pieces; the test wants several"
+        );
+        pieces
+    };
+    let db = Db::open(
+        &d,
+        Options {
+            adaptive_shape: true,
+            l0_trigger: 100,
+            ..Options::default()
+        },
+    )
+    .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
     assert_eq!(
-        db.levels().0,
-        0,
+        db.levels(),
+        (0, pieces),
         "nothing was read, and the store was merged anyway"
     );
     let r = db.reader().unwrap();
@@ -3772,7 +3820,6 @@ fn overlapping_pieces_are_merged_once_the_store_is_read() {
         scans += 1;
     }
     assert!(db.levels().0 > 0, "{scans} scans and nothing was merged");
-    db.settle().unwrap();
     for i in (0..n).step_by(97) {
         assert_eq!(read_vec(&r, format!("k{i:08}").as_bytes()), vec![val(i)]);
     }

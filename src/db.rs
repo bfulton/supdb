@@ -404,15 +404,17 @@ pub struct Options {
     /// thread. `false` is the shape before it: the writer drives the same
     /// work inline, at its commits, seals and flushes.
     pub publish_in_background: bool,
-    /// EXPERIMENT: a store with pieces and no partition is partitioned as
-    /// soon as anything reads it, rather than when `l0_trigger` pieces
-    /// have piled up: every scan over it takes the merge path and every
-    /// read consults every piece, and a partitioning happens once in a
-    /// store's life, so nothing is gained by waiting while it is read and
-    /// nothing is spent while it is not. A `sync` over such a store hands
-    /// its tail to a seal as well, so what it leaves in memory is
-    /// partitioned with the rest; everything but the durable write is the
-    /// segment work's, which is why this wants `publish_in_background`.
+    /// EXPERIMENT: a store with pieces and no partition is partitioned by
+    /// the segment work rather than when `l0_trigger` pieces have piled
+    /// up: every scan over it takes the merge path and every read consults
+    /// every piece, and a partitioning happens once in a store's life. A
+    /// promotion rewrites nothing and happens as soon as it can -- at a
+    /// landing, at open -- and a seal over an empty store names the first
+    /// partition itself; a merge is a rewrite and waits until something
+    /// reads the store. A `sync` over a store with no partition hands its
+    /// tail to a seal as well, without waiting for it. Everything but the
+    /// durable write is the segment work's, which is why this wants
+    /// `publish_in_background`.
     pub adaptive_shape: bool,
     /// How a flush drains level 0 once partitions exist: merge only the
     /// ranges that hold pieces, under the live fences (`true`), or
@@ -3888,6 +3890,38 @@ impl MemTable {
         self.chunk_len(off) == TOMB_LEN
     }
 
+    /// Every entry in key order: an LSD radix sort over the keys' first
+    /// sixteen bytes as two words, the sort the scan snapshot uses, then a
+    /// comparison sort inside each run of equal prefixes, which the
+    /// suite's keys never have. The comparison sort of the whole table
+    /// read two arena keys a compare, five million compares at three
+    /// hundred thousand keys, and was a fifth of the seal.
+    fn entries_in_key_order(&self) -> Vec<&MemEntry> {
+        let n = self.len();
+        let mut recs: Vec<(u64, u64, u32)> = Vec::with_capacity(n);
+        for i in 0..n {
+            let (a, b) = key_prefix(self.key_of(self.entry(i)));
+            recs.push((a, b, i as u32));
+        }
+        let mut scratch = Vec::new();
+        radix_by_prefix(&mut recs, &mut scratch);
+        let mut i = 0;
+        while i < recs.len() {
+            let mut j = i + 1;
+            while j < recs.len() && (recs[j].0, recs[j].1) == (recs[i].0, recs[i].1) {
+                j += 1;
+            }
+            if j - i > 1 {
+                recs[i..j].sort_unstable_by(|x, y| {
+                    self.key_of(self.entry(x.2 as usize))
+                        .cmp(self.key_of(self.entry(y.2 as usize)))
+                });
+            }
+            i = j;
+        }
+        recs.iter().map(|r| self.entry(r.2 as usize)).collect()
+    }
+
     /// The key's live values, oldest first, and whether a tombstone ends
     /// the chain -- in which case everything older, here and in every older
     /// source, is dead. Chunks at or past `wm` are skipped: a reader's
@@ -5480,6 +5514,12 @@ struct Shared {
     /// EXPERIMENT: scan snapshots built over this store's life, which is
     /// what publishing one is meant to bring down; for a test.
     snap_builds: AtomicU64,
+    /// A read over a store with no partition happened since the segment
+    /// work last looked (`Options::adaptive_shape`): set by the read that
+    /// finds it clear, which wakes the thread, cleared by the look.
+    unshaped_wake: std::sync::atomic::AtomicBool,
+    /// The segment work's thread, for a read to wake.
+    maint_thread: std::sync::OnceLock<std::thread::Thread>,
     /// Reads that took a canonical form, over this store's life. The
     /// count beside it on `State` is that state's and is zero again at
     /// every publish, so reading it at the end of a pass says what
@@ -7618,7 +7658,7 @@ impl Reader {
         let at = segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
         let part = segs[..np].get(at).filter(|s| s.may_hold(key));
         let l0 = st.pieces_over(np, at);
-        if np == 0 && !segs.is_empty() {
+        if np == 0 {
             self.count_unshaped();
         }
         // Sources oldest to newest: the partition (0), the level-0 pieces
@@ -7922,7 +7962,7 @@ impl Reader {
         // on: before the first partitioning it stands aside.
         let use_cache =
             self.opts.scan_block_cache && self.segs().first().is_some_and(|s| s.level > 0);
-        if self.segs().first().is_some_and(|s| s.level == 0) {
+        if !use_cache {
             self.count_unshaped();
         }
         if let (true, Some(slot)) = (self.counted, self.slot) {
@@ -8760,6 +8800,17 @@ impl Reader {
                     .fetch_add(1, AtomicOrdering::Relaxed);
             }
             _ => SealCounts::add(&self.shared.seal_counts.unshaped, 1),
+        }
+        // The first such read since the thread last looked wakes it; the
+        // rest find the flag set and cost nothing. A wake is a futex call,
+        // so one per read would have been the read's whole cost again.
+        if !self.shared.unshaped_wake.load(AtomicOrdering::Relaxed) {
+            self.shared
+                .unshaped_wake
+                .store(true, AtomicOrdering::Release);
+            if let Some(t) = self.shared.maint_thread.get() {
+                t.unpark();
+            }
         }
     }
 
@@ -11208,10 +11259,13 @@ impl Db {
     /// a third of the load, and the promotion's link, second open,
     /// directory sync, manifest sync and directory sync a quarter of the
     /// drain.
+    ///
+    /// Under `Options::adaptive_shape` every seal over an empty store may:
+    /// the promotion it saves is the one the segment work would make at
+    /// the landing, and until it landed every read took the merge path.
     fn seals_first_partition(&self) -> bool {
-        self.draining
+        ((self.draining && self.opts.partition_on_flush) || self.opts.adaptive_shape)
             && self.opts.compact
-            && self.opts.partition_on_flush
             && self.opts.promote
             && self.segs().is_empty()
     }
@@ -11314,6 +11368,8 @@ impl Db {
             retired_forms: RetireList::new(),
             retired_snaps: RetireList::new(),
             snap_builds: AtomicU64::new(0),
+            unshaped_wake: std::sync::atomic::AtomicBool::new(false),
+            maint_thread: std::sync::OnceLock::new(),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
             canon_tried: AtomicU64::new(0),
@@ -11628,6 +11684,8 @@ impl Db {
             retired_forms: RetireList::new(),
             retired_snaps: RetireList::new(),
             snap_builds: AtomicU64::new(0),
+            unshaped_wake: std::sync::atomic::AtomicBool::new(false),
+            maint_thread: std::sync::OnceLock::new(),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
             canon_tried: AtomicU64::new(0),
@@ -12158,8 +12216,7 @@ impl Db {
             // costs -- and the sort is affordable because a seal is off the
             // commit path. The same sort is what makes splitting at the
             // fences a matter of slicing.
-            let mut order: Vec<&MemEntry> = (0..mem.len()).map(|i| mem.entry(i)).collect();
-            order.sort_unstable_by_key(|e| mem.key_of(e));
+            let order = mem.entries_in_key_order();
 
             let ranges: Vec<Fence> = if fences.is_empty() {
                 vec![(Vec::new(), None)]
@@ -12188,14 +12245,15 @@ impl Db {
                 {
                     let mut w = PieceWriter::create(&tmp, &opts, sync_every, inline_max)
                         .map_err(|e| err(&format!("seal create: {e}")))?;
+                    let mut offs = Vec::new();
                     for e in &order[start..at] {
                         let key = mem.key_of(e);
                         // Only what is live after the newest tombstone, and
                         // the flag if there was one: the segment carries the
                         // delete forward for the sources older than it.
-                        let (offs, tomb) = mem.live_chain(e, SEE_ALL);
+                        let tomb = mem.live_offs_into(e, &mut offs, SEE_ALL);
                         w.begin(key)?;
-                        for off in offs {
+                        for &off in &offs {
                             w.value(mem.value_at(off));
                         }
                         w.end_with(tomb)?;
@@ -15906,6 +15964,9 @@ struct Maint {
     /// The reads over an unshaped store counted when the store was last
     /// shaped (`Options::adaptive_shape`).
     shaped_at: u64,
+    /// Whether the seal in `sealing` was a flush's, for the wait to be
+    /// booked as one when `collect` lands it.
+    seal_draining: bool,
 }
 
 impl std::ops::Deref for Maint {
@@ -15929,6 +15990,9 @@ impl Maint {
     /// then whatever finished meanwhile landed, then asleep until woken.
     fn run(mut self: Box<Self>, rx: std::sync::mpsc::Receiver<MaintJob>) {
         self.wake = Some(std::thread::current());
+        let _ = self.shared.maint_thread.set(std::thread::current());
+        // A store opened with pieces and no partition is shaped now.
+        self.shape_if_read(true);
         loop {
             if self.shared.maint_stop.load(AtomicOrdering::Acquire) {
                 break;
@@ -15942,7 +16006,7 @@ impl Maint {
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
             self.collect();
-            self.shape_if_read();
+            self.shape_if_read(false);
             std::thread::park_timeout(MAINT_POLL);
         }
         // Closing: whatever was handed over and not landed is joined, as
@@ -15969,13 +16033,15 @@ impl Maint {
                 tmp,
                 draining,
             } => {
+                // Landed by `collect` once the seal thread is done, and
+                // not joined here: joined, this thread sat in the join for
+                // the seal's whole run -- 700 ms at three hundred thousand
+                // keys -- and landed nothing else meanwhile, a finished
+                // merge and a piece to promote among them.
                 self.sealing = Some(handle);
+                self.seal_draining = draining;
                 self.retiring_wals.extend(wal);
                 self.retiring_tmps.extend(tmp);
-                if let Err(e) = self.join_seal(draining) {
-                    self.shared.in_seal.store(false, AtomicOrdering::Release);
-                    self.shared.put_maint_err(e);
-                }
             }
             MaintJob::Ask(ask, reply) => {
                 let _ = reply.send(self.answer(ask));
@@ -16002,17 +16068,24 @@ impl Maint {
     /// A merge or a piece merge that finished, landed: on the thread of its
     /// own, nothing else would, where inline the next seal did.
     fn collect(&mut self) {
+        let sealed = self.sealing.as_ref().is_some_and(|h| h.is_finished());
         let merged = self
             .compacting
             .as_ref()
             .is_some_and(|(_, h)| h.is_finished());
         let tiered = self.tiering.as_ref().is_some_and(|(_, h)| h.is_finished());
-        if !(merged || tiered) {
+        if !(sealed || merged || tiered) {
             return;
         }
         let op = self.op();
         let mut done = Ok(());
-        if merged {
+        if sealed {
+            done = self.join_seal(self.seal_draining);
+            if done.is_err() {
+                self.shared.in_seal.store(false, AtomicOrdering::Release);
+            }
+        }
+        if merged && done.is_ok() {
             done = self.join_compact();
         }
         if tiered && done.is_ok() {
@@ -16024,16 +16097,26 @@ impl Maint {
         drop(op);
     }
 
-    /// Partition a store with pieces and no partition once anything has
-    /// read it; see `Options::adaptive_shape`. Nothing is in flight when it
-    /// decides, so the pieces it takes are every piece the store has: a
-    /// promotion where they are disjoint, a merge of all of them where not.
-    fn shape_if_read(&mut self) {
+    /// Partition a store that has pieces and no partition; see
+    /// `Options::adaptive_shape`. A promotion rewrites nothing, so it waits
+    /// for no read: at a landing, at open, or when a read wakes the thread.
+    /// A merge is a rewrite, so it waits until something has read the
+    /// store since the last decision. Nothing else is in flight when either
+    /// starts, so the pieces taken are every piece the store has.
+    ///
+    /// `look` is a landing or the open, which decide regardless of the
+    /// wake flag; the loop passes false and decides only when a read has
+    /// set it since the last look, and leaves it set while the store has
+    /// no segment to shape, so the reads over a memtable-only store wake
+    /// the thread once and not once each.
+    fn shape_if_read(&mut self, look: bool) {
         if !(self.opts.adaptive_shape && self.opts.compact)
-            || self.sealing.is_some()
             || self.compacting.is_some()
             || self.tiering.is_some()
         {
+            return;
+        }
+        if !look && !self.shared.unshaped_wake.load(AtomicOrdering::Acquire) {
             return;
         }
         let read = self.shared.readers.stat(|s| &s.unshaped)
@@ -16042,23 +16125,30 @@ impl Maint {
                 .seal_counts
                 .unshaped
                 .load(AtomicOrdering::Relaxed);
-        if read == self.shaped_at {
-            return;
-        }
         let op = self.op();
         let segs = self.segs();
-        if segs.is_empty() || segs.iter().any(|s| s.level > 0) {
+        if segs.is_empty() {
+            drop(op);
+            return;
+        }
+        self.shared
+            .unshaped_wake
+            .store(false, AtomicOrdering::Release);
+        if segs.iter().any(|s| s.level > 0) {
             drop(op);
             return;
         }
         let done = match self.promote_unpartitioned() {
             Ok(true) => Ok(()),
-            Ok(false) => self.start_compact(None),
+            Ok(false) if read != self.shaped_at => {
+                self.shaped_at = read;
+                self.start_compact(None)
+            }
+            Ok(false) => Ok(()),
             Err(e) => Err(e),
         };
-        match done {
-            Ok(()) => self.shaped_at = read,
-            Err(e) => self.shared.put_maint_err(e),
+        if let Err(e) = done {
+            self.shared.put_maint_err(e);
         }
         drop(op);
     }
@@ -16091,6 +16181,7 @@ impl Maint {
             flush_merge: false,
             wake: None,
             shaped_at: 0,
+            seal_draining: false,
         }
     }
 
@@ -16260,6 +16351,7 @@ impl Maint {
             self.maybe_compact()?;
             self.maybe_tier()?;
         }
+        self.shape_if_read(true);
         Ok(())
     }
 
