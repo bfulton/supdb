@@ -208,9 +208,14 @@ fn a_transaction_is_all_or_nothing_and_sees_its_own_writes() {
 
 #[test]
 fn crash_between_rename_and_wal_reset_does_not_duplicate() {
-    // The window the segment file name exists for: the seal renamed its
-    // segment into place and synced the directory, then the process died
-    // before the WAL reset. The WAL still holds every sealed record.
+    // The window the segment file name exists for: the seal's segment is
+    // in place and the manifest names it, then the process died before
+    // the WAL reset. The WAL still holds every sealed record. (Before the
+    // manifest from birth this staged the state one step earlier, the
+    // segment renamed and named by nothing, and the open found it by
+    // scanning the directory; that state is now the swept one, and
+    // `a_segment_the_manifest_does_not_name_is_swept_and_its_wal_replayed`
+    // has it.)
     let d = dir("renamewin");
     let mut db = Db::create(&d, Options::default()).unwrap();
     for i in 0u32..40 {
@@ -218,11 +223,13 @@ fn crash_between_rename_and_wal_reset_does_not_duplicate() {
     }
     db.commit().unwrap();
 
-    // Emulate: copy the WAL aside, seal (which resets it), then put the
-    // pre-seal WAL back. Disk state is now exactly rename-done, reset-lost.
+    // Emulate: copy the WAL aside, seal and land it (which resets the
+    // WAL), then put the pre-seal WAL back. Disk state is now exactly
+    // manifest-done, reset-lost.
     let wal = d.join("wal-00000000");
     let saved = std::fs::read(&wal).unwrap();
     db.seal().unwrap();
+    db.settle().unwrap();
     drop(db);
     std::fs::write(&wal, &saved).unwrap();
 
@@ -4786,12 +4793,16 @@ fn carry_model(block_cache: bool) {
     db.flush().unwrap();
     m.flushed();
     assert!(db.levels().0 > 1, "several partitions");
-    // A seal that is not joined, so the snapshot is built over a frozen
-    // memtable and a live one both.
+    // A seal that is not landed, so the snapshot is built over a frozen
+    // memtable and a live one both: held before its segments are written,
+    // since a landing between the two scans below replaces the frozen
+    // table and the snapshot with it, and the landing waits for no fsync
+    // now, so it came inside the scans on a loaded machine.
     for k in (0..6000u32).step_by(6) {
         m.append(&mut db, &key(k), "f");
     }
     db.commit().unwrap();
+    db.hold_seal_landing(true);
     db.seal().unwrap();
     assert!(db.in_flight().0, "a seal in flight");
     for k in (0..6000u32).step_by(12) {
@@ -4823,6 +4834,7 @@ fn carry_model(block_cache: bool) {
     );
     assert_eq!(db.snapshot_extends(), 1, "by one merge");
     m.check(&db, "a snapshot carried forward over a frozen memtable");
+    db.hold_seal_landing(false);
 }
 
 /// The maintenance regime is the store's behaviour, not a setting: the
@@ -6563,4 +6575,402 @@ fn a_scan_builds_the_snapshot_only_where_a_block_needs_it() {
         // Everything, now that the snapshot stands.
         m.check(&db, if lazy { "lazy, after" } else { "eager, after" });
     }
+}
+
+/// Whether `needle` occurs in `hay`: a segment's name in the manifest's
+/// bytes.
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Poll `done` until it holds, and fail rather than hang when it does not
+/// within two minutes: a test that waits for a thread's state says so when
+/// the state is never reached.
+fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let t = std::time::Instant::now();
+    while !done() {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(120),
+            "{what}: the case was not reached"
+        );
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+}
+
+/// The `.sup` and `ord-` files of a store, sorted.
+fn segment_files(d: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(d)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sup") || n.starts_with("ord-"))
+        .collect();
+    out.sort();
+    out
+}
+
+/// The window a seal opens by renaming its segment into place before its
+/// fsyncs: the segment and its index stand under their final names, the
+/// manifest -- a store has one from birth -- does not name them, and the
+/// WAL still holds every write they carry. Open sweeps the segment and
+/// replays the WAL. Trusting the segment would read a file whose sync
+/// never happened, and reading both would answer every value twice; before
+/// the manifest from birth, an open with no manifest took every `seg-`
+/// file as live and skipped the WAL behind it, which is the second of
+/// those.
+#[test]
+fn a_segment_the_manifest_does_not_name_is_swept_and_its_wal_replayed() {
+    let d = dir("unnamed-seg");
+    let mut db = Db::create(&d, wal_arm()).unwrap();
+    assert!(d.join("manifest").exists(), "a manifest from birth");
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    for round in 0u32..3 {
+        for k in 0u32..200 {
+            let key = format!("k{k:04}").into_bytes();
+            let val = format!("v{round}-{k}").into_bytes();
+            db.append(&key, &val);
+            model.entry(key).or_default().push(val);
+        }
+        db.commit().unwrap();
+    }
+    drop(db); // the writes are in the WAL alone
+
+    // A copy of the store seals them; its segment and index, moved into
+    // the original, are the files phase R leaves before phase D and the
+    // manifest that would name them.
+    let d2 = dir("unnamed-seg2");
+    for e in std::fs::read_dir(&d).unwrap() {
+        let name = e.unwrap().file_name();
+        std::fs::copy(d.join(&name), d2.join(&name)).unwrap();
+    }
+    let mut db2 = Db::open(&d2, wal_arm()).unwrap();
+    db2.seal().unwrap();
+    db2.settle().unwrap();
+    assert_eq!(db2.levels(), (0, 1), "the copy sealed one piece");
+    drop(db2);
+    let moved = segment_files(&d2);
+    assert!(
+        moved.iter().any(|n| n.ends_with(".sup")) && moved.iter().any(|n| n.starts_with("ord-")),
+        "the copy left no segment and index to stage the window with: {moved:?}"
+    );
+    for name in &moved {
+        std::fs::copy(d2.join(name), d.join(name)).unwrap();
+    }
+    let manifest = std::fs::read(d.join("manifest")).unwrap();
+    for name in &moved {
+        assert!(
+            !contains(&manifest, name.as_bytes()),
+            "the window is a segment the manifest does not name: {name}"
+        );
+    }
+
+    let db = Db::open(&d, wal_arm()).unwrap();
+    for name in &moved {
+        assert!(!d.join(name).exists(), "{name} is swept at open");
+    }
+    assert_eq!(db.segments(), 0, "nothing the manifest names");
+    let r = db.reader().unwrap();
+    for (key, want) in &model {
+        assert_eq!(
+            &read_vec(&db, key),
+            want,
+            "every value once, in order, from the WAL: {}",
+            String::from_utf8_lossy(key)
+        );
+        assert_eq!(
+            &read_vec(&r, key),
+            want,
+            "and through a handle: {}",
+            String::from_utf8_lossy(key)
+        );
+    }
+}
+
+/// A store written before manifests has none, and its `seg-` files are
+/// what it has: open takes them as live and the replay bound from their
+/// names, as it always did. The path is kept for those stores and taken by
+/// no store `create` made, which has a manifest from birth.
+#[test]
+fn a_store_from_before_manifests_opens_from_its_segment_names() {
+    let d = dir("premanifest");
+    let mut db = Db::create(&d, wal_arm()).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    for round in 0u32..2 {
+        for k in 0u32..200 {
+            let key = format!("k{k:04}").into_bytes();
+            let val = format!("v{round}-{k}").into_bytes();
+            db.append(&key, &val);
+            model.entry(key).or_default().push(val);
+        }
+        db.commit().unwrap();
+    }
+    db.seal().unwrap();
+    db.settle().unwrap();
+    assert_eq!(db.levels(), (0, 1));
+    // A batch after the seal, in the WAL the segment does not cover.
+    db.append(b"after", b"walled");
+    db.commit().unwrap();
+    model.insert(b"after".to_vec(), vec![b"walled".to_vec()]);
+    drop(db);
+    std::fs::remove_file(d.join("manifest")).unwrap();
+    let segs: Vec<String> = segment_files(&d)
+        .into_iter()
+        .filter(|n| n.ends_with(".sup"))
+        .collect();
+    assert!(
+        !segs.is_empty() && segs.iter().all(|n| n.starts_with("seg-")),
+        "the fallback reads seg- names: {segs:?}"
+    );
+
+    let db = Db::open(&d, wal_arm()).unwrap();
+    assert_eq!(db.segments(), 1, "the segment taken as live from its name");
+    for (key, want) in &model {
+        assert_eq!(
+            &read_vec(&db, key),
+            want,
+            "key {}",
+            String::from_utf8_lossy(key)
+        );
+    }
+}
+
+/// A seal's segments are published to readers before their fsyncs, and no
+/// manifest may be written until those are paid: a merge that finishes in
+/// that window waits for it. Here the window is held open
+/// (`hold_seal_durable`) with a merge of the partition running beside the
+/// seal, so the merge finishes inside it every time; the segment work must
+/// leave the merge unlanded and the manifest untouched until the seal is
+/// durable, and land both after. Under the checked profile `publish`
+/// asserts the same rule.
+#[test]
+fn a_merge_that_finishes_while_a_seal_is_between_its_phases_lands_after_it() {
+    let d = dir("held-landing");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(64 << 20),
+        l0_trigger: 2,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    let key = |k: u32| format!("key-{k:06}").into_bytes();
+    let between = |k: u32, i: u32| format!("key-{k:06}x{i}").into_bytes();
+    let put = |db: &mut Db, model: &mut BTreeMap<Vec<u8>, Vec<Vec<u8>>>, k: &[u8], v: &str| {
+        db.append(k, v.as_bytes());
+        model
+            .entry(k.to_vec())
+            .or_default()
+            .push(v.as_bytes().to_vec());
+    };
+    for k in 0..400_000 {
+        put(&mut db, &mut model, &key(k), "p");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.levels(), (1, 0), "one partition over every key");
+    // Two pieces over keys the partition holds: the second's durable
+    // landing starts the merge of the range.
+    for (tag, base) in [("a", 1000u32), ("b", 2000u32)] {
+        for i in 0..10 {
+            put(&mut db, &mut model, &key(base + i), tag);
+            put(&mut db, &mut model, &between(base, i), tag);
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        wait_for("the seal's landing", || !db.in_flight().0);
+    }
+    wait_for("the merge's start", || db.in_flight().1);
+    assert_eq!(db.levels(), (1, 2));
+    let manifest_before = std::fs::read(d.join("manifest")).unwrap();
+    // The third piece, held between its phases: published, not durable.
+    db.hold_seal_durable(true);
+    for i in 0..10 {
+        put(&mut db, &mut model, &key(3000 + i), "c");
+        put(&mut db, &mut model, &between(3000, i), "c");
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    wait_for("the third piece's publish", || db.levels() == (1, 3));
+    assert!(
+        db.in_flight().0,
+        "a seal is in flight until its segments are durable"
+    );
+    assert!(
+        db.in_flight().1,
+        "the merge landed before the third piece was published; the case was not reached"
+    );
+    // The merge finishes under the hold, and the segment work finds it
+    // finished and leaves it: that look is what the counter counts.
+    wait_for("a merge held for the seal", || {
+        db.seal_waits().held_landings > 0
+    });
+    assert!(db.in_flight().1, "the merge is not landed in the window");
+    assert_eq!(
+        std::fs::read(d.join("manifest")).unwrap(),
+        manifest_before,
+        "no manifest is written while the seal is between its phases"
+    );
+    assert_eq!(db.levels(), (1, 3));
+    db.hold_seal_durable(false);
+    db.settle().unwrap();
+    assert_eq!(db.in_flight(), (false, false));
+    assert_eq!(
+        db.levels(),
+        (1, 1),
+        "the merge landed after the seal: a new partition, the third piece kept"
+    );
+    let manifest_after = std::fs::read(d.join("manifest")).unwrap();
+    assert_ne!(manifest_after, manifest_before, "the landings wrote it");
+    let check = |db: &Reader, state: &str| {
+        let mut seen: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+        db.scan(b"", usize::MAX, |k, v| {
+            seen.entry(k.to_vec()).or_default().push(v.to_vec())
+        })
+        .unwrap();
+        assert_eq!(seen.len(), model.len(), "{state}: the scan's key count");
+        assert!(seen == model, "{state}: the scan disagrees with the model");
+    };
+    check(&db, "after the landings");
+    drop(db);
+    let db = Db::open(&d, opts).unwrap();
+    assert_eq!(db.levels(), (1, 1), "the manifest names both landings");
+    check(&db, "reopened");
+}
+
+/// Reader handles across seals whose segments land before their fsyncs:
+/// every value of a key once and in order, through point reads and scans,
+/// before the landing, in the window between the phases -- held open at
+/// each seal -- and after it, and a handle never sees fewer values of a key
+/// than it saw before.
+#[test]
+fn reader_handles_across_seals_see_every_value_once_and_in_order() {
+    let d = dir("readers-across-seals");
+    let opts = Options {
+        // Seals are the test's own.
+        seal_bytes: 1 << 30,
+        partition_bytes: Some(1 << 30),
+        l0_trigger: 1 << 20,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let keys = 2000u32;
+    let key = |k: u32| format!("key-{k:05}").into_bytes();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut threads = Vec::new();
+    for t in 0..3u64 {
+        let r = db.reader().unwrap();
+        let stop = stop.clone();
+        threads.push(std::thread::spawn(move || {
+            // A value is the round it was appended in, so a key's values
+            // are ascending and distinct, and a handle's view of a key
+            // only grows.
+            let mut seen: HashMap<u32, usize> = HashMap::new();
+            let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ (t + 1);
+            let mut ops = 0usize;
+            let check = |seen: &mut HashMap<u32, usize>, k: u32, vals: &[Vec<u8>], how: &str| {
+                let mut last = 0u64;
+                for v in vals {
+                    let ver: u64 = std::str::from_utf8(v).unwrap().parse().unwrap();
+                    assert!(
+                        ver > last,
+                        "{how}: key {k} has value {ver} after {last}: repeated or out of order"
+                    );
+                    last = ver;
+                }
+                let prev = seen.entry(k).or_insert(0);
+                assert!(
+                    vals.len() >= *prev,
+                    "{how}: key {k} lost values: {} after {prev}",
+                    vals.len()
+                );
+                *prev = vals.len();
+            };
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                if x.is_multiple_of(4) {
+                    let mut by_key: BTreeMap<u32, Vec<Vec<u8>>> = BTreeMap::new();
+                    r.scan(&key(k), 20, |kk, v| {
+                        let kn: u32 = std::str::from_utf8(&kk[4..]).unwrap().parse().unwrap();
+                        by_key.entry(kn).or_default().push(v.to_vec());
+                    })
+                    .unwrap();
+                    for (kn, vals) in &by_key {
+                        check(&mut seen, *kn, vals, "scan");
+                    }
+                } else {
+                    let got = read_vec(&r, &key(k));
+                    check(&mut seen, k, &got, "read");
+                }
+                ops += 1;
+            }
+            ops
+        }));
+    }
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    let mut x = 42u64;
+    let mut pieces = 0usize;
+    for round in 1..=40u64 {
+        // Each key at most once a round, so a key's values are distinct,
+        // in the order drawn: an ascending batch would be an ordered run
+        // and go straight to a segment of its own.
+        let mut drawn = BTreeSet::new();
+        let mut batch = Vec::new();
+        for _ in 0..300 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % keys as u64) as u32;
+            if drawn.insert(k) {
+                batch.push(k);
+            }
+        }
+        for k in batch {
+            let v = round.to_string().into_bytes();
+            db.append(&key(k), &v);
+            model.entry(key(k)).or_default().push(v);
+        }
+        db.commit().unwrap();
+        if round % 5 == 0 {
+            // The seal's segments published and held short of durable, so
+            // the readers see the window; then released. The last seal is
+            // durable before the hold is set again: a seal thread released
+            // and not yet past its check would take the new hold, and the
+            // seal after it would wait for a durable end nobody ends.
+            wait_for("the last seal's durable end", || !db.in_flight().0);
+            db.hold_seal_durable(true);
+            db.seal().unwrap();
+            pieces += 1;
+            wait_for("the seal's publish", || db.levels().1 >= pieces);
+            assert!(db.in_flight().0, "held: in flight until durable");
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            db.hold_seal_durable(false);
+        }
+    }
+    db.settle().unwrap();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut total = 0usize;
+    for t in threads {
+        total += t.join().unwrap();
+    }
+    assert!(total > 100, "the threads did some work: {total}");
+    assert_eq!(db.levels(), (0, pieces));
+    let check = |db: &Reader, state: &str| {
+        for (k, want) in &model {
+            assert_eq!(
+                &read_vec(db, k),
+                want,
+                "{state}: key {}",
+                String::from_utf8_lossy(k)
+            );
+        }
+    };
+    let r = db.reader().unwrap();
+    check(&r, "a handle after the seals");
+    drop(r);
+    drop(db);
+    let db = Db::open(&d, opts).unwrap();
+    assert_eq!(db.levels(), (0, pieces), "every seal's manifest landed");
+    check(&db, "reopened");
 }
