@@ -7045,9 +7045,18 @@ impl Snapshot {
         let arena = self.arena.clone();
         let mut rscratch: Vec<(u64, u32)> = Vec::new();
         let mut batch: Vec<SnapKey> = Vec::with_capacity(to - from);
+        // The batch's order from its keys' prefix words, as the build
+        // takes it: the sort that compared the keys through the arena
+        // was two block lookups a compare, a millisecond for five
+        // thousand keys at a hundred thousand, where the radix over the
+        // words touches the arena only for keys alike through sixteen
+        // bytes.
+        let mut recs: Vec<(u64, u64, u32)> = Vec::with_capacity(to - from);
         for i in from..to {
             let e = mem.entry(i);
             let key = mem.key_of(e);
+            let (a, b) = key_prefix(key);
+            recs.push((a, b, batch.len() as u32));
             let lrun = if runs {
                 arena.copy_run(mem, e, &mut rscratch)
             } else {
@@ -7063,7 +7072,28 @@ impl Snapshot {
             });
         }
         let key_at = |e: &SnapKey| arena.slice(e.off, e.len);
-        batch.sort_unstable_by(|a, b| key_at(a).cmp(key_at(b)));
+        if recs.len() > 1 {
+            let mut pscratch: Vec<(u64, u64, u32)> = Vec::new();
+            radix_by_prefix(&mut recs, &mut pscratch);
+            drop(pscratch);
+            let mut i = 0;
+            while i < recs.len() {
+                let mut j = i + 1;
+                while j < recs.len() && (recs[j].0, recs[j].1) == (recs[i].0, recs[i].1) {
+                    j += 1;
+                }
+                if j - i > 1 {
+                    // A batch holds each key once, so the index only
+                    // settles what the keys cannot, as the build's does.
+                    recs[i..j].sort_by(|x, y| {
+                        key_at(&batch[x.2 as usize])
+                            .cmp(key_at(&batch[y.2 as usize]))
+                            .then(x.2.cmp(&y.2))
+                    });
+                }
+                i = j;
+            }
+        }
         let mut out = Snapshot {
             arena: self.arena.clone(),
             runs,
@@ -7084,14 +7114,32 @@ impl Snapshot {
         // key the run has from the frozen table alone. The run between
         // two batch keys is sorted and folded already, and is copied
         // whole: the merge that compared every pair was a compare an
-        // entry for a batch of a hundred.
+        // entry for a batch of a hundred. Each batch key's place is found
+        // from the last one's: by walking the run where the batch is
+        // dense in it, since the run's keys lie in key order in the arena
+        // and a walk streams them, and by a gallop where it is sparse, the
+        // log of the gap a key. A binary search over the rest of the run
+        // was its whole log of cold lines a key -- fourteen for a thousand
+        // keys over ten thousand, two milliseconds of a scan pass of four
+        // at a hundred thousand -- and the gallop alone still seven.
+        let sparse = self.ents.len() > 64 * batch.len();
         let mut i = 0usize;
-        for b in &batch {
-            let key = key_at(b);
-            let at = i + self.ents[i..].partition_point(|a| self.key_of(a) <= key);
+        for r in &recs {
+            let b = batch[r.2 as usize];
+            let key = key_at(&b);
+            let below = |a: &SnapKey| self.key_of(a) <= key;
+            let at = if sparse {
+                i + gallop_point(&self.ents[i..], below)
+            } else {
+                let mut at = i;
+                while at < self.ents.len() && below(&self.ents[at]) {
+                    at += 1;
+                }
+                at
+            };
             out.ents.extend_from_slice(&self.ents[i..at]);
             i = at;
-            out.push_sorted(*b);
+            out.push_sorted(b);
         }
         out.ents.extend_from_slice(&self.ents[i..]);
         // A run written again since this snapshot copied it, found by
@@ -7359,6 +7407,32 @@ mod radix {
             }
         }
     }
+
+    /// The gallop answers as `partition_point` does for every monotone
+    /// predicate over runs of every length, the answer at every place:
+    /// the start, one past it, inside each probe's span, and the end.
+    #[test]
+    fn the_gallop_finds_the_partition_point() {
+        let key = |i: usize| super::SnapKey {
+            off: i as u32,
+            len: 0,
+            mem: u32::MAX,
+            frozen: u32::MAX,
+            lrun: super::NO_RUN,
+            frun: super::NO_RUN,
+        };
+        for n in [0usize, 1, 2, 3, 7, 8, 9, 100, 1000, 1025] {
+            let run: Vec<super::SnapKey> = (0..n).map(key).collect();
+            for at in 0..=n {
+                let below = |e: &super::SnapKey| (e.off as usize) < at;
+                assert_eq!(
+                    super::gallop_point(&run, below),
+                    run.partition_point(below),
+                    "run of {n}, answer {at}"
+                );
+            }
+        }
+    }
 }
 
 /// Records ordered by their two prefix words as `(a, b)` compare, stably:
@@ -7401,6 +7475,36 @@ fn radix_by_prefix(v: &mut Vec<(u64, u64, u32)>, scratch: &mut Vec<(u64, u64, u3
             std::mem::swap(v, scratch);
         }
     }
+}
+
+/// `run.partition_point(below)` for a run whose answer is expected near
+/// its start: probes at 1, 3, 7, ... from the start, each twice as far as
+/// the last, until one fails, then a binary search inside the last span,
+/// so the answer at distance `d` costs about two log `d` compares: fewer
+/// than the run's log where `d` is well short of its length, twice it for
+/// an answer at the end, which is why the caller walks a dense batch
+/// instead.
+fn gallop_point(run: &[SnapKey], below: impl Fn(&SnapKey) -> bool) -> usize {
+    let n = run.len();
+    if n == 0 || !below(&run[0]) {
+        return 0;
+    }
+    let mut lo = 0usize;
+    let mut step = 1usize;
+    let hi = loop {
+        let probe = lo + step;
+        if probe >= n {
+            break n;
+        }
+        if below(&run[probe]) {
+            lo = probe;
+            step *= 2;
+        } else {
+            break probe;
+        }
+    };
+    // `run[lo]` is below and `run[hi]` is not (or `hi` is the end).
+    lo + 1 + run[lo + 1..hi].partition_point(below)
 }
 
 /// The first sixteen bytes of a key as two big-endian words, zero-padded,
@@ -15760,6 +15864,67 @@ impl Db {
     }
 }
 
+/// The ranks of every level-0 piece in `segs` against the partition it is
+/// aligned to, where the piece has none against that partition yet; see
+/// `BuildCtx::rank_pieces`. In any order: a set about to be published is
+/// not yet sorted.
+fn rank_pieces_of(segs: &[std::sync::Arc<Seg>]) -> Result<()> {
+    for p in segs.iter().filter(|s| s.level == 0) {
+        let Some(part) = segs
+            .iter()
+            .find(|q| q.level > 0 && q.lo == p.lo && q.hi == p.hi)
+        else {
+            continue;
+        };
+        let id = part.blob.id();
+        if p.ranks.get(id).is_some() {
+            continue;
+        }
+        p.ranks
+            .put(id, std::sync::Arc::new(BuildCtx::ranks_over(part, p)?));
+    }
+    Ok(())
+}
+
+/// The bounds of every level-0 piece in `segs` against every partition
+/// whose range it meets, where the piece has none against that partition
+/// yet: the same walk `BuildCtx::table_bounds` makes when a table is made,
+/// and the same cache.
+fn bound_pieces_of(segs: &[std::sync::Arc<Seg>]) -> Result<()> {
+    for seg in segs.iter().filter(|s| s.level > 0) {
+        let nblocks = seg.blob.keys().div_ceil(CACHE_BLOCK);
+        let against = seg.blob.id();
+        for p in segs.iter().filter(|s| s.level == 0) {
+            if !seg.lo.is_empty()
+                && p.hi
+                    .as_ref()
+                    .is_some_and(|h| h.as_slice() <= seg.lo.as_slice())
+            {
+                continue;
+            }
+            if seg
+                .hi
+                .as_ref()
+                .is_some_and(|h| !p.lo.is_empty() && p.lo.as_slice() >= h.as_slice())
+            {
+                continue;
+            }
+            if p.bounds.get(against).is_some() {
+                continue;
+            }
+            let at = block_bounds_of(
+                seg,
+                nblocks,
+                p.blob.keys(),
+                |k| p.ord.seek(p.cursor_from(k), |i| p.blob.key_at(i)),
+                |i, bound| p.ord.advance_below(i, bound, |r| p.blob.key_at(r)),
+            )?;
+            p.bounds.put(against, std::sync::Arc::new(at));
+        }
+    }
+    Ok(())
+}
+
 /// PROTOTYPE: what building a cached block reads, and nothing the cache
 /// keeps: the segments, the live and the frozen memtable, and whether any
 /// source holds a tombstone. A handle makes one over the state it holds
@@ -15928,24 +16093,11 @@ impl<'s> BuildCtx<'s> {
         Ok(out)
     }
     /// PROTOTYPE: rank the keys of every piece aligned to a partition
-    /// that has no ranks against that partition yet. Called when a seal
-    /// or a merge publishes, so the work is off the read path, and by a
-    /// table's making for pieces that were opened from disk.
+    /// that has no ranks against that partition yet: what the segment
+    /// work does before it publishes a set (`Maint::rank_before_publish`),
+    /// and a table's making does for pieces that were opened from disk.
     fn rank_pieces(&self) -> Result<()> {
-        let np = self.segs.partition_point(|s| s.level > 0);
-        let (parts, l0) = self.segs.split_at(np);
-        for p in l0 {
-            let Some(part) = parts.iter().find(|q| q.lo == p.lo && q.hi == p.hi) else {
-                continue;
-            };
-            let id = part.blob.id();
-            if p.ranks.get(id).is_some() {
-                continue;
-            }
-            p.ranks
-                .put(id, std::sync::Arc::new(BuildCtx::ranks_over(part, p)?));
-        }
-        Ok(())
+        rank_pieces_of(self.segs)
     }
     /// PROTOTYPE: where the snapshot's keys fall against the partition's
     /// block boundaries.
@@ -17447,12 +17599,31 @@ impl Maint {
                 self.opts.segment.checksums,
             )?));
         }
+        self.rank_before_publish(&segs)?;
         self.publish_segs_with(segs, false, Some(table));
         for name in names {
             self.covered_seq = self.covered_seq.max(Db::name_end_seq(name).unwrap_or(0));
         }
+        Ok(())
+    }
+
+    /// The pieces' ranks against the partitions they are aligned to
+    /// (`BuildCtx::rank_pieces`) and the pieces' bounds against the
+    /// partitions they meet (`BuildCtx::table_bounds`), taken before the
+    /// publish that makes `segs` the live set. Each is a function of two
+    /// immutable segments, keyed by the partition's blob id, and taken
+    /// once; taken after the publish, the writer's next scan found the
+    /// new piece's missing and took them itself, on the read path -- the
+    /// ranks 0.6 ms at ten thousand keys, 4.4 at a hundred thousand for a
+    /// seal's piece, and 17 for every piece over a partition a merge had
+    /// rewritten, the bounds 0.3 and 0.7 ms at a hundred and three hundred
+    /// thousand, in a scan pass of 0.2 and 4.5 ms. A promotion took none
+    /// at all, and its re-opened partition has a new id. Nothing where
+    /// the block cache is off, since nothing reads them then.
+    fn rank_before_publish(&self, segs: &[std::sync::Arc<Seg>]) -> Result<()> {
         if self.opts.scan_block_cache {
-            self.build_ctx().rank_pieces()?;
+            rank_pieces_of(segs)?;
+            bound_pieces_of(segs)?;
         }
         Ok(())
     }
@@ -17845,10 +18016,8 @@ impl Maint {
                 self.opts.segment.checksums,
             )?));
         }
+        self.rank_before_publish(&merged)?;
         self.publish_segs_with(merged, true, None);
-        if self.opts.scan_block_cache {
-            self.build_ctx().rank_pieces()?;
-        }
         self.publish()?;
         for name in &inputs {
             self.retire_seg(name);
@@ -18183,6 +18352,7 @@ impl Maint {
             old_names.push(old);
         }
         File::open(&self.dir)?.sync_all()?;
+        self.rank_before_publish(&segs)?;
         self.publish_segs(segs);
         self.publish()?;
         for old in old_names {
@@ -18352,10 +18522,8 @@ impl Maint {
         // Partitions first (older, disjoint), then whatever L0 arrived
         // while the merge ran, oldest to newest.
         merged.extend(kept);
+        self.rank_before_publish(&merged)?;
         self.publish_segs(merged);
-        if self.opts.scan_block_cache {
-            self.build_ctx().rank_pieces()?;
-        }
         self.publish()?;
         for name in &inputs {
             self.retire_seg(name);

@@ -122,7 +122,11 @@ sweep and each was read as a refutation before it was read as a bad
 model: one amortised the block builds over a hundred thousand scans
 where the sweep does `size / scan_len` of them, one buffered its writes
 differently from the mix driver, and all of them used forty-byte values
-against the suite's hundred (`VALUE_SIZE`) and sixteen-byte keys. The
+against the suite's hundred (`VALUE_SIZE`) and sixteen-byte keys. A
+fifth skipped the `sync` the suite's load ends in, so its store at three
+hundred thousand keys stayed two pieces through the whole sweep, where
+the suite's second flush had joined the partitioning, and read every
+point at a third of the suite's rate. The
 suite's own arms answer most of these questions without a probe at all,
 and `bench ab` prices two of them in one process; reach for a probe only
 when no pair of arms isolates what you are asking.
@@ -799,6 +803,44 @@ was nobody's until the reads waited on it. The rule: a sort over keys
 that live behind a pointer is priced by its misses, not its compares,
 and when one structure already sorts the same keys the way that costs
 less, the other takes that way.
+
+**A publish that left its derived work to whoever looked first.** A
+level-0 piece's ranks -- each key's cut in the partition it is aligned
+to -- and its bounds -- where the partition's block boundaries fall in
+it -- are functions of two immutable segments, taken once and kept on
+the piece under the partition's id. The segment work took them after it
+published the piece, so the writer's next scan found them missing at its
+rebase and took them itself, on the read path: 0.6 ms at ten thousand
+keys and 4.4 at a hundred thousand for a seal's piece, 17 for every
+piece over a partition a merge had rewritten, in scan passes of 0.2 and
+4.5 ms; a promotion, whose re-opened partition has a fresh id, took none
+at all. It hid for as long as a landing came after the fsyncs, which put
+it after every pass of the sweep; the two-phase landing put it inside
+them, and the flush arm's fully-unmerged lag point read 0.3x of what it
+had, at every rung, with the shape arm beside it flat. A host-normalised
+bisect against LMDB named the commit, a probe timing each scan of the
+pass beside the store's counters named the scan, and timers in the
+scan's phases named the call. The ranks and the bounds are taken before
+the publish now. The rule: what a publish is to derive is derived before
+the publish is visible, since the first reader to find the cache empty
+is the one that pays for it; and a cost that timing hides is a cost --
+price a landing where the reads are, not where it happens to fall.
+
+**A merge priced for a batch of a hundred.** The scan snapshot's
+extension found each new key's place in the run by a binary search over
+the rest of the run: right for a batch of a hundred over a hundred
+thousand, and fourteen cold lines a key for a thousand over ten
+thousand, which is the shape of every lag point's first scan and of the
+switch to the seal's snapshot -- two milliseconds of a scan pass of four
+at a hundred thousand keys. It sorted the batch by comparing keys through
+the arena, two block lookups a compare, a millisecond for five thousand.
+The batch sorts by its prefix words now, as the build does, and the
+merge walks the run where the batch is dense in it and gallops where it
+is sparse. The rule is the one the seal's sort gave, applied to a
+search: a search over a run that lives behind a pointer is priced by its
+misses, and a merge of two sides within a factor of a hundred of each
+other walks the longer side rather than searching it, since a walk
+streams and a search does not.
 
 **A sentinel that crosses the wasm boundary changes sign.** A wasm `u32`
 arrives in JavaScript as a signed i32, so a failure sentinel of `u32::MAX`

@@ -4779,6 +4779,104 @@ fn a_snapshot_carried_forward_on_the_merge_path_folds_it_too() {
     carry_model(false);
 }
 
+/// The extension orders its batch by the keys' prefix words and finds
+/// each key's place from the last one's, by a gallop where the batch is
+/// sparse in the run and a walk where it is dense (`Snapshot::extend`).
+/// Neither raises anything when wrong: a key put in the wrong gap of
+/// the run is a scan out of order, and a tie the prefix words cannot
+/// settle is a batch in insertion order. So both shapes are scanned
+/// against the model: a batch of a dozen keys spread a hundred and fifty
+/// run keys apart, extended onto the seal's snapshot of two thousand --
+/// the gallop, doubling several times and searching inside its last
+/// span -- then a batch of thousands, half of them alike through sixteen
+/// bytes and written out of order, half between the run's keys, carried
+/// forward by the walk. Keys of every batch are checked at every start.
+fn extend_order_model(block_cache: bool) {
+    let d = dir(&format!("extend-order-{block_cache}"));
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        scan_block_cache: block_cache,
+        scan_cache_ahead: false,
+        share_snapshot: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:06}");
+    for k in (0..6000u32).step_by(3) {
+        m.append(&mut db, &key(k), "p");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    assert!(db.levels().0 > 1, "several partitions");
+    // The run: the seal's snapshot over a frozen table of two thousand
+    // keys, the seal held short of its landing so the run stands.
+    for k in (0..6000u32).step_by(3) {
+        m.append(&mut db, &key(k), "f");
+    }
+    db.commit().unwrap();
+    db.hold_seal_landing(true);
+    db.seal().unwrap();
+    assert!(db.in_flight().0, "a seal in flight");
+    wait_for("the seal's snapshot", || {
+        db.seal_snapshots() > 0 || !db.in_flight().0
+    });
+    let (b0, e0) = (db.snapshot_builds(), db.snapshot_extends());
+    // Sparse: a key just above every four hundred and fiftieth run key.
+    for k in (0..6000u32).step_by(450) {
+        m.append(&mut db, &format!("{}x", key(k)), "s");
+    }
+    db.commit().unwrap();
+    let mut sink = 0usize;
+    db.scan(key(0).as_bytes(), 100, |_k, v| sink += v.len())
+        .unwrap();
+    assert_eq!(
+        (db.snapshot_builds() - b0) + (db.snapshot_extends() - e0),
+        1,
+        "the sparse batch is one extension of the seal's snapshot, or one sort"
+    );
+    m.check(&db, "a sparse batch galloped into the run");
+    // Dense, and more than a snapshot may lack before a scan carries it
+    // forward: keys between the run's, and keys alike through sixteen
+    // bytes in an order that is not theirs.
+    let (b1, e1) = (db.snapshot_builds(), db.snapshot_extends());
+    for k in (1..6000u32).step_by(3) {
+        m.append(&mut db, &key(k), "d");
+    }
+    let tie = |i: u32| format!("tiekey-000000000{i:05}");
+    let mut x = 7u32;
+    for _ in 0..2600 {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        m.append(&mut db, &tie((x >> 8) % 100_000), "t");
+    }
+    db.commit().unwrap();
+    db.scan(key(0).as_bytes(), 100, |_k, v| sink += v.len())
+        .unwrap();
+    assert_eq!(
+        db.snapshot_builds(),
+        b1,
+        "carried forward, not sorted again"
+    );
+    assert_eq!(db.snapshot_extends(), e1 + 1, "by one walk");
+    m.check(
+        &db,
+        "a dense batch alike through sixteen bytes walked into the run",
+    );
+    db.hold_seal_landing(false);
+}
+
+#[test]
+fn the_extension_gallops_a_sparse_batch_and_walks_a_dense_one_into_the_run() {
+    extend_order_model(true);
+}
+
+#[test]
+fn the_extension_orders_a_batch_alike_through_sixteen_bytes_on_the_merge_path() {
+    extend_order_model(false);
+}
+
 fn carry_model(block_cache: bool) {
     let d = dir(&format!("extend-snap-{block_cache}"));
     let opts = Options {
