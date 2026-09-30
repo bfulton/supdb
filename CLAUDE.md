@@ -888,6 +888,29 @@ a read names -- in the log, the entries, the arena -- is bounded by the
 mark's quantity for it, and a value the watermark hides is still a key
 until the count hides it too.
 
+**A carry that took its own publish for the only one.** The writer
+carries its tables across a publish it makes itself -- a freeze, the
+switch to an ordered table at a direct run's start -- since it knows what
+it changed, and leaves any other publish to its next look at the log,
+which rebases the tables across it. The freeze carried only over the
+state it had settled; the switch carried over whatever state it
+replaced. A seal emptied the live table, the segment work landed it
+readable, and before the writer looked at its log a key above the
+store's greatest opened a direct run: the switch carried the tables
+across the landing as well, so they had no bounds for the landing's
+piece and the snapshot named the frozen table the landing had retired,
+and every scan through the writer walked the last block without a key
+of the piece -- all of them, since every key sat above the last
+partition's last key -- while a point read and a handle's scan found
+them. Nothing raised. The test that caught it passed alone and failed
+under load, in about a third of its runs with seals that keep the log
+and a twelfth with seals that rotate it, so it surfaced only when the
+default changed. The switch carries now only
+when it is the one publish since the tables' state, and hands the rest
+to the rebase. The rule: a carry across one's own publish holds only
+over the state it was prepared against, and the check is that state's
+identity or generation, never the one field the carry changes.
+
 **A sentinel that crosses the wasm boundary changes sign.** A wasm `u32`
 arrives in JavaScript as a signed i32, so a failure sentinel of `u32::MAX`
 arrives as -1 and a comparison against 4294967295 can never match. Every

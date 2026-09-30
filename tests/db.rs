@@ -2642,6 +2642,66 @@ fn a_seal_drops_the_scan_snapshot_before_the_next_rehash() {
     m.check(&db, "the seal joined");
 }
 
+/// A seal's piece landed readable, with its keys above the last
+/// partition's last key, before the writer looks at its log again, and
+/// then a key above the store's greatest opens a direct run: the writer's
+/// switch to the ordered table is its own publish and carries its tables,
+/// and the landing between is not its own. Carried across both, the
+/// tables had no bounds for the piece and the snapshot named a frozen
+/// table the landing had retired, so every scan through the writer read
+/// the last block without a key of the piece, while a point read and a
+/// handle found them all. The seal is held between its phases so the
+/// piece stays unpromoted for the scans.
+#[test]
+fn a_direct_run_opened_after_a_landing_the_writer_has_not_seen_keeps_the_piece() {
+    for staged in [true, false] {
+        let d = dir(&format!("switch-after-landing-{staged}"));
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(64 << 10),
+            scan_block_cache: true,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut m = ScanModel::default();
+        for k in 0..2100 {
+            m.append(&mut db, &format!("key-{k:05}"), "p");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        assert!(db.levels().0 > 1);
+        // Written high to low, so the seal is the memtable's and not a
+        // direct run's.
+        for k in (0..2100).rev() {
+            m.append(&mut db, &format!("live-{k:05}"), "l");
+        }
+        db.commit().unwrap();
+        m.check(&db, "a snapshot over thousands of live keys");
+        db.hold_seal_durable(true);
+        db.seal().unwrap();
+        // The landing, with nothing through the writer that reads its log.
+        wait_for("the piece's publish", || db.levels().1 == 1);
+        assert!(db.in_flight().0, "held: in flight until durable");
+        // Ascending and above everything: the first opens a direct run.
+        for k in 0..600 {
+            m.append(&mut db, &format!("new-{k:05}"), "n");
+        }
+        if !staged {
+            db.commit().unwrap();
+        }
+        m.check(&db, "a direct run opened after the landing");
+        if !staged {
+            let r = db.reader().unwrap();
+            m.check(&r, "a handle beside it");
+        }
+        db.hold_seal_durable(false);
+        db.commit().unwrap();
+        db.settle().unwrap();
+        m.check(&db, "the seal durable");
+    }
+}
+
 /// A scan starts at the first partition that may reach its start, found
 /// by a gallop from the front: over enough partitions for the gallop to
 /// double past them several times, every scan from every sampled start,

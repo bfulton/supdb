@@ -12773,6 +12773,25 @@ impl Db {
         if !noted {
             return;
         }
+        // Carried as it stands only when the switch is the one publish
+        // since the state the tables are current to, as the freeze
+        // carries only over the state it settled: a publish counts one
+        // generation. The segment work may have published between -- a
+        // seal's landing that retired the frozen table the snapshot names
+        // and made a piece the tables have no bounds for -- and carried
+        // across that as well, every scan through the writer walked the
+        // last block without the piece and lost each of its keys above the
+        // last partition. The new table stands for the old in the note,
+        // since both are empty and nothing the tables hold names either,
+        // and the next look at the log carries the tables across the rest
+        // (`rebase_tables`) from the new table's first log entry.
+        if st.gen != self.fs().log_gen.get().wrapping_add(1) {
+            if let Some(o) = self.fs().over.borrow_mut().as_mut() {
+                o.mem = std::sync::Arc::downgrade(&st.mem);
+            }
+            self.fs().log_seen.set(0);
+            return;
+        }
         if let Some((g, _)) = self.fs().scan_keys.borrow_mut().as_mut() {
             *g = st.gen;
         }
