@@ -2413,20 +2413,45 @@ took a merge. A sync that finds a seal in flight leaves the tail.
 The load keeps its gain -- 1.6-2.4x ordered, 2.5-3.7x shuffled -- and
 the passes over the ordered store come most of the way back: the first
 point-read pass 0.63-0.81x, the scan passes 0.72-1.06x, the mixes level
-at a hundred thousand. The lag sweep does not: 0.03-0.1x at every rung.
-Timed, most of that is one seal. The shuffled load's last threshold
-seal, most of the store at three hundred thousand keys, is in flight
-when the load's sync and the sweep's first sync both run; it takes 0.75
-s, and until it lands the sweep scans a frozen memtable on the merge
-path, about 100 us a scan of a hundred where the block path takes 3. The
-flushing arm pays the same seal inside its load window, which is its
-shuffled load's 3.7x. The sweep's last point runs after the store is
-partitioned and reads 0.08-0.09x at ten and three hundred thousand keys
-all the same, where a hundred thousand reads 0.85x; that is not
-explained here. That is the trade a sync that only makes the store
-durable offers, stated in this suite's terms: the load is faster by the
-work it no longer waits for, and the reads that follow within that
-work's duration pay for it instead.
+at a hundred thousand. The lag sweep did not: 0.03-0.1x at every rung,
+its last point included, which runs after the store is partitioned.
+Traced, that last point was three things, none of them the reads. The
+segment work's thread joined each seal as it was handed over and sat in
+the join for the seal's whole run, landing nothing else meanwhile, so at
+three hundred thousand keys the piece a promotion would have made a
+partition waited behind a seal the burst had triggered; shaping waited
+for a read that had counted, and only a read that saw a piece counted,
+so at ten thousand keys, where the sweep ran inside the first seal,
+nothing was counted when the piece landed; and the seal sorted the
+frozen table by comparison, two arena reads a compare, 147 ms of its
+715 at three hundred thousand keys. The thread polls its seal as it
+polls its merges now, a promotion waits for no read, any read the block
+path cannot serve counts, a seal over an empty store under
+`adaptive_shape` names the first partition itself, and the seal takes
+the snapshot's radix sort. Twelve pairs a rung against the flushing
+buffered arm, after: the ordered load 1.5-2.2x and the shuffled
+2.4-2.6x; the sweep's last point 0.87x at ten thousand keys, 1.03x at a
+hundred thousand, 0.41x at three hundred thousand; its first two points
+0.03-0.14x at every rung, and its 10% point 0.11x at ten thousand keys,
+where everything but the last point runs inside the first seal's 19 ms.
+
+What is left is two things. Every pass that runs while a seal is in
+flight reads the frozen table: on the merge path where no partition
+exists yet, 60 us a scan of a hundred at three hundred thousand keys
+where the block path takes 3, and on the block path through blocks the
+frozen table dirties, which is the 0.41x; the seal is 440-650 ms there
+-- the sort 31 ms now, the rest the record walk, four dependent misses a
+record, and the kernel's copy into fresh page-cache pages. And an
+ordered load's last ten thousand keys at three hundred thousand stay a
+live ordered table for the whole read phase: the sync finds a seal in
+flight and leaves the tail, and after the landing finds a partition and
+leaves it again, so every read binary-searches it whatever the key and
+every scan builds its block over a table that is never complete --
+point reads 0.61x, scans 0.58-0.71x, the threaded passes with them.
+That is the trade a sync that only makes the store durable offers,
+stated in this suite's terms: the load is faster by the work it no
+longer waits for, and the reads that follow within that work's duration
+pay for it instead, at the merge path's price rather than the flush's.
 
 ### Arrival order
 
