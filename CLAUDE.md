@@ -49,7 +49,13 @@ timing run needs the machine to itself, and CI gives it a job of its own.
 The tests leave their stores under the temp directory, one per test and
 process (`supdb-next-<name>-<pid>`), so a day of test runs on one box is
 tens of thousands of them and the disk they fill; `rm -rf
-$TMPDIR/supdb-next-*` between runs.
+$TMPDIR/supdb-next-*` between runs. On a box other runs share, give each
+run a `TMPDIR` of its own and clean that: the glob takes every process's
+stores, and a run whose store another run's cleanup removed mid-test
+fails with a bare `NotFound` from whatever file operation came next --
+eight tests of one run, one of them in six runs alone, before a syscall
+trace showed the store's directory gone and nothing in the process that
+removed it.
 
 Keep it that way. Every gate this repository has broken has broken the same
 way: a check that was not running, or one reporting a verdict it had not
@@ -200,9 +206,14 @@ block tables of its own. What they share is published whole: the segment
 set and the two memtables as one `State` behind one pointer, swapped by a
 compare-and-swap against the state it was made from and made again over
 whichever won. The writer changes only the memtables (a freeze, a switch
-of memtable) and the segment work only the segments, so a retry takes the
-other's half afresh and nobody holds anybody off. A memtable's arenas,
-entries and index never move once published. Everyone who reads a state
+of memtable) and the segment work only the segments -- with one exception
+the writer consents to at the hand-off: the landing that retires a table
+the writer handed to a seal without freezing it installs an empty live
+table in its place, and the writer, which writes nothing into a handed
+table, takes whichever table it finds live at its next write -- so a
+retry takes the other's half afresh and nobody holds anybody off. A
+memtable's arenas, entries and index never move once published. Everyone
+who reads a state
 pins the epoch it reads in through a slot in the reader table -- a handle
 for each read, the writer for each of its operations, the segment work
 and the upkeep thread for each of theirs -- and whoever replaces a state
@@ -212,7 +223,15 @@ state twice took an entry from one memtable to the chains of another when
 a freeze landed between, and three reader threads found it in their
 first minute. An operation that publishes moves what it holds to what it
 published, and the writer's operations hold one state each: what the
-segment work publishes meanwhile, the writer sees at its next. The
+segment work publishes meanwhile, the writer sees at its next. A table
+the writer hands to a seal without freezing it -- `sync` under
+`adaptive_shape` hands the live table whenever it holds anything and no
+table is handed already, a seal in flight or not, since the frozen slot
+may be that seal's -- is replaced by whichever side publishes first: the
+writer at its next write, freezing it under a fresh table once the frozen
+slot is free, or the landing, installing an empty one, each by
+compare-and-swap on the same pointer; and the writer writes nothing into
+it after the hand-off. The
 isolation is the reader's: `Latest` honours the memtable's watermark at the
 last commit, `Snapshot` pins a state and a watermark, `Dirty` honours none,
 which is what the writer's own reads do. A `#[cfg(test)]` module asks the
@@ -309,8 +328,17 @@ fsync and the manifest does, and no manifest is written while a seal's
 segments are published and unsynced -- it would name a segment that may be
 torn and cover a sequence the WAL still has to hold -- so a merge that
 finishes in that window lands after the seal (`Maint::collect` holds it,
-`publish` asserts it). A crash between any two of those leaves either a WAL
-that replays the whole memtable, with a segment the manifest never named --
+`publish` asserts it). The seals in flight are a queue (`Maint::sealing`),
+landed in the order they were handed and each in its two phases, and only
+the oldest lands at all until it is durable, so one seal at most is between
+its phases and no manifest covers a later seal's records before an earlier
+one's are durable; a table `sync` hands without a freeze is a seal in
+flight beside the frozen table's, the writer's next freeze waits on the
+frozen slot, which the readable landing empties, and the count of seals
+(`in_seal`) is read before the state whoever decides against it, so a
+count of zero is one whose landings the state shows. A crash between any
+two of those leaves either a WAL that replays the whole memtable, with a
+segment the manifest never named --
 possibly torn -- swept at open, or a complete, named segment plus a WAL
 whose sealed prefix is skipped by sequence. Every store has a manifest from
 birth for that reason: without one, open takes every `seg-` file as live
@@ -670,6 +698,19 @@ the new one, and three reader-thread tests read a key's older value after
 its newer one. The rule is the one "a form dropped by its writer stayed
 published" already gave -- a copy handed out needs a tombstone when the
 kept copy is dropped -- and it applies to every copy, however it was made.
+It came a third time in review, before it landed: the landing that
+installs an empty live table for a table `sync` handed without a freeze
+copied the published forms as every landing does, and a freeze files the
+writer's backlog before it publishes where a hand-off files nothing, so
+the copies were current to a position short of the handed table's end
+while the piece the landing published held the rest; the writer's next
+maintained commit stamped the new state's position over them, and a
+handle's scan at that commit read a key short of the last batch while the
+point read beside it, through the piece, was right. That landing carries
+no form now, as a freeze that carries nothing does. The corollary: a copy
+is current to the log position its source was filed to, and a publish that
+carries copies across a change of the live table has to know that position
+was the table's end.
 
 **A rename under a merge.** A promotion hard-links a partition under a
 new name to close its fence, and a merge's landing removes its inputs by
@@ -692,7 +733,26 @@ promotion beside it would have made pieces younger than it into
 partitions, which read as older than every piece. A merge's fences are
 grown to cover every input now, and a range such a piece overlaps is
 merged, never promoted. The rule: when two jobs cut one space and either
-may land first, whatever reads the result must take either order.
+may land first, whatever reads the result must take either order. A
+promotion at every landing made the stale cut the common case: an
+ordered load's tail was named against the last partition while the
+piece ahead of it was in flight, that piece's landing promoted it and
+closed the partition, and the tail landed wide over two ranges and went
+to a merge of both, at every landing, where a link would do. A piece
+open above and cut at least as low as the last range is promoted on its
+keys now, the check a promotion makes anyway, since the fence in a name
+says nothing the keys do not.
+
+**A name decided against a store a seal in flight will change.** The
+seal that names the first partition asked only whether the store had a
+segment. With a table handed to a seal beside one already in flight,
+both asked over an empty store and both were named the first partition,
+two partitions over the whole range, and the landing's tiling assertion
+was what said so. The count of seals in flight is asked first now, and
+the state after it, so a seal counted out is one whose landing the
+state shows. The rule: a decision about the store's shape is made
+against the store plus everything in flight that will change it, and
+the order of the two reads is the order the other side wrote them in.
 
 **A precondition left to the callers.** Promotion without a merge is for
 a store with no partitions yet, and two of its three callers asked

@@ -4568,17 +4568,24 @@ fn a_piece_kept_across_a_merge_is_ranked_against_the_partition_it_meets() {
     db.commit().unwrap();
     db.seal().unwrap();
     // The third piece: keys the partition holds and keys between them.
-    // Its seal joins the second piece's first, which publishes it and
-    // starts the merge, so the merge is running when this piece seals.
+    // Its seal waits for the second piece's publish, whose landing then
+    // starts the merge on the segment work's thread -- a few fsyncs after
+    // the publish the writer waited for, so the start is polled for -- and
+    // that thread lands this piece after it, so the merge is running when
+    // this piece lands.
     for i in 0..10 {
         put(&mut db, &mut model, &key(3000 + i), "c");
         put(&mut db, &mut model, &between(3000, i), "c");
     }
     db.commit().unwrap();
     db.seal().unwrap();
+    let t = std::time::Instant::now();
+    while !db.in_flight().1 && t.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     assert!(
         db.in_flight().1,
-        "the merge did not start at the second piece's publish"
+        "the merge did not start at the second piece's landing"
     );
     // A commit joins a finished seal and leaves a running merge alone:
     // the third piece is published, and ranked, under the old partition.
@@ -7083,6 +7090,399 @@ fn a_handle_reads_the_seals_snapshot_while_the_seal_runs() {
     db.close().unwrap();
 }
 
+// ------------------------------------------------------------------------
+// The tail a `sync` hands to a seal without freezing it
+// (`Options::adaptive_shape`): replaced by whichever side publishes first.
+
+fn tail_key(i: u32) -> Vec<u8> {
+    format!("k{i:08}").into_bytes()
+}
+
+/// A hundred-byte value carrying `ver`, the suite's shape, so a load of a
+/// few thousand keys crosses a small seal.
+fn tail_val(ver: u32) -> Vec<u8> {
+    format!("{ver:08}{}", "x".repeat(92)).into_bytes()
+}
+
+fn tail_ver(v: &[u8]) -> u32 {
+    std::str::from_utf8(&v[..8]).unwrap().parse().unwrap()
+}
+
+fn sup_files(d: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(d)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".sup"))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Reader threads over keys `0..n`, each holding one value whose version
+/// never goes backwards: point reads, and scans that check the keys come
+/// in order and every one is present. Returns the operations made.
+fn tail_readers(
+    db: &Db,
+    n: u32,
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Vec<std::thread::JoinHandle<usize>> {
+    (0..3u64)
+        .map(|t| {
+            let r = db.reader().unwrap();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut seen: HashMap<u32, u32> = HashMap::new();
+                let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ (t + 1);
+                let mut ops = 0usize;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let k = (x % n as u64) as u32;
+                    if x.is_multiple_of(8) {
+                        let mut expect = k;
+                        r.scan(&tail_key(k), 50, |kk, v| {
+                            assert_eq!(
+                                kk,
+                                tail_key(expect).as_slice(),
+                                "scan from {k}: key {expect} missing or out of order"
+                            );
+                            let ver = tail_ver(v);
+                            let prev = seen.entry(expect).or_insert(0);
+                            assert!(ver >= *prev, "key {expect} scanned {ver} after {prev}");
+                            *prev = ver;
+                            expect += 1;
+                        })
+                        .unwrap();
+                        assert_eq!(expect, (k + 50).min(n), "scan from {k} came up short");
+                    } else {
+                        let got = read_vec(&r, &tail_key(k));
+                        assert_eq!(got.len(), 1, "key {k}: {} values", got.len());
+                        let ver = tail_ver(&got[0]);
+                        let prev = seen.entry(k).or_insert(0);
+                        assert!(ver >= *prev, "key {k} read {ver} after {prev}");
+                        *prev = ver;
+                    }
+                    ops += 1;
+                }
+                ops
+            })
+        })
+        .collect()
+}
+
+/// `n` keys loaded in order under a seal small enough that the run closes
+/// once mid-load, leaving a tail live beside a seal in flight or a
+/// partition: the shape a durable-only `sync` used to leave for good.
+fn load_ordered_with_tail(d: &std::path::Path, n: u32) -> Db {
+    let mut db = Db::create(
+        d,
+        Options {
+            adaptive_shape: true,
+            seal_bytes: 1 << 20,
+            partition_bytes: Some(8 << 20),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    for i in 0..n {
+        db.append(&tail_key(i), &tail_val(1));
+        if i % 500 == 499 {
+            db.commit().unwrap();
+        }
+    }
+    // The run closed once mid-load -- its seal in flight or landed -- and
+    // the keys since are the live tail. The unsealed count takes in the
+    // frozen table too, so the tail's size is not read here; a sync over
+    // an empty live table would hand nothing, which the tests then see.
+    assert!(
+        db.in_flight().0 || db.levels() == (1, 0),
+        "the run closed once mid-load: {:?}, {:?}",
+        db.in_flight(),
+        db.levels()
+    );
+    assert!(db.unsealed_keys() > 0, "a tail beside the run that closed");
+    db
+}
+
+/// An ordered load whose run closed once mid-load leaves a tail; a `sync`
+/// hands the tail to a seal without freezing it, the seal lands beside the
+/// first partition as a piece over its range, and the landing promotes
+/// the piece by link: two partitions, no unsealed key, no merge. Reader
+/// threads read and scan throughout, and every key reads once with its
+/// value after. Before this the tail stayed live for good -- the sync
+/// sealed nothing while a seal was in flight or a partition existed -- and
+/// every read of another key searched it.
+#[test]
+fn an_ordered_tail_handed_at_sync_is_promoted_beside_the_partition() {
+    let d = dir("handed-tail-ordered");
+    let n = 14_000u32;
+    let db = load_ordered_with_tail(&d, n);
+    let merges_before = db.phase_ns().2;
+    let mut db = db;
+    db.sync().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let readers = tail_readers(&db, n, &stop);
+    let t = std::time::Instant::now();
+    while !(db.levels() == (2, 0) && db.unsealed_keys() == 0) {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(20),
+            "the tail did not land and promote: levels {:?}, unsealed {}",
+            db.levels(),
+            db.unsealed_keys()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let ops: usize = readers.into_iter().map(|h| h.join().unwrap()).sum();
+    assert!(ops > 100, "the readers read: {ops}");
+    assert_eq!(
+        db.phase_ns().2,
+        merges_before,
+        "promoted by link, not merged"
+    );
+    let names = sup_files(&d);
+    assert!(
+        names.len() == 2 && names.iter().all(|nm| nm.starts_with("par-")),
+        "two partitions and nothing else: {names:?}"
+    );
+    assert_eq!(db.tail_swaps(), (0, 1), "the landing replaced the table");
+    let r = db.reader().unwrap();
+    for i in 0..n {
+        assert_eq!(read_vec(&r, &tail_key(i)), vec![tail_val(1)], "key {i}");
+    }
+    drop(r);
+    db.close().unwrap();
+    let db = Db::open(
+        &d,
+        Options {
+            adaptive_shape: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.levels(), (2, 0));
+    for i in (0..n).step_by(37) {
+        assert_eq!(
+            read_vec(&db, &tail_key(i)),
+            vec![tail_val(1)],
+            "key {i} reopened"
+        );
+    }
+}
+
+/// The writer writes again before the handed seal lands, in both orders.
+/// The landing first: the writer's next write finds the table replaced by
+/// an empty one. The writer first: its write freezes the handed table
+/// under a fresh one, forced by a seal slow enough -- a large hashed table
+/// -- that the write comes before it. Which side swapped is asserted from
+/// the store's own count, and every value reads exactly once before,
+/// during and after, through reader threads and a handle.
+#[test]
+fn a_write_after_a_handed_seal_takes_a_fresh_table_from_whichever_side_swapped() {
+    // The landing first.
+    {
+        let d = dir("handed-tail-landing-first");
+        let n = 14_000u32;
+        let mut db = load_ordered_with_tail(&d, n);
+        db.sync().unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers = tail_readers(&db, n, &stop);
+        let t = std::time::Instant::now();
+        while db.unsealed_keys() > 0 {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(20),
+                "the tail did not land"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(db.tail_swaps(), (0, 1), "the landing replaced the table");
+        // Writes of every kind after: updates of loaded keys under the
+        // readers, then -- the readers' model ends at `n` -- keys above
+        // the store's greatest, which go direct again over the empty
+        // table the landing installed.
+        for k in (0..n).step_by(7) {
+            db.put(&tail_key(k), &tail_val(2));
+        }
+        db.commit().unwrap();
+        assert_eq!(db.tail_swaps(), (0, 1), "nothing for the writer to replace");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let ops: usize = readers.into_iter().map(|h| h.join().unwrap()).sum();
+        assert!(ops > 100, "the readers read: {ops}");
+        for k in n..n + 2000 {
+            db.append(&tail_key(k), &tail_val(1));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        let r = db.reader().unwrap();
+        for k in 0..n + 2000 {
+            let want = if k < n && k % 7 == 0 { 2 } else { 1 };
+            assert_eq!(read_vec(&r, &tail_key(k)), vec![tail_val(want)], "key {k}");
+        }
+    }
+    // The writer first.
+    {
+        let d = dir("handed-tail-writer-first");
+        let n = 60_000u32;
+        let mut db = Db::create(
+            &d,
+            Options {
+                adaptive_shape: true,
+                // Never on its own: the whole table is the sync's to hand.
+                seal_bytes: 1 << 40,
+                partition_bytes: Some(64 << 20),
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        // Shuffled, so the table is hashed and its seal sorts and writes
+        // sixty thousand keys: tens of milliseconds the write below beats.
+        for i in 0..n {
+            let k = (i as u64 * 7919 % n as u64) as u32;
+            db.append(&tail_key(k), &tail_val(1));
+            if i % 1000 == 999 {
+                db.commit().unwrap();
+            }
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers = tail_readers(&db, n, &stop);
+        db.sync().unwrap();
+        assert!(db.in_flight().0, "the tail's seal is in flight");
+        db.put(&tail_key(3), &tail_val(2));
+        assert_eq!(
+            db.tail_swaps(),
+            (1, 0),
+            "the writer froze the handed table under a fresh one before the landing"
+        );
+        assert_eq!(read_vec(&db, &tail_key(3)), vec![tail_val(2)]);
+        assert_eq!(read_vec(&db, &tail_key(4)), vec![tail_val(1)]);
+        for k in (0..n).step_by(11) {
+            db.put(&tail_key(k), &tail_val(2));
+        }
+        db.commit().unwrap();
+        // Until the landing, the handed table is the frozen one and the
+        // reads merge both; after it, the piece and the live table.
+        let t = std::time::Instant::now();
+        while db.in_flight().0 {
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(30),
+                "the handed table did not land: unsealed {}",
+                db.unsealed_keys()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            db.unsealed_keys() < n as usize / 2,
+            "the handed table went with its landing: unsealed {}",
+            db.unsealed_keys()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let ops: usize = readers.into_iter().map(|h| h.join().unwrap()).sum();
+        assert!(ops > 100, "the readers read: {ops}");
+        assert_eq!(db.tail_swaps(), (1, 0));
+        db.flush().unwrap();
+        let r = db.reader().unwrap();
+        for k in 0..n {
+            let want = if k % 11 == 0 || k == 3 { 2 } else { 1 };
+            assert_eq!(read_vec(&r, &tail_key(k)), vec![tail_val(want)], "key {k}");
+        }
+    }
+}
+
+/// A hashed tail -- shuffled writes -- handed while a seal is in flight:
+/// the frozen slot is that seal's, so the tail goes without a freeze, and
+/// lands after it as a piece over the partition, which shuffled keys
+/// cannot promote. Every key reads right through the landings, and both
+/// WALs -- the frozen table's and the handed one's -- are retired by
+/// their own landings. The seal in flight is held before it writes
+/// (`hold_seal_landing`), so it is in flight at the sync on every run and
+/// not only where the machine's timing puts it there.
+#[test]
+fn a_hashed_tail_handed_beside_a_seal_in_flight_lands_as_a_piece() {
+    let d = dir("handed-tail-hashed");
+    let n = 40_000u32;
+    let mut db = Db::create(
+        &d,
+        Options {
+            adaptive_shape: true,
+            seal_bytes: 4 << 20,
+            partition_bytes: Some(64 << 20),
+            // Buffered commits, the arm's shape, so the tail's few commits
+            // do not wait out the seal in flight.
+            sync: supdb::SyncPolicy::EveryN(u32::MAX),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    db.hold_seal_landing(true);
+    for i in 0..n {
+        let k = (i as u64 * 7919 % n as u64) as u32;
+        db.append(&tail_key(k), &tail_val(1));
+        if i % 200 == 199 {
+            db.commit().unwrap();
+        }
+    }
+    // The run's seal is in flight, held, and nothing has landed: every key
+    // is in the frozen table or the live tail, which is the case the test
+    // is about.
+    assert!(
+        db.in_flight().0 && db.levels() == (0, 0),
+        "a seal in flight and nothing landed: {:?}, {:?}",
+        db.in_flight(),
+        db.levels()
+    );
+    assert_eq!(db.unsealed_keys(), n as usize);
+    db.sync().unwrap();
+    assert!(
+        db.in_flight().0 && db.unsealed_keys() == n as usize,
+        "the tail handed, and still live beside the frozen table"
+    );
+    assert_eq!(db.segments(), 2, "two tables whose seals are in flight");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let readers = tail_readers(&db, n, &stop);
+    db.hold_seal_landing(false);
+    let t = std::time::Instant::now();
+    while db.unsealed_keys() > 0 || db.in_flight().0 {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(30),
+            "the seals did not land: levels {:?}, unsealed {}",
+            db.levels(),
+            db.unsealed_keys()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let ops: usize = readers.into_iter().map(|h| h.join().unwrap()).sum();
+    assert!(ops > 100, "the readers read: {ops}");
+    assert_eq!(
+        db.levels(),
+        (1, 1),
+        "the partition, and the tail as a piece"
+    );
+    assert_eq!(db.tail_swaps(), (0, 1));
+    // Every seal is durable, its WAL retired behind its own manifest.
+    db.settle().unwrap();
+    // The first seal rotated to wal-1, the hand-off to wal-2; each landing
+    // retired its own.
+    assert!(
+        !d.join("wal-00000000").exists(),
+        "the frozen table's WAL retired"
+    );
+    assert!(
+        !d.join("wal-00000001").exists(),
+        "the handed table's WAL retired"
+    );
+    assert!(d.join("wal-00000002").exists(), "the live WAL");
+    let r = db.reader().unwrap();
+    for k in 0..n {
+        assert_eq!(read_vec(&r, &tail_key(k)), vec![tail_val(1)], "key {k}");
+    }
+    drop(r);
+    db.close().unwrap();
+}
+
 /// Keys written into the fresh live table while the seal runs: past the
 /// frozen keys, between them, and over them -- an append, a delete, a
 /// delete and then an append. A handle's scan extends the published
@@ -7161,4 +7561,382 @@ fn a_handle_extends_the_seals_snapshot_with_the_keys_written_after_it() {
     m.check(&db, "the writer after the landing");
     drop(r);
     db.close().unwrap();
+}
+
+/// The crash windows of a handed table, emulated on the files: the WAL
+/// the hand-off rotated out is retired only at the landing, so a crash
+/// after the manifest and before the retirement replays nothing twice, and
+/// a crash before the manifest sweeps the piece and replays the WAL. The
+/// ordered tail's log is its direct segment's temp file, with the same
+/// two windows.
+#[test]
+fn a_handed_tables_log_is_retired_at_its_landing_and_replays_before_it() {
+    let opts = || Options {
+        adaptive_shape: true,
+        ..Options::default()
+    };
+    // The hashed tail: updates over a partition, through the WAL.
+    {
+        let d = dir("handed-tail-wal");
+        let n = 3000u32;
+        let mut db = Db::create(&d, opts()).unwrap();
+        for i in 0..n {
+            db.append(&tail_key(i), &tail_val(1));
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.levels(), (1, 0));
+        for i in 0..2000u32 {
+            let k = (i as u64 * 7919 % 2000) as u32;
+            db.put(&tail_key(k), &tail_val(2));
+            if i % 500 == 499 {
+                db.commit().unwrap();
+            }
+        }
+        // The live WAL, the one the tail's frames are in: the flush of an
+        // ordered run rotates nothing, so its id is not fixed here.
+        let wal1 = db.wal_durable().0;
+        let saved_wal = std::fs::read(&wal1).unwrap();
+        let saved_manifest = std::fs::read(d.join("manifest")).unwrap();
+        db.sync().unwrap();
+        let wal2 = db.wal_durable().0;
+        assert_ne!(wal1, wal2, "the hand-off rotated the WAL");
+        db.settle().unwrap();
+        assert_eq!(db.levels(), (1, 1), "the tail landed as a piece");
+        assert_eq!(db.unsealed_keys(), 0);
+        assert!(
+            !wal1.exists(),
+            "the handed table's WAL retired at its landing"
+        );
+        assert!(wal2.exists());
+        drop(db);
+        let check = |db: &Db, what: &str| {
+            for k in 0..n {
+                let want = if k < 2000 { 2 } else { 1 };
+                assert_eq!(
+                    read_vec(db, &tail_key(k)),
+                    vec![tail_val(want)],
+                    "{what}: key {k}"
+                );
+            }
+        };
+        // The manifest names the piece, the WAL was not yet retired: its
+        // records are covered by sequence and replay nothing.
+        std::fs::write(&wal1, &saved_wal).unwrap();
+        let db = Db::open(&d, opts()).unwrap();
+        assert_eq!(db.levels(), (1, 1));
+        assert_eq!(db.unsealed_keys(), 0, "the covered WAL replayed nothing");
+        check(&db, "after the manifest, before the retirement");
+        drop(db);
+        // Before the manifest: the piece is an orphan and the WAL replays.
+        std::fs::write(&wal1, &saved_wal).unwrap();
+        std::fs::write(d.join("manifest"), &saved_manifest).unwrap();
+        let db = Db::open(&d, opts()).unwrap();
+        assert_eq!(db.levels(), (1, 0), "the piece swept");
+        assert_eq!(db.unsealed_keys(), 2000, "the WAL replayed the tail");
+        check(&db, "before the manifest");
+    }
+    // The ordered tail: its direct segment's temp file.
+    {
+        let d = dir("handed-tail-tmp");
+        let n = 14_000u32;
+        let mut db = load_ordered_with_tail(&d, n);
+        db.settle().unwrap();
+        assert_eq!(db.levels(), (1, 0));
+        let tmp: Vec<PathBuf> = std::fs::read_dir(&d)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s.starts_with("direct-") && s.ends_with(".tmp"))
+            })
+            .collect();
+        assert_eq!(tmp.len(), 1, "the tail's open run: {tmp:?}");
+        let saved_tmp = std::fs::read(&tmp[0]).unwrap();
+        let saved_manifest = std::fs::read(d.join("manifest")).unwrap();
+        // The partition as the old manifest names it: a promotion links it
+        // under a name with its fence closed and unlinks this one after
+        // the manifest, so the window before the manifest still has it.
+        let parts = sup_files(&d);
+        assert_eq!(
+            parts.len(),
+            1,
+            "one partition before the hand-off: {parts:?}"
+        );
+        let old_part = d.join(&parts[0]);
+        let saved_part = std::fs::read(&old_part).unwrap();
+        db.sync().unwrap();
+        db.settle().unwrap();
+        assert_eq!(db.levels(), (2, 0), "landed and promoted");
+        assert!(!tmp[0].exists(), "the temp name retired at the landing");
+        assert!(!old_part.exists(), "the partition's old name unlinked");
+        drop(db);
+        let check = |db: &Db, what: &str| {
+            for k in (0..n).step_by(3) {
+                assert_eq!(
+                    read_vec(db, &tail_key(k)),
+                    vec![tail_val(1)],
+                    "{what}: key {k}"
+                );
+            }
+        };
+        // After the manifest: a temp name whose id the manifest already
+        // names is the window's leftover, removed rather than recovered.
+        std::fs::write(&tmp[0], &saved_tmp).unwrap();
+        let db = Db::open(&d, opts()).unwrap();
+        assert_eq!(db.levels(), (2, 0));
+        assert_eq!(db.unsealed_keys(), 0);
+        assert!(!tmp[0].exists());
+        check(&db, "after the manifest");
+        drop(db);
+        // Before the manifest: the promoted names are orphans, swept, the
+        // partition stands under its old name, and the temp file recovers
+        // as a piece over the last range -- which the segment work's
+        // thread may already have promoted again.
+        std::fs::write(&tmp[0], &saved_tmp).unwrap();
+        std::fs::write(&old_part, &saved_part).unwrap();
+        std::fs::write(d.join("manifest"), &saved_manifest).unwrap();
+        let db = Db::open(&d, opts()).unwrap();
+        let lv = db.levels();
+        assert!(
+            lv == (1, 1) || lv == (2, 0),
+            "the orphan swept and the temp file recovered: {lv:?}"
+        );
+        assert_eq!(db.unsealed_keys(), 0, "nothing replayed into memory");
+        check(&db, "before the manifest");
+    }
+}
+
+/// A landing that installs an empty live table for a handed one carries no
+/// form into the new state. A freeze files the writer's backlog first, so
+/// the forms of the state it replaces are current to the frozen table's
+/// whole log and a copy of one is the block; a hand-off files nothing, so
+/// a form copied out of that state is current to a position short of the
+/// table's end while the piece the landing publishes holds the rest.
+/// Carried, such a form stood as the block once the writer's next
+/// maintained commit stamped the new state's position over it, and a
+/// handle's scan at that commit read a key short of the handed table's
+/// last batch while the point read beside it answered right.
+///
+/// The shape: the writer scans, which builds the forms its next commit
+/// publishes; a handle scans, so that commit maintains; a batch is then
+/// committed with no scan since the last maintained commit, so the
+/// published forms are behind the log by that batch; the sync hands the
+/// table and the landing wins the swap, the writer writing nothing until
+/// it has; the handle scans once more, so the writer's next commit
+/// maintains; one write and its commit; then the handle's scans against
+/// the model. Under a cache budget (`scan_cache_bytes`), the arm where the
+/// commit's maintenance stamps the position and publishes only what the
+/// writer settled: the arm that builds a form for every overlaid block at
+/// the commit rebuilt every carried one first and hid the stale copies,
+/// and the settle-only arm publishes none at all.
+#[test]
+fn a_landing_that_replaces_the_live_table_carries_no_form() {
+    let d = dir("handed-tail-forms");
+    let opts = Options {
+        adaptive_shape: true,
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_bytes: 64 << 20,
+        scan_cache_ahead: false,
+        commit_forms: true,
+        forms_carry: true,
+        // Filed only where a scan preceded the commit, so a batch committed
+        // with none since is left to the next scan, as the shape needs.
+        forms_settle_backlog_pct: 0,
+        // The writer files at its own commit: the position the forms are
+        // current to is the writer's, not a thread's.
+        upkeep: supdb::Upkeep::Inline,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 1, "several partitions");
+    let mut sink = 0usize;
+    // Overlay keys in most blocks; the writer's scan builds their forms,
+    // and a handle's scan makes the next commit publish them.
+    for k in (0..1500u32).step_by(5) {
+        m.append(&mut db, &key(k), "v1");
+    }
+    db.commit().unwrap();
+    db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    let r = db.reader().unwrap();
+    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    for k in (1..1500u32).step_by(13) {
+        m.append(&mut db, &key(k), "v1b");
+    }
+    db.commit().unwrap();
+    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    let (forms, _, takes, _) = db.canonical_forms();
+    assert!(forms > 0, "forms published before the hand-off: {forms}");
+    assert!(takes > 0, "the handle walked them: {takes}");
+    m.check(&r, "a handle over the maintained forms");
+    // A commit after the handle's scans, maintained, so the one after it
+    // has no scan since; then the last batch, left to the next scan, so
+    // every published form is behind the log by it.
+    m.append(&mut db, &key(1499), "v1x");
+    db.commit().unwrap();
+    for k in (2..1500u32).step_by(17) {
+        m.append(&mut db, &key(k), "v1c");
+    }
+    db.commit().unwrap();
+    assert_eq!(db.tail_swaps(), (0, 0));
+    db.sync().unwrap();
+    // The landing wins the swap: the writer writes nothing until it has.
+    wait_for("the landing", || db.tail_swaps() == (0, 1));
+    assert_eq!(db.unsealed_keys(), 0, "the table went with its landing");
+    assert_eq!(
+        db.canonical_forms().0,
+        0,
+        "the state the landing published starts with no form"
+    );
+    // The handle's scans make the writer's next commit maintain; through
+    // them the handle reads the piece, since the state has no form yet.
+    m.check(&r, "a handle after the landing");
+    m.append(&mut db, &key(0), "after");
+    db.commit().unwrap();
+    // At the new commit's position: whatever form the state holds now is
+    // the block to this handle.
+    m.check(&r, "a handle at the commit after the landing");
+    m.check(&db, "the writer at it");
+    db.settle().unwrap();
+    m.check(&r, "a handle after the settle");
+    std::hint::black_box(sink);
+}
+
+/// An ordered load's tail handed while a threshold seal is still in
+/// flight, the case a promotion at every landing makes common: the seal
+/// in flight is a piece cut open above against the last partition, and
+/// the tail is cut the same way; the piece's landing promotes it and
+/// closes the partition the tail was cut against, so the tail lands as a
+/// piece open above and cut lower than the last range's low fence -- an
+/// unaligned piece, which used to go to a merge of every range it
+/// overlapped. It is promoted on its keys now (`promote_ranges`), which
+/// the counter says, and the store settles as partitions and no merge.
+/// The seal in flight is held before it writes (`hold_seal_landing`), so
+/// the case is reached on every run rather than when the machine's
+/// timing puts a seal inside the sync.
+#[test]
+fn an_open_cut_tail_handed_beside_a_seal_in_flight_is_promoted_on_its_keys() {
+    let d = dir("handed-tail-open-cut");
+    let mut db = Db::create(
+        &d,
+        Options {
+            adaptive_shape: true,
+            seal_bytes: 512 << 10,
+            partition_bytes: Some(8 << 20),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    // Load until two partitions stand and nothing is in flight, then hold
+    // every seal before it writes and load on until the next threshold
+    // seal starts, held.
+    let mut i = 0u32;
+    let mut parts = 0usize;
+    let mut held = false;
+    while !(held && db.in_flight().0) {
+        assert!(i < 80_000, "the shape was not reached: {:?}", db.levels());
+        for _ in 0..500 {
+            db.append(&tail_key(i), &tail_val(1));
+            i += 1;
+        }
+        db.commit().unwrap();
+        // Counted out at its manifest, a seal is not in flight while its
+        // landing's promotion still runs: the piece must be gone too.
+        let lv = db.levels();
+        if !held && lv.0 >= 2 && lv.1 == 0 && !db.in_flight().0 {
+            parts = lv.0;
+            db.hold_seal_landing(true);
+            held = true;
+        }
+    }
+    assert_eq!(
+        db.levels(),
+        (parts, 0),
+        "the held seal's piece has not landed"
+    );
+    // The tail: a run above the held seal's keys, small enough that no
+    // threshold seal waits on the held one.
+    for _ in 0..1500 {
+        db.append(&tail_key(i), &tail_val(1));
+        i += 1;
+    }
+    db.commit().unwrap();
+    let n = i;
+    let merges_before = db.phase_ns().2;
+    let promoted_before = db.promotions();
+    db.sync().unwrap();
+    assert!(db.in_flight().0, "the held seal and the handed tail");
+    assert_eq!(db.tail_swaps(), (0, 0));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let readers = tail_readers(&db, n, &stop);
+    db.hold_seal_landing(false);
+    wait_for("the piece and the tail landed and promoted", || {
+        db.levels() == (parts + 2, 0) && db.unsealed_keys() == 0 && !db.in_flight().0
+    });
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let ops: usize = readers.into_iter().map(|h| h.join().unwrap()).sum();
+    assert!(ops > 100, "the readers read: {ops}");
+    assert_eq!(db.tail_swaps(), (0, 1), "the landing replaced the table");
+    // The promotion unlinks the old names after its manifest, on the
+    // segment work's thread: joined before the directory is read.
+    db.settle().unwrap();
+    assert_eq!(
+        db.phase_ns().2,
+        merges_before,
+        "promoted by link, not merged"
+    );
+    let (promoted, open) = db.promotions();
+    assert_eq!(
+        promoted - promoted_before.0,
+        2,
+        "the held seal's piece and the tail, each promoted at its landing"
+    );
+    assert_eq!(
+        open - promoted_before.1,
+        1,
+        "the tail promoted as a piece cut against fences a landing closed"
+    );
+    let names = sup_files(&d);
+    assert!(
+        names.len() == parts + 2 && names.iter().all(|nm| nm.starts_with("par-")),
+        "partitions and nothing else: {names:?}"
+    );
+    let r = db.reader().unwrap();
+    for k in 0..n {
+        assert_eq!(read_vec(&r, &tail_key(k)), vec![tail_val(1)], "key {k}");
+    }
+    drop(r);
+    db.close().unwrap();
+    let db = Db::open(
+        &d,
+        Options {
+            adaptive_shape: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.levels(), (parts + 2, 0));
+    for k in (0..n).step_by(41) {
+        assert_eq!(
+            read_vec(&db, &tail_key(k)),
+            vec![tail_val(1)],
+            "key {k} reopened"
+        );
+    }
 }

@@ -99,21 +99,77 @@ fn a_store_life(name: &str) {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// One store's life under `adaptive_shape`, whose `sync` hands the live
+/// table to a seal without freezing it: an ordered load and its tail
+/// handed, a handle reading across the landing, then shuffled updates and
+/// a second hand-off of a hashed table beside them, and the store closed
+/// with whatever the queue of seals still holds -- a seal in flight is
+/// joined at the close and landed by no one, and its job owns the table
+/// it wrote.
+fn a_handed_life(name: &str) {
+    let d = std::env::temp_dir().join(format!("supdb-next-leak-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let opts = Options {
+        adaptive_shape: true,
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(64 << 20),
+        scan_block_cache: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let keys = 20_000u32;
+    let key = |k: u32| format!("key-{k:08}").into_bytes();
+    let scan_all = |r: &supdb::Reader| {
+        for s in (0..keys).step_by(500) {
+            r.scan(&key(s), 100, |_, _| {}).unwrap();
+        }
+    };
+    for k in 0..keys {
+        db.append(&key(k), &[7u8; 100]);
+        if k % 2000 == 1999 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    db.sync().unwrap();
+    let h = db.reader().unwrap();
+    scan_all(&h);
+    drop(h);
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    for _ in 0..2000 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        db.put(&key((x % keys as u64) as u32), &[2u8; 100]);
+    }
+    db.commit().unwrap();
+    db.sync().unwrap();
+    let h = db.reader().unwrap();
+    scan_all(&h);
+    drop(h);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 #[test]
 fn a_closed_store_gives_back_what_it_allocated() {
     // The first life allocates what lives for the process -- the test
     // harness's buffers, lazily built statics -- so the count starts after.
     a_store_life("warm");
+    a_handed_life("warm-handed");
     let before = LIVE.load(Ordering::SeqCst);
     let lives = 4;
     for i in 0..lives {
         a_store_life(&format!("life-{i}"));
+        a_handed_life(&format!("handed-{i}"));
     }
     let after = LIVE.load(Ordering::SeqCst);
     let kept = after - before;
     assert!(
         kept < 64 << 10,
-        "{lives} closed stores kept {kept} bytes allocated ({} a store)",
-        kept / lives
+        "{} closed stores kept {kept} bytes allocated ({} a store)",
+        2 * lives,
+        kept / (2 * lives)
     );
 }
