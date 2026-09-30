@@ -433,14 +433,15 @@ pub struct Options {
     /// landing, at open -- and a seal over an empty store names the first
     /// partition itself; a merge is a rewrite and waits until something
     /// reads the store. A `sync` hands its live table to a seal as well,
-    /// whenever the table holds anything and no table is handed already,
-    /// seal in flight or not, and without waiting for it or freezing it
+    /// whenever the table holds anything, no table is handed already and
+    /// the segment work runs on its thread (`publish_in_background`), seal
+    /// in flight or not, and without waiting for it or freezing it
     /// (`Db::hand_tail`): the table stays the live one until the landing
     /// installs an empty one in its place or the writer's next write
     /// freezes it under a fresh one, whichever publishes first, and a
     /// piece whose keys lie above its partition's last is promoted by link
     /// at its landing. Everything but the durable write is the segment
-    /// work's, which is why this wants `publish_in_background`.
+    /// work's, and inline the writer would be doing it itself.
     pub adaptive_shape: bool,
     /// How a flush drains level 0 once partitions exist: merge only the
     /// ranges that hold pieces, under the live fences (`true`), or
@@ -5737,6 +5738,17 @@ struct Shared {
     /// between its two phases, the segments published and their fsyncs
     /// not yet paid (`Db::hold_seal_landing`, `Db::hold_seal_durable`).
     seal_hold: std::sync::atomic::AtomicU8,
+    /// A seal's landing failed before its segments were published: no seal
+    /// behind it in the queue lands from here, since a manifest a later
+    /// landing wrote would cover the failed seal's sequence with its
+    /// segments unnamed, and a reopen would skip the WAL that holds its
+    /// writes. The writer's waits on the frozen slot read this and fail
+    /// instead of waiting on a landing that will not come; a reopen
+    /// replays every WAL the manifest does not cover and sweeps the
+    /// segments it does not name.
+    seal_wedged: std::sync::atomic::AtomicBool,
+    /// A test's: the next readable landing fails as a `Seg::open` would.
+    fail_landing: std::sync::atomic::AtomicBool,
     /// An error of the segment work's, for the writer's next commit to
     /// return: one slot, the first error kept.
     maint_err: AtomicPtr<std::io::Error>,
@@ -11759,6 +11771,8 @@ impl Db {
             in_seal: AtomicUsize::new(0),
             in_merge: std::sync::atomic::AtomicBool::new(false),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
+            seal_wedged: std::sync::atomic::AtomicBool::new(false),
+            fail_landing: std::sync::atomic::AtomicBool::new(false),
             maint_err: AtomicPtr::new(std::ptr::null_mut()),
             maint_stop: std::sync::atomic::AtomicBool::new(false),
             spare_wal: AtomicPtr::new(spare_wal),
@@ -12093,6 +12107,8 @@ impl Db {
             in_seal: AtomicUsize::new(0),
             in_merge: std::sync::atomic::AtomicBool::new(false),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
+            seal_wedged: std::sync::atomic::AtomicBool::new(false),
+            fail_landing: std::sync::atomic::AtomicBool::new(false),
             maint_err: AtomicPtr::new(std::ptr::null_mut()),
             maint_stop: std::sync::atomic::AtomicBool::new(false),
             spare_wal: AtomicPtr::new(spare_wal),
@@ -13051,6 +13067,17 @@ impl Db {
             if replaced {
                 break;
             }
+            // Before the freeze, not only before the wait: frozen under a
+            // fresh table with its seal failed, the handed table would sit
+            // in the slot for no landing to retire, and every later seal
+            // would wait on it. Live, its keys stay readable and the next
+            // write tries again.
+            if let Some(e) = self.shared.take_maint_err() {
+                return Err(e);
+            }
+            if seals == 0 || self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
+                return Err(err("a handed table's seal did not land"));
+            }
             if slot_free {
                 if self.freeze_table(&handed) {
                     SealCounts::add(&self.shared.seal_counts.tail_by_writer, 1);
@@ -13058,12 +13085,6 @@ impl Db {
                 }
                 // Lost the swap to a publish since: look again.
                 continue;
-            }
-            if let Some(e) = self.shared.take_maint_err() {
-                return Err(e);
-            }
-            if seals == 0 {
-                return Err(err("a handed table's seal did not land"));
             }
             waited = true;
             std::thread::park_timeout(MAINT_LAND_POLL);
@@ -13898,7 +13919,7 @@ impl Db {
             if let Some(e) = self.shared.take_maint_err() {
                 return Err(e);
             }
-            if seals == 0 {
+            if seals == 0 || self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
                 return Err(err("the frozen table's seal did not land"));
             }
             waited = true;
@@ -14097,10 +14118,28 @@ impl Db {
 
     /// A test's: while `on`, every seal thread waits before it writes
     /// anything -- after it has published the frozen table's snapshot,
-    /// where it does (`Options::seal_snapshot`) -- so the frozen table
-    /// stays what reads see for as long as the test wants a seal in
-    /// flight. Lifted before a `settle`, a `flush` or the next seal, as
-    /// `hold_seal_durable` is.
+    /// where it does (`Options::seal_snapshot`; a table `sync` handed
+    /// gets none while it is live) -- so the table it writes, frozen or
+    /// handed, stays what reads see for as long as the test wants a seal
+    /// in flight. Lifted before a `settle`, a `flush` or the next seal,
+    /// as `hold_seal_durable` is.
+    /// A test's: the next seal's readable landing fails as a `Seg::open`
+    /// that cannot read the segment would, so the queue behind it is seen
+    /// to stop and a reopen to replay what the failed seal covered.
+    #[doc(hidden)]
+    pub fn fail_next_landing(&self) {
+        self.shared
+            .fail_landing
+            .store(true, AtomicOrdering::Release);
+    }
+
+    /// Whether a seal's landing has failed and the seals behind it stopped;
+    /// see `Shared::seal_wedged`.
+    #[doc(hidden)]
+    pub fn seals_wedged(&self) -> bool {
+        self.shared.seal_wedged.load(AtomicOrdering::Acquire)
+    }
+
     #[doc(hidden)]
     pub fn hold_seal_landing(&self, on: bool) {
         self.set_seal_hold(SEAL_HOLD_LANDING, on);
@@ -17030,6 +17069,9 @@ impl Maint {
     /// one seal at most is between its phases and the landings keep hand
     /// order. Inline, `Db::seal_due` asks this at every commit.
     fn seal_phases_due(&self) -> (bool, bool) {
+        if self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
+            return (false, false);
+        }
         self.sealing.front().map_or((false, false), |s| {
             (
                 !s.landed && s.readable.get().is_some(),
@@ -17079,14 +17121,18 @@ impl Maint {
                 Ok(())
             }
             Err(e) => {
-                // Nothing of the seal is landed, or its segments are live
-                // and its sequence covered (`land_readable`); either way
-                // the thread is joined and the seal is over, counted out,
-                // and the next landing's manifest names whatever is live.
+                // Nothing of the seal is landed: its segments are unnamed
+                // and its sequence uncovered, and only its WAL holds its
+                // writes. The thread is joined and the seal counted out,
+                // and no seal behind it lands from here (`seal_wedged`):
+                // the first version let the next one land, and its
+                // manifest covered this seal's sequence with its segments
+                // unnamed, so a reopen skipped the WAL that had them.
                 if let Some(s) = self.sealing.pop_front() {
                     let _ = s.handle.join();
                 }
                 self.shared.in_seal.fetch_sub(1, AtomicOrdering::AcqRel);
+                self.shared.seal_wedged.store(true, AtomicOrdering::Release);
                 Err(e)
             }
         }
@@ -17299,6 +17345,11 @@ impl Maint {
     /// if the poll has not done that (`land_readable`), then the durable
     /// landing (`land_durable`). `draining` books the waits as a flush's.
     fn join_seal(&mut self, draining: bool) -> Result<()> {
+        if self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
+            return Err(err(
+                "a seal's landing failed and the seals behind it will not land; reopen the store",
+            ));
+        }
         while let Some(front) = self.sealing.front() {
             let draining = draining || front.draining;
             self.land_front(draining)?;
@@ -17310,9 +17361,11 @@ impl Maint {
     /// it is still writing, its segments published for readers if the
     /// poll has not done that (`land_readable`), then the durable landing
     /// (`land_durable`) and the decisions a landing makes. The seal is
-    /// counted out whether the landing succeeds or not, since a count that
-    /// stays up for a seal that will never land is a writer waiting
-    /// forever. `draining` books the wait as a flush's.
+    /// counted out whether the landing succeeds or not: the writer waits
+    /// on the frozen slot and reads the count only to tell a landing still
+    /// to come from one that failed, so a count left up for a seal that
+    /// will never land turns that wait into one that never ends.
+    /// `draining` books the wait as a flush's.
     fn land_front(&mut self, draining: bool) -> Result<()> {
         let Some(job) = self.sealing.pop_front() else {
             return Ok(());
@@ -17340,20 +17393,25 @@ impl Maint {
         let names = match joined.and_then(|r| r) {
             Ok(names) => names,
             Err(e) => {
-                // Phase R failed before the names were signalled, and
-                // nothing is landed; or phase D's fsync failed after the
+                // The seal thread failed: before the names were signalled,
+                // and nothing is landed, or at its fsyncs after the
                 // segments were published, and they stay live with their
                 // sequence covered (`land_readable`), so the next landing's
-                // manifest names them. Either way the WAL is not retired
-                // here: it retires only behind a manifest that names what
-                // covers it.
+                // manifest names them. The WAL is not retired here either
+                // way: it retires only behind a manifest that names what
+                // covers it. With nothing landed the queue stops, as in
+                // `land_front_readable`.
                 self.shared.in_seal.fetch_sub(1, AtomicOrdering::AcqRel);
+                if !landed {
+                    self.shared.seal_wedged.store(true, AtomicOrdering::Release);
+                }
                 return Err(e);
             }
         };
         if !landed {
             if let Err(e) = self.land_readable(&names, &table) {
                 self.shared.in_seal.fetch_sub(1, AtomicOrdering::AcqRel);
+                self.shared.seal_wedged.store(true, AtomicOrdering::Release);
                 return Err(e);
             }
         }
@@ -17376,6 +17434,9 @@ impl Maint {
     /// whichever landing writes it, names them; the manifest itself waits
     /// for phase D.
     fn land_readable(&mut self, names: &[String], table: &std::sync::Arc<MemTable>) -> Result<()> {
+        if self.shared.fail_landing.swap(false, AtomicOrdering::AcqRel) {
+            return Err(err("a test failed this landing"));
+        }
         let mut segs = self.segs().to_vec();
         for name in names {
             segs.push(std::sync::Arc::new(Seg::open(
@@ -17420,8 +17481,10 @@ impl Maint {
         self.retiring_wals.extend(wal);
         self.retiring_tmps.extend(tmp);
         for old in std::mem::take(&mut self.retiring_wals) {
-            // One spare is enough: the writer takes it at its next
-            // rotation, and a seal lands before the next one rotates.
+            // One spare is enough for the common shape, a seal landed
+            // before the next rotation; a table handed beside a seal in
+            // flight retires two WALs at one landing, and the second is
+            // removed rather than kept.
             if self.opts.recycle_wal
                 && self
                     .shared

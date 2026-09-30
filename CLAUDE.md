@@ -225,9 +225,10 @@ first minute. An operation that publishes moves what it holds to what it
 published, and the writer's operations hold one state each: what the
 segment work publishes meanwhile, the writer sees at its next. A table
 the writer hands to a seal without freezing it -- `sync` under
-`adaptive_shape` hands the live table whenever it holds anything and no
-table is handed already, a seal in flight or not, since the frozen slot
-may be that seal's -- is replaced by whichever side publishes first: the
+`adaptive_shape` hands the live table whenever it holds anything, no
+table is handed already and the segment work has a thread of its own, a
+seal in flight or not, since the frozen slot may be that seal's -- is
+replaced by whichever side publishes first: the
 writer at its next write, freezing it under a fresh table once the frozen
 slot is free, or the landing, installing an empty one, each by
 compare-and-swap on the same pointer; and the writer writes nothing into

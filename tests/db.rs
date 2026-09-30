@@ -6711,6 +6711,75 @@ fn a_segment_the_manifest_does_not_name_is_swept_and_its_wal_replayed() {
     }
 }
 
+/// A seal whose readable landing fails is counted out, and the seals
+/// queued behind it do not land: a manifest a later landing wrote would
+/// cover the failed seal's sequence with its segments unnamed, and a
+/// reopen would skip the WAL that holds its writes. The first version of
+/// the queue let the next seal land, and a frozen table whose piece could
+/// not be opened was gone at the reopen after. Here the first seal is a
+/// frozen table and the second a table `sync` handed beside it; the
+/// first's landing fails, the settle reports it, no manifest moves, every
+/// value still reads through the tables, and the reopen replays both
+/// WALs, each value once.
+#[test]
+fn a_failed_landing_stops_the_seals_behind_it_and_a_reopen_replays_them() {
+    let d = dir("wedged-landing");
+    let opts = Options {
+        seal_bytes: 1 << 30,
+        adaptive_shape: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut model: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    let key = |k: u32| format!("key-{k:05}").into_bytes();
+    // Descending, so the batch is a hashed table and not an ordered run.
+    for k in (0..3000u32).rev() {
+        db.append(&key(k), b"a");
+        model.entry(key(k)).or_default().push(b"a".to_vec());
+    }
+    db.commit().unwrap();
+    db.hold_seal_landing(true);
+    db.seal().unwrap();
+    for k in (0..3000u32).rev().step_by(3) {
+        db.append(&key(k), b"b");
+        model.entry(key(k)).or_default().push(b"b".to_vec());
+    }
+    db.commit().unwrap();
+    db.sync().unwrap();
+    assert!(db.in_flight().0, "two seals in flight, both held");
+    let manifest_before = std::fs::read(d.join("manifest")).unwrap();
+    db.fail_next_landing();
+    db.hold_seal_landing(false);
+    assert!(
+        db.settle().is_err(),
+        "the failed landing is reported to the settle"
+    );
+    assert!(db.seals_wedged(), "the seals behind the failed one stopped");
+    assert_eq!(
+        std::fs::read(d.join("manifest")).unwrap(),
+        manifest_before,
+        "no manifest covers the failed seal's sequence"
+    );
+    for (k, want) in &model {
+        assert_eq!(
+            &read_vec(&db, k),
+            want,
+            "still readable through the tables: {}",
+            String::from_utf8_lossy(k)
+        );
+    }
+    drop(db);
+    let db = Db::open(&d, opts).unwrap();
+    for (k, want) in &model {
+        assert_eq!(
+            &read_vec(&db, k),
+            want,
+            "replayed from the WALs, once: {}",
+            String::from_utf8_lossy(k)
+        );
+    }
+}
+
 /// A store written before manifests has none, and its `seg-` files are
 /// what it has: open takes them as live and the replay bound from their
 /// names, as it always did. The path is kept for those stores and taken by
