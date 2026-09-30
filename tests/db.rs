@@ -276,20 +276,35 @@ fn reopen_after_seal_serves_both_old_and_new_writes() {
 }
 
 fn oracle(cursors: bool, upkeep: supdb::Upkeep) {
+    let _ = oracle_in(
+        &format!(
+            "oracle-{}-{upkeep:?}",
+            if cursors { "cursors" } else { "probes" }
+        ),
+        Options {
+            cursor_merge: cursors,
+            upkeep,
+            ..Options::default()
+        },
+    );
+}
+
+fn oracle_in(name: &str, opts: Options) -> supdb::db::SealWaits {
     // The differential model oracle: random appends, commits, seals, and
     // crash-reopens, checked against a HashMap after every reopen.
     // Uncommitted writes are trimmed from the model at a crash, which is the
     // durability contract.
-    let d = dir(&format!(
-        "oracle-{}-{upkeep:?}",
-        if cursors { "cursors" } else { "probes" }
-    ));
-    let opts = Options {
-        cursor_merge: cursors,
-        upkeep,
-        ..Options::default()
-    };
+    let d = dir(name);
     let mut db = Db::create(&d, opts.clone()).unwrap();
+    // What the seals did, summed over the reopens, for a wrapper to hold
+    // its option to having been taken.
+    let mut total = supdb::db::SealWaits::default();
+    let add = |t: &mut supdb::db::SealWaits, w: supdb::db::SealWaits| {
+        t.wal_rotations += w.wal_rotations;
+        t.rotated_unsynced += w.rotated_unsynced;
+        t.deferred += w.deferred;
+        t.publishes += w.publishes;
+    };
     let mut model: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
     let mut uncommitted: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
     let mut state = 0x5eedu64;
@@ -321,6 +336,7 @@ fn oracle(cursors: bool, upkeep: supdb::Upkeep) {
                 db.seal().unwrap();
             }
             13 => {
+                add(&mut total, db.seal_waits());
                 drop(db); // crash: uncommitted appends vanish
                 uncommitted.clear();
                 db = match Db::open(&d, opts.clone()) {
@@ -359,6 +375,8 @@ fn oracle(cursors: bool, upkeep: supdb::Upkeep) {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     assert_eq!(scanned, live, "the scan must agree with the model");
+    add(&mut total, db.seal_waits());
+    total
 }
 
 /// Apply a committed batch to the model: an append pushes, a delete clears.
@@ -374,21 +392,61 @@ fn apply(model: &mut HashMap<Vec<u8>, Vec<Vec<u8>>>, batch: &mut Vec<(Vec<u8>, O
 
 #[test]
 fn model_oracle_over_random_ops_and_crashes() {
-    oracle(true, supdb::Upkeep::Inline)
+    oracle(true, supdb::Upkeep::Inline);
 }
 
 /// The same oracle with the writer's upkeep on a thread: every reopen is
 /// a drop, which stops the thread with the upkeep lent or home.
 #[test]
 fn the_oracle_holds_with_the_upkeep_on_a_thread() {
-    oracle(true, supdb::Upkeep::Background(3))
+    oracle(true, supdb::Upkeep::Background(3));
 }
 
 /// The probe merge stays behind `cursor_merge` as the comparison arm -- and
 /// a path only one arm exercises is a path nothing tests.
 #[test]
 fn the_probe_merge_arm_passes_the_same_oracle() {
-    oracle(false, supdb::Upkeep::Inline)
+    oracle(false, supdb::Upkeep::Inline);
+}
+
+/// The oracle with seals that take their end from the live WAL
+/// (`seal_rotates_wal` off) and a log small enough to rotate by size
+/// every few commits: files that span landed seals, files closed and
+/// retired by the next seal's landing, and crash-reopens between every
+/// one of those, each replaying from the manifest's covered sequence.
+#[test]
+fn the_oracle_holds_with_seals_that_keep_the_wal() {
+    let w = oracle_in(
+        "oracle-walseq",
+        Options {
+            seal_rotates_wal: false,
+            seal_bytes: 2 << 10,
+            ..Options::default()
+        },
+    );
+    assert!(w.wal_rotations > 0, "the log rotated by size: {w:?}");
+    assert_eq!(w.rotated_unsynced, 0, "{w:?}");
+}
+
+/// And under the shape (`adaptive_shape`), whose landings promote and
+/// shape: seals that keep the WAL beside the shaping's merges, under
+/// random writes and crashes. Deferral is not here: at this cadence the
+/// seals are too small to hold the slot at a threshold commit, and an
+/// oracle that sets the option without reaching it would claim a path
+/// it never took; `a_commit_past_the_threshold_keeps_writing_while_a_seal_holds_the_slot`
+/// holds a seal to take it.
+#[test]
+fn the_oracle_holds_under_the_shape_with_seals_that_keep_the_wal() {
+    let w = oracle_in(
+        "oracle-shape-walseq",
+        Options {
+            seal_rotates_wal: false,
+            adaptive_shape: true,
+            seal_bytes: 2 << 10,
+            ..Options::default()
+        },
+    );
+    assert!(w.wal_rotations > 0 && w.publishes > 0, "{w:?}");
 }
 
 /// The names of the live segment files, sorted. A promoted piece keeps the
@@ -8415,4 +8473,422 @@ fn an_open_cut_tail_handed_beside_a_seal_in_flight_is_promoted_on_its_keys() {
             "key {k} reopened"
         );
     }
+}
+
+/// The WAL files in a store's directory, sorted by id.
+fn wal_files(d: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut wals: Vec<std::path::PathBuf> = std::fs::read_dir(d)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("wal-"))
+        .collect();
+    wals.sort();
+    wals
+}
+
+/// Every key the store holds, read back by point read and by one scan,
+/// against the values it should hold.
+fn holds_all(db: &Reader, want: &BTreeMap<Vec<u8>, Vec<Vec<u8>>>, state: &str) {
+    for (k, v) in want {
+        let mut got = Vec::new();
+        db.read_all(k, |x| got.push(x.to_vec())).unwrap();
+        assert_eq!(&got, v, "{state}: key {:?}", String::from_utf8_lossy(k));
+    }
+    let mut scanned: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    db.scan(b"", usize::MAX, |k, v| {
+        scanned.entry(k.to_vec()).or_default().push(v.to_vec())
+    })
+    .unwrap();
+    assert_eq!(&scanned, want, "{state}: the scan");
+}
+
+/// A seal that keeps the WAL (`seal_rotates_wal` off) rotates nothing:
+/// the seal ends at the live file's sequence, a reopen replays the file
+/// from the manifest's covered sequence and finds nothing to replay, and
+/// the file rotates only once it passes `seal_bytes`, synced whole first,
+/// retiring at the next seal's landing.
+#[test]
+fn a_seal_that_keeps_the_wal_retires_files_by_sequence() {
+    let d = dir("walseq-retire");
+    let opts = Options {
+        seal_rotates_wal: false,
+        seal_bytes: 1 << 20,
+        seal_max_pct: 0,
+        // Buffered, the shape whose commits never sync: a rotation must
+        // sync the file itself before it starts the next.
+        sync: supdb::SyncPolicy::EveryN(u32::MAX),
+        // Ascending keys would go to ordered ingest, which writes a
+        // segment and not the log.
+        direct_ingest: false,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut want: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    let put = |db: &mut Db, want: &mut BTreeMap<Vec<u8>, Vec<Vec<u8>>>, i: u32, ver: u32| {
+        db.append(&tail_key(i), &tail_val(ver));
+        want.entry(tail_key(i)).or_default().push(tail_val(ver));
+    };
+    for i in 0..3_000u32 {
+        put(&mut db, &mut want, i, 1);
+        if i % 100 == 99 {
+            db.commit().unwrap();
+        }
+    }
+    db.seal().unwrap();
+    db.settle().unwrap();
+    let w = db.seal_waits();
+    assert_eq!(w.wal_rotations, 0, "the seal rotated nothing");
+    assert_eq!(wal_files(&d).len(), 1, "one WAL, spanning the landed seal");
+    assert!(db.levels().1 > 0 || db.levels().0 > 0, "the seal landed");
+    holds_all(&db, &want, "after the seal");
+    drop(db);
+    let mut db = Db::open(&d, opts.clone()).unwrap();
+    assert_eq!(
+        db.unsealed_keys(),
+        0,
+        "the covered records are not replayed"
+    );
+    holds_all(&db, &want, "reopened over a WAL that spans the seal");
+
+    // Past `seal_bytes` of log -- the first phase's bytes are in the file
+    // still -- the commit rotates, synced first, while the memtable is
+    // well under the seal.
+    let levels = db.levels();
+    let mut i = 3_000u32;
+    while db.seal_waits().wal_rotations == 0 {
+        put(&mut db, &mut want, i, 1);
+        i += 1;
+        if i.is_multiple_of(100) {
+            db.commit().unwrap();
+        }
+        assert!(i < 20_000, "the log never rotated");
+    }
+    db.commit().unwrap();
+    let w = db.seal_waits();
+    assert_eq!(w.rotated_unsynced, 0, "every rotated file was synced whole");
+    assert_eq!(db.levels(), levels, "nothing sealed since the reopen");
+    assert_eq!(db.unsealed_keys(), (i - 3_000) as usize);
+    assert_eq!(wal_files(&d).len(), 2, "the closed file and the live one");
+    // The next seal covers every record in the closed file, and its
+    // landing retires it.
+    db.seal().unwrap();
+    db.settle().unwrap();
+    let wals = wal_files(&d);
+    assert_eq!(wals.len(), 1, "the closed files retired: {wals:?}");
+    holds_all(&db, &want, "after the rotation's seal");
+
+    // A crash with committed writes past the last seal: the reopen
+    // replays them from the live file behind the covered sequence.
+    for i in 0..500u32 {
+        put(&mut db, &mut want, i, 2);
+        if i % 100 == 99 {
+            db.commit().unwrap();
+        }
+    }
+    drop(db);
+    let db = Db::open(&d, opts).unwrap();
+    holds_all(&db, &want, "reopened after a crash past the seal");
+}
+
+/// The crash the rotation's sync exists for: the closed file whole and
+/// the new file torn anywhere, including before its header. Every record
+/// of the closed file comes back, and of the new file the batches before
+/// the tear, each whole -- and the store opens, where a closed file with
+/// an unsynced tail could leave a sequence gap replay refuses.
+#[test]
+fn a_rotated_wal_torn_in_its_new_file_reopens_to_a_prefix() {
+    let d = dir("walseq-torn");
+    let opts = Options {
+        seal_rotates_wal: false,
+        seal_bytes: 1 << 20,
+        seal_max_pct: 0,
+        sync: supdb::SyncPolicy::EveryN(u32::MAX),
+        // Ascending keys would go to ordered ingest, which writes a
+        // segment and not the log.
+        direct_ingest: false,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    // Records until the log has rotated once and before the memtable
+    // reaches the seal: a log frame carries its header beside the key and
+    // value, so the log passes `seal_bytes` first.
+    let mut i = 0u32;
+    while db.seal_waits().wal_rotations == 0 {
+        db.append(&tail_key(i), &tail_val(1));
+        i += 1;
+        if i.is_multiple_of(100) {
+            db.commit().unwrap();
+        }
+        assert!(i < 20_000, "the log never rotated");
+    }
+    let closed = i;
+    assert_eq!(
+        db.levels(),
+        (0, 0),
+        "nothing sealed: the closed file is not covered"
+    );
+    assert_eq!(db.seal_waits().rotated_unsynced, 0);
+    // Five batches of a hundred into the new file.
+    for b in 0..5u32 {
+        for j in 0..100u32 {
+            db.append(&tail_key(closed + b * 100 + j), &tail_val(1));
+        }
+        db.commit().unwrap();
+    }
+    assert_eq!(db.levels(), (0, 0), "still nothing sealed");
+    drop(db);
+    let wals = wal_files(&d);
+    assert_eq!(wals.len(), 2, "the closed file and the new one: {wals:?}");
+    let full = std::fs::read(&wals[1]).unwrap();
+    for cut in [
+        0usize,
+        3,
+        full.len() / 3,
+        full.len() / 2,
+        full.len() - 1,
+        full.len(),
+    ] {
+        std::fs::write(&wals[1], &full[..cut]).unwrap();
+        let db = Db::open(&d, opts.clone())
+            .unwrap_or_else(|e| panic!("the store must open with the new file cut at {cut}: {e}"));
+        let mut got = 0u32;
+        db.scan(b"", usize::MAX, |_, _| got += 1).unwrap();
+        assert!(
+            got >= closed,
+            "cut {cut}: every record of the closed file ({closed}), got {got}"
+        );
+        assert_eq!(
+            (got - closed) % 100,
+            0,
+            "cut {cut}: the new file's batches whole, got {got}"
+        );
+        if cut == full.len() {
+            assert_eq!(got, closed + 500, "uncut, every batch");
+        }
+        drop(db);
+        // The open truncated the file to its last commit; put it back.
+        std::fs::write(&wals[1], &full).unwrap();
+    }
+}
+
+/// A commit past the threshold while a seal holds the frozen slot keeps
+/// writing (`seal_defers`): the seal in flight is held before it writes,
+/// so a commit that waited for the slot would wait for good, and the
+/// deferred count says the commits took the other path. Released, a later
+/// commit seals what grew, and every key reads right.
+#[test]
+fn a_commit_past_the_threshold_keeps_writing_while_a_seal_holds_the_slot() {
+    let d = dir("seal-defers");
+    let opts = Options {
+        seal_rotates_wal: false,
+        seal_defers: true,
+        seal_bytes: 256 << 10,
+        seal_max_pct: 0,
+        sync: supdb::SyncPolicy::EveryN(u32::MAX),
+        // Ascending keys would go to ordered ingest, which writes a
+        // segment and not the log.
+        direct_ingest: false,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    // A commit that waited would never return; say so rather than hang.
+    // Disarmed as the commits end, or by the unwind of a failure in them,
+    // so an assertion below reports itself and not the watchdog.
+    struct Disarm(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let disarm = Disarm(done.clone());
+    let watch = {
+        let done = done.clone();
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                if t.elapsed() > std::time::Duration::from_secs(60) {
+                    eprintln!("a commit waited for a held seal: seal_defers did not defer");
+                    std::process::exit(101);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        })
+    };
+    db.hold_seal_landing(true);
+    let mut want: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    // Past the threshold once, which seals and holds the slot, then past
+    // it again and under the ceiling of twice the threshold.
+    let per = tail_key(0).len() + tail_val(1).len();
+    let first = (256 << 10) / per as u32 + 100;
+    let n = first + (350 << 10) / per as u32;
+    for i in 0..n {
+        db.append(&tail_key(i), &tail_val(1));
+        want.entry(tail_key(i)).or_default().push(tail_val(1));
+        if i % 100 == 99 {
+            db.commit().unwrap();
+        }
+    }
+    db.commit().unwrap();
+    drop(disarm);
+    watch.join().unwrap();
+    let w = db.seal_waits();
+    assert!(db.in_flight().0, "the first seal is in flight, held");
+    assert!(
+        w.deferred > 0,
+        "the commits past the threshold deferred: {w:?}"
+    );
+    assert_eq!(w.join_wait_ns, 0, "and none waited for the slot");
+    holds_all(&db, &want, "beside the held seal");
+    db.hold_seal_landing(false);
+    // The first seal lands; the table that grew meanwhile seals at the
+    // first commit that finds the slot free. A writer that goes quiet
+    // first leaves it live until it commits again -- this stage moves no
+    // idle tail.
+    db.settle().unwrap();
+    let before = db.seal_waits().publishes;
+    for i in n..n + 100 {
+        db.append(&tail_key(i), &tail_val(1));
+        want.entry(tail_key(i)).or_default().push(tail_val(1));
+    }
+    db.commit().unwrap();
+    db.settle().unwrap();
+    assert!(
+        db.seal_waits().publishes > before,
+        "the deferred seal happened once the slot freed"
+    );
+    assert!(
+        db.unsealed_keys() < 200,
+        "and took what grew: {} unsealed",
+        db.unsealed_keys()
+    );
+    holds_all(&db, &want, "after the deferred seal");
+}
+
+/// A fresh store under the shape (`adaptive_shape`) seals its first load
+/// at the floor (`seal_first_floor`), so the load leaves a partition
+/// behind, where without it a store under `seal_bytes` stays wholly in
+/// the memtable until something reads it.
+#[test]
+fn a_fresh_store_under_the_shape_seals_its_first_load_at_the_floor() {
+    for floor in [false, true] {
+        let d = dir(if floor {
+            "first-floor"
+        } else {
+            "first-floor-off"
+        });
+        let opts = Options {
+            adaptive_shape: true,
+            seal_rotates_wal: false,
+            seal_first_floor: floor,
+            sync: supdb::SyncPolicy::EveryN(u32::MAX),
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let n = 30_000u32;
+        let mut want: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+        for i in 0..n {
+            let k = (i as u64 * 7919 % n as u64) as u32;
+            db.append(&tail_key(k), &tail_val(1));
+            want.entry(tail_key(k)).or_default().push(tail_val(1));
+            if i % 1000 == 999 {
+                db.commit().unwrap();
+            }
+        }
+        db.settle().unwrap();
+        if floor {
+            assert!(
+                db.levels().0 >= 1,
+                "the load left a partition: {:?}, unsealed {}",
+                db.levels(),
+                db.unsealed_keys()
+            );
+            assert!(
+                db.unsealed_keys() < n as usize / 2,
+                "most of the load sealed: {} unsealed",
+                db.unsealed_keys()
+            );
+        } else {
+            assert_eq!(db.levels(), (0, 0), "without the floor nothing sealed");
+            assert_eq!(db.unsealed_keys(), n as usize);
+        }
+        holds_all(&db, &want, if floor { "the floor" } else { "no floor" });
+    }
+}
+
+/// The window a closed file spends between a seal's phases: the seal that
+/// takes it published and not durable, held there. The closed file is
+/// kept and the manifest untouched for as long as the seal is between its
+/// phases, and a crash there -- the drop joins the held seal and lands
+/// nothing durable -- reopens on the manifest before it, replaying both
+/// files: every committed record comes back.
+#[test]
+fn a_closed_wal_outlives_a_seal_between_its_phases_and_a_crash_there() {
+    let d = dir("walseq-between");
+    let opts = Options {
+        seal_rotates_wal: false,
+        seal_bytes: 1 << 20,
+        seal_max_pct: 0,
+        sync: supdb::SyncPolicy::EveryN(u32::MAX),
+        direct_ingest: false,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let mut want: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+    let mut i = 0u32;
+    while db.seal_waits().wal_rotations == 0 {
+        db.append(&tail_key(i), &tail_val(1));
+        want.entry(tail_key(i)).or_default().push(tail_val(1));
+        i += 1;
+        if i.is_multiple_of(100) {
+            db.commit().unwrap();
+        }
+        assert!(i < 20_000, "the log never rotated");
+    }
+    for _ in 0..3 {
+        for _ in 0..100 {
+            db.append(&tail_key(i), &tail_val(1));
+            want.entry(tail_key(i)).or_default().push(tail_val(1));
+            i += 1;
+        }
+        db.commit().unwrap();
+    }
+    assert_eq!(db.levels(), (0, 0), "nothing sealed yet");
+    let wals = wal_files(&d);
+    assert_eq!(wals.len(), 2, "the closed file and the live one: {wals:?}");
+    let closed = wals[0].clone();
+    let manifest = std::fs::read(d.join("manifest")).unwrap();
+    db.hold_seal_durable(true);
+    db.seal().unwrap();
+    wait_for("the seal's publish", || db.levels() != (0, 0));
+    assert!(db.in_flight().0, "the seal is between its phases");
+    assert!(
+        closed.exists(),
+        "the closed file outlives the undurable seal"
+    );
+    assert_eq!(
+        std::fs::read(d.join("manifest")).unwrap(),
+        manifest,
+        "no manifest while the seal is between its phases"
+    );
+    holds_all(&db, &want, "between the seal's phases");
+    drop(db);
+    let db = Db::open(&d, opts.clone()).unwrap();
+    holds_all(&db, &want, "reopened after a crash between the phases");
+    drop(db);
+    // And once a seal lands after the reopen, the open's older file is
+    // retired by it, as the closed one was to be.
+    let mut db = Db::open(&d, opts).unwrap();
+    db.append(&tail_key(i), &tail_val(1));
+    want.entry(tail_key(i)).or_default().push(tail_val(1));
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    assert_eq!(
+        wal_files(&d).len(),
+        1,
+        "the open's older files retired: {:?}",
+        wal_files(&d)
+    );
+    holds_all(&db, &want, "after the reopen's seal");
 }

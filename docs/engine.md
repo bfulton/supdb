@@ -2638,6 +2638,56 @@ that moves with the reads would have to be worth more than a seal's
 these rungs the lag it removes is worth less than that in either
 direction.
 
+#### Seals that keep the log, and a first seal at the floor
+
+The shape arm -- a `sync` that is the durable write alone, the store
+shaped once something reads it -- loads at 1.6-2.4x the flush arm and
+reads its first pass after the load at 0.05-0.08x. The question was
+whether a writer that only logs and a background that always seals
+could have both. Three levers, each behind its own option and priced
+against the arm it adds to, twelve pairs a rung at 10k, 100k and 300k:
+
+- **A seal keeps the WAL** (`seal_rotates_wal` off). The seal's end is
+  the live file's sequence, the file is not synced or rotated, and it
+  rotates by size at a commit, synced first -- replay carries each
+  file's sequence into the next and refuses a gap, so a file rotated
+  away with an unsynced tail could leave a store that does not open.
+  The writer's time in the seals its commits start fell to 4-10% on the
+  shape arm and 22-56% on the durable default, ycsb-F rose 1.2-1.3x on
+  the shape arm, and nothing fell.
+- **A commit defers** a seal the frozen slot cannot take
+  (`seal_defers`), up to twice the threshold. Inert on the suite: the
+  slot was almost never held at a threshold commit.
+- **A fresh store's first seal comes at the floor** under the shape
+  (`seal_first_floor`), so its load leaves a partition. The lag sweep's
+  first point rose 11x at 100k and 7.5x at 300k -- and the shuffled load
+  fell to 0.32x and 0.23x, with the point-read mixes at 0.83-0.87x.
+
+The floor's load was the commits'. A probe timing the load's appends
+and commits apart put the commits at 130-160 ms at a hundred thousand
+keys and 890 ms at three hundred thousand, against 6 ms without the
+floor: the settle files a batch whenever the backlog passes a share of
+the partitions' keys, and with a partition in place from the first
+megabyte every commit of the load filed its batch into block forms --
+over a thousand blocks built, most invalidated by the next seal or
+merge. Lending that work to the upkeep thread freed the commits and
+left the reads after the load building those blocks themselves, at a
+tenth of the rate. Counted as the load and the first pass together, the
+flush arm takes about 156 ms at a hundred thousand keys and 467 at
+three hundred thousand, the shape arm without the floor 116 and 334,
+and with it 222 and 1,004: the decoupled arm is already the faster in
+total, its first pass slow because the suite charges the flush arm's
+drain to its load and the shape arm's deferred shaping to its reads,
+and the floor moved work into the load rather than out of the path.
+
+Kept: all three options, off, with arms to price them (`supdb-walseq`,
+`supdb-shapewal`, `supdb-shapedefer`, `supdb-shapefloor`); a floor that
+never closes a direct run, which at the floor had cut the ordered load
+into partitions of a megabyte each. A rotation's bookkeeping moves
+before its directory barrier, and a failed barrier is retried by every
+commit before it writes: done after it, a failed fsync left the writer
+on a file at sequence zero under the old id.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and

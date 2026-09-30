@@ -852,6 +852,17 @@ misses, and a merge of two sides within a factor of a hundred of each
 other walks the longer side rather than searching it, since a walk
 streams and a search does not.
 
+**A read measured fast because the write paid for it.** A first seal
+at the floor left a partition behind a load, and the pass after the
+load read eleven times faster -- because every commit of the load, with
+a partition in place, filed its batch into block forms that the next
+seal or merge invalidated: 890 ms of commits at three hundred thousand
+keys against a load of 155. The row showed a read win and a load loss
+in two cells, and only their sum said the change was a loss. The rule:
+price a change that moves work between phases by the phases' sum; a
+structure built on a commit in a write-only stretch is paid for by the
+writer whether anything reads it or not.
+
 **A mark taken whole and then read in part.** A commit publishes the
 log's length, the entry count and the watermark as one mark, and a
 handle under `Latest` or `Snapshot` took the length and the watermark

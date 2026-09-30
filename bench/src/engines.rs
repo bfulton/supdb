@@ -425,6 +425,9 @@ pub struct Supdb {
     shape: bool,
     adaptcap: Option<usize>,
     adapttrig: bool,
+    walseq: bool,
+    defer: bool,
+    firstfloor: bool,
 }
 
 /// What an arm differs from `supdb` by. One struct rather than a row of
@@ -526,6 +529,15 @@ struct Policy {
     /// The merge trigger follows them too, `Options::adaptive_trigger`,
     /// with the cap. `supdb-adapttrig`, `supdb-ingestadapttrig`.
     adapttrig: bool,
+    /// A seal takes its end from the live WAL rather than rotating it,
+    /// `Options::seal_rotates_wal` off. `supdb-walseq`, `supdb-shapewal`.
+    walseq: bool,
+    /// A commit past the threshold keeps writing while a seal holds the
+    /// slot, `Options::seal_defers`. `supdb-shapedefer`.
+    defer: bool,
+    /// A store with nothing sealed seals at the floor under the shape,
+    /// `Options::seal_first_floor`. `supdb-shapefloor`.
+    firstfloor: bool,
 }
 
 impl Default for Policy {
@@ -550,6 +562,9 @@ impl Default for Policy {
             shape: false,
             adaptcap: None,
             adapttrig: false,
+            walseq: false,
+            defer: false,
+            firstfloor: false,
             aheadmin: None,
             lazyforms: false,
             eager: None,
@@ -698,6 +713,70 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 adapttrig: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// EXPERIMENT: `supdb` whose seals take their end from the live WAL
+    /// instead of rotating it (`Options::seal_rotates_wal` off).
+    pub fn create_walseq(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                walseq: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// EXPERIMENT: `supdb-ingestshape` whose seals keep the WAL.
+    pub fn create_shape_wal(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                drain: false,
+                durable: false,
+                shape: true,
+                walseq: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// EXPERIMENT: `supdb-shapewal` whose commits defer a seal the frozen
+    /// slot cannot take yet (`Options::seal_defers`); the deferred seal
+    /// takes whatever grew, up to twice the threshold, so the seal's size
+    /// moves with the wait it removes.
+    pub fn create_shape_defer(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                drain: false,
+                durable: false,
+                shape: true,
+                walseq: true,
+                defer: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// EXPERIMENT: `supdb-shapedefer` whose first seal comes at the floor
+    /// (`Options::seal_first_floor`), so its load leaves a partition.
+    pub fn create_shape_floor(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                drain: false,
+                durable: false,
+                shape: true,
+                walseq: true,
+                defer: true,
+                firstfloor: true,
                 ..Policy::default()
             },
         )
@@ -1248,6 +1327,9 @@ impl Supdb {
             leave,
             adaptcap,
             adapttrig,
+            walseq,
+            defer,
+            firstfloor,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -1362,6 +1444,9 @@ impl Supdb {
             adaptive_cap: adaptcap.is_some() || adapttrig,
             cap_reading_pct: adaptcap.unwrap_or(supdb::Options::default().cap_reading_pct),
             adaptive_trigger: adapttrig,
+            seal_rotates_wal: !walseq,
+            seal_defers: defer,
+            seal_first_floor: firstfloor,
             // Below this the builder declines and the writer fills the
             // forms inline on the commit path instead, which is the
             // comparison the threshold was never measured against.
@@ -1426,6 +1511,9 @@ impl Supdb {
             leave,
             adaptcap,
             adapttrig,
+            walseq,
+            defer,
+            firstfloor,
         })
     }
 }
@@ -1491,6 +1579,19 @@ impl Engine for Supdb {
     fn name(&self) -> &'static str {
         if self.budget > 0 {
             return "supdb-cache256";
+        }
+        if self.firstfloor {
+            return "supdb-shapefloor";
+        }
+        if self.defer {
+            return "supdb-shapedefer";
+        }
+        if self.walseq {
+            return if self.shape {
+                "supdb-shapewal"
+            } else {
+                "supdb-walseq"
+            };
         }
         if self.settle {
             return "supdb-settle";
@@ -1686,6 +1787,10 @@ impl Engine for Supdb {
             ("lazy_scans_resumed", db.lazy_scans().1 as f64),
             ("seals", db.seal_waits().joins as f64),
             ("publishes", db.seal_waits().publishes as f64),
+            ("seals_deferred", db.seal_waits().deferred as f64),
+            ("wal_rotations", db.seal_waits().wal_rotations as f64),
+            ("freeze_ms", db.seal_waits().freeze_ns as f64 / 1e6),
+            ("join_wait_ms", db.seal_waits().join_wait_ns as f64 / 1e6),
         ]
     }
     fn thread_reader(&self) -> Res<ReaderOpener> {
@@ -2144,9 +2249,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settleall" | "supdb-inline" | "supdb-tier" | "supdb-runs" | "supdb-keeper"
         | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice"
         | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "supdb-inlinemaint"
-        | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose" | "lmdb" | "rocksdb-tuned" => {
-            Guarantee::Durable
-        }
+        | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose" | "supdb-walseq" | "lmdb"
+        | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest"
         | "supdb-ingestleave"
         | "supdb-ingestnoseal"
@@ -2156,6 +2260,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestadapt"
         | "supdb-ingestadapttrig"
         | "supdb-ingestadaptloose"
+        | "supdb-shapewal"
+        | "supdb-shapedefer"
+        | "supdb-shapefloor"
         | "lmdb-nosync"
         | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
@@ -2208,6 +2315,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestadapt" => Box::new(Supdb::create_ingest_adapt(dir)?),
         "supdb-ingestadapttrig" => Box::new(Supdb::create_ingest_adapttrig(dir)?),
         "supdb-adaptloose" => Box::new(Supdb::create_adaptloose(dir)?),
+        "supdb-walseq" => Box::new(Supdb::create_walseq(dir)?),
+        "supdb-shapewal" => Box::new(Supdb::create_shape_wal(dir)?),
+        "supdb-shapedefer" => Box::new(Supdb::create_shape_defer(dir)?),
+        "supdb-shapefloor" => Box::new(Supdb::create_shape_floor(dir)?),
         "supdb-ingestadaptloose" => Box::new(Supdb::create_ingest_adaptloose(dir)?),
         "supdb-ingestnoseal" => Box::new(Supdb::create_ingest_noseal(dir)?),
         "lmdb" => Box::new(Lmdb::create(dir, map_gb)?),

@@ -482,6 +482,39 @@ pub struct Options {
     /// at its landing. Everything but the durable write is the segment
     /// work's, and inline the writer would be doing it itself.
     pub adaptive_shape: bool,
+    /// EXPERIMENT: whether a seal rotates the WAL. Rotating, the seal
+    /// syncs the log, starts the next file and syncs the directory on the
+    /// writer's thread -- 2.8 ms of a 5-6 ms freeze commit at a hundred
+    /// thousand keys, the fdatasync on a buffered store whose commits
+    /// never sync -- and the landing retires the file. Off, the seal
+    /// takes its end from the live file's sequence and leaves the file
+    /// open: replay skips every record below the manifest's covered
+    /// sequence inside a file as it does across files, and a seal ends
+    /// on a commit frame, so a file that spans a landed seal replays as
+    /// one that does not. The log rotates by size instead, at a commit
+    /// past `seal_bytes` of it, and only once the file is synced: replay carries each file's sequence into the next
+    /// and refuses a gap, so a file rotated away with an unsynced tail
+    /// could leave a store that does not open. A closed file retires at
+    /// the landing of the next seal, which covers every record in it.
+    pub seal_rotates_wal: bool,
+    /// EXPERIMENT: a commit past the seal threshold while a seal holds
+    /// the frozen slot keeps writing instead of waiting for the landing;
+    /// a later commit seals once the slot is free. Past a ceiling of
+    /// twice the threshold the commit waits as before, which keeps the
+    /// live table and the piece it seals into within a factor of two of
+    /// where the wait bounded them. Off, the commit waits in the seal for
+    /// the slot.
+    pub seal_defers: bool,
+    /// EXPERIMENT: under `adaptive_shape`, with `compact` and `promote`, a
+    /// store with no segment seals its first table at `SEAL_CAP_FLOOR`
+    /// rather than at `seal_bytes`, so a first load leaves a partition
+    /// behind -- the first seal's piece is promoted at its landing -- and
+    /// the cap's share of the store takes over from there. Never a direct
+    /// run's: a run closes when a seal would, and closed at the floor an
+    /// ordered load became partitions of a megabyte each. Without it a store under `seal_bytes` stays
+    /// wholly in the memtable until something reads it, and the first
+    /// scans after its load sort the whole table and walk the merge path.
+    pub seal_first_floor: bool,
     /// How a flush drains level 0 once partitions exist: merge only the
     /// ranges that hold pieces, under the live fences (`true`), or
     /// re-partition everything from every key (`false`, the original), kept
@@ -1071,6 +1104,9 @@ impl Default for Options {
             writer_pins: true,
             publish_in_background: true,
             adaptive_shape: false,
+            seal_rotates_wal: true,
+            seal_defers: false,
+            seal_first_floor: false,
             recycle_wal: false,
             read_advice: ReadAdvice::default(),
             scan_readahead_bytes: 256 << 10,
@@ -4982,6 +5018,17 @@ struct SealCounts {
     /// closed, promoted on their keys; for a test that asserts the arm.
     promoted: AtomicU64,
     promoted_open: AtomicU64,
+    /// Commits past the seal threshold that kept writing because a seal
+    /// held the frozen slot (`Options::seal_defers`).
+    deferred: AtomicU64,
+    /// WAL rotations, at seals or by size, and the bytes a rotation left
+    /// unsynced in the file it closed -- zero by construction, and the
+    /// quantity a test holds to it.
+    wal_rotations: AtomicU64,
+    rotated_unsynced: AtomicU64,
+    /// Time the writer spent in the seals its commits started: the wait
+    /// for the slot, the freeze, and the seal's writer half.
+    freeze_ns: AtomicU64,
 }
 
 impl SealCounts {
@@ -4999,6 +5046,10 @@ impl SealCounts {
             seal_snap_ns: get(&self.seal_snap_ns),
             seal_records_ns: get(&self.seal_records_ns),
             seal_thread_ns: get(&self.seal_thread_ns),
+            deferred: get(&self.deferred),
+            wal_rotations: get(&self.wal_rotations),
+            rotated_unsynced: get(&self.rotated_unsynced),
+            freeze_ns: get(&self.freeze_ns),
         }
     }
 
@@ -5029,6 +5080,13 @@ pub struct SealWaits {
     pub seal_snap_ns: u64,
     pub seal_records_ns: u64,
     pub seal_thread_ns: u64,
+    /// See `SealCounts`: commits that deferred their seal, WAL rotations
+    /// and the bytes they left unsynced, and the writer's time in the
+    /// seals its commits started.
+    pub deferred: u64,
+    pub wal_rotations: u64,
+    pub rotated_unsynced: u64,
+    pub freeze_ns: u64,
 }
 
 /// PROTOTYPE: records of one partition block a scan reads over unsealed
@@ -6367,6 +6425,11 @@ pub struct Db {
     dir: PathBuf,
     wal: Wal,
     wal_id: u64,
+    /// WAL files a size rotation closed (`Options::seal_rotates_wal` off),
+    /// each synced whole before the next was started, and handed to the
+    /// next seal's job: every record in them is below that seal's end, so
+    /// its durable landing's manifest covers them.
+    closed_wals: Vec<PathBuf>,
     mem_bytes: usize,
     /// The segment ordered ingest streams into, while one is open. The
     /// memtable is ordered exactly while a run is forming or open.
@@ -6392,8 +6455,15 @@ pub struct Db {
     built_ahead_len: usize,
     built_ahead_gen: u64,
     /// An error from leaving order mid-batch, which `append` and `delete`
-    /// cannot return: the next `commit` does.
+    /// cannot return: the next `commit` does. Also a rotation's, which
+    /// comes after its commit's batch is written and must not be read as
+    /// that batch failing.
     pending_err: Option<std::io::Error>,
+    /// A rotated WAL whose directory entry has not been made durable: the
+    /// barrier failed after the rotation's bookkeeping, and every commit
+    /// retries it before it writes, so nothing is acknowledged into a file
+    /// a crash could lose the name of (`Db::wal_dir_barrier`).
+    wal_dir_unsynced: bool,
     /// Commits written since the last barrier, for `SyncPolicy::EveryN`.
     unsynced: u32,
     /// The writes since the last read over lag, and the live table with
@@ -8043,6 +8113,18 @@ impl Reader {
                 .seal_bytes
                 .max(usize::try_from(grown).unwrap_or(usize::MAX))
         };
+        // A store with no segment and a shape the background makes: its
+        // first seal at the floor, so a first load leaves a partition. Not
+        // a direct run's; see `Options::seal_first_floor`.
+        if self.opts.seal_first_floor
+            && self.opts.adaptive_shape
+            && self.opts.compact
+            && self.opts.promote
+            && !st.mem.ordered
+            && st.segs.is_empty()
+        {
+            return base.min(SEAL_CAP_FLOOR);
+        }
         let pct = self.cap_pct();
         if pct == 0 {
             return base;
@@ -11942,10 +12024,93 @@ impl Db {
         dir.join(format!("spare-{id:08}"))
     }
 
+    /// The live WAL rotated once it passes `seal_bytes`, where seals no
+    /// longer rotate it (`Options::seal_rotates_wal` off): synced first,
+    /// since replay carries each file's sequence into the next and refuses
+    /// a gap, so a file rotated away with an unsynced tail could leave a
+    /// store that does not open; then the next file and its directory
+    /// entry, as a seal's rotation made them. The closed file waits in
+    /// `closed_wals` for the next seal to retire. The commit's batch is
+    /// written before this, so an error here is the next call's.
+    fn rotate_wal_by_size(&mut self) {
+        if self.opts.seal_rotates_wal || self.wal.written < self.opts.seal_bytes as u64 {
+            return;
+        }
+        if let Err(e) = self.rotate_wal() {
+            self.pending_err.get_or_insert(e);
+        }
+    }
+
+    /// The live WAL swapped for the next file. Every piece of the writer's
+    /// state moves before anything that can fail after the swap: the id,
+    /// the sequence, and the closed file's place in `closed_wals`. Done
+    /// after the barrier, a failed directory fsync left the writer on a
+    /// file at sequence zero under the old id, whose commits replay
+    /// skipped as covered, and the next rotation created the same name
+    /// over the live file and retired it. A failed barrier is sticky
+    /// instead (`wal_dir_unsynced`) and every commit retries it first.
+    fn rotate_wal(&mut self) -> Result<()> {
+        if self.wal.synced < self.wal.written {
+            self.wal.sync()?;
+            self.unsynced = 0;
+        }
+        let mut new_wal = self.next_wal(self.wal_id + 1)?;
+        new_wal.seq = self.wal.seq;
+        let old_wal = std::mem::replace(&mut self.wal, new_wal);
+        self.wal_id += 1;
+        SealCounts::add(
+            &self.shared.seal_counts.rotated_unsynced,
+            old_wal.written - old_wal.synced.min(old_wal.written),
+        );
+        SealCounts::add(&self.shared.seal_counts.wal_rotations, 1);
+        self.closed_wals.push(old_wal.path.clone());
+        self.wal_dir_unsynced = true;
+        self.wal_dir_barrier()
+    }
+
+    /// The directory fsync a rotation owes its new file, retried by every
+    /// commit until it succeeds; see `wal_dir_unsynced`.
+    fn wal_dir_barrier(&mut self) -> Result<()> {
+        if self.wal_dir_unsynced {
+            File::open(&self.dir)?.sync_all()?;
+            self.wal_dir_unsynced = false;
+        }
+        Ok(())
+    }
+
+    /// Whether a commit past the seal threshold seals now: always, unless
+    /// `Options::seal_defers` and a seal holds the frozen slot, when the
+    /// live table keeps growing and a later commit seals once the slot is
+    /// free -- up to a ceiling of twice the threshold, past which the
+    /// commit waits in the seal as before, so the table and the piece it
+    /// seals into stay within a factor of two of what the wait held them
+    /// to. A wedged queue seals, so its error reaches the caller.
+    fn seal_now(&self, threshold: usize) -> bool {
+        if !self.opts.seal_defers {
+            return true;
+        }
+        // The commit's held state dates from its start; a landing the
+        // segment work published meanwhile may have emptied the slot. A
+        // stale full slot only defers, so no order against the count.
+        self.rehold();
+        if self.state().frozen.is_none() || self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
+            return true;
+        }
+        if self.mem_bytes >= threshold.saturating_mul(2) {
+            return true;
+        }
+        SealCounts::add(&self.shared.seal_counts.deferred, 1);
+        false
+    }
+
     /// The new live WAL for a rotation: a recycled retiree when the pool
-    /// has one, else a fresh file.
+    /// has one, else a fresh file -- never over the live file's own name,
+    /// which a create would truncate and a retirement would delete.
     fn next_wal(&mut self, id: u64) -> Result<Wal> {
         let path = Db::wal_path(&self.dir, id);
+        if path == self.wal.path {
+            return Err(err("a rotation named the live WAL"));
+        }
         if self.opts.recycle_wal {
             if let Some(spare) = self.shared.take_spare() {
                 return Wal::recycle(&spare, &path, id);
@@ -12172,6 +12337,7 @@ impl Db {
             dir: dir.to_path_buf(),
             wal,
             wal_id: 0,
+            closed_wals: Vec::new(),
             mem_bytes: 0,
             direct: None,
             mem_handed: None,
@@ -12180,6 +12346,7 @@ impl Db {
             built_ahead_len: 0,
             built_ahead_gen: 0,
             pending_err: None,
+            wal_dir_unsynced: false,
             keeper: None,
             upkeeper: None,
             upkeep_log: (0, 0),
@@ -12517,6 +12684,7 @@ impl Db {
             dir: dir.to_path_buf(),
             wal,
             wal_id,
+            closed_wals: Vec::new(),
             mem_bytes,
             direct: None,
             mem_handed: None,
@@ -12525,6 +12693,7 @@ impl Db {
             built_ahead_len: 0,
             built_ahead_gen: 0,
             pending_err: None,
+            wal_dir_unsynced: false,
             keeper: None,
             upkeeper: None,
             upkeep_log: (0, 0),
@@ -12778,6 +12947,7 @@ impl Db {
         if self.mem().ordered {
             self.commit_direct()?;
         } else {
+            self.wal_dir_barrier()?;
             self.wal.mark_commit();
             self.wal.write()?;
             self.mem().commit();
@@ -12797,6 +12967,7 @@ impl Db {
                 self.wal.sync()?;
                 self.unsynced = 0;
             }
+            self.rotate_wal_by_size();
         }
         // A finished seal is joined before the maintenance, not after
         // it: its publish empties the writer's tables, and joined after
@@ -12839,8 +13010,14 @@ impl Db {
         self.lag_tick();
         // A direct run closes when a seal would: it joins whole, as a
         // seal's piece does by promotion, so the two paths leave one shape.
-        if self.mem_bytes >= self.seal_threshold() {
+        let threshold = self.seal_threshold();
+        if self.mem_bytes >= threshold && self.seal_now(threshold) {
+            let ts = std::time::Instant::now();
             self.seal()?;
+            SealCounts::add(
+                &self.shared.seal_counts.freeze_ns,
+                ts.elapsed().as_nanos() as u64,
+            );
             // The freeze's publish took the upkeep back, and a burst's
             // last commit that seals would leave the new state's upkeep
             // to the first read after it.
@@ -12915,6 +13092,7 @@ impl Db {
         if self.mem().ordered {
             self.commit_direct()
         } else {
+            self.wal_dir_barrier()?;
             self.wal.commit()?;
             self.mem().commit();
             Ok(())
@@ -13051,7 +13229,12 @@ impl Db {
             // waited for.
             Ok(names)
         };
-        self.hand_seal(job, table, None, Some(retiring));
+        // Every WAL record below the run's end was in a table sealed
+        // before the run opened -- a run opens only over an empty table
+        // and writes nothing to the log -- so its landing covers the
+        // files a size rotation closed as a seal's does.
+        let wals = std::mem::take(&mut self.closed_wals);
+        self.hand_seal(job, table, wals, Some(retiring));
     }
 
     /// Freeze the memtable, rotate the WAL, and hand the frozen table to a
@@ -13085,9 +13268,31 @@ impl Db {
             self.commit_direct()?;
             return self.close_direct();
         }
-        self.wal.commit()?;
-        self.mem().commit();
-        self.unsynced = 0;
+        self.wal_dir_barrier()?;
+        if self.opts.seal_rotates_wal {
+            self.wal.commit()?;
+            self.mem().commit();
+            self.unsynced = 0;
+        } else {
+            // What is staged commits as any commit does, synced when the
+            // policy is due and not otherwise: the seal no longer rotates
+            // the file, so nothing about the seal needs the log synced.
+            let staged = !self.wal.pending.is_empty();
+            self.wal.mark_commit();
+            self.wal.write()?;
+            self.mem().commit();
+            if staged {
+                self.unsynced += 1;
+            }
+            let due = match self.opts.sync {
+                SyncPolicy::Always => staged,
+                SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
+            };
+            if due {
+                self.wal.sync()?;
+                self.unsynced = 0;
+            }
+        }
         if self.mem().is_empty() {
             return Ok(());
         }
@@ -13104,15 +13309,22 @@ impl Db {
     /// file the landing retires, and the table cut at the partitions'
     /// fences into one piece per range; the second half of `seal`.
     fn seal_table(&mut self, table: std::sync::Arc<MemTable>) -> Result<()> {
-        let new_wal = self.next_wal(self.wal_id + 1)?;
-        let old_wal = std::mem::replace(&mut self.wal, new_wal);
-        // The new file's directory entry is made durable now, not at the
-        // end of the seal: commits into it are acknowledged from here on,
-        // and an fdatasync of the file does not promise the entry that
-        // names it. One directory barrier per seal, off the per-commit path.
-        File::open(&self.dir)?.sync_all()?;
-        self.wal_id += 1;
-        self.wal.seq = old_wal.seq;
+        // The file this seal retires, when it rotates one; otherwise the
+        // seal ends at the live file's sequence and the files a size
+        // rotation closed since the last seal retire with it. The new
+        // file's directory entry is made durable now, not at the end of
+        // the seal: commits into it are acknowledged from here on, and an
+        // fdatasync of the file does not promise the entry that names it.
+        // One directory barrier per seal, off the per-commit path, and a
+        // failed one sticky for the next commit to retry, as a size
+        // rotation's is (`rotate_wal`); the seal itself goes on, since it
+        // needs nothing of the new file.
+        if self.opts.seal_rotates_wal {
+            if let Err(e) = self.rotate_wal() {
+                self.pending_err.get_or_insert(e);
+            }
+        }
+        let retiring = std::mem::take(&mut self.closed_wals);
         // First, since it moves the held state to the latest, and the
         // fences below are taken from the same state.
         let first_partition = self.seals_first_partition();
@@ -13136,9 +13348,7 @@ impl Db {
         let background_io = self.opts.background_io;
         let sync_every = self.opts.seal_sync_every;
         let inline_max = self.opts.inline_bytes;
-        let end_seq = old_wal.seq;
-        let retiring = old_wal.path.clone();
-        drop(old_wal);
+        let end_seq = self.wal.seq;
         let limit = self.partition_limit();
         let mem = table.clone();
         let shared = self.shared.clone();
@@ -13346,7 +13556,7 @@ impl Db {
             // names the segments in the manifest, before the WAL retires.
             Ok(names)
         };
-        self.hand_seal(job, table, Some(retiring), None);
+        self.hand_seal(job, table, retiring, None);
         Ok(())
     }
 
@@ -14422,7 +14632,7 @@ impl Db {
         &mut self,
         job: impl FnOnce(&SealReadable) -> Result<Vec<String>> + Send + 'static,
         table: std::sync::Arc<MemTable>,
-        wal: Option<PathBuf>,
+        wal: Vec<PathBuf>,
         tmp: Option<PathBuf>,
     ) {
         let draining = self.draining;
@@ -17355,7 +17565,7 @@ struct SealJob {
     readable: std::sync::Arc<SealReadable>,
     landed: bool,
     table: std::sync::Arc<MemTable>,
-    wal: Option<PathBuf>,
+    wal: Vec<PathBuf>,
     tmp: Option<PathBuf>,
     draining: bool,
 }
@@ -18001,7 +18211,7 @@ impl Maint {
     fn land_durable(
         &mut self,
         t: std::time::Instant,
-        wal: Option<PathBuf>,
+        wal: Vec<PathBuf>,
         tmp: Option<PathBuf>,
     ) -> Result<()> {
         let tp = std::time::Instant::now();
