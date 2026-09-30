@@ -2378,6 +2378,31 @@ hundred markers on clean blocks, which ask a reader for more than those
 blocks need and lose nothing. What leaves them there inline is not
 traced.
 
+#### A seal lands in two phases
+
+A seal's thread renames its segments into place unsynced and names
+them to the segment work, which opens and publishes them and retires
+the frozen table in the same state; the fsyncs follow, on the seal's
+thread, and only when they are paid does the segment work write the
+manifest, retire the WAL and end the seal. A reader waits for no fsync,
+and the writer's backpressure -- one seal in flight -- still waits for
+the durable end, so landings keep sequence order. Between the phases no
+manifest is written: it would name segments that may be torn and cover
+a sequence the WAL still has to hold, so a merge that finishes in the
+window lands after the seal, and the shaping does not run in it. A
+store has a manifest from birth for the same reason; without one, open
+took every `seg-` file as live and skipped the WAL behind it, which was
+safe only while a segment was synced before it was renamed. The direct
+run's close takes the same two phases, its hard link being its rename.
+
+Priced with the probe of the seal's own landing at the suite's shape --
+shuffled keys, one seal, the landing polled for -- the time from
+`seal()` to the segments' visibility lost the fsyncs and nothing else;
+what remains of the landing is the piece's open, the Bloom built over
+its keys, which nothing here moved. `tests/db.rs` holds the store in the
+window (`Db::hold_seal_durable`) with a merge finishing beside the seal
+and checks that the manifest stands still until the seal is durable.
+
 #### A sync that is only the durable write
 
 The suite's supdb arms flush at `sync`: the tail sealed, the seal waited
