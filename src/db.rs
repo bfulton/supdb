@@ -3420,6 +3420,12 @@ const SLAB_BLOCKS: usize = 1 << 12;
 struct Slab<T> {
     blocks: Box<[AtomicPtr<T>]>,
     len: AtomicUsize,
+    /// The most entries ever published, which a truncation leaves where
+    /// it was: a reader that loaded the length before a truncation may
+    /// still read any entry below it (`truncate`), so that is what `get`
+    /// holds a number to.
+    #[cfg(debug_assertions)]
+    pushed: AtomicUsize,
 }
 
 impl<T> Slab<T> {
@@ -3429,6 +3435,8 @@ impl<T> Slab<T> {
                 .map(|_| AtomicPtr::new(std::ptr::null_mut()))
                 .collect(),
             len: AtomicUsize::new(0),
+            #[cfg(debug_assertions)]
+            pushed: AtomicUsize::new(0),
         }
     }
 
@@ -3456,15 +3464,26 @@ impl<T> Slab<T> {
         }
         // SAFETY: inside the block, at a number no reader has been given.
         unsafe { std::ptr::write(p.add(w), v) };
+        #[cfg(debug_assertions)]
+        {
+            assert_eq!(
+                self.pushed.load(AtomicOrdering::Relaxed),
+                id,
+                "memtable: a push into a truncated slab, over an entry a reader may hold"
+            );
+            self.pushed.store(id + 1, AtomicOrdering::Release);
+        }
         self.len.store(id + 1, AtomicOrdering::Release);
         id
     }
 
-    /// A published entry.
+    /// A published entry: below the length, or below the length a
+    /// truncation lowered, which a reader may have loaded before it.
     fn get(&self, id: usize) -> &T {
-        debug_assert!(
-            id < self.len(),
-            "memtable: an entry number past the published length"
+        #[cfg(debug_assertions)]
+        assert!(
+            id < self.pushed.load(AtomicOrdering::Acquire),
+            "memtable: an entry number past anything published"
         );
         let p = self.blocks[id >> SLAB_SHIFT].load(AtomicOrdering::Acquire);
         assert!(
@@ -4104,19 +4123,32 @@ impl MemTable {
         self.vals.slice(off + CHUNK_HDR, len as usize)
     }
 
-    fn get(&self, key: &[u8]) -> Option<&MemEntry> {
-        self.slot_of(key).map(|i| self.entry(i))
+    /// No bound on the entries a lookup may answer: the writer's own, and
+    /// a frozen table's, whose entries are all committed and final.
+    const ALL: usize = usize::MAX;
+
+    /// The entry holding `key` among the first `upto`: the entry count of
+    /// the commit the reader holds (`Reader::len_bound`), since an entry
+    /// past it is a key that commit does not hold -- staged by the writer
+    /// or committed after -- and a direct run's exit truncates its
+    /// uncommitted tail below the length a reader may have loaded
+    /// (`Slab::truncate`).
+    fn get(&self, key: &[u8], upto: usize) -> Option<&MemEntry> {
+        self.slot_of(key, upto).map(|i| self.entry(i))
     }
 
     /// `get` with the hash `prefetch` returned.
-    fn get_with(&self, hash: u64, key: &[u8]) -> Option<&MemEntry> {
+    fn get_with(&self, hash: u64, key: &[u8], upto: usize) -> Option<&MemEntry> {
         if self.ordered {
-            return self.get(key);
+            return self.get(key, upto);
         }
-        self.probe(hash, key).map(|i| self.entry(i))
+        self.probe(hash, key)
+            .filter(|&i| i < upto)
+            .map(|i| self.entry(i))
     }
 
-    /// The entry number holding `key`, if the table has it.
+    /// The entry number holding `key`, if the table has it among the
+    /// first `upto`; see `get`.
     ///
     /// An ordered table's entries are in key order, so its first and
     /// last entries fence it: a key outside them is answered by two
@@ -4124,9 +4156,9 @@ impl MemTable {
     /// the table cannot hold used to walk the whole binary search -- a
     /// live ordered tail of ten thousand keys beside a partition cost
     /// every read of the partition's keys fourteen steps to find nothing.
-    fn slot_of(&self, key: &[u8]) -> Option<usize> {
+    fn slot_of(&self, key: &[u8], upto: usize) -> Option<usize> {
         if self.ordered {
-            let n = self.len();
+            let n = self.len().min(upto);
             if n == 0 {
                 return None;
             }
@@ -4151,7 +4183,7 @@ impl MemTable {
             }
             return None;
         }
-        self.probe(mem_hash(key), key)
+        self.probe(mem_hash(key), key).filter(|&i| i < upto)
     }
 
     /// A hint to fetch the slot line `key` probes first, and its hash for
@@ -7665,10 +7697,16 @@ impl Reader {
                     self.held.store(p, AtomicOrdering::Relaxed);
                     // SAFETY: pinned above, so not freed under this handle.
                     let mem = &unsafe { &*p }.mem;
-                    // The log's length and the watermark of one commit:
-                    // see `MemTable::committed_at`.
-                    let (log, _, wm) = mem.committed_at();
+                    // The log's length, the entry count and the
+                    // watermark of one commit: see
+                    // `MemTable::committed_at`. The count bounds every
+                    // entry the read names, as the length bounds the log
+                    // it reads: a snapshot over the table's raw length
+                    // named the writer's staged keys, and a scan counted
+                    // them against its limit with nothing to emit.
+                    let (log, len, wm) = mem.committed_at();
                     self.log_bound.set(log);
+                    self.len_bound.set(len);
                     self.wm.set(wm);
                 }
                 Isolation::Dirty => {
@@ -7676,6 +7714,7 @@ impl Reader {
                     let p = self.shared.state.load(AtomicOrdering::Acquire);
                     self.held.store(p, AtomicOrdering::Relaxed);
                     self.log_bound.set(usize::MAX);
+                    self.len_bound.set(usize::MAX);
                     self.wm.set(SEE_ALL);
                 }
             }
@@ -7741,17 +7780,19 @@ impl Reader {
         self.held.store(p, AtomicOrdering::Relaxed);
         // SAFETY: pinned above, so not freed under this handle.
         let mem = &unsafe { &*p }.mem;
-        let (log, _, wm) = mem.committed_at();
+        let (log, len, wm) = mem.committed_at();
         self.log_bound.set(log);
+        self.len_bound.set(len);
         self.wm.set(wm);
         self.isolation.set(Isolation::Snapshot);
     }
 
-    /// PROTOTYPE: hold the state of generation `gen` under watermark `wm`,
-    /// both named by the writer for its builder ahead, as `snapshot`
-    /// holds the latest; false, and nothing held, when the state has moved
-    /// on already.
-    fn pin_at(&self, gen: u64, wm: u64, log: usize) -> bool {
+    /// PROTOTYPE: hold the state of generation `gen` at the commit `at`
+    /// names -- its watermark, log length and entry count -- named by the
+    /// writer for its builder ahead, as `snapshot` holds the latest; false,
+    /// and nothing held, when the state has moved on already.
+    fn pin_at(&self, at: &AtCommit) -> bool {
+        let AtCommit { gen, wm, log, len } = *at;
         let Some(slot) = self.slot else { return false };
         if self.isolation.get() == Isolation::Snapshot {
             self.release();
@@ -7765,6 +7806,7 @@ impl Reader {
         }
         self.held.store(p, AtomicOrdering::Relaxed);
         self.log_bound.set(log);
+        self.len_bound.set(len);
         self.wm.set(wm);
         self.isolation.set(Isolation::Snapshot);
         true
@@ -8258,7 +8300,7 @@ impl Reader {
         let mut start = 0usize;
         if st.has_tombstones() {
             if !mem_empty {
-                if let Some(e) = mem.get_with(hash, key) {
+                if let Some(e) = mem.get_with(hash, key, self.len_bound.get()) {
                     if mem.has_tomb(e, self.wm()) {
                         start = mem_ix;
                     }
@@ -8266,7 +8308,7 @@ impl Reader {
             }
             if start == 0 {
                 if let Some(fr) = &st.frozen {
-                    if let Some(e) = fr.get(key) {
+                    if let Some(e) = fr.get(key, MemTable::ALL) {
                         if fr.has_tomb(e, SEE_ALL) {
                             start = fr_ix;
                         }
@@ -8307,7 +8349,7 @@ impl Reader {
         }
         if fr_ix >= start {
             if let Some(fr) = &st.frozen {
-                if let Some(e) = fr.get(key) {
+                if let Some(e) = fr.get(key, MemTable::ALL) {
                     let (offs, _) = fr.live_chain(e, SEE_ALL);
                     n += offs.len() as u64;
                     for off in offs {
@@ -8317,7 +8359,7 @@ impl Reader {
             }
         }
         if mem_ix >= start && !mem_empty {
-            if let Some(e) = mem.get_with(hash, key) {
+            if let Some(e) = mem.get_with(hash, key, self.len_bound.get()) {
                 let (offs, _) = mem.live_chain(e, self.wm());
                 n += offs.len() as u64;
                 for off in offs {
@@ -8697,14 +8739,14 @@ impl Reader {
                 if in_unsealed {
                     if self
                         .mem()
-                        .get(key)
+                        .get(key, self.len_bound.get())
                         .is_some_and(|e| self.mem().has_tomb(e, self.wm()))
                     {
                         start = nc + 1;
                     } else if self
                         .frozen()
                         .as_ref()
-                        .and_then(|fr| fr.get(key).map(|e| fr.has_tomb(e, SEE_ALL)))
+                        .and_then(|fr| fr.get(key, MemTable::ALL).map(|e| fr.has_tomb(e, SEE_ALL)))
                         .unwrap_or(false)
                     {
                         start = nc;
@@ -8736,7 +8778,7 @@ impl Reader {
             if in_unsealed {
                 if nc >= start {
                     if let Some(fr) = self.frozen() {
-                        if let Some(e) = fr.get(key) {
+                        if let Some(e) = fr.get(key, MemTable::ALL) {
                             for off in fr.live_chain(e, SEE_ALL).0 {
                                 f(key, fr.value_at(off));
                             }
@@ -8744,7 +8786,7 @@ impl Reader {
                     }
                 }
                 if nc + 1 >= start {
-                    if let Some(e) = self.mem().get(key) {
+                    if let Some(e) = self.mem().get(key, self.len_bound.get()) {
                         for off in self.mem().live_chain(e, self.wm()).0 {
                             f(key, self.mem().value_at(off));
                         }
@@ -9162,7 +9204,10 @@ impl Reader {
                         let cut = BuildCtx::owner_of(seg, k).1;
                         // The list carries keys and not slots, so this
                         // path probes for the one the settle carries.
-                        let slot = self.mem().slot_of(k).map_or(u32::MAX, |i| i as u32);
+                        let slot = self
+                            .mem()
+                            .slot_of(k, self.len_bound.get())
+                            .map_or(u32::MAX, |i| i as u32);
                         self.patch_block(pi, b, table, k, cut, slot)?;
                     }
                 }
@@ -9826,12 +9871,15 @@ impl Reader {
                 .as_ref()
                 .filter(|(g, _)| *g == gen)
                 .map(|(_, s)| s.clone());
-            let snap = match self.adopt_snapshot() {
-                Some(s)
-                    if live_len.saturating_sub(s.live_len) <= self.opts.snapshot_adopt_behind =>
-                {
-                    s
-                }
+            // Only a published snapshot within this handle's commit: one
+            // past it -- published at a later commit, or by the writer
+            // over what it has staged -- names keys the commit does not
+            // hold, which the walk would count against the limit with
+            // nothing to emit. The builder ahead and the keeper refuse
+            // one for the same reason.
+            let published = self.adopt_snapshot().filter(|s| s.live_len <= live_len);
+            let snap = match published {
+                Some(s) if live_len - s.live_len <= self.opts.snapshot_adopt_behind => s,
                 // Short of current: carry the longer of the two runs
                 // forward rather than sort everything again. Taking it
                 // as it stands would leave the keys past it in the added
@@ -10550,7 +10598,8 @@ impl Reader {
                     held.push((key, j, r, u32::MAX));
                 }
             }
-            let slot_in = |t: &MemTable| t.slot_of(key).map_or(u32::MAX, |i| i as u32);
+            let slot_in =
+                |t: &MemTable| t.slot_of(key, MemTable::ALL).map_or(u32::MAX, |i| i as u32);
             let sk = SnapKey {
                 off: 0,
                 len: 0,
@@ -11797,7 +11846,7 @@ impl Reader {
         let mut start = 0usize;
         if st.has_tombstones() {
             if !mem_empty {
-                if let Some(e) = mem.get_with(hash, key) {
+                if let Some(e) = mem.get_with(hash, key, self.len_bound.get()) {
                     if mem.has_tomb(e, self.wm()) {
                         start = mem_ix;
                     }
@@ -11805,7 +11854,7 @@ impl Reader {
             }
             if start == 0 {
                 if let Some(fr) = &st.frozen {
-                    if let Some(e) = fr.get(key) {
+                    if let Some(e) = fr.get(key, MemTable::ALL) {
                         if fr.has_tomb(e, SEE_ALL) {
                             start = fr_ix;
                         }
@@ -11846,13 +11895,13 @@ impl Reader {
         }
         if fr_ix >= start {
             if let Some(fr) = &st.frozen {
-                if let Some(e) = fr.get(key) {
+                if let Some(e) = fr.get(key, MemTable::ALL) {
                     n += e.count.load(AtomicOrdering::Relaxed);
                 }
             }
         }
         if mem_ix >= start && !mem_empty {
-            if let Some(e) = mem.get_with(hash, key) {
+            if let Some(e) = mem.get_with(hash, key, self.len_bound.get()) {
                 n += mem.live_chain(e, self.wm()).0.len() as u64;
             }
         }
@@ -14985,10 +15034,10 @@ impl Reader {
         posted: &std::sync::atomic::AtomicBool,
         held: &[Vec<bool>],
     ) -> Result<()> {
-        let AtCommit { gen, wm, log, len } = at;
-        if !self.pin_at(gen, wm, log) {
+        if !self.pin_at(&at) {
             return Ok(());
         }
+        let len = at.len;
         // The builder needs the keys up to `len` exactly, so it takes a
         // published snapshot only to carry it forward: one that stops
         // short is merged with the batch since, and one past `len` holds
@@ -15039,7 +15088,7 @@ impl Reader {
                 let full = forms.len() == AHEAD_BATCH || (b == nblocks && !forms.is_empty());
                 if full {
                     let built = Built {
-                        gen,
+                        gen: at.gen,
                         name: seg.name.clone(),
                         forms: std::mem::replace(&mut forms, Vec::with_capacity(AHEAD_BATCH)),
                     };

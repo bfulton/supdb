@@ -3024,7 +3024,10 @@ per-commit path.
   construction. How far behind a published snapshot may be and still be
   worth adopting is its own quantity (`snapshot_adopt_behind`, 0): at
   zero a handle takes only a snapshot that is current, which is the
-  whole of the saving above and buys no list at all, and the looser
+  whole of the saving above and buys no list at all. None past the
+  handle's commit is taken at any setting: one published at a later
+  commit, or by the writer over what it has staged, names keys the
+  handle's commit does not hold, and a scan would count them. The looser
   settings are the arm for a store written between the reads. Its first version built from the segments alone with
   an empty memtable, because the memtable was one thread's; that version
   was a tie at thirty million, where E starts on a million and a half
@@ -3242,8 +3245,12 @@ per-commit path.
   blocks from is read to the same mark: the length it had at the
   watermark's commit. Read to its end, a handle settled a staged write
   under the committed watermark and kept the old run after the commit,
-  since the log had not moved. The length and the watermark are taken
-  as one commit's: a commit writes its log length, entry count and
+  since the log had not moved. The live table's entries are read to the
+  same mark too, the entry count of that commit: read to the raw
+  length, a handle's scan snapshot held the writer's staged keys, whose
+  values the watermark hid, and the walk counted each against the
+  scan's limit with nothing to emit. The length, the count and the
+  watermark are taken as one commit's: a commit writes its log length, entry count and
   watermark into the one of two marks the commit before it did not
   write, and then names it, and a reader takes a mark only while it
   stays named, so it never waits on the writer. Taken as two loads, a

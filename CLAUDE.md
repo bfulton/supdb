@@ -852,6 +852,31 @@ misses, and a merge of two sides within a factor of a hundred of each
 other walks the longer side rather than searching it, since a walk
 streams and a search does not.
 
+**A mark taken whole and then read in part.** A commit publishes the
+log's length, the entry count and the watermark as one mark, and a
+handle under `Latest` or `Snapshot` took the length and the watermark
+and left the count: it read the live table's entries to their raw
+length, the writer's staged keys among them. A staged key's values sit
+past the watermark, so nothing read back wrong by value and every test
+that compared values passed; but a scan's snapshot held the key, and
+the walk counted it against the limit with nothing to emit -- a scan of
+ten beside ten staged keys answered five. The snapshot went into the
+state for other handles, and a handle adopted any published snapshot at
+or past its own length, so a handle pinned at one commit counted a later
+commit's keys the same way. It surfaced as a debug assertion in the
+reader-thread test, where the store's first key opens a direct run and
+the writer's next, smaller key leaves it: the run's uncommitted tail is
+truncated from the ordered table, and a handle whose snapshot named that
+entry read past the table's length. A bisect named the commit where the
+test began to catch it; the three tests written for the fix fail on the
+commit before it too. Every pin now takes all three quantities, a
+live-table lookup honours the count, and a handle adopts no published
+snapshot past it, as the builder ahead and the keeper already refused
+one. The rule: a mark published as one is taken as one, every position
+a read names -- in the log, the entries, the arena -- is bounded by the
+mark's quantity for it, and a value the watermark hides is still a key
+until the count hides it too.
+
 **A sentinel that crosses the wasm boundary changes sign.** A wasm `u32`
 arrives in JavaScript as a signed i32, so a failure sentinel of `u32::MAX`
 arrives as -1 and a comparison against 4294967295 can never match. Every

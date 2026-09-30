@@ -7206,6 +7206,138 @@ fn a_merge_that_finishes_while_a_seal_is_between_its_phases_lands_after_it() {
     check(&db, "reopened");
 }
 
+/// A handle under `Latest` or `Snapshot` reads the live table to the entry
+/// count of the commit it holds, as it reads the log to that commit's
+/// length and the values to its watermark. A handle held across a direct
+/// run's exit is the sharp case: the run's uncommitted tail is truncated
+/// from the ordered table and re-appended to the next one, so a snapshot
+/// over the table's raw length names an entry the table no longer has.
+#[test]
+fn a_held_handle_never_names_an_entry_a_direct_run_left_uncommitted() {
+    let d = dir("held-direct-exit");
+    let mut db = Db::create(&d, Options::default()).unwrap();
+    let r = db.reader().unwrap();
+    // The first key of an empty store opens an ordered run, left
+    // uncommitted.
+    db.append(b"key-5", b"staged");
+    r.snapshot();
+    let mut first = Vec::new();
+    let n = r
+        .scan(b"", 10, |k, v| first.push((k.to_vec(), v.to_vec())))
+        .unwrap();
+    assert!(first.is_empty(), "the held commit has nothing: {first:?}");
+    assert_eq!(n, 0, "a scan counted a key its commit does not hold");
+    // A key below the run's greatest leaves the run: its uncommitted tail
+    // is truncated from the ordered table.
+    db.append(b"key-1", b"staged");
+    let mut again = Vec::new();
+    let n = r
+        .scan(b"", 10, |k, v| again.push((k.to_vec(), v.to_vec())))
+        .unwrap();
+    assert!(again.is_empty(), "the held commit has nothing: {again:?}");
+    assert_eq!(n, 0);
+    r.release();
+    db.commit().unwrap();
+    let mut after = Vec::new();
+    r.scan(b"", 10, |k, _| after.push(k.to_vec())).unwrap();
+    assert_eq!(after, vec![b"key-1".to_vec(), b"key-5".to_vec()]);
+}
+
+/// A scan's limit counts the keys its commit holds: a key the writer has
+/// staged and not committed is not one, and a handle that counted it
+/// answered short of the limit with every key it skipped still unsealed.
+#[test]
+fn a_handles_scan_limit_counts_only_committed_keys() {
+    let d = dir("scan-limit-committed");
+    let opts = Options {
+        direct_ingest: false,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    for k in 0..20u32 {
+        db.append(format!("key-{k:02}").as_bytes(), b"v");
+    }
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    // New keys between the committed ones, staged and not committed.
+    for k in 0..10u32 {
+        db.append(format!("key-{k:02}a").as_bytes(), b"staged");
+    }
+    let mut got = Vec::new();
+    let n = r.scan(b"", 10, |k, _| got.push(k.to_vec())).unwrap();
+    let want: Vec<Vec<u8>> = (0..10u32)
+        .map(|k| format!("key-{k:02}").into_bytes())
+        .collect();
+    assert_eq!(
+        got, want,
+        "a handle's scan answered keys of no commit or fell short"
+    );
+    assert_eq!(n, 10);
+    db.commit().unwrap();
+}
+
+/// A published snapshot is adopted only by a handle whose commit holds
+/// every entry it names: one published at a later commit, or by the
+/// writer over what it has staged, names keys the adopting handle's
+/// commit does not hold, and a scan that walked it counted them.
+#[test]
+fn a_handle_adopts_no_snapshot_past_its_commit() {
+    let d = dir("adopt-past-commit");
+    let opts = Options {
+        direct_ingest: false,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    for k in 0..20u32 {
+        db.append(format!("key-{k:02}").as_bytes(), b"v");
+    }
+    db.commit().unwrap();
+    let want: Vec<Vec<u8>> = (0..10u32)
+        .map(|k| format!("key-{k:02}").into_bytes())
+        .collect();
+    let scan10 = |r: &Reader| {
+        let mut got = Vec::new();
+        let n = r.scan(b"", 10, |k, _| got.push(k.to_vec())).unwrap();
+        (got, n)
+    };
+    // A handle pinned at this commit, and a later commit's snapshot
+    // published by another handle over the same state.
+    let pinned = db.reader().unwrap();
+    pinned.snapshot();
+    for k in 0..10u32 {
+        db.append(format!("key-{k:02}a").as_bytes(), b"later");
+    }
+    db.commit().unwrap();
+    let latest = db.reader().unwrap();
+    let (got, n) = scan10(&latest);
+    assert_eq!(n, 10);
+    assert_eq!(got.len(), 10);
+    let (got, n) = scan10(&pinned);
+    assert_eq!(got, want, "a pinned handle walked a later commit's keys");
+    assert_eq!(n, 10);
+    pinned.release();
+    // The writer's own scan over keys it has staged, and a handle at the
+    // last commit after it.
+    for k in 0..10u32 {
+        db.append(format!("key-{k:02}b").as_bytes(), b"staged");
+    }
+    let mut mine = 0usize;
+    db.scan(b"", 40, |_, _| mine += 1).unwrap();
+    assert_eq!(mine, 40, "the writer reads what it has staged");
+    let fresh = db.reader().unwrap();
+    let (got, n) = scan10(&fresh);
+    let want_latest: Vec<Vec<u8>> = (0..5u32)
+        .flat_map(|k| [format!("key-{k:02}"), format!("key-{k:02}a")])
+        .map(String::into_bytes)
+        .collect();
+    assert_eq!(
+        got, want_latest,
+        "a handle walked keys the writer has only staged"
+    );
+    assert_eq!(n, 10);
+    db.commit().unwrap();
+}
+
 /// Reader handles across seals whose segments land before their fsyncs:
 /// every value of a key once and in order, through point reads and scans,
 /// before the landing, in the window between the phases -- held open at
