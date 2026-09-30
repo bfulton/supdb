@@ -482,13 +482,14 @@ pub struct Options {
     /// at its landing. Everything but the durable write is the segment
     /// work's, and inline the writer would be doing it itself.
     pub adaptive_shape: bool,
-    /// EXPERIMENT: whether a seal rotates the WAL. Rotating, the seal
-    /// syncs the log, starts the next file and syncs the directory on the
-    /// writer's thread -- 2.8 ms of a 5-6 ms freeze commit at a hundred
-    /// thousand keys, the fdatasync on a buffered store whose commits
-    /// never sync -- and the landing retires the file. Off, the seal
-    /// takes its end from the live file's sequence and leaves the file
-    /// open: replay skips every record below the manifest's covered
+    /// Whether a seal rotates the WAL, the shape before seals kept it,
+    /// kept as the comparison arm (`supdb-rotate`, `supdb-shaperotate`).
+    /// Rotating, the seal syncs the log, starts the next file and syncs
+    /// the directory on the writer's thread -- 2.8 ms of a 5-6 ms freeze
+    /// commit at a hundred thousand keys, the fdatasync on a buffered
+    /// store whose commits never sync -- and the landing retires the
+    /// file. Off, the default, a write only logs: the seal takes its end
+    /// from the live file's sequence and leaves the file open: replay skips every record below the manifest's covered
     /// sequence inside a file as it does across files, and a seal ends
     /// on a commit frame, so a file that spans a landed seal replays as
     /// one that does not. The log rotates by size instead, at a commit
@@ -1104,7 +1105,7 @@ impl Default for Options {
             writer_pins: true,
             publish_in_background: true,
             adaptive_shape: false,
-            seal_rotates_wal: true,
+            seal_rotates_wal: false,
             seal_defers: false,
             seal_first_floor: false,
             recycle_wal: false,

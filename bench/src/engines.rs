@@ -425,7 +425,7 @@ pub struct Supdb {
     shape: bool,
     adaptcap: Option<usize>,
     adapttrig: bool,
-    walseq: bool,
+    rotate: bool,
     defer: bool,
     firstfloor: bool,
 }
@@ -529,9 +529,9 @@ struct Policy {
     /// The merge trigger follows them too, `Options::adaptive_trigger`,
     /// with the cap. `supdb-adapttrig`, `supdb-ingestadapttrig`.
     adapttrig: bool,
-    /// A seal takes its end from the live WAL rather than rotating it,
-    /// `Options::seal_rotates_wal` off. `supdb-walseq`, `supdb-shapewal`.
-    walseq: bool,
+    /// A seal syncs and rotates the WAL, the shape before seals kept it,
+    /// `Options::seal_rotates_wal`. `supdb-rotate`, `supdb-shaperotate`.
+    rotate: bool,
     /// A commit past the threshold keeps writing while a seal holds the
     /// slot, `Options::seal_defers`. `supdb-shapedefer`.
     defer: bool,
@@ -562,7 +562,7 @@ impl Default for Policy {
             shape: false,
             adaptcap: None,
             adapttrig: false,
-            walseq: false,
+            rotate: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -718,20 +718,21 @@ impl Supdb {
         )
     }
 
-    /// EXPERIMENT: `supdb` whose seals take their end from the live WAL
-    /// instead of rotating it (`Options::seal_rotates_wal` off).
-    pub fn create_walseq(path: &Path) -> Res<Supdb> {
+    /// `supdb` whose seals sync and rotate the WAL on the writer's
+    /// thread (`Options::seal_rotates_wal`), the shape before seals kept
+    /// it: the comparison arm for that change.
+    pub fn create_rotate(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                walseq: true,
+                rotate: true,
                 ..Policy::default()
             },
         )
     }
 
-    /// EXPERIMENT: `supdb-ingestshape` whose seals keep the WAL.
-    pub fn create_shape_wal(path: &Path) -> Res<Supdb> {
+    /// `supdb-ingestshape` whose seals rotate the WAL, as `supdb-rotate`.
+    pub fn create_shape_rotate(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
@@ -739,13 +740,13 @@ impl Supdb {
                 drain: false,
                 durable: false,
                 shape: true,
-                walseq: true,
+                rotate: true,
                 ..Policy::default()
             },
         )
     }
 
-    /// EXPERIMENT: `supdb-shapewal` whose commits defer a seal the frozen
+    /// EXPERIMENT: `supdb-ingestshape` whose commits defer a seal the frozen
     /// slot cannot take yet (`Options::seal_defers`); the deferred seal
     /// takes whatever grew, up to twice the threshold, so the seal's size
     /// moves with the wait it removes.
@@ -757,7 +758,6 @@ impl Supdb {
                 drain: false,
                 durable: false,
                 shape: true,
-                walseq: true,
                 defer: true,
                 ..Policy::default()
             },
@@ -774,7 +774,6 @@ impl Supdb {
                 drain: false,
                 durable: false,
                 shape: true,
-                walseq: true,
                 defer: true,
                 firstfloor: true,
                 ..Policy::default()
@@ -1327,7 +1326,7 @@ impl Supdb {
             leave,
             adaptcap,
             adapttrig,
-            walseq,
+            rotate,
             defer,
             firstfloor,
         } = policy;
@@ -1444,7 +1443,7 @@ impl Supdb {
             adaptive_cap: adaptcap.is_some() || adapttrig,
             cap_reading_pct: adaptcap.unwrap_or(supdb::Options::default().cap_reading_pct),
             adaptive_trigger: adapttrig,
-            seal_rotates_wal: !walseq,
+            seal_rotates_wal: rotate,
             seal_defers: defer,
             seal_first_floor: firstfloor,
             // Below this the builder declines and the writer fills the
@@ -1511,7 +1510,7 @@ impl Supdb {
             leave,
             adaptcap,
             adapttrig,
-            walseq,
+            rotate,
             defer,
             firstfloor,
         })
@@ -1586,11 +1585,11 @@ impl Engine for Supdb {
         if self.defer {
             return "supdb-shapedefer";
         }
-        if self.walseq {
+        if self.rotate {
             return if self.shape {
-                "supdb-shapewal"
+                "supdb-shaperotate"
             } else {
-                "supdb-walseq"
+                "supdb-rotate"
             };
         }
         if self.settle {
@@ -2249,7 +2248,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settleall" | "supdb-inline" | "supdb-tier" | "supdb-runs" | "supdb-keeper"
         | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice"
         | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "supdb-inlinemaint"
-        | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose" | "supdb-walseq" | "lmdb"
+        | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose" | "supdb-rotate" | "lmdb"
         | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest"
         | "supdb-ingestleave"
@@ -2260,7 +2259,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestadapt"
         | "supdb-ingestadapttrig"
         | "supdb-ingestadaptloose"
-        | "supdb-shapewal"
+        | "supdb-shaperotate"
         | "supdb-shapedefer"
         | "supdb-shapefloor"
         | "lmdb-nosync"
@@ -2315,8 +2314,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestadapt" => Box::new(Supdb::create_ingest_adapt(dir)?),
         "supdb-ingestadapttrig" => Box::new(Supdb::create_ingest_adapttrig(dir)?),
         "supdb-adaptloose" => Box::new(Supdb::create_adaptloose(dir)?),
-        "supdb-walseq" => Box::new(Supdb::create_walseq(dir)?),
-        "supdb-shapewal" => Box::new(Supdb::create_shape_wal(dir)?),
+        "supdb-rotate" => Box::new(Supdb::create_rotate(dir)?),
+        "supdb-shaperotate" => Box::new(Supdb::create_shape_rotate(dir)?),
         "supdb-shapedefer" => Box::new(Supdb::create_shape_defer(dir)?),
         "supdb-shapefloor" => Box::new(Supdb::create_shape_floor(dir)?),
         "supdb-ingestadaptloose" => Box::new(Supdb::create_ingest_adaptloose(dir)?),

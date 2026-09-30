@@ -63,8 +63,10 @@ checkpoint.
   interface: the store knows its greatest key. `direct_ingest: false` is
   the WAL path, kept as the comparison arm.
 - **Seal** = when the memtable reaches segment size, write one immutable
-  segment (data blocks + its own flat index), fsync it, truncate the WAL.
-  Sealing is off the commit path; a durability point never publishes index
+  segment (data blocks + its own flat index) and fsync it. The WAL is not
+  touched: the seal ends at the live file's sequence, replay skips what a
+  manifest covers, and the log rotates by size, a closed file retiring at
+  the next seal's landing. Sealing is off the commit path; a durability point never publishes index
   structure, which is what removes the checkpoint's mechanism rather than
   its cost.
 - **Read** = probe segments, newest first. Both halves of this were
@@ -2680,8 +2682,10 @@ total, its first pass slow because the suite charges the flush arm's
 drain to its load and the shape arm's deferred shaping to its reads,
 and the floor moved work into the load rather than out of the path.
 
-Kept: all three options, off, with arms to price them (`supdb-walseq`,
-`supdb-shapewal`, `supdb-shapedefer`, `supdb-shapefloor`); a floor that
+Kept: seals that keep the WAL as the default, since nothing fell, with
+the rotating seal as the comparison arm (`supdb-rotate`,
+`supdb-shaperotate`); the other two options off, with arms to price
+them (`supdb-shapedefer`, `supdb-shapefloor`); a floor that
 never closes a direct run, which at the floor had cut the ordered load
 into partitions of a megabyte each. A rotation's bookkeeping moves
 before its directory barrier, and a failed barrier is retried by every

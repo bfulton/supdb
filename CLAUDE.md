@@ -338,7 +338,13 @@ Commit is a WAL append and one fdatasync; the batch is durable or its tail
 frame fails its CRC and replay stops before it. Seal is write to a temp name,
 rename into place, publish to readers, fsync, then the manifest -- written,
 fsynced and renamed, and the directory fsynced once for the segment's entry
-and the manifest's together -- then reset the WAL. Readers wait for no
+and the manifest's together. The seal leaves the WAL open and ends at
+its sequence, since replay skips every record a manifest covers; the log
+rotates by size at a commit, synced and its directory entry synced
+first, because replay refuses a sequence gap across files, and a closed
+file retires at the next seal's durable landing, whose manifest covers
+it (`seal_rotates_wal` is the arm that syncs and rotates at every seal
+instead). Readers wait for no
 fsync and the manifest does, and no manifest is written while a seal's
 segments are published and unsynced -- it would name a segment that may be
 torn and cover a sequence the WAL still has to hold -- so a merge that

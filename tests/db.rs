@@ -1356,6 +1356,8 @@ fn a_wal_header_torn_by_power_loss_opens_and_is_rewritten() {
     let d = dir("torn-header");
     let opts = Options {
         seal_bytes: 1 << 10,
+        // The seal's rotation; a rotation by size has its own test.
+        seal_rotates_wal: true,
         ..Options::default()
     };
     let newest_wal = |d: &std::path::Path| -> std::path::PathBuf {
@@ -8006,6 +8008,8 @@ fn a_hashed_tail_handed_beside_a_seal_in_flight_lands_as_a_piece() {
             // Buffered commits, the arm's shape, so the tail's few commits
             // do not wait out the seal in flight.
             sync: supdb::SyncPolicy::EveryN(u32::MAX),
+            // Each seal's own WAL, retired by its own landing.
+            seal_rotates_wal: true,
             ..Options::default()
         },
     )
@@ -8165,8 +8169,11 @@ fn a_handle_extends_the_seals_snapshot_with_the_keys_written_after_it() {
 /// two windows.
 #[test]
 fn a_handed_tables_log_is_retired_at_its_landing_and_replays_before_it() {
+    // The windows of a hand-off that rotates the WAL; a seal that keeps
+    // it has its own, below.
     let opts = || Options {
         adaptive_shape: true,
+        seal_rotates_wal: true,
         ..Options::default()
     };
     // The hashed tail: updates over a partition, through the WAL.
