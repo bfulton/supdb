@@ -321,6 +321,45 @@ pub struct Options {
     /// one-sided on the ladder: ycsb-E is the only mix this engine loses
     /// to LMDB, at 0.74x-0.87x, and ycsb-F it wins by 2.84x-6.27x.
     pub seal_max_pct: usize,
+    /// EXPERIMENT: the seal cap follows the reads. A scan over unsealed
+    /// keys or level-0 pieces, or a point read whose key's range has
+    /// level-0 pieces, is a read that lag costs, and one raises the
+    /// store's lag level to its full at the writer's next commit
+    /// (`Reader::lag_level`); the writes since the last such read, over
+    /// `lag_relax_pct` of the partitions' keys, take it back to zero. The
+    /// cap the seal threshold takes is `cap_reading_pct` at the full
+    /// level, `seal_max_pct` at zero, and the line between, so a store
+    /// nobody reads seals as the cap has it and one being read seals
+    /// sooner -- or later, with `cap_reading_pct` above the cap, for the
+    /// store whose reads a seal costs more than the lag it removes; the
+    /// sweep's shape -- a burst with no reads, then a pass of
+    /// them -- is why the level decays with writes and not with time,
+    /// and the level moves at a commit, so a pass of reads with no write
+    /// between tightens the cadence of the burst after it. Off is the
+    /// cap as it stands, whoever is reading; `seal_max_pct` of zero,
+    /// uncapped, stays uncapped either way.
+    pub adaptive_cap: bool,
+    /// The seal cap, as a percentage of the store, at the full lag
+    /// level; `SEAL_CAP_FLOOR` floors it as it floors the cap. Below
+    /// `seal_max_pct` the cap tightens under reads, above it the cap
+    /// loosens.
+    pub cap_reading_pct: usize,
+    /// EXPERIMENT: the merge trigger follows the reads as the cap does:
+    /// `trigger_reading` pieces a range at the full lag level,
+    /// `l0_trigger` at zero, and the line between. The seal's growth
+    /// rule (`seal_grows`) keeps dividing by `l0_trigger`, so at the full
+    /// level a merge takes in fewer pieces than the seal was sized for
+    /// and rewrites more per byte taken; that is the trade the arm
+    /// prices.
+    pub adaptive_trigger: bool,
+    /// The pieces a range holds before it merges, at the full lag level;
+    /// below `l0_trigger` the trigger tightens under reads, above it the
+    /// trigger loosens.
+    pub trigger_reading: usize,
+    /// The writes, as a percentage of the partitions' keys, over which
+    /// the lag level decays from full to zero with no read over lag
+    /// between; floored at `LAG_RELAX_FLOOR` keys.
+    pub lag_relax_pct: usize,
     /// Size the store for `seal_grows` and `seal_max_pct` by its
     /// partitions' file bytes (`true`, the rule before) rather than by the
     /// key and value bytes they hold (`false`). The file's length moves
@@ -1008,6 +1047,11 @@ impl Default for Options {
             // bytes.
             seal_bytes: 32 << 20,
             seal_max_pct: 10,
+            adaptive_cap: false,
+            cap_reading_pct: 2,
+            adaptive_trigger: false,
+            trigger_reading: 2,
+            lag_relax_pct: 100,
             seal_on_file: false,
             seal_grows: true,
             direct_ingest: true,
@@ -3494,6 +3538,9 @@ struct Slot {
     /// Reads and scans this handle made over a store with pieces and no
     /// partition (`Options::adaptive_shape`).
     unshaped: AtomicU64,
+    /// Reads and scans this handle made that lag cost: over unsealed
+    /// keys or level-0 pieces (`Options::adaptive_cap`).
+    lag: AtomicU64,
     takes: AtomicU64,
     tried: AtomicU64,
     hit: AtomicU64,
@@ -3507,6 +3554,7 @@ impl Slot {
             scans: AtomicU64::new(0),
             blockpath: AtomicU64::new(0),
             unshaped: AtomicU64::new(0),
+            lag: AtomicU64::new(0),
             takes: AtomicU64::new(0),
             tried: AtomicU64::new(0),
             hit: AtomicU64::new(0),
@@ -4870,6 +4918,10 @@ impl Db {}
 /// writer's thread, and the time of each landing and each merge's.
 #[derive(Default)]
 struct SealCounts {
+    /// Reads and scans over lag by the engine's own handles -- the
+    /// writer's above all, whose reads are the sweep's -- where a
+    /// caller's handle counts on its slot's line (`Options::adaptive_cap`).
+    lag: AtomicU64,
     /// Reads and scans over a store with pieces and no partition made
     /// through no handle of a caller's: the writer's own.
     unshaped: AtomicU64,
@@ -5659,6 +5711,13 @@ struct Shared {
     /// work last looked (`Options::adaptive_shape`): set by the read that
     /// finds it clear, which wakes the thread, cleared by the look.
     unshaped_wake: std::sync::atomic::AtomicBool,
+    /// A read over lag happened since the writer's last commit
+    /// (`Options::adaptive_cap`): set by the read that finds it clear,
+    /// taken by the commit.
+    lag_wake: std::sync::atomic::AtomicBool,
+    /// The lag level the writer's last commit left, for the segment
+    /// work's trigger and the tests; see `Db::lag_level`.
+    lag_level: std::sync::atomic::AtomicU32,
     /// The segment work's thread, for a read to wake.
     maint_thread: std::sync::OnceLock<std::thread::Thread>,
     /// Reads that took a canonical form, over this store's life. The
@@ -6305,6 +6364,13 @@ pub struct Db {
     pending_err: Option<std::io::Error>,
     /// Commits written since the last barrier, for `SyncPolicy::EveryN`.
     unsynced: u32,
+    /// The writes since the last read over lag, and the live table with
+    /// the log position they were last counted to (`Db::lag_tick`,
+    /// `Options::adaptive_cap`): the table by identity -- its address,
+    /// as a number so the store stays `Send` -- since a landing publishes
+    /// a new state over the same table and its log.
+    lag_writes: usize,
+    lag_log: (usize, usize),
     /// Nanoseconds spent in each phase of a load, accumulated so an
     /// experiment can attribute the durable-load cost instead of inferring
     /// it. `commit` is the WAL append and its fdatasync -- the only work on
@@ -7407,6 +7473,29 @@ mod radix {
             }
         }
     }
+    /// The line the cap and the trigger follow: the idle value at a level
+    /// of zero, the reading value at the full level, both directions, and
+    /// the two clamps.
+    #[test]
+    fn the_lag_line_runs_both_ways() {
+        assert_eq!(super::lag_interp(10, 2, 0), 10);
+        assert_eq!(super::lag_interp(10, 2, super::LAG_FULL), 2);
+        assert_eq!(super::lag_interp(10, 2, super::LAG_FULL / 2), 6);
+        assert_eq!(super::lag_interp(10, 30, 0), 10);
+        assert_eq!(super::lag_interp(10, 30, super::LAG_FULL), 30);
+        assert_eq!(super::lag_interp(10, 30, super::LAG_FULL / 2), 20);
+        assert_eq!(super::lag_interp(4, 4, super::LAG_FULL), 4);
+        assert_eq!(
+            super::lag_interp(4, 0, super::LAG_FULL),
+            1,
+            "a reading value of zero is one"
+        );
+        assert_eq!(
+            super::lag_interp(10, 2, super::LAG_FULL + 5),
+            2,
+            "a level past full is full"
+        );
+    }
 
     /// The gallop answers as `partition_point` does for every monotone
     /// predicate over runs of every length, the answer at every place:
@@ -7851,6 +7940,28 @@ impl State {
 /// cap a no-op on a store too small to have a lag problem.
 const SEAL_CAP_FLOOR: usize = 1 << 20;
 
+/// The lag level at a read over lag (`Options::adaptive_cap`); zero is a
+/// store nothing has read that way for a relax span of writes.
+const LAG_FULL: u32 = 1000;
+/// The fewest writes a lag level decays over, for a store whose
+/// partitions hold few keys or none.
+const LAG_RELAX_FLOOR: usize = 4096;
+
+/// `idle` at a lag level of zero, `reading` at the full level, and the
+/// line between, in either direction: what the cap's share and the merge
+/// trigger both follow (`Options::adaptive_cap`,
+/// `Options::adaptive_trigger`). A `reading` below `idle` tightens under
+/// reads, one above loosens; zero reads as one.
+fn lag_interp(idle: usize, reading: usize, level: u32) -> usize {
+    let reading = reading.max(1);
+    let level = level.min(LAG_FULL) as usize;
+    if reading <= idle {
+        idle - (idle - reading) * level / LAG_FULL as usize
+    } else {
+        idle + (reading - idle) * level / LAG_FULL as usize
+    }
+}
+
 /// Data bytes per file byte, as a fraction, at the shape the seal rules
 /// were tuned in: the store's size in their terms is its key and value
 /// bytes scaled by the inverse, so the cadence stays where the tuning left
@@ -7890,16 +8001,65 @@ impl Reader {
                 .seal_bytes
                 .max(usize::try_from(grown).unwrap_or(usize::MAX))
         };
-        if self.opts.seal_max_pct == 0 {
+        let pct = self.cap_pct();
+        if pct == 0 {
             return base;
         }
         let store = usize::try_from(sized).unwrap_or(usize::MAX);
         // Nothing sealed yet is nothing to take a share of, and the floor
         // keeps a store of a few kilobytes off a seal a commit.
-        match store / 100 * self.opts.seal_max_pct {
+        match store / 100 * pct {
             0 => base,
             cap => base.min(cap.max(SEAL_CAP_FLOOR)),
         }
+    }
+
+    /// The seal cap's share of the store now: `seal_max_pct`, or under
+    /// `Options::adaptive_cap` the line from it at a lag level of zero to
+    /// `cap_reading_pct` at the full level. Uncapped stays uncapped.
+    #[doc(hidden)]
+    pub fn cap_pct(&self) -> usize {
+        let idle = self.opts.seal_max_pct;
+        if !self.opts.adaptive_cap || idle == 0 {
+            return idle;
+        }
+        lag_interp(
+            idle,
+            self.opts.cap_reading_pct,
+            self.shared.lag_level.load(AtomicOrdering::Relaxed),
+        )
+    }
+
+    /// The merge trigger now: `l0_trigger`, or under
+    /// `Options::adaptive_trigger` the line from it at a lag level of zero
+    /// to `trigger_reading` at the full level.
+    #[doc(hidden)]
+    pub fn l0_trigger_now(&self) -> usize {
+        if !self.opts.adaptive_trigger {
+            return self.opts.l0_trigger;
+        }
+        lag_interp(
+            self.opts.l0_trigger.max(1),
+            self.opts.trigger_reading,
+            self.shared.lag_level.load(AtomicOrdering::Relaxed),
+        )
+    }
+
+    /// The store's lag level, as the writer's last commit left it: full
+    /// (`LAG_FULL`) at a read over lag since the commit before, and what
+    /// the writes since the last such read leave of it otherwise; see
+    /// `Options::adaptive_cap`.
+    #[doc(hidden)]
+    pub fn lag_level(&self) -> u32 {
+        self.shared.lag_level.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Reads and scans that lag cost, over this store's life; see
+    /// `Options::adaptive_cap`.
+    #[doc(hidden)]
+    pub fn lag_reads(&self) -> u64 {
+        self.shared.readers.stat(|s| &s.lag)
+            + self.shared.seal_counts.lag.load(AtomicOrdering::Relaxed)
     }
 
     /// The partitions' file bytes and their key and value bytes: the two
@@ -8082,6 +8242,11 @@ impl Reader {
         let l0 = st.pieces_over(np, at);
         if np == 0 {
             self.count_unshaped();
+        }
+        // A point read pays lag per piece it consults; the memtable's
+        // probe it pays whatever the cadence.
+        if !l0.is_empty() && self.lag_adapts() {
+            self.count_lag();
         }
         // Sources oldest to newest: the partition (0), the level-0 pieces
         // (1..), the frozen memtable, the live one. `start` is the source
@@ -8387,6 +8552,18 @@ impl Reader {
             self.opts.scan_block_cache && self.segs().first().is_some_and(|s| s.level > 0);
         if !use_cache {
             self.count_unshaped();
+        }
+        // A scan pays lag over every unsealed key and every piece its
+        // blocks meet. The pieces are counted from the partitions' end,
+        // since the segments sort partitions first: a walk over every
+        // segment here was a dependent load a partition on the drained
+        // scans the arms are timed on.
+        if self.lag_adapts() {
+            let st = self.state();
+            let np = st.segs.partition_point(|s| s.level > 0);
+            if st.frozen.is_some() || !st.mem.is_empty() || np < st.segs.len() {
+                self.count_lag();
+            }
         }
         if let (true, Some(slot)) = (self.counted, self.slot) {
             let s = &self.shared.readers.slots[slot];
@@ -8720,7 +8897,9 @@ impl Reader {
             return false;
         };
         // The live table is the one the log position is of; another is a
-        // freeze, which the writer makes itself and carries at once.
+        // freeze, or the ordered table a direct run opens over an empty
+        // one, which the writer makes itself and carries at once
+        // (`carry_switch`).
         if !std::ptr::eq(over.mem.as_ptr(), std::sync::Arc::as_ptr(&st.mem)) {
             return false;
         }
@@ -9236,6 +9415,31 @@ impl Reader {
             if let Some(t) = self.shared.maint_thread.get() {
                 t.unpark();
             }
+        }
+    }
+
+    /// Whether the store's cadence follows its reads at all.
+    fn lag_adapts(&self) -> bool {
+        self.opts.adaptive_cap || self.opts.adaptive_trigger
+    }
+
+    /// A read or a scan that lag cost -- over unsealed keys or level-0
+    /// pieces -- for the writer's commit to take the store's lag level
+    /// from (`Options::adaptive_cap`): counted on the handle's own line,
+    /// and the first since the writer's last commit sets the flag, which
+    /// the rest find set. No wake: the commit reads the flag, and the
+    /// segment work polls.
+    fn count_lag(&self) {
+        match (self.counted, self.slot) {
+            (true, Some(slot)) => {
+                self.shared.readers.slots[slot]
+                    .lag
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            _ => SealCounts::add(&self.shared.seal_counts.lag, 1),
+        }
+        if !self.shared.lag_wake.load(AtomicOrdering::Relaxed) {
+            self.shared.lag_wake.store(true, AtomicOrdering::Release);
         }
     }
 
@@ -11857,6 +12061,8 @@ impl Db {
             retired_snaps: RetireList::new(),
             snap_builds: AtomicU64::new(0),
             unshaped_wake: std::sync::atomic::AtomicBool::new(false),
+            lag_wake: std::sync::atomic::AtomicBool::new(false),
+            lag_level: std::sync::atomic::AtomicU32::new(0),
             maint_thread: std::sync::OnceLock::new(),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
@@ -11932,6 +12138,8 @@ impl Db {
             upkeep_since_scan: 0,
             upkeep_hand: Hand::Lend,
             unsynced: 0,
+            lag_writes: usize::MAX,
+            lag_log: (0, 0),
             phase_ns: [0; 3],
             draining: false,
         };
@@ -12193,6 +12401,8 @@ impl Db {
             retired_snaps: RetireList::new(),
             snap_builds: AtomicU64::new(0),
             unshaped_wake: std::sync::atomic::AtomicBool::new(false),
+            lag_wake: std::sync::atomic::AtomicBool::new(false),
+            lag_level: std::sync::atomic::AtomicU32::new(0),
             maint_thread: std::sync::OnceLock::new(),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
@@ -12273,6 +12483,8 @@ impl Db {
             upkeep_since_scan: 0,
             upkeep_hand: Hand::Lend,
             unsynced: 0,
+            lag_writes: usize::MAX,
+            lag_log: (0, 0),
             phase_ns: [0; 3],
             draining: false,
         };
@@ -12290,7 +12502,9 @@ impl Db {
         if self.mem().ordered || self.direct_can_open() {
             if self.goes_direct(key, value) {
                 if !self.mem().ordered {
-                    self.set_mem(std::sync::Arc::new(MemTable::new_ordered()));
+                    let old = self.mem().clone();
+                    self.set_mem_with(std::sync::Arc::new(MemTable::new_ordered()), true);
+                    self.carry_switch(&old);
                 }
                 self.max_key.clear();
                 self.max_key.extend_from_slice(key);
@@ -12317,6 +12531,38 @@ impl Db {
     /// the memtable empty, nothing of this batch staged before it. A seal
     /// in flight is no bar -- the run's keys lie above the frozen table's,
     /// and the run's own close joins the seal first.
+    /// The empty live table replaced by an ordered one at a direct run's
+    /// start: the writer's own act, carried at once as a freeze is -- the
+    /// published forms by the publish (`set_mem_with`), the writer's own
+    /// tables here. Both are current to an empty table's end, so to the
+    /// new table's start, and only the state they are of moves.
+    /// Left to the next look at the log, the rebase found a live table it
+    /// did not know and dropped every form: a seal that emptied the
+    /// table, then a run of keys above the store's greatest, cost the
+    /// scans after the piece landed a build of every block.
+    fn carry_switch(&self, old: &std::sync::Arc<MemTable>) {
+        debug_assert!(old.is_empty(), "a direct run opens over an empty table");
+        if !(self.opts.forms_carry && self.opts.commit_forms && self.opts.scan_block_cache) {
+            return;
+        }
+        let st = self.state();
+        let noted = self
+            .fs()
+            .over
+            .borrow()
+            .as_ref()
+            .is_some_and(|o| std::ptr::eq(o.mem.as_ptr(), std::sync::Arc::as_ptr(old)));
+        if !noted {
+            return;
+        }
+        if let Some((g, _)) = self.fs().scan_keys.borrow_mut().as_mut() {
+            *g = st.gen;
+        }
+        self.fs().log_gen.set(st.gen);
+        self.fs().log_seen.set(0);
+        self.note_over(st);
+    }
+
     fn direct_can_open(&self) -> bool {
         self.opts.direct_ingest && self.mem().is_empty() && self.wal.pending.is_empty()
     }
@@ -12541,6 +12787,7 @@ impl Db {
             self.sweep_retired_forms();
         }
         self.phase_ns[0] += t.elapsed().as_nanos() as u64;
+        self.lag_tick();
         // A direct run closes when a seal would: it joins whole, as a
         // seal's piece does by promotion, so the two paths leave one shape.
         if self.mem_bytes >= self.seal_threshold() {
@@ -12553,6 +12800,56 @@ impl Db {
             }
         }
         Ok(())
+    }
+
+    /// The lag level at this commit (`Options::adaptive_cap`): full when
+    /// a read over lag happened since the last commit, else what the
+    /// writes since the last such read leave of it over the relax span --
+    /// `lag_relax_pct` of the partitions' keys, floored -- so a store's
+    /// worth of writes with no read between takes it to zero, and a
+    /// burst's first commits after a pass of reads still seal at the
+    /// reading cap. The writes are the live table's log, counted from the
+    /// position the last tick left, and the table by identity: a landing
+    /// publishes a new state over the same table, and a tick keyed on the
+    /// state's generation counted that table's whole log again at every
+    /// one. Published for the segment work's trigger and the tests, and
+    /// read by the seal threshold this commit asks next.
+    fn lag_tick(&mut self) {
+        if !self.lag_adapts() {
+            return;
+        }
+        let (table, len) = {
+            let st = self.state();
+            (std::sync::Arc::as_ptr(&st.mem) as usize, st.mem.log_len())
+        };
+        let grew = if self.lag_log.0 == table {
+            len.saturating_sub(self.lag_log.1)
+        } else {
+            len
+        };
+        self.lag_log = (table, len);
+        if self.shared.lag_wake.swap(false, AtomicOrdering::AcqRel) {
+            self.lag_writes = 0;
+        } else {
+            self.lag_writes = self.lag_writes.saturating_add(grew);
+        }
+        let level = if self.lag_writes == 0 {
+            LAG_FULL
+        } else if self.lag_writes == usize::MAX {
+            0
+        } else {
+            let keys: usize = self
+                .segs()
+                .iter()
+                .filter(|s| s.level > 0)
+                .map(|s| s.blob.keys())
+                .sum();
+            let span = (keys / 100 * self.opts.lag_relax_pct).max(LAG_RELAX_FLOOR);
+            let spent =
+                (self.lag_writes as u64 * LAG_FULL as u64 / span as u64).min(LAG_FULL as u64);
+            LAG_FULL - spent as u32
+        };
+        self.shared.lag_level.store(level, AtomicOrdering::Relaxed);
     }
 
     /// What is staged made durable where it is going: the batch's records
@@ -13503,25 +13800,43 @@ impl Db {
 
     /// The state with `mem` as the live memtable.
     fn set_mem(&mut self, mem: std::sync::Arc<MemTable>) {
-        let old = self.publish_writer(|cur| State {
-            forms: Reader::forms_for(&cur.segs),
-            forms_moved: std::sync::atomic::AtomicBool::new(false),
-            snap: AtomicPtr::new(std::ptr::null_mut()),
-            reader_scans: AtomicU64::new(cur.reader_scans.load(AtomicOrdering::Relaxed)),
-            forms_at: AtomicUsize::new(usize::MAX),
-            forms_complete: std::sync::atomic::AtomicBool::new(false),
-            scans: AtomicU64::new(0),
-            forms_bytes: AtomicUsize::new(0),
-            segs: cur.segs.clone(),
-            mem: mem.clone(),
-            frozen: cur.frozen.clone(),
-            gen: cur.gen + 1,
-            mean_key_bytes: cur.mean_key_bytes,
-            store_bytes: cur.store_bytes,
-            data_bytes: cur.data_bytes,
-            l0_aligned: cur.l0_aligned,
-            segs_tombs: cur.segs_tombs,
-            layout: cur.layout.clone(),
+        self.set_mem_with(mem, false);
+    }
+
+    /// The live table replaced, and with `carry` the published forms
+    /// carried into the new state as a freeze carries them, current to
+    /// what they were: for the table an empty one is replaced by at a
+    /// direct run's start, whose log starts where the empty one's ended.
+    fn set_mem_with(&mut self, mem: std::sync::Arc<MemTable>, carry: bool) {
+        let old = self.publish_writer(|cur| {
+            let mut next = State {
+                forms: Reader::forms_for(&cur.segs),
+                forms_moved: std::sync::atomic::AtomicBool::new(false),
+                snap: AtomicPtr::new(std::ptr::null_mut()),
+                reader_scans: AtomicU64::new(cur.reader_scans.load(AtomicOrdering::Relaxed)),
+                forms_at: AtomicUsize::new(usize::MAX),
+                forms_complete: std::sync::atomic::AtomicBool::new(false),
+                scans: AtomicU64::new(0),
+                forms_bytes: AtomicUsize::new(0),
+                segs: cur.segs.clone(),
+                mem: mem.clone(),
+                frozen: cur.frozen.clone(),
+                gen: cur.gen + 1,
+                mean_key_bytes: cur.mean_key_bytes,
+                store_bytes: cur.store_bytes,
+                data_bytes: cur.data_bytes,
+                l0_aligned: cur.l0_aligned,
+                segs_tombs: cur.segs_tombs,
+                layout: cur.layout.clone(),
+            };
+            if carry {
+                cur.carry_published(&mut next);
+                next.forms_at = AtomicUsize::new(cur.forms_at.load(AtomicOrdering::Acquire));
+                next.forms_complete = std::sync::atomic::AtomicBool::new(
+                    cur.forms_complete.load(AtomicOrdering::Acquire),
+                );
+            }
+            next
         });
         self.published(old);
     }
@@ -18056,7 +18371,8 @@ impl Maint {
     }
 
     /// A merge is due when any one range has accumulated `l0_trigger`
-    /// aligned pieces -- or, before the first partitioning, when that many
+    /// aligned pieces -- `l0_trigger_now` where the trigger follows the
+    /// reads -- or, before the first partitioning, when that many
     /// full-range segments have piled up.
     fn maybe_compact(&mut self) -> Result<()> {
         // Collect a finished merge BEFORE deciding. Its outputs are the
@@ -18092,9 +18408,10 @@ impl Maint {
         // range is due when it holds `l0_trigger` pieces, a piece not
         // aligned to the live ranges selects every range it overlaps, and
         // before the first partitioning the trigger counts every piece.
-        match self.merge_due(self.opts.l0_trigger) {
+        let trigger = self.l0_trigger_now();
+        match self.merge_due(trigger) {
             None => {
-                if self.l0_len() >= self.opts.l0_trigger {
+                if self.l0_len() >= trigger {
                     if self.opts.promote && self.promote_unpartitioned()? {
                         return Ok(());
                     }

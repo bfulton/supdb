@@ -4877,6 +4877,108 @@ fn the_extension_orders_a_batch_alike_through_sixteen_bytes_on_the_merge_path() 
     extend_order_model(false);
 }
 
+/// The seal cap and the merge trigger follow the reads
+/// (`Options::adaptive_cap`, `Options::adaptive_trigger`): a scan over
+/// unsealed keys, or a point read that consults a piece, raises the lag
+/// level to its full at the next commit, and the cap's share and the
+/// trigger stand at their reading values; a scan over a drained store
+/// raises nothing; and commits with no read over lag between decay the
+/// level by their writes over the partitions' keys, back to the idle
+/// values. A write-only stretch of the store's size relaxes the cadence
+/// and one read over lag tightens it again.
+#[test]
+fn the_cap_and_the_trigger_follow_the_reads_and_relax_over_a_write_only_stretch() {
+    let d = dir("adaptive-lag");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        seal_max_pct: 10,
+        adaptive_cap: true,
+        cap_reading_pct: 2,
+        l0_trigger: 4,
+        adaptive_trigger: true,
+        trigger_reading: 2,
+        lag_relax_pct: 100,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let key = |k: u32| format!("key-{k:06}");
+    for k in 0..6000u32 {
+        db.append(key(k).as_bytes(), b"p");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert!(db.levels().0 > 1, "several partitions");
+    assert_eq!(db.lag_level(), 0, "nothing has read over lag");
+    assert_eq!(
+        (db.cap_pct(), db.l0_trigger_now()),
+        (10, 4),
+        "the idle values"
+    );
+    // A scan over a drained store costs no lag, and counts for none.
+    let mut sink = 0usize;
+    db.scan(key(0).as_bytes(), 10, |_k, v| sink += v.len())
+        .unwrap();
+    db.put(key(6000).as_bytes(), b"w");
+    db.commit().unwrap();
+    assert_eq!(db.lag_level(), 0, "a drained scan is not a read over lag");
+    assert_eq!(db.lag_reads(), 0);
+    // A scan over the key just written is; the next commit takes it.
+    db.scan(key(5990).as_bytes(), 20, |_k, v| sink += v.len())
+        .unwrap();
+    assert_eq!(db.lag_reads(), 1);
+    assert_eq!(
+        db.lag_level(),
+        0,
+        "the level moves at the commit, not the read"
+    );
+    db.put(key(6001).as_bytes(), b"w");
+    db.commit().unwrap();
+    assert_eq!(db.lag_level(), 1000);
+    assert_eq!(
+        (db.cap_pct(), db.l0_trigger_now()),
+        (2, 2),
+        "the reading values"
+    );
+    // Writes with no read over lag between: the relax span is the
+    // partitions' six thousand keys, so a thousand writes a commit take
+    // a sixth of the level each, and seven commits take it to zero.
+    let mut k = 7000u32;
+    for round in 1..=7u32 {
+        for _ in 0..1000 {
+            db.put(key(k).as_bytes(), b"w");
+            k += 1;
+        }
+        db.commit().unwrap();
+        let level = db.lag_level();
+        assert!(
+            level <= 1000u32.saturating_sub(round * 166),
+            "round {round}: level {level} has not decayed by the writes"
+        );
+    }
+    assert_eq!(db.lag_level(), 0, "a store's worth of writes relaxes it");
+    assert_eq!(
+        (db.cap_pct(), db.l0_trigger_now()),
+        (10, 4),
+        "back to the idle values"
+    );
+    // A point read over a piece counts as a scan does. A seal alone
+    // leaves its piece a piece -- the drain's promotion and the shaping
+    // are a flush's and `adaptive_shape`'s -- so the read below meets it.
+    db.seal().unwrap();
+    db.settle().unwrap();
+    assert!(db.levels().1 > 0, "the seal left a piece");
+    let mut got = 0usize;
+    db.read_all(key(7100).as_bytes(), |v| got += v.len())
+        .unwrap();
+    assert_eq!(got, 1);
+    assert_eq!(db.lag_reads(), 2, "a point read over a piece");
+    db.put(key(k).as_bytes(), b"w");
+    db.commit().unwrap();
+    assert_eq!(db.lag_level(), 1000, "one read over lag tightens it again");
+    db.close().unwrap();
+}
+
 fn carry_model(block_cache: bool) {
     let d = dir(&format!("extend-snap-{block_cache}"));
     let opts = Options {
@@ -5725,6 +5827,81 @@ fn the_forms_survive_a_seal_with(snapshot_carry: bool) {
         "a merge starts the table afresh"
     );
     m.check(&db, "after the merge");
+}
+
+/// A seal that empties the live table, then a run of keys above the
+/// store's greatest, which the writer takes into an ordered table for
+/// direct ingest: the writer's forms survive the switch as they survive
+/// the seal, so the scans after the piece lands build nothing. Left to
+/// the next look at the log, the rebase found a live table it did not
+/// know and dropped every form, and the scans built every block.
+#[test]
+fn the_forms_survive_a_direct_runs_start() {
+    let d = dir("forms-carry-direct");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        forms_settle_backlog_pct: 0,
+        commit_forms: true,
+        forms_carry: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 1, "several partitions");
+    let mut sink = 0usize;
+    // Overlay in most blocks, a handle's scan so the forms are
+    // maintained, then the seal, which files the overlay, carries the
+    // forms across and leaves the live table empty.
+    for k in (0..1500u32).step_by(5) {
+        m.append(&mut db, &key(k), "v1");
+    }
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    r.scan(key(0).as_bytes(), 2000, |_k, v| sink += v.len())
+        .unwrap();
+    db.commit().unwrap();
+    let (forms, _, _, _) = db.canonical_forms();
+    assert!(forms > 0, "maintained");
+    db.seal().unwrap();
+    // Keys above the store's greatest into the empty table: a direct
+    // run, which replaces the live table with an ordered one.
+    for k in 0..200u32 {
+        m.append(&mut db, &key(2000 + k), "run");
+    }
+    db.commit().unwrap();
+    // The seal's piece lands on the segment work's thread; `settle`
+    // would join it, but a flush would close the run too.
+    let t = std::time::Instant::now();
+    while db.levels().1 == 0 && t.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(db.levels().1 > 0, "the seal landed a piece");
+    let built0 = db.blocks_built().1;
+    m.check(&db, "the writer after the switch and the landing");
+    let built = db.blocks_built().1 - built0;
+    assert!(
+        built <= 2,
+        "the writer's tables survived the switch: {built} blocks built by the scans after it"
+    );
+    let (after, _, _, _) = db.canonical_forms();
+    assert!(after > 0, "the forms survived: {after}");
+    m.check(&r, "a reader after the run");
+    db.settle().unwrap();
+    m.check(&db, "the writer after the settle");
+    db.close().unwrap();
+    std::hint::black_box(sink);
 }
 
 /// EXPERIMENT: a publish starts the builder and the next commit installs

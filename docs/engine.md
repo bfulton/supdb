@@ -2560,6 +2560,84 @@ posted, are 3.5 ms of one scan at a hundred thousand. The carry was
 priced once and found to move no timing quantity, before the segment
 work had a thread and the seal a snapshot; it is due another pricing.
 
+#### The cap that follows the reads, both ways
+
+A seal cadence chosen once is right for one shape, and the question
+was whether the store could pick its own: tighten the seal cap and the
+merge trigger while reads pay for lag, relax them over a write-only
+stretch. The signal is a read that lag costs -- a scan over unsealed
+keys or level-0 pieces, a point read whose range has a piece -- counted
+on the handle's own line, and the writer's next commit takes the
+store's lag level from it: full at such a read since the commit before,
+and what the writes since the last one leave of it over a relax span,
+`lag_relax_pct` of the partitions' keys, so a burst with no reads in it
+decays the level with its writes and not with time, which is the
+sweep's shape. The cap the seal threshold takes is the line from
+`seal_max_pct` at a level of zero to `cap_reading_pct` at the full
+level, and the trigger the segment work asks is the line from
+`l0_trigger` to `trigger_reading` (`Options::adaptive_cap`,
+`Options::adaptive_trigger`). The level is keyed on the live table by
+identity: keyed on the state's generation, which every landing bumps,
+the first version counted the table's whole log again at every one.
+
+Priced in one process against the arm it differs from by the one
+option, twelve pairs a rung, the cap at two percent under reads against
+ten:
+
+| tighter under reads | 10k | 100k | 300k |
+|---|---|---|---|
+| seals, buffered | 2 / 2 | 11 / 15 | 13 / 23 |
+| ycsb-D, buffered | 1.23x (ns) | **0.69x** | **0.84x** |
+| ycsb-E, buffered | 0.95x (ns) | **0.73x** | 0.94x |
+| ycsb-F, buffered | 1.02x (ns) | 0.98x (ns) | 0.78x |
+| scan-lag, a tenth unmerged, buffered | 0.86x (ns) | 0.99x (ns) | 0.76x |
+| scan-lag, all unmerged, buffered | 0.96x (ns) | 0.82x (ns) | 1.18x (ns) |
+| seals, durable | 3 / 3 | 11 / 14 | 13 / 24 |
+| scan-lag, a tenth unmerged, durable | 1.46x (ns) | 0.87x (ns) | **0.85x** |
+| ycsb-D, durable | 0.82x (ns) | 0.49x (ns) | 0.94x (ns) |
+
+Bold is 0/12 or 12/12 and holds under Holm; the rest of the table's
+figures are the sign test's marks or noise. The trigger at two pieces
+on top of the cap moved no timing quantity at any rung, buffered or
+durable, and its seal and publish counts were the cap's: the level
+moves at a commit and decays over the burst, so at the burst's end,
+where the pieces are, the trigger stood at its idle value. The cap the
+other way, thirty percent under reads against ten, cut the seals to
+seven from eleven at a hundred thousand keys and nine from thirteen at
+three hundred thousand, on both configurations, and moved no timing
+quantity either: the mixes' one seal lands in F before any piece
+exists, so nothing has counted lag when it is decided, and the lag
+points do not price the seal count at all.
+
+What they price, the probe that ran the suite's mixes on one store
+with every window of a thousand operations split into its reads and
+its commits found in the commits. The freeze's commit at a hundred
+thousand keys, 5-6 ms on the writer's thread: the WAL fdatasync the
+seal makes before it rotates, 2.5 ms, on the buffered arm whose commits
+never sync; the settle the commit files before the freeze, 2 ms; the
+freeze itself, 0.6; the directory fsync for the new WAL, 0.3. The
+reads beside a seal in flight ran at their own rate to the nanosecond.
+And with the cap tighter, D's freeze left an empty table, D's last
+inserts -- keys above the store's greatest -- opened a direct run over
+it, and E's first scans built every one of the store's 1,538 blocks:
+the writer's rebase of its tables at the piece's landing found a live
+table it did not know, the ordered one the run had installed, and
+dropped every form. The switch is the writer's own act and is carried
+at once now (`carry_switch`), as a freeze is: through the probe, E's
+scans built 213 blocks in place of 1,538 and E ran at the plain arm's
+rate, and the test that holds it built 32 blocks before and at most
+two after. What a seal costs its readers
+otherwise is the piece each point read consults until the merge,
+about a hundred nanoseconds a read, and the first scan's snapshot over
+the frozen table.
+
+So the cadence stands at the cap as measured, and the signal and the
+lines stay behind their options for the arm that prices them. A cap
+that moves with the reads would have to be worth more than a seal's
+5 ms on the writer and its landing inside a pass of reads, and at
+these rungs the lag it removes is worth less than that in either
+direction.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and

@@ -141,6 +141,16 @@ and the pass built every block it met. Find the count that separates
 the rounds before averaging them, and read the slow shape as a
 measurement of its own.
 
+A window of a mix is several kinds of operation, and a rate over it
+names none of them. The mixes' windows around a seal read at four to
+ten times their neighbours, and two probes read that as the reads
+slowed beside a seal in flight -- the shape a known problem has --
+until a third split each window into its reads and its commits: the
+reads were flat to the nanosecond and one commit in the window was
+the whole excess, the freeze's, at five milliseconds. Time the kinds
+apart before naming the one that is slow, and when the excess is one
+operation, decompose that operation next.
+
 ## The suite lives in bench/, and it gates this repository
 
 `bench/` is a time series. `bench run` measures every arm -- supdb's
