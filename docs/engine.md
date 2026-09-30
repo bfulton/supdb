@@ -2408,7 +2408,18 @@ too late for any pass to see; a second let the sync wait for a seal
 already in flight so as to seal the tail behind it, which gave the load
 back most of what not flushing had won, and made the tail a second piece
 overlapping the first, so that what one promotion would have partitioned
-took a merge. A sync that finds a seal in flight leaves the tail.
+took a merge. A third left the tail live whenever a seal was in flight or
+a partition existed, and after an ordered load that was the shape every
+read pass paid for: the last run's keys in a live ordered table beside a
+partition of the rest, searched by every point read of a key it did not
+hold, and every scan building a block since a store with unsealed keys
+never has its forms complete. The sync now hands the tail to a seal
+without freezing it (`Db::hand_tail`): readers keep reading it as the
+live table, the writer writes nothing into it, and it is replaced by
+whichever side publishes first, the landing or the writer's next write.
+The landing promotes by link a piece whose keys lie above its
+partition's last key, which an ordered tail's do, so the ordered store
+settles as two partitions and no unsealed key without a merge.
 
 The load keeps its gain -- 1.6-2.4x ordered, 2.5-3.7x shuffled -- and
 the passes over the ordered store come most of the way back: the first

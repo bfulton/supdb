@@ -3985,10 +3985,30 @@ impl MemTable {
     }
 
     /// The entry number holding `key`, if the table has it.
+    ///
+    /// An ordered table's entries are in key order, so its first and
+    /// last entries fence it: a key outside them is answered by two
+    /// compares, and the first entry's line is hot. Every read of a key
+    /// the table cannot hold used to walk the whole binary search -- a
+    /// live ordered tail of ten thousand keys beside a partition cost
+    /// every read of the partition's keys fourteen steps to find nothing.
     fn slot_of(&self, key: &[u8]) -> Option<usize> {
         if self.ordered {
             let n = self.len();
-            let (mut lo, mut hi) = (0usize, n);
+            if n == 0 {
+                return None;
+            }
+            match self.key_of(self.entry(0)).cmp(key) {
+                Ordering::Greater => return None,
+                Ordering::Equal => return Some(0),
+                Ordering::Less => {}
+            }
+            match self.key_of(self.entry(n - 1)).cmp(key) {
+                Ordering::Less => return None,
+                Ordering::Equal => return Some(n - 1),
+                Ordering::Greater => {}
+            }
+            let (mut lo, mut hi) = (1usize, n - 1);
             while lo < hi {
                 let m = lo + (hi - lo) / 2;
                 match self.key_of(self.entry(m)).cmp(key) {
@@ -4777,6 +4797,11 @@ struct SealCounts {
     publishes: AtomicU64,
     seal_ns: AtomicU64,
     merge_ns: AtomicU64,
+    /// Tables a `sync` handed to a seal without a freeze, by which side
+    /// replaced them: the writer at its next write, or the landing. For
+    /// a test that wants to know which order it reached.
+    tail_by_writer: AtomicU64,
+    tail_by_landing: AtomicU64,
 }
 
 impl SealCounts {
@@ -5288,7 +5313,9 @@ struct State {
     mem: std::sync::Arc<MemTable>,
     /// A seal in flight: the frozen memtable stays readable (it is newer
     /// than every segment and older than `mem`) while a thread writes it
-    /// out; `join_seal` collects the finished segment.
+    /// out; the landing retires it (`Maint::land`). A table a `sync`
+    /// handed without a freeze is a seal in flight too, and stays `mem`
+    /// until the landing or the writer's next write replaces it.
     frozen: Option<std::sync::Arc<MemTable>>,
     /// Bumped at every publish: what a scan snapshot and a block table
     /// are keyed by, so either is rebuilt when the segments or the
@@ -5574,10 +5601,13 @@ struct Shared {
     /// What the segment work did, wherever it runs: see `SealWaits`, and
     /// the nanoseconds of each landing and each merge's landing.
     seal_counts: SealCounts,
-    /// A seal handed to the segment work and not yet landed, and a merge
-    /// in flight: what `Db::in_flight` answers, and what the writer waits
-    /// on before its next freeze.
-    in_seal: std::sync::atomic::AtomicBool,
+    /// Seals handed to the segment work and not yet landed -- a queue,
+    /// landed in the order they were handed, since a seal's WAL retires
+    /// only after its own manifest -- and whether a merge is in flight:
+    /// what `Db::in_flight` answers. The writer waits on the frozen slot
+    /// before its next freeze, not on this; a count of zero beside a
+    /// table still waiting is a landing that failed.
+    in_seal: AtomicUsize,
     in_merge: std::sync::atomic::AtomicBool,
     /// An error of the segment work's, for the writer's next commit to
     /// return: one slot, the first error kept.
@@ -6107,6 +6137,14 @@ pub struct Db {
     /// The segment ordered ingest streams into, while one is open. The
     /// memtable is ordered exactly while a run is forming or open.
     direct: Option<Direct>,
+    /// The live memtable a `sync` handed to a seal without freezing it
+    /// (`hand_tail`): readers go on reading it as the live table, the seal
+    /// thread reads it, and the writer writes nothing into it from the
+    /// hand-off on. It is replaced by whichever side publishes first --
+    /// the landing, with an empty table, or the writer at its next write
+    /// (`take_fresh_mem`), which freezes it under a fresh one -- and this
+    /// is cleared once the writer has seen it replaced.
+    mem_handed: Option<std::sync::Arc<MemTable>>,
     /// The store's greatest key, or empty for none: what a key has to be
     /// above to go direct.
     max_key: Vec<u8>,
@@ -11263,11 +11301,23 @@ impl Db {
     /// Under `Options::adaptive_shape` every seal over an empty store may:
     /// the promotion it saves is the one the segment work would make at
     /// the landing, and until it landed every read took the merge path.
+    ///
+    /// No segment, and no seal in flight: a seal in flight over an empty
+    /// store is the one naming the first partition, and a table a `sync`
+    /// hands beside it (`hand_tail`) would have named a second one over
+    /// the same range -- the landing's tiling assertion found it. The
+    /// count is read before the state, as in `take_fresh_mem`, so a seal
+    /// counted out is one whose landing the state shows.
     fn seals_first_partition(&self) -> bool {
-        ((self.draining && self.opts.partition_on_flush) || self.opts.adaptive_shape)
+        if !(((self.draining && self.opts.partition_on_flush) || self.opts.adaptive_shape)
             && self.opts.compact
-            && self.opts.promote
-            && self.segs().is_empty()
+            && self.opts.promote)
+        {
+            return false;
+        }
+        let seals = self.shared.in_seal.load(AtomicOrdering::Acquire);
+        self.rehold();
+        seals == 0 && self.segs().is_empty()
     }
 
     /// The largest file a partition may be, in bytes.
@@ -11384,7 +11434,7 @@ impl Db {
             keeper_thread: std::sync::OnceLock::new(),
             next_seg: AtomicU64::new(next_seg),
             seal_counts: SealCounts::default(),
-            in_seal: std::sync::atomic::AtomicBool::new(false),
+            in_seal: AtomicUsize::new(0),
             in_merge: std::sync::atomic::AtomicBool::new(false),
             maint_err: AtomicPtr::new(std::ptr::null_mut()),
             maint_stop: std::sync::atomic::AtomicBool::new(false),
@@ -11427,6 +11477,7 @@ impl Db {
             wal_id: 0,
             mem_bytes: 0,
             direct: None,
+            mem_handed: None,
             max_key: Vec::new(),
             run_scratch: Vec::new(),
             built_ahead_len: 0,
@@ -11700,7 +11751,7 @@ impl Db {
             keeper_thread: std::sync::OnceLock::new(),
             next_seg: AtomicU64::new(next_seg),
             seal_counts: SealCounts::default(),
-            in_seal: std::sync::atomic::AtomicBool::new(false),
+            in_seal: AtomicUsize::new(0),
             in_merge: std::sync::atomic::AtomicBool::new(false),
             maint_err: AtomicPtr::new(std::ptr::null_mut()),
             maint_stop: std::sync::atomic::AtomicBool::new(false),
@@ -11748,6 +11799,7 @@ impl Db {
             wal_id,
             mem_bytes,
             direct: None,
+            mem_handed: None,
             max_key,
             run_scratch: Vec::new(),
             built_ahead_len: 0,
@@ -11771,6 +11823,9 @@ impl Db {
     /// which is the read-your-writes contract `Store::read_all` set.
     pub fn append(&mut self, key: &[u8], value: &[u8]) {
         let _op = self.op();
+        if !self.writes_go() {
+            return;
+        }
         if self.mem().ordered || self.direct_can_open() {
             if self.goes_direct(key, value) {
                 if !self.mem().ordered {
@@ -11880,6 +11935,9 @@ impl Db {
     /// onto its key until each read walked the pile.
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
         let _op = self.op();
+        if !self.writes_go() {
+            return;
+        }
         if self.mem().ordered {
             self.leave_direct();
         }
@@ -11899,6 +11957,9 @@ impl Db {
     /// and reclaimed by the next merge that reaches the key.
     pub fn delete(&mut self, key: &[u8]) {
         let _op = self.op();
+        if !self.writes_go() {
+            return;
+        }
         if self.mem().ordered {
             self.leave_direct();
         }
@@ -11906,6 +11967,24 @@ impl Db {
         self.wal.delete(key);
         self.mem().delete(hash, key, &self.shared.readers);
         self.mem_bytes += key.len() + 16;
+    }
+
+    /// The start of every write: the live table a `sync` handed to a seal
+    /// replaced first (`take_fresh_mem`), so nothing is written into it.
+    /// A write cannot fail, so when the replacement does -- the segment
+    /// work has stopped -- the write is dropped and the next `commit`
+    /// returns the error, as `leave_direct` leaves a failed close.
+    fn writes_go(&mut self) -> bool {
+        if self.mem_handed.is_none() {
+            return true;
+        }
+        match self.take_fresh_mem() {
+            Ok(()) => true,
+            Err(e) => {
+                self.pending_err.get_or_insert(e);
+                false
+            }
+        }
     }
 
     /// Start a transaction: puts and deletes staged until `Txn::commit`
@@ -11930,6 +12009,13 @@ impl Db {
         }
         if let Some(e) = self.shared.take_maint_err() {
             return Err(e);
+        }
+        // Nothing is staged after a hand-off -- the sync that handed the
+        // table committed everything, and a write since would have taken
+        // a fresh table -- and a commit's mark is a write into the table
+        // the writer promised not to touch.
+        if self.mem_handed.is_some() {
+            return Ok(());
         }
         let t = std::time::Instant::now();
         let background = matches!(self.opts.upkeep, Upkeep::Background(_));
@@ -12013,6 +12099,10 @@ impl Db {
         if let Some(e) = self.pending_err.take() {
             return Err(e);
         }
+        // As in `commit`: nothing is staged after a hand-off.
+        if self.mem_handed.is_some() {
+            return Ok(());
+        }
         if self.mem().ordered {
             self.commit_direct()
         } else {
@@ -12094,13 +12184,21 @@ impl Db {
             return Ok(());
         };
         self.land_seal()?;
-        debug_assert_eq!(
-            self.mem().len(),
-            d.committed,
-            "a run closes between batches"
-        );
-        self.freeze();
+        let table = self.freeze();
+        self.close_run(d, table);
+        Ok(())
+    }
+
+    /// The direct run `d` -- `table`'s records, committed to its segment
+    /// -- closed on the seal thread and handed to the segment work; the
+    /// second half of `close_direct`, and of `hand_tail` for an ordered
+    /// table handed without a freeze.
+    fn close_run(&mut self, d: Direct, table: std::sync::Arc<MemTable>) {
+        debug_assert_eq!(table.len(), d.committed, "a run closes between batches");
         let end_seq = self.wal.seq;
+        // First, since it moves the held state to the latest, and the name
+        // below is cut against the same state.
+        let first_partition = self.seals_first_partition();
         let np = self.segs().partition_point(|s| s.level > 0);
         let name = if np == 0 {
             Db::seg_name(d.id, end_seq)
@@ -12115,7 +12213,6 @@ impl Db {
         let dir = self.dir.clone();
         let tmp = d.tmp;
         let w = d.w;
-        let first_partition = self.seals_first_partition();
         let limit = self.partition_limit();
         let (id, seq) = (d.id, end_seq);
         let retiring = tmp.clone();
@@ -12137,8 +12234,7 @@ impl Db {
             // waited for.
             Ok(vec![name])
         };
-        self.hand_seal(job, None, Some(retiring));
-        Ok(())
+        self.hand_seal(job, table, None, Some(retiring));
     }
 
     /// Freeze the memtable, rotate the WAL, and hand the frozen table to a
@@ -12153,6 +12249,9 @@ impl Db {
         if let Some(e) = self.pending_err.take() {
             return Err(e);
         }
+        // A table a sync handed to a seal is already going: what is live
+        // after this is a fresh table, and empty.
+        self.take_fresh_mem()?;
         if self.mem().ordered {
             // The ordered memtable is the direct segment: committing what
             // is staged and closing it is the seal.
@@ -12168,6 +12267,16 @@ impl Db {
         self.land_seal()?;
         let frozen = self.freeze();
         self.mem_bytes = 0;
+        self.seal_table(frozen)
+    }
+
+    /// `table`, a hashed memtable whose every write is committed and
+    /// which the writer writes into no more -- frozen, or handed by a
+    /// `sync` -- written out on a thread of its own and handed to the
+    /// segment work: the WAL rotated, so the table's frames end in the
+    /// file the landing retires, and the table cut at the partitions'
+    /// fences into one piece per range; the second half of `seal`.
+    fn seal_table(&mut self, table: std::sync::Arc<MemTable>) -> Result<()> {
         let new_wal = self.next_wal(self.wal_id + 1)?;
         let old_wal = std::mem::replace(&mut self.wal, new_wal);
         // The new file's directory entry is made durable now, not at the
@@ -12177,6 +12286,9 @@ impl Db {
         File::open(&self.dir)?.sync_all()?;
         self.wal_id += 1;
         self.wal.seq = old_wal.seq;
+        // First, since it moves the held state to the latest, and the
+        // fences below are taken from the same state.
+        let first_partition = self.seals_first_partition();
         // The live partition fences, if any. A seal splits the memtable at
         // them and writes one piece per range, so every piece overlaps only
         // its own range and a later merge touches one partition instead of
@@ -12200,9 +12312,8 @@ impl Db {
         let end_seq = old_wal.seq;
         let retiring = old_wal.path.clone();
         drop(old_wal);
-        let first_partition = self.seals_first_partition();
         let limit = self.partition_limit();
-        let mem = frozen.clone();
+        let mem = table.clone();
         let job = move || -> Result<Vec<String>> {
             if background_io == BackgroundIo::Idle {
                 idle_io_priority();
@@ -12287,7 +12398,7 @@ impl Db {
             // names the segments in the manifest, before the WAL retires.
             Ok(names)
         };
-        self.hand_seal(job, Some(retiring), None);
+        self.hand_seal(job, table, Some(retiring), None);
         Ok(())
     }
 
@@ -12365,22 +12476,116 @@ impl Db {
         let _op = self.op();
         self.commit_staged()?;
         self.unsynced = 0;
-        // A store with no partition is one no read path is built for, so
-        // its tail goes to a seal too, and the sync does not wait for the
-        // seal; the segment work partitions what lands as soon as anything
-        // reads it (`Options::adaptive_shape`). With a seal still in
-        // flight the tail stays, since the store has one frozen table: the
-        // sync waited for that seal once, and lost the load most of what
-        // not flushing had won, and the tail it then sealed overlapped the
-        // seal before it, so a merge had to partition what a promotion of
-        // the one piece would have.
+        // The tail goes to a seal too, without waiting for it and without
+        // a freeze (`hand_tail`): the segment work partitions what lands
+        // as soon as anything reads it, and promotes by link what it can
+        // (`Options::adaptive_shape`). The tail used to stay where a seal
+        // was in flight or a partition existed -- the store has one frozen
+        // slot, and waiting for the seal lost the load most of what not
+        // flushing had won -- and what stayed was the shape the read
+        // passes after an ordered load paid for: a live ordered table of
+        // the last ten thousand keys beside a partition of the rest, every
+        // point read searching it for a key it did not hold, and every
+        // scan building a block because a store with unsealed keys never
+        // has its forms complete.
         if self.opts.adaptive_shape
             && matches!(self.maint, MaintHome::Away(_))
-            && !self.shared.in_seal.load(AtomicOrdering::Acquire)
+            && self.mem_handed.is_none()
             && !self.mem().is_empty()
-            && self.segs().iter().all(|s| s.level == 0)
         {
-            self.seal()?;
+            self.hand_tail()?;
+        }
+        Ok(())
+    }
+
+    /// The live table handed to a seal without a freeze: the writer marks
+    /// it handed (`mem_handed`), stops writing into it, and hands the seal
+    /// the table itself -- readers go on reading it as the live table,
+    /// since no state is published here. A hashed table goes as a seal's
+    /// frozen table does, its WAL rotated for the landing to retire; an
+    /// ordered one closes its direct run as `close_direct` does. The table
+    /// is replaced by whichever side publishes first: the landing installs
+    /// an empty table in its place, or the writer's next write freezes it
+    /// under a fresh one (`take_fresh_mem`), both by compare-and-swap on
+    /// the one state pointer. A freeze here would have needed the frozen
+    /// slot, held by a seal already in flight for as long as it runs.
+    fn hand_tail(&mut self) -> Result<()> {
+        debug_assert!(self.mem_handed.is_none(), "one table handed at a time");
+        let table = self.mem().clone();
+        self.mem_bytes = 0;
+        if table.ordered {
+            let Some(d) = self.direct.take() else {
+                debug_assert!(
+                    false,
+                    "an ordered table with committed entries has a run open"
+                );
+                return Ok(());
+            };
+            self.mem_handed = Some(table.clone());
+            self.close_run(d, table);
+            Ok(())
+        } else {
+            self.mem_handed = Some(table.clone());
+            self.seal_table(table)
+        }
+    }
+
+    /// The live table a `sync` handed to a seal (`mem_handed`) replaced,
+    /// before the writer writes again: by the landing, which the writer
+    /// finds done, or here, the table frozen under a fresh one as `freeze`
+    /// does it -- once the frozen slot is free, since a seal frozen before
+    /// the hand-off may still hold it, waited for as `land_seal` waits.
+    /// Nothing writes into the handed table between the hand-off and this,
+    /// so the writer's own caches, keyed to the live table's slots, stay
+    /// right until the publish here resets them as a freeze's does.
+    fn take_fresh_mem(&mut self) -> Result<()> {
+        let Some(handed) = self.mem_handed.clone() else {
+            return Ok(());
+        };
+        if matches!(self.maint, MaintHome::Here(_)) {
+            // Inline, nothing lands without the writer.
+            self.with_maint(|m| m.join_seal(false))?;
+        }
+        let t = std::time::Instant::now();
+        let mut waited = false;
+        loop {
+            // The count before the state: a count of zero read after the
+            // landing's publish sees that publish, so a table still live
+            // beside a count of zero has a seal that failed to land.
+            let seals = self.shared.in_seal.load(AtomicOrdering::Acquire);
+            self.rehold();
+            let (replaced, slot_free) = {
+                let st = self.state();
+                (
+                    !std::sync::Arc::ptr_eq(&st.mem, &handed),
+                    st.frozen.is_none(),
+                )
+            };
+            if replaced {
+                break;
+            }
+            if slot_free {
+                if self.freeze_table(&handed) {
+                    SealCounts::add(&self.shared.seal_counts.tail_by_writer, 1);
+                    break;
+                }
+                // Lost the swap to a publish since: look again.
+                continue;
+            }
+            if let Some(e) = self.shared.take_maint_err() {
+                return Err(e);
+            }
+            if seals == 0 {
+                return Err(err("a handed table's seal did not land"));
+            }
+            waited = true;
+            std::thread::park_timeout(MAINT_LAND_POLL);
+        }
+        self.mem_handed = None;
+        if waited {
+            let c = &self.shared.seal_counts;
+            SealCounts::add(&c.join_wait_ns, t.elapsed().as_nanos() as u64);
+            SealCounts::add(&c.blocked_joins, 1);
         }
         Ok(())
     }
@@ -12424,13 +12629,25 @@ impl Db {
     /// they read without a pin of their own. Returns the state replaced,
     /// retired and still readable for the rest of the operation.
     fn publish_writer(&mut self, make: impl Fn(&State) -> State) -> *const State {
+        self.try_publish_writer(|cur| Some(make(cur)))
+            .expect("a publish that declines no state")
+    }
+
+    /// `publish_writer` for a publish that may decline: `make` answers
+    /// `None` for a state it must not be made over -- one another thread
+    /// published first that changed what the publish assumed -- and
+    /// nothing is published.
+    fn try_publish_writer(
+        &mut self,
+        make: impl Fn(&State) -> Option<State>,
+    ) -> Option<*const State> {
         self.take_back_upkeep();
         self.stop_ahead();
         loop {
             let cur_p = self.shared.state.load(AtomicOrdering::Acquire);
             // SAFETY: the writer is pinned for its operation, and a state
             // is freed only past every pinned slot.
-            let next = make(unsafe { &*cur_p });
+            let next = make(unsafe { &*cur_p })?;
             let p = Box::into_raw(Box::new(next));
             if self
                 .shared
@@ -12447,7 +12664,7 @@ impl Db {
             if !self.r.held.load(AtomicOrdering::Relaxed).is_null() {
                 self.r.held.store(p, AtomicOrdering::Relaxed);
             }
-            return cur_p;
+            return Some(cur_p);
         }
     }
 
@@ -12473,12 +12690,31 @@ impl Db {
     /// carries nothing, and the writer's tables start afresh.
     fn freeze(&mut self) -> std::sync::Arc<MemTable> {
         self.rehold();
+        let table = self.mem().clone();
+        let frozen = self.freeze_table(&table);
+        debug_assert!(
+            frozen,
+            "the live table is the writer's own to freeze, and `land_seal` emptied the slot"
+        );
+        table
+    }
+
+    /// `table`, the live one, frozen under a fresh one in one publish,
+    /// when `table` is still the live table and the frozen slot is empty
+    /// at the publish; false, and nothing published, otherwise. Both hold
+    /// for the writer's own freeze; a table handed to a seal
+    /// (`take_fresh_mem`) may have been replaced by the landing since.
+    /// The forms go with it as `freeze` says.
+    fn freeze_table(&mut self, table: &std::sync::Arc<MemTable>) -> bool {
         let settled = self.freeze_prepare();
         let settled_at = self.state() as *const State;
         let complete = self.fs().tables_complete.get();
         let fresh = std::sync::Arc::new(MemTable::new());
         let carried = std::cell::Cell::new(false);
-        let old = self.publish_writer(|cur| {
+        let Some(old) = self.try_publish_writer(|cur| {
+            if !std::sync::Arc::ptr_eq(&cur.mem, table) || cur.frozen.is_some() {
+                return None;
+            }
             let carry = settled && std::ptr::eq(cur, settled_at);
             carried.set(carry);
             let mut next = State {
@@ -12506,11 +12742,12 @@ impl Db {
                 next.forms_at = AtomicUsize::new(0);
                 next.forms_complete = std::sync::atomic::AtomicBool::new(complete);
             }
-            next
-        });
+            Some(next)
+        }) else {
+            return false;
+        };
         // SAFETY: retired by `published` below, and the writer is pinned.
         let cur = unsafe { &*old };
-        let frozen = cur.mem.clone();
         if carried.get() {
             self.freeze_carry(cur);
         } else {
@@ -12527,7 +12764,7 @@ impl Db {
             self.drop_blocks();
         }
         self.published(old);
-        frozen
+        true
     }
 
     /// Whether the freeze carries the forms (`Options::forms_carry`), with
@@ -13104,7 +13341,7 @@ impl Db {
     /// thread of its own lands its seals itself.
     fn seal_finished(&self) -> bool {
         match &self.maint {
-            MaintHome::Here(m) => m.sealing.as_ref().is_some_and(|h| h.is_finished()),
+            MaintHome::Here(m) => m.sealing.front().is_some_and(|j| j.handle.is_finished()),
             MaintHome::Away(_) => false,
         }
     }
@@ -13120,9 +13357,12 @@ impl Db {
         }
     }
 
-    /// The seal in flight landed before the next freeze, which needs the
-    /// frozen slot empty: joined inline, or waited for where the segment
-    /// work is away -- the writer's backpressure, as the join was.
+    /// The frozen slot emptied before the next freeze, which needs it: the
+    /// seals joined inline, or the landing of the frozen table waited for
+    /// where the segment work is away -- the writer's backpressure, as the
+    /// join was. The slot, and not the seal count: a table a `sync` handed
+    /// without a freeze (`hand_tail`) is a seal in flight that holds no
+    /// slot, and a freeze need not wait for it.
     fn land_seal(&mut self) -> Result<()> {
         let draining = self.draining;
         if matches!(self.maint, MaintHome::Here(_)) {
@@ -13130,9 +13370,18 @@ impl Db {
         }
         let t = std::time::Instant::now();
         let mut waited = false;
-        while self.shared.in_seal.load(AtomicOrdering::Acquire) {
+        loop {
+            // The count before the state, as in `take_fresh_mem`.
+            let seals = self.shared.in_seal.load(AtomicOrdering::Acquire);
+            self.rehold();
+            if self.state().frozen.is_none() {
+                break;
+            }
             if let Some(e) = self.shared.take_maint_err() {
                 return Err(e);
+            }
+            if seals == 0 {
+                return Err(err("the frozen table's seal did not land"));
             }
             waited = true;
             std::thread::park_timeout(MAINT_LAND_POLL);
@@ -13155,11 +13404,13 @@ impl Db {
     }
 
     /// A seal's work started on a thread of its own and handed to the
-    /// segment work to land, with the WAL and the temp name its landing
-    /// retires.
+    /// segment work to land, with the table it writes out -- frozen, or
+    /// handed live -- for the landing to retire, and the WAL and the temp
+    /// name its landing retires.
     fn hand_seal(
         &mut self,
         job: impl FnOnce() -> Result<Vec<String>> + Send + 'static,
+        table: std::sync::Arc<MemTable>,
         wal: Option<PathBuf>,
         tmp: Option<PathBuf>,
     ) {
@@ -13175,21 +13426,21 @@ impl Db {
             }
             out
         });
-        self.shared.in_seal.store(true, AtomicOrdering::Release);
+        let job = SealJob {
+            handle,
+            table,
+            wal,
+            tmp,
+            draining,
+        };
+        // Counted before it is sent, so the count never reads zero with a
+        // seal in flight.
+        self.shared.in_seal.fetch_add(1, AtomicOrdering::AcqRel);
         match &mut self.maint {
-            MaintHome::Here(m) => {
-                m.sealing = Some(handle);
-                m.retiring_wals.extend(wal);
-                m.retiring_tmps.extend(tmp);
-            }
+            MaintHome::Here(m) => m.sealing.push_back(job),
             MaintHome::Away(a) => {
                 if let Some(tx) = &a.tx {
-                    let _ = tx.send(MaintJob::Seal {
-                        handle,
-                        wal,
-                        tmp,
-                        draining,
-                    });
+                    let _ = tx.send(MaintJob::Seal(job));
                 }
                 if let Some(t) = &a.thread {
                     t.unpark();
@@ -13262,16 +13513,28 @@ impl Db {
         self.shared.seal_counts.waits()
     }
 
+    /// Tables a `sync` handed to a seal without a freeze, replaced by the
+    /// writer's next write and by the landing respectively; for a test
+    /// that asserts which order it reached.
+    #[doc(hidden)]
+    pub fn tail_swaps(&self) -> (u64, u64) {
+        let c = &self.shared.seal_counts;
+        (
+            c.tail_by_writer.load(AtomicOrdering::Relaxed),
+            c.tail_by_landing.load(AtomicOrdering::Relaxed),
+        )
+    }
+
     pub fn segments(&self) -> usize {
         let _op = self.op();
-        self.segs().len() + usize::from(self.shared.in_seal.load(AtomicOrdering::Acquire))
+        self.segs().len() + self.shared.in_seal.load(AtomicOrdering::Acquire)
     }
 
     /// Whether a seal and a merge are running right now. A crash experiment
     /// records the state it died in with these.
     pub fn in_flight(&self) -> (bool, bool) {
         (
-            self.shared.in_seal.load(AtomicOrdering::Acquire),
+            self.shared.in_seal.load(AtomicOrdering::Acquire) > 0,
             self.shared.in_merge.load(AtomicOrdering::Acquire),
         )
     }
@@ -15879,16 +16142,23 @@ struct MaintAway {
 
 /// What the writer hands the segment work.
 enum MaintJob {
-    /// A seal's thread, to join and land, with the WAL and the temp name
-    /// its landing retires; `draining` books the wait as a flush's.
-    Seal {
-        handle: std::thread::JoinHandle<Result<Vec<String>>>,
-        wal: Option<PathBuf>,
-        tmp: Option<PathBuf>,
-        draining: bool,
-    },
+    /// A seal, to join and land.
+    Seal(SealJob),
     /// Something the writer waits for, answered down the sender.
     Ask(MaintAsk, std::sync::mpsc::Sender<Result<()>>),
+}
+
+/// A seal handed to the segment work: its thread, the table it writes
+/// out -- the frozen one, or the live one a `sync` handed without a
+/// freeze (`Db::hand_tail`) -- which the landing retires from whichever
+/// slot of the state holds it, and the WAL and the temp name the landing
+/// retires; `draining` books the wait as a flush's.
+struct SealJob {
+    handle: std::thread::JoinHandle<Result<Vec<String>>>,
+    table: std::sync::Arc<MemTable>,
+    wal: Option<PathBuf>,
+    tmp: Option<PathBuf>,
+    draining: bool,
 }
 
 /// What the writer waits for.
@@ -15956,7 +16226,12 @@ struct Maint {
     /// inputs and a partition merge's are disjoint, each excluding the
     /// other's at its start, so the two run beside each other.
     tiering: Option<Compaction>,
-    sealing: Option<std::thread::JoinHandle<Result<Vec<String>>>>,
+    /// The seals in flight, landed in the order they were handed: a seal's
+    /// WAL is retired only after its own manifest, and the manifest's
+    /// covered sequence is a maximum, so a later seal landed first would
+    /// have named the earlier one's records covered. The front is the
+    /// oldest; `collect` lands the front while it has finished.
+    sealing: std::collections::VecDeque<SealJob>,
     /// The thread this work runs on, when it has one of its own: the seal
     /// and merge threads wake it when they finish, so a finished one is
     /// landed at once rather than at the next seal.
@@ -15964,9 +16239,6 @@ struct Maint {
     /// The reads over an unshaped store counted when the store was last
     /// shaped (`Options::adaptive_shape`).
     shaped_at: u64,
-    /// Whether the seal in `sealing` was a flush's, for the wait to be
-    /// booked as one when `collect` lands it.
-    seal_draining: bool,
 }
 
 impl std::ops::Deref for Maint {
@@ -16013,8 +16285,8 @@ impl Maint {
         // the writer's own drop joined its seal, and landed by no one.
         while let Ok(job) = rx.try_recv() {
             match job {
-                MaintJob::Seal { handle, .. } => {
-                    let _ = handle.join();
+                MaintJob::Seal(job) => {
+                    let _ = job.handle.join();
                 }
                 MaintJob::Ask(_, reply) => {
                     let _ = reply.send(Err(err("the store is closing")));
@@ -16027,27 +16299,25 @@ impl Maint {
     fn handle(&mut self, job: MaintJob) {
         let op = self.op();
         match job {
-            MaintJob::Seal {
-                handle,
-                wal,
-                tmp,
-                draining,
-            } => {
+            MaintJob::Seal(job) => {
                 // Landed by `collect` once the seal thread is done, and
                 // not joined here: joined, this thread sat in the join for
                 // the seal's whole run -- 700 ms at three hundred thousand
                 // keys -- and landed nothing else meanwhile, a finished
                 // merge and a piece to promote among them.
-                self.sealing = Some(handle);
-                self.seal_draining = draining;
-                self.retiring_wals.extend(wal);
-                self.retiring_tmps.extend(tmp);
+                self.sealing.push_back(job);
+                drop(op);
             }
             MaintJob::Ask(ask, reply) => {
-                let _ = reply.send(self.answer(ask));
+                let out = self.answer(ask);
+                // Unpinned before the answer goes: the writer's operation
+                // ends on the reply and sweeps what the answer's publishes
+                // retired, and a slot still pinned here kept those states
+                // until the next publish.
+                drop(op);
+                let _ = reply.send(out);
             }
         }
-        drop(op);
     }
 
     /// What the writer waits for; see `MaintAsk`.
@@ -16068,7 +16338,7 @@ impl Maint {
     /// A merge or a piece merge that finished, landed: on the thread of its
     /// own, nothing else would, where inline the next seal did.
     fn collect(&mut self) {
-        let sealed = self.sealing.as_ref().is_some_and(|h| h.is_finished());
+        let sealed = self.sealing.front().is_some_and(|j| j.handle.is_finished());
         let merged = self
             .compacting
             .as_ref()
@@ -16079,11 +16349,11 @@ impl Maint {
         }
         let op = self.op();
         let mut done = Ok(());
-        if sealed {
-            done = self.join_seal(self.seal_draining);
-            if done.is_err() {
-                self.shared.in_seal.store(false, AtomicOrdering::Release);
-            }
+        // The front, and the seals behind it that have finished too, in
+        // order; one still writing holds the rest.
+        while done.is_ok() && self.sealing.front().is_some_and(|j| j.handle.is_finished()) {
+            let draining = self.sealing.front().is_some_and(|j| j.draining);
+            done = self.land_front(draining);
         }
         if merged && done.is_ok() {
             done = self.join_compact();
@@ -16135,6 +16405,23 @@ impl Maint {
             .unshaped_wake
             .store(false, AtomicOrdering::Release);
         if segs.iter().any(|s| s.level > 0) {
+            // A partitioned store: a piece whose keys lie above its
+            // partition's last key -- an ordered tail's, landed as a piece
+            // over the last range -- becomes a partition by link at the
+            // landing, as the flush's drain would have made it. No merge
+            // starts here; that waits for `l0_trigger` pieces, or a flush.
+            // Before this the piece stayed a piece: `maybe_compact` waits
+            // for the trigger and this returned, so every read consulted
+            // it and every scan took the merge path for the store's life.
+            if look && self.opts.promote {
+                let done = match self.merge_due(1) {
+                    Some(due) if !due.is_empty() => self.promote_ranges(due).map(|_| ()),
+                    _ => Ok(()),
+                };
+                if let Err(e) = done {
+                    self.shared.put_maint_err(e);
+                }
+            }
             drop(op);
             return;
         }
@@ -16157,8 +16444,8 @@ impl Maint {
     /// being dropped, and a seal thread left running would go on mutating
     /// the directory under whoever reopens it.
     fn stop(&mut self) {
-        if let Some(h) = self.sealing.take() {
-            let _ = h.join();
+        for job in self.sealing.drain(..) {
+            let _ = job.handle.join();
         }
         if let Some((_, h)) = self.compacting.take() {
             let _ = h.join();
@@ -16177,11 +16464,10 @@ impl Maint {
             retiring_tmps: Vec::new(),
             compacting: None,
             tiering: None,
-            sealing: None,
+            sealing: std::collections::VecDeque::new(),
             flush_merge: false,
             wake: None,
             shaped_at: 0,
-            seal_draining: false,
         }
     }
 
@@ -16273,18 +16559,44 @@ impl Maint {
         Op(&self.r)
     }
 
-    /// Collect a finished (or in-flight) seal: join the thread, open its
-    /// segments, and publish them and the frozen memtable's retirement as
-    /// one state -- two publishes, as the writer made them, left a state
-    /// between with the frozen table's keys in the piece and the table
-    /// alike. `draining` books the wait as a flush's.
+    /// Every seal in flight collected, oldest first; `draining` books the
+    /// waits as a flush's.
     fn join_seal(&mut self, draining: bool) -> Result<()> {
-        let Some(handle) = self.sealing.take() else {
+        while !self.sealing.is_empty() {
+            self.land_front(draining)?;
+        }
+        Ok(())
+    }
+
+    /// The oldest seal in flight landed, its thread joined first if it is
+    /// still writing: the seal counted out whether the landing succeeds or
+    /// not, since a count that stays up for a seal that will never land is
+    /// a writer waiting forever.
+    fn land_front(&mut self, draining: bool) -> Result<()> {
+        let Some(job) = self.sealing.pop_front() else {
             return Ok(());
         };
+        let SealJob {
+            handle,
+            table,
+            wal,
+            tmp,
+            ..
+        } = job;
         let t = std::time::Instant::now();
         let blocked = !handle.is_finished();
-        let names = handle.join().map_err(|_| err("seal thread panicked"))??;
+        let opened = handle
+            .join()
+            .map_err(|_| err("seal thread panicked"))
+            .and_then(|names| names)
+            .and_then(|names| self.open_sealed(&names));
+        let segs = match opened {
+            Ok(segs) => segs,
+            Err(e) => {
+                self.shared.in_seal.fetch_sub(1, AtomicOrdering::AcqRel);
+                return Err(e);
+            }
+        };
         let waited = t.elapsed().as_nanos() as u64;
         let counts = &self.shared.seal_counts;
         SealCounts::add(&counts.joins, 1);
@@ -16294,8 +16606,14 @@ impl Maint {
             SealCounts::add(&counts.join_wait_ns, waited);
             SealCounts::add(&counts.blocked_joins, 1);
         }
+        self.land(t, segs, &table, wal, tmp)
+    }
+
+    /// The seal's segments opened, and the covered sequence moved up to
+    /// what their names say.
+    fn open_sealed(&mut self, names: &[String]) -> Result<Vec<std::sync::Arc<Seg>>> {
         let mut segs = self.segs().to_vec();
-        for name in &names {
+        for name in names {
             self.covered_seq = self.covered_seq.max(Db::name_end_seq(name).unwrap_or(0));
             segs.push(std::sync::Arc::new(Seg::open(
                 &self.dir,
@@ -16305,7 +16623,30 @@ impl Maint {
                 self.opts.segment.checksums,
             )?));
         }
-        self.publish_segs_with(segs, false, true);
+        Ok(segs)
+    }
+
+    /// A seal landed: its segments and the table's retirement published as
+    /// one state -- two publishes, as the writer made them, left a state
+    /// between with the table's keys in the piece and the table alike --
+    /// then the manifest, the WAL and temp name retired, and what the new
+    /// segment set makes due. The table is retired from whichever slot
+    /// holds it: the frozen one for a seal the writer froze, the live one
+    /// for a table a `sync` handed without a freeze that the writer has not
+    /// written past. The seal is counted out at the publish: from there the
+    /// table is out of the state and the segments are in, and a count that
+    /// stayed up through the manifest's fsyncs read a landed seal twice in
+    /// `segments`, once as its segment and once as in flight.
+    fn land(
+        &mut self,
+        t: std::time::Instant,
+        segs: Vec<std::sync::Arc<Seg>>,
+        table: &std::sync::Arc<MemTable>,
+        wal: Option<PathBuf>,
+        tmp: Option<PathBuf>,
+    ) -> Result<()> {
+        self.publish_segs_with(segs, false, Some(table));
+        self.shared.in_seal.fetch_sub(1, AtomicOrdering::AcqRel);
         if self.opts.scan_block_cache {
             self.build_ctx().rank_pieces()?;
         }
@@ -16315,6 +16656,11 @@ impl Maint {
             &self.shared.seal_counts.publish_ns,
             tp.elapsed().as_nanos() as u64,
         );
+        // This seal's WAL and temp name, retired now that the manifest
+        // names the segments that cover them; the ones the open left are
+        // covered by the first landing after it.
+        self.retiring_wals.extend(wal);
+        self.retiring_tmps.extend(tmp);
         for old in std::mem::take(&mut self.retiring_wals) {
             // One spare is enough: the writer takes it at its next
             // rotation, and a seal lands before the next one rotates.
@@ -16346,7 +16692,6 @@ impl Maint {
             &self.shared.seal_counts.seal_ns,
             t.elapsed().as_nanos() as u64,
         );
-        self.shared.in_seal.store(false, AtomicOrdering::Release);
         if self.opts.compact {
             self.maybe_compact()?;
             self.maybe_tier()?;
@@ -16356,7 +16701,7 @@ impl Maint {
     }
 
     fn publish_segs(&mut self, segs: Vec<std::sync::Arc<Seg>>) {
-        self.publish_segs_with(segs, false, false)
+        self.publish_segs_with(segs, false, None)
     }
 
     /// What a flush does once its seal has landed: the merges in flight
@@ -16443,17 +16788,31 @@ impl Maint {
         Ok(())
     }
 
-    /// `segs` published as the live set, with the frozen memtable retired
-    /// in the same state where `land`. The segments are this work's alone
+    /// `segs` published as the live set, with the memtable `landed` --
+    /// the table a seal wrote out -- retired in the same state: from the
+    /// frozen slot where the writer froze it, or from the live slot,
+    /// replaced by an empty table, where a `sync` handed it live and the
+    /// writer has not written since. The segments are this work's alone
     /// to change, so a publish another thread made first -- the writer's
     /// freeze or its switch of memtable -- changes nothing here but the
     /// memtables, which are taken again from the state that won and the
-    /// swap tried once more. The published forms are carried by the
-    /// publish (`State::carry_published`), and the writer carries its own
-    /// at its next look at the log (`Reader::rebase_tables`); with
-    /// `tier`, a piece merge's, no partition is rewritten.
-    fn publish_segs_with(&mut self, mut segs: Vec<std::sync::Arc<Seg>>, tier: bool, land: bool) {
+    /// swap tried once more; the writer's freeze of a handed table moves
+    /// it from the live slot to the frozen one, and the retry finds it
+    /// there. The published forms are carried by the publish
+    /// (`State::carry_published`), and the writer carries its own at its
+    /// next look at the log (`Reader::rebase_tables`), which drops them
+    /// where the live table changed under it; with `tier`, a piece
+    /// merge's, no partition is rewritten.
+    fn publish_segs_with(
+        &mut self,
+        mut segs: Vec<std::sync::Arc<Seg>>,
+        tier: bool,
+        landed: Option<&std::sync::Arc<MemTable>>,
+    ) {
         segs.sort_by(|a, b| seg_order(a, b));
+        // One fresh table for every attempt: a landing that lost the swap
+        // installs the same empty table on its retry.
+        let fresh = landed.map(|_| std::sync::Arc::new(MemTable::new()));
         debug_assert!(
             Self::partitions_tile(&segs),
             "a segment publish left partitions that do not tile the key space"
@@ -16469,6 +16828,33 @@ impl Maint {
             // is freed only past every pinned slot.
             let cur = unsafe { &*cur_p };
             let layout = Db::layout_of(cur, &segs, !tier && self.opts.forms_rebase);
+            let mut swapped_live = false;
+            let (mem, frozen) = match landed {
+                Some(t) if std::sync::Arc::ptr_eq(&cur.mem, t) => {
+                    swapped_live = true;
+                    (
+                        fresh.clone().expect("made for a landing"),
+                        cur.frozen.clone(),
+                    )
+                }
+                Some(t)
+                    if cur
+                        .frozen
+                        .as_ref()
+                        .is_some_and(|f| std::sync::Arc::ptr_eq(f, t)) =>
+                {
+                    (cur.mem.clone(), None)
+                }
+                Some(_) => {
+                    // Neither slot: the table's own seal is the only
+                    // publish that retires it, and this is that publish.
+                    // Left as it is rather than a slot emptied of some
+                    // other table, whose seal has not landed.
+                    debug_assert!(false, "a landed table is the live one or the frozen one");
+                    (cur.mem.clone(), cur.frozen.clone())
+                }
+                None => (cur.mem.clone(), cur.frozen.clone()),
+            };
             let mut next = State {
                 layout,
                 forms: Reader::forms_for(&segs),
@@ -16480,8 +16866,8 @@ impl Maint {
                 scans: AtomicU64::new(0),
                 forms_bytes: AtomicUsize::new(0),
                 segs: segs.clone(),
-                mem: cur.mem.clone(),
-                frozen: if land { None } else { cur.frozen.clone() },
+                mem,
+                frozen,
                 gen: cur.gen + 1,
                 mean_key_bytes,
                 store_bytes,
@@ -16504,6 +16890,9 @@ impl Maint {
             self.shared
                 .forms_rebased
                 .fetch_add(rebases, AtomicOrdering::Relaxed);
+            if swapped_live {
+                SealCounts::add(&self.shared.seal_counts.tail_by_landing, 1);
+            }
             // This operation reads what it published from here on.
             if !self.r.held.load(AtomicOrdering::Relaxed).is_null() {
                 self.r.held.store(p, AtomicOrdering::Relaxed);
@@ -16614,7 +17003,7 @@ impl Maint {
                 self.opts.segment.checksums,
             )?));
         }
-        self.publish_segs_with(merged, true, false);
+        self.publish_segs_with(merged, true, None);
         if self.opts.scan_block_cache {
             self.build_ctx().rank_pieces()?;
         }
@@ -16733,6 +17122,21 @@ impl Maint {
     fn promote_ranges(&mut self, due: Vec<Fence>) -> Result<Vec<Fence>> {
         let mut rest = Vec::new();
         for f in due {
+            // The range's pieces: those cut at its fences and, for the last
+            // range, those cut open-ended against an older set of fences,
+            // whose range reached at least as low -- a tail's, named while
+            // the piece ahead of it was in flight, whose landing promoted
+            // that piece and closed the partition the tail was aligned to.
+            // Such a piece is promoted on its keys as an aligned one is: a
+            // promotion checks every key against the partition's last and
+            // the pieces' order, and the fence in the name says nothing a
+            // check does not. Left to the merge, an ordered load whose
+            // seals overlap merged its last partitions at every landing.
+            let candidate = |s: &Seg| {
+                s.level == 0
+                    && ((s.lo == f.0 && s.hi == f.1)
+                        || (f.1.is_none() && s.hi.is_none() && s.lo <= f.0))
+            };
             let part = self
                 .segs()
                 .iter()
@@ -16741,7 +17145,7 @@ impl Maint {
                 .segs()
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| s.level == 0 && s.lo == f.0 && s.hi == f.1)
+                .filter(|(_, s)| candidate(s))
                 .map(|(i, _)| i)
                 .collect();
             let Some(pi) = part else {
@@ -16761,11 +17165,10 @@ impl Maint {
             // older than the pieces promoted, and a promoted piece becomes
             // a partition, older than every piece: that piece's values
             // would read as newer than theirs. The range is merged instead.
-            let unaligned = self.segs().iter().any(|s| {
-                s.level == 0
-                    && !(s.lo == f.0 && s.hi == f.1)
-                    && fences_overlap(&s.lo, &s.hi, &f.0, &f.1)
-            });
+            let unaligned = self
+                .segs()
+                .iter()
+                .any(|s| s.level == 0 && !candidate(s) && fences_overlap(&s.lo, &s.hi, &f.0, &f.1));
             if unaligned {
                 rest.push(f);
                 continue;
@@ -16798,6 +17201,14 @@ impl Maint {
                 None => rest.push(f),
             }
         }
+        // A range refused for a piece over it that a later range's
+        // promotion took -- an open-ended piece over the last ranges,
+        // promoted at the last -- has nothing left to merge.
+        rest.retain(|f| {
+            self.segs()
+                .iter()
+                .any(|s| s.level == 0 && fences_overlap(&s.lo, &s.hi, &f.0, &f.1))
+        });
         Ok(rest)
     }
 

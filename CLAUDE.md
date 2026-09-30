@@ -48,7 +48,13 @@ timing run needs the machine to itself, and CI gives it a job of its own.
 The tests leave their stores under the temp directory, one per test and
 process (`supdb-next-<name>-<pid>`), so a day of test runs on one box is
 tens of thousands of them and the disk they fill; `rm -rf
-$TMPDIR/supdb-next-*` between runs.
+$TMPDIR/supdb-next-*` between runs. On a box other runs share, give each
+run a `TMPDIR` of its own and clean that: the glob takes every process's
+stores, and a run whose store another run's cleanup removed mid-test
+fails with a bare `NotFound` from whatever file operation came next --
+eight tests of one run, one of them in six runs alone, before a syscall
+trace showed the store's directory gone and nothing in the process that
+removed it.
 
 Keep it that way. Every gate this repository has broken has broken the same
 way: a check that was not running, or one reporting a verdict it had not
@@ -211,7 +217,13 @@ state twice took an entry from one memtable to the chains of another when
 a freeze landed between, and three reader threads found it in their
 first minute. An operation that publishes moves what it holds to what it
 published, and the writer's operations hold one state each: what the
-segment work publishes meanwhile, the writer sees at its next. The
+segment work publishes meanwhile, the writer sees at its next. A table
+the writer hands to a seal without freezing it (`sync` under
+`adaptive_shape`, with the frozen slot held by a seal in flight) is
+replaced by whichever side publishes first -- the writer at its next
+write, freezing it under a fresh table, or the landing, installing an
+empty one -- by compare-and-swap on the same pointer, and the writer
+writes nothing into it after the hand-off. The
 isolation is the reader's: `Latest` honours the memtable's watermark at the
 last commit, `Snapshot` pins a state and a watermark, `Dirty` honours none,
 which is what the writer's own reads do. A `#[cfg(test)]` module asks the
@@ -682,7 +694,26 @@ promotion beside it would have made pieces younger than it into
 partitions, which read as older than every piece. A merge's fences are
 grown to cover every input now, and a range such a piece overlaps is
 merged, never promoted. The rule: when two jobs cut one space and either
-may land first, whatever reads the result must take either order.
+may land first, whatever reads the result must take either order. A
+promotion at every landing made the stale cut the common case: an
+ordered load's tail was named against the last partition while the
+piece ahead of it was in flight, that piece's landing promoted it and
+closed the partition, and the tail landed wide over two ranges and went
+to a merge of both, at every landing, where a link would do. A piece
+open above and cut at least as low as the last range is promoted on its
+keys now, the check a promotion makes anyway, since the fence in a name
+says nothing the keys do not.
+
+**A name decided against a store a seal in flight will change.** The
+seal that names the first partition asked only whether the store had a
+segment. With a table handed to a seal beside one already in flight,
+both asked over an empty store and both were named the first partition,
+two partitions over the whole range, and the landing's tiling assertion
+was what said so. The count of seals in flight is asked first now, and
+the state after it, so a seal counted out is one whose landing the
+state shows. The rule: a decision about the store's shape is made
+against the store plus everything in flight that will change it, and
+the order of the two reads is the order the other side wrote them in.
 
 **A precondition left to the callers.** Promotion without a merge is for
 a store with no partitions yet, and two of its three callers asked
