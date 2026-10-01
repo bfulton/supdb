@@ -5729,6 +5729,11 @@ fn block_bounds_of(
     Ok(at)
 }
 
+/// The frozen tables a state holds at most, each a seal in flight: the
+/// writer freezes into room and waits for the oldest to land only when
+/// the list is full.
+const FROZEN_CAP: usize = 1;
+
 /// What a reader reads: the store as of a publish. The writer builds a
 /// new one at every seal, join, merge or freeze and swaps it in whole,
 /// so a reader that loaded the old one keeps it, unchanged, until its
@@ -5740,12 +5745,15 @@ struct State {
     /// holds.
     segs: Vec<std::sync::Arc<Seg>>,
     mem: std::sync::Arc<MemTable>,
-    /// A seal in flight: the frozen memtable stays readable (it is newer
-    /// than every segment and older than `mem`) while a thread writes it
-    /// out; the landing retires it (`Maint::land`). A table a `sync`
-    /// handed without a freeze is a seal in flight too, and stays `mem`
-    /// until the landing or the writer's next write replaces it.
-    frozen: Option<std::sync::Arc<MemTable>>,
+    /// The seals in flight, oldest first: each frozen memtable stays
+    /// readable while a thread writes it out -- newer than every segment
+    /// and than the tables before it, older than those after it and than
+    /// `mem` -- and the landing retires the front (`Maint::land`), since
+    /// seals land in the order they were handed. At most `FROZEN_CAP`. A
+    /// table a `sync` handed without a freeze is a seal in flight too,
+    /// and stays `mem` until the landing or the writer's next write
+    /// replaces it.
+    frozen: Vec<std::sync::Arc<MemTable>>,
     /// Bumped at every publish: what a scan snapshot and a block table
     /// are keyed by, so either is rebuilt when the segments or the
     /// memtables change under it.
@@ -6534,7 +6542,18 @@ struct FormsState {
 /// over; see `FormsState::over`.
 struct SyncedOver {
     mem: std::sync::Weak<MemTable>,
-    frozen: Option<std::sync::Weak<MemTable>>,
+    frozen: Vec<std::sync::Weak<MemTable>>,
+}
+
+/// Whether `noted` names the tables of `now`, one for one in order, by
+/// identity: a `Weak` keeps its allocation, so an address it names is
+/// not another table's.
+fn same_tables(noted: &[std::sync::Weak<MemTable>], now: &[std::sync::Arc<MemTable>]) -> bool {
+    noted.len() == now.len()
+        && noted
+            .iter()
+            .zip(now)
+            .all(|(a, b)| std::ptr::eq(a.as_ptr(), std::sync::Arc::as_ptr(b)))
 }
 
 impl FormsState {
@@ -8145,8 +8164,17 @@ impl Reader {
         &self.state().mem
     }
 
-    fn frozen(&self) -> Option<&std::sync::Arc<MemTable>> {
-        self.state().frozen.as_ref()
+    /// The frozen tables, oldest first.
+    fn frozen(&self) -> &[std::sync::Arc<MemTable>] {
+        &self.state().frozen
+    }
+
+    /// The frozen table, where the snapshot's single base can name it:
+    /// the list holds one at most.
+    fn frozen_single(&self) -> Option<&std::sync::Arc<MemTable>> {
+        let fr = self.frozen();
+        debug_assert!(fr.len() <= 1, "a snapshot's base names one frozen table");
+        fr.first()
     }
 
     fn set_advice_random(&self, random: bool) {
@@ -8255,9 +8283,7 @@ impl Reader {
 
 impl State {
     fn has_tombstones(&self) -> bool {
-        self.segs_tombs
-            || self.mem.tombs() > 0
-            || self.frozen.as_ref().is_some_and(|f| f.tombs() > 0)
+        self.segs_tombs || self.mem.tombs() > 0 || self.frozen.iter().any(|f| f.tombs() > 0)
     }
 
     /// The level-0 pieces a read of a key in partition `at` consults.
@@ -8616,12 +8642,13 @@ impl Reader {
             self.count_lag();
         }
         // Sources oldest to newest: the partition (0), the level-0 pieces
-        // (1..), the frozen memtable, the live one. `start` is the source
-        // live values begin at: 0 unless a newer source holds a tombstone
-        // for this key. Only a store with tombstones in it checks, and the
-        // check is what a delete costs a read -- a second probe on the
-        // sources that hold the key.
-        let (fr_ix, mem_ix) = (1 + l0.len(), 2 + l0.len());
+        // (1..), the frozen memtables oldest first, the live one. `start`
+        // is the source live values begin at: 0 unless a newer source
+        // holds a tombstone for this key. Only a store with tombstones in
+        // it checks, and the check is what a delete costs a read -- a
+        // second probe on the sources that hold the key.
+        let fr_ix = 1 + l0.len();
+        let mem_ix = fr_ix + st.frozen.len();
         let mut start = 0usize;
         if st.has_tombstones() {
             if !mem_empty {
@@ -8632,11 +8659,15 @@ impl Reader {
                 }
             }
             if start == 0 {
-                if let Some(fr) = &st.frozen {
-                    if let Some(e) = fr.get(key, MemTable::ALL) {
-                        if fr.has_tomb(e, SEE_ALL) {
-                            start = fr_ix;
-                        }
+                // The frozen tables newest first: the newest holding a
+                // tombstone is the cut.
+                for (i, fr) in st.frozen.iter().enumerate().rev() {
+                    if fr
+                        .get(key, MemTable::ALL)
+                        .is_some_and(|e| fr.has_tomb(e, SEE_ALL))
+                    {
+                        start = fr_ix + i;
+                        break;
                     }
                 }
             }
@@ -8672,14 +8703,15 @@ impl Reader {
                 .read_all(key, &mut f)
                 .map_err(|e| err(&format!("segment read: {e}")))?;
         }
-        if fr_ix >= start {
-            if let Some(fr) = &st.frozen {
-                if let Some(e) = fr.get(key, MemTable::ALL) {
-                    let (offs, _) = fr.live_chain(e, SEE_ALL);
-                    n += offs.len() as u64;
-                    for off in offs {
-                        f(fr.value_at(off));
-                    }
+        for (i, fr) in st.frozen.iter().enumerate() {
+            if fr_ix + i < start {
+                continue;
+            }
+            if let Some(e) = fr.get(key, MemTable::ALL) {
+                let (offs, _) = fr.live_chain(e, SEE_ALL);
+                n += offs.len() as u64;
+                for off in offs {
+                    f(fr.value_at(off));
                 }
             }
         }
@@ -8709,7 +8741,7 @@ impl Reader {
         // The log's length before any chain is read: see `extend`.
         let log_at = self.log_end();
         let live = self.build_over(Some((self.mem(), live_len)), None, log_at);
-        match self.frozen() {
+        match self.frozen_single() {
             Some(fr) => live.with_base(self.frozen_snapshot(fr)),
             None => live,
         }
@@ -8950,7 +8982,7 @@ impl Reader {
         if self.lag_adapts() {
             let st = self.state();
             let np = st.segs.partition_point(|s| s.level > 0);
-            if st.frozen.is_some() || !st.mem.is_empty() || np < st.segs.len() {
+            if !st.frozen.is_empty() || !st.mem.is_empty() || np < st.segs.len() {
                 self.count_lag();
             }
         }
@@ -8983,7 +9015,7 @@ impl Reader {
             .borrow()
             .as_ref()
             .is_none_or(|(g, _)| *g != gen);
-        let unsealed_any = !self.mem().is_empty() || self.frozen().is_some();
+        let unsealed_any = !self.mem().is_empty() || !self.frozen().is_empty();
         if use_cache && absent && unsealed_any && self.opts.scan_lazy_snapshot {
             let mut counts = self.fs().lazy_scans.get();
             let (seen, from) = match self.scan_blocks(from, limit, None, false, &mut f)? {
@@ -9074,11 +9106,12 @@ impl Reader {
             let Some(key) = next else { break };
 
             // Emit in append order -- partitions, then L0 oldest to
-            // newest, then the frozen memtable, then the live one -- and
-            // advance every cursor that was sitting on this key.
+            // newest, then the frozen memtables oldest first, then the live
+            // one -- and advance every cursor that was sitting on this key.
             // Sources are ordered oldest to newest -- the cursors, then the
-            // frozen memtable, then the live one -- so the newest source with
-            // a tombstone for this key is a cut, and live values start there.
+            // frozen memtables, then the live one -- so the newest source
+            // with a tombstone for this key is a cut, and live values start
+            // there.
             let nc = cursors.len();
             let in_unsealed = unsealed.peek(mc).map(|(k, _)| k) == Some(key);
             let mut start = 0usize;
@@ -9089,14 +9122,12 @@ impl Reader {
                         .get(key, self.len_bound.get())
                         .is_some_and(|e| self.mem().has_tomb(e, self.wm()))
                     {
-                        start = nc + 1;
-                    } else if self
-                        .frozen()
-                        .as_ref()
-                        .and_then(|fr| fr.get(key, MemTable::ALL).map(|e| fr.has_tomb(e, SEE_ALL)))
-                        .unwrap_or(false)
-                    {
-                        start = nc;
+                        start = nc + self.frozen().len();
+                    } else if let Some(i) = self.frozen().iter().rposition(|fr| {
+                        fr.get(key, MemTable::ALL)
+                            .is_some_and(|e| fr.has_tomb(e, SEE_ALL))
+                    }) {
+                        start = nc + i;
                     }
                 }
                 if start == 0 {
@@ -9123,16 +9154,17 @@ impl Reader {
                 }
             }
             if in_unsealed {
-                if nc >= start {
-                    if let Some(fr) = self.frozen() {
-                        if let Some(e) = fr.get(key, MemTable::ALL) {
-                            for off in fr.live_chain(e, SEE_ALL).0 {
-                                f(key, fr.value_at(off));
-                            }
+                for (i, fr) in self.frozen().iter().enumerate() {
+                    if nc + i < start {
+                        continue;
+                    }
+                    if let Some(e) = fr.get(key, MemTable::ALL) {
+                        for off in fr.live_chain(e, SEE_ALL).0 {
+                            f(key, fr.value_at(off));
                         }
                     }
                 }
-                if nc + 1 >= start {
+                if nc + self.frozen().len() >= start {
                     if let Some(e) = self.mem().get(key, self.len_bound.get()) {
                         for off in self.mem().live_chain(e, self.wm()).0 {
                             f(key, self.mem().value_at(off));
@@ -9244,7 +9276,7 @@ impl Reader {
     fn note_over(&self, st: &State) {
         *self.fs().over.borrow_mut() = Some(SyncedOver {
             mem: std::sync::Arc::downgrade(&st.mem),
-            frozen: st.frozen.as_ref().map(std::sync::Arc::downgrade),
+            frozen: st.frozen.iter().map(std::sync::Arc::downgrade).collect(),
         });
     }
 
@@ -9292,12 +9324,14 @@ impl Reader {
         if !std::ptr::eq(over.mem.as_ptr(), std::sync::Arc::as_ptr(&st.mem)) {
             return false;
         }
-        let same_frozen = match (&over.frozen, &st.frozen) {
-            (Some(a), Some(b)) => std::ptr::eq(a.as_ptr(), std::sync::Arc::as_ptr(b)),
-            (None, None) => true,
-            _ => false,
-        };
-        let landed = over.frozen.is_some() && st.frozen.is_none();
+        let same_frozen = same_tables(&over.frozen, &st.frozen);
+        // Landings retire the front of the list, so a list that lost its
+        // oldest tables and kept the rest is one the landings made.
+        let landed = st.frozen.len() < over.frozen.len()
+            && same_tables(
+                &over.frozen[over.frozen.len() - st.frozen.len()..],
+                &st.frozen,
+            );
         if !same_frozen && !landed {
             return false;
         }
@@ -9726,7 +9760,7 @@ impl Reader {
         if !self.opts.share_snapshot || !self.opts.frozen_snaps {
             return None;
         }
-        let fr = self.frozen()?.clone();
+        let fr = self.frozen_single()?.clone();
         let base = self.frozen_snapshot(&fr);
         let runs = base.runs;
         Some(std::sync::Arc::new(Snapshot::over_base(base, runs)))
@@ -9740,7 +9774,7 @@ impl Reader {
         if !self.opts.share_snapshot || !self.opts.frozen_snaps {
             return s;
         }
-        match (s.base.as_ref(), self.frozen()) {
+        match (s.base.as_ref(), self.frozen_single()) {
             (Some(b), Some(fr)) if !b.runs => match fr.snaps.copied.get() {
                 Some(c) => std::sync::Arc::new(s.with_base(c)),
                 None => s,
@@ -10145,7 +10179,7 @@ impl Reader {
             wm: self.wm(),
             segs: self.segs(),
             mem: self.mem(),
-            frozen: self.frozen().map(|f| f.as_ref()),
+            frozen: self.frozen_single().map(|f| f.as_ref()),
             tombs: self.has_tombstones(),
             dense_from: if self.opts.commit_forms && self.slot.is_none() {
                 match self.opts.form_dense_from {
@@ -10183,7 +10217,7 @@ impl Reader {
             return false;
         }
         let st = self.state();
-        if st.frozen.is_none() {
+        if st.frozen.is_empty() {
             return false;
         }
         let Some((g, mine)) = mine else {
@@ -10420,7 +10454,8 @@ impl Reader {
         // memtables' own, and the store's is what the partitions hold,
         // which is a load a segment and there are few.
         if self.opts.forms_max_unsealed_pct > 0 {
-            let unsealed = st.mem.committed_len() + st.frozen.as_ref().map_or(0, |f| f.len());
+            let unsealed =
+                st.mem.committed_len() + st.frozen.iter().map(|f| f.len()).sum::<usize>();
             let keys: usize = self.segs().iter().map(|s| s.blob.keys()).sum();
             if keys > 0 && unsealed * 100 > keys * self.opts.forms_max_unsealed_pct {
                 return None;
@@ -11033,7 +11068,7 @@ impl Reader {
                 off: 0,
                 len: 0,
                 mem: slot,
-                frozen: self.frozen().as_ref().map_or(u32::MAX, |fr| slot_in(fr)),
+                frozen: self.frozen_single().map_or(u32::MAX, |fr| slot_in(fr)),
                 lrun: NO_RUN,
                 frun: NO_RUN,
             };
@@ -12035,8 +12070,7 @@ impl Reader {
                 } else if frozen_run {
                     snap.frozen_run_has_tomb(sk.frun, SEE_ALL)
                 } else {
-                    self.frozen()
-                        .as_ref()
+                    self.frozen_single()
                         .is_some_and(|fr| fr.has_tomb(fr.entry(sk.frozen as usize), SEE_ALL))
                 }
             };
@@ -12056,7 +12090,7 @@ impl Reader {
         if sk.frozen != u32::MAX && start <= 1 {
             if frozen_run {
                 snap.frozen_run_values(sk.frun, SEE_ALL, |v| f(key, v));
-            } else if let Some(fr) = self.frozen() {
+            } else if let Some(fr) = self.frozen_single() {
                 let e = fr.entry(sk.frozen as usize);
                 fr.live_offs_into(e, scratch, SEE_ALL);
                 for &off in scratch.iter() {
@@ -12188,8 +12222,7 @@ impl Reader {
                         start = nc + 2;
                     } else if sk.frozen != u32::MAX
                         && self
-                            .frozen()
-                            .as_ref()
+                            .frozen_single()
                             .is_some_and(|fr| fr.has_tomb(fr.entry(sk.frozen as usize), SEE_ALL))
                     {
                         start = nc + 1;
@@ -12238,7 +12271,7 @@ impl Reader {
             }
             if let Some(sk) = snap.filter(|_| in_unsealed) {
                 if sk.frozen != u32::MAX && nc + 1 >= start {
-                    if let Some(fr) = self.frozen() {
+                    if let Some(fr) = self.frozen_single() {
                         let e = fr.entry(sk.frozen as usize);
                         fr.live_offs_into(e, &mut scratch, SEE_ALL);
                         for &off in &scratch {
@@ -12276,7 +12309,8 @@ impl Reader {
         let at = segs[..np].partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
         let part = segs[..np].get(at).filter(|s| s.may_hold(key));
         let l0 = st.pieces_over(np, at);
-        let (fr_ix, mem_ix) = (1 + l0.len(), 2 + l0.len());
+        let fr_ix = 1 + l0.len();
+        let mem_ix = fr_ix + st.frozen.len();
         let mut start = 0usize;
         if st.has_tombstones() {
             if !mem_empty {
@@ -12287,11 +12321,15 @@ impl Reader {
                 }
             }
             if start == 0 {
-                if let Some(fr) = &st.frozen {
-                    if let Some(e) = fr.get(key, MemTable::ALL) {
-                        if fr.has_tomb(e, SEE_ALL) {
-                            start = fr_ix;
-                        }
+                // The frozen tables newest first: the newest holding a
+                // tombstone is the cut.
+                for (i, fr) in st.frozen.iter().enumerate().rev() {
+                    if fr
+                        .get(key, MemTable::ALL)
+                        .is_some_and(|e| fr.has_tomb(e, SEE_ALL))
+                    {
+                        start = fr_ix + i;
+                        break;
                     }
                 }
             }
@@ -12327,11 +12365,12 @@ impl Reader {
                 .count(key)
                 .map_err(|e| err(&format!("segment count: {e}")))?;
         }
-        if fr_ix >= start {
-            if let Some(fr) = &st.frozen {
-                if let Some(e) = fr.get(key, MemTable::ALL) {
-                    n += e.count.load(AtomicOrdering::Relaxed);
-                }
+        for (i, fr) in st.frozen.iter().enumerate() {
+            if fr_ix + i < start {
+                continue;
+            }
+            if let Some(e) = fr.get(key, MemTable::ALL) {
+                n += e.count.load(AtomicOrdering::Relaxed);
             }
         }
         if mem_ix >= start && !mem_empty {
@@ -12346,7 +12385,7 @@ impl Reader {
     /// seal is in flight, the frozen one. A key in both counts twice.
     pub fn unsealed_keys(&self) -> usize {
         let _entered = self.enter();
-        self.mem().len() + self.frozen().as_ref().map_or(0, |f| f.len())
+        self.mem().len() + self.frozen().iter().map(|f| f.len()).sum::<usize>()
     }
 
     /// Live segment count by level: (partitioned, L0). The compaction
@@ -12445,7 +12484,9 @@ impl Db {
         // segment work published meanwhile may have emptied the slot. A
         // stale full slot only defers, so no order against the count.
         self.rehold();
-        if self.state().frozen.is_none() || self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
+        if self.state().frozen.len() < FROZEN_CAP
+            || self.shared.seal_wedged.load(AtomicOrdering::Acquire)
+        {
             return true;
         }
         if self.mem_bytes >= threshold.saturating_mul(2) {
@@ -12610,7 +12651,7 @@ impl Db {
             forms_bytes: AtomicUsize::new(0),
             segs,
             mem: std::sync::Arc::new(MemTable::new()),
-            frozen: None,
+            frozen: Vec::new(),
             gen: 1,
             mean_key_bytes,
             store_bytes,
@@ -12955,7 +12996,7 @@ impl Db {
             forms_bytes: AtomicUsize::new(0),
             segs,
             mem: std::sync::Arc::new(mem),
-            frozen: None,
+            frozen: Vec::new(),
             gen: 1,
             mean_key_bytes,
             store_bytes,
@@ -13837,10 +13878,7 @@ impl Db {
                 // no live entry over the copy as its base.
                 let entered = r.enter();
                 let st = r.state();
-                if st
-                    .frozen
-                    .as_ref()
-                    .is_some_and(|f| std::sync::Arc::ptr_eq(f, &mem))
+                if matches!(st.frozen.as_slice(), [f] if std::sync::Arc::ptr_eq(f, &mem))
                     && r.publish_snapshot(&std::sync::Arc::new(Snapshot::over_base(
                         snap.clone(),
                         true,
@@ -14150,7 +14188,7 @@ impl Db {
                 let st = self.state();
                 (
                     !std::sync::Arc::ptr_eq(&st.mem, &handed),
-                    st.frozen.is_none(),
+                    st.frozen.len() < FROZEN_CAP,
                 )
             };
             if replaced {
@@ -14309,7 +14347,7 @@ impl Db {
         let fresh = std::sync::Arc::new(MemTable::new());
         let carried = std::cell::Cell::new(false);
         let Some(old) = self.try_publish_writer(|cur| {
-            if !std::sync::Arc::ptr_eq(&cur.mem, table) || cur.frozen.is_some() {
+            if !std::sync::Arc::ptr_eq(&cur.mem, table) || cur.frozen.len() >= FROZEN_CAP {
                 return None;
             }
             let carry = settled && std::ptr::eq(cur, settled_at);
@@ -14325,7 +14363,14 @@ impl Db {
                 forms_bytes: AtomicUsize::new(0),
                 segs: cur.segs.clone(),
                 mem: fresh.clone(),
-                frozen: Some(cur.mem.clone()),
+                // Made again from `cur` on every retry, so a table a
+                // landing retired since is never brought back.
+                frozen: cur
+                    .frozen
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(cur.mem.clone()))
+                    .collect(),
                 gen: cur.gen + 1,
                 mean_key_bytes: cur.mean_key_bytes,
                 store_bytes: cur.store_bytes,
@@ -14431,7 +14476,7 @@ impl Db {
         let held = self.fs().scan_keys.borrow_mut().take();
         let carried = held
             .filter(|_| self.opts.snapshot_carry)
-            .and_then(|(_, s)| self.carry_snapshot(s, &cur.mem, cur.frozen.as_ref(), next, false));
+            .and_then(|(_, s)| self.carry_snapshot(s, &cur.mem, &cur.frozen, next, false));
         self.fs()
             .tables
             .borrow_mut()
@@ -14852,7 +14897,7 @@ impl Reader {
         // the lag sweep's first point, which had never had one.
         if self.segs().iter().all(|s| s.level > 0)
             && self.mem().is_empty()
-            && self.frozen().is_none()
+            && self.frozen().is_empty()
         {
             let (_tx, rx) = std::sync::mpsc::channel();
             *self.fs().ahead.borrow_mut() = Some(Ahead {
@@ -15028,7 +15073,7 @@ impl Db {
             // The count before the state, as in `take_fresh_mem`.
             let seals = self.shared.in_seal.load(AtomicOrdering::Acquire);
             self.rehold();
-            if self.state().frozen.is_none() {
+            if self.state().frozen.len() < FROZEN_CAP {
                 break;
             }
             if let Some(e) = self.shared.take_maint_err() {
@@ -15217,7 +15262,7 @@ impl Db {
             .mem_handed
             .as_ref()
             .is_some_and(|h| std::sync::Arc::ptr_eq(&st.mem, h));
-        st.segs.len() + usize::from(st.frozen.is_some()) + usize::from(handed)
+        st.segs.len() + st.frozen.len() + usize::from(handed)
     }
 
     /// A test's: while `on`, every seal thread waits between its two
@@ -15818,7 +15863,7 @@ struct Kept {
     snap: Option<std::sync::Arc<Snapshot>>,
     gen: u64,
     live: Option<std::sync::Arc<MemTable>>,
-    frozen: Option<std::sync::Arc<MemTable>>,
+    frozen: Vec<std::sync::Arc<MemTable>>,
     seen_log: usize,
     scans_seen: u64,
     scan_at: (u64, usize),
@@ -15907,7 +15952,7 @@ impl Reader {
         if st.gen != k.gen {
             let carried = k.snap.take().and_then(|s| {
                 let live = k.live.clone()?;
-                self.carry_snapshot(s, &live, k.frozen.as_ref(), st, true)
+                self.carry_snapshot(s, &live, &k.frozen, st, true)
             });
             k.gen = st.gen;
             k.live = Some(mem.clone());
@@ -16018,33 +16063,31 @@ impl Reader {
         &self,
         s: std::sync::Arc<Snapshot>,
         live: &std::sync::Arc<MemTable>,
-        frozen: Option<&std::sync::Arc<MemTable>>,
+        frozen: &[std::sync::Arc<MemTable>],
         st: &State,
         landing: bool,
     ) -> Option<std::sync::Arc<Snapshot>> {
         let same_mem = std::sync::Arc::ptr_eq(&st.mem, live);
-        let same_frozen = match (&st.frozen, &frozen) {
-            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
-            (None, None) => true,
-            _ => false,
-        };
+        let same_frozen = st.frozen.len() == frozen.len()
+            && st
+                .frozen
+                .iter()
+                .zip(frozen)
+                .all(|(a, b)| std::sync::Arc::ptr_eq(a, b));
         if same_mem && same_frozen {
             return Some(s);
         }
         // The live runs hold the live table's entries alone, so a landing
         // that keeps the live table keeps them and their bounds, and drops
         // the base that named the table it sealed.
-        if landing && same_mem && st.frozen.is_none() && frozen.is_some() {
+        if landing && same_mem && st.frozen.is_empty() && !frozen.is_empty() {
             return Some(std::sync::Arc::new(Snapshot {
                 base: None,
                 ..(*s).clone()
             }));
         }
-        let froze = frozen.is_none()
-            && st
-                .frozen
-                .as_ref()
-                .is_some_and(|f| std::sync::Arc::ptr_eq(f, live));
+        let froze = frozen.is_empty()
+            && matches!(st.frozen.as_slice(), [f] if std::sync::Arc::ptr_eq(f, live));
         if froze {
             debug_assert!(s.base.is_none(), "a freeze finds no frozen table");
             let runs = s.runs;
@@ -18926,6 +18969,12 @@ impl Maint {
             let mut swapped_live = false;
             let (mem, frozen) = match landed {
                 Some(t) if std::sync::Arc::ptr_eq(&cur.mem, t) => {
+                    // A handed table still live: the seals before it have
+                    // landed, and a freeze since would have frozen it.
+                    debug_assert!(
+                        cur.frozen.is_empty(),
+                        "a live table lands after the frozen ones"
+                    );
                     swapped_live = true;
                     (
                         fresh.clone().expect("made for a landing"),
@@ -18935,17 +18984,21 @@ impl Maint {
                 Some(t)
                     if cur
                         .frozen
-                        .as_ref()
+                        .first()
                         .is_some_and(|f| std::sync::Arc::ptr_eq(f, t)) =>
                 {
-                    (cur.mem.clone(), None)
+                    (cur.mem.clone(), cur.frozen[1..].to_vec())
                 }
                 Some(_) => {
-                    // Neither slot: the table's own seal is the only
-                    // publish that retires it, and this is that publish.
-                    // Left as it is rather than a slot emptied of some
-                    // other table, whose seal has not landed.
-                    debug_assert!(false, "a landed table is the live one or the frozen one");
+                    // Neither the live table nor the oldest frozen one: the
+                    // table's own seal is the only publish that retires it,
+                    // and seals land in the order they were handed. Left
+                    // as it is rather than a list emptied of some other
+                    // table, whose seal has not landed.
+                    debug_assert!(
+                        false,
+                        "a landed table is the live one or the oldest frozen one"
+                    );
                     (cur.mem.clone(), cur.frozen.clone())
                 }
                 None => (cur.mem.clone(), cur.frozen.clone()),
