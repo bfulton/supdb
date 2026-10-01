@@ -7847,52 +7847,7 @@ fn the_seal_takes_the_order_the_writers_freeze_carried() {
 /// every scan arm.
 #[test]
 fn a_live_write_over_the_frozen_table_is_one_key_on_every_scan_path() {
-    let arms: [(&str, Options); 7] = [
-        ("default", Options::default()),
-        (
-            "cursormerge",
-            Options {
-                scan_merge: false,
-                scan_block_cache: false,
-                ..Options::default()
-            },
-        ),
-        (
-            "nocache",
-            Options {
-                scan_block_cache: false,
-                ..Options::default()
-            },
-        ),
-        (
-            "lazy",
-            Options {
-                scan_lazy_snapshot: true,
-                ..Options::default()
-            },
-        ),
-        (
-            "runs",
-            Options {
-                snapshot_runs: true,
-                ..Options::default()
-            },
-        ),
-        (
-            "unshared",
-            Options {
-                share_snapshot: false,
-                ..Options::default()
-            },
-        ),
-        (
-            "nofrozen",
-            Options {
-                frozen_snaps: false,
-                ..Options::default()
-            },
-        ),
-    ];
+    let arms = scan_path_arms();
     let key = |k: u32| format!("key-{k:05}");
     for (name, base) in arms {
         let d = dir(&format!("live-over-frozen-{name}"));
@@ -7966,6 +7921,60 @@ fn a_live_write_over_the_frozen_table_is_one_key_on_every_scan_path() {
         drop(r);
         db.close().unwrap();
     }
+}
+
+/// The scan paths a frozen table's keys reach a scan through, each the
+/// arm that keeps it: the block cache's, the cursor merge's, the merge
+/// over unrouted sources, the lazy snapshot, the snapshot's runs, a
+/// snapshot each handle builds alone, and frozen tables with no snapshot
+/// of their own.
+fn scan_path_arms() -> [(&'static str, Options); 7] {
+    [
+        ("default", Options::default()),
+        (
+            "cursormerge",
+            Options {
+                scan_merge: false,
+                scan_block_cache: false,
+                ..Options::default()
+            },
+        ),
+        (
+            "nocache",
+            Options {
+                scan_block_cache: false,
+                ..Options::default()
+            },
+        ),
+        (
+            "lazy",
+            Options {
+                scan_lazy_snapshot: true,
+                ..Options::default()
+            },
+        ),
+        (
+            "runs",
+            Options {
+                snapshot_runs: true,
+                ..Options::default()
+            },
+        ),
+        (
+            "unshared",
+            Options {
+                share_snapshot: false,
+                ..Options::default()
+            },
+        ),
+        (
+            "nofrozen",
+            Options {
+                frozen_snaps: false,
+                ..Options::default()
+            },
+        ),
+    ]
 }
 
 /// The writer's snapshot holds the live table's keys alone over the
@@ -8317,6 +8326,511 @@ fn a_write_after_a_handed_seal_takes_a_fresh_table_from_whichever_side_swapped()
             let want = if k % 11 == 0 || k == 3 { 2 } else { 1 };
             assert_eq!(read_vec(&r, &tail_key(k)), vec![tail_val(want)], "key {k}");
         }
+    }
+}
+
+/// Exits the process unless dropped within a minute: for a test whose
+/// failure is a wait that never returns, so it reports itself rather
+/// than hanging. Dropped as the waits end, or by the unwind of a failure
+/// in them, so an assertion reports itself and not the watchdog.
+struct Watchdog {
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    watch: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watchdog {
+    fn arm(what: &'static str) -> Watchdog {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watch = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let t = std::time::Instant::now();
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if t.elapsed() > std::time::Duration::from_secs(60) {
+                        eprintln!("{what}");
+                        std::process::exit(101);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            })
+        };
+        Watchdog {
+            done,
+            watch: Some(watch),
+        }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(w) = self.watch.take() {
+            let _ = w.join();
+        }
+    }
+}
+
+/// Partitions under a piece, the store each held-seal test below starts
+/// from: three thousand keys flushed, then updates and tombstones over a
+/// fifth and a thirteenth of them sealed and landed as a piece.
+fn partitions_under_a_piece(name: &str, base: Options) -> (Db, ScanModel, PathBuf) {
+    let d = dir(name);
+    let mut db = Db::create(
+        &d,
+        Options {
+            seal_bytes: 1 << 30,
+            partition_bytes: Some(64 << 10),
+            direct_ingest: false,
+            // No merge of the pieces the landings leave: a merge drops
+            // the tombstones the model's scans still visit.
+            l0_trigger: 64,
+            ..base
+        },
+    )
+    .unwrap();
+    let key = |k: u32| format!("key-{k:05}");
+    let mut m = ScanModel::default();
+    for k in 0..3000u32 {
+        m.append(&mut db, &key(k), "p");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    assert!(db.levels().0 > 1, "{name}: partitions under the rest");
+    for k in (0..3000u32).step_by(5) {
+        m.append(&mut db, &key(k), "q");
+    }
+    for k in (0..3000u32).step_by(13) {
+        m.delete(&mut db, &key(k));
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    assert!(db.levels().1 >= 1, "{name}: a piece over the partitions");
+    (db, m, d)
+}
+
+/// Frozen table `f` of three: values, tombstones and keys of its own,
+/// each table over a different stride so every pair of them shares keys,
+/// and two keys whose versions cross all three -- a value, a tombstone
+/// and a value again, and two values under a tombstone -- committed and
+/// sealed.
+fn freeze_one_of_three(db: &mut Db, m: &mut ScanModel, f: u32) {
+    let key = |k: u32| format!("key-{k:05}");
+    for k in (0..3000u32).step_by(3 + f as usize) {
+        m.append(db, &key(k), &format!("f{f}"));
+    }
+    for k in (0..3000u32).step_by(11 + 2 * f as usize) {
+        m.delete(db, &key(k));
+    }
+    for k in 0..200u32 {
+        m.append(db, &format!("key-{k:05}f{f}"), "f");
+    }
+    match f {
+        0 => {
+            m.append(db, "key-cross-a", "v0");
+            m.append(db, "key-cross-b", "a");
+        }
+        1 => {
+            m.delete(db, "key-cross-a");
+            m.append(db, "key-cross-b", "b");
+        }
+        _ => {
+            m.append(db, "key-cross-a", "v2");
+            m.delete(db, "key-cross-b");
+        }
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+}
+
+/// Three seals in flight, each held before it writes
+/// (`hold_seal_landing`): the writer freezes into the room the list has
+/// and waits for none of them, and every read path folds the three
+/// frozen tables and the live one by age -- a tombstone in a newer frozen
+/// table cuts the values of the older ones and of the piece and the
+/// partition under them, and the values after it stand. Released, the
+/// seals land in the order they were handed and every read holds after.
+#[test]
+fn a_writer_freezes_into_room_while_three_seals_are_held() {
+    let key = |k: u32| format!("key-{k:05}");
+    for (name, base) in scan_path_arms() {
+        let (mut db, mut m, _) = partitions_under_a_piece(&format!("three-held-{name}"), base);
+        let watch = Watchdog::arm("a freeze waited for a held seal: the list had no room");
+        let w0 = db.seal_waits();
+        db.hold_seal_landing(true);
+        for f in 0..3u32 {
+            freeze_one_of_three(&mut db, &mut m, f);
+            assert_eq!(
+                db.frozen_tables(),
+                f as usize + 1,
+                "{name}: frozen into room, the seals held"
+            );
+            m.check(&db, &format!("{name}: the writer over {} frozen", f + 1));
+        }
+        drop(watch);
+        let w = db.seal_waits();
+        assert_eq!(
+            (
+                w.join_wait_ns - w0.join_wait_ns,
+                w.blocked_joins - w0.blocked_joins
+            ),
+            (0, 0),
+            "{name}: no freeze waited: {w:?}"
+        );
+        // The live table over the three: values after frozen values and
+        // after frozen tombstones, tombstones over frozen values, and a
+        // key the oldest frozen table made that the live one deletes.
+        for k in (0..3000u32).step_by(4) {
+            m.append(&mut db, &key(k), "l");
+        }
+        for k in (0..3000u32).step_by(9) {
+            m.delete(&mut db, &key(k));
+        }
+        for k in (0..200u32).step_by(2) {
+            m.delete(&mut db, &format!("key-{k:05}f0"));
+        }
+        m.append(&mut db, "key-cross-a", "v3");
+        db.commit().unwrap();
+        let r = db.reader().unwrap();
+        m.check(&r, &format!("{name}: a handle beside three held seals"));
+        m.check(&db, &format!("{name}: the writer beside three held seals"));
+        // The two crossing keys, spelled out: the middle table's tombstone
+        // cut the oldest's value, and the newest's cut both of theirs.
+        assert_eq!(
+            read_vec(&db, b"key-cross-a"),
+            vec![b"v2".to_vec(), b"v3".to_vec()],
+            "{name}"
+        );
+        assert_eq!(db.count(b"key-cross-a").unwrap(), 2, "{name}");
+        assert!(read_vec(&db, b"key-cross-b").is_empty(), "{name}");
+        assert_eq!(db.count(b"key-cross-b").unwrap(), 0, "{name}");
+        db.hold_seal_landing(false);
+        db.settle().unwrap();
+        assert_eq!(db.frozen_tables(), 0, "{name}: all three landed");
+        m.check(&r, &format!("{name}: a handle after the landings"));
+        m.check(&db, &format!("{name}: the writer after the landings"));
+        drop(r);
+        db.close().unwrap();
+    }
+}
+
+/// A fourth freeze beside three held seals waits, and only for the front:
+/// once the hold lifts the oldest lands, the freeze takes its room, and
+/// the wait is counted once. The seals land in the order they were
+/// handed, so a newer table's tombstone keeps cutting an older table's
+/// values at every landing.
+#[test]
+fn a_fourth_freeze_waits_for_the_front_to_land() {
+    let key = |k: u32| format!("key-{k:05}");
+    let (mut db, mut m, _) = partitions_under_a_piece("fourth-freeze", Options::default());
+    let watch = Watchdog::arm("a freeze waited for a held seal, or the fourth past the release");
+    db.hold_seal_landing(true);
+    for f in 0..3u32 {
+        freeze_one_of_three(&mut db, &mut m, f);
+    }
+    assert_eq!(db.frozen_tables(), 3);
+    for k in (0..3000u32).step_by(7) {
+        m.append(&mut db, &key(k), "f3");
+    }
+    m.append(&mut db, "key-cross-b", "c");
+    db.commit().unwrap();
+    let w0 = db.seal_waits();
+    let release = db.release_seal_landing_after(std::time::Duration::from_millis(500));
+    db.seal().unwrap();
+    release.join().unwrap();
+    drop(watch);
+    let w = db.seal_waits();
+    assert_eq!(
+        w.blocked_joins - w0.blocked_joins,
+        1,
+        "the fourth freeze waited once: {w:?}"
+    );
+    assert!(w.join_wait_ns > w0.join_wait_ns, "{w:?}");
+    assert!(db.frozen_tables() >= 1, "the fourth table frozen");
+    m.check(&db, "the writer over the fourth frozen table");
+    let r = db.reader().unwrap();
+    m.check(&r, "a handle over the fourth frozen table");
+    db.settle().unwrap();
+    assert_eq!(db.frozen_tables(), 0, "every seal landed");
+    m.check(&db, "the writer after the landings");
+    m.check(&r, "a handle after the landings");
+    assert_eq!(
+        read_vec(&db, b"key-cross-b"),
+        vec![b"c".to_vec()],
+        "the fourth table's value over the third's tombstone"
+    );
+}
+
+/// A table `sync` hands to a seal beside two frozen tables whose seals
+/// are held: the writer's next write freezes it into the third room and
+/// waits for neither, where a list of one parked the write until the
+/// frozen slot emptied. Its seal lands behind the other two.
+#[test]
+fn a_handed_tail_freezes_into_room_beside_two_seals() {
+    let (mut db, mut m, _) = partitions_under_a_piece(
+        "handed-into-room",
+        Options {
+            adaptive_shape: true,
+            ..Options::default()
+        },
+    );
+    let watch = Watchdog::arm("a freeze or the write after the hand-off waited for a held seal");
+    let w0 = db.seal_waits();
+    db.hold_seal_landing(true);
+    for f in 0..2u32 {
+        freeze_one_of_three(&mut db, &mut m, f);
+    }
+    assert_eq!(db.frozen_tables(), 2);
+    // Shuffled, so the tail is hashed and goes to a seal.
+    for i in 0..500u32 {
+        m.append(&mut db, &format!("key-{:05}t", i * 7919 % 500), "t");
+    }
+    db.commit().unwrap();
+    db.sync().unwrap();
+    assert_eq!(db.tail_swaps(), (0, 0), "handed, not yet replaced");
+    m.append(&mut db, "key-00001", "w");
+    db.commit().unwrap();
+    drop(watch);
+    assert_eq!(db.tail_swaps(), (1, 0), "the write froze the handed table");
+    assert_eq!(db.frozen_tables(), 3, "into the third room");
+    let w = db.seal_waits();
+    assert_eq!(
+        (
+            w.join_wait_ns - w0.join_wait_ns,
+            w.blocked_joins - w0.blocked_joins
+        ),
+        (0, 0),
+        "{w:?}"
+    );
+    let r = db.reader().unwrap();
+    m.check(&r, "a handle over three frozen, the newest handed");
+    m.check(&db, "the writer over three frozen, the newest handed");
+    db.hold_seal_landing(false);
+    db.settle().unwrap();
+    assert_eq!(db.frozen_tables(), 0);
+    m.check(&r, "a handle after the landings");
+    m.check(&db, "the writer after the landings");
+}
+
+/// Every file of a store copied as it stands, as a crash at this instant
+/// would leave it on a device that kept every write. A file gone between
+/// the listing and its copy -- a merge's temp name renamed or removed --
+/// is left out, as a crash before its creation would leave it: no
+/// manifest names a file of work that has not landed.
+fn copy_store(from: &std::path::Path, to: &std::path::Path) {
+    let _ = std::fs::remove_dir_all(to);
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        if !e.file_type().unwrap().is_file() {
+            continue;
+        }
+        match std::fs::copy(e.path(), to.join(e.file_name())) {
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => panic!("copying {:?}: {err}", e.path()),
+        }
+    }
+}
+
+/// A crash with three seals in flight, the store copied as it stood with
+/// nothing writing a file: all three held before they write, and the
+/// oldest between its phases -- its segment renamed into place, unsynced
+/// and named in no manifest -- with the two behind it held before they
+/// write. Each copy opens to every committed key: the manifest covers
+/// nothing the three sealed, open sweeps the segments it does not name,
+/// and the WAL replays the three tables' records by sequence, refusing
+/// no gap.
+#[test]
+fn a_crash_with_three_seals_in_flight_replays_them_all() {
+    for between in [false, true] {
+        let name = format!("crash-three-{between}");
+        let (mut db, mut m, src) = partitions_under_a_piece(&name, Options::default());
+        let watch = Watchdog::arm("a freeze waited for a held seal");
+        if between {
+            db.hold_seal_durable(true);
+            freeze_one_of_three(&mut db, &mut m, 0);
+            wait_for("the oldest seal's readable landing", || {
+                db.frozen_tables() == 0
+            });
+            db.hold_seal_landing(true);
+            for f in 1..3u32 {
+                freeze_one_of_three(&mut db, &mut m, f);
+            }
+            assert_eq!(db.frozen_tables(), 2);
+        } else {
+            db.hold_seal_landing(true);
+            for f in 0..3u32 {
+                freeze_one_of_three(&mut db, &mut m, f);
+            }
+            assert_eq!(db.frozen_tables(), 3);
+        }
+        drop(watch);
+        assert!(db.in_flight().0);
+        m.append(&mut db, "key-00002", "after");
+        db.commit().unwrap();
+        let copy = dir(&format!("{name}-copy"));
+        copy_store(&src, &copy);
+        // Opened as the store was made: no merge of the pieces at open.
+        let opts = Options {
+            l0_trigger: 64,
+            ..Options::default()
+        };
+        let opened = Db::open(&copy, opts.clone()).unwrap();
+        m.check(&opened, &format!("{name}: the crash copy reopened"));
+        drop(opened);
+        db.hold_seal_durable(false);
+        db.hold_seal_landing(false);
+        db.settle().unwrap();
+        m.check(&db, &format!("{name}: the store itself, landed"));
+        // The close is a flush.
+        db.close().unwrap();
+        m.flushed();
+        let reopened = Db::open(&src, opts).unwrap();
+        m.check(&reopened, &format!("{name}: the store reopened"));
+    }
+}
+
+/// Reader handles on their own threads keep answering while the writer
+/// freezes three tables at a time under held seals and releases them to
+/// land under the readers, round after round: every value read is one
+/// the writer wrote for that key, a key's version never goes backwards
+/// for one reader, and a scan comes back in key order.
+#[test]
+fn readers_on_threads_keep_answering_beside_three_frozen_tables() {
+    let d = dir("readers-three-frozen");
+    let opts = Options {
+        seal_bytes: 1 << 30,
+        partition_bytes: Some(64 << 10),
+        l0_trigger: 2,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let keys = 3000u32;
+    let key = |k: u32| format!("key-{k:05}").into_bytes();
+    for k in 0..keys {
+        db.append(&key(k), b"0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut threads = Vec::new();
+    for t in 0..3u64 {
+        let r = db.reader().unwrap();
+        let stop = stop.clone();
+        threads.push(std::thread::spawn(move || {
+            let mut seen: HashMap<u32, u64> = HashMap::new();
+            let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ t;
+            let (mut reads, mut scans) = (0usize, 0usize);
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                if x.is_multiple_of(8) {
+                    let mut last: Option<Vec<u8>> = None;
+                    r.scan(&key(k), 20, |kk, v| {
+                        if let Some(l) = &last {
+                            assert!(l.as_slice() < kk, "a scan out of key order");
+                        }
+                        last = Some(kk.to_vec());
+                        let s = std::str::from_utf8(v).unwrap();
+                        assert!(
+                            s.parse::<u64>().is_ok(),
+                            "a scanned value that is no version: {s}"
+                        );
+                    })
+                    .unwrap();
+                    scans += 1;
+                } else {
+                    let got = read_vec(&r, &key(k));
+                    assert!(got.len() <= 1, "a put key with two values");
+                    if let Some(v) = got.first() {
+                        let ver: u64 = std::str::from_utf8(v).unwrap().parse().unwrap();
+                        let prev = seen.entry(k).or_insert(0);
+                        assert!(
+                            ver >= *prev,
+                            "a version that went backwards: key {k} read {ver} after {prev}"
+                        );
+                        *prev = ver;
+                    }
+                    reads += 1;
+                }
+            }
+            (reads, scans)
+        }));
+    }
+    let mut x = 42u64;
+    let mut ver = 0u64;
+    let mut deepest = 0usize;
+    for _ in 0..12 {
+        let watch = Watchdog::arm("a freeze waited for a held seal: the list had no room");
+        db.hold_seal_landing(true);
+        for _ in 0..3 {
+            for _ in 0..4 {
+                ver += 1;
+                for _ in 0..50 {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let k = (x % keys as u64) as u32;
+                    db.put(&key(k), ver.to_string().as_bytes());
+                }
+                db.commit().unwrap();
+            }
+            db.seal().unwrap();
+            deepest = deepest.max(db.frozen_tables());
+        }
+        drop(watch);
+        // Writes over the three while they are held, then the landings
+        // under the readers and under the writes that follow.
+        for _ in 0..4 {
+            ver += 1;
+            for _ in 0..50 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), ver.to_string().as_bytes());
+            }
+            db.commit().unwrap();
+        }
+        db.hold_seal_landing(false);
+        // The landings under the readers and under writes, all of them
+        // before the next round holds again: a seal released for less
+        // than its poll would be held once more, and the round's first
+        // freeze would wait on it for good.
+        let watch = Watchdog::arm("the released seals did not land");
+        while db.frozen_tables() > 0 {
+            ver += 1;
+            for _ in 0..50 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let k = (x % keys as u64) as u32;
+                db.put(&key(k), ver.to_string().as_bytes());
+            }
+            db.commit().unwrap();
+        }
+        drop(watch);
+    }
+    db.flush().unwrap();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut total = (0usize, 0usize);
+    for t in threads {
+        let (r, s) = t.join().unwrap();
+        total.0 += r;
+        total.1 += s;
+    }
+    assert_eq!(deepest, 3, "the list reached three");
+    assert!(
+        total.0 > 1000 && total.1 > 100,
+        "the readers read: {total:?}"
+    );
+    let r = db.reader().unwrap();
+    for k in (0..keys).step_by(97) {
+        assert_eq!(read_vec(&db, &key(k)), read_vec(&r, &key(k)), "key {k}");
     }
 }
 
@@ -9144,13 +9658,14 @@ fn a_rotated_wal_torn_in_its_new_file_reopens_to_a_prefix() {
     }
 }
 
-/// A commit past the threshold while a seal holds the frozen slot keeps
-/// writing (`seal_defers`): the seal in flight is held before it writes,
-/// so a commit that waited for the slot would wait for good, and the
-/// deferred count says the commits took the other path. Released, a later
+/// A commit past the threshold while the frozen tables fill the list
+/// keeps writing (`seal_defers`): the seals in flight are held before
+/// they write, so a commit that waited for room would wait for good, and
+/// the deferred count says the commits took the other path. The first
+/// three crossings freeze into room and defer nothing. Released, a later
 /// commit seals what grew, and every key reads right.
 #[test]
-fn a_commit_past_the_threshold_keeps_writing_while_a_seal_holds_the_slot() {
+fn a_commit_past_the_threshold_keeps_writing_while_the_frozen_list_is_full() {
     let d = dir("seal-defers");
     let opts = Options {
         seal_rotates_wal: false,
@@ -9190,23 +9705,29 @@ fn a_commit_past_the_threshold_keeps_writing_while_a_seal_holds_the_slot() {
     };
     db.hold_seal_landing(true);
     let mut want: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
-    // Past the threshold once, which seals and holds the slot, then past
-    // it again and under the ceiling of twice the threshold.
+    // Past the threshold three times, each sealing into room and held,
+    // then past it again and under the ceiling of twice the threshold.
     let per = tail_key(0).len() + tail_val(1).len();
-    let first = (256 << 10) / per as u32 + 100;
-    let n = first + (350 << 10) / per as u32;
+    let crossing = (256 << 10) / per as u32 + 100;
+    let full = 3 * crossing;
+    let n = full + (350 << 10) / per as u32;
     for i in 0..n {
         db.append(&tail_key(i), &tail_val(1));
         want.entry(tail_key(i)).or_default().push(tail_val(1));
         if i % 100 == 99 {
             db.commit().unwrap();
         }
+        if i + 1 == full {
+            db.commit().unwrap();
+            assert_eq!(db.frozen_tables(), 3, "three crossings froze into room");
+            assert_eq!(db.seal_waits().deferred, 0, "and deferred nothing");
+        }
     }
     db.commit().unwrap();
     drop(disarm);
     watch.join().unwrap();
     let w = db.seal_waits();
-    assert!(db.in_flight().0, "the first seal is in flight, held");
+    assert!(db.in_flight().0, "the seals are in flight, held");
     assert!(
         w.deferred > 0,
         "the commits past the threshold deferred: {w:?}"
@@ -9214,8 +9735,8 @@ fn a_commit_past_the_threshold_keeps_writing_while_a_seal_holds_the_slot() {
     assert_eq!(w.join_wait_ns, 0, "and none waited for the slot");
     holds_all(&db, &want, "beside the held seal");
     db.hold_seal_landing(false);
-    // The first seal lands; the table that grew meanwhile seals at the
-    // first commit that finds the slot free. A writer that goes quiet
+    // The seals land; the table that grew meanwhile seals at the first
+    // commit that finds room. A writer that goes quiet
     // first leaves it live until it commits again -- this stage moves no
     // idle tail.
     db.settle().unwrap();
@@ -9228,7 +9749,7 @@ fn a_commit_past_the_threshold_keeps_writing_while_a_seal_holds_the_slot() {
     db.settle().unwrap();
     assert!(
         db.seal_waits().publishes > before,
-        "the deferred seal happened once the slot freed"
+        "the deferred seal happened once the list had room"
     );
     assert!(
         db.unsealed_keys() < 200,

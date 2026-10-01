@@ -477,7 +477,7 @@ pub struct Options {
     /// reads the store. A `sync` hands its live table to a seal as well,
     /// whenever the table holds anything, no table is handed already and
     /// the segment work runs on its thread (`publish_in_background`), seal
-    /// in flight or not, and without waiting for it or freezing it
+    /// in flight or not, and without waiting for room or freezing it
     /// (`Db::hand_tail`): the table stays the live one until the landing
     /// installs an empty one in its place or the writer's next write
     /// freezes it under a fresh one, whichever publishes first, and a
@@ -501,13 +501,13 @@ pub struct Options {
     /// could leave a store that does not open. A closed file retires at
     /// the landing of the next seal, which covers every record in it.
     pub seal_rotates_wal: bool,
-    /// EXPERIMENT: a commit past the seal threshold while a seal holds
-    /// the frozen slot keeps writing instead of waiting for the landing;
-    /// a later commit seals once the slot is free. Past a ceiling of
-    /// twice the threshold the commit waits as before, which keeps the
-    /// live table and the piece it seals into within a factor of two of
-    /// where the wait bounded them. Off, the commit waits in the seal for
-    /// the slot.
+    /// EXPERIMENT: a commit past the seal threshold while the frozen
+    /// tables fill the list keeps writing instead of waiting for the
+    /// oldest to land; a later commit seals once the list has room. Past
+    /// a ceiling of twice the threshold the commit waits as before, which
+    /// keeps the live table and the piece it seals into within a factor
+    /// of two of where the wait bounded them. Off, the commit waits in the
+    /// seal for room.
     pub seal_defers: bool,
     /// EXPERIMENT: under `adaptive_shape`, with `compact` and `promote`, a
     /// store with no segment seals its first table at `SEAL_CAP_FLOOR`
@@ -3736,13 +3736,14 @@ const READER_SLOTS: usize = 256;
 /// writer's, which its operations pin, the upkeep thread's, which its
 /// passes pin, the segment work's (`Maint`), the seal threads', which
 /// each pins to publish its table's snapshot (`Options::seal_snapshot`)
-/// -- two, since a table a `sync` hands without a freeze (`Db::hand_tail`)
-/// starts its seal beside the frozen table's, and both may be at their
-/// start together; a third seal starts only once the frozen slot is free,
-/// which is past the earlier seal's publish -- and one spare, so a
-/// claimant added next does not take a seal's. Apart, so a caller holding
-/// every handle it may have cannot leave the engine without one.
-const ENGINE_SLOTS: usize = 6;
+/// -- one for each frozen table the list holds and one more, since a
+/// table a `sync` hands without a freeze (`Db::hand_tail`) starts its
+/// seal beside theirs and all may be at their start together; a seal
+/// past those starts only once the list has room, which is past the
+/// oldest seal's publish -- and one spare, so a claimant added next does
+/// not take a seal's. Apart, so a caller holding every handle it may
+/// have cannot leave the engine without one.
+const ENGINE_SLOTS: usize = 3 + FROZEN_CAP + 1 + 1;
 
 impl Readers {
     fn new() -> Readers {
@@ -5149,8 +5150,8 @@ struct SealCounts {
     /// closed, promoted on their keys; for a test that asserts the arm.
     promoted: AtomicU64,
     promoted_open: AtomicU64,
-    /// Commits past the seal threshold that kept writing because a seal
-    /// held the frozen slot (`Options::seal_defers`).
+    /// Commits past the seal threshold that kept writing because the
+    /// frozen tables filled the list (`Options::seal_defers`).
     deferred: AtomicU64,
     /// WAL rotations, at seals or by size, and the bytes a rotation left
     /// unsynced in the file it closed -- zero by construction, and the
@@ -5158,7 +5159,7 @@ struct SealCounts {
     wal_rotations: AtomicU64,
     rotated_unsynced: AtomicU64,
     /// Time the writer spent in the seals its commits started: the wait
-    /// for the slot, the freeze, and the seal's writer half.
+    /// for room, the freeze, and the seal's writer half.
     freeze_ns: AtomicU64,
 }
 
@@ -5742,7 +5743,7 @@ fn block_bounds_of(
 /// The frozen tables a state holds at most, each a seal in flight: the
 /// writer freezes into room and waits for the oldest to land only when
 /// the list is full.
-const FROZEN_CAP: usize = 1;
+const FROZEN_CAP: usize = 3;
 
 /// What a reader reads: the store as of a publish. The writer builds a
 /// new one at every seal, join, merge or freeze and swaps it in whole,
@@ -6066,9 +6067,10 @@ struct Shared {
     /// a maximum -- each in two phases: its segments published to readers
     /// once its thread has them in place (`Maint::land_readable`), and the
     /// manifest once their fsyncs are paid (`Maint::land_durable`), where
-    /// the seal is counted out. The writer waits on the frozen slot before
-    /// its next freeze, not on this: a table a `sync` handed without a
-    /// freeze (`Db::hand_tail`) is a seal in flight that holds no slot.
+    /// the seal is counted out. The writer waits for room in the frozen
+    /// list before its next freeze, not on this: a table a `sync` handed
+    /// without a freeze (`Db::hand_tail`) is a seal in flight that holds
+    /// no place in the list.
     /// Whoever decides against the count reads it before the state
     /// (`seals_first_partition`, `land_seal`, `take_fresh_mem`), so a count
     /// of zero is one whose landings the state shows, and a table still
@@ -6086,8 +6088,8 @@ struct Shared {
     /// behind it in the queue lands from here, since a manifest a later
     /// landing wrote would cover the failed seal's sequence with its
     /// segments unnamed, and a reopen would skip the WAL that holds its
-    /// writes. The writer's waits on the frozen slot read this and fail
-    /// instead of waiting on a landing that will not come; a reopen
+    /// writes. The writer's waits for room in the frozen list read this
+    /// and fail instead of waiting on a landing that will not come; a reopen
     /// replays every WAL the manifest does not cover and sweeps the
     /// segments it does not name.
     seal_wedged: std::sync::atomic::AtomicBool,
@@ -6548,7 +6550,7 @@ struct FormsState {
     over: std::cell::RefCell<Option<SyncedOver>>,
 }
 
-/// The live and the frozen memtable a handle's upkeep was last current
+/// The live and the frozen memtables a handle's upkeep was last current
 /// over; see `FormsState::over`.
 struct SyncedOver {
     mem: std::sync::Weak<MemTable>,
@@ -8623,7 +8625,8 @@ impl Reader {
     }
 
     /// Every value for `key`, in append order: partitions first, then L0
-    /// oldest to newest, then the frozen memtable, then the live one.
+    /// oldest to newest, then the frozen memtables oldest first, then the
+    /// live one.
     ///
     /// `may_hold` is the routing F38-F41 settled. A partition answers from
     /// its fence in two comparisons and no memory beyond the `Seg`; an L0
@@ -12249,9 +12252,9 @@ impl Reader {
     /// disjoint partitions in order, one cursor per level-0 segment, and the
     /// unsealed snapshot with each key's entries in hand. Every cursor's key
     /// is resolved once per emitted key. Sources are ordered oldest to
-    /// newest -- the partition, level 0 oldest first, the frozen memtable,
-    /// the live one -- and a tombstone in the newest source that holds the
-    /// key cuts everything older, as in `read_all`.
+    /// newest -- the partition, level 0 oldest first, the frozen memtables
+    /// oldest first, the live one -- and a tombstone in the newest source
+    /// that holds the key cuts everything older, as in `read_all`.
     fn scan_merged<F: FnMut(&[u8], &[u8])>(
         &self,
         from: &[u8],
@@ -12611,9 +12614,9 @@ impl Db {
     }
 
     /// Whether a commit past the seal threshold seals now: always, unless
-    /// `Options::seal_defers` and a seal holds the frozen slot, when the
-    /// live table keeps growing and a later commit seals once the slot is
-    /// free -- up to a ceiling of twice the threshold, past which the
+    /// `Options::seal_defers` and the frozen tables fill the list, when
+    /// the live table keeps growing and a later commit seals once the list
+    /// has room -- up to a ceiling of twice the threshold, past which the
     /// commit waits in the seal as before, so the table and the piece it
     /// seals into stay within a factor of two of what the wait held them
     /// to. A wedged queue seals, so its error reaches the caller.
@@ -12622,8 +12625,8 @@ impl Db {
             return true;
         }
         // The commit's held state dates from its start; a landing the
-        // segment work published meanwhile may have emptied the slot. A
-        // stale full slot only defers, so no order against the count.
+        // segment work published meanwhile may have made room. A stale
+        // full list only defers, so no order against the count.
         self.rehold();
         if self.state().frozen.len() < FROZEN_CAP
             || self.shared.seal_wedged.load(AtomicOrdering::Acquire)
@@ -13807,12 +13810,12 @@ impl Db {
     /// waits for no fsync, and the WAL holds the writes until the
     /// manifest names the segment; a crash before that leaves a segment
     /// the manifest does not name, swept at open, and a WAL that replays
-    /// it. Commits continue into the new WAL while it runs. A second
-    /// trigger waits for the frozen slot, which the first seal's readable
-    /// landing empties (`land_seal`, the writer's backpressure); a table a
-    /// `sync` handed without a freeze (`hand_tail`) is a seal in flight
-    /// beside it, holding no slot, and the seals land in the order they
-    /// were handed.
+    /// it. Commits continue into the new WAL while it runs. A trigger
+    /// with `FROZEN_CAP` tables frozen waits for room, which the oldest
+    /// seal's readable landing makes (`land_seal`, the writer's
+    /// backpressure); a table a `sync` handed without a freeze
+    /// (`hand_tail`) is a seal in flight beside them, holding no place in
+    /// the list, and the seals land in the order they were handed.
     pub fn seal(&mut self) -> Result<()> {
         let _op = self.op();
         if let Some(e) = self.pending_err.take() {
@@ -14259,7 +14262,7 @@ impl Db {
         // a freeze (`hand_tail`): the segment work partitions what lands
         // as soon as anything reads it, and promotes by link what it can
         // (`Options::adaptive_shape`). The tail used to stay where a seal
-        // was in flight or a partition existed -- the store has one frozen
+        // was in flight or a partition existed -- the store had one frozen
         // slot, and waiting for the seal lost the load most of what not
         // flushing had won -- and what stayed was the shape the read
         // passes after an ordered load paid for: a live ordered table of
@@ -14286,8 +14289,9 @@ impl Db {
     /// is replaced by whichever side publishes first: the landing installs
     /// an empty table in its place, or the writer's next write freezes it
     /// under a fresh one (`take_fresh_mem`), both by compare-and-swap on
-    /// the one state pointer. A freeze here would have needed the frozen
-    /// slot, held by a seal already in flight for as long as it runs.
+    /// the one state pointer. A freeze here would need room in the frozen
+    /// list, which seals already in flight may fill for as long as the
+    /// oldest runs.
     fn hand_tail(&mut self) -> Result<()> {
         debug_assert!(self.mem_handed.is_none(), "one table handed at a time");
         let table = self.mem().clone();
@@ -14317,8 +14321,8 @@ impl Db {
     /// The live table a `sync` handed to a seal (`mem_handed`) replaced,
     /// before the writer writes again: by the landing, which the writer
     /// finds done, or here, the table frozen under a fresh one as `freeze`
-    /// does it -- once the frozen slot is free, since a seal frozen before
-    /// the hand-off may still hold it, waited for as `land_seal` waits.
+    /// does it -- once the frozen list has room, since the seals frozen
+    /// before the hand-off may fill it, waited for as `land_seal` waits.
     /// Nothing writes into the handed table between the hand-off and this,
     /// so the writer's own caches, keyed to the live table's slots, stay
     /// right until the publish here resets them as a freeze's does.
@@ -14338,7 +14342,7 @@ impl Db {
             // beside a count of zero has a seal that failed to land.
             let seals = self.shared.in_seal.load(AtomicOrdering::Acquire);
             self.rehold();
-            let (replaced, slot_free) = {
+            let (replaced, room) = {
                 let st = self.state();
                 (
                     !std::sync::Arc::ptr_eq(&st.mem, &handed),
@@ -14350,7 +14354,7 @@ impl Db {
             }
             // Before the freeze, not only before the wait: frozen under a
             // fresh table with its seal failed, the handed table would sit
-            // in the slot for no landing to retire, and every later seal
+            // in the list for no landing to retire, and every later seal
             // would wait on it. Live, its keys stay readable and the next
             // write tries again.
             if let Some(e) = self.shared.take_maint_err() {
@@ -14359,7 +14363,7 @@ impl Db {
             if seals == 0 || self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
                 return Err(err("a handed table's seal did not land"));
             }
-            if slot_free {
+            if room {
                 if self.freeze_table(&handed) {
                     SealCounts::add(&self.shared.seal_counts.tail_by_writer, 1);
                     break;
@@ -14483,14 +14487,15 @@ impl Db {
         let frozen = self.freeze_table(&table);
         debug_assert!(
             frozen,
-            "the live table is the writer's own to freeze, and `land_seal` emptied the slot"
+            "the live table is the writer's own to freeze, and `land_seal` left room"
         );
         table
     }
 
     /// `table`, the live one, frozen under a fresh one in one publish,
-    /// when `table` is still the live table and the frozen slot is empty
-    /// at the publish; false, and nothing published, otherwise. Both hold
+    /// when `table` is still the live table and the frozen list has room
+    /// at the publish, the table going to its back; false, and nothing
+    /// published, otherwise. Both hold
     /// for the writer's own freeze; a table handed to a seal
     /// (`take_fresh_mem`) may have been replaced by the landing since.
     /// The forms go with it as `freeze` says.
@@ -15210,12 +15215,13 @@ impl Db {
         }
     }
 
-    /// The frozen slot emptied before the next freeze, which needs it: the
-    /// seals joined inline, or the landing of the frozen table waited for
-    /// where the segment work is away -- the writer's backpressure, as the
-    /// join was. The slot, and not the seal count: a table a `sync` handed
-    /// without a freeze (`hand_tail`) is a seal in flight that holds no
-    /// slot, and a freeze need not wait for it.
+    /// Room in the frozen list before the next freeze, which needs it: the
+    /// seals joined inline, or, where the segment work is away and the
+    /// list is full, the landing of its oldest table waited for -- the
+    /// writer's backpressure, as the join was. The list, and not the seal
+    /// count: a table a `sync` handed without a freeze (`hand_tail`) is a
+    /// seal in flight that holds no place in it, and a freeze need not
+    /// wait for it.
     fn land_seal(&mut self) -> Result<()> {
         let draining = self.draining;
         if matches!(self.maint, MaintHome::Here(_)) {
@@ -15387,6 +15393,31 @@ impl Db {
             c.tail_by_writer.load(AtomicOrdering::Relaxed),
             c.tail_by_landing.load(AtomicOrdering::Relaxed),
         )
+    }
+
+    /// The frozen tables the store holds, each a seal in flight; for a
+    /// test that asserts how many the writer froze into room.
+    #[doc(hidden)]
+    pub fn frozen_tables(&self) -> usize {
+        let _op = self.op();
+        self.state().frozen.len()
+    }
+
+    /// A test's: `hold_seal_landing(false)` after `after`, from a thread
+    /// of its own, for a test whose thread is the writer waiting on the
+    /// seals the hold keeps.
+    #[doc(hidden)]
+    pub fn release_seal_landing_after(
+        &self,
+        after: std::time::Duration,
+    ) -> std::thread::JoinHandle<()> {
+        let shared = self.shared.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            shared
+                .seal_hold
+                .fetch_and(!SEAL_HOLD_LANDING, AtomicOrdering::AcqRel);
+        })
     }
 
     /// Pieces a range's landing promoted by link into a partitioned store,
@@ -18296,9 +18327,9 @@ enum MaintJob {
 /// segments published and named by no manifest until the thread returns;
 /// the table it writes out -- the frozen one, or the live one a `sync`
 /// handed without a freeze (`Db::hand_tail`) -- which the readable
-/// landing retires from whichever slot of the state holds it; and the WAL
-/// and the temp name the durable landing retires. `draining` books the
-/// wait as a flush's.
+/// landing retires from the front of the frozen list or from the live
+/// slot, whichever holds it; and the WAL and the temp name the durable
+/// landing retires. `draining` books the wait as a flush's.
 struct SealJob {
     handle: std::thread::JoinHandle<Result<Vec<String>>>,
     readable: std::sync::Arc<SealReadable>,
@@ -18827,9 +18858,10 @@ impl Maint {
     /// poll has not done that (`land_readable`), then the durable landing
     /// (`land_durable`) and the decisions a landing makes. The seal is
     /// counted out whether the landing succeeds or not: the writer waits
-    /// on the frozen slot and reads the count only to tell a landing still
-    /// to come from one that failed, so a count left up for a seal that
-    /// will never land turns that wait into one that never ends.
+    /// for room in the frozen list and reads the count only to tell a
+    /// landing still to come from one that failed, so a count left up for
+    /// a seal that will never land turns that wait into one that never
+    /// ends.
     /// `draining` books the wait as a flush's.
     fn land_front(&mut self, draining: bool) -> Result<()> {
         let Some(job) = self.sealing.pop_front() else {
@@ -19101,15 +19133,16 @@ impl Maint {
 
     /// `segs` published as the live set, with the memtable `landed` --
     /// the table a seal wrote out -- retired in the same state: from the
-    /// frozen slot where the writer froze it, or from the live slot,
-    /// replaced by an empty table, where a `sync` handed it live and the
-    /// writer has not written since. The segments are this work's alone
-    /// to change, so a publish another thread made first -- the writer's
-    /// freeze or its switch of memtable -- changes nothing here but the
-    /// memtables, which are taken again from the state that won and the
-    /// swap tried once more; the writer's freeze of a handed table moves
-    /// it from the live slot to the frozen one, and the retry finds it
-    /// there. The published forms are carried by the publish
+    /// front of the frozen list where the writer froze it, or from the
+    /// live slot, replaced by an empty table, where a `sync` handed it
+    /// live and the writer has not written since. The segments are this
+    /// work's alone to change, so a publish another thread made first --
+    /// the writer's freeze or its switch of memtable -- changes nothing
+    /// here but the memtables, which are taken again from the state that
+    /// won and the swap tried once more; the writer's freeze of a handed
+    /// table moves it from the live slot to the back of the frozen list,
+    /// and the retry finds it there, at the front once the seals before it
+    /// have landed. The published forms are carried by the publish
     /// (`State::carry_published`), and the writer carries its own at its
     /// next look at the log (`Reader::rebase_tables`); with `tier`, a
     /// piece merge's, no partition is rewritten. Not where the landing

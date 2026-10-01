@@ -152,24 +152,77 @@ fn a_handed_life(name: &str) {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// One store's life with three seals in flight at its close, each held
+/// before it writes: the state holds three frozen tables, each with its
+/// own snapshot set on it and named as a base by the live snapshots the
+/// writer and a handle built over them. The close lifts the hold and
+/// joins the seals, and every table and snapshot goes with the store.
+fn a_three_frozen_life(name: &str) {
+    let d = std::env::temp_dir().join(format!("supdb-next-leak-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let opts = Options {
+        seal_bytes: 1 << 30,
+        partition_bytes: Some(64 << 10),
+        scan_block_cache: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let keys = 20_000u32;
+    let key = |k: u32| format!("key-{k:08}").into_bytes();
+    let scan_all = |r: &supdb::Reader| {
+        for s in (0..keys).step_by(500) {
+            r.scan(&key(s), 100, |_, _| {}).unwrap();
+        }
+    };
+    for k in 0..keys {
+        db.append(&key(k), &[7u8; 100]);
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.hold_seal_landing(true);
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    for round in 1..=4u64 {
+        for _ in 0..1000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            db.put(&key((x % keys as u64) as u32), &[round as u8; 100]);
+        }
+        db.commit().unwrap();
+        scan_all(&db);
+        let h = db.reader().unwrap();
+        scan_all(&h);
+        drop(h);
+        if round < 4 {
+            db.seal().unwrap();
+        }
+    }
+    assert_eq!(db.frozen_tables(), 3, "three frozen at the close");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 #[test]
 fn a_closed_store_gives_back_what_it_allocated() {
     // The first life allocates what lives for the process -- the test
     // harness's buffers, lazily built statics -- so the count starts after.
     a_store_life("warm");
     a_handed_life("warm-handed");
+    a_three_frozen_life("warm-three");
     let before = LIVE.load(Ordering::SeqCst);
     let lives = 4;
     for i in 0..lives {
         a_store_life(&format!("life-{i}"));
         a_handed_life(&format!("handed-{i}"));
+        a_three_frozen_life(&format!("three-{i}"));
     }
     let after = LIVE.load(Ordering::SeqCst);
     let kept = after - before;
     assert!(
         kept < 64 << 10,
         "{} closed stores kept {kept} bytes allocated ({} a store)",
-        2 * lives,
-        kept / (2 * lives)
+        3 * lives,
+        kept / (3 * lives)
     );
 }

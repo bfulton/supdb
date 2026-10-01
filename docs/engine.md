@@ -2389,10 +2389,11 @@ thread, and only when they are paid does the segment work write the
 manifest, retire the WAL and end the seal. A reader waits for no fsync.
 The seals in flight are a queue, landed in the order they were handed
 and the next only once the one before it is durable, so landings keep
-sequence order and one seal at most is between its phases; the writer's
-backpressure waits on the frozen slot, which the readable landing
-empties, and a table a `sync` hands without a freeze joins the queue
-behind the frozen table's seal. Between the phases no
+sequence order and one seal at most is between its phases; the frozen
+tables are a list in the queue's order, the writer freezes into room
+and its backpressure waits only when the list is full, for the oldest's
+readable landing, and a table a `sync` hands without a freeze joins the
+queue behind the frozen tables' seals. Between the phases no
 manifest is written: it would name segments that may be torn and cover
 a sequence the WAL still has to hold, so a merge that finishes in the
 window lands after the seal, and the shaping does not run in it. A
@@ -2659,7 +2660,8 @@ against the arm it adds to, twelve pairs a rung at 10k, 100k and 300k:
   the shape arm, and nothing fell.
 - **A commit defers** a seal the frozen slot cannot take
   (`seal_defers`), up to twice the threshold. Inert on the suite: the
-  slot was almost never held at a threshold commit.
+  slot was almost never held at a threshold commit. Since the frozen
+  tables became a list, it defers only while the list is full.
 - **A fresh store's first seal comes at the floor** under the shape
   (`seal_first_floor`), so its load leaves a partition. The lag sweep's
   first point rose 11x at 100k and 7.5x at 300k -- and the shuffled load

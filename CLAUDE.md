@@ -217,7 +217,8 @@ retirement -- runs on a thread of its own (`publish_in_background`), or
 inline where the writer drives it; a `Reader` from `Db::reader` is
 another thread's, `Send` and not `Sync`, with the scan snapshot and the
 block tables of its own. What they share is published whole: the segment
-set and the two memtables as one `State` behind one pointer, swapped by a
+set and the memtables, the live one and the frozen list, as one `State`
+behind one pointer, swapped by a
 compare-and-swap against the state it was made from and made again over
 whichever won. The writer changes only the memtables (a freeze, a switch
 of memtable) and the segment work only the segments -- with one exception
@@ -241,10 +242,10 @@ segment work publishes meanwhile, the writer sees at its next. A table
 the writer hands to a seal without freezing it -- `sync` under
 `adaptive_shape` hands the live table whenever it holds anything, no
 table is handed already and the segment work has a thread of its own, a
-seal in flight or not, since the frozen slot may be that seal's -- is
-replaced by whichever side publishes first: the
+seal in flight or not, since seals in flight may fill the frozen list --
+is replaced by whichever side publishes first: the
 writer at its next write, freezing it under a fresh table once the frozen
-slot is free, or the landing, installing an empty one, each by
+list has room, or the landing, installing an empty one, each by
 compare-and-swap on the same pointer; and the writer writes nothing into
 it after the hand-off. The
 isolation is the reader's: `Latest` honours the memtable's watermark at the
@@ -353,9 +354,12 @@ finishes in that window lands after the seal (`Maint::collect` holds it,
 landed in the order they were handed and each in its two phases, and only
 the oldest lands at all until it is durable, so one seal at most is between
 its phases and no manifest covers a later seal's records before an earlier
-one's are durable; a table `sync` hands without a freeze is a seal in
-flight beside the frozen table's, the writer's next freeze waits on the
-frozen slot, which the readable landing empties, and the count of seals
+one's are durable; the frozen tables are a list in the queue's order,
+up to `FROZEN_CAP`, and a landing retires its front; a table `sync`
+hands without a freeze is a seal in flight beside theirs that joins the
+list's back only when the writer freezes it; the writer freezes into
+room and waits only when the list is full, for the oldest's readable
+landing; and the count of seals
 (`in_seal`) is read before the state whoever decides against it, so a
 count of zero is one whose landings the state shows. A crash between any
 two of those leaves either a WAL that replays the whole memtable, with a
