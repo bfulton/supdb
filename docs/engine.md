@@ -2811,6 +2811,69 @@ summed (faster in every pair of both), the 10% point at 0.84x and 0.91x
 (4 and 5 of 6), the 0% point at 0.88x and 0.91x (4 of 6 each), the 100%
 point level, and nothing at 100k on one side.
 
+#### Seals whenever the sealer is idle
+
+`Options::seal_idle` (the `supdb-idle` and `supdb-shapeidle` arms) seals
+at a commit under the threshold whenever no seal is writing a table --
+the frozen list empty, no table handed -- and the live table holds
+`SEAL_CAP_FLOOR` or more, so the unsealed backlog is at most what was
+written while one seal ran, and a `sync` hands a small table where it
+handed up to `seal_bytes` of one. It runs only in a stretch of writes
+nobody reads, counted at each commit: a store read by key or by range
+keeps its writes in the table, where a point read is one probe and a
+scan reads them through the forms. While it runs the threshold is
+`seal_bytes` alone, the cap and the first floor off, and a commit with
+no scan near files no backlog into the forms.
+
+Each of those three conditions was a loss before it was a rule. Sealing
+regardless of reads put partitions under the shuffled load from its
+first megabyte, and every commit of the load filed its batch into forms
+the next seal replaced: the shuffled load at three hundred thousand keys
+read 0.23x. A window of recency on that filing gave the load back and
+left the point-read mixes' writes unfiled for the scan mix after them,
+which filed them: ycsb-E at 0.79-0.94x on every rung. With no filing in
+any quiet commit, the lag sweep's last burst at ten thousand keys went
+to the upkeep's hold instead of its commits' own filing, and the scans
+after it read 0.74x; that burst is near a scan, and files as it would
+without the option.
+
+Priced in three sittings of fourteen pairs, each arm against its
+comparator in one process. The first sitting and the second's 300k pairs
+ran on one host and the rest on a second. On the shape arm at 300k the
+1% lag point read 3.22x, 3.43x and 4.17x, faster in 13, 14 and 14 of 14
+pairs, and the 10% point 2.70x, 2.97x and 1.19x (11, 11, 12 of 14); at
+10k the 0% point read 4.13x, 5.22x and 4.98x (14, 14, 13 of 14) and the
+1% point 1.19x, 1.15x and 1.03x. Nothing else held a side in more than
+one sitting, the loads and ycsb-E included: E read 0.97-1.06x on the
+shape arm and 0.93-1.11x on the flush arm, whose sweep stayed level.
+
+At 100k the two hosts disagree. On the first, the 1% and 10% points read
+2.90x and 4.22x (14 and 13 of 14); on the second, 0.85x and 0.89x, then
+0.77x and 0.79x, faster in 5 or 6 pairs of 14, while the 0% point read
+1.37x and 1.43x (14 of 14 in both). The store's shape at each point says
+why. On the second host the comparator's one table, the whole load
+handed at the sync, lands within the 0% pass in two reps of four and
+within the 1% pass in a third, promoted to one partition of a hundred
+thousand keys, and the passes after it read 28-36 million entries a
+second; the idle arm reaches the 1% pass with the partition its first
+seal made at the floor, ten thousand keys, under five or six pieces of
+up to thirty thousand that the shaping has not merged, and reads 22-23
+million, or 28-32 where the shaping had merged most of them. The slow
+reps of either arm are a pass run beside a seal in flight -- the
+comparator's hundred thousand keys, or the idle arm's last backlog of
+fifty-five thousand, which a slow seal let grow -- a cost the option
+leaves as it was.
+
+Summed by phase on the second host, the sweep's sequence with one rep a
+process and the arms alternated, the idle arm took 0.89x of the
+comparator's time over the whole sequence at 100k (less in 8 of 8
+pairs), 0.82x over the load, the sync and the 0% pass (7 of 8), and
+1.16x over the 10% burst and its pass (2 of 8); at 300k, 0.95x over the
+sequence (4 of 6) and 0.50x over the 1% burst and its pass (6 of 6). The
+option stays off: the gains are the shape arm's lag points and its
+sweep's sum, and the 100k reading on the second host is one a default
+would carry.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and
