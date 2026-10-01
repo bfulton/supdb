@@ -8137,6 +8137,79 @@ fn a_write_after_a_handed_seal_takes_a_fresh_table_from_whichever_side_swapped()
     }
 }
 
+/// A table a `sync` handed to a seal is final, and the seal sets its
+/// snapshot on the table while it is still live (`FrozenSnaps`); the
+/// writer's next write freezes it, and the first scan over that state, a
+/// handle's, carries the seal's copy forward with the live key alone. The
+/// seal publishes into a state only a snapshot of that state's own frozen
+/// table, which a handed table was not when the seal made it, so off,
+/// the handle sorts the handed table again. The seal is held before it
+/// writes, so the write freezes the table on every run.
+#[test]
+fn a_handed_tables_seal_snapshot_serves_the_state_that_freezes_it() {
+    for frozen_snaps in [true, false] {
+        let d = dir(&format!("handed-snap-{frozen_snaps}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                adaptive_shape: true,
+                // Never on its own: the whole table is the sync's to hand.
+                seal_bytes: 1 << 40,
+                partition_bytes: Some(64 << 20),
+                frozen_snaps,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let n = 4000u64;
+        let mut m = ScanModel::default();
+        // Shuffled, so the table is hashed and the seal sorts it.
+        for i in 0..n {
+            m.append(&mut db, &format!("key-{:05}", i * 7919 % n), "a");
+        }
+        db.commit().unwrap();
+        db.hold_seal_landing(true);
+        db.sync().unwrap();
+        assert!(db.in_flight().0, "the handed table's seal is in flight");
+        // The copy made, its publish refused -- the seal's time is counted
+        // after both -- and, on, set on the table.
+        wait_for("the seal's snapshot", || {
+            db.seal_waits().seal_snap_ns > 0 && db.seal_table_snapshots() == u64::from(frozen_snaps)
+        });
+        assert_eq!(
+            db.seal_snapshots(),
+            0,
+            "the handed table is live: no publish"
+        );
+        m.append(&mut db, "key-00007", "b");
+        db.commit().unwrap();
+        assert_eq!(db.tail_swaps(), (1, 0), "the write froze the handed table");
+        let builds = db.snapshot_builds();
+        let r = db.reader().unwrap();
+        m.check(&r, "a handle over the frozen handed table");
+        if frozen_snaps {
+            assert_eq!(
+                db.snapshot_builds(),
+                builds,
+                "the handle carried the seal's copy forward"
+            );
+        } else {
+            assert!(
+                db.snapshot_builds() > builds,
+                "off, the handle sorts the handed table itself"
+            );
+        }
+        m.check(&db, "the writer over the frozen handed table");
+        assert_eq!(db.frozen_sorts(), 0, "nobody sorted the handed table alone");
+        db.hold_seal_landing(false);
+        db.settle().unwrap();
+        m.check(&r, "a handle after the landing");
+        m.check(&db, "the writer after the landing");
+        drop(r);
+        db.close().unwrap();
+    }
+}
+
 /// A hashed tail -- shuffled writes -- handed while a seal is in flight:
 /// the frozen slot is that seal's, so the tail goes without a freeze, and
 /// lands after it as a piece over the partition, which shuffled keys

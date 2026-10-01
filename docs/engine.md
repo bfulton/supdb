@@ -2699,14 +2699,35 @@ three times: by the writer's first scan after the freeze, inside its
 snapshot of frozen and live keys together; by the seal, for its records;
 and by any reader of a state published while the seal ran, since the
 seal's copy was published into the state the freeze made and no later
-one. The table keeps its own snapshot now (`FrozenSnaps`): whoever
+one -- and for a table a `sync` handed without a freeze, into none, the
+table being live when the copy was made and frozen by the writer's next
+write. The table keeps its own snapshot now (`FrozenSnaps`): whoever
 sorts it first -- the seal, a freeze's carry, the keeper, a scan -- sets
 it on the table, and every later reader takes it. A scan over a state
 with a frozen table and no snapshot of its own carries the table's
 forward with the live keys alone, where it sorted both; the seal takes
-an order it finds, and builds its copy from it rather than from a sort.
-`frozen_snaps` off is the shape before it, and `supdb-nofrozen` prices
-it.
+an order it finds, once it holds every entry, and builds its copy from
+it rather than from a sort. `frozen_snaps` off is the shape before it,
+priced by `supdb-nofrozen` and, under the shape, `supdb-shapenofrozen`.
+
+The default arm saves no sort by it. A seal starts its own sort at the
+freeze, ahead of any reader, and a reader that scans before the seal's
+copy is set sorts the table alone where it sorted both tables before:
+per pass at a hundred thousand keys, builds and the frozen table's sorts
+came to 13-17 against 13-18 builds without it, and none of the pass's
+timed quantities moved at ten thousand, a hundred thousand or three
+hundred thousand keys. The shape is where it pays, because a handed
+table's copy reached no reader: the sorts per pass fell from 4.6 to 3.6
+at ten thousand keys, 16.3 to 13.5 at a hundred thousand and 22.9 to
+21.1 at three hundred thousand. The lag sweep's first point of writes
+read 1.5-2.4x faster at ten and a hundred thousand keys in both of two
+sittings, and its next point slower at ten thousand in both, by 13% in
+one and 3x in the other: both points read bimodal across reps in both
+arms, so the change moves which shape a point lands in rather than
+making one, and the sweep's four points summed came out level -- 444
+against 455 ns an entry at ten thousand keys, 654 against 698 at a
+hundred thousand, 476 against 487 at three hundred thousand, none
+resolved by sign.
 
 ### Arrival order
 

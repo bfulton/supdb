@@ -541,7 +541,7 @@ struct Policy {
     firstfloor: bool,
     /// Each reader of a frozen table sorts it for itself, as before the
     /// table kept its own snapshot: `Options::frozen_snaps` off.
-    /// `supdb-nofrozen`.
+    /// `supdb-nofrozen`, and `supdb-shapenofrozen` under the shape.
     nofrozen: bool,
 }
 
@@ -744,6 +744,23 @@ impl Supdb {
         Supdb::with_policy(
             path,
             Policy {
+                nofrozen: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingestshape` whose readers of a frozen table each sort it
+    /// for themselves, as `supdb-nofrozen`: the arm a `sync` hands its
+    /// table to a seal under, which the table's own snapshot is for.
+    pub fn create_shape_nofrozen(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                drain: false,
+                durable: false,
+                shape: true,
                 nofrozen: true,
                 ..Policy::default()
             },
@@ -1612,7 +1629,11 @@ impl Engine for Supdb {
             return "supdb-shapedefer";
         }
         if self.nofrozen {
-            return "supdb-nofrozen";
+            return if self.shape {
+                "supdb-shapenofrozen"
+            } else {
+                "supdb-nofrozen"
+            };
         }
         if self.rotate {
             return if self.shape {
@@ -2297,6 +2318,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-shaperotate"
         | "supdb-shapedefer"
         | "supdb-shapefloor"
+        | "supdb-shapenofrozen"
         | "lmdb-nosync"
         | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
@@ -2354,6 +2376,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-shaperotate" => Box::new(Supdb::create_shape_rotate(dir)?),
         "supdb-shapedefer" => Box::new(Supdb::create_shape_defer(dir)?),
         "supdb-shapefloor" => Box::new(Supdb::create_shape_floor(dir)?),
+        "supdb-shapenofrozen" => Box::new(Supdb::create_shape_nofrozen(dir)?),
         "supdb-ingestadaptloose" => Box::new(Supdb::create_ingest_adaptloose(dir)?),
         "supdb-ingestnoseal" => Box::new(Supdb::create_ingest_noseal(dir)?),
         "lmdb" => Box::new(Lmdb::create(dir, map_gb)?),

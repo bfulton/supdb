@@ -6057,6 +6057,10 @@ struct Shared {
     /// Snapshots the seal thread published over the frozen table it was
     /// writing (`Options::seal_snapshot`); for a test.
     snap_sealed: AtomicU64,
+    /// Snapshots the seal thread set on the table it was writing
+    /// (`FrozenSnaps`), frozen or handed, counted after the set so a test
+    /// that sees the count sees the cell; for a test.
+    snap_on_table: AtomicU64,
     /// The writer's upkeep while it is lent to the upkeep thread; see
     /// `Upkeep::Background`.
     upkeep: Lend,
@@ -12508,6 +12512,7 @@ impl Db {
             snap_carried: AtomicU64::new(0),
             snap_switched: AtomicU64::new(0),
             snap_sealed: AtomicU64::new(0),
+            snap_on_table: AtomicU64::new(0),
             upkeep: Lend::default(),
         });
         let pin_slot = Some(
@@ -12852,6 +12857,7 @@ impl Db {
             snap_carried: AtomicU64::new(0),
             snap_switched: AtomicU64::new(0),
             snap_sealed: AtomicU64::new(0),
+            snap_on_table: AtomicU64::new(0),
             upkeep: Lend::default(),
         });
         let pin_slot = Some(
@@ -13663,7 +13669,10 @@ impl Db {
                             built.bounds = h.bounds.clone();
                         }
                         let built = std::sync::Arc::new(built);
-                        if !frozen_snaps || mem.snaps.copied.set(built.clone()) {
+                        if !frozen_snaps {
+                            built
+                        } else if mem.snaps.copied.set(built.clone()) {
+                            shared.snap_on_table.fetch_add(1, AtomicOrdering::Release);
                             built
                         } else {
                             mem.snaps.copied.get().expect("set by whoever won")
@@ -16715,6 +16724,15 @@ impl Db {
     #[doc(hidden)]
     pub fn seal_snapshots(&self) -> u64 {
         self.shared.snap_sealed.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Snapshots the seal thread set on the table it was writing
+    /// (`FrozenSnaps`) over this store's life, a table `sync` handed while
+    /// it is live among them. For a test: a count seen here is a cell a
+    /// reader of the table finds set.
+    #[doc(hidden)]
+    pub fn seal_table_snapshots(&self) -> u64 {
+        self.shared.snap_on_table.load(AtomicOrdering::Acquire)
     }
 
     #[doc(hidden)]
