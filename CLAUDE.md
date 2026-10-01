@@ -660,6 +660,24 @@ instructions whose cost is not their count -- a divide, a call through
 a pointer, a store the next load depends on -- and give the common
 shape a path without them.
 
+**A value built a field at a time and handed back whole.** The scan
+snapshot's cursor, generalised to a base a frozen table, folded each
+run's head into one value -- a key's slot and run in every table -- and
+returned it with the mask: the fold wrote it to the stack in stores of
+one, four, eight and sixteen bytes, and the return copied it out in loads
+of eight and sixteen that spanned them, and a load that spans stores of
+other widths is not forwarded from them, twice a key. Callgrind counted
+the same instructions in the cursor before and after; perf put four and a
+half times the samples on it, 42% on one sixteen-byte load from the
+stack, and a lag point read 0.77x in every round of a sitting while the
+point after it read 2.8x, its blocks built by the upkeep thread in the
+time the slower scans gave it. The cursor finds the key and the mask as
+two scalars now and reads the entries only where a caller asks. The rule:
+a value assembled field by field and then moved whole costs a stall per
+move that no instruction count shows; keep a hot path's results in
+scalars, and when time moves with no instruction to account for it, look
+in the annotation for a load from bytes just stored in pieces.
+
 **A join that took back what it was about to wait for.** Under
 `Upkeep::Background` the writer's upkeep is lent to a thread, and any
 touch of it by the writer takes it back, waiting only for a pass in

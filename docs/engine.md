@@ -2761,6 +2761,27 @@ lag points read 1.1-1.3x in 7-9 of 12 rounds and the durable drained scan
 0.9x in 2-3 of 12, where the cursor has no unsealed key to fold; neither
 was held to a second sitting.
 
+Generalised to a base a frozen table, the fold took each head into one
+value -- a key's slot and run in every table -- and returned it with the
+mask, and it stalled: the value went to the stack in stores of one, four,
+eight and sixteen bytes and came out to the caller in loads of eight and
+sixteen that spanned them, none of them forwarded, twice a key. Callgrind
+counted the same 4.56 million instructions in the cursor before and after
+over the shape arm's first lag point at ten thousand keys; perf put 4.6
+times the samples on it, 42% of them on one sixteen-byte load from the
+stack, and the point's median scan rose from 11.5 to 17.3 us, slower in
+every round of a sitting. Its third point read faster beside it, the
+slower points before leaving the upkeep thread time to build the blocks
+the third point's scans would have built. The cursor finds the key and
+the mask as two scalars now and reads a head's entries only where a
+caller asks (`Snapshot::entries`): 12.0 us, and the third point back to
+its two shapes in the old proportion. Against the binary before the
+list, two sittings of twelve rounds over the two smallest rungs, each
+arm over its comparator: no timed quantity was on one side in both. The
+shape arm's first point read 0.95-0.97x in the first and 1.04-1.07x in
+the second; the durable arm's 0.94-0.97x in both, ahead in 4-5 of 12
+rounds, which the sign does not resolve.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and

@@ -6917,30 +6917,6 @@ impl UKey {
     }
 }
 
-/// One run's head folded into the least key so far: a smaller key starts
-/// the fold again, an equal one adds its entry and its run's bit.
-#[inline]
-fn fold_head<'a>(
-    best: &mut Option<(&'a [u8], UKey, u8)>,
-    k: &'a [u8],
-    bit: usize,
-    put: impl Fn(&mut UKey),
-) {
-    match best.as_ref().map(|(bk, _, _)| k.cmp(bk)) {
-        Some(Ordering::Greater) => {}
-        Some(Ordering::Equal) => {
-            let (_, u, at) = best.as_mut().expect("compared against it");
-            put(u);
-            *at |= 1 << bit;
-        }
-        None | Some(Ordering::Less) => {
-            let mut u = UKey::NONE;
-            put(&mut u);
-            *best = Some((k, u, 1 << bit));
-        }
-    }
-}
-
 /// How far ahead of the seal's copy (`Snapshot::from_frozen`) the entry
 /// lines are prefetched, how far ahead the key and chunk lines are once
 /// the entry is in, and how many bytes of the chunk: its twelve-byte
@@ -7442,42 +7418,90 @@ impl Snapshot {
             k: self.seek_in(&self.fresh, from),
         }
     }
-    /// The key at the cursor, its entries folded across the runs, and a
-    /// bit for each run whose head stands on it -- the bases' first, then
-    /// main, side, fresh -- from one ordered compare a head past the
-    /// first. Each head's key is read from its own run's arena; a caller
-    /// takes the key returned here, and a frozen run from its base.
-    #[inline]
-    fn front(&self, c: SnapCursor) -> Option<(&[u8], UKey, u8)> {
-        let mut best: Option<(&[u8], UKey, u8)> = None;
+    /// The key at the cursor and a bit for each run whose head stands on
+    /// it -- the bases' first, then main, side, fresh -- from one ordered
+    /// compare a head past the first. Each head's key is read from its own
+    /// run's arena; a caller takes the key returned here. The entries are
+    /// not folded here but read from the heads the mask names
+    /// (`entries`): folded into one value a head at a time and returned,
+    /// its fields went to the stack in stores of four, eight and sixteen
+    /// bytes and came back out in loads of eight and sixteen that spanned
+    /// them, so no load was forwarded from its stores, and the cursor of
+    /// a lag point's scans spent four times what the same instructions
+    /// had cost folding a copy of one entry. The key and the mask are two
+    /// scalars, and inlined they never leave registers.
+    #[inline(always)]
+    fn front<'s>(&'s self, c: SnapCursor) -> Option<(&'s [u8], u32)> {
+        let mut best: &'s [u8] = &[];
+        let mut at = 0u32;
+        let mut head = |k: &'s [u8], bit: usize| {
+            if at == 0 {
+                best = k;
+                at = 1 << bit;
+                return;
+            }
+            match k.cmp(best) {
+                Ordering::Less => {
+                    best = k;
+                    at = 1 << bit;
+                }
+                Ordering::Equal => at |= 1 << bit,
+                Ordering::Greater => {}
+            }
+        };
         for (i, b) in self.bases.iter().enumerate() {
             if let Some(e) = b.ents.get(c.b[i]) {
-                fold_head(&mut best, b.key_of(e), i, |u| u.fz[i] = (e.frozen, e.frun));
+                head(b.key_of(e), i);
             }
         }
-        let live = [self.ents.get(c.i), self.side.get(c.j), self.fresh.get(c.k)];
-        for (n, e) in live.into_iter().enumerate() {
-            if let Some(e) = e {
-                fold_head(&mut best, self.key_of(e), MAX_FROZEN + n, |u| {
-                    if e.mem != u32::MAX {
-                        u.mem = e.mem;
-                        u.lrun = e.lrun;
-                    }
-                });
+        if let Some(e) = self.ents.get(c.i) {
+            head(self.key_of(e), MAX_FROZEN);
+        }
+        if let Some(e) = self.side.get(c.j) {
+            head(self.key_of(e), MAX_FROZEN + 1);
+        }
+        if let Some(e) = self.fresh.get(c.k) {
+            head(self.key_of(e), MAX_FROZEN + 2);
+        }
+        (at != 0).then_some((best, at))
+    }
+    /// The entries of the heads `at` names at the cursor, folded: each
+    /// frozen table's slot and run from its base's head, and the live
+    /// table's from whichever live run holds the key.
+    #[inline(always)]
+    fn entries(&self, c: SnapCursor, at: u32) -> UKey {
+        let mut u = UKey::NONE;
+        for (i, b) in self.bases.iter().enumerate() {
+            if at >> i & 1 == 1 {
+                let e = &b.ents[c.b[i]];
+                u.fz[i] = (e.frozen, e.frun);
             }
         }
-        best
+        let live = [(&self.ents, c.i), (&self.side, c.j), (&self.fresh, c.k)];
+        for (n, (run, pos)) in live.into_iter().enumerate() {
+            if at >> (MAX_FROZEN + n) & 1 == 1 {
+                let e = &run[pos];
+                if e.mem != u32::MAX {
+                    u.mem = e.mem;
+                    u.lrun = e.lrun;
+                }
+            }
+        }
+        u
     }
     /// The key at the cursor and its entries, folded across the runs.
+    #[inline(always)]
     fn peek(&self, c: SnapCursor) -> Option<(&[u8], UKey)> {
-        self.front(c).map(|(k, u, _)| (k, u))
+        let (k, at) = self.front(c)?;
+        Some((k, self.entries(c, at)))
     }
     /// Past the key at the cursor, in every run that holds it: the runs
     /// `front` found on it, with no compare of its own. It peeked again
     /// and compared each head to the key, four compares a key with a base
     /// and a live run where `front` makes one.
+    #[inline(always)]
     fn advance(&self, c: &mut SnapCursor) {
-        let Some((_, _, at)) = self.front(*c) else {
+        let Some((_, at)) = self.front(*c) else {
             return;
         };
         for (i, b) in c.b.iter_mut().enumerate() {
