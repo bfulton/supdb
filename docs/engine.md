@@ -2784,6 +2784,33 @@ shape arm's first point read 0.95-0.97x in the first and 1.04-1.07x in
 the second; the durable arm's 0.94-0.97x in both, ahead in 4-5 of 12
 rounds, which the sign does not resolve.
 
+#### Three frozen tables
+
+The frozen tables are a list, oldest first and in the order their seals
+were handed, of up to three (`FROZEN_CAP`): the writer freezes into room
+at a seal, at a commit past the threshold and at its first write after a
+`sync`'s hand-off, and waits for the oldest's readable landing only when
+the list is full. A landing retires the front, and a table a `sync`
+handed without a freeze joins the back when the writer freezes it. Every
+read folds the frozen tables by age, each through its own snapshot as a
+base of the live one.
+
+Priced against the binary with one frozen table, two sittings of six
+rounds over the 100k and 300k rungs, each arm over its comparator: the
+shape arm's 1% and 10% lag points at 300k read 0.35x and 0.41x in the
+first and 0.35x and 0.32x in the second, slower in every round of both,
+and nothing else held a side across the two. The suite times a lag
+point's scans and not its burst. Under one frozen table the burst's first
+write after the sync's hand-off waited for the load's last seal --
+42-354 ms of join wait in the 1% point's 3,000 updates -- and the scans
+after it met a landed store; under three it waits for nothing, and the
+scans run beside the seals still in flight. The sweep's own sequence,
+the burst and the scans timed apart over six pairs a size in each of two
+sittings, puts the 1% point at 0.29x and 0.52x of the one-table binary
+summed (faster in every pair of both), the 10% point at 0.84x and 0.91x
+(4 and 5 of 6), the 0% point at 0.88x and 0.91x (4 of 6 each), the 100%
+point level, and nothing at 100k on one side.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and
