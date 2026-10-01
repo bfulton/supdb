@@ -5500,12 +5500,13 @@ const CACHE_DENSE: usize = 16;
 const CACHE_BLOCK: usize = 64;
 
 /// PROTOTYPE: one key of a block's overlay, the sources above the
-/// partition that hold it: the memtables (`sk`, the snapshot's entry) and
+/// partition that hold it: the memtables (`sk`, folded from the
+/// snapshot's runs) and
 /// level-0 pieces (`pieces`: the piece's index among the store's level-0
 /// segments, oldest first, and the key's rank in it).
 struct Over<'a> {
     key: &'a [u8],
-    sk: Option<SnapKey>,
+    sk: Option<UKey>,
     /// The key's rank in the partition, shifted left one with the low bit
     /// for an equal partition key, or `u32::MAX` when no source carried
     /// it and the build searches.
@@ -5593,12 +5594,12 @@ struct BlockTable {
     /// The snapshot's positions at the partition's two fences, which is
     /// what `clean_throughout` asks of the bounds: two searches.
     snap_span: (u32, u32),
-    /// The same two over the snapshot's base, the frozen table's own
-    /// run: taken from the base, which keeps them for every snapshot over
-    /// it, and dropped with the live ones or when a landing drops the
-    /// base. Empty with no base.
-    fsnap_at: std::cell::OnceCell<std::sync::Arc<SnapBounds>>,
-    fsnap_span: (u32, u32),
+    /// The same two over each of the snapshot's bases, the frozen tables'
+    /// own runs, oldest first: taken from the base, which keeps them for
+    /// every snapshot over it, and dropped with the live ones or when a
+    /// landing drops bases. Empty past the bases there are.
+    fsnap_at: [std::cell::OnceCell<std::sync::Arc<SnapBounds>>; MAX_FROZEN],
+    fsnap_span: [(u32, u32); MAX_FROZEN],
     snap_gen: u64,
     /// Live slots created since that snapshot, under the block their key
     /// falls in, in creation order, each with the cut the write's seek
@@ -5624,34 +5625,46 @@ impl BlockTable {
         self.pieces.is_empty()
             && self.filed == 0
             && self.snap_span.0 == self.snap_span.1
-            && self.fsnap_span.0 == self.fsnap_span.1
+            && self.fsnap_span.iter().all(|s| s.0 == s.1)
     }
 
     /// The snapshot's bounds, walked now if this table has not yet, and
-    /// the base's beside them: `overlay_count` reads both, and a block
-    /// over the base's keys alone counted none and was taken for clean.
+    /// the bases' beside them: `overlay_count` reads them all, and a
+    /// block over a base's keys alone counted none and was taken for
+    /// clean.
     fn snap_at(&self, seg: &Seg, unsealed: &Snapshot) -> Result<&SnapBounds> {
         if let Some(at) = self.snap_at.get() {
             return Ok(at);
         }
-        self.fsnap_at(seg, unsealed)?;
+        for i in 0..unsealed.bases.len() {
+            self.fsnap_at(i, seg, unsealed)?;
+        }
         let at = BuildCtx::snap_bounds(seg, self.slots.len(), unsealed)?;
         let _ = self.snap_at.set(at);
         Ok(self.snap_at.get().expect("just set"))
     }
 
-    /// The base's bounds, from the base's own cache or walked now, or
-    /// none for a snapshot with no base.
-    fn fsnap_at(&self, seg: &Seg, unsealed: &Snapshot) -> Result<Option<&SnapBounds>> {
-        let Some(base) = unsealed.base.as_deref() else {
+    /// Base `i`'s bounds, from the base's own cache or walked now, or
+    /// none past the snapshot's bases.
+    fn fsnap_at(&self, i: usize, seg: &Seg, unsealed: &Snapshot) -> Result<Option<&SnapBounds>> {
+        let Some(base) = unsealed.bases.get(i) else {
             return Ok(None);
         };
-        if let Some(at) = self.fsnap_at.get() {
+        if let Some(at) = self.fsnap_at[i].get() {
             return Ok(Some(at));
         }
         let at = BuildCtx::snap_bounds(seg, self.slots.len(), base)?;
-        let _ = self.fsnap_at.set(at);
-        Ok(self.fsnap_at.get().map(|a| &**a))
+        let _ = self.fsnap_at[i].set(at);
+        Ok(self.fsnap_at[i].get().map(|a| &**a))
+    }
+
+    /// The bases' spans over `seg`, oldest first, empty past them.
+    fn base_spans(seg: &Seg, unsealed: &Snapshot) -> [(u32, u32); MAX_FROZEN] {
+        let mut spans = [(0, 0); MAX_FROZEN];
+        for (span, base) in spans.iter_mut().zip(&unsealed.bases) {
+            *span = BuildCtx::snap_span(seg, base);
+        }
+        spans
     }
 
     /// The bounds dropped for a snapshot that replaced the one they
@@ -5664,15 +5677,12 @@ impl BlockTable {
         self.snap_gen = gen;
     }
 
-    /// The base's bounds dropped and its span taken again over
-    /// `unsealed`'s base: at a replacement of the snapshot, and at a
-    /// landing that keeps the live runs and drops the base.
+    /// The bases' bounds dropped and their spans taken again over
+    /// `unsealed`'s bases: at a replacement of the snapshot, and at a
+    /// landing that keeps the live runs and drops the bases it retired.
     fn unbase(&mut self, seg: &Seg, unsealed: &Snapshot) {
-        self.fsnap_at = std::cell::OnceCell::new();
-        self.fsnap_span = unsealed
-            .base
-            .as_deref()
-            .map_or((0, 0), |b| BuildCtx::snap_span(seg, b));
+        self.fsnap_at = Default::default();
+        self.fsnap_span = BlockTable::base_spans(seg, unsealed);
     }
 }
 
@@ -6849,6 +6859,88 @@ struct SnapKey {
 /// No copied run for a snapshot key.
 const NO_RUN: u32 = u32::MAX;
 
+/// The most frozen tables a state may hold, which the fixed arrays a read
+/// keeps per frozen table are sized for; `FROZEN_CAP` is how many it does.
+const MAX_FROZEN: usize = 3;
+const _: () = assert!(FROZEN_CAP <= MAX_FROZEN);
+
+/// A key's entries in the unsealed sources, folded from a snapshot's
+/// runs: the live table's slot and run, and each frozen table's, oldest
+/// first, `u32::MAX` and `NO_RUN` where a table does not hold the key.
+#[derive(Clone, Copy, Debug)]
+struct UKey {
+    mem: u32,
+    lrun: u32,
+    fz: [(u32, u32); MAX_FROZEN],
+}
+
+impl UKey {
+    /// No table holds the key.
+    const NONE: UKey = UKey {
+        mem: u32::MAX,
+        lrun: NO_RUN,
+        fz: [(u32::MAX, NO_RUN); MAX_FROZEN],
+    };
+
+    /// The live table alone holds it, at `mem` with run `lrun`.
+    fn live(mem: u32, lrun: u32) -> UKey {
+        UKey {
+            mem,
+            lrun,
+            ..UKey::NONE
+        }
+    }
+
+    /// Frozen table `i` alone holds it, at `slot` with run `run`.
+    fn frozen(i: usize, slot: u32, run: u32) -> UKey {
+        let mut u = UKey::NONE;
+        u.fz[i] = (slot, run);
+        u
+    }
+
+    /// One key's entries from two lists that each name tables the other
+    /// does not: each table's from whichever names it.
+    fn merge(a: UKey, b: UKey) -> UKey {
+        let mut out = a;
+        if b.mem != u32::MAX {
+            debug_assert_eq!(a.mem, u32::MAX, "a live key was created twice");
+            out.mem = b.mem;
+            out.lrun = b.lrun;
+        }
+        for (o, &f) in out.fz.iter_mut().zip(&b.fz) {
+            if f.0 != u32::MAX {
+                debug_assert_eq!(o.0, u32::MAX, "a frozen key named twice");
+                *o = f;
+            }
+        }
+        out
+    }
+}
+
+/// One run's head folded into the least key so far: a smaller key starts
+/// the fold again, an equal one adds its entry and its run's bit.
+#[inline]
+fn fold_head<'a>(
+    best: &mut Option<(&'a [u8], UKey, u8)>,
+    k: &'a [u8],
+    bit: usize,
+    put: impl Fn(&mut UKey),
+) {
+    match best.as_ref().map(|(bk, _, _)| k.cmp(bk)) {
+        Some(Ordering::Greater) => {}
+        Some(Ordering::Equal) => {
+            let (_, u, at) = best.as_mut().expect("compared against it");
+            put(u);
+            *at |= 1 << bit;
+        }
+        None | Some(Ordering::Less) => {
+            let mut u = UKey::NONE;
+            put(&mut u);
+            *best = Some((k, u, 1 << bit));
+        }
+    }
+}
+
 /// How far ahead of the seal's copy (`Snapshot::from_frozen`) the entry
 /// lines are prefetched, how far ahead the key and chunk lines are once
 /// the entry is in, and how many bytes of the chunk: its twelve-byte
@@ -7146,15 +7238,16 @@ struct Snapshot {
     /// PROTOTYPE: whether the runs were copied at all; a filed key has
     /// none either way.
     runs: bool,
-    /// The frozen table's own snapshot (`FrozenSnaps`), where the state
-    /// this one is of has a frozen table, and then this one's runs hold
-    /// the live table's entries alone: a read folds the base's run in as
-    /// a fourth, and a base's run offsets name the base's arena. A
-    /// snapshot of both tables in one run copied every frozen entry into
-    /// every extension and every handle's build while the seal ran, and
-    /// lost the live run at the seal's landing with the frozen keys it
-    /// had to shed. A base has no base of its own and no live entry.
-    base: Option<std::sync::Arc<Snapshot>>,
+    /// The frozen tables' own snapshots (`FrozenSnaps`), where the state
+    /// this one is of has frozen tables -- one a table, oldest first --
+    /// and then this one's runs hold the live table's entries alone: a
+    /// read folds each base's run in beside the live runs, and a base's
+    /// run offsets name the base's arena. A snapshot of both tables in
+    /// one run copied every frozen entry into every extension and every
+    /// handle's build while the seal ran, and lost the live run at the
+    /// seal's landing with the frozen keys it had to shed. A base has no
+    /// base of its own and no live entry.
+    bases: Vec<std::sync::Arc<Snapshot>>,
     ents: Vec<SnapKey>,
     /// The write log's length when the runs were copied: every log entry
     /// from here on may have moved a chain past its copy.
@@ -7205,7 +7298,7 @@ const SNAP_FRESH: usize = 256;
 /// the live runs do.
 #[derive(Clone, Copy)]
 struct SnapCursor {
-    b: usize,
+    b: [usize; MAX_FROZEN],
     i: usize,
     j: usize,
     k: usize,
@@ -7229,36 +7322,39 @@ impl Snapshot {
     fn rank(&self) -> (bool, usize, usize) {
         (self.frozen_copied(), self.live_len, self.log_at)
     }
-    /// Whether a frozen entry a read meets carries its run: the base's,
-    /// or for a frozen table's own snapshot its own.
+    /// Whether every frozen entry a read meets carries its run: every
+    /// base's, or for a snapshot with none its own.
     fn frozen_copied(&self) -> bool {
-        match &self.base {
-            Some(b) => b.runs,
-            None => self.runs,
+        if self.bases.is_empty() {
+            self.runs
+        } else {
+            self.bases.iter().all(|b| b.runs)
         }
     }
-    /// This snapshot's live runs over `base`, a frozen table's own: what
-    /// a state with that frozen table reads.
-    fn with_base(&self, base: std::sync::Arc<Snapshot>) -> Snapshot {
+    /// This snapshot's live runs over `bases`, the frozen tables' own,
+    /// oldest first: what a state with those frozen tables reads.
+    fn with_bases(&self, bases: Vec<std::sync::Arc<Snapshot>>) -> Snapshot {
+        debug_assert!(bases.len() <= MAX_FROZEN, "a base a frozen table");
         debug_assert!(
-            base.base.is_none() && base.live_len == 0,
+            bases.iter().all(|b| b.bases.is_empty() && b.live_len == 0),
             "a base is a frozen table's own"
         );
         Snapshot {
-            base: Some(base),
+            bases,
             ..self.clone()
         }
     }
-    /// A snapshot of no live entry over `base`: the start of every state
-    /// whose live table the freeze that made `base` emptied. `runs` is
-    /// what its live runs, none yet, say of their chains: what the
-    /// snapshot it stands in for said, since an extension sets its own.
-    fn over_base(base: std::sync::Arc<Snapshot>, runs: bool) -> Snapshot {
+    /// A snapshot of no live entry over `bases`: the start of every state
+    /// whose live table the freeze that made the newest base emptied.
+    /// `runs` is what its live runs, none yet, say of their chains: what
+    /// the snapshot it stands in for said, since an extension sets its
+    /// own.
+    fn over_bases(bases: Vec<std::sync::Arc<Snapshot>>, runs: bool) -> Snapshot {
         Snapshot {
             runs,
             ..Snapshot::default()
         }
-        .with_base(base)
+        .with_bases(bases)
     }
     /// The seal's snapshot over the frozen table it is writing: every
     /// entry of `mem` in the key order `order` gives, its key and then
@@ -7321,7 +7417,7 @@ impl Snapshot {
         Some(Snapshot {
             arena: std::sync::Arc::new(arena),
             runs: true,
-            base: None,
+            bases: Vec::new(),
             ents,
             log_at: 0,
             live_len: 0,
@@ -7335,65 +7431,46 @@ impl Snapshot {
         run.partition_point(|e| self.key_of(e) < from)
     }
     fn cursor(&self, from: &[u8]) -> SnapCursor {
+        let mut b = [0usize; MAX_FROZEN];
+        for (at, base) in b.iter_mut().zip(&self.bases) {
+            *at = base.seek(from);
+        }
         SnapCursor {
-            b: self.base.as_ref().map_or(0, |b| b.seek(from)),
+            b,
             i: self.seek(from),
             j: self.seek_in(&self.side, from),
             k: self.seek_in(&self.fresh, from),
         }
     }
-    /// The key at the cursor, its entry folded across the runs, and a bit
-    /// for each run whose head stands on it -- base, main, side, fresh --
-    /// from one ordered compare a head past the first. Each head's key is
-    /// read from its own run's arena, and the entry's `off` names
-    /// whichever arena its first head's does: a caller takes the key
-    /// returned here and never the entry's bytes.
+    /// The key at the cursor, its entries folded across the runs, and a
+    /// bit for each run whose head stands on it -- the bases' first, then
+    /// main, side, fresh -- from one ordered compare a head past the
+    /// first. Each head's key is read from its own run's arena; a caller
+    /// takes the key returned here, and a frozen run from its base.
     #[inline]
-    fn front(&self, c: SnapCursor) -> Option<(&[u8], SnapKey, u8)> {
-        let base = self.base.as_deref();
-        let heads = [
-            base.and_then(|b| b.ents.get(c.b).map(|e| (b.key_of(e), e))),
-            self.ents.get(c.i).map(|e| (self.key_of(e), e)),
-            self.side.get(c.j).map(|e| (self.key_of(e), e)),
-            self.fresh.get(c.k).map(|e| (self.key_of(e), e)),
-        ];
-        let mut best: Option<(&[u8], SnapKey, u8)> = None;
-        for (bit, head) in heads.into_iter().enumerate() {
-            let Some((k, e)) = head else {
-                continue;
-            };
-            best = match best {
-                None => Some((k, *e, 1 << bit)),
-                Some((bk, be, at)) => match k.cmp(bk) {
-                    Ordering::Less => Some((k, *e, 1 << bit)),
-                    Ordering::Greater => Some((bk, be, at)),
-                    Ordering::Equal => Some((
-                        bk,
-                        SnapKey {
-                            mem: if e.mem != u32::MAX { e.mem } else { be.mem },
-                            lrun: if e.mem != u32::MAX { e.lrun } else { be.lrun },
-                            frozen: if e.frozen != u32::MAX {
-                                e.frozen
-                            } else {
-                                be.frozen
-                            },
-                            frun: if e.frozen != u32::MAX {
-                                e.frun
-                            } else {
-                                be.frun
-                            },
-                            ..be
-                        },
-                        at | 1 << bit,
-                    )),
-                },
-            };
+    fn front(&self, c: SnapCursor) -> Option<(&[u8], UKey, u8)> {
+        let mut best: Option<(&[u8], UKey, u8)> = None;
+        for (i, b) in self.bases.iter().enumerate() {
+            if let Some(e) = b.ents.get(c.b[i]) {
+                fold_head(&mut best, b.key_of(e), i, |u| u.fz[i] = (e.frozen, e.frun));
+            }
+        }
+        let live = [self.ents.get(c.i), self.side.get(c.j), self.fresh.get(c.k)];
+        for (n, e) in live.into_iter().enumerate() {
+            if let Some(e) = e {
+                fold_head(&mut best, self.key_of(e), MAX_FROZEN + n, |u| {
+                    if e.mem != u32::MAX {
+                        u.mem = e.mem;
+                        u.lrun = e.lrun;
+                    }
+                });
+            }
         }
         best
     }
-    /// The key at the cursor and its entry, folded across the runs.
-    fn peek(&self, c: SnapCursor) -> Option<(&[u8], SnapKey)> {
-        self.front(c).map(|(k, e, _)| (k, e))
+    /// The key at the cursor and its entries, folded across the runs.
+    fn peek(&self, c: SnapCursor) -> Option<(&[u8], UKey)> {
+        self.front(c).map(|(k, u, _)| (k, u))
     }
     /// Past the key at the cursor, in every run that holds it: the runs
     /// `front` found on it, with no compare of its own. It peeked again
@@ -7403,10 +7480,12 @@ impl Snapshot {
         let Some((_, _, at)) = self.front(*c) else {
             return;
         };
-        c.b += (at & 1) as usize;
-        c.i += (at >> 1 & 1) as usize;
-        c.j += (at >> 2 & 1) as usize;
-        c.k += (at >> 3 & 1) as usize;
+        for (i, b) in c.b.iter_mut().enumerate() {
+            *b += (at >> i & 1) as usize;
+        }
+        c.i += (at >> MAX_FROZEN & 1) as usize;
+        c.j += (at >> (MAX_FROZEN + 1) & 1) as usize;
+        c.k += (at >> (MAX_FROZEN + 2) & 1) as usize;
     }
     /// File the live memtable's slots `slots`, created since the build,
     /// as a sorted run: their keys copied into the arena, the batch
@@ -7514,7 +7593,7 @@ impl Snapshot {
         let mut out = Snapshot {
             arena: self.arena.clone(),
             runs,
-            base: self.base.clone(),
+            bases: self.bases.clone(),
             ents: Vec::with_capacity(self.ents.len() + batch.len()),
             log_at,
             live_len: to,
@@ -7710,20 +7789,14 @@ impl Snapshot {
         Snapshot::run_visible(n, v, wm).1
     }
 
-    /// `run_values` for a frozen entry's run, which is the base's.
-    fn frozen_run_values<F: FnMut(&[u8])>(&self, off: u32, wm: u64, f: F) {
-        match &self.base {
-            Some(b) => b.run_values(off, wm, f),
-            None => self.run_values(off, wm, f),
-        }
+    /// `run_values` for frozen table `i`'s run, which is its base's.
+    fn frozen_run_values<F: FnMut(&[u8])>(&self, i: usize, off: u32, wm: u64, f: F) {
+        self.bases[i].run_values(off, wm, f)
     }
 
-    /// `run_has_tomb` for a frozen entry's run, which is the base's.
-    fn frozen_run_has_tomb(&self, off: u32, wm: u64) -> bool {
-        match &self.base {
-            Some(b) => b.run_has_tomb(off, wm),
-            None => self.run_has_tomb(off, wm),
-        }
+    /// `run_has_tomb` for frozen table `i`'s run, which is its base's.
+    fn frozen_run_has_tomb(&self, i: usize, off: u32, wm: u64) -> bool {
+        self.bases[i].run_has_tomb(off, wm)
     }
 }
 
@@ -8167,14 +8240,6 @@ impl Reader {
     /// The frozen tables, oldest first.
     fn frozen(&self) -> &[std::sync::Arc<MemTable>] {
         &self.state().frozen
-    }
-
-    /// The frozen table, where the snapshot's single base can name it:
-    /// the list holds one at most.
-    fn frozen_single(&self) -> Option<&std::sync::Arc<MemTable>> {
-        let fr = self.frozen();
-        debug_assert!(fr.len() <= 1, "a snapshot's base names one frozen table");
-        fr.first()
     }
 
     fn set_advice_random(&self, random: bool) {
@@ -8741,10 +8806,15 @@ impl Reader {
         // The log's length before any chain is read: see `extend`.
         let log_at = self.log_end();
         let live = self.build_over(Some((self.mem(), live_len)), None, log_at);
-        match self.frozen_single() {
-            Some(fr) => live.with_base(self.frozen_snapshot(fr)),
-            None => live,
+        if self.frozen().is_empty() {
+            return live;
         }
+        let bases = self
+            .frozen()
+            .iter()
+            .map(|fr| self.frozen_snapshot(fr))
+            .collect();
+        live.with_bases(bases)
     }
 
     /// The build itself, over the first `live_len` entries of a live
@@ -8773,7 +8843,7 @@ impl Reader {
             log_at,
             arena: std::sync::Arc::new(SnapArena::with_capacity(bytes)),
             runs,
-            base: None,
+            bases: Vec::new(),
             ents: Vec::with_capacity(n),
             side: Vec::new(),
             fresh: Vec::new(),
@@ -9355,8 +9425,8 @@ impl Reader {
         }
         drop(ctx);
 
-        // The snapshot stands with the frozen table it names, and its
-        // live runs without it across the landing that sealed that table:
+        // The snapshot stands with the frozen tables it names, and its
+        // live runs without the bases of the tables the landings sealed:
         // they are the live table's, which is the one standing.
         let keep_snap = same_frozen || landed;
         if !keep_snap {
@@ -9365,13 +9435,24 @@ impl Reader {
             self.fs().snap_added.borrow_mut().clear();
         } else if let Some((g, snap)) = self.fs().scan_keys.borrow_mut().as_mut() {
             *g = st.gen;
-            if landed && snap.base.is_some() {
-                *snap = std::sync::Arc::new(Snapshot {
-                    base: None,
-                    ..(**snap).clone()
-                });
+            if landed {
+                let retired = over.frozen.len() - st.frozen.len();
+                if snap.bases.len() == over.frozen.len() {
+                    *snap = std::sync::Arc::new(snap.with_bases(snap.bases[retired..].to_vec()));
+                } else {
+                    debug_assert!(
+                        snap.bases.is_empty(),
+                        "a snapshot holds a base a frozen table"
+                    );
+                }
             }
         }
+        let kept = self
+            .fs()
+            .scan_keys
+            .borrow()
+            .as_ref()
+            .map(|(_, s)| s.clone());
 
         let mut old = std::mem::take(&mut *self.fs().tables.borrow_mut());
         let tables = Db::tables_for(st.segs.len());
@@ -9443,17 +9524,23 @@ impl Reader {
                 t.blob = seg.blob.id();
             }
             if landed {
-                // The base went with the table it named.
-                t.fsnap_at = std::cell::OnceCell::new();
-                t.fsnap_span = (0, 0);
+                // The retired bases went with the tables they named, and
+                // the rest moved to the front.
+                match &kept {
+                    Some(snap) => t.unbase(seg, snap),
+                    None => {
+                        t.fsnap_at = Default::default();
+                        t.fsnap_span = Default::default();
+                    }
+                }
             }
             if keep_snap && !rebased {
                 continue;
             }
             t.snap_at = std::cell::OnceCell::new();
             t.snap_span = (0, 0);
-            t.fsnap_at = std::cell::OnceCell::new();
-            t.fsnap_span = (0, 0);
+            t.fsnap_at = Default::default();
+            t.fsnap_span = Default::default();
             t.snap_gen = u64::MAX;
             t.reads.fill(0);
             t.touched.fill(0);
@@ -9752,34 +9839,53 @@ impl Reader {
         }
     }
 
-    /// A snapshot of no live entry over the frozen table's own, the
+    /// A snapshot of no live entry over the frozen tables' own, the
     /// start an extension carries forward with the live keys, where
     /// snapshots are shared: unshared, each handle builds its own from
     /// nothing, which is that arm's meaning.
     fn frozen_base(&self) -> Option<std::sync::Arc<Snapshot>> {
-        if !self.opts.share_snapshot || !self.opts.frozen_snaps {
+        if !self.opts.share_snapshot || !self.opts.frozen_snaps || self.frozen().is_empty() {
             return None;
         }
-        let fr = self.frozen_single()?.clone();
-        let base = self.frozen_snapshot(&fr);
-        let runs = base.runs;
-        Some(std::sync::Arc::new(Snapshot::over_base(base, runs)))
+        let bases: Vec<std::sync::Arc<Snapshot>> = self
+            .frozen()
+            .iter()
+            .map(|fr| self.frozen_snapshot(fr))
+            .collect();
+        let runs = bases.iter().all(|b| b.runs);
+        Some(std::sync::Arc::new(Snapshot::over_bases(bases, runs)))
     }
 
-    /// `s` over the frozen table's copy with every chain, where its base
+    /// `s` over the frozen tables' copies with every chain, where a base
     /// is an order without them and the seal or a reader has set the
-    /// copy since: the live runs and their bounds stand, and each frozen
-    /// key is read from its run instead of through the table's chains.
+    /// table's copy since: the live runs and their bounds stand, and each
+    /// frozen key is read from its run instead of through the table's
+    /// chains.
     fn upgrade_base(&self, s: std::sync::Arc<Snapshot>) -> std::sync::Arc<Snapshot> {
-        if !self.opts.share_snapshot || !self.opts.frozen_snaps {
+        if !self.opts.share_snapshot
+            || !self.opts.frozen_snaps
+            || s.bases.len() != self.frozen().len()
+            || s.bases.iter().all(|b| b.runs)
+        {
             return s;
         }
-        match (s.base.as_ref(), self.frozen_single()) {
-            (Some(b), Some(fr)) if !b.runs => match fr.snaps.copied.get() {
-                Some(c) => std::sync::Arc::new(s.with_base(c)),
-                None => s,
-            },
-            _ => s,
+        let mut swapped = false;
+        let bases = s
+            .bases
+            .iter()
+            .zip(self.frozen())
+            .map(|(b, fr)| match fr.snaps.copied.get().filter(|_| !b.runs) {
+                Some(c) => {
+                    swapped = true;
+                    c
+                }
+                None => b.clone(),
+            })
+            .collect();
+        if swapped {
+            std::sync::Arc::new(s.with_bases(bases))
+        } else {
+            s
         }
     }
 
@@ -10179,7 +10285,7 @@ impl Reader {
             wm: self.wm(),
             segs: self.segs(),
             mem: self.mem(),
-            frozen: self.frozen_single().map(|f| f.as_ref()),
+            frozen: self.frozen(),
             tombs: self.has_tombstones(),
             dense_from: if self.opts.commit_forms && self.slot.is_none() {
                 match self.opts.form_dense_from {
@@ -11064,14 +11170,10 @@ impl Reader {
             }
             let slot_in =
                 |t: &MemTable| t.slot_of(key, MemTable::ALL).map_or(u32::MAX, |i| i as u32);
-            let sk = SnapKey {
-                off: 0,
-                len: 0,
-                mem: slot,
-                frozen: self.frozen_single().map_or(u32::MAX, |fr| slot_in(fr)),
-                lrun: NO_RUN,
-                frun: NO_RUN,
-            };
+            let mut sk = UKey::live(slot, NO_RUN);
+            for (f, fr) in sk.fz.iter_mut().zip(self.frozen()) {
+                f.0 = slot_in(fr);
+            }
             let ctx = self.build_ctx();
             let ov = Overlay {
                 over: vec![Over {
@@ -11276,11 +11378,8 @@ impl Reader {
             piece_ranks,
             snap_at: std::cell::OnceCell::new(),
             snap_span: BuildCtx::snap_span(seg, unsealed),
-            fsnap_at: std::cell::OnceCell::new(),
-            fsnap_span: unsealed
-                .base
-                .as_deref()
-                .map_or((0, 0), |b| BuildCtx::snap_span(seg, b)),
+            fsnap_at: Default::default(),
+            fsnap_span: BlockTable::base_spans(seg, unsealed),
             snap_gen: self.fs().snap_gen.get(),
             added,
             filed,
@@ -12037,47 +12136,53 @@ impl Reader {
 
     /// One unsealed key, emitted as `scan_merged` emits it with no level-0
     /// piece in the way: the partition's values first when `part` names an
-    /// equal key, then the frozen memtable's, then the live one's, each
+    /// equal key, then the frozen memtables', then the live one's, each
     /// older source cut by a tombstone in a newer. Sources are numbered
-    /// partition 0, frozen 1, live 2; `start` is the oldest one whose
-    /// values are live.
+    /// partition 0, the frozen tables 1.. oldest first, live after them;
+    /// `start` is the oldest one whose values are live.
     fn emit_unsealed<F: FnMut(&[u8], &[u8])>(
         &self,
         f: &mut F,
         scratch: &mut Vec<usize>,
         tombs: bool,
-        entry: (&[u8], &SnapKey),
+        entry: (&[u8], &UKey),
         part: Option<(&Seg, usize)>,
         snap: &Snapshot,
     ) -> Result<()> {
-        let (key, sk) = entry;
+        let (key, uk) = entry;
+        let frozen = self.frozen();
+        debug_assert_eq!(snap.bases.len(), frozen.len(), "a base a frozen table");
+        let nf = frozen.len();
         let stale = self.fs().snap_stale.borrow();
-        let live_run = sk.mem != u32::MAX && sk.lrun != NO_RUN && !stale.contains(&sk.mem);
-        let frozen_run = sk.frozen != u32::MAX && sk.frun != NO_RUN;
+        let live_run = uk.mem != u32::MAX && uk.lrun != NO_RUN && !stale.contains(&uk.mem);
         let mut start = 0usize;
         if tombs {
-            let live_tomb = if sk.mem == u32::MAX {
+            let live_tomb = if uk.mem == u32::MAX {
                 false
             } else if live_run {
-                snap.run_has_tomb(sk.lrun, self.wm())
+                snap.run_has_tomb(uk.lrun, self.wm())
             } else {
                 self.mem()
-                    .has_tomb(self.mem().entry(sk.mem as usize), self.wm())
-            };
-            let frozen_tomb = || {
-                if sk.frozen == u32::MAX {
-                    false
-                } else if frozen_run {
-                    snap.frozen_run_has_tomb(sk.frun, SEE_ALL)
-                } else {
-                    self.frozen_single()
-                        .is_some_and(|fr| fr.has_tomb(fr.entry(sk.frozen as usize), SEE_ALL))
-                }
+                    .has_tomb(self.mem().entry(uk.mem as usize), self.wm())
             };
             if live_tomb {
-                start = 2;
-            } else if frozen_tomb() {
-                start = 1;
+                start = 1 + nf;
+            } else {
+                // The frozen tables newest first: the newest holding a
+                // tombstone is the cut.
+                for i in (0..nf).rev() {
+                    let (slot, run) = uk.fz[i];
+                    let tomb = slot != u32::MAX
+                        && if run != NO_RUN {
+                            snap.frozen_run_has_tomb(i, run, SEE_ALL)
+                        } else {
+                            frozen[i].has_tomb(frozen[i].entry(slot as usize), SEE_ALL)
+                        };
+                    if tomb {
+                        start = 1 + i;
+                        break;
+                    }
+                }
             }
         }
         if start == 0 {
@@ -12087,22 +12192,26 @@ impl Reader {
                     .map_err(|e| err(&format!("segment scan read: {e}")))?;
             }
         }
-        if sk.frozen != u32::MAX && start <= 1 {
-            if frozen_run {
-                snap.frozen_run_values(sk.frun, SEE_ALL, |v| f(key, v));
-            } else if let Some(fr) = self.frozen_single() {
-                let e = fr.entry(sk.frozen as usize);
+        for (i, fr) in frozen.iter().enumerate() {
+            let (slot, run) = uk.fz[i];
+            if slot == u32::MAX || 1 + i < start {
+                continue;
+            }
+            if run != NO_RUN {
+                snap.frozen_run_values(i, run, SEE_ALL, |v| f(key, v));
+            } else {
+                let e = fr.entry(slot as usize);
                 fr.live_offs_into(e, scratch, SEE_ALL);
                 for &off in scratch.iter() {
                     f(key, fr.value_at(off));
                 }
             }
         }
-        if sk.mem != u32::MAX {
+        if uk.mem != u32::MAX {
             if live_run {
-                snap.run_values(sk.lrun, self.wm(), |v| f(key, v));
+                snap.run_values(uk.lrun, self.wm(), |v| f(key, v));
             } else {
-                let e = self.mem().entry(sk.mem as usize);
+                let e = self.mem().entry(uk.mem as usize);
                 self.mem().live_offs_into(e, scratch, self.wm());
                 for &off in scratch.iter() {
                     f(key, self.mem().value_at(off));
@@ -12209,8 +12318,11 @@ impl Reader {
             let in_unsealed = snap.is_some_and(|(k, _)| k == key);
             let snap = snap.map(|(_, sk)| sk);
 
-            // Source indices: partition 0, level 0 at 1..=nc, frozen nc+1,
-            // live nc+2. `start` is the oldest source whose values are live.
+            // Source indices: partition 0, level 0 at 1..=nc, the frozen
+            // tables at nc+1.. oldest first, live after them. `start` is the
+            // oldest source whose values are live.
+            let frozen = self.frozen();
+            let nf = frozen.len();
             let mut start = 0usize;
             if tombs {
                 if let Some(sk) = snap.filter(|_| in_unsealed) {
@@ -12219,13 +12331,17 @@ impl Reader {
                             .mem()
                             .has_tomb(self.mem().entry(sk.mem as usize), self.wm())
                     {
-                        start = nc + 2;
-                    } else if sk.frozen != u32::MAX
-                        && self
-                            .frozen_single()
-                            .is_some_and(|fr| fr.has_tomb(fr.entry(sk.frozen as usize), SEE_ALL))
-                    {
-                        start = nc + 1;
+                        start = nc + 1 + nf;
+                    } else {
+                        for i in (0..nf).rev() {
+                            let slot = sk.fz[i].0;
+                            if slot != u32::MAX
+                                && frozen[i].has_tomb(frozen[i].entry(slot as usize), SEE_ALL)
+                            {
+                                start = nc + 1 + i;
+                                break;
+                            }
+                        }
                     }
                 }
                 if start == 0 {
@@ -12270,16 +12386,17 @@ impl Reader {
                 }
             }
             if let Some(sk) = snap.filter(|_| in_unsealed) {
-                if sk.frozen != u32::MAX && nc + 1 >= start {
-                    if let Some(fr) = self.frozen_single() {
-                        let e = fr.entry(sk.frozen as usize);
+                for (i, fr) in frozen.iter().enumerate() {
+                    let slot = sk.fz[i].0;
+                    if slot != u32::MAX && nc + 1 + i >= start {
+                        let e = fr.entry(slot as usize);
                         fr.live_offs_into(e, &mut scratch, SEE_ALL);
                         for &off in &scratch {
                             f(key, fr.value_at(off));
                         }
                     }
                 }
-                if sk.mem != u32::MAX && nc + 2 >= start {
+                if sk.mem != u32::MAX && nc + 1 + nf >= start {
                     let e = self.mem().entry(sk.mem as usize);
                     self.mem().live_offs_into(e, &mut scratch, self.wm());
                     for &off in &scratch {
@@ -13875,16 +13992,29 @@ impl Db {
                     }
                 };
                 // Published as what a state with this frozen table reads:
-                // no live entry over the copy as its base.
+                // no live entry over the copies as its bases, this one and
+                // every other frozen table's, so only once each has one.
                 let entered = r.enter();
                 let st = r.state();
-                if matches!(st.frozen.as_slice(), [f] if std::sync::Arc::ptr_eq(f, &mem))
-                    && r.publish_snapshot(&std::sync::Arc::new(Snapshot::over_base(
-                        snap.clone(),
-                        true,
-                    )))
-                {
-                    shared.snap_sealed.fetch_add(1, AtomicOrdering::Relaxed);
+                let bases: Option<Vec<_>> =
+                    if st.frozen.iter().any(|f| std::sync::Arc::ptr_eq(f, &mem)) {
+                        st.frozen
+                            .iter()
+                            .map(|f| {
+                                if std::sync::Arc::ptr_eq(f, &mem) {
+                                    Some(snap.clone())
+                                } else {
+                                    f.snaps.copied.get()
+                                }
+                            })
+                            .collect()
+                    } else {
+                        None
+                    };
+                if let Some(bases) = bases {
+                    if r.publish_snapshot(&std::sync::Arc::new(Snapshot::over_bases(bases, true))) {
+                        shared.snap_sealed.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
                 }
                 drop(entered);
                 Some(snap)
@@ -14502,8 +14632,8 @@ impl Db {
             t.piece_ranks = piece_ranks;
             t.snap_at = std::cell::OnceCell::new();
             t.snap_span = (0, 0);
-            t.fsnap_at = std::cell::OnceCell::new();
-            t.fsnap_span = (0, 0);
+            t.fsnap_at = Default::default();
+            t.fsnap_span = Default::default();
             t.snap_gen = u64::MAX;
             t.reads.fill(0);
             t.touched.fill(0);
@@ -15763,11 +15893,8 @@ impl Reader {
                 piece_ranks,
                 snap_at: std::cell::OnceCell::new(),
                 snap_span: BuildCtx::snap_span(seg, &unsealed),
-                fsnap_at: std::cell::OnceCell::new(),
-                fsnap_span: unsealed
-                    .base
-                    .as_deref()
-                    .map_or((0, 0), |b| BuildCtx::snap_span(seg, b)),
+                fsnap_at: Default::default(),
+                fsnap_span: BlockTable::base_spans(seg, &unsealed),
                 snap_gen: 0,
                 added: (0..nblocks).map(|_| Vec::new()).collect(),
                 filed: 0,
@@ -16077,20 +16204,35 @@ impl Reader {
         if same_mem && same_frozen {
             return Some(s);
         }
+        debug_assert_eq!(s.bases.len(), frozen.len(), "a base a frozen table");
         // The live runs hold the live table's entries alone, so a landing
         // that keeps the live table keeps them and their bounds, and drops
-        // the base that named the table it sealed.
-        if landing && same_mem && st.frozen.is_empty() && !frozen.is_empty() {
-            return Some(std::sync::Arc::new(Snapshot {
-                base: None,
-                ..(*s).clone()
-            }));
+        // the bases that named the tables it sealed: the oldest, since
+        // seals land in the order they were handed.
+        let retired = frozen.len().wrapping_sub(st.frozen.len());
+        if landing
+            && same_mem
+            && st.frozen.len() < frozen.len()
+            && st
+                .frozen
+                .iter()
+                .zip(&frozen[retired..])
+                .all(|(a, b)| std::sync::Arc::ptr_eq(a, b))
+        {
+            return Some(std::sync::Arc::new(
+                s.with_bases(s.bases[retired..].to_vec()),
+            ));
         }
-        let froze = frozen.is_empty()
-            && matches!(st.frozen.as_slice(), [f] if std::sync::Arc::ptr_eq(f, live));
+        let froze = st.frozen.len() == frozen.len() + 1
+            && std::sync::Arc::ptr_eq(&st.frozen[frozen.len()], live)
+            && st
+                .frozen
+                .iter()
+                .zip(frozen)
+                .all(|(a, b)| std::sync::Arc::ptr_eq(a, b));
         if froze {
-            debug_assert!(s.base.is_none(), "a freeze finds no frozen table");
             let runs = s.runs;
+            let mut bases = s.bases.clone();
             // The table's own snapshot, where its seal or a scan set one
             // first: the same keys in the same order, made already.
             let own = match live.snaps.best().filter(|_| self.opts.frozen_snaps) {
@@ -16116,7 +16258,8 @@ impl Reader {
                     }
                 }
             };
-            return Some(std::sync::Arc::new(Snapshot::over_base(own, runs)));
+            bases.push(own);
+            return Some(std::sync::Arc::new(Snapshot::over_bases(bases, runs)));
         }
         None
     }
@@ -16140,7 +16283,7 @@ impl Reader {
         let mut out = Snapshot {
             arena: s.arena.clone(),
             runs: s.runs,
-            base: None,
+            bases: Vec::new(),
             ents: Vec::with_capacity(s.ents.len()),
             log_at: 0,
             live_len: 0,
@@ -16989,8 +17132,12 @@ fn bound_pieces_of(segs: &[std::sync::Arc<Seg>]) -> Result<()> {
     Ok(())
 }
 
+/// A block's run of each base, oldest first, with the cuts its bounds
+/// carry: `None` past the bases or for a base without bounds.
+type FrozenRuns<'c> = [Option<(std::ops::Range<usize>, &'c [u32])>; MAX_FROZEN];
+
 /// PROTOTYPE: what building a cached block reads, and nothing the cache
-/// keeps: the segments, the live and the frozen memtable, and whether any
+/// keeps: the segments, the live and the frozen memtables, and whether any
 /// source holds a tombstone. A handle makes one over the state it holds
 /// for every build and every settle; the builder ahead of the reader is a
 /// handle holding the state as of a commit, and the store splices in the
@@ -17000,7 +17147,8 @@ struct BuildCtx<'s> {
     wm: u64,
     segs: &'s [std::sync::Arc<Seg>],
     mem: &'s MemTable,
-    frozen: Option<&'s MemTable>,
+    /// The frozen tables, oldest first.
+    frozen: &'s [std::sync::Arc<MemTable>],
     tombs: bool,
     /// Overlay keys from which a block is built as a merged copy rather
     /// than as resolved deltas: `CACHE_DENSE`, or one for the writer
@@ -17217,7 +17365,7 @@ impl<'s> BuildCtx<'s> {
         Ok(cuts)
     }
     /// PROTOTYPE: the memtables' keys of a block, in order: a run of the
-    /// snapshot's live entries, a run of its base's frozen ones, and the
+    /// snapshot's live entries, a run of each base's frozen ones, and the
     /// filed keys, merged, a key more than one of them holds folded into
     /// one. The filed keys are put in key order here unless `sorted` says
     /// they are, with their keys resolved once; sorting the slots through
@@ -17228,11 +17376,14 @@ impl<'s> BuildCtx<'s> {
         unsealed: &'a Snapshot,
         snap: std::ops::Range<usize>,
         cuts: &[u32],
-        frozen: Option<(std::ops::Range<usize>, &[u32])>,
+        frozen: &FrozenRuns<'_>,
         filed: &[(u32, u32)],
         sorted: bool,
     ) -> Result<Vec<Over<'a>>> {
-        let run = |s: &'a Snapshot, r: std::ops::Range<usize>, cuts: &[u32]| {
+        let run = |s: &'a Snapshot,
+                   r: std::ops::Range<usize>,
+                   cuts: &[u32],
+                   uk: &dyn Fn(&SnapKey) -> UKey| {
             let mut out: Vec<Over<'a>> = Vec::with_capacity(r.len());
             for i in r {
                 let (k, sk) = s
@@ -17240,32 +17391,42 @@ impl<'s> BuildCtx<'s> {
                     .ok_or_else(|| err("block cache: a snapshot bound did not resolve"))?;
                 out.push(Over {
                     key: k,
-                    sk: Some(*sk),
+                    sk: Some(uk(sk)),
                     cut: cuts.get(i).copied().unwrap_or(u32::MAX),
                     pieces: 0..0,
                 });
             }
             Ok::<_, std::io::Error>(out)
         };
-        let mut out = run(unsealed, snap, cuts)?;
-        if let (Some(base), Some((fr, fcuts))) = (unsealed.base.as_deref(), frozen) {
-            if !fr.is_empty() {
-                let fout = run(base, fr, fcuts)?;
-                out = if out.is_empty() {
-                    fout
-                } else {
-                    Self::fold_overs(fout, out, |f, l| {
-                        debug_assert_eq!(f.mem, u32::MAX, "a base holds no live entry");
-                        debug_assert_eq!(l.frozen, u32::MAX, "a live run holds no frozen entry");
-                        SnapKey {
-                            mem: l.mem,
-                            lrun: l.lrun,
-                            ..f
-                        }
-                    })
-                };
+        // The bases oldest first, then the live run: a key's cut is the
+        // first list's that knows it.
+        let mut out: Vec<Over<'a>> = Vec::new();
+        for (i, (base, f)) in unsealed.bases.iter().zip(frozen).enumerate() {
+            let Some((fr, fcuts)) = f else { continue };
+            if fr.is_empty() {
+                continue;
             }
+            let fout = run(base, fr.clone(), fcuts, &|e| {
+                debug_assert_eq!(e.mem, u32::MAX, "a base holds no live entry");
+                UKey::frozen(i, e.frozen, e.frun)
+            })?;
+            out = if out.is_empty() {
+                fout
+            } else {
+                Self::fold_overs(out, fout, UKey::merge)
+            };
         }
+        let lout = run(unsealed, snap, cuts, &|e| {
+            debug_assert_eq!(e.frozen, u32::MAX, "a live run holds no frozen entry");
+            UKey::live(e.mem, e.lrun)
+        })?;
+        out = if out.is_empty() {
+            lout
+        } else if lout.is_empty() {
+            out
+        } else {
+            Self::fold_overs(out, lout, UKey::merge)
+        };
         if filed.is_empty() {
             return Ok(out);
         }
@@ -17274,14 +17435,7 @@ impl<'s> BuildCtx<'s> {
             .iter()
             .map(|&(i, cut)| Over {
                 key: key_of(i),
-                sk: Some(SnapKey {
-                    off: 0,
-                    len: 0,
-                    mem: i,
-                    frozen: u32::MAX,
-                    lrun: NO_RUN,
-                    frun: NO_RUN,
-                }),
+                sk: Some(UKey::live(i, NO_RUN)),
                 cut,
                 pieces: 0..0,
             })
@@ -17293,18 +17447,11 @@ impl<'s> BuildCtx<'s> {
             return Ok(fresh);
         }
         // A key in both is one key: the snapshot's entry names its frozen
-        // slot, the side list's the live slot created since, and the live
+        // slots, the side list's the live slot created since, and the live
         // one's tombstone must cut the frozen values. Merged as two entries
         // they came out as two keys, the tombstone cutting nothing, and the
         // test that scans between a seal and a live delete found it.
-        Ok(Self::fold_overs(out, fresh, |xs, ys| {
-            debug_assert_eq!(xs.mem, u32::MAX, "a live key was created twice");
-            SnapKey {
-                mem: ys.mem,
-                lrun: NO_RUN,
-                ..xs
-            }
-        }))
+        Ok(Self::fold_overs(out, fresh, UKey::merge))
     }
     /// Two key-ordered lists of overlay keys, each holding a key once,
     /// merged into one where a key both hold is one entry: `fold` makes
@@ -17313,7 +17460,7 @@ impl<'s> BuildCtx<'s> {
     fn fold_overs<'a>(
         a: Vec<Over<'a>>,
         b: Vec<Over<'a>>,
-        fold: impl Fn(SnapKey, SnapKey) -> SnapKey,
+        fold: impl Fn(UKey, UKey) -> UKey,
     ) -> Vec<Over<'a>> {
         let mut merged = Vec::with_capacity(a.len() + b.len());
         let (mut a, mut b) = (a.into_iter().peekable(), b.into_iter().peekable());
@@ -17431,10 +17578,13 @@ impl<'s> BuildCtx<'s> {
     ) -> Result<Overlay<'a>> {
         let sb = table.snap_at(src.seg, unsealed)?;
         let snap = sb.at[b] as usize..sb.at[b + 1] as usize;
-        let frozen = table
-            .fsnap_at(src.seg, unsealed)?
-            .map(|f| (f.at[b] as usize..f.at[b + 1] as usize, f.cuts.as_slice()));
-        let mem = self.overlay_mem(unsealed, snap, &sb.cuts, frozen, &table.added[b], false)?;
+        let mut frozen: FrozenRuns<'_> = Default::default();
+        for (i, f) in frozen.iter_mut().enumerate() {
+            *f = table
+                .fsnap_at(i, src.seg, unsealed)?
+                .map(|f| (f.at[b] as usize..f.at[b + 1] as usize, f.cuts.as_slice()));
+        }
+        let mem = self.overlay_mem(unsealed, snap, &sb.cuts, &frozen, &table.added[b], false)?;
         let pieces: Vec<PieceRun<'_>> = table
             .pieces
             .iter()
@@ -17468,8 +17618,10 @@ impl<'s> BuildCtx<'s> {
             .map_or(0, |sb| (sb.at[b + 1] - sb.at[b]) as usize);
         let frozen = table
             .fsnap_at
-            .get()
-            .map_or(0, |sb| (sb.at[b + 1] - sb.at[b]) as usize);
+            .iter()
+            .map(|f| f.get().map_or(0, |sb| (sb.at[b + 1] - sb.at[b]) as usize))
+            .max()
+            .unwrap_or(0);
         let pieces = table
             .pieces
             .iter()
@@ -17510,17 +17662,19 @@ impl<'s> BuildCtx<'s> {
         };
         let sb = table.snap_at(src.seg, unsealed)?;
         let snap = window_of(unsealed, sb.at[b] as usize, sb.at[b + 1] as usize);
-        let frozen = match (unsealed.base.as_deref(), table.fsnap_at(src.seg, unsealed)?) {
-            (Some(base), Some(f)) => Some((
-                window_of(base, f.at[b] as usize, f.at[b + 1] as usize),
-                f.cuts.as_slice(),
-            )),
-            _ => None,
-        };
+        let mut frozen: FrozenRuns<'_> = Default::default();
+        for (i, (f, base)) in frozen.iter_mut().zip(&unsealed.bases).enumerate() {
+            *f = table.fsnap_at(i, src.seg, unsealed)?.map(|fb| {
+                (
+                    window_of(base, fb.at[b] as usize, fb.at[b + 1] as usize),
+                    fb.cuts.as_slice(),
+                )
+            });
+        }
         let key_of = |slot: u32| self.mem.key_of(self.mem.entry(slot as usize));
         let f0 = wide.sorted.partition_point(|&(i, _)| key_of(i) < cursor);
         let filed = &wide.sorted[f0..wide.sorted.len().min(f0.saturating_add(limit))];
-        let mem = self.overlay_mem(unsealed, snap, &sb.cuts, frozen, filed, true)?;
+        let mem = self.overlay_mem(unsealed, snap, &sb.cuts, &frozen, filed, true)?;
         let pieces: Vec<PieceRun<'_>> = table
             .pieces
             .iter()
@@ -17545,7 +17699,7 @@ impl<'s> BuildCtx<'s> {
     /// live: 0 with no tombstone in the way, else one past the newest
     /// source holding one. Sources are numbered oldest to newest -- the
     /// partition 0, level-0 pieces 1 through their count, the frozen
-    /// memtable, the live one.
+    /// memtables oldest first, the live one.
     fn oldest_live(
         &self,
         em: &Emit,
@@ -17565,21 +17719,25 @@ impl<'s> BuildCtx<'s> {
                 } else {
                     self.mem.has_tomb(self.mem.entry(sk.mem as usize), self.wm)
                 };
-                let frozen_tomb = || {
-                    if sk.frozen == u32::MAX {
-                        false
-                    } else if sk.frun != NO_RUN {
-                        ov.snap.frozen_run_has_tomb(sk.frun, SEE_ALL)
-                    } else {
-                        self.frozen
-                            .as_ref()
-                            .is_some_and(|fr| fr.has_tomb(fr.entry(sk.frozen as usize), SEE_ALL))
-                    }
-                };
+                let nf = self.frozen.len();
                 if live_tomb {
-                    start = nc + 2;
-                } else if frozen_tomb() {
-                    start = nc + 1;
+                    start = nc + 1 + nf;
+                } else {
+                    // The frozen tables newest first: the newest holding
+                    // a tombstone is the cut.
+                    for (i, fr) in self.frozen.iter().enumerate().rev() {
+                        let (slot, run) = sk.fz[i];
+                        let tomb = slot != u32::MAX
+                            && if run != NO_RUN {
+                                ov.snap.frozen_run_has_tomb(i, run, SEE_ALL)
+                            } else {
+                                fr.has_tomb(fr.entry(slot as usize), SEE_ALL)
+                            };
+                        if tomb {
+                            start = nc + 1 + i;
+                            break;
+                        }
+                    }
                 }
             }
             if start == 0 {
@@ -17601,7 +17759,8 @@ impl<'s> BuildCtx<'s> {
     }
     /// PROTOTYPE: one overlay key emitted as `scan_merged` emits it.
     /// Sources are numbered oldest to newest -- the partition 0, level-0
-    /// pieces 1 through their count, the frozen memtable, the live one --
+    /// pieces 1 through their count, the frozen memtables oldest first,
+    /// the live one --
     /// and the newest that holds a tombstone for the key cuts every older
     /// one. `part_rank` names the partition's own record for the key, if
     /// it has one.
@@ -17634,11 +17793,15 @@ impl<'s> BuildCtx<'s> {
             }
         }
         if let Some(sk) = o.sk {
-            if sk.frozen != u32::MAX && nc + 1 >= start {
-                if sk.frun != NO_RUN {
-                    ov.snap.frozen_run_values(sk.frun, SEE_ALL, |v| f(key, v));
-                } else if let Some(fr) = self.frozen {
-                    let e = fr.entry(sk.frozen as usize);
+            for (i, fr) in self.frozen.iter().enumerate() {
+                let (slot, run) = sk.fz[i];
+                if slot == u32::MAX || nc + 1 + i < start {
+                    continue;
+                }
+                if run != NO_RUN {
+                    ov.snap.frozen_run_values(i, run, SEE_ALL, |v| f(key, v));
+                } else {
+                    let e = fr.entry(slot as usize);
                     fr.live_offs_into(e, &mut em.scratch, SEE_ALL);
                     for &off in em.scratch.iter() {
                         f(key, fr.value_at(off));
@@ -17755,15 +17918,23 @@ impl<'s> BuildCtx<'s> {
         let hi = ((b + 1) * CACHE_BLOCK).min(keys);
         let sb = table.snap_at(src.seg, unsealed)?;
         let live = (sb.at[b + 1] - sb.at[b]) as usize;
-        let frozen = table
-            .fsnap_at(src.seg, unsealed)?
-            .map_or(0, |f| (f.at[b + 1] - f.at[b]) as usize);
+        // Each base's entries over the block, and whether every base
+        // with any carries its chains.
+        let mut frozen = 0usize;
+        let mut frozen_runs = true;
+        for (i, base) in unsealed.bases.iter().enumerate() {
+            let n = table
+                .fsnap_at(i, src.seg, unsealed)?
+                .map_or(0, |f| (f.at[b + 1] - f.at[b]) as usize);
+            frozen += n;
+            frozen_runs &= n == 0 || base.runs;
+        }
         let floor = BuildCtx::overlay_count(table, b);
         // The runs cover the block when their entries over it are most of
         // its keys: three quarters, a fraction the walk-against-copy
         // pricing in `docs/engine.md` puts between. The snapshot has to
-        // carry its chains for the walk to stream them, and so does its
-        // base where the base has keys over the block.
+        // carry its chains for the walk to stream them, and so does each
+        // base that has keys over the block.
         let over: usize = live
             + frozen
             + table
@@ -17771,7 +17942,7 @@ impl<'s> BuildCtx<'s> {
                 .iter()
                 .map(|(_, at)| (at[b + 1] - at[b]) as usize)
                 .sum::<usize>();
-        let runs = unsealed.runs && (frozen == 0 || unsealed.frozen_copied());
+        let runs = unsealed.runs && frozen_runs;
         let covered = !self.copy_dense && runs && over * 4 >= (hi - lo) * 3;
         if floor > WIDE || covered {
             return Ok(Cached::Wide(WideBlock {
@@ -17923,55 +18094,44 @@ impl<'s> BuildCtx<'s> {
     /// spent 15 of its 23 us emitting 33 keys: two misses a key into a
     /// 5 MB arena.
     fn prefetch_overlay(&self, ov: &Overlay) {
-        let tables: [Option<&MemTable>; 2] = [Some(self.mem), self.frozen];
         // A key read from its run streams the snapshot's arena; only the
         // chains are chased. Fetching the runs and the pieces' records
         // ahead as well was measured on the pass over emptied tables at
         // ten thousand keys, timers on the builds, and moved nothing:
         // the run's cost there was its parse, see `SnapArena::copy_run`.
-        let chased = |sk: &SnapKey| -> (u32, u32) {
-            (
-                if sk.lrun != NO_RUN && !ov.stale.contains(&sk.mem) {
-                    u32::MAX
-                } else {
-                    sk.mem
-                },
-                if sk.frun != NO_RUN {
-                    u32::MAX
-                } else {
-                    sk.frozen
-                },
-            )
+        let chased = |sk: &UKey, each: &mut dyn FnMut(&MemTable, u32)| {
+            if sk.mem != u32::MAX && (sk.lrun == NO_RUN || ov.stale.contains(&sk.mem)) {
+                each(self.mem, sk.mem);
+            }
+            for (fr, &(slot, run)) in self.frozen.iter().zip(&sk.fz) {
+                if slot != u32::MAX && run == NO_RUN {
+                    each(fr, slot);
+                }
+            }
         };
         for o in &ov.over {
             let Some(sk) = o.sk else { continue };
-            let (m, fz) = chased(&sk);
-            for (t, slot) in [(tables[0], m), (tables[1], fz)] {
-                if let Some(t) = t {
-                    if slot != u32::MAX && (slot as usize) < t.len() {
-                        let e = t.entry(slot as usize);
-                        prefetch_lines(
-                            e as *const MemEntry as *const u8,
-                            std::mem::size_of::<MemEntry>(),
-                        );
-                    }
+            chased(&sk, &mut |t, slot| {
+                if (slot as usize) < t.len() {
+                    let e = t.entry(slot as usize);
+                    prefetch_lines(
+                        e as *const MemEntry as *const u8,
+                        std::mem::size_of::<MemEntry>(),
+                    );
                 }
-            }
+            });
         }
         for o in &ov.over {
             let Some(sk) = o.sk else { continue };
-            let (m, fz) = chased(&sk);
-            for (t, slot) in [(tables[0], m), (tables[1], fz)] {
-                if let Some(t) = t {
-                    if slot != u32::MAX && (slot as usize) < t.len() {
-                        let head = MemTable::head(t.entry(slot as usize));
-                        if head != NO_CHUNK {
-                            let at = head as usize;
-                            t.vals.prefetch(at.saturating_sub(64), 192);
-                        }
+            chased(&sk, &mut |t, slot| {
+                if (slot as usize) < t.len() {
+                    let head = MemTable::head(t.entry(slot as usize));
+                    if head != NO_CHUNK {
+                        let at = head as usize;
+                        t.vals.prefetch(at.saturating_sub(64), 192);
                     }
                 }
-            }
+            });
         }
     }
     /// PROTOTYPE: the merged copy of the ranks with the overlay laid over
