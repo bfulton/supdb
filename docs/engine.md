@@ -2729,6 +2729,21 @@ against 455 ns an entry at ten thousand keys, 654 against 698 at a
 hundred thousand, 476 against 487 at three hundred thousand, none
 resolved by sign.
 
+#### A live snapshot over the frozen table's own
+
+The snapshot a state with a frozen table reads holds the live table's
+entries alone, with the frozen table's own snapshot as its base, and a
+read folds the base's run in beside the live runs: a scan's cursor takes
+the least of four heads, and a block's overlay merges the base's run
+over the block, the live run over it and the keys filed since, a key two
+of them hold made one entry. One run held both tables before, so every
+extension and every handle's build while the seal ran copied every
+frozen entry, and the landing that sealed the frozen table dropped the
+run with the frozen keys it could no longer hold. An extension copies the
+live keys alone now, the writer's landing keeps its live runs and drops
+the base, and the base's bounds against a partition are taken once on
+the base, for every snapshot over it.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and

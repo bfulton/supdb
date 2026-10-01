@@ -7836,6 +7836,189 @@ fn the_seal_takes_the_order_the_writers_freeze_carried() {
     db.close().unwrap();
 }
 
+/// A key the frozen table holds and the live table writes again is one
+/// key on every path a scan takes, read from the snapshot's base -- the
+/// frozen table's own run -- and its live runs together: a live
+/// tombstone cuts the frozen values, a live append comes after them, a
+/// frozen tombstone cuts what was older and nothing written live. The
+/// store has partitions and a piece under the frozen table, and the seal
+/// is held before it writes, so every scan meets all four sources;
+/// through the writer and a handle, before and after the landing, on
+/// every scan arm.
+#[test]
+fn a_live_write_over_the_frozen_table_is_one_key_on_every_scan_path() {
+    let arms: [(&str, Options); 7] = [
+        ("default", Options::default()),
+        (
+            "cursormerge",
+            Options {
+                scan_merge: false,
+                scan_block_cache: false,
+                ..Options::default()
+            },
+        ),
+        (
+            "nocache",
+            Options {
+                scan_block_cache: false,
+                ..Options::default()
+            },
+        ),
+        (
+            "lazy",
+            Options {
+                scan_lazy_snapshot: true,
+                ..Options::default()
+            },
+        ),
+        (
+            "runs",
+            Options {
+                snapshot_runs: true,
+                ..Options::default()
+            },
+        ),
+        (
+            "unshared",
+            Options {
+                share_snapshot: false,
+                ..Options::default()
+            },
+        ),
+        (
+            "nofrozen",
+            Options {
+                frozen_snaps: false,
+                ..Options::default()
+            },
+        ),
+    ];
+    let key = |k: u32| format!("key-{k:05}");
+    for (name, base) in arms {
+        let d = dir(&format!("live-over-frozen-{name}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                seal_bytes: 1 << 30,
+                partition_bytes: Some(64 << 10),
+                direct_ingest: false,
+                ..base
+            },
+        )
+        .unwrap();
+        let mut m = ScanModel::default();
+        for k in 0..3000u32 {
+            m.append(&mut db, &key(k), "p");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        m.flushed();
+        assert!(db.levels().0 > 1, "{name}: partitions under the rest");
+        // A piece: updates and new keys sealed and landed over them.
+        for k in (0..3000u32).step_by(5) {
+            m.append(&mut db, &key(k), "q");
+        }
+        for k in (0..3000u32).step_by(13) {
+            m.delete(&mut db, &key(k));
+        }
+        db.commit().unwrap();
+        db.seal().unwrap();
+        db.settle().unwrap();
+        assert!(db.levels().1 >= 1, "{name}: a piece over the partitions");
+        // The frozen table: values, tombstones, and keys of its own.
+        for k in (0..3000u32).step_by(3) {
+            m.append(&mut db, &key(k), "f");
+        }
+        for k in (0..3000u32).step_by(11) {
+            m.delete(&mut db, &key(k));
+        }
+        for k in 0..400u32 {
+            m.append(&mut db, &format!("key-{k:05}f"), "f");
+        }
+        db.commit().unwrap();
+        m.check(&db, &format!("{name}: the writer before the freeze"));
+        db.hold_seal_landing(true);
+        db.seal().unwrap();
+        assert!(db.in_flight().0, "{name}: the seal is held");
+        // The live table over it: appends after frozen values and after
+        // frozen tombstones, tombstones over frozen values, keys of its
+        // own, and a key the frozen table made and the live one deletes.
+        for k in (0..3000u32).step_by(4) {
+            m.append(&mut db, &key(k), "l");
+        }
+        for k in (0..3000u32).step_by(9) {
+            m.delete(&mut db, &key(k));
+        }
+        for k in (0..400u32).step_by(2) {
+            m.delete(&mut db, &format!("key-{k:05}f"));
+        }
+        for k in 0..300u32 {
+            m.append(&mut db, &format!("key-{k:05}l"), "l");
+        }
+        db.commit().unwrap();
+        let r = db.reader().unwrap();
+        m.check(&r, &format!("{name}: a handle during the seal"));
+        m.check(&db, &format!("{name}: the writer during the seal"));
+        db.hold_seal_landing(false);
+        db.settle().unwrap();
+        m.check(&r, &format!("{name}: a handle after the landing"));
+        m.check(&db, &format!("{name}: the writer after the landing"));
+        drop(r);
+        db.close().unwrap();
+    }
+}
+
+/// The writer's snapshot holds the live table's keys alone over the
+/// frozen table's own as its base, so the landing that seals the frozen
+/// table keeps it with the base dropped: the writer's first scan after
+/// the landing builds and extends nothing, where a snapshot of both
+/// tables went with the frozen keys it held and was sorted again.
+#[test]
+fn the_writer_keeps_its_live_snapshot_across_a_landing() {
+    let d = dir("live-snap-across-landing");
+    let mut db = Db::create(
+        &d,
+        Options {
+            seal_bytes: 1 << 30,
+            partition_bytes: Some(64 << 10),
+            direct_ingest: false,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..3000u32 {
+        m.append(&mut db, &key(k), "p");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    for k in (0..3000u32).step_by(3) {
+        m.append(&mut db, &key(k), "f");
+    }
+    db.commit().unwrap();
+    m.check(&db, "the writer before the freeze");
+    db.hold_seal_landing(true);
+    db.seal().unwrap();
+    for k in (0..3000u32).step_by(7) {
+        m.append(&mut db, &key(k), "l");
+    }
+    db.commit().unwrap();
+    m.check(&db, "the writer during the seal");
+    let before = (db.snapshot_builds(), db.snapshot_extends());
+    db.hold_seal_landing(false);
+    db.settle().unwrap();
+    assert!(!db.in_flight().0, "the seal landed");
+    m.check(&db, "the writer after the landing");
+    assert_eq!(
+        (db.snapshot_builds(), db.snapshot_extends()),
+        before,
+        "the writer's live snapshot stood across the landing"
+    );
+    db.close().unwrap();
+}
+
 // ------------------------------------------------------------------------
 // The tail a `sync` hands to a seal without freezing it
 // (`Options::adaptive_shape`): replaced by whichever side publishes first.

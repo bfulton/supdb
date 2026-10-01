@@ -730,15 +730,16 @@ pub struct Options {
     /// only content is the table being sealed is read on the merge path
     /// for the seal's whole run, and without this the first handle to
     /// scan sorted the same table again and every scan after chased each
-    /// key's entry, chain and value through the memtable. A handle's
-    /// extension of the published snapshot carries the frozen runs with
-    /// it, and a handle holding a snapshot without them switches to the
-    /// seal's at its next scan. The copy is set on the table as well
-    /// (`FrozenSnaps`), where a state published later finds it, and is
-    /// built from the order a freeze, a scan or the keeper set there
-    /// first rather than from a sort of its own. The copy is about the
-    /// table's key and value bytes, held until the seal lands. Off is the
-    /// shape before it, kept to price it.
+    /// key's entry, chain and value through the memtable. It is
+    /// published as the base of a snapshot of no live entry, a handle's
+    /// extension carries it as its base, and a handle whose base is an
+    /// order without the chains takes the copy as its base at its next
+    /// scan. The copy is set on the table as well (`FrozenSnaps`), where
+    /// a state published later finds it, and is built from the order a
+    /// freeze, a scan or the keeper set there first rather than from a
+    /// sort of its own. The copy is about the table's key and value
+    /// bytes, held until the seal lands. Off is the shape before it, kept
+    /// to price it.
     pub seal_snapshot: bool,
     /// The seal writes its records from that snapshot's arena -- the keys
     /// and the copied chains in key order, one sequential read -- instead
@@ -5592,6 +5593,12 @@ struct BlockTable {
     /// The snapshot's positions at the partition's two fences, which is
     /// what `clean_throughout` asks of the bounds: two searches.
     snap_span: (u32, u32),
+    /// The same two over the snapshot's base, the frozen table's own
+    /// run: taken from the base, which keeps them for every snapshot over
+    /// it, and dropped with the live ones or when a landing drops the
+    /// base. Empty with no base.
+    fsnap_at: std::cell::OnceCell<std::sync::Arc<SnapBounds>>,
+    fsnap_span: (u32, u32),
     snap_gen: u64,
     /// Live slots created since that snapshot, under the block their key
     /// falls in, in creation order, each with the cut the write's seek
@@ -5614,26 +5621,58 @@ impl BlockTable {
     /// was filed since. A scan then walks the partition's records as the
     /// bulk walk does, with no block touched.
     fn clean_throughout(&self) -> bool {
-        self.pieces.is_empty() && self.filed == 0 && self.snap_span.0 == self.snap_span.1
+        self.pieces.is_empty()
+            && self.filed == 0
+            && self.snap_span.0 == self.snap_span.1
+            && self.fsnap_span.0 == self.fsnap_span.1
     }
 
-    /// The snapshot's bounds, walked now if this table has not yet.
+    /// The snapshot's bounds, walked now if this table has not yet, and
+    /// the base's beside them: `overlay_count` reads both, and a block
+    /// over the base's keys alone counted none and was taken for clean.
     fn snap_at(&self, seg: &Seg, unsealed: &Snapshot) -> Result<&SnapBounds> {
         if let Some(at) = self.snap_at.get() {
             return Ok(at);
         }
+        self.fsnap_at(seg, unsealed)?;
         let at = BuildCtx::snap_bounds(seg, self.slots.len(), unsealed)?;
         let _ = self.snap_at.set(at);
         Ok(self.snap_at.get().expect("just set"))
     }
 
+    /// The base's bounds, from the base's own cache or walked now, or
+    /// none for a snapshot with no base.
+    fn fsnap_at(&self, seg: &Seg, unsealed: &Snapshot) -> Result<Option<&SnapBounds>> {
+        let Some(base) = unsealed.base.as_deref() else {
+            return Ok(None);
+        };
+        if let Some(at) = self.fsnap_at.get() {
+            return Ok(Some(at));
+        }
+        let at = BuildCtx::snap_bounds(seg, self.slots.len(), base)?;
+        let _ = self.fsnap_at.set(at);
+        Ok(self.fsnap_at.get().map(|a| &**a))
+    }
+
     /// The bounds dropped for a snapshot that replaced the one they
-    /// were walked over: the span taken again, the bounds at the next
+    /// were walked over: the spans taken again, the bounds at the next
     /// build.
     fn resnap(&mut self, seg: &Seg, unsealed: &Snapshot, gen: u64) {
         self.snap_at = std::cell::OnceCell::new();
         self.snap_span = BuildCtx::snap_span(seg, unsealed);
+        self.unbase(seg, unsealed);
         self.snap_gen = gen;
+    }
+
+    /// The base's bounds dropped and its span taken again over
+    /// `unsealed`'s base: at a replacement of the snapshot, and at a
+    /// landing that keeps the live runs and drops the base.
+    fn unbase(&mut self, seg: &Seg, unsealed: &Snapshot) {
+        self.fsnap_at = std::cell::OnceCell::new();
+        self.fsnap_span = unsealed
+            .base
+            .as_deref()
+            .map_or((0, 0), |b| BuildCtx::snap_span(seg, b));
     }
 }
 
@@ -7041,11 +7080,6 @@ impl SnapArena {
         key.len() + p
     }
 
-    /// The bytes a run at `off` takes.
-    fn run_len(&self, off: u32) -> u32 {
-        8 + self.word(off + 4)
-    }
-
     /// The run at `off`: its chunk count and its records.
     #[inline]
     fn run(&self, off: u32) -> (u32, &[u8]) {
@@ -7053,10 +7087,6 @@ impl SnapArena {
         let n = u32::from_le_bytes(head[..4].try_into().expect("four bytes"));
         let bytes = u32::from_le_bytes(head[4..].try_into().expect("four bytes"));
         (n, self.slice(off + 8, bytes))
-    }
-
-    fn word(&self, off: u32) -> u32 {
-        u32::from_le_bytes(self.slice(off, 4).try_into().expect("four bytes"))
     }
 }
 
@@ -7097,15 +7127,15 @@ struct Snapshot {
     /// PROTOTYPE: whether the runs were copied at all; a filed key has
     /// none either way.
     runs: bool,
-    /// Whether every frozen entry carries its run: set by a build with
-    /// the runs on and by the seal's build over the frozen table, and
-    /// kept by an extension, whose live entries may carry none. What a
-    /// publish ranks first (`rank`): a snapshot without the frozen runs
-    /// reads each frozen key through the memtable's chains for as long
-    /// as the seal runs, and the seal's snapshot must not be refused in
-    /// favour of one such over the same state, whatever its live length,
-    /// while a handle's extension of the seal's still wins.
-    frozen_runs: bool,
+    /// The frozen table's own snapshot (`FrozenSnaps`), where the state
+    /// this one is of has a frozen table, and then this one's runs hold
+    /// the live table's entries alone: a read folds the base's run in as
+    /// a fourth, and a base's run offsets name the base's arena. A
+    /// snapshot of both tables in one run copied every frozen entry into
+    /// every extension and every handle's build while the seal ran, and
+    /// lost the live run at the seal's landing with the frozen keys it
+    /// had to shed. A base has no base of its own and no live entry.
+    base: Option<std::sync::Arc<Snapshot>>,
     ents: Vec<SnapKey>,
     /// The write log's length when the runs were copied: every log entry
     /// from here on may have moved a chain past its copy.
@@ -7150,11 +7180,13 @@ enum Walk {
 const SNAP_FRESH: usize = 256;
 
 /// A scan's position in a snapshot: one index per run, and the key at
-/// the front is the least of the three runs' heads, folded when the main
-/// run and a side run hold it -- a key in the frozen table written again
-/// live after the build, whose live slot only the side run knows.
+/// the front is the least of the runs' heads, folded when the base's run
+/// and a live one hold it -- a key in the frozen table written again
+/// live, whose frozen slot only the base knows and whose live slot only
+/// the live runs do.
 #[derive(Clone, Copy)]
 struct SnapCursor {
+    b: usize,
     i: usize,
     j: usize,
     k: usize,
@@ -7170,11 +7202,44 @@ impl Snapshot {
     /// What a publish and a handle's choice of base compare: the frozen
     /// runs first, then how much of the live memtable the snapshot
     /// covers, then how late its runs were copied. Two snapshots over one
-    /// state with the frozen runs alike order as they did before the
-    /// seal published one; the seal's, with no live entry, outranks any
-    /// without them, and an extension of the seal's outranks the seal's.
+    /// state with the frozen runs alike order by the live table; one
+    /// whose base carries every frozen entry's run outranks any whose
+    /// base does not, whatever its live length, since without them each
+    /// frozen key is read through the memtable's chains for as long as
+    /// the seal runs.
     fn rank(&self) -> (bool, usize, usize) {
-        (self.frozen_runs, self.live_len, self.log_at)
+        (self.frozen_copied(), self.live_len, self.log_at)
+    }
+    /// Whether a frozen entry a read meets carries its run: the base's,
+    /// or for a frozen table's own snapshot its own.
+    fn frozen_copied(&self) -> bool {
+        match &self.base {
+            Some(b) => b.runs,
+            None => self.runs,
+        }
+    }
+    /// This snapshot's live runs over `base`, a frozen table's own: what
+    /// a state with that frozen table reads.
+    fn with_base(&self, base: std::sync::Arc<Snapshot>) -> Snapshot {
+        debug_assert!(
+            base.base.is_none() && base.live_len == 0,
+            "a base is a frozen table's own"
+        );
+        Snapshot {
+            base: Some(base),
+            ..self.clone()
+        }
+    }
+    /// A snapshot of no live entry over `base`: the start of every state
+    /// whose live table the freeze that made `base` emptied. `runs` is
+    /// what its live runs, none yet, say of their chains: what the
+    /// snapshot it stands in for said, since an extension sets its own.
+    fn over_base(base: std::sync::Arc<Snapshot>, runs: bool) -> Snapshot {
+        Snapshot {
+            runs,
+            ..Snapshot::default()
+        }
+        .with_base(base)
     }
     /// The seal's snapshot over the frozen table it is writing: every
     /// entry of `mem` in the key order `order` gives, its key and then
@@ -7237,7 +7302,7 @@ impl Snapshot {
         Some(Snapshot {
             arena: std::sync::Arc::new(arena),
             runs: true,
-            frozen_runs: true,
+            base: None,
             ents,
             log_at: 0,
             live_len: 0,
@@ -7252,17 +7317,26 @@ impl Snapshot {
     }
     fn cursor(&self, from: &[u8]) -> SnapCursor {
         SnapCursor {
+            b: self.base.as_ref().map_or(0, |b| b.seek(from)),
             i: self.seek(from),
             j: self.seek_in(&self.side, from),
             k: self.seek_in(&self.fresh, from),
         }
     }
-    /// The key at the cursor and its entry, folded across the runs.
+    /// The key at the cursor and its entry, folded across the runs. Each
+    /// head's key is read from its own run's arena, and the entry's `off`
+    /// names whichever arena its first head's does: a caller takes the
+    /// key returned here and never the entry's bytes.
     fn peek(&self, c: SnapCursor) -> Option<(&[u8], SnapKey)> {
-        let heads = [self.ents.get(c.i), self.side.get(c.j), self.fresh.get(c.k)];
+        let base = self.base.as_deref();
+        let heads = [
+            base.and_then(|b| b.ents.get(c.b).map(|e| (b.key_of(e), e))),
+            self.ents.get(c.i).map(|e| (self.key_of(e), e)),
+            self.side.get(c.j).map(|e| (self.key_of(e), e)),
+            self.fresh.get(c.k).map(|e| (self.key_of(e), e)),
+        ];
         let mut best: Option<(&[u8], SnapKey)> = None;
-        for e in heads.into_iter().flatten() {
-            let k = self.key_of(e);
+        for (k, e) in heads.into_iter().flatten() {
             best = match best {
                 None => Some((k, *e)),
                 Some((bk, _)) if k < bk => Some((k, *e)),
@@ -7295,6 +7369,11 @@ impl Snapshot {
             return;
         };
         let key: &[u8] = key;
+        if let Some(b) = self.base.as_deref() {
+            if b.ents.get(c.b).is_some_and(|e| b.key_of(e) == key) {
+                c.b += 1;
+            }
+        }
         if self.ents.get(c.i).is_some_and(|e| self.key_of(e) == key) {
             c.i += 1;
         }
@@ -7348,6 +7427,10 @@ impl Snapshot {
     /// it: a handle's side runs are that handle's own and are not what
     /// gets published.
     fn extend(&self, mem: &MemTable, to: usize, runs: bool) -> Snapshot {
+        debug_assert!(
+            self.ents.iter().all(|e| e.frozen == u32::MAX),
+            "an extension is of live runs; a frozen table's own is a base"
+        );
         let from = self.live_len;
         // The log's length first, then the chains: a write that lands
         // between is logged past this mark and read from its chain.
@@ -7407,7 +7490,7 @@ impl Snapshot {
         let mut out = Snapshot {
             arena: self.arena.clone(),
             runs,
-            frozen_runs: self.frozen_runs,
+            base: self.base.clone(),
             ents: Vec::with_capacity(self.ents.len() + batch.len()),
             log_at,
             live_len: to,
@@ -7416,22 +7499,19 @@ impl Snapshot {
             filed: 0,
             bounds: Default::default(),
         };
-        // The run first where the keys are equal, as the build pushes
-        // the frozen table's entries before the live ones: `push_sorted`
-        // folds the batch's slot onto the run's entry, whose bytes are
-        // the same. Only two can meet: the run holds one entry a key and
-        // the memtable gives a key one slot, so a slot past `from` is a
-        // key the run has from the frozen table alone. The run between
-        // two batch keys is sorted and folded already, and is copied
-        // whole: the merge that compared every pair was a compare an
-        // entry for a batch of a hundred. Each batch key's place is found
-        // from the last one's: by walking the run where the batch is
-        // dense in it, since the run's keys lie in key order in the arena
-        // and a walk streams them, and by a gallop where it is sparse, the
-        // log of the gap a key. A binary search over the rest of the run
-        // was its whole log of cold lines a key -- fourteen for a thousand
-        // keys over ten thousand, two milliseconds of a scan pass of four
-        // at a hundred thousand -- and the gallop alone still seven.
+        // The run holds the live table's entries alone and the table
+        // gives a key one slot, so no batch key meets a key of the run:
+        // `push_sorted` pushes it. The run between two batch keys is
+        // sorted already, and is copied whole: the merge that compared
+        // every pair was a compare an entry for a batch of a hundred.
+        // Each batch key's place is found from the last one's: by walking
+        // the run where the batch is dense in it, since the run's keys
+        // lie in key order in the arena and a walk streams them, and by a
+        // gallop where it is sparse, the log of the gap a key. A binary
+        // search over the rest of the run was its whole log of cold lines
+        // a key -- fourteen for a thousand keys over ten thousand, two
+        // milliseconds of a scan pass of four at a hundred thousand --
+        // and the gallop alone still seven.
         let sparse = self.ents.len() > 64 * batch.len();
         let mut i = 0usize;
         for r in &recs {
@@ -7604,6 +7684,22 @@ impl Snapshot {
     fn run_has_tomb(&self, off: u32, wm: u64) -> bool {
         let (n, v) = self.arena.run(off);
         Snapshot::run_visible(n, v, wm).1
+    }
+
+    /// `run_values` for a frozen entry's run, which is the base's.
+    fn frozen_run_values<F: FnMut(&[u8])>(&self, off: u32, wm: u64, f: F) {
+        match &self.base {
+            Some(b) => b.run_values(off, wm, f),
+            None => self.run_values(off, wm, f),
+        }
+    }
+
+    /// `run_has_tomb` for a frozen entry's run, which is the base's.
+    fn frozen_run_has_tomb(&self, off: u32, wm: u64) -> bool {
+        match &self.base {
+            Some(b) => b.run_has_tomb(off, wm),
+            None => self.run_has_tomb(off, wm),
+        }
     }
 }
 
@@ -8607,11 +8703,11 @@ impl Reader {
             .fetch_add(1, AtomicOrdering::Relaxed);
         // The log's length before any chain is read: see `extend`.
         let log_at = self.log_end();
-        self.build_over(
-            Some((self.mem(), live_len)),
-            self.frozen().map(|f| &**f),
-            log_at,
-        )
+        let live = self.build_over(Some((self.mem(), live_len)), None, log_at);
+        match self.frozen() {
+            Some(fr) => live.with_base(self.frozen_snapshot(fr)),
+            None => live,
+        }
     }
 
     /// The build itself, over the first `live_len` entries of a live
@@ -8640,7 +8736,7 @@ impl Reader {
             log_at,
             arena: std::sync::Arc::new(SnapArena::with_capacity(bytes)),
             runs,
-            frozen_runs: runs,
+            base: None,
             ents: Vec::with_capacity(n),
             side: Vec::new(),
             fresh: Vec::new(),
@@ -9220,14 +9316,22 @@ impl Reader {
         }
         drop(ctx);
 
-        // The snapshot stands with the frozen table it names.
-        let keep_snap = same_frozen;
+        // The snapshot stands with the frozen table it names, and its
+        // live runs without it across the landing that sealed that table:
+        // they are the live table's, which is the one standing.
+        let keep_snap = same_frozen || landed;
         if !keep_snap {
             *self.fs().scan_keys.borrow_mut() = None;
             self.fs().snap_entries.set(0);
             self.fs().snap_added.borrow_mut().clear();
-        } else if let Some((g, _)) = self.fs().scan_keys.borrow_mut().as_mut() {
+        } else if let Some((g, snap)) = self.fs().scan_keys.borrow_mut().as_mut() {
             *g = st.gen;
+            if landed && snap.base.is_some() {
+                *snap = std::sync::Arc::new(Snapshot {
+                    base: None,
+                    ..(**snap).clone()
+                });
+            }
         }
 
         let mut old = std::mem::take(&mut *self.fs().tables.borrow_mut());
@@ -9299,11 +9403,18 @@ impl Reader {
             if rebased {
                 t.blob = seg.blob.id();
             }
+            if landed {
+                // The base went with the table it named.
+                t.fsnap_at = std::cell::OnceCell::new();
+                t.fsnap_span = (0, 0);
+            }
             if keep_snap && !rebased {
                 continue;
             }
             t.snap_at = std::cell::OnceCell::new();
             t.snap_span = (0, 0);
+            t.fsnap_at = std::cell::OnceCell::new();
+            t.fsnap_span = (0, 0);
             t.snap_gen = u64::MAX;
             t.reads.fill(0);
             t.touched.fill(0);
@@ -9579,6 +9690,10 @@ impl Reader {
     /// sorted the table first set on it, and otherwise sorted here, alone,
     /// by the build a scan would make, and set for whoever comes next.
     fn frozen_snapshot(&self, fr: &MemTable) -> std::sync::Arc<Snapshot> {
+        if !self.opts.share_snapshot || !self.opts.frozen_snaps {
+            // Each its own, sorted from nothing: what those arms price.
+            return std::sync::Arc::new(self.build_over(None, Some(fr), 0));
+        }
         if let Some(s) = fr.snaps.best() {
             return s;
         }
@@ -9598,15 +9713,35 @@ impl Reader {
         }
     }
 
-    /// The frozen table's own snapshot as the base a snapshot of this
-    /// state starts from, where snapshots are shared: unshared, each
-    /// handle sorts its own from nothing, which is that arm's meaning.
+    /// A snapshot of no live entry over the frozen table's own, the
+    /// start an extension carries forward with the live keys, where
+    /// snapshots are shared: unshared, each handle builds its own from
+    /// nothing, which is that arm's meaning.
     fn frozen_base(&self) -> Option<std::sync::Arc<Snapshot>> {
         if !self.opts.share_snapshot || !self.opts.frozen_snaps {
             return None;
         }
         let fr = self.frozen()?.clone();
-        Some(self.frozen_snapshot(&fr))
+        let base = self.frozen_snapshot(&fr);
+        let runs = base.runs;
+        Some(std::sync::Arc::new(Snapshot::over_base(base, runs)))
+    }
+
+    /// `s` over the frozen table's copy with every chain, where its base
+    /// is an order without them and the seal or a reader has set the
+    /// copy since: the live runs and their bounds stand, and each frozen
+    /// key is read from its run instead of through the table's chains.
+    fn upgrade_base(&self, s: std::sync::Arc<Snapshot>) -> std::sync::Arc<Snapshot> {
+        if !self.opts.share_snapshot || !self.opts.frozen_snaps {
+            return s;
+        }
+        match (s.base.as_ref(), self.frozen()) {
+            (Some(b), Some(fr)) if !b.runs => match fr.snaps.copied.get() {
+                Some(c) => std::sync::Arc::new(s.with_base(c)),
+                None => s,
+            },
+            _ => s,
+        }
     }
 
     fn adopt_snapshot(&self) -> Option<std::sync::Arc<Snapshot>> {
@@ -10049,13 +10184,13 @@ impl Reader {
         let Some((g, mine)) = mine else {
             return false;
         };
-        if *g != gen || mine.frozen_runs {
+        if *g != gen || mine.frozen_copied() {
             return false;
         }
         let p = st.snap.load(AtomicOrdering::Acquire);
         // SAFETY: as in `adopt_snapshot`: published into the state this
         // handle has pinned, and freed only past every reader pinned then.
-        !p.is_null() && unsafe { &*p }.frozen_runs
+        !p.is_null() && unsafe { &*p }.frozen_copied()
     }
 
     /// `refresh_snapshot`, and with `current` a snapshot short of the live
@@ -10175,6 +10310,9 @@ impl Reader {
                 // and the build that replaced it cost 9.5 ms where the
                 // merge costs 2.
                 published => {
+                    // This handle's own over the table's copy where the
+                    // copy is set since: its live runs stand.
+                    let have = have.map(|s| self.upgrade_base(s));
                     let base = match (have, published) {
                         (Some(a), Some(b)) if b.rank() > a.rank() => Some(b),
                         (Some(a), _) => Some(a),
@@ -11098,6 +11236,11 @@ impl Reader {
             piece_ranks,
             snap_at: std::cell::OnceCell::new(),
             snap_span: BuildCtx::snap_span(seg, unsealed),
+            fsnap_at: std::cell::OnceCell::new(),
+            fsnap_span: unsealed
+                .base
+                .as_deref()
+                .map_or((0, 0), |b| BuildCtx::snap_span(seg, b)),
             snap_gen: self.fs().snap_gen.get(),
             added,
             filed,
@@ -11885,7 +12028,7 @@ impl Reader {
                 if sk.frozen == u32::MAX {
                     false
                 } else if frozen_run {
-                    snap.run_has_tomb(sk.frun, SEE_ALL)
+                    snap.frozen_run_has_tomb(sk.frun, SEE_ALL)
                 } else {
                     self.frozen()
                         .as_ref()
@@ -11907,7 +12050,7 @@ impl Reader {
         }
         if sk.frozen != u32::MAX && start <= 1 {
             if frozen_run {
-                snap.run_values(sk.frun, SEE_ALL, |v| f(key, v));
+                snap.frozen_run_values(sk.frun, SEE_ALL, |v| f(key, v));
             } else if let Some(fr) = self.frozen() {
                 let e = fr.entry(sk.frozen as usize);
                 fr.live_offs_into(e, scratch, SEE_ALL);
@@ -13657,11 +13800,17 @@ impl Db {
             let t_snap = std::time::Instant::now();
             let snap = snap_reader.as_ref().and_then(|r| {
                 // The copy set on the table first, for every reader of it
-                // and for the records below: one with the chains taken as
-                // it is, one without them built from its order and given
-                // its bounds, which hold for the same keys in the same
-                // order.
-                let snap = match have.as_ref().filter(|h| h.runs && h.frozen_runs) {
+                // and for the records below: the table's copy taken as it
+                // is, since every entry of it carries its chain, and an
+                // order without them made into one, given its bounds,
+                // which hold for the same keys in the same order.
+                let copied = have.as_ref().filter(|h| {
+                    mem.snaps
+                        .copied
+                        .get()
+                        .is_some_and(|c| std::sync::Arc::ptr_eq(&c, h))
+                });
+                let snap = match copied {
                     Some(h) => h.clone(),
                     None => {
                         let mut built = Snapshot::from_frozen(&mem, &order)?;
@@ -13679,13 +13828,18 @@ impl Db {
                         }
                     }
                 };
+                // Published as what a state with this frozen table reads:
+                // no live entry over the copy as its base.
                 let entered = r.enter();
                 let st = r.state();
                 if st
                     .frozen
                     .as_ref()
                     .is_some_and(|f| std::sync::Arc::ptr_eq(f, &mem))
-                    && r.publish_snapshot(&snap)
+                    && r.publish_snapshot(&std::sync::Arc::new(Snapshot::over_base(
+                        snap.clone(),
+                        true,
+                    )))
                 {
                     shared.snap_sealed.fetch_add(1, AtomicOrdering::Relaxed);
                 }
@@ -14298,6 +14452,8 @@ impl Db {
             t.piece_ranks = piece_ranks;
             t.snap_at = std::cell::OnceCell::new();
             t.snap_span = (0, 0);
+            t.fsnap_at = std::cell::OnceCell::new();
+            t.fsnap_span = (0, 0);
             t.snap_gen = u64::MAX;
             t.reads.fill(0);
             t.touched.fill(0);
@@ -15557,6 +15713,11 @@ impl Reader {
                 piece_ranks,
                 snap_at: std::cell::OnceCell::new(),
                 snap_span: BuildCtx::snap_span(seg, &unsealed),
+                fsnap_at: std::cell::OnceCell::new(),
+                fsnap_span: unsealed
+                    .base
+                    .as_deref()
+                    .map_or((0, 0), |b| BuildCtx::snap_span(seg, b)),
                 snap_gen: 0,
                 added: (0..nblocks).map(|_| Vec::new()).collect(),
                 filed: 0,
@@ -15843,12 +16004,11 @@ impl Reader {
     /// PROTOTYPE: the keeper's snapshot, over the memtables `k` names,
     /// carried into the state `st`: unchanged where the memtables are
     /// the same, which is a merge; at a freeze, brought current to the
-    /// old live table's end -- a frozen table is complete -- and its live
-    /// entries made frozen ones, the run's order and so its bounds the
-    /// same; when the seal lands, its frozen entries dropped and the
-    /// live keys and runs moved to an arena of their own, so the old
-    /// arena and the values it copied go with the frozen table. Nothing
-    /// else carries.
+    /// old live table's end -- a frozen table is complete -- and made the
+    /// table's own, the run's order and so its bounds the same, under a
+    /// live run of nothing; when the seal lands, its base dropped and the
+    /// live runs kept, the base's arena and the values it copied going
+    /// with the frozen table. Nothing else carries.
     fn carry_snapshot(
         &self,
         s: std::sync::Arc<Snapshot>,
@@ -15866,56 +16026,14 @@ impl Reader {
         if same_mem && same_frozen {
             return Some(s);
         }
-        // The landing's filter drops entries, so the bounds every
-        // partition was walked against go with them -- their positions
-        // are positions in the run. For a caller whose next reads want
-        // those bounds that is a bad trade: at three hundred thousand
-        // keys the burst's five walks cost 20 ms against the 17 ms of
-        // builds the carry saved, and the writes ran 7-11% slower. The
-        // keeper walks them on its own thread and asks for this; the
-        // writer does not.
+        // The live runs hold the live table's entries alone, so a landing
+        // that keeps the live table keeps them and their bounds, and drops
+        // the base that named the table it sealed.
         if landing && same_mem && st.frozen.is_none() && frozen.is_some() {
-            let live_ents = s.ents.iter().filter(|e| e.mem != u32::MAX);
-            let bytes: usize = live_ents
-                .clone()
-                .map(|e| {
-                    e.len as usize
-                        + if e.lrun != NO_RUN {
-                            s.arena.run_len(e.lrun) as usize
-                        } else {
-                            0
-                        }
-                })
-                .sum();
-            let mut out = Snapshot {
-                arena: std::sync::Arc::new(SnapArena::with_capacity(bytes)),
-                runs: s.runs,
-                frozen_runs: s.runs,
-                ents: Vec::with_capacity(live_ents.clone().count()),
-                log_at: s.log_at,
-                live_len: s.live_len,
-                side: Vec::new(),
-                fresh: Vec::new(),
-                filed: 0,
-                bounds: Default::default(),
-            };
-            for e in live_ents {
-                let lrun = if e.lrun != NO_RUN {
-                    out.arena
-                        .append(s.arena.slice(e.lrun, s.arena.run_len(e.lrun)))
-                } else {
-                    NO_RUN
-                };
-                out.ents.push(SnapKey {
-                    off: out.arena.append(s.key_of(e)),
-                    len: e.len,
-                    mem: e.mem,
-                    frozen: u32::MAX,
-                    lrun,
-                    frun: NO_RUN,
-                });
-            }
-            return Some(std::sync::Arc::new(out));
+            return Some(std::sync::Arc::new(Snapshot {
+                base: None,
+                ..(*s).clone()
+            }));
         }
         let froze = frozen.is_none()
             && st
@@ -15923,60 +16041,78 @@ impl Reader {
                 .as_ref()
                 .is_some_and(|f| std::sync::Arc::ptr_eq(f, live));
         if froze {
+            debug_assert!(s.base.is_none(), "a freeze finds no frozen table");
+            let runs = s.runs;
             // The table's own snapshot, where its seal or a scan set one
             // first: the same keys in the same order, made already.
-            if let Some(have) = live.snaps.best().filter(|_| self.opts.frozen_snaps) {
-                return Some(have);
-            }
-            let s = if s.live_len < live.len() || s.log_at < live.log_len() {
-                self.shared
-                    .snap_extends
-                    .fetch_add(1, AtomicOrdering::Relaxed);
-                std::sync::Arc::new(s.extend(live, live.len(), s.runs))
-            } else {
-                s
+            let own = match live.snaps.best().filter(|_| self.opts.frozen_snaps) {
+                Some(have) => have,
+                None => {
+                    let own = self.own_snapshot(s, live);
+                    if !self.opts.frozen_snaps {
+                        own
+                    } else {
+                        // Offered to the table, which is final now, for the
+                        // seal and every reader after: with every chain, as
+                        // the seal's own copy is, or as an order alone.
+                        let cell = if own.runs && own.ents.iter().all(|e| e.frun != NO_RUN) {
+                            &live.snaps.copied
+                        } else {
+                            &live.snaps.sorted
+                        };
+                        if cell.set(own.clone()) {
+                            own
+                        } else {
+                            live.snaps.best().expect("set by whoever won")
+                        }
+                    }
+                }
             };
-            let mut out = Snapshot {
-                arena: s.arena.clone(),
-                runs: s.runs,
-                frozen_runs: s.runs,
-                ents: Vec::with_capacity(s.ents.len()),
-                log_at: 0,
-                live_len: 0,
-                side: Vec::new(),
-                fresh: Vec::new(),
-                filed: 0,
-                bounds: s.bounds.clone(),
-            };
-            for e in &s.ents {
-                debug_assert_eq!(e.frozen, u32::MAX, "a freeze finds no frozen table");
-                out.ents.push(SnapKey {
-                    off: e.off,
-                    len: e.len,
-                    mem: u32::MAX,
-                    frozen: e.mem,
-                    lrun: NO_RUN,
-                    frun: e.lrun,
-                });
-            }
-            // Offered to the table, which is final now, for the seal and
-            // every reader after: with every chain, as the seal's own copy
-            // is, or as an order alone.
-            let out = std::sync::Arc::new(out);
-            if !self.opts.frozen_snaps {
-                return Some(out);
-            }
-            let cell = if out.runs && out.ents.iter().all(|e| e.frun != NO_RUN) {
-                &live.snaps.copied
-            } else {
-                &live.snaps.sorted
-            };
-            if cell.set(out.clone()) {
-                return Some(out);
-            }
-            return live.snaps.best();
+            return Some(std::sync::Arc::new(Snapshot::over_base(own, runs)));
         }
         None
+    }
+
+    /// The live snapshot `s` of a table the freeze just made frozen,
+    /// brought current to its end and its entries made frozen ones: the
+    /// table's own snapshot, with `s`'s bounds where nothing moved.
+    fn own_snapshot(
+        &self,
+        s: std::sync::Arc<Snapshot>,
+        live: &MemTable,
+    ) -> std::sync::Arc<Snapshot> {
+        let s = if s.live_len < live.len() || s.log_at < live.log_len() {
+            self.shared
+                .snap_extends
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            std::sync::Arc::new(s.extend(live, live.len(), s.runs))
+        } else {
+            s
+        };
+        let mut out = Snapshot {
+            arena: s.arena.clone(),
+            runs: s.runs,
+            base: None,
+            ents: Vec::with_capacity(s.ents.len()),
+            log_at: 0,
+            live_len: 0,
+            side: Vec::new(),
+            fresh: Vec::new(),
+            filed: 0,
+            bounds: s.bounds.clone(),
+        };
+        for e in &s.ents {
+            debug_assert_eq!(e.frozen, u32::MAX, "a live snapshot holds no frozen entry");
+            out.ents.push(SnapKey {
+                off: e.off,
+                len: e.len,
+                mem: u32::MAX,
+                frozen: e.mem,
+                lrun: NO_RUN,
+                frun: e.lrun,
+            });
+        }
+        std::sync::Arc::new(out)
     }
 }
 
@@ -17033,29 +17169,54 @@ impl<'s> BuildCtx<'s> {
         Ok(cuts)
     }
     /// PROTOTYPE: the memtables' keys of a block, in order: a run of the
-    /// snapshot and the filed keys, merged. The filed keys are put in key
-    /// order here unless `sorted` says they are, with their keys resolved
-    /// once; sorting the slots through a key read per compare cost a
-    /// dense block's build measurably.
+    /// snapshot's live entries, a run of its base's frozen ones, and the
+    /// filed keys, merged, a key more than one of them holds folded into
+    /// one. The filed keys are put in key order here unless `sorted` says
+    /// they are, with their keys resolved once; sorting the slots through
+    /// a key read per compare cost a dense block's build measurably.
+    #[allow(clippy::too_many_arguments)]
     fn overlay_mem<'a>(
         &'a self,
         unsealed: &'a Snapshot,
         snap: std::ops::Range<usize>,
+        cuts: &[u32],
+        frozen: Option<(std::ops::Range<usize>, &[u32])>,
         filed: &[(u32, u32)],
         sorted: bool,
-        cuts: &[u32],
     ) -> Result<Vec<Over<'a>>> {
-        let mut out: Vec<Over> = Vec::with_capacity(snap.len() + filed.len());
-        for i in snap {
-            let (k, sk) = unsealed
-                .get(i)
-                .ok_or_else(|| err("block cache: a snapshot bound did not resolve"))?;
-            out.push(Over {
-                key: k,
-                sk: Some(*sk),
-                cut: cuts.get(i).copied().unwrap_or(u32::MAX),
-                pieces: 0..0,
-            });
+        let run = |s: &'a Snapshot, r: std::ops::Range<usize>, cuts: &[u32]| {
+            let mut out: Vec<Over<'a>> = Vec::with_capacity(r.len());
+            for i in r {
+                let (k, sk) = s
+                    .get(i)
+                    .ok_or_else(|| err("block cache: a snapshot bound did not resolve"))?;
+                out.push(Over {
+                    key: k,
+                    sk: Some(*sk),
+                    cut: cuts.get(i).copied().unwrap_or(u32::MAX),
+                    pieces: 0..0,
+                });
+            }
+            Ok::<_, std::io::Error>(out)
+        };
+        let mut out = run(unsealed, snap, cuts)?;
+        if let (Some(base), Some((fr, fcuts))) = (unsealed.base.as_deref(), frozen) {
+            if !fr.is_empty() {
+                let fout = run(base, fr, fcuts)?;
+                out = if out.is_empty() {
+                    fout
+                } else {
+                    Self::fold_overs(fout, out, |f, l| {
+                        debug_assert_eq!(f.mem, u32::MAX, "a base holds no live entry");
+                        debug_assert_eq!(l.frozen, u32::MAX, "a live run holds no frozen entry");
+                        SnapKey {
+                            mem: l.mem,
+                            lrun: l.lrun,
+                            ..f
+                        }
+                    })
+                };
+            }
         }
         if filed.is_empty() {
             return Ok(out);
@@ -17088,35 +17249,49 @@ impl<'s> BuildCtx<'s> {
         // one's tombstone must cut the frozen values. Merged as two entries
         // they came out as two keys, the tombstone cutting nothing, and the
         // test that scans between a seal and a live delete found it.
-        let mut merged = Vec::with_capacity(out.len() + fresh.len());
-        let (mut out, mut fresh) = (out.into_iter().peekable(), fresh.into_iter().peekable());
+        Ok(Self::fold_overs(out, fresh, |xs, ys| {
+            debug_assert_eq!(xs.mem, u32::MAX, "a live key was created twice");
+            SnapKey {
+                mem: ys.mem,
+                lrun: NO_RUN,
+                ..xs
+            }
+        }))
+    }
+    /// Two key-ordered lists of overlay keys, each holding a key once,
+    /// merged into one where a key both hold is one entry: `fold` makes
+    /// its entry from the first list's and the second's, and its cut is
+    /// whichever of theirs is known, the first list's first.
+    fn fold_overs<'a>(
+        a: Vec<Over<'a>>,
+        b: Vec<Over<'a>>,
+        fold: impl Fn(SnapKey, SnapKey) -> SnapKey,
+    ) -> Vec<Over<'a>> {
+        let mut merged = Vec::with_capacity(a.len() + b.len());
+        let (mut a, mut b) = (a.into_iter().peekable(), b.into_iter().peekable());
         loop {
-            match (out.peek(), fresh.peek()) {
+            match (a.peek(), b.peek()) {
                 (None, None) => break,
-                (Some(_), None) => merged.push(out.next().unwrap()),
-                (None, Some(_)) => merged.push(fresh.next().unwrap()),
+                (Some(_), None) => merged.push(a.next().unwrap()),
+                (None, Some(_)) => merged.push(b.next().unwrap()),
                 (Some(x), Some(y)) => match x.key.cmp(y.key) {
-                    Ordering::Less => merged.push(out.next().unwrap()),
-                    Ordering::Greater => merged.push(fresh.next().unwrap()),
+                    Ordering::Less => merged.push(a.next().unwrap()),
+                    Ordering::Greater => merged.push(b.next().unwrap()),
                     Ordering::Equal => {
-                        let (x, y) = (out.next().unwrap(), fresh.next().unwrap());
-                        let (xs, ys) = (x.sk.expect("snapshot key"), y.sk.expect("side-list key"));
-                        debug_assert_eq!(xs.mem, u32::MAX, "a live key was created twice");
+                        let (x, y) = (a.next().unwrap(), b.next().unwrap());
+                        let (xs, ys) =
+                            (x.sk.expect("a memtable key"), y.sk.expect("a memtable key"));
                         merged.push(Over {
                             key: x.key,
-                            sk: Some(SnapKey {
-                                mem: ys.mem,
-                                lrun: NO_RUN,
-                                ..xs
-                            }),
-                            cut: y.cut,
+                            sk: Some(fold(xs, ys)),
+                            cut: if x.cut != u32::MAX { x.cut } else { y.cut },
                             pieces: 0..0,
                         });
                     }
                 },
             }
         }
-        Ok(merged)
+        merged
     }
     /// PROTOTYPE: the filed entries of a block in key order.
     fn sorted_filed(&self, filed: &[(u32, u32)]) -> Vec<(u32, u32)> {
@@ -17208,7 +17383,10 @@ impl<'s> BuildCtx<'s> {
     ) -> Result<Overlay<'a>> {
         let sb = table.snap_at(src.seg, unsealed)?;
         let snap = sb.at[b] as usize..sb.at[b + 1] as usize;
-        let mem = self.overlay_mem(unsealed, snap, &table.added[b], false, &sb.cuts)?;
+        let frozen = table
+            .fsnap_at(src.seg, unsealed)?
+            .map(|f| (f.at[b] as usize..f.at[b + 1] as usize, f.cuts.as_slice()));
+        let mem = self.overlay_mem(unsealed, snap, &sb.cuts, frozen, &table.added[b], false)?;
         let pieces: Vec<PieceRun<'_>> = table
             .pieces
             .iter()
@@ -17240,11 +17418,16 @@ impl<'s> BuildCtx<'s> {
             .snap_at
             .get()
             .map_or(0, |sb| (sb.at[b + 1] - sb.at[b]) as usize);
+        let frozen = table
+            .fsnap_at
+            .get()
+            .map_or(0, |sb| (sb.at[b + 1] - sb.at[b]) as usize);
         let pieces = table
             .pieces
             .iter()
             .map(|(_, at)| (at[b + 1] - at[b]) as usize);
-        snap.max(table.added[b].len())
+        snap.max(frozen)
+            .max(table.added[b].len())
             .max(pieces.max().unwrap_or(0))
     }
     /// PROTOTYPE: a wide block's keys above the partition from `cursor`
@@ -17262,24 +17445,34 @@ impl<'s> BuildCtx<'s> {
         window: (&[u8], usize),
     ) -> Result<Overlay<'a>> {
         let (cursor, limit) = window;
-        let sb = table.snap_at(src.seg, unsealed)?;
-        let (s0, s1) = (sb.at[b] as usize, sb.at[b + 1] as usize);
-        let key_at = |i: usize| unsealed.get(i).map(|(k, _)| k);
-        let mut lo = s0;
-        let mut hi = s1;
-        while lo < hi {
-            let m = lo + (hi - lo) / 2;
-            if key_at(m).is_some_and(|k| k < cursor) {
-                lo = m + 1;
-            } else {
-                hi = m;
+        // A run's positions over the block from the cursor on, at most
+        // `limit` of them.
+        let window_of = |s: &Snapshot, s0: usize, s1: usize| {
+            let mut lo = s0;
+            let mut hi = s1;
+            while lo < hi {
+                let m = lo + (hi - lo) / 2;
+                if s.get(m).is_some_and(|(k, _)| k < cursor) {
+                    lo = m + 1;
+                } else {
+                    hi = m;
+                }
             }
-        }
-        let snap = lo..s1.min(lo.saturating_add(limit));
+            lo..s1.min(lo.saturating_add(limit))
+        };
+        let sb = table.snap_at(src.seg, unsealed)?;
+        let snap = window_of(unsealed, sb.at[b] as usize, sb.at[b + 1] as usize);
+        let frozen = match (unsealed.base.as_deref(), table.fsnap_at(src.seg, unsealed)?) {
+            (Some(base), Some(f)) => Some((
+                window_of(base, f.at[b] as usize, f.at[b + 1] as usize),
+                f.cuts.as_slice(),
+            )),
+            _ => None,
+        };
         let key_of = |slot: u32| self.mem.key_of(self.mem.entry(slot as usize));
         let f0 = wide.sorted.partition_point(|&(i, _)| key_of(i) < cursor);
         let filed = &wide.sorted[f0..wide.sorted.len().min(f0.saturating_add(limit))];
-        let mem = self.overlay_mem(unsealed, snap, filed, true, &sb.cuts)?;
+        let mem = self.overlay_mem(unsealed, snap, &sb.cuts, frozen, filed, true)?;
         let pieces: Vec<PieceRun<'_>> = table
             .pieces
             .iter()
@@ -17328,7 +17521,7 @@ impl<'s> BuildCtx<'s> {
                     if sk.frozen == u32::MAX {
                         false
                     } else if sk.frun != NO_RUN {
-                        ov.snap.run_has_tomb(sk.frun, SEE_ALL)
+                        ov.snap.frozen_run_has_tomb(sk.frun, SEE_ALL)
                     } else {
                         self.frozen
                             .as_ref()
@@ -17395,7 +17588,7 @@ impl<'s> BuildCtx<'s> {
         if let Some(sk) = o.sk {
             if sk.frozen != u32::MAX && nc + 1 >= start {
                 if sk.frun != NO_RUN {
-                    ov.snap.run_values(sk.frun, SEE_ALL, |v| f(key, v));
+                    ov.snap.frozen_run_values(sk.frun, SEE_ALL, |v| f(key, v));
                 } else if let Some(fr) = self.frozen {
                     let e = fr.entry(sk.frozen as usize);
                     fr.live_offs_into(e, &mut em.scratch, SEE_ALL);
@@ -17513,17 +17706,25 @@ impl<'s> BuildCtx<'s> {
         let lo = b * CACHE_BLOCK;
         let hi = ((b + 1) * CACHE_BLOCK).min(keys);
         let sb = table.snap_at(src.seg, unsealed)?;
+        let live = (sb.at[b + 1] - sb.at[b]) as usize;
+        let frozen = table
+            .fsnap_at(src.seg, unsealed)?
+            .map_or(0, |f| (f.at[b + 1] - f.at[b]) as usize);
         let floor = BuildCtx::overlay_count(table, b);
-        // The run covers the block when its entries over it are most of
+        // The runs cover the block when their entries over it are most of
         // its keys: three quarters, a fraction the walk-against-copy
-        // pricing in `docs/engine.md` puts between.
-        let over: usize = (sb.at[b + 1] - sb.at[b]) as usize
+        // pricing in `docs/engine.md` puts between. The snapshot has to
+        // carry its chains for the walk to stream them, and so does its
+        // base where the base has keys over the block.
+        let over: usize = live
+            + frozen
             + table
                 .pieces
                 .iter()
                 .map(|(_, at)| (at[b + 1] - at[b]) as usize)
                 .sum::<usize>();
-        let covered = !self.copy_dense && unsealed.runs && over * 4 >= (hi - lo) * 3;
+        let runs = unsealed.runs && (frozen == 0 || unsealed.frozen_copied());
+        let covered = !self.copy_dense && runs && over * 4 >= (hi - lo) * 3;
         if floor > WIDE || covered {
             return Ok(Cached::Wide(WideBlock {
                 sorted: self.sorted_filed(&table.added[b]),
