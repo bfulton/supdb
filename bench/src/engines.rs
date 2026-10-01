@@ -1170,7 +1170,9 @@ impl Supdb {
     }
 
     /// `supdb` with the writer's operations pinning nothing, as before
-    /// `Options::writer_pins`: against `supdb` it prices the pins.
+    /// `Options::writer_pins`, and so with the segment work inline, since
+    /// an unpinned writer must be the one publisher: against
+    /// `supdb-inlinemaint` it prices the pins alone.
     pub fn create_nopin(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
@@ -1436,7 +1438,9 @@ impl Supdb {
             seal_max_pct: sealcap.unwrap_or(base_seal_max_pct),
             l0_trigger: l0.unwrap_or(supdb::Options::default().l0_trigger),
             writer_pins: !nopin,
-            publish_in_background: !inlinemaint,
+            // Unpinned, the writer must be the one publisher, as it was
+            // when the pins were priced: the store refuses the pair.
+            publish_in_background: !(inlinemaint || nopin),
             adaptive_shape: shape,
             // The cap and the trigger following the reads, or the cap
             // as it stands whoever reads; the trigger arm takes both.

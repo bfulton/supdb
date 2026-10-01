@@ -409,6 +409,48 @@ fn the_probe_merge_arm_passes_the_same_oracle() {
     oracle(false, supdb::Upkeep::Inline);
 }
 
+/// An unpinned writer holds no state it reads, so a store refuses it
+/// beside any other thread that publishes: the segment work on its own
+/// thread replaced and freed a state under the writer's read, and the
+/// suite's unpinned arm faulted in a third of its runs. Inline, where the
+/// writer is the one publisher, it is the shape the pins were priced
+/// against, and the model holds there.
+#[test]
+fn an_unpinned_writer_is_refused_beside_another_publisher() {
+    let refused = |name: &str, opts: Options| {
+        let d = dir(name);
+        let e = Db::create(&d, opts.clone())
+            .err()
+            .expect("create refuses it");
+        assert!(e.to_string().contains("writer_pins"), "{e}");
+        assert!(Db::open(&d, opts).is_err(), "and so does open");
+    };
+    refused(
+        "nopin-background",
+        Options {
+            writer_pins: false,
+            ..Options::default()
+        },
+    );
+    refused(
+        "nopin-keeper",
+        Options {
+            writer_pins: false,
+            publish_in_background: false,
+            snapshot_keeper: true,
+            ..Options::default()
+        },
+    );
+    oracle_in(
+        "oracle-nopin-inline",
+        Options {
+            writer_pins: false,
+            publish_in_background: false,
+            ..Options::default()
+        },
+    );
+}
+
 /// The oracle with seals that take their end from the live WAL
 /// (`seal_rotates_wal` off) and a log small enough to rotate by size
 /// every few commits: files that span landed seals, files closed and

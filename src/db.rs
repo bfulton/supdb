@@ -455,7 +455,10 @@ pub struct Options {
     /// does for each read. Nothing needs it while the writer is the only
     /// thread that publishes; it is what lets another thread publish
     /// without freeing or swapping a state under the writer. `false` is
-    /// the shape before it, kept to price it.
+    /// the shape before it, kept to price it, and a store refuses it
+    /// beside another publisher -- `publish_in_background` or
+    /// `snapshot_keeper` -- since the segment work would free a state the
+    /// writer is reading.
     pub writer_pins: bool,
     /// EXPERIMENT: the store's segment work (`Maint`) -- a seal's
     /// landing, the merges, the promotions, the manifest and the WAL
@@ -4266,6 +4269,23 @@ impl Drop for MemTable {
         }
         // The retired indexes drop with the cell.
     }
+}
+
+/// Combinations of options the engine cannot run soundly, refused before
+/// anything on disk is touched. An unpinned writer holds no state it
+/// reads, which is sound only while it is the one thread that publishes:
+/// the segment work on its own thread, or the keeper swapping the
+/// published snapshot, replaced a state and freed it under the writer's
+/// read, and the suite's unpinned arm faulted in a third of its runs once
+/// the segment work moved to a thread of its own.
+fn check_options(opts: &Options) -> Result<()> {
+    if !opts.writer_pins && (opts.publish_in_background || opts.snapshot_keeper) {
+        return Err(err(
+            "writer_pins off needs every publish on the writer's thread: \
+             publish_in_background and snapshot_keeper off",
+        ));
+    }
+    Ok(())
 }
 
 /// The live segment set, named atomically.
@@ -12213,6 +12233,7 @@ impl Db {
     }
 
     pub fn create(dir: &Path, opts: Options) -> Result<Db> {
+        check_options(&opts)?;
         let starts_random = opts.read_advice.starts_random();
         std::fs::create_dir_all(dir)?;
         let mut wal = Wal::create(&Db::wal_path(dir, 0), 0)?;
@@ -12372,6 +12393,7 @@ impl Db {
     /// directory with no segments and only a WAL is a store killed before
     /// its first seal, and it opens -- the brief's P-E.
     pub fn open(dir: &Path, opts: Options) -> Result<Db> {
+        check_options(&opts)?;
         // The manifest is the truth when it exists, and every store made
         // by `create` has one from birth. Without one the directory is
         // scanned, which is how a store written before manifests still

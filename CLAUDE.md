@@ -917,6 +917,21 @@ to the rebase. The rule: a carry across one's own publish holds only
 over the state it was prepared against, and the check is that state's
 identity or generation, never the one field the carry changes.
 
+**An arm sound only beside the default it was priced with.** An arm
+keeps an older shape alive for pricing, and `supdb-nopin` kept the
+writer's reads unpinned, which is sound only while the writer is the one
+thread that publishes. The segment work then moved to a thread of its
+own and publishing in the background became the default, and the arm
+kept running beside it: the segment work replaced a state and freed it
+while the writer's commit built a block through one of its segments, and
+the suite faulted in about a third of the arm's runs. No test ran the
+arm at all, so nothing said so until a pairing crashed. A store now
+refuses an unpinned writer beside another publisher, and the arm runs
+its segment work inline as it did when the pins were priced. The rule:
+an option sound only under another's value is checked against it where
+the store opens, and an arm that keeps an old shape keeps that shape's
+other settings with it.
+
 **A sentinel that crosses the wasm boundary changes sign.** A wasm `u32`
 arrives in JavaScript as a signed i32, so a failure sentinel of `u32::MAX`
 arrives as -1 and a comparison against 4294967295 can never match. Every
