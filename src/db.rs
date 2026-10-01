@@ -7323,11 +7323,14 @@ impl Snapshot {
             k: self.seek_in(&self.fresh, from),
         }
     }
-    /// The key at the cursor and its entry, folded across the runs. Each
-    /// head's key is read from its own run's arena, and the entry's `off`
-    /// names whichever arena its first head's does: a caller takes the
-    /// key returned here and never the entry's bytes.
-    fn peek(&self, c: SnapCursor) -> Option<(&[u8], SnapKey)> {
+    /// The key at the cursor, its entry folded across the runs, and a bit
+    /// for each run whose head stands on it -- base, main, side, fresh --
+    /// from one ordered compare a head past the first. Each head's key is
+    /// read from its own run's arena, and the entry's `off` names
+    /// whichever arena its first head's does: a caller takes the key
+    /// returned here and never the entry's bytes.
+    #[inline]
+    fn front(&self, c: SnapCursor) -> Option<(&[u8], SnapKey, u8)> {
         let base = self.base.as_deref();
         let heads = [
             base.and_then(|b| b.ents.get(c.b).map(|e| (b.key_of(e), e))),
@@ -7335,54 +7338,56 @@ impl Snapshot {
             self.side.get(c.j).map(|e| (self.key_of(e), e)),
             self.fresh.get(c.k).map(|e| (self.key_of(e), e)),
         ];
-        let mut best: Option<(&[u8], SnapKey)> = None;
-        for (k, e) in heads.into_iter().flatten() {
+        let mut best: Option<(&[u8], SnapKey, u8)> = None;
+        for (bit, head) in heads.into_iter().enumerate() {
+            let Some((k, e)) = head else {
+                continue;
+            };
             best = match best {
-                None => Some((k, *e)),
-                Some((bk, _)) if k < bk => Some((k, *e)),
-                Some((bk, be)) if k == bk => Some((
-                    bk,
-                    SnapKey {
-                        mem: if e.mem != u32::MAX { e.mem } else { be.mem },
-                        lrun: if e.mem != u32::MAX { e.lrun } else { be.lrun },
-                        frozen: if e.frozen != u32::MAX {
-                            e.frozen
-                        } else {
-                            be.frozen
+                None => Some((k, *e, 1 << bit)),
+                Some((bk, be, at)) => match k.cmp(bk) {
+                    Ordering::Less => Some((k, *e, 1 << bit)),
+                    Ordering::Greater => Some((bk, be, at)),
+                    Ordering::Equal => Some((
+                        bk,
+                        SnapKey {
+                            mem: if e.mem != u32::MAX { e.mem } else { be.mem },
+                            lrun: if e.mem != u32::MAX { e.lrun } else { be.lrun },
+                            frozen: if e.frozen != u32::MAX {
+                                e.frozen
+                            } else {
+                                be.frozen
+                            },
+                            frun: if e.frozen != u32::MAX {
+                                e.frun
+                            } else {
+                                be.frun
+                            },
+                            ..be
                         },
-                        frun: if e.frozen != u32::MAX {
-                            e.frun
-                        } else {
-                            be.frun
-                        },
-                        ..be
-                    },
-                )),
-                other => other,
+                        at | 1 << bit,
+                    )),
+                },
             };
         }
         best
     }
-    /// Past the key at the cursor, in every run that holds it.
+    /// The key at the cursor and its entry, folded across the runs.
+    fn peek(&self, c: SnapCursor) -> Option<(&[u8], SnapKey)> {
+        self.front(c).map(|(k, e, _)| (k, e))
+    }
+    /// Past the key at the cursor, in every run that holds it: the runs
+    /// `front` found on it, with no compare of its own. It peeked again
+    /// and compared each head to the key, four compares a key with a base
+    /// and a live run where `front` makes one.
     fn advance(&self, c: &mut SnapCursor) {
-        let Some((key, _)) = self.peek(*c) else {
+        let Some((_, _, at)) = self.front(*c) else {
             return;
         };
-        let key: &[u8] = key;
-        if let Some(b) = self.base.as_deref() {
-            if b.ents.get(c.b).is_some_and(|e| b.key_of(e) == key) {
-                c.b += 1;
-            }
-        }
-        if self.ents.get(c.i).is_some_and(|e| self.key_of(e) == key) {
-            c.i += 1;
-        }
-        if self.side.get(c.j).is_some_and(|e| self.key_of(e) == key) {
-            c.j += 1;
-        }
-        if self.fresh.get(c.k).is_some_and(|e| self.key_of(e) == key) {
-            c.k += 1;
-        }
+        c.b += (at & 1) as usize;
+        c.i += (at >> 1 & 1) as usize;
+        c.j += (at >> 2 & 1) as usize;
+        c.k += (at >> 3 & 1) as usize;
     }
     /// File the live memtable's slots `slots`, created since the build,
     /// as a sorted run: their keys copied into the arena, the batch

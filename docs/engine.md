@@ -2744,6 +2744,23 @@ live keys alone now, the writer's landing keeps its live runs and drops
 the base, and the base's bounds against a partition are taken once on
 the base, for every snapshot over it.
 
+The suite has no arm for the run of both tables, so it was priced as two
+binaries alternated in one sitting, each supdb arm over its comparator in
+the same run. The durable arm's fully unmerged lag point at ten thousand
+keys read 1.5x in two sittings of eight rounds over the quick ladder and
+1.4x in a third of twelve over its two smallest rungs, in every round of
+all three. Nothing else held across sittings. The shape arm's first lag
+point read about 0.94x over the first two pooled, the new binary ahead in
+18 of 64 rounds, and level in the third. Where a base stands beside a live
+run the cursor folds two runs a key, and its peek and the advance after
+it made four compares a key where one merged run made one; it folds once
+now (`Snapshot::front`) and steps the runs it found on the key without
+comparing again, one compare a key with a base and none with a run alone.
+Against the binary before the fold, in the third sitting, the shape arm's
+lag points read 1.1-1.3x in 7-9 of 12 rounds and the durable drained scan
+0.9x in 2-3 of 12, where the cursor has no unsealed key to fold; neither
+was held to a second sitting.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and
