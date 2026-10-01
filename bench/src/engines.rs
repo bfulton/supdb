@@ -428,6 +428,7 @@ pub struct Supdb {
     rotate: bool,
     defer: bool,
     firstfloor: bool,
+    nofrozen: bool,
 }
 
 /// What an arm differs from `supdb` by. One struct rather than a row of
@@ -538,6 +539,10 @@ struct Policy {
     /// A store with nothing sealed seals at the floor under the shape,
     /// `Options::seal_first_floor`. `supdb-shapefloor`.
     firstfloor: bool,
+    /// Each reader of a frozen table sorts it for itself, as before the
+    /// table kept its own snapshot: `Options::frozen_snaps` off.
+    /// `supdb-nofrozen`.
+    nofrozen: bool,
 }
 
 impl Default for Policy {
@@ -563,6 +568,7 @@ impl Default for Policy {
             adaptcap: None,
             adapttrig: false,
             rotate: false,
+            nofrozen: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -726,6 +732,19 @@ impl Supdb {
             path,
             Policy {
                 rotate: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose readers of a frozen table each sort it for
+    /// themselves (`Options::frozen_snaps` off), the shape before the
+    /// table kept its own snapshot.
+    pub fn create_nofrozen(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                nofrozen: true,
                 ..Policy::default()
             },
         )
@@ -1331,6 +1350,7 @@ impl Supdb {
             rotate,
             defer,
             firstfloor,
+            nofrozen,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -1448,6 +1468,7 @@ impl Supdb {
             cap_reading_pct: adaptcap.unwrap_or(supdb::Options::default().cap_reading_pct),
             adaptive_trigger: adapttrig,
             seal_rotates_wal: rotate,
+            frozen_snaps: !nofrozen,
             seal_defers: defer,
             seal_first_floor: firstfloor,
             // Below this the builder declines and the writer fills the
@@ -1517,6 +1538,7 @@ impl Supdb {
             rotate,
             defer,
             firstfloor,
+            nofrozen,
         })
     }
 }
@@ -1588,6 +1610,9 @@ impl Engine for Supdb {
         }
         if self.defer {
             return "supdb-shapedefer";
+        }
+        if self.nofrozen {
+            return "supdb-nofrozen";
         }
         if self.rotate {
             return if self.shape {
@@ -1794,6 +1819,12 @@ impl Engine for Supdb {
             ("wal_rotations", db.seal_waits().wal_rotations as f64),
             ("freeze_ms", db.seal_waits().freeze_ns as f64 / 1e6),
             ("join_wait_ms", db.seal_waits().join_wait_ns as f64 / 1e6),
+            // Who sorted the frozen tables: the seals that found no order
+            // on their table, and readers that sorted one alone.
+            ("seal_sorts", db.seal_waits().seal_sorts as f64),
+            ("seal_sort_ms", db.seal_waits().seal_sort_ns as f64 / 1e6),
+            ("seal_snap_ms", db.seal_waits().seal_snap_ns as f64 / 1e6),
+            ("frozen_sorts", db.frozen_sorts() as f64),
         ]
     }
     fn thread_reader(&self) -> Res<ReaderOpener> {
@@ -2252,8 +2283,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settleall" | "supdb-inline" | "supdb-tier" | "supdb-runs" | "supdb-keeper"
         | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice"
         | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "supdb-inlinemaint"
-        | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose" | "supdb-rotate" | "lmdb"
-        | "rocksdb-tuned" => Guarantee::Durable,
+        | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose" | "supdb-rotate"
+        | "supdb-nofrozen" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest"
         | "supdb-ingestleave"
         | "supdb-ingestnoseal"
@@ -2319,6 +2350,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestadapttrig" => Box::new(Supdb::create_ingest_adapttrig(dir)?),
         "supdb-adaptloose" => Box::new(Supdb::create_adaptloose(dir)?),
         "supdb-rotate" => Box::new(Supdb::create_rotate(dir)?),
+        "supdb-nofrozen" => Box::new(Supdb::create_nofrozen(dir)?),
         "supdb-shaperotate" => Box::new(Supdb::create_shape_rotate(dir)?),
         "supdb-shapedefer" => Box::new(Supdb::create_shape_defer(dir)?),
         "supdb-shapefloor" => Box::new(Supdb::create_shape_floor(dir)?),

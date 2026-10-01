@@ -2692,6 +2692,22 @@ before its directory barrier, and a failed barrier is retried by every
 commit before it writes: done after it, a failed fsync left the writer
 on a file at sequence zero under the old id.
 
+#### A frozen table sorted once
+
+A frozen table is final, so its order is too, and it was sorted up to
+three times: by the writer's first scan after the freeze, inside its
+snapshot of frozen and live keys together; by the seal, for its records;
+and by any reader of a state published while the seal ran, since the
+seal's copy was published into the state the freeze made and no later
+one. The table keeps its own snapshot now (`FrozenSnaps`): whoever
+sorts it first -- the seal, a freeze's carry, the keeper, a scan -- sets
+it on the table, and every later reader takes it. A scan over a state
+with a frozen table and no snapshot of its own carries the table's
+forward with the live keys alone, where it sorted both; the seal takes
+an order it finds, and builds its copy from it rather than from a sort.
+`frozen_snaps` off is the shape before it, and `supdb-nofrozen` prices
+it.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and

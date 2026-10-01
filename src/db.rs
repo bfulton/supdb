@@ -733,9 +733,12 @@ pub struct Options {
     /// key's entry, chain and value through the memtable. A handle's
     /// extension of the published snapshot carries the frozen runs with
     /// it, and a handle holding a snapshot without them switches to the
-    /// seal's at its next scan. The copy is about the table's key and
-    /// value bytes, held until the seal lands. Off is the shape before
-    /// it, kept to price it.
+    /// seal's at its next scan. The copy is set on the table as well
+    /// (`FrozenSnaps`), where a state published later finds it, and is
+    /// built from the order a freeze, a scan or the keeper set there
+    /// first rather than from a sort of its own. The copy is about the
+    /// table's key and value bytes, held until the seal lands. Off is the
+    /// shape before it, kept to price it.
     pub seal_snapshot: bool,
     /// The seal writes its records from that snapshot's arena -- the keys
     /// and the copied chains in key order, one sequential read -- instead
@@ -938,6 +941,14 @@ pub struct Options {
     /// first scan after -- so what it buys is the pass and what it costs
     /// is the burst. `supdb-snapcarry` prices it.
     pub snapshot_carry: bool,
+    /// A frozen table keeps its own sorted snapshot (`FrozenSnaps`): the
+    /// seal, a freeze's carry, the keeper or the first scan sets it, and
+    /// every later reader of the table -- the seal for its records, a
+    /// scan over a state published while the seal runs -- carries it
+    /// forward instead of sorting the table again. Off is the shape
+    /// before it, where each sorted the table for itself; `supdb-nofrozen`
+    /// prices it.
+    pub frozen_snaps: bool,
     /// EXPERIMENT: keys of one block in a settle's backlog from which
     /// the block is dropped and built once rather than patched key by
     /// key. A patch resolves one key's run against every source and
@@ -1138,6 +1149,7 @@ impl Default for Options {
             forms_settle_keys_all: false,
             upkeep: Upkeep::default(),
             snapshot_carry: false,
+            frozen_snaps: true,
             scan_lazy_snapshot: false,
             forms_settle_rebuild_from: 0,
             forms_settle_recent_pct: 0,
@@ -3241,6 +3253,99 @@ struct MemTable {
     /// for settling into cached blocks -- without the writer keeping a
     /// list for it.
     log: Slab<u32>,
+    /// The table's own sorted snapshots, once it is frozen; see
+    /// `FrozenSnaps`.
+    snaps: FrozenSnaps,
+}
+
+/// A value set at most once and never replaced, read without a lock: the
+/// cell holds an `Arc`'s raw pointer, set by a compare-and-swap from null,
+/// and a thread that loses the race drops its own copy. Not a `OnceLock`,
+/// whose initialiser runs under a `Once` a second caller waits on: the
+/// first caller may be the niced keeper or a seal on the idle IO class,
+/// and a scan must never wait on either.
+struct SetOnce<T> {
+    p: AtomicPtr<T>,
+    _owns: std::marker::PhantomData<std::sync::Arc<T>>,
+}
+
+impl<T> SetOnce<T> {
+    fn new() -> SetOnce<T> {
+        SetOnce {
+            p: AtomicPtr::new(std::ptr::null_mut()),
+            _owns: std::marker::PhantomData,
+        }
+    }
+
+    fn get(&self) -> Option<std::sync::Arc<T>> {
+        let p = self.p.load(AtomicOrdering::Acquire);
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: set from `Arc::into_raw` and never replaced, the cell's
+        // own count held until the cell drops, and the caller reaches the
+        // cell through an owner it holds.
+        unsafe {
+            std::sync::Arc::increment_strong_count(p);
+            Some(std::sync::Arc::from_raw(p))
+        }
+    }
+
+    /// `v` set unless a value is there already; whether it was.
+    fn set(&self, v: std::sync::Arc<T>) -> bool {
+        let p = std::sync::Arc::into_raw(v) as *mut T;
+        match self.p.compare_exchange(
+            std::ptr::null_mut(),
+            p,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(_) => {
+                // SAFETY: ours, and the cell refused it.
+                drop(unsafe { std::sync::Arc::from_raw(p) });
+                false
+            }
+        }
+    }
+}
+
+impl<T> Drop for SetOnce<T> {
+    fn drop(&mut self) {
+        let p = *self.p.get_mut();
+        if !p.is_null() {
+            // SAFETY: the cell's own count, released once.
+            drop(unsafe { std::sync::Arc::from_raw(p) });
+        }
+    }
+}
+
+/// A frozen table's snapshots, kept on the table: every entry of it once,
+/// in key order, live length and log position zero -- what the seal sorts
+/// for its records, what a freeze's carry turns the writer's snapshot
+/// into, what a scan over the table would sort. Whoever makes one first
+/// sets it here, and every later reader of the table takes it instead of
+/// sorting the table again: the table is final, so the order is too.
+/// `copied` carries every entry's chain (`Snapshot::from_frozen`), which
+/// the seal streams its records from; `sorted` may carry none. Set only on
+/// a table nothing writes into any more, and freed with the table.
+struct FrozenSnaps {
+    sorted: SetOnce<Snapshot>,
+    copied: SetOnce<Snapshot>,
+}
+
+impl FrozenSnaps {
+    fn new() -> FrozenSnaps {
+        FrozenSnaps {
+            sorted: SetOnce::new(),
+            copied: SetOnce::new(),
+        }
+    }
+
+    /// The one with the chains where there is one.
+    fn best(&self) -> Option<std::sync::Arc<Snapshot>> {
+        self.copied.get().or_else(|| self.sorted.get())
+    }
 }
 
 // SAFETY: the writer-only cells (`retired`, and the arenas' and the
@@ -3743,6 +3848,7 @@ impl MemTable {
             mark: AtomicU64::new(0),
             retired: UnsafeCell::new(Vec::new()),
             log: Slab::new(),
+            snaps: FrozenSnaps::new(),
         }
     }
 
@@ -3759,6 +3865,7 @@ impl MemTable {
             mark: AtomicU64::new(0),
             retired: UnsafeCell::new(Vec::new()),
             log: Slab::new(),
+            snaps: FrozenSnaps::new(),
         }
     }
 
@@ -5029,6 +5136,8 @@ struct SealCounts {
     seal_snap_ns: AtomicU64,
     seal_records_ns: AtomicU64,
     seal_thread_ns: AtomicU64,
+    /// Seals that sorted their table, finding no order on it.
+    seal_sorts: AtomicU64,
     /// Tables a `sync` handed to a seal without a freeze, by which side
     /// replaced them: the writer at its next write, or the landing. For
     /// a test that wants to know which order it reached.
@@ -5067,6 +5176,7 @@ impl SealCounts {
             seal_snap_ns: get(&self.seal_snap_ns),
             seal_records_ns: get(&self.seal_records_ns),
             seal_thread_ns: get(&self.seal_thread_ns),
+            seal_sorts: get(&self.seal_sorts),
             deferred: get(&self.deferred),
             wal_rotations: get(&self.wal_rotations),
             rotated_unsynced: get(&self.rotated_unsynced),
@@ -5101,6 +5211,9 @@ pub struct SealWaits {
     pub seal_snap_ns: u64,
     pub seal_records_ns: u64,
     pub seal_thread_ns: u64,
+    /// Seals that sorted their table themselves; the rest took the order
+    /// a freeze, a scan or the keeper had set on it.
+    pub seal_sorts: u64,
     /// See `SealCounts`: commits that deferred their seal, WAL rotations
     /// and the bytes they left unsynced, and the writer's time in the
     /// seals its commits started.
@@ -5818,6 +5931,10 @@ struct Shared {
     /// EXPERIMENT: scan snapshots built over this store's life, which is
     /// what publishing one is meant to bring down; for a test.
     snap_builds: AtomicU64,
+    /// Frozen tables sorted by a reader because nothing had sorted them
+    /// yet (`Reader::frozen_snapshot`); the seal's own sorts are
+    /// `SealCounts::seal_sorts`.
+    frozen_sorts: AtomicU64,
     /// A read over a store with no partition happened since the segment
     /// work last looked (`Options::adaptive_shape`): set by the read that
     /// finds it clear, which wakes the thread, cleared by the look.
@@ -8484,21 +8601,39 @@ impl Reader {
         self.shared
             .snap_builds
             .fetch_add(1, AtomicOrdering::Relaxed);
-        let n = live_len + self.frozen().as_ref().map_or(0, |f| f.len());
+        // The log's length before any chain is read: see `extend`.
+        let log_at = self.log_end();
+        self.build_over(
+            Some((self.mem(), live_len)),
+            self.frozen().map(|f| &**f),
+            log_at,
+        )
+    }
+
+    /// The build itself, over the first `live_len` entries of a live
+    /// table and every entry of a frozen one, either of them absent: a
+    /// frozen table alone is its own snapshot (`frozen_snapshot`).
+    fn build_over(
+        &self,
+        live: Option<(&MemTable, usize)>,
+        frozen: Option<&MemTable>,
+        log_at: usize,
+    ) -> Snapshot {
+        let live_len = live.map_or(0, |(_, n)| n);
+        let n = live_len + frozen.map_or(0, |f| f.len());
         let runs = self.opts.snapshot_runs;
         // The arena's first block sized to what the build appends: the
         // keys, and with the runs the values and sixteen bytes a chunk.
         let mut bytes =
-            self.mem().key_bytes() + self.frozen().as_ref().map_or(0, |f| f.key_bytes());
+            live.map_or(0, |(m, _)| m.key_bytes()) + frozen.map_or(0, |f| f.key_bytes());
         if runs {
-            bytes += self.mem().value_bytes()
-                + self.frozen().as_ref().map_or(0, |f| f.value_bytes())
+            bytes += live.map_or(0, |(m, _)| m.value_bytes())
+                + frozen.map_or(0, |f| f.value_bytes())
                 + 16 * n;
         }
         let mut snap = Snapshot {
             live_len,
-            // The log's length before any chain is read: see `extend`.
-            log_at: self.log_end(),
+            log_at,
             arena: std::sync::Arc::new(SnapArena::with_capacity(bytes)),
             runs,
             frozen_runs: runs,
@@ -8568,10 +8703,12 @@ impl Reader {
                     });
                 }
             };
-            if let Some(fr) = self.frozen() {
+            if let Some(fr) = frozen {
                 take(fr, false);
             }
-            take(self.mem(), true);
+            if let Some((m, _)) = live {
+                take(m, true);
+            }
             let arena = &snap.arena;
             let key_of = |e: &SnapKey| arena.slice(e.off, e.len);
             // Ordered by prefix, then key, then index -- frozen entries
@@ -8644,10 +8781,12 @@ impl Reader {
                     });
                 }
             };
-            if let Some(fr) = self.frozen() {
+            if let Some(fr) = frozen {
                 take(fr, false);
             }
-            take(self.mem(), true);
+            if let Some((m, _)) = live {
+                take(m, true);
+            }
             all.sort_by(|a, b| a.key.cmp(&b.key));
             for o in all {
                 snap.push_sorted(SnapKey {
@@ -9411,7 +9550,13 @@ impl Reader {
         to: usize,
         have: Option<std::sync::Arc<Snapshot>>,
     ) -> std::sync::Arc<Snapshot> {
-        let carry = have.filter(|s| s.live_len <= to && s.side.is_empty() && s.fresh.is_empty());
+        // With no run of this state to carry, the frozen table's own
+        // snapshot is one -- of the frozen table and none of the live --
+        // and carrying it forward merges the live keys alone, where a
+        // build sorts the frozen table again with them.
+        let carry = have
+            .filter(|s| s.live_len <= to && s.side.is_empty() && s.fresh.is_empty())
+            .or_else(|| self.frozen_base());
         let snap = match carry {
             Some(s) if s.live_len == to => return s,
             Some(s) => {
@@ -9424,6 +9569,40 @@ impl Reader {
         };
         self.publish_snapshot(&snap);
         snap
+    }
+
+    /// The frozen table's own snapshot (`FrozenSnaps`): the one whoever
+    /// sorted the table first set on it, and otherwise sorted here, alone,
+    /// by the build a scan would make, and set for whoever comes next.
+    fn frozen_snapshot(&self, fr: &MemTable) -> std::sync::Arc<Snapshot> {
+        if let Some(s) = fr.snaps.best() {
+            return s;
+        }
+        let s = std::sync::Arc::new(self.build_over(None, Some(fr), 0));
+        self.shared
+            .frozen_sorts
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        let cell = if s.runs {
+            &fr.snaps.copied
+        } else {
+            &fr.snaps.sorted
+        };
+        if cell.set(s.clone()) {
+            s
+        } else {
+            cell.get().expect("set by whoever won")
+        }
+    }
+
+    /// The frozen table's own snapshot as the base a snapshot of this
+    /// state starts from, where snapshots are shared: unshared, each
+    /// handle sorts its own from nothing, which is that arm's meaning.
+    fn frozen_base(&self) -> Option<std::sync::Arc<Snapshot>> {
+        if !self.opts.share_snapshot || !self.opts.frozen_snaps {
+            return None;
+        }
+        let fr = self.frozen()?.clone();
+        Some(self.frozen_snapshot(&fr))
     }
 
     fn adopt_snapshot(&self) -> Option<std::sync::Arc<Snapshot>> {
@@ -12296,6 +12475,7 @@ impl Db {
             retired_forms: RetireList::new(),
             retired_snaps: RetireList::new(),
             snap_builds: AtomicU64::new(0),
+            frozen_sorts: AtomicU64::new(0),
             unshaped_wake: std::sync::atomic::AtomicBool::new(false),
             lag_wake: std::sync::atomic::AtomicBool::new(false),
             lag_level: std::sync::atomic::AtomicU32::new(0),
@@ -12639,6 +12819,7 @@ impl Db {
             retired_forms: RetireList::new(),
             retired_snaps: RetireList::new(),
             snap_builds: AtomicU64::new(0),
+            frozen_sorts: AtomicU64::new(0),
             unshaped_wake: std::sync::atomic::AtomicBool::new(false),
             lag_wake: std::sync::atomic::AtomicBool::new(false),
             lag_level: std::sync::atomic::AtomicU32::new(0),
@@ -13415,6 +13596,7 @@ impl Db {
             None
         };
         let from_snapshot = self.opts.seal_from_snapshot;
+        let frozen_snaps = self.opts.frozen_snaps;
         let job = move |readable: &SealReadable| -> Result<Vec<String>> {
             if background_io == BackgroundIo::Idle {
                 idle_io_priority();
@@ -13429,8 +13611,26 @@ impl Db {
             // the new engine -- how the roll writes decides what the read
             // costs -- and the sort is affordable because a seal is off the
             // commit path. The same sort is what makes splitting at the
-            // fences a matter of slicing.
-            let order = mem.slots_in_key_order();
+            // fences a matter of slicing. A table someone sorted already --
+            // the writer's carry at the freeze, a scan, the keeper -- has
+            // its order on it (`FrozenSnaps`), and the seal takes that once
+            // it holds every entry: an entry it lacked would be a key the
+            // segment never wrote, so a short one is sorted past.
+            let have = mem.snaps.best().filter(|h| {
+                let whole = h.ents.len() == mem.len() && h.side.is_empty() && h.fresh.is_empty();
+                debug_assert!(
+                    whole,
+                    "a frozen table's snapshot holds every entry of it once"
+                );
+                frozen_snaps && whole
+            });
+            let order: Vec<u32> = match &have {
+                Some(h) => h.ents.iter().map(|e| e.frozen).collect(),
+                None => {
+                    SealCounts::add(&counts.seal_sorts, 1);
+                    mem.slots_in_key_order()
+                }
+            };
             SealCounts::add(&counts.seal_sort_ns, t_job.elapsed().as_nanos() as u64);
 
             // The table's snapshot, with every chain copied in key order,
@@ -13450,7 +13650,26 @@ impl Db {
             // alone.
             let t_snap = std::time::Instant::now();
             let snap = snap_reader.as_ref().and_then(|r| {
-                let snap = std::sync::Arc::new(Snapshot::from_frozen(&mem, &order)?);
+                // The copy set on the table first, for every reader of it
+                // and for the records below: one with the chains taken as
+                // it is, one without them built from its order and given
+                // its bounds, which hold for the same keys in the same
+                // order.
+                let snap = match have.as_ref().filter(|h| h.runs && h.frozen_runs) {
+                    Some(h) => h.clone(),
+                    None => {
+                        let mut built = Snapshot::from_frozen(&mem, &order)?;
+                        if let Some(h) = &have {
+                            built.bounds = h.bounds.clone();
+                        }
+                        let built = std::sync::Arc::new(built);
+                        if !frozen_snaps || mem.snaps.copied.set(built.clone()) {
+                            built
+                        } else {
+                            mem.snaps.copied.get().expect("set by whoever won")
+                        }
+                    }
+                };
                 let entered = r.enter();
                 let st = r.state();
                 if st
@@ -14147,6 +14366,12 @@ impl Db {
     #[doc(hidden)]
     pub fn forms_rebased(&self) -> u64 {
         self.shared.forms_rebased.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Frozen tables a reader sorted over this store's life, because the
+    /// seal, the freeze or another reader had not sorted them first.
+    pub fn frozen_sorts(&self) -> u64 {
+        self.shared.frozen_sorts.load(AtomicOrdering::Relaxed)
     }
 
     /// EXPERIMENT: scan snapshots built over this store's life. Sharing
@@ -15578,7 +15803,8 @@ impl Reader {
             (Some(a), Some(b)) if (b.live_len, b.log_at) > (a.live_len, a.log_at) => Some(b),
             (Some(a), _) => Some(a),
             (None, b) => b,
-        };
+        }
+        .or_else(|| self.frozen_base());
         let next = match base {
             Some(s) => {
                 self.shared
@@ -15688,6 +15914,11 @@ impl Reader {
                 .as_ref()
                 .is_some_and(|f| std::sync::Arc::ptr_eq(f, live));
         if froze {
+            // The table's own snapshot, where its seal or a scan set one
+            // first: the same keys in the same order, made already.
+            if let Some(have) = live.snaps.best().filter(|_| self.opts.frozen_snaps) {
+                return Some(have);
+            }
             let s = if s.live_len < live.len() || s.log_at < live.log_len() {
                 self.shared
                     .snap_extends
@@ -15719,7 +15950,22 @@ impl Reader {
                     frun: e.lrun,
                 });
             }
-            return Some(std::sync::Arc::new(out));
+            // Offered to the table, which is final now, for the seal and
+            // every reader after: with every chain, as the seal's own copy
+            // is, or as an order alone.
+            let out = std::sync::Arc::new(out);
+            if !self.opts.frozen_snaps {
+                return Some(out);
+            }
+            let cell = if out.runs && out.ents.iter().all(|e| e.frun != NO_RUN) {
+                &live.snaps.copied
+            } else {
+                &live.snaps.sorted
+            };
+            if cell.set(out.clone()) {
+                return Some(out);
+            }
+            return live.snaps.best();
         }
         None
     }
@@ -19242,6 +19488,10 @@ mod threading {
         fn sent<T: Send>() {}
         shared::<super::State>();
         shared::<super::Shared>();
+        // The memtable's own `Sync` is asserted by hand, so what it holds
+        // is asked here for itself.
+        shared::<super::Snapshot>();
+        shared::<super::FrozenSnaps>();
         sent::<super::Reader>();
     }
 

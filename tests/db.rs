@@ -7650,12 +7650,16 @@ fn reader_handles_across_seals_see_every_value_once_and_in_order() {
 /// few hundred kilobytes did not: this disk's syncs are fast, and the
 /// seal was landed by a commit two milliseconds after its publish.
 fn seal_snapshot_store(name: &str) -> (Db, ScanModel) {
+    seal_snapshot_store_with(name, Options::default())
+}
+
+fn seal_snapshot_store_with(name: &str, base: Options) -> (Db, ScanModel) {
     let d = dir(name);
     let opts = Options {
         seal_bytes: 1 << 30,
         publish_in_background: false,
         seal_sync_every: 1024,
-        ..Options::default()
+        ..base
     };
     let mut db = Db::create(&d, opts).unwrap();
     let mut m = ScanModel::default();
@@ -7724,6 +7728,110 @@ fn a_handle_reads_the_seals_snapshot_while_the_seal_runs() {
     m.check(&r, "a handle after the landing");
     m.check(&db, "the writer after the landing");
     assert_eq!(db.seal_snapshots(), 1);
+    drop(r);
+    db.close().unwrap();
+}
+
+/// A frozen table's snapshot lives on the table, not in the state it was
+/// published into: a state the writer publishes while the seal runs --
+/// here the switch to an ordered table a key above the store's greatest
+/// makes -- holds no published snapshot, and the first scan over it, a
+/// handle's or the writer's, carries the table's own forward instead of
+/// sorting the table again. The seal sorted it once and nobody else does.
+#[test]
+fn a_frozen_tables_snapshot_outlives_the_state_it_was_published_in() {
+    for frozen_snaps in [true, false] {
+        let (mut db, mut m) = seal_snapshot_store_with(
+            &format!("frozen-snap-on-table-{frozen_snaps}"),
+            Options {
+                frozen_snaps,
+                ..Options::default()
+            },
+        );
+        db.seal().unwrap();
+        await_seal_snapshot(&db);
+        // Above every key, over the empty live table: a direct run opens,
+        // and its switch publishes a state with no snapshot in it.
+        m.append(&mut db, "zz-00001", "after");
+        m.append(&mut db, "zz-00002", "after");
+        db.commit().unwrap();
+        let r = db.reader().unwrap();
+        m.check(&r, "a handle over the switched state");
+        m.check(&db, "the writer over the switched state");
+        if frozen_snaps {
+            assert_eq!(
+                db.snapshot_builds(),
+                0,
+                "the handle and the writer carried the table's snapshot forward"
+            );
+        } else {
+            assert!(
+                db.snapshot_builds() > 0,
+                "off, a reader of the switched state sorts the table itself"
+            );
+        }
+        assert_eq!(db.frozen_sorts(), 0, "nobody sorted the frozen table alone");
+        assert!(db.in_flight().0, "nothing landed the seal");
+        db.settle().unwrap();
+        m.check(&r, "a handle after the landing");
+        m.check(&db, "the writer after the landing");
+        assert_eq!(db.seal_waits().seal_sorts, 1, "the seal sorted its table");
+        drop(r);
+        db.close().unwrap();
+    }
+}
+
+/// The writer's snapshot carried across its freeze (`snapshot_carry`) is
+/// the frozen table's whole order, set on the table at the freeze, so the
+/// seal takes it rather than sorting the table again, and the reads
+/// through the seal and after its landing answer as the model does.
+#[test]
+fn the_seal_takes_the_order_the_writers_freeze_carried() {
+    let d = dir("seal-takes-carried-order");
+    let opts = Options {
+        seal_bytes: 1 << 30,
+        partition_bytes: Some(64 << 10),
+        snapshot_carry: true,
+        direct_ingest: false,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    for k in 0..3000u32 {
+        m.append(&mut db, &format!("key-{k:05}"), "p");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    assert!(db.levels().0 > 1, "partitions for the forms to carry over");
+    for k in (0..3000u32).step_by(3) {
+        m.append(&mut db, &format!("key-{k:05}"), "u");
+    }
+    for k in 0..500u32 {
+        m.append(&mut db, &format!("key-{k:05}a"), "n");
+    }
+    for k in (0..3000u32).step_by(11) {
+        m.delete(&mut db, &format!("key-{k:05}"));
+    }
+    db.commit().unwrap();
+    // A scan through the writer before the freeze, so its tables are in
+    // use and the freeze carries them and the snapshot.
+    m.check(&db, "the writer before the freeze");
+    // The flush's seal sorted its own table; this seal is counted alone.
+    let sorts_before = db.seal_waits().seal_sorts;
+    db.seal().unwrap();
+    m.check(&db, "the writer during the seal");
+    let r = db.reader().unwrap();
+    m.check(&r, "a handle during the seal");
+    db.settle().unwrap();
+    m.check(&db, "the writer after the landing");
+    m.check(&r, "a handle after the landing");
+    assert_eq!(
+        db.seal_waits().seal_sorts,
+        sorts_before,
+        "the seal took the order the freeze set on its table"
+    );
+    assert_eq!(db.frozen_sorts(), 0, "and so did every reader");
     drop(r);
     db.close().unwrap();
 }
