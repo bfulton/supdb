@@ -429,6 +429,7 @@ pub struct Supdb {
     defer: bool,
     firstfloor: bool,
     nofrozen: bool,
+    idle: bool,
 }
 
 /// What an arm differs from `supdb` by. One struct rather than a row of
@@ -543,6 +544,10 @@ struct Policy {
     /// table kept its own snapshot: `Options::frozen_snaps` off.
     /// `supdb-nofrozen`, and `supdb-shapenofrozen` under the shape.
     nofrozen: bool,
+    /// A commit under the threshold seals whenever no seal is writing
+    /// (`Options::seal_idle`). `supdb-idle`, and `supdb-shapeidle` under
+    /// the shape.
+    idle: bool,
 }
 
 impl Default for Policy {
@@ -569,6 +574,7 @@ impl Default for Policy {
             adapttrig: false,
             rotate: false,
             nofrozen: false,
+            idle: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -762,6 +768,34 @@ impl Supdb {
                 durable: false,
                 shape: true,
                 nofrozen: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// EXPERIMENT: `supdb` whose commits seal whenever no seal is writing
+    /// (`Options::seal_idle`).
+    pub fn create_idle(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                idle: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// EXPERIMENT: `supdb-ingestshape` whose commits seal whenever no seal
+    /// is writing (`Options::seal_idle`).
+    pub fn create_shape_idle(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                drain: false,
+                durable: false,
+                shape: true,
+                idle: true,
                 ..Policy::default()
             },
         )
@@ -1368,6 +1402,7 @@ impl Supdb {
             defer,
             firstfloor,
             nofrozen,
+            idle,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -1487,6 +1522,7 @@ impl Supdb {
             seal_rotates_wal: rotate,
             frozen_snaps: !nofrozen,
             seal_defers: defer,
+            seal_idle: idle,
             seal_first_floor: firstfloor,
             // Below this the builder declines and the writer fills the
             // forms inline on the commit path instead, which is the
@@ -1556,6 +1592,7 @@ impl Supdb {
             defer,
             firstfloor,
             nofrozen,
+            idle,
         })
     }
 }
@@ -1627,6 +1664,13 @@ impl Engine for Supdb {
         }
         if self.defer {
             return "supdb-shapedefer";
+        }
+        if self.idle {
+            return if self.shape {
+                "supdb-shapeidle"
+            } else {
+                "supdb-idle"
+            };
         }
         if self.nofrozen {
             return if self.shape {
@@ -1837,6 +1881,7 @@ impl Engine for Supdb {
             ("seals", db.seal_waits().joins as f64),
             ("publishes", db.seal_waits().publishes as f64),
             ("seals_deferred", db.seal_waits().deferred as f64),
+            ("seals_idle", db.seal_waits().idle_seals as f64),
             ("wal_rotations", db.seal_waits().wal_rotations as f64),
             ("freeze_ms", db.seal_waits().freeze_ns as f64 / 1e6),
             ("join_wait_ms", db.seal_waits().join_wait_ns as f64 / 1e6),
@@ -2305,7 +2350,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice"
         | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "supdb-inlinemaint"
         | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose" | "supdb-rotate"
-        | "supdb-nofrozen" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
+        | "supdb-nofrozen" | "supdb-idle" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest"
         | "supdb-ingestleave"
         | "supdb-ingestnoseal"
@@ -2319,6 +2364,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-shapedefer"
         | "supdb-shapefloor"
         | "supdb-shapenofrozen"
+        | "supdb-shapeidle"
         | "lmdb-nosync"
         | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
@@ -2377,6 +2423,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-shapedefer" => Box::new(Supdb::create_shape_defer(dir)?),
         "supdb-shapefloor" => Box::new(Supdb::create_shape_floor(dir)?),
         "supdb-shapenofrozen" => Box::new(Supdb::create_shape_nofrozen(dir)?),
+        "supdb-idle" => Box::new(Supdb::create_idle(dir)?),
+        "supdb-shapeidle" => Box::new(Supdb::create_shape_idle(dir)?),
         "supdb-ingestadaptloose" => Box::new(Supdb::create_ingest_adaptloose(dir)?),
         "supdb-ingestnoseal" => Box::new(Supdb::create_ingest_noseal(dir)?),
         "lmdb" => Box::new(Lmdb::create(dir, map_gb)?),

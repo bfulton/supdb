@@ -509,6 +509,28 @@ pub struct Options {
     /// of two of where the wait bounded them. Off, the commit waits in the
     /// seal for room.
     pub seal_defers: bool,
+    /// EXPERIMENT: a commit under the seal threshold seals anyway when no
+    /// seal is writing a table -- the frozen list empty and no table
+    /// handed -- and the live table holds `SEAL_CAP_FLOOR` or more: the
+    /// sealer runs whenever it is idle, so the unsealed backlog at any
+    /// moment is at most what was written while one seal ran, and a
+    /// `sync` finds a small table to hand rather than up to `seal_bytes`
+    /// of one. Hashed tables alone: a direct run writes its segment as it
+    /// goes and closes at the threshold. Only where the segment work has
+    /// a thread of its own, since inline every seal is joined. And only
+    /// in a stretch of writes nobody reads (`Db::read_mode`): a store
+    /// being read, by key or by range, keeps its writes in the table,
+    /// where a point read is one hash probe and a scan reads them through
+    /// the forms, both cheaper than over a piece in flight and then a
+    /// piece; sealed meanwhile, a backlog left by a point-read phase met
+    /// the scans of the phase after as a frozen table and then a piece,
+    /// and ycsb-E read 0.88-0.91x. While the idle seals run the threshold
+    /// is `seal_bytes` alone, the cap and the first floor left off, since
+    /// the idle seals keep the backlog small; with reads around the cap
+    /// stands. A commit in such a stretch with no scan near files no
+    /// backlog into the forms either, since the idle seals put partitions
+    /// under a load nobody reads.
+    pub seal_idle: bool,
     /// EXPERIMENT: under `adaptive_shape`, with `compact` and `promote`, a
     /// store with no segment seals its first table at `SEAL_CAP_FLOOR`
     /// rather than at `seal_bytes`, so a first load leaves a partition
@@ -1122,6 +1144,7 @@ impl Default for Options {
             adaptive_shape: false,
             seal_rotates_wal: false,
             seal_defers: false,
+            seal_idle: false,
             seal_first_floor: false,
             recycle_wal: false,
             read_advice: ReadAdvice::default(),
@@ -5153,6 +5176,9 @@ struct SealCounts {
     /// Commits past the seal threshold that kept writing because the
     /// frozen tables filled the list (`Options::seal_defers`).
     deferred: AtomicU64,
+    /// Seals a commit under the threshold started because no seal was
+    /// writing (`Options::seal_idle`).
+    idle_seals: AtomicU64,
     /// WAL rotations, at seals or by size, and the bytes a rotation left
     /// unsynced in the file it closed -- zero by construction, and the
     /// quantity a test holds to it.
@@ -5180,6 +5206,7 @@ impl SealCounts {
             seal_thread_ns: get(&self.seal_thread_ns),
             seal_sorts: get(&self.seal_sorts),
             deferred: get(&self.deferred),
+            idle_seals: get(&self.idle_seals),
             wal_rotations: get(&self.wal_rotations),
             rotated_unsynced: get(&self.rotated_unsynced),
             freeze_ns: get(&self.freeze_ns),
@@ -5220,6 +5247,9 @@ pub struct SealWaits {
     /// and the bytes they left unsynced, and the writer's time in the
     /// seals its commits started.
     pub deferred: u64,
+    /// Seals started by a commit under the threshold because no seal was
+    /// writing (`Options::seal_idle`).
+    pub idle_seals: u64,
     pub wal_rotations: u64,
     pub rotated_unsynced: u64,
     pub freeze_ns: u64,
@@ -6028,6 +6058,12 @@ struct Shared {
     /// how long ago the last one was; the state's own count restarts at
     /// every publish.
     scans_life: AtomicU64,
+    /// Scans and point reads through any handle but the writer's, a
+    /// handle's said once per commit as with `scans_life`, where the idle
+    /// seals follow the reads (`Options::seal_idle`); the writer counts
+    /// its own apart (`Reader::mode_note`).
+    mode_scans: AtomicU64,
+    mode_points: AtomicU64,
     /// Handles the caller made and still holds: who the forms are
     /// published for.
     live_handles: AtomicUsize,
@@ -6408,6 +6444,9 @@ pub struct Reader {
     /// The commit -- generation and committed log length -- this handle
     /// last signalled a scan at, so it signals once per commit.
     signalled: std::cell::Cell<(u64, usize)>,
+    /// Under `Options::seal_idle`, the commits this handle last said a
+    /// scan and a point read at, and the writer's own counts of each.
+    mode_note: std::cell::Cell<ModeNote>,
     /// How far into the write log this handle may look: the log's length
     /// at the commit whose watermark it reads under, taken before the
     /// watermark so it never runs ahead of it, or unbounded under `Dirty`
@@ -6654,6 +6693,11 @@ pub struct Db {
     /// (`take_fresh_mem`), which freezes it under a fresh one -- and this
     /// is cleared once the writer has seen it replaced.
     mem_handed: Option<std::sync::Arc<MemTable>>,
+    /// The reads the writer last counted, scans and point reads, and
+    /// whether none came between that look and the one before: a stretch
+    /// of writes nobody reads, where the idle seals run
+    /// (`Options::seal_idle`). A store nothing has read starts in one.
+    read_mode: (u64, u64, bool),
     /// The store's greatest key, or empty for none: what a key has to be
     /// above to go direct.
     max_key: Vec<u8>,
@@ -6860,6 +6904,31 @@ struct SnapKey {
 
 /// No copied run for a snapshot key.
 const NO_RUN: u32 = u32::MAX;
+
+/// What a handle last said of its reads for the read mode
+/// (`Reader::note_read`): the commits it last said a scan and a point
+/// read at, and the writer's own counts, which it says to no one.
+#[derive(Clone, Copy)]
+struct ModeNote {
+    scan_at: (u64, usize),
+    point_at: (u64, usize),
+    scans: u64,
+    points: u64,
+    /// The writer's: its last commit came after no read at all.
+    quiet: bool,
+}
+
+impl Default for ModeNote {
+    fn default() -> ModeNote {
+        ModeNote {
+            scan_at: (0, usize::MAX),
+            point_at: (0, usize::MAX),
+            scans: 0,
+            points: 0,
+            quiet: false,
+        }
+    }
+}
 
 /// The most frozen tables a state may hold, which the fixed arrays a read
 /// keeps per frozen table are sized for; `FROZEN_CAP` is how many it does.
@@ -8458,6 +8527,17 @@ impl Reader {
     /// bytes at the calibrated ratio (`DATA_PER_FILE`), or their file bytes
     /// themselves under `seal_on_file`.
     pub fn seal_threshold(&self) -> usize {
+        self.threshold_for(false)
+    }
+
+    /// `seal_threshold`, or with `idle` -- the idle seals on and the store
+    /// not being read by key -- `seal_bytes` alone: the cap and the first
+    /// floor keep the backlog small by sealing sooner, which the idle
+    /// seals do already, and would only cut the pieces finer. While the
+    /// store is read by key the idle seals are off and the cap stands, so
+    /// a backlog a point-read phase leaves is the cap's and not
+    /// `seal_bytes` of one; see `Options::seal_idle`.
+    fn threshold_for(&self, idle: bool) -> usize {
         let _e = self.enter();
         let st = self.state();
         let sized = if self.opts.seal_on_file {
@@ -8473,6 +8553,9 @@ impl Reader {
                 .seal_bytes
                 .max(usize::try_from(grown).unwrap_or(usize::MAX))
         };
+        if idle {
+            return base;
+        }
         // A store with no segment and a shape the background makes: its
         // first seal at the floor, so a first load leaves a partition. Not
         // a direct run's; see `Options::seal_first_floor`.
@@ -8659,6 +8742,38 @@ impl Reader {
         limit.saturating_mul(mean) >= self.opts.scan_readahead_bytes
     }
 
+    /// A read, scan or point, for the read mode the idle seals follow
+    /// (`Options::seal_idle`): the writer's counted in a cell of its own,
+    /// a handle's said once per commit, so no read writes a shared line
+    /// more than once a commit.
+    #[inline]
+    fn note_read(&self, scan: bool) {
+        if !self.opts.seal_idle {
+            return;
+        }
+        let mut m = self.mode_note.get();
+        if self.slot.is_none() {
+            if scan {
+                m.scans += 1;
+            } else {
+                m.points += 1;
+            }
+            self.mode_note.set(m);
+            return;
+        }
+        let now = (self.state().gen, self.mem().committed_log());
+        let (at, shared) = if scan {
+            (&mut m.scan_at, &self.shared.mode_scans)
+        } else {
+            (&mut m.point_at, &self.shared.mode_points)
+        };
+        if *at != now {
+            *at = now;
+            self.mode_note.set(m);
+            shared.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
     fn advise(&self, random: bool) {
         if self.opts.read_advice != ReadAdvice::Adaptive || self.advice_random() == random {
             return;
@@ -8712,6 +8827,7 @@ impl Reader {
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], mut f: F) -> Result<u64> {
         let _entered = self.enter();
         self.advise(true);
+        self.note_read(false);
         // The state once, and the memtable's hash and slot line only when
         // it has entries: a read over a store just flushed hashed the key
         // and fetched a line of an empty table, and took the state through
@@ -9043,6 +9159,7 @@ impl Reader {
         mut f: F,
     ) -> Result<usize> {
         let _entered = self.enter();
+        self.note_read(true);
         self.advise(!self.scan_wants_readahead(limit));
         // `Prefetch` never changes mode, so `advise` above is a no-op for it.
         // Instead the segments are told exactly which value bytes this scan
@@ -10643,9 +10760,23 @@ impl Reader {
         // A burst is settled by its backlog only near a scan, see
         // `Options::forms_settle_recent_pct`: far from one, what it would
         // file is more likely discarded at the next seal than read.
-        let recent = self.opts.forms_settle_recent_pct == 0
-            || writes - self.fs().writes_at_scan.get()
-                <= (keys / 100 * self.opts.forms_settle_recent_pct) as u64;
+        // Under the idle seals a commit in a stretch nobody reads, with
+        // no scan near, files no backlog: they put partitions under a load
+        // from its first megabyte, and every commit of a load nobody reads
+        // filed its batch into forms the next seal replaced, which took a
+        // shuffled load at three hundred thousand keys to a quarter of its
+        // rate. A window of recency did the same for the load and left the
+        // point-read mixes' writes unfiled for the scans after them,
+        // ycsb-E at 0.79-0.94x. A burst near a scan files as it would
+        // without them: left to the upkeep's hold, the lag sweep's last
+        // burst at ten thousand keys had its forms built on the thread,
+        // and the scans after it ran at 0.74x.
+        let far = !reads_around(life, writes - self.fs().writes_at_scan.get(), keys);
+        let quiet = self.opts.seal_idle && self.mode_note.get().quiet && far;
+        let recent = !quiet
+            && (self.opts.forms_settle_recent_pct == 0
+                || writes - self.fs().writes_at_scan.get()
+                    <= (keys / 100 * self.opts.forms_settle_recent_pct) as u64);
         // Forms the builder has posted are installed now, and the batch
         // settled with them, so the first read after finds them in
         // place; see `Options::build_ahead_on_publish`.
@@ -12445,6 +12576,7 @@ impl Reader {
         // A count resolves one key, so it is a point read for advice
         // purposes even though it returns no bytes (`F28`: 94 ns, a lookup).
         self.advise(true);
+        self.note_read(false);
         let st = self.state();
         let (segs, mem) = (&st.segs, &*st.mem);
         let mem_empty = mem.is_empty();
@@ -12640,6 +12772,45 @@ impl Db {
         false
     }
 
+    /// Whether a commit under the seal threshold seals because the sealer
+    /// is idle (`Options::seal_idle`): no table frozen, none handed, the
+    /// segment work on its own thread, and the live table hashed and past
+    /// `SEAL_CAP_FLOOR`. The state held from the commit's start may still
+    /// show a table a landing has since retired; a stale one only waits
+    /// for the next commit.
+    fn seal_while_idle(&self) -> bool {
+        if !self.opts.seal_idle
+            || self.mem_bytes < SEAL_CAP_FLOOR
+            || self.mem_handed.is_some()
+            || !matches!(self.maint, MaintHome::Away(_))
+        {
+            return false;
+        }
+        if !self.read_mode.2 {
+            return false;
+        }
+        self.rehold();
+        let st = self.state();
+        st.frozen.is_empty() && !st.mem.ordered
+    }
+
+    /// Whether the commit is in a write-only stretch, counted at its look
+    /// (`Db::read_mode`).
+    fn note_read_mode(&mut self) {
+        if !self.opts.seal_idle {
+            return;
+        }
+        let own = self.mode_note.get();
+        let scans = self.shared.mode_scans.load(AtomicOrdering::Relaxed) + own.scans;
+        let points = self.shared.mode_points.load(AtomicOrdering::Relaxed) + own.points;
+        let (s0, p0, _) = self.read_mode;
+        let quiet = scans == s0 && points == p0;
+        self.read_mode = (scans, points, quiet);
+        let mut note = self.mode_note.get();
+        note.quiet = quiet;
+        self.mode_note.set(note);
+    }
+
     /// The new live WAL for a rotation: a recycled retiree when the pool
     /// has one, else a fresh file -- never over the live file's own name,
     /// which a create would truncate and a retirement would delete.
@@ -12824,6 +12995,8 @@ impl Db {
             rd_scans: AtomicU64::new(0),
             rd_blocks: AtomicU64::new(0),
             scans_life: AtomicU64::new(0),
+            mode_scans: AtomicU64::new(0),
+            mode_points: AtomicU64::new(0),
             live_handles: AtomicUsize::new(0),
             blk_reader: AtomicU64::new(0),
             blk_engine: AtomicU64::new(0),
@@ -12866,6 +13039,7 @@ impl Db {
             opts,
             fs: FormsCell::new(),
             signalled: std::cell::Cell::new((0, usize::MAX)),
+            mode_note: std::cell::Cell::new(ModeNote::default()),
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
@@ -12881,6 +13055,7 @@ impl Db {
             mem_bytes: 0,
             direct: None,
             mem_handed: None,
+            read_mode: (0, 0, true),
             max_key: Vec::new(),
             run_scratch: Vec::new(),
             built_ahead_len: 0,
@@ -13169,6 +13344,8 @@ impl Db {
             rd_scans: AtomicU64::new(0),
             rd_blocks: AtomicU64::new(0),
             scans_life: AtomicU64::new(0),
+            mode_scans: AtomicU64::new(0),
+            mode_points: AtomicU64::new(0),
             live_handles: AtomicUsize::new(0),
             blk_reader: AtomicU64::new(0),
             blk_engine: AtomicU64::new(0),
@@ -13211,6 +13388,7 @@ impl Db {
             opts,
             fs: FormsCell::with_tables(Db::tables_for(ntables)),
             signalled: std::cell::Cell::new((0, usize::MAX)),
+            mode_note: std::cell::Cell::new(ModeNote::default()),
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
@@ -13231,6 +13409,7 @@ impl Db {
             mem_bytes,
             direct: None,
             mem_handed: None,
+            read_mode: (0, 0, true),
             max_key,
             run_scratch: Vec::new(),
             built_ahead_len: 0,
@@ -13572,8 +13751,13 @@ impl Db {
         self.lag_tick();
         // A direct run closes when a seal would: it joins whole, as a
         // seal's piece does by promotion, so the two paths leave one shape.
-        let threshold = self.seal_threshold();
-        if self.mem_bytes >= threshold && self.seal_now(threshold) {
+        self.note_read_mode();
+        let threshold = self.threshold_for(self.opts.seal_idle && self.read_mode.2);
+        let due = self.mem_bytes >= threshold && self.seal_now(threshold);
+        if due || self.seal_while_idle() {
+            if !due {
+                SealCounts::add(&self.shared.seal_counts.idle_seals, 1);
+            }
             let ts = std::time::Instant::now();
             self.seal()?;
             SealCounts::add(
@@ -14850,6 +15034,7 @@ impl Reader {
             opts: self.opts.clone(),
             fs: FormsCell::new(),
             signalled: std::cell::Cell::new((0, usize::MAX)),
+            mode_note: std::cell::Cell::new(ModeNote::default()),
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
@@ -14876,6 +15061,7 @@ impl Reader {
             opts: self.opts.clone(),
             fs: FormsCell::new(),
             signalled: std::cell::Cell::new((0, usize::MAX)),
+            mode_note: std::cell::Cell::new(ModeNote::default()),
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
@@ -14909,6 +15095,7 @@ impl Reader {
             opts: self.opts.clone(),
             fs: FormsCell::new(),
             signalled: std::cell::Cell::new((0, usize::MAX)),
+            mode_note: std::cell::Cell::new(ModeNote::default()),
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
@@ -16723,6 +16910,7 @@ impl Reader {
             wm: std::cell::Cell::new(SEE_ALL),
             opts: self.opts.clone(),
             signalled: std::cell::Cell::new((0, usize::MAX)),
+            mode_note: std::cell::Cell::new(ModeNote::default()),
             log_bound: std::cell::Cell::new(usize::MAX),
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
@@ -16785,6 +16973,13 @@ impl Reader {
         let fs = self.lend_fs().expect("the pass holds the upkeep");
         (fs, done)
     }
+}
+
+/// Whether reads are around: a scan over the store in its life, and no
+/// more than two stores' worth of writes since the last. The upkeep's
+/// hand-over and the idle seals' filing ask it alike.
+fn reads_around(life: u64, since_scan: u64, keys: usize) -> bool {
+    life > 0 && since_scan <= 2 * keys as u64
 }
 
 /// The upkeep thread in flight: its handle and the flag that stops it.
@@ -16850,7 +17045,7 @@ impl Db {
         } else {
             self.upkeep_since_scan += batch as u64;
         }
-        let reads_around = life > 0 && self.upkeep_since_scan <= 2 * keys as u64;
+        let reads_around = reads_around(life, self.upkeep_since_scan, keys);
         let force = match level {
             0 | 1 => false,
             2 => reads_around,

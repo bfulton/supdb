@@ -9759,6 +9759,117 @@ fn a_commit_past_the_threshold_keeps_writing_while_the_frozen_list_is_full() {
     holds_all(&db, &want, "after the deferred seal");
 }
 
+/// A commit under the seal threshold seals whenever the sealer is idle
+/// (`seal_idle`) in a stretch of writes nobody reads: no table frozen or
+/// handed, the live table past the floor, and no read since the commit
+/// before. The seal it starts is held before it writes, so the sealer is
+/// busy for as long as the test says: commits past the floor meanwhile
+/// seal nothing more, and the first quiet commit after the landing seals
+/// what grew. Writes with a read before every commit, as a mix makes
+/// them, keep their writes in the table and seal nothing. Off, nothing
+/// seals below the threshold at all. Every key reads right throughout.
+#[test]
+fn a_commit_seals_whenever_the_sealer_is_idle() {
+    for idle in [false, true] {
+        let d = dir(&format!("seal-idle-{idle}"));
+        let opts = Options {
+            seal_idle: idle,
+            // Never by the threshold: every seal here is the idle rule's.
+            seal_bytes: 1 << 30,
+            seal_max_pct: 0,
+            sync: supdb::SyncPolicy::EveryN(u32::MAX),
+            direct_ingest: false,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        let mut want: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+        let per = tail_key(0).len() + tail_val(1).len();
+        // A little past the floor's worth of keys, shuffled so the table
+        // is hashed.
+        let batch = (1u32 << 20) / per as u32 + 200;
+        let mut next = 0u32;
+        let mut write = |db: &mut Db, want: &mut BTreeMap<Vec<u8>, Vec<Vec<u8>>>, n: u32| {
+            for i in 0..n {
+                let k = tail_key((next + i).wrapping_mul(7919) % 1_000_003);
+                db.append(&k, &tail_val(1));
+                want.entry(k).or_default().push(tail_val(1));
+                if i % 100 == 99 {
+                    db.commit().unwrap();
+                }
+            }
+            db.commit().unwrap();
+            next += n;
+        };
+        let scan_once = |db: &Db| {
+            db.scan(b"", 1, |_, _| {}).unwrap();
+        };
+        db.hold_seal_landing(true);
+        let watch = Watchdog::arm("a commit waited for a held seal");
+        write(&mut db, &mut want, batch);
+        let first = db.seal_waits().idle_seals;
+        assert_eq!(
+            (first, db.frozen_tables()),
+            if idle { (1, 1) } else { (0, 0) },
+            "idle {idle}: one seal past the floor"
+        );
+        // Busy: past the floor again, and nothing more seals.
+        write(&mut db, &mut want, batch);
+        assert_eq!(db.seal_waits().idle_seals, first, "idle {idle}: busy");
+        drop(watch);
+        holds_all(&db, &want, &format!("idle {idle}: beside the held seal"));
+        db.hold_seal_landing(false);
+        db.settle().unwrap();
+        // Idle again: the check's reads are one commit's window, and the
+        // next quiet commit seals what grew.
+        db.commit().unwrap();
+        write(&mut db, &mut want, 100);
+        db.settle().unwrap();
+        assert_eq!(
+            db.seal_waits().idle_seals,
+            if idle { 2 } else { 0 },
+            "idle {idle}: the next commit after the landing"
+        );
+        if idle {
+            assert!(
+                db.unsealed_keys() < 200,
+                "idle {idle}: what grew went to the seal: {} unsealed",
+                db.unsealed_keys()
+            );
+        } else {
+            assert_eq!(db.segments(), 0, "off, nothing sealed under the threshold");
+        }
+        // A read before every commit, by key and by range in turn: past
+        // the floor, and nothing seals.
+        let probe: Vec<Vec<u8>> = want.keys().take(64).cloned().collect();
+        for i in 0..batch {
+            let k = tail_key((next + i).wrapping_mul(7919) % 1_000_003);
+            db.append(&k, &tail_val(2));
+            want.entry(k).or_default().push(tail_val(2));
+            if i % 100 == 99 {
+                if (i / 100) % 2 == 0 {
+                    read_vec(&db, &probe[(i as usize / 100) % probe.len()]);
+                } else {
+                    scan_once(&db);
+                }
+                db.commit().unwrap();
+            }
+        }
+        read_vec(&db, &probe[0]);
+        db.commit().unwrap();
+        db.settle().unwrap();
+        assert_eq!(
+            db.seal_waits().idle_seals,
+            if idle { 2 } else { 0 },
+            "idle {idle}: reads around keep the writes in the table"
+        );
+        assert!(
+            db.unsealed_keys() >= batch as usize,
+            "idle {idle}: unsealed"
+        );
+        holds_all(&db, &want, &format!("idle {idle}: after the landings"));
+    }
+}
+
 /// A fresh store under the shape (`adaptive_shape`) seals its first load
 /// at the floor (`seal_first_floor`), so the load leaves a partition
 /// behind, where without it a store under `seal_bytes` stays wholly in
