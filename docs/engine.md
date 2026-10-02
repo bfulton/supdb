@@ -2933,6 +2933,36 @@ same time; on the idle seals' arm, whose seals leave pieces over a small
 partition, 84% of the pass was building block forms over the pieces
 after the landing.
 
+#### The flush's path, one step at a time
+
+The buffered arm's ordered load at three hundred thousand keys loaded at
+the durable arm's rate, and its `sync`, a flush, took 127-177 ms against
+54-60 for `lmdb-nosync`'s. The writer made no sync call of its own in
+it: it waited. Timestamps on the steps put the flush's time in a chain.
+The direct run that had reached the threshold just before the flush was
+still finishing its index, 23-58 ms more; then its segment's fsync,
+49-62 ms; then the landing's open of the segment, 25-35 ms, its key
+index's checksums and the Bloom a level-0 piece is given at open; then
+the promotion that relinks it as the partition, 9 ms. The landing came
+after the fsync because a drain joined each seal's thread before landing
+it, where the poll lands a seal readable as soon as its thread names its
+segments. The drain lands the front seal readable first now and joins it
+after, so the open runs inside the fsync. The promotion's 9 ms was its
+reopen reading the key index's checksum row again, 6-7 ms of it, for a
+link to a file whose open had just read it; it reads none now.
+
+Priced as two binaries alternated a process at a time, ten to sixteen
+pairs a rung, the buffered arm's ordered load's flush read 0.74x at
+three hundred thousand keys (shorter in 9 of 10 pairs), 0.78x at a
+hundred thousand (12 of 12) and 0.81x at ten thousand (13 of 16), the
+load with it 0.86-0.90x, and the durable arm's ordered flush 0.77x (7 of
+8); the batches, which the change does not touch, were level in all of
+them, and so was the durable arm's shuffled flush, a seal and a
+partition merge whose time the fsync does not lead: 0.99x and 0.97x at
+three hundred thousand and a hundred thousand keys. What is left of the
+ordered flush is the run's index and its fsync, the second about what
+LMDB's whole sync costs for about the same bytes.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and
