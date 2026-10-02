@@ -2963,6 +2963,27 @@ three hundred thousand and a hundred thousand keys. What is left of the
 ordered flush is the run's index and its fsync, the second about what
 LMDB's whole sync costs for about the same bytes.
 
+#### A buffered run written back as it grows
+
+What was left of the buffered ordered load's flush after the drain
+landed readable first was the run's index and its segment's fsync, which
+wrote back the whole run: nothing of a thirty-megabyte file written in a
+third of a second is written back before a sync on this guest, whose
+background writeback starts at a tenth of its memory, a gigabyte and a
+half, or at thirty seconds. A direct run whose commits do not sync it
+now hands each 2 MB piece to writeback as it writes it
+(`direct_writeback`, `sync_file_range`). The run's final fsync at three
+hundred thousand keys, traced in three pairs, fell from 43-48 ms to
+27-30; what it still writes is mostly the index, written at the close
+just before it. That is about a twentieth of the load, under what the
+suite resolves: against `supdb-ingestnowb` in one process, fourteen
+pairs a rung, the ordered load read 1.05x at three hundred thousand and
+a hundred thousand keys and 1.06x at ten thousand, where a run of a
+megabyte and a half fills no piece and the writeback never runs. Where
+every commit syncs the run the writeback is off: on the durable arm the
+same writeback read the ordered load 1.10x slower, slower in seven of
+eight pairs, its commits' syncs already writing what it asked for.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and
