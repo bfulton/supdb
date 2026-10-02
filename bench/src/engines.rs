@@ -430,6 +430,7 @@ pub struct Supdb {
     firstfloor: bool,
     nofrozen: bool,
     idle: bool,
+    sortover: bool,
 }
 
 /// What an arm differs from `supdb` by. One struct rather than a row of
@@ -548,6 +549,10 @@ struct Policy {
     /// (`Options::seal_idle`). `supdb-idle`, and `supdb-shapeidle` under
     /// the shape.
     idle: bool,
+    /// A block over pieces sorts the pieces' keys whole rather than
+    /// merging their runs: `Options::overlay_merge` off. `supdb-sortover`,
+    /// and `supdb-shapesortover` under the shape.
+    sortover: bool,
 }
 
 impl Default for Policy {
@@ -575,6 +580,7 @@ impl Default for Policy {
             rotate: false,
             nofrozen: false,
             idle: false,
+            sortover: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -751,6 +757,35 @@ impl Supdb {
             path,
             Policy {
                 nofrozen: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose blocks over pieces sort the pieces' keys whole
+    /// (`Options::overlay_merge` off), the shape before the merge.
+    pub fn create_sortover(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                sortover: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingestshape` whose blocks over pieces sort the pieces' keys
+    /// whole, as `supdb-sortover`: the arm that keeps its pieces until a
+    /// read shapes the store.
+    pub fn create_shape_sortover(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                drain: false,
+                durable: false,
+                shape: true,
+                sortover: true,
                 ..Policy::default()
             },
         )
@@ -1403,6 +1438,7 @@ impl Supdb {
             firstfloor,
             nofrozen,
             idle,
+            sortover,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -1521,6 +1557,7 @@ impl Supdb {
             adaptive_trigger: adapttrig,
             seal_rotates_wal: rotate,
             frozen_snaps: !nofrozen,
+            overlay_merge: !sortover,
             seal_defers: defer,
             seal_idle: idle,
             seal_first_floor: firstfloor,
@@ -1593,6 +1630,7 @@ impl Supdb {
             firstfloor,
             nofrozen,
             idle,
+            sortover,
         })
     }
 }
@@ -1670,6 +1708,13 @@ impl Engine for Supdb {
                 "supdb-shapeidle"
             } else {
                 "supdb-idle"
+            };
+        }
+        if self.sortover {
+            return if self.shape {
+                "supdb-shapesortover"
+            } else {
+                "supdb-sortover"
             };
         }
         if self.nofrozen {
@@ -2350,7 +2395,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice"
         | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "supdb-inlinemaint"
         | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose" | "supdb-rotate"
-        | "supdb-nofrozen" | "supdb-idle" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
+        | "supdb-nofrozen" | "supdb-idle" | "supdb-sortover" | "lmdb" | "rocksdb-tuned" => {
+            Guarantee::Durable
+        }
         "supdb-ingest"
         | "supdb-ingestleave"
         | "supdb-ingestnoseal"
@@ -2365,6 +2412,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-shapefloor"
         | "supdb-shapenofrozen"
         | "supdb-shapeidle"
+        | "supdb-shapesortover"
         | "lmdb-nosync"
         | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
@@ -2423,6 +2471,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-shapedefer" => Box::new(Supdb::create_shape_defer(dir)?),
         "supdb-shapefloor" => Box::new(Supdb::create_shape_floor(dir)?),
         "supdb-shapenofrozen" => Box::new(Supdb::create_shape_nofrozen(dir)?),
+        "supdb-sortover" => Box::new(Supdb::create_sortover(dir)?),
+        "supdb-shapesortover" => Box::new(Supdb::create_shape_sortover(dir)?),
         "supdb-idle" => Box::new(Supdb::create_idle(dir)?),
         "supdb-shapeidle" => Box::new(Supdb::create_shape_idle(dir)?),
         "supdb-ingestadaptloose" => Box::new(Supdb::create_ingest_adaptloose(dir)?),

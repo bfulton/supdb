@@ -972,6 +972,13 @@ pub struct Options {
     /// before it, where each sorted the table for itself; `supdb-nofrozen`
     /// prices it.
     pub frozen_snaps: bool,
+    /// A block built over level-0 pieces merges the pieces' runs of keys
+    /// over it, each already in key order, comparing their heads by the
+    /// keys' leading sixteen bytes as two words (`merge_runs`). Off is the
+    /// shape before it, a comparison sort of all of them through the keys
+    /// themselves; `supdb-sortover` and, under the shape,
+    /// `supdb-shapesortover` price it.
+    pub overlay_merge: bool,
     /// EXPERIMENT: keys of one block in a settle's backlog from which
     /// the block is dropped and built once rather than patched key by
     /// key. A patch resolves one key's run against every source and
@@ -1174,6 +1181,7 @@ impl Default for Options {
             upkeep: Upkeep::default(),
             snapshot_carry: false,
             frozen_snaps: true,
+            overlay_merge: true,
             scan_lazy_snapshot: false,
             forms_settle_rebuild_from: 0,
             forms_settle_recent_pct: 0,
@@ -10441,6 +10449,7 @@ impl Reader {
             },
             stale: self.fs().snap_stale.borrow(),
             copy_dense: false,
+            merge_pieces: self.opts.overlay_merge,
         }
     }
 
@@ -16112,6 +16121,7 @@ impl Reader {
         let unsealed = self.snapshot_to(len, self.adopt_snapshot().filter(|s| s.live_len <= len));
         let ctx = BuildCtx {
             copy_dense: true,
+            merge_pieces: self.opts.overlay_merge,
             ..self.build_ctx()
         };
         // Under a budget, the forms queued for the install are bounded
@@ -16982,6 +16992,71 @@ fn reads_around(life: u64, since_scan: u64, keys: usize) -> bool {
     life > 0 && since_scan <= 2 * keys as u64
 }
 
+/// A block's piece keys in key order and, among equal keys, by piece
+/// index -- what sorting them all gives -- from `runs`, ranges of `held`
+/// each in key order, as a piece's keys over a block are. The keys were
+/// sorted whole, a comparison sort through a compare of the keys
+/// themselves, a fifth of the scans of a pass over pieces a seal had
+/// just landed. The runs are merged by a tournament over their heads, a
+/// compare a level, each by the keys' leading sixteen bytes as two words
+/// (`pre`) and by the keys only where those agree: a scan of every head
+/// for every key cost about what the sort had at the nine or ten pieces
+/// such a block has.
+fn merge_runs<'a>(
+    held: &[(&'a [u8], usize, usize, u32)],
+    pre: &[(u64, u64)],
+    runs: &mut [(usize, usize)],
+) -> Vec<(&'a [u8], usize, usize, u32)> {
+    // Whether run `a`'s head comes before run `b`'s; a spent run, or a
+    // leaf with no run, comes after everything.
+    let first = |runs: &[(usize, usize)], a: usize, b: usize| -> bool {
+        let live = |r: usize| r < runs.len() && runs[r].0 < runs[r].1;
+        match (live(a), live(b)) {
+            (false, _) => false,
+            (true, false) => true,
+            (true, true) => {
+                let (x, y) = (runs[a].0, runs[b].0);
+                match pre[x].cmp(&pre[y]) {
+                    Ordering::Less => true,
+                    Ordering::Greater => false,
+                    Ordering::Equal => {
+                        held[x].0.cmp(held[y].0).then(held[x].1.cmp(&held[y].1)) == Ordering::Less
+                    }
+                }
+            }
+        }
+    };
+    // A winner tree: leaves `width..2 * width` are the runs, each inner
+    // node the run whose head wins below it, the root at 1.
+    let width = runs.len().next_power_of_two();
+    let mut tree = vec![usize::MAX; 2 * width];
+    for (i, leaf) in tree[width..].iter_mut().enumerate() {
+        *leaf = i;
+    }
+    for n in (1..width).rev() {
+        let (a, b) = (tree[2 * n], tree[2 * n + 1]);
+        tree[n] = if first(runs, b, a) { b } else { a };
+    }
+    let mut out = Vec::with_capacity(held.len());
+    while out.len() < held.len() {
+        let r = tree[1];
+        let at = runs[r].0;
+        debug_assert!(
+            at + 1 >= runs[r].1 || held[at].0 < held[at + 1].0,
+            "a piece's keys over a block are in key order"
+        );
+        out.push(held[at]);
+        runs[r].0 = at + 1;
+        let mut n = (width + r) / 2;
+        while n >= 1 {
+            let (a, b) = (tree[2 * n], tree[2 * n + 1]);
+            tree[n] = if first(runs, b, a) { b } else { a };
+            n /= 2;
+        }
+    }
+    out
+}
+
 /// The upkeep thread in flight: its handle and the flag that stops it.
 struct Upkeeper {
     handle: Option<std::thread::JoinHandle<()>>,
@@ -17415,6 +17490,9 @@ struct BuildCtx<'s> {
     /// the builder ahead and a promotion copy, since they run where no
     /// read waits or for a block whose reads have repaid it.
     copy_dense: bool,
+    /// The pieces' runs over a block merged on their keys' leading words
+    /// (`merge_runs`) rather than sorted whole: `Options::overlay_merge`.
+    merge_pieces: bool,
 }
 
 impl<'s> BuildCtx<'s> {
@@ -17756,15 +17834,26 @@ impl<'s> BuildCtx<'s> {
     ) -> Result<Overlay<'a>> {
         let stale: &'a std::collections::HashSet<u32> = &self.stale;
         let mut held: Vec<(&[u8], usize, usize, u32)> = Vec::new();
+        // Each key's leading sixteen bytes as two words, and where each
+        // piece's run starts and ends in `held`.
+        let mut pre: Vec<(u64, u64)> = Vec::new();
+        let mut runs: Vec<(usize, usize)> = Vec::with_capacity(pieces.len());
         for (j, run, ranks) in pieces {
             let p = &src.l0[*j];
+            let start = held.len();
             for r in run.clone() {
                 let k = p
                     .blob
                     .key_at(r)
                     .ok_or_else(|| err("block cache: a rank did not resolve"))?;
                 let cut = ranks.map_or(u32::MAX, |v| v[r]);
+                if self.merge_pieces {
+                    pre.push(key_prefix(k));
+                }
                 held.push((k, *j, r, cut));
+            }
+            if held.len() > start {
+                runs.push((start, held.len()));
             }
         }
         if held.is_empty() {
@@ -17775,7 +17864,11 @@ impl<'s> BuildCtx<'s> {
                 stale,
             });
         }
-        held.sort_by(|x, y| x.0.cmp(y.0).then(x.1.cmp(&y.1)));
+        if !self.merge_pieces {
+            held.sort_by(|x, y| x.0.cmp(y.0).then(x.1.cmp(&y.1)));
+        } else if runs.len() > 1 {
+            held = merge_runs(&held, &pre, &mut runs);
+        }
         let mut over: Vec<Over> = Vec::with_capacity(mem.len() + held.len());
         let mut mem = mem.into_iter().peekable();
         let mut h = 0usize;
@@ -20361,5 +20454,72 @@ mod lockfree {
             1,
             "the cache's drop gave up its references"
         );
+    }
+}
+
+#[cfg(test)]
+mod merge_runs {
+    /// The merge of a block's piece runs answers what the sort it replaced
+    /// answered, on runs that share keys, keys longer than sixteen bytes
+    /// that agree on their first sixteen, and keys that end in zero bytes,
+    /// where the leading words alone cannot tell two keys apart.
+    #[test]
+    fn a_merge_of_sorted_runs_orders_as_the_sort_did() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut pool: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..400 {
+            let mut k = vec![b'k'; 16];
+            k[..8].copy_from_slice(&next().to_be_bytes());
+            match next() % 4 {
+                0 => k.truncate(1 + (next() % 15) as usize),
+                1 => k.extend_from_slice(&next().to_be_bytes()[..1 + (next() % 8) as usize]),
+                _ => {}
+            }
+            pool.push(k.clone());
+            // A twin: equal first sixteen bytes, or a zero byte past the end.
+            let mut twin = k.clone();
+            if twin.len() >= 16 {
+                twin.push((next() % 3) as u8);
+            } else {
+                twin.push(0);
+            }
+            pool.push(twin);
+        }
+        for round in 0..200 {
+            let pieces = 1 + (next() % 9) as usize;
+            let mut held: Vec<(&[u8], usize, usize, u32)> = Vec::new();
+            let mut pre = Vec::new();
+            let mut runs = Vec::new();
+            for j in (0..pieces).rev() {
+                let mut keys: Vec<&[u8]> = pool
+                    .iter()
+                    .filter(|_| next() % 3 == 0)
+                    .map(|k| k.as_slice())
+                    .collect();
+                keys.sort();
+                keys.dedup();
+                let start = held.len();
+                for (r, k) in keys.into_iter().enumerate() {
+                    pre.push(super::key_prefix(k));
+                    held.push((k, j, r, round));
+                }
+                if held.len() > start {
+                    runs.push((start, held.len()));
+                }
+            }
+            let mut want = held.clone();
+            want.sort_by(|x, y| x.0.cmp(y.0).then(x.1.cmp(&y.1)));
+            assert_eq!(
+                super::merge_runs(&held, &pre, &mut runs),
+                want,
+                "round {round}"
+            );
+        }
     }
 }
