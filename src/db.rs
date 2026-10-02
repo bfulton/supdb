@@ -3026,7 +3026,17 @@ impl Seg {
     /// process need never have written a segment: read it off a global and
     /// a store written with checksums off is refused by the engine that
     /// wrote it, on every run whose values reached a block.
-    fn open(dir: &Path, name: &str, random: bool, advise_ord: bool, verify: bool) -> Result<Seg> {
+    /// `verify` reads the block checksums as blocks are read and
+    /// `verify_index` the key index's checksum row here, once: off only
+    /// where the same file's open has just read it.
+    fn open(
+        dir: &Path,
+        name: &str,
+        random: bool,
+        advise_ord: bool,
+        verify: bool,
+        verify_index: bool,
+    ) -> Result<Seg> {
         let src = MmapBytes::open(&dir.join(name)).map_err(|e| {
             // A manifest naming a segment that is not on disk is a damaged
             // store, not a missing file, and saying so is the difference
@@ -3040,6 +3050,7 @@ impl Seg {
             src,
             crate::blob::BlobOptions {
                 verify_checksums: verify,
+                verify_index,
                 ..Default::default()
             },
         )
@@ -13225,6 +13236,7 @@ impl Db {
                 starts_random,
                 opts.read_advice != ReadAdvice::Normal,
                 opts.segment.checksums,
+                true,
             )?);
         }
         segs.sort_by(seg_order);
@@ -15613,6 +15625,23 @@ impl Db {
             shared
                 .seal_hold
                 .fetch_and(!SEAL_HOLD_LANDING, AtomicOrdering::AcqRel);
+        })
+    }
+
+    /// A test's: `hold_seal_durable(false)` after `after`, from a thread
+    /// of its own, for a test whose thread is the writer waiting on the
+    /// seal the hold keeps between its phases.
+    #[doc(hidden)]
+    pub fn release_seal_durable_after(
+        &self,
+        after: std::time::Duration,
+    ) -> std::thread::JoinHandle<()> {
+        let shared = self.shared.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(after);
+            shared
+                .seal_hold
+                .fetch_and(!SEAL_HOLD_DURABLE, AtomicOrdering::AcqRel);
         })
     }
 
@@ -19136,6 +19165,25 @@ impl Maint {
         }
         while let Some(front) = self.sealing.front() {
             let draining = draining || front.draining;
+            // Readable first, where the seal has not landed so yet: its
+            // segments opened and published while its fsyncs run, as the
+            // poll lands them, rather than after its thread is joined.
+            // Joined whole, a flush waited for the fsyncs and then for the
+            // open -- the key index's checksums and a level-0 piece's
+            // Bloom -- one after the other.
+            if !front.landed {
+                loop {
+                    let (readable, sealed) = self.seal_phases_due();
+                    if sealed || self.shared.seal_wedged.load(AtomicOrdering::Acquire) {
+                        break;
+                    }
+                    if readable {
+                        self.land_front_readable()?;
+                        break;
+                    }
+                    std::thread::park_timeout(MAINT_LAND_POLL);
+                }
+            }
             self.land_front(draining)?;
         }
         Ok(())
@@ -19230,6 +19278,7 @@ impl Maint {
                 self.advice_random(),
                 self.opts.read_advice != ReadAdvice::Normal,
                 self.opts.segment.checksums,
+                true,
             )?));
         }
         self.rank_before_publish(&segs)?;
@@ -19658,6 +19707,7 @@ impl Maint {
                 self.advice_random(),
                 self.opts.read_advice != ReadAdvice::Normal,
                 self.opts.segment.checksums,
+                true,
             )?));
         }
         self.rank_before_publish(&merged)?;
@@ -19987,13 +20037,18 @@ impl Maint {
             std::fs::hard_link(self.dir.join(&old), self.dir.join(&new))?;
             // A segment is immutable once open, so the promoted one is
             // opened again under its new name: the partition's fences and
-            // level come from the name.
+            // level come from the name. Its key index's checksum row is not
+            // read again: the link is the same file, whose open under the
+            // old name read it, and reading it again was most of the
+            // promotion a drain waits for, 6-7 ms for a run of three
+            // hundred thousand keys.
             segs[si] = std::sync::Arc::new(Seg::open(
                 &self.dir,
                 &new,
                 self.advice_random(),
                 self.opts.read_advice != ReadAdvice::Normal,
                 self.opts.segment.checksums,
+                false,
             )?);
             old_names.push(old);
         }
@@ -20163,6 +20218,7 @@ impl Maint {
                 self.advice_random(),
                 self.opts.read_advice != ReadAdvice::Normal,
                 self.opts.segment.checksums,
+                true,
             )?));
         }
         // Partitions first (older, disjoint), then whatever L0 arrived

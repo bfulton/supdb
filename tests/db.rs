@@ -9997,3 +9997,67 @@ fn a_closed_wal_outlives_a_seal_between_its_phases_and_a_crash_there() {
     );
     holds_all(&db, &want, "after the reopen's seal");
 }
+
+/// A flush lands its seal readable before the seal's fsyncs, as the
+/// poll does, rather than joining the seal's thread first: held between
+/// its phases, the seal's table is already retired and its segment
+/// published to a handle while the flush still waits for the fsyncs.
+/// Joined whole, the flush published nothing until the hold lifted. On
+/// both arms of the segment work, and with every key read back after.
+#[test]
+fn a_flush_publishes_its_seal_before_the_seal_is_durable() {
+    for background in [true, false] {
+        let d = dir(&format!("flush-readable-{background}"));
+        let mut db = Db::create(
+            &d,
+            Options {
+                publish_in_background: background,
+                direct_ingest: false,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let mut want: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+        for i in 0..2_000u32 {
+            let k = tail_key(i.wrapping_mul(7919) % 100_003);
+            db.append(&k, &tail_val(1));
+            want.entry(k).or_default().push(tail_val(1));
+        }
+        db.commit().unwrap();
+        let handle = db.reader().unwrap();
+        let hold = std::time::Duration::from_millis(400);
+        db.hold_seal_durable(true);
+        let release = db.release_seal_durable_after(hold);
+        let t0 = std::time::Instant::now();
+        let watcher = std::thread::spawn(move || {
+            while handle.unsealed_keys() > 0 {
+                if t0.elapsed() > std::time::Duration::from_secs(10) {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Some(t0.elapsed())
+        });
+        db.flush().unwrap();
+        let waited = t0.elapsed();
+        release.join().unwrap();
+        let seen = watcher
+            .join()
+            .unwrap()
+            .expect("the seal's table was never retired");
+        assert!(
+            waited >= hold,
+            "background {background}: the flush waited for the held fsyncs ({waited:?})"
+        );
+        assert!(
+            seen < hold / 2,
+            "background {background}: the segment was published at {seen:?}, \
+             with the seal held until {hold:?}"
+        );
+        holds_all(
+            &db,
+            &want,
+            &format!("background {background}: after the flush"),
+        );
+    }
+}
