@@ -2874,6 +2874,34 @@ option stays off: the gains are the shape arm's lag points and its
 sweep's sum, and the 100k reading on the second host is one a default
 would carry.
 
+#### A block's pieces merged, not sorted
+
+A block built over level-0 pieces gathers each piece's keys over it and
+orders them; the order was a comparison sort through the keys
+themselves, and on the idle seals' arm, whose seals leave nine or ten
+pieces over a small partition, that sort was 18% of the lag sweep's
+first pass at three hundred thousand keys, profiled. Each piece's keys
+over a block are in key order already, so the runs are merged now, a
+tournament over their heads compared by the keys' leading sixteen bytes
+as two words (`merge_runs`); in the same pass the merge was 9.9%. A
+merge that scanned every head for every key was 13.5%, near the sort's
+cost at that many pieces. `overlay_merge` off is the sort, priced by
+`supdb-sortover` and `supdb-shapesortover`.
+
+Against the sort in one process, fourteen pairs a pairing, nothing held
+for a table as a whole: the shape arm at ten thousand, a hundred
+thousand and three hundred thousand keys, the flush arm at three hundred
+thousand, and the idle seals' arm at a hundred thousand and three
+hundred thousand once with each version of the merge. The two quantities
+marked singly were passes the merge does not run in, threaded point
+reads and threaded scans that took published forms. The pass it cuts
+varies by tens of percent with where the seals land, and the shipping
+arms seldom build over that many pieces. Two binaries alternated
+instead, with the first version of the merge, read the idle arm's first
+pass 0.90x, and the shape arm's 1% point, which builds nothing over
+pieces, at a median scan 5% slower in all eight pairs: that is the
+layout of two binaries and not the merge.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and
