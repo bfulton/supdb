@@ -431,6 +431,7 @@ pub struct Supdb {
     nofrozen: bool,
     idle: bool,
     sortover: bool,
+    nowb: bool,
 }
 
 /// What an arm differs from `supdb` by. One struct rather than a row of
@@ -553,6 +554,10 @@ struct Policy {
     /// merging their runs: `Options::overlay_merge` off. `supdb-sortover`,
     /// and `supdb-shapesortover` under the shape.
     sortover: bool,
+    /// A direct run whose commits do not sync it is written back only at
+    /// the sync that ends it: `Options::direct_writeback` off.
+    /// `supdb-ingestnowb`.
+    nowb: bool,
 }
 
 impl Default for Policy {
@@ -581,6 +586,7 @@ impl Default for Policy {
             nofrozen: false,
             idle: false,
             sortover: false,
+            nowb: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -757,6 +763,21 @@ impl Supdb {
             path,
             Policy {
                 nofrozen: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose direct runs are written back only at the sync
+    /// that ends them (`Options::direct_writeback` off), the shape before
+    /// the writeback.
+    pub fn create_ingest_nowb(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                nowb: true,
                 ..Policy::default()
             },
         )
@@ -1439,6 +1460,7 @@ impl Supdb {
             nofrozen,
             idle,
             sortover,
+            nowb,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -1558,6 +1580,7 @@ impl Supdb {
             seal_rotates_wal: rotate,
             frozen_snaps: !nofrozen,
             overlay_merge: !sortover,
+            direct_writeback: !nowb,
             seal_defers: defer,
             seal_idle: idle,
             seal_first_floor: firstfloor,
@@ -1631,6 +1654,7 @@ impl Supdb {
             nofrozen,
             idle,
             sortover,
+            nowb,
         })
     }
 }
@@ -1709,6 +1733,9 @@ impl Engine for Supdb {
             } else {
                 "supdb-idle"
             };
+        }
+        if self.nowb {
+            return "supdb-ingestnowb";
         }
         if self.sortover {
             return if self.shape {
@@ -2413,6 +2440,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-shapenofrozen"
         | "supdb-shapeidle"
         | "supdb-shapesortover"
+        | "supdb-ingestnowb"
         | "lmdb-nosync"
         | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
@@ -2472,6 +2500,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-shapefloor" => Box::new(Supdb::create_shape_floor(dir)?),
         "supdb-shapenofrozen" => Box::new(Supdb::create_shape_nofrozen(dir)?),
         "supdb-sortover" => Box::new(Supdb::create_sortover(dir)?),
+        "supdb-ingestnowb" => Box::new(Supdb::create_ingest_nowb(dir)?),
         "supdb-shapesortover" => Box::new(Supdb::create_shape_sortover(dir)?),
         "supdb-idle" => Box::new(Supdb::create_idle(dir)?),
         "supdb-shapeidle" => Box::new(Supdb::create_shape_idle(dir)?),

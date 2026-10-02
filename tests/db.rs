@@ -10061,3 +10061,43 @@ fn a_flush_publishes_its_seal_before_the_seal_is_durable() {
         );
     }
 }
+
+/// A direct run under a policy that does not sync its commits hands its
+/// pieces to writeback as they fill (`direct_writeback`), which no store
+/// under the default policy reaches: a run of several pieces, flushed and
+/// reopened, reads back every key, and so does one with the writeback off.
+#[test]
+fn a_buffered_direct_run_written_back_as_it_grows_reads_back_whole() {
+    for writeback in [true, false] {
+        let d = dir(&format!("direct-writeback-{writeback}"));
+        let opts = Options {
+            sync: supdb::SyncPolicy::EveryN(u32::MAX),
+            direct_writeback: writeback,
+            ..Options::default()
+        };
+        let mut want: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
+        {
+            let mut db = Db::create(&d, opts.clone()).unwrap();
+            // Ascending keys, a value of a few hundred bytes each: about
+            // seven megabytes, three and more whole pieces of the run.
+            for i in 0..24_000u32 {
+                let k = tail_key(i);
+                let v = vec![(i % 251) as u8; 300];
+                db.append(&k, &v);
+                want.entry(k).or_default().push(v);
+                if i % 500 == 499 {
+                    db.commit().unwrap();
+                }
+            }
+            db.commit().unwrap();
+            db.flush().unwrap();
+            holds_all(
+                &db,
+                &want,
+                &format!("writeback {writeback}: after the flush"),
+            );
+        }
+        let db = Db::open(&d, opts).unwrap();
+        holds_all(&db, &want, &format!("writeback {writeback}: reopened"));
+    }
+}

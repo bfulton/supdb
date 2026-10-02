@@ -972,6 +972,13 @@ pub struct Options {
     /// before it, where each sorted the table for itself; `supdb-nofrozen`
     /// prices it.
     pub frozen_snaps: bool,
+    /// A direct run whose commits do not sync it hands each 2 MB piece of
+    /// its segment to the kernel's writeback as the piece fills
+    /// (`sync_file_range`, Linux only), so the sync that ends the run
+    /// finds most of it written. Off is the shape before it, where the
+    /// whole run was written back at that sync; `supdb-ingestnowb`
+    /// prices it. No effect where every commit syncs the run.
+    pub direct_writeback: bool,
     /// A block built over level-0 pieces merges the pieces' runs of keys
     /// over it, each already in key order, comparing their heads by the
     /// keys' leading sixteen bytes as two words (`merge_runs`). Off is the
@@ -1181,6 +1188,7 @@ impl Default for Options {
             upkeep: Upkeep::default(),
             snapshot_carry: false,
             frozen_snaps: true,
+            direct_writeback: true,
             overlay_merge: true,
             scan_lazy_snapshot: false,
             forms_settle_rebuild_from: 0,
@@ -1785,11 +1793,37 @@ struct AlignedWriter {
     buf: Vec<u8>,
     /// Bytes on the file so far: where the buffer's contents land.
     written: u64,
+    /// Each whole piece's writeback started as it is written
+    /// (`start_writeback`): see `Options::direct_writeback`.
+    writeback: bool,
 }
 
 /// The piece: the PMD size on x86-64 and on arm64 with 4 KB pages, and a
 /// harmless write size anywhere else.
 const WRITE_PIECE: u64 = 2 << 20;
+
+/// The writeback of `len` bytes of `file` from `from` started, and not
+/// waited for, so a later sync finds them clean. Linux only; elsewhere a
+/// no-op, and a failure is ignored: the sync that makes the bytes durable
+/// writes whatever this did not.
+fn start_writeback(file: &File, from: u64, len: u64) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: a range of a file this writer holds open; the call only
+        // queues the range's dirty pages for writeback.
+        unsafe {
+            let _ = libc::sync_file_range(
+                file.as_raw_fd(),
+                from as libc::off64_t,
+                len as libc::off64_t,
+                libc::SYNC_FILE_RANGE_WRITE,
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (file, from, len);
+}
 
 impl AlignedWriter {
     fn new(file: File) -> AlignedWriter {
@@ -1797,6 +1831,7 @@ impl AlignedWriter {
             file,
             buf: Vec::with_capacity(WRITE_PIECE as usize),
             written: 0,
+            writeback: false,
         }
     }
 
@@ -1816,8 +1851,12 @@ impl AlignedWriter {
     }
 
     fn write_buf(&mut self) -> std::io::Result<()> {
+        let from = self.written;
         std::io::Write::write_all(&mut self.file, &self.buf)?;
         self.written += self.buf.len() as u64;
+        if self.writeback && self.buf.len() as u64 == WRITE_PIECE {
+            start_writeback(&self.file, from, WRITE_PIECE);
+        }
         self.buf.clear();
         Ok(())
     }
@@ -2163,6 +2202,12 @@ impl SegmentWriter {
     /// instead of once at `finish`. Zero restores the single sync.
     pub fn set_sync_every(&mut self, bytes: usize) {
         self.sync_every = bytes as u64;
+    }
+
+    /// Start each whole piece's writeback as it is written
+    /// (`Options::direct_writeback`).
+    fn set_writeback(&mut self, on: bool) {
+        self.out.writeback = on;
     }
 
     /// A commit marker after the records so far, in the records-first
@@ -2949,6 +2994,10 @@ impl PieceWriter {
             crate::ordindex::Builder::new(),
             false,
         ))
+    }
+
+    fn set_writeback(&mut self, on: bool) {
+        self.0.set_writeback(on);
     }
 
     fn begin(&mut self, k: &[u8]) -> Result<()> {
@@ -13881,6 +13930,16 @@ impl Db {
             let opts = Db::segment_opts(&self.opts);
             let mut w = PieceWriter::create(&tmp, &opts, 0, self.opts.inline_bytes)?;
             w.set_marks(true);
+            // Where a commit does not sync the run, its pieces are handed
+            // to writeback as they fill, so the sync that ends the run --
+            // a flush's, or the close's -- finds them written; where every
+            // commit syncs, the sync writes them anyway, and the extra
+            // requests made the durable ordered load 1.1x slower.
+            let syncs_every = match self.opts.sync {
+                SyncPolicy::Always => true,
+                SyncPolicy::EveryN(n) => n <= 1,
+            };
+            w.set_writeback(self.opts.direct_writeback && !syncs_every);
             self.direct = Some(Direct {
                 w,
                 tmp,
