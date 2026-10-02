@@ -2902,6 +2902,37 @@ pass 0.90x, and the shape arm's 1% point, which builds nothing over
 pieces, at a median scan 5% slower in all eight pairs: that is the
 layout of two binaries and not the merge.
 
+#### A scan that waits for the landing, measured before it was built
+
+The rule proposed was that a scan over a store with much unsealed and a
+seal in flight wait for the seal's readable landing and then read the
+segments, since a scan beside a frozen table reads at a tenth of the
+rate of one over the segment it becomes: on the shape arm at three
+hundred thousand keys, about 42 µs a scan beside the load's seal against
+4 µs after it. It was measured first, in two parts, and not built.
+
+Scans that run back to back until the landing spend beside it exactly
+the time a wait would have taken, and finish scans while they do: on the
+idle seals' arm at a hundred thousand keys, a pass's 106 scans beside
+its seal took 19.5 ms against a wait of 19.4 to the same landing. A wait
+can only win if the scans slow the seal enough to repay the scans they
+finish, a tenth of its time at three hundred thousand keys. They do not
+slow it. The same load, synced, landed its seal sooner with scans run
+back to back beside it than with nobody reading in 8 of 12 alternated
+pairs at a hundred thousand keys and 10 of 12 at three hundred thousand,
+over two runs of six: medians of 111 and 131 ms with nobody reading
+against 63 and 102 scanning at a hundred thousand, 419 and 442 against
+319 and 268 at three hundred thousand. Why is not established; the seal
+sorted the table itself in every rep of both.
+
+What the passes beside a seal do spend is elsewhere. On the shape arm at
+three hundred thousand keys the pass's first scan was 73-75 ms of
+135-147, all of it the frozen table's sort and copy for its snapshot,
+the work the seal was doing for its own copy of the same table at the
+same time; on the idle seals' arm, whose seals leave pieces over a small
+partition, 84% of the pass was building block forms over the pieces
+after the landing.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and
