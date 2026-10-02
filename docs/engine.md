@@ -2933,6 +2933,49 @@ same time; on the idle seals' arm, whose seals leave pieces over a small
 partition, 84% of the pass was building block forms over the pieces
 after the landing.
 
+#### A scan that takes the seal's table, measured before it was built
+
+The contract proposed: a reader asks for the table a seal is sorting; if
+the seal has built it the reader takes it, and if not one side builds it
+once, the reader reads it and the seal goes on from it. Half of that is
+`FrozenSnaps`, where whoever finishes first sets the table's copy and
+later readers take it. What it lacks is the wait, so a reader that
+arrives while the seal sorts sorts the table again beside it. On the
+arms traced -- the shape arm, `supdb`, `supdb-ingest` and the idle
+seals' -- the one timed pass where that happens is the shape arm's first
+lag pass; on `supdb` the upkeep thread sorts each table of the last
+point's burst beside the seal, 2-5 ms on a core nothing timed waits on.
+The wait was prototyped three ways and priced at three hundred thousand
+keys, eight rounds alternated in one binary, before anything was built.
+
+At that rung the load's last freeze leaves 290,000 keys to a seal that
+starts 13-18 ms before the pass's first scan. The scan builds a key order
+of the table in 45-52 ms, its keys copied and its values not; the seal
+sorts the same table in 14-22 ms as a list of slots, which is not that
+form, and then copies the keys with their values in 50-62 ms. A scan
+over an order without the values reads each key's values through the
+memtable, about 37 µs; over the seal's copy, about 10. Waiting for the
+copy made the first scan 70 ms and the pass 1.04x (slower in 5 of 8).
+Having the seal make the reader's form from its slots first, with the
+reader waiting for that, made the first scan 26 ms against 51 and the
+pass 1.08x (slower in 6 of 8): the scans after it ran at 37 µs, and the
+copy came later by the time the form took. A wait saves at most the
+seal's head start, and the seal's product that makes scans fast takes
+longer than the reader's own sort.
+
+At ten and a hundred thousand keys nothing is frozen: `sync` hands the
+live table to the seal (`hand_tail`), the pass starts with it, and the
+seal's copy is never published to a state that holds its table live, so
+the hundred-thousand-key pass scans at 20-45 µs to its end where a
+frozen table's scans read at 8-11 once its copy lands. Freezing the tail
+at `sync` when the frozen list has room -- the hand-off avoided a freeze
+because the store had one frozen slot then -- read that point 0.82x
+(faster in 7 of 8), and the 10% point 1.54x at a hundred thousand keys
+and 1.72x at three hundred thousand (slower in 6 and 5 of 8) and the
+100% point at three hundred thousand 0.68x (faster in 5 of 8): it
+changes what the burst after the sync meets, not only what the first
+pass reads. Neither was kept.
+
 #### The flush's path, one step at a time
 
 The buffered arm's ordered load at three hundred thousand keys loaded at
