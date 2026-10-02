@@ -891,6 +891,29 @@ price a change that moves work between phases by the phases' sum; a
 structure built on a commit in a write-only stretch is paid for by the
 writer whether anything reads it or not.
 
+**A page made for the reader on the writer's path.** The segment
+writer wrote 2 MB pieces at 2 MB offsets so the page cache would hold a
+segment in folios a mapping takes with one entry each, a gain to a scan
+this machine never showed. A 2 MB folio takes a whole free 2 MB block,
+and this guest's balloon hands free 2 MB blocks back to its host two
+seconds after they free, so every such write faulted on the host for
+each of its pages: the buffered ordered load ran at a third of LMDB's
+from that commit on, 45% of a fresh process's load in the kernel's copy
+into the page cache, and nothing the engine counts could see it. The
+rule: work one path does for the other side's benefit is priced on the
+path that pays it, and a gain never measured is no reason to pay
+anything.
+
+**A test that bet a seal would still be running.** Tests that needed a
+seal in flight across a commit left it unheld, on the bet that the seal
+thread could not finish first, and with the segment work inline a commit
+lands a seal that has. When seals got faster the bets lost, a different
+test each gate run, and the first of them had been losing one run in
+three under load before anything changed. They hold the seal now
+(`hold_seal_landing`, and `hold_seal_durable` where only the oldest may
+land). The rule: a test that needs a state holds it, and a bet on timing
+loses the first time the thing it bets against gets faster.
+
 **A mark taken whole and then read in part.** A commit publishes the
 log's length, the entry count and the watermark as one mark, and a
 handle under `Latest` or `Snapshot` took the length and the watermark

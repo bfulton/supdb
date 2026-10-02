@@ -431,6 +431,9 @@ pub struct Supdb {
     nofrozen: bool,
     idle: bool,
     sortover: bool,
+    /// Segments written in 2 MB pieces, `SegmentOptions::write_piece`.
+    /// `supdb-pmd`, and `supdb-ingestpmd` buffered.
+    pmd: bool,
 }
 
 /// What an arm differs from `supdb` by. One struct rather than a row of
@@ -553,6 +556,11 @@ struct Policy {
     /// merging their runs: `Options::overlay_merge` off. `supdb-sortover`,
     /// and `supdb-shapesortover` under the shape.
     sortover: bool,
+    /// Segments written in 2 MB pieces at 2 MB offsets, the page cache's
+    /// PMD-sized folios, where the engine writes a megabyte:
+    /// `SegmentOptions::write_piece`. `supdb-pmd`, and `supdb-ingestpmd`
+    /// buffered.
+    pmd: bool,
 }
 
 impl Default for Policy {
@@ -581,6 +589,7 @@ impl Default for Policy {
             nofrozen: false,
             idle: false,
             sortover: false,
+            pmd: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -769,6 +778,33 @@ impl Supdb {
             path,
             Policy {
                 sortover: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose segments are written in 2 MB pieces, the shape
+    /// before `SegmentOptions::write_piece` was a megabyte.
+    pub fn create_pmd(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                pmd: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose segments are written in 2 MB pieces, as
+    /// `supdb-pmd`: the arm whose ordered load writes its segment on the
+    /// commit path without a sync between pieces.
+    pub fn create_ingest_pmd(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                pmd: true,
                 ..Policy::default()
             },
         )
@@ -1439,6 +1475,7 @@ impl Supdb {
             nofrozen,
             idle,
             sortover,
+            pmd,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -1451,6 +1488,11 @@ impl Supdb {
             segment: supdb::SegmentOptions {
                 checksums: false,
                 compact_records: !fullrec,
+                write_piece: if pmd {
+                    2 << 20
+                } else {
+                    supdb::SegmentOptions::default().write_piece
+                },
                 ..Default::default()
             },
             // The engine's own defaults: 32 MB seals over 64 MB partitions,
@@ -1631,6 +1673,7 @@ impl Supdb {
             nofrozen,
             idle,
             sortover,
+            pmd,
         })
     }
 }
@@ -1708,6 +1751,13 @@ impl Engine for Supdb {
                 "supdb-shapeidle"
             } else {
                 "supdb-idle"
+            };
+        }
+        if self.pmd {
+            return if self.partition {
+                "supdb-pmd"
+            } else {
+                "supdb-ingestpmd"
             };
         }
         if self.sortover {
@@ -2395,9 +2445,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice"
         | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "supdb-inlinemaint"
         | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose" | "supdb-rotate"
-        | "supdb-nofrozen" | "supdb-idle" | "supdb-sortover" | "lmdb" | "rocksdb-tuned" => {
-            Guarantee::Durable
-        }
+        | "supdb-nofrozen" | "supdb-idle" | "supdb-sortover" | "supdb-pmd" | "lmdb"
+        | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest"
         | "supdb-ingestleave"
         | "supdb-ingestnoseal"
@@ -2413,6 +2462,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-shapenofrozen"
         | "supdb-shapeidle"
         | "supdb-shapesortover"
+        | "supdb-ingestpmd"
         | "lmdb-nosync"
         | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
@@ -2473,6 +2523,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-shapenofrozen" => Box::new(Supdb::create_shape_nofrozen(dir)?),
         "supdb-sortover" => Box::new(Supdb::create_sortover(dir)?),
         "supdb-shapesortover" => Box::new(Supdb::create_shape_sortover(dir)?),
+        "supdb-pmd" => Box::new(Supdb::create_pmd(dir)?),
+        "supdb-ingestpmd" => Box::new(Supdb::create_ingest_pmd(dir)?),
         "supdb-idle" => Box::new(Supdb::create_idle(dir)?),
         "supdb-shapeidle" => Box::new(Supdb::create_shape_idle(dir)?),
         "supdb-ingestadaptloose" => Box::new(Supdb::create_ingest_adaptloose(dir)?),

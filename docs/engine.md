@@ -1280,8 +1280,9 @@ write shows 45 MB of `FilePmdMapped` in `smaps`, the seal-written one 4
 MB. `MADV_COLLAPSE` on a file mapping is `EINVAL` here (the kernel is
 built without collapse for files), and a cold file read back by one
 readahead gets small folios, so a file has its huge folios from the
-write that made it or not at all. The segment writer writes 2 MB
-pieces at 2 MB offsets now, where a `BufWriter` of a megabyte flushed
+write that made it or not at all. The segment writer wrote 2 MB
+pieces at 2 MB offsets from here (until the write side was priced,
+in the section after this one), where a `BufWriter` of a megabyte flushed
 wherever it filled; every segment a seal, a partition or a merge
 rewrites is cached in PMD folios. The one that is not is the direct
 segment the ordered load appends to, whose pieces are its commits, each
@@ -1298,6 +1299,57 @@ changes between runs is where the guest's pages land, and how the host
 backs them is not visible from inside. A question of ten percent about
 translation or folio size is not answerable on this machine, and a
 figure for the writer's change waits for one where it is.
+
+#### The write piece, priced on the write side
+
+The 2 MB pieces were the reader's: a 2 MB write at a 2 MB offset is
+cached in a PMD-sized folio that a mapping takes with one page-table
+entry, and what that is worth to a scan was not settled here (the
+section before). What it costs the write was never priced, and on this
+machine it is the larger number. The guest's balloon reports free
+memory to its host: a free 2 MB block is handed back about two seconds
+after it frees, and the guest's next touch of it faults on the host for
+every 4 KB page, which nothing inside the guest can see. A 2 MB folio
+takes a whole free 2 MB block, so a 2 MB write lands in memory the host
+has taken back; a smaller folio comes from memory the guest freed
+recently and has not reported, while there is some. Written to a new
+file three seconds after the last write, 36 MB went at 2.8-4.7 GB/s in
+pieces of 64 KB to 1 MB and at 150-250 MB/s in pieces of 2 and 4 MB; the
+same 2 MB pieces written again within a second went at 4.5 GB/s, and
+slowly again after three. 300 MB went at 140-240 MB/s in every piece,
+4 KB included: what the guest has freed and not reported is tens of
+megabytes, and past it every page the cache adds is a fault on the host.
+
+The buffered ordered load writes its segment on the commit path with no
+sync between pieces, so its pieces were whole 2 MB ones: 17 writes at
+three hundred thousand keys took 228 ms of the load, and the kernel's
+copy into them was 45% of the load's samples in a fresh process. LMDB
+writes the same bytes in writes of about 130 KB. The suite returns a
+dropped store's memory between passes, so every pass's load met
+reported memory. With the piece a megabyte, the suite at a hundred and
+three hundred thousand keys, two runs of each alternated:
+`supdb-ingest`'s ordered load went from 0.33-0.44x of `lmdb-nosync`'s to
+0.69-0.73x, its batches from 103-123 ms to 49-52 at a hundred thousand
+keys and from 355-381 to 148-152 at three hundred thousand, and
+`supdb`'s shuffled load from 3.8-4.4x of `lmdb`'s to 4.6-5.6x; nothing
+read moved by more than the runs moved.
+
+In one process, each arm's pass beside the other's, eight pairs a size,
+2 MB read 0.89x and 0.91x of 1 MB on the buffered ordered load at a
+hundred and three hundred thousand keys (1 MB faster in 7 and 6 of 8),
+0.97x and 0.68x on the durable shuffled load (7 of 8 each), and 1.07x
+the other way on the buffered shuffled load (2 MB faster in 7 and 6 of
+8); no read, scan or mix resolved. Passes back to back reuse the memory
+the pass before freed, within the two seconds the balloon waits: with
+three seconds before each load, the buffered ordered load read 0.72x and
+0.54x (1 MB faster in 8 of 8 at both) and the buffered shuffled load
+0.65x and 0.68x (7 and 8 of 8). What a 2 MB piece costs is how long the
+memory under it has been free, which the suite's separate passes and a
+process's first load make long.
+
+A megabyte is the default (`SegmentOptions::write_piece`), the write
+path's own size, and `supdb-pmd` and `supdb-ingestpmd` keep 2 MB to
+price it.
 
 #### The fully-unmerged point is the build, and the build is the pieces
 

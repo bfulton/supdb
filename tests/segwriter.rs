@@ -312,6 +312,45 @@ fn the_two_segment_layouts_agree_with_checksums_off_too() {
     );
 }
 
+/// The writer's piece decides how the file is written, never what it
+/// holds: the same keys written in pieces of 4 KB, of a megabyte and of
+/// 2 MB make the same bytes, so the piece is priced as a write path alone.
+#[test]
+fn the_write_piece_changes_how_a_segment_is_written_and_not_what() {
+    let _serial = serial();
+    let dir = scratch("piece");
+    let data = varlen(4_000, 23);
+    let files: Vec<Vec<u8>> = [4096usize, 1 << 20, 2 << 20]
+        .iter()
+        .map(|&piece| {
+            let path = dir.join(format!("piece-{piece}.sup"));
+            write_bulk(
+                &path,
+                &data,
+                SegmentOptions {
+                    write_piece: piece,
+                    ..opts()
+                },
+            );
+            without_the_clock(&std::fs::read(&path).unwrap())
+        })
+        .collect();
+    assert!(
+        files[0].len() > 2 * (2 << 20),
+        "the segment spans several 2 MB pieces, or the pieces were never tested"
+    );
+    for (a, b, what) in [(0, 1, "4 KB and 1 MB"), (1, 2, "1 MB and 2 MB")] {
+        let first = files[a].iter().zip(&files[b]).position(|(x, y)| x != y);
+        assert!(
+            files[a].len() == files[b].len() && first.is_none(),
+            "{what} pieces wrote different segments: lengths {} and {}, first difference at {first:?}",
+            files[a].len(),
+            files[b].len()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn fixed_width_counts_come_from_the_extent_alone() {
     let _serial = serial();

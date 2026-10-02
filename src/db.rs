@@ -1763,40 +1763,33 @@ fn seg_order(a: &Seg, b: &Seg) -> Ordering {
 
 // ------------------------------------------------------- the segment writer --
 
-/// The segment file's output, written in 2 MB pieces at 2 MB offsets.
+/// The segment file's output, written in pieces of
+/// `SegmentOptions::write_piece` at multiples of it.
 ///
 /// The page cache sizes a folio by the write that creates it, at that
-/// write's alignment: a file written in pieces of a few hundred kilobytes
-/// is cached in folios of that size, and a mapping of it costs a page
-/// table entry and a TLB entry per 4 KB page, where a file written in
-/// 2 MB pieces at 2 MB offsets is cached in PMD-sized folios that the
-/// mapping takes with one entry each. The difference is the address
-/// translation a scan pays over a partition of 46 MB: 12% of the scan
-/// through the blob, paired window by window against the same bytes
-/// rewritten in one write, and nothing over a partition of 16 MB. The
-/// WAL recycler met the same rule from the other side, a folio sized by
-/// a write far larger than the commits after it (`CLAUDE.md`). A
-/// `BufWriter` of a megabyte flushed wherever it filled. This buffers to
-/// the next boundary of the file and writes the piece there whole; a
-/// flush before the boundary writes what there is, and the direct
-/// segment's commits do that by design.
+/// write's alignment, so the piece is the folio too. This buffers to the
+/// next boundary of the file and writes the piece there whole; a flush
+/// before the boundary writes what there is, and the direct segment's
+/// commits do that by design. The WAL recycler met the folio rule from
+/// the other side, a folio sized by a write far larger than the commits
+/// after it (`CLAUDE.md`).
 struct AlignedWriter {
     file: File,
     buf: Vec<u8>,
     /// Bytes on the file so far: where the buffer's contents land.
     written: u64,
+    /// The piece, and the boundary every write but a flush's ends on.
+    piece: u64,
 }
 
-/// The piece: the PMD size on x86-64 and on arm64 with 4 KB pages, and a
-/// harmless write size anywhere else.
-const WRITE_PIECE: u64 = 2 << 20;
-
 impl AlignedWriter {
-    fn new(file: File) -> AlignedWriter {
+    fn new(file: File, piece: usize) -> AlignedWriter {
+        let piece = piece.max(4096);
         AlignedWriter {
             file,
-            buf: Vec::with_capacity(WRITE_PIECE as usize),
+            buf: Vec::with_capacity(piece),
             written: 0,
+            piece: piece as u64,
         }
     }
 
@@ -1812,7 +1805,7 @@ impl AlignedWriter {
     /// Bytes from the file's end to the next boundary: what the buffer
     /// holds before it is written.
     fn to_boundary(&self) -> usize {
-        (WRITE_PIECE - self.written % WRITE_PIECE) as usize
+        (self.piece - self.written % self.piece) as usize
     }
 
     fn write_buf(&mut self) -> std::io::Result<()> {
@@ -2114,7 +2107,7 @@ impl SegmentWriter {
             .write(true)
             .truncate(true)
             .open(path)?;
-        let mut out = AlignedWriter::new(file);
+        let mut out = AlignedWriter::new(file, opts.write_piece);
         // The header region stays zero until `finish`, so a segment that
         // was never finished is a file no reader accepts rather than a
         // segment with some of its keys.
@@ -2912,6 +2905,19 @@ pub struct SegmentOptions {
     /// extent, as before format 0007. `docs/engine.md` has the figures;
     /// `supdb-fullrec` prices it.
     pub compact_records: bool,
+    /// The size of the pieces the writer hands the file, each written
+    /// whole at a multiple of its size; the page cache sizes a folio by
+    /// the write that makes it, so it is the folio size too. A megabyte:
+    /// a writer's piece is the write path's to pick, and a page the
+    /// writer makes for the reader's sake is work on the write path for
+    /// the other side. At 2 MB the folios are PMD-sized and a mapping
+    /// takes each with one page-table entry, which was to save a scan its
+    /// address translation and was never measured to on this machine; a
+    /// 2 MB folio takes a whole free 2 MB block, which a guest whose
+    /// balloon reports free memory has handed back to its host, and the
+    /// write pays the host's fault for every page of it. `docs/engine.md`
+    /// has the figures; `supdb-pmd` and `supdb-ingestpmd` price 2 MB.
+    pub write_piece: usize,
 }
 
 impl Default for SegmentOptions {
@@ -2921,6 +2927,7 @@ impl Default for SegmentOptions {
             checksums: true,
             parallel_index: true,
             compact_records: crate::reserve::COMPACT_RECORDS,
+            write_piece: 1 << 20,
         }
     }
 }

@@ -6688,11 +6688,14 @@ fn the_run_keeper_keeps_the_published_snapshot_current() {
             snapshot_runs: true,
             snapshot_keeper: true,
             snapshot_keeper_recent_pct: pct,
-            // The seal below is held in flight across a burst of writes,
-            // which only the writer driving its own landings can promise:
-            // on a thread of its own the landing may fall between the
-            // keeper's settle and the scan after it, and the landing's
-            // carry is checked apart, after the settle that lands it.
+            // The seal below is held in flight across a burst of writes
+            // (`hold_seal_landing`), and the writer drives its own
+            // landings: on a thread of its own the landing may fall
+            // between the keeper's settle and the scan after it, and the
+            // landing's carry is checked apart, after the settle that
+            // lands it. Unheld, a seal that finished first landed at the
+            // burst's commit, whose upkeep sorted the live table again
+            // where the keeper carries it across a landing anywhere else.
             publish_in_background: false,
             ..Options::default()
         };
@@ -6762,9 +6765,10 @@ fn the_run_keeper_keeps_the_published_snapshot_current() {
             builds,
             "{block_cache} {pct}: the handle adopted it"
         );
-        // A seal left in flight: the keeper carries the snapshot across
+        // A seal held in flight: the keeper carries the snapshot across
         // the freeze, the live entries frozen ones now, and the writes
         // after go into the new table over the same keys.
+        db.hold_seal_landing(true);
         db.seal().unwrap();
         db.settle_keeper();
         assert_eq!(
@@ -6798,6 +6802,7 @@ fn the_run_keeper_keeps_the_published_snapshot_current() {
         // The seal lands: the frozen entries leave the snapshot. At least
         // one more carry: the landing's publish, and a merge it starts
         // is one more when the keeper meets the two apart.
+        db.hold_seal_landing(false);
         db.settle().unwrap();
         assert!(
             db.snapshot_kept().1 >= 2,
@@ -7738,6 +7743,8 @@ fn a_handle_reads_the_seals_snapshot_while_the_seal_runs() {
 /// makes -- holds no published snapshot, and the first scan over it, a
 /// handle's or the writer's, carries the table's own forward instead of
 /// sorting the table again. The seal sorted it once and nobody else does.
+/// The seal is held after its publish until the settle, since the commit
+/// that opens the run lands a seal that has finished.
 #[test]
 fn a_frozen_tables_snapshot_outlives_the_state_it_was_published_in() {
     for frozen_snaps in [true, false] {
@@ -7748,6 +7755,7 @@ fn a_frozen_tables_snapshot_outlives_the_state_it_was_published_in() {
                 ..Options::default()
             },
         );
+        db.hold_seal_landing(true);
         db.seal().unwrap();
         await_seal_snapshot(&db);
         // Above every key, over the empty live table: a direct run opens,
@@ -7772,6 +7780,7 @@ fn a_frozen_tables_snapshot_outlives_the_state_it_was_published_in() {
         }
         assert_eq!(db.frozen_sorts(), 0, "nobody sorted the frozen table alone");
         assert!(db.in_flight().0, "nothing landed the seal");
+        db.hold_seal_landing(false);
         db.settle().unwrap();
         m.check(&r, "a handle after the landing");
         m.check(&db, "the writer after the landing");
@@ -8526,6 +8535,12 @@ fn a_fourth_freeze_waits_for_the_front_to_land() {
     let (mut db, mut m, _) = partitions_under_a_piece("fourth-freeze", Options::default());
     let watch = Watchdog::arm("a freeze waited for a held seal, or the fourth past the release");
     db.hold_seal_landing(true);
+    // The durable phase held as well, so once the release lets the front
+    // land readable the seals behind it stay frozen: only the oldest
+    // lands at all until it is durable. Without it the release let every
+    // seal land, and a count of frozen tables after the fourth freeze
+    // read zero as often as not on a loaded machine.
+    db.hold_seal_durable(true);
     for f in 0..3u32 {
         freeze_one_of_three(&mut db, &mut m, f);
     }
@@ -8547,10 +8562,15 @@ fn a_fourth_freeze_waits_for_the_front_to_land() {
         "the fourth freeze waited once: {w:?}"
     );
     assert!(w.join_wait_ns > w0.join_wait_ns, "{w:?}");
-    assert!(db.frozen_tables() >= 1, "the fourth table frozen");
+    assert_eq!(
+        db.frozen_tables(),
+        3,
+        "the fourth table frozen into the front's room"
+    );
     m.check(&db, "the writer over the fourth frozen table");
     let r = db.reader().unwrap();
     m.check(&r, "a handle over the fourth frozen table");
+    db.hold_seal_durable(false);
     db.settle().unwrap();
     assert_eq!(db.frozen_tables(), 0, "every seal landed");
     m.check(&db, "the writer after the landings");
@@ -9006,13 +9026,16 @@ fn a_hashed_tail_handed_beside_a_seal_in_flight_lands_as_a_piece() {
 /// delete and then an append. A handle's scan extends the published
 /// snapshot with them rather than sorting everything, and the frozen
 /// runs come along; a second batch is carried onto that extension. Only
-/// a writer operation lands the seal inline, so the commits come within
-/// milliseconds of the publish, before the seal thread can have
-/// finished, and the model checks, which take long, come after them.
+/// a writer operation lands the seal inline, and a commit lands one that
+/// has finished, so the seal is held after its publish
+/// (`hold_seal_landing`) until the settle: the commits once came within
+/// milliseconds of the publish on the bet that the seal thread could not
+/// have finished, and a seal written faster won the bet back.
 #[test]
 fn a_handle_extends_the_seals_snapshot_with_the_keys_written_after_it() {
     let (mut db, mut m) = seal_snapshot_store("seal-snapshot-extends");
     let key = |k: u32| format!("key-{k:05}");
+    db.hold_seal_landing(true);
     db.seal().unwrap();
     for k in 3000..3200u32 {
         m.append(&mut db, &key(k), "live");
@@ -9073,6 +9096,7 @@ fn a_handle_extends_the_seals_snapshot_with_the_keys_written_after_it() {
     m.check(&db, "the writer during the seal");
     assert_eq!(db.snapshot_builds(), 0, "the writer extended too");
     assert!(db.in_flight().0, "the seal is still in flight");
+    db.hold_seal_landing(false);
     db.settle().unwrap();
     assert_eq!(db.levels(), (0, 1), "the piece landed");
     m.check(&r, "a handle after the landing");
