@@ -402,6 +402,13 @@ fn the_oracle_holds_with_the_upkeep_on_a_thread() {
     oracle(true, supdb::Upkeep::Background(3));
 }
 
+/// And at the level that ships, where no commit holds: the thread's
+/// passes run beside the writer's commits rather than between them.
+#[test]
+fn the_oracle_holds_with_the_upkeep_never_held_for() {
+    oracle(true, supdb::Upkeep::Background(1));
+}
+
 /// The probe merge stays behind `cursor_merge` as the comparison arm -- and
 /// a path only one arm exercises is a path nothing tests.
 #[test]
@@ -4150,6 +4157,9 @@ fn a_reader_walks_the_forms_the_writer_maintains_at_commit() {
         // store's writes with no scan at all, is off here.
         forms_settle_backlog_pct: 0,
         commit_forms: true,
+        // The commit's own maintenance, step by step: on the thread, which
+        // commit a pass files is the thread's timing.
+        upkeep: supdb::Upkeep::Inline,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -5245,6 +5255,9 @@ fn the_writer_maintains_the_forms_once_a_reader_handle_is_live() {
         // since with the snapshot shared the forms cost the writer's own
         // reads nothing.
         forms_from_reader_scans: 1,
+        // The commit's own maintenance, step by step: on the thread, which
+        // commit a pass files is the thread's timing.
+        upkeep: supdb::Upkeep::Inline,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -5331,6 +5344,9 @@ fn the_writers_own_handle_takes_the_forms_it_maintains() {
             // but only once a handle the caller made has scanned.
             forms_from_reader_scans: 0,
             forms_to_writer: to_writer,
+            // The commit's own maintenance, step by step: on the thread, which
+            // commit a pass files is the thread's timing.
+            upkeep: supdb::Upkeep::Inline,
             ..Options::default()
         };
         let mut db = Db::create(&d, opts).unwrap();
@@ -5685,6 +5701,9 @@ fn a_reader_meets_a_block_gone_wide_through_the_forms() {
         scan_cache_ahead: false,
         forms_settle_backlog_pct: 0,
         commit_forms: true,
+        // The commit's own maintenance, step by step: on the thread, which
+        // commit a pass files is the thread's timing.
+        upkeep: supdb::Upkeep::Inline,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -5775,6 +5794,9 @@ fn the_copies_survive_a_merge_with(compact: bool) {
             compact_records: compact,
             ..Default::default()
         },
+        // The commit's own maintenance, step by step: on the thread, which
+        // commit a pass files is the thread's timing.
+        upkeep: supdb::Upkeep::Inline,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -5879,6 +5901,9 @@ fn the_forms_survive_a_seal_with(snapshot_carry: bool) {
         scan_cache_ahead: false,
         forms_settle_backlog_pct: 0,
         commit_forms: true,
+        // The commit's own maintenance, step by step: on the thread, which
+        // commit a pass files is the thread's timing.
+        upkeep: supdb::Upkeep::Inline,
         forms_carry: true,
         snapshot_carry,
         ..Options::default()
@@ -6009,6 +6034,9 @@ fn the_forms_survive_a_direct_runs_start() {
         forms_settle_backlog_pct: 0,
         commit_forms: true,
         forms_carry: true,
+        // The commit's own maintenance, step by step: on the thread, which
+        // commit a pass files is the thread's timing.
+        upkeep: supdb::Upkeep::Inline,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -6072,7 +6100,19 @@ fn the_forms_survive_a_direct_runs_start() {
 /// fills it. Held to the model through a handle and the writer.
 #[test]
 fn a_publish_starts_the_builder_and_a_commit_installs_its_forms() {
-    let d = dir("ahead-publish");
+    a_publish_starts_the_builder_and_a_commit_installs_its_forms_with(supdb::Upkeep::Inline);
+}
+
+/// The same with the commit's upkeep lent to the thread, which installs
+/// the builder's forms at its pass: the builder's check at the commit
+/// takes the upkeep home, and the commit it dropped is handed back.
+#[test]
+fn a_publish_starts_the_builder_and_the_upkeep_thread_installs_its_forms() {
+    a_publish_starts_the_builder_and_a_commit_installs_its_forms_with(supdb::Upkeep::Background(1));
+}
+
+fn a_publish_starts_the_builder_and_a_commit_installs_its_forms_with(upkeep: supdb::Upkeep) {
+    let d = dir(&format!("ahead-publish-{upkeep:?}"));
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(2 << 10),
@@ -6083,6 +6123,7 @@ fn a_publish_starts_the_builder_and_a_commit_installs_its_forms() {
         forms_settle_backlog_pct: 0,
         commit_forms: true,
         build_ahead_on_publish: true,
+        upkeep,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -6111,7 +6152,15 @@ fn a_publish_starts_the_builder_and_a_commit_installs_its_forms() {
     for k in (1..1500u32).step_by(11) {
         m.append(&mut db, &key(k), "v2");
     }
+    let passes = db.upkeep_counts()[0];
     db.commit().unwrap();
+    if upkeep != supdb::Upkeep::Inline {
+        db.settle().unwrap();
+        assert!(
+            db.upkeep_counts()[0] > passes,
+            "the thread made no pass, so nothing here tested it"
+        );
+    }
     let (forms, _, _, _) = db.canonical_forms();
     assert!(
         forms > 0,
@@ -6140,6 +6189,9 @@ fn the_forms_are_published_when_a_handle_asks() {
         scan_cache_ahead: false,
         forms_settle_backlog_pct: 0,
         commit_forms: true,
+        // The commit's own maintenance, step by step: on the thread, which
+        // commit a pass files is the thread's timing.
+        upkeep: supdb::Upkeep::Inline,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -6243,6 +6295,9 @@ fn a_table_the_commit_filled_takes_the_writes_after_it() {
         scan_cache_ahead: false,
         forms_settle_backlog_pct: 0,
         commit_forms: true,
+        // The commit's own maintenance, step by step: on the thread, which
+        // commit a pass files is the thread's timing.
+        upkeep: supdb::Upkeep::Inline,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -6947,6 +7002,9 @@ fn a_scan_builds_the_snapshot_only_where_a_block_needs_it() {
             commit_forms: true,
             forms_carry: true,
             scan_lazy_snapshot: lazy,
+            // The commit's own maintenance, step by step: on the thread,
+            // which commit a pass files is the thread's timing.
+            upkeep: supdb::Upkeep::Inline,
             ..Options::default()
         };
         let mut db = Db::create(&d, opts).unwrap();
@@ -8081,7 +8139,11 @@ fn tail_readers(
                 let mut seen: HashMap<u32, u32> = HashMap::new();
                 let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ (t + 1);
                 let mut ops = 0usize;
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // A floor under each thread's reads, whatever the window:
+                // the callers' count of them bet the window would hold a
+                // hundred, and a commit that stopped holding for the
+                // upkeep made it short enough on a loaded box to lose.
+                while ops < 50 || !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     x ^= x << 13;
                     x ^= x >> 7;
                     x ^= x << 17;

@@ -2394,10 +2394,10 @@ section knows.
 
 #### Commits that never hold, priced by the sum
 
-`supdb-lend` and `supdb-ingestlend` run the upkeep at level 1: a commit
-hands its writes to the thread and neither holds for it nor files them
-itself, so no commit does work for the reads. Priced in one process
-against the shipping arms, ten pairs a size: ycsb-A 1.58x and 1.41x and
+At level 1 a commit hands its writes to the thread and neither holds for
+it nor files them itself, so no commit does work for the reads. Priced
+in one process against the same arms at level 2 (`supdb-hold` and
+`supdb-ingesthold` now), ten pairs a size: ycsb-A 1.58x and 1.41x and
 ycsb-F 1.23x and 1.29x on the buffered arm at a hundred and three hundred
 thousand keys, 10 of 10 each, and 0.98-1.20x and 1.02-1.34x unresolved on
 the durable arm, whose commits are mostly their fsync; the lag sweep's
@@ -2417,6 +2417,9 @@ cache the fully unmerged point reads 2.7-5.0M entries a second, with the
 forms 22-54M. Lend does less work than the hold and moves it to where the
 suite does not time it; the pass after a burst is its cost, and
 shortening that window is the background's job, not the commit's.
+
+Level 1 is the default now, and the lag sweep times each burst beside its
+pass (`updates_per_s_lagNpct`), so the trade reads in both quantities.
 
 #### The segment work on a thread of its own
 

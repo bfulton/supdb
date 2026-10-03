@@ -1150,28 +1150,28 @@ impl Supdb {
         )
     }
 
-    /// EXPERIMENT: `supdb` whose commits hand their writes to the upkeep
-    /// thread and never hold for it nor file them themselves
-    /// (`Upkeep::Background(1)`): no commit does work for the reads.
-    pub fn create_lend(path: &Path) -> Res<Supdb> {
+    /// `supdb` whose commits hold for the upkeep thread while reads are
+    /// around (`Upkeep::Background(2)`), the default before commits
+    /// stopped waiting for it: against `supdb` it prices the hold, the
+    /// lag sweep's bursts against the passes after them.
+    pub fn create_hold(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                upkeep: Some(supdb::Upkeep::Background(1)),
+                upkeep: Some(supdb::Upkeep::Background(2)),
                 ..Policy::default()
             },
         )
     }
 
-    /// EXPERIMENT: `supdb-ingest` whose commits lend and never hold, as
-    /// `supdb-lend`.
-    pub fn create_ingest_lend(path: &Path) -> Res<Supdb> {
+    /// `supdb-ingest` whose commits hold for the upkeep, as `supdb-hold`.
+    pub fn create_ingest_hold(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
                 partition: false,
                 durable: false,
-                upkeep: Some(supdb::Upkeep::Background(1)),
+                upkeep: Some(supdb::Upkeep::Background(2)),
                 ..Policy::default()
             },
         )
@@ -1836,11 +1836,11 @@ impl Engine for Supdb {
             return "supdb-settleall";
         }
         match self.upkeep {
-            Some(supdb::Upkeep::Background(1)) => {
+            Some(supdb::Upkeep::Background(2)) => {
                 return if self.partition {
-                    "supdb-lend"
+                    "supdb-hold"
                 } else {
-                    "supdb-ingestlend"
+                    "supdb-ingesthold"
                 };
             }
             Some(_) => return "supdb-inline",
@@ -2480,7 +2480,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice"
         | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "supdb-inlinemaint"
         | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose" | "supdb-rotate"
-        | "supdb-nofrozen" | "supdb-idle" | "supdb-sortover" | "supdb-pmd" | "supdb-lend"
+        | "supdb-nofrozen" | "supdb-idle" | "supdb-sortover" | "supdb-pmd" | "supdb-hold"
         | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest"
         | "supdb-ingestleave"
@@ -2498,7 +2498,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-shapeidle"
         | "supdb-shapesortover"
         | "supdb-ingestpmd"
-        | "supdb-ingestlend"
+        | "supdb-ingesthold"
         | "lmdb-nosync"
         | "rocksdb-nosync" => Guarantee::Buffered,
         _ => return None,
@@ -2524,8 +2524,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-sealfile" => Box::new(Supdb::create_sealfile(dir)?),
         "supdb-settleall" => Box::new(Supdb::create_settleall(dir)?),
         "supdb-inline" => Box::new(Supdb::create_inline(dir)?),
-        "supdb-lend" => Box::new(Supdb::create_lend(dir)?),
-        "supdb-ingestlend" => Box::new(Supdb::create_ingest_lend(dir)?),
+        "supdb-hold" => Box::new(Supdb::create_hold(dir)?),
+        "supdb-ingesthold" => Box::new(Supdb::create_ingest_hold(dir)?),
         "supdb-tier" => Box::new(Supdb::create_tier(dir)?),
         "supdb-runs" => Box::new(Supdb::create_runs(dir)?),
         "supdb-keeper" => Box::new(Supdb::create_keeper(dir)?),

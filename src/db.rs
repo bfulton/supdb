@@ -157,7 +157,7 @@ fn idle_io_priority() {
 
 /// Who keeps the writer's upkeep current: the block forms its range
 /// reads walk and the scan snapshot of the unsealed keys, both filed with
-/// every commit's writes. `Background(2)` by default.
+/// every commit's writes. `Background(1)` by default.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Upkeep {
     /// The writer, on its own thread: a commit files its writes when a
@@ -172,7 +172,9 @@ pub enum Upkeep {
     /// commits do not take it back, so the thread works beside the next
     /// batch. The level is how eagerly it files:
     ///
-    /// - 1: what a commit would have filed, by the same rules.
+    /// - 1: what a commit would have filed, by the same rules, and no
+    ///   commit waits for it: the default, so a write never waits on work
+    ///   done for the reads.
     /// - 2: what `Inline` does, except that while reads are around -- a
     ///   scan over the store within the last two stores' worth of writes
     ///   -- a commit whose own rules would leave its batch to the next
@@ -192,7 +194,7 @@ pub enum Upkeep {
 
 impl Default for Upkeep {
     fn default() -> Upkeep {
-        Upkeep::Background(2)
+        Upkeep::Background(1)
     }
 }
 
@@ -922,11 +924,12 @@ pub struct Options {
     /// writes -- 0.5-0.8 ms of a pass of 0.45. Kept as the comparison arm.
     pub forms_settle_keys_all: bool,
     /// Who keeps the writer's upkeep current; see `Upkeep`. A thread at
-    /// level 2, which holds a commit for its pass only where the commit
-    /// would leave its batch to the next read: the fully-unmerged lag
-    /// point at a hundred and three hundred thousand keys read 1.6-1.9x
-    /// over six sittings, and ycsb-E there 2-8% slower. `supdb-inline`
-    /// prices the writer keeping it.
+    /// level 1, to which every commit hands its writes and for which none
+    /// waits: no write pays for the reads, and the first reads after a
+    /// burst pay for what the thread has not yet filed. `supdb-hold`
+    /// prices level 2, whose commits hold for the thread while reads are
+    /// around, and `supdb-inline` the writer keeping it; `docs/engine.md`
+    /// has the figures.
     pub upkeep: Upkeep,
     /// EXPERIMENT: a scan builds the snapshot only when a block it
     /// reaches needs one. A block held as a sparse form, a copy or a
@@ -13759,15 +13762,23 @@ impl Db {
         if self.flush_merge_finished() {
             self.with_maint(|m| m.join_compact())?;
         }
-        if background {
+        let lent = if background {
             if let Some(e) = self.shared.upkeep.take_err() {
                 return Err(e);
             }
-            self.finish_hand()?;
+            self.finish_hand()?
         } else {
             self.maintain_forms()?;
-        }
+            false
+        };
         self.build_ahead_if_due();
+        // The builder's check reads the upkeep, and taking it home drops
+        // the commit no pass has begun on: handed back, or what the
+        // thread was given waits for the first read, and an arm that
+        // builds ahead at every publish had none of its commits filed.
+        if lent && self.fs_home() {
+            self.hand_over_upkeep();
+        }
         self.start_keeper();
         // The thread frees what it replaced at its own passes: freed here
         // while it is lent, a form it had just replaced could go under a
@@ -14409,12 +14420,15 @@ impl Db {
         if (due == 0 && !on_publish) || !self.opts.scan_block_cache {
             return;
         }
-        let running = self
-            .fs()
-            .ahead
-            .borrow()
-            .as_ref()
-            .is_some_and(|a| a.handle.as_ref().is_some_and(|h| !h.is_finished()));
+        // Nor one whose forms wait for the maintenance that installs them,
+        // which their posting made due: a builder started over it threw
+        // them away and the reason with them. The commit's own maintenance
+        // runs before this and never left them waiting; a pass on the
+        // upkeep thread that had not begun did.
+        let running = self.fs().ahead.borrow().as_ref().is_some_and(|a| {
+            a.handle.as_ref().is_some_and(|h| !h.is_finished())
+                || (!a.done.get() && a.posted.load(std::sync::atomic::Ordering::Acquire))
+        });
         if running {
             return;
         }
@@ -17227,17 +17241,18 @@ impl Db {
 
     /// The end of a commit's upkeep: handed over if it came home since
     /// the barrier, then what the hand-over decided -- filed here, or
-    /// held for until the thread has filed it.
-    fn finish_hand(&mut self) -> Result<()> {
+    /// held for until the thread has filed it. Whether it was left lent
+    /// with no pass waited for.
+    fn finish_hand(&mut self) -> Result<bool> {
         if self.fs_home() && self.upkeep_hand != Hand::Inline {
             self.hand_over_upkeep();
         }
         match std::mem::take(&mut self.upkeep_hand) {
-            Hand::Lend => Ok(()),
-            Hand::Inline => self.maintain_forms(),
+            Hand::Lend => Ok(true),
+            Hand::Inline => self.maintain_forms().map(|()| false),
             Hand::Hold => {
                 self.hold_for_upkeep();
-                Ok(())
+                Ok(false)
             }
         }
     }

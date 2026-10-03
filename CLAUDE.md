@@ -256,10 +256,11 @@ keeps a cell out of a segment, a blob or a memtable, since a raw pointer
 behind an atomic would let one in unasked.
 
 **The writer's upkeep is lent, never shared.** By default
-(`Upkeep::Background(2)`) a commit that would leave its batch to the
-next scan lends the writer's `FormsState` -- its block tables and scan
-snapshot -- to a thread of the store's own, and returns once the thread
-has filed it. One thread holds it at a time, and one word says which:
+(`Upkeep::Background(1)`) a commit lends the writer's `FormsState` --
+its block tables and scan snapshot -- to a thread of the store's own and
+returns without waiting for it; at level 2 (`supdb-hold`) a commit that
+would leave its batch to the next scan returns only once the thread has
+filed it. One thread holds it at a time, and one word says which:
 every hand-over is a single operation on that word, the side giving it
 up fills the cell before it and the side taking it empties the cell
 after, so nothing in it needs to be `Sync`. A writer's touch of it takes
@@ -697,7 +698,18 @@ check is green on work that was never handed over. The same test found
 the converse once the commits held for their pass: under a hold the
 writer commits nothing past the commit it named, so a pass stamping its
 forms with the writer's latest commit instead of the named one is
-invisible there, and only the level that never holds catches it.
+invisible there, and only the level that never holds catches it. It
+came again when that level became the default: the builder's check,
+after the commit had lent its upkeep, read the upkeep for whether a
+builder ran, took it home and dropped the commit no pass had begun,
+so the arm that builds ahead at every publish had none of its commits
+filed; and at a new generation it started a builder over the one whose
+posted forms were the reason that commit's maintenance was due, which
+the commit's own maintenance, running before the check, had always
+taken first. A commit that lent hands the upkeep back if anything
+after the hand-over took it home, and a builder whose forms wait to be
+installed is left alone, as a running one was. The test that found
+both failed 28 runs in 48 under contention and none alone.
 
 **A format change priced on the path that reads it in bulk.** The
 compact record was priced against `supdb`, whose scans walk a
