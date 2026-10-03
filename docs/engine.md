@@ -2486,6 +2486,62 @@ dense burst the per-write upkeep costs about four times what one build a
 block after it does; on the durable arm, whose commits wait on their
 fsync, the thread keeps up and the burst gains.
 
+#### A cost model for the background work
+
+What decides when the background works, how much and in what order is
+the foreground's time, with reads weighted twice writes (`γ = 2`): a
+lag point is priced by its burst plus twice its pass. Per write and per
+block, at a hundred thousand keys: a patch `p` ≈ 0.4-1.0 µs on the
+upkeep thread, a block build `B` ≈ 15-25 µs, a ready block's walk
+about 2.5 µs, the buffered writer `c_w` ≈ 0.75 µs a write and the
+durable one 2-2.5. Three rules follow, block by block. A block's
+writes before its next read cost `k·p` patched and `B` rebuilt, so past
+`k* = B/p` (about forty) it is cheaper rebuilt once, and online the
+choice is rent-or-buy. A patched form walks slower than a copy, and
+rebuilding it repays only through later walks, so with no read coming
+it never repays. And the thread keeps up only while
+`ρ = c_t / c_w ≤ 1`, `c_t` its cost a write; past that, the deficit
+`(ρ - 1)` of the burst lands on the first read at weight `γ`, or on
+the writer at weight one if the writer is held back, but held in
+lockstep the writer pays the thread's whole work, not the deficit.
+
+The upkeep's cost a write is counted now (`upkeep_ms` against the
+writes a point files). Measured over the lag sweep's largest burst on
+the buffered arm, the lazy freeze's thread spent about 1.1 µs a write
+against the writer's 0.75, a sixth of it rebuilding dense sparse forms
+nothing would read before the burst patched them again. With
+`Options::forms_convert_unread` off, the fill rebuilds a dense form
+only where a scan has come since the fill before: the burst's builds
+fell from about 1,570 to under a dozen, the thread to about 0.85 µs a
+write, and the pass after it from about 44 ms to 26. Level 2 holds a
+commit until the thread has filed it, and its burst cost the writer
+plus the thread, 0.8 + 1.5 µs a write: at `γ = 2` it priced at
+0.59x and 0.49x of the default at a hundred and three hundred
+thousand keys on the buffered arm, while winning the sparse points
+by 1.0-1.3x.
+
+`Options::upkeep_lag` holds a commit only while the thread trails by
+more than a bound, and lets it go once the thread is within half of
+it, and `Options::upkeep_batch` keeps the thread from beginning a pass
+for fewer writes. They did what they say and lost: a pass has a fixed
+part `F` -- the log read, and the scan snapshot moved and every table's
+bounds walked again at each state the thread looks at -- fitted at
+about 0.76 ms beside 0.83 µs a write, so a bound that makes the thread
+look often makes it slower than the writer, and no bound tried beat
+the unbounded thread. The rule the model gives for the pass size is the
+square-root one, `n* = √(N·F / (γ·p))`, about 6,500 writes for a
+hundred-thousand-write burst, and with `F` as it is the bound cannot
+be smaller than that. `F` itself is the next thing to cut.
+
+Priced in one process, eight pairs a rung, burst plus twice the pass
+summed over the lag points: `supdb-ingestbg` and `supdb-bg` (the lazy
+freeze, the conversion gated on reads) against the default read 0.94,
+1.05 and 1.17 on the buffered arm and 1.03, 1.19 and 1.00 on the
+durable at ten, a hundred and three hundred thousand keys, the durable
+burst at the largest point 1.19x and 1.14x (8/8) at the larger rungs
+and nothing else held; `supdb-ingestbglag`, with a bound of sixteen
+thousand and a batch of eight, read 0.98 and 0.89. The defaults stand.
+
 #### The segment work on a thread of its own
 
 A seal's landing, the merges and piece merges, the promotions, the

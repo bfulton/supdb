@@ -931,6 +931,22 @@ pub struct Options {
     /// around, and `supdb-inline` the writer keeping it; `docs/engine.md`
     /// has the figures.
     pub upkeep: Upkeep,
+    /// Writes the upkeep thread may trail the writer by, with reads
+    /// around, before a commit at level 1 holds until it has caught up;
+    /// zero never holds. Holding for every batch (level 2) puts the
+    /// thread's whole work on the writer, which waits through each pass
+    /// in turn; a bound lets the two run side by side and costs the
+    /// writer only what the thread cannot keep up with, while a read
+    /// that follows a burst finds at most the bound left to file.
+    /// `supdb-bg` and `supdb-ingestbg` set it.
+    pub upkeep_lag: usize,
+    /// Writes the upkeep thread lets gather before it begins a pass,
+    /// unless a commit holds for it or the writes have stopped for
+    /// `UPKEEP_BATCH_WAIT`; zero begins one at every commit. A pass costs
+    /// a fixed part -- the log read, the snapshot moved and the tables'
+    /// bounds walked again -- besides a part per write, so a thread that
+    /// begins a pass for every commit spends the fixed part per commit.
+    pub upkeep_batch: usize,
     /// EXPERIMENT: a scan builds the snapshot only when a block it
     /// reaches needs one. A block held as a sparse form, a copy or a
     /// clean one is walked from the form and the partition alone; only a
@@ -997,6 +1013,15 @@ pub struct Options {
     /// built, the rebuilt block being the one the reads want -- so zero
     /// is the default and `supdb-rebuild` prices it.
     pub forms_settle_rebuild_from: usize,
+    /// Whether a sparse form the patches have grown past `CACHE_DENSE`
+    /// deltas is rebuilt as a copy at the next fill even when nothing has
+    /// read since the last one. The copy repays its build only through
+    /// the walks it makes cheaper, and a stretch of writes nobody reads
+    /// patches the copy again before anything walks it, so off, the fill
+    /// rebuilds a dense form only where a scan has come since the fill
+    /// before, and the write-driven rebuilds a burst made, one per block,
+    /// wait for a read to ask. `supdb-bg` and `supdb-ingestbg` turn it off.
+    pub forms_convert_unread: bool,
     /// EXPERIMENT: the writes since the last scan over the store, as a
     /// share of the partitions' keys, within which the backlog bound
     /// above settles at all; zero, the default, settles by the bound
@@ -1194,11 +1219,14 @@ impl Default for Options {
             forms_settle_backlog_pct: 2,
             forms_settle_keys_all: false,
             upkeep: Upkeep::default(),
+            upkeep_lag: 0,
+            upkeep_batch: 0,
             snapshot_carry: false,
             frozen_snaps: true,
             overlay_merge: true,
             scan_lazy_snapshot: false,
             forms_settle_rebuild_from: 0,
+            forms_convert_unread: true,
             forms_settle_recent_pct: 0,
             forms_carry: true,
             freeze_settles: true,
@@ -6617,6 +6645,11 @@ struct FormsState {
     /// backlog's density: settles, keys, blocks those keys fall in, and
     /// blocks at or past `Options::forms_settle_rebuild_from`.
     settle_density: std::cell::Cell<[u64; 4]>,
+    /// Whether this fill may rebuild a dense sparse form as a copy, and
+    /// the store's scan count at the fill before, which says whether
+    /// anything has read since (`Options::forms_convert_unread`).
+    convert_dense: std::cell::Cell<bool>,
+    convert_life: std::cell::Cell<u64>,
     /// PROTOTYPE: every built block holding bytes, as (partition index,
     /// block), so the sampler draws from blocks and never from empty
     /// slots. Sampling slots was tried: with a tenth of them built, a
@@ -6704,6 +6737,8 @@ impl FormsState {
             choices: std::cell::Cell::new([0; 5]),
             lazy_scans: std::cell::Cell::new([0; 2]),
             settle_density: std::cell::Cell::new([0; 4]),
+            convert_dense: std::cell::Cell::new(true),
+            convert_life: std::cell::Cell::new(u64::MAX),
             built: std::cell::RefCell::new(Vec::new()),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),
@@ -6824,6 +6859,11 @@ pub struct Db {
     upkeep_log: (u64, usize),
     upkeep_life: u64,
     upkeep_since_scan: u64,
+    /// Writes lent over the store's life, and the count below which all
+    /// were filed when the thread was last seen caught up, for
+    /// `Options::upkeep_lag`.
+    upkeep_lent: u64,
+    upkeep_floor: u64,
     /// What the commit in progress does with its batch, decided when it
     /// hands the upkeep over: see `Hand`.
     upkeep_hand: Hand,
@@ -11011,6 +11051,10 @@ impl Reader {
         let scans = st.scans.load(AtomicOrdering::Relaxed);
         self.fs().scans_seen.set(scans);
         self.fs().cache_used.set(true);
+        let life = self.shared.scans_life.load(AtomicOrdering::Relaxed);
+        self.fs()
+            .convert_dense
+            .set(self.opts.forms_convert_unread || life != self.fs().convert_life.replace(life));
         let gen = st.gen;
         let moved = self.sync_log() || self.fs().scan_keys.borrow().is_none();
         // Settle before the snapshot moves, which is the order the scan
@@ -11125,10 +11169,11 @@ impl Reader {
             for b in 0..table.slots.len() {
                 // An empty slot with an overlay, or a form the patches
                 // grew to what a build would have copied.
-                let dense = matches!(
-                    table.slots[b].as_deref(),
-                    Some(Cached::Sparse(sb)) if sb.ents.len() >= CACHE_DENSE
-                );
+                let dense = self.fs().convert_dense.get()
+                    && matches!(
+                        table.slots[b].as_deref(),
+                        Some(Cached::Sparse(sb)) if sb.ents.len() >= CACHE_DENSE
+                    );
                 if dense {
                     self.unlist(pi, b, table);
                 } else if table.slots[b].is_some() || BuildCtx::overlay_count(table, b) == 0 {
@@ -11390,6 +11435,22 @@ impl Reader {
             // loop's cost beyond the splice was mostly those.
             if let Some(&(_, _, _, off2, len2, _, _)) = resolved.get(i + 2) {
                 src.prefetch_key(off2, len2);
+            }
+            // And the chains the patch reads, two dependent misses a write
+            // for the same reason: the entry eight ahead, then, four ahead,
+            // the chunk its head names, which a put's tombstone sits just
+            // before. The masked patch's chain walk was a fifth of the
+            // upkeep thread's time over a burst of updates, stalled on
+            // those two loads.
+            if let Some(&(.., s8)) = resolved.get(i + 8) {
+                if s8 != u32::MAX {
+                    src.prefetch_entry(s8 as usize);
+                }
+            }
+            if let Some(&(.., s4)) = resolved.get(i + 4) {
+                if s4 != u32::MAX {
+                    src.prefetch_chunk(MemTable::head(src.entry(s4 as usize)), CHUNK_HDR);
+                }
             }
             let (at, b) = (at as usize, b as usize);
             let key = src.key_at(off, len);
@@ -11685,7 +11746,7 @@ impl Reader {
                 .cache_bytes
                 .set(self.fs().cache_bytes.get() + after - before);
         }
-        if dense && self.opts.commit_forms && self.slot.is_none() {
+        if dense && self.opts.commit_forms && self.slot.is_none() && self.fs().convert_dense.get() {
             self.fs().tables_complete.set(false);
         }
         if bloated {
@@ -13312,6 +13373,8 @@ impl Db {
             upkeep_log: (0, 0),
             upkeep_life: 0,
             upkeep_since_scan: 0,
+            upkeep_lent: 0,
+            upkeep_floor: 0,
             upkeep_hand: Hand::Lend,
             unsynced: 0,
             lag_writes: usize::MAX,
@@ -13670,6 +13733,8 @@ impl Db {
             upkeep_log: (0, 0),
             upkeep_life: 0,
             upkeep_since_scan: 0,
+            upkeep_lent: 0,
+            upkeep_floor: 0,
             upkeep_hand: Hand::Lend,
             unsynced: 0,
             lag_writes: usize::MAX,
@@ -16921,6 +16986,9 @@ struct UpkeepTo {
     wm: u64,
     /// File everything whatever the commit's own rules say.
     force: bool,
+    /// The writes lent up to this commit, over the store's life: the
+    /// thread publishes it as filed once its pass is done.
+    lent: u64,
 }
 
 /// The writer's upkeep while it is away from the writer, and the thread
@@ -16965,6 +17033,12 @@ struct Lend {
     /// Commits that held for their pass, and the nanoseconds they held.
     holds: AtomicU64,
     hold_ns: AtomicU64,
+    /// For a measurement: the nanoseconds the thread spent in its passes,
+    /// which over the writes it filed is what the upkeep costs a write.
+    busy_ns: AtomicU64,
+    /// `UpkeepTo::lent` of the last pass done: how far the thread has
+    /// filed, for `Options::upkeep_lag`.
+    filed: AtomicU64,
 }
 
 /// The upkeep is away from the writer: in the cell, or out with the
@@ -17004,6 +17078,7 @@ struct SeqTo {
     len: AtomicUsize,
     wm: AtomicU64,
     force: std::sync::atomic::AtomicBool,
+    lent: AtomicU64,
 }
 
 impl SeqTo {
@@ -17017,6 +17092,7 @@ impl SeqTo {
         self.len.store(to.len, AtomicOrdering::Relaxed);
         self.wm.store(to.wm, AtomicOrdering::Relaxed);
         self.force.store(to.force, AtomicOrdering::Relaxed);
+        self.lent.store(to.lent, AtomicOrdering::Relaxed);
         self.seq.store(n + 2, AtomicOrdering::Release);
     }
 
@@ -17031,6 +17107,7 @@ impl SeqTo {
                     len: self.len.load(AtomicOrdering::Relaxed),
                     wm: self.wm.load(AtomicOrdering::Relaxed),
                     force: self.force.load(AtomicOrdering::Relaxed),
+                    lent: self.lent.load(AtomicOrdering::Relaxed),
                 };
                 std::sync::atomic::fence(AtomicOrdering::Acquire);
                 if self.seq.load(AtomicOrdering::Relaxed) == n {
@@ -17059,6 +17136,11 @@ impl SeqTo {
 const UPKEEP_POLL_MIN: std::time::Duration = std::time::Duration::from_micros(100);
 const UPKEEP_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(20);
 const UPKEEP_WAKE_WRITES: usize = 256;
+
+/// How long the upkeep thread lets a commit short of
+/// `Options::upkeep_batch` wait before it begins the pass anyway: the
+/// writes have stopped, and a read may be next.
+const UPKEEP_BATCH_WAIT: std::time::Duration = std::time::Duration::from_millis(1);
 
 impl Lend {
     /// `fs` handed over, to be brought to `to`.
@@ -17283,17 +17365,42 @@ impl Reader {
         let lend = &shared.upkeep;
         let _ = lend.thread.set(std::thread::current());
         let mut idle = UPKEEP_POLL_MIN;
+        let mut short_since: Option<std::time::Instant> = None;
         loop {
             if stop.load(AtomicOrdering::SeqCst) {
                 break;
             }
+            // Short of a batch: wait for more, unless a commit holds for
+            // the pass or the writes have stopped.
+            if self.opts.upkeep_batch > 0
+                && lend.state.load(AtomicOrdering::Acquire) & LEND_POSTED != 0
+            {
+                let to = lend.to.load();
+                let behind = to
+                    .lent
+                    .saturating_sub(lend.filed.load(AtomicOrdering::Acquire));
+                let since = *short_since.get_or_insert_with(std::time::Instant::now);
+                if !to.force
+                    && behind < self.opts.upkeep_batch as u64
+                    && since.elapsed() < UPKEEP_BATCH_WAIT
+                {
+                    std::thread::park_timeout(UPKEEP_POLL_MIN);
+                    continue;
+                }
+            }
+            short_since = None;
             let Some((fs, to)) = lend.take_out() else {
                 std::thread::park_timeout(idle);
                 idle = (idle * 2).min(UPKEEP_POLL_MAX);
                 continue;
             };
+            let began = std::time::Instant::now();
+            let lent = to.lent;
             let pass =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.upkeep_pass(fs, to)));
+            lend.filed.store(lent, AtomicOrdering::Release);
+            lend.busy_ns
+                .fetch_add(began.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
             lend.passes.fetch_add(1, AtomicOrdering::Relaxed);
             match pass {
                 Ok((fs, done)) => lend.put_back(Some(fs), done.err(), None),
@@ -17470,8 +17577,19 @@ impl Db {
             self.upkeep_since_scan += batch as u64;
         }
         let reads_around = reads_around(life, self.upkeep_since_scan, keys);
+        // How far the thread trails, this batch included: what was lent
+        // past what it has filed, or past everything lent before this
+        // batch where it is caught up now.
+        if self.shared.upkeep.caught_up() {
+            self.upkeep_floor = self.upkeep_lent;
+        }
+        self.upkeep_lent += batch as u64;
+        let bounded = level == 1
+            && reads_around
+            && self.opts.upkeep_lag > 0
+            && self.upkeep_behind() > self.opts.upkeep_lag as u64;
         let force = match level {
-            0 | 1 => false,
+            0 | 1 => bounded,
             2 => reads_around,
             _ => true,
         };
@@ -17496,6 +17614,9 @@ impl Db {
         self.upkeep_hand = match (level, reads_around, batch) {
             (2, true, b) if b >= UPKEEP_WAKE_WRITES && !self.commit_files_it() => Hand::Hold,
             (2, _, _) => Hand::Inline,
+            // Past the bound the commit holds until the thread has caught
+            // up, then runs ahead again: see `Options::upkeep_lag`.
+            (1, _, _) if bounded => Hand::Hold,
             (_, _, 0) | (0 | 1, _, _) | (_, false, _) => Hand::Lend,
             (_, true, _) => Hand::Hold,
         };
@@ -17520,6 +17641,7 @@ impl Db {
             len,
             wm,
             force,
+            lent: self.upkeep_lent,
         };
         match self.r.lend_fs() {
             Some(fs) => self.shared.upkeep.lend(fs, to),
@@ -17549,11 +17671,47 @@ impl Db {
         match std::mem::take(&mut self.upkeep_hand) {
             Hand::Lend => Ok(true),
             Hand::Inline => self.maintain_forms().map(|()| false),
+            Hand::Hold if matches!(self.opts.upkeep, Upkeep::Background(1)) => {
+                self.hold_within((self.opts.upkeep_lag / 2) as u64);
+                Ok(true)
+            }
             Hand::Hold => {
                 self.hold_for_upkeep();
                 Ok(false)
             }
         }
+    }
+
+    /// Writes lent and not yet filed, by the thread's last report or the
+    /// floor where it was seen caught up.
+    fn upkeep_behind(&self) -> u64 {
+        let filed = self.shared.upkeep.filed.load(AtomicOrdering::Acquire);
+        self.upkeep_lent
+            .saturating_sub(filed.max(self.upkeep_floor))
+    }
+
+    /// Wait until the thread trails by at most `within` writes, or has
+    /// caught up, or does not have the upkeep: it goes on filing while
+    /// the writer waits, and the writer goes on as soon as the bound is
+    /// met rather than when the thread has nothing left, so the two
+    /// stay side by side and the passes stay long.
+    fn hold_within(&mut self, within: u64) {
+        let t = std::time::Instant::now();
+        let lend = &self.shared.upkeep;
+        while self.upkeep_behind() > within && !lend.caught_up_or_home(std::thread::current()) {
+            if self
+                .upkeeper
+                .as_ref()
+                .is_none_or(|u| u.handle.as_ref().is_none_or(|h| h.is_finished()))
+            {
+                break;
+            }
+            lend.wake();
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
+        }
+        lend.holds.fetch_add(1, AtomicOrdering::Relaxed);
+        lend.hold_ns
+            .fetch_add(t.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
     }
 
     /// Wait for the thread to bring the lent upkeep to the last commit
@@ -17620,9 +17778,11 @@ impl Db {
     /// EXPERIMENT: what the upkeep thread did over this store's life:
     /// passes, the times the writer took the upkeep back, the times it
     /// waited for a pass in flight, the microseconds it waited, the
-    /// commits that held for their pass, and the microseconds they held.
+    /// commits that held for their pass, the microseconds they held, and
+    /// the microseconds the thread spent in its passes. Atomics only: a
+    /// read of them takes nothing back from the thread.
     #[doc(hidden)]
-    pub fn upkeep_counts(&self) -> [u64; 6] {
+    pub fn upkeep_counts(&self) -> [u64; 7] {
         let l = &self.shared.upkeep;
         [
             l.passes.load(AtomicOrdering::Relaxed),
@@ -17631,6 +17791,7 @@ impl Db {
             l.wait_ns.load(AtomicOrdering::Relaxed) / 1000,
             l.holds.load(AtomicOrdering::Relaxed),
             l.hold_ns.load(AtomicOrdering::Relaxed) / 1000,
+            l.busy_ns.load(AtomicOrdering::Relaxed) / 1000,
         ]
     }
 }

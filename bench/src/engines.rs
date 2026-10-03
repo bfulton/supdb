@@ -438,6 +438,15 @@ pub struct Supdb {
     /// look at the log, `Options::freeze_settles` off. `supdb-lazyfreeze`,
     /// and `supdb-ingestlazyfreeze` buffered.
     lazyfreeze: bool,
+    /// The background work as the cost model in `docs/engine.md` orders
+    /// it: the lazy freeze, and no dense form rebuilt while nothing reads
+    /// (`Options::forms_convert_unread` off). `supdb-bg`, and
+    /// `supdb-ingestbg` buffered.
+    bg: bool,
+    /// `bg` with the thread's lag bounded and its passes batched
+    /// (`Options::upkeep_lag`, `Options::upkeep_batch`): `supdb-bglag`,
+    /// and `supdb-ingestbglag` buffered.
+    bglag: bool,
 }
 
 /// What an arm differs from `supdb` by. One struct rather than a row of
@@ -570,6 +579,13 @@ struct Policy {
     /// across it as it does a landing: `Options::freeze_settles` off.
     /// `supdb-lazyfreeze`, and `supdb-ingestlazyfreeze` buffered.
     lazyfreeze: bool,
+    /// The background work as the cost model orders it: `supdb-bg`, and
+    /// `supdb-ingestbg` buffered.
+    bg: bool,
+    /// `bg` with the thread's lag bounded and its passes batched
+    /// (`Options::upkeep_lag`, `Options::upkeep_batch`): `supdb-bglag`,
+    /// and `supdb-ingestbglag` buffered.
+    bglag: bool,
 }
 
 impl Default for Policy {
@@ -600,6 +616,8 @@ impl Default for Policy {
             sortover: false,
             pmd: false,
             lazyfreeze: false,
+            bg: false,
+            bglag: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -841,6 +859,55 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 lazyfreeze: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the background work the cost model orders.
+    pub fn create_bg(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                bg: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` with the background work the cost model orders.
+    pub fn create_ingest_bg(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                bg: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-bg` with the thread's lag bounded and its passes batched.
+    pub fn create_bglag(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                bglag: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingestbg` with the thread's lag bounded and its passes
+    /// batched.
+    pub fn create_ingest_bglag(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                bglag: true,
                 ..Policy::default()
             },
         )
@@ -1540,6 +1607,8 @@ impl Supdb {
             sortover,
             pmd,
             lazyfreeze,
+            bg,
+            bglag,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -1620,7 +1689,13 @@ impl Supdb {
             // The forms carried across a seal, or the table started
             // afresh at every publish as it was.
             forms_carry: carry,
-            freeze_settles: !lazyfreeze,
+            freeze_settles: !(lazyfreeze || bg || bglag),
+            forms_convert_unread: !(bg || bglag),
+            // The thread trails a burst by at most a few thousand writes
+            // with reads around, and begins a pass for no fewer than a
+            // batch: the bound and the batch of the cost model.
+            upkeep_lag: if bglag { 16_000 } else { 0 },
+            upkeep_batch: if bglag { 8_000 } else { 0 },
             forms_rebase: !norebase,
             // The seal sized by the file, as it was before the store's
             // payload was recorded.
@@ -1740,6 +1815,8 @@ impl Supdb {
             sortover,
             pmd,
             lazyfreeze,
+            bg,
+            bglag,
         })
     }
 }
@@ -1831,6 +1908,20 @@ impl Engine for Supdb {
                 "supdb-lazyfreeze"
             } else {
                 "supdb-ingestlazyfreeze"
+            };
+        }
+        if self.bg {
+            return if self.partition {
+                "supdb-bg"
+            } else {
+                "supdb-ingestbg"
+            };
+        }
+        if self.bglag {
+            return if self.partition {
+                "supdb-bglag"
+            } else {
+                "supdb-ingestbglag"
             };
         }
         if self.sortover {
@@ -2067,6 +2158,10 @@ impl Engine for Supdb {
             ("seal_sort_ms", db.seal_waits().seal_sort_ns as f64 / 1e6),
             ("seal_snap_ms", db.seal_waits().seal_snap_ns as f64 / 1e6),
             ("frozen_sorts", db.frozen_sorts() as f64),
+            // What the upkeep thread spent, and the passes it spent it in.
+            ("upkeep_ms", db.upkeep_counts()[6] as f64 / 1e3),
+            ("upkeep_passes", db.upkeep_counts()[0] as f64),
+            ("snap_switches", db.snapshot_switches() as f64),
         ]
     }
     fn thread_reader(&self) -> Res<ReaderOpener> {
@@ -2527,7 +2622,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "supdb-inlinemaint"
         | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose" | "supdb-rotate"
         | "supdb-nofrozen" | "supdb-idle" | "supdb-sortover" | "supdb-pmd" | "supdb-hold"
-        | "supdb-lazyfreeze" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
+        | "supdb-lazyfreeze" | "supdb-bg" | "supdb-bglag" | "lmdb" | "rocksdb-tuned" => {
+            Guarantee::Durable
+        }
         "supdb-ingest"
         | "supdb-ingestleave"
         | "supdb-ingestnoseal"
@@ -2545,6 +2642,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-shapesortover"
         | "supdb-ingestpmd"
         | "supdb-ingestlazyfreeze"
+        | "supdb-ingestbg"
+        | "supdb-ingestbglag"
         | "supdb-ingesthold"
         | "lmdb-nosync"
         | "rocksdb-nosync" => Guarantee::Buffered,
@@ -2611,6 +2710,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-pmd" => Box::new(Supdb::create_pmd(dir)?),
         "supdb-ingestpmd" => Box::new(Supdb::create_ingest_pmd(dir)?),
         "supdb-lazyfreeze" => Box::new(Supdb::create_lazyfreeze(dir)?),
+        "supdb-bg" => Box::new(Supdb::create_bg(dir)?),
+        "supdb-ingestbg" => Box::new(Supdb::create_ingest_bg(dir)?),
+        "supdb-bglag" => Box::new(Supdb::create_bglag(dir)?),
+        "supdb-ingestbglag" => Box::new(Supdb::create_ingest_bglag(dir)?),
         "supdb-ingestlazyfreeze" => Box::new(Supdb::create_ingest_lazyfreeze(dir)?),
         "supdb-idle" => Box::new(Supdb::create_idle(dir)?),
         "supdb-shapeidle" => Box::new(Supdb::create_shape_idle(dir)?),

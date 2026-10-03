@@ -423,6 +423,26 @@ fn the_oracle_holds_with_the_carry_left_to_the_next_look() {
     );
 }
 
+/// And with the background work as the cost model orders it: no dense
+/// form rebuilt while nothing reads, the thread's lag bounded with
+/// commits holding past it, and its passes begun only for a batch. The
+/// bound and the batch are small here so the holds and the waits for a
+/// batch happen inside the oracle's few thousand operations.
+#[test]
+fn the_oracle_holds_with_the_lag_bounded_and_the_passes_batched() {
+    let _ = oracle_in(
+        "oracle-bglag",
+        Options {
+            freeze_settles: false,
+            forms_convert_unread: false,
+            upkeep_lag: 8,
+            upkeep_batch: 16,
+            upkeep: supdb::Upkeep::Background(1),
+            ..Options::default()
+        },
+    );
+}
+
 /// The probe merge stays behind `cursor_merge` as the comparison arm -- and
 /// a path only one arm exercises is a path nothing tests.
 #[test]
@@ -10379,5 +10399,59 @@ fn a_commit_that_freezes_leaves_the_carry_to_the_upkeep_thread() {
     db.hold_seal_landing(false);
     db.settle().unwrap();
     m.check(&r, "a handle after the landing");
+    std::hint::black_box(sink);
+}
+
+/// A commit that finds the upkeep thread more than `Options::upkeep_lag`
+/// writes behind, with reads around, holds until the thread trails by
+/// half the bound, and the thread begins a pass only for
+/// `Options::upkeep_batch` writes or a holding commit. The holds happen,
+/// and every answer after the burst is the model's through a handle and
+/// through the writer.
+#[test]
+fn a_commit_past_the_bound_holds_for_the_thread() {
+    let d = dir("upkeep-lag");
+    let opts = Options {
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        forms_settle_backlog_pct: 0,
+        freeze_settles: false,
+        forms_convert_unread: false,
+        upkeep_lag: 100,
+        upkeep_batch: 50,
+        upkeep: supdb::Upkeep::Background(1),
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    // A scan, so the burst after it has reads around.
+    let mut sink = 0usize;
+    db.scan(key(0).as_bytes(), 10, |_k, v| sink += v.len())
+        .unwrap();
+    let holds = db.upkeep_counts()[4];
+    for round in 0..10u32 {
+        let value = format!("v{}", round + 1);
+        for k in (round..1500u32).step_by(7) {
+            m.append(&mut db, &key(k), &value);
+        }
+        db.commit().unwrap();
+    }
+    assert!(
+        db.upkeep_counts()[4] > holds,
+        "a commit held for the thread"
+    );
+    let r = db.reader().unwrap();
+    m.check(&r, "a handle after the bounded burst");
+    m.check(&db, "the writer after the bounded burst");
     std::hint::black_box(sink);
 }
