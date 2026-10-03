@@ -10,7 +10,7 @@ row outside the error bars its neighbours drew.
 
 ## Workloads
 
-Five, plus three floors. Each yields one or more quantities.
+The workloads below, plus three floors. Each yields one or more quantities.
 
 | workload | shape | quantities |
 |---|---|---|
@@ -19,6 +19,7 @@ Five, plus three floors. Each yields one or more quantities.
 | `read` | uniform point reads over the loaded set, on one thread and again on 2 and on 4 | reads/s, p99 µs; reads/s per thread count |
 | `scan` | `size/100` scans of 100 entries, from uniform random starts, on one thread and again on 2 and on 4 | entries/s; entries/s per thread count |
 | `ycsb` | core A–F on the loaded store, zipfian, a sixth of the keys in operations per mix | ops/s per mix |
+| `scan-lag` | on the store the shuffled load leaves, the keys updated in slices to 0, 1, 10 and 100% of the store, each slice a burst of batches followed by the `scan` workload's scans with nothing merged between | entries/s of each point's scans; updates/s of each point's burst |
 | `wal-floor` | framed 1,000-record batches appended to one file, one `fdatasync` each, no engine | ops/s |
 | `scan-floor` | one `mmap` sequential walk of a file the top rung's size (capped at 4 GiB), no engine | bytes/s |
 | `mem-floor` | one dependent load at a time around a permutation of a 64 MiB buffer's cache lines, no engine | chases/s |
@@ -77,6 +78,13 @@ costs is measured rather than assumed: `rocksdb-tuned` holds its memtable
 there on purpose, because flushing it would charge that arm a compaction
 the others do not pay, and at 300 000 keys its WAL weighs 1.03 against the
 1.00 of the SST it becomes.
+
+A lag point's burst is timed beside its scans. An engine can convert a
+burst's writes into the form its scans read while it takes them, and
+another leaves them for its scans or its background; timed alone, the
+scans would credit the first for work they never see it do. The two
+quantities are each a rate, and a change that moves work between them
+is read by both.
 
 YCSB-D reads uniformly over the loaded keys rather than skewed to the latest
 inserts: the latest distribution needs a Zipfian over a count that grows

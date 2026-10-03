@@ -340,6 +340,10 @@ pub fn run(
                         let q = format!("entries_per_s_lag{pct}pct");
                         s.push("scan-lag", sz, arm, g, (q.as_str(), "entries/s"), *v);
                     }
+                    for (pct, v) in &one.burst_lag {
+                        let q = format!("updates_per_s_lag{pct}pct");
+                        s.push("scan-lag", sz, arm, g, (q.as_str(), "ops/s"), *v);
+                    }
                     for (threads, v) in &one.reads_s_threaded {
                         let q = threaded_quantity("reads_per_s", *threads);
                         s.push("read", sz, arm, g, (q.as_str(), "reads/s"), *v);
@@ -459,6 +463,9 @@ struct OnePass {
     /// at every point, and a store that defers merging trades this curve
     /// for its write cost.
     scan_lag: Vec<(u64, f64)>,
+    /// Each lag point's burst: the updates it wrote over the time it took
+    /// to write them, its last batch flushed.
+    burst_lag: Vec<(u64, f64)>,
     /// The same reads and scans again over each count in `THREADS`:
     /// (threads, aggregate throughput).
     reads_s_threaded: Vec<(usize, f64)>,
@@ -487,6 +494,9 @@ impl OnePass {
         ];
         for (pct, x) in &self.scan_lag {
             v.push((format!("scan-lag entries_per_s_lag{pct}pct"), *x));
+        }
+        for (pct, x) in &self.burst_lag {
+            v.push((format!("scan-lag updates_per_s_lag{pct}pct"), *x));
         }
         for (t, x) in &self.reads_s_threaded {
             v.push((format!("read reads_per_s_{t}t"), *x));
@@ -665,12 +675,19 @@ fn one_pass(
     // against merge lag rather than one number at whatever lag a
     // workload happened to leave.
     let mut scan_lag = Vec::with_capacity(LAG_PCT.len());
+    let mut burst_lag = Vec::with_capacity(LAG_PCT.len());
     let mut vrng = Rng::new(0x1A5);
     let mut updated = 0u64;
     let mut ug = KeyGen::new(KeyDist::Uniform, size, 0x1A6);
     let mut buf = Batch::with_capacity(plan.batch, payload.value_size());
     for pct in LAG_PCT {
         let want = size * pct / 100;
+        // The burst is timed as well as the scans after it: an engine can
+        // make its scans fast by converting the burst's writes while it
+        // takes them, and a point that times only the scans would credit
+        // the conversion without charging for it.
+        let wrote = want.saturating_sub(updated);
+        let tw = Instant::now();
         while updated < want {
             db_key_into(ug.next(), &mut kb);
             buf.push(&kb, payload.get(&mut vrng));
@@ -681,6 +698,9 @@ fn one_pass(
         }
         if !buf.is_empty() {
             buf.flush_updates(e.as_mut())?;
+        }
+        if wrote > 0 {
+            burst_lag.push((pct, wrote as f64 / tw.elapsed().as_secs_f64()));
         }
         if pct == 0 {
             // Nothing unmerged: the shuffled load's own tail is drained
@@ -711,6 +731,7 @@ fn one_pass(
         disk_bpb: on_disk as f64 / stored,
         shuffled_ops_s: size as f64 / shuf_s,
         scan_lag,
+        burst_lag,
         reads_s: size as f64 / read_s,
         p99_us: h.percentile(99.0) as f64 / 1000.0,
         scan_entries_s: (scans * plan.scan_len as u64) as f64 / scan_s,
