@@ -409,6 +409,20 @@ fn the_oracle_holds_with_the_upkeep_never_held_for() {
     oracle(true, supdb::Upkeep::Background(1));
 }
 
+/// And with the freeze that swaps the tables and leaves their carry to
+/// the next look at the log (`Options::freeze_settles` off).
+#[test]
+fn the_oracle_holds_with_the_carry_left_to_the_next_look() {
+    let _ = oracle_in(
+        "oracle-lazyfreeze",
+        Options {
+            freeze_settles: false,
+            upkeep: supdb::Upkeep::Background(1),
+            ..Options::default()
+        },
+    );
+}
+
 /// The probe merge stays behind `cursor_merge` as the comparison arm -- and
 /// a path only one arm exercises is a path nothing tests.
 #[test]
@@ -5797,6 +5811,9 @@ fn the_copies_survive_a_merge_with(compact: bool) {
         // The commit's own maintenance, step by step: on the thread, which
         // commit a pass files is the thread's timing.
         upkeep: supdb::Upkeep::Inline,
+        // The freeze's own carry, which this is about: off, the next look
+        // at the log carries the tables (`the_next_look_carries_the_forms_across_a_freeze`).
+        freeze_settles: true,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -5906,6 +5923,9 @@ fn the_forms_survive_a_seal_with(snapshot_carry: bool) {
         upkeep: supdb::Upkeep::Inline,
         forms_carry: true,
         snapshot_carry,
+        // The freeze's own carry, which this is about: off, the next look
+        // at the log carries the tables (`the_next_look_carries_the_forms_across_a_freeze`).
+        freeze_settles: true,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -6037,6 +6057,9 @@ fn the_forms_survive_a_direct_runs_start() {
         // The commit's own maintenance, step by step: on the thread, which
         // commit a pass files is the thread's timing.
         upkeep: supdb::Upkeep::Inline,
+        // The freeze's own carry, which this is about: off, the next look
+        // at the log carries the tables (`the_next_look_carries_the_forms_across_a_freeze`).
+        freeze_settles: true,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -7005,6 +7028,9 @@ fn a_scan_builds_the_snapshot_only_where_a_block_needs_it() {
             // The commit's own maintenance, step by step: on the thread,
             // which commit a pass files is the thread's timing.
             upkeep: supdb::Upkeep::Inline,
+            // The freeze's own carry, which this is about: off, the next look
+            // at the log carries the tables (`the_next_look_carries_the_forms_across_a_freeze`).
+            freeze_settles: true,
             ..Options::default()
         };
         let mut db = Db::create(&d, opts).unwrap();
@@ -7860,6 +7886,9 @@ fn the_seal_takes_the_order_the_writers_freeze_carried() {
         partition_bytes: Some(64 << 10),
         snapshot_carry: true,
         direct_ingest: false,
+        // The order set at the freeze itself, which this is about: off,
+        // the look that carries the snapshot races the seal's own sort.
+        freeze_settles: true,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -10146,4 +10175,209 @@ fn a_flush_publishes_its_seal_before_the_seal_is_durable() {
             &format!("background {background}: after the flush"),
         );
     }
+}
+
+/// The freeze swaps the tables and nothing else (`Options::freeze_settles`
+/// off): the writer's tables, the writes it read and had not settled, and
+/// the rest of the frozen table's log are carried by the next look at the
+/// log, whoever's it is, and a seal whose landing comes before that look
+/// carries the same way, from the table the look held. Carried, not
+/// rebuilt: nothing is built across the seal. Every answer is held to the
+/// model through a handle and the writer, after writes into the carried
+/// forms, and across two freezes before one look.
+#[test]
+fn the_next_look_carries_the_forms_across_a_freeze() {
+    for (snapshot_carry, upkeep) in [
+        (true, supdb::Upkeep::Inline),
+        (false, supdb::Upkeep::Inline),
+        (true, supdb::Upkeep::Background(1)),
+    ] {
+        the_next_look_carries_the_forms_across_a_freeze_with(snapshot_carry, upkeep);
+    }
+}
+
+fn the_next_look_carries_the_forms_across_a_freeze_with(
+    snapshot_carry: bool,
+    upkeep: supdb::Upkeep,
+) {
+    let d = dir(&format!("forms-look-{snapshot_carry}-{upkeep:?}"));
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        forms_settle_backlog_pct: 0,
+        commit_forms: true,
+        forms_carry: true,
+        freeze_settles: false,
+        snapshot_carry,
+        upkeep,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    assert!(db.levels().0 > 1, "several partitions");
+    let mut sink = 0usize;
+    // Overlay in most blocks and keys past the end enough to make the
+    // last block wide, and a handle's scan so the forms are kept.
+    for k in (0..1500u32).step_by(5) {
+        m.append(&mut db, &key(k), "v1");
+    }
+    for k in 0..300u32 {
+        m.append(&mut db, &key(2000 + k), "past");
+    }
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    r.scan(key(0).as_bytes(), 2000, |_k, v| sink += v.len())
+        .unwrap();
+    db.commit().unwrap();
+    // A burst nobody settles -- no scan between these commits and the
+    // bound off -- then the seal, which files nothing, and its landing,
+    // both before anyone looks at the log.
+    for k in (2..1500u32).step_by(7) {
+        m.append(&mut db, &key(k), "burst");
+    }
+    db.commit().unwrap();
+    m.delete(&mut db, &key(10));
+    db.commit().unwrap();
+    db.settle().unwrap();
+    let built = db.blocks_built();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    assert!(db.levels().1 > 0, "the seal left a piece");
+    // The look: a handle's claim reads the log, carries the tables across
+    // the freeze and the landing, settles the frozen table's writes
+    // through it, and publishes.
+    let r = db.reader().unwrap();
+    let (forms, _, _, _) = db.canonical_forms();
+    assert!(forms > 0, "the look carried the forms: {forms}");
+    assert_ne!(db.forms_position(), usize::MAX, "and published them");
+    assert_eq!(db.blocks_built(), built, "carried, not rebuilt");
+    m.check(&r, "a handle over the forms the look carried");
+    m.check(&db, "the writer over its carried tables");
+    // Writes into the carried forms.
+    for k in (3..1500u32).step_by(11) {
+        m.append(&mut db, &key(k), "after");
+    }
+    m.delete(&mut db, &key(2005));
+    for k in 300..320u32 {
+        m.append(&mut db, &key(2000 + k), "past");
+    }
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    r.scan(key(0).as_bytes(), 10, |_k, v| sink += v.len())
+        .unwrap();
+    db.commit().unwrap();
+    let r = db.reader().unwrap();
+    m.check(&r, "a handle after writes into the carried forms");
+    m.check(&db, "the writer after them");
+    // Two freezes before one look, the landings held: the look reads the
+    // first frozen table from where it stopped and the second whole.
+    db.hold_seal_landing(true);
+    for k in (4..1500u32).step_by(13) {
+        m.append(&mut db, &key(k), "first");
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    for k in (5..1500u32).step_by(17) {
+        m.append(&mut db, &key(k), "second");
+    }
+    for k in 320..340u32 {
+        m.append(&mut db, &key(2000 + k), "past");
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    assert_eq!(db.frozen_tables(), 2, "both frozen, neither landed");
+    let r = db.reader().unwrap();
+    m.check(&r, "a handle across two freezes");
+    m.check(&db, "the writer across two freezes");
+    db.hold_seal_landing(false);
+    db.settle().unwrap();
+    let r = db.reader().unwrap();
+    m.check(&r, "a handle after both landed");
+    m.check(&db, "the writer after both landed");
+    std::hint::black_box(sink);
+}
+
+/// A commit that crosses the seal bound freezes without the upkeep and
+/// names the new state's commit to the thread, whose pass carries the
+/// writer's tables across the freeze and publishes them for the handle
+/// that holds them: nothing on the writer's side looks at the log, and the
+/// forms are there at the new state for the handle to take.
+#[test]
+fn a_commit_that_freezes_leaves_the_carry_to_the_upkeep_thread() {
+    let d = dir("freeze-carry-thread");
+    let opts = Options {
+        seal_bytes: 64 << 10,
+        partition_bytes: Some(2 << 10),
+        l0_trigger: 64,
+        scan_block_cache: true,
+        scan_cache_ahead: false,
+        forms_settle_backlog_pct: 0,
+        freeze_settles: false,
+        upkeep: supdb::Upkeep::Background(1),
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in 0..1500u32 {
+        m.append(&mut db, &key(k), "v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    db.settle().unwrap();
+    let r = db.reader().unwrap();
+    let mut sink = 0usize;
+    for k in (0..1500u32).step_by(5) {
+        m.append(&mut db, &key(k), "v1");
+    }
+    db.commit().unwrap();
+    r.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    db.scan(key(0).as_bytes(), 1500, |_k, v| sink += v.len())
+        .unwrap();
+    db.commit().unwrap();
+    db.settle().unwrap();
+    // Commits until one freezes, the landing held so the table stays
+    // frozen and the look is the thread's to make.
+    db.hold_seal_landing(true);
+    let value = "x".repeat(200);
+    let mut round = 0u32;
+    // The thread's passes before the commit that froze, which wakes it.
+    let mut passes = db.upkeep_counts()[0];
+    while db.frozen_tables() == 0 {
+        for k in (round % 7..1500u32).step_by(7) {
+            m.append(&mut db, &key(k), &value);
+        }
+        passes = db.upkeep_counts()[0];
+        db.commit().unwrap();
+        round += 1;
+        assert!(round < 200, "a commit froze");
+    }
+    let t = std::time::Instant::now();
+    while db.forms_position() == usize::MAX {
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(20),
+            "the thread published the carried forms"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(db.upkeep_counts()[0] > passes, "the thread made the pass");
+    m.check(&r, "a handle over the forms the thread carried");
+    m.check(&db, "the writer");
+    db.hold_seal_landing(false);
+    db.settle().unwrap();
+    m.check(&r, "a handle after the landing");
+    std::hint::black_box(sink);
 }

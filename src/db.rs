@@ -1075,6 +1075,18 @@ pub struct Options {
     /// the rows, and the test holds it to the model through two seals
     /// and a merge.
     pub forms_carry: bool,
+    /// Whether the freeze carries the forms itself, as `forms_carry` first
+    /// did: it takes the upkeep home, waiting for a pass in flight, files
+    /// the backlog and publishes it, and only then swaps the tables --
+    /// every part of it work for the reads on the writer's path. Off, the
+    /// freeze swaps the tables and touches nothing else, and whoever holds
+    /// the upkeep next carries the tables across it at its look at the
+    /// log, as a landing is carried (`rebase_tables`), with the frozen
+    /// table's unsettled writes kept to settle through that table.
+    /// `supdb-lazyfreeze` and `supdb-ingestlazyfreeze` price that; it
+    /// stays off until the pass after a burst the upkeep cannot keep up
+    /// with reads level with this freeze's (`docs/engine.md`).
+    pub freeze_settles: bool,
     /// The carry across a merge that rewrote a partition over the same
     /// keys -- the same fences, key count and key at every block's first
     /// rank -- keeps the partition's copies and drops its sparse forms,
@@ -1189,6 +1201,7 @@ impl Default for Options {
             forms_settle_rebuild_from: 0,
             forms_settle_recent_pct: 0,
             forms_carry: true,
+            freeze_settles: true,
             forms_rebase: true,
             forms_to_writer: false,
             form_dense_from: 0,
@@ -5555,6 +5568,9 @@ impl Cached {
 /// the copy it saves. Rounds interleaved, one machine.
 const CACHE_DENSE: usize = 16;
 
+/// The most live tables `State::replaced` keeps.
+const REPLACED_CAP: usize = 8;
+
 /// PROTOTYPE: records a block spans. A scan of the suite's length touches
 /// one or two.
 const CACHE_BLOCK: usize = 64;
@@ -5828,6 +5844,18 @@ struct State {
     /// are keyed by, so either is rebuilt when the segments or the
     /// memtables change under it.
     gen: u64,
+    /// The live tables before `mem` over the store's life: bumped by
+    /// every publish that replaces the live table -- a freeze, a switch,
+    /// a landing that empties a handed one -- so the writer's upkeep can
+    /// tell, from the count at its last look, which tables were live in
+    /// between.
+    lives: u64,
+    /// The live tables those publishes replaced, oldest first, the last
+    /// the one live before `mem`, from the one live at the writer's
+    /// upkeep's last look (`Shared::upkeep_lives`) on: a look reads the
+    /// writes it has not read from each, a landing having retired it or
+    /// not. Empty where the upkeep reads none (`Db::replaced_from`).
+    replaced: Vec<std::sync::Arc<MemTable>>,
     /// Mean bytes a key costs across the live segments, kept rather than
     /// recomputed because `scan` asks it on every call and a fold over the
     /// segments there measured 5% of an in-core scan. Refreshed by
@@ -6188,6 +6216,10 @@ struct Shared {
     /// The writer's upkeep while it is lent to the upkeep thread; see
     /// `Upkeep::Background`.
     upkeep: Lend,
+    /// `State::lives` at the writer's upkeep's last look at the log: the
+    /// tables live from there on are the ones a look may still have to
+    /// read, and `State::replaced` keeps those. Nothing before a look.
+    upkeep_lives: AtomicU64,
 }
 
 /// EXPERIMENT: a replaced canonical form on its way to being freed. A
@@ -6536,6 +6568,12 @@ struct FormsState {
     /// and lost a fifth. The next scan drops and files the distinct keys
     /// at once, and a mix that never scans never pays.
     pending: std::cell::RefCell<Vec<(u32, u32, bool, u32)>>,
+    /// Writes read from a table's log, as `pending` holds them, that the
+    /// table has been frozen since: each list with its table, whose arena
+    /// the offsets are in. A freeze leaves the writer's tables to the next
+    /// look at the log (`rebase_tables`), which moves `pending` here with
+    /// the rest of the frozen table's log, to settle with no live entry.
+    pending_frozen: std::cell::RefCell<PendingFrozen>,
     /// A settled write's resolved run, built here and spliced into the
     /// block: one buffer for every write of a settle, where a `Vec` built
     /// from empty per write was a malloc, a realloc and a free apiece,
@@ -6620,9 +6658,15 @@ struct FormsState {
 
 /// The live and the frozen memtables a handle's upkeep was last current
 /// over; see `FormsState::over`.
+/// Writes awaiting their settle, per table they were read from; see
+/// `FormsState::pending_frozen`.
+type PendingFrozen = Vec<(std::sync::Arc<MemTable>, Vec<(u32, u32, bool, u32)>)>;
+
 struct SyncedOver {
     mem: std::sync::Weak<MemTable>,
     frozen: Vec<std::sync::Weak<MemTable>>,
+    /// `State::lives` at the look.
+    lives: u64,
 }
 
 /// Whether `noted` names the tables of `now`, one for one in order, by
@@ -6646,6 +6690,7 @@ impl FormsState {
             scan_tick: std::cell::Cell::new(0),
             shed_seed: std::cell::Cell::new(0x9E37_79B9_7F4A_7C15),
             pending: std::cell::RefCell::new(Vec::new()),
+            pending_frozen: std::cell::RefCell::new(Vec::new()),
             settle_run: std::cell::RefCell::new(Vec::new()),
             settle_offs: std::cell::RefCell::new(Vec::new()),
             dirty_any: std::cell::Cell::new(false),
@@ -8475,6 +8520,26 @@ impl State {
         self.segs_tombs || self.mem.tombs() > 0 || self.frozen.iter().any(|f| f.tombs() > 0)
     }
 
+    /// `replaced` for the state that replaces this one, with `old`, the
+    /// live table, replaced as well when it is: the tables from `from`,
+    /// a value of `lives`, on, and at most `REPLACED_CAP` of them, since
+    /// a look that has fallen further behind drops its tables anyway.
+    fn replaced_after(
+        &self,
+        old: Option<&std::sync::Arc<MemTable>>,
+        from: Option<u64>,
+    ) -> Vec<std::sync::Arc<MemTable>> {
+        let Some(from) = from else {
+            return Vec::new();
+        };
+        let first = self.lives - self.replaced.len() as u64;
+        let all: Vec<_> = self.replaced.iter().chain(old).collect();
+        let skip = (from.saturating_sub(first) as usize)
+            .max(all.len().saturating_sub(REPLACED_CAP))
+            .min(all.len());
+        all[skip..].iter().map(|t| (*t).clone()).collect()
+    }
+
     /// The level-0 pieces a read of a key in partition `at` consults.
     fn pieces_over(&self, np: usize, at: usize) -> &[std::sync::Arc<Seg>] {
         let l0 = &self.segs[np..];
@@ -9520,7 +9585,13 @@ impl Reader {
         *self.fs().over.borrow_mut() = Some(SyncedOver {
             mem: std::sync::Arc::downgrade(&st.mem),
             frozen: st.frozen.iter().map(std::sync::Arc::downgrade).collect(),
+            lives: st.lives,
         });
+        if self.slot.is_none() {
+            self.shared
+                .upkeep_lives
+                .store(st.lives, AtomicOrdering::Relaxed);
+        }
     }
 
     /// The writer's tables carried to `st`, a state published over the
@@ -9560,21 +9631,49 @@ impl Reader {
         let Some(over) = self.fs().over.borrow_mut().take() else {
             return false;
         };
-        // The live table is the one the log position is of; another is a
-        // freeze, or the ordered table a direct run opens over an empty
-        // one, which the writer makes itself and carries at once
-        // (`carry_switch`).
-        if !std::ptr::eq(over.mem.as_ptr(), std::sync::Arc::as_ptr(&st.mem)) {
+        // The live table is the one the log position is of, or freezes
+        // that leave their carry to the look (`Options::freeze_settles`
+        // off) and landings have replaced it since,
+        // and the table of the look and every one live after it are the
+        // back of `State::replaced`, oldest first, landed or not. A look
+        // fallen further behind than it keeps drops the tables. The
+        // ordered table a direct run opens over an empty one the writer
+        // makes itself and carries at once (`carry_switch`).
+        let changes = match st.lives.checked_sub(over.lives) {
+            Some(d) => d as usize,
+            None => return false,
+        };
+        let k = st.frozen.len();
+        let read_from: Vec<std::sync::Arc<MemTable>> = if changes == 0 {
+            if !std::ptr::eq(over.mem.as_ptr(), std::sync::Arc::as_ptr(&st.mem)) {
+                return false;
+            }
+            Vec::new()
+        } else if self.opts.freeze_settles {
             return false;
-        }
-        let same_frozen = same_tables(&over.frozen, &st.frozen);
+        } else {
+            let Some(at) = st.replaced.len().checked_sub(changes) else {
+                return false;
+            };
+            if !std::ptr::eq(over.mem.as_ptr(), std::sync::Arc::as_ptr(&st.replaced[at])) {
+                return false;
+            }
+            st.replaced[at..].to_vec()
+        };
+        let froze = !read_from.is_empty();
+        // The frozen tables older than the table of the look: the list up
+        // to the first table read from, which is all of it when that
+        // table and every one after it have landed.
+        let before = &st.frozen[..st
+            .frozen
+            .iter()
+            .position(|f| read_from.iter().any(|t| std::sync::Arc::ptr_eq(t, f)))
+            .unwrap_or(k)];
+        let same_frozen = same_tables(&over.frozen, before);
         // Landings retire the front of the list, so a list that lost its
         // oldest tables and kept the rest is one the landings made.
-        let landed = st.frozen.len() < over.frozen.len()
-            && same_tables(
-                &over.frozen[over.frozen.len() - st.frozen.len()..],
-                &st.frozen,
-            );
+        let landed = before.len() < over.frozen.len()
+            && same_tables(&over.frozen[over.frozen.len() - before.len()..], before);
         if !same_frozen && !landed {
             return false;
         }
@@ -9598,11 +9697,71 @@ impl Reader {
         }
         drop(ctx);
 
+        // Across a freeze, the writes this handle has read and not settled,
+        // the rest of the frozen table's log, and the logs of any table
+        // frozen after it, all kept to settle through their own tables:
+        // nothing in a frozen table is staged, so each is read to its end.
+        if froze {
+            let mut carried = std::mem::take(&mut *self.fs().pending_frozen.borrow_mut());
+            for (k, table) in read_from.iter().enumerate() {
+                let mut writes = if k == 0 {
+                    std::mem::take(&mut *self.fs().pending.borrow_mut())
+                } else {
+                    Vec::new()
+                };
+                let from = if k == 0 { self.fs().log_seen.get() } else { 0 };
+                for i in from..table.log_len() {
+                    let (id, _) = table.log_at(i);
+                    let e = table.entry(id);
+                    match writes.last() {
+                        Some(last) if last.0 == e.key_off => {}
+                        _ => writes.push((e.key_off, e.key_len, false, id as u32)),
+                    }
+                }
+                for w in &mut writes {
+                    w.2 = false;
+                }
+                if !writes.is_empty() {
+                    carried.push((table.clone(), writes));
+                }
+            }
+            *self.fs().pending_frozen.borrow_mut() = carried;
+            self.fs().snap_added.borrow_mut().clear();
+            self.fs().snap_stale.borrow_mut().clear();
+            self.fs().log_seen.set(0);
+            // The snapshot carried as the freeze would have carried it, its
+            // live entries made the frozen table's own, over the bases the
+            // landings left: across one freeze; across more, built again.
+            let held = self.fs().scan_keys.borrow_mut().take();
+            let one = changes == 1 && before.len() + 1 == k;
+            let carried = held
+                .filter(|_| self.opts.snapshot_carry && one)
+                .map(|(_, s)| {
+                    let retired = over.frozen.len() - before.len();
+                    if landed && s.bases.len() == over.frozen.len() {
+                        std::sync::Arc::new(s.with_bases(s.bases[retired..].to_vec()))
+                    } else {
+                        s
+                    }
+                })
+                .filter(|s| s.bases.len() == before.len())
+                .and_then(|s| self.carry_snapshot(s, &read_from[0], before, st, false));
+            match carried {
+                Some(s) => {
+                    self.fs().snap_entries.set(s.live_len);
+                    *self.fs().scan_keys.borrow_mut() = Some((st.gen, s));
+                }
+                None => self.fs().snap_entries.set(0),
+            }
+        }
+
         // The snapshot stands with the frozen tables it names, and its
         // live runs without the bases of the tables the landings sealed:
         // they are the live table's, which is the one standing.
-        let keep_snap = same_frozen || landed;
-        if !keep_snap {
+        let keep_snap = (same_frozen || landed) && !froze;
+        if froze {
+            // Carried above, or gone.
+        } else if !keep_snap {
             *self.fs().scan_keys.borrow_mut() = None;
             self.fs().snap_entries.set(0);
             self.fs().snap_added.borrow_mut().clear();
@@ -9642,8 +9801,14 @@ impl Reader {
 
         // Every overlaid block holds a form only where every partition has
         // a table: one a publish added -- a promotion's -- has none yet.
-        let mut complete =
-            self.fs().tables_complete.get() && tables.iter().take(np).all(|c| c.borrow().is_some());
+        // Across a freeze the state carried no form at all, not even the
+        // mark of a block this handle holds none for, so an empty slot
+        // there says nothing until the fill has made the table whole
+        // again: called clean, a handle read the last block of a store
+        // without a key the frozen table held for it.
+        let mut complete = self.fs().tables_complete.get()
+            && !froze
+            && tables.iter().take(np).all(|c| c.borrow().is_some());
         let mut dirty_any = false;
         let mut cache_bytes = 0usize;
         let mut dense_bytes = 0u64;
@@ -9696,7 +9861,7 @@ impl Reader {
             if rebased {
                 t.blob = seg.blob.id();
             }
-            if landed {
+            if landed && !froze {
                 // The retired bases went with the tables they named, and
                 // the rest moved to the front.
                 match &kept {
@@ -9753,6 +9918,7 @@ impl Reader {
         self.fs().cache_bytes.set(0);
         self.fs().built.borrow_mut().clear();
         self.fs().pending.borrow_mut().clear();
+        self.fs().pending_frozen.borrow_mut().clear();
     }
 
     /// PROTOTYPE: the forms the builder ahead has sent, installed: each
@@ -9864,7 +10030,7 @@ impl Reader {
                             .mem()
                             .slot_of(k, self.len_bound.get())
                             .map_or(u32::MAX, |i| i as u32);
-                        self.patch_block(pi, b, table, k, cut, slot)?;
+                        self.patch_block(pi, b, table, k, cut, (self.mem(), slot))?;
                     }
                 }
             }
@@ -10819,12 +10985,23 @@ impl Reader {
         } else {
             self.fs().publish_due.get()
         };
+        // A freeze since the last look that left the tables to be carried
+        // across it (`Options::freeze_settles` off), with the frozen table's
+        // writes to settle: the look's to make, near a scan, as a burst's
+        // backlog is.
+        let froze =
+            !self.opts.freeze_settles
+                && self.fs().cache_used.get()
+                && self.fs().over.borrow().as_ref().is_some_and(|o| {
+                    !std::ptr::eq(o.mem.as_ptr(), std::sync::Arc::as_ptr(&st.mem))
+                });
         Some(
             self.force_due.get()
                 || scans != self.fs().scans_seen.get()
                 || (backlog >= bound && recent)
                 || posted
-                || publish_due,
+                || publish_due
+                || (froze && !far),
         )
     }
 
@@ -11110,6 +11287,18 @@ impl Reader {
     /// times costs one seek, the created one's record first so the flag
     /// survives the fold.
     fn settle_pending(&self) -> Result<()> {
+        // The writes read from tables frozen since, first: each through
+        // the table it was read from, which a freeze or a landing has
+        // taken out of the live slot but not out of the sources a patch
+        // resolves its run from.
+        let carried = std::mem::take(&mut *self.fs().pending_frozen.borrow_mut());
+        for (table, mut writes) in carried {
+            writes.sort_unstable_by_key(|&(off, ..)| off);
+            if let Err(e) = self.settle_each(&writes, &table) {
+                self.drop_blocks();
+                return Err(e);
+            }
+        }
         let mut pending = std::mem::take(&mut *self.fs().pending.borrow_mut());
         if pending.is_empty() {
             return Ok(());
@@ -11121,7 +11310,7 @@ impl Reader {
         pending.sort_unstable_by_key(|&(off, _, new, _)| ((off as u64) << 1) | u64::from(!new));
         // A write that could not be settled leaves the block it landed in
         // stale, so an error drops every table rather than leave one.
-        let settled = self.settle_each(&pending);
+        let settled = self.settle_each(&pending, self.mem());
         if settled.is_err() {
             self.drop_blocks();
         }
@@ -11130,7 +11319,10 @@ impl Reader {
         settled
     }
 
-    fn settle_each(&self, pending: &[(u32, u32, bool, u32)]) -> Result<()> {
+    /// `pending` settled, its keys in `src`'s arena: the live table's, or
+    /// a table frozen since they were read from its log, whose writes
+    /// name no live entry (`settle_pending`).
+    fn settle_each(&self, pending: &[(u32, u32, bool, u32)], src: &MemTable) -> Result<()> {
         let np = self.segs().partition_point(|s| s.level > 0);
         // Resolved first, applied in the partition's order. A write's
         // position is one seek, but applying it reads the partition's
@@ -11147,7 +11339,7 @@ impl Reader {
                 continue;
             }
             last = off;
-            let key = self.mem().key_at(off, len);
+            let key = src.key_at(off, len);
             let at = self.segs()[..np]
                 .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
             let Some(seg) = self.segs()[..np].get(at) else {
@@ -11197,10 +11389,10 @@ impl Reader {
             // each otherwise, and at three hundred thousand keys the
             // loop's cost beyond the splice was mostly those.
             if let Some(&(_, _, _, off2, len2, _, _)) = resolved.get(i + 2) {
-                self.mem().prefetch_key(off2, len2);
+                src.prefetch_key(off2, len2);
             }
             let (at, b) = (at as usize, b as usize);
-            let key = self.mem().key_at(off, len);
+            let key = src.key_at(off, len);
             let tables = self.fs().tables.borrow();
             let mut held = tables[at].borrow_mut();
             let Some(table) = held.as_mut() else {
@@ -11254,7 +11446,7 @@ impl Reader {
                     );
                     self.fs().tables_complete.set(false);
                 }
-                self.patch_block(at, b, table, key, cut, slot)?;
+                self.patch_block(at, b, table, key, cut, (src, slot))?;
             }
             if new {
                 if let Some(list) = table.added.get_mut(b) {
@@ -11294,7 +11486,7 @@ impl Reader {
         table: &mut BlockTable,
         key: &[u8],
         cut: u32,
-        slot: u32,
+        (from, slot): (&MemTable, u32),
     ) -> Result<()> {
         if matches!(table.slots[b].as_deref(), None | Some(Cached::Wide(_))) {
             return Ok(());
@@ -11319,11 +11511,19 @@ impl Reader {
         // seven pieces standing, and every mix that updates pays the
         // same per key.
         let tombs = self.has_tombstones();
-        let masked = tombs
-            && slot != u32::MAX
-            && self
-                .mem()
-                .has_tomb(self.mem().entry(slot as usize), self.wm());
+        // `slot` is the write's entry in `from`: the live table's, under
+        // the watermark, or a table frozen since the write was read,
+        // whose entries are all committed. A frozen write's tombstone
+        // masks every source older than its table, and whatever a newer
+        // table holds for the key is a write settled after this one,
+        // which writes the key's run again: the writes frozen tables
+        // carry settle oldest table first and the live table's last
+        // (`settle_pending`). Without this a frozen write took the
+        // general path, a seek of every piece standing, at about 2 µs a
+        // write where the masked path takes a third of one.
+        let live_src = std::ptr::eq(from, &**self.mem());
+        let from_wm = if live_src { self.wm() } else { u64::MAX };
+        let masked = tombs && slot != u32::MAX && from.has_tomb(from.entry(slot as usize), from_wm);
         let (c, at_eq) = BuildCtx::cut_known(cut, lo, hi);
         let same = c < hi && at_eq == Ordering::Equal;
         let mut run_scratch = self.fs().settle_run.borrow_mut();
@@ -11339,11 +11539,10 @@ impl Reader {
             // instructions to file one hundred-byte run, a third of them
             // in that machinery, and an update mix takes this path for
             // every key: 88,742 of the lag point's 88,744.
-            let mem = self.mem();
             let mut offs = self.fs().settle_offs.borrow_mut();
-            mem.live_offs_into(mem.entry(slot as usize), &mut offs, self.wm());
+            from.live_offs_into(from.entry(slot as usize), &mut offs, from_wm);
             for &off in offs.iter() {
-                let v = mem.value_at(off);
+                let v = from.value_at(off);
                 run.extend_from_slice(&(v.len() as u32).to_le_bytes());
                 run.extend_from_slice(v);
             }
@@ -11358,7 +11557,7 @@ impl Reader {
             }
             let slot_in =
                 |t: &MemTable| t.slot_of(key, MemTable::ALL).map_or(u32::MAX, |i| i as u32);
-            let mut sk = UKey::live(slot, NO_RUN);
+            let mut sk = UKey::live(if live_src { slot } else { u32::MAX }, NO_RUN);
             for (f, fr) in sk.fz.iter_mut().zip(self.frozen()) {
                 f.0 = slot_in(fr);
             }
@@ -11608,7 +11807,20 @@ impl Reader {
         // that started it made four builds on the builder's core over
         // four passes at three hundred thousand keys that the eager
         // scan never made, twice what the lazy scans saved.
-        if self.opts.scan_cache_ahead && self.fs().ahead.borrow().is_none() && !lazy {
+        // A builder of another generation is none of this one's: a
+        // publish that leaves the builder running -- the segment work's,
+        // or a freeze that leaves the upkeep away -- would otherwise keep
+        // this state's one run from ever starting.
+        let gen = self.state().gen;
+        if self.opts.scan_cache_ahead
+            && self
+                .fs()
+                .ahead
+                .borrow()
+                .as_ref()
+                .is_none_or(|a| a.gen != gen)
+            && !lazy
+        {
             self.start_ahead();
         }
         match unsealed {
@@ -12998,6 +13210,8 @@ impl Db {
             mem: std::sync::Arc::new(MemTable::new()),
             frozen: Vec::new(),
             gen: 1,
+            lives: 0,
+            replaced: Vec::new(),
             mean_key_bytes,
             store_bytes,
             data_bytes,
@@ -13050,6 +13264,7 @@ impl Db {
             snap_sealed: AtomicU64::new(0),
             snap_on_table: AtomicU64::new(0),
             upkeep: Lend::default(),
+            upkeep_lives: AtomicU64::new(u64::MAX),
         });
         let pin_slot = Some(
             shared
@@ -13348,6 +13563,8 @@ impl Db {
             mem: std::sync::Arc::new(mem),
             frozen: Vec::new(),
             gen: 1,
+            lives: 0,
+            replaced: Vec::new(),
             mean_key_bytes,
             store_bytes,
             data_bytes,
@@ -13400,6 +13617,7 @@ impl Db {
             snap_sealed: AtomicU64::new(0),
             snap_on_table: AtomicU64::new(0),
             upkeep: Lend::default(),
+            upkeep_lives: AtomicU64::new(u64::MAX),
         });
         let pin_slot = Some(
             shared
@@ -13541,6 +13759,7 @@ impl Db {
         if st.gen != self.fs().log_gen.get().wrapping_add(1) {
             if let Some(o) = self.fs().over.borrow_mut().as_mut() {
                 o.mem = std::sync::Arc::downgrade(&st.mem);
+                o.lives = st.lives;
             }
             self.fs().log_seen.set(0);
             return;
@@ -13805,8 +14024,14 @@ impl Db {
             );
             // The freeze's publish took the upkeep back, and a burst's
             // last commit that seals would leave the new state's upkeep
-            // to the first read after it.
+            // to the first read after it. One that left it lent names the
+            // new state's commit to the thread and wakes it, since the
+            // carry across the freeze is the thread's to make.
             if background {
+                if !self.fs_home() {
+                    self.hand_over_upkeep();
+                    self.shared.upkeep.wake();
+                }
                 self.finish_hand()?;
             }
         }
@@ -14662,6 +14887,18 @@ impl Db {
     ) -> Option<*const State> {
         self.take_back_upkeep();
         self.stop_ahead();
+        self.try_publish_writer_away(make)
+    }
+
+    /// `try_publish_writer` with the upkeep and the builder left where
+    /// they are: both pin what they read, so a state the publish retires
+    /// stays readable under them, and what they make of it is checked
+    /// against the generation when it comes home. For a publish that
+    /// needs neither, which a freeze that carries nothing is.
+    fn try_publish_writer_away(
+        &mut self,
+        make: impl Fn(&State) -> Option<State>,
+    ) -> Option<*const State> {
         loop {
             let cur_p = self.shared.state.load(AtomicOrdering::Acquire);
             // SAFETY: the writer is pinned for its operation, and a state
@@ -14696,17 +14933,31 @@ impl Db {
         self.build_ahead_if_due();
     }
 
+    /// `published` for a publish made with the upkeep away: nothing swept
+    /// while it is lent, since only its holder sweeps, and the builder
+    /// left to the commit's own look.
+    fn published_away(&mut self, old: *const State) {
+        retire_state(&self.shared, old as *mut State);
+        if self.fs_home() {
+            self.sweep_retired_forms();
+            self.build_ahead_if_due();
+        }
+        self.wake_keeper();
+    }
+
     /// The live memtable frozen and a fresh one live, in one publish;
     /// the frozen one returned for the seal.
     ///
-    /// The forms go with it where they can: the writer's backlog is
-    /// filed and published into the state the freeze replaces, so every
-    /// form there is current to the frozen table's whole log, and the new
-    /// state takes copies of them current to its own log's start -- what
-    /// lets a reader at the new log's first position take them. Only over
-    /// that state: a publish another thread made in between copied its
-    /// forms before the writer's last ones reached it, so the freeze then
-    /// carries nothing, and the writer's tables start afresh.
+    /// With `Options::freeze_settles` off the forms are carried by whoever
+    /// next looks at the log, as across a landing: the freeze waits for no
+    /// pass and files nothing. With it on, the default, the freeze carries
+    /// them itself: the writer's backlog is filed and published into the state the freeze
+    /// replaces, so every form there is current to the frozen table's
+    /// whole log, and the new state takes copies of them current to its
+    /// own log's start. Only over that state: a publish another thread
+    /// made in between copied its forms before the writer's last ones
+    /// reached it, so the freeze then carries nothing, and the writer's
+    /// tables start afresh.
     fn freeze(&mut self) -> std::sync::Arc<MemTable> {
         self.rehold();
         let table = self.mem().clone();
@@ -14726,8 +14977,12 @@ impl Db {
     /// (`take_fresh_mem`) may have been replaced by the landing since.
     /// The forms go with it as `freeze` says.
     fn freeze_table(&mut self, table: &std::sync::Arc<MemTable>) -> bool {
+        if !self.opts.freeze_settles {
+            return self.freeze_swap(table);
+        }
         let settled = self.freeze_prepare();
         let settled_at = self.state() as *const State;
+        let from = Db::replaced_from(&self.opts, &self.shared);
         let complete = self.fs().tables_complete.get();
         let fresh = std::sync::Arc::new(MemTable::new());
         let carried = std::cell::Cell::new(false);
@@ -14737,33 +14992,7 @@ impl Db {
             }
             let carry = settled && std::ptr::eq(cur, settled_at);
             carried.set(carry);
-            let mut next = State {
-                forms: Reader::forms_for(&cur.segs),
-                forms_moved: std::sync::atomic::AtomicBool::new(false),
-                snap: AtomicPtr::new(std::ptr::null_mut()),
-                reader_scans: AtomicU64::new(cur.reader_scans.load(AtomicOrdering::Relaxed)),
-                forms_at: AtomicUsize::new(usize::MAX),
-                forms_complete: std::sync::atomic::AtomicBool::new(false),
-                scans: AtomicU64::new(0),
-                forms_bytes: AtomicUsize::new(0),
-                segs: cur.segs.clone(),
-                mem: fresh.clone(),
-                // Made again from `cur` on every retry, so a table a
-                // landing retired since is never brought back.
-                frozen: cur
-                    .frozen
-                    .iter()
-                    .cloned()
-                    .chain(std::iter::once(cur.mem.clone()))
-                    .collect(),
-                gen: cur.gen + 1,
-                mean_key_bytes: cur.mean_key_bytes,
-                store_bytes: cur.store_bytes,
-                data_bytes: cur.data_bytes,
-                l0_aligned: cur.l0_aligned,
-                segs_tombs: cur.segs_tombs,
-                layout: cur.layout.clone(),
-            };
+            let mut next = Db::frozen_over(cur, &fresh, from);
             if carry {
                 cur.carry_published(&mut next);
                 next.forms_at = AtomicUsize::new(0);
@@ -14792,6 +15021,69 @@ impl Db {
         }
         self.published(old);
         true
+    }
+
+    /// `table`, the live one, frozen under a fresh one and nothing else:
+    /// the upkeep and the builder left where they are and the writer's
+    /// tables untouched, for the next look at the log to carry across
+    /// (`Options::freeze_settles` off). The state goes uncarried -- its forms
+    /// vouch for nothing until a publish into it says otherwise -- so a
+    /// handle at it builds its own blocks until the upkeep has looked.
+    fn freeze_swap(&mut self, table: &std::sync::Arc<MemTable>) -> bool {
+        let fresh = std::sync::Arc::new(MemTable::new());
+        let from = Db::replaced_from(&self.opts, &self.shared);
+        let Some(old) = self.try_publish_writer_away(|cur| {
+            if !std::sync::Arc::ptr_eq(&cur.mem, table) || cur.frozen.len() >= FROZEN_CAP {
+                return None;
+            }
+            Some(Db::frozen_over(cur, &fresh, from))
+        }) else {
+            return false;
+        };
+        self.published_away(old);
+        true
+    }
+
+    /// The state `cur` makes with its live table frozen, at the frozen
+    /// list's back, under `fresh`; no form carried.
+    fn frozen_over(cur: &State, fresh: &std::sync::Arc<MemTable>, from: Option<u64>) -> State {
+        State {
+            forms: Reader::forms_for(&cur.segs),
+            forms_moved: std::sync::atomic::AtomicBool::new(false),
+            snap: AtomicPtr::new(std::ptr::null_mut()),
+            reader_scans: AtomicU64::new(cur.reader_scans.load(AtomicOrdering::Relaxed)),
+            forms_at: AtomicUsize::new(usize::MAX),
+            forms_complete: std::sync::atomic::AtomicBool::new(false),
+            scans: AtomicU64::new(0),
+            forms_bytes: AtomicUsize::new(0),
+            segs: cur.segs.clone(),
+            mem: fresh.clone(),
+            // Made again from `cur` on every retry, so a table a
+            // landing retired since is never brought back.
+            frozen: cur
+                .frozen
+                .iter()
+                .cloned()
+                .chain(std::iter::once(cur.mem.clone()))
+                .collect(),
+            gen: cur.gen + 1,
+            lives: cur.lives + 1,
+            replaced: cur.replaced_after(Some(&cur.mem), from),
+            mean_key_bytes: cur.mean_key_bytes,
+            store_bytes: cur.store_bytes,
+            data_bytes: cur.data_bytes,
+            l0_aligned: cur.l0_aligned,
+            segs_tombs: cur.segs_tombs,
+            layout: cur.layout.clone(),
+        }
+    }
+
+    /// Where `State::replaced` keeps tables from: the writer's upkeep's
+    /// last look, or nowhere when nothing looks across a change of the
+    /// live table (`Reader::rebase_tables`).
+    fn replaced_from(opts: &Options, shared: &Shared) -> Option<u64> {
+        (opts.forms_carry && opts.commit_forms && opts.scan_block_cache && !opts.freeze_settles)
+            .then(|| shared.upkeep_lives.load(AtomicOrdering::Relaxed))
     }
 
     /// Whether the freeze carries the forms (`Options::forms_carry`), with
@@ -14928,6 +15220,7 @@ impl Db {
     /// what they were: for the table an empty one is replaced by at a
     /// direct run's start, whose log starts where the empty one's ended.
     fn set_mem_with(&mut self, mem: std::sync::Arc<MemTable>, carry: bool) {
+        let from = Db::replaced_from(&self.opts, &self.shared);
         let old = self.publish_writer(|cur| {
             let mut next = State {
                 forms: Reader::forms_for(&cur.segs),
@@ -14942,6 +15235,8 @@ impl Db {
                 mem: mem.clone(),
                 frozen: cur.frozen.clone(),
                 gen: cur.gen + 1,
+                lives: cur.lives + 1,
+                replaced: cur.replaced_after(Some(&cur.mem), from),
                 mean_key_bytes: cur.mean_key_bytes,
                 store_bytes: cur.store_bytes,
                 data_bytes: cur.data_bytes,
@@ -15289,6 +15584,7 @@ impl Reader {
         {
             let (_tx, rx) = std::sync::mpsc::channel();
             *self.fs().ahead.borrow_mut() = Some(Ahead {
+                gen,
                 handle: None,
                 rx,
                 stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -15351,6 +15647,7 @@ impl Reader {
             post.store(true, std::sync::atomic::Ordering::Release);
         });
         *self.fs().ahead.borrow_mut() = Some(Ahead {
+            gen,
             handle: Some(handle),
             rx,
             stop,
@@ -15992,6 +16289,8 @@ struct Ahead {
     handle: Option<std::thread::JoinHandle<()>>,
     rx: std::sync::mpsc::Receiver<Built>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The generation it builds over: its forms are of that state alone.
+    gen: u64,
     /// The write log's length at the commit the builder took its
     /// watermark from: every write logged from here on is one its forms
     /// lack, filed into `since` as the log is read, until every form is
@@ -19542,6 +19841,7 @@ impl Maint {
             // is freed only past every pinned slot.
             let cur = unsafe { &*cur_p };
             let layout = Db::layout_of(cur, &segs, !tier && self.opts.forms_rebase);
+            let from = Db::replaced_from(&self.opts, &self.shared);
             let mut swapped_live = false;
             let (mem, frozen) = match landed {
                 Some(t) if std::sync::Arc::ptr_eq(&cur.mem, t) => {
@@ -19593,6 +19893,8 @@ impl Maint {
                 mem,
                 frozen,
                 gen: cur.gen + 1,
+                lives: cur.lives + u64::from(swapped_live),
+                replaced: cur.replaced_after(swapped_live.then_some(&cur.mem), from),
                 mean_key_bytes,
                 store_bytes,
                 data_bytes,

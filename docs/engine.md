@@ -2421,6 +2421,71 @@ shortening that window is the background's job, not the commit's.
 Level 1 is the default now, and the lag sweep times each burst beside its
 pass (`updates_per_s_lagNpct`), so the trade reads in both quantities.
 
+#### The freeze that leaves its carry to the next look
+
+At level 1 the freeze is the one place the writer still does work for
+the reads: it takes the upkeep home, waiting out a pass in flight, reads
+the log, settles the whole backlog into the forms and publishes them,
+and only then swaps the tables, carrying the forms across only if no
+other publish came between its prepare and its swap. On the buffered
+arm's fully unmerged burst at a hundred thousand keys a seal's landing
+comes between them at most freezes, the freeze carries nothing and
+drops the tables, and the pass builds every block itself. With
+`Options::freeze_settles` off the freeze swaps the tables and touches
+nothing else; the next look at the log, the thread's or the writer's,
+carries the tables across it as it carries them across a landing, keeps
+the frozen table's unsettled writes to settle through that table, and
+finds every table live since its last look in `State::replaced`.
+`supdb-lazyfreeze` and `supdb-ingestlazyfreeze` are that freeze; the
+default keeps the freeze that settles.
+
+The first pricing read the durable arm's fully unmerged burst at 1.11x
+and 1.27x at a hundred and three hundred thousand keys (8/8 each) and
+the buffered arm's pass after it at 0.26-0.44x. The lag probe did not
+reproduce the second: it read the store's counters between the burst and
+the scans, and a counter read takes the upkeep home, so the probe waited
+out the thread's pass before its clock started. Read inside the suite's
+own loop, the writer's first scan after the burst was 17-82 ms of a pass
+the rest of which took 4: a wait for the thread's pass in flight of
+14-36 ms, then 26-34 ms settling the twelve to sixteen thousand frozen
+writes the thread had not reached, at 2 µs a write, and in two reps of
+seven a look that found a table missing and dropped every one, after
+which the pass built the store.
+
+The 2 µs was the general path. A settle copies a key's run from its own
+chain when the chain holds a tombstone, which masks every older source,
+and asked that only of live writes; a frozen write has the same chain,
+and took a seek of every piece standing. Given the masked path, frozen
+writes settled at 0.6-0.9 µs and the pass read 0.71-1.15x of the
+default's. The missing table was one that went live, froze and landed
+between two looks: the look's note held the table live at that look and
+nothing after it, and the thread's passes ran longer than the freezes
+came. `State::replaced` keeps every table replaced since the upkeep's
+last look, which it publishes (`Shared::upkeep_lives`), up to eight;
+with it no look dropped its tables in any rep, the thread's included.
+
+Priced in one process against the default, eight pairs a rung, burst
+and pass summed pair by pair: on the durable arm the fully unmerged
+burst read 1.17x and 1.25x at a hundred and three hundred thousand keys
+(8/8 each) and its pass 1.04x unresolved, summed 1.22x and 1.28x (8/8
+each), with nothing moved at ten thousand. On the buffered arm the
+burst read 1.66x at ten thousand (8/8) and level above it, and the pass
+0.49x, 0.75x and 0.63x at the three rungs (2/8, 1/8, 0/8), summed 1.25x
+at ten thousand (7/8) and 0.88x and 0.87x at a hundred and three
+hundred thousand (1/8, 2/8).
+
+What is left is capacity. Through the hundred-thousand-update burst the
+thread did 90-110 ms of maintenance against a burst of about 70: some
+eighty thousand settles at about 0.45 µs, and 18-28 ms of fills, most
+of them blocks a sixteenth patch had made dense and the fill rebuilds
+as copies, one per block per burst. It ends the burst 25-45 ms behind,
+and the writer's first scan waits for the pass in flight and settles
+the rest. The freeze that settles drops the tables at most freezes, and
+the pass builds each block once, about 20-25 ms for the store. Over a
+dense burst the per-write upkeep costs about four times what one build a
+block after it does; on the durable arm, whose commits wait on their
+fsync, the thread keeps up and the burst gains.
+
 #### The segment work on a thread of its own
 
 A seal's landing, the merges and piece merges, the promotions, the

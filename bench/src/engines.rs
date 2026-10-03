@@ -434,6 +434,10 @@ pub struct Supdb {
     /// Segments written in 2 MB pieces, `SegmentOptions::write_piece`.
     /// `supdb-pmd`, and `supdb-ingestpmd` buffered.
     pmd: bool,
+    /// The freeze swaps the tables and leaves their carry to the next
+    /// look at the log, `Options::freeze_settles` off. `supdb-lazyfreeze`,
+    /// and `supdb-ingestlazyfreeze` buffered.
+    lazyfreeze: bool,
 }
 
 /// What an arm differs from `supdb` by. One struct rather than a row of
@@ -561,6 +565,11 @@ struct Policy {
     /// `SegmentOptions::write_piece`. `supdb-pmd`, and `supdb-ingestpmd`
     /// buffered.
     pmd: bool,
+    /// The freeze swaps the tables and touches nothing else, the upkeep
+    /// left where it is, and the next look at the log carries the tables
+    /// across it as it does a landing: `Options::freeze_settles` off.
+    /// `supdb-lazyfreeze`, and `supdb-ingestlazyfreeze` buffered.
+    lazyfreeze: bool,
 }
 
 impl Default for Policy {
@@ -590,6 +599,7 @@ impl Default for Policy {
             idle: false,
             sortover: false,
             pmd: false,
+            lazyfreeze: false,
             defer: false,
             firstfloor: false,
             aheadmin: None,
@@ -805,6 +815,32 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 pmd: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose freeze only swaps the tables, leaving their carry
+    /// to the next look at the log.
+    pub fn create_lazyfreeze(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                lazyfreeze: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose freeze only swaps the tables, as
+    /// `supdb-lazyfreeze`.
+    pub fn create_ingest_lazyfreeze(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                lazyfreeze: true,
                 ..Policy::default()
             },
         )
@@ -1503,6 +1539,7 @@ impl Supdb {
             idle,
             sortover,
             pmd,
+            lazyfreeze,
         } = policy;
         // What the engine ships, so an arm that pins nothing inherits it
         // rather than restating it and drifting from it.
@@ -1583,6 +1620,7 @@ impl Supdb {
             // The forms carried across a seal, or the table started
             // afresh at every publish as it was.
             forms_carry: carry,
+            freeze_settles: !lazyfreeze,
             forms_rebase: !norebase,
             // The seal sized by the file, as it was before the store's
             // payload was recorded.
@@ -1701,6 +1739,7 @@ impl Supdb {
             idle,
             sortover,
             pmd,
+            lazyfreeze,
         })
     }
 }
@@ -1785,6 +1824,13 @@ impl Engine for Supdb {
                 "supdb-pmd"
             } else {
                 "supdb-ingestpmd"
+            };
+        }
+        if self.lazyfreeze {
+            return if self.partition {
+                "supdb-lazyfreeze"
+            } else {
+                "supdb-ingestlazyfreeze"
             };
         }
         if self.sortover {
@@ -2481,7 +2527,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "supdb-inlinemaint"
         | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose" | "supdb-rotate"
         | "supdb-nofrozen" | "supdb-idle" | "supdb-sortover" | "supdb-pmd" | "supdb-hold"
-        | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
+        | "supdb-lazyfreeze" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest"
         | "supdb-ingestleave"
         | "supdb-ingestnoseal"
@@ -2498,6 +2544,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-shapeidle"
         | "supdb-shapesortover"
         | "supdb-ingestpmd"
+        | "supdb-ingestlazyfreeze"
         | "supdb-ingesthold"
         | "lmdb-nosync"
         | "rocksdb-nosync" => Guarantee::Buffered,
@@ -2563,6 +2610,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-shapesortover" => Box::new(Supdb::create_shape_sortover(dir)?),
         "supdb-pmd" => Box::new(Supdb::create_pmd(dir)?),
         "supdb-ingestpmd" => Box::new(Supdb::create_ingest_pmd(dir)?),
+        "supdb-lazyfreeze" => Box::new(Supdb::create_lazyfreeze(dir)?),
+        "supdb-ingestlazyfreeze" => Box::new(Supdb::create_ingest_lazyfreeze(dir)?),
         "supdb-idle" => Box::new(Supdb::create_idle(dir)?),
         "supdb-shapeidle" => Box::new(Supdb::create_shape_idle(dir)?),
         "supdb-ingestadaptloose" => Box::new(Supdb::create_ingest_adaptloose(dir)?),

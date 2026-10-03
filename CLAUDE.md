@@ -126,7 +126,13 @@ against the suite's hundred (`VALUE_SIZE`) and sixteen-byte keys. A
 fifth skipped the `sync` the suite's load ends in, so its store at three
 hundred thousand keys stayed two pieces through the whole sweep, where
 the suite's second flush had joined the partitioning, and read every
-point at a third of the suite's rate. The
+point at a third of the suite's rate. A sixth read the store's counters
+between a burst and its scans, and a counter read takes the writer's
+upkeep home, waiting out the thread's pass in flight before the clock
+started: it read the lazy freeze's pass level where the suite read it
+at four tenths, and the wait it hid was half of the suite's first scan.
+Read nothing between the phases the suite times that the suite does not
+read. The
 suite's own arms answer most of these questions without a probe at all,
 and `bench ab` prices two of them in one process; reach for a probe only
 when no pair of arms isolates what you are asking.
@@ -270,8 +276,12 @@ thread could be preempted holding. The thread pins a slot for each pass,
 so a publish from the segment work needs nothing of it: the forms go
 across as copies the publish makes (`State::carry_published`) and the
 writer's own tables follow at its next look at the log
-(`Reader::rebase_tables`); the writer's own publishes still take it back
-first. The forms a pass publishes carry the commit the writer named,
+(`Reader::rebase_tables`). The writer's own publishes still take it back
+first; the freeze with `Options::freeze_settles` off does not, swapping
+the tables and touching nothing else, and the next look carries the
+tables across it as it does a landing, the frozen table's unsettled
+writes kept to settle through that table and every table live since the
+look kept for it in `State::replaced`. The forms a pass publishes carry the commit the writer named,
 never the latest, or a handle at the latest takes forms without the
 writes between; and `settle` joins it before anything else, because
 every other join touches it. The threaded test runs at each level, since
@@ -742,6 +752,62 @@ climbed about 35 MB a rep at a million keys over every arm, and held
 level once the wrappers freed. The rule: whatever owns a pointer it will free is a
 type with a `Drop`, so the owner's end frees it, not only the path
 that remembered to.
+
+**A carry that required nothing to have moved.** The freeze carried
+the writer's tables only over the state it had prepared them against,
+and the prepare was a settle of the whole backlog, milliseconds on the
+writer's path. A seal's landing from the segment work fell inside it at
+the second freeze of the buffered lag sweep's largest burst, so the
+freeze carried nothing and dropped the tables; every freeze and look
+after it then refused for want of a table some scan had used, the
+burst ended with none, and the pass built every block of the store at
+a seventh of the rate the rows had shown. Retrying the prepare over the
+landing restored the pass and doubled the burst, the settle being the
+writer's; the freeze with `freeze_settles` off swaps the tables and
+nothing else, and the look carries them. The rule: an optimistic check
+that fails falls back to work, never to a state nothing recovers from;
+and a fallback that drops a structure must not also be what stops
+anyone rebuilding it.
+
+**A publish that dropped the marks an empty slot is read by.** A reader
+takes a published form as the block and, with the table complete, an
+empty slot as clean, so the writer publishes a mark for every block it
+holds no form for, and the marks travel from state to state with the
+copies a publish carries. The freeze that carries nothing published a
+state with no form and no mark while the writer's tables still called
+themselves complete, and a handle read the last block of a store
+without one key the frozen table held for it -- the writer, walking its
+own tables, was right. The tables carried across a freeze are
+incomplete now until the fill makes them whole. The rule: where an
+absence means something, whatever drops the things it is the absence
+of drops the claim that gives it the meaning.
+
+**A note that held one of the things its look would need.** The look
+that carries the writer's tables across a freeze reads the writes it
+has not read from every table live since its last look, and its note
+held the one live at that look and nothing after it. At the buffered
+lag sweep's largest burst a table froze and landed every few
+milliseconds while a pass ran longer than that, so a table went live,
+froze and landed between two looks, nobody held it, and the look
+dropped every table: the thread rebuilt the store in the burst, and
+when the writer's first scan was the look, the pass built every block.
+The state keeps the tables replaced since the upkeep's last look now
+(`State::replaced`, trimmed at the count the look publishes). The rule:
+what a reader that runs behind will need is kept by the side that
+retires it, until the reader says it has passed it, never by the
+reader's own record of where it last was.
+
+**A fast path gated on the case it was written for.** A settle copies a
+written key's run from its own chain when the chain holds a tombstone,
+since a tombstone masks every older source, and the gate asked whether
+the write was the live table's. A write read from a table frozen since
+-- what the freeze that leaves its carry to the next look settles --
+has the same chain and the same tombstone, and took the general path,
+a seek of every piece standing, at about six times the price: the
+writer's first scan after the buffered lag sweep's largest burst spent
+thirty milliseconds there. The rule: a fast path is gated on the
+property that makes it valid, not on the source it was first written
+for.
 
 **A form dropped after the copy stood as the block.** A publish from
 the segment work copies the old state's published forms into the new one,
