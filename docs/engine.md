@@ -2392,6 +2392,32 @@ unmerged burst holding past the same number of writes; whether the
 burst keeps its win then is the next thing to price, not a thing this
 section knows.
 
+#### Commits that never hold, priced by the sum
+
+`supdb-lend` and `supdb-ingestlend` run the upkeep at level 1: a commit
+hands its writes to the thread and neither holds for it nor files them
+itself, so no commit does work for the reads. Priced in one process
+against the shipping arms, ten pairs a size: ycsb-A 1.58x and 1.41x and
+ycsb-F 1.23x and 1.29x on the buffered arm at a hundred and three hundred
+thousand keys, 10 of 10 each, and 0.98-1.20x and 1.02-1.34x unresolved on
+the durable arm, whose commits are mostly their fsync; the lag sweep's
+passes 0.09-0.87x on the buffered arm and 0.24-0.92x on the durable, the
+tenth point 0.34-0.66x at every size on both. The suite times a lag
+point's pass and not its burst, and the hold is what moves the
+conversion of the burst's writes out of the pass and into the burst.
+Timed apart -- the lag probe, one rep a process, four rounds -- the burst
+and the pass summed read lend at 0.48-1.01x of the default: the fully
+unmerged point at 0.48x and 0.51x on the buffered arm at three hundred
+and a hundred thousand keys, its burst 214 ms against 679 and its pass
+116 against 14 at the larger, and the hundredth point level everywhere.
+In the pass after a burst the upkeep thread took 0.03% of the samples,
+and the scans built the blocks they read over pieces the burst's merges
+had not yet folded, at about the merge path's speed: without the block
+cache the fully unmerged point reads 2.7-5.0M entries a second, with the
+forms 22-54M. Lend does less work than the hold and moves it to where the
+suite does not time it; the pass after a burst is its cost, and
+shortening that window is the background's job, not the commit's.
+
 #### The segment work on a thread of its own
 
 A seal's landing, the merges and piece merges, the promotions, the
