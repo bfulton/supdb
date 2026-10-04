@@ -2784,9 +2784,38 @@ move, the burst plus twice the pass read 0.89x and 0.94x; the tenth
 point read 0.87x at a hundred thousand and level at three hundred
 thousand; and the durable arm's fully rewritten point read 0.92x (4/4).
 What the first scan waits for now is the thread's pass in flight, 5-29
-ms at three hundred thousand, and the thread's time there is its fills
-as much as its settles -- the blocks a burst's patches bloat, drop and
-build fresh, twenty microseconds each -- which is the next cut.
+ms at three hundred thousand keys.
+
+That wait was read three ways. The thread's fills are not in it: over
+the fully rewritten burst the fill converts a few hundred dense forms at
+most and builds under a dozen blocks fresh -- the thousands of fresh
+builds the suite's counters show for a rep are the update mixes'. The
+bounded pass, re-priced once the writer settled in key order, loses by
+more than before: 1.17x and 1.05x at a hundred and three hundred
+thousand keys on the buffered arm (7/8, 5/8) and 1.09x on the durable
+arm at a hundred thousand (6/8), because the thread's small passes each
+pay the pass's fixed cost, so it ends the burst further behind, and the
+writer settles the leftover at the thread's own rate (`scan_settle_us`
+up 3.1x where `upkeep_ms` fell to 0.9x) -- moving the work moves
+nothing. And the thread, which runs in the idle scheduling class, is on
+a core for 94-99% of its pass time (`upkeep_cpu_us` beside
+`upkeep_ms`, on both arms at both rungs), so the scheduler is not the
+gap either. What is left is that the thread's CPU per write equals the
+writer's -- 0.5-0.85 µs each in one run of the buffered arm, the thread
+within a tenth of the writer either way -- so it ends every dense burst
+about a pass behind. Profiled after the resolve change, the thread's
+time is the splice 34% (`patch_block`, the sparse form's sorted inserts
+and their moves, the allocator), the settle loop's own 15%, key
+compares 7%, the sorts 6%, the chain's tombstone check 4%: a few
+percent each. The structural question is whether the sparse form a
+clean block's first write makes is worth making at all for a burst of
+uniformly random keys -- it walks at about 2.3 µs against a copy's
+1.05, and the walk through the snapshot's run, which carries the values
+in key order, is the comparison not yet measured. A settle that counted
+a clean block's writes and built the copy at the density where one pays,
+instead of patching a sparse form sixteen times and converting it,
+would halve the thread's work on this burst and leave the pass walking
+copies.
 
 #### The segment work on a thread of its own
 

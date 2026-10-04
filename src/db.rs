@@ -17034,6 +17034,24 @@ fn idle_cpu_priority() {
     }
 }
 
+/// The calling thread's time on a core so far, in nanoseconds, for the
+/// gap between a pass's wall time and its time running: zero where the
+/// clock is not had.
+fn thread_cpu_ns() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: a valid out-pointer for the clock's one write.
+        if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } == 0 {
+            return ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
+        }
+    }
+    0
+}
+
 impl Reader {
     /// PROTOTYPE: the run keeper's loop, on a handle of its own. Each
     /// tick pins the state, carries the snapshot across a publish if one
@@ -17399,6 +17417,10 @@ struct Lend {
     /// For a measurement: the nanoseconds the thread spent in its passes,
     /// which over the writes it filed is what the upkeep costs a write.
     busy_ns: AtomicU64,
+    /// For a measurement: the nanoseconds of those the thread was on a
+    /// core for. The thread runs in the idle class, so the gap to
+    /// `busy_ns` is time the machine had something else to run.
+    cpu_ns: AtomicU64,
     /// `UpkeepTo::lent` of the last pass done: how far the thread has
     /// filed, for `Options::upkeep_lag_pct`.
     filed: AtomicU64,
@@ -17771,11 +17793,16 @@ impl Reader {
                 continue;
             };
             let began = std::time::Instant::now();
+            let cpu0 = thread_cpu_ns();
             let lent = to.lent;
             let pass =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.upkeep_pass(fs, to)));
             lend.busy_ns
                 .fetch_add(began.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+            lend.cpu_ns.fetch_add(
+                thread_cpu_ns().saturating_sub(cpu0),
+                AtomicOrdering::Relaxed,
+            );
             lend.passes.fetch_add(1, AtomicOrdering::Relaxed);
             match pass {
                 Ok((fs, ran, whole, done)) => {
@@ -18225,12 +18252,13 @@ impl Db {
     /// passes, the times the writer took the upkeep back, the times it
     /// waited for a pass in flight, the microseconds it waited, the
     /// commits that held for their pass, the microseconds they held, and
-    /// the microseconds the thread spent in its passes, and the passes
-    /// that found another table live than their commit's and filed
-    /// nothing. Atomics only: a read of them takes nothing back from the
-    /// thread.
+    /// the microseconds the thread spent in its passes, the passes that
+    /// found another table live than their commit's and filed nothing,
+    /// the passes cut short, and the microseconds of the passes the
+    /// thread was on a core for. Atomics only: a read of them takes
+    /// nothing back from the thread.
     #[doc(hidden)]
-    pub fn upkeep_counts(&self) -> [u64; 9] {
+    pub fn upkeep_counts(&self) -> [u64; 10] {
         let l = &self.shared.upkeep;
         [
             l.passes.load(AtomicOrdering::Relaxed),
@@ -18242,6 +18270,7 @@ impl Db {
             l.busy_ns.load(AtomicOrdering::Relaxed) / 1000,
             l.skipped.load(AtomicOrdering::Relaxed),
             l.partial.load(AtomicOrdering::Relaxed),
+            l.cpu_ns.load(AtomicOrdering::Relaxed) / 1000,
         ]
     }
 }

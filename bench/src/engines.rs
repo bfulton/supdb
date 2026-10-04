@@ -2357,6 +2357,7 @@ impl Engine for Supdb {
             ("scan_install_us", ph[5] as f64 / 1e3),
             ("upkeep_wait_us", uk[3] as f64),
             ("upkeep_partial", uk[8] as f64),
+            ("upkeep_cpu_us", uk[9] as f64),
         ]
     }
     fn thread_reader(&self) -> Res<ReaderOpener> {
