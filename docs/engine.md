@@ -2645,6 +2645,34 @@ with the p99 0.89-0.94 against 0.94-0.98 µs, a margin one sitting has
 seen and a second has not. The row is banked as the host it ran on, and
 its point reads are what both binaries read there.
 
+#### Where the reads lose now: the pass after a dense burst is a build
+
+Ranked against their comparators in the row at b247414, the ten worst
+read quantities are one shape: the scan pass after a write burst on the
+buffered arm, the fully rewritten point at 0.17x of LMDB at a hundred
+thousand keys and 0.22x at three hundred thousand, the tenth at
+0.37-0.78x; nothing else on the read side is below LMDB. On the burst
+plus twice the pass the arm is ahead at every point, its bursts three
+to four times LMDB's, and the pass alone is five to six times slower
+than LMDB's, which is what a reader meets. `lag_only` over the fully
+rewritten point at a hundred thousand keys, three reps, the burst and
+pass in milliseconds beside the thread's time and the blocks the pass
+built: 94 and 24 with 55 ms of thread and 2,340 built; 70 and 32 with 26
+and 1,536; 47 and 17 with 5 and 766; nine pieces and one partition at
+the end of every pass, the partition merge of about 60 ms not landed.
+LMDB's pass there is 3.6 ms, its burst 201. The pass rebuilds the
+store's blocks at 15-25 µs each over nine pieces where a built block
+walks in 2.5, and the thread's filing during the burst was dropped at
+the settling freezes or rebuilt by the pass anyway: the rep whose thread
+filed most ran its burst twice as slow and built the most blocks after.
+
+The model reads it. A block here takes sixty to ninety writes before its
+next read, past `k* = B/p` of about forty, so patching it per write is
+the wrong strategy for this burst and rebuilding it once is right; what
+is missing is the switch on density and the timing, a rebuild made by
+the background after each landing and ahead of the readers rather than
+by the first scan. The per-block rent-or-buy at the settle and the
+builder-ahead thread exist; the policy that joins them does not.
 #### The segment work on a thread of its own
 
 A seal's landing, the merges and piece merges, the promotions, the

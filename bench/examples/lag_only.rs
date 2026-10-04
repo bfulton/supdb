@@ -76,6 +76,18 @@ fn main() {
             let passes = get(&c1, "upkeep_passes") - get(&c0, "upkeep_passes");
             let built = get(&c1, "blk_by_engine") - get(&c0, "blk_by_engine");
             let skipped = get(&c1, "upkeep_skipped") - get(&c0, "upkeep_skipped");
+            let scans_n = get(&c1, "rd_scans") - get(&c0, "rd_scans");
+            let blockpath = get(&c1, "rd_blockpath") - get(&c0, "rd_blockpath");
+            let seals = get(&c1, "seals") - get(&c0, "seals");
+            let pubs = get(&c1, "publishes") - get(&c0, "publishes");
+            let snaps = get(&c1, "snapshot_builds") - get(&c0, "snapshot_builds");
+            let layout = format!(
+                "parts {:.0} pieces {:.0} unsealed {:.0} forms {:.0}",
+                get(&c1, "partitions"),
+                get(&c1, "pieces"),
+                get(&c1, "unsealed_keys"),
+                get(&c1, "forms_held_at_end")
+            );
             let ct = if wrote > 0 {
                 up * 1e3 / wrote as f64
             } else {
@@ -87,7 +99,7 @@ fn main() {
                 0.0
             };
             line.push_str(&format!(
-                " | lag{pct} {burst:.1}+{pass:.1}ms up {up:.1}ms/{passes:.0}p c_t {ct:.2} c_w {cw:.2} built {built:.0} skipped {skipped:.0}"
+                "\n  lag{pct} {burst:.1}+{pass:.1}ms up {up:.1}ms/{passes:.0}p c_t {ct:.2} c_w {cw:.2} built {built:.0} skipped {skipped:.0} blockpath {blockpath:.0}/{scans_n:.0} seals {seals:.0} pubs {pubs:.0} snaps {snaps:.0} | {layout}"
             ));
             c0 = c1;
         }
