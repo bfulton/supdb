@@ -647,30 +647,8 @@ impl OrdIndex {
         if self.n == 0 {
             return (0, Some(false));
         }
-        // The heads order only keys that carry the common prefix. A query
-        // that does not is above or below every key, and its own first
-        // bytes against the prefix say which; its bytes after the prefix,
-        // which the heads are, say nothing. The prefix is read off the first
-        // key, which every key starts with. A first key the segment will not
-        // resolve sorts the query below everything, widening the answer the
-        // way the record search does with damage.
-        if self.pfx > 0 {
-            let m = self.pfx.min(key.len());
-            let learned = self.prefix.as_deref();
-            let first = match learned {
-                Some(p) => p,
-                None => match key_at(0) {
-                    Some(k) => k,
-                    None => return (0, Some(false)),
-                },
-            };
-            let m = m.min(first.len());
-            match cmp_short(&key[..m], &first[..m]) {
-                std::cmp::Ordering::Less => return (0, Some(false)),
-                std::cmp::Ordering::Greater => return (self.n, Some(false)),
-                std::cmp::Ordering::Equal if m < self.pfx => return (0, Some(false)),
-                std::cmp::Ordering::Equal => {}
-            }
+        if let Some(end) = self.outside_prefix(key, &key_at) {
+            return end;
         }
         let h = head_of(key, self.pfx);
         // The samples below the query: the answer lies past the last of
@@ -700,6 +678,109 @@ impl OrdIndex {
         // level is: the branch form mispredicted about half its steps.
         let base = lo;
         lo = base + crate::db::select_lower_bound(hi - lo, |i| self.head(base + i) < h);
+        self.exact_at(lo, h, key, key_at)
+    }
+
+    /// `seek_exact` for a query expected at or past rank `from`, the
+    /// answer to the query before it in key order: the heads are galloped
+    /// from there -- probes one, two, four past it, each twice as far,
+    /// until one is not below the query -- and searched inside that span,
+    /// so each of a run of queries in key order costs about two log of its
+    /// distance from the last in probes, over heads the last search left
+    /// warm, where a seek from the top reads a stride's eight lines cold.
+    /// The settle resolved each of a batch's keys to its block with a seek
+    /// from the top, in arrival order, a cold stride a key: a quarter of
+    /// the upkeep thread's time over a dense burst. A query below `from`,
+    /// or one whose head ties the head before `from`, takes the full
+    /// seek, so the answer is `seek_exact`'s from any rank.
+    pub fn seek_exact_from<'a>(
+        &self,
+        from: usize,
+        key: &[u8],
+        key_at: impl Fn(usize) -> Option<&'a [u8]>,
+    ) -> (usize, Option<bool>) {
+        if from == 0 || from >= self.n {
+            return self.seek_exact(key, key_at);
+        }
+        if let Some(end) = self.outside_prefix(key, &key_at) {
+            return end;
+        }
+        let h = head_of(key, self.pfx);
+        // The answer is at or past `from` only where the head before it
+        // is below the query; a head there that ties or exceeds it puts
+        // the answer at or before `from`, which the full seek finds.
+        if self.head(from - 1) >= h {
+            return self.seek_exact(key, key_at);
+        }
+        let lo = if self.head(from) >= h {
+            from
+        } else {
+            let mut lo = from;
+            let mut step = 1usize;
+            let hi = loop {
+                let p = lo + step;
+                if p >= self.n {
+                    break self.n;
+                }
+                if self.head(p) < h {
+                    lo = p;
+                    step *= 2;
+                } else {
+                    break p;
+                }
+            };
+            // `head(lo) < h`, and `head(hi)` is not, or `hi` is the end:
+            // the answer is in `lo + 1..=hi`.
+            let base = lo + 1;
+            base + crate::db::select_lower_bound(hi - base, |i| self.head(base + i) < h)
+        };
+        self.exact_at(lo, h, key, key_at)
+    }
+
+    /// The heads order only keys that carry the common prefix. A query
+    /// that does not is above or below every key, and its own first
+    /// bytes against the prefix say which; its bytes after the prefix,
+    /// which the heads are, say nothing. The prefix is read off the first
+    /// key, which every key starts with. A first key the segment will not
+    /// resolve sorts the query below everything, widening the answer the
+    /// way the record search does with damage. `None` for a query that
+    /// carries the prefix, which the heads then order.
+    fn outside_prefix<'a>(
+        &self,
+        key: &[u8],
+        key_at: &impl Fn(usize) -> Option<&'a [u8]>,
+    ) -> Option<(usize, Option<bool>)> {
+        if self.pfx == 0 {
+            return None;
+        }
+        let m = self.pfx.min(key.len());
+        let learned = self.prefix.as_deref();
+        let first = match learned {
+            Some(p) => p,
+            None => match key_at(0) {
+                Some(k) => k,
+                None => return Some((0, Some(false))),
+            },
+        };
+        let m = m.min(first.len());
+        match cmp_short(&key[..m], &first[..m]) {
+            std::cmp::Ordering::Less => Some((0, Some(false))),
+            std::cmp::Ordering::Greater => Some((self.n, Some(false))),
+            std::cmp::Ordering::Equal if m < self.pfx => Some((0, Some(false))),
+            std::cmp::Ordering::Equal => None,
+        }
+    }
+
+    /// The seek's answer from `lo`, the first rank whose head is not below
+    /// the query's `h`: the rank, and whether the key there is the query,
+    /// from the heads where they can say and the records where they must.
+    fn exact_at<'a>(
+        &self,
+        lo: usize,
+        h: u64,
+        key: &[u8],
+        key_at: impl Fn(usize) -> Option<&'a [u8]>,
+    ) -> (usize, Option<bool>) {
         if lo >= self.n || self.head(lo) != h {
             // No head ties the query: with heads that are whole keys the
             // key at the rank is not the query; otherwise the records
@@ -870,6 +951,59 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// `seek_exact_from` answers as `seek_exact` does from every rank,
+    /// those past the answer included: the settle's resolve in key order
+    /// relies on the ranks before the answer, and a tie among the sixteen
+    /// bytes it sorts by on the full seek the others fall back to.
+    fn check_from(keys: &[&[u8]], probes: &[&[u8]], name: &str) {
+        let p = write(&build(keys), name);
+        let idx = OrdIndex::open(&p, keys.len()).expect("opens");
+        let n = keys.len();
+        let froms: Vec<usize> = (0..=n)
+            .step_by(37)
+            .chain([1, n.saturating_sub(1), n])
+            .collect();
+        for k in keys.iter().chain(probes) {
+            let want = idx.seek_exact(k, resolver(keys));
+            for &from in &froms {
+                assert_eq!(
+                    idx.seek_exact_from(from, k, resolver(keys)),
+                    want,
+                    "{name}: from {from}, key {:?}",
+                    String::from_utf8_lossy(k)
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_seek_from_a_rank_answers_as_the_seek_does() {
+        let digits: Vec<Vec<u8>> = (0u32..2_000)
+            .map(|i| format!("{:016}", i * 3).into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = digits.iter().map(|k| k.as_slice()).collect();
+        let between: Vec<Vec<u8>> = (0u32..700)
+            .map(|i| format!("{:016}", i * 9 + 1).into_bytes())
+            .collect();
+        let probes: Vec<&[u8]> = between.iter().map(|k| k.as_slice()).collect();
+        check_from(&keys, &probes, "from-digits");
+        let tied: Vec<Vec<u8>> = (0u32..300)
+            .map(|i| {
+                let mut k = vec![b'x'; 40];
+                k.extend_from_slice(format!("{i:06}").as_bytes());
+                k
+            })
+            .collect();
+        let keys: Vec<&[u8]> = tied.iter().map(|k| k.as_slice()).collect();
+        let longer: Vec<u8> = {
+            let mut k = vec![b'x'; 40];
+            k.extend_from_slice(b"000150a");
+            k
+        };
+        check_from(&keys, &[b"x", longer.as_slice(), b"zz"], "from-headtie");
     }
 
     /// Sixteen zero-padded digits: the shape whose first ten bytes are

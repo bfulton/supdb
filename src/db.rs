@@ -11566,24 +11566,63 @@ impl Reader {
         // half of a settle waited on `Blob::key_at`. Sorted by position
         // the reads run through the partition once, the way a B-tree
         // applies a batch.
+        //
+        // And resolved in key order: the keys' first sixteen bytes read in
+        // the log's order, which is the arena's, so those reads stream,
+        // and the batch sorted by them stably -- it arrives sorted by the
+        // key's arena offset with the write that created a key first
+        // (`settle_pending`), so equal keys stay adjacent in that order
+        // and the duplicate skip below holds. Each resolve is then a seek
+        // from the rank the key before it resolved to, over heads that
+        // seek left warm, where a seek from the top read a cold stride of
+        // heads a key: in arrival order the resolve was a quarter of the
+        // upkeep thread's time over a dense burst, as much as the splices
+        // (`OrdIndex::seek_exact_from`).
+        let mut keyed: Vec<(u64, u64, u32)> = Vec::with_capacity(pending.len());
+        for (i, &(off, len, _, _)) in pending.iter().enumerate() {
+            let (a, b) = key_prefix(src.key_at(off, len));
+            keyed.push((a, b, i as u32));
+        }
+        let mut scratch = Vec::new();
+        radix_by_prefix(&mut keyed, &mut scratch);
         let mut last = u32::MAX;
+        let mut at = 0usize;
+        let mut floor = 0usize;
         let mut resolved: Vec<(u32, u32, u32, u32, u32, bool, u32)> =
             Vec::with_capacity(pending.len());
-        for &(off, len, new, slot) in pending {
+        for &(_, _, i) in &keyed {
+            let (off, len, new, slot) = pending[i as usize];
             if off == last {
                 continue;
             }
             last = off;
             let key = src.key_at(off, len);
-            let at = self.segs()[..np]
-                .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+            // The partition holding the key: the one before's or a later
+            // one in key order, found by stepping, and from the top for a
+            // key that sorts below it -- keys longer than the sixteen
+            // bytes sorted by, tied on them, may arrive out of order.
+            while at < np
+                && self.segs()[at]
+                    .hi
+                    .as_ref()
+                    .is_some_and(|h| h.as_slice() <= key)
+            {
+                at += 1;
+                floor = 0;
+            }
+            if at < np && at > 0 && self.segs()[at].below_lo(key) {
+                at = self.segs()[..np]
+                    .partition_point(|s| s.hi.as_ref().is_some_and(|h| h.as_slice() <= key));
+                floor = 0;
+            }
             let Some(seg) = self.segs()[..np].get(at) else {
                 continue;
             };
             if seg.blob.keys() == 0 {
                 continue;
             }
-            let (b, cut) = BuildCtx::owner_of(seg, key);
+            let (b, cut) = BuildCtx::owner_of_from(seg, key, floor);
+            floor = (cut >> 1) as usize;
             resolved.push((at as u32, b as u32, cut, off, len, new, slot));
         }
         resolved.sort_unstable_by_key(|r| (u64::from(r.0) << 32) | u64::from(r.2));
@@ -18488,8 +18527,15 @@ impl<'s> BuildCtx<'s> {
     /// filed, and the record parse was the largest leaf of the settle's
     /// samples after the lag burst at three hundred thousand keys.
     fn owner_of(seg: &Seg, key: &[u8]) -> (usize, u32) {
+        Self::owner_of_from(seg, key, 0)
+    }
+    /// `owner_of` for a key expected at or past rank `floor` -- the rank
+    /// the key before it in key order resolved to -- so a batch resolved
+    /// in key order gallops from one answer to the next over warm heads
+    /// (`OrdIndex::seek_exact_from`).
+    fn owner_of_from(seg: &Seg, key: &[u8], floor: usize) -> (usize, u32) {
         let keys = seg.blob.keys();
-        let (rank, exact) = seg.ord.seek_exact(key, |r| seg.blob.key_at(r));
+        let (rank, exact) = seg.ord.seek_exact_from(floor, key, |r| seg.blob.key_at(r));
         let same = rank < keys && exact.unwrap_or_else(|| seg.blob.key_at(rank) == Some(key));
         let owner = if same { rank } else { rank.saturating_sub(1) };
         (owner / CACHE_BLOCK, ((rank as u32) << 1) | same as u32)

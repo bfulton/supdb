@@ -2767,9 +2767,26 @@ report --comm` had not filtered them), the thread's 161 ms over 222
 thousand writes was: the settle loop's own 20%, the resolve of a key to
 its block 23% (`owner_of` and its compares, a cold binary search a key
 in arrival order), the splice 27% (`patch_block`, its moves and the
-allocator), the sorts 5%, task switches 3%. The resolve in key order,
-each seek floored at the last answer, is the next cut; the target is
-`ρ < 1`, where the first scan's settle vanishes.
+allocator), the sorts 5%, task switches 3%.
+
+The resolve runs in key order now: a settle reads its batch's keys'
+first sixteen bytes in the log's order, which is the arena's, sorts the
+batch by them stably with the radix the snapshot uses, and resolves each
+key with a seek galloped from the rank the key before it resolved to
+(`OrdIndex::seek_exact_from`), over heads the last seek left warm, where
+the seek from the top read a cold stride of heads a key. Alternating the
+probe's two binaries four rounds, the order swapped each round, on the
+buffered arm's fully rewritten burst: the pass after it read 0.68x at a
+hundred thousand keys (7/8 pairs) and 0.84x at three hundred thousand
+(4/4), its first scan 7 ms against 12 and 23 against 33, the settle
+inside that scan 2 ms against 5 and 6 against 20; the burst did not
+move, the burst plus twice the pass read 0.89x and 0.94x; the tenth
+point read 0.87x at a hundred thousand and level at three hundred
+thousand; and the durable arm's fully rewritten point read 0.92x (4/4).
+What the first scan waits for now is the thread's pass in flight, 5-29
+ms at three hundred thousand, and the thread's time there is its fills
+as much as its settles -- the blocks a burst's patches bloat, drop and
+build fresh, twenty microseconds each -- which is the next cut.
 
 #### The segment work on a thread of its own
 

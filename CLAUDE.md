@@ -998,6 +998,22 @@ misses, and a merge of two sides within a factor of a hundred of each
 other walks the longer side rather than searching it, since a walk
 streams and a search does not.
 
+**A batch resolved in arrival order.** The settle resolved each of a
+batch's keys to its block with a seek from the ordered index's top,
+in the order the log held them, and the index's heads below the top
+level are a cold stride a seek -- eight lines, issued at once, one miss
+each key -- so the resolve was a quarter of the upkeep thread's time
+over a dense burst, as much as the splices themselves, with nothing
+raised and nothing wrong. Sorted by their sixteen-byte prefixes first,
+the keys resolve in the index's order and each seek gallops from the
+rank the key before it reached, over heads the last seek left warm; the
+pass after the buffered arm's fully rewritten burst read 0.68x and
+0.84x at a hundred and three hundred thousand keys. The rule is the one
+the snapshot's merge and the seal's sort gave, applied to lookups: a
+batch of searches over a sorted structure is made in the structure's
+order, each from the last answer, since a search from the top pays the
+structure's depth in misses for every key and a walk pays it once.
+
 **A read measured fast because the write paid for it.** A first seal
 at the floor left a partition behind a load, and the pass after the
 load read eleven times faster -- because every commit of the load, with
