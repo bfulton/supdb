@@ -66,9 +66,13 @@ fn main() {
             let burst = tw.elapsed().as_secs_f64() * 1e3;
             let mut g3 = KeyGen::new(KeyDist::Uniform, scan_keys, 0x1A7);
             let t = Instant::now();
-            for _ in 0..scans {
+            let mut first = 0.0f64;
+            for i in 0..scans {
                 db_key_into(g3.next(), &mut kb);
                 e.range(&kb, 100).unwrap();
+                if i == 0 {
+                    first = t.elapsed().as_secs_f64() * 1e3;
+                }
             }
             let pass = t.elapsed().as_secs_f64() * 1e3;
             let c1 = e.counters();
@@ -81,6 +85,37 @@ fn main() {
             let seals = get(&c1, "seals") - get(&c0, "seals");
             let pubs = get(&c1, "publishes") - get(&c0, "publishes");
             let snaps = get(&c1, "snapshot_builds") - get(&c0, "snapshot_builds");
+            let d = |n: &str| get(&c1, n) - get(&c0, n);
+            let upkeep_built = format!(
+                "first {first:.2}ms up_built {:.0} drops {:.0} ahead {:.0}/{:.0}/{:.0} notable {:.0} fill {:.0}/{:.0} bld skip {:.0}/{:.0} built {:.0} inst drop {:.0} skip {:.0} walks {:.0}/{:.0}/{:.0}",
+                d("blk_by_upkeep"),
+                d("table_drops"),
+                d("ahead_starts"),
+                d("ahead_stops"),
+                d("ahead_installed"),
+                d("settle_notable"),
+                d("fill_dense"),
+                d("fill_fresh"),
+                d("ahead_skip_held"),
+                d("ahead_skip_overlay"),
+                d("ahead_built"),
+                d("install_gen_drop"),
+                d("install_slot_skip"),
+                d("walk_copy"),
+                d("walk_sparse"),
+                d("walk_other")
+            );
+            let phases = format!(
+                "ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} ms, wait {:.2}",
+                d("scan_take_us") / 1e3,
+                d("scan_sync_us") / 1e3,
+                d("scan_settle_us") / 1e3,
+                d("scan_snap_us") / 1e3,
+                d("scan_ahead_us") / 1e3,
+                d("scan_install_us") / 1e3,
+                d("upkeep_wait_us") / 1e3
+            );
+            let phases = format!("{phases} partial {:.0}", d("upkeep_partial"));
             let layout = format!(
                 "parts {:.0} pieces {:.0} unsealed {:.0} forms {:.0}",
                 get(&c1, "partitions"),
@@ -99,7 +134,7 @@ fn main() {
                 0.0
             };
             line.push_str(&format!(
-                "\n  lag{pct} {burst:.1}+{pass:.1}ms up {up:.1}ms/{passes:.0}p c_t {ct:.2} c_w {cw:.2} built {built:.0} skipped {skipped:.0} blockpath {blockpath:.0}/{scans_n:.0} seals {seals:.0} pubs {pubs:.0} snaps {snaps:.0} | {layout}"
+                "\n  lag{pct} {burst:.1}+{pass:.1}ms up {up:.1}ms/{passes:.0}p c_t {ct:.2} c_w {cw:.2} built {built:.0} skipped {skipped:.0} blockpath {blockpath:.0}/{scans_n:.0} seals {seals:.0} pubs {pubs:.0} snaps {snaps:.0} | {layout} | {upkeep_built} | {phases}"
             ));
             c0 = c1;
         }

@@ -434,12 +434,27 @@ pub struct Supdb {
     /// Segments written in 2 MB pieces, `SegmentOptions::write_piece`.
     /// `supdb-pmd`, and `supdb-ingestpmd` buffered.
     pmd: bool,
-    /// The freeze swaps the tables and leaves their carry to the next
-    /// look at the log, `Options::freeze_settles` off. `supdb-lazyfreeze`,
-    /// and `supdb-ingestlazyfreeze` buffered.
-    lazyfreeze: bool,
+    /// The freeze settles the backlog and carries the tables itself,
+    /// `Options::freeze_settles` on, as it did before the carry was left
+    /// to the look. `supdb-settlefreeze`, and `supdb-ingestsettlefreeze`
+    /// buffered.
+    settlefreeze: bool,
+    /// Dense forms' conversions capped at a fill, the builder ahead of a
+    /// reader converting the rest (`Options::forms_convert_cap` at
+    /// `CONVERT_CAP`, `Options::ahead_converts` on). `supdb-convertcap`,
+    /// and `supdb-ingestconvertcap` buffered.
+    convertcap: bool,
+    /// The upkeep thread's pass bounded at `SHORT_PASS_PCT` of the
+    /// store's keys (`Options::upkeep_pass_pct`). `supdb-shortpass`, and
+    /// `supdb-ingestshortpass` buffered.
+    shortpass: bool,
+    /// The upkeep thread's fill converting every dense form it meets
+    /// rather than yielding to a newer commit (`Options::forms_convert_yield`
+    /// off), the shape before. `supdb-noyield`, and `supdb-ingestnoyield`
+    /// buffered.
+    noyield: bool,
     /// The background work as the cost model in `docs/engine.md` orders
-    /// it: the lazy freeze, and no dense form rebuilt while nothing reads
+    /// it: no dense form rebuilt while nothing reads
     /// (`Options::forms_convert_unread` off). `supdb-bg`, and
     /// `supdb-ingestbg` buffered.
     bg: bool,
@@ -574,11 +589,20 @@ struct Policy {
     /// `SegmentOptions::write_piece`. `supdb-pmd`, and `supdb-ingestpmd`
     /// buffered.
     pmd: bool,
-    /// The freeze swaps the tables and touches nothing else, the upkeep
-    /// left where it is, and the next look at the log carries the tables
-    /// across it as it does a landing: `Options::freeze_settles` off.
-    /// `supdb-lazyfreeze`, and `supdb-ingestlazyfreeze` buffered.
-    lazyfreeze: bool,
+    /// The freeze takes the upkeep home, settles the backlog and carries
+    /// the tables itself: `Options::freeze_settles` on.
+    /// `supdb-settlefreeze`, and `supdb-ingestsettlefreeze` buffered.
+    settlefreeze: bool,
+    /// Dense forms' conversions capped at a fill, the builder converting
+    /// the rest: `supdb-convertcap`, and `supdb-ingestconvertcap`
+    /// buffered.
+    convertcap: bool,
+    /// The upkeep thread's pass bounded: `supdb-shortpass`, and
+    /// `supdb-ingestshortpass` buffered.
+    shortpass: bool,
+    /// The upkeep thread's fill never yielding its conversions:
+    /// `supdb-noyield`, and `supdb-ingestnoyield` buffered.
+    noyield: bool,
     /// The background work as the cost model orders it: `supdb-bg`, and
     /// `supdb-ingestbg` buffered.
     bg: bool,
@@ -587,6 +611,16 @@ struct Policy {
     /// `supdb-bglag`, and `supdb-ingestbglag` buffered.
     bglag: bool,
 }
+
+/// The conversions a fill makes at most in `supdb-convertcap`: the first
+/// version's cap, about a pass's worth of conversions at a hundred
+/// thousand keys.
+const CONVERT_CAP: usize = 64;
+
+/// The share of the store's keys a pass of `supdb-shortpass` files at
+/// most: the square-root rule's pass size at the quick ladder's rungs
+/// (`docs/engine.md`, the cost model).
+const SHORT_PASS_PCT: usize = 2;
 
 impl Default for Policy {
     /// `supdb`: the shipping configuration.
@@ -615,7 +649,10 @@ impl Default for Policy {
             idle: false,
             sortover: false,
             pmd: false,
-            lazyfreeze: false,
+            settlefreeze: false,
+            convertcap: false,
+            shortpass: false,
+            noyield: false,
             bg: false,
             bglag: false,
             defer: false,
@@ -838,27 +875,102 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose freeze only swaps the tables, leaving their carry
-    /// to the next look at the log.
-    pub fn create_lazyfreeze(path: &Path) -> Res<Supdb> {
+    /// `supdb` whose freeze settles the backlog and carries the tables
+    /// itself, as it did before the carry was left to the look.
+    pub fn create_settlefreeze(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
-                lazyfreeze: true,
+                settlefreeze: true,
                 ..Policy::default()
             },
         )
     }
 
-    /// `supdb-ingest` whose freeze only swaps the tables, as
-    /// `supdb-lazyfreeze`.
-    pub fn create_ingest_lazyfreeze(path: &Path) -> Res<Supdb> {
+    /// `supdb-ingest` whose freeze settles and carries, as
+    /// `supdb-settlefreeze`.
+    pub fn create_ingest_settlefreeze(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
                 partition: false,
                 durable: false,
-                lazyfreeze: true,
+                settlefreeze: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with the dense forms' conversions capped at a fill and the
+    /// builder ahead of a reader converting the rest.
+    pub fn create_convertcap(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                convertcap: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` converting as `supdb-convertcap`.
+    pub fn create_ingest_convertcap(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                convertcap: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose upkeep thread files at most a share of the store's
+    /// keys in one pass and re-posts the rest.
+    pub fn create_shortpass(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                shortpass: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` with the bounded pass, as `supdb-shortpass`.
+    pub fn create_ingest_shortpass(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                shortpass: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose upkeep thread converts every dense form a fill
+    /// meets, yielding to no commit: the shape before the yield.
+    pub fn create_noyield(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                noyield: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose fill never yields, as `supdb-noyield`.
+    pub fn create_ingest_noyield(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                noyield: true,
                 ..Policy::default()
             },
         )
@@ -1606,7 +1718,10 @@ impl Supdb {
             idle,
             sortover,
             pmd,
-            lazyfreeze,
+            settlefreeze,
+            convertcap,
+            shortpass,
+            noyield,
             bg,
             bglag,
         } = policy;
@@ -1689,8 +1804,24 @@ impl Supdb {
             // The forms carried across a seal, or the table started
             // afresh at every publish as it was.
             forms_carry: carry,
-            freeze_settles: !(lazyfreeze || bg || bglag),
+            freeze_settles: settlefreeze,
             forms_convert_unread: !(bg || bglag),
+            // The capped conversions and the builder's, kept to price again
+            // once the thread keeps up with the writer.
+            forms_convert_cap: if convertcap {
+                CONVERT_CAP
+            } else {
+                supdb::Options::default().forms_convert_cap
+            },
+            ahead_converts: convertcap,
+            forms_convert_yield: !noyield,
+            // The bounded pass, at the share the square-root rule of the
+            // cost model gives at these rungs.
+            upkeep_pass_pct: if shortpass {
+                SHORT_PASS_PCT
+            } else {
+                supdb::Options::default().upkeep_pass_pct
+            },
             // The thread trails a burst by at most a sixth of the store's
             // keys with reads around, and begins a pass for no fewer than
             // a twelfth: the bound and the batch of the cost model, as
@@ -1815,7 +1946,10 @@ impl Supdb {
             idle,
             sortover,
             pmd,
-            lazyfreeze,
+            settlefreeze,
+            convertcap,
+            shortpass,
+            noyield,
             bg,
             bglag,
         })
@@ -1904,11 +2038,32 @@ impl Engine for Supdb {
                 "supdb-ingestpmd"
             };
         }
-        if self.lazyfreeze {
+        if self.settlefreeze {
             return if self.partition {
-                "supdb-lazyfreeze"
+                "supdb-settlefreeze"
             } else {
-                "supdb-ingestlazyfreeze"
+                "supdb-ingestsettlefreeze"
+            };
+        }
+        if self.convertcap {
+            return if self.partition {
+                "supdb-convertcap"
+            } else {
+                "supdb-ingestconvertcap"
+            };
+        }
+        if self.shortpass {
+            return if self.partition {
+                "supdb-shortpass"
+            } else {
+                "supdb-ingestshortpass"
+            };
+        }
+        if self.noyield {
+            return if self.partition {
+                "supdb-noyield"
+            } else {
+                "supdb-ingestnoyield"
             };
         }
         if self.bg {
@@ -2132,6 +2287,10 @@ impl Engine for Supdb {
         // seal and be read as the pass's. The pass's takes come from the
         // store's own life instead.
         let (forms, form_bytes, _, _) = db.canonical_forms();
+        let ev = db.forms_events();
+        let wk = db.forms_walks();
+        let ph = db.scan_phases();
+        let uk = db.upkeep_counts();
         vec![
             ("snapshot_builds", db.snapshot_builds() as f64),
             ("snapshot_extends", db.snapshot_extends() as f64),
@@ -2170,6 +2329,34 @@ impl Engine for Supdb {
             ("pieces", db.levels().1 as f64),
             ("unsealed_keys", db.unsealed_keys() as f64),
             ("pieces_aligned", db.pieces_aligned() as u8 as f64),
+            // What the forms' upkeep did: see `Db::forms_events`.
+            ("blk_by_upkeep", ev[0] as f64),
+            ("table_drops", ev[1] as f64),
+            ("ahead_starts", ev[2] as f64),
+            ("ahead_stops", ev[3] as f64),
+            ("ahead_installed", ev[4] as f64),
+            ("settle_notable", ev[5] as f64),
+            ("fill_dense", ev[6] as f64),
+            ("fill_fresh", ev[7] as f64),
+            ("ahead_skip_held", ev[8] as f64),
+            ("ahead_skip_overlay", ev[9] as f64),
+            ("ahead_built", ev[10] as f64),
+            ("install_gen_drop", ev[11] as f64),
+            ("install_slot_skip", ev[12] as f64),
+            // The forms the writer's walks met: see `Db::forms_walks`.
+            ("walk_copy", wk[0] as f64),
+            ("walk_sparse", wk[1] as f64),
+            ("walk_other", wk[2] as f64),
+            // Where the writer's scans spent their time before walking,
+            // in microseconds: see `Db::scan_phases`.
+            ("scan_take_us", ph[0] as f64 / 1e3),
+            ("scan_sync_us", ph[1] as f64 / 1e3),
+            ("scan_settle_us", ph[2] as f64 / 1e3),
+            ("scan_snap_us", ph[3] as f64 / 1e3),
+            ("scan_ahead_us", ph[4] as f64 / 1e3),
+            ("scan_install_us", ph[5] as f64 / 1e3),
+            ("upkeep_wait_us", uk[3] as f64),
+            ("upkeep_partial", uk[8] as f64),
         ]
     }
     fn thread_reader(&self) -> Res<ReaderOpener> {
@@ -2630,9 +2817,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "supdb-inlinemaint"
         | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose" | "supdb-rotate"
         | "supdb-nofrozen" | "supdb-idle" | "supdb-sortover" | "supdb-pmd" | "supdb-hold"
-        | "supdb-lazyfreeze" | "supdb-bg" | "supdb-bglag" | "lmdb" | "rocksdb-tuned" => {
-            Guarantee::Durable
-        }
+        | "supdb-settlefreeze" | "supdb-convertcap" | "supdb-shortpass" | "supdb-noyield"
+        | "supdb-bg" | "supdb-bglag" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest"
         | "supdb-ingestleave"
         | "supdb-ingestnoseal"
@@ -2649,7 +2835,10 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-shapeidle"
         | "supdb-shapesortover"
         | "supdb-ingestpmd"
-        | "supdb-ingestlazyfreeze"
+        | "supdb-ingestsettlefreeze"
+        | "supdb-ingestconvertcap"
+        | "supdb-ingestshortpass"
+        | "supdb-ingestnoyield"
         | "supdb-ingestbg"
         | "supdb-ingestbglag"
         | "supdb-ingesthold"
@@ -2717,12 +2906,18 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-shapesortover" => Box::new(Supdb::create_shape_sortover(dir)?),
         "supdb-pmd" => Box::new(Supdb::create_pmd(dir)?),
         "supdb-ingestpmd" => Box::new(Supdb::create_ingest_pmd(dir)?),
-        "supdb-lazyfreeze" => Box::new(Supdb::create_lazyfreeze(dir)?),
+        "supdb-settlefreeze" => Box::new(Supdb::create_settlefreeze(dir)?),
+        "supdb-convertcap" => Box::new(Supdb::create_convertcap(dir)?),
+        "supdb-shortpass" => Box::new(Supdb::create_shortpass(dir)?),
+        "supdb-noyield" => Box::new(Supdb::create_noyield(dir)?),
         "supdb-bg" => Box::new(Supdb::create_bg(dir)?),
         "supdb-ingestbg" => Box::new(Supdb::create_ingest_bg(dir)?),
         "supdb-bglag" => Box::new(Supdb::create_bglag(dir)?),
         "supdb-ingestbglag" => Box::new(Supdb::create_ingest_bglag(dir)?),
-        "supdb-ingestlazyfreeze" => Box::new(Supdb::create_ingest_lazyfreeze(dir)?),
+        "supdb-ingestsettlefreeze" => Box::new(Supdb::create_ingest_settlefreeze(dir)?),
+        "supdb-ingestconvertcap" => Box::new(Supdb::create_ingest_convertcap(dir)?),
+        "supdb-ingestshortpass" => Box::new(Supdb::create_ingest_shortpass(dir)?),
+        "supdb-ingestnoyield" => Box::new(Supdb::create_ingest_noyield(dir)?),
         "supdb-idle" => Box::new(Supdb::create_idle(dir)?),
         "supdb-shapeidle" => Box::new(Supdb::create_shape_idle(dir)?),
         "supdb-ingestadaptloose" => Box::new(Supdb::create_ingest_adaptloose(dir)?),

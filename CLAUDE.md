@@ -276,9 +276,10 @@ thread could be preempted holding. The thread pins a slot for each pass,
 so a publish from the segment work needs nothing of it: the forms go
 across as copies the publish makes (`State::carry_published`) and the
 writer's own tables follow at its next look at the log
-(`Reader::rebase_tables`). The writer's own publishes still take it back
-first; the freeze with `Options::freeze_settles` off does not, swapping
-the tables and touching nothing else, and the next look carries the
+(`Reader::rebase_tables`). The writer's other publishes take it back
+first; the freeze does not, swapping the tables and touching nothing
+else (`Options::freeze_settles` is the freeze that did, kept for
+pricing), and the next look carries the
 tables across it as it does a landing, the frozen table's unsettled
 writes kept to settle through that table and every table live since the
 look kept for it in `State::replaced`. The forms a pass publishes carry the commit the writer named,
@@ -763,8 +764,8 @@ after it then refused for want of a table some scan had used, the
 burst ended with none, and the pass built every block of the store at
 a seventh of the rate the rows had shown. Retrying the prepare over the
 landing restored the pass and doubled the burst, the settle being the
-writer's; the freeze with `freeze_settles` off swaps the tables and
-nothing else, and the look carries them. The rule: an optimistic check
+writer's; the freeze swaps the tables and nothing else now
+(`freeze_settles` off), and the look carries them. The rule: an optimistic check
 that fails falls back to work, never to a state nothing recovers from;
 and a fallback that drops a structure must not also be what stops
 anyone rebuilding it.
@@ -823,7 +824,14 @@ whatever state holds the table its bounds are of -- a landing moves the
 generation, not the table -- and reports filed only for a pass that ran.
 The rule: a worker reports progress for work it did and never for a turn
 it took, and a check that a thing is the one named compares the quantity
-the work depends on, not a counter that other things also move.
+the work depends on, not a counter that other things also move. It came
+back as a bound: the pass that files at most a share of the store took
+its share from the commit's generation against the log position it had
+read to, a landing between the two read as a position of zero, and the
+pass read nothing and re-posted itself seventy thousand times in one
+burst. The bound is applied where the position is known now, in the log
+read and the frozen tables' settle, and never computed from a count
+beside it.
 
 **A derivative walked for every key when a few blocks asked.** The
 snapshot's cuts -- where each unsealed key cuts the partition's walk --

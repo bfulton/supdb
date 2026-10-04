@@ -2436,8 +2436,9 @@ nothing else; the next look at the log, the thread's or the writer's,
 carries the tables across it as it carries them across a landing, keeps
 the frozen table's unsettled writes to settle through that table, and
 finds every table live since its last look in `State::replaced`.
-`supdb-lazyfreeze` and `supdb-ingestlazyfreeze` are that freeze; the
-default keeps the freeze that settles.
+That freeze is the default now; `supdb-settlefreeze` and
+`supdb-ingestsettlefreeze` keep the freeze that settles, priced in
+"The dense-burst regime" below.
 
 The first pricing read the durable arm's fully unmerged burst at 1.11x
 and 1.27x at a hundred and three hundred thousand keys (8/8 each) and
@@ -2673,6 +2674,103 @@ is missing is the switch on density and the timing, a rebuild made by
 the background after each landing and ahead of the readers rather than
 by the first scan. The per-block rent-or-buy at the settle and the
 builder-ahead thread exist; the policy that joins them does not.
+
+#### The dense-burst regime: the lazy freeze stays, the bound and the cap do not
+
+The policy was built as levers, each behind an option with an arm
+keeping the other shape, and priced lever by lever in one process:
+eight pairs a rung at a hundred and three hundred thousand keys, on the
+buffered arm and the durable one, a lag point read as its burst plus
+twice its pass (`weighted_ms`, lower better) beside the two rates it is
+made of. The probe (`lag_only`) read the same bursts with the store's
+counters, the first scan timed apart from the pass and its phases apart
+from each other (`scan_take_us` and kin).
+
+**The freeze that leaves its carry to the look is the default**
+(`Options::freeze_settles` off; `supdb-settlefreeze` and
+`supdb-ingestsettlefreeze` keep the settling one). Through the buffered
+arm's fully rewritten burst at a hundred thousand keys the settling
+freeze found a landing between its prepare and its swap at twelve to
+sixteen freezes a burst and dropped the writer's tables each time, so
+every form the thread had filed went with them and the pass after built
+the store; and its wait for the pass in flight was the last place the
+writer waited on work done for the reads. Left to the look, no table
+was dropped in any rep. Priced, the settling freeze read the sweep's
+weighted sum at 1.09x on the buffered arm at a hundred thousand keys
+(6/8) and its ycsb-F at 0.83x (0/8, the one quantity under Holm), level
+at three hundred thousand; on the durable arm level at a hundred
+thousand and 1.11x at the fully rewritten point at three hundred
+thousand (7/8), where its pass ran 1.65x faster (8/8) and its burst
+0.88x (0/8): the backlog filed at the freeze is the pass's gain and the
+burst's cost, and at `γ = 2` the cost is the larger.
+
+**The bounded pass lost** (`Options::upkeep_pass_pct`, off;
+`supdb-shortpass` and `supdb-ingestshortpass` keep the two-percent
+bound). The first scan after the buffered burst waited 13.7 ms for the
+thread's pass in flight in one run of two, most of its 17.9 ms, and a
+reader waits for at most one pass, so the pass was bounded at two
+percent of the store's keys, re-posting the rest. The wait fell to 1-5
+ms and the same writes moved into the first scan's own settle, 27 ms at
+a hundred thousand keys and 86-102 at three hundred thousand: the
+thread's deficit over the burst lands on the first read whichever of
+the two files it, and a bound only chooses which. Priced, the bounded
+pass read the fully rewritten point at 1.07x and 1.23x of the unbounded
+one's on the buffered arm (5/8 each) and level on the durable arm. Its
+first version took the bound from the commit's generation against the
+position the pass had read to, which a landing between the two made
+zero, and re-posted an empty pass seventy thousand times in one burst;
+the bound is applied in the log read and the frozen settle, where the
+position is known.
+
+**The conversions: a cap lost, and a yield won where the thread runs
+behind.** A sparse form grown to sixteen deltas is rebuilt as a copy at
+the next fill, and a fill on the upkeep thread that rebuilt every dense
+form of a burst ran ten to fifteen milliseconds, which the writer's
+first scan waited out. Two answers were built: a cap on the conversions
+a fill makes, with the builder beside a reader's first scan converting
+the rest (`Options::forms_convert_cap`, `Options::ahead_converts`;
+`supdb-convertcap` and `supdb-ingestconvertcap`), and a yield, the fill
+leaving the rest of its conversions the moment a newer commit is posted
+or the writer wants the upkeep back (`Options::forms_convert_yield`;
+`supdb-noyield` and `supdb-ingestnoyield` keep the fill that does not).
+Against the yield alone the cap read the pass after the fully rewritten
+burst at 0.77-0.93x in all four cells and the weighted sum within 5%
+either way; against the fill that neither caps nor yields it read the
+weighted sum at 0.92x and 0.89x on the buffered arm (6/8, 7/8) and
+1.13x on the durable arm at three hundred thousand keys (8/8, under
+Holm), its pass there at a fifth of the rate: a dense form the cap
+leaves sparse is patched on until its replaced runs outweigh the live
+ones, then dropped and built fresh -- twice the fresh builds, the
+thread's last pass forty milliseconds longer, and the first scan waiting
+out all of it. So the cap is off. The yield alone, against the fill
+that never yields, read 1.13x on the buffered arm at a hundred thousand
+keys (8/8, under Holm) and 1.03x at three hundred thousand, level on
+the durable arm at a hundred thousand and 0.94x at three hundred
+thousand (7/8), where the pass ran 1.6x faster with every dense form
+converted through the burst. The yield pays where the thread runs behind
+the writer and costs where it has slack; a yield only while the thread
+is behind would take both, and waits on the thread's speed.
+
+**What is left is the thread's speed.** With those settled, the buffered
+arm's pass after the fully rewritten burst is one scan long: through the
+probe at a hundred thousand keys the writer's first scan took 10-29 ms
+of a pass of 17-36, 1-5 ms of it waiting for the thread's pass in flight
+and the rest settling what the thread had not reached, and the 999
+scans after it ran at 5-6 µs each, the drained rate; at three hundred
+thousand the first scan was 98-112 ms of 118-132. The durable arm's
+pass runs at the drained rate throughout. The thread filed at 0.66-0.99
+µs a write against the writer's 0.65-0.97 and was busy for the whole
+burst -- 59 ms of maintenance over a burst of 59 -- and still ended
+behind by what the first scan then settled. Profiled through the burst
+(perf's software clock, the samples split by thread id, since `perf
+report --comm` had not filtered them), the thread's 161 ms over 222
+thousand writes was: the settle loop's own 20%, the resolve of a key to
+its block 23% (`owner_of` and its compares, a cold binary search a key
+in arrival order), the splice 27% (`patch_block`, its moves and the
+allocator), the sorts 5%, task switches 3%. The resolve in key order,
+each seek floored at the last answer, is the next cut; the target is
+`ρ < 1`, where the first scan's settle vanishes.
+
 #### The segment work on a thread of its own
 
 A seal's landing, the merges and piece merges, the promotions, the
