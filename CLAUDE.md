@@ -809,6 +809,38 @@ thirty milliseconds there. The rule: a fast path is gated on the
 property that makes it valid, not on the source it was first written
 for.
 
+**A pass that reported done for a turn it skipped.** The upkeep thread's
+pass checked that the state was the commit's by its generation and, where
+a landing from the segment thread had moved it between the hand-over and
+the pass, filed nothing -- and reported the commit filed all the same. A
+commit holding for the thread (`Options::upkeep_lag`) was released by
+those reports, the writer ran on through its freezes, and the thread's
+real look fell past the tables the state keeps for it (`State::replaced`):
+the writer's first scan after the burst dropped its tables and built the
+store, in one bounded burst in four, with every count the probe kept the
+same in both shapes but the blocks built. The pass runs now against
+whatever state holds the table its bounds are of -- a landing moves the
+generation, not the table -- and reports filed only for a pass that ran.
+The rule: a worker reports progress for work it did and never for a turn
+it took, and a check that a thing is the one named compares the quantity
+the work depends on, not a counter that other things also move.
+
+**A derivative walked for every key when a few blocks asked.** The
+snapshot's cuts -- where each unsealed key cuts the partition's walk --
+were taken for the whole run in one forward walk when the bounds were,
+since the first version built every overlaid block and needed them all.
+An upkeep pass that replaces the snapshot took them again: half a
+millisecond over seven thousand keys, on every other pass of a dense
+burst, for the eight or twenty blocks the burst had the thread build. A
+block's keys cut inside its own sixty-four ranks, so each block's cuts
+are walked on its first build or walk and no other's, seeded at the
+block's first rank, behind a per-block flag published after them since
+the bounds are shared through the snapshot across threads. The rule is
+the one the empty-join entry gave, read the other way: a derivative of
+one object per item is taken per item at the item's first use when the
+items used are a fraction, and the whole-run walk is a choice to be
+re-made when the fraction changes.
+
 **A form dropped after the copy stood as the block.** A publish from
 the segment work copies the old state's published forms into the new one,
 and the writer marks a block dirty at its next look unless the new state

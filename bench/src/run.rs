@@ -119,6 +119,12 @@ fn ycsb_ops(size: u64) -> u64 {
 /// rather than counts so a quantity means the same thing at every rung.
 const LAG_PCT: [u64; 4] = [0, 1, 10, 100];
 
+/// What a millisecond of a lag point's scans weighs against one of its
+/// burst in `bench ab`'s decision quantity for the sweep: the store is
+/// read-optimized, and its owner weights read time twice. It is printed
+/// beside the two rates it is made of and gates nothing.
+const READ_WEIGHT: f64 = 2.0;
+
 /// The scan floor's file: the top rung's bytes, capped, so `full` on a
 /// large machine does not spend its disk on a file that is not a store.
 const SCAN_FLOOR_CAP: u64 = 4 << 30;
@@ -816,6 +822,38 @@ pub fn ab(
         );
     }
     let _ = std::fs::remove_dir_all(&root);
+    // The sweep's decision quantity, per point and summed: the burst's
+    // milliseconds plus `READ_WEIGHT` times the pass's, from the two
+    // rates of each pair. A rate alone credits a change that moves work
+    // from the pass into the burst, or the other way, without charging
+    // for it; lower is better, as `p99_us` is.
+    let entries = ((size / plan.scan_len as u64).max(1) * plan.scan_len as u64) as f64;
+    let mut total: Vec<(f64, f64)> = Vec::new();
+    for w in LAG_PCT.windows(2) {
+        let (prev, pct) = (w[0], w[1]);
+        let e = pairs.get(&format!("scan-lag entries_per_s_lag{pct}pct"));
+        let u = pairs.get(&format!("scan-lag updates_per_s_lag{pct}pct"));
+        let (Some(e), Some(u)) = (e, u) else { continue };
+        let wrote = (size * (pct - prev) / 100) as f64;
+        let ms = |u: f64, e: f64| 1e3 * (wrote / u + READ_WEIGHT * entries / e);
+        let j: Vec<(f64, f64)> = e
+            .iter()
+            .zip(u)
+            .map(|(&(ea, eb), &(ua, ub))| (ms(ua, ea), ms(ub, eb)))
+            .collect();
+        if total.is_empty() {
+            total = j.clone();
+        } else {
+            for (t, x) in total.iter_mut().zip(&j) {
+                t.0 += x.0;
+                t.1 += x.1;
+            }
+        }
+        pairs.insert(format!("scan-lag weighted_ms_lag{pct}pct"), j);
+    }
+    if !total.is_empty() {
+        pairs.insert("scan-lag weighted_ms_lagall".into(), total);
+    }
     Ok(pairs
         .into_iter()
         .map(|(quantity, v)| AbQuantity::of(quantity, v))

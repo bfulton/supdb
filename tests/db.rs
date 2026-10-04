@@ -435,8 +435,8 @@ fn the_oracle_holds_with_the_lag_bounded_and_the_passes_batched() {
         Options {
             freeze_settles: false,
             forms_convert_unread: false,
-            upkeep_lag: 8,
-            upkeep_batch: 16,
+            upkeep_lag_pct: 50,
+            upkeep_batch_pct: 50,
             upkeep: supdb::Upkeep::Background(1),
             ..Options::default()
         },
@@ -10402,10 +10402,11 @@ fn a_commit_that_freezes_leaves_the_carry_to_the_upkeep_thread() {
     std::hint::black_box(sink);
 }
 
-/// A commit that finds the upkeep thread more than `Options::upkeep_lag`
-/// writes behind, with reads around, holds until the thread trails by
-/// half the bound, and the thread begins a pass only for
-/// `Options::upkeep_batch` writes or a holding commit. The holds happen,
+/// A commit that finds the upkeep thread more than the bound of
+/// `Options::upkeep_lag_pct` behind, with reads around, holds until the
+/// thread trails by half the bound, and the thread begins a pass only
+/// for `Options::upkeep_batch_pct` of the store's keys or a holding
+/// commit. The holds happen,
 /// and every answer after the burst is the model's through a handle and
 /// through the writer.
 #[test]
@@ -10419,8 +10420,8 @@ fn a_commit_past_the_bound_holds_for_the_thread() {
         forms_settle_backlog_pct: 0,
         freeze_settles: false,
         forms_convert_unread: false,
-        upkeep_lag: 100,
-        upkeep_batch: 50,
+        upkeep_lag_pct: 7,
+        upkeep_batch_pct: 3,
         upkeep: supdb::Upkeep::Background(1),
         ..Options::default()
     };

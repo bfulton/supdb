@@ -2490,8 +2490,9 @@ fsync, the thread keeps up and the burst gains.
 
 What decides when the background works, how much and in what order is
 the foreground's time, with reads weighted twice writes (`γ = 2`): a
-lag point is priced by its burst plus twice its pass. Per write and per
-block, at a hundred thousand keys: a patch `p` ≈ 0.4-1.0 µs on the
+lag point is priced by its burst plus twice its pass, which `bench ab`
+prints beside the two rates it is made of, as `weighted_ms`, lower
+better. Per write and per block, at a hundred thousand keys: a patch `p` ≈ 0.4-1.0 µs on the
 upkeep thread, a block build `B` ≈ 15-25 µs, a ready block's walk
 about 2.5 µs, the buffered writer `c_w` ≈ 0.75 µs a write and the
 durable one 2-2.5. Three rules follow, block by block. A block's
@@ -2520,10 +2521,10 @@ plus the thread, 0.8 + 1.5 µs a write: at `γ = 2` it priced at
 thousand keys on the buffered arm, while winning the sparse points
 by 1.0-1.3x.
 
-`Options::upkeep_lag` holds a commit only while the thread trails by
+`Options::upkeep_lag_pct` holds a commit only while the thread trails by
 more than a bound, and lets it go once the thread is within half of
-it, and `Options::upkeep_batch` keeps the thread from beginning a pass
-for fewer writes. They did what they say and lost: a pass has a fixed
+it, and `Options::upkeep_batch_pct` keeps the thread from beginning a
+pass for fewer writes, both shares of the store's keys. They did what they say and lost: a pass has a fixed
 part `F` -- the log read, and the scan snapshot moved and every table's
 bounds walked again at each state the thread looks at -- fitted at
 about 0.76 ms beside 0.83 µs a write, so a bound that makes the thread
@@ -2539,8 +2540,67 @@ freeze, the conversion gated on reads) against the default read 0.94,
 1.05 and 1.17 on the buffered arm and 1.03, 1.19 and 1.00 on the
 durable at ten, a hundred and three hundred thousand keys, the durable
 burst at the largest point 1.19x and 1.14x (8/8) at the larger rungs
-and nothing else held; `supdb-ingestbglag`, with a bound of sixteen
-thousand and a batch of eight, read 0.98 and 0.89. The defaults stand.
+and nothing else held; `supdb-ingestbglag`, then with a bound of
+sixteen thousand writes and a batch of eight thousand, read 0.98 and
+0.89. The defaults stand.
+
+#### The pass's fixed cost, and the bound priced again
+
+The model's `F`, timed phase by phase on the upkeep thread over the
+buffered arm's largest burst at a hundred thousand keys with the lag
+bounded at sixteen thousand writes and the batch at eight: a pass of
+about 5.3 ms was 4.2-4.9 ms of settle, 0.7-0.8 µs a write and
+proportional, and 1.0-1.4 ms that was not -- the log read 0.15-0.25,
+the snapshot moved 0.3-0.6, and 0.55-1.3 in the fill that completes the
+tables, of which all but a few microseconds was the snapshot's bounds:
+on every pass that replaced the snapshot, every table's block
+boundaries walked against it (0.2 ms) and every key's cut in the
+partition (0.5 ms, over about seven thousand keys), for the eight to
+twenty blocks a burst had the thread build. The cuts are per block now
+(`SnapBounds::cuts_of`): a block's keys cut inside its own ranks, so a
+block's cuts are walked at its first build or walk from its first rank
+and no other block's, behind a per-block flag the walker publishes
+after them, the bounds being shared through the snapshot across
+threads. A reader pays the same for the blocks it walks and nothing for
+the rest; the thread pays for the blocks it builds.
+
+Timing the bounded arm beside that found a second shape. One bounded
+burst in four built the whole store -- 458-1,293 blocks against 8-34 --
+in its pass, with every other count the same. The thread's pass skipped
+itself whenever the state's generation had moved between the hand-over
+and the pass, which a landing from the segment thread does every few
+milliseconds in a dense burst, and reported the commit filed all the
+same; a holding commit was released by those reports, the writer ran on
+through its freezes, the thread's real look fell past the eight tables
+the state keeps for it, and the writer's first scan dropped its tables.
+A pass runs now against whatever state holds the table its three
+bounds are of, since a landing moves the generation and not the table,
+and reports filed only for a pass that ran (`upkeep_skipped` counts the
+rest: none to one a burst).
+
+With both, the bounded buffered arm's thread cost 0.70-0.99 µs a write
+over the burst (median about 0.78, from 1.0-1.3 in the sweep before),
+its burst 74-108 ms and its pass 4.5-10 ms, where the default's pass
+is 24-38; eight runs of eight built 6-20 blocks. Priced in one process, eight pairs a rung, the decision quantity summed
+over the lag points, lower better. `supdb-bg` against the default read
+1.07, 1.07 and 0.92 on the buffered arm at ten, a hundred and three
+hundred thousand keys, none resolved, and 0.99 and 0.82 (0/8, p=0.008)
+on the durable arm at a hundred and three hundred thousand, its burst at
+the largest point 1.21x (8/8). The bounded arm as typed counts, sixteen
+thousand writes and eight thousand, read 1.12 (8/8) and 1.27 (7/8) at
+ten and three hundred thousand keys buffered -- the count most of a
+burst at one rung and a small share of the store at the other -- and
+0.87 between them; as shares, a sixth of the store's keys for the bound
+and a twelfth for the batch, 1.16, 1.03 and 1.07 buffered and 1.08,
+0.93 and 0.98 durable, none resolved, its pass after the largest burst
+2.4-2.8x the default's at a hundred thousand and its burst 0.67-0.81x.
+The hold charges the writer what it saves the reads, one for one: what
+is left in the pass is the settle of the writes the thread had not
+reached, at the thread's own 0.7 µs a write, and the writer waiting for
+the thread to reach them costs the same. The defaults stand; the
+unbounded thread with the freeze that leaves its carry to the look is
+the configuration to make the default once its buffered weighted sum
+resolves, and the bound is not the lever.
 
 #### The segment work on a thread of its own
 

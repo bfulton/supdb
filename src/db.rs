@@ -31,7 +31,7 @@ use std::cmp::Ordering;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Result, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 
 use crate::block::{self, crc32, BlockBuilder, BlockLoc};
 use crate::bytes::MmapBytes;
@@ -931,22 +931,28 @@ pub struct Options {
     /// around, and `supdb-inline` the writer keeping it; `docs/engine.md`
     /// has the figures.
     pub upkeep: Upkeep,
-    /// Writes the upkeep thread may trail the writer by, with reads
-    /// around, before a commit at level 1 holds until it has caught up;
-    /// zero never holds. Holding for every batch (level 2) puts the
-    /// thread's whole work on the writer, which waits through each pass
-    /// in turn; a bound lets the two run side by side and costs the
-    /// writer only what the thread cannot keep up with, while a read
-    /// that follows a burst finds at most the bound left to file.
-    /// `supdb-bg` and `supdb-ingestbg` set it.
-    pub upkeep_lag: usize,
-    /// Writes the upkeep thread lets gather before it begins a pass,
-    /// unless a commit holds for it or the writes have stopped for
-    /// `UPKEEP_BATCH_WAIT`; zero begins one at every commit. A pass costs
-    /// a fixed part -- the log read, the snapshot moved and the tables'
-    /// bounds walked again -- besides a part per write, so a thread that
-    /// begins a pass for every commit spends the fixed part per commit.
-    pub upkeep_batch: usize,
+    /// How far the upkeep thread may trail the writer, with reads
+    /// around, before a commit at level 1 holds until it is within half
+    /// of it: a percentage of the store's keys, the partitions', as the
+    /// settle bound is; zero never holds. Holding for every batch (level
+    /// 2) puts the thread's whole work on the writer, which waits through
+    /// each pass in turn; a bound lets the two run side by side and
+    /// costs the writer only what the thread cannot keep up with, while
+    /// a read that follows a burst finds at most the bound left to file.
+    /// A share and not a count, since a count that is a few commits at
+    /// one rung is the whole burst at the rung below. `supdb-bglag` and
+    /// `supdb-ingestbglag` set it.
+    pub upkeep_lag_pct: usize,
+    /// Writes the upkeep thread lets gather before it begins a pass, as
+    /// a percentage of the store's keys, unless a commit holds for it or
+    /// the writes have stopped for `UPKEEP_BATCH_WAIT`; zero begins one
+    /// at every commit. A pass costs a fixed part -- the log read, the
+    /// snapshot moved and the tables' bounds walked again -- besides a
+    /// part per write, so a thread that begins a pass for every commit
+    /// spends the fixed part per commit. As a count of eight thousand it
+    /// was most of a burst at ten thousand keys, and the thread's pass
+    /// ran under the scans after it instead of beside the writes.
+    pub upkeep_batch_pct: usize,
     /// EXPERIMENT: a scan builds the snapshot only when a block it
     /// reaches needs one. A block held as a sparse form, a copy or a
     /// clean one is walked from the form and the partition alone; only a
@@ -1219,8 +1225,8 @@ impl Default for Options {
             forms_settle_backlog_pct: 2,
             forms_settle_keys_all: false,
             upkeep: Upkeep::default(),
-            upkeep_lag: 0,
-            upkeep_batch: 0,
+            upkeep_lag_pct: 0,
+            upkeep_batch_pct: 0,
             snapshot_carry: false,
             frozen_snaps: true,
             overlay_merge: true,
@@ -6861,7 +6867,7 @@ pub struct Db {
     upkeep_since_scan: u64,
     /// Writes lent over the store's life, and the count below which all
     /// were filed when the thread was last seen caught up, for
-    /// `Options::upkeep_lag`.
+    /// `Options::upkeep_lag_pct`.
     upkeep_lent: u64,
     upkeep_floor: u64,
     /// What the commit in progress does with its batch, decided when it
@@ -16331,14 +16337,57 @@ unsafe impl<T: Send + Sync> Sync for IdCache<T> {}
 /// run's positions fall against the partition's block boundaries, and
 /// where each key of the run cuts the partition's walk, encoded as
 /// `owner_of` encodes a cut. Both are functions of the run and the
-/// partition, taken once in one forward walk along the partition's index
-/// heads and kept with the snapshot under the partition's blob id. The
+/// partition, kept with the snapshot under the partition's blob id. The
 /// cuts were searched for at every build instead, a binary search over
 /// the block's heads per snapshot key, six mispredicted branches a key
-/// by the simulator's count and a quarter of a build's.
+/// by the simulator's count and a quarter of a build's. They were then
+/// walked for the whole run at once, with the boundaries: half a
+/// millisecond of every upkeep pass that replaced the snapshot, over
+/// seven thousand keys, for the eight or twenty blocks the burst built.
+/// A block's keys cut inside its own ranks, so each block's cuts are
+/// walked on its first build or walk and no other block's (`cuts_of`).
 struct SnapBounds {
     at: Vec<u32>,
-    cuts: Vec<u32>,
+    /// Each entry's cut, `u32::MAX` until its block's are written; an
+    /// entry outside every block keeps it, as a key with no cut.
+    cuts: Box<[AtomicU32]>,
+    /// Per block, whether its cuts are written -- set after them, so a
+    /// reader that finds it set finds them all. The bounds are shared
+    /// through the snapshot across threads, and two that walk one block
+    /// together write the same values.
+    ready: Box<[std::sync::atomic::AtomicBool]>,
+}
+
+impl SnapBounds {
+    /// The cuts, with block `b`'s written: the cut of each of `snap`'s
+    /// entries over the block, `at[b]..at[b + 1]`, where each cuts the
+    /// partition's walk, from one forward walk along the index heads
+    /// from the block's first rank, since every key over the block is at
+    /// or past it. Indexed by the entry's position in `snap`.
+    fn cuts_of(&self, b: usize, seg: &Seg, snap: &Snapshot) -> Result<&[AtomicU32]> {
+        if self.ready[b].load(AtomicOrdering::Acquire) {
+            return Ok(&self.cuts);
+        }
+        let lo = self.at[b] as usize;
+        let hi = (self.at[b + 1] as usize).min(self.cuts.len());
+        let keys = seg.blob.keys();
+        let mut r = (b * CACHE_BLOCK).min(keys);
+        let mut kbuf = Vec::new();
+        for i in lo..hi {
+            let (k, _) = snap
+                .get(i)
+                .ok_or_else(|| err("block cache: a snapshot bound did not resolve"))?;
+            r = seg.ord.advance_below(r, k, |j| seg.blob.key_at(j));
+            let same = r < keys
+                && match seg.ord.whole_key_at(r, &mut kbuf) {
+                    Some(w) => w == k,
+                    None => seg.blob.key_at(r) == Some(k),
+                };
+            self.cuts[i].store(((r as u32) << 1) | same as u32, AtomicOrdering::Relaxed);
+        }
+        self.ready[b].store(true, AtomicOrdering::Release);
+        Ok(&self.cuts)
+    }
 }
 type SnapById = IdCache<SnapBounds>;
 
@@ -16989,6 +17038,16 @@ struct UpkeepTo {
     /// The writes lent up to this commit, over the store's life: the
     /// thread publishes it as filed once its pass is done.
     lent: u64,
+    /// Writes the thread lets gather before it begins a pass, resolved
+    /// from `Options::upkeep_batch_pct` against the store's keys at the
+    /// commit; zero begins one at once.
+    batch: u64,
+    /// `State::lives` at the commit: the live table the three bounds are
+    /// of. A pass runs against whatever state holds that table, since a
+    /// landing from the segment thread moves the generation and not the
+    /// table; one that finds another table live leaves the work to the
+    /// next pass, whose bounds are that table's.
+    lives: u64,
 }
 
 /// The writer's upkeep while it is away from the writer, and the thread
@@ -17037,8 +17096,11 @@ struct Lend {
     /// which over the writes it filed is what the upkeep costs a write.
     busy_ns: AtomicU64,
     /// `UpkeepTo::lent` of the last pass done: how far the thread has
-    /// filed, for `Options::upkeep_lag`.
+    /// filed, for `Options::upkeep_lag_pct`.
     filed: AtomicU64,
+    /// For a measurement: passes that found another table live than the
+    /// one their commit named, and filed nothing.
+    skipped: AtomicU64,
 }
 
 /// The upkeep is away from the writer: in the cell, or out with the
@@ -17079,6 +17141,8 @@ struct SeqTo {
     wm: AtomicU64,
     force: std::sync::atomic::AtomicBool,
     lent: AtomicU64,
+    lives: AtomicU64,
+    batch: AtomicU64,
 }
 
 impl SeqTo {
@@ -17093,6 +17157,8 @@ impl SeqTo {
         self.wm.store(to.wm, AtomicOrdering::Relaxed);
         self.force.store(to.force, AtomicOrdering::Relaxed);
         self.lent.store(to.lent, AtomicOrdering::Relaxed);
+        self.lives.store(to.lives, AtomicOrdering::Relaxed);
+        self.batch.store(to.batch, AtomicOrdering::Relaxed);
         self.seq.store(n + 2, AtomicOrdering::Release);
     }
 
@@ -17108,6 +17174,8 @@ impl SeqTo {
                     wm: self.wm.load(AtomicOrdering::Relaxed),
                     force: self.force.load(AtomicOrdering::Relaxed),
                     lent: self.lent.load(AtomicOrdering::Relaxed),
+                    lives: self.lives.load(AtomicOrdering::Relaxed),
+                    batch: self.batch.load(AtomicOrdering::Relaxed),
                 };
                 std::sync::atomic::fence(AtomicOrdering::Acquire);
                 if self.seq.load(AtomicOrdering::Relaxed) == n {
@@ -17138,8 +17206,8 @@ const UPKEEP_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(20
 const UPKEEP_WAKE_WRITES: usize = 256;
 
 /// How long the upkeep thread lets a commit short of
-/// `Options::upkeep_batch` wait before it begins the pass anyway: the
-/// writes have stopped, and a read may be next.
+/// `Options::upkeep_batch_pct` wait before it begins the pass anyway:
+/// the writes have stopped, and a read may be next.
 const UPKEEP_BATCH_WAIT: std::time::Duration = std::time::Duration::from_millis(1);
 
 impl Lend {
@@ -17372,7 +17440,7 @@ impl Reader {
             }
             // Short of a batch: wait for more, unless a commit holds for
             // the pass or the writes have stopped.
-            if self.opts.upkeep_batch > 0
+            if self.opts.upkeep_batch_pct > 0
                 && lend.state.load(AtomicOrdering::Acquire) & LEND_POSTED != 0
             {
                 let to = lend.to.load();
@@ -17380,10 +17448,7 @@ impl Reader {
                     .lent
                     .saturating_sub(lend.filed.load(AtomicOrdering::Acquire));
                 let since = *short_since.get_or_insert_with(std::time::Instant::now);
-                if !to.force
-                    && behind < self.opts.upkeep_batch as u64
-                    && since.elapsed() < UPKEEP_BATCH_WAIT
-                {
+                if !to.force && behind < to.batch && since.elapsed() < UPKEEP_BATCH_WAIT {
                     std::thread::park_timeout(UPKEEP_POLL_MIN);
                     continue;
                 }
@@ -17398,12 +17463,24 @@ impl Reader {
             let lent = to.lent;
             let pass =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.upkeep_pass(fs, to)));
-            lend.filed.store(lent, AtomicOrdering::Release);
             lend.busy_ns
                 .fetch_add(began.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
             lend.passes.fetch_add(1, AtomicOrdering::Relaxed);
             match pass {
-                Ok((fs, done)) => lend.put_back(Some(fs), done.err(), None),
+                Ok((fs, ran, done)) => {
+                    // Filed only by a pass that ran: a commit holding for
+                    // the thread (`Options::upkeep_lag_pct`) was let go by
+                    // passes that had filed nothing, and the writer's
+                    // tables fell past the tables the state keeps for
+                    // them, so its first scan after a burst dropped them
+                    // and built the store, in one burst in four.
+                    if ran {
+                        lend.filed.store(lent, AtomicOrdering::Release);
+                    } else {
+                        lend.skipped.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    lend.put_back(Some(fs), done.err(), None)
+                }
                 // The upkeep is whatever the pass left in the cell; the
                 // writer raises the panic before it could use it.
                 Err(p) => lend.put_back(self.lend_fs(), None, Some(p)),
@@ -17415,16 +17492,22 @@ impl Reader {
     /// One pass: the writer's upkeep brought to `to` by the commit's own
     /// maintenance, bounded to what `to` names, and the forms and
     /// snapshots it replaced freed where no reader holds them.
-    fn upkeep_pass(&mut self, fs: FormsState, to: UpkeepTo) -> (FormsState, Result<()>) {
+    fn upkeep_pass(&mut self, fs: FormsState, to: UpkeepTo) -> (FormsState, bool, Result<()>) {
         *self.fs.0.get_mut() = Some(fs);
         // Pinned, and the state held, for the pass: what it walks is not
         // freed under it, and one state answers for all of it.
         std::mem::forget(self.enter());
         let op = Op(self);
-        // A publish takes the upkeep back before it swaps the state, so
-        // the state is the commit's; were it not, the work is the next
-        // pass's.
-        let done = if self.state().gen == to.gen {
+        // The writer's own publishes take the upkeep back before they
+        // swap the state, so the live table is the commit's unless a
+        // landing replaced a handed one meanwhile; the segment thread's
+        // other publishes move the generation and not the table, and the
+        // bounds are the table's, so the pass runs over them. Matched on
+        // the generation, a landing between the hand-over and the pass
+        // skipped it: most passes of a dense burst, a landing every few
+        // milliseconds.
+        let ran = self.state().lives == to.lives;
+        let done = if ran {
             self.log_bound.set(to.log);
             self.len_bound.set(to.len);
             self.wm.set(to.wm);
@@ -17437,7 +17520,7 @@ impl Reader {
         };
         drop(op);
         let fs = self.lend_fs().expect("the pass holds the upkeep");
-        (fs, done)
+        (fs, ran, done)
     }
 }
 
@@ -17548,7 +17631,7 @@ impl Db {
         };
         // The commit's three quantities and the store's keys, read
         // before any field of the writer's moves.
-        let (gen, log, len, wm, keys) = {
+        let (gen, log, len, wm, keys, lives) = {
             let st = self.state();
             let mem = &st.mem;
             let keys: usize = st
@@ -17558,7 +17641,7 @@ impl Db {
                 .map(|s| s.blob.keys())
                 .sum();
             let (log, len, wm) = mem.committed_at();
-            (st.gen, log, len, wm, keys)
+            (st.gen, log, len, wm, keys, st.lives)
         };
         let batch = if self.upkeep_log.0 == gen {
             log.saturating_sub(self.upkeep_log.1)
@@ -17584,10 +17667,17 @@ impl Db {
             self.upkeep_floor = self.upkeep_lent;
         }
         self.upkeep_lent += batch as u64;
+        // The bound and the batch, shares of the store's keys.
+        let lag = (keys / 100 * self.opts.upkeep_lag_pct).max(1) as u64;
+        let batch_of = if self.opts.upkeep_batch_pct > 0 {
+            (keys / 100 * self.opts.upkeep_batch_pct).max(1) as u64
+        } else {
+            0
+        };
         let bounded = level == 1
             && reads_around
-            && self.opts.upkeep_lag > 0
-            && self.upkeep_behind() > self.opts.upkeep_lag as u64;
+            && self.opts.upkeep_lag_pct > 0
+            && self.upkeep_behind() > lag;
         let force = match level {
             0 | 1 => bounded,
             2 => reads_around,
@@ -17615,7 +17705,7 @@ impl Db {
             (2, true, b) if b >= UPKEEP_WAKE_WRITES && !self.commit_files_it() => Hand::Hold,
             (2, _, _) => Hand::Inline,
             // Past the bound the commit holds until the thread has caught
-            // up, then runs ahead again: see `Options::upkeep_lag`.
+            // up, then runs ahead again: see `Options::upkeep_lag_pct`.
             (1, _, _) if bounded => Hand::Hold,
             (_, _, 0) | (0 | 1, _, _) | (_, false, _) => Hand::Lend,
             (_, true, _) => Hand::Hold,
@@ -17642,6 +17732,8 @@ impl Db {
             wm,
             force,
             lent: self.upkeep_lent,
+            lives,
+            batch: batch_of,
         };
         match self.r.lend_fs() {
             Some(fs) => self.shared.upkeep.lend(fs, to),
@@ -17672,7 +17764,14 @@ impl Db {
             Hand::Lend => Ok(true),
             Hand::Inline => self.maintain_forms().map(|()| false),
             Hand::Hold if matches!(self.opts.upkeep, Upkeep::Background(1)) => {
-                self.hold_within((self.opts.upkeep_lag / 2) as u64);
+                let keys: usize = self
+                    .segs()
+                    .iter()
+                    .filter(|s| s.level > 0)
+                    .map(|s| s.blob.keys())
+                    .sum();
+                let lag = (keys / 100 * self.opts.upkeep_lag_pct).max(1) as u64;
+                self.hold_within(lag / 2);
                 Ok(true)
             }
             Hand::Hold => {
@@ -17779,10 +17878,12 @@ impl Db {
     /// passes, the times the writer took the upkeep back, the times it
     /// waited for a pass in flight, the microseconds it waited, the
     /// commits that held for their pass, the microseconds they held, and
-    /// the microseconds the thread spent in its passes. Atomics only: a
-    /// read of them takes nothing back from the thread.
+    /// the microseconds the thread spent in its passes, and the passes
+    /// that found another table live than their commit's and filed
+    /// nothing. Atomics only: a read of them takes nothing back from the
+    /// thread.
     #[doc(hidden)]
-    pub fn upkeep_counts(&self) -> [u64; 7] {
+    pub fn upkeep_counts(&self) -> [u64; 8] {
         let l = &self.shared.upkeep;
         [
             l.passes.load(AtomicOrdering::Relaxed),
@@ -17792,6 +17893,7 @@ impl Db {
             l.holds.load(AtomicOrdering::Relaxed),
             l.hold_ns.load(AtomicOrdering::Relaxed) / 1000,
             l.busy_ns.load(AtomicOrdering::Relaxed) / 1000,
+            l.skipped.load(AtomicOrdering::Relaxed),
         ]
     }
 }
@@ -17970,7 +18072,7 @@ fn bound_pieces_of(segs: &[std::sync::Arc<Seg>]) -> Result<()> {
 
 /// A block's run of each base, oldest first, with the cuts its bounds
 /// carry: `None` past the bases or for a base without bounds.
-type FrozenRuns<'c> = [Option<(std::ops::Range<usize>, &'c [u32])>; MAX_FROZEN];
+type FrozenRuns<'c> = [Option<(std::ops::Range<usize>, &'c [AtomicU32])>; MAX_FROZEN];
 
 /// PROTOTYPE: what building a cached block reads, and nothing the cache
 /// keeps: the segments, the live and the frozen memtables, and whether any
@@ -18168,40 +18270,15 @@ impl<'s> BuildCtx<'s> {
             |k| unsealed.seek(k),
             |i, bound| unsealed.advance_below(i, bound),
         )?;
-        let (lo, hi) = (
-            at.first().copied().unwrap_or(0) as usize,
-            at.last().copied().unwrap_or(0) as usize,
-        );
-        let cuts = Self::snap_cuts(seg, unsealed, lo, hi)?;
-        let sb = std::sync::Arc::new(SnapBounds { at, cuts });
+        let cuts = (0..unsealed.len())
+            .map(|_| AtomicU32::new(u32::MAX))
+            .collect();
+        let ready = (0..nblocks)
+            .map(|_| std::sync::atomic::AtomicBool::new(false))
+            .collect();
+        let sb = std::sync::Arc::new(SnapBounds { at, cuts, ready });
         unsealed.bounds.put(against, sb.clone());
         Ok(sb)
-    }
-    /// PROTOTYPE: where each key of the snapshot's run over `lo..hi` cuts
-    /// the partition's walk, from one forward walk along the index heads:
-    /// the run is sorted, so each key's rank is at or past the last one's.
-    /// Entries outside the range carry no cut, and a build meeting one
-    /// searches as it did.
-    fn snap_cuts(seg: &Seg, unsealed: &Snapshot, lo: usize, hi: usize) -> Result<Vec<u32>> {
-        let n = unsealed.len();
-        let mut cuts = vec![u32::MAX; n];
-        let keys = seg.blob.keys();
-        let mut r = 0usize;
-        let mut kbuf = Vec::new();
-        let hi = hi.min(n);
-        for (i, cut) in cuts.iter_mut().enumerate().take(hi).skip(lo) {
-            let (k, _) = unsealed
-                .get(i)
-                .ok_or_else(|| err("block cache: a snapshot bound did not resolve"))?;
-            r = seg.ord.advance_below(r, k, |j| seg.blob.key_at(j));
-            let same = r < keys
-                && match seg.ord.whole_key_at(r, &mut kbuf) {
-                    Some(w) => w == k,
-                    None => seg.blob.key_at(r) == Some(k),
-                };
-            *cut = ((r as u32) << 1) | same as u32;
-        }
-        Ok(cuts)
     }
     /// PROTOTYPE: the memtables' keys of a block, in order: a run of the
     /// snapshot's live entries, a run of each base's frozen ones, and the
@@ -18214,14 +18291,14 @@ impl<'s> BuildCtx<'s> {
         &'a self,
         unsealed: &'a Snapshot,
         snap: std::ops::Range<usize>,
-        cuts: &[u32],
+        cuts: &[AtomicU32],
         frozen: &FrozenRuns<'_>,
         filed: &[(u32, u32)],
         sorted: bool,
     ) -> Result<Vec<Over<'a>>> {
         let run = |s: &'a Snapshot,
                    r: std::ops::Range<usize>,
-                   cuts: &[u32],
+                   cuts: &[AtomicU32],
                    uk: &dyn Fn(&SnapKey) -> UKey| {
             let mut out: Vec<Over<'a>> = Vec::with_capacity(r.len());
             for i in r {
@@ -18231,7 +18308,9 @@ impl<'s> BuildCtx<'s> {
                 out.push(Over {
                     key: k,
                     sk: Some(uk(sk)),
-                    cut: cuts.get(i).copied().unwrap_or(u32::MAX),
+                    cut: cuts
+                        .get(i)
+                        .map_or(u32::MAX, |c| c.load(AtomicOrdering::Relaxed)),
                     pieces: 0..0,
                 });
             }
@@ -18432,13 +18511,18 @@ impl<'s> BuildCtx<'s> {
     ) -> Result<Overlay<'a>> {
         let sb = table.snap_at(src.seg, unsealed)?;
         let snap = sb.at[b] as usize..sb.at[b + 1] as usize;
+        let cuts = sb.cuts_of(b, src.seg, unsealed)?;
         let mut frozen: FrozenRuns<'_> = Default::default();
-        for (i, f) in frozen.iter_mut().enumerate() {
-            *f = table
-                .fsnap_at(i, src.seg, unsealed)?
-                .map(|f| (f.at[b] as usize..f.at[b + 1] as usize, f.cuts.as_slice()));
+        for (i, (f, base)) in frozen.iter_mut().zip(&unsealed.bases).enumerate() {
+            *f = match table.fsnap_at(i, src.seg, unsealed)? {
+                Some(fb) => Some((
+                    fb.at[b] as usize..fb.at[b + 1] as usize,
+                    fb.cuts_of(b, src.seg, base)?,
+                )),
+                None => None,
+            };
         }
-        let mem = self.overlay_mem(unsealed, snap, &sb.cuts, &frozen, &table.added[b], false)?;
+        let mem = self.overlay_mem(unsealed, snap, cuts, &frozen, &table.added[b], false)?;
         let pieces: Vec<PieceRun<'_>> = table
             .pieces
             .iter()
@@ -18516,19 +18600,21 @@ impl<'s> BuildCtx<'s> {
         };
         let sb = table.snap_at(src.seg, unsealed)?;
         let snap = window_of(unsealed, sb.at[b] as usize, sb.at[b + 1] as usize);
+        let cuts = sb.cuts_of(b, src.seg, unsealed)?;
         let mut frozen: FrozenRuns<'_> = Default::default();
         for (i, (f, base)) in frozen.iter_mut().zip(&unsealed.bases).enumerate() {
-            *f = table.fsnap_at(i, src.seg, unsealed)?.map(|fb| {
-                (
+            *f = match table.fsnap_at(i, src.seg, unsealed)? {
+                Some(fb) => Some((
                     window_of(base, fb.at[b] as usize, fb.at[b + 1] as usize),
-                    fb.cuts.as_slice(),
-                )
-            });
+                    fb.cuts_of(b, src.seg, base)?,
+                )),
+                None => None,
+            };
         }
         let key_of = |slot: u32| self.mem.key_of(self.mem.entry(slot as usize));
         let f0 = wide.sorted.partition_point(|&(i, _)| key_of(i) < cursor);
         let filed = &wide.sorted[f0..wide.sorted.len().min(f0.saturating_add(limit))];
-        let mem = self.overlay_mem(unsealed, snap, &sb.cuts, &frozen, filed, true)?;
+        let mem = self.overlay_mem(unsealed, snap, cuts, &frozen, filed, true)?;
         let pieces: Vec<PieceRun<'_>> = table
             .pieces
             .iter()

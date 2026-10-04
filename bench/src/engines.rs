@@ -444,8 +444,8 @@ pub struct Supdb {
     /// `supdb-ingestbg` buffered.
     bg: bool,
     /// `bg` with the thread's lag bounded and its passes batched
-    /// (`Options::upkeep_lag`, `Options::upkeep_batch`): `supdb-bglag`,
-    /// and `supdb-ingestbglag` buffered.
+    /// (`Options::upkeep_lag_pct`, `Options::upkeep_batch_pct`):
+    /// `supdb-bglag`, and `supdb-ingestbglag` buffered.
     bglag: bool,
 }
 
@@ -583,8 +583,8 @@ struct Policy {
     /// `supdb-ingestbg` buffered.
     bg: bool,
     /// `bg` with the thread's lag bounded and its passes batched
-    /// (`Options::upkeep_lag`, `Options::upkeep_batch`): `supdb-bglag`,
-    /// and `supdb-ingestbglag` buffered.
+    /// (`Options::upkeep_lag_pct`, `Options::upkeep_batch_pct`):
+    /// `supdb-bglag`, and `supdb-ingestbglag` buffered.
     bglag: bool,
 }
 
@@ -1691,11 +1691,12 @@ impl Supdb {
             forms_carry: carry,
             freeze_settles: !(lazyfreeze || bg || bglag),
             forms_convert_unread: !(bg || bglag),
-            // The thread trails a burst by at most a few thousand writes
-            // with reads around, and begins a pass for no fewer than a
-            // batch: the bound and the batch of the cost model.
-            upkeep_lag: if bglag { 16_000 } else { 0 },
-            upkeep_batch: if bglag { 8_000 } else { 0 },
+            // The thread trails a burst by at most a sixth of the store's
+            // keys with reads around, and begins a pass for no fewer than
+            // a twelfth: the bound and the batch of the cost model, as
+            // the shares the sweep at a hundred thousand keys settled on.
+            upkeep_lag_pct: if bglag { 16 } else { 0 },
+            upkeep_batch_pct: if bglag { 8 } else { 0 },
             forms_rebase: !norebase,
             // The seal sized by the file, as it was before the store's
             // payload was recorded.
@@ -2161,6 +2162,7 @@ impl Engine for Supdb {
             // What the upkeep thread spent, and the passes it spent it in.
             ("upkeep_ms", db.upkeep_counts()[6] as f64 / 1e3),
             ("upkeep_passes", db.upkeep_counts()[0] as f64),
+            ("upkeep_skipped", db.upkeep_counts()[7] as f64),
             ("snap_switches", db.snapshot_switches() as f64),
         ]
     }
