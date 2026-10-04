@@ -2164,6 +2164,12 @@ impl Engine for Supdb {
             ("upkeep_passes", db.upkeep_counts()[0] as f64),
             ("upkeep_skipped", db.upkeep_counts()[7] as f64),
             ("snap_switches", db.snapshot_switches() as f64),
+            // The store's shape as it stands: what a read has to consult.
+            ("segments", db.segments() as f64),
+            ("partitions", db.levels().0 as f64),
+            ("pieces", db.levels().1 as f64),
+            ("unsealed_keys", db.unsealed_keys() as f64),
+            ("pieces_aligned", db.pieces_aligned() as u8 as f64),
         ]
     }
     fn thread_reader(&self) -> Res<ReaderOpener> {

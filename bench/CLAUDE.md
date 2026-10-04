@@ -271,7 +271,11 @@ Every read and scan now copies each value into its thread's own buffer
 (`consume`), and the read and scan series stepped at that commit on
 every arm, comparators included. The rule: a workload does what its
 caller would with the answer, or it measures something the caller never
-sees.
+sees. The first row banked after such a step fails its gate on the
+quantities the step moved, against a window that predates it, and is
+banked on its controls -- floors and comparators in band -- so the next
+window carries the new definition; the engine's part of the step was
+read by alternating two binaries in one sitting, never from the row.
 
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft

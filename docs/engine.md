@@ -2602,6 +2602,49 @@ unbounded thread with the freeze that leaves its carry to the look is
 the configuration to make the default once its buffered weighted sum
 resolves, and the bound is not the lever.
 
+#### The first quick row after the defaults moved
+
+The row at b247414 was the first banked since f19abe5, seventy commits
+before it, and its gate failed on eleven quantities with the host's
+floors inside their bands and every comparator but RocksDB's bytes on
+disk inside its own. Three were lag passes -- the tenth point at ten
+thousand keys on two arms and at a hundred thousand on one -- at a
+third of the window's rate: the never-hold default's trade (above, the
+tenth point's pass at 0.34-0.66x under lend) against a window whose
+every row held. The row's own bursts, which no row before it recorded,
+put the default's burst plus twice its pass at 2.0 ms against LMDB's
+4.1 at that point and 10 against 39 at the hundredth, at ten thousand
+keys; 60 against 600 and 690 against 5,460 at three hundred thousand.
+Eight were point reads: the default and the uncached arm at three
+hundred thousand keys below every row, the p99 of five arms, and the
+ratio to LMDB at 1.38 and 1.18 where the window held 1.76-2.13 and
+1.40-1.93.
+
+Three measurements read the eight. The store a point read meets after
+the load is clean at every rung -- one partition, or two at three
+hundred thousand, no piece and no unsealed key (`read_only`, which
+loads, syncs and reads the pass in ten windows beside the store's
+layout) -- and the default read 1.04x of the arm that runs its segment
+work inline, 4 of 6 pairs, so nothing in flight after the sync is what
+the pass paid. The suite's switch to consuming every value (b0cb464,
+after f19abe5) prices the ratio from about 2x to 1.6x by its own
+measurement. The rest is the host. The probe's fresh pass at a hundred
+thousand keys read 2.8-3.8 million a second in one run and 2.2-3.0 in
+another twenty minutes later, LMDB's 1.6-2.3 in both, with no fault, no
+system time and no involuntary switch in either, and stores read in one
+process spread 2.2-3.8 and 1.5-2.3 rep to rep; a second pass after a
+second's pause read slower than the first in nine runs of nine and in
+none of twelve more with the same pause, a spin or nothing between.
+Alternated against the binary at 343a01d, the last whose point reads
+were checked that way, four rounds with the order swapped and each
+binary's default against its LMDB in one process: at a hundred thousand
+keys 2.1-2.4 million reads a second on both with the ratio 1.10-1.33 on
+both, which is the row's 1.18; at three hundred thousand 1.80-1.99 on
+the old binary and 1.73-1.82 on this one, 0.91-0.97x in all four rounds
+with the p99 0.89-0.94 against 0.94-0.98 µs, a margin one sitting has
+seen and a second has not. The row is banked as the host it ran on, and
+its point reads are what both binaries read there.
+
 #### The segment work on a thread of its own
 
 A seal's landing, the merges and piece merges, the promotions, the
