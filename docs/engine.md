@@ -2942,10 +2942,26 @@ so the difference is the overlay itself: after a burst every memtable
 key the walk lays over a block was written since the snapshot's runs
 were copied and is read from its chain, two or three dependent misses a
 key behind the prefetch, where the default's patched form holds the
-value inline. What would close it is the thread keeping the runs
-current -- the stale slots' chains copied into the run arena in key
-order at each pass, as the settle's resolve already walks them -- so
-the walk streams the run as it streams a form.
+value inline. That was the reading, and it was priced: the snapshot
+carries no runs by default (`Options::snapshot_runs`, the `supdb-runs`
+arm), so every overlaid key was read from its chain stale or not, and
+with the runs on, the upkeep republishing the snapshot with its stale
+runs copied again (`Reader::refresh_runs`, once a sixteenth of them are)
+and every handle switching to the version with its filed keys kept, the
+pass did not move at any point -- 4.9-7.3 ms against 4.8-5.5 at the
+ten-percent point on the durable arm at a hundred thousand keys and
+21-30 against 21-29 at three hundred thousand, 45-104 against 40-73 at
+the hundred-percent point there -- while the thread paid the copies,
+0.42-0.71 µs a write against 0.30-0.43 at ten percent. The arms carry
+neither; the refresh stays as the mechanism that keeps the runs current
+where a store asks for them. What the pass pays is not the chain but
+the overlay: an `Over` gathered per key per block, and the emit's walk
+over the sources for each, where the sparse form is one array with the
+values inline. The step that remains is a walk that merges the
+snapshot's window in place, without the gathering, and until it is
+taken the arm reads level on burst plus twice the pass at the one- and
+ten-percent points and trails by up to a third at the hundred-percent
+ones.
 
 #### The pin's fence, priced against a sweep that fences for it
 

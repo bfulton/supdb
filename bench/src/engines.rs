@@ -2393,6 +2393,7 @@ impl Engine for Supdb {
         vec![
             ("snapshot_builds", db.snapshot_builds() as f64),
             ("snapshot_extends", db.snapshot_extends() as f64),
+            ("snapshot_refreshes", db.snapshot_refreshes() as f64),
             ("form_takes", db.form_takes() as f64),
             ("blk_by_reader", db.blocks_built().0 as f64),
             ("blk_by_engine", db.blocks_built().1 as f64),

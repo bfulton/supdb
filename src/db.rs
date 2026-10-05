@@ -493,8 +493,12 @@ pub struct Options {
     /// the one- and ten-percent points and the pass alone trails at the
     /// hundred-percent ones, since every memtable key the walk lays over
     /// a block after a burst is read from its chain, where the patched
-    /// form holds the value inline. Not the default until the runs are
-    /// kept current. `supdb-piecesonly`, `supdb-ingestpiecesonly`.
+    /// form holds the value inline -- which was the reading, and priced
+    /// it was not the pass's cost: with `snapshot_runs` the snapshot
+    /// carries the values and the upkeep republishes it with its stale
+    /// runs copied again (`Reader::refresh_runs`), and the pass did not
+    /// move while the thread paid the copies, so the arms carry neither.
+    /// Not the default. `supdb-piecesonly`, `supdb-ingestpiecesonly`.
     pub forms_pieces_only: bool,
     /// EXPERIMENT: the store's segment work (`Maint`) -- a seal's
     /// landing, the merges, the promotions, the manifest and the WAL
@@ -6423,6 +6427,9 @@ struct Shared {
     /// run rather than sorting everything again; the count that should
     /// rise where `snap_builds` stops.
     snap_extends: AtomicU64,
+    /// Snapshots republished with their stale runs copied again
+    /// (`Snapshot::refreshed`).
+    snap_refreshes: AtomicU64,
     /// PROTOTYPE: the run keeper's thread, for a publish and a settle
     /// to wake; a commit and a scan wake nothing, since the keeper
     /// polls for those -- see `Reader::keep`. The flush sequence a
@@ -7427,6 +7434,8 @@ const SEAL_AHEAD_CHUNK_BYTES: usize = 128;
 #[derive(Default)]
 struct SlotSet {
     bits: Vec<u64>,
+    /// How many slots are set.
+    len: usize,
 }
 
 impl SlotSet {
@@ -7435,15 +7444,23 @@ impl SlotSet {
         if w >= self.bits.len() {
             self.bits.resize(w + 1, 0);
         }
-        self.bits[w] |= 1u64 << b;
+        let bit = 1u64 << b;
+        if self.bits[w] & bit == 0 {
+            self.bits[w] |= bit;
+            self.len += 1;
+        }
     }
     fn contains(&self, slot: &u32) -> bool {
         self.bits
             .get((*slot / 64) as usize)
             .is_some_and(|w| (w >> (*slot % 64)) & 1 == 1)
     }
+    fn len(&self) -> usize {
+        self.len
+    }
     fn clear(&mut self) {
         self.bits.clear();
+        self.len = 0;
     }
 }
 
@@ -7828,6 +7845,23 @@ impl Snapshot {
         } else {
             self.bases.iter().all(|b| b.runs)
         }
+    }
+    /// This snapshot with the live runs of the slots in `stale` copied
+    /// again from their chains, current to `log_at`: the same keys in the
+    /// same order, so the bounds and the bases carry, and the arena is
+    /// the same, appended to. Under `forms_pieces_only` the upkeep makes
+    /// one when enough of the runs have gone stale, so that a walk
+    /// streams the run where it read the chain (`Reader::refresh_runs`).
+    fn refreshed(&self, mem: &MemTable, stale: &SlotSet, log_at: usize) -> Snapshot {
+        let mut out = self.clone();
+        let mut scratch = Vec::new();
+        for e in out.ents.iter_mut() {
+            if e.mem != u32::MAX && (e.mem as usize) < mem.len() && stale.contains(&e.mem) {
+                e.lrun = self.copy_run(mem, mem.entry(e.mem as usize), &mut scratch);
+            }
+        }
+        out.log_at = log_at;
+        out
     }
     /// This snapshot's live runs over `bases`, the frozen tables' own,
     /// oldest first: what a state with those frozen tables reads.
@@ -11260,6 +11294,42 @@ impl Reader {
                 }
             }
         }
+        // Under `forms_pieces_only` the writer's upkeep republishes the
+        // snapshot with its stale runs copied again (`refresh_runs`): the
+        // same keys over the same bounds and bases, current to a later
+        // log position. A handle on the version before takes it and reads
+        // the log from that position for what is stale now, and keeps its
+        // filed keys, since the keys are the same.
+        if !stale && self.opts.forms_pieces_only {
+            if let Some((g, mine)) = cache.as_mut() {
+                if *g == gen {
+                    if let Some(published) = self.adopt_snapshot() {
+                        let same = published.live_len == mine.live_len
+                            && published.log_at > mine.log_at
+                            && std::sync::Arc::ptr_eq(&published.bounds, &mine.bounds)
+                            && published.bases.len() == mine.bases.len()
+                            && published
+                                .bases
+                                .iter()
+                                .zip(&mine.bases)
+                                .all(|(a, b)| std::sync::Arc::ptr_eq(a, b));
+                        if same {
+                            let mem = self.mem();
+                            let mut st = self.fs().snap_stale.borrow_mut();
+                            st.clear();
+                            let to = self.fs().log_seen.get().min(mem.log_len());
+                            for i in published.log_at..to {
+                                st.insert(mem.log_at(i).0 as u32);
+                            }
+                            *mine = published;
+                            self.shared
+                                .snap_switched
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
         if !stale && !use_cache {
             let (_, snap) = cache.as_mut().expect("not stale");
             let added = self.fs().snap_added.borrow();
@@ -11377,6 +11447,51 @@ impl Reader {
             return Ok(());
         }
         self.fill_forms()
+    }
+
+    /// Under `forms_pieces_only`, on the writer's upkeep: once a
+    /// sixteenth of the snapshot's live runs are stale -- written since
+    /// the runs were copied, so a walk that lays the key over its block
+    /// reads the chain, two or three dependent misses, where a form
+    /// holds the value inline -- the snapshot is republished with those
+    /// runs copied again (`Snapshot::refreshed`), the same keys over the
+    /// same bounds, current to the log position this handle has read
+    /// to, and the stale set starts over from there. Every handle holding
+    /// the version before switches at its next scan
+    /// (`refresh_snapshot_to`). Not beside the keeper, which appends to
+    /// the same arena from its own thread.
+    fn refresh_runs(&self) {
+        if !self.opts.forms_pieces_only
+            || self.opts.snapshot_keeper
+            || !self.opts.share_snapshot
+            || self.slot.is_some()
+        {
+            return;
+        }
+        let fresh = {
+            let cache = self.fs().scan_keys.borrow();
+            let Some((_, snap)) = cache.as_ref() else {
+                return;
+            };
+            if !snap.runs || snap.live_len == 0 {
+                return;
+            }
+            let stale = self.fs().snap_stale.borrow();
+            if stale.len() < (snap.len() / 16).max(64) {
+                return;
+            }
+            let mem = self.mem();
+            let log_at = self.fs().log_seen.get().min(mem.log_len());
+            std::sync::Arc::new(snap.refreshed(mem, &stale, log_at))
+        };
+        self.fs().snap_stale.borrow_mut().clear();
+        if let Some((_, snap)) = self.fs().scan_keys.borrow_mut().as_mut() {
+            *snap = fresh.clone();
+        }
+        self.publish_snapshot(&fresh);
+        self.shared
+            .snap_refreshes
+            .fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Whether this commit's maintenance files its writes, by the rules
@@ -11543,6 +11658,7 @@ impl Reader {
             self.settle_pending()?;
         }
         self.refresh_snapshot(gen, true, moved);
+        self.refresh_runs();
         {
             let cache = self.fs().scan_keys.borrow();
             let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
@@ -14212,6 +14328,7 @@ impl Db {
             blk_upkeep: AtomicU64::new(0),
             forms_events: Default::default(),
             snap_extends: AtomicU64::new(0),
+            snap_refreshes: AtomicU64::new(0),
             keeper_thread: std::sync::OnceLock::new(),
             next_seg: AtomicU64::new(next_seg),
             seal_counts: SealCounts::default(),
@@ -14573,6 +14690,7 @@ impl Db {
             blk_upkeep: AtomicU64::new(0),
             forms_events: Default::default(),
             snap_extends: AtomicU64::new(0),
+            snap_refreshes: AtomicU64::new(0),
             keeper_thread: std::sync::OnceLock::new(),
             next_seg: AtomicU64::new(next_seg),
             seal_counts: SealCounts::default(),
@@ -16261,6 +16379,12 @@ impl Db {
     /// sort of everything; see `Snapshot::extend`.
     pub fn snapshot_extends(&self) -> u64 {
         self.shared.snap_extends.load(AtomicOrdering::Relaxed)
+    }
+
+    /// EXPERIMENT: snapshots republished with their stale runs copied
+    /// again; see `Snapshot::refreshed`.
+    pub fn snapshot_refreshes(&self) -> u64 {
+        self.shared.snap_refreshes.load(AtomicOrdering::Relaxed)
     }
 
     /// EXPERIMENT: reads that took a canonical form over this store's
