@@ -2842,6 +2842,99 @@ The regime stands; the thread's cost a write is the lever that remains,
 and a block with few overlay keys and no piece under it is the one
 place the walk without a form wins.
 
+#### The pin's fence, priced against a sweep that fences for it
+
+A read pins the epoch it reads in by storing it in its slot of the
+reader table and reading the epoch again; a publish bumps the epoch,
+and the sweep that frees what the publish replaced reads the slots. The
+two are a Dekker pair -- each side a store and then a load of the
+other's word -- and one side has to fence between its two, or both can
+miss the other: the pinner's store sits in its store buffer while its
+load reads the old epoch, the sweep's load reads the slot before the
+store lands, and the sweep frees a state the pinner is about to walk.
+The pin fences, with a sequentially consistent store, an `xchg`, on
+every read of every handle and, since the writer's operations pin
+(`Options::writer_pins`), on every operation of the writer. The sweep
+runs once a publish; the pin runs once a read.
+
+The quick row on the 2.10 GHz host class read point reads about a
+quarter behind the rows of a fortnight before, and a bisect by
+alternation (`bench run` rows of each commit against a fixed older one,
+two rounds each) named the commit that pinned the writer's operations.
+An asymmetric pin was built on that reading (`Options::asym_pins`,
+`supdb-asympin`): where the kernel offers `membarrier`, the table
+registers for its expedited private command at its making
+(`Readers::asym`), the pin is a plain store between two acquire loads
+with a compiler fence to keep the second load after the store, and a
+sweep issues one `membarrier` before it reads the slots, which runs a
+full barrier on every thread of the process. The proof is
+the one `membarrier`-flavoured RCU makes. The barrier falls at some
+point of each pinner's instruction stream: a pinner whose store is
+before that point has it visible to the sweep's reads after the
+barrier, so the sweep sees the pin; one whose store is after it has its
+second load after it too, and that load sees the bump the sweep made
+before the barrier, so the pin retries and lands at or past the bump,
+where it holds the object the publish installed and not the one the
+sweep frees. The loads are acquire so that a pin at or past a bump sees
+the swap that preceded the bump. A kernel without `membarrier` keeps
+the fence on the pin whatever the option says.
+
+The barrier's own price here, from a C probe making twenty thousand of
+them: 12-14 µs a call with one, two or three sibling threads spinning
+on other cores -- an interrupt of each, through the hypervisor -- and
+0.1-0.2 µs with every sibling asleep. Once a publish that is nothing,
+and the arm's first build cost the buffered arm's largest lag burst
+its whole margin: 3,000 barriers in the burst of a hundred thousand puts at
+a hundred thousand keys, the burst 95 ms against 50. The writer's
+every operation asks at its end whether a state a landing replaced can
+be freed, since a writer gone quiet makes no publish to ask at, and for
+as long as the upkeep thread's pass pins the replaced state the answer
+is no -- and each asking was a barrier. The sweep peeks first now
+(`Readers::oldest_for`): it reads the slots without the barrier, and a
+pin it sees at an epoch below every tag in the list means nothing frees
+whatever the barrier would show, so none is issued; the unfenced
+reading is trusted only to say no, since a pin it sees may be gone,
+which frees nothing early, and a pin it misses is the barrier's to
+find. About sixty barriers a burst after that, and the burst level
+within the alternation's spread (48-66 ms against 42-58 in two rounds).
+
+Moving the fence also found a hole in the sweep's order that predates
+it. The sweep read the slots and then took the list of retired items,
+and two threads retire -- the writer at its freezes, the segment work
+at its landings -- so an item the other thread pushed between the two
+steps was judged against pins read before its retirement bumped the
+epoch, and a reader pinned at the epoch before, holding what the item
+was, is one those pins could miss. Tens of nanoseconds a landing, and
+nothing raised; the proof above needs every bump the sweep frees for to
+precede the barrier, and the order gave it only the sweep's own. The
+list is taken first now, and the lowest tag in it is what the peek
+compares against.
+
+Priced as the arm pair, `bench ab --pairs read`, twelve pairs after a
+warmup, the fenced pin against the plain one, the single-thread read:
+at a hundred thousand keys the fenced pin read 0.84-0.99x in eleven
+pairs of twelve in one sitting, 0.90x at the median, and 0.85-1.16x in
+the next, faster in eight of twelve; at three hundred thousand
+0.81-1.09x, slower in nine of twelve, 0.96x at the median; at thirty
+thousand the pairs split six and six, 0.71-1.35x; and the two- and
+four-thread rates were too wide to read at any rung, 0.6-2.1x pair to
+pair. Two sittings that disagree in sign at one rung are no result,
+and the margin they disagree over is the few percent one `xchg` a read
+should cost, so the fence stays the default and the barrier is the arm.
+The alternation through `bench run` rows that the bisect used, three
+rounds at thirty and a hundred thousand, had read the two engines flat
+on reads at about a tenth's resolution, which agrees.
+
+What the bisect had conflated came out of the same alternation. Its two
+neighbours were not adjacent commits: between them sits the commit that
+made the harness copy every value a read returns into a sink, on every
+arm, a fixed cost a read that is a larger share of supdb's read than of
+LMDB's, so supdb's ratio to the comparator fell there with the engine
+unchanged, and the rows before it are not comparable to the rows after
+for a point read. The fence is a few percent at most; the quick row's
+quarter is the harness's copy and a loss confined to the C mix that the
+bisect has yet to reach.
+
 #### The segment work on a thread of its own
 
 A seal's landing, the merges and piece merges, the promotions, the

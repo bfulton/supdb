@@ -462,6 +462,15 @@ pub struct Options {
     /// `snapshot_keeper` -- since the segment work would free a state the
     /// writer is reading.
     pub writer_pins: bool,
+    /// EXPERIMENT: the pin is a plain store and a load, and the sweep
+    /// that frees fences for it, once, through `membarrier` (`Readers`);
+    /// off, every pin fences -- a sequentially consistent store of the
+    /// slot, a full fence on every read -- and no sweep does. Priced as
+    /// the pair `supdb` against `supdb-asympin` and not resolved: two
+    /// sittings at a hundred thousand keys read the fence's removal
+    /// 1.1x and 0.97x on reads, so the fence stays and this is the arm.
+    /// A kernel without `membarrier` has the fence whatever this says.
+    pub asym_pins: bool,
     /// EXPERIMENT: the store's segment work (`Maint`) -- a seal's
     /// landing, the merges, the promotions, the manifest and the WAL
     /// retirement -- runs on a thread of its own and publishes from there,
@@ -1257,6 +1266,7 @@ impl Default for Options {
             promote: true,
             flush_schedules: true,
             writer_pins: true,
+            asym_pins: false,
             publish_in_background: true,
             adaptive_shape: false,
             seal_rotates_wal: false,
@@ -3841,9 +3851,58 @@ impl<T> Drop for Slab<T> {
 /// what it may still be walking. Readers store and the writer scans;
 /// neither locks, and neither ever waits for the other -- a reader that
 /// holds a pin only holds memory.
+///
+/// The pin's store and the sweep's reads of the slots order against each
+/// other as a Dekker pair: a pinner stores its epoch and reads the epoch
+/// again, a sweeper bumps the epoch and reads the slots, and one side
+/// must fence between its store and its load or both can miss the other.
+/// The pin fences -- a sequentially consistent store, an `xchg` -- on
+/// every operation. Under `Options::asym_pins` the sweep fences instead
+/// (`asym`): before it reads the slots it has every thread of the
+/// process run a barrier, through `membarrier`, which drains a pinner's
+/// store and makes a pinner's later load see the bump, so the pin is a
+/// plain store and a load; the sweep runs once a publish and the pin
+/// once a read. Priced as an arm pair, the fence's removal was not
+/// resolvable on a point read (`docs/engine.md`), so the fence is the
+/// default and the barrier the arm. Without `membarrier` the pin keeps
+/// its fence whatever the option says.
 pub(crate) struct Readers {
     epoch: AtomicU64,
     slots: Box<[Slot]>,
+    /// Whether the sweep fences for the pins, see above: asked for and
+    /// `membarrier` registered for this process at the table's making.
+    asym: bool,
+    /// Barriers issued, for the suite: each is a system call and an
+    /// interrupt of every core a thread of the process is on.
+    barriers: AtomicU64,
+}
+
+/// Register this process for `membarrier`'s expedited private command,
+/// which the sweep then issues; false where the kernel has none, and
+/// off Linux. The commands are `linux/membarrier.h`'s:
+/// `MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED` is bit four,
+/// `MEMBARRIER_CMD_PRIVATE_EXPEDITED` bit three.
+fn register_membarrier() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: a syscall with two integer arguments and no pointer.
+        return unsafe { libc::syscall(libc::SYS_membarrier, 1i32 << 4, 0i32) } == 0;
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
+/// A memory barrier on every thread of the process, through the kernel:
+/// what the sweep issues between the epoch's bump and its reads of the
+/// slots when `Readers::asym`. Registered first, or it fails, which the
+/// caller never relies on: `asym` is set only by a registration that
+/// succeeded.
+fn membarrier_all_threads() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: a syscall with two integer arguments and no pointer.
+    unsafe {
+        libc::syscall(libc::SYS_membarrier, 1i32 << 3, 0i32);
+    }
 }
 
 /// A reader's slot on a cache line of its own. The slots were adjacent
@@ -3913,12 +3972,17 @@ const READER_SLOTS: usize = 256;
 const ENGINE_SLOTS: usize = 3 + FROZEN_CAP + 1 + 1;
 
 impl Readers {
-    fn new() -> Readers {
+    /// `asym`: the sweep fences for the pins where the kernel lets it
+    /// (`Options::asym_pins`); otherwise every pin fences and no sweep
+    /// does.
+    fn new(asym: bool) -> Readers {
         Readers {
             epoch: AtomicU64::new(1),
             slots: (0..ENGINE_SLOTS + READER_SLOTS)
                 .map(|_| Slot::new())
                 .collect(),
+            asym: asym && register_membarrier(),
+            barriers: AtomicU64::new(0),
         }
     }
 
@@ -3928,25 +3992,44 @@ impl Readers {
     }
 
     /// The oldest epoch a reader is pinned at, or `u64::MAX` when none
-    /// is: `none_before(e)` is `e <= oldest_pinned()`, in one walk of the
-    /// table for a whole sweep, where asking `none_before` of every item
-    /// walked it once an item.
+    /// is: nothing retired at an epoch at or below it can still be
+    /// walked. One walk of the table, and one barrier, for a whole sweep;
+    /// asking per item walked it once an item.
     fn oldest_pinned(&self) -> u64 {
+        self.sync_pins();
+        self.walk_pins()
+    }
+
+    /// `oldest_pinned` for a sweep whose lowest tag is `lowest`: where the
+    /// sweep fences for the pins (`asym`), the slots are read once without
+    /// the barrier first, and a pin seen at an epoch below every tag means
+    /// the sweep frees nothing whatever the barrier would show, so none is
+    /// issued -- a reader that pins and reads for a while, the upkeep
+    /// thread's pass over the state a landing replaced, is the common
+    /// case, and the writer's every operation asks at its end while a
+    /// replaced state waits. The first version asked with the barrier
+    /// each time: three thousand barriers, forty milliseconds, in a burst
+    /// of a hundred thousand puts. The answer without the barrier is
+    /// trusted only to say no: a pin it sees may be gone, which frees
+    /// nothing early; a pin it misses is the barrier's to find.
+    fn oldest_for(&self, lowest: u64) -> u64 {
+        if self.asym {
+            let seen = self.walk_pins();
+            if seen < lowest {
+                return seen;
+            }
+        }
+        self.oldest_pinned()
+    }
+
+    /// The lowest pinned epoch over every slot, as the slots read now.
+    fn walk_pins(&self) -> u64 {
         self.slots
             .iter()
             .map(|s| s.epoch.load(AtomicOrdering::SeqCst))
             .filter(|&v| v != 0)
             .min()
             .unwrap_or(u64::MAX)
-    }
-
-    /// Whether every pinned reader pinned at or after `epoch`, so nothing
-    /// retired at `epoch` can still be walked.
-    fn none_before(&self, epoch: u64) -> bool {
-        self.slots.iter().all(|s| {
-            let v = s.epoch.load(AtomicOrdering::SeqCst);
-            v == 0 || v >= epoch
-        })
     }
 
     /// A slot for a reader handle's life, or none when every slot is
@@ -3984,8 +4067,24 @@ impl Readers {
     /// Pin the current epoch in `slot`: a load, a store, and the load
     /// again, so an epoch the writer bumped between the two is not the one
     /// left pinned. Between operations a claimed slot holds `u64::MAX`,
-    /// which no retirement is ever older than.
+    /// which no retirement is ever older than. With the sweep fencing
+    /// (`asym`) the store is a plain one and the loads acquire; the
+    /// compiler fence keeps the second load after the store, and the
+    /// processor's own reordering of the two is what the sweep's barrier
+    /// on this thread resolves: a load it moved ahead of the store either
+    /// precedes the barrier, in which case the sweep's bump is what it
+    /// re-reads after, or follows it, in which case so does the store.
     fn pin(&self, slot: usize) {
+        if self.asym {
+            loop {
+                let e = self.epoch.load(AtomicOrdering::Acquire);
+                self.slots[slot].epoch.store(e, AtomicOrdering::Release);
+                std::sync::atomic::compiler_fence(AtomicOrdering::SeqCst);
+                if self.epoch.load(AtomicOrdering::Acquire) == e {
+                    return;
+                }
+            }
+        }
         loop {
             let e = self.epoch.load(AtomicOrdering::SeqCst);
             self.slots[slot].epoch.store(e, AtomicOrdering::SeqCst);
@@ -3995,7 +4094,17 @@ impl Readers {
         }
     }
 
-    /// Release suffices: the writer's `none_before` wants the unpin to
+    /// The sweep's side of the pins' ordering: every thread's barrier,
+    /// where the pin itself does not fence. Called once a sweep, before
+    /// the slots are read and after the epoch was bumped.
+    fn sync_pins(&self) {
+        if self.asym {
+            self.barriers.fetch_add(1, AtomicOrdering::Relaxed);
+            membarrier_all_threads();
+        }
+    }
+
+    /// Release suffices: a sweep's `oldest_pinned` wants the unpin to
     /// come after the reads it ends, and nothing here waits on it.
     fn unpin(&self, slot: usize) {
         self.slots[slot]
@@ -4311,11 +4420,14 @@ impl MemTable {
         unsafe { &*fresh }
     }
 
-    /// Writer: free the retired indexes no reader can still hold.
+    /// Writer: free the retired indexes no reader can still hold, in one
+    /// read of the table for the whole list, since a read of it is a
+    /// sweep, with the barrier a sweep issues.
     fn reclaim(&self, rd: &Readers) {
         // SAFETY: writer-only.
         let retired = unsafe { &mut *self.retired.get() };
-        retired.retain(|(tag, _)| !rd.none_before(*tag));
+        let oldest = rd.oldest_pinned();
+        retired.retain(|(tag, _)| oldest < *tag);
     }
 
     fn push_chunk(&self, prev: u64, value: &[u8]) -> u64 {
@@ -6414,16 +6526,38 @@ impl<T> RetireList<T> {
         }
     }
 
-    /// Drop every item no reader pinned at `oldest` or later can reach --
-    /// `oldest` being the oldest epoch a reader is pinned at -- and keep
-    /// the rest.
-    fn sweep(&self, oldest: u64) {
+    /// Drop every item no reader pinned at `oldest()` or later can reach
+    /// -- `oldest` answering the oldest epoch a reader is pinned at -- and
+    /// keep the rest. The list is taken before the pins are read, never
+    /// after: an item another thread retired between a read of the pins
+    /// and the taking was judged against pins read before its retirement
+    /// bumped the epoch, and a reader pinned at the epoch before, holding
+    /// what the item is, was one those pins could miss. Taken first, every
+    /// item's bump precedes the read of the pins, which is what the pin
+    /// protocol (`Readers::pin`) asks of a sweep. An empty list asks
+    /// nothing, and `oldest` is where the sweep's barrier is: it is told
+    /// the lowest tag in the list, so it can answer without one when no
+    /// pin it can see is at or past that tag (`Readers::oldest_for`).
+    fn sweep(&self, oldest: impl FnOnce(u64) -> u64) {
         if self.head.load(AtomicOrdering::Relaxed).is_null() {
             return;
         }
         let mut p = self
             .head
             .swap(std::ptr::null_mut(), AtomicOrdering::Acquire);
+        if p.is_null() {
+            return;
+        }
+        let mut lowest = u64::MAX;
+        let mut q = p;
+        while !q.is_null() {
+            // SAFETY: taken off the list by the swap, so this sweep's alone.
+            unsafe {
+                lowest = lowest.min((*q).epoch);
+                q = (*q).next;
+            }
+        }
+        let oldest = oldest(lowest);
         let (mut first, mut last) = (std::ptr::null_mut(), std::ptr::null_mut());
         let mut freed = 0;
         while !p.is_null() {
@@ -10496,14 +10630,14 @@ impl Reader {
         // handle that could be between the load and the clone has left.
         self.shared
             .retired_snaps
-            .sweep(self.shared.readers.oldest_pinned());
+            .sweep(|low| self.shared.readers.oldest_for(low));
     }
 
     /// The replaced states no pinned reader can still be walking.
     fn sweep_retired_states(&self) {
         self.shared
             .retired
-            .sweep(self.shared.readers.oldest_pinned());
+            .sweep(|low| self.shared.readers.oldest_for(low));
     }
 
     /// EXPERIMENT: free the replaced canonical forms no pinned reader can
@@ -10520,7 +10654,7 @@ impl Reader {
         // and so freed, once every reader that could hold it has left.
         self.shared
             .retired_forms
-            .sweep(self.shared.readers.oldest_pinned());
+            .sweep(|low| self.shared.readers.oldest_for(low));
     }
 
     /// A read or a scan over a store with pieces and no partition, for the
@@ -13525,7 +13659,7 @@ impl Db {
         };
         let shared = std::sync::Arc::new(Shared {
             state: AtomicPtr::new(Box::into_raw(Box::new(state))),
-            readers: Readers::new(),
+            readers: Readers::new(opts.asym_pins),
             retired: RetireList::new(),
             advice_random: std::sync::atomic::AtomicBool::new(starts_random),
             retired_forms: RetireList::new(),
@@ -13798,7 +13932,9 @@ impl Db {
         }
         wal_ids.sort_unstable();
         let mem = MemTable::new();
-        let readers = Readers::new();
+        // Replay's own table, for the index resizes a replayed delete
+        // frees through; nothing reads beside it.
+        let readers = Readers::new(false);
         let mut mem_bytes = 0usize;
         let mut from = sealed;
         let mut valid_len = 0u64;
@@ -18254,11 +18390,12 @@ impl Db {
     /// commits that held for their pass, the microseconds they held, and
     /// the microseconds the thread spent in its passes, the passes that
     /// found another table live than their commit's and filed nothing,
-    /// the passes cut short, and the microseconds of the passes the
-    /// thread was on a core for. Atomics only: a read of them takes
-    /// nothing back from the thread.
+    /// the passes cut short, the microseconds of the passes the thread
+    /// was on a core for, and the barriers the sweeps issued for the pins
+    /// (`Readers`). Atomics only: a read of them takes nothing back from
+    /// the thread.
     #[doc(hidden)]
-    pub fn upkeep_counts(&self) -> [u64; 10] {
+    pub fn upkeep_counts(&self) -> [u64; 11] {
         let l = &self.shared.upkeep;
         [
             l.passes.load(AtomicOrdering::Relaxed),
@@ -18271,6 +18408,7 @@ impl Db {
             l.skipped.load(AtomicOrdering::Relaxed),
             l.partial.load(AtomicOrdering::Relaxed),
             l.cpu_ns.load(AtomicOrdering::Relaxed) / 1000,
+            self.shared.readers.barriers.load(AtomicOrdering::Relaxed),
         ]
     }
 }
@@ -19708,7 +19846,7 @@ fn retire_state(shared: &Shared, old: *mut State) {
     let tag = shared.readers.bump();
     // SAFETY: the caller swapped it out of the state pointer and owns it.
     shared.retired.push(tag, unsafe { Box::from_raw(old) });
-    shared.retired.sweep(shared.readers.oldest_pinned());
+    shared.retired.sweep(|low| shared.readers.oldest_for(low));
 }
 
 impl Maint {
@@ -21297,7 +21435,7 @@ mod threading {
     #[test]
     fn a_reader_takes_a_commit_whole() {
         use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-        let rd = super::Readers::new();
+        let rd = super::Readers::new(false);
         let key = |i: u64| format!("k{:06}", i % 5000).into_bytes();
         let fill = |mem: &super::MemTable, mut on_commit: Box<dyn FnMut(&super::MemTable) + '_>| {
             let mut i = 0u64;
@@ -21393,7 +21531,7 @@ mod lockfree {
             sweepers.push(std::thread::spawn(move || {
                 while !stop.load(SeqCst) {
                     let o = oldest.load(SeqCst);
-                    list.sweep(o);
+                    list.sweep(|_| o);
                     // Nothing retired past what this sweep was told is
                     // dropped, by it or by another sweep told less.
                     for (id, d) in drops.iter().enumerate() {
@@ -21418,7 +21556,7 @@ mod lockfree {
         for s in sweepers {
             s.join().unwrap();
         }
-        list.sweep(PER as u64 / 2);
+        list.sweep(|_| PER as u64 / 2);
         let live = list.len();
         let dropped = drops.iter().filter(|d| d.load(SeqCst) == 1).count();
         assert_eq!(

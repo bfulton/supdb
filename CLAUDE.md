@@ -250,7 +250,11 @@ who reads a state
 pins the epoch it reads in through a slot in the reader table -- a handle
 for each read, the writer for each of its operations, the segment work
 and the upkeep thread for each of theirs -- and whoever replaces a state
-frees it only past every pinned slot; nobody waits for a reader. A read
+frees it only past every pinned slot; nobody waits for a reader. The
+pin fences, a sequentially consistent store on every read;
+`Options::asym_pins` is the arm where the sweep fences for it instead,
+once a publish through `membarrier`, priced on a point read and not
+resolved (`docs/engine.md`). A read
 takes the state once, at its start, and holds it: a read that loaded the
 state twice took an entry from one memtable to the chains of another when
 a freeze landed between, and three reader threads found it in their
@@ -1122,6 +1126,51 @@ its segment work inline as it did when the pins were priced. The rule:
 an option sound only under another's value is checked against it where
 the store opens, and an arm that keeps an old shape keeps that shape's
 other settings with it.
+
+**A sweep that read the pins before it took the list.** A retired
+item is freed once every pinned reader is past the epoch its
+retirement bumped, and the sweep read the pins first and took the list
+of items second. Two threads retire -- the writer at its freezes, the
+segment work at its landings -- so an item the other thread pushed
+between the sweep's two steps was judged against pins read before its
+bump, and a reader pinned at the epoch before, holding what the item
+was, is one those pins could miss: a window of tens of nanoseconds a
+landing, with nothing raised. No test found it; the pin protocol's
+proof did, when the pin's fence moved to the sweep, since the proof
+needs every bump the sweep frees for to precede the barrier the sweep
+issues, and the order gave it only the sweep's own. The list is taken
+first now. The rule: a judgement over a set against a condition reads
+the set before the condition when the set can grow between the two,
+since a new member's condition is one the old reading cannot know.
+
+**A barrier on every operation for a sweep once a publish.** An arm
+made the pin a plain store and a load with the sweep fencing for it
+through `membarrier`, twelve microseconds a call with a sibling thread
+running, once a publish by design. The writer's every operation asks
+at its end whether a replaced state can be freed, and while the upkeep
+thread's pass pins the state a landing replaced the answer is no for
+the pass's length: three thousand barriers in a burst of a hundred
+thousand puts, forty milliseconds on a burst of fifty. The sweep peeks
+at the pins without the barrier first and fences only when the peek
+cannot rule a free out, since a pin the peek sees may be gone, which
+frees nothing early, and a pin it misses is the barrier's to find. The
+rule: a cost designed to be rare is priced at every site that can
+reach it, and a site that asks on every operation needs an answer that
+is cheap to say no with.
+
+**A bisect across a change in the measurement.** The quick row read
+point reads a quarter behind the rows of a fortnight before, and a
+bisect by alternation named the commit that pinned the writer's
+operations, with a full fence a read. Priced as an arm pair in one
+process, the fence was nothing the pairs could resolve: two sittings
+at a hundred thousand keys disagreed in sign over a tenth. Between the
+bisect's two neighbours sat the commit that made the harness copy every
+value it reads into a sink, on every arm: a fixed cost a read that is a
+larger share of a shorter read, so supdb's ratio to LMDB fell at that
+commit with no change in the engine, and the rows before it are not
+the rows after it for a point read. The rule: a bisect of a ratio walks
+the harness's commits as well as the engine's, and a step that changes
+what is measured ends the comparison there, whatever the engine did.
 
 **A sentinel that crosses the wasm boundary changes sign.** A wasm `u32`
 arrives in JavaScript as a signed i32, so a failure sentinel of `u32::MAX`

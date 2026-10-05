@@ -417,6 +417,9 @@ pub struct Supdb {
     /// The writer's operations pin nothing and hold no state, as before
     /// `Options::writer_pins`. `supdb-nopin`.
     nopin: bool,
+    /// The sweep fences for the pins and the pin does not
+    /// (`Options::asym_pins`). `supdb-asympin`.
+    asympin: bool,
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
@@ -549,6 +552,9 @@ struct Policy {
     /// The writer's operations pin nothing and hold no state, as before
     /// `Options::writer_pins`. `supdb-nopin`.
     nopin: bool,
+    /// The sweep fences for the pins and the pin does not
+    /// (`Options::asym_pins`). `supdb-asympin`.
+    asympin: bool,
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
@@ -640,6 +646,7 @@ impl Default for Policy {
             sealcap: None,
             l0: None,
             nopin: false,
+            asympin: false,
             inlinemaint: false,
             shape: false,
             adaptcap: None,
@@ -1566,6 +1573,19 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with the sweep fencing for the pins through `membarrier`
+    /// and the pin a plain store (`Options::asym_pins`): against `supdb`
+    /// it prices the fence on every read.
+    pub fn create_asympin(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                asympin: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with the segment work driven inline by the writer, as
     /// before `Options::publish_in_background`: against `supdb` it prices
     /// the thread that lands the seals and merges.
@@ -1688,6 +1708,7 @@ impl Supdb {
             sealcap,
             l0,
             nopin,
+            asympin,
             inlinemaint,
             shape,
             aheadmin,
@@ -1860,6 +1881,7 @@ impl Supdb {
             seal_max_pct: sealcap.unwrap_or(base_seal_max_pct),
             l0_trigger: l0.unwrap_or(supdb::Options::default().l0_trigger),
             writer_pins: !nopin,
+            asym_pins: asympin,
             // Unpinned, the writer must be the one publisher, as it was
             // when the pins were priced: the store refuses the pair.
             publish_in_background: !(inlinemaint || nopin),
@@ -1916,6 +1938,7 @@ impl Supdb {
             sealcap,
             l0,
             nopin,
+            asympin,
             inlinemaint,
             shape,
             aheadmin,
@@ -2177,6 +2200,9 @@ impl Engine for Supdb {
         if self.nopin {
             return "supdb-nopin";
         }
+        if self.asympin {
+            return "supdb-asympin";
+        }
         if self.shape {
             return "supdb-ingestshape";
         }
@@ -2358,6 +2384,7 @@ impl Engine for Supdb {
             ("upkeep_wait_us", uk[3] as f64),
             ("upkeep_partial", uk[8] as f64),
             ("upkeep_cpu_us", uk[9] as f64),
+            ("pin_barriers", uk[10] as f64),
         ]
     }
     fn thread_reader(&self) -> Res<ReaderOpener> {
@@ -2815,11 +2842,13 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-lazysnap" | "supdb-fullrec" | "supdb-norebase" | "supdb-sealfile"
         | "supdb-settleall" | "supdb-inline" | "supdb-tier" | "supdb-runs" | "supdb-keeper"
         | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice"
-        | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "supdb-inlinemaint"
-        | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose" | "supdb-rotate"
-        | "supdb-nofrozen" | "supdb-idle" | "supdb-sortover" | "supdb-pmd" | "supdb-hold"
-        | "supdb-settlefreeze" | "supdb-convertcap" | "supdb-shortpass" | "supdb-noyield"
-        | "supdb-bg" | "supdb-bglag" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
+        | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "supdb-asympin"
+        | "supdb-inlinemaint" | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose"
+        | "supdb-rotate" | "supdb-nofrozen" | "supdb-idle" | "supdb-sortover" | "supdb-pmd"
+        | "supdb-hold" | "supdb-settlefreeze" | "supdb-convertcap" | "supdb-shortpass"
+        | "supdb-noyield" | "supdb-bg" | "supdb-bglag" | "lmdb" | "rocksdb-tuned" => {
+            Guarantee::Durable
+        }
         "supdb-ingest"
         | "supdb-ingestleave"
         | "supdb-ingestnoseal"
@@ -2888,6 +2917,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestleave" => Box::new(Supdb::create_ingest_leave(dir)?),
         "supdb-l0" => Box::new(Supdb::create_l0(dir)?),
         "supdb-nopin" => Box::new(Supdb::create_nopin(dir)?),
+        "supdb-asympin" => Box::new(Supdb::create_asympin(dir)?),
         "supdb-inlinemaint" => Box::new(Supdb::create_inlinemaint(dir)?),
         "supdb-ingestinline" => Box::new(Supdb::create_ingest_inline(dir)?),
         "supdb-ingestsync" => Box::new(Supdb::create_ingest_sync(dir)?),
