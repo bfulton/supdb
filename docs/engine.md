@@ -2817,6 +2817,31 @@ instead of patching a sparse form sixteen times and converting it,
 would halve the thread's work on this burst and leave the pass walking
 copies.
 
+Measured, in a scratch build that gave a block its first write as an
+empty wide form kept across every publish, so that its writes were
+never patched and every walk of it folded its sources -- the partition,
+the pieces and the snapshot's run -- as the open block's walk does:
+alternated against the sparse forms three rounds, the thread's cost a
+write did halve (0.27-0.45 µs against 0.58-0.66 across the points) and
+the first scan's wait went (0.5 ms against 2.9 at the tenth point at a
+hundred thousand keys, 2.6 against 9.2 at three hundred thousand); at
+the tenth point, over a store with no piece standing, the pass read
+level and the burst plus twice the pass 0.89x and 0.95x. At the fully
+rewritten point the pass ran 3x longer, 23 ms against 8 at a hundred
+thousand keys and 100 against 35 at three hundred thousand, the sum
+1.19x and 1.38x. A walk there folds the eight or nine pieces the burst
+sealed, their keys over the block read from each piece's records, and
+the sparse form is the cache of that fold -- not of the memtable's
+values, as its doc has it, which the snapshot carries in key order
+anyway -- so a block of the rewritten store costs 8-12 µs a walk
+without one against 2.3 with. The patches are how that cache is kept
+without ever reading a piece: a key's chain holds a tombstone, which
+masks every older source, so the patch copies the run from the chain.
+What a build at the burst's end saves in patches it pays in piece reads.
+The regime stands; the thread's cost a write is the lever that remains,
+and a block with few overlay keys and no piece under it is the one
+place the walk without a form wins.
+
 #### The segment work on a thread of its own
 
 A seal's landing, the merges and piece merges, the promotions, the

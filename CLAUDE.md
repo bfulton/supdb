@@ -116,6 +116,18 @@ Profile a probe that does one thing. The scan probe's own `format!` per
 iteration was 8% of its samples until the keys were built before the
 loop.
 
+Price a structure by taking it away, not by what its doc says it saves.
+The sparse form's doc says it saves the walk the memtable's value
+reads, and the snapshot carries those values in key order anyway, so
+the form read as a cache the upkeep thread paid a patch a write to keep
+for nothing; a scratch build that walked every written block without
+one halved the thread's cost and ran the pass after the rewritten burst
+three times longer, because the form's real saving was the fold of the
+level-0 pieces under the block, read from their records at every walk
+otherwise (`docs/engine.md`, the dense-burst regime). Measure the
+removal in the suite's shape, pieces and all, before building the
+replacement.
+
 Give the probe the suite's shape before believing it disagrees with the
 suite. Four probes in one day failed to reproduce a figure from the lag
 sweep and each was read as a refutation before it was read as a bad
