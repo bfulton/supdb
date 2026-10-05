@@ -2064,7 +2064,36 @@ fn the_block_cache_answers_the_same_model() {
 /// thread has brought it.
 #[test]
 fn the_block_cache_answers_the_same_model_with_the_upkeep_on_a_thread() {
-    overlay_model_with("overlay-upkeep", true, 0, supdb::Upkeep::Background(3));
+    overlay_model_with(
+        "overlay-upkeep",
+        true,
+        0,
+        supdb::Upkeep::Background(3),
+        false,
+    );
+}
+
+/// The same model with the forms holding the pieces' fold alone and every
+/// walk overlaying the snapshot (`Options::forms_pieces_only`): a block
+/// with a form and memtable keys over it walks both, a key in both is one
+/// key with the memtable's values newest, and a tombstone in the memtable
+/// masks the form's run.
+#[test]
+fn the_block_cache_answers_the_same_model_with_pieces_only_forms() {
+    overlay_model_with("overlay-pieces", true, 0, supdb::Upkeep::Inline, true);
+}
+
+/// The pieces-only forms with the upkeep on a thread, which extends the
+/// snapshot the walks overlay and builds the forms a landing dropped.
+#[test]
+fn the_block_cache_answers_the_same_model_with_pieces_only_forms_on_a_thread() {
+    overlay_model_with(
+        "overlay-pieces-upkeep",
+        true,
+        0,
+        supdb::Upkeep::Background(1),
+        true,
+    );
 }
 
 /// Under a budget of a couple of blocks, every build sheds another, and
@@ -2139,6 +2168,12 @@ fn a_live_write_over_a_frozen_key_folds_into_it_after_the_snapshot() {
     fold_model(true);
 }
 
+/// The fold with the forms holding the pieces' fold alone.
+#[test]
+fn the_fold_answers_the_same_model_with_pieces_only_forms() {
+    fold_model_with(true, true);
+}
+
 /// The same phases on the merge path, where the keys written since the
 /// snapshot are filed into its side runs instead of by block: a burst
 /// under the rebuild threshold is filed and folded, one over it rebuilds,
@@ -2149,11 +2184,16 @@ fn the_merge_path_files_the_keys_written_since_its_snapshot() {
 }
 
 fn fold_model(block_cache: bool) {
-    let d = dir(&format!("overlay-fold-{block_cache}"));
+    fold_model_with(block_cache, false)
+}
+
+fn fold_model_with(block_cache: bool, pieces_only: bool) {
+    let d = dir(&format!("overlay-fold-{block_cache}-{pieces_only}"));
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(2 << 10),
         scan_block_cache: block_cache,
+        forms_pieces_only: pieces_only,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -2199,8 +2239,10 @@ fn fold_model(block_cache: bool) {
     }
     m.check(&db, "a burst that rebuilds the snapshot under the tables");
     held(&db, 0);
+    // With the forms holding the pieces' fold alone, a block dense with
+    // memtable keys overlays the snapshot and is not held wide.
     assert!(
-        !block_cache || db.block_cache_wide() > 0,
+        !block_cache || pieces_only || db.block_cache_wide() > 0,
         "the burst's blocks are walked wide"
     );
     // Fewer than the snapshot holds, so no rebuild: the wide blocks take
@@ -2236,7 +2278,7 @@ fn fold_model(block_cache: bool) {
     m.check(&db, "keys filed into wide blocks after the rebuild");
     held(&db, 0);
     assert!(
-        !block_cache || db.block_cache_wide() > 0,
+        !block_cache || pieces_only || db.block_cache_wide() > 0,
         "the wide blocks stand after the rebuild"
     );
     m.delete(&mut db, &key(303));
@@ -3204,10 +3246,16 @@ fn held(db: &Db, budget: usize) {
 }
 
 fn overlay_model(name: &str, block_cache: bool, budget: usize) {
-    overlay_model_with(name, block_cache, budget, supdb::Upkeep::Inline)
+    overlay_model_with(name, block_cache, budget, supdb::Upkeep::Inline, false)
 }
 
-fn overlay_model_with(name: &str, block_cache: bool, budget: usize, upkeep: supdb::Upkeep) {
+fn overlay_model_with(
+    name: &str,
+    block_cache: bool,
+    budget: usize,
+    upkeep: supdb::Upkeep,
+    pieces_only: bool,
+) {
     let d = dir(name);
     let opts = Options {
         seal_bytes: 1 << 20,
@@ -3215,6 +3263,7 @@ fn overlay_model_with(name: &str, block_cache: bool, budget: usize, upkeep: supd
         scan_block_cache: block_cache,
         scan_cache_bytes: budget,
         upkeep,
+        forms_pieces_only: pieces_only,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -4372,8 +4421,99 @@ fn reader_threads_over_forms_a_lagging_upkeep_maintains() {
     reader_threads_over_blocks(true, supdb::Upkeep::Background(1));
 }
 
+/// A handle's scan over pieces-only forms, one step at a time: each
+/// round rewrites one seventh of the keys, a different seventh each
+/// round, so a piece a flush seals holds keys the rounds after it leave
+/// alone, and the handle has to read those from the piece through the
+/// forms the writer publishes -- an empty slot over a block the piece
+/// has keys in is not a clean block. The upkeep runs inline so the
+/// writer's commit publishes its forms before the handle's scan.
+#[test]
+fn a_handle_reads_replaced_keys_over_pieces_only_forms() {
+    let d = dir("pieces-only-handle");
+    let opts = Options {
+        upkeep: supdb::Upkeep::Inline,
+        seal_bytes: 32 << 10,
+        partition_bytes: Some(64 << 10),
+        l0_trigger: 2,
+        scan_block_cache: true,
+        commit_forms: true,
+        forms_pieces_only: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let key = |k: u32| format!("key-{k:05}").into_bytes();
+    for k in 0..3000u32 {
+        db.append(&key(k), b"0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    let r = db.reader().unwrap();
+    let scan_all = |r: &supdb::Reader| {
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        r.scan(b"", usize::MAX, |k, v| got.push((k.to_vec(), v.to_vec())))
+            .unwrap();
+        got
+    };
+    let first = scan_all(&r);
+    assert_eq!(first.len(), 3000);
+    // The round each key was last written in, 0 for the load.
+    let mut last = vec![0u32; 3000];
+    for round in 1..=16u32 {
+        for k in (0..3000u32).filter(|k| k % 7 == round % 7) {
+            db.delete(&key(k));
+            db.append(&key(k), round.to_string().as_bytes());
+            last[k as usize] = round;
+        }
+        db.commit().unwrap();
+        let got = scan_all(&r);
+        assert_eq!(got.len(), 3000, "round {round}: one value a key");
+        for (k, v) in &got {
+            let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+            assert_eq!(
+                std::str::from_utf8(v).unwrap(),
+                last[kn as usize].to_string(),
+                "round {round}: key {kn}"
+            );
+        }
+        if round % 3 == 0 {
+            db.flush().unwrap();
+            let got = scan_all(&r);
+            assert_eq!(got.len(), 3000, "round {round} flushed: one value a key");
+            for (k, v) in &got {
+                let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+                assert_eq!(
+                    std::str::from_utf8(v).unwrap(),
+                    last[kn as usize].to_string(),
+                    "round {round} flushed: key {kn}"
+                );
+            }
+        }
+    }
+}
+
+/// The same threads with the forms holding the pieces' fold alone: the
+/// published forms carry a marker for every block a landing's piece
+/// covers, and each handle overlays its own snapshot on the rest.
+#[test]
+fn reader_threads_over_pieces_only_forms_keep_answering() {
+    reader_threads_over_blocks_with(true, supdb::Upkeep::Inline, true);
+}
+
+/// The same with the upkeep on a thread.
+#[test]
+fn reader_threads_over_pieces_only_forms_the_upkeep_thread_maintains() {
+    reader_threads_over_blocks_with(true, supdb::Upkeep::Background(1), true);
+}
+
 fn reader_threads_over_blocks(commit_forms: bool, upkeep: supdb::Upkeep) {
-    let d = dir(&format!("commit-forms-threads-{commit_forms}-{upkeep:?}"));
+    reader_threads_over_blocks_with(commit_forms, upkeep, false)
+}
+
+fn reader_threads_over_blocks_with(commit_forms: bool, upkeep: supdb::Upkeep, pieces_only: bool) {
+    let d = dir(&format!(
+        "commit-forms-threads-{commit_forms}-{upkeep:?}-{pieces_only}"
+    ));
     let opts = Options {
         upkeep,
         seal_bytes: 32 << 10,
@@ -4381,6 +4521,7 @@ fn reader_threads_over_blocks(commit_forms: bool, upkeep: supdb::Upkeep) {
         l0_trigger: 2,
         scan_block_cache: true,
         commit_forms,
+        forms_pieces_only: pieces_only,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -4417,6 +4558,12 @@ fn reader_threads_over_blocks(commit_forms: bool, upkeep: supdb::Upkeep) {
                         *prev = (*prev).max(ver);
                     }
                     let mut last: Option<Vec<u8>> = None;
+                    // A scan that went backwards is diagnosed after the
+                    // scan returns, through the same handle: the point
+                    // read's answer, a second scan's, and the forms the
+                    // handle was taking.
+                    let mut bad: Option<(u32, u64, u64, usize)> = None;
+                    let mut scanned: Vec<(u32, u64)> = Vec::new();
                     r.scan(&key(k), 30, |kk, v| {
                         if let Some(l) = &last {
                             assert!(l.as_slice() < kk, "a scan out of key order");
@@ -4427,14 +4574,36 @@ fn reader_threads_over_blocks(commit_forms: bool, upkeep: supdb::Upkeep) {
                             .parse()
                             .unwrap_or_else(|_| panic!("a scanned value that is no version: {s}"));
                         let kn: u32 = std::str::from_utf8(&kk[4..]).unwrap().parse().unwrap();
+                        scanned.push((kn, ver));
                         let prev = seen.entry(kn).or_insert(0);
-                        assert!(
-                            ver >= *prev,
-                            "a scan went backwards: key {kn} scanned {ver} after {prev}"
-                        );
-                        *prev = ver;
+                        if ver < *prev && bad.is_none() {
+                            bad = Some((kn, ver, *prev, scanned.len() - 1));
+                        }
+                        *prev = (*prev).max(ver);
                     })
                     .unwrap();
+                    if let Some((kn, ver, prev, at)) = bad {
+                        let point: Vec<String> = read_vec(&r, &key(kn))
+                            .iter()
+                            .map(|v| String::from_utf8_lossy(v).into_owned())
+                            .collect();
+                        let mut again: Vec<String> = Vec::new();
+                        r.scan(&key(kn), 1, |_, v| {
+                            again.push(String::from_utf8_lossy(v).into_owned())
+                        })
+                        .unwrap();
+                        let (forms, _, takes, complete) = r.canonical_forms();
+                        let kinds = r.block_cache_kinds();
+                        let where_ = r.debug_key(&key(kn));
+                        panic!(
+                            "a scan went backwards: key {kn} scanned {ver} after {prev} \
+                             (entry {at} of {} from key {k}); point read now {point:?}, \
+                             scan again {again:?}; published forms {forms} takes {takes} \
+                             complete {complete}, own forms clean/sparse/copies/wide \
+                             {kinds:?}; where: {where_}; scanned {scanned:?}",
+                            scanned.len()
+                        );
+                    }
                 } else {
                     let got = read_vec(&r, &key(k));
                     assert!(got.len() <= 1, "a put key with two values");
@@ -4504,12 +4673,23 @@ fn reader_threads_over_blocks(commit_forms: bool, upkeep: supdb::Upkeep) {
     quiet(&mut db);
     let before = db.canonical_forms().2;
     r.scan(&key(0), 500, |_k, v| sink += v.len()).unwrap();
-    let (forms, _, takes, _) = db.canonical_forms();
-    assert!(forms > 0, "the quiet writer maintained forms: {forms}");
-    assert!(
-        takes > before,
-        "a reader over a quiet store walks them: {takes} against {before}"
-    );
+    let (forms, _, takes, complete) = db.canonical_forms();
+    // Under `forms_pieces_only` the forms hold the pieces' fold alone, so
+    // a store whose pieces a merge has folded away has no form to hold
+    // and a complete table of empty slots, every block clean; the keys
+    // just put reach the reader through the snapshot.
+    if pieces_only && forms == 0 {
+        assert!(
+            complete,
+            "a quiet writer under pieces-only forms left its table incomplete"
+        );
+    } else {
+        assert!(forms > 0, "the quiet writer maintained forms: {forms}");
+        assert!(
+            takes > before,
+            "a reader over a quiet store walks them: {takes} against {before}"
+        );
+    }
     // At level 2 every commit above followed a scan, which the commit's
     // own rules file, so the thread is not asked to.
     if matches!(upkeep, supdb::Upkeep::Background(l) if l != 2) {
@@ -4977,6 +5157,12 @@ fn a_snapshot_carried_forward_folds_a_live_write_onto_a_frozen_key() {
     carry_model(true);
 }
 
+/// The carry with the forms holding the pieces' fold alone.
+#[test]
+fn the_carried_snapshot_answers_the_same_model_with_pieces_only_forms() {
+    carry_model_with(true, true);
+}
+
 /// The same on the merge path, where the snapshot's runs are what a scan
 /// walks rather than the bounds of a block it builds: a key left in the
 /// run twice is emitted twice there, which the block path does not show.
@@ -4998,13 +5184,18 @@ fn a_snapshot_carried_forward_on_the_merge_path_folds_it_too() {
 /// bytes and written out of order, half between the run's keys, carried
 /// forward by the walk. Keys of every batch are checked at every start.
 fn extend_order_model(block_cache: bool) {
-    let d = dir(&format!("extend-order-{block_cache}"));
+    extend_order_model_with(block_cache, false)
+}
+
+fn extend_order_model_with(block_cache: bool, pieces_only: bool) {
+    let d = dir(&format!("extend-order-{block_cache}-{pieces_only}"));
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(2 << 10),
         scan_block_cache: block_cache,
         scan_cache_ahead: false,
         share_snapshot: true,
+        forms_pieces_only: pieces_only,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -5076,6 +5267,12 @@ fn extend_order_model(block_cache: bool) {
 #[test]
 fn the_extension_gallops_a_sparse_batch_and_walks_a_dense_one_into_the_run() {
     extend_order_model(true);
+}
+
+/// The extension's order with the forms holding the pieces' fold alone.
+#[test]
+fn the_extended_snapshot_answers_the_same_model_with_pieces_only_forms() {
+    extend_order_model_with(true, true);
 }
 
 #[test]
@@ -5186,13 +5383,18 @@ fn the_cap_and_the_trigger_follow_the_reads_and_relax_over_a_write_only_stretch(
 }
 
 fn carry_model(block_cache: bool) {
-    let d = dir(&format!("extend-snap-{block_cache}"));
+    carry_model_with(block_cache, false)
+}
+
+fn carry_model_with(block_cache: bool, pieces_only: bool) {
+    let d = dir(&format!("extend-snap-{block_cache}-{pieces_only}"));
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(2 << 10),
         scan_block_cache: block_cache,
         scan_cache_ahead: false,
         share_snapshot: true,
+        forms_pieces_only: pieces_only,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();

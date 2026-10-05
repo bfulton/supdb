@@ -810,6 +810,46 @@ incomplete now until the fill makes them whole. The rule: where an
 absence means something, whatever drops the things it is the absence
 of drops the claim that gives it the meaning.
 
+**An absence whose meaning a publish changed.** A reader at the
+writer's commit takes a published form as the block and, with the
+table complete, an empty slot as clean. With the forms holding the
+memtables' keys, a seal's landing changed no block's key set -- the
+piece's keys were the frozen table's, filed at the freeze -- so a slot
+empty before the landing was empty after it, and the rebase dropped
+only the forms a rewritten partition made stale. The arm whose forms
+hold the pieces' fold alone (`forms_pieces_only`) made the landing the
+one publish that adds keys to a block, and its rebase dropped the forms
+of the blocks the piece covers and left the table complete where a
+covered block had no form: a handle took the empty slot as clean,
+walked the partition alone, and read a key's sealed value as the one
+before it, in the reader threads' first seconds, while the point read
+beside it, through the piece, was right. The rebase marks the table
+incomplete for every block a landed piece has keys over, form or none.
+The rule is the one above, turned around: where an absence means
+something, whatever changes the facts the absence is about drops the
+claim that gives it the meaning, and a change that adds to a set is as
+much a change as one that drops from it.
+
+**A check for what landed that read the sets on either side of it.**
+The same arm's rebase asks which pieces landed since the writer's last
+look by comparing the table's pieces with the state's, and drops the
+forms of the blocks a new piece has keys over. A piece that landed and
+was merged into its partition between two looks is in neither set: the
+copies over the rewritten partition were carried across the rewrite as
+the default arm carries them -- there the copy holds the frozen table's
+keys already, so a vanished piece changes nothing -- and republished,
+and a handle at the writer's commit read a key's merged value as the
+one before it, with the key in no memtable and no piece for the point
+read to disagree about. It surfaced in one gate run of two and in none
+of ten quiet runs; four processes stressing the two threaded tests found
+it in minutes, and a debug accessor on the handle naming the key's
+every source said where it was not. Under the arm a copy now survives a
+partition's rewrite only when the rewrite was the one publish since the
+look, by the state's generation. The rule: a difference of two sets
+shows nothing that joined and left between them, so a check for what
+happened between two looks counts the publishes between them, not the
+members present at either end.
+
 **A note that held one of the things its look would need.** The look
 that carries the writer's tables across a freeze reads the writes it
 has not read from every table live since its last look, and its note

@@ -423,6 +423,10 @@ pub struct Supdb {
     /// A point read takes a segment's extents by value, as before
     /// `Blob::with_lookup` (`Options::exts_by_value`). `supdb-extsval`.
     extsval: bool,
+    /// The forms hold the pieces' fold alone and every walk overlays the
+    /// snapshot (`Options::forms_pieces_only`). `supdb-piecesonly`, and
+    /// `supdb-ingestpiecesonly` buffered.
+    piecesonly: bool,
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
@@ -561,6 +565,10 @@ struct Policy {
     /// A point read takes a segment's extents by value, as before
     /// `Blob::with_lookup` (`Options::exts_by_value`). `supdb-extsval`.
     extsval: bool,
+    /// The forms hold the pieces' fold alone and every walk overlays the
+    /// snapshot (`Options::forms_pieces_only`). `supdb-piecesonly`, and
+    /// `supdb-ingestpiecesonly` buffered.
+    piecesonly: bool,
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
@@ -654,6 +662,7 @@ impl Default for Policy {
             nopin: false,
             asympin: false,
             extsval: false,
+            piecesonly: false,
             inlinemaint: false,
             shape: false,
             adaptcap: None,
@@ -1580,6 +1589,33 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with the forms holding the pieces' fold alone and every
+    /// walk overlaying the scan snapshot (`Options::forms_pieces_only`):
+    /// against `supdb` it prices the settle that files nothing.
+    pub fn create_piecesonly(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                piecesonly: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` with the forms holding the pieces' fold alone, as
+    /// `supdb-piecesonly`.
+    pub fn create_ingest_piecesonly(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                piecesonly: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with a point read taking a segment's extents by value from
     /// `lookup_full`, as before `Blob::with_lookup` lent them on the
     /// index's frame (`Options::exts_by_value`): against `supdb` it prices
@@ -1731,6 +1767,7 @@ impl Supdb {
             nopin,
             asympin,
             extsval,
+            piecesonly,
             inlinemaint,
             shape,
             aheadmin,
@@ -1905,6 +1942,7 @@ impl Supdb {
             writer_pins: !nopin,
             asym_pins: asympin,
             exts_by_value: extsval,
+            forms_pieces_only: piecesonly,
             // Unpinned, the writer must be the one publisher, as it was
             // when the pins were priced: the store refuses the pair.
             publish_in_background: !(inlinemaint || nopin),
@@ -1963,6 +2001,7 @@ impl Supdb {
             nopin,
             asympin,
             extsval,
+            piecesonly,
             inlinemaint,
             shape,
             aheadmin,
@@ -2229,6 +2268,13 @@ impl Engine for Supdb {
         }
         if self.extsval {
             return "supdb-extsval";
+        }
+        if self.piecesonly {
+            return if self.partition {
+                "supdb-piecesonly"
+            } else {
+                "supdb-ingestpiecesonly"
+            };
         }
         if self.shape {
             return "supdb-ingestshape";
@@ -2870,9 +2916,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settleall" | "supdb-inline" | "supdb-tier" | "supdb-runs" | "supdb-keeper"
         | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice"
         | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "supdb-asympin"
-        | "supdb-extsval" | "supdb-inlinemaint" | "supdb-adapt" | "supdb-adapttrig"
-        | "supdb-adaptloose" | "supdb-rotate" | "supdb-nofrozen" | "supdb-idle"
-        | "supdb-sortover" | "supdb-pmd" | "supdb-hold" | "supdb-settlefreeze"
+        | "supdb-extsval" | "supdb-piecesonly" | "supdb-inlinemaint" | "supdb-adapt"
+        | "supdb-adapttrig" | "supdb-adaptloose" | "supdb-rotate" | "supdb-nofrozen"
+        | "supdb-idle" | "supdb-sortover" | "supdb-pmd" | "supdb-hold" | "supdb-settlefreeze"
         | "supdb-convertcap" | "supdb-shortpass" | "supdb-noyield" | "supdb-bg" | "supdb-bglag"
         | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest"
@@ -2895,6 +2941,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestconvertcap"
         | "supdb-ingestshortpass"
         | "supdb-ingestnoyield"
+        | "supdb-ingestpiecesonly"
         | "supdb-ingestbg"
         | "supdb-ingestbglag"
         | "supdb-ingesthold"
@@ -2945,6 +2992,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-nopin" => Box::new(Supdb::create_nopin(dir)?),
         "supdb-asympin" => Box::new(Supdb::create_asympin(dir)?),
         "supdb-extsval" => Box::new(Supdb::create_extsval(dir)?),
+        "supdb-piecesonly" => Box::new(Supdb::create_piecesonly(dir)?),
+        "supdb-ingestpiecesonly" => Box::new(Supdb::create_ingest_piecesonly(dir)?),
         "supdb-inlinemaint" => Box::new(Supdb::create_inlinemaint(dir)?),
         "supdb-ingestinline" => Box::new(Supdb::create_ingest_inline(dir)?),
         "supdb-ingestsync" => Box::new(Supdb::create_ingest_sync(dir)?),

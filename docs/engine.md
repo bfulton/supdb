@@ -2842,6 +2842,81 @@ The regime stands; the thread's cost a write is the lever that remains,
 and a block with few overlay keys and no piece under it is the one
 place the walk without a form wins.
 
+#### The forms hold the pieces' fold alone, and the walk lays the snapshot over them
+
+The scratch build above priced the shape at its worst, a block without
+a form walked from its sources at every read. The arm built from it
+keeps the form and changes what it holds (`Options::forms_pieces_only`;
+`supdb-piecesonly`, `supdb-ingestpiecesonly`): a block's form is the
+fold of the partition and the level-0 pieces, built once for a set of
+pieces and never patched, and the memtables' keys reach a scan through
+the scan snapshot, whose positions over the block the table has already
+-- the main run's bounds, the bases' and the keys filed since -- laid
+over whatever form the block holds by the walk itself: the partition's
+records for a clean block, the deltas for a sparse one, the copy for a
+dense one, a merge of two sorted streams where a key both hold is
+emitted once (`emit_both`: the form's run unless a memtable tombstone
+masks every source older than it). The settle resolves and files only
+the keys created since the snapshot's run was built, for their cuts,
+and splices nothing; a key written again reaches the walk through the
+stale set as it did. A landing is then the one publish that changes a
+block's fold, and the rebase drops the forms of the blocks the landed
+piece has keys over, marks the table incomplete for them whether they
+had a form or not, and leaves them to the fills, which build them from
+the pieces again; the published copies carry a marker in their place.
+A copy carried across a partition's rewrite survives only when the
+rewrite was the one publish since the writer's last look: with more, a
+piece may have landed and been merged away between the two, which no
+piece set shows, and the copy that never folded it would stand as the
+rewritten partition's.
+
+Alternated as two arms of one probe binary, two rounds of three reps
+with the order swapped, the probe's lag sweep at a hundred and three
+hundred thousand keys on both arms, with the upkeep's cost a write
+(`c_t`), the pass, the first scan's wait on the thread and the blocks
+built read beside the rates. Where no piece lands the thread's cost did
+what the shape says: at the ten-percent point `c_t` read 0.26-0.48 µs
+against 0.75-1.02 on the durable arm at a hundred thousand keys and
+0.28-0.40 against 0.80-1.16 at three hundred thousand, 0.24-0.31
+against 0.57-1.07 and 0.31-0.43 against 0.54-0.77 on the buffered arm,
+and the first scan's wait on the thread went with it -- 1.7-3.3 ms
+against 9.5-14.1 on the buffered arm at three hundred thousand keys,
+0.4-0.7 against 1.9-5.6 at a hundred thousand -- the burst a little
+faster on every cell. But the pass after it runs slower: 4.9-8.2 ms
+against 2.6-4.5 and 22-34 against 15-24 on the durable arm, 5.8-8.6
+against 4.2-8.0 and 23-32 against 23-28 on the buffered, since every
+scan of a block with memtable keys over it merges the snapshot's
+window into the walk -- the window found, its keys and cuts gathered
+into an overlay, each key's tombstone asked of the stale set and the
+run -- where the sparse form the default patches is that merge done
+once, read as one array with the values inline. Burst plus twice the
+pass at that point: 18-29 against 17-24 and 75-102 against 63-88 on
+the durable arm, 15-24 against 13-23 and 58-76 against 62-70 on the
+buffered; level to worse. Where pieces land, every landing drops the
+forms of every block the piece has keys over, which over a rewritten
+store is every block, and the thread builds them all again: 11-14
+thousand builds a burst against 1.5-1.7 thousand on the durable arm at
+a hundred thousand keys, 37-41 against 3-5 thousand at three hundred
+thousand, `c_t` above the default's (1.5-1.9 against 1.1-1.6), the
+first scan waiting out the rebuilding pass, and the pass after the
+fully rewritten burst 10-42 ms against 4-6 and 40-69 against 9-14 on
+the two arms at a hundred thousand keys, 79-134 against 35-82 and
+97-215 against 33-48 at three hundred thousand. Paired in one process
+over the suite's workloads at a hundred thousand keys on the durable
+arm, six pairs: ycsb-E read 0.45x (0/6), the writer's scans waiting
+out the thread's rebuilding passes at every take-back (18.5 ms of
+waits a rep against 2.2), the threaded scan mix 0.79x and 0.74x, the
+lag points 0.79x, 0.47x and 0.12x and their weighted sum 1.40x (6/6),
+the thread building 3.6x the blocks; the load, the point reads and the
+plain scan level. The arm stands for pricing and is not the default. Two things would make it one, and
+neither is a tuning: a landing that folds the piece's run over each
+block into the form standing -- a merge of two sorted lists with the
+piece's ranks already taken before the publish, where a build reads
+every piece's records again -- and a walk that merges the snapshot's
+window without gathering it first, since the snapshot's keys, entries
+and runs are already contiguous in key order and the overlay it builds
+from them is a copy of what it could read in place.
+
 #### The pin's fence, priced against a sweep that fences for it
 
 A read pins the epoch it reads in by storing it in its slot of the
