@@ -471,6 +471,10 @@ pub struct Options {
     /// 1.1x and 0.97x on reads, so the fence stays and this is the arm.
     /// A kernel without `membarrier` has the fence whatever this says.
     pub asym_pins: bool,
+    /// EXPERIMENT: a point read takes a segment's extents by value from
+    /// `Blob::lookup_full`, the shape before `Blob::with_lookup` lent them
+    /// on the index's frame; kept to price it. `supdb-extsval`.
+    pub exts_by_value: bool,
     /// EXPERIMENT: the store's segment work (`Maint`) -- a seal's
     /// landing, the merges, the promotions, the manifest and the WAL
     /// retirement -- runs on a thread of its own and publishes from there,
@@ -1267,6 +1271,7 @@ impl Default for Options {
             flush_schedules: true,
             writer_pins: true,
             asym_pins: false,
+            exts_by_value: false,
             publish_in_background: true,
             adaptive_shape: false,
             seal_rotates_wal: false,
@@ -9275,22 +9280,27 @@ impl Reader {
             }
         }
         let mut n = 0u64;
+        // The segment read lends the extents on the index's frame; the arm
+        // takes them by value, the shape before (`Options::exts_by_value`).
+        let by_value = self.opts.exts_by_value;
+        let seg_read = |seg: &Seg, f: &mut F| {
+            if by_value {
+                seg.blob.read_all_by_value(key, f)
+            } else {
+                seg.blob.read_all(key, f)
+            }
+            .map_err(|e| err(&format!("segment read: {e}")))
+        };
         if start == 0 {
             if let Some(seg) = part {
-                n += seg
-                    .blob
-                    .read_all(key, &mut f)
-                    .map_err(|e| err(&format!("segment read: {e}")))?;
+                n += seg_read(seg, &mut f)?;
             }
         }
         for (i, seg) in l0.iter().enumerate() {
             if 1 + i < start || !seg.may_hold(key) {
                 continue;
             }
-            n += seg
-                .blob
-                .read_all(key, &mut f)
-                .map_err(|e| err(&format!("segment read: {e}")))?;
+            n += seg_read(seg, &mut f)?;
         }
         for (i, fr) in st.frozen.iter().enumerate() {
             if fr_ix + i < start {

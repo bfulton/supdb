@@ -852,6 +852,14 @@ impl<B: Bytes> Blob<B> {
         idx.lookup_full(sec, key, flatindex::key_hash)
     }
 
+    /// `lookup_full` with the extents and tail lent to `f` on the index's
+    /// frame rather than returned by value; see `FlatIndex::with_lookup`.
+    #[inline]
+    pub fn with_lookup<R>(&self, key: &[u8], f: impl FnOnce(&[Ext], &[u8]) -> R) -> Option<R> {
+        let (sec, idx) = self.flat()?;
+        idx.with_lookup(sec, key, flatindex::key_hash, f)
+    }
+
     /// `exts_at`, with the record's tail of inline runs.
     pub fn exts_at_full(&self, rank: usize) -> Option<(&[u8], Exts<'_>, &[u8])> {
         let (sec, idx) = self.flat()?;
@@ -1255,6 +1263,14 @@ impl<B: Bytes> Blob<B> {
     /// this work was written against says "read_all returns a count", and it
     /// does not.
     pub fn read_all<F: FnMut(&[u8])>(&self, key: &[u8], f: F) -> Result<u64> {
+        self.with_lookup(key, |exts, tail| self.read_exts(exts, tail, f))
+            .unwrap_or(Ok(0))
+    }
+
+    /// EXPERIMENT: `read_all` through `lookup_full`, the extents returned
+    /// by value: the shape before `with_lookup`, kept to price it
+    /// (`Options::exts_by_value`).
+    pub fn read_all_by_value<F: FnMut(&[u8])>(&self, key: &[u8], f: F) -> Result<u64> {
         let Some((exts, tail)) = self.lookup_full(key) else {
             return Ok(0);
         };

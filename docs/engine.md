@@ -2935,6 +2935,42 @@ for a point read. The fence is a few percent at most; the quick row's
 quarter is the harness's copy and a loss confined to the C mix that the
 bisect has yet to reach.
 
+#### The compact record's extents on the point read
+
+The bisect the pin's fence came out of had a second step to find: the
+quick row's C mix, zipfian point reads, stood about a quarter behind the
+rows of a fortnight before once the harness's copy and the fence were
+accounted for, while the uniform read stood level. Alternated commit by
+commit against a fixed older head, two rounds each at thirty and a
+hundred thousand keys with LMDB as the control, the loss was a slope
+rather than a step -- about 0.95x at the 22nd commit of the range, 0.98
+at the 33rd, 0.93 at the 35th, 0.97 at the 36th, 0.84 at the 37th, 0.80
+at the 39th and at the 49th, 0.72 from the harness's copy on -- and its
+one large drop was the commit that introduced the compact inline
+record, with the record off. What that commit changed on a point read:
+`flatindex::lookup_full` began returning the record's extents as a
+two-variant value, a borrowed slice or the one extent rebuilt from a
+compact header, by value through the blob and into the read, where it
+had returned a borrowed slice. The scan path met the same shape and was
+given `with_record_at`, which rebuilds the extent on the index's frame
+and lends it (0.88x scans otherwise, above); the point read was not.
+
+The uniform read did not show it because a uniform read over a store
+larger than the cache is its misses, and a fixed cost of a few tens of
+nanoseconds is noise beside them; the zipfian read is in cache and is
+made of fixed costs. `Blob::read_all` goes through `with_lookup` now,
+the extents lent on the index's frame to `read_exts`, and
+`Options::exts_by_value` -- `supdb-extsval` -- keeps the by-value shape
+as the arm. Priced as the pair, twelve pairs after a warmup: the
+by-value shape reads the C mix at 0.89x in twelve pairs of twelve at
+thirty thousand keys and 0.91x in ten of twelve at a hundred thousand,
+the D and F mixes 0.90x and 0.93x at thirty thousand on seven and five
+pairs, the uniform read 0.93x on nine of twelve at thirty thousand and
+level at a hundred thousand, the loads and the scans level. The
+remaining slope -- the 35th commit's few percent, the 38th and 39th --
+is below what two rounds of alternation resolve and is left to the
+rows.
+
 #### The segment work on a thread of its own
 
 A seal's landing, the merges and piece merges, the promotions, the

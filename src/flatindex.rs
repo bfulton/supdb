@@ -1597,6 +1597,47 @@ impl FlatIndex {
         self.lookup_full(sec, key, hash_of).map(|(e, _)| e)
     }
 
+    /// `lookup_full` with the extents and tail handed to `f` rather than
+    /// returned: a compact record's extent is rebuilt on this frame and
+    /// lent, as `with_record_at` lends it to a scan, where `lookup_full`
+    /// returns it by value through every layer above. The point read is
+    /// the most frequent call this index takes, and the shape that
+    /// returned the rebuilt extent read the C mix at about 0.85x of the
+    /// shape before compact records (`docs/engine.md`).
+    #[inline]
+    pub fn with_lookup<'a, R>(
+        &self,
+        sec: &'a [u8],
+        key: &[u8],
+        hash_of: fn(&[u8]) -> u64,
+        f: impl FnOnce(&[Ext], &'a [u8]) -> R,
+    ) -> Option<R> {
+        let hash = sec.get(self.hash.0..self.hash.1)?;
+        let recs = sec.get(self.recs.0..self.recs.1)?;
+        let h = hash_of(key);
+        let tag = ((h >> 56) | 1) & 0xff;
+        let mut s = (h as usize) & self.mask;
+        for _ in 0..self.hash_cap {
+            let packed = rd_u64(hash, s * SLOT)?;
+            if packed == 0 {
+                return None;
+            }
+            if packed >> 56 == tag {
+                let off = (packed & 0x00ff_ffff_ffff_ffff) as usize;
+                if let Some((k, exts, tail, _)) = parse_record(recs, off) {
+                    if k == key {
+                        return Some(match exts {
+                            Exts::One(e) => f(std::slice::from_ref(&e), tail),
+                            Exts::Borrowed(exts) => f(exts, tail),
+                        });
+                    }
+                }
+            }
+            s = (s + 1) & self.mask;
+        }
+        None
+    }
+
     /// `lookup`, with the record's tail of inline runs.
     pub fn lookup_full<'a>(
         &self,

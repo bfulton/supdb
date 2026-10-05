@@ -751,7 +751,18 @@ bisect in one sitting against its comparator named the two commits.
 The rule: a change to what a record holds is priced on every path that
 reads one -- the bulk walk, the merge's per-key calls, the point read
 -- and an accessor answers only what it is asked, since a key read is
-the most frequent call a merge or a seek makes.
+the most frequent call a merge or a seek makes. The point read was the
+path not priced: the same commit made every lookup return the record's
+extents as a two-variant value, borrowed or rebuilt from the compact
+header, by value through every layer above, and the C mix read 0.84x
+of the commit before in a bisect by alternation three weeks later,
+with the uniform read, whose misses hide a fixed cost, level. The scan
+had already been given a callback that lends the rebuilt extent on the
+index's frame; the point read has one now, and the by-value shape is
+the arm `supdb-extsval`, which reads the C mix at 0.89x in twelve
+pairs of twelve. The corollary: when one path is given the fix for a
+shape, every path that shares the shape is checked for it then, not
+when a row finds it.
 
 **A list of raw pointers drops the pointers.** A replaced canonical
 form and a replaced scan snapshot wait in lists until every reader
