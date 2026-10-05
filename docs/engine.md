@@ -2908,14 +2908,44 @@ out the thread's rebuilding passes at every take-back (18.5 ms of
 waits a rep against 2.2), the threaded scan mix 0.79x and 0.74x, the
 lag points 0.79x, 0.47x and 0.12x and their weighted sum 1.40x (6/6),
 the thread building 3.6x the blocks; the load, the point reads and the
-plain scan level. The arm stands for pricing and is not the default. Two things would make it one, and
-neither is a tuning: a landing that folds the piece's run over each
-block into the form standing -- a merge of two sorted lists with the
-piece's ranks already taken before the publish, where a build reads
-every piece's records again -- and a walk that merges the snapshot's
-window without gathering it first, since the snapshot's keys, entries
-and runs are already contiguous in key order and the overlay it builds
-from them is a copy of what it could read in place.
+plain scan level. The arm stands for pricing and is not the default.
+
+Two of its costs went next. The landing folds now: where the partition
+stands, a landed piece's run over each block it has keys in is merged
+into the block's standing form in one pass over the piece's records for
+the block (`fold_piece_block`), its tombstones masking the form's run
+for the key and its values following it otherwise, pieces oldest first
+-- a landed piece is newer than every piece a form holds -- with the
+fill left only the blocks a table short of complete had no form for;
+a rewritten partition keeps the drop. And the stale set, which every
+overlaid key's emit asked twice, is a bitset over the live table's
+slots in place of a hash set that after a burst held every key written
+(`SlotSet`), and the walk's overlay fetches its keys' chains ahead as a
+build's does (`prefetch_overlay`). Alternated as before, two rounds of
+three, the thread's cost a write is now below the default's at every
+point: at the hundred-percent point 0.66-1.02 µs against 1.21-1.54 on
+the durable arm at a hundred thousand keys and 0.88-1.13 against
+1.22-1.47 at three hundred thousand, 0.53-0.78 against 0.74-1.04 and
+0.62-0.81 against 0.80-1.09 on the buffered arm, its work over the
+burst 59-91 ms against 109-139 and 237-306 against 328-396 on the
+durable arm, the builds a burst back to the default's count. Burst plus
+twice the pass reads level at the one- and ten-percent points on both
+arms at both rungs -- 18.6-23.0 against 19.1-22.7 and 70.9-94.3
+against 62.2-77.4 on the durable arm at ten percent, 15.5-21.9 against
+15.6-30.7 and 54.9-79.1 against 57.6-89.0 on the buffered -- and at the
+hundred-percent point 166-201 against 176-222 and 559-612 against
+504-691 on the durable arm, 86-135 against 81-140 and 384-424 against
+303-401 on the buffered. The pass alone still trails, 1.3-2x at the
+hundred-percent points, and both arms walk sparse forms there at three
+hundred thousand keys on the buffered arm (7,616 walks against 7,151),
+so the difference is the overlay itself: after a burst every memtable
+key the walk lays over a block was written since the snapshot's runs
+were copied and is read from its chain, two or three dependent misses a
+key behind the prefetch, where the default's patched form holds the
+value inline. What would close it is the thread keeping the runs
+current -- the stale slots' chains copied into the run arena in key
+order at each pass, as the settle's resolve already walks them -- so
+the walk streams the run as it streams a form.
 
 #### The pin's fence, priced against a sweep that fences for it
 

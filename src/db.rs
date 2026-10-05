@@ -485,13 +485,16 @@ pub struct Options {
     /// is patched into its block's form, one resolve and one splice a
     /// write, a chain of dependent misses that was the thread's whole
     /// cost over a dense burst and left it behind the writer in the
-    /// buffered arm (`docs/engine.md`). Priced as the arm: the thread's
-    /// cost a write halves where no piece lands and the first scan's
-    /// wait on it goes, but every scan of a block with memtable keys
-    /// over it pays the merge the patched form had done once, and a
-    /// landing drops every covered block's form for the fills to build
-    /// again -- ycsb-E at 0.45x, the lag points at 0.12-0.79x -- so it is
-    /// not the default. `supdb-piecesonly`, `supdb-ingestpiecesonly`.
+    /// buffered arm (`docs/engine.md`). A landing folds its piece's run
+    /// into the standing forms where the partition stands and drops them
+    /// where it was rewritten. Priced as the arm: the thread's cost a
+    /// write is below the default's at every lag point and the first
+    /// scan's wait on it goes; burst plus twice the pass reads level at
+    /// the one- and ten-percent points and the pass alone trails at the
+    /// hundred-percent ones, since every memtable key the walk lays over
+    /// a block after a burst is read from its chain, where the patched
+    /// form holds the value inline. Not the default until the runs are
+    /// kept current. `supdb-piecesonly`, `supdb-ingestpiecesonly`.
     pub forms_pieces_only: bool,
     /// EXPERIMENT: the store's segment work (`Maint`) -- a seal's
     /// landing, the merges, the promotions, the manifest and the WAL
@@ -5840,7 +5843,7 @@ struct Overlay<'a> {
     /// The snapshot whose runs the keys' `SnapKey`s name, and the slots
     /// written since its copy, whose runs are not read.
     snap: &'a Snapshot,
-    stale: &'a std::collections::HashSet<u32>,
+    stale: &'a SlotSet,
 }
 
 /// PROTOTYPE: what emitting an overlay key needs beyond the key: whether
@@ -6960,7 +6963,7 @@ struct FormsState {
     /// PROTOTYPE: live slots written since the scan snapshot's runs were
     /// copied, by the write log from the snapshot's `log_at`: a key here
     /// is read from its chain, not its run. See `Snapshot::vals`.
-    snap_stale: std::cell::RefCell<std::collections::HashSet<u32>>,
+    snap_stale: std::cell::RefCell<SlotSet>,
     /// How far into the memtable's write log this handle has looked, and
     /// the generation it looked in: a new generation is a new memtable
     /// or a new segment set, and the log is read from the start again.
@@ -7037,7 +7040,7 @@ impl FormsState {
             built: std::cell::RefCell::new(Vec::new()),
             snap_gen: std::cell::Cell::new(0),
             snap_added: std::cell::RefCell::new(Vec::new()),
-            snap_stale: std::cell::RefCell::new(std::collections::HashSet::new()),
+            snap_stale: std::cell::RefCell::new(SlotSet::default()),
             log_seen: std::cell::Cell::new(0),
             log_gen: std::cell::Cell::new(0),
             snap_entries: std::cell::Cell::new(0),
@@ -7412,6 +7415,37 @@ impl UKey {
 const SEAL_AHEAD_ENTRY: usize = 32;
 const SEAL_AHEAD_CHAIN: usize = 12;
 const SEAL_AHEAD_CHUNK_BYTES: usize = 128;
+
+/// A set of live-table slots as a bitset: the stale set, the slots
+/// written since the snapshot's runs were copied, which every overlaid
+/// key's emit asks twice. It was a hash set, and after a burst over a
+/// hundred-thousand-key store it held every key written, so each
+/// lookup was a probe into a table of thirty thousand entries that no
+/// cache kept: two of them a key, a microsecond and more a block of the
+/// pass's walks. A bit a slot is a word the block's keys share, grown as
+/// the table does, and cleared by forgetting its words.
+#[derive(Default)]
+struct SlotSet {
+    bits: Vec<u64>,
+}
+
+impl SlotSet {
+    fn insert(&mut self, slot: u32) {
+        let (w, b) = ((slot / 64) as usize, slot % 64);
+        if w >= self.bits.len() {
+            self.bits.resize(w + 1, 0);
+        }
+        self.bits[w] |= 1u64 << b;
+    }
+    fn contains(&self, slot: &u32) -> bool {
+        self.bits
+            .get((*slot / 64) as usize)
+            .is_some_and(|w| (w >> (*slot % 64)) & 1 == 1)
+    }
+    fn clear(&mut self) {
+        self.bits.clear();
+    }
+}
 
 /// An overlay assembled from a chain alone names no snapshot; this one
 /// stands in, and nothing reads a run from it.
@@ -10171,9 +10205,9 @@ impl Reader {
         // there says nothing until the fill has made the table whole
         // again: called clean, a handle read the last block of a store
         // without a key the frozen table held for it.
-        let mut complete = self.fs().tables_complete.get()
-            && !froze
-            && tables.iter().take(np).all(|c| c.borrow().is_some());
+        let was_complete = self.fs().tables_complete.get();
+        let mut complete =
+            was_complete && !froze && tables.iter().take(np).all(|c| c.borrow().is_some());
         // The publishes since this handle's last look, by the generation.
         let publishes = st.gen.saturating_sub(self.fs().log_gen.get());
         let mut dirty_any = false;
@@ -10213,18 +10247,53 @@ impl Reader {
             // read beside them, through the piece, was right. A piece
             // is the same piece when its bounds against this partition
             // are, the bounds being a function of the two.
+            // ... or, where the partition stands, folded in: a landed
+            // piece is newer than every piece the form holds, so its run
+            // over a block merges into the form in one pass over the
+            // piece's records for the block (`fold_piece_block`), where a
+            // build read every piece's again -- ten to fourteen thousand
+            // builds a burst at a hundred thousand keys, the thread's
+            // whole cost under this arm. Pieces fold oldest first, the
+            // order they stand in. A block with no form is clean, and
+            // folded from clean, only while the table was complete; short
+            // of that it is left to the fill, which knows what it lacks.
             let mut landed_over: Vec<bool> = Vec::new();
             if self.opts.forms_pieces_only {
                 landed_over = vec![false; t.slots.len()];
-                for (_, at) in &pieces {
+                for (idx, (j, at)) in pieces.iter().enumerate() {
                     if t.pieces
                         .iter()
                         .any(|(_, old)| std::sync::Arc::ptr_eq(old, at))
                     {
                         continue;
                     }
-                    for (b, over) in landed_over.iter_mut().enumerate() {
-                        *over |= at[b + 1] > at[b];
+                    if rebased {
+                        for (b, over) in landed_over.iter_mut().enumerate() {
+                            *over |= at[b + 1] > at[b];
+                        }
+                        continue;
+                    }
+                    let piece = &l0[*j];
+                    let cuts = piece_ranks[idx].as_deref().map(|v| v.as_slice());
+                    for b in 0..t.slots.len() {
+                        let (r0, r1) = (at[b] as usize, at[b + 1] as usize);
+                        if r1 <= r0 {
+                            continue;
+                        }
+                        match t.slots[b].as_deref() {
+                            None if !was_complete => {
+                                complete = false;
+                                continue;
+                            }
+                            Some(Cached::Wide(_)) => continue,
+                            _ => {}
+                        }
+                        if self
+                            .fold_piece_block(p, b, t, seg, piece, (r0..r1, cuts))
+                            .is_err()
+                        {
+                            return false;
+                        }
                     }
                 }
             }
@@ -12168,6 +12237,26 @@ impl Reader {
             )?;
             *self.fs().settle_offs.borrow_mut() = em.scratch;
         }
+        self.splice_run(at, b, table, key, (c, same), run)
+    }
+
+    /// `run`, a key's values each behind a u32 length, written into block
+    /// `b`'s form as the key's whole run: over the run it replaces where it
+    /// fits, appended where it does not, inserted where the form lacks the
+    /// key; a clean block becomes the one-delta sparse form. The form's
+    /// bytes are re-counted, a form grown past twice its live bytes is
+    /// unlisted for a rebuild, and a sparse form grown dense asks the fill
+    /// to convert it.
+    fn splice_run(
+        &self,
+        at: usize,
+        b: usize,
+        table: &mut BlockTable,
+        key: &[u8],
+        cut: (usize, bool),
+        run: &mut Vec<u8>,
+    ) -> Result<()> {
+        let (c, same) = cut;
         let before = table.slots[b].as_ref().map_or(0, |c| c.bytes());
         let was_clean = matches!(table.slots[b].as_deref(), Some(Cached::Clean));
         let mut bloated = false;
@@ -12268,6 +12357,98 @@ impl Reader {
         }
         if bloated {
             self.unlist(at, b, table);
+        }
+        Ok(())
+    }
+
+    /// Under `forms_pieces_only`: piece `p`'s run over block `b` of
+    /// partition `seg` -- `run_over`, its ranks with their cuts in the
+    /// partition where the piece has them -- folded into the block's
+    /// standing form, which holds the fold of the partition and every
+    /// piece older than `p`. A key the piece holds with a tombstone takes
+    /// the piece's values alone, since the tombstone masks every older
+    /// source; any other key's run is the form's for it, or the
+    /// partition's record where the key is the partition's own and the
+    /// form has none, with the piece's values after. A block with no
+    /// form is a clean block here, which the caller has checked.
+    fn fold_piece_block(
+        &self,
+        at: usize,
+        b: usize,
+        table: &mut BlockTable,
+        seg: &Seg,
+        p: &Seg,
+        run_over: (std::ops::Range<usize>, Option<&[u32]>),
+    ) -> Result<()> {
+        let (ranks, cuts) = run_over;
+        let keys = seg.blob.keys();
+        let lo = b * CACHE_BLOCK;
+        let hi = ((b + 1) * CACHE_BLOCK).min(keys);
+        if table.slots[b].is_none() {
+            table.slots[b] = Some(std::sync::Arc::new(Cached::Clean));
+        }
+        if self.opts.commit_forms && self.slot.is_none() {
+            table.dirty[b] = true;
+            self.fs().dirty_any.set(true);
+        }
+        let read = |e: std::io::Error| err(&format!("block cache read: {e}"));
+        let mut run_scratch = self.fs().settle_run.borrow_mut();
+        let run: &mut Vec<u8> = &mut run_scratch;
+        for r in ranks {
+            let key = p
+                .blob
+                .key_at(r)
+                .ok_or_else(|| err("block cache: a piece rank did not resolve"))?;
+            let cut = cuts.map_or(u32::MAX, |v| v[r]);
+            let (c, at_eq) = if cut != u32::MAX {
+                BuildCtx::cut_known(cut, lo, hi)
+            } else {
+                BuildCtx::cut_at(seg, lo, hi, key)
+            };
+            let same = c < hi && at_eq == Ordering::Equal;
+            run.clear();
+            let tomb = p.tombs
+                && p.blob
+                    .exts_at(r)
+                    .is_some_and(|(_, exts)| exts.iter().any(|e| e.is_tombstone()));
+            if !tomb {
+                let had = match table.slots[b].as_deref() {
+                    Some(Cached::Sparse(sb)) => {
+                        let i = sb.ents.partition_point(|e| sb.key(e) < key);
+                        (i < sb.ents.len() && sb.key(&sb.ents[i]) == key).then(|| {
+                            let (o, n) = sb.ents[i].run;
+                            &sb.vals[o as usize..(o + n) as usize]
+                        })
+                    }
+                    Some(Cached::Block(blk)) => {
+                        let i = blk.lower_bound(key);
+                        (i < blk.ents.len() && blk.key(&blk.ents[i]) == key).then(|| {
+                            let e = &blk.ents[i];
+                            &blk.vals[e[2] as usize..(e[2] + e[3]) as usize]
+                        })
+                    }
+                    _ => None,
+                };
+                match had {
+                    Some(bytes) => run.extend_from_slice(bytes),
+                    None if same => {
+                        seg.blob
+                            .values_at(c, |v| {
+                                run.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                                run.extend_from_slice(v);
+                            })
+                            .map_err(read)?;
+                    }
+                    None => {}
+                }
+            }
+            p.blob
+                .values_at(r, |v| {
+                    run.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    run.extend_from_slice(v);
+                })
+                .map_err(read)?;
+            self.splice_run(at, b, table, key, (c, same), run)?;
         }
         Ok(())
     }
@@ -18957,7 +19138,7 @@ struct BuildCtx<'s> {
     /// structure over the block and never merge it with a source.
     dense_from: usize,
     /// The handle's stale set, held for the build: see `Snapshot::vals`.
-    stale: std::cell::Ref<'s, std::collections::HashSet<u32>>,
+    stale: std::cell::Ref<'s, SlotSet>,
     /// PROTOTYPE: whether a block the unsealed run covers is copied now
     /// or walked. A read's first touch walks it: every partition record
     /// under a run that covers the block is masked by its update's
@@ -19295,7 +19476,7 @@ impl<'s> BuildCtx<'s> {
         pieces: &[PieceRun<'_>],
         snap: &'a Snapshot,
     ) -> Result<Overlay<'a>> {
-        let stale: &'a std::collections::HashSet<u32> = &self.stale;
+        let stale: &'a SlotSet = &self.stale;
         let mut held: Vec<(&[u8], usize, usize, u32)> = Vec::new();
         // Each key's leading sixteen bytes as two words, and where each
         // piece's run starts and ends in `held`.
@@ -19943,12 +20124,17 @@ impl<'s> BuildCtx<'s> {
         if over.is_empty() {
             return Ok(None);
         }
-        Ok(Some(Overlay {
+        let ov = Overlay {
             over,
             held: Vec::new(),
             snap: unsealed,
             stale: &self.stale,
-        }))
+        };
+        // The chains the walk will read, fetched ahead as a build's are:
+        // after a burst every overlaid key is written since the runs were
+        // copied and read from its chain, two dependent misses a key.
+        self.prefetch_overlay(&ov);
+        Ok(Some(ov))
     }
     /// A key the form and the memtables both hold, emitted: the form's run
     /// -- the partition's values and the pieces', oldest first -- unless a

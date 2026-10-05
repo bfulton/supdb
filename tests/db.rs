@@ -4675,10 +4675,13 @@ fn reader_threads_over_blocks_with(commit_forms: bool, upkeep: supdb::Upkeep, pi
     r.scan(&key(0), 500, |_k, v| sink += v.len()).unwrap();
     let (forms, _, takes, complete) = db.canonical_forms();
     // Under `forms_pieces_only` the forms hold the pieces' fold alone, so
-    // a store whose pieces a merge has folded away has no form to hold
-    // and a complete table of empty slots, every block clean; the keys
-    // just put reach the reader through the snapshot.
-    if pieces_only && forms == 0 {
+    // the keys just put make none and the reader reaches them through
+    // the snapshot: a store whose pieces a merge has folded away has a
+    // complete table of empty slots, every block clean, and one with
+    // pieces standing has forms only where their keys fall, which the
+    // scan below may not cross. What holds is that the quiet writer
+    // left its table whole.
+    if pieces_only {
         assert!(
             complete,
             "a quiet writer under pieces-only forms left its table incomplete"
