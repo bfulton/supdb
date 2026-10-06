@@ -8,6 +8,18 @@ use std::time::Instant;
 use supdb_bench::engines::{self, Batch};
 use supdb_bench::workload::{db_key_into, KeyDist, KeyGen, Payload, Permutation, Rng};
 
+/// This thread's CPU time, for the pass's wall time against it: a pass
+/// slower than its CPU was descheduled, one as slow as its CPU stalled.
+fn thread_cpu_ms() -> f64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a clock read into a timespec on the stack.
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    ts.tv_sec as f64 * 1e3 + ts.tv_nsec as f64 / 1e6
+}
+
 fn get(c: &[(&'static str, f64)], n: &str) -> f64 {
     c.iter().find(|(m, _)| *m == n).map_or(0.0, |x| x.1)
 }
@@ -69,7 +81,15 @@ fn main() {
                 e.sync().unwrap();
             }
             let burst = tw.elapsed().as_secs_f64() * 1e3;
+            // LAG_SETTLE=1: the burst's background work joined before the
+            // pass -- not the suite's shape, a decomposition of the pass
+            // into its own cost and what runs beside it.
+            if std::env::var_os("LAG_SETTLE").is_some() {
+                e.sync().unwrap();
+            }
+            let cpu0 = thread_cpu_ms();
             let mut g3 = KeyGen::new(KeyDist::Uniform, scan_keys, 0x1A7);
+            supdb_bench::run::lag_mark(&arm, pct, "start");
             let t = Instant::now();
             let mut first = 0.0f64;
             for i in 0..scans {
@@ -80,6 +100,8 @@ fn main() {
                 }
             }
             let pass = t.elapsed().as_secs_f64() * 1e3;
+            let pass_cpu = thread_cpu_ms() - cpu0;
+            supdb_bench::run::lag_mark(&arm, pct, "end");
             let c1 = e.counters();
             let up = get(&c1, "upkeep_ms") - get(&c0, "upkeep_ms");
             let cpu = (get(&c1, "upkeep_cpu_us") - get(&c0, "upkeep_cpu_us")) / 1e3;
@@ -144,7 +166,7 @@ fn main() {
                 0.0
             };
             line.push_str(&format!(
-                "\n  lag{pct} {burst:.1}+{pass:.1}ms up {up:.1}ms/{passes:.0}p cpu {cpu:.1}ms mb {barriers:.0} c_t {ct:.2} c_w {cw:.2} built {built:.0} skipped {skipped:.0} blockpath {blockpath:.0}/{scans_n:.0} seals {seals:.0} pubs {pubs:.0} snaps {snaps:.0} refr {refr:.0} swit {swit:.0} ext {ext:.0} | {layout} | {upkeep_built} | {phases}"
+                "\n  lag{pct} {burst:.1}+{pass:.1}ms (cpu {pass_cpu:.1}) up {up:.1}ms/{passes:.0}p cpu {cpu:.1}ms mb {barriers:.0} c_t {ct:.2} c_w {cw:.2} built {built:.0} skipped {skipped:.0} blockpath {blockpath:.0}/{scans_n:.0} seals {seals:.0} pubs {pubs:.0} snaps {snaps:.0} refr {refr:.0} swit {swit:.0} ext {ext:.0} | {layout} | {upkeep_built} | {phases}"
             ));
             c0 = c1;
         }

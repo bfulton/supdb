@@ -467,6 +467,11 @@ pub struct Supdb {
     /// off), the shape before. `supdb-noyield`, and `supdb-ingestnoyield`
     /// buffered.
     noyield: bool,
+    /// The fill yielding its conversions at any posted commit
+    /// (`Options::forms_convert_behind` zero), the shape before it
+    /// converted in the thread's slack. `supdb-postedyield`, and
+    /// `supdb-ingestpostedyield` buffered.
+    postedyield: bool,
     /// The background work as the cost model in `docs/engine.md` orders
     /// it: no dense form rebuilt while nothing reads
     /// (`Options::forms_convert_unread` off). `supdb-bg`, and
@@ -631,6 +636,9 @@ struct Policy {
     /// The upkeep thread's fill never yielding its conversions:
     /// `supdb-noyield`, and `supdb-ingestnoyield` buffered.
     noyield: bool,
+    /// The fill yielding at any posted commit: `supdb-postedyield`, and
+    /// `supdb-ingestpostedyield` buffered.
+    postedyield: bool,
     /// The background work as the cost model orders it: `supdb-bg`, and
     /// `supdb-ingestbg` buffered.
     bg: bool,
@@ -685,6 +693,7 @@ impl Default for Policy {
             convertcap: false,
             shortpass: false,
             noyield: false,
+            postedyield: false,
             bg: false,
             bglag: false,
             defer: false,
@@ -990,6 +999,33 @@ impl Supdb {
             path,
             Policy {
                 noyield: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose fill yields its conversions at any posted commit
+    /// (`Options::forms_convert_behind` zero): against `supdb` it prices
+    /// converting in the thread's slack through a burst.
+    pub fn create_postedyield(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                postedyield: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose fill yields at any posted commit, as
+    /// `supdb-postedyield`.
+    pub fn create_ingest_postedyield(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                postedyield: true,
                 ..Policy::default()
             },
         )
@@ -1840,6 +1876,7 @@ impl Supdb {
             convertcap,
             shortpass,
             noyield,
+            postedyield,
             bg,
             bglag,
         } = policy;
@@ -1939,6 +1976,11 @@ impl Supdb {
             },
             ahead_converts: convertcap,
             forms_convert_yield: !noyield,
+            forms_convert_behind: if postedyield {
+                0
+            } else {
+                supdb::Options::default().forms_convert_behind
+            },
             // The bounded pass, at the share the square-root rule of the
             // cost model gives at these rungs.
             upkeep_pass_pct: if shortpass {
@@ -2081,6 +2123,7 @@ impl Supdb {
             convertcap,
             shortpass,
             noyield,
+            postedyield,
             bg,
             bglag,
         })
@@ -2195,6 +2238,13 @@ impl Engine for Supdb {
                 "supdb-noyield"
             } else {
                 "supdb-ingestnoyield"
+            };
+        }
+        if self.postedyield {
+            return if self.partition {
+                "supdb-postedyield"
+            } else {
+                "supdb-ingestpostedyield"
             };
         }
         if self.bg {
@@ -2971,7 +3021,9 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose" | "supdb-rotate"
         | "supdb-nofrozen" | "supdb-idle" | "supdb-sortover" | "supdb-pmd" | "supdb-hold"
         | "supdb-settlefreeze" | "supdb-convertcap" | "supdb-shortpass" | "supdb-noyield"
-        | "supdb-bg" | "supdb-bglag" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
+        | "supdb-postedyield" | "supdb-bg" | "supdb-bglag" | "lmdb" | "rocksdb-tuned" => {
+            Guarantee::Durable
+        }
         "supdb-ingest"
         | "supdb-ingestleave"
         | "supdb-ingestnoseal"
@@ -2992,6 +3044,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestconvertcap"
         | "supdb-ingestshortpass"
         | "supdb-ingestnoyield"
+        | "supdb-ingestpostedyield"
         | "supdb-ingestpiecesonly"
         | "supdb-ingestlatewb"
         | "supdb-ingestbg"
@@ -3071,6 +3124,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-convertcap" => Box::new(Supdb::create_convertcap(dir)?),
         "supdb-shortpass" => Box::new(Supdb::create_shortpass(dir)?),
         "supdb-noyield" => Box::new(Supdb::create_noyield(dir)?),
+        "supdb-postedyield" => Box::new(Supdb::create_postedyield(dir)?),
         "supdb-bg" => Box::new(Supdb::create_bg(dir)?),
         "supdb-ingestbg" => Box::new(Supdb::create_ingest_bg(dir)?),
         "supdb-bglag" => Box::new(Supdb::create_bglag(dir)?),
@@ -3079,6 +3133,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestconvertcap" => Box::new(Supdb::create_ingest_convertcap(dir)?),
         "supdb-ingestshortpass" => Box::new(Supdb::create_ingest_shortpass(dir)?),
         "supdb-ingestnoyield" => Box::new(Supdb::create_ingest_noyield(dir)?),
+        "supdb-ingestpostedyield" => Box::new(Supdb::create_ingest_postedyield(dir)?),
         "supdb-idle" => Box::new(Supdb::create_idle(dir)?),
         "supdb-shapeidle" => Box::new(Supdb::create_shape_idle(dir)?),
         "supdb-ingestadaptloose" => Box::new(Supdb::create_ingest_adaptloose(dir)?),

@@ -119,6 +119,24 @@ fn ycsb_ops(size: u64) -> u64 {
 /// rather than counts so a quantity means the same thing at every rung.
 const LAG_PCT: [u64; 4] = [0, 1, 10, 100];
 
+/// With `SUPDB_LAG_MARK` set, the monotonic clock at a lag pass's edges on
+/// stderr, so a profile of the whole process can be cut to the pass:
+/// `perf record -k CLOCK_MONOTONIC`, then the times `perf script` prints
+/// against these. The pass itself is timed by `Instant` as before; this
+/// adds two clock reads outside it.
+pub fn lag_mark(arm: &str, pct: u64, edge: &str) {
+    if std::env::var_os("SUPDB_LAG_MARK").is_none() {
+        return;
+    }
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a clock read into a timespec on the stack.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    eprintln!("lagmark {arm} {pct} {edge} {}.{:09}", ts.tv_sec, ts.tv_nsec);
+}
+
 /// What a millisecond of a lag point's scans weighs against one of its
 /// burst in `bench ab`'s decision quantity for the sweep: the store is
 /// read-optimized, and its owner weights read time twice. It is printed
@@ -714,12 +732,14 @@ fn one_pass(
             e.sync()?;
         }
         let mut g3 = KeyGen::new(KeyDist::Uniform, scan_keys, 0x1A7);
+        lag_mark(arm, pct, "start");
         let t = Instant::now();
         for _ in 0..scans {
             db_key_into(g3.next(), &mut kb);
             e.range(&kb, plan.scan_len)?;
         }
         let secs = t.elapsed().as_secs_f64();
+        lag_mark(arm, pct, "end");
         scan_lag.push((pct, (scans * plan.scan_len as u64) as f64 / secs));
     }
     for (name, v) in e.counters() {

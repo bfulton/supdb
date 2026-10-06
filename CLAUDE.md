@@ -130,6 +130,18 @@ back counts a megabyte again while the device writes a page. Read the
 device's own counter in `/sys/block/vda/stat` beside it before calling
 such a move a cost.
 
+A pass that runs beside the engine's other threads is not profiled by
+sampling the process: four cores shared with a seal, a merge, the
+helper and the upkeep put most of a pass window's samples in those
+threads, and perf's own cost on every one of them read the durable
+arm's rewritten pass at 62-110 ms where it runs in 11-25. Stamp the
+window (`SUPDB_LAG_MARK`, `perf record -k CLOCK_MONOTONIC`), cut the
+samples to it by thread, and give the probe the scanning thread's CPU
+clock beside its wall clock: a pass slower than its CPU was descheduled
+or waiting, one as slow as its CPU stalled, and the nine reps that read
+13-66 ms split into three shapes on that one column before anything
+was changed (`docs/engine.md`, the pass after the rewritten burst).
+
 Profile a probe that does one thing. The scan probe's own `format!` per
 iteration was 8% of its samples until the keys were built before the
 loop.
@@ -1130,8 +1142,13 @@ lands a seal that has. When seals got faster the bets lost, a different
 test each gate run, and the first of them had been losing one run in
 three under load before anything changed. They hold the seal now
 (`hold_seal_landing`, and `hold_seal_durable` where only the oldest may
-land). The rule: a test that needs a state holds it, and a bet on timing
-loses the first time the thing it bets against gets faster.
+land). It came back as a count: the segment writer's helper thread syncs
+once an `ahead` of the file is unsynced and begins no sync once the
+finish asks it to stop, and its test asserted a sync after writing a
+quarter megabyte, which a host twice as fast wrote before the thread's
+first turn; the test waits for that turn now. The rule: a test that
+needs a state holds it, and a bet on timing loses the first time the
+thing it bets against gets faster.
 
 **A mark taken whole and then read in part.** A commit publishes the
 log's length, the entry count and the watermark as one mark, and a

@@ -1125,6 +1125,19 @@ pub struct Options {
     /// behind would take both; `supdb-noyield` and `supdb-ingestnoyield`
     /// keep the fill that does not yield (`docs/engine.md`).
     pub forms_convert_yield: bool,
+    /// How far behind the writer, in committed writes it has not read,
+    /// the upkeep thread must be before a posted commit makes its fill
+    /// yield its conversions; the writer's own wait yields always. Zero
+    /// yields at any posted commit, the shape before. The yield at any
+    /// posted commit deferred every dense block of a burst to one
+    /// rebuild after the landing, on the durable arm at three hundred
+    /// thousand keys 4,700 blocks built fresh in one pass of 23-56 ms,
+    /// which the first scan after the burst waited out whenever the
+    /// landing fell at the burst's end -- while the thread had been on a
+    /// core for half the burst. A batch, the default, converts in that
+    /// slack and yields where the thread runs behind; `supdb-postedyield`
+    /// and `supdb-ingestpostedyield` keep the yield at any posted commit.
+    pub forms_convert_behind: usize,
     /// EXPERIMENT: the writes since the last scan over the store, as a
     /// share of the partitions' keys, within which the backlog bound
     /// above settles at all; zero, the default, settles by the bound
@@ -1342,6 +1355,7 @@ impl Default for Options {
             forms_convert_cap: 0,
             ahead_converts: false,
             forms_convert_yield: true,
+            forms_convert_behind: 1000,
             forms_settle_recent_pct: 0,
             forms_carry: true,
             freeze_settles: false,
@@ -12420,11 +12434,14 @@ impl Reader {
                     );
                 if dense {
                     let cap = self.opts.forms_convert_cap;
+                    // The writer's wait yields always; a posted commit
+                    // only once the thread is behind it by more than the
+                    // allowance (`Options::forms_convert_behind`).
+                    let state = self.shared.upkeep.state.load(AtomicOrdering::Acquire);
                     let yielding = self.opts.forms_convert_yield
                         && self.understudy
-                        && self.shared.upkeep.state.load(AtomicOrdering::Acquire)
-                            & (LEND_POSTED | LEND_WANT)
-                            != 0;
+                        && (state & LEND_WANT != 0
+                            || (state & LEND_POSTED != 0 && self.convert_behind()));
                     if (cap > 0 && converted >= cap) || yielding {
                         continue;
                     }
@@ -12449,6 +12466,14 @@ impl Reader {
             }
         }
         Ok(())
+    }
+
+    /// Whether the upkeep thread is behind the writer by more than the
+    /// conversions' allowance: the writes committed past the position
+    /// this handle has read the log to (`Options::forms_convert_behind`).
+    fn convert_behind(&self) -> bool {
+        let allow = self.opts.forms_convert_behind;
+        allow == 0 || self.log_end().saturating_sub(self.fs().log_seen.get()) > allow
     }
 
     fn list_built(&self, p: usize, b: usize, table: &mut BlockTable) {
@@ -23092,6 +23117,21 @@ mod streaming_writes {
             w.begin(key.as_bytes()).unwrap();
             w.value(format!("value-{i:0100}").as_bytes());
             w.end_with(false).unwrap();
+            // The thread syncs once an `ahead` is unsynced on the file and
+            // begins no sync once the finish asks it to stop, and a writer
+            // this fast finishes before the thread's first turn: on one
+            // host the test read no sync at all. Held here, with several
+            // `ahead`s on the file, until the thread has had its turn.
+            if i == 600 {
+                let t = std::time::Instant::now();
+                while flushes.load(AtomicOrdering::Relaxed) == 0 {
+                    assert!(
+                        t.elapsed() < std::time::Duration::from_secs(10),
+                        "the helper never synced the pieces on the file"
+                    );
+                    std::thread::yield_now();
+                }
+            }
         }
         w.finish(1).unwrap();
         assert!(

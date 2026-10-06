@@ -3013,6 +3013,85 @@ the rest; or two filing threads over disjoint halves would halve the
 lag at a core's price. Either is a redesign of the upkeep's ownership
 and is its own move.
 
+#### The pass after the rewritten burst: a rebuild deferred to the first reader, and the thread's slack
+
+The durable arm's scan pass after the fully rewritten burst at three
+hundred thousand keys read 0.66x of LMDB's in one sitting (25 ms against
+17) and 0.95x in another, and the move that was to take it had been
+contracted on the copy walk's rate -- copies at 19 million entries a
+second where the partition's records walk at 48. The profile that was
+its first step said otherwise. The pass's window, cut from a profile of
+the suite's own process by the monotonic clock (`SUPDB_LAG_MARK`), was
+mostly other threads: the burst's last seal writing its segment, a
+partition merge, the landing taking its ranks, and the upkeep thread
+building copies; and the profile distorted the pass itself five-fold,
+since every one of those threads is sampled on four cores. So the probe
+was given the scanning thread's CPU clock beside its wall clock, and read
+the pass nine times in the suite's shape.
+
+Three shapes. Four reps at 13-17 ms with the CPU equal to the wall, the
+first scan 3-5 ms of settle and every block walked as a copy -- the
+pass's own cost, and 4-5 ms of it over a clean pass's 8.5-10 is the copy
+walk. Four reps at 36-66 ms with 11-24 of CPU: the first scan was 25-56
+ms of it, all of that `scan_take_us`, the writer waiting for the upkeep
+thread's pass in flight. Two reps at 21-37 ms, CPU-bound, the scans
+walking sparse forms where the others walked copies. The counts named the
+pass the first scan waited for: about 4,700 blocks built fresh by the
+thread in the rewritten point (`fill_fresh`), 5-12 µs each, in one pass.
+The partition merge the burst triggers lands near the burst's end; its
+landing's rebase drops every sparse form over the rewritten partition,
+whose cuts are ranks into records the merge replaced, and the fill after
+it builds a copy for every overlaid empty slot -- a build the yield does
+not cover, since the yield was written for conversions. Where the merge
+landed early enough the thread finished before the first scan; where it
+landed at the burst's end the first scan waited the whole pass out; where
+it landed later still the scans walked what stood. The thread had been
+on a core for about half the burst.
+
+The conversions that would have made those blocks copies during the
+burst never ran, because the fill yields them at any posted commit, and
+through a burst a commit is always posted; the entry on the dense-burst
+regime had written that a yield only while the thread is behind would
+take both the gain and the cost, and the thread then had no slack. It
+has slack on the durable arm now. `Options::forms_convert_behind` is the
+allowance: a posted commit yields the fill's conversions only once the
+thread is behind by more than that many committed writes it has not
+read, a batch by default; the writer's own wait yields as before.
+`supdb-postedyield` and `supdb-ingestpostedyield` keep the yield at any
+posted commit.
+
+Alternated as two probe binaries, three rounds of two reps on the durable
+arm at three hundred thousand keys, the rewritten point's pass read
+13-17.5 ms in every rep against 12-117 before, its first scan 1.8-5.1 ms
+with a wait of 0.1-3.6 against waits of up to 83, and the thread
+converted 4,687 blocks through the burst and built 4-11 fresh after it
+where it had converted 40-1,006 and built 3,700-4,650; the burst did not
+move, and the thread's time over the point was level over fewer, longer
+passes. The suite's own pair, six pairs at three hundred thousand keys:
+the rewritten point 1.19x faster than the old yield on the durable arm
+and 1.42x on the buffered, the buffered point's burst plus twice its
+pass 0.97x, and against LMDB the point read 1.19x where the morning's
+sitting had read 0.66x. On the replaced host, six pairs: the durable
+arm's rewritten point 1.23x of LMDB at three hundred thousand keys and
+0.86x at a hundred thousand (3/6), its clean scan 1.10x; the buffered
+arm's rewritten point 0.47x and 0.55x of `lmdb-nosync` there and its
+tenth 0.65x and 0.60x, the cell the parked move on the settle beside the
+scans owns, and on this host the largest loss on the board again. Twelve pairs, on a
+faster host after the machine was replaced under the session: on the
+buffered arm at three hundred thousand keys the point's burst plus twice
+its pass 1.09x better than the old yield (9/12) and the scan mix
+(ycsb-E) 1.10x (11/12, under Holm), the update mixes level; at a hundred
+thousand keys the buffered sums 1.05-1.08x better (9/12) with one cost,
+the read-mostly mix (ycsb-B) 2% slower (11/12, under Holm), the thread's
+conversions running beside reads that never scan; on the durable arm at
+a hundred thousand the sums 1.15x better (9/12) and everything else
+level.
+
+What remains of the cell is the copy walk's 4-5 ms over a clean pass,
+and the single-thread scan on the ordered store, 0.68-0.88x of LMDB's
+cursor at three hundred thousand keys, which is the clean record walk
+and not the forms.
+
 #### The pin's fence, priced against a sweep that fences for it
 
 A read pins the epoch it reads in by storing it in its slot of the
