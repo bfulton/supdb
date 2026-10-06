@@ -1770,6 +1770,7 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
 /// is. Here it guards only the bounded L0 tail, because every keys-sized
 /// global router tried lost to routing by range -- the partitioned levels
 /// below are routed by fences that cost two comparisons.
+#[derive(Clone)]
 pub(crate) struct BlockedBloom {
     blocks: Vec<[u64; 8]>,
 }
@@ -1781,17 +1782,47 @@ impl BlockedBloom {
         }
     }
 
-    fn hash(key: &[u8]) -> u64 {
-        let mut h = 0xcbf29ce484222325u64;
-        for &b in key {
-            h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
-        }
-        h = (h ^ (h >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    /// The hash's first half: the word `flatindex::key_hash` computes
+    /// for the index's slots, so a writer that has those words has this
+    /// half for every key. It was an FNV-1a of its own here, a multiplier
+    /// apart from the index's -- the filter is built at open and never
+    /// stored, so its hash is free to be the index's; the test beside the
+    /// landing holds the two halves to the whole.
+    fn fnv(key: &[u8]) -> u64 {
+        crate::flatindex::key_hash(key)
+    }
+
+    /// The hash's second half: the finalizer that spreads an FNV word.
+    fn finalize(h: u64) -> u64 {
+        let h = (h ^ (h >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
         h ^ (h >> 31)
     }
 
+    fn hash(key: &[u8]) -> u64 {
+        BlockedBloom::finalize(BlockedBloom::fnv(key))
+    }
+
+    /// The filter a walk of a segment's keys would build, from the keys'
+    /// FNV words the segment writer kept for the index (`key_hash`): what
+    /// the landing takes instead of walking the records it just wrote,
+    /// which was three quarters of the segment work's time over an
+    /// ordered load.
+    fn from_fnv(hashes: &[u64]) -> BlockedBloom {
+        let mut b = BlockedBloom::with_capacity(hashes.len());
+        for &h in hashes {
+            let (bi, probes) = b.slots_of(BlockedBloom::finalize(h));
+            for (w, m) in probes {
+                b.blocks[bi][w] |= m;
+            }
+        }
+        b
+    }
+
     fn slots(&self, key: &[u8]) -> (usize, [(usize, u64); 4]) {
-        let h = BlockedBloom::hash(key);
+        self.slots_of(BlockedBloom::hash(key))
+    }
+
+    fn slots_of(&self, h: u64) -> (usize, [(usize, u64); 4]) {
         let bi = (h >> 32) as usize % self.blocks.len();
         let mut probes = [(0usize, 0u64); 4];
         let mut x = h;
@@ -1939,16 +1970,57 @@ struct AlignedWriter {
     written: u64,
     /// The piece, and the boundary every write but a flush's ends on.
     piece: u64,
+    /// Start the device on each piece as it lands
+    /// (`SegmentOptions::early_writeback`).
+    writeback: bool,
+    /// `SegmentOptions::sync_ahead`; the thread once the file is that
+    /// long; how far the writer's own syncs reach, which the thread syncs
+    /// nothing below; and where the key section starts, for the thread's
+    /// hashing, once the layout has said.
+    ahead: u64,
+    helper: Option<WriterHelper>,
+    helper_done: bool,
+    synced: u64,
+    section: Option<u64>,
+    /// The file's head, written as its own small write ahead of the first
+    /// piece so the superblock, the reserve and the section header -- the
+    /// bytes the finish patches in place -- live in small folios: a patch
+    /// re-dirties its whole folio, and a 1 MB piece makes a 1 MB folio,
+    /// which `/proc/self/io` counts again in full though the device sees
+    /// a page (`SegmentOptions::sync_ahead`). Zero for no split.
+    prefix: u64,
+    /// The thread's fdatasyncs and the pieces it hashed so far, for the
+    /// tests.
+    flushes: std::sync::Arc<AtomicU64>,
+    hashed: std::sync::Arc<AtomicU64>,
+}
+
+/// The pieces of the key section the helper hashed: `crcs[i]` is the CRC
+/// of the file's bytes `[from + i * P, from + (i + 1) * P)`, `P` the
+/// checksum piece, and `to` is where the hashed run ends.
+struct HelperRow {
+    from: u64,
+    to: u64,
+    crcs: Vec<u32>,
 }
 
 impl AlignedWriter {
-    fn new(file: File, piece: usize) -> AlignedWriter {
+    fn new(file: File, piece: usize, writeback: bool, ahead: u64) -> AlignedWriter {
         let piece = piece.max(4096);
         AlignedWriter {
             file,
             buf: Vec::with_capacity(piece),
             written: 0,
             piece: piece as u64,
+            writeback,
+            ahead,
+            helper: None,
+            helper_done: false,
+            synced: 0,
+            section: None,
+            prefix: 0,
+            flushes: std::sync::Arc::new(AtomicU64::new(0)),
+            hashed: std::sync::Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1956,9 +2028,101 @@ impl AlignedWriter {
         &self.file
     }
 
+    /// The file, every buffered byte written and the helper joined; what
+    /// it synced is synced, and the caller's fsync covers the rest.
     fn into_inner(mut self) -> std::io::Result<File> {
         std::io::Write::flush(&mut self)?;
+        self.join_helper()?;
         Ok(self.file)
+    }
+
+    /// The helper joined, with the section pieces it hashed; none is
+    /// started after. Idempotent.
+    fn join_helper(&mut self) -> std::io::Result<Option<HelperRow>> {
+        self.helper_done = true;
+        match self.helper.take() {
+            Some(h) => h.finish(),
+            None => Ok(None),
+        }
+    }
+
+    /// `prefix` bytes of the file's head written on their own ahead of the
+    /// first piece. Before the first piece lands.
+    fn set_prefix(&mut self, prefix: u64) {
+        self.prefix = prefix;
+    }
+
+    /// `dst.len()` bytes of the output from `off`: from the file where
+    /// they have landed, from the buffer where they have not.
+    fn read_section(&self, off: u64, dst: &mut [u8]) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let on_file = (self.written.saturating_sub(off) as usize).min(dst.len());
+        if on_file > 0 {
+            self.file.read_exact_at(&mut dst[..on_file], off)?;
+        }
+        if on_file < dst.len() {
+            let start = (off + on_file as u64 - self.written) as usize;
+            let n = dst.len() - on_file;
+            let held = self.buf.get(start..start + n).ok_or_else(|| {
+                std::io::Error::other("segment writer: a read past what was written")
+            })?;
+            dst[on_file..].copy_from_slice(held);
+        }
+        Ok(())
+    }
+
+    /// A piece landed on the file: the helper, started the first time the
+    /// file is an `ahead` long, is told how far the file goes.
+    fn landed(&mut self) -> std::io::Result<()> {
+        if self.helper.is_none() {
+            if self.helper_done || self.written < self.ahead {
+                return Ok(());
+            }
+            self.helper = Some(WriterHelper::spawn(
+                &self.file,
+                self.ahead,
+                self.synced,
+                self.section,
+                self.flushes.clone(),
+                self.hashed.clone(),
+            )?);
+        }
+        let h = self.helper.as_ref().expect("spawned above");
+        h.shared.landed.store(self.written, AtomicOrdering::Release);
+        h.unpark();
+        Ok(())
+    }
+
+    /// The writer synced the file itself, to its end: nothing on it is the
+    /// thread's to sync.
+    fn synced_all(&mut self) {
+        self.synced = self.written;
+        if let Some(h) = &self.helper {
+            h.shared
+                .synced
+                .fetch_max(self.written, AtomicOrdering::AcqRel);
+        }
+    }
+
+    /// The key section starts at `at`, the next byte written: the helper
+    /// hashes its checksum pieces from the first piece boundary after it.
+    /// Before any of the section is written.
+    fn start_section(&mut self, at: u64) {
+        self.section = Some(at);
+        if let Some(h) = &self.helper {
+            h.shared.set_section(at);
+        }
+    }
+
+    /// The key section ends at `end`, every byte of it on the file: the
+    /// helper hashes what it has not and exits. Before anything is written
+    /// past the section, since a piece the helper finds whole is one it
+    /// hashes.
+    fn end_section(&mut self, end: u64) {
+        if let Some(h) = &self.helper {
+            h.shared.section_end.store(end, AtomicOrdering::Release);
+            h.request_stop();
+        }
     }
 
     /// Bytes from the file's end to the next boundary: what the buffer
@@ -1968,10 +2132,250 @@ impl AlignedWriter {
     }
 
     fn write_buf(&mut self) -> std::io::Result<()> {
-        std::io::Write::write_all(&mut self.file, &self.buf)?;
+        let at = self.written;
+        let split = (self.prefix as usize).min(self.buf.len());
+        if at == 0 && split > 0 && split < self.buf.len() {
+            std::io::Write::write_all(&mut self.file, &self.buf[..split])?;
+            std::io::Write::write_all(&mut self.file, &self.buf[split..])?;
+        } else {
+            std::io::Write::write_all(&mut self.file, &self.buf)?;
+        }
         self.written += self.buf.len() as u64;
+        if self.writeback {
+            start_writeback(&self.file, at, self.buf.len() as u64);
+        }
         self.buf.clear();
+        if self.ahead > 0 {
+            self.landed()?;
+        }
         Ok(())
+    }
+}
+
+/// Ask the kernel to start writing `len` bytes of `file` from `at` to the
+/// device, waiting for nothing: `sync_file_range` with the write flag on
+/// Linux, where it is a hint the later fsync is shorter for; nothing on
+/// another platform, and nothing on an error, since the fsync that follows
+/// writes whatever this did not.
+fn start_writeback(file: &File, at: u64, len: u64) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: a hint over a range of an open file; the call reads and
+        // writes no memory of ours.
+        let _ = unsafe {
+            libc::sync_file_range(
+                file.as_raw_fd(),
+                at as libc::off64_t,
+                len as libc::off64_t,
+                libc::SYNC_FILE_RANGE_WRITE,
+            )
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (file, at, len);
+}
+
+/// The thread behind a segment's writer (`SegmentOptions::sync_ahead`):
+/// it syncs the file whenever `ahead` bytes are on it past what is synced,
+/// an fdatasync on a dup of the writer's descriptor, so the fsync that
+/// closes the segment finds the device holding all but the last pieces;
+/// and it hashes the key section's checksum pieces as they land, read
+/// back from the page cache, so the finish takes its row from the thread
+/// and reads nothing.
+///
+/// The writeback hint (`start_writeback`) moves a piece from this guest's
+/// page cache to the device's, and the fsync that closed a 40 MB segment
+/// still paid 24 ms after every piece's writeback had finished: the device
+/// flushing its own cache to what is behind it, which nothing but an fsync
+/// asks for. A probe writing 40 MB at the load's pace, a flush every 8 MB
+/// on a thread, saw the closing fsync fall from 25 ms to 0.2 and the
+/// writer's longest write stay at half a millisecond; the flushes, 31 ms
+/// in all, ran beside the writer. The row's re-read of the section was
+/// then the close's largest piece, 11.5 ms of a 29 ms flush at three
+/// hundred thousand keys, and it moved here for the same reason.
+///
+/// The thread parks between pieces and is woken by each; told to stop, it
+/// hashes to the section's end and exits. An fdatasync that fails is kept
+/// for `finish`, since a dup shares the descriptor's error with the
+/// writer's own fsync, which would then report nothing; a read that fails
+/// ends the hashing where it is, and the finish reads the rest itself.
+struct WriterHelper {
+    shared: std::sync::Arc<HelperShared>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+struct HelperShared {
+    /// Bytes on the file.
+    landed: AtomicU64,
+    /// Bytes synced, by this thread or by the writer itself.
+    synced: AtomicU64,
+    stop: std::sync::atomic::AtomicBool,
+    /// The first fdatasync error's code, zero for none.
+    error: std::sync::atomic::AtomicI32,
+    flushes: std::sync::Arc<AtomicU64>,
+    hashed: std::sync::Arc<AtomicU64>,
+    /// The key section's first whole piece boundary (`u64::MAX`: no
+    /// section yet), where the hashing has reached, and the section's end
+    /// (`u64::MAX` until the finish names it); the pieces' CRCs in order.
+    hash_from: AtomicU64,
+    hashed_to: AtomicU64,
+    section_end: AtomicU64,
+    row: std::sync::Mutex<Vec<u32>>,
+}
+
+impl HelperShared {
+    fn set_section(&self, at: u64) {
+        let piece = 1u64 << flatindex::PIECE_SHIFT;
+        let from = at.div_ceil(piece) * piece;
+        self.hashed_to.store(from, AtomicOrdering::Release);
+        self.hash_from.store(from, AtomicOrdering::Release);
+    }
+}
+
+impl WriterHelper {
+    fn spawn(
+        file: &File,
+        ahead: u64,
+        synced: u64,
+        section: Option<u64>,
+        flushes: std::sync::Arc<AtomicU64>,
+        hashed: std::sync::Arc<AtomicU64>,
+    ) -> std::io::Result<WriterHelper> {
+        let dup = file.try_clone()?;
+        let shared = std::sync::Arc::new(HelperShared {
+            landed: AtomicU64::new(synced),
+            synced: AtomicU64::new(synced),
+            stop: std::sync::atomic::AtomicBool::new(false),
+            error: std::sync::atomic::AtomicI32::new(0),
+            flushes,
+            hashed,
+            hash_from: AtomicU64::new(u64::MAX),
+            hashed_to: AtomicU64::new(u64::MAX),
+            section_end: AtomicU64::new(u64::MAX),
+            row: std::sync::Mutex::new(Vec::new()),
+        });
+        if let Some(at) = section {
+            shared.set_section(at);
+        }
+        let s = shared.clone();
+        let thread = std::thread::Builder::new()
+            .name("supdb-helper".into())
+            .spawn(move || WriterHelper::run(&s, &dup, ahead))?;
+        Ok(WriterHelper {
+            shared,
+            thread: Some(thread),
+        })
+    }
+
+    fn run(s: &HelperShared, dup: &File, ahead: u64) {
+        use std::os::unix::fs::FileExt;
+        let piece = 1u64 << flatindex::PIECE_SHIFT;
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let landed = s.landed.load(AtomicOrdering::Acquire);
+            let synced = s.synced.load(AtomicOrdering::Acquire);
+            // The section's pieces whole on the file, hashed in order.
+            let from = s.hash_from.load(AtomicOrdering::Acquire);
+            if from != u64::MAX {
+                let end = landed.min(s.section_end.load(AtomicOrdering::Acquire));
+                let at = s.hashed_to.load(AtomicOrdering::Acquire);
+                let to = at + end.saturating_sub(at) / piece * piece;
+                let mut off = at;
+                while off < to {
+                    let n = ((to - off) as usize).min(buf.len());
+                    if dup.read_exact_at(&mut buf[..n], off).is_err() {
+                        break;
+                    }
+                    let mut row = s.row.lock().unwrap_or_else(|e| e.into_inner());
+                    for p in buf[..n].chunks_exact(piece as usize) {
+                        row.push(block::crc32(p));
+                    }
+                    s.hashed
+                        .fetch_add(n as u64 / piece, AtomicOrdering::Relaxed);
+                    off += n as u64;
+                }
+                if off > at {
+                    s.hashed_to.store(off, AtomicOrdering::Release);
+                }
+            }
+            let stop = s.stop.load(AtomicOrdering::Acquire);
+            // No sync begins once a stop is asked: the fsync that closes
+            // the segment covers what is left, and the finish waits for the
+            // join.
+            if !stop && landed.saturating_sub(synced) >= ahead {
+                if let Err(e) = dup.sync_data() {
+                    let code = e.raw_os_error().unwrap_or(libc::EIO);
+                    let _ = s.error.compare_exchange(
+                        0,
+                        code,
+                        AtomicOrdering::AcqRel,
+                        AtomicOrdering::Acquire,
+                    );
+                }
+                s.synced.fetch_max(landed, AtomicOrdering::AcqRel);
+                s.flushes.fetch_add(1, AtomicOrdering::Relaxed);
+                continue;
+            }
+            if stop {
+                // A stop is asked after the section's last write; whatever
+                // landed since the loads above is hashed first.
+                if s.landed.load(AtomicOrdering::Acquire) != landed {
+                    continue;
+                }
+                break;
+            }
+            std::thread::park();
+        }
+    }
+
+    fn unpark(&self) {
+        if let Some(t) = &self.thread {
+            t.thread().unpark();
+        }
+    }
+
+    /// Ask the thread to hash what is left, start no sync, and exit;
+    /// nothing waits here.
+    fn request_stop(&self) {
+        self.shared.stop.store(true, AtomicOrdering::Release);
+        self.unpark();
+    }
+
+    fn stop(&mut self) {
+        if let Some(t) = self.thread.take() {
+            self.shared.stop.store(true, AtomicOrdering::Release);
+            t.thread().unpark();
+            let _ = t.join();
+        }
+    }
+
+    /// The thread joined: the error any of its syncs met, else the section
+    /// pieces it hashed, if it was given a section.
+    fn finish(mut self) -> std::io::Result<Option<HelperRow>> {
+        self.stop();
+        match self.shared.error.load(AtomicOrdering::Acquire) {
+            0 => {}
+            code => return Err(std::io::Error::from_raw_os_error(code)),
+        }
+        let from = self.shared.hash_from.load(AtomicOrdering::Acquire);
+        if from == u64::MAX {
+            return Ok(None);
+        }
+        let crcs = std::mem::take(&mut *self.shared.row.lock().unwrap_or_else(|e| e.into_inner()));
+        let to = self.shared.hashed_to.load(AtomicOrdering::Acquire);
+        debug_assert_eq!(
+            from + (crcs.len() as u64) * (1u64 << flatindex::PIECE_SHIFT),
+            to,
+            "a CRC per piece hashed"
+        );
+        Ok(Some(HelperRow { from, to, crcs }))
+    }
+}
+
+impl Drop for WriterHelper {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -2092,6 +2496,9 @@ pub struct SegmentWriter {
     rec_offs: Vec<u32>,
     hashes: Vec<u64>,
     rec_buf: Vec<u8>,
+    /// A marking segment's records since its last marker, written and
+    /// hashed as one at the marker (`mark`).
+    batch_buf: Vec<u8>,
     /// Records-first mode: block bytes held until the section is complete,
     /// with their table rows (offsets filled in when they are written).
     pending_blocks: Vec<Vec<u8>>,
@@ -2266,7 +2673,12 @@ impl SegmentWriter {
             .write(true)
             .truncate(true)
             .open(path)?;
-        let mut out = AlignedWriter::new(file, opts.write_piece);
+        let mut out = AlignedWriter::new(
+            file,
+            opts.write_piece,
+            opts.early_writeback,
+            opts.sync_ahead,
+        );
         // The header region stays zero until `finish`, so a segment that
         // was never finished is a file no reader accepts rather than a
         // segment with some of its keys.
@@ -2307,6 +2719,7 @@ impl SegmentWriter {
             rec_offs: Vec::new(),
             hashes: Vec::new(),
             rec_buf: Vec::new(),
+            batch_buf: Vec::new(),
             pending_blocks: Vec::new(),
         })
     }
@@ -2315,6 +2728,29 @@ impl SegmentWriter {
     /// instead of once at `finish`. Zero restores the single sync.
     pub fn set_sync_every(&mut self, bytes: usize) {
         self.sync_every = bytes as u64;
+    }
+
+    /// Room for `n` keys of `key_bytes` in all, so the per-key buffers
+    /// do not grow by doubling as the keys arrive: each doubling copied
+    /// what it held and faulted in what it took, and the batches that met
+    /// one -- at sixteen, thirty-two, sixty-five, a hundred and thirty-one
+    /// and two hundred and sixty-two thousand keys -- ran two to forty
+    /// times the median batch of an ordered load. Reserved, not touched:
+    /// an estimate past the count costs address space alone.
+    pub fn reserve_keys(&mut self, n: usize, key_bytes: usize) {
+        self.key_arena.reserve(key_bytes);
+        self.spans.reserve(n);
+        self.rec_offs.reserve(n);
+        self.hashes.reserve(n);
+    }
+
+    /// The Bloom a landing would build by walking this segment's keys,
+    /// from the hashes the records-first layout kept for the index; none
+    /// for a blocks-first segment or one with no keys, which the landing
+    /// walks as before.
+    pub(crate) fn landing_bloom(&self) -> Option<BlockedBloom> {
+        (self.mode == Some(Layout::RecordsFirst) && !self.hashes.is_empty())
+            .then(|| BlockedBloom::from_fnv(&self.hashes))
     }
 
     /// A commit marker after the records so far, in the records-first
@@ -2332,6 +2768,11 @@ impl SegmentWriter {
         if !self.marks {
             return Err(err("segment writer: mark on a writer not set to mark"));
         }
+        // The batch's records, hashed and written as one; the CRC of the
+        // concatenation is the CRC the records chained one by one gave.
+        self.mark_crc = block::crc32_resume(self.mark_crc, &self.batch_buf);
+        self.out.write_all(&self.batch_buf)?;
+        self.batch_buf.clear();
         let mut m = [0u8; DIRECT_MARK_LEN];
         m[4..8].copy_from_slice(&DIRECT_MARK);
         m[8..12].copy_from_slice(&self.mark_crc.to_le_bytes());
@@ -2347,8 +2788,22 @@ impl SegmentWriter {
 
     /// Everything written so far made durable: a direct segment's commit.
     pub fn sync(&mut self) -> Result<()> {
+        // Records held for a marker that has not come are written, not
+        // committed: without their marker the recovery walk stops before
+        // them, as it does for a batch nobody was told was durable.
+        if !self.batch_buf.is_empty() {
+            // Hashed into the marker that will cover them: the recovery
+            // walk's CRC spans every record since the last marker, these
+            // among them, so a sync that writes them ahead of their marker
+            // must not leave them out of its CRC.
+            self.mark_crc = block::crc32_resume(self.mark_crc, &self.batch_buf);
+            self.out.write_all(&self.batch_buf)?;
+            self.batch_buf.clear();
+        }
         self.out.flush()?;
-        self.out.get_ref().sync_data()
+        self.out.get_ref().sync_data()?;
+        self.out.synced_all();
+        Ok(())
     }
 
     /// The keys and values a direct segment's stream holds up to its last
@@ -2428,6 +2883,13 @@ impl SegmentWriter {
         self.marks = on;
     }
 
+    /// The helper thread's fdatasyncs and hashed pieces so far, for the
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn helper_counts(&self) -> (std::sync::Arc<AtomicU64>, std::sync::Arc<AtomicU64>) {
+        (self.out.flushes.clone(), self.out.hashed.clone())
+    }
+
     pub fn set_inline_max(&mut self, bytes: usize) {
         self.inline_max = bytes;
     }
@@ -2469,6 +2931,17 @@ impl SegmentWriter {
         } else {
             Layout::BlocksFirst
         };
+        // The head the finish patches -- superblock, reserve, and the
+        // section header in the records-first layout -- as a write of its
+        // own (`AlignedWriter::prefix`).
+        let patched = self.pos
+            + self.head_reserve as u64
+            + if m == Layout::RecordsFirst {
+                flatindex::HEADER as u64
+            } else {
+                0
+            };
+        self.out.set_prefix(patched.div_ceil(4096) * 4096);
         if self.head_reserve > 0 && self.reserve_off == 0 {
             self.reserve_off = self.pos;
             let mut left = self.head_reserve;
@@ -2484,6 +2957,7 @@ impl SegmentWriter {
             // The section header is written last, once the trailer's
             // offsets are known; its bytes are reserved now so the
             // records start where `stream_trailer` says they do.
+            self.out.start_section(self.pos);
             self.out.write_all(&[0u8; flatindex::HEADER])?;
             self.pos += flatindex::HEADER as u64;
         }
@@ -2609,9 +3083,14 @@ impl SegmentWriter {
                     self.compact_records,
                 )
                 .ok_or_else(|| err("segment writer: record exceeds the flat index's limits"))?;
-                self.out.write_all(&self.rec_buf)?;
                 if self.marks {
-                    self.mark_crc = block::crc32_resume(self.mark_crc, &self.rec_buf);
+                    // Held to the marker, where the batch is hashed and
+                    // written as one: a CRC call and a write a record, over
+                    // records of a hundred and thirty bytes, were a tenth
+                    // of the writer's time over an ordered load.
+                    self.batch_buf.extend_from_slice(&self.rec_buf);
+                } else {
+                    self.out.write_all(&self.rec_buf)?;
                 }
                 self.pos += wrote as u64;
                 self.rec_offs.push(self.recs_len as u32);
@@ -2702,6 +3181,7 @@ impl SegmentWriter {
             if self.since_sync >= self.sync_every {
                 self.out.flush()?;
                 self.out.get_ref().sync_data()?;
+                self.out.synced_all();
                 self.since_sync = 0;
             }
         }
@@ -2712,6 +3192,61 @@ impl SegmentWriter {
     /// index hands back `&[Ext]` borrowed from the mapping at its absolute
     /// address, and `store::write_section_raw` carries the story of the
     /// lookups that returned nothing when that was forgotten.
+    /// The checksum row of a records-first section `total` bytes long at
+    /// `key_off`, whose header is `header` as it will be written and whose
+    /// every other byte has gone through `out`: each piece from the helper
+    /// where it hashed one, else read back -- the header's pieces always,
+    /// since the file holds zeroes where the header goes, and the pieces
+    /// past where the helper reached, the last of them partial.
+    fn row_for(
+        out: &AlignedWriter,
+        header: &[u8],
+        key_off: u64,
+        total: usize,
+        helped: Option<HelperRow>,
+    ) -> Result<Vec<u8>> {
+        let piece = 1usize << flatindex::PIECE_SHIFT;
+        let mut buf = vec![0u8; piece];
+        let mut row = Vec::with_capacity(flatindex::checksum_row_len(
+            total,
+            flatindex::PIECE_SHIFT,
+            key_off,
+        ));
+        let mut read_back = |at: usize, end: usize| -> Result<u32> {
+            let n = end - at;
+            let from_header = header.len().saturating_sub(at).min(n);
+            if from_header > 0 {
+                buf[..from_header].copy_from_slice(&header[at..at + from_header]);
+            }
+            if n > from_header {
+                out.read_section(
+                    key_off + (at + from_header) as u64,
+                    &mut buf[from_header..n],
+                )?;
+            }
+            Ok(block::crc32(&buf[..n]))
+        };
+        for (at, end) in flatindex::pieces(total, flatindex::PIECE_SHIFT, key_off) {
+            let f = key_off + at as u64;
+            let hashed = helped.as_ref().and_then(|h| {
+                let whole = at >= header.len()
+                    && f >= h.from
+                    && f + (end - at) as u64 <= h.to
+                    && (f - h.from).is_multiple_of(piece as u64);
+                whole.then(|| h.crcs[((f - h.from) / piece as u64) as usize])
+            });
+            let crc = match hashed {
+                Some(c) => {
+                    debug_assert_eq!(c, read_back(at, end)?, "the helper's piece is the file's");
+                    c
+                }
+                None => read_back(at, end)?,
+            };
+            row.extend_from_slice(&crc.to_le_bytes());
+        }
+        Ok(row)
+    }
+
     fn pad_to(&mut self, align: u64) -> Result<()> {
         let rem = self.pos % align;
         if rem != 0 {
@@ -2750,6 +3285,11 @@ impl SegmentWriter {
         // deleted still has to exist, or the fences stop tiling the key
         // space and a later seal would route keys into a neighbour's range.
         self.flush_block()?;
+        if !self.batch_buf.is_empty() {
+            self.mark_crc = block::crc32_resume(self.mark_crc, &self.batch_buf);
+            self.out.write_all(&self.batch_buf)?;
+            self.batch_buf.clear();
+        }
 
         let (key_off, key_len, header): (u64, usize, Option<Vec<u8>>) = match layout {
             Layout::RecordsFirst => {
@@ -2775,37 +3315,18 @@ impl SegmentWriter {
                 self.out.write_all(&trailer)?;
                 self.pos += trailer.len() as u64;
                 debug_assert_eq!(self.pos, key_off + total as u64);
-                // The checksum row: named in the header, computed over the
-                // header as it will be written plus the records already on
-                // disk, one piece at a time, and appended after the trailer.
+                // The checksum row, named in the header, goes after the
+                // trailer: the pieces the helper hashed as they landed, the
+                // header's and the last from what is on the file and in the
+                // buffer (`row_for`), written in sequence so that nothing of
+                // the section is patched in place but the header. The
+                // section ends here, and the helper is told so and joined
+                // before anything is written past it.
                 let mut header = header;
                 flatindex::set_checksum_words(&mut header, total);
-                self.out.flush()?;
-                let row = {
-                    use std::os::unix::fs::FileExt;
-                    let file = self.out.get_ref();
-                    let mut buf = vec![0u8; 1usize << flatindex::PIECE_SHIFT];
-                    let mut row = Vec::with_capacity(flatindex::checksum_row_len(
-                        total,
-                        flatindex::PIECE_SHIFT,
-                        key_off,
-                    ));
-                    for (at, end) in flatindex::pieces(total, flatindex::PIECE_SHIFT, key_off) {
-                        let n = end - at;
-                        let from_header = header.len().saturating_sub(at).min(n);
-                        if from_header > 0 {
-                            buf[..from_header].copy_from_slice(&header[at..at + from_header]);
-                        }
-                        if n > from_header {
-                            file.read_exact_at(
-                                &mut buf[from_header..n],
-                                key_off + (at + from_header) as u64,
-                            )?;
-                        }
-                        row.extend_from_slice(&block::crc32(&buf[..n]).to_le_bytes());
-                    }
-                    row
-                };
+                self.out.end_section(self.pos);
+                let helped = self.out.join_helper()?;
+                let row = SegmentWriter::row_for(&self.out, &header, key_off, total, helped)?;
                 self.out.write_all(&row)?;
                 self.pos += row.len() as u64;
                 let total = total + row.len();
@@ -3077,6 +3598,29 @@ pub struct SegmentOptions {
     /// write pays the host's fault for every page of it. `docs/engine.md`
     /// has the figures; `supdb-pmd` and `supdb-ingestpmd` price 2 MB.
     pub write_piece: usize,
+    /// Start the device writing each piece as it is handed to the file
+    /// (`sync_file_range` with the write flag, Linux; nothing elsewhere),
+    /// so the fsync that closes the segment finds most of it written. A
+    /// segment the writer streams is dirty in the page cache until that
+    /// fsync, which then writes all of it at once: forty megabytes at
+    /// three hundred thousand keys, forty milliseconds the load's sync
+    /// waited through while the comparator's sync wrote the same bytes.
+    /// Nothing waits here; the hint costs a syscall a piece. On by
+    /// default; `supdb-latewb` and `supdb-ingestlatewb` price the fsync
+    /// that writes everything at the end.
+    pub early_writeback: bool,
+    /// A thread behind the writer, started once the file is this long
+    /// (`WriterHelper`): it syncs the file for every this many bytes the
+    /// writer has handed it past what is synced, and it hashes the key
+    /// section's checksum pieces as they land, so the finish re-reads
+    /// nothing. The writeback hint moves a piece to the device, and only
+    /// an fsync makes the device flush its own cache: the fsync that
+    /// closes a segment paid 24 ms for 40 MB whose writeback had long
+    /// finished, and the row's re-read of the section 11 ms more, both
+    /// inside the sync a load ends with, while the writer's own pace
+    /// leaves a thread time for both beside it. Zero leaves it all to the
+    /// close. On by default; the `latewb` arms turn it and the hint off.
+    pub sync_ahead: u64,
 }
 
 impl Default for SegmentOptions {
@@ -3087,6 +3631,8 @@ impl Default for SegmentOptions {
             parallel_index: true,
             compact_records: crate::reserve::COMPACT_RECORDS,
             write_piece: 1 << 20,
+            early_writeback: true,
+            sync_ahead: 8 << 20,
         }
     }
 }
@@ -3115,6 +3661,20 @@ impl PieceWriter {
             crate::ordindex::Builder::new(),
             false,
         ))
+    }
+
+    /// Room for `n` keys of about `key_bytes`, in the segment's buffers
+    /// and the ordered index's (`SegmentWriter::reserve_keys`).
+    fn reserve_keys(&mut self, n: usize, key_bytes: usize) {
+        self.0.reserve_keys(n, key_bytes);
+        self.1.reserve(n, key_bytes);
+    }
+
+    /// What the landing's open would walk the records for: the Bloom and
+    /// whether any key ended with a tombstone. `None` where the writer
+    /// cannot say (`SegmentWriter::landing_bloom`).
+    fn landing_facts(&self) -> Option<(BlockedBloom, bool)> {
+        self.0.landing_bloom().map(|b| (b, self.2))
     }
 
     fn begin(&mut self, k: &[u8]) -> Result<()> {
@@ -3194,7 +3754,8 @@ impl Seg {
     /// wrote it, on every run whose values reached a block.
     /// `verify` reads the block checksums as blocks are read and
     /// `verify_index` the key index's checksum row here, once: off only
-    /// where the same file's open has just read it.
+    /// where the same file's open has just read it, or this process has
+    /// just written it (`open_landed`).
     fn open(
         dir: &Path,
         name: &str,
@@ -3202,6 +3763,33 @@ impl Seg {
         advise_ord: bool,
         verify: bool,
         verify_index: bool,
+    ) -> Result<Seg> {
+        Seg::open_full(dir, name, random, advise_ord, verify, verify_index, None)
+    }
+
+    /// `open` for a segment this process has just written and synced:
+    /// the key section's checksum row is not verified, and the Bloom and
+    /// the tombstone flag come from the writer (`facts`) where it has
+    /// them, so no record is walked at the landing.
+    fn open_landed(
+        dir: &Path,
+        name: &str,
+        random: bool,
+        advise_ord: bool,
+        verify: bool,
+        facts: Option<(BlockedBloom, bool)>,
+    ) -> Result<Seg> {
+        Seg::open_full(dir, name, random, advise_ord, verify, false, facts)
+    }
+
+    fn open_full(
+        dir: &Path,
+        name: &str,
+        random: bool,
+        advise_ord: bool,
+        verify: bool,
+        verify_index: bool,
+        facts: Option<(BlockedBloom, bool)>,
     ) -> Result<Seg> {
         let src = MmapBytes::open(&dir.join(name)).map_err(|e| {
             // A manifest naming a segment that is not on disk is a damaged
@@ -3262,7 +3850,10 @@ impl Seg {
             } else {
                 Some(unhex(f[3]).ok_or_else(|| err("segment fence is malformed"))?)
             };
-            let (bloom, tombs) = Seg::bloom_and_tombs(&blob)?;
+            let (bloom, tombs) = match facts {
+                Some(f) => f,
+                None => Seg::bloom_and_tombs(&blob)?,
+            };
             return Ok(Seg {
                 blob,
                 name: name.to_string(),
@@ -3310,11 +3901,15 @@ impl Seg {
                 data,
             });
         }
-        // L0: build the Bloom by walking the segment's keys. That walk is
-        // O(keys) and it is affordable for exactly one reason -- L0 is
-        // bounded at `l0_trigger` segments of at most `seal_bytes` each, so
-        // this cost is bounded where the level below it is not.
-        let (bloom, tombs) = Seg::bloom_and_tombs(&blob)?;
+        // L0: the Bloom from the writer where it had the keys' hashes, and
+        // otherwise by walking the segment's keys. That walk is O(keys)
+        // and it is affordable for exactly one reason -- L0 is bounded at
+        // `l0_trigger` segments of at most `seal_bytes` each, so this cost
+        // is bounded where the level below it is not.
+        let (bloom, tombs) = match facts {
+            Some(f) => f,
+            None => Seg::bloom_and_tombs(&blob)?,
+        };
         Ok(Seg {
             blob,
             name: name.to_string(),
@@ -7173,7 +7768,6 @@ pub struct Db {
     max_key: Vec<u8>,
     /// Scratch for the run a value would encode as, measured at `append`
     /// against the inline limit.
-    run_scratch: Vec<u8>,
     /// EXPERIMENT: the memtable's entry count when the last builder was
     /// started from a commit, so the next starts a burst later and not a
     /// batch later, and the state's generation then, since a publish
@@ -14474,7 +15068,6 @@ impl Db {
             mem_handed: None,
             read_mode: (0, 0, true),
             max_key: Vec::new(),
-            run_scratch: Vec::new(),
             built_ahead_len: 0,
             built_ahead_gen: 0,
             pending_err: None,
@@ -14841,7 +15434,6 @@ impl Db {
             mem_handed: None,
             read_mode: (0, 0, true),
             max_key,
-            run_scratch: Vec::new(),
             built_ahead_len: 0,
             built_ahead_gen: 0,
             pending_err: None,
@@ -14868,6 +15460,20 @@ impl Db {
     /// which is the read-your-writes contract `Store::read_all` set.
     pub fn append(&mut self, key: &[u8], value: &[u8]) {
         let _op = self.op();
+        self.append_pinned(key, value);
+    }
+
+    /// `append` for every record of `items`, pinned once for all of them:
+    /// the pin and its fence a record were three percent of an ordered
+    /// load's writer.
+    pub fn append_batch(&mut self, items: &[(&[u8], &[u8])]) {
+        let _op = self.op();
+        for &(key, value) in items {
+            self.append_pinned(key, value);
+        }
+    }
+
+    fn append_pinned(&mut self, key: &[u8], value: &[u8]) {
         if !self.writes_go() {
             return;
         }
@@ -14969,8 +15575,10 @@ impl Db {
         if key.is_empty() || key <= self.max_key.as_slice() {
             return false;
         }
-        crate::index::encode_run(value, &[value.len() as u32], &mut self.run_scratch);
-        inlines(self.opts.inline_bytes, self.run_scratch.len())
+        // One value's run is the value itself (`encode_run`'s fixed form),
+        // or a one-byte length for an empty value: its size, without the
+        // encoding the record's end makes again.
+        inlines(self.opts.inline_bytes, value.len().max(1))
     }
 
     /// The batch has written something the run cannot take. The run's
@@ -15306,6 +15914,11 @@ impl Db {
             let _ = std::fs::remove_file(&tmp);
             let opts = Db::segment_opts(&self.opts);
             let mut w = PieceWriter::create(&tmp, &opts, 0, self.opts.inline_bytes)?;
+            // Sized for the run the seal threshold allows, at a key and
+            // value of sixty-four bytes together: address space until
+            // touched, and the doublings the batches met otherwise.
+            let hint = (self.seal_threshold() / 64).max(1 << 10);
+            w.reserve_keys(hint, hint * 16);
             w.set_marks(true);
             self.direct = Some(Direct {
                 w,
@@ -15400,6 +16013,7 @@ impl Db {
         let job = move |readable: &SealReadable| -> Result<Vec<String>> {
             seal_hold_wait(&shared, SEAL_HOLD_LANDING);
             let tombs = w.tombs();
+            let fact = w.landing_facts();
             let (seg, ord) = w
                 .finish_unsynced()
                 .map_err(|e| err(&format!("direct finish: {e}")))?;
@@ -15413,7 +16027,7 @@ impl Db {
             // Phase R, then the fsyncs, as a seal's job orders them; the
             // link is this job's rename.
             let names = vec![name];
-            seal_readable(&shared, readable, &names);
+            seal_readable(&shared, readable, &names, vec![fact]);
             seg.sync_all()?;
             ordf.sync_all()?;
             // The directory's entries are made durable by the publish that
@@ -15705,6 +16319,7 @@ impl Db {
                 fences
             };
             let mut names = Vec::new();
+            let mut facts = Vec::new();
             // The files of every piece, unsynced until phase D.
             let mut files: Vec<(File, File)> = Vec::new();
             let mut at = 0usize;
@@ -15726,9 +16341,11 @@ impl Db {
                 let ord;
                 let seg;
                 let tombs;
+                let fact;
                 {
                     let mut w = PieceWriter::create(&tmp, &opts, sync_every, inline_max)
                         .map_err(|e| err(&format!("seal create: {e}")))?;
+                    w.reserve_keys(at - start, (at - start) * 16);
                     let t_recs = std::time::Instant::now();
                     match stream {
                         Some(s) => {
@@ -15771,6 +16388,7 @@ impl Db {
                     }
                     SealCounts::add(&counts.seal_records_ns, t_recs.elapsed().as_nanos() as u64);
                     tombs = w.tombs();
+                    fact = w.landing_facts();
                     (seg, ord) = w
                         .finish_unsynced()
                         .map_err(|e| err(&format!("seal finish: {e}")))?;
@@ -15796,12 +16414,13 @@ impl Db {
                 let ordf = write_ord_unsynced(&dir, &name, &ord)?;
                 std::fs::rename(&tmp, dir.join(&name))?;
                 names.push(name);
+                facts.push(fact);
                 files.push((seg, ordf));
             }
             // Phase R: every piece is in place and complete, and the
             // segment work may publish it to readers. Phase D: the
             // fsyncs, which nothing but the manifest waits for.
-            seal_readable(&shared, readable, &names);
+            seal_readable(&shared, readable, &names, facts);
             for (seg, ordf) in files {
                 seg.sync_all()?;
                 ordf.sync_all()?;
@@ -17055,6 +17674,7 @@ impl Db {
         };
         let readable = std::sync::Arc::new(SealReadable {
             names: std::sync::OnceLock::new(),
+            facts: std::sync::OnceLock::new(),
             wake: wake.clone(),
         });
         let signal = readable.clone();
@@ -20744,6 +21364,10 @@ struct MaintAway {
 /// waits on it.
 struct SealReadable {
     names: std::sync::OnceLock<Vec<String>>,
+    /// For each name, what the writer knows of it that the landing's open
+    /// would otherwise walk the records for: the Bloom and the tombstone
+    /// flag (`PieceWriter::landing_facts`). Set before the names.
+    facts: std::sync::OnceLock<Vec<Option<(BlockedBloom, bool)>>>,
     wake: Option<std::thread::Thread>,
 }
 
@@ -20768,7 +21392,14 @@ fn seal_hold_wait(shared: &Shared, bit: u8) {
 /// thread woken, then the hold a test may have set
 /// (`Db::hold_seal_durable`) waited out, so the job's fsyncs -- phase D --
 /// start only after it lifts.
-fn seal_readable(shared: &Shared, readable: &SealReadable, names: &[String]) {
+fn seal_readable(
+    shared: &Shared,
+    readable: &SealReadable,
+    names: &[String],
+    facts: Vec<Option<(BlockedBloom, bool)>>,
+) {
+    debug_assert_eq!(facts.len(), names.len(), "a fact a name");
+    let _ = readable.facts.set(facts);
     let _ = readable.names.set(names.to_vec());
     if let Some(t) = &readable.wake {
         t.unpark();
@@ -21066,9 +21697,10 @@ impl Maint {
             return Ok(());
         };
         let names = front.readable.get().cloned().unwrap_or_default();
+        let facts = front.readable.facts.get().cloned().unwrap_or_default();
         let table = front.table.clone();
         let t = std::time::Instant::now();
-        match self.land_readable(&names, &table) {
+        match self.land_readable(&names, &facts, &table) {
             Ok(()) => {
                 if let Some(s) = self.sealing.front_mut() {
                     s.landed = true;
@@ -21355,6 +21987,7 @@ impl Maint {
             table,
             wal,
             tmp,
+            readable,
             ..
         } = job;
         let t = std::time::Instant::now();
@@ -21388,7 +22021,8 @@ impl Maint {
             }
         };
         if !landed {
-            if let Err(e) = self.land_readable(&names, &table) {
+            let facts = readable.facts.get().cloned().unwrap_or_default();
+            if let Err(e) = self.land_readable(&names, &facts, &table) {
                 self.shared.in_seal.fetch_sub(1, AtomicOrdering::AcqRel);
                 self.shared.seal_wedged.store(true, AtomicOrdering::Release);
                 return Err(e);
@@ -21412,19 +22046,31 @@ impl Maint {
     /// here, since from here on they are live and the next manifest,
     /// whichever landing writes it, names them; the manifest itself waits
     /// for phase D.
-    fn land_readable(&mut self, names: &[String], table: &std::sync::Arc<MemTable>) -> Result<()> {
+    fn land_readable(
+        &mut self,
+        names: &[String],
+        facts: &[Option<(BlockedBloom, bool)>],
+        table: &std::sync::Arc<MemTable>,
+    ) -> Result<()> {
         if self.shared.fail_landing.swap(false, AtomicOrdering::AcqRel) {
             return Err(err("a test failed this landing"));
         }
         let mut segs = self.segs().to_vec();
-        for name in names {
-            segs.push(std::sync::Arc::new(Seg::open(
+        for (i, name) in names.iter().enumerate() {
+            // Opened as a segment this process has just written: the key
+            // section's checksum row is not read back, since the bytes
+            // under it were written and synced by this very landing's
+            // job, and the Bloom and the tombstone flag are the writer's
+            // where it has them, not a walk of every record. The walk and
+            // the row's check were three quarters of the segment work's
+            // time over an ordered load, inside the sync the load ends in.
+            segs.push(std::sync::Arc::new(Seg::open_landed(
                 &self.dir,
                 name,
                 self.advice_random(),
                 self.opts.read_advice != ReadAdvice::Normal,
                 self.opts.segment.checksums,
-                true,
+                facts.get(i).cloned().flatten(),
             )?));
         }
         self.rank_before_publish(&segs)?;
@@ -22411,6 +23057,230 @@ impl Drop for Db {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod streaming_writes {
+    use super::*;
+
+    fn fresh(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("supdb-next-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A segment longer than `sync_ahead` is synced behind its writer at
+    /// least once -- the thread cannot exit while an `ahead`'s worth is
+    /// unsynced -- and reads back whole, the thread's syncs changing
+    /// nothing a reader sees.
+    #[test]
+    fn a_long_segment_is_synced_behind_its_writer() {
+        let dir = fresh("sync-ahead");
+        let sopts = SegmentOptions {
+            write_piece: 4096,
+            sync_ahead: 16384,
+            ..Default::default()
+        };
+        let path = dir.join("seg.sup");
+        let mut w = SegmentWriter::create(&path, &sopts).unwrap();
+        w.set_inline_max(256);
+        let (flushes, hashed) = w.helper_counts();
+        for i in 0..2000u32 {
+            let key = format!("key-{i:08}");
+            w.begin(key.as_bytes()).unwrap();
+            w.value(format!("value-{i:0100}").as_bytes());
+            w.end_with(false).unwrap();
+        }
+        w.finish(1).unwrap();
+        assert!(
+            flushes.load(AtomicOrdering::Relaxed) >= 1,
+            "a segment of a quarter megabyte was synced behind its writer"
+        );
+        assert!(
+            hashed.load(AtomicOrdering::Relaxed) >= 8,
+            "the helper hashed most of a quarter megabyte of section in 16 KB pieces, not {}",
+            hashed.load(AtomicOrdering::Relaxed)
+        );
+        let blob = crate::blob::Blob::open(crate::bytes::MmapBytes::open(&path).unwrap()).unwrap();
+        assert_eq!(blob.count(b"key-00000000").unwrap(), 1);
+        assert_eq!(blob.count(b"key-00001999").unwrap(), 1);
+        assert_eq!(blob.count(b"key-00002000").unwrap(), 0);
+        let mut got = Vec::new();
+        blob.read_all(b"key-00001234", |v| got.push(v.to_vec()))
+            .unwrap();
+        assert_eq!(got, vec![format!("value-{:0100}", 1234).into_bytes()]);
+    }
+
+    /// The row the helper hashes as the pieces land is the row a re-read
+    /// of the finished section gives: a segment written with the helper
+    /// verifies, and is byte-identical past the superblock, whose
+    /// timestamp differs, to the same data written without one.
+    #[test]
+    fn the_helpers_row_is_the_re_reads() {
+        let dir = fresh("helper-row");
+        let write = |path: &Path, ahead: u64| {
+            let sopts = SegmentOptions {
+                write_piece: 4096,
+                sync_ahead: ahead,
+                ..Default::default()
+            };
+            let mut w = SegmentWriter::create(path, &sopts).unwrap();
+            w.set_inline_max(256);
+            for i in 0..3000u32 {
+                let key = format!("key-{i:08}");
+                w.begin(key.as_bytes()).unwrap();
+                w.value(format!("value-{i:0100}").as_bytes());
+                w.end_with(false).unwrap();
+            }
+            w.finish(1).unwrap();
+        };
+        let helped = dir.join("helped.sup");
+        let alone = dir.join("alone.sup");
+        write(&helped, 16384);
+        write(&alone, 0);
+        for p in [&helped, &alone] {
+            crate::blob::Blob::open_with(
+                crate::bytes::MmapBytes::open(p).unwrap(),
+                crate::blob::BlobOptions {
+                    verify_index: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        }
+        let (a, b) = (
+            std::fs::read(&helped).unwrap(),
+            std::fs::read(&alone).unwrap(),
+        );
+        assert_eq!(a.len(), b.len());
+        let body = crate::format::SUPER as usize;
+        assert!(
+            a[body..] == b[body..],
+            "the body written with the helper is the body without"
+        );
+    }
+
+    /// Records a sync wrote ahead of their marker are in that marker's
+    /// CRC: the recovery walk hashes every record since the last marker,
+    /// and a marker whose CRC left the synced records out would cut the
+    /// walk before the batch it covers.
+    #[test]
+    fn a_sync_before_the_marker_keeps_its_records_recoverable() {
+        let dir = fresh("sync-then-mark");
+        let path = dir.join("direct-00000001.tmp");
+        let mut w = SegmentWriter::create(&path, &SegmentOptions::default()).unwrap();
+        w.set_inline_max(256);
+        w.set_marks(true);
+        let put = |w: &mut SegmentWriter, i: u32| {
+            let key = format!("key-{i:08}");
+            w.begin(key.as_bytes()).unwrap();
+            w.value(format!("value-{i}").as_bytes());
+            w.end_with(false).unwrap();
+        };
+        for i in 0..100 {
+            put(&mut w, i);
+        }
+        w.sync().unwrap();
+        for i in 100..200 {
+            put(&mut w, i);
+        }
+        w.mark().unwrap();
+        w.sync().unwrap();
+        drop(w);
+        let recs = SegmentWriter::recover_direct(&path).unwrap();
+        assert_eq!(recs.len(), 200, "both batches are behind the one marker");
+        assert_eq!(recs[150].0, b"key-00000150".to_vec());
+        assert_eq!(recs[150].1, b"value-150".to_vec());
+    }
+}
+
+#[cfg(test)]
+mod landing_facts {
+    use super::*;
+
+    /// The Bloom and the tombstone flag the writer hands the landing
+    /// (`PieceWriter::landing_facts`) are the ones a walk of the finished
+    /// segment's records builds (`Seg::bloom_and_tombs`), bit for bit, and
+    /// a segment opened either way answers `may_hold` alike.
+    #[test]
+    fn the_writers_facts_are_the_walks() {
+        let dir =
+            std::env::temp_dir().join(format!("supdb-next-landing-facts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let opts = Options::default();
+        let sopts = Db::segment_opts(&opts);
+        let name = Db::seg_name(7, 7);
+        let tmp = dir.join("seal-00000007.tmp");
+        let mut w = PieceWriter::create(&tmp, &sopts, 0, opts.inline_bytes).unwrap();
+        w.reserve_keys(5000, 5000 * 16);
+        for i in 0..5000u32 {
+            let key = format!("key-{i:08}");
+            w.begin(key.as_bytes()).unwrap();
+            w.value(format!("value-{i}").as_bytes());
+            w.end_with(i % 7 == 0).unwrap();
+        }
+        let facts = w
+            .landing_facts()
+            .expect("a records-first segment has every key's hash");
+        assert!(facts.1, "a key ended with a tombstone");
+        let (seg, ord) = w.finish_unsynced().unwrap();
+        drop(seg);
+        write_ord_unsynced(&dir, &name, &ord).unwrap();
+        std::fs::rename(&tmp, dir.join(&name)).unwrap();
+        let walked = Seg::open(&dir, &name, false, false, true, true).unwrap();
+        let handed = Seg::open_landed(&dir, &name, false, false, true, Some(facts)).unwrap();
+        assert_eq!(walked.tombs, handed.tombs);
+        assert_eq!(
+            walked.bloom.as_ref().unwrap().blocks,
+            handed.bloom.as_ref().unwrap().blocks,
+            "the filter from the writer's hashes is the filter from the walk"
+        );
+        for k in ["key-00000001", "key-00004999", "nope", "key-99999999"] {
+            assert_eq!(
+                walked.may_hold(k.as_bytes()),
+                handed.may_hold(k.as_bytes()),
+                "{k}"
+            );
+        }
+        drop((walked, handed));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two halves of the Bloom's hash, taken apart, give the hash.
+    #[test]
+    fn the_hash_halves_agree() {
+        for k in [
+            "key-00000000",
+            "key-00004999",
+            "",
+            "x",
+            "a longer key than sixteen bytes",
+        ] {
+            let k = k.as_bytes();
+            assert_eq!(
+                BlockedBloom::hash(k),
+                BlockedBloom::finalize(crate::flatindex::key_hash(k)),
+                "{}",
+                String::from_utf8_lossy(k)
+            );
+        }
+        let keys: Vec<String> = (0..5000u32).map(|i| format!("key-{i:08}")).collect();
+        let mut by_key = BlockedBloom::with_capacity(keys.len());
+        for k in &keys {
+            by_key.insert(k.as_bytes());
+        }
+        let hashes: Vec<u64> = keys
+            .iter()
+            .map(|k| crate::flatindex::key_hash(k.as_bytes()))
+            .collect();
+        let by_hash = BlockedBloom::from_fnv(&hashes);
+        assert_eq!(
+            by_key.blocks, by_hash.blocks,
+            "inserted by key and by FNV word"
+        );
     }
 }
 

@@ -112,6 +112,24 @@ the host backs them cannot be seen from inside, so a question of ten
 percent about translation, huge pages or folio size is not one this
 machine can answer; `docs/engine.md` has the probe and both outcomes.
 
+The block device has a write-back cache, and an fsync's cost here is
+the host's flush of it, not the page cache's writeback: a probe that
+wrote forty megabytes with a `sync_file_range` hint after every piece
+and waited for the writeback to finish still paid 24 ms at the fsync,
+and nothing but an fsync issues that flush. So price a sync by who
+issues the fsync and when, not by how much is dirty, and before
+reading a sync phase as the device's, time its steps -- the buffered
+load's sync at three hundred thousand keys stayed level after the
+fsync inside it fell from 25 ms to under one, because the phase was a
+segment close whose checksum row re-read the section (`docs/engine.md`,
+the streaming write). The suite's device-bytes quantity is
+`/proc/self/io`'s `write_bytes`, which the kernel counts at dirtying
+time per folio: a one-megabyte write makes a one-megabyte folio, and a
+patch of a hundred bytes made in place after the folio was written
+back counts a megabyte again while the device writes a page. Read the
+device's own counter in `/sys/block/vda/stat` beside it before calling
+such a move a cost.
+
 Profile a probe that does one thing. The scan probe's own `format!` per
 iteration was 8% of its samples until the keys were built before the
 loop.

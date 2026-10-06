@@ -427,6 +427,10 @@ pub struct Supdb {
     /// snapshot (`Options::forms_pieces_only`). `supdb-piecesonly`, and
     /// `supdb-ingestpiecesonly` buffered.
     piecesonly: bool,
+    /// The segment writer leaves every piece dirty and unsynced until the
+    /// closing fsync, as before `SegmentOptions::early_writeback` and
+    /// `sync_ahead`. `supdb-latewb`, and `supdb-ingestlatewb` buffered.
+    latewb: bool,
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
@@ -569,6 +573,10 @@ struct Policy {
     /// snapshot (`Options::forms_pieces_only`). `supdb-piecesonly`, and
     /// `supdb-ingestpiecesonly` buffered.
     piecesonly: bool,
+    /// The segment writer leaves every piece dirty and unsynced until the
+    /// closing fsync, as before `SegmentOptions::early_writeback` and
+    /// `sync_ahead`. `supdb-latewb`, and `supdb-ingestlatewb` buffered.
+    latewb: bool,
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
@@ -663,6 +671,7 @@ impl Default for Policy {
             asympin: false,
             extsval: false,
             piecesonly: false,
+            latewb: false,
             inlinemaint: false,
             shape: false,
             adaptcap: None,
@@ -1616,6 +1625,34 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with the segment writer leaving every piece dirty and
+    /// unsynced until the closing fsync (`SegmentOptions::early_writeback`
+    /// off and `sync_ahead` zero): against `supdb` it prices the writeback
+    /// the writer starts early and the syncs its thread makes behind it.
+    pub fn create_latewb(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                latewb: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` with the closing fsync writing everything, as
+    /// `supdb-latewb`.
+    pub fn create_ingest_latewb(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                latewb: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with a point read taking a segment's extents by value from
     /// `lookup_full`, as before `Blob::with_lookup` lent them on the
     /// index's frame (`Options::exts_by_value`): against `supdb` it prices
@@ -1768,6 +1805,7 @@ impl Supdb {
             asympin,
             extsval,
             piecesonly,
+            latewb,
             inlinemaint,
             shape,
             aheadmin,
@@ -1816,6 +1854,12 @@ impl Supdb {
             segment: supdb::SegmentOptions {
                 checksums: false,
                 compact_records: !fullrec,
+                early_writeback: !latewb,
+                sync_ahead: if latewb {
+                    0
+                } else {
+                    supdb::SegmentOptions::default().sync_ahead
+                },
                 write_piece: if pmd {
                     2 << 20
                 } else {
@@ -2002,6 +2046,7 @@ impl Supdb {
             asympin,
             extsval,
             piecesonly,
+            latewb,
             inlinemaint,
             shape,
             aheadmin,
@@ -2276,6 +2321,13 @@ impl Engine for Supdb {
                 "supdb-ingestpiecesonly"
             };
         }
+        if self.latewb {
+            return if self.partition {
+                "supdb-latewb"
+            } else {
+                "supdb-ingestlatewb"
+            };
+        }
         if self.shape {
             return "supdb-ingestshape";
         }
@@ -2355,9 +2407,7 @@ impl Engine for Supdb {
     }
     fn write_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
         let db = self.db.as_mut().ok_or("db closed")?;
-        for &(k, v) in items {
-            db.append(k, v);
-        }
+        db.append_batch(items);
         db.commit().map_err(|e| e.to_string())
     }
     fn update_batch(&mut self, items: &[(&[u8], &[u8])]) -> Res<()> {
@@ -2917,11 +2967,11 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settleall" | "supdb-inline" | "supdb-tier" | "supdb-runs" | "supdb-keeper"
         | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice"
         | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "supdb-asympin"
-        | "supdb-extsval" | "supdb-piecesonly" | "supdb-inlinemaint" | "supdb-adapt"
-        | "supdb-adapttrig" | "supdb-adaptloose" | "supdb-rotate" | "supdb-nofrozen"
-        | "supdb-idle" | "supdb-sortover" | "supdb-pmd" | "supdb-hold" | "supdb-settlefreeze"
-        | "supdb-convertcap" | "supdb-shortpass" | "supdb-noyield" | "supdb-bg" | "supdb-bglag"
-        | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
+        | "supdb-extsval" | "supdb-piecesonly" | "supdb-latewb" | "supdb-inlinemaint"
+        | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose" | "supdb-rotate"
+        | "supdb-nofrozen" | "supdb-idle" | "supdb-sortover" | "supdb-pmd" | "supdb-hold"
+        | "supdb-settlefreeze" | "supdb-convertcap" | "supdb-shortpass" | "supdb-noyield"
+        | "supdb-bg" | "supdb-bglag" | "lmdb" | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest"
         | "supdb-ingestleave"
         | "supdb-ingestnoseal"
@@ -2943,6 +2993,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestshortpass"
         | "supdb-ingestnoyield"
         | "supdb-ingestpiecesonly"
+        | "supdb-ingestlatewb"
         | "supdb-ingestbg"
         | "supdb-ingestbglag"
         | "supdb-ingesthold"
@@ -2995,6 +3046,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-extsval" => Box::new(Supdb::create_extsval(dir)?),
         "supdb-piecesonly" => Box::new(Supdb::create_piecesonly(dir)?),
         "supdb-ingestpiecesonly" => Box::new(Supdb::create_ingest_piecesonly(dir)?),
+        "supdb-latewb" => Box::new(Supdb::create_latewb(dir)?),
+        "supdb-ingestlatewb" => Box::new(Supdb::create_ingest_latewb(dir)?),
         "supdb-inlinemaint" => Box::new(Supdb::create_inlinemaint(dir)?),
         "supdb-ingestinline" => Box::new(Supdb::create_ingest_inline(dir)?),
         "supdb-ingestsync" => Box::new(Supdb::create_ingest_sync(dir)?),

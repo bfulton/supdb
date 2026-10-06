@@ -22,16 +22,45 @@ fn main() {
         let mut e = engines::open(&arm, &dir, 1).unwrap();
         let mut vrng = Rng::new(0xE1);
         let mut buf = Batch::with_capacity(1000, payload.value_size());
+        // Each batch's flush timed on its own, for the shape of the
+        // commits: the first few, the median and the slowest.
+        let mut batches: Vec<f64> = Vec::new();
         let t = Instant::now();
         for i in 0..size {
             db_key_into(i, &mut kb);
             buf.push(&kb, payload.get(&mut vrng));
             if buf.len() == 1000 {
+                let tb = Instant::now();
                 buf.flush(e.as_mut()).unwrap();
+                batches.push(tb.elapsed().as_secs_f64() * 1e6);
             }
         }
         buf.flush(e.as_mut()).unwrap();
         let loaded = t.elapsed();
+        let mut sorted = batches.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = sorted[sorted.len() / 2];
+        let slow = batches.iter().filter(|&&b| b > 2.0 * med).count();
+        let slow_sum: f64 = batches.iter().filter(|&&b| b > 2.0 * med).sum();
+        let slow_at: Vec<String> = batches
+            .iter()
+            .enumerate()
+            .filter(|(_, &b)| b > 2.0 * med)
+            .take(16)
+            .map(|(i, b)| format!("{i}:{b:.0}"))
+            .collect();
+        println!(
+            "  batches us: first {:.0} {:.0} {:.0} median {:.0} p90 {:.0} max {:.0}; {} over 2x median summing {:.1} ms",
+            batches.first().copied().unwrap_or(0.0),
+            batches.get(1).copied().unwrap_or(0.0),
+            batches.get(2).copied().unwrap_or(0.0),
+            med,
+            sorted[sorted.len() * 9 / 10],
+            sorted[sorted.len() - 1],
+            slow,
+            slow_sum / 1e3
+        );
+        println!("  slow batches (index:us): {}", slow_at.join(" "));
         e.sync().unwrap();
         let all = t.elapsed();
         println!(

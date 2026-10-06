@@ -3824,6 +3824,151 @@ writeback never ran. On the durable arm, whose commits sync the run, the
 same writeback read the ordered load 1.10x slower, in seven of eight
 pairs.
 
+#### The ordered load as a streaming write: the sync was the device's, and then the close's
+
+The buffered ordered load, in one process against `lmdb-nosync`, read
+0.76x at a hundred thousand keys and 0.82x at three hundred thousand,
+and the load probe in the suite's shape split it into the commits and
+the sync the harness ends the load with: at three hundred thousand keys
+118-136 ms of commits and 62-71 of sync against LMDB's 110-126 and
+43-45. The commits were the writer's, and callgrind priced them at
+1,592 instructions a key: the staging memtable's write, a pin a key, a
+record encoded and CRC'd and written one at a time, the value encoded
+once more to test the inline bound, and the writer's four vectors
+doubling from empty at every power of two, which the per-batch probe
+read as batches of 0.6-9.4 ms at the doublings against a median of
+0.3. The sync was the close of the direct segment: its index finished,
+the whole segment fsynced, and the landing's open walking every record
+for the Bloom filter and the tombstone flag and reading the key section
+again to verify its checksum row.
+
+The writer's cuts, each alternated as two binaries against the one
+before it. The landing takes the Bloom from the hashes the writer
+already has and the tombstone flag from the writer, and opens a segment
+this process just wrote without verifying the index: the durable sync
+-34%, the buffered unchanged, since there the walk had run beside the
+fsync and been hidden by it. The vectors sized for the run, the seal's
+from its table's count and a direct run's from the seal threshold,
+address space until touched: buffered commits -12% at three hundred
+thousand keys and -26% at a hundred thousand, the doublings' batches
+gone from the tail. A batch's records appended to one buffer and hashed
+and written at the marker, a pin a batch through `Db::append_batch`,
+and the inline bound tested from the value's length: 1,699 to 1,377
+instructions a key by callgrind, the time within the probe's spread --
+an alternation of one binary against itself in the same sitting read
+its commit medians 7% apart, so a commit difference under ten
+milliseconds at this rung is not the probe's to resolve. The buffer
+has a rule the recovery walk imposes: a sync that writes the held
+records ahead of their marker folds them into the marker's CRC, since
+the walk hashes every record since the last marker; the first version
+did not, no caller reached it, and a unit test now writes, syncs, writes,
+marks and recovers both batches.
+
+The sync was then taken apart with a C probe writing forty megabytes in
+one-megabyte pieces to a file on this guest's disk. Plain writes and an
+fsync: 35-41 ms, the same after three hundred milliseconds idle, since
+nothing starts the writeback before the kernel's timer. A
+`sync_file_range` write hint after each piece: the fsync fell to 22-27
+ms -- and stayed there after three hundred milliseconds idle with a wait
+over the whole file taking 0-3 ms, the writeback long done. The
+twenty-four milliseconds were not the page cache's: the block device has
+a write-back cache (`queue/write_cache` reads `write back`), and the
+fsync's FLUSH makes the host write what it holds to its own disk, forty
+megabytes at about 1.7 GB/s, and nothing but an fsync asks it to. An
+fdatasync a megabyte paid it inline, 62-80 ms over the writes with a
+closing fsync of 0.1-0.3. On a thread beside a writer paced at the
+load's rate, an fdatasync every eight megabytes: five flushes of 31-35
+ms in all, hidden under the writer, whose longest write stayed at half a
+millisecond, and a closing fsync of 0.1-0.2 ms; every sixteen, 5-6 ms;
+every four, the same 0.1-0.4 at 37 ms of flushes.
+
+So the segment writer hands each piece to the device as it lands
+(`SegmentOptions::early_writeback`) and, once the file is eight
+megabytes long, starts a thread of its own behind the writer
+(`WriterHelper`, `sync_ahead`), woken by each piece: an fdatasync on a
+dup of the descriptor whenever eight megabytes are on the file past what
+is synced, with the writer's own sync, the durable arm's at every batch,
+marking what it synced so that writer's thread syncs nothing. The hint
+had been tried on 2 MB pieces and not kept (above): the run's fsync fell
+by the same third and nothing the suite times resolved, because the
+close's other costs stood, and the durable arm read 1.10x slower in
+seven of eight pairs. This time the hint alone, alternated as probes:
+buffered sync 62-78 ms to 34-39 at three hundred thousand keys, 25-31
+to 16-29 at a hundred thousand, the durable arm's sync 35 to 23 by the
+median and its commits level over three rounds. The thread's syncs
+beside it: 23-27 to 19-23 at a hundred thousand keys and level at three
+hundred thousand -- strace showed the four fdatasyncs of 5-6 ms and the
+closing fsync at 0.8 ms, the mechanism exactly as predicted, and the
+phase unmoved.
+
+Timers in the close named why. The load at three hundred thousand keys
+is two direct runs: the first reaches the seal threshold a few
+milliseconds before the load ends, at thirty-eight of forty megabytes,
+so its whole close runs inside the sync phase -- the trailer built in
+2.5 ms, the checksum row's re-read and CRC of the section 11.5, the
+table and the ordered index 3.5-7, the index's write 0.6-10, the two
+fsyncs 0.8 and 2.9 -- then the tail run's small close, then the landings
+with three manifest writes and the promotion by link, 3.6-8 ms. The row
+was the largest piece, and it went to the same thread: the helper reads
+each landed piece back from the page cache and hashes the section's
+16 KB checksum pieces as they land, up to the section's end the finish
+names, and the finish takes its row from the thread and reads back only
+the header's piece, where the file holds zeroes until the header is
+written, and the pieces past where the thread reached, from the file
+or the writer's buffer. A unit test holds the helper's row to the one a
+re-read gives, and a segment written with the helper byte-identical past
+the superblock to one written without. Alternated: buffered sync 36 to
+26.5 ms by the median at three hundred thousand keys and 19.5 to 17 at
+a hundred thousand, the durable arm's 22 to 15.
+
+One cost came with it, in the suite's device-bytes quantity, which is
+the process's `write_bytes` from `/proc/self/io`: the buffered arm read
+1.3646 bytes written per byte of data against 1.3035 before, about a
+megabyte a segment, while the device's own counter in
+`/sys/block/vda/stat` wrote the same bytes for every build. That
+counter is kept at dirtying time, per folio, and a one-megabyte write
+makes a one-megabyte folio: the three patches the finish makes in place
+-- the superblock, the section header, and the row's placeholder --
+each re-dirtied a folio the hints had already written back, and a probe
+read exactly 2.000 MB for three patches of a few hundred bytes, 1.008
+with the first eight kilobytes written as their own folio. The row is
+now written in sequence, after the join, and the head of the file the
+finish patches -- superblock, reserve, section header -- goes to the
+file as a write of its own ahead of the first piece. Paired
+again against the old arm at a hundred thousand keys, the quantity
+reads 1.3669 against 1.3662, the eight kilobytes of the head, and the
+probe alternated against the build before reads the sync level, 21-38
+ms against 25-42 at three hundred thousand keys.
+
+The verdict, `bench ab` in one sitting, six pairs: the buffered load
+0.973x of `lmdb-nosync` at three hundred thousand keys and 0.931x at a
+hundred thousand (0.819x and 0.759x in the baseline sitting), the
+durable load 1.150x and 1.109x of `lmdb` (0.990x and 1.139x), and the
+shuffled loads 2.43x, 1.94x, 6.1x and 5.9x (2.17x, 1.82x, 4.33x, 5.65x),
+since a seal's segment is written by the same writer. Against its own
+old shape in one process, the new default loads 1.23x and 1.36x on the
+buffered arm (`supdb-ingestlatewb`) and 1.15x on the durable
+(`supdb-latewb`), in twelve pairs of twelve, where the hint alone on 2 MB
+pieces had read that arm 1.10x slower. The arms keep the shape before all of it: every piece
+dirty and unsynced until the close, the row read back. A reader sees
+nothing of any of it; the segment's bytes are the same.
+
+What the close still holds at three hundred thousand keys, for the next
+move on this cell: the first run cut at the threshold a few milliseconds
+before the load's end, so that a thirty-eight megabyte close sits in the
+flush where smaller runs would hide all but the tail's under the load's
+commits; the ordered index built and written whole at the finish and
+fsynced cold, 2.9 ms; and the drain's three manifest writes, each an
+fsync and a directory sync, where one publish would do.
+
+The rule the probe gave: on this machine a sync's cost is the device's
+flush of what the hints already wrote, and it is paid by whoever issues
+the fsync, so a write path that will be fsynced at its end hands the
+device its pieces as they land and has something off the critical path
+issue the flushes behind it; and a quantity read from `/proc/self/io` is
+a count of folios dirtied, so a patch made in place after a writeback is
+a folio written twice to it, whatever the device sees.
+
 ### Arrival order
 
 Every durable-load number above comes from a load whose keys ascend, and

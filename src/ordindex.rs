@@ -225,6 +225,13 @@ impl Builder {
         Builder::default()
     }
 
+    /// Room for `n` keys of about `key_bytes` in all, so the buffers do
+    /// not grow by doubling as the keys arrive.
+    pub fn reserve(&mut self, n: usize, key_bytes: usize) {
+        self.starts.reserve(n + 1);
+        self.bytes.reserve(key_bytes);
+    }
+
     /// Keys arrive in the order they are written, which is key order.
     pub fn push(&mut self, key: &[u8]) {
         self.starts.push(self.bytes.len() as u32);
