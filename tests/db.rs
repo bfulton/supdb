@@ -2326,6 +2326,60 @@ fn fold_model_with(block_cache: bool, pieces_only: bool) {
 /// blocks never built: the first write makes the rest materialize clean,
 /// and every later write finds a built block to patch. The model's scans
 /// and reads hold each result to the merge.
+/// A copy built over updates alone starts a scan at the rank the
+/// partition's seek found, instead of searching its entries for the
+/// cursor, and streams what the search streamed
+/// (`Options::copy_start_at_rank`). One partition of several blocks, every
+/// key updated once: every block is dense with overlay keys that are all
+/// updates, so its copy's entries are its records. The model's scans start
+/// at every key and between keys, where the two starts could differ. Then
+/// one insert, which leaves that block's copy searched from there and the
+/// others starting at the rank. In the checked profile the walk also
+/// asserts the two starts agree on every scan.
+#[test]
+fn a_copy_of_updates_starts_a_scan_at_the_seeks_rank() {
+    let d = dir("copy-start-at-rank");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(64 << 10),
+        scan_block_cache: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in (0..1200).step_by(3) {
+        m.append(&mut db, &key(k), &format!("p{k}"));
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    assert_eq!(db.levels(), (1, 0), "one partition of several blocks");
+    for k in (0..1200).step_by(3) {
+        m.append(&mut db, &key(k), &format!("u{k}"));
+    }
+    db.commit().unwrap();
+    m.check(&db, "every key updated once: copies of the records alone");
+    let [at_rank, searched] = db.copy_starts();
+    assert!(
+        at_rank > 0,
+        "the scans walked copies and started at the seek's rank"
+    );
+    assert_eq!(
+        searched, 0,
+        "no copy was searched: every block's keys are updates"
+    );
+    m.append(&mut db, &key(601), "new");
+    db.commit().unwrap();
+    m.check(&db, "one block holds an insert");
+    let [at_rank2, searched2] = db.copy_starts();
+    assert!(
+        at_rank2 > at_rank,
+        "the blocks without the insert still start at the rank"
+    );
+    assert!(searched2 > 0, "the block with the insert is searched");
+}
+
 #[test]
 fn a_write_settles_into_the_block_it_lands_in() {
     let d = dir("settle-in-place");

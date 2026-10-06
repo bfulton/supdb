@@ -1242,6 +1242,15 @@ pub struct Options {
     /// rebuilt every block. On by default; `supdb-norebase` is the carry
     /// that drops them, and `docs/engine.md` has the figures.
     pub forms_rebase: bool,
+    /// A scan over a copy starts at the rank the partition's seek found
+    /// when the copy's entries are the block's records and nothing else
+    /// -- the copy of a block whose unsealed keys are all updates, which
+    /// is every copy after a burst of them -- instead of searching the
+    /// copy for the cursor again. The search was six dependent misses
+    /// into two cold buffers that the seek's answer already settled.
+    /// `supdb-copysearch` is the second search; `docs/engine.md` has the
+    /// figures.
+    pub copy_start_at_rank: bool,
     /// EXPERIMENT: the writer's own handle takes the canonical forms it
     /// maintains, instead of building its own. Without this the
     /// maintenance is pure cost wherever the reads are the writer's: a
@@ -1360,6 +1369,7 @@ impl Default for Options {
             forms_carry: true,
             freeze_settles: false,
             forms_rebase: true,
+            copy_start_at_rank: true,
             forms_to_writer: false,
             form_dense_from: 0,
             scan_snapshot_arena: true,
@@ -6162,6 +6172,12 @@ struct CachedBlock {
     /// key offset, key length, run offset, run length; the run is values
     /// each behind a u32 length.
     ents: Vec<[u32; 4]>,
+    /// Entry `i` is the block's record `lo + i` for every `i`: the copy
+    /// was built over updates alone and no insert has been spliced in
+    /// since, so a walk's start is the seek's rank less the block's first
+    /// (`Options::copy_start_at_rank`). An insert clears it for good; a
+    /// delete leaves the entry, with an empty run, so it holds.
+    identity: bool,
 }
 
 impl CachedBlock {
@@ -7597,6 +7613,9 @@ struct FormsState {
     /// The forms the writer's block walks met: copies, sparse forms,
     /// anything else -- what a pass after a burst is walking.
     walk_kinds: std::cell::Cell<[u64; 3]>,
+    /// Scans that started a copy walk at the seek's rank, and that
+    /// searched the copy (`Options::copy_start_at_rank`).
+    copy_starts: std::cell::Cell<[u64; 2]>,
     /// For a pass on the upkeep thread: the most writes it reads from the
     /// live log, and the most it settles from the frozen tables' carried
     /// lists, and whether it stopped short of either, for the thread to
@@ -7703,6 +7722,7 @@ impl FormsState {
             log_counted: std::cell::Cell::new((0, 0)),
             choices: std::cell::Cell::new([0; 5]),
             walk_kinds: std::cell::Cell::new([0; 3]),
+            copy_starts: std::cell::Cell::new([0; 2]),
             read_cap: std::cell::Cell::new(0),
             log_short: std::cell::Cell::new(false),
             lazy_scans: std::cell::Cell::new([0; 2]),
@@ -13091,6 +13111,7 @@ impl Reader {
                     blk.keys.extend_from_slice(key);
                     blk.ents
                         .insert(i, [key_at, key.len() as u32, at_run, run.len() as u32]);
+                    blk.identity = false;
                 }
                 // Bloated only past twice the floor: below that the sum
                 // over the entries, a load an entry a write, cannot say so.
@@ -13817,7 +13838,29 @@ impl Reader {
                             ctx.walk_copy_over(src, blk, ov, from_key, limit - seen, &mut *f)?;
                     }
                     Cached::Block(blk) => {
-                        let i = if first { blk.lower_bound(cursor) } else { 0 };
+                        // The seek's rank is the entry when the copy's
+                        // entries are the block's records; the cursor is
+                        // above record `start - 1` and not above `start`,
+                        // so no entry between them is skipped.
+                        let at_rank = self.opts.copy_start_at_rank && blk.identity;
+                        let i = if !first {
+                            0
+                        } else if at_rank {
+                            let i = (start - lo).min(blk.ents.len());
+                            debug_assert_eq!(
+                                i,
+                                blk.lower_bound(cursor),
+                                "a copy's identity start disagrees with its search"
+                            );
+                            i
+                        } else {
+                            blk.lower_bound(cursor)
+                        };
+                        if first {
+                            let mut c = self.fs().copy_starts.get();
+                            c[usize::from(!at_rank)] += 1;
+                            self.fs().copy_starts.set(c);
+                        }
                         for e in &blk.ents[i..] {
                             if seen >= limit {
                                 break;
@@ -17169,6 +17212,13 @@ impl Db {
     pub fn forms_walks(&self) -> [u64; 3] {
         self.take_back_upkeep();
         self.r.fs().walk_kinds.get()
+    }
+
+    /// The writer's own copy walks by how they started: at the seek's
+    /// rank, and by searching the copy (`Options::copy_start_at_rank`).
+    pub fn copy_starts(&self) -> [u64; 2] {
+        self.take_back_upkeep();
+        self.r.fs().copy_starts.get()
     }
 
     /// Nanoseconds the writer's scans spent in each phase before their
@@ -21311,10 +21361,12 @@ impl<'s> BuildCtx<'s> {
         // checker.
         self.prefetch_overlay(ov);
         let n = ranks.len() + ov.over.len();
+        let (lo, hi) = (ranks.start, ranks.end);
         let blk = std::cell::RefCell::new(CachedBlock {
             keys: Vec::with_capacity(n * 16),
             vals: Vec::with_capacity(n * 128),
             ents: Vec::with_capacity(n),
+            identity: false,
         });
         let mut current: Vec<u8> = Vec::with_capacity(32);
         let mut open = false;
@@ -21341,6 +21393,14 @@ impl<'s> BuildCtx<'s> {
         if open {
             blk.end();
         }
+        // Every overlay key an update of a record at a known cut, and a
+        // key emitted per record: a tombstone that took a record out, or
+        // a cut the build had to search for, leaves the copy searched.
+        let updates = ov
+            .over
+            .iter()
+            .all(|o| o.cut != u32::MAX && BuildCtx::cut_known(o.cut, lo, hi).1 == Ordering::Equal);
+        blk.identity = updates && blk.ents.len() == hi - lo;
         Ok(blk)
     }
     /// The first rank in `rank..end` whose key is not below `uk`, or `end`,

@@ -434,6 +434,9 @@ pub struct Supdb {
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
+    /// A scan over a copy searches the copy for its cursor, as before
+    /// `Options::copy_start_at_rank`. `supdb-copysearch`.
+    copysearch: bool,
     /// A store with no partitions partitioned once it is read,
     /// `Options::adaptive_shape`. `supdb-ingestshape`.
     shape: bool,
@@ -585,6 +588,9 @@ struct Policy {
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
+    /// A scan over a copy searches the copy for its cursor, as before
+    /// `Options::copy_start_at_rank`. `supdb-copysearch`.
+    copysearch: bool,
     /// A store with no partitions partitioned once it is read,
     /// `Options::adaptive_shape`. `supdb-ingestshape`.
     shape: bool,
@@ -681,6 +687,7 @@ impl Default for Policy {
             piecesonly: false,
             latewb: false,
             inlinemaint: false,
+            copysearch: false,
             shape: false,
             adaptcap: None,
             adapttrig: false,
@@ -1675,6 +1682,19 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose scans search a copy for their cursor, as before
+    /// `Options::copy_start_at_rank`: against `supdb` it prices starting
+    /// the walk at the rank the partition's seek found.
+    pub fn create_copysearch(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                copysearch: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-ingest` with the closing fsync writing everything, as
     /// `supdb-latewb`.
     pub fn create_ingest_latewb(path: &Path) -> Res<Supdb> {
@@ -1843,6 +1863,7 @@ impl Supdb {
             piecesonly,
             latewb,
             inlinemaint,
+            copysearch,
             shape,
             aheadmin,
             lazyforms,
@@ -1966,6 +1987,7 @@ impl Supdb {
             // afresh at every publish as it was.
             forms_carry: carry,
             freeze_settles: settlefreeze,
+            copy_start_at_rank: !copysearch,
             forms_convert_unread: !(bg || bglag),
             // The capped conversions and the builder's, kept to price again
             // once the thread keeps up with the writer.
@@ -2090,6 +2112,7 @@ impl Supdb {
             piecesonly,
             latewb,
             inlinemaint,
+            copysearch,
             shape,
             aheadmin,
             lazyforms,
@@ -2378,6 +2401,9 @@ impl Engine for Supdb {
                 "supdb-ingestlatewb"
             };
         }
+        if self.copysearch {
+            return "supdb-copysearch";
+        }
         if self.shape {
             return "supdb-ingestshape";
         }
@@ -2488,6 +2514,7 @@ impl Engine for Supdb {
         let (forms, form_bytes, _, _) = db.canonical_forms();
         let ev = db.forms_events();
         let wk = db.forms_walks();
+        let cs = db.copy_starts();
         let ph = db.scan_phases();
         let uk = db.upkeep_counts();
         vec![
@@ -2545,6 +2572,8 @@ impl Engine for Supdb {
             ("install_slot_skip", ev[12] as f64),
             // The forms the writer's walks met: see `Db::forms_walks`.
             ("walk_copy", wk[0] as f64),
+            ("start_at_rank", cs[0] as f64),
+            ("start_search", cs[1] as f64),
             ("walk_sparse", wk[1] as f64),
             ("walk_other", wk[2] as f64),
             // Where the writer's scans spent their time before walking,
@@ -3017,13 +3046,12 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-settleall" | "supdb-inline" | "supdb-tier" | "supdb-runs" | "supdb-keeper"
         | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice"
         | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "supdb-asympin"
-        | "supdb-extsval" | "supdb-piecesonly" | "supdb-latewb" | "supdb-inlinemaint"
-        | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose" | "supdb-rotate"
-        | "supdb-nofrozen" | "supdb-idle" | "supdb-sortover" | "supdb-pmd" | "supdb-hold"
-        | "supdb-settlefreeze" | "supdb-convertcap" | "supdb-shortpass" | "supdb-noyield"
-        | "supdb-postedyield" | "supdb-bg" | "supdb-bglag" | "lmdb" | "rocksdb-tuned" => {
-            Guarantee::Durable
-        }
+        | "supdb-extsval" | "supdb-piecesonly" | "supdb-latewb" | "supdb-copysearch"
+        | "supdb-inlinemaint" | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose"
+        | "supdb-rotate" | "supdb-nofrozen" | "supdb-idle" | "supdb-sortover" | "supdb-pmd"
+        | "supdb-hold" | "supdb-settlefreeze" | "supdb-convertcap" | "supdb-shortpass"
+        | "supdb-noyield" | "supdb-postedyield" | "supdb-bg" | "supdb-bglag" | "lmdb"
+        | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest"
         | "supdb-ingestleave"
         | "supdb-ingestnoseal"
@@ -3100,6 +3128,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-piecesonly" => Box::new(Supdb::create_piecesonly(dir)?),
         "supdb-ingestpiecesonly" => Box::new(Supdb::create_ingest_piecesonly(dir)?),
         "supdb-latewb" => Box::new(Supdb::create_latewb(dir)?),
+        "supdb-copysearch" => Box::new(Supdb::create_copysearch(dir)?),
         "supdb-ingestlatewb" => Box::new(Supdb::create_ingest_latewb(dir)?),
         "supdb-inlinemaint" => Box::new(Supdb::create_inlinemaint(dir)?),
         "supdb-ingestinline" => Box::new(Supdb::create_ingest_inline(dir)?),

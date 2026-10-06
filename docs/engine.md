@@ -3087,10 +3087,75 @@ conversions running beside reads that never scan; on the durable arm at
 a hundred thousand the sums 1.15x better (9/12) and everything else
 level.
 
-What remains of the cell is the copy walk's 4-5 ms over a clean pass,
-and the single-thread scan on the ordered store, 0.68-0.88x of LMDB's
-cursor at three hundred thousand keys, which is the clean record walk
-and not the forms.
+The copy walk's excess, taken apart. The probe's rewritten point with
+the thread's passes done and the forms as they stand (`LAG_WAIT_MS`),
+alternated in rotated rounds on the durable arm at three hundred
+thousand keys, per scan with the first scan taken out: a copy walk
+2.6-2.9 µs against a clean walk's 2.0-2.3. The first lever
+pre-registered for it was the copy's prefetch -- the forty-eight lines
+of a copy's three buffers, issued right before the search that needs
+them, a fifth of the pass's samples on the prefetch instructions
+themselves -- and it is refuted: with no prefetch the walk reads 4.0 µs
+a scan, with the current block's prefetch cut or trimmed to its entries
+and keys 2.7-2.9, with the next block's lines dripped through the
+current block's walk 2.8-3.0, each over six to eighteen passes. The
+prefetch pays through the next block, issued a block ahead, and the
+samples on the instructions are where the memory wait lands, not a cost
+a shape removes. The settle's prefetch of the next group's block, the
+hottest instructions in `settle_each` by the same instrument, answers
+the same way: entries and keys alone 0.45-0.54 µs a write on the first
+scan against 0.43-0.71 whole, and none 0.47-0.59.
+
+The second component is the first scan's. In the suite's shape the
+pass's first scan is 1.7 ms of 9.6-10 at three hundred thousand keys
+and 0.6 of 2.3-2.9 at a hundred thousand, and the trace says what it
+does: the thread ran a pass for each of the burst's last commits and
+each pass filed nothing, since `settle_due` declines a backlog under
+`Options::forms_settle_backlog_pct` with no scan recent, so the burst's
+tail -- two to three thousand writes at three hundred thousand keys --
+waits for the first scan, which reads and files it at 0.45-0.55 µs a
+write where the thread would have at 0.50-0.56. The thread's
+one-millisecond fallback for a stopped writer runs the pass and the due
+rule skips it. The option's own entry says the bound decides who files
+a burst's tail; the first read after a burst is who.
+
+The third is the copy's own search. The partition's seek has found the
+cursor's rank, and the walk then searched the copy's entries for the
+cursor again, six dependent misses into two buffers the prefetch above
+exists to warm. After a burst of updates every copy's entries are the
+block's records and nothing else -- an update patches an entry in place
+and inserts none -- and the copy knows it (`CachedBlock::identity`,
+set by the build over updates at known cuts, cleared by an insert for
+good), so the walk starts at the seek's rank less the block's first
+(`Options::copy_start_at_rank`; `supdb-copysearch` searches). On the
+probe, eighteen passes a shape over nine rotated rounds, the start at
+the rank read 2.90 µs a scan against the search's 2.98 with the first
+block's prefetch kept and 2.83 against 3.23 without it, faster in six
+and eight rounds of nine by each round's best pass: about a twentieth
+of the walk, not the tenth predicted.
+The suite's own pair, twelve pairs on the durable arm: at a hundred
+thousand keys the search reads the rewritten point 0.91x of the start at
+the rank (2/12 above it, p=0.039), at three hundred thousand the point
+is within noise (6/12), and nothing else moves at either size, the mixes
+and the clean scans included. The start at the rank is the default.
+
+The bound itself, priced as the suite's own pair at one percent
+(`BACKLOG=1`, `supdb-eager`), twelve pairs: at a hundred thousand keys
+the tenth-rewritten point 1.17x (10/12, p=0.039) and the rewritten point
+1.06x (7/12); at three hundred thousand both within noise (1.04x, 9/12);
+the update mixes 0.87-0.94x in four to seven pairs of twelve at either
+size, the trade the option's entry describes and not one the pairs
+resolve. The bound stays at two.
+
+What remains of the cell: the burst's tail, 1.7 ms of the pass at three
+hundred thousand keys and 0.6 of 2.3-2.9 at a hundred thousand, which
+the bound only moves between the commits and the first read, and a
+filing by block at the walk, or a cheaper filing, would take; the copy
+walk's half a microsecond a scan over the clean walk, which is the
+copy's three buffers against the partition's one record stream; and the
+single-thread scan on the ordered store, 0.68-0.88x of LMDB's cursor at
+three hundred thousand keys, which is the clean record walk and not the
+forms.
 
 #### The pin's fence, priced against a sweep that fences for it
 

@@ -84,13 +84,19 @@ known-red input before trusting it with a push.
 ## Profiling
 
 Two instruments, and they disagree where it matters. Callgrind
-(`valgrind --tool=callgrind --collect-atstart=no --toggle-collect='*supdb*Reader*scan*'`)
+(`valgrind --tool=callgrind --collect-atstart=no --toggle-collect='supdb::db::Reader::scan'`)
 counts instructions exactly and attributes them without sampling noise,
 which is what a fixed cost of a few hundred nanoseconds needs. It is
 blind to waiting: on the scan path `Blob::scan_at` is 9% of the
 instructions and a third of the time. Count what the toggle collects and
 not what the probe times -- a warmup loop inside the toggle doubled every
-figure once.
+figure once. Name the function exactly: the toggle flips at every
+function the pattern matches, so `*Reader*scan*` turned collection off
+again inside `scan_blocks` and counted a scan without its walk, three
+runs before anyone read the function list. And valgrind runs one thread
+at a time: a state the upkeep thread must build while the probe sleeps
+-- the copies after a burst -- is never reached under it, however long
+the sleep, so the copy walk's instruction count cannot be had this way.
 
 For time, `perf record -e cpu-clock`. There are no hardware counters
 here: this is a Firecracker guest, `/sys/bus/event_source/devices/` has
@@ -174,7 +180,12 @@ upkeep home, waiting out the thread's pass in flight before the clock
 started: it read the lazy freeze's pass level where the suite read it
 at four tenths, and the wait it hid was half of the suite's first scan.
 Read nothing between the phases the suite times that the suite does not
-read. The
+read. A seventh ran the rewritten lag point alone (`LAG_PCTS=100`) and
+read sparse forms and a pass twice as long where the ladder reads
+copies: the thread converts a burst's forms only once a scan has
+happened since its last pass, and the point before it is where those
+scans come from, so a lag point measured without the ladder is a point
+of a different store. The
 suite's own arms answer most of these questions without a probe at all,
 and `bench ab` prices two of them in one process; reach for a probe only
 when no pair of arms isolates what you are asking.

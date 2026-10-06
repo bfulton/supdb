@@ -87,6 +87,15 @@ fn main() {
             if std::env::var_os("LAG_SETTLE").is_some() {
                 e.sync().unwrap();
             }
+            // LAG_WAIT_MS=n: the pass starts n milliseconds after the
+            // burst, with the thread's passes done and the forms as they
+            // stand -- the copy walk alone, against LAG_SETTLE's clean one.
+            if let Some(ms) = std::env::var("LAG_WAIT_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+            }
             let cpu0 = thread_cpu_ms();
             let mut g3 = KeyGen::new(KeyDist::Uniform, scan_keys, 0x1A7);
             supdb_bench::run::lag_mark(&arm, pct, "start");
@@ -119,7 +128,7 @@ fn main() {
             let ext = get(&c1, "snapshot_extends") - get(&c0, "snapshot_extends");
             let d = |n: &str| get(&c1, n) - get(&c0, n);
             let upkeep_built = format!(
-                "first {first:.2}ms up_built {:.0} drops {:.0} ahead {:.0}/{:.0}/{:.0} notable {:.0} fill {:.0}/{:.0} bld skip {:.0}/{:.0} built {:.0} inst drop {:.0} skip {:.0} walks {:.0}/{:.0}/{:.0}",
+                "first {first:.2}ms up_built {:.0} drops {:.0} ahead {:.0}/{:.0}/{:.0} notable {:.0} fill {:.0}/{:.0} bld skip {:.0}/{:.0} built {:.0} inst drop {:.0} skip {:.0} walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0}",
                 d("blk_by_upkeep"),
                 d("table_drops"),
                 d("ahead_starts"),
@@ -135,7 +144,9 @@ fn main() {
                 d("install_slot_skip"),
                 d("walk_copy"),
                 d("walk_sparse"),
-                d("walk_other")
+                d("walk_other"),
+                d("start_at_rank"),
+                d("start_search")
             );
             let phases = format!(
                 "ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} ms, wait {:.2}",
