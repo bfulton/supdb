@@ -2963,6 +2963,56 @@ taken the arm reads level on burst plus twice the pass at the one- and
 ten-percent points and trails by up to a third at the hundred-percent
 ones.
 
+#### The buffered lag points are one scan, and that scan is the thread's lag
+
+The buffered arm's scan pass after a burst, in one process against
+`lmdb-nosync`, read 0.33-0.36x at the fully rewritten point and
+0.56-0.68x at the tenth, at a hundred and three hundred thousand keys,
+the only significant losses on the board. Decomposed with the lag probe
+in the suite's shape: the pass is one slow scan and then scans within
+0-15% of LMDB's rate. At three hundred thousand keys the fully
+rewritten pass was 26-54 ms with a first scan of 8-37 and the rest at
+16-19 against LMDB's whole pass of 16; the tenth was 20-30 with a first
+scan of 9-19 and the rest at 11.5 against 14. The first scan is the
+wait for the upkeep thread's pass in flight plus the settle of what the
+writer logged during it, about twice the size of that pass; and the
+pass is large because the thread's cost a write is the writer's --
+0.5-0.9 µs against 0.4-0.9 across the points -- so a pass covers what
+was written during the one before and never shrinks. Nine pieces stand
+at every pass's end, and the steady scans over the sparse forms and
+copies are near LMDB's, so the pieces are not the cost there.
+
+The thread's cost a write was then priced by instruction count under
+callgrind, perf's software clock having spread it over a dozen leaves:
+2,660 instructions a settled write at a hundred thousand keys, more
+than half in the patch (the chain walked once for the tombstone and
+again for the values, the key search through `memcmp`, a sum over every
+entry for the bloat check), a seventh in the resolve, a tenth in the
+loop itself and a fifth in the allocator. Three rounds of local cuts followed, each
+measured against the head's binary alternated two rounds of three reps:
+the first, which also narrowed the form prefetch to its entries and keys
+and grew a full form one delta at a time past the dense count, read
+worse at the fully rewritten point (a miss a splice into the values, a
+reallocation a write on the forms that burst makes); the second and
+third took the instructions to 2,056, 23% fewer with 17 of them the
+allocator's, its share of the thread's samples from a fifth to a
+fourteenth, and the thread's cost a write a fifth lower at the tenth
+point at a hundred thousand keys in two sittings -- and the
+pass and its first scan level everywhere within a rep spread that is a
+factor of two for one build on this host. A change the thread's lag
+would need is a third of its cost a write, and the cuts available
+locally are each two to seven percent. The lever is parked.
+
+What would move the cell is not a cheaper write but a settle that runs
+beside the writer's scans instead of before them: the forms' upkeep is
+one object with one holder, so a scan takes the whole of it back and
+waits for a pass over every block to finish before it walks three.
+Owned by shards of blocks, a scan would take back the shards it walks
+and wait for a pass over those alone, and the thread would keep filing
+the rest; or two filing threads over disjoint halves would halve the
+lag at a core's price. Either is a redesign of the upkeep's ownership
+and is its own move.
+
 #### The pin's fence, priced against a sweep that fences for it
 
 A read pins the epoch it reads in by storing it in its slot of the
