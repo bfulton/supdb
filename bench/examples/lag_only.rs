@@ -45,7 +45,12 @@ fn main() {
         let mut buf = Batch::with_capacity(1000, payload.value_size());
         let mut line = format!("rep {rep}:");
         let mut c0 = e.counters();
-        for pct in [0u64, 1, 10, 100] {
+        // LAG_PCTS=0,1,10 runs a prefix of the sweep, for a profile of one point.
+        let pcts: Vec<u64> = std::env::var("LAG_PCTS")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![0, 1, 10, 100]);
+        for pct in pcts {
             let want = size * pct / 100;
             let wrote = want.saturating_sub(updated);
             let tw = Instant::now();
@@ -88,6 +93,8 @@ fn main() {
             let pubs = get(&c1, "publishes") - get(&c0, "publishes");
             let snaps = get(&c1, "snapshot_builds") - get(&c0, "snapshot_builds");
             let refr = get(&c1, "snapshot_refreshes") - get(&c0, "snapshot_refreshes");
+            let swit = get(&c1, "snap_switches") - get(&c0, "snap_switches");
+            let ext = get(&c1, "snapshot_extends") - get(&c0, "snapshot_extends");
             let d = |n: &str| get(&c1, n) - get(&c0, n);
             let upkeep_built = format!(
                 "first {first:.2}ms up_built {:.0} drops {:.0} ahead {:.0}/{:.0}/{:.0} notable {:.0} fill {:.0}/{:.0} bld skip {:.0}/{:.0} built {:.0} inst drop {:.0} skip {:.0} walks {:.0}/{:.0}/{:.0}",
@@ -137,7 +144,7 @@ fn main() {
                 0.0
             };
             line.push_str(&format!(
-                "\n  lag{pct} {burst:.1}+{pass:.1}ms up {up:.1}ms/{passes:.0}p cpu {cpu:.1}ms mb {barriers:.0} c_t {ct:.2} c_w {cw:.2} built {built:.0} skipped {skipped:.0} blockpath {blockpath:.0}/{scans_n:.0} seals {seals:.0} pubs {pubs:.0} snaps {snaps:.0} refr {refr:.0} | {layout} | {upkeep_built} | {phases}"
+                "\n  lag{pct} {burst:.1}+{pass:.1}ms up {up:.1}ms/{passes:.0}p cpu {cpu:.1}ms mb {barriers:.0} c_t {ct:.2} c_w {cw:.2} built {built:.0} skipped {skipped:.0} blockpath {blockpath:.0}/{scans_n:.0} seals {seals:.0} pubs {pubs:.0} snaps {snaps:.0} refr {refr:.0} swit {swit:.0} ext {ext:.0} | {layout} | {upkeep_built} | {phases}"
             ));
             c0 = c1;
         }

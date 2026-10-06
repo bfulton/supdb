@@ -5580,7 +5580,9 @@ impl CachedBlock {
     }
     /// First entry whose key is not below `from`.
     fn lower_bound(&self, from: &[u8]) -> usize {
-        select_lower_bound(self.ents.len(), |i| self.key(&self.ents[i]) < from)
+        select_lower_bound(self.ents.len(), |i| {
+            key_cmp(self.key(&self.ents[i]), from) == Ordering::Less
+        })
     }
     /// PROTOTYPE: pull the entries and the keys toward the core, and the
     /// first lines of the values, ahead of a walk. After a pass over
@@ -5601,6 +5603,28 @@ impl CachedBlock {
             f(&run[p + 4..p + 4 + n]);
             p += 4 + n;
         }
+    }
+}
+
+/// Two keys compared, their first sixteen bytes as two big-endian words
+/// where both have them and the rest as bytes: what `memcmp` answers,
+/// without the call. A form's key search compared through `memcmp`,
+/// and the calls were a thirtieth of the settle's instructions at
+/// sixteen-byte keys.
+#[inline]
+fn key_cmp(a: &[u8], b: &[u8]) -> Ordering {
+    if a.len() >= 16 && b.len() >= 16 {
+        let word =
+            |s: &[u8], i: usize| u64::from_be_bytes(s[i..i + 8].try_into().expect("eight bytes"));
+        match word(a, 0).cmp(&word(b, 0)) {
+            Ordering::Equal => match word(a, 8).cmp(&word(b, 8)) {
+                Ordering::Equal => a[16..].cmp(&b[16..]),
+                o => o,
+            },
+            o => o,
+        }
+    } else {
+        a.cmp(b)
     }
 }
 
@@ -5761,6 +5785,34 @@ struct DeltaEnt {
 }
 
 impl SparseBlock {
+    /// An empty form with room for `ROOM_AT_BIRTH` deltas of a key and a
+    /// run like these, for the splices that make a form a delta at a
+    /// time; a build sizes its own from the count it has. Not the dense
+    /// count at birth: most forms a mix leaves hold a delta or two, and
+    /// at thirty million keys the difference is the page cache's.
+    fn with_room(key_len: usize, run_len: usize) -> SparseBlock {
+        SparseBlock {
+            keys: Vec::with_capacity(ROOM_AT_BIRTH * key_len.max(16)),
+            ents: Vec::with_capacity(ROOM_AT_BIRTH),
+            vals: Vec::with_capacity(ROOM_AT_BIRTH * (run_len + 8)),
+        }
+    }
+    /// Room for one more delta of a key and a run like these: a buffer
+    /// that is full grows to the dense count at once, and past it by
+    /// doubling, as a `Vec` does -- a form the fill has not yet rebuilt
+    /// as a copy grows on through the dense count, and growing it a
+    /// delta at a time there was a reallocation a write.
+    fn room(&mut self, key_len: usize, run_len: usize) {
+        fn grow<T>(v: &mut Vec<T>, need: usize, dense: usize) {
+            if v.len() + need > v.capacity() {
+                let target = dense.max(2 * v.capacity()).max(v.len() + need);
+                v.reserve_exact(target - v.len());
+            }
+        }
+        grow(&mut self.ents, 1, CACHE_DENSE);
+        grow(&mut self.keys, key_len, CACHE_DENSE * key_len.max(16));
+        grow(&mut self.vals, run_len, CACHE_DENSE * (run_len + 8));
+    }
     /// PROTOTYPE: the block's three buffers toward the core ahead of a
     /// walk, as a copy's; the lower bound over the deltas is the same
     /// dependent misses into two of them.
@@ -5812,6 +5864,10 @@ impl Cached {
 /// quarter on the second, a walk cut every few keys costing more than
 /// the copy it saves. Rounds interleaved, one machine.
 const CACHE_DENSE: usize = 16;
+
+/// Deltas a sparse form made by a splice has room for at birth; full, it
+/// grows to `CACHE_DENSE` at once and doubles from there (`SparseBlock::room`).
+const ROOM_AT_BIRTH: usize = 4;
 
 /// The most live tables `State::replaced` keeps.
 const REPLACED_CAP: usize = 8;
@@ -10569,7 +10625,8 @@ impl Reader {
                             .mem()
                             .slot_of(k, self.len_bound.get())
                             .map_or(u32::MAX, |i| i as u32);
-                        self.patch_block(pi, b, table, k, cut, (self.mem(), slot))?;
+                        let tombs = self.has_tombstones();
+                        self.patch_block(pi, b, table, k, cut, (self.mem(), slot, tombs))?;
                     }
                 }
             }
@@ -12103,6 +12160,7 @@ impl Reader {
         // leaves one block's keys contiguous and the count is this
         // loop's own. See `Options::forms_settle_rebuild_from`.
         let from = self.opts.forms_settle_rebuild_from;
+        let tombs = self.has_tombstones();
         let mut density = self.fs().settle_density.get();
         density[0] += 1;
         let mut group_end = 0usize;
@@ -12209,7 +12267,7 @@ impl Reader {
                     );
                     self.fs().tables_complete.set(false);
                 }
-                self.patch_block(at, b, table, key, cut, (src, slot))?;
+                self.patch_block(at, b, table, key, cut, (src, slot, tombs))?;
             }
             if new {
                 if let Some(list) = table.added.get_mut(b) {
@@ -12220,7 +12278,10 @@ impl Reader {
             // Only a build chooses the wide form, and a patched block is
             // never rebuilt: past the bound, the block is dropped so the
             // next scan builds it wide, as the drop-and-rebuild did.
-            if b < table.slots.len()
+            // Asked once per block, at its group's last key: the count
+            // is a block's and the keys are grouped by block here.
+            if i + 1 == group_end
+                && b < table.slots.len()
                 && BuildCtx::overlay_count(table, b) > WIDE
                 && !matches!(table.slots[b].as_deref(), Some(Cached::Wide(_)))
             {
@@ -12249,7 +12310,7 @@ impl Reader {
         table: &mut BlockTable,
         key: &[u8],
         cut: u32,
-        (from, slot): (&MemTable, u32),
+        (from, slot, tombs): (&MemTable, u32, bool),
     ) -> Result<()> {
         if matches!(table.slots[b].as_deref(), None | Some(Cached::Wide(_))) {
             return Ok(());
@@ -12272,8 +12333,8 @@ impl Reader {
         // A `put` is a delete and an append, so that is every replacing
         // write: the lag point's settles seeked each of the three to
         // seven pieces standing, and every mix that updates pays the
-        // same per key.
-        let tombs = self.has_tombstones();
+        // same per key. `tombs`, whether the store holds any, is the
+        // caller's: asked of the state once a settle, not once a write.
         // `slot` is the write's entry in `from`: the live table's, under
         // the watermark, or a table frozen since the write was read,
         // whose entries are all committed. A frozen write's tombstone
@@ -12286,7 +12347,14 @@ impl Reader {
         // write where the masked path takes a third of one.
         let live_src = std::ptr::eq(from, &**self.mem());
         let from_wm = if live_src { self.wm() } else { u64::MAX };
-        let masked = tombs && slot != u32::MAX && from.has_tomb(from.entry(slot as usize), from_wm);
+        // The chain walked once, for the tombstone and the live values
+        // together: asked for the tombstone first and then for the
+        // values, the same chain was walked twice a write, two dependent
+        // misses each, a twelfth of the settle's instructions.
+        let mut offs = self.fs().settle_offs.borrow_mut();
+        let masked = tombs
+            && slot != u32::MAX
+            && from.live_offs_into(from.entry(slot as usize), &mut offs, from_wm);
         let (c, at_eq) = BuildCtx::cut_known(cut, lo, hi);
         let same = c < hi && at_eq == Ordering::Equal;
         let mut run_scratch = self.fs().settle_run.borrow_mut();
@@ -12302,8 +12370,6 @@ impl Reader {
             // instructions to file one hundred-byte run, a third of them
             // in that machinery, and an update mix takes this path for
             // every key: 88,742 of the lag point's 88,744.
-            let mut offs = self.fs().settle_offs.borrow_mut();
-            from.live_offs_into(from.entry(slot as usize), &mut offs, from_wm);
             for &off in offs.iter() {
                 let v = from.value_at(off);
                 run.extend_from_slice(&(v.len() as u32).to_le_bytes());
@@ -12338,7 +12404,7 @@ impl Reader {
             };
             let mut em = Emit {
                 tombs,
-                scratch: std::mem::take(&mut *self.fs().settle_offs.borrow_mut()),
+                scratch: std::mem::take(&mut *offs),
             };
             ctx.emit_over(
                 &mut |_, v: &[u8]| {
@@ -12351,7 +12417,7 @@ impl Reader {
                 same.then_some(c),
                 src,
             )?;
-            *self.fs().settle_offs.borrow_mut() = em.scratch;
+            *offs = em.scratch;
         }
         self.splice_run(at, b, table, key, (c, same), run)
     }
@@ -12370,7 +12436,7 @@ impl Reader {
         table: &mut BlockTable,
         key: &[u8],
         cut: (usize, bool),
-        run: &mut Vec<u8>,
+        run: &[u8],
     ) -> Result<()> {
         let (c, same) = cut;
         let before = table.slots[b].as_ref().map_or(0, |c| c.bytes());
@@ -12380,7 +12446,8 @@ impl Reader {
         match std::sync::Arc::make_mut(table.slots[b].as_mut().expect("checked above")) {
             Cached::Block(blk) => {
                 let i = blk.lower_bound(key);
-                let found = i < blk.ents.len() && blk.key(&blk.ents[i]) == key;
+                let found =
+                    i < blk.ents.len() && key_cmp(blk.key(&blk.ents[i]), key) == Ordering::Equal;
                 // A run no longer than the one it replaces is written
                 // over it: the values stay where a build laid them and
                 // the array does not grow. Appended, a burst that
@@ -12391,38 +12458,52 @@ impl Reader {
                 // followed, half of them in one round.
                 if found && run.len() <= blk.ents[i][3] as usize {
                     let at = blk.ents[i][2] as usize;
-                    blk.vals[at..at + run.len()].copy_from_slice(&run[..]);
+                    blk.vals[at..at + run.len()].copy_from_slice(run);
                     blk.ents[i][3] = run.len() as u32;
                 } else if found {
                     let at_run = blk.vals.len() as u32;
-                    blk.vals.extend_from_slice(&run[..]);
+                    blk.vals.extend_from_slice(run);
                     blk.ents[i][2] = at_run;
                     blk.ents[i][3] = run.len() as u32;
                 } else {
                     let at_run = blk.vals.len() as u32;
-                    blk.vals.extend_from_slice(&run[..]);
+                    blk.vals.extend_from_slice(run);
                     let key_at = blk.keys.len() as u32;
                     blk.keys.extend_from_slice(key);
                     blk.ents
                         .insert(i, [key_at, key.len() as u32, at_run, run.len() as u32]);
                 }
-                let live: usize = blk.ents.iter().map(|e| e[3] as usize).sum();
-                bloated = blk.vals.len() > 2 * live.max(4096);
+                // Bloated only past twice the floor: below that the sum
+                // over the entries, a load an entry a write, cannot say so.
+                if blk.vals.len() > 2 * 4096 {
+                    let live: usize = blk.ents.iter().map(|e| e[3] as usize).sum();
+                    bloated = blk.vals.len() > 2 * live.max(4096);
+                }
             }
             Cached::Sparse(sb) => {
-                let i = sb.ents.partition_point(|e| sb.key(e) < key);
-                let found = i < sb.ents.len() && sb.key(&sb.ents[i]) == key;
+                let i = sb
+                    .ents
+                    .partition_point(|e| key_cmp(sb.key(e), key) == Ordering::Less);
+                let found =
+                    i < sb.ents.len() && key_cmp(sb.key(&sb.ents[i]), key) == Ordering::Equal;
+                // Room for the dense count at once where a buffer is full:
+                // grown by doubling from the two or three deltas a build
+                // sized it for, each of the three buffers reallocated
+                // three times on the way to sixteen, and the allocator
+                // was a fifth of the upkeep thread's time over the
+                // tenth-rewritten burst.
+                sb.room(key.len(), run.len());
                 if found && run.len() <= sb.ents[i].run.1 as usize {
                     let at = sb.ents[i].run.0 as usize;
-                    sb.vals[at..at + run.len()].copy_from_slice(&run[..]);
+                    sb.vals[at..at + run.len()].copy_from_slice(run);
                     sb.ents[i].run.1 = run.len() as u32;
                 } else if found {
                     let at_run = sb.vals.len() as u32;
-                    sb.vals.extend_from_slice(&run[..]);
+                    sb.vals.extend_from_slice(run);
                     sb.ents[i].run = (at_run, run.len() as u32);
                 } else {
                     let at_run = sb.vals.len() as u32;
-                    sb.vals.extend_from_slice(&run[..]);
+                    sb.vals.extend_from_slice(run);
                     let key_at = sb.keys.len() as u32;
                     sb.keys.extend_from_slice(key);
                     sb.ents.insert(
@@ -12435,8 +12516,10 @@ impl Reader {
                         },
                     );
                 }
-                let live: usize = sb.ents.iter().map(|e| e.run.1 as usize).sum();
-                bloated = sb.vals.len() > 2 * live.max(4096);
+                if sb.vals.len() > 2 * 4096 {
+                    let live: usize = sb.ents.iter().map(|e| e.run.1 as usize).sum();
+                    bloated = sb.vals.len() > 2 * live.max(4096);
+                }
                 // Grown to what a build would have copied: the fill
                 // rebuilds it as a copy, see `complete_forms`. A form the
                 // patches alone had made -- clean at its build, a delta
@@ -12447,16 +12530,19 @@ impl Reader {
                 dense = sb.ents.len() >= CACHE_DENSE;
             }
             slot @ Cached::Clean => {
-                *slot = Cached::Sparse(SparseBlock {
-                    keys: key.to_vec(),
-                    ents: vec![DeltaEnt {
-                        key: (0, key.len() as u32),
-                        cut: c as u32,
-                        same,
-                        run: (0, run.len() as u32),
-                    }],
-                    vals: std::mem::take(run),
+                // Sized for the dense count at birth, and the run copied
+                // rather than its scratch taken: taken, the next splice
+                // allocated the scratch again, one allocation a write.
+                let mut sb = SparseBlock::with_room(key.len(), run.len());
+                sb.keys.extend_from_slice(key);
+                sb.ents.push(DeltaEnt {
+                    key: (0, key.len() as u32),
+                    cut: c as u32,
+                    same,
+                    run: (0, run.len() as u32),
                 });
+                sb.vals.extend_from_slice(run);
+                *slot = Cached::Sparse(sb);
             }
             Cached::Wide(_) => unreachable!("a wide block is left alone above"),
         }
