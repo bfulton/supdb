@@ -484,6 +484,11 @@ pub struct Supdb {
     /// converted in the thread's slack. `supdb-postedyield`, and
     /// `supdb-ingestpostedyield` buffered.
     postedyield: bool,
+    /// The fill's conversions yielding to a posted commit once the thread
+    /// is a thousand writes behind (`Options::forms_convert_behind`), as
+    /// the option's first default meant. `supdb-behindyield`, and
+    /// `supdb-ingestbehindyield` buffered.
+    behindyield: bool,
     /// The background work as the cost model in `docs/engine.md` orders
     /// it: no dense form rebuilt while nothing reads
     /// (`Options::forms_convert_unread` off). `supdb-bg`, and
@@ -663,6 +668,11 @@ struct Policy {
     /// The fill yielding at any posted commit: `supdb-postedyield`, and
     /// `supdb-ingestpostedyield` buffered.
     postedyield: bool,
+    /// The fill's conversions yielding to a posted commit once the thread
+    /// is a thousand writes behind (`Options::forms_convert_behind`), as
+    /// the option's first default meant. `supdb-behindyield`, and
+    /// `supdb-ingestbehindyield` buffered.
+    behindyield: bool,
     /// The background work as the cost model orders it: `supdb-bg`, and
     /// `supdb-ingestbg` buffered.
     bg: bool,
@@ -721,6 +731,7 @@ impl Default for Policy {
             shortpass: false,
             noyield: false,
             postedyield: false,
+            behindyield: false,
             bg: false,
             bglag: false,
             defer: false,
@@ -1066,6 +1077,33 @@ impl Supdb {
                 partition: false,
                 durable: false,
                 noyield: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose conversions yield to a posted commit once the thread
+    /// is a thousand writes behind the writer (`Options::forms_convert_behind`):
+    /// against `supdb` it prices the yield to the writer's wait alone.
+    pub fn create_behindyield(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                behindyield: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` yielding a thousand writes behind, as
+    /// `supdb-behindyield`.
+    pub fn create_ingest_behindyield(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                behindyield: true,
                 ..Policy::default()
             },
         )
@@ -2001,6 +2039,7 @@ impl Supdb {
             shortpass,
             noyield,
             postedyield,
+            behindyield,
             bg,
             bglag,
         } = policy;
@@ -2105,6 +2144,8 @@ impl Supdb {
             forms_convert_yield: !noyield,
             forms_convert_behind: if postedyield {
                 0
+            } else if behindyield {
+                1000
             } else {
                 supdb::Options::default().forms_convert_behind
             },
@@ -2254,6 +2295,7 @@ impl Supdb {
             shortpass,
             noyield,
             postedyield,
+            behindyield,
             bg,
             bglag,
         })
@@ -2375,6 +2417,13 @@ impl Engine for Supdb {
                 "supdb-postedyield"
             } else {
                 "supdb-ingestpostedyield"
+            };
+        }
+        if self.behindyield {
+            return if self.partition {
+                "supdb-behindyield"
+            } else {
+                "supdb-ingestbehindyield"
             };
         }
         if self.bg {
@@ -3225,6 +3274,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-shortpass"
         | "supdb-noyield"
         | "supdb-postedyield"
+        | "supdb-behindyield"
         | "supdb-bg"
         | "supdb-bglag"
         | "lmdb"
@@ -3250,6 +3300,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestshortpass"
         | "supdb-ingestnoyield"
         | "supdb-ingestpostedyield"
+        | "supdb-ingestbehindyield"
         | "supdb-ingestpiecesonly"
         | "supdb-ingestlatewb"
         | "supdb-ingestcopysearch"
@@ -3342,6 +3393,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-shortpass" => Box::new(Supdb::create_shortpass(dir)?),
         "supdb-noyield" => Box::new(Supdb::create_noyield(dir)?),
         "supdb-postedyield" => Box::new(Supdb::create_postedyield(dir)?),
+        "supdb-behindyield" => Box::new(Supdb::create_behindyield(dir)?),
         "supdb-bg" => Box::new(Supdb::create_bg(dir)?),
         "supdb-ingestbg" => Box::new(Supdb::create_ingest_bg(dir)?),
         "supdb-bglag" => Box::new(Supdb::create_bglag(dir)?),
@@ -3351,6 +3403,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestshortpass" => Box::new(Supdb::create_ingest_shortpass(dir)?),
         "supdb-ingestnoyield" => Box::new(Supdb::create_ingest_noyield(dir)?),
         "supdb-ingestpostedyield" => Box::new(Supdb::create_ingest_postedyield(dir)?),
+        "supdb-ingestbehindyield" => Box::new(Supdb::create_ingest_behindyield(dir)?),
         "supdb-idle" => Box::new(Supdb::create_idle(dir)?),
         "supdb-shapeidle" => Box::new(Supdb::create_shape_idle(dir)?),
         "supdb-ingestadaptloose" => Box::new(Supdb::create_ingest_adaptloose(dir)?),

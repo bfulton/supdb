@@ -3351,15 +3351,34 @@ read its rewritten point 6% against the change in ten pairs of twelve
 the pair's position effect is real and a verdict at p .04 on one
 pairing is not one.
 
+The yield's measure was then made what its doc said -- the writes the
+writer has lent past the commit the pass brings the upkeep to -- and
+priced against the behaviour the dead measure had given, yielding to the
+writer's wait alone, at three hundred thousand keys in twenty-four pairs.
+It lost everywhere it moved: the thread converted 1,657 of the burst's
+forms where it had converted 4,913, the pass after it walked 20% more
+sparse forms and 10% fewer copies, and the buffered point read 0.65x
+(twenty-one pairs above for the want-only shape, p < .001); the durable
+arm's thread spent 11% more, patching forms it had left sparse, with its
+points level. In the row's shape the slow reps stayed, with the first
+scan waiting 47-65 ms for a pass that was settling, not converting, and
+the fast reps slowed to 27-30 ms. So the default yields to the writer's
+wait alone, now said as an infinite allowance, and the yield a thousand
+behind is the arm (`supdb-behindyield`, `supdb-ingestbehindyield`). The
+measure that never fired had, in effect, chosen the better shape, and a
+conversion made early is also the cheaper form to patch for the rest of
+the burst.
+
 What the change did not do: the slow mode is still there, one rep in
 four in the row's shape, because the thread's budget is what it was.
 The burst writes three hundred thousand keys in 180-200 ms and the
 thread's work for it is the settles at about 0.4 µs a write, 120 ms,
 the conversions, 33 ms now against 52, and the log read and snapshot,
 about 20; the thread is on a core for nearly the whole burst, and any
-slip puts the burst's end on the first scan. The yield's measure, the
-settle's per-write cost and what the first scan has to wait for are
-the levers left, in that order.
+slip puts the burst's end on the first scan. The settle's per-write cost -- which the row's thread
+column reads at 0.46-0.83 µs a write across reps for the same burst --
+and what the first scan has to wait for are the levers left, in that
+order.
 
 #### The pin's fence, priced against a sweep that fences for it
 

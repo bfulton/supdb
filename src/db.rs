@@ -1125,18 +1125,26 @@ pub struct Options {
     /// behind would take both; `supdb-noyield` and `supdb-ingestnoyield`
     /// keep the fill that does not yield (`docs/engine.md`).
     pub forms_convert_yield: bool,
-    /// How far behind the writer, in committed writes it has not read,
-    /// the upkeep thread must be before a posted commit makes its fill
-    /// yield its conversions; the writer's own wait yields always. Zero
-    /// yields at any posted commit, the shape before. The yield at any
-    /// posted commit deferred every dense block of a burst to one
-    /// rebuild after the landing, on the durable arm at three hundred
-    /// thousand keys 4,700 blocks built fresh in one pass of 23-56 ms,
-    /// which the first scan after the burst waited out whenever the
-    /// landing fell at the burst's end -- while the thread had been on a
-    /// core for half the burst. A batch, the default, converts in that
-    /// slack and yields where the thread runs behind; `supdb-postedyield`
-    /// and `supdb-ingestpostedyield` keep the yield at any posted commit.
+    /// How far behind the writer, in writes lent past the commit its pass
+    /// is bringing the upkeep to, the upkeep thread must be before a
+    /// posted commit makes its fill yield its conversions; the writer's
+    /// own wait yields always. Zero yields at any posted commit: that
+    /// deferred every dense block of a burst to one rebuild after the
+    /// landing, on the durable arm at three hundred thousand keys 4,700
+    /// blocks built fresh in one pass of 23-56 ms, which the first scan
+    /// after the burst waited out whenever the landing fell at the
+    /// burst's end (`supdb-postedyield`, `supdb-ingestpostedyield`).
+    /// `usize::MAX`, the default, yields to the writer's wait alone and
+    /// converts whatever the pass finds dense, behind or not. A thousand
+    /// was the default while the measure of "behind" was the log position
+    /// the pass may read to less the position it had read, which on the
+    /// thread is zero in every pass, so it yielded to the writer's wait
+    /// alone in effect; measured as written, with the writer's lead, the
+    /// thread converted a third of the rewriting burst's forms, the scans
+    /// after it walked the rest as sixty-four-delta sparse forms and read
+    /// 0.65x on the buffered arm, and the durable arm's thread spent a
+    /// tenth more patching forms kept sparse. `supdb-behindyield` and
+    /// `supdb-ingestbehindyield` keep the thousand for pricing.
     pub forms_convert_behind: usize,
     /// Whether a dense sparse form is converted into a copy from its own
     /// deltas and the partition's records, or built again from the
@@ -1393,7 +1401,7 @@ impl Default for Options {
             forms_convert_cap: 0,
             ahead_converts: false,
             forms_convert_yield: true,
-            forms_convert_behind: 1000,
+            forms_convert_behind: usize::MAX,
             convert_from_form: true,
             forms_settle_recent_pct: 0,
             forms_carry: true,
@@ -7717,6 +7725,11 @@ struct FormsState {
     /// take the rest in its next pass (`Options::upkeep_pass_pct`). Zero
     /// is unbounded, which the writer's own looks are.
     read_cap: std::cell::Cell<usize>,
+    /// For a pass on the upkeep thread: `UpkeepTo::lent` of the commit
+    /// the pass brings the upkeep to, against which the conversions'
+    /// yield measures how far the writer has gone on
+    /// (`Options::forms_convert_behind`).
+    pass_lent: std::cell::Cell<u64>,
     log_short: std::cell::Cell<bool>,
     /// What the lazy snapshot did, for a measurement and for the test
     /// that must know the path was taken: scans that finished without a
@@ -7819,6 +7832,7 @@ impl FormsState {
             walk_kinds: std::cell::Cell::new([0; 3]),
             copy_starts: std::cell::Cell::new([0; 2]),
             read_cap: std::cell::Cell::new(0),
+            pass_lent: std::cell::Cell::new(0),
             log_short: std::cell::Cell::new(false),
             lazy_scans: std::cell::Cell::new([0; 2]),
             settle_density: std::cell::Cell::new([0; 4]),
@@ -12637,11 +12651,23 @@ impl Reader {
     }
 
     /// Whether the upkeep thread is behind the writer by more than the
-    /// conversions' allowance: the writes committed past the position
-    /// this handle has read the log to (`Options::forms_convert_behind`).
+    /// conversions' allowance: the writes the writer has lent past the
+    /// commit this pass brings the upkeep to
+    /// (`Options::forms_convert_behind`). The first version measured the
+    /// log position this handle may read to less the position it had
+    /// read, and on the thread the first is the pass's own bound, which
+    /// the log read has just reached: zero in every pass, so no posted
+    /// commit ever yielded a conversion and only the writer's wait did.
     fn convert_behind(&self) -> bool {
         let allow = self.opts.forms_convert_behind;
-        allow == 0 || self.log_end().saturating_sub(self.fs().log_seen.get()) > allow
+        if allow == 0 {
+            return true;
+        }
+        if allow == usize::MAX {
+            return false;
+        }
+        let lent = self.shared.upkeep.to.load().lent;
+        lent.saturating_sub(self.fs().pass_lent.get()) > allow as u64
     }
 
     fn list_built(&self, p: usize, b: usize, table: &mut BlockTable) {
@@ -19656,6 +19682,7 @@ impl Reader {
             self.wm.set(to.wm);
             self.force_due.set(to.force);
             self.fs().read_cap.set(to.cap as usize);
+            self.fs().pass_lent.set(to.lent);
             self.fs().log_short.set(false);
             let done = self.maintain_forms();
             whole = !self.fs().log_short.replace(false);

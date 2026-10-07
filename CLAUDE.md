@@ -1318,6 +1318,24 @@ shared borrow, and the mutable one is taken only once the answer says
 there is something to change; and a function that promises uniqueness is
 priced by what it does to prove it.
 
+**A check that never fired, fixed to fire.** The upkeep thread's
+conversions were to yield to a posted commit once the thread ran a
+thousand writes behind, and the measure of "behind" was the log
+position the pass may read to less the position it had read -- on the
+thread the pass's own bound, which the log read has just reached, so
+zero in every pass: the yield never fired, and the thread converted
+every dense form it met, behind or not. Fixed to measure the writer's
+lead as the doc said, it fired as designed and lost: the thread
+converted a third of a rewriting burst's forms, the scans after walked
+the rest as sixty-four-delta sparse forms at 0.65x, and the forms left
+sparse cost the thread a tenth more to patch. The default is the
+behaviour the dead check had given, said plainly, and the fixed
+measure is an arm. The rule: a check that was never firing has a
+behaviour of its own that every row so far has measured, and the doc's
+intended behaviour has been measured by nothing; fix the measure, but
+price the intended behaviour as a new shape against the one the rows
+know before making it the default.
+
 **A sentinel that crosses the wasm boundary changes sign.** A wasm `u32`
 arrives in JavaScript as a signed i32, so a failure sentinel of `u32::MAX`
 arrives as -1 and a comparison against 4294967295 can never match. Every
