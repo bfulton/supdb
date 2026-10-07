@@ -109,7 +109,18 @@ says how many of them are the allocator's give-back: a process's
 second burst drops from ten thousand to under four, its first stays at
 fifteen, and the difference priced at a microsecond or two a fault was
 a tenth of the thread, not the half. Count the faults and alternate the
-tunables before pooling anything.
+tunables before pooling anything. And price a fault by the thread's
+own kernel share, window by window, not by a count: the count was the
+same twelve to fourteen thousand in every rep of the buffered
+rewritten point while the thread's samples in `clear_page_erms` were
+6-15% in the fast reps and 57% in the slow -- a first touch costs the
+guest about 0.7 µs where it still backs the page and about 9 where its
+balloon has given the page to the host, and which pages a burst gets
+is the host's. The faults that were the engine's to remove were the
+copies sized with room, each twice its form's bytes and fitting no
+chunk the forms before it had freed (`Options::copy_exact`); the
+tunables had said the give-back was not it, and the profile's kernel
+share said what was.
 
 For time, `perf record -e cpu-clock`. There are no hardware counters
 here: this is a Firecracker guest, `/sys/bus/event_source/devices/` has

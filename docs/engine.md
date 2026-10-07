@@ -3375,10 +3375,42 @@ The burst writes three hundred thousand keys in 180-200 ms and the
 thread's work for it is the settles at about 0.4 µs a write, 120 ms,
 the conversions, 33 ms now against 52, and the log read and snapshot,
 about 20; the thread is on a core for nearly the whole burst, and any
-slip puts the burst's end on the first scan. The settle's per-write cost -- which the row's thread
-column reads at 0.46-0.83 µs a write across reps for the same burst --
-and what the first scan has to wait for are the levers left, in that
-order.
+slip puts the burst's end on the first scan. The settle's per-write cost was then counted by kind,
+and it is not the slow mode: a trace of every patch by the form it met
+read 0.36-0.43 µs a write in every window, the copy in place cheapest
+(0.27-0.34) and the sparse insert dearest (0.36-0.45), while the slow
+windows had settled 138,000-165,000 writes before the burst ended where
+the fast ones settled 230,000-263,000, at the same cost each. The
+thread was never idle and never off its core between passes, so the
+difference was inside the passes, and a split by phase put it in the
+conversions: the same 4,688 conversions cost 43-82 ms across windows,
+and in one pass 346 of them took 35 ms, 102 µs each, where the ab's
+counter had read 6.6. Glibc's trimming was not it -- run with trimming
+off and alternated, the faults stayed at 12-14 thousand a burst and
+the conversions no cheaper -- so the thread was profiled inside the
+burst windows, by thread. In the slow window 69% of its samples were in
+the kernel and 57% in `clear_page_erms`, against 18-26% and 6-15% in
+the fast ones, with the same twelve to fourteen thousand faults in
+each: the count is constant and the price is not, about 0.7 µs a fault
+where the guest still backed the page and about 9 where its balloon
+had handed the page to the host, which is the shape the segment
+writer's folios had. The faults were the conversions' copies: each was
+sized with a record's worth of room per record, twice the form's
+bytes, so none fit the chunks the forms before it had freed and the
+heap grew about ninety megabytes a burst. Sized exactly
+(`Options::copy_exact`, the room kept as `supdb-copyslack` and
+`supdb-ingestcopyslack`), the conversions read 1.20x and 1.28x cheaper
+in the two pairs of twenty-four (p .023 and .007), the rewritten point
+1.09x and 1.03x (neither significant), the tenth-rewritten point 3%
+against in one pair and 6% for in the other at p .023 each -- the
+position effect again -- and E and the mixes level; six reps of the
+row's shape read no slow mode, passes of 12-22 ms with the thread at
+131-166 ms, but the thread's faults fell only to about eleven
+thousand, a fifth and not the half predicted. The rest of the fresh
+pages are the snapshot's arena, which copies every value written in
+key order, about 36 MB a burst at this rung, the sparse forms' growth
+and the settle's scratch; the next count is the faults by the call
+that took them, and what the first scan waits for follows.
 
 #### The pin's fence, priced against a sweep that fences for it
 

@@ -442,6 +442,10 @@ pub struct Supdb {
     /// before `Options::convert_from_form`. `supdb-convertsources`, and
     /// `supdb-ingestconvertsources` buffered.
     convertsources: bool,
+    /// A dense form's copy sized with a record's worth of room per record,
+    /// as before `Options::copy_exact`. `supdb-copyslack`, and
+    /// `supdb-ingestcopyslack` buffered.
+    copyslack: bool,
     /// A piece's keys ranked over the partition's records, as before
     /// `Options::piece_ranks_by_heads`. `supdb-rankrecords`, and
     /// `supdb-ingestrankrecords` buffered.
@@ -610,6 +614,10 @@ struct Policy {
     /// before `Options::convert_from_form`. `supdb-convertsources`, and
     /// `supdb-ingestconvertsources` buffered.
     convertsources: bool,
+    /// A dense form's copy sized with a record's worth of room per record,
+    /// as before `Options::copy_exact`. `supdb-copyslack`, and
+    /// `supdb-ingestcopyslack` buffered.
+    copyslack: bool,
     /// A piece's keys ranked over the partition's records, as before
     /// `Options::piece_ranks_by_heads`. `supdb-rankrecords`, and
     /// `supdb-ingestrankrecords` buffered.
@@ -717,6 +725,7 @@ impl Default for Policy {
             inlinemaint: false,
             copysearch: false,
             convertsources: false,
+            copyslack: false,
             rankrecords: false,
             shape: false,
             adaptcap: None,
@@ -1808,6 +1817,32 @@ impl Supdb {
         )
     }
 
+    /// `supdb` sizing a dense form's copy with room, as before
+    /// `Options::copy_exact`: against `supdb` it prices the exact size,
+    /// which fits the chunks the forms before it freed.
+    pub fn create_copyslack(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                copyslack: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` with the copies sized with room, as `supdb-copyslack`.
+    pub fn create_ingest_copyslack(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                copyslack: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` ranking a piece's keys over the partition's records, as
     /// before `Options::piece_ranks_by_heads`: against `supdb` it prices
     /// the ranking over the index's heads, on the segment work's thread.
@@ -2004,6 +2039,7 @@ impl Supdb {
             inlinemaint,
             copysearch,
             convertsources,
+            copyslack,
             rankrecords,
             shape,
             aheadmin,
@@ -2131,6 +2167,7 @@ impl Supdb {
             freeze_settles: settlefreeze,
             copy_start_at_rank: !copysearch,
             convert_from_form: !convertsources,
+            copy_exact: !copyslack,
             piece_ranks_by_heads: !rankrecords,
             forms_convert_unread: !(bg || bglag),
             // The capped conversions and the builder's, kept to price again
@@ -2260,6 +2297,7 @@ impl Supdb {
             inlinemaint,
             copysearch,
             convertsources,
+            copyslack,
             rankrecords,
             shape,
             aheadmin,
@@ -2573,6 +2611,13 @@ impl Engine for Supdb {
                 "supdb-convertsources"
             } else {
                 "supdb-ingestconvertsources"
+            };
+        }
+        if self.copyslack {
+            return if self.partition {
+                "supdb-copyslack"
+            } else {
+                "supdb-ingestcopyslack"
             };
         }
         if self.rankrecords {
@@ -3259,6 +3304,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-latewb"
         | "supdb-copysearch"
         | "supdb-convertsources"
+        | "supdb-copyslack"
         | "supdb-inlinemaint"
         | "supdb-adapt"
         | "supdb-adapttrig"
@@ -3305,6 +3351,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestlatewb"
         | "supdb-ingestcopysearch"
         | "supdb-ingestconvertsources"
+        | "supdb-ingestcopyslack"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
         | "supdb-ingestrankrecords"
@@ -3364,8 +3411,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-latewb" => Box::new(Supdb::create_latewb(dir)?),
         "supdb-copysearch" => Box::new(Supdb::create_copysearch(dir)?),
         "supdb-convertsources" => Box::new(Supdb::create_convertsources(dir)?),
+        "supdb-copyslack" => Box::new(Supdb::create_copyslack(dir)?),
         "supdb-ingestcopysearch" => Box::new(Supdb::create_ingest_copysearch(dir)?),
         "supdb-ingestconvertsources" => Box::new(Supdb::create_ingest_convertsources(dir)?),
+        "supdb-ingestcopyslack" => Box::new(Supdb::create_ingest_copyslack(dir)?),
         "supdb-rankrecords" => Box::new(Supdb::create_rankrecords(dir)?),
         "supdb-ingestrankrecords" => Box::new(Supdb::create_ingest_rankrecords(dir)?),
         "supdb-ingestlatewb" => Box::new(Supdb::create_ingest_latewb(dir)?),

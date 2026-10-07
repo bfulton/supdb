@@ -1164,6 +1164,23 @@ pub struct Options {
     /// for pricing as `supdb-convertsources` and
     /// `supdb-ingestconvertsources`.
     pub convert_from_form: bool,
+    /// Whether the copy a dense form converts to is sized to what it will
+    /// hold -- the form's keys, runs and entries plus a key, a run and an
+    /// entry for each record the form does not replace -- or with room
+    /// for a further record's worth per record of the block, as a copy
+    /// built from the sources is. Sized with that room, a copy of a block
+    /// whose every record the form replaces asks for twice the form's
+    /// bytes, fits no chunk the forms before it freed, and takes fresh
+    /// pages: a burst that rewrites a store of three hundred thousand keys
+    /// grew the heap by about ninety megabytes and the upkeep thread took
+    /// twelve to fourteen thousand page faults, each a first touch, at
+    /// 0.7 µs where the guest still backed the page and about 9 µs where
+    /// its balloon had handed the page to the host -- the thread's whole
+    /// slow mode, 57% of its samples zeroing pages in the slow reps
+    /// against 6-15% in the fast. Sized exactly, each block's copy fits
+    /// the chunks the block before it freed. Off, the room, kept for
+    /// pricing as `supdb-copyslack` and `supdb-ingestcopyslack`.
+    pub copy_exact: bool,
     /// EXPERIMENT: the writes since the last scan over the store, as a
     /// share of the partitions' keys, within which the backlog bound
     /// above settles at all; zero, the default, settles by the bound
@@ -1403,6 +1420,7 @@ impl Default for Options {
             forms_convert_yield: true,
             forms_convert_behind: usize::MAX,
             convert_from_form: true,
+            copy_exact: true,
             forms_settle_recent_pct: 0,
             forms_carry: true,
             freeze_settles: false,
@@ -11972,6 +11990,7 @@ impl Reader {
             },
             stale: self.fs().snap_stale.borrow(),
             copy_dense: false,
+            copy_exact: self.opts.copy_exact,
             merge_pieces: self.opts.overlay_merge,
             pieces_only: self.opts.forms_pieces_only,
             ranks_by_heads: self.opts.piece_ranks_by_heads,
@@ -20312,6 +20331,8 @@ struct BuildCtx<'s> {
     /// the builder ahead and a promotion copy, since they run where no
     /// read waits or for a block whose reads have repaid it.
     copy_dense: bool,
+    /// See `Options::copy_exact`.
+    copy_exact: bool,
     /// `Options::forms_pieces_only`: the forms hold the pieces' fold alone
     /// and the walk overlays the snapshot.
     pieces_only: bool,
@@ -21711,11 +21732,19 @@ impl<'s> BuildCtx<'s> {
     ) -> Result<CachedBlock> {
         let seg = src.seg;
         let (lo, hi) = (ranks.start, ranks.end);
-        let n = (hi - lo) + sb.ents.len();
+        // Sized to the form plus the records it does not replace: a copy
+        // with room for a record's worth more per record fit no chunk the
+        // forms before it freed and faulted in fresh pages for the whole
+        // burst (`Options::copy_exact`).
+        let kept = if self.copy_exact {
+            (hi - lo).saturating_sub(sb.ents.iter().filter(|e| e.same).count())
+        } else {
+            hi - lo
+        };
         let mut blk = CachedBlock {
-            keys: Vec::with_capacity(sb.keys.len() + (hi - lo) * 16),
-            vals: Vec::with_capacity(sb.vals.len() + (hi - lo) * 128),
-            ents: Vec::with_capacity(n),
+            keys: Vec::with_capacity(sb.keys.len() + kept * 16),
+            vals: Vec::with_capacity(sb.vals.len() + kept * 128),
+            ents: Vec::with_capacity(sb.ents.len() + kept),
             identity: false,
         };
         // Every key once, then its values, as `copy_block` opens them: an
