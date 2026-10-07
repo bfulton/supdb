@@ -1240,16 +1240,39 @@ fn load(
     let mut kb = [0u8; KEY_SIZE];
     let io0 = IoCounters::read_now();
     let t = Instant::now();
+    let (mut tc, mut tfirst, mut tmax, mut nc) = (0f64, 0f64, 0f64, 0usize);
     for i in 0..size {
         db_key_into(order(i), &mut kb);
         buf.push(&kb, payload.get(&mut vrng));
         if buf.len() == plan.batch {
+            let t0 = Instant::now();
             buf.flush(e)?;
+            let d = t0.elapsed().as_secs_f64();
+            if nc == 0 {
+                tfirst = d;
+            }
+            tmax = tmax.max(d);
+            tc += d;
+            nc += 1;
         }
     }
+    let t0 = Instant::now();
     buf.flush(e)?;
+    tc += t0.elapsed().as_secs_f64();
+    let ts = Instant::now();
     e.sync()?;
+    let tsync = ts.elapsed().as_secs_f64();
     let secs = t.elapsed().as_secs_f64();
+    // The load's own counters, as `SUPDB_LAG_COUNTERS` is the lag sweep's:
+    // the commits' time, the first and the slowest commit, and the closing
+    // sync, which is where the buffered arm's loss at the small rungs sat
+    // -- a drain of 8-9 ms against a comparator's one fdatasync of 2.
+    if std::env::var_os("SUPDB_LOAD_PHASES").is_some() {
+        eprintln!(
+            "loadphases {} size {} commits {} ms {:.2} first {:.2} max {:.2} sync {:.2} total {:.2}",
+            e.name(), size, nc, tc * 1e3, tfirst * 1e3, tmax * 1e3, tsync * 1e3, secs * 1e3
+        );
+    }
     let wrote = IoCounters::read_now().since(&io0).write_bytes;
     Ok((secs, wrote))
 }

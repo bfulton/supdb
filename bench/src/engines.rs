@@ -446,6 +446,10 @@ pub struct Supdb {
     /// as before `Options::copy_exact`. `supdb-copyslack`, and
     /// `supdb-ingestcopyslack` buffered.
     copyslack: bool,
+    /// A drain landing its lone piece and promoting it under a second
+    /// manifest, as before `Options::drain_names_partition`:
+    /// `supdb-ingestdrainpromote`.
+    drainpromote: bool,
     /// A piece's keys ranked over the partition's records, as before
     /// `Options::piece_ranks_by_heads`. `supdb-rankrecords`, and
     /// `supdb-ingestrankrecords` buffered.
@@ -618,6 +622,10 @@ struct Policy {
     /// as before `Options::copy_exact`. `supdb-copyslack`, and
     /// `supdb-ingestcopyslack` buffered.
     copyslack: bool,
+    /// A drain landing its lone piece and promoting it under a second
+    /// manifest, as before `Options::drain_names_partition`:
+    /// `supdb-ingestdrainpromote`.
+    drainpromote: bool,
     /// A piece's keys ranked over the partition's records, as before
     /// `Options::piece_ranks_by_heads`. `supdb-rankrecords`, and
     /// `supdb-ingestrankrecords` buffered.
@@ -726,6 +734,7 @@ impl Default for Policy {
             copysearch: false,
             convertsources: false,
             copyslack: false,
+            drainpromote: false,
             rankrecords: false,
             shape: false,
             adaptcap: None,
@@ -1843,6 +1852,21 @@ impl Supdb {
         )
     }
 
+    /// `supdb-ingest` whose drain lands its lone piece and promotes it
+    /// under a second manifest, as before `Options::drain_names_partition`:
+    /// against `supdb-ingest` it prices naming the partition at the close.
+    pub fn create_ingest_drainpromote(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                drainpromote: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` ranking a piece's keys over the partition's records, as
     /// before `Options::piece_ranks_by_heads`: against `supdb` it prices
     /// the ranking over the index's heads, on the segment work's thread.
@@ -2040,6 +2064,7 @@ impl Supdb {
             copysearch,
             convertsources,
             copyslack,
+            drainpromote,
             rankrecords,
             shape,
             aheadmin,
@@ -2168,6 +2193,7 @@ impl Supdb {
             copy_start_at_rank: !copysearch,
             convert_from_form: !convertsources,
             copy_exact: !copyslack,
+            drain_names_partition: !drainpromote,
             piece_ranks_by_heads: !rankrecords,
             forms_convert_unread: !(bg || bglag),
             // The capped conversions and the builder's, kept to price again
@@ -2298,6 +2324,7 @@ impl Supdb {
             copysearch,
             convertsources,
             copyslack,
+            drainpromote,
             rankrecords,
             shape,
             aheadmin,
@@ -2619,6 +2646,9 @@ impl Engine for Supdb {
             } else {
                 "supdb-ingestcopyslack"
             };
+        }
+        if self.drainpromote {
+            return "supdb-ingestdrainpromote";
         }
         if self.rankrecords {
             return if self.partition {
@@ -3352,6 +3382,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestcopysearch"
         | "supdb-ingestconvertsources"
         | "supdb-ingestcopyslack"
+        | "supdb-ingestdrainpromote"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
         | "supdb-ingestrankrecords"
@@ -3415,6 +3446,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestcopysearch" => Box::new(Supdb::create_ingest_copysearch(dir)?),
         "supdb-ingestconvertsources" => Box::new(Supdb::create_ingest_convertsources(dir)?),
         "supdb-ingestcopyslack" => Box::new(Supdb::create_ingest_copyslack(dir)?),
+        "supdb-ingestdrainpromote" => Box::new(Supdb::create_ingest_drainpromote(dir)?),
         "supdb-rankrecords" => Box::new(Supdb::create_rankrecords(dir)?),
         "supdb-ingestrankrecords" => Box::new(Supdb::create_ingest_rankrecords(dir)?),
         "supdb-ingestlatewb" => Box::new(Supdb::create_ingest_latewb(dir)?),

@@ -3412,6 +3412,44 @@ key order, about 36 MB a burst at this rung, the sparse forms' growth
 and the settle's scratch; the next count is the faults by the call
 that took them, and what the first scan waits for follows.
 
+#### The buffered load's drain: two manifests for one partition
+
+The quick row read the buffered arm's ordered load at 0.39x of LMDB
+without sync at ten thousand keys, 0.55x at thirty, 0.83x and 0.74x at a
+hundred and three hundred thousand. The runner prints the load's own
+phases now (`SUPDB_LOAD_PHASES=1`: the commits' time, the first and the
+slowest commit, and the closing sync), and they split the loss in two.
+At the small rungs the commits are close -- 2.1-2.9 ms against 1.5 at ten
+thousand keys -- and the closing sync is the loss: 7-23 ms against the
+comparator's one fdatasync of 1.7-2. At three hundred thousand the sync
+is level, 28-37 ms against 28-31, and the commits are 58-110 ms against
+53-57, with a commit of 4 ms in the slow reps where a 32 MB seal closes
+inside the load.
+
+The drain at ten thousand keys, stamped step by step with strace beside
+it: the direct segment's finish 0.8-1.0 ms on the seal's thread, its
+fsync 1.2-1.35 and the ordered index file's 0.4, and then two manifest
+publishes of 2.3 ms each -- the manifest written and fsynced (0.3-0.5),
+renamed over the last (1.5-1.8 ms on this filesystem, ext4's flush of a
+file renamed over another) and the directory fsynced (0.2). The first
+publish lands the segment as a piece, since the buffered arm's seals
+leave pieces so that its reads take the piece path; the second is the
+drain's promotion of that one piece to the partition, by link. The store
+is the same partition after either, and `seals_first_partition` already
+names a first partition at the close where the flush partitions, so the
+drain under `flush_schedules` names it too
+(`Options::drain_names_partition`, the two publishes kept as
+`supdb-ingestdrainpromote`). Priced in pairs of twenty-four: the ordered
+load 1.34x and 1.33x at ten thousand keys (21 and 24 of 24, p < .001)
+and the shuffled 1.26x and 1.23x, since its drain promoted a lone piece
+the same way; 1.17x and 1.05x at thirty thousand (p .007 and .023); at
+three hundred thousand, twelve pairs, the load 0.94x and nothing moved
+at p < .05. A side cell at ten thousand read 3% against the change at p
+.023 and 11% for it in the replication: the position effect, again. The
+drain reads 4.7-5.5 ms in the row's shape now, against 1.7-2 for the
+comparator; what is left is the finish, the two data fsyncs and the one
+manifest publish, two thirds of which is the rename.
+
 #### The pin's fence, priced against a sweep that fences for it
 
 A read pins the epoch it reads in by storing it in its slot of the

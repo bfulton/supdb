@@ -1181,6 +1181,17 @@ pub struct Options {
     /// the chunks the block before it freed. Off, the room, kept for
     /// pricing as `supdb-copyslack` and `supdb-ingestcopyslack`.
     pub copy_exact: bool,
+    /// Whether a drain that does not partition on flush names its first
+    /// seal's piece as the partition at the close, where it fits one and
+    /// holds no tombstone, rather than landing it as a piece and promoting
+    /// it by link under a second manifest. The store after the drain is
+    /// the same partition either way; the second publish -- a manifest
+    /// written, fsynced and renamed and the directory fsynced -- was 2.3
+    /// ms of a drain of 8.5 at ten thousand keys on the buffered arm, whose
+    /// seals leave pieces so that its reads take the piece path, and whose
+    /// drain then promoted the one piece the load left. Off, the two
+    /// publishes, kept for pricing as `supdb-ingestdrainpromote`.
+    pub drain_names_partition: bool,
     /// EXPERIMENT: the writes since the last scan over the store, as a
     /// share of the partitions' keys, within which the backlog bound
     /// above settles at all; zero, the default, settles by the bound
@@ -1421,6 +1432,7 @@ impl Default for Options {
             forms_convert_behind: usize::MAX,
             convert_from_form: true,
             copy_exact: true,
+            drain_names_partition: true,
             forms_settle_recent_pct: 0,
             forms_carry: true,
             freeze_settles: false,
@@ -15180,9 +15192,14 @@ impl Db {
     /// count is read before the state, as in `take_fresh_mem`, so a seal
     /// counted out is one whose landing the state shows.
     fn seals_first_partition(&self) -> bool {
-        if !(((self.draining && self.opts.partition_on_flush) || self.opts.adaptive_shape)
-            && self.opts.compact
-            && self.opts.promote)
+        // A drain that does not partition promotes a lone piece by link
+        // under a manifest of its own (`drain`, `promote_unpartitioned`):
+        // the same partition one publish later, so the close names it
+        // (`Options::drain_names_partition`).
+        let drain_promotes = self.draining
+            && (self.opts.partition_on_flush
+                || (self.opts.drain_names_partition && self.opts.flush_schedules));
+        if !((drain_promotes || self.opts.adaptive_shape) && self.opts.compact && self.opts.promote)
         {
             return false;
         }

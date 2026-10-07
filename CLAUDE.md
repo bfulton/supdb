@@ -192,7 +192,16 @@ each reproduced one shape and called the row wrong. Find the count
 that separates the reps there before building a probe, and read a
 verdict at p .04 on one pairing of `bench ab` as a position effect
 until a second pairing agrees: the durable arm read a point 6% against
-a change in ten pairs of twelve and 6% for it in the replication.
+a change in ten pairs of twelve and 6% for it in the replication, and
+the buffered arm's rewritten point at ten thousand keys 3% against one
+at p .023 and 11% for it the second time. The load has the same
+(`SUPDB_LOAD_PHASES=1`, a `loadphases` line per load on stderr): the
+commits' time, the first and the slowest commit, and the closing sync,
+which split the buffered arm's loss at ten thousand keys into commits
+near the comparator's and a drain of 8-9 ms against one fdatasync of
+2; a drain is then stamped step by step and read beside `strace -f -tt
+-T -y` for the fsyncs and renames it makes, since a rename over an
+existing file costs an fsync's worth here.
 
 Profile a probe that does one thing. The scan probe's own `format!` per
 iteration was 8% of its samples until the keys were built before the
@@ -492,7 +501,11 @@ store that does not partition on flush too, and the suite's ingest arm,
 whose seal must leave a piece, scanned three times faster for one row.
 Such a flush now promotes the piece itself, by link, and hands what
 promotion cannot tile to a background merge the writer publishes at its
-next commit (`flush_schedules`): before it the background waited for
+next commit (`flush_schedules`); and its drain's own last seal, the one
+whose piece it would promote alone, is named the partition at the close
+(`drain_names_partition`), since the promotion was a second manifest
+publish for the same store, 2.3 ms of a drain of 8.5 at ten thousand
+keys: before it the background waited for
 `l0_trigger` pieces, a store of fewer stayed pieces for good, every scan
 took the merge path, and the block cache had no partition to cache.
 Replay applies the frames between commit frames whole or not at all -- a
