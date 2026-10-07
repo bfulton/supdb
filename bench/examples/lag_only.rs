@@ -24,6 +24,44 @@ fn get(c: &[(&'static str, f64)], n: &str) -> f64 {
     c.iter().find(|(m, _)| *m == n).map_or(0.0, |x| x.1)
 }
 
+/// Minor page faults so far of every thread of this process named `comm`,
+/// from `/proc/self/task/*/stat`: field 10, the eighth after the comm's
+/// closing parenthesis. Zero for a name no thread has.
+fn minflt_of(comm: &str) -> u64 {
+    let mut total = 0u64;
+    let Ok(rd) = std::fs::read_dir("/proc/self/task") else {
+        return 0;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        let name = std::fs::read_to_string(p.join("comm")).unwrap_or_default();
+        if name.trim() != comm {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(p.join("stat")) else {
+            continue;
+        };
+        if let Some((_, rest)) = stat.rsplit_once(')') {
+            total += rest
+                .split_whitespace()
+                .nth(7)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+        }
+    }
+    total
+}
+
+/// This thread's minor page faults so far.
+fn minflt_self() -> u64 {
+    let Ok(stat) = std::fs::read_to_string("/proc/thread-self/stat") else {
+        return 0;
+    };
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(7).and_then(|v| v.parse().ok()))
+        .unwrap_or(0)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arm = args.get(1).cloned().unwrap_or("supdb-ingestbglag".into());
@@ -65,6 +103,7 @@ fn main() {
         for pct in pcts {
             let want = size * pct / 100;
             let wrote = want.saturating_sub(updated);
+            let (flt_up0, flt_main0) = (minflt_of("supdb-upkeep"), minflt_self());
             let tw = Instant::now();
             while updated < want {
                 db_key_into(ug.next(), &mut kb);
@@ -110,6 +149,10 @@ fn main() {
             }
             let pass = t.elapsed().as_secs_f64() * 1e3;
             let pass_cpu = thread_cpu_ms() - cpu0;
+            let (flt_up, flt_main) = (
+                minflt_of("supdb-upkeep").saturating_sub(flt_up0),
+                minflt_self().saturating_sub(flt_main0),
+            );
             supdb_bench::run::lag_mark(&arm, pct, "end");
             let c1 = e.counters();
             let up = get(&c1, "upkeep_ms") - get(&c0, "upkeep_ms");
@@ -177,7 +220,7 @@ fn main() {
                 0.0
             };
             line.push_str(&format!(
-                "\n  lag{pct} {burst:.1}+{pass:.1}ms (cpu {pass_cpu:.1}) up {up:.1}ms/{passes:.0}p cpu {cpu:.1}ms mb {barriers:.0} c_t {ct:.2} c_w {cw:.2} built {built:.0} skipped {skipped:.0} blockpath {blockpath:.0}/{scans_n:.0} seals {seals:.0} pubs {pubs:.0} snaps {snaps:.0} refr {refr:.0} swit {swit:.0} ext {ext:.0} | {layout} | {upkeep_built} | {phases}"
+                "\n  lag{pct} {burst:.1}+{pass:.1}ms (cpu {pass_cpu:.1}) up {up:.1}ms/{passes:.0}p cpu {cpu:.1}ms flt {flt_up}/{flt_main} mb {barriers:.0} c_t {ct:.2} c_w {cw:.2} built {built:.0} skipped {skipped:.0} blockpath {blockpath:.0}/{scans_n:.0} seals {seals:.0} pubs {pubs:.0} snaps {snaps:.0} refr {refr:.0} swit {swit:.0} ext {ext:.0} | {layout} | {upkeep_built} | {phases}"
             ));
             c0 = c1;
         }

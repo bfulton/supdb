@@ -3157,6 +3157,86 @@ single-thread scan on the ordered store, 0.68-0.88x of LMDB's cursor at
 three hundred thousand keys, which is the clean record walk and not the
 forms.
 
+#### The first scan after the buffered burst: the thread's lag, and what the settle's searches were worth
+
+The buffered arm's rewritten and tenth-rewritten points read 0.47x and
+0.65x of `lmdb-nosync` at three hundred thousand keys, and the probe in
+the suite's shape puts the whole of both losses in the pass's first
+scan: at three hundred thousand keys the tenth-rewritten pass is 11-15
+ms with its first scan 6-10, nearly all of it the take-back's wait for
+the thread's pass in flight, and the rewritten pass 14-19 ms with its
+first scan 6-12, split between that wait, the tail's settle and one
+snapshot rebuild; at a hundred thousand the first scan is 1-2 ms of a
+2.7-3.7 ms pass and 1-4 of 3.2-6.1. Without the first scan both passes
+sit at the comparator's 7.6-7.7 ms or under it.
+
+What the first scan waits for is the thread's lag. Traced pass by pass,
+the thread ends the burst 10-40 thousand writes behind the writer in
+one rep and 90-160 thousand in the next, in passes of 4-8 ms when close
+and 26-71 ms when far, and the first scan pays the pass in flight and
+then files what is left: 1.3 ms in the close reps, 16-20 in the far
+ones. The thread's time over a three hundred thousand key burst is
+150-210 ms against a burst of 150-200: its cost a write and the
+writer's are the same number, so which side of the burst's end it lands
+on is scheduling, and the pass is bimodal because of it. The thread's
+time, cut to the burst window and the thread, is spread thin: the
+settle's own loop 13-21%, memory moves 6-12%, the resolve 5-7%, the
+sorts and the snapshot's extension a few percent each, and 7-47% in the
+kernel zeroing pages. The probe counts the thread's minor faults now
+(`flt`), from `/proc/self/task`: 10-15 thousand a burst at three
+hundred thousand keys, of which about ten thousand are pages the
+allocator gave back at a pass's end and faulted in again on the next,
+measured by running the same binary with glibc's trimming turned off
+through its tunables, where a process's second burst faults 0.5-4
+thousand and its first 14-15 thousand either way. That is 5-10% of the
+thread, not the half one rep's profile showed; a library does not set
+the process's allocator, and keeping the settle's three arrays across
+passes -- seventy-six bytes a write, the largest per-pass allocation --
+moved neither the thread's time nor the passes in two alternations of
+eight, so they are allocated as they were.
+
+Two cuts stand, both the mechanism the copy walk's start already uses.
+A patch found its entry in a copy by a binary search over the copy's
+keys, and in a sparse form by one over its keys through a second
+buffer, while the resolve had just computed the key's cut: the copy's
+entry is the cut less the block's first rank where the copy holds the
+block's records and nothing else (`CachedBlock::identity`), and a
+sparse form's entries sort by cut, then the inserts below a record
+before the record's own update, then by key among the inserts at one
+cut, so the search probes the entries alone and reads a key only among
+the inserts at the key's cut (`SparseBlock::find_at_cut`). Both are
+under `Options::copy_start_at_rank`; `supdb-copysearch` and
+`supdb-ingestcopysearch` search. Twelve pairs each: the copy's patch by
+rank reads the thread's time 0.92x of the search's on the buffered arm
+at a hundred thousand keys (10/12, p=0.039) and the lag sum 0.93x
+(10/12, p=0.039), level at three hundred thousand where the burst's
+patches land on sparse forms, the thread being too far behind to
+convert; the sparse form's find by cut reads the buffered
+tenth-rewritten point 1.08x at three hundred thousand keys (11/12,
+p=0.006), the scan mix 1.05x (10/12, p=0.039), the thread's time 0.96x
+on the durable arm (10/12, p=0.039), and the buffered rewritten point
+1.3-1.4x by median at both sizes in nine pairs of twelve, which its
+bimodality keeps from significance. Nothing read against either.
+
+Refuted, and kept as an arm: dropping a block from six keys of it in a
+batch and building it once (`forms_settle_rebuild_from`,
+`supdb-ingestrebuild`), on the reasoning that the buffered passes
+carry tens of a block's keys where the bound was priced against two.
+Twelve pairs: the rewritten point 0.16x and 0.20x at three hundred and
+a hundred thousand keys (0/12), the thread's time 1.27x, twice the
+blocks built, the lag sum 1.7-1.9x worse. The blocks dropped are the
+ones the first scan then builds.
+
+What remains of the cell is the thread's cost a write against the
+writer's, which no search or allocation decides: a settle resolves a
+key's rank and splices its run, about half a microsecond, and the
+buffered writer commits one in the same time. The first scan after a
+burst inherits the difference, and the shapes that would change it --
+a filing by block at the walk, forms that hold the pieces' fold alone
+with the memtable overlaid at the walk (`forms_pieces_only`), or a
+pass whose take-back cuts a settle short -- each move the work rather
+than remove it for a pass that reads every block once.
+
 #### The pin's fence, priced against a sweep that fences for it
 
 A read pins the epoch it reads in by storing it in its slot of the

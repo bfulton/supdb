@@ -434,8 +434,9 @@ pub struct Supdb {
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
-    /// A scan over a copy searches the copy for its cursor, as before
-    /// `Options::copy_start_at_rank`. `supdb-copysearch`.
+    /// A scan and a settle search a copy for their key, as before
+    /// `Options::copy_start_at_rank`. `supdb-copysearch`, and
+    /// `supdb-ingestcopysearch` buffered.
     copysearch: bool,
     /// A store with no partitions partitioned once it is read,
     /// `Options::adaptive_shape`. `supdb-ingestshape`.
@@ -588,8 +589,9 @@ struct Policy {
     /// The segment work driven inline by the writer, as before
     /// `Options::publish_in_background`. `supdb-inlinemaint`.
     inlinemaint: bool,
-    /// A scan over a copy searches the copy for its cursor, as before
-    /// `Options::copy_start_at_rank`. `supdb-copysearch`.
+    /// A scan and a settle search a copy for their key, as before
+    /// `Options::copy_start_at_rank`. `supdb-copysearch`, and
+    /// `supdb-ingestcopysearch` buffered.
     copysearch: bool,
     /// A store with no partitions partitioned once it is read,
     /// `Options::adaptive_shape`. `supdb-ingestshape`.
@@ -1355,6 +1357,22 @@ impl Supdb {
         )
     }
 
+    /// `supdb-ingest` dropping and rebuilding a block from six keys of
+    /// it in a settle's backlog, as `supdb-rebuild`: the buffered arm's
+    /// passes carry tens of keys a block where the durable arm's carry
+    /// two, which is the density the bound was measured against.
+    pub fn create_ingest_rebuild(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                rebuild: 6,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with the writer's scan snapshot carried across a publish
     /// rather than dropped and sorted again at the next commit due.
     /// Against `supdb` it prices where that work lands: the pass after a
@@ -1682,13 +1700,26 @@ impl Supdb {
         )
     }
 
-    /// `supdb` whose scans search a copy for their cursor, as before
-    /// `Options::copy_start_at_rank`: against `supdb` it prices starting
-    /// the walk at the rank the partition's seek found.
+    /// `supdb` whose scans and settles search a copy for their key, as
+    /// before `Options::copy_start_at_rank`: against `supdb` it prices
+    /// finding the entry by the rank the seek or the resolve found.
     pub fn create_copysearch(path: &Path) -> Res<Supdb> {
         Supdb::with_policy(
             path,
             Policy {
+                copysearch: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` with the copies searched, as `supdb-copysearch`.
+    pub fn create_ingest_copysearch(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
                 copysearch: true,
                 ..Policy::default()
             },
@@ -2312,7 +2343,11 @@ impl Engine for Supdb {
             return "supdb-nocarry";
         }
         if self.rebuild > 0 {
-            return "supdb-rebuild";
+            return if self.partition {
+                "supdb-rebuild"
+            } else {
+                "supdb-ingestrebuild"
+            };
         }
         if self.snapcarry {
             return "supdb-snapcarry";
@@ -2402,7 +2437,11 @@ impl Engine for Supdb {
             };
         }
         if self.copysearch {
-            return "supdb-copysearch";
+            return if self.partition {
+                "supdb-copysearch"
+            } else {
+                "supdb-ingestcopysearch"
+            };
         }
         if self.shape {
             return "supdb-ingestshape";
@@ -3075,6 +3114,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestpostedyield"
         | "supdb-ingestpiecesonly"
         | "supdb-ingestlatewb"
+        | "supdb-ingestcopysearch"
+        | "supdb-ingestrebuild"
         | "supdb-ingestbg"
         | "supdb-ingestbglag"
         | "supdb-ingesthold"
@@ -3096,6 +3137,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-recency" => Box::new(Supdb::create_recency(dir)?),
         "supdb-nocarry" => Box::new(Supdb::create_nocarry(dir)?),
         "supdb-rebuild" => Box::new(Supdb::create_rebuild(dir)?),
+        "supdb-ingestrebuild" => Box::new(Supdb::create_ingest_rebuild(dir)?),
         "supdb-snapcarry" => Box::new(Supdb::create_snapcarry(dir)?),
         "supdb-lazysnap" => Box::new(Supdb::create_lazysnap(dir)?),
         "supdb-fullrec" => Box::new(Supdb::create_fullrec(dir)?),
@@ -3129,6 +3171,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestpiecesonly" => Box::new(Supdb::create_ingest_piecesonly(dir)?),
         "supdb-latewb" => Box::new(Supdb::create_latewb(dir)?),
         "supdb-copysearch" => Box::new(Supdb::create_copysearch(dir)?),
+        "supdb-ingestcopysearch" => Box::new(Supdb::create_ingest_copysearch(dir)?),
         "supdb-ingestlatewb" => Box::new(Supdb::create_ingest_latewb(dir)?),
         "supdb-inlinemaint" => Box::new(Supdb::create_inlinemaint(dir)?),
         "supdb-ingestinline" => Box::new(Supdb::create_ingest_inline(dir)?),

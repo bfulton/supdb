@@ -98,6 +98,19 @@ at a time: a state the upkeep thread must build while the probe sleeps
 -- the copies after a burst -- is never reached under it, however long
 the sleep, so the copy walk's instruction count cannot be had this way.
 
+A hypothesis about where a thread's time goes is tested by a count
+before a fix is timed. The upkeep thread's profile over a buffered
+burst, cut to the window and the thread, put up to half of it in the
+kernel zeroing pages; the largest per-pass allocation was kept across
+passes and nothing moved. The lag probe counts each thread's minor
+faults now (`flt`, from `/proc/self/task/*/stat`), and the same binary
+run with glibc's trimming off (`GLIBC_TUNABLES=glibc.malloc.trim_threshold=...:glibc.malloc.mmap_threshold=...`)
+says how many of them are the allocator's give-back: a process's
+second burst drops from ten thousand to under four, its first stays at
+fifteen, and the difference priced at a microsecond or two a fault was
+a tenth of the thread, not the half. Count the faults and alternate the
+tunables before pooling anything.
+
 For time, `perf record -e cpu-clock`. There are no hardware counters
 here: this is a Firecracker guest, `/sys/bus/event_source/devices/` has
 no `cpu` and the CPU flags have no `arch_perfmon`, so cycles, cache

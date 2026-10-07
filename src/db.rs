@@ -1242,14 +1242,16 @@ pub struct Options {
     /// rebuilt every block. On by default; `supdb-norebase` is the carry
     /// that drops them, and `docs/engine.md` has the figures.
     pub forms_rebase: bool,
-    /// A scan over a copy starts at the rank the partition's seek found
-    /// when the copy's entries are the block's records and nothing else
-    /// -- the copy of a block whose unsealed keys are all updates, which
-    /// is every copy after a burst of them -- instead of searching the
-    /// copy for the cursor again. The search was six dependent misses
-    /// into two cold buffers that the seek's answer already settled.
-    /// `supdb-copysearch` is the second search; `docs/engine.md` has the
-    /// figures.
+    /// A copy's entry is found by rank when the copy's entries are the
+    /// block's records and nothing else -- the copy of a block whose
+    /// unsealed keys are all updates, which is every copy after a burst
+    /// of them: a scan over it starts at the rank the partition's seek
+    /// found, and a settle patches the entry at the rank the resolve
+    /// found, instead of searching the copy for the key again. The
+    /// search was six dependent misses into two cold buffers that the
+    /// rank already settled, on every scan's first block and on every
+    /// patch. `supdb-copysearch` and `supdb-ingestcopysearch` are the
+    /// second search; `docs/engine.md` has the figures.
     pub copy_start_at_rank: bool,
     /// EXPERIMENT: the writer's own handle takes the canonical forms it
     /// maintains, instead of building its own. Without this the
@@ -6174,9 +6176,10 @@ struct CachedBlock {
     ents: Vec<[u32; 4]>,
     /// Entry `i` is the block's record `lo + i` for every `i`: the copy
     /// was built over updates alone and no insert has been spliced in
-    /// since, so a walk's start is the seek's rank less the block's first
-    /// (`Options::copy_start_at_rank`). An insert clears it for good; a
-    /// delete leaves the entry, with an empty run, so it holds.
+    /// since, so a walk's start and a patch's entry are a rank less the
+    /// block's first (`Options::copy_start_at_rank`). An insert clears it
+    /// for good; a delete leaves the entry, with an empty run, so it
+    /// holds.
     identity: bool,
 }
 
@@ -6410,6 +6413,31 @@ struct DeltaEnt {
 }
 
 impl SparseBlock {
+    /// The entry of a key whose cut and sameness the resolve found, and
+    /// whether it is there: the entries sort by key, which is by cut,
+    /// then the inserts below a record before the record's own update,
+    /// then by key among the inserts at one cut. So the search probes
+    /// the entries alone, two words each, and reads a key only among the
+    /// inserts at the key's cut, where a search by key read a key out of
+    /// the second buffer at every probe: six dependent misses into two
+    /// buffers a patch, over a burst whose every write patches a sparse
+    /// form before the thread has slack to convert one
+    /// (`Options::copy_start_at_rank`).
+    fn find_at_cut(&self, cut: u32, same: bool, key: &[u8]) -> (usize, bool) {
+        let mut i = self.ents.partition_point(|e| (e.cut, e.same) < (cut, same));
+        if same {
+            let found = i < self.ents.len() && self.ents[i].cut == cut && self.ents[i].same;
+            return (i, found);
+        }
+        while i < self.ents.len() && self.ents[i].cut == cut && !self.ents[i].same {
+            match key_cmp(self.key(&self.ents[i]), key) {
+                Ordering::Less => i += 1,
+                Ordering::Equal => return (i, true),
+                Ordering::Greater => break,
+            }
+        }
+        (i, false)
+    }
     /// An empty form with room for `ROOM_AT_BIRTH` deltas of a key and a
     /// run like these, for the splices that make a form a delta at a
     /// time; a build sizes its own from the count it has. Not the dense
@@ -13084,9 +13112,33 @@ impl Reader {
         let mut dense = false;
         match std::sync::Arc::make_mut(table.slots[b].as_mut().expect("checked above")) {
             Cached::Block(blk) => {
-                let i = blk.lower_bound(key);
-                let found =
-                    i < blk.ents.len() && key_cmp(blk.key(&blk.ents[i]), key) == Ordering::Equal;
+                // The cut is the key's rank in the partition, and while
+                // the copy's entries are the block's records the entry is
+                // the rank less the block's first: the search over the
+                // copy's keys, six dependent misses into two cold buffers
+                // a patch, was a tenth of the upkeep thread's time over a
+                // burst of updates, repeating what the resolve had
+                // answered (`Options::copy_start_at_rank`).
+                let lo = b * CACHE_BLOCK;
+                let at_rank = self.opts.copy_start_at_rank
+                    && blk.identity
+                    && same
+                    && c >= lo
+                    && c - lo < blk.ents.len();
+                let (i, found) = if at_rank {
+                    debug_assert!(
+                        key_cmp(blk.key(&blk.ents[c - lo]), key) == Ordering::Equal,
+                        "a copy's identity entry disagrees with its search"
+                    );
+                    (c - lo, true)
+                } else {
+                    let i = blk.lower_bound(key);
+                    (
+                        i,
+                        i < blk.ents.len()
+                            && key_cmp(blk.key(&blk.ents[i]), key) == Ordering::Equal,
+                    )
+                };
                 // A run no longer than the one it replaces is written
                 // over it: the values stay where a build laid them and
                 // the array does not grow. Appended, a burst that
@@ -13121,11 +13173,34 @@ impl Reader {
                 }
             }
             Cached::Sparse(sb) => {
-                let i = sb
-                    .ents
-                    .partition_point(|e| key_cmp(sb.key(e), key) == Ordering::Less);
-                let found =
-                    i < sb.ents.len() && key_cmp(sb.key(&sb.ents[i]), key) == Ordering::Equal;
+                // By the cut the resolve found, not by the key: see
+                // `SparseBlock::find_at_cut`.
+                let (i, found) = if self.opts.copy_start_at_rank {
+                    let at = sb.find_at_cut(c as u32, same, key);
+                    debug_assert_eq!(
+                        at,
+                        {
+                            let i = sb
+                                .ents
+                                .partition_point(|e| key_cmp(sb.key(e), key) == Ordering::Less);
+                            (
+                                i,
+                                i < sb.ents.len()
+                                    && key_cmp(sb.key(&sb.ents[i]), key) == Ordering::Equal,
+                            )
+                        },
+                        "a sparse form's entry by cut disagrees with its search by key"
+                    );
+                    at
+                } else {
+                    let i = sb
+                        .ents
+                        .partition_point(|e| key_cmp(sb.key(e), key) == Ordering::Less);
+                    (
+                        i,
+                        i < sb.ents.len() && key_cmp(sb.key(&sb.ents[i]), key) == Ordering::Equal,
+                    )
+                };
                 // Room for the dense count at once where a buffer is full:
                 // grown by doubling from the two or three deltas a build
                 // sized it for, each of the three buffers reallocated
