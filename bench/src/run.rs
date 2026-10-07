@@ -124,6 +124,57 @@ const LAG_PCT: [u64; 4] = [0, 1, 10, 100];
 /// `perf record -k CLOCK_MONOTONIC`, then the times `perf script` prints
 /// against these. The pass itself is timed by `Instant` as before; this
 /// adds two clock reads outside it.
+/// Minor page faults so far of every thread of this process named `comm`,
+/// from `/proc/self/task/*/stat`: the eighth field after the comm's closing
+/// parenthesis. Zero for a name no thread has.
+pub fn minflt_of(comm: &str) -> u64 {
+    let Ok(rd) = std::fs::read_dir("/proc/self/task") else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for e in rd.flatten() {
+        let p = e.path();
+        if std::fs::read_to_string(p.join("comm"))
+            .unwrap_or_default()
+            .trim()
+            != comm
+        {
+            continue;
+        }
+        if let Ok(stat) = std::fs::read_to_string(p.join("stat")) {
+            total += stat_minflt(&stat);
+        }
+    }
+    total
+}
+
+/// This thread's minor page faults so far.
+pub fn minflt_self() -> u64 {
+    std::fs::read_to_string("/proc/thread-self/stat").map_or(0, |s| stat_minflt(&s))
+}
+
+fn stat_minflt(stat: &str) -> u64 {
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(7).and_then(|v| v.parse().ok()))
+        .unwrap_or(0)
+}
+
+/// `MemFree` from `/proc/meminfo`, in megabytes: what the guest has not
+/// handed back to its host through the balloon is what a fresh page costs
+/// a guest fault rather than a host one.
+pub fn mem_free_mb() -> u64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|m| {
+            m.lines().find(|l| l.starts_with("MemFree:")).and_then(|l| {
+                l.split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse::<u64>().ok())
+            })
+        })
+        .map_or(0, |kb| kb / 1024)
+}
+
 pub fn lag_mark(arm: &str, pct: u64, edge: &str) {
     if std::env::var_os("SUPDB_LAG_MARK").is_none() {
         return;
@@ -711,6 +762,20 @@ fn one_pass(
         // takes them, and a point that times only the scans would credit
         // the conversion without charging for it.
         let wrote = want.saturating_sub(updated);
+        // With `SUPDB_LAG_COUNTERS` set, the store's counters around each
+        // point, read before its burst and after its pass and never
+        // between, since a counter read takes the writer's upkeep home.
+        // The deltas go to stderr as `lagcounters`, one line a point: the
+        // scans' phases before their walk, the threads' time, the blocks
+        // built and the forms copied, which say what a pass was made of
+        // in the suite's own shape rather than a probe's.
+        let counting = std::env::var_os("SUPDB_LAG_COUNTERS").is_some();
+        let c0 = if counting { e.counters() } else { Vec::new() };
+        let (flt_up0, flt_main0) = if counting {
+            (minflt_of("supdb-upkeep"), minflt_self())
+        } else {
+            (0, 0)
+        };
         let tw = Instant::now();
         while updated < want {
             db_key_into(ug.next(), &mut kb);
@@ -723,8 +788,9 @@ fn one_pass(
         if !buf.is_empty() {
             buf.flush_updates(e.as_mut())?;
         }
+        let burst_secs = tw.elapsed().as_secs_f64();
         if wrote > 0 {
-            burst_lag.push((pct, wrote as f64 / tw.elapsed().as_secs_f64()));
+            burst_lag.push((pct, wrote as f64 / burst_secs));
         }
         if pct == 0 {
             // Nothing unmerged: the shuffled load's own tail is drained
@@ -741,6 +807,46 @@ fn one_pass(
         let secs = t.elapsed().as_secs_f64();
         lag_mark(arm, pct, "end");
         scan_lag.push((pct, (scans * plan.scan_len as u64) as f64 / secs));
+        if counting {
+            let c1 = e.counters();
+            let get = |c: &[(&str, f64)], n: &str| {
+                c.iter().find(|(k, _)| *k == n).map_or(0.0, |(_, v)| *v)
+            };
+            let d = |n: &str| get(&c1, n) - get(&c0, n);
+            let (flt_up, flt_main) = (
+                minflt_of("supdb-upkeep").saturating_sub(flt_up0),
+                minflt_self().saturating_sub(flt_main0),
+            );
+            eprintln!(
+                "lagcounters {arm} {pct} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {:.1} pass_ms {:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0}",
+                mem_free_mb(),
+                burst_secs * 1e3,
+                secs * 1e3,
+                d("scan_take_us") / 1e3,
+                d("scan_sync_us") / 1e3,
+                d("scan_settle_us") / 1e3,
+                d("scan_snap_us") / 1e3,
+                d("scan_ahead_us") / 1e3,
+                d("scan_install_us") / 1e3,
+                d("upkeep_cpu_us") / 1e3,
+                d("upkeep_passes"),
+                d("maint_cpu_us") / 1e3,
+                d("blk_by_upkeep"),
+                d("blk_by_engine"),
+                d("blk_by_reader"),
+                d("forms_cloned"),
+                d("snapshot_builds"),
+                d("snapshot_refreshes"),
+                d("walk_copy"),
+                d("walk_sparse"),
+                d("walk_other"),
+                d("start_at_rank"),
+                d("start_search"),
+                get(&c1, "pieces"),
+                get(&c1, "unsealed_keys"),
+                d("rd_scans")
+            );
+        }
     }
     for (name, v) in e.counters() {
         match counters.iter_mut().find(|(n, _)| *n == name) {

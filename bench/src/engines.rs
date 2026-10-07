@@ -438,6 +438,10 @@ pub struct Supdb {
     /// `Options::copy_start_at_rank`. `supdb-copysearch`, and
     /// `supdb-ingestcopysearch` buffered.
     copysearch: bool,
+    /// A dense sparse form converted by a build from the sources, as
+    /// before `Options::convert_from_form`. `supdb-convertsources`, and
+    /// `supdb-ingestconvertsources` buffered.
+    convertsources: bool,
     /// A piece's keys ranked over the partition's records, as before
     /// `Options::piece_ranks_by_heads`. `supdb-rankrecords`, and
     /// `supdb-ingestrankrecords` buffered.
@@ -597,6 +601,10 @@ struct Policy {
     /// `Options::copy_start_at_rank`. `supdb-copysearch`, and
     /// `supdb-ingestcopysearch` buffered.
     copysearch: bool,
+    /// A dense sparse form converted by a build from the sources, as
+    /// before `Options::convert_from_form`. `supdb-convertsources`, and
+    /// `supdb-ingestconvertsources` buffered.
+    convertsources: bool,
     /// A piece's keys ranked over the partition's records, as before
     /// `Options::piece_ranks_by_heads`. `supdb-rankrecords`, and
     /// `supdb-ingestrankrecords` buffered.
@@ -698,6 +706,7 @@ impl Default for Policy {
             latewb: false,
             inlinemaint: false,
             copysearch: false,
+            convertsources: false,
             rankrecords: false,
             shape: false,
             adaptcap: None,
@@ -1735,6 +1744,32 @@ impl Supdb {
         )
     }
 
+    /// `supdb` converting a dense sparse form by a build from the sources,
+    /// as before `Options::convert_from_form`: against `supdb` it prices
+    /// the conversion from the form's own deltas.
+    pub fn create_convertsources(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                convertsources: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` converting from the sources, as `supdb-convertsources`.
+    pub fn create_ingest_convertsources(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                convertsources: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` ranking a piece's keys over the partition's records, as
     /// before `Options::piece_ranks_by_heads`: against `supdb` it prices
     /// the ranking over the index's heads, on the segment work's thread.
@@ -1930,6 +1965,7 @@ impl Supdb {
             latewb,
             inlinemaint,
             copysearch,
+            convertsources,
             rankrecords,
             shape,
             aheadmin,
@@ -2055,6 +2091,7 @@ impl Supdb {
             forms_carry: carry,
             freeze_settles: settlefreeze,
             copy_start_at_rank: !copysearch,
+            convert_from_form: !convertsources,
             piece_ranks_by_heads: !rankrecords,
             forms_convert_unread: !(bg || bglag),
             // The capped conversions and the builder's, kept to price again
@@ -2181,6 +2218,7 @@ impl Supdb {
             latewb,
             inlinemaint,
             copysearch,
+            convertsources,
             rankrecords,
             shape,
             aheadmin,
@@ -2481,6 +2519,13 @@ impl Engine for Supdb {
                 "supdb-ingestcopysearch"
             };
         }
+        if self.convertsources {
+            return if self.partition {
+                "supdb-convertsources"
+            } else {
+                "supdb-ingestconvertsources"
+            };
+        }
         if self.rankrecords {
             return if self.partition {
                 "supdb-rankrecords"
@@ -2654,6 +2699,7 @@ impl Engine for Supdb {
             ("ahead_built", ev[10] as f64),
             ("install_gen_drop", ev[11] as f64),
             ("install_slot_skip", ev[12] as f64),
+            ("fill_from_form", ev[13] as f64),
             // The forms the writer's walks met: see `Db::forms_walks`.
             ("walk_copy", wk[0] as f64),
             ("start_at_rank", cs[0] as f64),
@@ -2672,6 +2718,9 @@ impl Engine for Supdb {
             ("upkeep_partial", uk[8] as f64),
             ("upkeep_cpu_us", uk[9] as f64),
             ("maint_cpu_us", db.maint_cpu_us() as f64),
+            ("convert_build_us", db.convert_us().0 as f64),
+            ("convert_total_us", db.convert_us().1 as f64),
+            ("forms_cloned", db.forms_cloned() as f64),
             ("pin_barriers", uk[10] as f64),
         ]
     }
@@ -3124,18 +3173,61 @@ pub const ARMS: [&str; 12] = [
 
 pub fn guarantee(arm: &str) -> Option<Guarantee> {
     Some(match arm {
-        "supdb" | "supdb-forms" | "supdb-settle" | "supdb-wforms" | "supdb-regime"
-        | "supdb-noseal" | "supdb-ahead" | "supdb-lazyforms" | "supdb-eager" | "supdb-nosettle"
-        | "supdb-recency" | "supdb-nocarry" | "supdb-rebuild" | "supdb-snapcarry"
-        | "supdb-lazysnap" | "supdb-fullrec" | "supdb-norebase" | "supdb-sealfile"
-        | "supdb-settleall" | "supdb-inline" | "supdb-tier" | "supdb-runs" | "supdb-keeper"
-        | "supdb-aheadpub" | "supdb-pubalways" | "supdb-nosnap" | "supdb-noadvice"
-        | "supdb-nocache" | "supdb-cache256" | "supdb-l0" | "supdb-nopin" | "supdb-asympin"
-        | "supdb-extsval" | "supdb-piecesonly" | "supdb-latewb" | "supdb-copysearch"
-        | "supdb-inlinemaint" | "supdb-adapt" | "supdb-adapttrig" | "supdb-adaptloose"
-        | "supdb-rotate" | "supdb-nofrozen" | "supdb-idle" | "supdb-sortover" | "supdb-pmd"
-        | "supdb-hold" | "supdb-settlefreeze" | "supdb-convertcap" | "supdb-shortpass"
-        | "supdb-noyield" | "supdb-postedyield" | "supdb-bg" | "supdb-bglag" | "lmdb"
+        "supdb"
+        | "supdb-forms"
+        | "supdb-settle"
+        | "supdb-wforms"
+        | "supdb-regime"
+        | "supdb-noseal"
+        | "supdb-ahead"
+        | "supdb-lazyforms"
+        | "supdb-eager"
+        | "supdb-nosettle"
+        | "supdb-recency"
+        | "supdb-nocarry"
+        | "supdb-rebuild"
+        | "supdb-snapcarry"
+        | "supdb-lazysnap"
+        | "supdb-fullrec"
+        | "supdb-norebase"
+        | "supdb-sealfile"
+        | "supdb-settleall"
+        | "supdb-inline"
+        | "supdb-tier"
+        | "supdb-runs"
+        | "supdb-keeper"
+        | "supdb-aheadpub"
+        | "supdb-pubalways"
+        | "supdb-nosnap"
+        | "supdb-noadvice"
+        | "supdb-nocache"
+        | "supdb-cache256"
+        | "supdb-l0"
+        | "supdb-nopin"
+        | "supdb-asympin"
+        | "supdb-extsval"
+        | "supdb-piecesonly"
+        | "supdb-latewb"
+        | "supdb-copysearch"
+        | "supdb-convertsources"
+        | "supdb-inlinemaint"
+        | "supdb-adapt"
+        | "supdb-adapttrig"
+        | "supdb-adaptloose"
+        | "supdb-rotate"
+        | "supdb-nofrozen"
+        | "supdb-idle"
+        | "supdb-sortover"
+        | "supdb-pmd"
+        | "supdb-hold"
+        | "supdb-settlefreeze"
+        | "supdb-convertcap"
+        | "supdb-shortpass"
+        | "supdb-noyield"
+        | "supdb-postedyield"
+        | "supdb-bg"
+        | "supdb-bglag"
+        | "lmdb"
         | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest"
         | "supdb-ingestleave"
@@ -3161,6 +3253,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestpiecesonly"
         | "supdb-ingestlatewb"
         | "supdb-ingestcopysearch"
+        | "supdb-ingestconvertsources"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
         | "supdb-ingestrankrecords"
@@ -3219,7 +3312,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestpiecesonly" => Box::new(Supdb::create_ingest_piecesonly(dir)?),
         "supdb-latewb" => Box::new(Supdb::create_latewb(dir)?),
         "supdb-copysearch" => Box::new(Supdb::create_copysearch(dir)?),
+        "supdb-convertsources" => Box::new(Supdb::create_convertsources(dir)?),
         "supdb-ingestcopysearch" => Box::new(Supdb::create_ingest_copysearch(dir)?),
+        "supdb-ingestconvertsources" => Box::new(Supdb::create_ingest_convertsources(dir)?),
         "supdb-rankrecords" => Box::new(Supdb::create_rankrecords(dir)?),
         "supdb-ingestrankrecords" => Box::new(Supdb::create_ingest_rankrecords(dir)?),
         "supdb-ingestlatewb" => Box::new(Supdb::create_ingest_latewb(dir)?),

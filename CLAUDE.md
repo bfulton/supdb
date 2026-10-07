@@ -160,6 +160,28 @@ clock beside its wall clock: a pass slower than its CPU was descheduled
 or waiting, one as slow as its CPU stalled, and the nine reps that read
 13-66 ms split into three shapes on that one column before anything
 was changed (`docs/engine.md`, the pass after the rewritten burst).
+The same holds for a phase timed inside a thread: a trace stamped the
+upkeep thread's conversions by wall clock at 15-35 µs a block, and a
+counter on the thread's own clock that both arms report in one
+process (`Db::convert_us`) read 11 -- the rest was the thread off its
+core beside the writer and the seal. A per-block cost to be priced is
+counted on the thread's clock and compared between arms, never read
+off a wall-clock trace of a niced thread.
+
+The row has counters of its own: `SUPDB_LAG_COUNTERS=1` makes `bench
+run` print one `lagcounters` line per lag point on stderr -- the
+scans' phases, the threads' time and pass count, the faults by
+thread, the blocks built and the walks by form -- read before the
+burst and after the pass and never between. It is how a pass's two
+shapes are told apart in the suite's own shape: the slow reps of the
+buffered rewritten point at three hundred thousand keys read 4-9
+passes of the upkeep thread over the burst where the fast ones read
+13-45, with the thread's CPU the same in both, after four probes had
+each reproduced one shape and called the row wrong. Find the count
+that separates the reps there before building a probe, and read a
+verdict at p .04 on one pairing of `bench ab` as a position effect
+until a second pairing agrees: the durable arm read a point 6% against
+a change in ten pairs of twelve and 6% for it in the replication.
 
 Profile a probe that does one thing. The scan probe's own `format!` per
 iteration was 8% of its samples until the keys were built before the

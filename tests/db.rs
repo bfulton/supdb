@@ -2380,6 +2380,70 @@ fn a_copy_of_updates_starts_a_scan_at_the_seeks_rank() {
     assert!(searched2 > 0, "the block with the insert is searched");
 }
 
+/// A dense sparse form is converted into a copy from its own deltas and the
+/// partition's records (`Options::convert_from_form`), where the build from
+/// the sources gathered every key's run again. The forms here grow dense
+/// in rounds -- each round writes a part of every block, small enough that
+/// the first fill leaves a sparse form and the next finds it dense -- and
+/// hold every kind of delta: updates of a record, a key with two values,
+/// inserts between records, deletes of a record, which keep the entry with
+/// an empty run, and a delete of a key no record has. The model's scans
+/// check the copies after every round, and in the checked profile the
+/// conversion also builds the copy from the sources and asserts the two
+/// agree.
+#[test]
+fn a_dense_form_converts_from_its_own_deltas() {
+    let d = dir("convert-from-form");
+    // The writer's own commits file and fill, so the conversion is the
+    // commit's after the round that made a form dense, and not a thread's
+    // whose pass a scan may take back first.
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(64 << 10),
+        scan_block_cache: true,
+        upkeep: supdb::Upkeep::Inline,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let mut m = ScanModel::default();
+    let key = |k: u32| format!("key-{k:05}");
+    for k in (0..1200).step_by(3) {
+        m.append(&mut db, &key(k), &format!("p{k}"));
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    m.flushed();
+    assert_eq!(db.levels(), (1, 0), "one partition of several blocks");
+    m.check(&db, "clean: no block has a delta");
+    let before = db.forms_events()[13];
+    for off in [0u32, 3, 6, 9, 12] {
+        for k in (off..1200).step_by(15) {
+            m.append(&mut db, &key(k), &format!("u{k}"));
+            if k % 45 == off {
+                m.append(&mut db, &key(k), &format!("v{k}"));
+            }
+            if k % 75 == off {
+                m.append(&mut db, &key(k + 1), "new");
+            }
+            if k % 105 == off {
+                m.delete(&mut db, &key(k));
+            }
+        }
+        if off == 6 {
+            m.delete(&mut db, &key(1199));
+        }
+        db.commit().unwrap();
+        m.check(
+            &db,
+            &format!("round {off}: the forms grow by a part of every block"),
+        );
+    }
+    assert!(
+        db.forms_events()[13] > before,
+        "dense forms were converted from their own deltas"
+    );
+}
+
 #[test]
 fn a_write_settles_into_the_block_it_lands_in() {
     let d = dir("settle-in-place");

@@ -3281,6 +3281,86 @@ probe read the second pass 0.76 to 0.80 million operations a second by
 median against the search's 0.76, 0.68 to 0.88 against 0.76 to 0.88,
 within five rounds' noise and in the direction the removed work says.
 
+#### The buffered lag point in the row's shape: the thread's conversions and the first scan's wait
+
+The quick row read the buffered arm's fully rewritten lag point at
+0.17-0.59x of LMDB at every rung while every probe built for it read
+one shape or the other, so the row was given its own counters
+(`SUPDB_LAG_COUNTERS=1`): the scans' phases, the threads' time and pass
+count, the faults by thread, the blocks built and the walks by form,
+read before each burst and after its pass and never between. In that
+shape at three hundred thousand keys the pass after the rewritten
+burst read 12-24 ms in some reps and 40-212 in others, and the one
+count that split them was the upkeep thread's passes over the burst:
+4-9 in the slow reps, 13-45 in the fast, with the thread's CPU the same
+160-230 ms in both. Nothing else moved: the published forms were never
+copied before a patch (`forms_cloned` read zero in every rep), free
+memory was flat, and the allocator's tunables changed nothing, so the
+predecessor arm and the balloon were ruled out before anything was
+changed.
+
+Two levers the suite already had were priced first. The bounded pass
+(`supdb-ingestshortpass`, `upkeep_pass_pct` at 2%) read the point at
+0.434x of the default in twelve pairs, none above: the cap moves the
+backlog from the thread's pass to the first scan's own settle, which
+read 28-37 ms in every rep. The arm that converts no dense form unless
+a scan has come since the last fill (`supdb-ingestbg`) read it at
+0.751x, two pairs of twelve above, and E at 0.925x, none above: the
+pass walked sixty-four-delta sparse forms, and those cost more than the
+copies even at 1.6 walks a block.
+
+A trace with one clock across the runner and the engine then gave the
+mechanism as a timeline. In a slow rep the thread's pass in the middle
+of the burst converted 2,000-2,800 dense forms while 27,000-133,000
+writes waited behind it, and the next pass did the same; the burst
+ended with 130,000-186,000 writes unfiled, the thread's last pass filed
+them, and the first scan waited 13-38 ms for that pass (`take_back`),
+then ran its 13 ms of scans. In a fast rep the same conversions fell
+earlier, the thread was 6,000 writes behind when the burst ended, and
+the scan waited a millisecond. The conversions yielded to nothing while
+the writer was not waiting: the yield on a posted commit
+(`forms_convert_behind`) measures how far the thread is behind as the
+log position it may read to less the position it has read, and on the
+thread the first is the pass's own bound, which the log read has just
+reached, so the measure is zero in every pass and only the writer's wait
+(`LEND_WANT`) ever yielded -- 14-250 skipped conversions in the pass
+the first scan took back, none before it. That measure is to be
+changed and priced on its own.
+
+The conversion itself was priced in one process before it was changed.
+The trace had stamped it at 15-35 µs a block by wall clock; a counter on
+the thread's own clock, reported by both arms (`Db::convert_us`), read
+11.1 µs from the sources and 6.8 from the form, and the difference was
+the thread off its core beside the writer and the seal. A dense sparse
+form holds every key written over the block with its run resolved --
+the partition's values for an equal key, then the pieces' and the
+memtables', a tombstone masking the older -- and every settle keeps it
+so, which makes the copy one streaming merge of the form with the
+block's records by the cuts the form holds (`copy_from_deltas`), where
+the build from the sources gathered every key's run again through a
+seek of each piece and a chain walk in the memtable. In the checked
+profile the conversion builds the copy both ways and asserts they
+agree, entry for entry (`CachedBlock::agrees`). Priced at three hundred
+thousand keys, twenty-four pairs each: the buffered point's scans read
+1.105x with the form's conversion, nineteen pairs above (p .007), and
+the conversions 1.70x cheaper in all but one; the durable arm's thread
+spent 7.9% less (twenty pairs above, p .002) with its lag points level;
+E, B, D and F level in both. A first pairing of the durable arm had
+read its rewritten point 6% against the change in ten pairs of twelve
+(p .039) and the replication read it 6% for, fifteen of twenty-four:
+the pair's position effect is real and a verdict at p .04 on one
+pairing is not one.
+
+What the change did not do: the slow mode is still there, one rep in
+four in the row's shape, because the thread's budget is what it was.
+The burst writes three hundred thousand keys in 180-200 ms and the
+thread's work for it is the settles at about 0.4 µs a write, 120 ms,
+the conversions, 33 ms now against 52, and the log read and snapshot,
+about 20; the thread is on a core for nearly the whole burst, and any
+slip puts the burst's end on the first scan. The yield's measure, the
+settle's per-write cost and what the first scan has to wait for are
+the levers left, in that order.
+
 #### The pin's fence, priced against a sweep that fences for it
 
 A read pins the epoch it reads in by storing it in its slot of the

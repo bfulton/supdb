@@ -1138,6 +1138,24 @@ pub struct Options {
     /// slack and yields where the thread runs behind; `supdb-postedyield`
     /// and `supdb-ingestpostedyield` keep the yield at any posted commit.
     pub forms_convert_behind: usize,
+    /// Whether a dense sparse form is converted into a copy from its own
+    /// deltas and the partition's records, or built again from the
+    /// sources. A sparse form holds every key written over the block with
+    /// its run resolved -- the partition's values for an equal key, then
+    /// the pieces' and the memtables', a tombstone masking the older --
+    /// kept current by every settle, so the copy is one streaming merge
+    /// of the form with the block's records, by the cuts the form holds.
+    /// The build from the sources gathered every key's run again, a seek
+    /// of each piece standing and a chain walk in the memtable per key:
+    /// about 11 µs of the thread's time a block at three hundred thousand
+    /// keys with five to nine pieces against 7 from the form, timed in
+    /// one process (`Db::convert_us`), and a burst that rewrites the
+    /// store converts every block, on the thread that has the burst's
+    /// writes to file; the buffered lag point's scans after such a burst
+    /// read 1.1x with the form's. Off, the build from the sources, kept
+    /// for pricing as `supdb-convertsources` and
+    /// `supdb-ingestconvertsources`.
+    pub convert_from_form: bool,
     /// EXPERIMENT: the writes since the last scan over the store, as a
     /// share of the partitions' keys, within which the backlog bound
     /// above settles at all; zero, the default, settles by the bound
@@ -1376,6 +1394,7 @@ impl Default for Options {
             ahead_converts: false,
             forms_convert_yield: true,
             forms_convert_behind: 1000,
+            convert_from_form: true,
             forms_settle_recent_pct: 0,
             forms_carry: true,
             freeze_settles: false,
@@ -6216,6 +6235,17 @@ impl CachedBlock {
     fn key(&self, e: &[u32; 4]) -> &[u8] {
         &self.keys[e[0] as usize..(e[0] + e[1]) as usize]
     }
+    /// Whether this copy holds what `other` holds, entry for entry, and
+    /// claims the identity at least where `other` does: the check the
+    /// conversion from a form makes against the build from the sources
+    /// in the checked profile (`Options::convert_from_form`).
+    #[cfg(debug_assertions)]
+    fn agrees(&self, other: &CachedBlock) -> bool {
+        self.keys == other.keys
+            && self.vals == other.vals
+            && self.ents == other.ents
+            && (self.identity || !other.identity)
+    }
     /// First entry whose key is not below `from`.
     fn lower_bound(&self, from: &[u8]) -> usize {
         select_lower_bound(self.ents.len(), |i| {
@@ -7107,6 +7137,15 @@ struct Shared {
     /// last turn of its loop: what its seals' landings, merges and piece
     /// rankings have cost, read by the suite beside the upkeep thread's.
     maint_cpu_ns: AtomicU64,
+    /// For a measurement: nanoseconds the fill's dense conversions spent
+    /// building the copy, and in the whole conversion -- the form taken
+    /// out, the copy built, listed and published -- over the store's
+    /// life; see `Db::convert_us`.
+    convert_build_ns: AtomicU64,
+    convert_total_ns: AtomicU64,
+    /// Patches that found the form shared with a published copy and had
+    /// to copy it before writing (`Arc::make_mut` on a shared form).
+    forms_cloned: AtomicU64,
     /// Reads that took a canonical form, over this store's life. The
     /// count beside it on `State` is that state's and is zero again at
     /// every publish, so reading it at the end of a pass says what
@@ -7159,7 +7198,7 @@ struct Shared {
     /// installed from a builder, writes a settle found no table for, and
     /// the fill's dense conversions against its builds of blocks with no
     /// form.
-    forms_events: [AtomicU64; 12],
+    forms_events: [AtomicU64; 13],
     /// EXPERIMENT: snapshots carried forward by merging a batch into the
     /// run rather than sorting everything again; the count that should
     /// rise where `snap_builds` stops.
@@ -12523,7 +12562,60 @@ impl Reader {
                         continue;
                     }
                     converted += 1;
+                    let t_total = std::time::Instant::now();
+                    // From the form itself where it can be: every delta's
+                    // run is in it, resolved, so the copy is a merge of the
+                    // form with the block's records and reads no source;
+                    // the build from the sources gathered every key's run
+                    // again (`Options::convert_from_form`).
+                    let from_form = if self.opts.convert_from_form
+                        && BuildCtx::overlay_count(table, b) <= WIDE
+                    {
+                        table.slots[b].clone()
+                    } else {
+                        None
+                    };
                     self.unlist(pi, b, table);
+                    let t_build = std::time::Instant::now();
+                    let built = if let Some(form) = from_form {
+                        let Cached::Sparse(sb) = &*form else {
+                            unreachable!("a dense form is a sparse one")
+                        };
+                        let lo = b * CACHE_BLOCK;
+                        let hi = ((b + 1) * CACHE_BLOCK).min(seg.blob.keys());
+                        let copied = ctx.copy_from_deltas(src, lo..hi, sb)?;
+                        #[cfg(debug_assertions)]
+                        {
+                            let again = ctx.materialize(src, table, b, unsealed)?;
+                            match &again {
+                                Cached::Block(cb) => debug_assert!(
+                                    copied.agrees(cb),
+                                    "a copy from the form disagrees with the build from the sources"
+                                ),
+                                _ => debug_assert!(
+                                    false,
+                                    "a dense form's block built from the sources is not a copy"
+                                ),
+                            }
+                        }
+                        self.shared.forms_events[12].fetch_add(1, AtomicOrdering::Relaxed);
+                        Cached::Block(copied)
+                    } else {
+                        self.shared.forms_events[5].fetch_add(1, AtomicOrdering::Relaxed);
+                        ctx.materialize(src, table, b, unsealed)?
+                    };
+                    self.shared
+                        .convert_build_ns
+                        .fetch_add(t_build.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+                    let built = std::sync::Arc::new(built);
+                    self.count_built();
+                    let bytes = built.bytes();
+                    table.slots[b] = Some(built);
+                    self.list_built_bytes(pi, b, table, bytes);
+                    self.shared
+                        .convert_total_ns
+                        .fetch_add(t_total.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+                    continue;
                 } else if table.slots[b].is_some()
                     || (if self.opts.forms_pieces_only {
                         BuildCtx::piece_count(table, b)
@@ -12533,8 +12625,7 @@ impl Reader {
                 {
                     continue;
                 }
-                self.shared.forms_events[if dense { 5 } else { 6 }]
-                    .fetch_add(1, AtomicOrdering::Relaxed);
+                self.shared.forms_events[6].fetch_add(1, AtomicOrdering::Relaxed);
                 let built = std::sync::Arc::new(ctx.materialize(src, table, b, unsealed)?);
                 self.count_built();
                 let bytes = built.bytes();
@@ -13139,6 +13230,14 @@ impl Reader {
         let was_clean = matches!(table.slots[b].as_deref(), Some(Cached::Clean));
         let mut bloated = false;
         let mut dense = false;
+        if table.slots[b]
+            .as_ref()
+            .is_some_and(|a| std::sync::Arc::strong_count(a) > 1)
+        {
+            self.shared
+                .forms_cloned
+                .fetch_add(1, AtomicOrdering::Relaxed);
+        }
         match std::sync::Arc::make_mut(table.slots[b].as_mut().expect("checked above")) {
             Cached::Block(blk) => {
                 // The cut is the key's rank in the partition, and while
@@ -15162,6 +15261,9 @@ impl Db {
             lag_level: std::sync::atomic::AtomicU32::new(0),
             maint_thread: std::sync::OnceLock::new(),
             maint_cpu_ns: AtomicU64::new(0),
+            convert_build_ns: AtomicU64::new(0),
+            convert_total_ns: AtomicU64::new(0),
+            forms_cloned: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
             canon_tried: AtomicU64::new(0),
@@ -15524,6 +15626,9 @@ impl Db {
             lag_level: std::sync::atomic::AtomicU32::new(0),
             maint_thread: std::sync::OnceLock::new(),
             maint_cpu_ns: AtomicU64::new(0),
+            convert_build_ns: AtomicU64::new(0),
+            convert_total_ns: AtomicU64::new(0),
+            forms_cloned: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
             canon_tried: AtomicU64::new(0),
@@ -17299,9 +17404,11 @@ impl Db {
     /// `blocks_built().1`), then the events of `Shared::forms_events`:
     /// tables dropped, builders started, builders stopped unfinished,
     /// forms installed from a builder, writes settled against no table,
-    /// and the fill's dense conversions and fresh builds.
-    pub fn forms_events(&self) -> [u64; 13] {
-        let mut out = [0u64; 13];
+    /// the fill's dense conversions and fresh builds, the builder's skips
+    /// and builds, the installs dropped and skipped, and the dense
+    /// conversions made from the form itself (`Options::convert_from_form`).
+    pub fn forms_events(&self) -> [u64; 14] {
+        let mut out = [0u64; 14];
         out[0] = self.shared.blk_upkeep.load(AtomicOrdering::Relaxed);
         for (o, e) in out[1..].iter_mut().zip(self.shared.forms_events.iter()) {
             *o = e.load(AtomicOrdering::Relaxed);
@@ -19937,6 +20044,22 @@ impl Db {
         self.shared.maint_cpu_ns.load(AtomicOrdering::Relaxed) / 1000
     }
 
+    /// Microseconds the fill's dense conversions spent building their
+    /// copies, and in the whole conversion, over the store's life
+    /// (`Options::convert_from_form`).
+    pub fn convert_us(&self) -> (u64, u64) {
+        (
+            self.shared.convert_build_ns.load(AtomicOrdering::Relaxed) / 1000,
+            self.shared.convert_total_ns.load(AtomicOrdering::Relaxed) / 1000,
+        )
+    }
+
+    /// Patches that copied a form shared with a published copy before
+    /// writing it, over the store's life.
+    pub fn forms_cloned(&self) -> u64 {
+        self.shared.forms_cloned.load(AtomicOrdering::Relaxed)
+    }
+
     pub fn upkeep_counts(&self) -> [u64; 11] {
         let l = &self.shared.upkeep;
         [
@@ -21545,6 +21668,96 @@ impl<'s> BuildCtx<'s> {
             .over
             .iter()
             .all(|o| o.cut != u32::MAX && BuildCtx::cut_known(o.cut, lo, hi).1 == Ordering::Equal);
+        blk.identity = updates && blk.ents.len() == hi - lo;
+        Ok(blk)
+    }
+    /// The merged copy of the ranks with a sparse form's deltas laid over
+    /// them: the form's keys at their cuts, each with the run the form
+    /// holds, and the partition's records between, streamed. What
+    /// `copy_block` builds over the overlay, from the form instead of
+    /// from the sources; see `Options::convert_from_form`.
+    fn copy_from_deltas(
+        &self,
+        src: Sources,
+        ranks: std::ops::Range<usize>,
+        sb: &SparseBlock,
+    ) -> Result<CachedBlock> {
+        let seg = src.seg;
+        let (lo, hi) = (ranks.start, ranks.end);
+        let n = (hi - lo) + sb.ents.len();
+        let mut blk = CachedBlock {
+            keys: Vec::with_capacity(sb.keys.len() + (hi - lo) * 16),
+            vals: Vec::with_capacity(sb.vals.len() + (hi - lo) * 128),
+            ents: Vec::with_capacity(n),
+            identity: false,
+        };
+        // Every key once, then its values, as `copy_block` opens them: an
+        // entry opens on a key change, and a key without values -- a
+        // record a delta deleted -- still gets one.
+        let mut current: Vec<u8> = Vec::with_capacity(32);
+        let mut open = false;
+        let mut rank = lo;
+        let mut updates = true;
+        let stream = |blk: &mut CachedBlock,
+                      current: &mut Vec<u8>,
+                      open: &mut bool,
+                      from: usize,
+                      want: usize|
+         -> Result<()> {
+            let mut rec = |k: &[u8], v: &[u8]| {
+                if !*open || current.as_slice() != k {
+                    if *open {
+                        blk.end();
+                    }
+                    blk.begin(k);
+                    current.clear();
+                    current.extend_from_slice(k);
+                    *open = true;
+                }
+                blk.push(v);
+            };
+            let got = seg
+                .blob
+                .scan_at(from, want, &mut rec)
+                .map_err(|e| err(&format!("segment scan: {e}")))?;
+            if got < want {
+                return Err(err(
+                    "segment scan: a partition's walk stopped short of its key count",
+                ));
+            }
+            Ok(())
+        };
+        for e in &sb.ents {
+            let cut = (e.cut as usize).clamp(rank, hi);
+            if cut > rank {
+                stream(&mut blk, &mut current, &mut open, rank, cut - rank)?;
+                rank = cut;
+            }
+            let k = sb.key(e);
+            if !open || current.as_slice() != k {
+                if open {
+                    blk.end();
+                }
+                blk.begin(k);
+                current.clear();
+                current.extend_from_slice(k);
+                open = true;
+            }
+            sb.each_value(e, |v| blk.push(v));
+            if e.same {
+                rank += 1;
+            } else {
+                updates = false;
+            }
+        }
+        if rank < hi {
+            stream(&mut blk, &mut current, &mut open, rank, hi - rank)?;
+        }
+        if open {
+            blk.end();
+        }
+        // Every delta an update of a record, and a key emitted per record:
+        // `copy_block`'s rule, which the form's cuts answer exactly.
         blk.identity = updates && blk.ents.len() == hi - lo;
         Ok(blk)
     }
