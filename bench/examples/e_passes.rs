@@ -78,14 +78,22 @@ fn mix(
     t.elapsed().as_secs_f64()
 }
 
+/// This thread's minor page faults so far, from `/proc/thread-self/stat`.
+fn minflt_self() -> u64 {
+    let Ok(stat) = std::fs::read_to_string("/proc/thread-self/stat") else {
+        return 0;
+    };
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(7).and_then(|v| v.parse().ok()))
+        .unwrap_or(0)
+}
+
 fn main() {
     let mut a = std::env::args().skip(1);
     let size: u64 = a.next().unwrap().parse().unwrap();
     let rounds: usize = a.next().unwrap().parse().unwrap();
     let arms: Vec<String> = a.next().unwrap().split(',').map(str::to_string).collect();
-    let dir = std::path::PathBuf::from(
-        "/tmp/claude-0/-home-user-supdb/ee7b8ded-0bc9-50fc-95d2-e84de73c4b53/scratchpad/epass",
-    );
+    let dir = std::env::temp_dir().join(format!("supdb-epass-{}", std::process::id()));
     let payload = Payload::new(100, 0.5, 0xE1);
     println!("{size} keys, {rounds} rounds, arms interleaved within a round");
     for round in 1..=rounds {
@@ -113,11 +121,44 @@ fn main() {
                 mix(e.as_mut(), w, size, &mut inserted, &payload, 0);
             }
             let w = YCSB.iter().find(|w| w.0 == 'E').unwrap();
+            // The store's counters around each pass: the scans' phases
+            // before their walk, the thread's time and the blocks built,
+            // which say what a pass's time was made of. Read between the
+            // passes only, which is where the suite reads nothing either.
+            let c0 = e.counters();
+            let f0 = minflt_self();
+            supdb_bench::run::lag_mark(arm, 1, "start");
             let first = mix(e.as_mut(), w, size, &mut inserted, &payload, 0);
+            supdb_bench::run::lag_mark(arm, 1, "end");
+            let f1 = minflt_self();
+            let c1 = e.counters();
+            let f1b = minflt_self();
+            supdb_bench::run::lag_mark(arm, 2, "start");
             let second = mix(e.as_mut(), w, size, &mut inserted, &payload, 1);
+            supdb_bench::run::lag_mark(arm, 2, "end");
+            let f2 = minflt_self();
+            let c2 = e.counters();
             let ops = ycsb_ops(size) as f64;
             println!("  round {round}  {arm:<16} E first {:>9.0} ops/s   second {:>9.0} ops/s   second/first {:.2}x",
                      ops / first, ops / second, first / second);
+            let get = |c: &[(&str, f64)], n: &str| {
+                c.iter().find(|(k, _)| *k == n).map_or(0.0, |(_, v)| *v)
+            };
+            for (name, a, b, flt) in [("first", &c0, &c1, f1 - f0), ("second", &c1, &c2, f2 - f1b)]
+            {
+                let d = |n: &str| get(b, n) - get(a, n);
+                println!(
+                    "    {name}: pass {:.1} ms flt {flt} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} ms | thread {:.1} ms/{:.0}p | built up {:.0} rd {:.0} eng {:.0} | snaps {:.0} refr {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0}",
+                    (if name == "first" { first } else { second }) * 1e3,
+                    d("scan_take_us") / 1e3, d("scan_sync_us") / 1e3, d("scan_settle_us") / 1e3,
+                    d("scan_snap_us") / 1e3, d("scan_ahead_us") / 1e3, d("scan_install_us") / 1e3,
+                    d("upkeep_cpu_us") / 1e3, d("upkeep_passes"),
+                    d("blk_by_upkeep"), d("blk_by_reader"), d("blk_by_engine"),
+                    d("snapshot_builds"), d("snapshot_refreshes"),
+                    d("walk_copy"), d("walk_sparse"), d("walk_other"),
+                    d("start_at_rank"), d("start_search")
+                );
+            }
             drop(e);
             let _ = std::fs::remove_dir_all(&d);
         }

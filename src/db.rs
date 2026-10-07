@@ -1253,6 +1253,15 @@ pub struct Options {
     /// patch. `supdb-copysearch` and `supdb-ingestcopysearch` are the
     /// second search; `docs/engine.md` has the figures.
     pub copy_start_at_rank: bool,
+    /// A piece's keys are ranked against their partition over the ordered
+    /// index's heads, galloping from the rank the key before reached, as
+    /// the settle resolves a batch -- instead of over the partition's
+    /// records, a cold record read a probe. The ranking is taken once per
+    /// piece before its publish, on the segment work's thread, where it
+    /// was two fifths of that thread's time over the buffered arm's
+    /// rewritten burst. `supdb-rankrecords` and `supdb-ingestrankrecords`
+    /// rank over the records; `docs/engine.md` has the figures.
+    pub piece_ranks_by_heads: bool,
     /// EXPERIMENT: the writer's own handle takes the canonical forms it
     /// maintains, instead of building its own. Without this the
     /// maintenance is pure cost wherever the reads are the writer's: a
@@ -1372,6 +1381,7 @@ impl Default for Options {
             freeze_settles: false,
             forms_rebase: true,
             copy_start_at_rank: true,
+            piece_ranks_by_heads: true,
             forms_to_writer: false,
             form_dense_from: 0,
             scan_snapshot_arena: true,
@@ -6316,6 +6326,20 @@ pub(crate) fn select_lower_bound(n: usize, below: impl Fn(usize) -> bool) -> usi
 /// partition's records a walk would also want: what a splice needs,
 /// whose lower bound over the entries and the keys is six dependent
 /// misses into two cold allocations.
+/// The wide form in a slot, for writing, and `None` for any other form or
+/// an empty slot. The slot is looked at through a shared borrow first:
+/// `Arc::make_mut` proves its uniqueness with a locked exchange on the
+/// weak count before it can look, and a scan asked it of every block it
+/// walked to find the one in a thousand that was wide, 4% of the scan mix
+/// and 2% of the pass after a burst at three hundred thousand keys.
+fn wide_mut(slot: &mut Option<std::sync::Arc<Cached>>) -> Option<&mut Cached> {
+    if matches!(slot.as_deref(), Some(Cached::Wide(_))) {
+        slot.as_mut().map(std::sync::Arc::make_mut)
+    } else {
+        None
+    }
+}
+
 fn prefetch_form(form: &Cached) {
     match form {
         Cached::Block(blk) => blk.prefetch(),
@@ -7079,6 +7103,10 @@ struct Shared {
     lag_level: std::sync::atomic::AtomicU32,
     /// The segment work's thread, for a read to wake.
     maint_thread: std::sync::OnceLock<std::thread::Thread>,
+    /// The segment work's thread's CPU clock, in nanoseconds, as of its
+    /// last turn of its loop: what its seals' landings, merges and piece
+    /// rankings have cost, read by the suite beside the upkeep thread's.
+    maint_cpu_ns: AtomicU64,
     /// Reads that took a canonical form, over this store's life. The
     /// count beside it on `State` is that state's and is zero again at
     /// every publish, so reading it at the end of a pass says what
@@ -11893,6 +11921,7 @@ impl Reader {
             copy_dense: false,
             merge_pieces: self.opts.overlay_merge,
             pieces_only: self.opts.forms_pieces_only,
+            ranks_by_heads: self.opts.piece_ranks_by_heads,
         }
     }
 
@@ -13727,9 +13756,7 @@ impl Reader {
                 // and again wants -- ycsb-E at a hundred thousand keys
                 // read 0.58x with every touch assembling the window.
                 let mut recopy = false;
-                if let (None, Some(Cached::Wide(w))) =
-                    (canon, table.slots[b].as_mut().map(std::sync::Arc::make_mut))
-                {
+                if let (None, Some(Cached::Wide(w))) = (canon, wide_mut(&mut table.slots[b])) {
                     w.walks = w.walks.saturating_add(1);
                     recopy = w.covered && w.walks >= 2;
                 }
@@ -13749,9 +13776,7 @@ impl Reader {
                     self.list_built_bytes(pi, b, table, bytes);
                     self.shed(pi, b, table);
                 }
-                if let (None, Some(Cached::Wide(w))) =
-                    (canon, table.slots[b].as_mut().map(std::sync::Arc::make_mut))
-                {
+                if let (None, Some(Cached::Wide(w))) = (canon, wide_mut(&mut table.slots[b])) {
                     // Filed since the order was made: sorted and merged in.
                     let filed = &table.added[b];
                     if filed.len() > w.seen {
@@ -15136,6 +15161,7 @@ impl Db {
             lag_wake: std::sync::atomic::AtomicBool::new(false),
             lag_level: std::sync::atomic::AtomicU32::new(0),
             maint_thread: std::sync::OnceLock::new(),
+            maint_cpu_ns: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
             canon_tried: AtomicU64::new(0),
@@ -15497,6 +15523,7 @@ impl Db {
             lag_wake: std::sync::atomic::AtomicBool::new(false),
             lag_level: std::sync::atomic::AtomicU32::new(0),
             maint_thread: std::sync::OnceLock::new(),
+            maint_cpu_ns: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
             canon_tried: AtomicU64::new(0),
@@ -19904,6 +19931,12 @@ impl Db {
     /// (`Readers`). Atomics only: a read of them takes nothing back from
     /// the thread.
     #[doc(hidden)]
+    /// Microseconds of CPU the segment work's thread has used, as of the
+    /// last turn of its loop; zero where the segment work runs inline.
+    pub fn maint_cpu_us(&self) -> u64 {
+        self.shared.maint_cpu_ns.load(AtomicOrdering::Relaxed) / 1000
+    }
+
     pub fn upkeep_counts(&self) -> [u64; 11] {
         let l = &self.shared.upkeep;
         [
@@ -20037,7 +20070,7 @@ impl Db {
 /// aligned to, where the piece has none against that partition yet; see
 /// `BuildCtx::rank_pieces`. In any order: a set about to be published is
 /// not yet sorted.
-fn rank_pieces_of(segs: &[std::sync::Arc<Seg>]) -> Result<()> {
+fn rank_pieces_of(segs: &[std::sync::Arc<Seg>], by_heads: bool) -> Result<()> {
     for p in segs.iter().filter(|s| s.level == 0) {
         let Some(part) = segs
             .iter()
@@ -20049,8 +20082,10 @@ fn rank_pieces_of(segs: &[std::sync::Arc<Seg>]) -> Result<()> {
         if p.ranks.get(id).is_some() {
             continue;
         }
-        p.ranks
-            .put(id, std::sync::Arc::new(BuildCtx::ranks_over(part, p)?));
+        p.ranks.put(
+            id,
+            std::sync::Arc::new(BuildCtx::ranks_over(part, p, by_heads)?),
+        );
     }
     Ok(())
 }
@@ -20130,6 +20165,8 @@ struct BuildCtx<'s> {
     /// `Options::forms_pieces_only`: the forms hold the pieces' fold alone
     /// and the walk overlays the snapshot.
     pieces_only: bool,
+    /// See `Options::piece_ranks_by_heads`.
+    ranks_by_heads: bool,
     /// The pieces' runs over a block merged on their keys' leading words
     /// (`merge_runs`) rather than sorted whole: `Options::overlay_merge`.
     merge_pieces: bool,
@@ -20237,7 +20274,40 @@ impl<'s> BuildCtx<'s> {
     /// aligned to, from one forward walk: a gallop from the last rank, then
     /// a binary search inside the gallop's span, so a run of keys the
     /// partition also holds costs two reads a key.
-    fn ranks_over(part: &Seg, piece: &Seg) -> Result<Vec<u32>> {
+    fn ranks_over(part: &Seg, piece: &Seg, by_heads: bool) -> Result<Vec<u32>> {
+        if !by_heads {
+            return Self::ranks_over_records(part, piece);
+        }
+        // Over the heads, each key from the rank the key before it
+        // reached: the piece's keys are in order, so each seek gallops a
+        // short way over heads the last one left warm, where the walk
+        // over the records read a cold record a probe
+        // (`Options::piece_ranks_by_heads`).
+        let n = piece.blob.keys();
+        let pk = part.blob.keys();
+        let mut out = Vec::with_capacity(n);
+        let mut r = 0usize;
+        for i in 0..n {
+            let key = piece
+                .blob
+                .key_at(i)
+                .ok_or_else(|| err("block cache: a rank did not resolve"))?;
+            let (rank, exact) = part.ord.seek_exact_from(r, key, |j| part.blob.key_at(j));
+            let same = rank < pk && exact.unwrap_or_else(|| part.blob.key_at(rank) == Some(key));
+            r = rank;
+            out.push(((rank as u32) << 1) | same as u32);
+        }
+        debug_assert_eq!(
+            out,
+            Self::ranks_over_records(part, piece)?,
+            "a piece's ranks over the heads disagree with its ranks over the records"
+        );
+        Ok(out)
+    }
+    /// `ranks_over` by the partition's records: a gallop from the last
+    /// rank, then a binary search inside the gallop's span, a record read
+    /// a probe.
+    fn ranks_over_records(part: &Seg, piece: &Seg) -> Result<Vec<u32>> {
         let n = piece.blob.keys();
         let pk = part.blob.keys();
         let mut out = Vec::with_capacity(n);
@@ -20284,7 +20354,7 @@ impl<'s> BuildCtx<'s> {
     /// work does before it publishes a set (`Maint::rank_before_publish`),
     /// and a table's making does for pieces that were opened from disk.
     fn rank_pieces(&self) -> Result<()> {
-        rank_pieces_of(self.segs)
+        rank_pieces_of(self.segs, self.ranks_by_heads)
     }
     /// PROTOTYPE: where the snapshot's keys fall against the partition's
     /// block boundaries.
@@ -21705,6 +21775,9 @@ impl Maint {
         // A store opened with pieces and no partition is shaped now.
         self.shape_if_read(true);
         loop {
+            self.shared
+                .maint_cpu_ns
+                .store(thread_cpu_ns(), AtomicOrdering::Relaxed);
             if self.shared.maint_stop.load(AtomicOrdering::Acquire) {
                 break;
             }
@@ -21732,6 +21805,9 @@ impl Maint {
                 }
             }
         }
+        self.shared
+            .maint_cpu_ns
+            .store(thread_cpu_ns(), AtomicOrdering::Relaxed);
         self.stop();
     }
 
@@ -22256,7 +22332,7 @@ impl Maint {
     /// the block cache is off, since nothing reads them then.
     fn rank_before_publish(&self, segs: &[std::sync::Arc<Seg>]) -> Result<()> {
         if self.opts.scan_block_cache {
-            rank_pieces_of(segs)?;
+            rank_pieces_of(segs, self.opts.piece_ranks_by_heads)?;
             bound_pieces_of(segs)?;
         }
         Ok(())

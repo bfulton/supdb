@@ -157,6 +157,7 @@ fn main() {
             let c1 = e.counters();
             let up = get(&c1, "upkeep_ms") - get(&c0, "upkeep_ms");
             let cpu = (get(&c1, "upkeep_cpu_us") - get(&c0, "upkeep_cpu_us")) / 1e3;
+            let maint = (get(&c1, "maint_cpu_us") - get(&c0, "maint_cpu_us")) / 1e3;
             let barriers = get(&c1, "pin_barriers") - get(&c0, "pin_barriers");
             let passes = get(&c1, "upkeep_passes") - get(&c0, "upkeep_passes");
             let built = get(&c1, "blk_by_engine") - get(&c0, "blk_by_engine");
@@ -220,7 +221,7 @@ fn main() {
                 0.0
             };
             line.push_str(&format!(
-                "\n  lag{pct} {burst:.1}+{pass:.1}ms (cpu {pass_cpu:.1}) up {up:.1}ms/{passes:.0}p cpu {cpu:.1}ms flt {flt_up}/{flt_main} mb {barriers:.0} c_t {ct:.2} c_w {cw:.2} built {built:.0} skipped {skipped:.0} blockpath {blockpath:.0}/{scans_n:.0} seals {seals:.0} pubs {pubs:.0} snaps {snaps:.0} refr {refr:.0} swit {swit:.0} ext {ext:.0} | {layout} | {upkeep_built} | {phases}"
+                "\n  lag{pct} {burst:.1}+{pass:.1}ms (cpu {pass_cpu:.1}) up {up:.1}ms/{passes:.0}p cpu {cpu:.1}ms maint {maint:.1}ms flt {flt_up}/{flt_main} mb {barriers:.0} c_t {ct:.2} c_w {cw:.2} built {built:.0} skipped {skipped:.0} blockpath {blockpath:.0}/{scans_n:.0} seals {seals:.0} pubs {pubs:.0} snaps {snaps:.0} refr {refr:.0} swit {swit:.0} ext {ext:.0} | {layout} | {upkeep_built} | {phases}"
             ));
             c0 = c1;
         }

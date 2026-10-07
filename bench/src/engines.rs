@@ -438,6 +438,10 @@ pub struct Supdb {
     /// `Options::copy_start_at_rank`. `supdb-copysearch`, and
     /// `supdb-ingestcopysearch` buffered.
     copysearch: bool,
+    /// A piece's keys ranked over the partition's records, as before
+    /// `Options::piece_ranks_by_heads`. `supdb-rankrecords`, and
+    /// `supdb-ingestrankrecords` buffered.
+    rankrecords: bool,
     /// A store with no partitions partitioned once it is read,
     /// `Options::adaptive_shape`. `supdb-ingestshape`.
     shape: bool,
@@ -593,6 +597,10 @@ struct Policy {
     /// `Options::copy_start_at_rank`. `supdb-copysearch`, and
     /// `supdb-ingestcopysearch` buffered.
     copysearch: bool,
+    /// A piece's keys ranked over the partition's records, as before
+    /// `Options::piece_ranks_by_heads`. `supdb-rankrecords`, and
+    /// `supdb-ingestrankrecords` buffered.
+    rankrecords: bool,
     /// A store with no partitions partitioned once it is read,
     /// `Options::adaptive_shape`. `supdb-ingestshape`.
     shape: bool,
@@ -690,6 +698,7 @@ impl Default for Policy {
             latewb: false,
             inlinemaint: false,
             copysearch: false,
+            rankrecords: false,
             shape: false,
             adaptcap: None,
             adapttrig: false,
@@ -1726,6 +1735,32 @@ impl Supdb {
         )
     }
 
+    /// `supdb` ranking a piece's keys over the partition's records, as
+    /// before `Options::piece_ranks_by_heads`: against `supdb` it prices
+    /// the ranking over the index's heads, on the segment work's thread.
+    pub fn create_rankrecords(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                rankrecords: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` ranking over the records, as `supdb-rankrecords`.
+    pub fn create_ingest_rankrecords(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                rankrecords: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb-ingest` with the closing fsync writing everything, as
     /// `supdb-latewb`.
     pub fn create_ingest_latewb(path: &Path) -> Res<Supdb> {
@@ -1895,6 +1930,7 @@ impl Supdb {
             latewb,
             inlinemaint,
             copysearch,
+            rankrecords,
             shape,
             aheadmin,
             lazyforms,
@@ -2019,6 +2055,7 @@ impl Supdb {
             forms_carry: carry,
             freeze_settles: settlefreeze,
             copy_start_at_rank: !copysearch,
+            piece_ranks_by_heads: !rankrecords,
             forms_convert_unread: !(bg || bglag),
             // The capped conversions and the builder's, kept to price again
             // once the thread keeps up with the writer.
@@ -2144,6 +2181,7 @@ impl Supdb {
             latewb,
             inlinemaint,
             copysearch,
+            rankrecords,
             shape,
             aheadmin,
             lazyforms,
@@ -2443,6 +2481,13 @@ impl Engine for Supdb {
                 "supdb-ingestcopysearch"
             };
         }
+        if self.rankrecords {
+            return if self.partition {
+                "supdb-rankrecords"
+            } else {
+                "supdb-ingestrankrecords"
+            };
+        }
         if self.shape {
             return "supdb-ingestshape";
         }
@@ -2626,6 +2671,7 @@ impl Engine for Supdb {
             ("upkeep_wait_us", uk[3] as f64),
             ("upkeep_partial", uk[8] as f64),
             ("upkeep_cpu_us", uk[9] as f64),
+            ("maint_cpu_us", db.maint_cpu_us() as f64),
             ("pin_barriers", uk[10] as f64),
         ]
     }
@@ -3116,6 +3162,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestlatewb"
         | "supdb-ingestcopysearch"
         | "supdb-ingestrebuild"
+        | "supdb-rankrecords"
+        | "supdb-ingestrankrecords"
         | "supdb-ingestbg"
         | "supdb-ingestbglag"
         | "supdb-ingesthold"
@@ -3172,6 +3220,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-latewb" => Box::new(Supdb::create_latewb(dir)?),
         "supdb-copysearch" => Box::new(Supdb::create_copysearch(dir)?),
         "supdb-ingestcopysearch" => Box::new(Supdb::create_ingest_copysearch(dir)?),
+        "supdb-rankrecords" => Box::new(Supdb::create_rankrecords(dir)?),
+        "supdb-ingestrankrecords" => Box::new(Supdb::create_ingest_rankrecords(dir)?),
         "supdb-ingestlatewb" => Box::new(Supdb::create_ingest_latewb(dir)?),
         "supdb-inlinemaint" => Box::new(Supdb::create_inlinemaint(dir)?),
         "supdb-ingestinline" => Box::new(Supdb::create_ingest_inline(dir)?),

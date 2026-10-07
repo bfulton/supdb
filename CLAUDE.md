@@ -1282,6 +1282,20 @@ the rows after it for a point read. The rule: a bisect of a ratio walks
 the harness's commits as well as the engine's, and a step that changes
 what is measured ends the comparison there, whatever the engine did.
 
+**A locked exchange to look at a variant.** A scan asked, of every
+block it walked through its own table, whether the block's form was the
+wide one, and asked through `Arc::make_mut` so that it could update the
+form if so: `make_mut` proves the pointer unique before it looks, with a
+compare-and-exchange on the weak count, so every walked block paid a
+locked read-modify-write to find the one in a thousand that was wide --
+4% of the scan mix and 2% of the pass after a burst at three hundred
+thousand keys, visible in a profile of the pass as `Arc::make_mut` with
+no clone behind it. The variant is read through a shared borrow first
+now (`wide_mut`). The rule: a question about a shared value is asked of a
+shared borrow, and the mutable one is taken only once the answer says
+there is something to change; and a function that promises uniqueness is
+priced by what it does to prove it.
+
 **A sentinel that crosses the wasm boundary changes sign.** A wasm `u32`
 arrives in JavaScript as a signed i32, so a failure sentinel of `u32::MAX`
 arrives as -1 and a comparison against 4294967295 can never match. Every

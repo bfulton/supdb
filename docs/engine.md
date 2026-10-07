@@ -3237,6 +3237,50 @@ with the memtable overlaid at the walk (`forms_pieces_only`), or a
 pass whose take-back cuts a settle short -- each move the work rather
 than remove it for a pass that reads every block once.
 
+#### The piece's ranks over the heads, and a locked exchange to look at a form
+
+Every written key's rank in its partition is computed by three parties:
+the settle resolves it on the upkeep thread, galloping over the ordered
+index's heads from the rank the key before reached; the segment work
+ranks a piece's keys against the partition before the publish, for the
+merges and the reads; and the scan snapshot takes the same cuts lazily
+per block. The second was done over the partition's records -- a gallop
+and a binary search whose every probe read a record, a cold line each
+-- and was two fifths of the segment work's thread's time over the
+buffered arm's rewritten burst, by a profile cut to the burst's window
+and that thread. It ranks over the heads now, as the settle does
+(`Options::piece_ranks_by_heads`; `supdb-rankrecords` and
+`supdb-ingestrankrecords` rank over the records), and the checked
+profile asserts the two rankings agree on every piece. The suite reads
+the segment work's thread's CPU now (`maint_cpu_us`). Twelve pairs: the
+records' ranking costs that thread 1.62x the heads' on the buffered arm
+at three hundred thousand keys (12/12, p<0.001), 1.40x at a hundred
+thousand (11/12, p=0.006) and 1.85x on the durable arm at three hundred
+thousand (12/12); the upkeep thread's time and every pass and mix are
+within noise at twelve pairs. What the cut buys the first scan after a
+burst is a core the upkeep thread no longer shares for that time; the
+pairs do not resolve it.
+
+The scan mix's decomposition, at three hundred thousand keys on the
+durable arm with the probe that runs the mix twice: the second pass's
+counted phases -- take, sync, settle, snapshot, install -- are five
+milliseconds of ninety to a hundred, the thread under a millisecond,
+the blocks built under a hundred; the pass swings between 65 and 150 ms
+across rounds with every counter identical, and under one profile
+LMDB's pass swung the same way in the same rounds, the slow passes
+carrying the same sample count as the fast ones: the thread lost the
+CPU, not the work. The pass's own profile is the walks (a quarter in
+the block walk, a tenth in the prefetch), the twenty-five durable
+commits' fsyncs, the harness's sink and its Zipfian generator, and one
+cost that was the engine's alone: `Arc::make_mut` at 3-4%, called on
+every block a scan walked through the handle's own table to ask whether
+the form was wide. `make_mut` proves the pointer unique with a locked
+exchange on the weak count before it can look. The slot is looked at
+through a shared borrow first now (`wide_mut`); five rounds of the
+probe read the second pass 0.76 to 0.80 million operations a second by
+median against the search's 0.76, 0.68 to 0.88 against 0.76 to 0.88,
+within five rounds' noise and in the direction the removed work says.
+
 #### The pin's fence, priced against a sweep that fences for it
 
 A read pins the epoch it reads in by storing it in its slot of the
