@@ -550,7 +550,16 @@ version of this path kept the hash memtable for reads and closed the segment
 on the commit thread, and measured slower than the WAL it bypassed at three
 million keys and at thirty: the memtable insert was a quarter of the load
 and the close a tenth. A path that keeps the structure it was built to
-bypass has bypassed nothing.
+bypass has bypassed nothing. The ordered table the run keeps for the
+reads a run in progress serves holds a copy of every value, and the copy
+is a third of the writer's fresh pages at three hundred thousand keys,
+each first touch a fault the host prices; a table that holds references
+into the run's own segment instead (`Options::direct_table_refs`,
+`supdb-refvals`) took two fifths of those faults and a twentieth of the
+writer's CPU and moved the load 4% in twelve pairs, short of the tenth it
+was predicted to, so the copies ship and the references are an arm: the
+entries, the keys and the staged copy are the rest of what the table
+costs, and a run that kept no table at all is the shape left to price.
 
 ## Shapes the bugs come in
 

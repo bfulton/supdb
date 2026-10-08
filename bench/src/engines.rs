@@ -458,6 +458,10 @@ pub struct Supdb {
     /// `Options::ord_durable`. `supdb-oidxsync`, and `supdb-ingestoidxsync`
     /// buffered.
     oidxsync: bool,
+    /// A direct run's table holding references into its segment in place
+    /// of its values (`Options::direct_table_refs`). `supdb-refvals`, and
+    /// `supdb-ingestrefvals` buffered.
+    refvals: bool,
     /// A piece's keys ranked over the partition's records, as before
     /// `Options::piece_ranks_by_heads`. `supdb-rankrecords`, and
     /// `supdb-ingestrankrecords` buffered.
@@ -642,6 +646,10 @@ struct Policy {
     /// `Options::ord_durable`. `supdb-oidxsync`, and `supdb-ingestoidxsync`
     /// buffered.
     oidxsync: bool,
+    /// A direct run's table holding references into its segment in place
+    /// of its values (`Options::direct_table_refs`). `supdb-refvals`, and
+    /// `supdb-ingestrefvals` buffered.
+    refvals: bool,
     /// A piece's keys ranked over the partition's records, as before
     /// `Options::piece_ranks_by_heads`. `supdb-rankrecords`, and
     /// `supdb-ingestrankrecords` buffered.
@@ -753,6 +761,7 @@ impl Default for Policy {
             drainpromote: false,
             manifestfree: false,
             oidxsync: false,
+            refvals: false,
             rankrecords: false,
             shape: false,
             adaptcap: None,
@@ -1938,6 +1947,33 @@ impl Supdb {
         )
     }
 
+    /// A direct run's table holding references into its segment in place
+    /// of copies of its values (`Options::direct_table_refs`): against
+    /// `supdb` it prices the copy and the fresh pages it touches on the
+    /// writer's path.
+    pub fn create_refvals(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                refvals: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` with the references, as `supdb-refvals`.
+    pub fn create_ingest_refvals(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                refvals: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` ranking a piece's keys over the partition's records, as
     /// before `Options::piece_ranks_by_heads`: against `supdb` it prices
     /// the ranking over the index's heads, on the segment work's thread.
@@ -2138,6 +2174,7 @@ impl Supdb {
             drainpromote,
             manifestfree,
             oidxsync,
+            refvals,
             rankrecords,
             shape,
             aheadmin,
@@ -2269,6 +2306,7 @@ impl Supdb {
             drain_names_partition: !drainpromote,
             manifest_spare: !manifestfree,
             ord_durable: oidxsync,
+            direct_table_refs: refvals,
             piece_ranks_by_heads: !rankrecords,
             forms_convert_unread: !(bg || bglag),
             // The capped conversions and the builder's, kept to price again
@@ -2402,6 +2440,7 @@ impl Supdb {
             drainpromote,
             manifestfree,
             oidxsync,
+            refvals,
             rankrecords,
             shape,
             aheadmin,
@@ -2739,6 +2778,13 @@ impl Engine for Supdb {
                 "supdb-oidxsync"
             } else {
                 "supdb-ingestoidxsync"
+            };
+        }
+        if self.refvals {
+            return if self.partition {
+                "supdb-refvals"
+            } else {
+                "supdb-ingestrefvals"
             };
         }
         if self.rankrecords {
@@ -3428,6 +3474,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-copyslack"
         | "supdb-manifestfree"
         | "supdb-oidxsync"
+        | "supdb-refvals"
         | "supdb-inlinemaint"
         | "supdb-adapt"
         | "supdb-adapttrig"
@@ -3478,6 +3525,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestdrainpromote"
         | "supdb-ingestmanifestfree"
         | "supdb-ingestoidxsync"
+        | "supdb-ingestrefvals"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
         | "supdb-ingestrankrecords"
@@ -3540,12 +3588,14 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-copyslack" => Box::new(Supdb::create_copyslack(dir)?),
         "supdb-manifestfree" => Box::new(Supdb::create_manifestfree(dir)?),
         "supdb-oidxsync" => Box::new(Supdb::create_oidxsync(dir)?),
+        "supdb-refvals" => Box::new(Supdb::create_refvals(dir)?),
         "supdb-ingestcopysearch" => Box::new(Supdb::create_ingest_copysearch(dir)?),
         "supdb-ingestconvertsources" => Box::new(Supdb::create_ingest_convertsources(dir)?),
         "supdb-ingestcopyslack" => Box::new(Supdb::create_ingest_copyslack(dir)?),
         "supdb-ingestdrainpromote" => Box::new(Supdb::create_ingest_drainpromote(dir)?),
         "supdb-ingestmanifestfree" => Box::new(Supdb::create_ingest_manifestfree(dir)?),
         "supdb-ingestoidxsync" => Box::new(Supdb::create_ingest_oidxsync(dir)?),
+        "supdb-ingestrefvals" => Box::new(Supdb::create_ingest_refvals(dir)?),
         "supdb-rankrecords" => Box::new(Supdb::create_rankrecords(dir)?),
         "supdb-ingestrankrecords" => Box::new(Supdb::create_ingest_rankrecords(dir)?),
         "supdb-ingestlatewb" => Box::new(Supdb::create_ingest_latewb(dir)?),

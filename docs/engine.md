@@ -3518,6 +3518,46 @@ for its writes, and the rest the arena's reserve, the record's end, the
 CRC and the memtable's entries and chunks. The lever left on this cell
 is the copy the direct run keeps.
 
+The copy was then priced by taking it away. The writer's samples over
+the ordered commits at three hundred thousand keys, with frame pointers
+and cut to the writer's thread and the commit windows, were a third
+the harness's own -- its batch's copies and its key generation, paid by
+the comparator alike -- and of the engine's two thirds, a third the
+ordered table (its entries, keys and chunks, half of it the first touch
+of their pages), a third the segment writer (three copies of each value
+on the way to its record, the CRC and the record's end) and a tenth the
+kernel's copy into the page cache. Three shapes of the same lever were
+built in turn, each priced against the copies in one process
+(`supdb-ingestrefvals` against `supdb-ingest`, twelve pairs): the
+table's committed values as references into the run's own segment, read
+through a mapping of the temp file that grows with it, with the staged
+batch a copy in an arena. The first pushed the writer's buffer to the
+file at every commit so the references could be read at once: it halved
+the writer's faults and read the durable load at 1.18x, and the buffered
+load 4% slower, its commits thirteen milliseconds more CPU and its reads
+after the drain 3% slower in twelve pairs of twelve, since the three
+hundred writes of a hundred kilobytes that replaced thirty-six of a
+megabyte cost their calls and left the segment in folios an eighth the
+size. The second converted a head only once the buffer had carried its
+record to the file and kept the copy in the arena meanwhile, in two
+arenas the writer meant to alternate once every head was a reference --
+and never did on the buffered arm, since a commit's batch always
+straddles the buffer's piece and the queue of heads waiting was never
+empty at a commit's end: the faults read as the copies', and the load
+level. The third counts the chunks each arena holds that a head still
+names, stamps the arena drained of its last with the readers' epoch, and
+resets it at a later commit once no reader pinned before remains, turning
+to the other arena every piece: the buffered writer's faults fell from
+17,400 to 10,300 and its CPU 5%, the durable writer's CPU 13%, and the
+loads read 1.04x and 1.05x at three hundred thousand and a hundred
+thousand keys in twelve pairs, short of significance and of the tenth the
+lever was registered to move; the durable load 1.03x, every read cell
+level. The copies ship and the references are the arm. What is left of
+the table -- its entries at thirty-two bytes a key, its keys, the staged
+copy -- is as much as the arena was, and the shape not yet priced is a
+run that keeps no table, serving its reads from the segment writer's own
+sorted keys and record offsets.
+
 #### The pin's fence, priced against a sweep that fences for it
 
 A read pins the epoch it reads in by storing it in its slot of the

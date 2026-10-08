@@ -752,6 +752,156 @@ fn a_segment_whose_ordered_index_is_missing_or_damaged_rebuilds_it_at_open() {
     db.close().unwrap();
 }
 
+/// Under `Options::direct_table_refs`, a direct run's table holds its
+/// committed values as references into the run's segment, read through a
+/// mapping of it, and its values as copies until the writer's buffer has
+/// carried their records there. A handle on another thread reads the
+/// committed keys while the writer stages, commits and finally leaves the
+/// run; the writer's own reads see the staged keys too; and a table whose
+/// mapping starts far too small is grown under the readers.
+#[test]
+fn a_direct_runs_table_reads_its_values_through_the_runs_segment() {
+    let d = dir("direct-refs");
+    let opts = Options {
+        direct_table_refs: true,
+        // Far below the run's size, so the mapping has to grow, under a
+        // handle that reads through it meanwhile; and the writer's pieces
+        // small, so the file takes the records within a commit or two and
+        // the heads turn into references while the run is still open --
+        // at the shipping piece of a megabyte this run would stay in the
+        // arena to its close.
+        direct_map_bytes: 16 << 10,
+        segment: supdb::SegmentOptions {
+            write_piece: 4096,
+            ..Default::default()
+        },
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let key = |k: u32| format!("key-{k:06}").into_bytes();
+    let val = |k: u32| format!("value-{k}-{}", "x".repeat(60)).into_bytes();
+    // Three committed batches.
+    for b in 0u32..3 {
+        for k in b * 1000..(b + 1) * 1000 {
+            db.append(&key(k), &val(k));
+        }
+        db.commit().unwrap();
+    }
+    assert!(db.run_remaps() >= 1, "the mapping grew with the file");
+    // Staged, uncommitted: the writer sees them, a handle does not.
+    for k in 3000u32..3500 {
+        db.append(&key(k), &val(k));
+    }
+    assert_eq!(read_vec(&db, &key(3100)), vec![val(3100)]);
+    assert_eq!(read_vec(&db, &key(2999)), vec![val(2999)]);
+    let r = db.reader().unwrap();
+    assert!(
+        read_vec(&r, &key(3100)).is_empty(),
+        "a handle reads nothing staged"
+    );
+    assert_eq!(read_vec(&r, &key(2999)), vec![val(2999)]);
+    // The handle reads every committed key on its own thread while the
+    // writer commits and stages more, until it sees the last key land;
+    // each read answers the value or, for a key not yet committed when
+    // the handle looked, nothing. No bet on who is faster: the reader
+    // runs until the writer's last commit is visible to it.
+    std::thread::scope(|s| {
+        let reader = s.spawn(move || {
+            let mut rounds = 0usize;
+            loop {
+                rounds += 1;
+                let mut last = false;
+                for k in (0u32..6000).step_by(7).chain(std::iter::once(5999)) {
+                    let got = read_vec(&r, &key(k));
+                    if k < 3000 {
+                        assert_eq!(got, vec![val(k)], "committed key {k} in round {rounds}");
+                    } else if !got.is_empty() {
+                        assert_eq!(got, vec![val(k)], "key {k} read with another's value");
+                        last |= k == 5999;
+                    }
+                }
+                if last {
+                    return rounds;
+                }
+                assert!(rounds < 1_000_000, "the last commit never became visible");
+            }
+        });
+        db.commit().unwrap();
+        for b in 7u32..12 {
+            for k in b * 500..(b + 1) * 500 {
+                db.append(&key(k), &val(k));
+            }
+            db.commit().unwrap();
+        }
+        let rounds = reader.join().unwrap();
+        assert!(rounds >= 1);
+    });
+    // A scan through a fresh handle walks the run in order.
+    let r = db.reader().unwrap();
+    let mut n = 0u32;
+    r.scan(b"", usize::MAX, |k, v| {
+        assert_eq!(k, key(n).as_slice());
+        assert_eq!(v, val(n).as_slice());
+        n += 1;
+    })
+    .unwrap();
+    assert_eq!(n, 6000);
+    // A staged tail and then a key below the run's greatest: the run
+    // closes, the tail goes through the WAL, and nothing is lost.
+    for k in 6000u32..6300 {
+        db.append(&key(k), &val(k));
+    }
+    db.append(b"aaa", b"below");
+    db.commit().unwrap();
+    assert_eq!(read_vec(&db, &key(6150)), vec![val(6150)]);
+    assert_eq!(read_vec(&db, b"aaa"), vec![b"below".to_vec()]);
+    let r = db.reader().unwrap();
+    assert_eq!(read_vec(&r, &key(6299)), vec![val(6299)]);
+    assert_eq!(read_vec(&r, &key(100)), vec![val(100)]);
+    db.close().unwrap();
+
+    let db = Db::open(&d, opts).unwrap();
+    let mut n = 0u32;
+    db.scan(&key(0), usize::MAX, |k, v| {
+        assert_eq!(k, key(n).as_slice());
+        assert_eq!(v, val(n).as_slice());
+        n += 1;
+    })
+    .unwrap();
+    assert_eq!(n, 6300);
+    assert_eq!(read_vec(&db, b"aaa"), vec![b"below".to_vec()]);
+    db.close().unwrap();
+}
+
+/// The same run under the shipping shape, the copies.
+#[test]
+fn a_direct_runs_table_that_copies_its_values_reads_the_same() {
+    let d = dir("direct-copies");
+    let opts = Options::default();
+    let mut db = Db::create(&d, opts).unwrap();
+    let key = |k: u32| format!("key-{k:06}").into_bytes();
+    let val = |k: u32| format!("value-{k}").into_bytes();
+    for b in 0u32..3 {
+        for k in b * 1000..(b + 1) * 1000 {
+            db.append(&key(k), &val(k));
+        }
+        db.commit().unwrap();
+    }
+    for k in 3000u32..3500 {
+        db.append(&key(k), &val(k));
+    }
+    assert_eq!(db.run_remaps(), 0);
+    let r = db.reader().unwrap();
+    assert!(read_vec(&r, &key(3100)).is_empty());
+    assert_eq!(read_vec(&db, &key(3100)), vec![val(3100)]);
+    assert_eq!(read_vec(&r, &key(2500)), vec![val(2500)]);
+    db.commit().unwrap();
+    assert_eq!(read_vec(&r, &key(3100)), vec![val(3100)]);
+    db.flush().unwrap();
+    assert_eq!(read_vec(&db, &key(3499)), vec![val(3499)]);
+    db.close().unwrap();
+}
+
 /// The index has to survive a promotion, which renames the segment. It is
 /// named by the id and covered end-sequence, which a promotion keeps, so
 /// there is nothing to rename -- and this is what says so.

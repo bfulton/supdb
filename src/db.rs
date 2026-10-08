@@ -1224,6 +1224,27 @@ pub struct Options {
     /// On, the fsync, kept for pricing as `supdb-oidxsync` and
     /// `supdb-ingestoidxsync`.
     pub ord_durable: bool,
+    /// EXPERIMENT: whether an ordered table -- the memtable a direct run
+    /// keeps for the reads a run in progress serves -- holds its committed
+    /// values as references into the run's own segment, read through a
+    /// mapping of it, rather than as copies. The direct run writes every
+    /// record to its segment at the commit already, and the copy was the
+    /// table's value arena: a third of the writer's fresh pages over a
+    /// load of three hundred thousand keys, the first touch of each a
+    /// fault the host prices. A value stays a copy, in one of two staging
+    /// arenas, until the writer's buffer has carried its record to the
+    /// file, and an arena is reused once no head names a chunk in it and
+    /// the readers pinned before have gone. Measured, it takes two fifths
+    /// of the writer's faults and a twentieth of its CPU over that load
+    /// and moves the load 4% in twelve pairs, short of significance and of
+    /// the tenth it was to move; the entries, the keys and the staging copy
+    /// are the rest of the table's cost. Off, the default, the copies; on,
+    /// the arm `supdb-refvals` and `supdb-ingestrefvals`.
+    pub direct_table_refs: bool,
+    /// Bytes the mapping of a direct run's segment starts with; zero, the
+    /// default, twice `seal_bytes`. The mapping grows when the run's file
+    /// outgrows it. For a test of the growth.
+    pub direct_map_bytes: usize,
     /// EXPERIMENT: the writes since the last scan over the store, as a
     /// share of the partitions' keys, within which the backlog bound
     /// above settles at all; zero, the default, settles by the bound
@@ -1467,6 +1488,8 @@ impl Default for Options {
             drain_names_partition: true,
             manifest_spare: true,
             ord_durable: false,
+            direct_table_refs: false,
+            direct_map_bytes: 0,
             forms_settle_recent_pct: 0,
             forms_carry: true,
             freeze_settles: false,
@@ -1872,6 +1895,11 @@ struct Direct {
     tmp: PathBuf,
     id: u64,
     committed: usize,
+    /// Committed entries whose value still waits in a staging arena for
+    /// the writer's buffer to carry its record to the file: each with its
+    /// value's place in the file, converted to a reference once the file
+    /// holds it (`Options::direct_table_refs`).
+    pending: std::collections::VecDeque<(usize, u64, u32)>,
 }
 
 /// A half-open key range `[lo, hi)`, `None` above meaning unbounded. The
@@ -2533,6 +2561,13 @@ impl std::io::Write for AlignedWriter {
     }
 }
 
+impl AlignedWriter {
+    /// Bytes the file holds; the buffer's are not among them.
+    fn file_written(&self) -> u64 {
+        self.written
+    }
+}
+
 /// Writes an immutable segment in one forward pass, for input that arrives
 /// sorted by key with each key's values together.
 ///
@@ -2633,6 +2668,11 @@ pub struct SegmentWriter {
     /// Records-first mode: block bytes held until the section is complete,
     /// with their table rows (offsets filled in when they are written).
     pending_blocks: Vec<Vec<u8>>,
+    /// Where the last record's value bytes land in the file, and their
+    /// length, for a one-value inline record in the records-first layout:
+    /// what an ordered table keeps in place of the value
+    /// (`Options::direct_table_refs`).
+    last_value: (u64, u32),
 }
 
 /// The two layouts the writer produces. Same format, same readers, one
@@ -2818,6 +2858,7 @@ impl SegmentWriter {
         Ok(SegmentWriter {
             out,
             pos: crate::format::SUPER,
+            last_value: (0, 0),
             builder: BlockBuilder::new(block_size),
             block_size,
             blocks: Vec::new(),
@@ -2918,6 +2959,19 @@ impl SegmentWriter {
     }
 
     /// Everything written so far made durable: a direct segment's commit.
+    /// Where the last record's one inline value lies in the file, and its
+    /// length; zero for a record whose values went to a block.
+    pub(crate) fn last_value_at(&self) -> (u64, u32) {
+        self.last_value
+    }
+
+    /// The bytes the file holds: what the writer's buffer has carried to
+    /// it, a piece at a time or at a sync; the rest of what was written
+    /// waits in the buffer.
+    pub(crate) fn file_written(&self) -> u64 {
+        self.out.file_written()
+    }
+
     pub fn sync(&mut self) -> Result<()> {
         // Records held for a marker that has not come are written, not
         // committed: without their marker the recovery walk stops before
@@ -3146,6 +3200,7 @@ impl SegmentWriter {
             .open_key
             .take()
             .ok_or_else(|| err("segment writer: end without begin"))?;
+        let value_len = if self.records == 1 { self.raw.len() } else { 0 };
         let (last, flag) = crate::index::encode_run(&self.raw, &self.lens, &mut self.run);
         self.last = last as usize;
         // A put is its key and value and a delete its key and sixteen, as
@@ -3206,7 +3261,7 @@ impl SegmentWriter {
                 let key = &self.key_arena[start..start + len];
                 let tail: &[u8] = if inline { &self.run } else { &[] };
                 self.rec_buf.clear();
-                let wrote = flatindex::stream_record_as(
+                let (wrote, tail_at) = flatindex::stream_record_tail_at(
                     &mut self.rec_buf,
                     key,
                     &[ext],
@@ -3223,6 +3278,20 @@ impl SegmentWriter {
                 } else {
                     self.out.write_all(&self.rec_buf)?;
                 }
+                // The value is the last `value_len` bytes of the tail in
+                // either record form, a one-value run being the value
+                // itself or a length and the value; the record is padded
+                // after the tail, so the tail's place comes from the
+                // encoder and not from the record's end.
+                self.last_value = if inline {
+                    let run_len = self.run.len();
+                    (
+                        self.pos + (tail_at + run_len - value_len) as u64,
+                        value_len as u32,
+                    )
+                } else {
+                    (0, 0)
+                };
                 self.pos += wrote as u64;
                 self.rec_offs.push(self.recs_len as u32);
                 self.recs_len += wrote;
@@ -3821,6 +3890,14 @@ impl PieceWriter {
         self.0.value(v)
     }
 
+    fn last_value_at(&self) -> (u64, u32) {
+        self.0.last_value_at()
+    }
+
+    fn file_written(&self) -> u64 {
+        self.0.file_written()
+    }
+
     fn end_with(&mut self, tombstone: bool) -> Result<()> {
         self.2 |= tombstone;
         self.0.end_with(tombstone)
@@ -4203,6 +4280,38 @@ struct MemTable {
     /// Entry numbers by hash, or null when `ordered`.
     index: AtomicPtr<Index>,
     ordered: bool,
+    /// An ordered table whose committed values are references into the
+    /// run's segment (`Options::direct_table_refs`): a head is then
+    /// `REF_STAGED | arena offset` for a value the writer has not
+    /// committed, in `vals` as any chunk is, and `file offset << REF_LEN_BITS
+    /// | len` for a committed one, read through `run`. Every staged head
+    /// is above every committed one and above any commit's watermark, so
+    /// the watermark rule reads unchanged. The commit rewrites the heads
+    /// of the batch it writes and resets the arena, which nothing but
+    /// staged heads point into.
+    refs: bool,
+    /// The mapping of the run's segment the committed references read
+    /// through, published by the writer once the run has a file and
+    /// replaced by a larger one when the file outgrows it; the one
+    /// replaced is retired under the readers' epoch as an index is.
+    run: AtomicPtr<RunMap>,
+    /// The run's file length the writer has pushed to the file, which no
+    /// committed reference reaches past.
+    run_flushed: AtomicU64,
+    retired_runs: UnsafeCell<Vec<(u64, Box<RunMap>)>>,
+    /// With `refs`, the second staging arena: a value stays a copy until
+    /// the writer's buffer has carried its record to the file, which is a
+    /// piece of a megabyte at a time, so the chunks of several commits
+    /// wait in an arena together. The writer fills one arena to about a
+    /// piece and turns to the other; an arena is reset -- its pages
+    /// reused -- once no head names a chunk in it and every reader pinned
+    /// before its last chunk was converted has gone, as an index is
+    /// retired (`upkeep_staging`). A head says which arena with
+    /// `REF_ARENA2`.
+    vals2: ByteArena,
+    /// Writer-only: which arena takes the next chunk, the chunks each
+    /// holds that a head still names, and the epoch each was drained at.
+    staging: UnsafeCell<Staging>,
     keys: ByteArena,
     vals: ByteArena,
     /// Tombstone chunks pushed so far. Non-zero is what tells a read that
@@ -4451,6 +4560,20 @@ impl ByteArena {
         t.at += n;
         self.used.fetch_add(n, AtomicOrdering::Relaxed);
         off
+    }
+
+    /// Writer: the tail back to the first block's start, when the arena
+    /// holds one block or none, so the next reservations reuse the pages
+    /// the last ones touched; with more blocks it stays as it is, since a
+    /// block past the first would be allocated again rather than reused.
+    /// The caller owns the knowledge that nothing reads the bytes.
+    fn reset_if_single_block(&self) {
+        // SAFETY: writer-only.
+        let t = unsafe { &mut *self.tail.get() };
+        if t.next_block <= 1 {
+            t.at = 0;
+            t.block_end = self.caps[0].load(AtomicOrdering::Relaxed);
+        }
     }
 
     /// Writer: the tail, where the next reservation starts.
@@ -4913,6 +5036,12 @@ impl MemTable {
             entries: Slab::new(),
             index: AtomicPtr::new(Box::into_raw(Box::new(Index::with_slots(1024)))),
             ordered: false,
+            refs: false,
+            run: AtomicPtr::new(std::ptr::null_mut()),
+            run_flushed: AtomicU64::new(0),
+            retired_runs: UnsafeCell::new(Vec::new()),
+            vals2: ByteArena::new(),
+            staging: UnsafeCell::new(Staging::default()),
             keys: ByteArena::new(),
             vals: ByteArena::new(),
             tombs: AtomicUsize::new(0),
@@ -4924,12 +5053,20 @@ impl MemTable {
         }
     }
 
-    /// A table for keys that arrive in order: each above the last.
-    fn new_ordered() -> MemTable {
+    /// A table for keys that arrive in order: each above the last; with
+    /// `refs`, one whose committed values are references into the run's
+    /// segment (`Options::direct_table_refs`).
+    fn new_ordered(refs: bool) -> MemTable {
         MemTable {
             entries: Slab::new(),
             index: AtomicPtr::new(std::ptr::null_mut()),
             ordered: true,
+            refs,
+            run: AtomicPtr::new(std::ptr::null_mut()),
+            run_flushed: AtomicU64::new(0),
+            retired_runs: UnsafeCell::new(Vec::new()),
+            vals2: ByteArena::new(),
+            staging: UnsafeCell::new(Staging::default()),
             keys: ByteArena::new(),
             vals: ByteArena::new(),
             tombs: AtomicUsize::new(0),
@@ -4998,9 +5135,26 @@ impl MemTable {
     /// A hint to fetch the first `bytes` of the chunk at `off` -- its
     /// header and the start of its value; nothing is read.
     fn prefetch_chunk(&self, off: u64, bytes: usize) {
-        if off != NO_CHUNK {
-            self.vals.prefetch(off as usize, bytes);
+        if off == NO_CHUNK {
+            return;
         }
+        if self.refs {
+            // A staged chunk is in the arena under its tag; a committed
+            // reference is in the run's file, whose lines the hint can
+            // name once the mapping is published.
+            if off & REF_STAGED != 0 {
+                let (a, at) = self.arena_of(off);
+                a.prefetch(at, bytes);
+            } else if let Some(run) = self.run() {
+                let at = (off >> REF_LEN_BITS) as usize;
+                let len = ((off & REF_LEN_MASK) as usize).min(bytes);
+                if at + len <= self.run_flushed.load(AtomicOrdering::Acquire) as usize {
+                    prefetch_lines(run.map[at..].as_ptr(), len);
+                }
+            }
+            return;
+        }
+        self.vals.prefetch(off as usize, bytes);
     }
 
     fn key_bytes(&self) -> usize {
@@ -5024,7 +5178,15 @@ impl MemTable {
     }
 
     /// Writer: the entries from `n` on forgotten; see `Slab::truncate`.
-    fn truncate_entries(&self, n: usize) {
+    fn truncate_entries(&self, n: usize, rd: &Readers) {
+        if self.refs {
+            for i in n..self.len() {
+                let h = MemTable::head(self.entry(i));
+                if h & REF_STAGED != 0 {
+                    self.chunk_gone(h, rd);
+                }
+            }
+        }
         self.entries.truncate(n);
     }
 
@@ -5036,7 +5198,16 @@ impl MemTable {
         let m = &self.marks[(n & 1) as usize];
         m.log.store(self.log.len(), AtomicOrdering::Release);
         m.len.store(self.entries.len(), AtomicOrdering::Release);
-        m.wm.store(self.vals.tail() as u64, AtomicOrdering::Release);
+        // With references a head is a position in one of two arenas or
+        // in the file, none of them one order, and an entry has the one
+        // chunk it was appended with: what hides a staged entry from a
+        // handle is the count, and nothing a watermark could add.
+        let wm = if self.refs {
+            u64::MAX
+        } else {
+            self.vals.tail() as u64
+        };
+        m.wm.store(wm, AtomicOrdering::Release);
         self.mark.store(n, AtomicOrdering::Release);
     }
 
@@ -5225,6 +5396,18 @@ impl MemTable {
     }
 
     fn push_chunk(&self, prev: u64, value: &[u8]) -> u64 {
+        if self.refs {
+            // SAFETY: writer-only.
+            let st = unsafe { &mut *self.staging.get() };
+            let sel = st.sel;
+            st.in_arena[sel] += 1;
+            let a = if sel == 1 { &self.vals2 } else { &self.vals };
+            let off = a.reserve(CHUNK_HDR + value.len());
+            a.write(off, &prev.to_le_bytes());
+            a.write(off + 8, &(value.len() as u32).to_le_bytes());
+            a.write(off + CHUNK_HDR, value);
+            return off as u64 | REF_STAGED | if sel == 1 { REF_ARENA2 } else { 0 };
+        }
         let off = self.vals.reserve(CHUNK_HDR + value.len());
         self.vals.write(off, &prev.to_le_bytes());
         self.vals
@@ -5241,7 +5424,27 @@ impl MemTable {
         off as u64
     }
 
+    /// A tagged head's arena and the offset in it (`refs` only).
+    fn arena_of(&self, off: u64) -> (&ByteArena, usize) {
+        debug_assert!(off & REF_STAGED != 0);
+        let a = if off & REF_ARENA2 != 0 {
+            &self.vals2
+        } else {
+            &self.vals
+        };
+        (a, (off & !REF_TAGS) as usize)
+    }
+
     fn chunk_prev(&self, off: u64) -> u64 {
+        if self.refs {
+            // One value a key, so a committed reference has no chain; a
+            // staged chunk is in an arena, under its tags.
+            if off & REF_STAGED == 0 {
+                return NO_CHUNK;
+            }
+            let (a, at) = self.arena_of(off);
+            return u64::from_le_bytes(a.slice(at, 8).try_into().expect("eight bytes"));
+        }
         u64::from_le_bytes(
             self.vals
                 .slice(off as usize, 8)
@@ -5251,12 +5454,103 @@ impl MemTable {
     }
 
     fn chunk_len(&self, off: u64) -> u32 {
+        if self.refs {
+            if off & REF_STAGED == 0 {
+                return (off & REF_LEN_MASK) as u32;
+            }
+            let (a, at) = self.arena_of(off);
+            return u32::from_le_bytes(a.slice(at + 8, 4).try_into().expect("four bytes"));
+        }
         u32::from_le_bytes(
             self.vals
                 .slice(off as usize + 8, 4)
                 .try_into()
                 .expect("four bytes"),
         )
+    }
+
+    /// The mapping of the run's segment, once the writer has published one.
+    fn run(&self) -> Option<&RunMap> {
+        let p = self.run.load(AtomicOrdering::Acquire);
+        // SAFETY: a mapping the writer published, freed only past every
+        // reader that could hold it (`set_run`, `Drop`).
+        (!p.is_null()).then(|| unsafe { &*p })
+    }
+
+    /// Writer: the run's mapping, the one replaced retired under the
+    /// readers' epoch, as `rebuild_index` retires an index.
+    fn set_run(&self, map: RunMap, rd: &Readers) {
+        let fresh = Box::into_raw(Box::new(map));
+        let old = self.run.swap(fresh, AtomicOrdering::AcqRel);
+        if !old.is_null() {
+            let tag = rd.bump();
+            // SAFETY: writer-only; `old` was published by this table and
+            // is owned by it until freed here or in `Drop`.
+            unsafe {
+                (*self.retired_runs.get()).push((tag, Box::from_raw(old)));
+            }
+            let oldest = rd.oldest_pinned();
+            // SAFETY: writer-only.
+            unsafe { (*self.retired_runs.get()).retain(|(t, _)| oldest < *t) };
+        }
+    }
+
+    /// Writer: the file length every committed reference stays below.
+    fn set_run_flushed(&self, len: u64) {
+        self.run_flushed.store(len, AtomicOrdering::Release);
+    }
+
+    /// Writer: entry `id`'s head, a committed reference into the run in
+    /// place of the chunk it named, which its arena is then one chunk
+    /// closer to being rid of; the arena drained of its last is stamped
+    /// with the epoch, past which the readers that could have loaded the
+    /// head before are gone.
+    fn set_ref(&self, id: usize, off: u64, len: u32, rd: &Readers) {
+        debug_assert!(self.refs);
+        let e = self.entry(id);
+        let old = MemTable::head(e);
+        e.head
+            .store(ref_pack(off, len) + 1, AtomicOrdering::Release);
+        if old & REF_STAGED != 0 {
+            self.chunk_gone(old, rd);
+        }
+    }
+
+    /// Writer: one fewer head names a chunk in the arena `old` is in.
+    fn chunk_gone(&self, old: u64, rd: &Readers) {
+        let x = usize::from(old & REF_ARENA2 != 0);
+        // SAFETY: writer-only.
+        let st = unsafe { &mut *self.staging.get() };
+        st.in_arena[x] -= 1;
+        if st.in_arena[x] == 0 {
+            st.drained_at[x] = Some(rd.bump());
+        }
+    }
+
+    /// Writer, once a commit: an arena no head names, drained before every
+    /// reader now pinned arrived, has its pages given back for reuse; and
+    /// the arena the chunks go into, once it holds about a piece, is left
+    /// to drain while the other takes them. An arena turned to before its
+    /// reset is appended to as it stands, which overwrites nothing.
+    fn upkeep_staging(&self, rd: &Readers) {
+        debug_assert!(self.refs);
+        // SAFETY: writer-only.
+        let st = unsafe { &mut *self.staging.get() };
+        let arena = |x: usize| if x == 1 { &self.vals2 } else { &self.vals };
+        let oldest = rd.oldest_pinned();
+        for x in 0..2 {
+            if st.in_arena[x] == 0 {
+                if let Some(t) = st.drained_at[x] {
+                    if t <= oldest {
+                        arena(x).reset_if_single_block();
+                        st.drained_at[x] = None;
+                    }
+                }
+            }
+        }
+        if arena(st.sel).tail() >= STAGING_ROTATE {
+            st.sel ^= 1;
+        }
     }
 
     fn is_tomb(&self, off: u64) -> bool {
@@ -5342,6 +5636,24 @@ impl MemTable {
     fn value_at(&self, off: usize) -> &[u8] {
         let len = self.chunk_len(off as u64);
         debug_assert_ne!(len, TOMB_LEN, "a tombstone has no value");
+        if self.refs {
+            let off = off as u64;
+            if off & REF_STAGED != 0 {
+                let (a, at) = self.arena_of(off);
+                return a.slice(at + CHUNK_HDR, len as usize);
+            }
+            let at = off >> REF_LEN_BITS;
+            let end = at + u64::from(len);
+            // Not a debug assertion: past the pushed length the mapping
+            // may hold no page, and the kernel's answer to that is a
+            // signal, not an error.
+            assert!(
+                end <= self.run_flushed.load(AtomicOrdering::Acquire),
+                "a committed reference names bytes the run has not pushed"
+            );
+            let run = self.run().expect("a committed reference has a run to read");
+            return &run.map[at as usize..end as usize];
+        }
         self.vals.slice(off + CHUNK_HDR, len as usize)
     }
 
@@ -5449,8 +5761,71 @@ impl Drop for MemTable {
             // SAFETY: published by this table, owned by it.
             drop(unsafe { Box::from_raw(p) });
         }
-        // The retired indexes drop with the cell.
+        let r = self.run.load(AtomicOrdering::Relaxed);
+        if !r.is_null() {
+            // SAFETY: as the index: published by this table, owned by it.
+            drop(unsafe { Box::from_raw(r) });
+        }
+        // The retired indexes and runs drop with their cells.
     }
+}
+
+/// The mapping an ordered table's committed references read through: the
+/// direct run's temp file, mapped longer than it is -- the pages past its
+/// end are never reached, since a reference is published only once the
+/// writer has pushed the bytes it names to the file, and the file is
+/// only ever appended to and never truncated under the mapping.
+struct RunMap {
+    map: memmap2::Mmap,
+}
+
+impl RunMap {
+    fn open(path: &Path, cap: usize) -> Result<RunMap> {
+        let file = File::open(path)?;
+        // SAFETY: the file is appended to and never truncated or edited in
+        // the record bytes while a table maps it (`SegmentWriter` patches
+        // only its head reserve, which no reference names), and a read
+        // stays below `run_flushed`.
+        let map = unsafe { memmap2::MmapOptions::new().len(cap).map(&file)? };
+        Ok(RunMap { map })
+    }
+
+    fn cap(&self) -> usize {
+        self.map.len()
+    }
+}
+
+/// Which staging arena the writer appends into, how many chunks each
+/// holds that some head still names, and the epoch each was drained at
+/// (`MemTable::upkeep_staging`).
+#[derive(Default)]
+struct Staging {
+    sel: usize,
+    in_arena: [usize; 2],
+    drained_at: [Option<u64>; 2],
+}
+
+/// Chunk bytes a staging arena takes before the writer turns to the other:
+/// about one piece of the segment writer's buffer, since a chunk waits in
+/// the arena until the piece its record is in reaches the file.
+const STAGING_ROTATE: usize = 1 << 20;
+
+/// A staged value's head in a table with `refs`: the arena offset with
+/// this bit, and `REF_ARENA2` for the second arena.
+const REF_STAGED: u64 = 1 << 62;
+const REF_ARENA2: u64 = 1 << 61;
+const REF_TAGS: u64 = REF_STAGED | REF_ARENA2;
+/// A committed reference: the value's file offset above these bits, its
+/// length in them.
+const REF_LEN_BITS: u32 = 24;
+const REF_LEN_MASK: u64 = (1 << REF_LEN_BITS) - 1;
+
+fn ref_pack(off: u64, len: u32) -> u64 {
+    debug_assert!(
+        u64::from(len) <= REF_LEN_MASK,
+        "a direct value fits the record"
+    );
+    (off << REF_LEN_BITS) | u64::from(len)
 }
 
 /// Combinations of options the engine cannot run soundly, refused before
@@ -7314,6 +7689,9 @@ struct Shared {
     /// Ordered indexes the open rebuilt from their segments
     /// (`Seg::open_ord`); see `Db::ord_rebuilt`.
     ord_rebuilt: AtomicU64,
+    /// Direct runs whose mapping was grown past the file's end
+    /// (`Options::direct_table_refs`); see `Db::run_remaps`.
+    run_remaps: AtomicU64,
     /// Patches that found the form shared with a published copy and had
     /// to copy it before writing (`Arc::make_mut` on a shared form).
     forms_cloned: AtomicU64,
@@ -15459,6 +15837,7 @@ impl Db {
             convert_build_ns: AtomicU64::new(0),
             convert_total_ns: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(0),
+            run_remaps: AtomicU64::new(0),
             forms_cloned: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
@@ -15829,6 +16208,7 @@ impl Db {
             convert_build_ns: AtomicU64::new(0),
             convert_total_ns: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(ord_rebuilt),
+            run_remaps: AtomicU64::new(0),
             forms_cloned: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
@@ -15957,7 +16337,10 @@ impl Db {
             if self.goes_direct(key, value) {
                 if !self.mem().ordered {
                     let old = self.mem().clone();
-                    self.set_mem_with(std::sync::Arc::new(MemTable::new_ordered()), true);
+                    self.set_mem_with(
+                        std::sync::Arc::new(MemTable::new_ordered(self.opts.direct_table_refs)),
+                        true,
+                    );
                     self.carry_switch(&old);
                 }
                 self.max_key.clear();
@@ -16075,7 +16458,7 @@ impl Db {
                 )
             })
             .collect();
-        self.mem().truncate_entries(committed);
+        self.mem().truncate_entries(committed, &self.shared.readers);
         if let Err(e) = self.close_direct() {
             self.pending_err = Some(e);
         }
@@ -16401,10 +16784,23 @@ impl Db {
                 tmp,
                 id,
                 committed: 0,
+                pending: std::collections::VecDeque::new(),
             });
         }
         let mem = self.r.mem().clone();
+        let map_bytes = match self.opts.direct_map_bytes {
+            0 => (self.opts.seal_bytes * 2).max(1 << 20),
+            n => n,
+        };
+        let shared = self.shared.clone();
         let d = self.direct.as_mut().expect("opened above");
+        let refs = mem.refs;
+        if refs && mem.run().is_none() {
+            // The table reads its committed values through the run's
+            // file from here on; the mapping starts at twice the run's
+            // allowance and grows with the file.
+            mem.set_run(RunMap::open(&d.tmp, map_bytes)?, &shared.readers);
+        }
         for i in d.committed..mem.len() {
             let e = mem.entry(i);
             debug_assert_eq!(
@@ -16415,6 +16811,10 @@ impl Db {
             d.w.begin(mem.key_of(e))?;
             d.w.value(mem.value_at(MemTable::head(e) as usize));
             d.w.end_with(false)?;
+            if refs {
+                let (at, len) = d.w.last_value_at();
+                d.pending.push_back((i, at, len));
+            }
         }
         d.w.mark()?;
         d.committed = mem.len();
@@ -16427,6 +16827,34 @@ impl Db {
         if due {
             d.w.sync()?;
             self.unsynced = 0;
+        }
+        if refs {
+            // What the file holds -- the writer's buffer carries records
+            // to it a piece at a time, or the sync just did -- the table
+            // reads through its mapping from now on, each such entry's
+            // head a reference in place of its copy; the rest wait in the
+            // arena for the next piece. The mapping is grown past the
+            // file's end first where it would fall short, and the length
+            // published before any reference that needs it.
+            let written = d.w.file_written();
+            let cap = mem.run().map_or(0, |r| r.cap() as u64);
+            if written > cap {
+                let mut grown = cap.max(1 << 20);
+                while grown < written {
+                    grown *= 2;
+                }
+                mem.set_run(RunMap::open(&d.tmp, grown as usize)?, &shared.readers);
+                shared.run_remaps.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            mem.set_run_flushed(written);
+            while let Some(&(i, at, len)) = d.pending.front() {
+                if at + u64::from(len) > written {
+                    break;
+                }
+                mem.set_ref(i, at, len, &shared.readers);
+                d.pending.pop_front();
+            }
+            mem.upkeep_staging(&shared.readers);
         }
         Ok(())
     }
@@ -20268,6 +20696,12 @@ impl Db {
         self.shared.ord_rebuilt.load(AtomicOrdering::Relaxed)
     }
 
+    /// Direct runs whose segment mapping the writer grew past the file's
+    /// end, over this store's life (`Options::direct_table_refs`).
+    pub fn run_remaps(&self) -> u64 {
+        self.shared.run_remaps.load(AtomicOrdering::Relaxed)
+    }
+
     /// Patches that copied a form shared with a published copy before
     /// writing it, over the store's life.
     pub fn forms_cloned(&self) -> u64 {
@@ -21822,11 +22256,9 @@ impl<'s> BuildCtx<'s> {
             let Some(sk) = o.sk else { continue };
             chased(&sk, &mut |t, slot| {
                 if (slot as usize) < t.len() {
-                    let head = MemTable::head(t.entry(slot as usize));
-                    if head != NO_CHUNK {
-                        let at = head as usize;
-                        t.vals.prefetch(at.saturating_sub(64), 192);
-                    }
+                    // Through the table, which knows whether the head is
+                    // a chunk in its arena or a reference into its run.
+                    t.prefetch_chunk(MemTable::head(t.entry(slot as usize)), 192);
                 }
             });
         }

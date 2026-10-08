@@ -751,6 +751,20 @@ pub fn stream_record_as(
     tail: &[u8],
     compact: bool,
 ) -> Option<usize> {
+    stream_record_tail_at(out, key, exts, tail, compact).map(|(len, _)| len)
+}
+
+/// `stream_record_as`, reporting beside the record's length where its tail
+/// begins within it, since the record is padded to its alignment after the
+/// tail: what a reader that keeps a reference to the tail's bytes in place
+/// of a copy needs from the one definition of the layout.
+pub fn stream_record_tail_at(
+    out: &mut Vec<u8>,
+    key: &[u8],
+    exts: &[Ext],
+    tail: &[u8],
+    compact: bool,
+) -> Option<(usize, usize)> {
     if key.len() > u16::MAX as usize || exts.len() >= COMPACT as usize {
         return None;
     }
@@ -770,7 +784,7 @@ pub fn stream_record_as(
         let at = align_up(4 + key.len(), REC_ALIGN);
         rec[at..at + 4].copy_from_slice(&compact_header(&exts[0]));
         rec[at + 4..at + 4 + tail.len()].copy_from_slice(tail);
-        return Some(len);
+        return Some((len, at + 4));
     }
     let len = record_len_tail(key.len(), exts.len(), tail.len());
     let base = out.len();
@@ -789,7 +803,7 @@ pub fn stream_record_as(
         at += EXT_BYTES;
     }
     rec[at..at + tail.len()].copy_from_slice(tail);
-    Some(len)
+    Some((len, at))
 }
 
 /// The section header and the trailer for a records-first section: the
