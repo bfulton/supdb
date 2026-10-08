@@ -39,15 +39,23 @@ use crate::flatindex;
 use crate::index::{Ext, Extents};
 use crate::Blob;
 
-/// Write a segment's ordered index and make it durable.
+/// Write a segment's ordered index, and make it durable where `durable`
+/// says so (`Options::ord_durable`).
 ///
 /// The caller renames the segment into place AFTER this returns, which is
 /// the whole ordering: a segment that exists has an index, so a reader never
 /// meets one without. A crash between the two leaves an index no segment
-/// names, which the orphan sweep at open removes.
-fn write_ord(dir: &Path, seg_name: &str, bytes: &[u8]) -> Result<()> {
+/// names, which the orphan sweep at open removes. Unsynced, a crash may
+/// also leave the index missing or torn beside a segment the manifest
+/// names, and `Seg::open` rebuilds it from the segment's keys then: the
+/// index is a function of them and nothing else (`ordindex::Builder`), so
+/// its fsync bought the durability of a file the store can regenerate, at
+/// a device round trip on every seal's, drain's and merge's landing.
+fn write_ord(dir: &Path, seg_name: &str, bytes: &[u8], durable: bool) -> Result<()> {
     let (f, tmp, name) = write_ord_tmp(dir, seg_name, bytes)?;
-    f.sync_all()?;
+    if durable {
+        f.sync_all()?;
+    }
     drop(f);
     std::fs::rename(&tmp, dir.join(&name))?;
     Ok(())
@@ -1204,6 +1212,18 @@ pub struct Options {
     /// throughout either way. Off, the rename that frees, kept for pricing
     /// as `supdb-manifestfree` and `supdb-ingestmanifestfree`.
     pub manifest_spare: bool,
+    /// Whether a segment's ordered index is fsynced when it is written. The
+    /// index is a function of the segment's keys and nothing else, so a
+    /// store that finds it missing, torn or describing another segment at
+    /// open rebuilds it from the segment, byte for byte, and counts the
+    /// rebuild (`Db::ord_rebuilt`); its fsync bought the durability of a
+    /// file the store regenerates, at a device round trip on every seal's,
+    /// merge's and drain's landing -- 0.4 ms of a drain of 3.5 at ten
+    /// thousand keys, where the segment's own fsync is 1.2. Off, the
+    /// default, the index is written and renamed into place unsynced.
+    /// On, the fsync, kept for pricing as `supdb-oidxsync` and
+    /// `supdb-ingestoidxsync`.
+    pub ord_durable: bool,
     /// EXPERIMENT: the writes since the last scan over the store, as a
     /// share of the partitions' keys, within which the backlog bound
     /// above settles at all; zero, the default, settles by the bound
@@ -1446,6 +1466,7 @@ impl Default for Options {
             copy_exact: true,
             drain_names_partition: true,
             manifest_spare: true,
+            ord_durable: false,
             forms_settle_recent_pct: 0,
             forms_carry: true,
             freeze_settles: false,
@@ -2006,11 +2027,15 @@ struct Seg {
     bloom: Option<BlockedBloom>,
     /// The segment's ordered index, mapped. Not optional: it is written
     /// before its segment is renamed into place, so a segment a reader can
-    /// see always has one, and a missing or damaged one fails the open
-    /// rather than sending the seek back to `Blob::seek`. A fallback would
-    /// be the slow path taken silently, which is the shape of every gate
-    /// this repository has broken.
+    /// see always has one, and one missing or damaged at open is rebuilt
+    /// from the segment's keys and written back (`Seg::open_ord`) rather
+    /// than sending the seek to `Blob::seek`. A fallback would be the slow
+    /// path taken silently, which is the shape of every gate this
+    /// repository has broken; the rebuild is the fast path restored, and
+    /// `ord_rebuilt` says it happened.
     ord: crate::ordindex::OrdIndex,
+    /// Whether `open` rebuilt the index, for `Db::ord_rebuilt`.
+    ord_rebuilt: bool,
     /// Whether any extent here carries the tombstone flag. A read consults
     /// it before paying the newest-first pass that tombstones require.
     ///
@@ -3922,7 +3947,7 @@ impl Seg {
             .payload_bytes()
             .unwrap_or(file_len / DATA_PER_FILE.1 * DATA_PER_FILE.0);
         let oname = Db::ord_name_for(name).ok_or_else(|| err("segment name is malformed"))?;
-        let mut ord = crate::ordindex::OrdIndex::open(&dir.join(&oname), blob.keys())
+        let (mut ord, ord_rebuilt) = Seg::open_ord(dir, name, &oname, &blob)
             .map_err(|e| err(&format!("segment {name}: {e}")))?;
         // The common prefix, once, off the first key, so a seek's prefix
         // check reads no record.
@@ -3971,6 +3996,7 @@ impl Seg {
                 hi,
                 bloom: Some(bloom),
                 ord,
+                ord_rebuilt,
                 tombs,
                 data,
             });
@@ -4003,6 +4029,7 @@ impl Seg {
                 hi,
                 bloom: None,
                 ord,
+                ord_rebuilt,
                 tombs: false,
                 data,
             });
@@ -4027,9 +4054,44 @@ impl Seg {
             hi: None,
             bloom: Some(bloom),
             ord,
+            ord_rebuilt,
             tombs,
             data,
         })
+    }
+
+    /// The segment's ordered index, mapped, and whether it had to be
+    /// rebuilt: an index missing, torn, or describing another segment --
+    /// what a crash leaves beside a segment whose index was written
+    /// unsynced (`Options::ord_durable`), or an orphan a crashed merge
+    /// left under an id handed out again -- is composed again from the
+    /// segment's keys exactly as its writer composed it, written synced
+    /// under its name, and mapped. The walk is one pass over the key
+    /// section, on an open after a crash and nowhere else.
+    fn open_ord(
+        dir: &Path,
+        name: &str,
+        oname: &str,
+        blob: &Blob<MmapBytes>,
+    ) -> Result<(crate::ordindex::OrdIndex, bool)> {
+        let path = dir.join(oname);
+        let first = match crate::ordindex::OrdIndex::open(&path, blob.keys()) {
+            Ok(ord) => return Ok((ord, false)),
+            Err(e) => e,
+        };
+        let mut b = crate::ordindex::Builder::new();
+        b.reserve(
+            blob.keys(),
+            blob.keys() * blob.key_at(0).map_or(0, |k| k.len()),
+        );
+        Seg::for_each_key(blob, |k| b.push(k))?;
+        write_ord(dir, name, &b.finish(), true)?;
+        let ord = crate::ordindex::OrdIndex::open(&path, blob.keys()).map_err(|e| {
+            err(&format!(
+                "ordered index rebuilt after `{first}` and refused again: {e}"
+            ))
+        })?;
+        Ok((ord, true))
     }
 
     /// The Bloom for a level-0 piece and whether any of its extents carries
@@ -5565,6 +5627,7 @@ struct MergePlan {
     background_io: BackgroundIo,
     sync_every: usize,
     inline_max: usize,
+    ord_durable: bool,
 }
 
 fn compact_job(plan: MergePlan) -> Result<Vec<String>> {
@@ -5690,6 +5753,7 @@ struct Emitter<'a> {
     opts: &'a SegmentOptions,
     sync_every: usize,
     inline_max: usize,
+    ord_durable: bool,
     pieces: Vec<Piece>,
     pi: usize,
     r: usize,
@@ -5742,7 +5806,7 @@ impl Emitter<'_> {
                 .finish()
                 .map_err(|e| err(&format!("compact finish: {e}")))?;
             let p = &self.pieces[self.pi];
-            write_ord(self.dir, &p.name, &ord)?;
+            write_ord(self.dir, &p.name, &ord, self.ord_durable)?;
             std::fs::rename(&p.tmp, self.dir.join(&p.name))?;
             self.out.push(p.name.clone());
             self.pi += 1;
@@ -5802,6 +5866,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         background_io,
         sync_every,
         inline_max,
+        ord_durable,
     } = plan;
     if background_io == BackgroundIo::Idle {
         idle_io_priority();
@@ -5972,6 +6037,7 @@ fn compact_run(plan: MergePlan) -> Result<Vec<String>> {
         opts: &opts,
         sync_every,
         inline_max,
+        ord_durable,
         pieces,
         pi: 0,
         r: 0,
@@ -6057,6 +6123,7 @@ struct TierPlan {
     background_io: BackgroundIo,
     sync_every: usize,
     inline_max: usize,
+    ord_durable: bool,
 }
 
 /// The piece merge's body: the inputs' keys walked once for their count
@@ -6081,6 +6148,7 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         background_io,
         sync_every,
         inline_max,
+        ord_durable,
     } = plan;
     if background_io == BackgroundIo::Idle {
         idle_io_priority();
@@ -6117,6 +6185,7 @@ fn tier_run(plan: TierPlan) -> Result<Vec<String>> {
         opts: &opts,
         sync_every,
         inline_max,
+        ord_durable,
         pieces: vec![Piece {
             from: 0,
             to: total,
@@ -7242,6 +7311,9 @@ struct Shared {
     /// life; see `Db::convert_us`.
     convert_build_ns: AtomicU64,
     convert_total_ns: AtomicU64,
+    /// Ordered indexes the open rebuilt from their segments
+    /// (`Seg::open_ord`); see `Db::ord_rebuilt`.
+    ord_rebuilt: AtomicU64,
     /// Patches that found the form shared with a published copy and had
     /// to copy it before writing (`Arc::make_mut` on a shared form).
     forms_cloned: AtomicU64,
@@ -15386,6 +15458,7 @@ impl Db {
             maint_cpu_ns: AtomicU64::new(0),
             convert_build_ns: AtomicU64::new(0),
             convert_total_ns: AtomicU64::new(0),
+            ord_rebuilt: AtomicU64::new(0),
             forms_cloned: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
@@ -15592,7 +15665,7 @@ impl Db {
                 }
                 w.finish()?
             };
-            write_ord(dir, &name, &ord)?;
+            write_ord(dir, &name, &ord, true)?;
             std::fs::rename(&rebuilt, dir.join(&name))?;
             File::open(dir)?.sync_all()?;
             live.push(name);
@@ -15629,6 +15702,7 @@ impl Db {
             )?);
         }
         segs.sort_by(seg_order);
+        let ord_rebuilt = segs.iter().filter(|s| s.ord_rebuilt).count() as u64;
         let seg_ids: Vec<(u64, u64)> = live
             .iter()
             .filter_map(|n| Some((Db::name_id(n)?, Db::name_end_seq(n)?)))
@@ -15754,6 +15828,7 @@ impl Db {
             maint_cpu_ns: AtomicU64::new(0),
             convert_build_ns: AtomicU64::new(0),
             convert_total_ns: AtomicU64::new(0),
+            ord_rebuilt: AtomicU64::new(ord_rebuilt),
             forms_cloned: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
@@ -16411,6 +16486,7 @@ impl Db {
         let (id, seq) = (d.id, end_seq);
         let retiring = tmp.clone();
         let shared = self.shared.clone();
+        let ord_durable = self.opts.ord_durable;
         let job = move |readable: &SealReadable| -> Result<Vec<String>> {
             seal_hold_wait(&shared, SEAL_HOLD_LANDING);
             let tombs = w.tombs();
@@ -16430,7 +16506,9 @@ impl Db {
             let names = vec![name];
             seal_readable(&shared, readable, &names, vec![fact]);
             seg.sync_all()?;
-            ordf.sync_all()?;
+            if ord_durable {
+                ordf.sync_all()?;
+            }
             // The directory's entries are made durable by the publish that
             // names the segment in the manifest, before the WAL retires; a
             // sync here as well was one more device round trip a drain
@@ -16556,6 +16634,7 @@ impl Db {
         let background_io = self.opts.background_io;
         let sync_every = self.opts.seal_sync_every;
         let inline_max = self.opts.inline_bytes;
+        let ord_durable = self.opts.ord_durable;
         let end_seq = self.wal.seq;
         let limit = self.partition_limit();
         let mem = table.clone();
@@ -16824,7 +16903,9 @@ impl Db {
             seal_readable(&shared, readable, &names, facts);
             for (seg, ordf) in files {
                 seg.sync_all()?;
-                ordf.sync_all()?;
+                if ord_durable {
+                    ordf.sync_all()?;
+                }
             }
             SealCounts::add(&counts.seal_thread_ns, t_job.elapsed().as_nanos() as u64);
             // The directory's entries are made durable by the publish that
@@ -20181,6 +20262,12 @@ impl Db {
         )
     }
 
+    /// Ordered indexes this open found missing, torn or describing another
+    /// segment and rebuilt from their segments' keys (`Options::ord_durable`).
+    pub fn ord_rebuilt(&self) -> u64 {
+        self.shared.ord_rebuilt.load(AtomicOrdering::Relaxed)
+    }
+
     /// Patches that copied a form shared with a published copy before
     /// writing it, over the store's life.
     pub fn forms_cloned(&self) -> u64 {
@@ -23059,6 +23146,7 @@ impl Maint {
             background_io: self.opts.background_io,
             sync_every: self.opts.seal_sync_every,
             inline_max: self.opts.inline_bytes,
+            ord_durable: self.opts.ord_durable,
         };
         let wake = self.wake.clone();
         let handle = std::thread::spawn(move || {
@@ -23577,6 +23665,7 @@ impl Maint {
         let background_io = self.opts.background_io;
         let sync_every = self.opts.seal_sync_every;
         let inline_max = self.opts.inline_bytes;
+        let ord_durable = self.opts.ord_durable;
         let job_inputs = inputs.clone();
         let wake = self.wake.clone();
         let handle = std::thread::spawn(move || {
@@ -23593,6 +23682,7 @@ impl Maint {
                 background_io,
                 sync_every,
                 inline_max,
+                ord_durable,
             });
             if let Some(t) = wake {
                 t.unpark();

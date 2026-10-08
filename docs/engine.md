@@ -3470,6 +3470,39 @@ durable load 1.16x at ten thousand (22 of 24), the shuffled loads
 1.11-1.14x, and every read cell level. The buffered drain reads 3.3-3.8
 ms in the row's shape now; the comparator's sync 1.7-3.3.
 
+The next round trip on the drain was the ordered index's. Every
+segment's index (`ord-*.oidx`, `src/ordindex.rs`) was fsynced beside
+the segment at a seal's, a merge's and a drain's landing, a device
+round trip for a file that is a function of the segment's keys and
+nothing else: the builder takes the keys in rank order, and the prefix,
+the uniform length and the heads follow from them. The index is written
+and renamed into place unsynced now, and an open that finds it missing,
+torn, or describing another segment composes it again from the
+segment's keys, writes it synced and counts the rebuild
+(`Options::ord_durable`, `Db::ord_rebuilt`; the fsync is `supdb-oidxsync`
+and `supdb-ingestoidxsync`). The contract test flips a byte in every
+index of a store with a tombstone piece and deletes one, and requires the
+rebuilt files to equal the written ones byte for byte. Priced by the
+load's own phase print, the drain's median moved 0.4 ms in every cell
+but one: the buffered ordered drain 3.3 and 3.0 ms against 3.4 and 3.5
+at ten thousand keys in two pairings, 5.6 against 6.0 at thirty, the
+durable drain 2.1 against 2.5 twice, the shuffled 6.0-6.2 against
+6.5. In pairs of twenty-four the buffered ordered load read 1.04x (16
+of 24) and then 1.09x (20 of 24, p .002), the durable load 1.06x and
+1.03x (18 of 24, p .023), the shuffled load 1.04x (p .002) and 1.01x.
+
+One read cell moved against it twice: the durable arm's lag-10 scans
+read 7% faster in the arm that syncs, 20 and 18 of 24, while every
+counter the pairing reports was identical, no seal falls inside the
+sweep, and the scan phases' own timers were level. A runner built with
+both arms syncing, the names the only difference, read the two at
+parity (0.99x), and the arm that does not sync read what the shipping
+arm had read at that cell in every earlier pairing; the faster figure
+was the paired arm's, in that pairing only. A cell with no code path
+between the arms that moves anyway is the pairing's, and the gate's own
+rule applies to it: a figure implausibly good is a broken measurement
+until someone looks.
+
 The large rung's loss is the writer's, and it has the slow mode's
 shape. Over three hundred thousand ordered keys the commits take 61-74
 ms in four reps of seven, 89-108 in two and 203-236 in two, CPU equal

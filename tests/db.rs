@@ -639,23 +639,39 @@ fn ord_names(d: &std::path::Path) -> Vec<String> {
     v
 }
 
-/// Every live segment has an ordered index, and the store refuses to open
-/// without it.
+/// Every live segment has an ordered index, and one the open finds
+/// missing, damaged or describing another segment is rebuilt from the
+/// segment's keys, byte for byte, and counted.
 ///
 /// There is deliberately no fallback to `Blob::seek`. A reader that quietly
 /// took the slow path when the index was missing would answer correctly
 /// forever and never say so -- the shape of every gate this repository has
-/// broken -- so a missing or damaged index is damage, like a torn key
-/// section, and the open fails.
+/// broken. The index is a function of the segment's keys and nothing else,
+/// so the open composes it again as the writer did and `ord_rebuilt` says
+/// it happened; that is what lets the writer leave its fsync out
+/// (`Options::ord_durable`), since a crash can then leave the index
+/// missing or torn beside a segment the manifest names. The store here
+/// has a piece with tombstones, whose keys the rebuild must take as the
+/// writer did, flagged or not.
 #[test]
-fn a_segment_without_its_ordered_index_refuses_to_open() {
+fn a_segment_whose_ordered_index_is_missing_or_damaged_rebuilds_it_at_open() {
+    // No merge, so the tombstones' piece stays a piece beside the run's
+    // partition instead of folding into it.
+    let no_merge = || Options {
+        compact: false,
+        ..Options::default()
+    };
     let d = dir("ord-required");
-    let mut db = Db::create(&d, Options::default()).unwrap();
+    let mut db = Db::create(&d, no_merge()).unwrap();
     for k in 0u32..2_000 {
         db.append(
             format!("key-{k:05}").as_bytes(),
             format!("v-{k}").as_bytes(),
         );
+    }
+    db.commit().unwrap();
+    for k in (0u32..2_000).step_by(7) {
+        db.delete(format!("key-{k:05}").as_bytes());
     }
     db.commit().unwrap();
     db.flush().unwrap();
@@ -666,31 +682,74 @@ fn a_segment_without_its_ordered_index_refuses_to_open() {
         segs.len(),
         "one index a segment: {segs:?} {ords:?}"
     );
+    assert!(ords.len() >= 2, "a piece beside the run: {segs:?}");
     assert_eq!(read_vec(&db, b"key-00500"), vec![b"v-500".to_vec()]);
+    assert!(read_vec(&db, b"key-00497").is_empty());
+    assert_eq!(db.ord_rebuilt(), 0);
+    db.close().unwrap();
+    let written: Vec<Vec<u8>> = ords
+        .iter()
+        .map(|n| std::fs::read(d.join(n)).unwrap())
+        .collect();
+
+    // Reopens cleanly as it stands, rebuilding nothing.
+    let db = Db::open(&d, no_merge()).unwrap();
+    assert_eq!(read_vec(&db, b"key-00500"), vec![b"v-500".to_vec()]);
+    assert_eq!(db.ord_rebuilt(), 0);
     db.close().unwrap();
 
-    // Reopens cleanly as it stands.
-    let db = Db::open(&d, Options::default()).unwrap();
-    assert_eq!(read_vec(&db, b"key-00500"), vec![b"v-500".to_vec()]);
+    let reads_whole = |db: &Db| {
+        let mut n = 0usize;
+        db.scan(b"", usize::MAX, |k, val| {
+            n += 1;
+            let i: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+            assert!(
+                !i.is_multiple_of(7),
+                "deleted key {} read back",
+                String::from_utf8_lossy(k)
+            );
+            assert_eq!(val, format!("v-{i}").as_bytes());
+        })
+        .unwrap();
+        assert_eq!(n, 2_000 - 2_000usize.div_ceil(7));
+    };
+
+    // Damaged: a flipped byte in every index. The open rebuilds each,
+    // identical to what the writer wrote, and says how many.
+    for (n, bytes) in ords.iter().zip(&written) {
+        let mut damaged = bytes.clone();
+        let at = damaged.len() / 2;
+        damaged[at] ^= 0x40;
+        std::fs::write(d.join(n), &damaged).unwrap();
+    }
+    let db = Db::open(&d, no_merge()).unwrap();
+    assert_eq!(
+        db.ord_rebuilt(),
+        ords.len() as u64,
+        "every damaged index rebuilt"
+    );
+    reads_whole(&db);
     db.close().unwrap();
+    for (n, bytes) in ords.iter().zip(&written) {
+        assert_eq!(
+            &std::fs::read(d.join(n)).unwrap(),
+            bytes,
+            "{n} rebuilt differently"
+        );
+    }
 
-    // Damaged: a flipped byte fails the open rather than falling back.
-    let victim = d.join(&ords[0]);
-    let mut bytes = std::fs::read(&victim).unwrap();
-    let at = bytes.len() / 2;
-    bytes[at] ^= 0x40;
-    std::fs::write(&victim, &bytes).unwrap();
-    assert!(
-        Db::open(&d, Options::default()).is_err(),
-        "opened over a damaged ordered index"
-    );
+    // Absent: the same answer.
+    std::fs::remove_file(d.join(&ords[0])).unwrap();
+    let db = Db::open(&d, no_merge()).unwrap();
+    assert_eq!(db.ord_rebuilt(), 1);
+    reads_whole(&db);
+    db.close().unwrap();
+    assert_eq!(&std::fs::read(d.join(&ords[0])).unwrap(), &written[0]);
 
-    // Absent: the same answer, not a silent slow path.
-    std::fs::remove_file(&victim).unwrap();
-    assert!(
-        Db::open(&d, Options::default()).is_err(),
-        "opened with an ordered index missing"
-    );
+    // Rebuilt, it is a durable one: the next open finds it as it stands.
+    let db = Db::open(&d, no_merge()).unwrap();
+    assert_eq!(db.ord_rebuilt(), 0);
+    db.close().unwrap();
 }
 
 /// The index has to survive a promotion, which renames the segment. It is

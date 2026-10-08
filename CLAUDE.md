@@ -499,7 +499,14 @@ count of zero is one whose landings the state shows. A crash between any
 two of those leaves either a WAL that replays the whole memtable, with a
 segment the manifest never named --
 possibly torn -- swept at open, or a complete, named segment plus a WAL
-whose sealed prefix is skipped by sequence. Every store has a manifest from
+whose sealed prefix is skipped by sequence. The ordered index beside a segment
+is written unsynced and never fsynced (`Options::ord_durable` is the
+arm that syncs it): it is a function of the segment's keys and nothing
+else, so an open that finds it missing, torn or describing another
+segment composes it again as the writer did, byte for byte, writes it
+synced and counts the rebuild (`Db::ord_rebuilt`); its fsync was a
+device round trip on every seal's, merge's and drain's landing for the
+durability of a file the store regenerates. Every store has a manifest from
 birth for that reason: without one, open takes every `seg-` file as live
 and skips the WAL behind it, which was safe only while a segment was
 fsynced before it was renamed, and that scan is kept for stores from before
