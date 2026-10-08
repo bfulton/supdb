@@ -149,6 +149,17 @@ pub fn minflt_of(comm: &str) -> u64 {
 }
 
 /// This thread's minor page faults so far.
+/// Microseconds of CPU the calling thread has used.
+pub fn thread_cpu_us() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a clock read into a timespec on the stack.
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
+}
+
 pub fn minflt_self() -> u64 {
     std::fs::read_to_string("/proc/thread-self/stat").map_or(0, |s| stat_minflt(&s))
 }
@@ -173,6 +184,25 @@ pub fn mem_free_mb() -> u64 {
             })
         })
         .map_or(0, |kb| kb / 1024)
+}
+
+/// A phase's edge stamped on stderr in `CLOCK_MONOTONIC` seconds under
+/// `SUPDB_LAG_MARK`, as `lag_mark` stamps a lag point's: what a profile
+/// of the load is cut to, by thread.
+pub fn phase_mark(arm: &str, phase: &str, edge: &str) {
+    if std::env::var_os("SUPDB_LAG_MARK").is_none() {
+        return;
+    }
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a clock read into a timespec on the stack.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    eprintln!(
+        "phasemark {arm} {phase} {edge} {}.{:09}",
+        ts.tv_sec, ts.tv_nsec
+    );
 }
 
 pub fn lag_mark(arm: &str, pct: u64, edge: &str) {
@@ -1241,6 +1271,9 @@ fn load(
     let io0 = IoCounters::read_now();
     let t = Instant::now();
     let (mut tc, mut tfirst, mut tmax, mut nc) = (0f64, 0f64, 0f64, 0usize);
+    let flt0 = minflt_self();
+    let cpu0 = thread_cpu_us();
+    phase_mark(e.name(), "load", "start");
     for i in 0..size {
         db_key_into(order(i), &mut kb);
         buf.push(&kb, payload.get(&mut vrng));
@@ -1259,18 +1292,28 @@ fn load(
     let t0 = Instant::now();
     buf.flush(e)?;
     tc += t0.elapsed().as_secs_f64();
+    let flt_c = minflt_self().saturating_sub(flt0);
+    let cpu_c = thread_cpu_us().saturating_sub(cpu0);
+    phase_mark(e.name(), "load", "sync");
     let ts = Instant::now();
     e.sync()?;
     let tsync = ts.elapsed().as_secs_f64();
     let secs = t.elapsed().as_secs_f64();
+    phase_mark(e.name(), "load", "end");
+    let flt_s = minflt_self().saturating_sub(flt0 + flt_c);
+    let cpu_s = thread_cpu_us().saturating_sub(cpu0 + cpu_c);
     // The load's own counters, as `SUPDB_LAG_COUNTERS` is the lag sweep's:
     // the commits' time, the first and the slowest commit, and the closing
-    // sync, which is where the buffered arm's loss at the small rungs sat
-    // -- a drain of 8-9 ms against a comparator's one fdatasync of 2.
+    // sync, each with the writer's CPU and faults, which is where the
+    // buffered arm's loss at the small rungs sat -- a drain of 8-9 ms
+    // against a comparator's one fdatasync of 2 -- and where its loss at
+    // the large ones did: commits at the same fault count in every rep
+    // and two to four times the CPU in some.
     if std::env::var_os("SUPDB_LOAD_PHASES").is_some() {
         eprintln!(
-            "loadphases {} size {} commits {} ms {:.2} first {:.2} max {:.2} sync {:.2} total {:.2}",
-            e.name(), size, nc, tc * 1e3, tfirst * 1e3, tmax * 1e3, tsync * 1e3, secs * 1e3
+            "loadphases {} size {} commits {} ms {:.2} first {:.2} max {:.2} sync {:.2} total {:.2} | commits cpu {:.1} flt {} | sync cpu {:.1} flt {}",
+            e.name(), size, nc, tc * 1e3, tfirst * 1e3, tmax * 1e3, tsync * 1e3, secs * 1e3,
+            cpu_c as f64 / 1e3, flt_c, cpu_s as f64 / 1e3, flt_s
         );
     }
     let wrote = IoCounters::read_now().since(&io0).write_bytes;

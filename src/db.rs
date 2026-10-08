@@ -1192,6 +1192,18 @@ pub struct Options {
     /// drain then promoted the one piece the load left. Off, the two
     /// publishes, kept for pricing as `supdb-ingestdrainpromote`.
     pub drain_names_partition: bool,
+    /// Whether a manifest publish keeps the manifest it replaces linked
+    /// under a spare name until the segment work's idle tick, or at open,
+    /// unlinks it. Renaming the new manifest over the old frees the old
+    /// one's inode, and on a filesystem that discards freed blocks that is
+    /// a device round trip on the publish's path: 1.2-1.4 ms here, where
+    /// the write and fsync of the new manifest are 0.3 and the link, the
+    /// rename that frees nothing and the directory fsync tens of
+    /// microseconds together. Every landing publishes, and a drain's
+    /// waiter waits for it. The `manifest` name is present and complete
+    /// throughout either way. Off, the rename that frees, kept for pricing
+    /// as `supdb-manifestfree` and `supdb-ingestmanifestfree`.
+    pub manifest_spare: bool,
     /// EXPERIMENT: the writes since the last scan over the store, as a
     /// share of the partitions' keys, within which the backlog bound
     /// above settles at all; zero, the default, settles by the bound
@@ -1433,6 +1445,7 @@ impl Default for Options {
             convert_from_form: true,
             copy_exact: true,
             drain_names_partition: true,
+            manifest_spare: true,
             forms_settle_recent_pct: 0,
             forms_carry: true,
             freeze_settles: false,
@@ -5408,7 +5421,39 @@ fn check_options(opts: &Options) -> Result<()> {
 /// WAL sequence and then each live segment's name.
 const MANIFEST_MAGIC: &[u8; 9] = b"SUPDBMAN\x01";
 
-fn manifest_write(dir: &Path, covered_seq: u64, names: &[String]) -> Result<()> {
+/// The spare names a manifest publish leaves for the sweep
+/// (`Options::manifest_spare`), each unique, so two publishes close
+/// together never free an inode on the path to make room for one.
+static MANIFEST_SPARE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Whether `name` is a spare an earlier publish left (`manifest_write`).
+fn is_manifest_spare(name: &str) -> bool {
+    name.starts_with("manifest.prev-")
+}
+
+/// Every spare in `dir` removed: at open, and when the segment work is
+/// idle.
+fn sweep_manifest_spares(dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        if is_manifest_spare(&name.to_string_lossy()) {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+    }
+    Ok(())
+}
+
+/// The manifest written, fsynced and renamed into place, and the directory
+/// fsynced. With `spare`, the manifest it replaces is first linked under a
+/// spare name so that the rename frees no inode, and that name is returned
+/// for the caller to unlink off every waiter's path; see
+/// `Options::manifest_spare`.
+fn manifest_write(
+    dir: &Path,
+    covered_seq: u64,
+    names: &[String],
+    spare: bool,
+) -> Result<Option<PathBuf>> {
     let mut body = Vec::new();
     body.extend_from_slice(&covered_seq.to_le_bytes());
     body.extend_from_slice(&(names.len() as u32).to_le_bytes());
@@ -5428,9 +5473,25 @@ fn manifest_write(dir: &Path, covered_seq: u64, names: &[String]) -> Result<()> 
         f.write_all(&out)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, dir.join("manifest"))?;
+    let cur = dir.join("manifest");
+    let kept = if spare {
+        let name = format!(
+            "manifest.prev-{}",
+            MANIFEST_SPARE_SEQ.fetch_add(1, AtomicOrdering::Relaxed)
+        );
+        let spare_path = dir.join(name);
+        match std::fs::hard_link(&cur, &spare_path) {
+            Ok(()) => Some(spare_path),
+            // A store's birth: no manifest yet to keep.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        }
+    } else {
+        None
+    };
+    std::fs::rename(&tmp, &cur)?;
     File::open(dir)?.sync_all()?;
-    Ok(())
+    Ok(kept)
 }
 
 /// `None` when no manifest exists -- a store that has never sealed, or one
@@ -15275,7 +15336,7 @@ impl Db {
         // syncs after (`Db::seal`), so a crash between leaves a `seg-`
         // file that may be torn, and the manifest is what says it is not
         // the store's. The scan stays for stores written before manifests.
-        manifest_write(dir, 0, &[])?;
+        manifest_write(dir, 0, &[], false)?;
         let segs: Vec<std::sync::Arc<Seg>> = Vec::new();
         let mean_key_bytes = 0;
         let store_bytes = 0;
@@ -15476,7 +15537,7 @@ impl Db {
         // file the scan above trusts, skipping the WAL that holds the
         // same writes.
         if !had_manifest {
-            manifest_write(dir, sealed, &live)?;
+            manifest_write(dir, sealed, &live, false)?;
         }
         // A direct segment a crash left open: its records up to the last
         // commit marker are the batches that were acknowledged, rewritten
@@ -15535,7 +15596,7 @@ impl Db {
             std::fs::rename(&rebuilt, dir.join(&name))?;
             File::open(dir)?.sync_all()?;
             live.push(name);
-            manifest_write(dir, sealed, &live)?;
+            manifest_write(dir, sealed, &live, false)?;
             let _ = std::fs::remove_file(&tmp);
         }
         // The same for ordered indexes, which outlive their segment by a
@@ -15543,6 +15604,9 @@ impl Db {
         // still there after a merge unlinks its inputs. A promotion renames
         // a segment but keeps the id and end-sequence its index is named by,
         // so the live set below still claims it.
+        // Spares a publish left for the idle sweep that never ran, a
+        // store closed or crashed before it (`Options::manifest_spare`).
+        sweep_manifest_spares(dir)?;
         let live_ord: std::collections::HashSet<String> =
             live.iter().filter_map(|n| Db::ord_name_for(n)).collect();
         for entry in std::fs::read_dir(dir)? {
@@ -21985,6 +22049,9 @@ struct Maint {
     /// Direct segments' temp names, unlinked once the manifest names the
     /// segment; until then the temp name is what recovery reads.
     retiring_tmps: Vec<PathBuf>,
+    /// Manifests replaced and kept linked under spare names, for the idle
+    /// tick to unlink (`Options::manifest_spare`).
+    spares: Vec<PathBuf>,
     /// A merge a flush that does not partition started in the background:
     /// collected at the first commit after it finishes, where a merge the
     /// seals start waits for the next seal, since a store that has stopped
@@ -22077,8 +22144,10 @@ impl Maint {
             }
             self.collect();
             self.shape_if_read(false);
+            self.sweep_spares();
             std::thread::park_timeout(MAINT_POLL);
         }
+        self.sweep_spares();
         // Closing: whatever was handed over and not landed is joined, as
         // the writer's own drop joined its seal, and landed by no one.
         while let Ok(job) = rx.try_recv() {
@@ -22356,6 +22425,7 @@ impl Maint {
             covered_seq,
             retiring_wals,
             retiring_tmps: Vec::new(),
+            spares: Vec::new(),
             compacting: None,
             tiering: None,
             sealing: std::collections::VecDeque::new(),
@@ -23393,7 +23463,32 @@ impl Maint {
             "a manifest written while a seal's segments are published and not durable"
         );
         SealCounts::add(&self.shared.seal_counts.publishes, 1);
-        manifest_write(&self.dir, self.covered_seq, &self.live_names())
+        let spare = manifest_write(
+            &self.dir,
+            self.covered_seq,
+            &self.live_names(),
+            self.opts.manifest_spare,
+        )?;
+        if let Some(p) = spare {
+            if self.wake.is_some() {
+                // On a thread of its own: unlinked at the idle tick, off the
+                // path of whoever waits for this landing.
+                self.spares.push(p);
+            } else {
+                // Inline, on the writer's thread: now, as the rename that
+                // freed did.
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        Ok(())
+    }
+
+    /// The spares the publishes left, unlinked: an inode freed is a
+    /// discard round trip here, paid where nobody waits.
+    fn sweep_spares(&mut self) {
+        for p in std::mem::take(&mut self.spares) {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     /// Merge the L0 tail and every partition it overlaps into a new

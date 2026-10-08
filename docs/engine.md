@@ -3446,9 +3446,44 @@ the same way; 1.17x and 1.05x at thirty thousand (p .007 and .023); at
 three hundred thousand, twelve pairs, the load 0.94x and nothing moved
 at p < .05. A side cell at ten thousand read 3% against the change at p
 .023 and 11% for it in the replication: the position effect, again. The
-drain reads 4.7-5.5 ms in the row's shape now, against 1.7-2 for the
-comparator; what is left is the finish, the two data fsyncs and the one
-manifest publish, two thirds of which is the rename.
+drain read 4.7-5.5 ms in the row's shape then, against 1.7-2 for the
+comparator; what was left was the finish, the two data fsyncs and the
+one manifest publish, two thirds of which was the rename.
+
+The rename's price was then taken apart in forty rounds of each shape
+on this filesystem. A manifest written and fsynced costs 0.3 ms; the
+directory fsync 0.05-0.2; renaming it over the old manifest 1.2-1.4; and
+writing it under a fresh name and unlinking the old one afterwards costs
+the same 1.2 at the unlink. What costs is freeing an inode: the
+filesystem discards the freed blocks, and a discard is a device round
+trip here, as the strace of the suite's own teardown shows at 8 ms for
+a data file and 20 for a forty-megabyte floor file. A publish that frees
+nothing -- the old manifest hard-linked under a spare name, the new one
+renamed over it, the directory fsynced -- costs 0.46-0.48 ms on its
+path, and the spare's unlink, 1.2 ms, moves to the segment work's idle
+tick, to the close, or to the next open (`Options::manifest_spare`; the
+rename that frees is `supdb-manifestfree` and `supdb-ingestmanifestfree`).
+The `manifest` name is complete at every moment either way. Priced in
+pairs of twenty-four: the buffered ordered load 1.22x at ten thousand
+keys (19 of 24, p .007) and 1.15x at thirty (22 of 24, p < .001), the
+durable load 1.16x at ten thousand (22 of 24), the shuffled loads
+1.11-1.14x, and every read cell level. The buffered drain reads 3.3-3.8
+ms in the row's shape now; the comparator's sync 1.7-3.3.
+
+The large rung's loss is the writer's, and it has the slow mode's
+shape. Over three hundred thousand ordered keys the commits take 61-74
+ms in four reps of seven, 89-108 in two and 203-236 in two, CPU equal
+to wall throughout and the writer's faults 17,400 in every rep, where
+the comparator's commits take 54-99 with 400 faults, its writes landing
+in the page cache. The faults are the ordered memtable's -- 52% its
+entry slabs, 27% its byte arena -- and the segment writer's per-record
+state, 19%; the direct run writes every record to its segment already,
+and the memtable copies the keys and values again for the reads a run
+in progress serves. Profiled in its own window the writer's commit
+phase is 29% memmove, about 23% fault handling, 5% the kernel's copy
+for its writes, and the rest the arena's reserve, the record's end, the
+CRC and the memtable's entries and chunks. The lever left on this cell
+is the copy the direct run keeps.
 
 #### The pin's fence, priced against a sweep that fences for it
 

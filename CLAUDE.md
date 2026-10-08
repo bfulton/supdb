@@ -158,7 +158,17 @@ time per folio: a one-megabyte write makes a one-megabyte folio, and a
 patch of a hundred bytes made in place after the folio was written
 back counts a megabyte again while the device writes a page. Read the
 device's own counter in `/sys/block/vda/stat` beside it before calling
-such a move a cost.
+such a move a cost. And an inode freed is a device round trip here: the
+filesystem discards freed blocks, so a rename over an existing file, an
+unlink or a truncate costs 1.2-1.4 ms for a file of one block and 20 ms
+for one of forty megabytes, where writing and fsyncing a new file costs
+0.3. The manifest publish renamed over the old manifest at every
+landing and paid that on every drain's path, until the old manifest was
+kept linked under a spare name for an idle tick to unlink
+(`Options::manifest_spare`). Price a file operation by what it frees as
+well as by what it writes, and read `strace -f -tt -T -y` over a phase
+before reasoning about its syscalls: the drain's strace is what showed
+the rename beside the fsyncs it was costing as much as.
 
 A pass that runs beside the engine's other threads is not profiled by
 sampling the process: four cores shared with a seal, a merge, the

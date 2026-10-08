@@ -2444,6 +2444,67 @@ fn a_dense_form_converts_from_its_own_deltas() {
     );
 }
 
+/// A manifest publish keeps the manifest it replaces linked under a spare
+/// name, so that the rename frees no inode on the publish's path, and the
+/// spare is unlinked by the segment work when idle and at open
+/// (`Options::manifest_spare`). The `manifest` name is complete at every
+/// moment either way; the spares are what this test is about: none is left
+/// once the store is closed, and one a crash would leave is gone after an
+/// open, which reads the store as if it were not there.
+#[test]
+fn a_manifest_publish_leaves_its_spare_to_the_sweep() {
+    let d = dir("manifest-spare");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(64 << 10),
+        ..Options::default()
+    };
+    let spares = |d: &std::path::Path| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("manifest.prev-"))
+            .collect();
+        v.sort();
+        v
+    };
+    {
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        for k in 0..2000u32 {
+            db.append(format!("key-{k:05}").as_bytes(), b"v0");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        for k in 0..2000u32 {
+            db.put(format!("key-{k:05}").as_bytes(), b"v1");
+        }
+        db.commit().unwrap();
+        db.flush().unwrap();
+        assert!(d.join("manifest").is_file(), "the manifest is in place");
+        drop(db);
+    }
+    assert_eq!(
+        spares(&d),
+        Vec::<String>::new(),
+        "the closing sweep left no spare"
+    );
+    std::fs::write(d.join("manifest.prev-77"), b"stale").unwrap();
+    let db = Db::open(&d, opts).unwrap();
+    assert_eq!(
+        spares(&d),
+        Vec::<String>::new(),
+        "an open sweeps the spares a crash would leave"
+    );
+    let r = db.reader().unwrap();
+    let mut n = 0usize;
+    r.scan(b"key-00000", 5000, |_k, v| {
+        assert_eq!(v, b"v1");
+        n += 1;
+    })
+    .unwrap();
+    assert_eq!(n, 2000, "the store reads as published");
+}
+
 #[test]
 fn a_write_settles_into_the_block_it_lands_in() {
     let d = dir("settle-in-place");

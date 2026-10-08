@@ -450,6 +450,10 @@ pub struct Supdb {
     /// manifest, as before `Options::drain_names_partition`:
     /// `supdb-ingestdrainpromote`.
     drainpromote: bool,
+    /// A manifest publish that renames over the old manifest and frees it
+    /// on the path, as before `Options::manifest_spare`. `supdb-manifestfree`,
+    /// and `supdb-ingestmanifestfree` buffered.
+    manifestfree: bool,
     /// A piece's keys ranked over the partition's records, as before
     /// `Options::piece_ranks_by_heads`. `supdb-rankrecords`, and
     /// `supdb-ingestrankrecords` buffered.
@@ -626,6 +630,10 @@ struct Policy {
     /// manifest, as before `Options::drain_names_partition`:
     /// `supdb-ingestdrainpromote`.
     drainpromote: bool,
+    /// A manifest publish that renames over the old manifest and frees it
+    /// on the path, as before `Options::manifest_spare`. `supdb-manifestfree`,
+    /// and `supdb-ingestmanifestfree` buffered.
+    manifestfree: bool,
     /// A piece's keys ranked over the partition's records, as before
     /// `Options::piece_ranks_by_heads`. `supdb-rankrecords`, and
     /// `supdb-ingestrankrecords` buffered.
@@ -735,6 +743,7 @@ impl Default for Policy {
             convertsources: false,
             copyslack: false,
             drainpromote: false,
+            manifestfree: false,
             rankrecords: false,
             shape: false,
             adaptcap: None,
@@ -1867,6 +1876,33 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose manifest publish frees the old manifest on its path,
+    /// as before `Options::manifest_spare`: against `supdb` it prices the
+    /// spare link and the deferred unlink.
+    pub fn create_manifestfree(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                manifestfree: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` freeing the old manifest on the path, as
+    /// `supdb-manifestfree`.
+    pub fn create_ingest_manifestfree(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                manifestfree: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` ranking a piece's keys over the partition's records, as
     /// before `Options::piece_ranks_by_heads`: against `supdb` it prices
     /// the ranking over the index's heads, on the segment work's thread.
@@ -2065,6 +2101,7 @@ impl Supdb {
             convertsources,
             copyslack,
             drainpromote,
+            manifestfree,
             rankrecords,
             shape,
             aheadmin,
@@ -2194,6 +2231,7 @@ impl Supdb {
             convert_from_form: !convertsources,
             copy_exact: !copyslack,
             drain_names_partition: !drainpromote,
+            manifest_spare: !manifestfree,
             piece_ranks_by_heads: !rankrecords,
             forms_convert_unread: !(bg || bglag),
             // The capped conversions and the builder's, kept to price again
@@ -2325,6 +2363,7 @@ impl Supdb {
             convertsources,
             copyslack,
             drainpromote,
+            manifestfree,
             rankrecords,
             shape,
             aheadmin,
@@ -2649,6 +2688,13 @@ impl Engine for Supdb {
         }
         if self.drainpromote {
             return "supdb-ingestdrainpromote";
+        }
+        if self.manifestfree {
+            return if self.partition {
+                "supdb-manifestfree"
+            } else {
+                "supdb-ingestmanifestfree"
+            };
         }
         if self.rankrecords {
             return if self.partition {
@@ -3335,6 +3381,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-copysearch"
         | "supdb-convertsources"
         | "supdb-copyslack"
+        | "supdb-manifestfree"
         | "supdb-inlinemaint"
         | "supdb-adapt"
         | "supdb-adapttrig"
@@ -3383,6 +3430,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestconvertsources"
         | "supdb-ingestcopyslack"
         | "supdb-ingestdrainpromote"
+        | "supdb-ingestmanifestfree"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
         | "supdb-ingestrankrecords"
@@ -3443,10 +3491,12 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-copysearch" => Box::new(Supdb::create_copysearch(dir)?),
         "supdb-convertsources" => Box::new(Supdb::create_convertsources(dir)?),
         "supdb-copyslack" => Box::new(Supdb::create_copyslack(dir)?),
+        "supdb-manifestfree" => Box::new(Supdb::create_manifestfree(dir)?),
         "supdb-ingestcopysearch" => Box::new(Supdb::create_ingest_copysearch(dir)?),
         "supdb-ingestconvertsources" => Box::new(Supdb::create_ingest_convertsources(dir)?),
         "supdb-ingestcopyslack" => Box::new(Supdb::create_ingest_copyslack(dir)?),
         "supdb-ingestdrainpromote" => Box::new(Supdb::create_ingest_drainpromote(dir)?),
+        "supdb-ingestmanifestfree" => Box::new(Supdb::create_ingest_manifestfree(dir)?),
         "supdb-rankrecords" => Box::new(Supdb::create_rankrecords(dir)?),
         "supdb-ingestrankrecords" => Box::new(Supdb::create_ingest_rankrecords(dir)?),
         "supdb-ingestlatewb" => Box::new(Supdb::create_ingest_latewb(dir)?),
