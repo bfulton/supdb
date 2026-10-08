@@ -2152,6 +2152,25 @@ struct AlignedWriter {
     /// tests.
     flushes: std::sync::Arc<AtomicU64>,
     hashed: std::sync::Arc<AtomicU64>,
+    /// The key section's checksum pieces hashed on the writer's own thread
+    /// as their bytes are buffered, while they are hot, from the section's
+    /// first piece boundary until the helper is spawned to take over or
+    /// the section ends: a segment too small for the helper -- every
+    /// segment the small rungs' drains close -- had every piece read back
+    /// and hashed at its finish instead, 0.3 ms of a drain of 3 at ten
+    /// thousand keys (`SegmentOptions::row_on_write`). `own_from` is the
+    /// first boundary, `own_row` the whole pieces' CRCs from it, `own_at`
+    /// the next byte to hash and `own_crc` the piece in progress.
+    own_on: bool,
+    own_from: u64,
+    own_at: u64,
+    own_crc: u32,
+    own_row: Vec<u32>,
+    /// Whether the helper hashes pieces at all: not for a marking segment,
+    /// whose writer hashes every record once for its commit markers and
+    /// folds the pieces' CRCs out of the same pass (`write_hashed`), so the
+    /// helper there only syncs.
+    helper_hashes: bool,
 }
 
 /// The pieces of the key section the helper hashed: `crcs[i]` is the CRC
@@ -2180,7 +2199,106 @@ impl AlignedWriter {
             prefix: 0,
             flushes: std::sync::Arc::new(AtomicU64::new(0)),
             hashed: std::sync::Arc::new(AtomicU64::new(0)),
+            own_on: false,
+            own_from: 0,
+            own_at: 0,
+            own_crc: 0,
+            own_row: Vec::new(),
+            helper_hashes: true,
         }
+    }
+
+    /// Whether the helper hashes the section's pieces once it runs; a
+    /// writer that hashes them itself in the pass its markers need turns
+    /// it off and keeps the row to the end.
+    fn set_helper_hashes(&mut self, on: bool) {
+        self.helper_hashes = on;
+    }
+
+    /// `write`, hashing `data` once: the CRC of the whole of it is
+    /// returned, and the aligned pieces it completes go into the writer's
+    /// own row, each piece's CRC folded from the same chunk CRCs
+    /// (`block::crc32_combine`), so a marking segment's batch costs one
+    /// pass for its marker and its row together.
+    fn write_hashed(&mut self, data: &[u8]) -> std::io::Result<u32> {
+        let piece = 1u64 << flatindex::PIECE_SHIFT;
+        let at0 = self.written + self.buf.len() as u64;
+        let end = at0 + data.len() as u64;
+        let own = self.own_on && self.section.is_some();
+        let mut whole = 0u32;
+        let mut p = at0;
+        while p < end {
+            let boundary = (p / piece + 1) * piece;
+            let stop = boundary.min(end);
+            let chunk = &data[(p - at0) as usize..(stop - at0) as usize];
+            let c = block::crc32(chunk);
+            whole = block::crc32_combine(whole, c, chunk.len() as u64);
+            if own && stop > self.own_at {
+                // The chunk is within one piece, and the row's pieces
+                // start at the first boundary past the section's start.
+                debug_assert!(p >= self.own_at, "a chunk hashed twice into the row");
+                self.own_crc = block::crc32_combine(self.own_crc, c, chunk.len() as u64);
+                if stop == boundary {
+                    self.own_row.push(self.own_crc);
+                    self.own_crc = 0;
+                }
+                self.own_at = stop;
+            }
+            p = stop;
+        }
+        let was = self.own_on;
+        // The bytes are hashed; the buffering must not hash them again.
+        self.own_on = false;
+        let r = std::io::Write::write_all(self, data);
+        self.own_on = was;
+        r.map(|()| whole)
+    }
+
+    /// Whether the writer hashes the section's pieces itself until the
+    /// helper runs (`SegmentOptions::row_on_write`); off, the finish reads
+    /// back whatever the helper did not hash.
+    fn set_row_on_write(&mut self, on: bool) {
+        self.own_on = on;
+    }
+
+    /// Bytes at file offset `at`, just buffered: the whole pieces they
+    /// complete go into the writer's own row.
+    fn own_hash(&mut self, at: u64, bytes: &[u8]) {
+        let piece = 1u64 << flatindex::PIECE_SHIFT;
+        let end = at + bytes.len() as u64;
+        if end <= self.own_at {
+            return;
+        }
+        let mut p = self.own_at.max(at);
+        while p < end {
+            let boundary = (p / piece + 1) * piece;
+            let stop = boundary.min(end);
+            self.own_crc = block::crc32_resume(
+                self.own_crc,
+                &bytes[(p - at) as usize..(stop - at) as usize],
+            );
+            if stop == boundary {
+                self.own_row.push(self.own_crc);
+                self.own_crc = 0;
+            }
+            p = stop;
+        }
+        self.own_at = end;
+        debug_assert!(self.own_at >= self.own_from);
+    }
+
+    /// The writer's own row as it stands: the whole pieces from the
+    /// section's first boundary; none where no section started.
+    fn own_row_so_far(&mut self) -> Option<HelperRow> {
+        self.section?;
+        let piece = 1u64 << flatindex::PIECE_SHIFT;
+        let crcs = std::mem::take(&mut self.own_row);
+        let to = self.own_from + crcs.len() as u64 * piece;
+        Some(HelperRow {
+            from: self.own_from,
+            to,
+            crcs,
+        })
     }
 
     fn get_ref(&self) -> &File {
@@ -2200,8 +2318,11 @@ impl AlignedWriter {
     fn join_helper(&mut self) -> std::io::Result<Option<HelperRow>> {
         self.helper_done = true;
         match self.helper.take() {
-            Some(h) => h.finish(),
-            None => Ok(None),
+            Some(h) => match h.finish()? {
+                Some(row) => Ok(Some(row)),
+                None => Ok(self.own_row_so_far()),
+            },
+            None => Ok(self.own_row_so_far()),
         }
     }
 
@@ -2237,14 +2358,34 @@ impl AlignedWriter {
             if self.helper_done || self.written < self.ahead {
                 return Ok(());
             }
+            let hands_over = self.helper_hashes && self.own_on;
+            let own = if hands_over {
+                self.own_row_so_far()
+            } else {
+                None
+            };
+            if self.helper_hashes {
+                self.own_on = false;
+            }
             self.helper = Some(WriterHelper::spawn(
                 &self.file,
                 self.ahead,
                 self.synced,
-                self.section,
+                if self.helper_hashes {
+                    self.section
+                } else {
+                    None
+                },
                 self.flushes.clone(),
                 self.hashed.clone(),
             )?);
+            // The pieces the writer hashed before the helper ran are the
+            // helper's row's prefix, and the helper hashes on from there.
+            if let Some(own) = own {
+                let h = self.helper.as_ref().expect("spawned above");
+                *h.shared.row.lock().unwrap_or_else(|e| e.into_inner()) = own.crcs;
+                h.shared.hashed_to.store(own.to, AtomicOrdering::Release);
+            }
         }
         let h = self.helper.as_ref().expect("spawned above");
         h.shared.landed.store(self.written, AtomicOrdering::Release);
@@ -2268,8 +2409,18 @@ impl AlignedWriter {
     /// Before any of the section is written.
     fn start_section(&mut self, at: u64) {
         self.section = Some(at);
+        let piece = 1u64 << flatindex::PIECE_SHIFT;
+        self.own_from = at.div_ceil(piece) * piece;
+        self.own_at = self.own_from;
+        self.own_crc = 0;
+        self.own_row.clear();
         if let Some(h) = &self.helper {
-            h.shared.set_section(at);
+            if self.helper_hashes {
+                h.shared.set_section(at);
+                // The helper hashes from here; the writer's own hashing is
+                // for a section the helper is not yet running over.
+                self.own_on = false;
+            }
         }
     }
 
@@ -2278,6 +2429,7 @@ impl AlignedWriter {
     /// past the section, since a piece the helper finds whole is one it
     /// hashes.
     fn end_section(&mut self, end: u64) {
+        self.own_on = false;
         if let Some(h) = &self.helper {
             h.shared.section_end.store(end, AtomicOrdering::Release);
             h.request_stop();
@@ -2544,6 +2696,10 @@ impl std::io::Write for AlignedWriter {
         while !rest.is_empty() {
             let room = self.to_boundary() - self.buf.len();
             let take = room.min(rest.len());
+            if self.own_on && self.section.is_some() {
+                let at = self.written + self.buf.len() as u64;
+                self.own_hash(at, &rest[..take]);
+            }
             self.buf.extend_from_slice(&rest[..take]);
             rest = &rest[take..];
             if self.buf.len() == self.to_boundary() {
@@ -2673,6 +2829,9 @@ pub struct SegmentWriter {
     /// what an ordered table keeps in place of the value
     /// (`Options::direct_table_refs`).
     last_value: (u64, u32),
+    /// `SegmentOptions::row_on_write`: whether the writer's own pass yields
+    /// the row, which decides at `set_marks` whether the helper hashes.
+    row_on_write: bool,
 }
 
 /// The two layouts the writer produces. Same format, same readers, one
@@ -2850,6 +3009,7 @@ impl SegmentWriter {
             opts.early_writeback,
             opts.sync_ahead,
         );
+        out.set_row_on_write(opts.row_on_write);
         // The header region stays zero until `finish`, so a segment that
         // was never finished is a file no reader accepts rather than a
         // segment with some of its keys.
@@ -2859,6 +3019,7 @@ impl SegmentWriter {
             out,
             pos: crate::format::SUPER,
             last_value: (0, 0),
+            row_on_write: opts.row_on_write,
             builder: BlockBuilder::new(block_size),
             block_size,
             blocks: Vec::new(),
@@ -2942,8 +3103,8 @@ impl SegmentWriter {
         }
         // The batch's records, hashed and written as one; the CRC of the
         // concatenation is the CRC the records chained one by one gave.
-        self.mark_crc = block::crc32_resume(self.mark_crc, &self.batch_buf);
-        self.out.write_all(&self.batch_buf)?;
+        let c = self.out.write_hashed(&self.batch_buf)?;
+        self.mark_crc = block::crc32_combine(self.mark_crc, c, self.batch_buf.len() as u64);
         self.batch_buf.clear();
         let mut m = [0u8; DIRECT_MARK_LEN];
         m[4..8].copy_from_slice(&DIRECT_MARK);
@@ -2981,8 +3142,8 @@ impl SegmentWriter {
             // walk's CRC spans every record since the last marker, these
             // among them, so a sync that writes them ahead of their marker
             // must not leave them out of its CRC.
-            self.mark_crc = block::crc32_resume(self.mark_crc, &self.batch_buf);
-            self.out.write_all(&self.batch_buf)?;
+            let c = self.out.write_hashed(&self.batch_buf)?;
+            self.mark_crc = block::crc32_combine(self.mark_crc, c, self.batch_buf.len() as u64);
             self.batch_buf.clear();
         }
         self.out.flush()?;
@@ -3066,6 +3227,10 @@ impl SegmentWriter {
     /// the first key; a marker on a writer without it is an error.
     pub fn set_marks(&mut self, on: bool) {
         self.marks = on;
+        // A marking writer hashes every record for its markers and folds
+        // the row's pieces out of the same pass, so the helper only syncs;
+        // where the row is left to the close, the helper hashes as before.
+        self.out.set_helper_hashes(!(on && self.row_on_write));
     }
 
     /// The helper thread's fdatasyncs and hashed pieces so far, for the
@@ -3486,8 +3651,8 @@ impl SegmentWriter {
         // space and a later seal would route keys into a neighbour's range.
         self.flush_block()?;
         if !self.batch_buf.is_empty() {
-            self.mark_crc = block::crc32_resume(self.mark_crc, &self.batch_buf);
-            self.out.write_all(&self.batch_buf)?;
+            let c = self.out.write_hashed(&self.batch_buf)?;
+            self.mark_crc = block::crc32_combine(self.mark_crc, c, self.batch_buf.len() as u64);
             self.batch_buf.clear();
         }
 
@@ -3821,6 +3986,14 @@ pub struct SegmentOptions {
     /// leaves a thread time for both beside it. Zero leaves it all to the
     /// close. On by default; the `latewb` arms turn it and the hint off.
     pub sync_ahead: u64,
+    /// Whether the writer hashes the key section's checksum pieces itself,
+    /// as their bytes are buffered and hot, until the helper thread runs
+    /// (`sync_ahead`) or the section ends. Off, the finish reads back and
+    /// hashes every piece the helper did not, which for a segment too small
+    /// for the helper is every piece: 0.3 ms of a drain of 3 at ten
+    /// thousand keys, kept for pricing as `supdb-rowatclose` and
+    /// `supdb-ingestrowatclose`.
+    pub row_on_write: bool,
 }
 
 impl Default for SegmentOptions {
@@ -3833,6 +4006,7 @@ impl Default for SegmentOptions {
             write_piece: 1 << 20,
             early_writeback: true,
             sync_ahead: 8 << 20,
+            row_on_write: true,
         }
     }
 }

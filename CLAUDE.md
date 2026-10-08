@@ -211,7 +211,21 @@ which split the buffered arm's loss at ten thousand keys into commits
 near the comparator's and a drain of 8-9 ms against one fdatasync of
 2; a drain is then stamped step by step and read beside `strace -f -tt
 -T -y` for the fsyncs and renames it makes, since a rename over an
-existing file costs an fsync's worth here.
+existing file costs an fsync's worth here. A step that is CPU is priced
+by the phases' sum and not by the phase it leaves: the segment finish's
+checksum row read every piece of the key section back and hashed it,
+0.3 ms of a 10k drain, and hashing the pieces on the writer as they were
+buffered moved the whole of it into the commits -- the CRC costs the same
+hot or cold, and only the preads were the finish's own -- until the
+marker's pass over the same bytes was made to yield the row's pieces
+too (`block::crc32_combine`), one pass for both and the finish's share
+gone from the sum (`SegmentOptions::row_on_write`). And a step that
+reads a section the next phase will read warms the cache for it: the
+read-back made the lag pass at ten thousand keys, a hundred scans over
+the section it had just pulled through, a fifth faster than without it,
+forty microseconds against the three hundred the read-back cost, so a
+cell that moves when a step is removed is read beside the phase the step
+was in before it is read as the step's.
 
 Profile a probe that does one thing. The scan probe's own `format!` per
 iteration was 8% of its samples until the keys were built before the

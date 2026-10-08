@@ -124,6 +124,86 @@ pub fn crc32_resume(prev: u32, data: &[u8]) -> u32 {
     crc32_from(prev ^ 0xFFFF_FFFF, data)
 }
 
+/// The CRC of two inputs' concatenation from the CRC of each and the
+/// second's length: `crc32_combine(crc32(a), crc32(b), b.len()) ==
+/// crc32(a ++ b)`, and `crc32_combine(0, c, n)` is `c`, zero being the
+/// empty input's CRC. This is what lets one pass over a byte stream yield
+/// both the CRC of a run that crosses chunk boundaries and the CRC of each
+/// chunk: a direct segment's commit marker covers a batch of records and
+/// its checksum row covers the key section in aligned pieces, and the
+/// writer hashed every byte once for each until the pieces' CRCs were
+/// combined into the batch's instead.
+///
+/// zlib's method: shifting a CRC past `len2` zero bytes is a linear map
+/// over GF(2), the product of the maps for the powers of two in `len2`,
+/// each a 32x32 matrix built once; the shifted first CRC xored with the
+/// second is the whole's.
+pub fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
+    if len2 == 0 {
+        return crc1;
+    }
+    let shifts = CRC_SHIFTS.get_or_init(crc32c_shift_matrices);
+    let mut c = crc1;
+    let mut n = len2;
+    let mut k = 0usize;
+    while n != 0 {
+        if n & 1 != 0 {
+            c = gf2_times(&shifts[k], c);
+        }
+        n >>= 1;
+        k += 1;
+    }
+    c ^ crc2
+}
+
+/// The operator for shifting a CRC-32C past `2^k` zero bytes, for every
+/// `k` a length can hold.
+static CRC_SHIFTS: std::sync::OnceLock<Vec<[u32; 32]>> = std::sync::OnceLock::new();
+
+fn gf2_times(mat: &[u32; 32], mut vec: u32) -> u32 {
+    let mut sum = 0u32;
+    let mut i = 0usize;
+    while vec != 0 {
+        if vec & 1 != 0 {
+            sum ^= mat[i];
+        }
+        vec >>= 1;
+        i += 1;
+    }
+    sum
+}
+
+fn gf2_square(mat: &[u32; 32]) -> [u32; 32] {
+    let mut sq = [0u32; 32];
+    for (n, s) in sq.iter_mut().enumerate() {
+        *s = gf2_times(mat, mat[n]);
+    }
+    sq
+}
+
+fn crc32c_shift_matrices() -> Vec<[u32; 32]> {
+    // The operator for one zero bit, over the reflected Castagnoli
+    // polynomial; squared, the operator for one byte; squared again for
+    // each further power of two bytes.
+    let mut odd = [0u32; 32];
+    odd[0] = 0x82F6_3B78;
+    let mut row = 1u32;
+    for o in odd.iter_mut().skip(1) {
+        *o = row;
+        row <<= 1;
+    }
+    let even = gf2_square(&odd); // two bits
+    let mut byte = gf2_square(&even); // four bits
+    byte = gf2_square(&byte); // eight bits: one byte
+    let mut out = Vec::with_capacity(64);
+    let mut m = byte;
+    for _ in 0..64 {
+        out.push(m);
+        m = gf2_square(&m);
+    }
+    out
+}
+
 fn crc32_from(init: u32, data: &[u8]) -> u32 {
     #[allow(unused_imports)]
     use std::sync::atomic::Ordering;
@@ -445,6 +525,32 @@ pub fn read_chunked_range(
 #[cfg(test)]
 mod checksum_tests {
     use super::*;
+
+    #[test]
+    fn a_combined_crc_is_the_concatenation_s_crc() {
+        let data: Vec<u8> = (0..70_000u32).map(|i| (i * 31 + i / 7) as u8).collect();
+        for &split in &[
+            0usize, 1, 7, 255, 256, 4096, 16_383, 16_384, 16_385, 40_000, 69_999, 70_000,
+        ] {
+            let (a, b) = data.split_at(split);
+            assert_eq!(
+                crc32_combine(crc32(a), crc32(b), b.len() as u64),
+                crc32(&data),
+                "split at {split}"
+            );
+            assert_eq!(crc32_combine(0, crc32(b), b.len() as u64), crc32(b));
+            assert_eq!(crc32_resume(crc32(a), b), crc32(&data));
+        }
+        // Three pieces folded in turn, as a row's pieces into a batch's marker.
+        let (x, rest) = data.split_at(10_000);
+        let (y, z) = rest.split_at(16_384);
+        let c = crc32_combine(
+            crc32_combine(crc32(x), crc32(y), y.len() as u64),
+            crc32(z),
+            z.len() as u64,
+        );
+        assert_eq!(c, crc32(&data));
+    }
 
     #[test]
     fn a_resumed_crc_is_the_whole_input_s_crc() {

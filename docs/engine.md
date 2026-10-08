@@ -3503,6 +3503,38 @@ between the arms that moves anyway is the pairing's, and the gate's own
 rule applies to it: a figure implausibly good is a broken measurement
 until someone looks.
 
+The finish was then timed step by step. At ten thousand keys it is
+530-890 µs: the key section's trailer built in 80-250, the checksum row
+in 280-365, the writer's last buffer flushed in 120-360, everything else
+under ten; at three hundred thousand it is 7-8 ms, five of them the
+trailer's build and two its write, the row 0.1 since the helper thread
+hashes pieces as they land on a file that long. The row at the small
+rungs was every piece read back through eighty preads and hashed, on a
+segment too small for the helper to have started. Hashing the pieces on
+the writer as their bytes were buffered, hot, took the finish's 0.3 ms
+and put it in the commits -- sync 2.57 against 2.82 ms, commits 2.31
+against 2.17, the load level at ten thousand keys and 0.3 ms slower at
+thirty -- because the CRC costs the same wherever it runs and only the
+preads were the finish's own; the writer was hashing every record twice,
+once for the commit marker and once for the row. One pass yields both
+when the pieces' CRCs are combined into the batch's
+(`block::crc32_combine`, zlib's shift matrices built once), so the
+marking writer folds its row out of the marker's pass and its helper
+only syncs (`SegmentOptions::row_on_write`; the row hashed at the close
+is `supdb-rowatclose` and `supdb-ingestrowatclose`). In pairs of
+twenty-four the buffered ordered load read 1.06x at ten thousand keys
+(17 of 24) and 1.06x at thirty (21 of 24, p < .001), the durable load
+1.04x at ten thousand, with the commits level and the drain 0.3-0.8 ms
+shorter; at three hundred thousand, twelve pairs, the load read 0.97x
+with nothing resolved. The cells after the drain moved the other way at
+the small rungs: the lag pass with no updates read 1.26x and 1.23x in
+the arm that still reads the section back, 24 and 22 of 24, and the
+point reads 1.14x in the durable arm, because the read-back had just
+pulled the whole section through the cache for them. Those passes are a
+hundred scans or reads over a megabyte, forty microseconds against the
+three hundred the read-back cost, so the sum is the drain's, and the
+cell is read beside the step that warmed it.
+
 The large rung's loss is the writer's, and it has the slow mode's
 shape. Over three hundred thousand ordered keys the commits take 61-74
 ms in four reps of seven, 89-108 in two and 203-236 in two, CPU equal

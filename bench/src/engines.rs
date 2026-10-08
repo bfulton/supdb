@@ -462,6 +462,10 @@ pub struct Supdb {
     /// of its values (`Options::direct_table_refs`). `supdb-refvals`, and
     /// `supdb-ingestrefvals` buffered.
     refvals: bool,
+    /// The key section's checksum row hashed at the close from the file,
+    /// as before `SegmentOptions::row_on_write`. `supdb-rowatclose`, and
+    /// `supdb-ingestrowatclose` buffered.
+    rowatclose: bool,
     /// A piece's keys ranked over the partition's records, as before
     /// `Options::piece_ranks_by_heads`. `supdb-rankrecords`, and
     /// `supdb-ingestrankrecords` buffered.
@@ -650,6 +654,10 @@ struct Policy {
     /// of its values (`Options::direct_table_refs`). `supdb-refvals`, and
     /// `supdb-ingestrefvals` buffered.
     refvals: bool,
+    /// The key section's checksum row hashed at the close from the file,
+    /// as before `SegmentOptions::row_on_write`. `supdb-rowatclose`, and
+    /// `supdb-ingestrowatclose` buffered.
+    rowatclose: bool,
     /// A piece's keys ranked over the partition's records, as before
     /// `Options::piece_ranks_by_heads`. `supdb-rankrecords`, and
     /// `supdb-ingestrankrecords` buffered.
@@ -762,6 +770,7 @@ impl Default for Policy {
             manifestfree: false,
             oidxsync: false,
             refvals: false,
+            rowatclose: false,
             rankrecords: false,
             shape: false,
             adaptcap: None,
@@ -1974,6 +1983,32 @@ impl Supdb {
         )
     }
 
+    /// The checksum row hashed at the close from the file rather than on
+    /// the writer as the bytes are buffered (`SegmentOptions::row_on_write`):
+    /// against `supdb` it prices the read-back on the drain's path.
+    pub fn create_rowatclose(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                rowatclose: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` hashing the row at the close, as `supdb-rowatclose`.
+    pub fn create_ingest_rowatclose(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                rowatclose: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` ranking a piece's keys over the partition's records, as
     /// before `Options::piece_ranks_by_heads`: against `supdb` it prices
     /// the ranking over the index's heads, on the segment work's thread.
@@ -2175,6 +2210,7 @@ impl Supdb {
             manifestfree,
             oidxsync,
             refvals,
+            rowatclose,
             rankrecords,
             shape,
             aheadmin,
@@ -2236,6 +2272,7 @@ impl Supdb {
                 } else {
                     supdb::SegmentOptions::default().write_piece
                 },
+                row_on_write: !rowatclose,
                 ..Default::default()
             },
             // The engine's own defaults: 32 MB seals over 64 MB partitions,
@@ -2441,6 +2478,7 @@ impl Supdb {
             manifestfree,
             oidxsync,
             refvals,
+            rowatclose,
             rankrecords,
             shape,
             aheadmin,
@@ -2785,6 +2823,13 @@ impl Engine for Supdb {
                 "supdb-refvals"
             } else {
                 "supdb-ingestrefvals"
+            };
+        }
+        if self.rowatclose {
+            return if self.partition {
+                "supdb-rowatclose"
+            } else {
+                "supdb-ingestrowatclose"
             };
         }
         if self.rankrecords {
@@ -3475,6 +3520,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-manifestfree"
         | "supdb-oidxsync"
         | "supdb-refvals"
+        | "supdb-rowatclose"
         | "supdb-inlinemaint"
         | "supdb-adapt"
         | "supdb-adapttrig"
@@ -3526,6 +3572,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestmanifestfree"
         | "supdb-ingestoidxsync"
         | "supdb-ingestrefvals"
+        | "supdb-ingestrowatclose"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
         | "supdb-ingestrankrecords"
@@ -3589,6 +3636,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-manifestfree" => Box::new(Supdb::create_manifestfree(dir)?),
         "supdb-oidxsync" => Box::new(Supdb::create_oidxsync(dir)?),
         "supdb-refvals" => Box::new(Supdb::create_refvals(dir)?),
+        "supdb-rowatclose" => Box::new(Supdb::create_rowatclose(dir)?),
         "supdb-ingestcopysearch" => Box::new(Supdb::create_ingest_copysearch(dir)?),
         "supdb-ingestconvertsources" => Box::new(Supdb::create_ingest_convertsources(dir)?),
         "supdb-ingestcopyslack" => Box::new(Supdb::create_ingest_copyslack(dir)?),
@@ -3596,6 +3644,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestmanifestfree" => Box::new(Supdb::create_ingest_manifestfree(dir)?),
         "supdb-ingestoidxsync" => Box::new(Supdb::create_ingest_oidxsync(dir)?),
         "supdb-ingestrefvals" => Box::new(Supdb::create_ingest_refvals(dir)?),
+        "supdb-ingestrowatclose" => Box::new(Supdb::create_ingest_rowatclose(dir)?),
         "supdb-rankrecords" => Box::new(Supdb::create_rankrecords(dir)?),
         "supdb-ingestrankrecords" => Box::new(Supdb::create_ingest_rankrecords(dir)?),
         "supdb-ingestlatewb" => Box::new(Supdb::create_ingest_latewb(dir)?),
