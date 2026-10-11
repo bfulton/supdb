@@ -395,6 +395,13 @@ pub struct Supdb {
     /// were gated (`Options::scan_timers`). `supdb-timers`, and
     /// `supdb-ingesttimers` buffered.
     timers: bool,
+    /// A lend wakes the upkeep thread when it is parked past a short
+    /// batch's wait (`Options::upkeep_wake_parked`). `supdb-wake`, and
+    /// `supdb-ingestwake` buffered.
+    wake: bool,
+    /// The block walk issues no prefetches (`Options::scan_prefetch`
+    /// off). `supdb-noprefetch`, and `supdb-ingestnoprefetch` buffered.
+    noprefetch: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -598,6 +605,13 @@ struct Policy {
     /// were gated (`Options::scan_timers`). `supdb-timers`, and
     /// `supdb-ingesttimers` buffered.
     timers: bool,
+    /// A lend wakes the upkeep thread when it is parked past a short
+    /// batch's wait (`Options::upkeep_wake_parked`). `supdb-wake`, and
+    /// `supdb-ingestwake` buffered.
+    wake: bool,
+    /// The block walk issues no prefetches (`Options::scan_prefetch`
+    /// off). `supdb-noprefetch`, and `supdb-ingestnoprefetch` buffered.
+    noprefetch: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -793,6 +807,8 @@ impl Default for Policy {
             rowatclose: false,
             lendbursts: false,
             timers: false,
+            wake: false,
+            noprefetch: false,
             rankrecords: false,
             shape: false,
             adaptcap: None,
@@ -2085,6 +2101,56 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose lends wake the upkeep thread when it is parked past a
+    /// short batch's wait (`Options::upkeep_wake_parked`).
+    pub fn create_wake(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                wake: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-wake`.
+    pub fn create_ingest_wake(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                wake: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` whose block walks issue no prefetches
+    /// (`Options::scan_prefetch` off).
+    pub fn create_noprefetch(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                noprefetch: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-noprefetch`.
+    pub fn create_ingest_noprefetch(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                noprefetch: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` ranking a piece's keys over the partition's records, as
     /// before `Options::piece_ranks_by_heads`: against `supdb` it prices
     /// the ranking over the index's heads, on the segment work's thread.
@@ -2289,6 +2355,8 @@ impl Supdb {
             rowatclose,
             lendbursts,
             timers,
+            wake,
+            noprefetch,
             rankrecords,
             shape,
             aheadmin,
@@ -2462,6 +2530,8 @@ impl Supdb {
             // The upkeep where the arm puts it, or where the engine does.
             upkeep: upkeep.unwrap_or(supdb::Options::default().upkeep),
             upkeep_inline_bursts: !lendbursts,
+            upkeep_wake_parked: wake,
+            scan_prefetch: !noprefetch,
             // The scan phases timed where the arm asks, or where the
             // counters lines will read them: ten clock reads a scan.
             scan_timers: timers
@@ -2565,6 +2635,8 @@ impl Supdb {
             rowatclose,
             lendbursts,
             timers,
+            wake,
+            noprefetch,
             rankrecords,
             shape,
             aheadmin,
@@ -2930,6 +3002,20 @@ impl Engine for Supdb {
                 "supdb-timers"
             } else {
                 "supdb-ingesttimers"
+            };
+        }
+        if self.wake {
+            return if self.partition {
+                "supdb-wake"
+            } else {
+                "supdb-ingestwake"
+            };
+        }
+        if self.noprefetch {
+            return if self.partition {
+                "supdb-noprefetch"
+            } else {
+                "supdb-ingestnoprefetch"
             };
         }
         if self.rankrecords {
@@ -3623,6 +3709,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-rowatclose"
         | "supdb-lendbursts"
         | "supdb-timers"
+        | "supdb-wake"
+        | "supdb-noprefetch"
         | "supdb-inlinemaint"
         | "supdb-adapt"
         | "supdb-adapttrig"
@@ -3677,6 +3765,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestrowatclose"
         | "supdb-ingestlendbursts"
         | "supdb-ingesttimers"
+        | "supdb-ingestwake"
+        | "supdb-ingestnoprefetch"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
         | "supdb-ingestrankrecords"
@@ -3785,6 +3875,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestlendbursts" => Box::new(Supdb::create_ingest_lendbursts(dir)?),
         "supdb-timers" => Box::new(Supdb::create_timers(dir)?),
         "supdb-ingesttimers" => Box::new(Supdb::create_ingest_timers(dir)?),
+        "supdb-wake" => Box::new(Supdb::create_wake(dir)?),
+        "supdb-ingestwake" => Box::new(Supdb::create_ingest_wake(dir)?),
+        "supdb-noprefetch" => Box::new(Supdb::create_noprefetch(dir)?),
+        "supdb-ingestnoprefetch" => Box::new(Supdb::create_ingest_noprefetch(dir)?),
         "supdb-ingestsettlefreeze" => Box::new(Supdb::create_ingest_settlefreeze(dir)?),
         "supdb-ingestconvertcap" => Box::new(Supdb::create_ingest_convertcap(dir)?),
         "supdb-ingestshortpass" => Box::new(Supdb::create_ingest_shortpass(dir)?),

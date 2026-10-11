@@ -2545,6 +2545,46 @@ about twice as much per instruction as LMDB's leaf walk, on a dirtied
 store and a clean one alike, and that -- the walk's memory access, not
 its arithmetic -- is where the rest of E and the plain scans' margin is.
 
+A time profile cut to E's windows (each mix's edges are stamped under
+`SUPDB_LAG_MARK` now) put the block walk's own code at 28% of the mix,
+the harness's zipfian generator and value copies at a third, the walk's
+prefetches at 6%, and about a sixth in the first scan of the mix: the
+settle of the backlog the four mixes before it left, with its sorts and
+allocations, and the forms the scans then built for the blocks those
+mixes had dirtied. At ten thousand keys the upkeep thread made no pass
+through those four mixes: their commits of a hundred writes are below
+the batch that wakes it, and its poll had backed off to twenty
+milliseconds through the read workloads before them.
+
+Taking the prefetches away (`Options::scan_prefetch` off, the arm
+`supdb-ingestnoprefetch`) read E 1.04x at ten thousand keys, unresolved,
+and the lag passes 1.0-1.09x; at three hundred thousand, where the store
+is past the cache, the lag passes read 0.80-0.93x and E 0.97x, 11/12 and
+12/12. The prefetches stay.
+
+Waking the thread for the mixes' small batches was priced three ways
+(`Options::upkeep_wake_parked`, the arm `supdb-ingestwake`), each
+against the shape that wakes only for a batch worth waking for, 24 pairs
+at ten thousand keys. Woken whenever its poll had grown past its
+shortest, or past the wait it grants a short batch, the thread filed the
+mixes' writes beside them -- its passes 12 to 21, the blocks it built 0
+to 149 -- and ycsb-E read 1.18-1.19x, but ycsb-A 0.84-0.86x, ycsb-F
+0.82-0.85x and B 0.95x, 23/24 and 21/24; woken only at its full
+back-off it was never woken, since the reads before the mixes are
+shorter than the poll's climb to twenty milliseconds. At three hundred
+thousand keys nothing moved either way. A wake is a VM exit on this
+guest and the passes run on a sibling of the writer's core, and
+whichever of the two it is, the two mixes that write pay more than the
+one that scans gains. The option is off, and the mixes' backlog stays
+where the regime puts it: filed by the first scan that needs it.
+
+Where ycsb-E stands: 0.97x of LMDB at ten thousand keys, unresolved at
+twelve pairs, from 0.73x; 1.24x at three hundred thousand from 0.90x.
+Two levers were refuted, and the move stops here. The sixth of E that
+is the first scan's filing of the mixes' backlog is the shape to price
+next if the cell is to flip at the small rung: the settle's cost a write
+at a store that fits the cache, and the sorts and allocations around it.
+
 #### The freeze that leaves its carry to the next look
 
 At level 1 the freeze is the one place the writer still does work for

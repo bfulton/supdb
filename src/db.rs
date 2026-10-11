@@ -690,6 +690,17 @@ pub struct Options {
     /// `scan_cache_ahead_min_blocks` gets none. `false` is the arm
     /// without the thread.
     pub scan_cache_ahead: bool,
+    /// A block walk prefetches the lines it is about to read -- the
+    /// form's, or the partition's records over the ranks the scan will
+    /// take -- and the next block's where the scan will cross into it.
+    /// Issuing them was 6% of ycsb-E's time at ten thousand keys, scans
+    /// of fifty over blocks a zipfian mix keeps warm, and taking them
+    /// away there read E 1.04x (unresolved) and the lag passes 1.0-1.09x;
+    /// at three hundred thousand keys, where the store is past the
+    /// cache, the lag passes read 0.80-0.93x and E 0.97x without them,
+    /// 12/12 and 11/12. So they stay; `supdb-noprefetch` and
+    /// `supdb-ingestnoprefetch` are the arm that priced them.
+    pub scan_prefetch: bool,
     /// PROTOTYPE: the partitions' blocks below which no builder starts.
     /// Measured on the probe's E, six rounds interleaved, the builder
     /// against none: at ten thousand keys, 160 blocks, 310k-351k against
@@ -991,6 +1002,29 @@ pub struct Options {
     /// one rung is the whole burst at the rung below. `supdb-bglag` and
     /// `supdb-ingestbglag` set it.
     pub upkeep_lag_pct: usize,
+    /// EXPERIMENT: a commit that lends wakes the upkeep thread not only
+    /// for a batch worth waking it for but also when the thread is parked
+    /// for longer than the wait it grants a short batch before it begins
+    /// a pass anyway (`UPKEEP_BATCH_WAIT`). The thread doubles its poll to
+    /// twenty milliseconds while nothing is lent, and a run of commits
+    /// too small to wake it for -- the mixes' hundred-write batches --
+    /// then lies lent for the whole run: at ten thousand keys it made no
+    /// pass through four mixes, and the first scan of the fifth filed
+    /// their whole backlog and built every block they had dirtied, a
+    /// sixth of ycsb-E. The thread publishes its park timeout and the
+    /// commit reads it. Priced three ways against the shape that never
+    /// wakes for a small batch, 24 pairs at ten thousand keys: woken past
+    /// its shortest poll, or past this wait, the thread filed the mixes'
+    /// writes beside them -- its passes 12 to 21, the blocks it built 0
+    /// to 149 -- and ycsb-E read 1.18-1.19x, but ycsb-A 0.84-0.86x,
+    /// ycsb-F 0.82-0.85x and B 0.95x; woken only at its full back-off it
+    /// was never woken there, since the reads before the mixes are
+    /// shorter than the climb to it. At three hundred thousand keys
+    /// nothing moved. A wake is a VM exit on this guest, and the passes
+    /// run on a sibling of the writer's core; whichever of the two it is,
+    /// the mixes that write pay more than the mix that scans gains, so
+    /// this is off: `supdb-wake` and `supdb-ingestwake` price it.
+    pub upkeep_wake_parked: bool,
     /// With reads around, a commit that does not sync and whose batch is
     /// large enough to wake the upkeep thread for files the batch itself
     /// before it returns, whatever the settle bound says, and lends the
@@ -1484,6 +1518,7 @@ impl Default for Options {
             scan_block_cache: true,
             scan_cache_bytes: 0,
             scan_cache_ahead: true,
+            scan_prefetch: true,
             scan_cache_ahead_min_blocks: 1024,
             commit_forms: true,
             forms_from_reader_scans: 0,
@@ -1504,6 +1539,7 @@ impl Default for Options {
             forms_settle_keys_all: false,
             upkeep: Upkeep::default(),
             upkeep_lag_pct: 0,
+            upkeep_wake_parked: false,
             upkeep_inline_bursts: true,
             scan_timers: false,
             upkeep_batch_pct: 0,
@@ -14739,11 +14775,11 @@ impl Reader {
                 } else {
                     None
                 };
-                if !fetched {
+                if !fetched && self.opts.scan_prefetch {
                     prefetch_block(&seg.blob, form, start, ahead);
                 }
                 fetched = false;
-                if hi - start < ahead && b + 1 < nblocks {
+                if self.opts.scan_prefetch && hi - start < ahead && b + 1 < nblocks {
                     let next = match canonical.then(|| self.canonical(pi, b + 1)).flatten() {
                         Some(f) => {
                             takes += 1;
@@ -20074,6 +20110,10 @@ struct Lend {
     skipped: AtomicU64,
     /// Passes cut short at `UpkeepTo::cap` and re-posted.
     partial: AtomicU64,
+    /// The thread's park timeout in microseconds while it is parked
+    /// between polls, zero while it is awake: what a commit reads to
+    /// wake a thread that has backed off (`Options::upkeep_wake_parked`).
+    parked_us: std::sync::atomic::AtomicU32,
 }
 
 /// The upkeep is away from the writer: in the cell, or out with the
@@ -20433,7 +20473,10 @@ impl Reader {
             }
             short_since = None;
             let Some((fs, to)) = lend.take_out() else {
+                lend.parked_us
+                    .store(idle.as_micros() as u32, AtomicOrdering::Release);
                 std::thread::park_timeout(idle);
+                lend.parked_us.store(0, AtomicOrdering::Relaxed);
                 idle = (idle * 2).min(UPKEEP_POLL_MAX);
                 continue;
             };
@@ -20772,7 +20815,13 @@ impl Db {
             Some(fs) => self.shared.upkeep.lend(fs, to),
             None => self.shared.upkeep.post(to),
         }
-        if batch >= UPKEEP_WAKE_WRITES {
+        // Woken for a batch worth waking for, or for any batch while the
+        // thread is parked longer than a short batch's wait: see
+        // `Options::upkeep_wake_parked`.
+        let parked = self.shared.upkeep.parked_us.load(AtomicOrdering::Acquire);
+        if batch >= UPKEEP_WAKE_WRITES
+            || (self.opts.upkeep_wake_parked && parked > UPKEEP_BATCH_WAIT.as_micros() as u32)
+        {
             self.shared.upkeep.wake();
         }
     }
