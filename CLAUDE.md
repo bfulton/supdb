@@ -512,9 +512,17 @@ prove it.
 **Crash discipline is an order, and every window in it is survivable.**
 Commit is a WAL append and one fdatasync; the batch is durable or its tail
 frame fails its CRC and replay stops before it. Seal is write to a temp name,
-rename into place, publish to readers, fsync, then the manifest -- written,
-fsynced and renamed, and the directory fsynced once for the segment's entry
-and the manifest's together. The seal leaves the WAL open and ends at
+rename into place, publish to readers, fsync, then the manifest -- one of
+two slot files written in place and fdatasynced, the newest valid slot by
+its publish sequence being the store at open, so a torn publish is the
+slot an open ignores (`Options::manifest_slots`; the shape before it wrote
+a temp name, renamed it over the old manifest and fsynced the directory,
+`supdb-ingestmanifestrename`). The directory fsync the seal's names need
+runs at the seal's readable landing, on the segment work's thread beside
+the seal thread's fsync of their data, and the two wait on one journal
+commit here: the slots' first version dropped it as the manifest's own,
+and it was the segment's too -- an fsync taken off a path is first asked
+what else it made durable. The seal leaves the WAL open and ends at
 its sequence, since replay skips every record a manifest covers; the log
 rotates by size at a commit, synced and its directory entry synced
 first, because replay refuses a sequence gap across files, and a closed

@@ -3754,6 +3754,47 @@ copy -- is as much as the arena was, and the shape not yet priced is a
 run that keeps no table, serving its reads from the segment writer's own
 sorted keys and record offsets.
 
+
+#### The manifest in two slots
+
+The drain's publish was the next round trips on it. A publish wrote the
+manifest to a temp name, fsynced it, linked the old manifest under a
+spare name, renamed the new one over it and fsynced the directory: two
+device round trips after the segment's own fsync, 0.6 ms for the temp
+file's fsync and 0.4 for the directory's in the drain's strace at ten
+thousand keys, and the spare's unlink later, a discard of 1.2-3.8 ms of
+device time off the path. The manifest is two slot files now, `manifest`
+and `manifest.alt`: each publish is a sequence past the last and writes
+the slot of the sequence's parity in place, fdatasynced and never
+truncated, and the open takes the newest slot whose checksum holds, a
+torn write being the slot it ignores. Both slots exist from the store's
+birth or its first open under this, so no publish creates a directory
+entry (`Options::manifest_slots`; the rename shape is
+`supdb-manifestrename` and `supdb-ingestmanifestrename`). The header
+carries the sequence and a version-2 magic, the checksum covers the
+sequence with the body, and a version-1 manifest reads as sequence zero.
+
+The first version dropped the directory fsync as the manifest's own, and
+it was the segment's too: a seal's job leaves its rename, and a direct
+run's close its link, to the publish that names them, so a slot written
+without it would have retired a WAL behind a name that was not durable.
+The fsync runs at the seal's readable landing now, on the segment work's
+thread once the readers have the segments, while the seal's thread
+fsyncs their data -- and on this filesystem the two wait on one journal
+commit: in the drain's strace the directory's fsync ends 0.1 ms after
+the segment's in both of the load's drains, 0.2 ms of wall for the
+ordered load's where it had cost 0.4 as a round trip of its own after
+the manifest's, and the publish is then one fdatasync of 0.3 ms. A
+merge's and a promotion's landing fsync the directory themselves before
+their publish, as they did. Priced by the load's phases in twelve pairs
+at ten thousand keys: the ordered drain's median 2.5 ms against 3.0,
+below the rename shape in 11 of 13 loads, the shuffled 5.9 against 6.4
+in 10 of 13, the commits identical at 2.4. By rate, the buffered ordered
+load read 1.04x in twenty-four pairs and 1.07x in twelve at ten thousand
+keys and 1.11x in twelve at three hundred thousand, none resolved at p
+.05, since the commits' faults move a load by more than its drain; the
+durable load 1.01x, and every read, scan, lag and mix cell level.
+
 #### The pin's fence, priced against a sweep that fences for it
 
 A read pins the epoch it reads in by storing it in its slot of the

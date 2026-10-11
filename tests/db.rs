@@ -16,6 +16,65 @@ fn dir(name: &str) -> PathBuf {
     d
 }
 
+/// The manifest's two slots (`Options::manifest_slots`): the file names a
+/// publish alternates between.
+const MANIFEST_SLOTS: [&str; 2] = ["manifest", "manifest.alt"];
+
+/// The publish sequence a manifest file carries: zero for a file from
+/// before the slots, `None` for a missing, empty or unrecognised one.
+fn manifest_seq_of(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 17 || &bytes[..8] != b"SUPDBMAN" {
+        return None;
+    }
+    match bytes[8] {
+        1 => Some(0),
+        2 if bytes.len() >= 25 => Some(u64::from_le_bytes(bytes[9..17].try_into().unwrap())),
+        _ => None,
+    }
+}
+
+/// The newest manifest in `d`, by its publish sequence, with the slot it
+/// is in: what an open reads.
+fn newest_manifest(d: &std::path::Path) -> (PathBuf, Vec<u8>) {
+    let mut best: Option<(u64, PathBuf, Vec<u8>)> = None;
+    for slot in MANIFEST_SLOTS {
+        let path = d.join(slot);
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if let Some(seq) = manifest_seq_of(&bytes) {
+            if best.as_ref().is_none_or(|b| seq > b.0) {
+                best = Some((seq, path, bytes));
+            }
+        }
+    }
+    let (_, path, bytes) = best.expect("a manifest");
+    (path, bytes)
+}
+
+/// The newest manifest's bytes.
+fn manifest_bytes(d: &std::path::Path) -> Vec<u8> {
+    newest_manifest(d).1
+}
+
+/// The store's manifest put back to `bytes`, as a crash before the
+/// publishes since would have left it: the other slot, which may hold a
+/// newer one, is emptied, since an open takes the newest valid slot.
+fn restore_manifest(d: &std::path::Path, bytes: &[u8]) {
+    std::fs::write(d.join(MANIFEST_SLOTS[0]), bytes).unwrap();
+    let alt = d.join(MANIFEST_SLOTS[1]);
+    if alt.exists() {
+        std::fs::write(&alt, b"").unwrap();
+    }
+}
+
+/// Every manifest slot removed: a store from before manifests.
+fn remove_manifests(d: &std::path::Path) {
+    for slot in MANIFEST_SLOTS {
+        let _ = std::fs::remove_file(d.join(slot));
+    }
+}
+
 fn read_vec(db: &Reader, key: &[u8]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     db.read_all(key, |v| out.push(v.to_vec())).unwrap();
@@ -2696,6 +2755,7 @@ fn a_manifest_publish_leaves_its_spare_to_the_sweep() {
     let opts = Options {
         seal_bytes: 1 << 20,
         partition_bytes: Some(64 << 10),
+        manifest_slots: false,
         ..Options::default()
     };
     let spares = |d: &std::path::Path| -> Vec<String> {
@@ -2742,6 +2802,172 @@ fn a_manifest_publish_leaves_its_spare_to_the_sweep() {
     })
     .unwrap();
     assert_eq!(n, 2000, "the store reads as published");
+}
+
+/// A publish writes one of two slots, alternating, each stamped a
+/// sequence past the last, and never a temp name: one fsync, no rename,
+/// no directory fsync. The open takes the newest valid slot, so a slot a
+/// crash tore mid-write is the one it ignores and the slot before it is
+/// the store. A store from before the slots -- one `manifest` with no
+/// sequence -- opens as a sequence of zero and gets its second slot at
+/// that open, so no publish after it ever creates a directory entry.
+#[test]
+fn a_manifest_publish_alternates_two_slots_and_the_open_takes_the_newest_valid() {
+    let d = dir("manifest-slots");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        partition_bytes: Some(64 << 10),
+        ..Options::default()
+    };
+    let key = |k: u32| format!("key-{k:05}");
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    assert!(
+        d.join("manifest").is_file() && d.join("manifest.alt").is_file(),
+        "both slots from birth"
+    );
+    assert_eq!(
+        manifest_seq_of(&manifest_bytes(&d)),
+        Some(0),
+        "the birth manifest"
+    );
+    for k in 0..2000u32 {
+        db.append(key(k).as_bytes(), b"v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let (slot_a, bytes_a) = newest_manifest(&d);
+    let seq_a = manifest_seq_of(&bytes_a).unwrap();
+    assert!(seq_a >= 1, "the flush published: {seq_a}");
+    assert_eq!(db.manifest_seq(), seq_a, "the store's count is the slot's");
+    assert_eq!(
+        slot_a.file_name().unwrap().to_str().unwrap(),
+        MANIFEST_SLOTS[(seq_a % 2) as usize],
+        "the slot is the sequence's"
+    );
+    assert!(!d.join("manifest.tmp").exists(), "no temp name under slots");
+    // The window a publish torn by a crash leaves: the slot of the next
+    // sequence holds a manifest whose checksum fails, and the slot before
+    // it is the store, every file it names in place since a landing
+    // retires nothing until its publish has returned. Staged by hand on
+    // the store as the flush left it; the torn publish's own files, had
+    // it any, would be swept as unnamed, which the merge-window test holds.
+    // (A real second publish torn after the fact names files the publish
+    // retired, which is a different store from the window's.)
+    let other = d.join(MANIFEST_SLOTS[((seq_a + 1) % 2) as usize]);
+    let mut torn = bytes_a.clone();
+    torn[9..17].copy_from_slice(&(seq_a + 1).to_le_bytes());
+    std::fs::write(&other, &torn).unwrap();
+    drop(db);
+    let db = Db::open(&d, opts.clone()).unwrap();
+    assert_eq!(
+        db.manifest_seq(),
+        seq_a,
+        "the slot before the torn one is the store"
+    );
+    assert_eq!(read_vec(&db, key(7).as_bytes()), vec![b"v0".to_vec()]);
+    drop(db);
+    // Both torn: refused, as a torn single manifest was.
+    let mut torn_a = bytes_a.clone();
+    let last = torn_a.len() - 1;
+    torn_a[last] ^= 0xFF;
+    std::fs::write(&slot_a, &torn_a).unwrap();
+    assert!(
+        Db::open(&d, opts.clone()).is_err(),
+        "no valid slot is a torn store"
+    );
+    // The store restored: the publishes alternate the slots, each one
+    // past the last, and the torn slot is the first one written over.
+    std::fs::write(&slot_a, &bytes_a).unwrap();
+    let mut db = Db::open(&d, opts.clone()).unwrap();
+    for k in 0..2000u32 {
+        db.put(key(k).as_bytes(), b"v1");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let (slot_b, bytes_b) = newest_manifest(&d);
+    let seq_b = manifest_seq_of(&bytes_b).unwrap();
+    assert!(
+        seq_b > seq_a,
+        "every publish moves the sequence: {seq_b} after {seq_a}"
+    );
+    assert_eq!(
+        slot_b.file_name().unwrap().to_str().unwrap(),
+        MANIFEST_SLOTS[(seq_b % 2) as usize],
+        "the slot is the sequence's"
+    );
+    assert_eq!(db.manifest_seq(), seq_b);
+    let other = d.join(MANIFEST_SLOTS[1 - (seq_b % 2) as usize]);
+    let other_seq = manifest_seq_of(&std::fs::read(&other).unwrap()).unwrap();
+    assert_eq!(other_seq, seq_b - 1, "the other slot is the publish before");
+    assert_eq!(read_vec(&db, key(7).as_bytes()), vec![b"v1".to_vec()]);
+    drop(db);
+    let db = Db::open(&d, opts.clone()).unwrap();
+    assert_eq!(db.manifest_seq(), seq_b, "the open takes the newest");
+    assert_eq!(read_vec(&db, key(7).as_bytes()), vec![b"v1".to_vec()]);
+    drop(db);
+    // A store from before the slots: one manifest, version 1, no sequence.
+    // Its one write goes through the WAL -- a key above the store's
+    // greatest opens a direct run otherwise, whose temp file the open
+    // recovers and publishes, a sequence of its own.
+    let d2 = dir("manifest-slots-v1");
+    let opts = Options {
+        direct_ingest: false,
+        ..opts
+    };
+    let mut db = Db::create(&d2, opts.clone()).unwrap();
+    db.append(b"only", b"walled");
+    db.commit().unwrap();
+    drop(db);
+    let body: Vec<u8> = [0u64.to_le_bytes().as_slice(), 0u32.to_le_bytes().as_slice()].concat();
+    let mut v1 = b"SUPDBMAN\x01".to_vec();
+    v1.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    v1.extend_from_slice(&crc32c(&body).to_le_bytes());
+    v1.extend_from_slice(&body);
+    std::fs::write(d2.join("manifest"), &v1).unwrap();
+    std::fs::remove_file(d2.join("manifest.alt")).unwrap();
+    let mut db = Db::open(&d2, opts).unwrap();
+    assert_eq!(
+        db.manifest_seq(),
+        0,
+        "a version-1 manifest is sequence zero"
+    );
+    assert_eq!(
+        read_vec(&db, b"only"),
+        vec![b"walled".to_vec()],
+        "the WAL replayed"
+    );
+    assert!(
+        d2.join("manifest.alt").is_file(),
+        "the open made the second slot"
+    );
+    for k in 0..2000u32 {
+        db.append(key(k).as_bytes(), b"v0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    assert!(db.manifest_seq() >= 1);
+    assert!(!d2.join("manifest.tmp").exists());
+    let (_, newest) = newest_manifest(&d2);
+    assert_eq!(manifest_seq_of(&newest), Some(db.manifest_seq()));
+}
+
+/// CRC-32C over `data`, bitwise, for a test to make a manifest by hand.
+fn crc32c(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0x82F6_3B78
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }
 
 #[test]
@@ -8082,7 +8308,7 @@ fn a_segment_the_manifest_does_not_name_is_swept_and_its_wal_replayed() {
     for name in &moved {
         std::fs::copy(d2.join(name), d.join(name)).unwrap();
     }
-    let manifest = std::fs::read(d.join("manifest")).unwrap();
+    let manifest = manifest_bytes(&d);
     for name in &moved {
         assert!(
             !contains(&manifest, name.as_bytes()),
@@ -8148,7 +8374,7 @@ fn a_failed_landing_stops_the_seals_behind_it_and_a_reopen_replays_them() {
     db.commit().unwrap();
     db.sync().unwrap();
     assert!(db.in_flight().0, "two seals in flight, both held");
-    let manifest_before = std::fs::read(d.join("manifest")).unwrap();
+    let manifest_before = manifest_bytes(&d);
     db.fail_next_landing();
     db.hold_seal_landing(false);
     assert!(
@@ -8157,7 +8383,7 @@ fn a_failed_landing_stops_the_seals_behind_it_and_a_reopen_replays_them() {
     );
     assert!(db.seals_wedged(), "the seals behind the failed one stopped");
     assert_eq!(
-        std::fs::read(d.join("manifest")).unwrap(),
+        manifest_bytes(&d),
         manifest_before,
         "no manifest covers the failed seal's sequence"
     );
@@ -8207,7 +8433,7 @@ fn a_store_from_before_manifests_opens_from_its_segment_names() {
     db.commit().unwrap();
     model.insert(b"after".to_vec(), vec![b"walled".to_vec()]);
     drop(db);
-    std::fs::remove_file(d.join("manifest")).unwrap();
+    remove_manifests(&d);
     let segs: Vec<String> = segment_files(&d)
         .into_iter()
         .filter(|n| n.ends_with(".sup"))
@@ -8276,7 +8502,7 @@ fn a_merge_that_finishes_while_a_seal_is_between_its_phases_lands_after_it() {
     }
     wait_for("the merge's start", || db.in_flight().1);
     assert_eq!(db.levels(), (1, 2));
-    let manifest_before = std::fs::read(d.join("manifest")).unwrap();
+    let manifest_before = manifest_bytes(&d);
     // The third piece, held between its phases: published, not durable.
     db.hold_seal_durable(true);
     for i in 0..10 {
@@ -8301,7 +8527,7 @@ fn a_merge_that_finishes_while_a_seal_is_between_its_phases_lands_after_it() {
     });
     assert!(db.in_flight().1, "the merge is not landed in the window");
     assert_eq!(
-        std::fs::read(d.join("manifest")).unwrap(),
+        manifest_bytes(&d),
         manifest_before,
         "no manifest is written while the seal is between its phases"
     );
@@ -8314,7 +8540,7 @@ fn a_merge_that_finishes_while_a_seal_is_between_its_phases_lands_after_it() {
         (1, 1),
         "the merge landed after the seal: a new partition, the third piece kept"
     );
-    let manifest_after = std::fs::read(d.join("manifest")).unwrap();
+    let manifest_after = manifest_bytes(&d);
     assert_ne!(manifest_after, manifest_before, "the landings wrote it");
     let check = |db: &Reader, state: &str| {
         let mut seen: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
@@ -10108,7 +10334,7 @@ fn a_handed_tables_log_is_retired_at_its_landing_and_replays_before_it() {
         // ordered run rotates nothing, so its id is not fixed here.
         let wal1 = db.wal_durable().0;
         let saved_wal = std::fs::read(&wal1).unwrap();
-        let saved_manifest = std::fs::read(d.join("manifest")).unwrap();
+        let saved_manifest = manifest_bytes(&d);
         db.sync().unwrap();
         let wal2 = db.wal_durable().0;
         assert_ne!(wal1, wal2, "the hand-off rotated the WAL");
@@ -10141,7 +10367,7 @@ fn a_handed_tables_log_is_retired_at_its_landing_and_replays_before_it() {
         drop(db);
         // Before the manifest: the piece is an orphan and the WAL replays.
         std::fs::write(&wal1, &saved_wal).unwrap();
-        std::fs::write(d.join("manifest"), &saved_manifest).unwrap();
+        restore_manifest(&d, &saved_manifest);
         let db = Db::open(&d, opts()).unwrap();
         assert_eq!(db.levels(), (1, 0), "the piece swept");
         assert_eq!(db.unsealed_keys(), 2000, "the WAL replayed the tail");
@@ -10165,7 +10391,7 @@ fn a_handed_tables_log_is_retired_at_its_landing_and_replays_before_it() {
             .collect();
         assert_eq!(tmp.len(), 1, "the tail's open run: {tmp:?}");
         let saved_tmp = std::fs::read(&tmp[0]).unwrap();
-        let saved_manifest = std::fs::read(d.join("manifest")).unwrap();
+        let saved_manifest = manifest_bytes(&d);
         // The partition as the old manifest names it: a promotion links it
         // under a name with its fence closed and unlinks this one after
         // the manifest, so the window before the manifest still has it.
@@ -10207,7 +10433,7 @@ fn a_handed_tables_log_is_retired_at_its_landing_and_replays_before_it() {
         // thread may already have promoted again.
         std::fs::write(&tmp[0], &saved_tmp).unwrap();
         std::fs::write(&old_part, &saved_part).unwrap();
-        std::fs::write(d.join("manifest"), &saved_manifest).unwrap();
+        restore_manifest(&d, &saved_manifest);
         let db = Db::open(&d, opts()).unwrap();
         let lv = db.levels();
         assert!(
@@ -10952,7 +11178,7 @@ fn a_closed_wal_outlives_a_seal_between_its_phases_and_a_crash_there() {
     let wals = wal_files(&d);
     assert_eq!(wals.len(), 2, "the closed file and the live one: {wals:?}");
     let closed = wals[0].clone();
-    let manifest = std::fs::read(d.join("manifest")).unwrap();
+    let manifest = manifest_bytes(&d);
     db.hold_seal_durable(true);
     db.seal().unwrap();
     wait_for("the seal's publish", || db.levels() != (0, 0));
@@ -10962,7 +11188,7 @@ fn a_closed_wal_outlives_a_seal_between_its_phases_and_a_crash_there() {
         "the closed file outlives the undurable seal"
     );
     assert_eq!(
-        std::fs::read(d.join("manifest")).unwrap(),
+        manifest_bytes(&d),
         manifest,
         "no manifest while the seal is between its phases"
     );

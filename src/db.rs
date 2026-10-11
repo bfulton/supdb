@@ -1279,6 +1279,23 @@ pub struct Options {
     /// throughout either way. Off, the rename that frees, kept for pricing
     /// as `supdb-manifestfree` and `supdb-ingestmanifestfree`.
     pub manifest_spare: bool,
+    /// Whether the manifest is two slot files written alternately in
+    /// place, each publish a sequence past the last and the slot the
+    /// sequence's parity, the open taking the newest slot whose checksum
+    /// holds. A publish is then one fsync: no temp file, no rename and no
+    /// directory fsync, since both slots exist from the store's birth or
+    /// its first open under this; the directory fsync a seal's new names
+    /// need moves to the seal's readable landing, beside its thread's
+    /// fsync of their data (`Maint::land_readable`). A publish torn by a
+    /// crash is the slot the open ignores, and the other slot is the store as the publish
+    /// before it left it, which is what the rename gave. Off, the rename
+    /// shape -- the manifest written to a temp name, fsynced, renamed over
+    /// the old one and the directory fsynced, two device round trips more
+    /// a landing -- kept for pricing as `supdb-manifestrename` and
+    /// `supdb-ingestmanifestrename`. A store written under either shape
+    /// opens under either: a version-1 manifest reads as sequence zero
+    /// and the open makes the slot it lacks.
+    pub manifest_slots: bool,
     /// Whether a segment's ordered index is fsynced when it is written. The
     /// index is a function of the segment's keys and nothing else, so a
     /// store that finds it missing, torn or describing another segment at
@@ -1558,6 +1575,7 @@ impl Default for Options {
             copy_exact: true,
             drain_names_partition: true,
             manifest_spare: true,
+            manifest_slots: true,
             ord_durable: false,
             direct_table_refs: false,
             direct_map_bytes: 0,
@@ -6094,14 +6112,32 @@ fn check_options(opts: &Options) -> Result<()> {
 ///
 /// A compaction writes new files and retires old ones, and a crash between
 /// those two acts would otherwise leave both on disk -- every merged record
-/// readable twice. The manifest is the swap point: it is written to a temp
-/// name, fsynced, renamed over the old one and the directory fsynced, so a
-/// reopen sees exactly one of the two sets. Segment files not named by it
-/// are orphans from an interrupted job and are deleted at open.
+/// readable twice. The manifest is the swap point: a publish writes one of
+/// two slot files in place and fsyncs it, each publish a sequence past the
+/// last and the slot the sequence's parity, and an open takes the newest
+/// valid slot, so a reopen sees exactly one of the two sets and a publish
+/// torn by a crash is the slot it ignores (`Options::manifest_slots`). The
+/// shape before it wrote a temp name, renamed it over the old manifest and
+/// fsynced the directory, three device round trips a landing where this is
+/// one; it is kept as the arm that prices it. Segment files not named by
+/// the manifest are orphans from an interrupted job and are deleted at
+/// open.
 ///
-/// `SUPDBMAN\x01 | u32 body_len | u32 crc | body`, body being the covered
-/// WAL sequence and then each live segment's name.
-const MANIFEST_MAGIC: &[u8; 9] = b"SUPDBMAN\x01";
+/// `SUPDBMAN\x02 | u64 publish_seq | u32 body_len | u32 crc | body`, body
+/// being the covered WAL sequence and then each live segment's name, and
+/// the CRC over the sequence and the body. Version 1, `SUPDBMAN\x01 | u32
+/// body_len | u32 crc | body`, had no sequence and one file; it is read as
+/// a sequence of zero, and a store that has one gets its second slot at
+/// the open.
+const MANIFEST_MAGIC: &[u8; 9] = b"SUPDBMAN\x02";
+const MANIFEST_MAGIC_V1: &[u8; 9] = b"SUPDBMAN\x01";
+/// The two slot files a publish alternates between.
+const MANIFEST_SLOTS: [&str; 2] = ["manifest", "manifest.alt"];
+
+/// The slot a publish of sequence `seq` writes.
+fn manifest_slot(seq: u64) -> &'static str {
+    MANIFEST_SLOTS[(seq % 2) as usize]
+}
 
 /// The spare names a manifest publish leaves for the sweep
 /// (`Options::manifest_spare`), each unique, so two publishes close
@@ -6125,17 +6161,8 @@ fn sweep_manifest_spares(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The manifest written, fsynced and renamed into place, and the directory
-/// fsynced. With `spare`, the manifest it replaces is first linked under a
-/// spare name so that the rename frees no inode, and that name is returned
-/// for the caller to unlink off every waiter's path; see
-/// `Options::manifest_spare`.
-fn manifest_write(
-    dir: &Path,
-    covered_seq: u64,
-    names: &[String],
-    spare: bool,
-) -> Result<Option<PathBuf>> {
+/// A manifest's bytes: the header, then the covered sequence and the names.
+fn manifest_encode(seq: u64, covered_seq: u64, names: &[String]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&covered_seq.to_le_bytes());
     body.extend_from_slice(&(names.len() as u32).to_le_bytes());
@@ -6143,19 +6170,92 @@ fn manifest_write(
         body.extend_from_slice(&(n.len() as u16).to_le_bytes());
         body.extend_from_slice(n.as_bytes());
     }
-    let mut out = Vec::with_capacity(body.len() + 17);
+    let crc = block::crc32_resume(crc32(&seq.to_le_bytes()), &body);
+    let mut out = Vec::with_capacity(body.len() + 25);
     out.extend_from_slice(MANIFEST_MAGIC);
+    out.extend_from_slice(&seq.to_le_bytes());
     out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    out.extend_from_slice(&crc32(&body).to_le_bytes());
+    out.extend_from_slice(&crc.to_le_bytes());
     out.extend_from_slice(&body);
+    out
+}
 
+/// The manifest of sequence `seq` written into its slot in place and
+/// fsynced: one device round trip, no rename and no directory fsync, since
+/// both slots exist from the store's birth or its first open under them.
+/// The slot is never truncated -- a truncate frees blocks, and a freed
+/// block is a discard round trip here -- so a shorter manifest leaves the
+/// old one's tail behind it, past the length the header names.
+fn manifest_write_slot(dir: &Path, seq: u64, covered_seq: u64, names: &[String]) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+    let out = manifest_encode(seq, covered_seq, names);
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(manifest_slot(seq)))?;
+    f.write_all_at(&out, 0)?;
+    f.sync_data()?;
+    Ok(())
+}
+
+/// The slot files a store under `Options::manifest_slots` needs, made where
+/// missing -- a store born under the rename shape has one -- and the
+/// directory fsynced once for them, so no publish after creates an entry.
+fn manifest_make_slots(dir: &Path) -> Result<()> {
+    let mut made = false;
+    for slot in MANIFEST_SLOTS {
+        let path = dir.join(slot);
+        if !path.exists() {
+            File::create(path)?;
+            made = true;
+        }
+    }
+    if made {
+        File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// The manifest written by whichever shape the options name: the slot, or
+/// the temp name renamed into place with the directory fsynced, the spare
+/// it leaves (`manifest_write`) unlinked here, where no landing waits.
+fn manifest_write_shape(
+    dir: &Path,
+    opts: &Options,
+    seq: u64,
+    covered_seq: u64,
+    names: &[String],
+) -> Result<()> {
+    if opts.manifest_slots {
+        return manifest_write_slot(dir, seq, covered_seq, names);
+    }
+    if let Some(spare) = manifest_write(dir, seq, covered_seq, names, false)? {
+        let _ = std::fs::remove_file(spare);
+    }
+    Ok(())
+}
+
+/// The shape before the slots: the manifest written to a temp name,
+/// fsynced and renamed over `manifest`, and the directory fsynced. With
+/// `spare`, the manifest it replaces is first linked under a spare name so
+/// that the rename frees no inode, and that name is returned for the
+/// caller to unlink off every waiter's path; see `Options::manifest_spare`.
+fn manifest_write(
+    dir: &Path,
+    seq: u64,
+    covered_seq: u64,
+    names: &[String],
+    spare: bool,
+) -> Result<Option<PathBuf>> {
+    let out = manifest_encode(seq, covered_seq, names);
     let tmp = dir.join("manifest.tmp");
     {
         let mut f = File::create(&tmp)?;
         f.write_all(&out)?;
         f.sync_all()?;
     }
-    let cur = dir.join("manifest");
+    let cur = dir.join(MANIFEST_SLOTS[0]);
     let kept = if spare {
         let name = format!(
             "manifest.prev-{}",
@@ -6176,27 +6276,39 @@ fn manifest_write(
     Ok(kept)
 }
 
-/// `None` when no manifest exists -- a store that has never sealed, or one
-/// written before manifests. A manifest that fails its CRC is a torn write
-/// of the file that is supposed to be atomic, so it is refused rather than
-/// guessed at.
-fn manifest_read(dir: &Path) -> Result<Option<(u64, Vec<String>)>> {
-    let mut buf = Vec::new();
-    match File::open(dir.join("manifest")) {
-        Ok(mut f) => f.read_to_end(&mut buf)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    if buf.len() < 17 || &buf[..9] != MANIFEST_MAGIC {
+/// What a manifest names: its publish sequence, the WAL sequence it
+/// covers, and the live segments.
+struct Manifest {
+    seq: u64,
+    covered: u64,
+    names: Vec<String>,
+}
+
+/// One manifest file parsed, either version. A file that fails its CRC is
+/// a torn write and is refused.
+fn manifest_parse(buf: &[u8]) -> Result<Manifest> {
+    let (seq, at) = if buf.len() >= 25 && &buf[..9] == MANIFEST_MAGIC {
+        (u64::from_le_bytes(buf[9..17].try_into().unwrap()), 17usize)
+    } else if buf.len() >= 17 && &buf[..9] == MANIFEST_MAGIC_V1 {
+        (0u64, 9usize)
+    } else {
         return Err(err("manifest magic is wrong"));
-    }
-    let len = u32::from_le_bytes(buf[9..13].try_into().unwrap()) as usize;
-    let crc = u32::from_le_bytes(buf[13..17].try_into().unwrap());
+    };
+    let len = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()) as usize;
+    let crc = u32::from_le_bytes(buf[at + 4..at + 8].try_into().unwrap());
     let body = buf
-        .get(17..17 + len)
+        .get(at + 8..at + 8 + len)
         .ok_or_else(|| err("manifest is truncated"))?;
-    if crc32(body) != crc {
+    let want = if at == 17 {
+        block::crc32_resume(crc32(&seq.to_le_bytes()), body)
+    } else {
+        crc32(body)
+    };
+    if want != crc {
         return Err(err("manifest failed its checksum"));
+    }
+    if body.len() < 12 {
+        return Err(err("manifest is truncated"));
     }
     let covered = u64::from_le_bytes(body[..8].try_into().unwrap());
     let n = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
@@ -6216,7 +6328,47 @@ fn manifest_read(dir: &Path) -> Result<Option<(u64, Vec<String>)>> {
         names.push(String::from_utf8(raw.to_vec()).map_err(|_| err("manifest name is not utf8"))?);
         p += l;
     }
-    Ok(Some((covered, names)))
+    Ok(Manifest {
+        seq,
+        covered,
+        names,
+    })
+}
+
+/// The newest valid manifest of the two slots, by publish sequence. `None`
+/// when neither exists -- a store that has never sealed, or one written
+/// before manifests. An empty slot is one made and never written. A slot
+/// that fails its CRC is a torn write: ignored where the other slot is
+/// valid, since the torn one is the publish the crash interrupted and the
+/// other is the store, and refused where no slot is valid rather than
+/// guessed at.
+fn manifest_read(dir: &Path) -> Result<Option<Manifest>> {
+    let mut best: Option<Manifest> = None;
+    let mut torn: Option<std::io::Error> = None;
+    for slot in MANIFEST_SLOTS {
+        let mut buf = Vec::new();
+        match File::open(dir.join(slot)) {
+            Ok(mut f) => f.read_to_end(&mut buf)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if buf.is_empty() {
+            continue;
+        }
+        match manifest_parse(&buf) {
+            Ok(m) => {
+                if best.as_ref().is_none_or(|b| m.seq > b.seq) {
+                    best = Some(m);
+                }
+            }
+            Err(e) => torn = Some(e),
+        }
+    }
+    match (best, torn) {
+        (Some(m), _) => Ok(Some(m)),
+        (None, Some(e)) => Err(e),
+        (None, None) => Ok(None),
+    }
 }
 
 /// The partitioning merge, run on a background thread.
@@ -7937,6 +8089,10 @@ struct Shared {
     /// Direct runs whose mapping was grown past the file's end
     /// (`Options::direct_table_refs`); see `Db::run_remaps`.
     run_remaps: AtomicU64,
+    /// The sequence of the last manifest the store published, stored by
+    /// the publish once the slot or the rename is durable; see
+    /// `Db::manifest_seq`.
+    manifest_seq: AtomicU64,
     /// Patches that found the form shared with a published copy and had
     /// to copy it before writing (`Arc::make_mut` on a shared form).
     forms_cloned: AtomicU64,
@@ -16053,7 +16209,12 @@ impl Db {
         // syncs after (`Db::seal`), so a crash between leaves a `seg-`
         // file that may be torn, and the manifest is what says it is not
         // the store's. The scan stays for stores written before manifests.
-        manifest_write(dir, 0, &[], false)?;
+        if opts.manifest_slots {
+            manifest_write_slot(dir, 0, 0, &[])?;
+            manifest_make_slots(dir)?;
+        } else {
+            manifest_write(dir, 0, 0, &[], false)?;
+        }
         let segs: Vec<std::sync::Arc<Seg>> = Vec::new();
         let mean_key_bytes = 0;
         let store_bytes = 0;
@@ -16105,6 +16266,7 @@ impl Db {
             convert_total_ns: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(0),
             run_remaps: AtomicU64::new(0),
+            manifest_seq: AtomicU64::new(0),
             forms_cloned: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
@@ -16168,7 +16330,13 @@ impl Db {
             len_bound: std::cell::Cell::new(usize::MAX),
             force_due: std::cell::Cell::new(false),
         };
-        let maint = MaintHome::Here(Box::new(Maint::new(r.maint_reader()?, dir, 0, Vec::new())));
+        let maint = MaintHome::Here(Box::new(Maint::new(
+            r.maint_reader()?,
+            dir,
+            0,
+            Vec::new(),
+            0,
+        )));
         let mut db = Db {
             r,
             maint,
@@ -16229,8 +16397,14 @@ impl Db {
         }
         let manifest = manifest_read(dir)?;
         let had_manifest = manifest.is_some();
+        // The publish sequence the store is at, moved by every manifest
+        // written here and handed to the segment work.
+        let mut mseq = manifest.as_ref().map_or(0, |m| m.seq);
+        if opts.manifest_slots {
+            manifest_make_slots(dir)?;
+        }
         let (sealed, mut live) = match manifest {
-            Some((covered, names)) => (covered, names),
+            Some(m) => (m.covered, m.names),
             None => {
                 let mut names: Vec<String> = on_disk
                     .iter()
@@ -16256,7 +16430,8 @@ impl Db {
         // file the scan above trusts, skipping the WAL that holds the
         // same writes.
         if !had_manifest {
-            manifest_write(dir, sealed, &live, false)?;
+            mseq += 1;
+            manifest_write_shape(dir, &opts, mseq, sealed, &live)?;
         }
         // A direct segment a crash left open: its records up to the last
         // commit marker are the batches that were acknowledged, rewritten
@@ -16315,7 +16490,8 @@ impl Db {
             std::fs::rename(&rebuilt, dir.join(&name))?;
             File::open(dir)?.sync_all()?;
             live.push(name);
-            manifest_write(dir, sealed, &live, false)?;
+            mseq += 1;
+            manifest_write_shape(dir, &opts, mseq, sealed, &live)?;
             let _ = std::fs::remove_file(&tmp);
         }
         // The same for ordered indexes, which outlive their segment by a
@@ -16476,6 +16652,7 @@ impl Db {
             convert_total_ns: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(ord_rebuilt),
             run_remaps: AtomicU64::new(0),
+            manifest_seq: AtomicU64::new(0),
             forms_cloned: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
             forms_rebased: AtomicU64::new(0),
@@ -16544,6 +16721,7 @@ impl Db {
             dir,
             sealed,
             retiring,
+            mseq,
         )));
         let mut db = Db {
             r,
@@ -17204,9 +17382,10 @@ impl Db {
             if ord_durable {
                 ordf.sync_all()?;
             }
-            // The directory's entries are made durable by the publish that
-            // names the segment in the manifest, before the WAL retires; a
-            // sync here as well was one more device round trip a drain
+            // The directory's entry is made durable by the segment work,
+            // at the readable landing or by the publish that names the
+            // segment (`Options::manifest_slots`), before the WAL retires;
+            // a sync here as well was one more device round trip a drain
             // waited for.
             Ok(names)
         };
@@ -17603,8 +17782,9 @@ impl Db {
                 }
             }
             SealCounts::add(&counts.seal_thread_ns, t_job.elapsed().as_nanos() as u64);
-            // The directory's entries are made durable by the publish that
-            // names the segments in the manifest, before the WAL retires.
+            // The directory's entries are made durable by the segment work,
+            // at the readable landing or by the publish that names the
+            // segments (`Options::manifest_slots`), before the WAL retires.
             Ok(names)
         };
         self.hand_seal(job, table, retiring, None);
@@ -20995,6 +21175,15 @@ impl Db {
         self.shared.ord_rebuilt.load(AtomicOrdering::Relaxed)
     }
 
+    /// The sequence of the last manifest this store published
+    /// (`Options::manifest_slots`): what the open read, plus one for every
+    /// publish since. A landing in flight counts once it has published;
+    /// `settle` first for the count of everything handed over.
+    #[doc(hidden)]
+    pub fn manifest_seq(&self) -> u64 {
+        self.shared.manifest_seq.load(AtomicOrdering::Acquire)
+    }
+
     /// Direct runs whose segment mapping the writer grew past the file's
     /// end, over this store's life (`Options::direct_table_refs`).
     pub fn run_remaps(&self) -> u64 {
@@ -22895,6 +23084,11 @@ struct Maint {
     /// the model oracle as "wal sequence gap: a durable record is missing"
     /// on the reopen after a merge. A durability bound may only ever rise.
     covered_seq: u64,
+    /// The sequence of the last manifest written, every publish one past
+    /// it and the slot it writes the sequence's parity
+    /// (`Options::manifest_slots`); the open reads it from the manifest it
+    /// took and hands it here with the manifests it wrote itself counted.
+    manifest_seq: u64,
     /// A partitioning merge in flight. Its inputs stay live and readable
     /// until the manifest names its outputs instead, which is what makes
     /// the swap atomic across a crash.
@@ -23236,11 +23430,21 @@ impl Maint {
         }
     }
 
-    fn new(r: Reader, dir: &Path, covered_seq: u64, retiring_wals: Vec<PathBuf>) -> Maint {
+    fn new(
+        r: Reader,
+        dir: &Path,
+        covered_seq: u64,
+        retiring_wals: Vec<PathBuf>,
+        manifest_seq: u64,
+    ) -> Maint {
+        r.shared
+            .manifest_seq
+            .store(manifest_seq, AtomicOrdering::Release);
         Maint {
             r,
             dir: dir.to_path_buf(),
             covered_seq,
+            manifest_seq,
             retiring_wals,
             retiring_tmps: Vec::new(),
             spares: Vec::new(),
@@ -23487,6 +23691,19 @@ impl Maint {
         self.publish_segs_with(segs, false, Some(table));
         for name in names {
             self.covered_seq = self.covered_seq.max(Db::name_end_seq(name).unwrap_or(0));
+        }
+        if self.opts.manifest_slots {
+            // The segments' directory entries -- the seal's renames, the
+            // direct run's link -- made durable here, after the readers
+            // have them and while the seal's thread fsyncs the segments'
+            // data: the two wait on one journal commit where the
+            // filesystem orders them so, and the publish at phase D then
+            // writes its slot alone. Under the rename shape the publish's
+            // own directory fsync does this. An fsync that fails here
+            // leaves the segments published and unnamed, which is the
+            // state a crash before the publish leaves: the WAL holds the
+            // writes, and the seal is wedged by the caller.
+            File::open(&self.dir)?.sync_all()?;
         }
         Ok(())
     }
@@ -24282,12 +24499,32 @@ impl Maint {
             "a manifest written while a seal's segments are published and not durable"
         );
         SealCounts::add(&self.shared.seal_counts.publishes, 1);
+        self.manifest_seq += 1;
+        if self.opts.manifest_slots {
+            // The slot alone: the seal's directory entries were made
+            // durable at its readable landing (`land_readable`), and a
+            // merge's or a promotion's by the job itself before this.
+            manifest_write_slot(
+                &self.dir,
+                self.manifest_seq,
+                self.covered_seq,
+                &self.live_names(),
+            )?;
+            self.shared
+                .manifest_seq
+                .store(self.manifest_seq, AtomicOrdering::Release);
+            return Ok(());
+        }
         let spare = manifest_write(
             &self.dir,
+            self.manifest_seq,
             self.covered_seq,
             &self.live_names(),
             self.opts.manifest_spare,
         )?;
+        self.shared
+            .manifest_seq
+            .store(self.manifest_seq, AtomicOrdering::Release);
         if let Some(p) = spare {
             if self.wake.is_some() {
                 // On a thread of its own: unlinked at the idle tick, off the
