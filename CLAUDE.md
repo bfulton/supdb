@@ -1406,6 +1406,29 @@ intended behaviour has been measured by nothing; fix the measure, but
 price the intended behaviour as a new shape against the one the rows
 know before making it the default.
 
+**A first look that read nothing, trusting what came next to cover
+it.** A handle's first scan reads the write log to list the slots
+created since its snapshot, and a handle with no snapshot yet skipped
+the read: the snapshot it builds next covers every entry, so the list
+would be empty anyway. A snapshot it *adopts* may stop short of the
+memtable by up to `snapshot_adopt_behind` slots, and the switch to it
+trimmed the list to the slots past its end -- an empty list trimmed is
+empty, and the newest keys were gone from every scan of that handle
+while the point read beside them, through the memtable, was right. It
+surfaced one run in a hundred or two under eight-process load, because
+the upkeep thread's pass normally published a longer snapshot and the
+forms first, and under load the niced thread had made no pass when the
+handle was claimed. The diagnostic that named it printed the key's every
+source on the failing scan: the adopted snapshot's length, the handle's
+empty added list, and no form published. The list is made from the slot
+range now, the snapshot's end to the handle's bound, which is what the
+log read would have listed. The rule: an invariant one path keeps by
+construction is not kept by a path that skips the construction, so a
+shortcut taken on one assumption is checked wherever a later step
+depends on what the shortcut did not do; and a race that a background
+thread's work hides is reproduced by taking that work away, not by
+waiting for the timing.
+
 **A sentinel that crosses the wasm boundary changes sign.** A wasm `u32`
 arrives in JavaScript as a signed i32, so a failure sentinel of `u32::MAX`
 arrives as -1 and a comparison against 4294967295 can never match. Every

@@ -11494,10 +11494,11 @@ impl Reader {
         }
         let file = self.fs().cache_used.get();
         // A handle with no snapshot and no tables has nothing to file: the
-        // snapshot it builds or adopts next covers every entry there is,
-        // and the keys created since it is exactly what this loop lists.
-        // Read in full, the log's two thousand entries at ten thousand
-        // keys were twenty microseconds of a handle's first scan.
+        // snapshot it builds next covers every entry there is, and one it
+        // adopts short lists the slots past it from their range at the
+        // switch (`refresh_snapshot_to`), which is what this loop would
+        // list. Read in full, the log's two thousand entries at ten
+        // thousand keys were twenty microseconds of a handle's first scan.
         if !file && self.fs().scan_keys.borrow().is_none() && self.fs().ahead.borrow().is_none() {
             self.fs().log_seen.set(n);
             return true;
@@ -12926,12 +12927,23 @@ impl Reader {
             };
             // The keys the snapshot has are not added keys; an adopted
             // one may stop short of the memtable's end, and the slots
-            // past where it stops stay in the list for the tables.
+            // past where it stops are the added list for the tables. The
+            // list is made from the slots themselves, every one from the
+            // snapshot's end to this handle's: a slot is created once, in
+            // log order, so that range is what a read of the log past the
+            // snapshot would list -- and a handle on its first scan, with
+            // no snapshot yet, reads no log at all (`sync_log`), so the
+            // list it trimmed here was empty, and a snapshot adopted short
+            // (`Options::snapshot_adopt_behind`) lost every key created
+            // past it: the newest keys, in one run of a hundred under
+            // load, whenever the upkeep thread had made no pass to publish
+            // a longer one.
             self.fs().snap_entries.set(snap.live_len);
-            self.fs()
-                .snap_added
-                .borrow_mut()
-                .retain(|&slot| slot as usize >= snap.live_len);
+            {
+                let mut added = self.fs().snap_added.borrow_mut();
+                added.clear();
+                added.extend((snap.live_len..live_len).map(|slot| slot as u32));
+            }
             // The stale set is the log from the runs' copy to where this
             // handle has read it; what it reads on is added as it goes.
             {

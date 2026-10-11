@@ -5702,7 +5702,13 @@ fn every_handle_after_the_first_adopts_the_snapshot_it_published() {
 /// created since stay in the handle's added list, keyed by the length
 /// the snapshot it took covers rather than by the length it would have
 /// built at. Getting that wrong loses exactly the newest keys, which no
-/// scan of a store written and read in one go would show.
+/// scan of a store written and read in one go would show. The writer's
+/// forms are off here so the handle has nothing but the snapshot to read
+/// the memtable through: with them on, the short adoption was reached
+/// only when the upkeep thread had made no pass to publish a longer
+/// snapshot or the forms, one run in a hundred under load, and the
+/// handle's empty added list -- its first scan reads no log -- lost the
+/// newest keys there and nowhere else.
 #[test]
 fn a_handle_that_adopts_a_snapshot_sees_the_keys_written_past_it() {
     let d = dir("share-snap-past");
@@ -5716,6 +5722,7 @@ fn a_handle_that_adopts_a_snapshot_sees_the_keys_written_past_it() {
         // Wide enough that the writes below leave the published snapshot
         // adoptable, which is what this test is about.
         snapshot_adopt_behind: 4096,
+        commit_forms: false,
         ..Options::default()
     };
     let mut db = Db::create(&d, opts).unwrap();
@@ -5749,6 +5756,38 @@ fn a_handle_that_adopts_a_snapshot_sees_the_keys_written_past_it() {
     m.delete(&mut db, &key(9));
     db.commit().unwrap();
     let next = db.reader().unwrap();
+    // The scan the model's check fails on first when the handle streams
+    // the adopted snapshot's copy of a key the last commit rewrote: named
+    // here with the key's every source, since the check's own message
+    // says only which value came back.
+    let mut got: Vec<(String, String)> = Vec::new();
+    next.scan(key(0).as_bytes(), 2, |k, v| {
+        got.push((
+            String::from_utf8_lossy(k).into_owned(),
+            String::from_utf8_lossy(v).into_owned(),
+        ))
+    })
+    .unwrap();
+    let want: Vec<(String, String)> = [(0, "v0"), (0, "v1"), (1, "v0"), (1, "v2")]
+        .iter()
+        .map(|(k, v)| (key(*k), v.to_string()))
+        .collect();
+    if got != want {
+        let k1 = key(1);
+        panic!(
+            "the handle's first scan streamed {got:?} for {want:?}; handle: {}; writer: {}; \
+             forms at {} (MAX is unset), builds {} (published at {published}), handle forms \
+             (forms, bytes, takes, complete) {:?}, kinds clean/sparse/copies/wide {:?}, upkeep \
+             counts {:?}",
+            next.debug_key(k1.as_bytes()),
+            db.debug_key(k1.as_bytes()),
+            db.forms_position(),
+            db.snapshot_builds(),
+            next.canonical_forms(),
+            next.block_cache_kinds(),
+            db.upkeep_counts(),
+        );
+    }
     m.check(
         &next,
         "a handle over a snapshot from before the last writes",
