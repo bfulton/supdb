@@ -402,7 +402,13 @@ behind an atomic would let one in unasked.
 its block tables and scan snapshot -- to a thread of the store's own and
 returns without waiting for it; at level 2 (`supdb-hold`) a commit that
 would leave its batch to the next scan returns only once the thread has
-filed it. One thread holds it at a time, and one word says which:
+filed it. A commit with no fsync to work beside lends nothing of a
+burst's batch while reads are around and files it itself
+(`Options::upkeep_inline_bursts`): the thread's window is the barrier,
+and a buffered burst of one commit left it none, so the burst's whole
+filing fell to the first scan after it -- the buffered lag cells read
+0.2-0.6x of LMDB with the scans themselves at the drained store's rate.
+`supdb-ingestlendbursts` is the arm that lends anyway. One thread holds it at a time, and one word says which:
 every hand-over is a single operation on that word, the side giving it
 up fills the cell before it and the side taking it empties the cell
 after, so nothing in it needs to be `Sync`. A writer's touch of it takes

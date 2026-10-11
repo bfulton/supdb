@@ -443,6 +443,36 @@ fn the_oracle_holds_with_the_lag_bounded_and_the_passes_batched() {
     );
 }
 
+/// And on a buffered store, whose commits near reads file a burst's
+/// batch themselves (`Options::upkeep_inline_bursts`) and lend the thread
+/// only the batches too small to wake it for.
+#[test]
+fn the_oracle_holds_on_a_buffered_store_filing_its_bursts() {
+    let _ = oracle_in(
+        "oracle-inlinebursts",
+        Options {
+            upkeep_inline_bursts: true,
+            sync: supdb::SyncPolicy::EveryN(u32::MAX),
+            upkeep: supdb::Upkeep::Background(1),
+            ..Options::default()
+        },
+    );
+}
+
+/// And the same store lending every batch, the shape before it.
+#[test]
+fn the_oracle_holds_on_a_buffered_store_that_lends_every_batch() {
+    let _ = oracle_in(
+        "oracle-lendbursts",
+        Options {
+            upkeep_inline_bursts: false,
+            sync: supdb::SyncPolicy::EveryN(u32::MAX),
+            upkeep: supdb::Upkeep::Background(1),
+            ..Options::default()
+        },
+    );
+}
+
 /// The probe merge stays behind `cursor_merge` as the comparison arm -- and
 /// a path only one arm exercises is a path nothing tests.
 #[test]
@@ -4894,16 +4924,47 @@ fn reader_threads_over_pieces_only_forms_the_upkeep_thread_maintains() {
     reader_threads_over_blocks_with(true, supdb::Upkeep::Background(1), true);
 }
 
+/// The same on a buffered store, whose commits of four hundred near the
+/// threads' reads file their batch themselves and publish it before they
+/// return (`Options::upkeep_inline_bursts`), the commits of fifty lent.
+#[test]
+fn reader_threads_over_forms_a_buffered_writer_files_at_its_commits() {
+    reader_threads_over_blocks_on(true, supdb::Upkeep::Background(1), false, Some(true));
+}
+
+/// And the buffered store lending every batch, the shape before it.
+#[test]
+fn reader_threads_over_forms_a_buffered_writer_lends() {
+    reader_threads_over_blocks_on(true, supdb::Upkeep::Background(1), false, Some(false));
+}
+
 fn reader_threads_over_blocks(commit_forms: bool, upkeep: supdb::Upkeep) {
     reader_threads_over_blocks_with(commit_forms, upkeep, false)
 }
 
 fn reader_threads_over_blocks_with(commit_forms: bool, upkeep: supdb::Upkeep, pieces_only: bool) {
+    reader_threads_over_blocks_on(commit_forms, upkeep, pieces_only, None)
+}
+
+/// `buffered`: `None` for a durable store, `Some(files)` for one whose
+/// commits never sync, filing a burst's batch themselves or lending it.
+fn reader_threads_over_blocks_on(
+    commit_forms: bool,
+    upkeep: supdb::Upkeep,
+    pieces_only: bool,
+    buffered: Option<bool>,
+) {
     let d = dir(&format!(
-        "commit-forms-threads-{commit_forms}-{upkeep:?}-{pieces_only}"
+        "commit-forms-threads-{commit_forms}-{upkeep:?}-{pieces_only}-{buffered:?}"
     ));
     let opts = Options {
         upkeep,
+        sync: if buffered.is_some() {
+            supdb::SyncPolicy::EveryN(u32::MAX)
+        } else {
+            supdb::SyncPolicy::Always
+        },
+        upkeep_inline_bursts: buffered.unwrap_or(Options::default().upkeep_inline_bursts),
         seal_bytes: 32 << 10,
         partition_bytes: Some(64 << 10),
         l0_trigger: 2,
@@ -5156,6 +5217,168 @@ fn the_adaptive_upkeep_holds_only_for_what_a_commit_leaves_to_a_read() {
     write(&mut db, &mut want, 100, "c");
     assert_eq!(holds(&db), h + 1, "a batch too small to wake for does not");
     check(&db, &want, "after the three commits");
+}
+
+/// With `upkeep_inline_bursts`, a buffered commit near reads whose batch
+/// would wake the thread files the batch itself before it returns -- the
+/// forms stand at the commit's position with no pass run and no scan
+/// made -- and a batch too small to wake for is lent as ever, so the
+/// thread's pass is what takes it. Every write reads back through the
+/// writer and through a handle after each.
+#[test]
+fn a_buffered_commit_near_reads_files_its_burst_and_lends_a_small_batch() {
+    let d = dir("upkeep-inline-bursts");
+    let opts = Options {
+        upkeep: supdb::Upkeep::Background(1),
+        upkeep_inline_bursts: true,
+        sync: supdb::SyncPolicy::EveryN(u32::MAX),
+        partition_bytes: Some(256 << 10),
+        // The plain seal, so the few hundred writes below seal nothing.
+        seal_max_pct: 0,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    // The settle bound is 2% of the partitions' keys, 400: the batches
+    // below are under it, so nothing but the option files them at the
+    // commit.
+    let keys = 20_000u32;
+    let key = |k: u32| format!("key-{k:06}").into_bytes();
+    for k in 0..keys {
+        db.append(&key(k), b"0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+    // A handle live throughout: the forms are published only while one
+    // is, and the position they are published at is what says who filed.
+    let live = db.reader().unwrap();
+    let mut want: HashMap<u32, String> = HashMap::new();
+    let check = |db: &Db, want: &HashMap<u32, String>, when: &str| {
+        let verify = |k: &[u8], v: &[u8], who: &str| {
+            let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+            let got = std::str::from_utf8(v).unwrap();
+            let expect = want.get(&kn).map_or("0", |s| s.as_str());
+            assert_eq!(got, expect, "key {kn} {when} through {who}");
+        };
+        let mut seen = 0u32;
+        db.scan(&key(0), keys as usize, |k, v| {
+            verify(k, v, "the writer");
+            seen += 1;
+        })
+        .unwrap();
+        assert_eq!(seen, keys, "every key {when} through the writer");
+        let r = db.reader().unwrap();
+        let mut seen = 0u32;
+        r.scan(&key(0), keys as usize, |k, v| {
+            verify(k, v, "a handle");
+            seen += 1;
+        })
+        .unwrap();
+        assert_eq!(seen, keys, "every key {when} through a handle");
+    };
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    let mut write = |db: &mut Db, want: &mut HashMap<u32, String>, n: usize, v: &str| {
+        for _ in 0..n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let k = (x % keys as u64) as u32;
+            db.put(&key(k), v.as_bytes());
+            want.insert(k, v.to_string());
+        }
+        db.commit().unwrap();
+    };
+    let passes = |db: &Db| db.upkeep_counts()[0];
+    check(&db, &want, "before any write");
+    // Reads are around now. A commit the scan preceded files its batch by
+    // the commit's own rules whatever the option says; the second batch,
+    // with no scan since and under the bound, is the option's.
+    write(&mut db, &mut want, 300, "a");
+    let (p, at) = (passes(&db), db.forms_position());
+    write(&mut db, &mut want, 300, "b");
+    assert_eq!(passes(&db), p, "no pass of the thread filed the burst");
+    assert!(
+        db.forms_position() > at,
+        "the commit filed its own batch: forms at {} against {at}",
+        db.forms_position()
+    );
+    assert_eq!(db.upkeep_counts()[4], 0, "and held for nothing");
+    // A batch too small to wake the thread for is lent, and the thread's
+    // pass is what takes it -- by the commit's own rules, which leave a
+    // batch under the bound with no scan since to the next read.
+    write(&mut db, &mut want, 100, "c");
+    db.settle().unwrap();
+    assert!(passes(&db) > p, "the thread took the small batch");
+    check(&db, &want, "after the three commits");
+    drop(live);
+}
+
+/// A commit that syncs lends the same burst, option or no option: the
+/// thread works through the fsync, and holds for nothing. The forms stand
+/// at the commit's position once the thread has run.
+#[test]
+fn a_commit_that_syncs_lends_its_burst_to_the_thread() {
+    let d = dir("upkeep-inline-bursts-durable");
+    let opts = Options {
+        upkeep: supdb::Upkeep::Background(1),
+        upkeep_inline_bursts: true,
+        partition_bytes: Some(256 << 10),
+        seal_max_pct: 0,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let keys = 20_000u32;
+    let key = |k: u32| format!("key-{k:06}").into_bytes();
+    for k in 0..keys {
+        db.append(&key(k), b"0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+    let live = db.reader().unwrap();
+    let mut want: HashMap<u32, String> = HashMap::new();
+    let mut sink = 0usize;
+    // A handle's scan: reads around, and a scan since the writer's last
+    // maintenance, so the commit's own rules file the batch -- on the
+    // thread, since the commit syncs.
+    live.scan(&key(0), keys as usize, |_k, v| sink += v.len())
+        .unwrap();
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    for _ in 0..300 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let k = (x % keys as u64) as u32;
+        db.put(&key(k), b"a");
+        want.insert(k, "a".to_string());
+    }
+    assert_eq!(
+        db.forms_position(),
+        usize::MAX,
+        "nothing maintained before the burst"
+    );
+    db.commit().unwrap();
+    db.settle().unwrap();
+    assert!(
+        db.upkeep_counts()[0] > 0,
+        "the thread's pass filed the burst"
+    );
+    assert_eq!(db.upkeep_counts()[4], 0, "and the commit held for nothing");
+    assert_ne!(
+        db.forms_position(),
+        usize::MAX,
+        "and published the forms at the commit's position"
+    );
+    let mut seen = 0u32;
+    live.scan(&key(0), keys as usize, |k, v| {
+        let kn: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+        let expect = want.get(&kn).map_or("0", |s| s.as_str());
+        assert_eq!(std::str::from_utf8(v).unwrap(), expect, "key {kn}");
+        seen += 1;
+    })
+    .unwrap();
+    assert_eq!(seen, keys);
+    std::hint::black_box(sink);
 }
 
 /// A block held two ways at once, and the read choosing: with

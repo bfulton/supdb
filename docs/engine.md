@@ -2421,6 +2421,91 @@ shortening that window is the background's job, not the commit's.
 Level 1 is the default now, and the lag sweep times each burst beside its
 pass (`updates_per_s_lagNpct`), so the trade reads in both quantities.
 
+#### A buffered commit files its burst itself
+
+The pass after a buffered burst was the first scan's: with the lag
+sweep's counters read around each point (`SUPDB_LAG_COUNTERS`), the
+pass at ten thousand keys minus the first scan's phases -- the wait for
+the thread's pass in flight, the log read, the settle of the burst's
+tail and the snapshot's refresh -- was 0.1-0.17 ms at every lag point,
+the drained store's 0.1-0.2, and the phases were 0.2 ms at a tenth
+unmerged and 0.3-1.0 at all of it; at thirty thousand the scans were
+0.4-0.47 ms at every point against phases of 0.5-1.9. The scans over
+the forms the thread had built ran at the clean rate, and the whole
+loss against LMDB (0.23-0.63x at those two points, every rung) was the
+burst's filing deferred to the scan. The thread had no window to pay it
+in: the sweep's bursts at ten thousand keys are one commit each (99,
+900 and nine of 1,000 writes, `Plan::batch`), and at three hundred
+thousand the thread's 0.6 µs a write against the commit's 0.5 left it a
+pass or two behind at the end of three hundred commits. `supdb-ingesthold`
+had read its lag passes 2.6-6x faster at ten thousand keys with no pass
+of the thread at all: level 2 holds only for a batch its own rules would
+leave, and the bound of two percent made every commit of a thousand file
+itself, so what it had priced there was the writer filing inline.
+
+So a commit near reads whose batch is worth waking the thread for files
+it itself, forced past the settle bound, and lends the thread nothing
+(`Options::upkeep_inline_bursts`); a smaller batch lends as before. Priced
+against `supdb-ingest` in one process, 24 pairs at ten and thirty
+thousand keys and 12 at a hundred and three hundred thousand, the arm
+read the lag scans at all of it unmerged 4.7x, 2.6x, 1.9x and 2.1x up
+the ladder, at a tenth 2.6x, 2.5x, 2.2x and 2.9x, at a hundredth 0.99x
+(a batch of 99, lent), 1.35x, 1.31x and 1.38x, every one 24/24 or 12/12;
+the bursts at 0.66x, 0.64x, 0.59x and 0.49x at all of it, 0.56-0.67x and
+0.44x at a tenth; and the mixes within noise at every rung. The thread's
+time over a pass fell from 3.4 ms to 0.2 at ten thousand keys and from
+250 ms to 26 at three hundred thousand. The bursts cost more than the
+settle the scan had paid: the sum of a burst and its weighted pass at
+all of it unmerged read 1.19x, 1.40x, 1.69x and 1.91x of the default's,
+because the thread had filed 40-60% of a burst of nine commits beside
+the writer and nearly all of a burst of three hundred, and the inline
+fill pays all of it on the writer, at 0.2 µs a write at ten thousand
+keys and 0.8 at three hundred thousand, where the forms no longer fit a
+core's cache. The predictions had the sum level at the small rungs and
+within 1.3x at the large ones; the share the thread was doing for free
+was the quantity the first scan's phases could not show.
+
+Against `lmdb-nosync`, 12 pairs: at ten thousand keys the lag scans at
+all of it 1.47x, at a tenth 1.12x, at a hundredth 0.91x (lent, as
+before), the bursts 1.27x, 1.48x and 2.67x, the sums 0.70-0.86 of
+LMDB's, the mixes 1.55-2.4x with ycsb-E 0.73x as before; at three
+hundred thousand the lag scans 1.10x, 1.40x and 1.49x, the bursts
+1.38-1.96x, the sums 0.62-0.74, the mixes 1.59-3.0x with E 0.90x. The
+default before it read those scan cells at 0.23-0.63x and the bursts
+at 1.7-5.7x.
+
+The durable store paired the same way (`supdb` against the arm) read its
+lag scans 1.15-1.37x faster and its bursts 0.52-0.75x, the sums 1.5-1.75x
+worse -- and its lag scans already read 0.92-1.51x of LMDB's in the quick
+row, because a durable commit's fsync is the window the buffered commit
+lacks: the thread files a batch of a thousand in 0.5-0.8 ms while the
+device takes 0.7-1. So the rule is the commit's barrier: a commit that
+syncs lends its burst, one that does not files it. The buffered default
+flipped and the durable one is unchanged; `supdb-ingestlendbursts` lends
+every batch as before, and `supdb-lendbursts` is the durable store under
+the same option, which its commits never reach. The shipped default
+paired against the lending arm read the same as the arm had against the
+old default: at ten thousand keys the lag scans 4.4x and 2.7x at all of
+it and a tenth, the bursts 0.67x and 0.62x, and at three hundred
+thousand 1.85x and 2.4x against 0.44x and 0.42x, the mixes within noise
+at both; the durable store against `supdb-lendbursts`, identical code,
+marked two mixes at p=.04 and the plain scan at p=.006 in twelve pairs,
+which is what a null pairing reads on this machine.
+
+What the inline fill gives up is the thread's share beside a long
+burst, and at three hundred thousand keys that share was most of the
+filing. A commit that lends while the thread is keeping up and holds
+or files only when it falls behind -- a pipeline a batch deep -- would
+keep that share for a burst of hundreds of commits and still leave the
+first scan a batch at most, which at that rung is a tenth of its pass;
+at ten thousand keys a batch is a tenth of the store and the first
+scan's share of it is the cell, so the pipeline cannot flip the small
+rungs and the inline fill cannot keep the large rungs' burst. The
+quantity that separates them is a batch's filing time against the pass
+it would land on, and the engine measures the first; the second is the
+reader's. The settle's own cost a write, 0.2 µs at ten thousand keys
+and 0.8 at three hundred thousand, is the lever under both shapes.
+
 #### The freeze that leaves its carry to the next look
 
 At level 1 the freeze is the one place the writer still does work for

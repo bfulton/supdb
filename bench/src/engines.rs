@@ -385,6 +385,12 @@ pub struct Supdb {
     /// Who keeps the writer's upkeep, where not the engine's own choice:
     /// the writer itself, as before the thread. `supdb-inline`.
     upkeep: Option<supdb::Upkeep>,
+    /// Every commit lends its batch to the upkeep thread, as before a
+    /// commit with no fsync filed a burst's batch itself
+    /// (`Options::upkeep_inline_bursts` off). `supdb-ingestlendbursts`,
+    /// and `supdb-lendbursts` durable, where the commits sync and so
+    /// lend either way.
+    lendbursts: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -578,6 +584,12 @@ struct Policy {
     /// Who keeps the writer's upkeep, where not the engine's own choice:
     /// the writer itself, as before the thread. `supdb-inline`.
     upkeep: Option<supdb::Upkeep>,
+    /// Every commit lends its batch to the upkeep thread, as before a
+    /// commit with no fsync filed a burst's batch itself
+    /// (`Options::upkeep_inline_bursts` off). `supdb-ingestlendbursts`,
+    /// and `supdb-lendbursts` durable, where the commits sync and so
+    /// lend either way.
+    lendbursts: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -771,6 +783,7 @@ impl Default for Policy {
             oidxsync: false,
             refvals: false,
             rowatclose: false,
+            lendbursts: false,
             rankrecords: false,
             shape: false,
             adaptcap: None,
@@ -2009,6 +2022,35 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with every commit lending its batch to the upkeep thread
+    /// (`Options::upkeep_inline_bursts` off). Its commits sync, so they
+    /// lend either way: against `supdb` it is a null pairing.
+    pub fn create_lendbursts(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                lendbursts: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` with every commit lending its batch to the thread,
+    /// as before a buffered commit near reads filed a burst's batch
+    /// itself: against `supdb-ingest` it prices paying the filing in the
+    /// burst against the first scan after it paying it.
+    pub fn create_ingest_lendbursts(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                lendbursts: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` ranking a piece's keys over the partition's records, as
     /// before `Options::piece_ranks_by_heads`: against `supdb` it prices
     /// the ranking over the index's heads, on the segment work's thread.
@@ -2211,6 +2253,7 @@ impl Supdb {
             oidxsync,
             refvals,
             rowatclose,
+            lendbursts,
             rankrecords,
             shape,
             aheadmin,
@@ -2383,6 +2426,7 @@ impl Supdb {
             forms_settle_keys_all: settleall,
             // The upkeep where the arm puts it, or where the engine does.
             upkeep: upkeep.unwrap_or(supdb::Options::default().upkeep),
+            upkeep_inline_bursts: !lendbursts,
             forms_settle_rebuild_from: rebuild,
             snapshot_carry: snapcarry,
             scan_lazy_snapshot: lazysnap,
@@ -2479,6 +2523,7 @@ impl Supdb {
             oidxsync,
             refvals,
             rowatclose,
+            lendbursts,
             rankrecords,
             shape,
             aheadmin,
@@ -2830,6 +2875,13 @@ impl Engine for Supdb {
                 "supdb-rowatclose"
             } else {
                 "supdb-ingestrowatclose"
+            };
+        }
+        if self.lendbursts {
+            return if self.partition {
+                "supdb-lendbursts"
+            } else {
+                "supdb-ingestlendbursts"
             };
         }
         if self.rankrecords {
@@ -3521,6 +3573,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-oidxsync"
         | "supdb-refvals"
         | "supdb-rowatclose"
+        | "supdb-lendbursts"
         | "supdb-inlinemaint"
         | "supdb-adapt"
         | "supdb-adapttrig"
@@ -3573,6 +3626,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestoidxsync"
         | "supdb-ingestrefvals"
         | "supdb-ingestrowatclose"
+        | "supdb-ingestlendbursts"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
         | "supdb-ingestrankrecords"
@@ -3677,6 +3731,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestbg" => Box::new(Supdb::create_ingest_bg(dir)?),
         "supdb-bglag" => Box::new(Supdb::create_bglag(dir)?),
         "supdb-ingestbglag" => Box::new(Supdb::create_ingest_bglag(dir)?),
+        "supdb-lendbursts" => Box::new(Supdb::create_lendbursts(dir)?),
+        "supdb-ingestlendbursts" => Box::new(Supdb::create_ingest_lendbursts(dir)?),
         "supdb-ingestsettlefreeze" => Box::new(Supdb::create_ingest_settlefreeze(dir)?),
         "supdb-ingestconvertcap" => Box::new(Supdb::create_ingest_convertcap(dir)?),
         "supdb-ingestshortpass" => Box::new(Supdb::create_ingest_shortpass(dir)?),

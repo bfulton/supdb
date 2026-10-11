@@ -182,7 +182,9 @@ pub enum Upkeep {
     ///
     /// - 1: what a commit would have filed, by the same rules, and no
     ///   commit waits for it: the default, so a write never waits on work
-    ///   done for the reads.
+    ///   done for the reads -- except that a commit with no fsync to work
+    ///   beside files a burst's batch itself when reads are around
+    ///   (`Options::upkeep_inline_bursts`).
     /// - 2: what `Inline` does, except that while reads are around -- a
     ///   scan over the store within the last two stores' worth of writes
     ///   -- a commit whose own rules would leave its batch to the next
@@ -989,6 +991,28 @@ pub struct Options {
     /// one rung is the whole burst at the rung below. `supdb-bglag` and
     /// `supdb-ingestbglag` set it.
     pub upkeep_lag_pct: usize,
+    /// With reads around, a commit that does not sync and whose batch is
+    /// large enough to wake the upkeep thread for files the batch itself
+    /// before it returns, whatever the settle bound says, and lends the
+    /// thread nothing of it; a commit that syncs lends as ever, since the
+    /// thread works through the fsync, and so does a smaller batch.
+    /// Filing a burst's writes is a fixed bill, about the same a write on
+    /// whichever thread pays it, and a buffered commit has no barrier for
+    /// the thread to work beside: a burst of one commit -- the lag
+    /// sweep's bursts at ten thousand keys -- left the thread no window
+    /// at all, and a burst of three hundred left it a commit or two
+    /// behind at the end, so the bill fell to the first scan after,
+    /// which read the burst's tail into the forms before it walked
+    /// anything, and that settle was all of the pass's loss against LMDB
+    /// while the scans after it ran at the drained store's rate. Paid in
+    /// the commit, the burst keeps the margin a buffered commit has over
+    /// a page-copying one and the pass starts clean; what it gives up is
+    /// the share the thread filed beside the burst, which a durable
+    /// commit keeps because its thread works through the fsync. Off,
+    /// every commit lends: `supdb-ingestlendbursts` is that arm, and
+    /// `supdb-lendbursts` the durable store, whose commits lend either
+    /// way (`docs/engine.md`).
+    pub upkeep_inline_bursts: bool,
     /// Writes the upkeep thread lets gather before it begins a pass, as
     /// a percentage of the store's keys, unless a commit holds for it or
     /// the writes have stopped for `UPKEEP_BATCH_WAIT`; zero begins one
@@ -1471,6 +1495,7 @@ impl Default for Options {
             forms_settle_keys_all: false,
             upkeep: Upkeep::default(),
             upkeep_lag_pct: 0,
+            upkeep_inline_bursts: true,
             upkeep_batch_pct: 0,
             upkeep_pass_pct: 0,
             snapshot_carry: false,
@@ -8694,6 +8719,9 @@ enum Hand {
     /// The commit's own maintenance, as `Upkeep::Inline` runs it: at
     /// level 2, every commit it does not hold; or no thread to lend to.
     Inline,
+    /// The commit's own maintenance, forced: the batch filed now whatever
+    /// the settle bound says (`Options::upkeep_inline_bursts`).
+    File,
 }
 
 /// A read in progress on a handle; dropping it ends the read.
@@ -16766,18 +16794,18 @@ impl Db {
             self.wal.mark_commit();
             self.wal.write()?;
             self.mem().commit();
-            // The upkeep handed over before the barrier, so the thread
-            // works while the device syncs -- unless a seal's phase is to
-            // be landed, whose publish would take it straight back.
-            let (readable, sealed) = self.seal_due();
-            if background && !(readable || sealed) {
-                self.hand_over_upkeep();
-            }
             self.unsynced += 1;
             let due = match self.opts.sync {
                 SyncPolicy::Always => true,
                 SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
             };
+            // The upkeep handed over before the barrier, so the thread
+            // works while the device syncs -- unless a seal's phase is to
+            // be landed, whose publish would take it straight back.
+            let (readable, sealed) = self.seal_due();
+            if background && !(readable || sealed) {
+                self.hand_over_upkeep(due);
+            }
             if due {
                 self.wal.sync()?;
                 self.unsynced = 0;
@@ -16820,7 +16848,7 @@ impl Db {
         // thread was given waits for the first read, and an arm that
         // builds ahead at every publish had none of its commits filed.
         if lent && self.fs_home() {
-            self.hand_over_upkeep();
+            self.hand_over_upkeep(false);
         }
         self.start_keeper();
         // The thread frees what it replaced at its own passes: freed here
@@ -16853,7 +16881,7 @@ impl Db {
             // carry across the freeze is the thread's to make.
             if background {
                 if !self.fs_home() {
-                    self.hand_over_upkeep();
+                    self.hand_over_upkeep(false);
                     self.shared.upkeep.wake();
                 }
                 self.finish_hand()?;
@@ -20582,7 +20610,7 @@ impl Db {
     /// The upkeep handed to the thread, or the thread told of a later
     /// commit while it has it, and woken for a batch worth waking it for;
     /// and what the commit does after its barrier decided: see `Hand`.
-    fn hand_over_upkeep(&mut self) {
+    fn hand_over_upkeep(&mut self, syncs: bool) {
         let Upkeep::Background(level) = self.opts.upkeep else {
             return;
         };
@@ -20617,6 +20645,19 @@ impl Db {
             self.upkeep_since_scan += batch as u64;
         }
         let reads_around = reads_around(life, self.upkeep_since_scan, keys);
+        // With reads around, a batch worth waking the thread for is filed
+        // by a commit that does not sync, and the thread is lent nothing
+        // of it; one that syncs lends it, since the thread works through
+        // the fsync: see `Options::upkeep_inline_bursts`.
+        if level == 1
+            && self.opts.upkeep_inline_bursts
+            && !syncs
+            && reads_around
+            && batch >= UPKEEP_WAKE_WRITES
+        {
+            self.upkeep_hand = Hand::File;
+            return;
+        }
         // How far the thread trails, this batch included: what was lent
         // past what it has filed, or past everything lent before this
         // batch where it is caught up now.
@@ -20720,12 +20761,18 @@ impl Db {
     /// held for until the thread has filed it. Whether it was left lent
     /// with no pass waited for.
     fn finish_hand(&mut self) -> Result<bool> {
-        if self.fs_home() && self.upkeep_hand != Hand::Inline {
-            self.hand_over_upkeep();
+        if self.fs_home() && !matches!(self.upkeep_hand, Hand::Inline | Hand::File) {
+            self.hand_over_upkeep(false);
         }
         match std::mem::take(&mut self.upkeep_hand) {
             Hand::Lend => Ok(true),
             Hand::Inline => self.maintain_forms().map(|()| false),
+            Hand::File => {
+                self.r.force_due.set(true);
+                let filed = self.maintain_forms();
+                self.r.force_due.set(false);
+                filed.map(|()| false)
+            }
             Hand::Hold if matches!(self.opts.upkeep, Upkeep::Background(1)) => {
                 let keys: usize = self
                     .segs()
