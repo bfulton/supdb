@@ -3401,6 +3401,34 @@ with the memtable overlaid at the walk (`forms_pieces_only`), or a
 pass whose take-back cuts a settle short -- each move the work rather
 than remove it for a pass that reads every block once.
 
+#### The take-back's wait, measured again
+
+The first scan after a burst takes the writer's upkeep back and waits
+for the pass in flight, and a probe once put that wait at 25-56 ms on
+the durable arm at three hundred thousand keys, when the pass in flight
+was the rebuild a landing left -- every block of the store built fresh
+-- which the conversions through the burst and the ranks taken before
+the publish have since removed. Measured again in the row's shape with
+the lag counters, six reps of the durable arm: at three hundred thousand
+keys the scans' take phase is 0.07 ms in 21 of 24 lag points and 1.3-1.6
+in three, their settle phase 0.8-2.5 ms at every point with a burst, in
+passes of 6.8-11.8 ms; at a hundred thousand the tenth-rewritten point
+waits 0.23-0.58 ms in every rep with a settle of nothing, and the other
+points wait nothing and settle 0.3-0.5. The thread's passes over a burst
+are half a millisecond each, one batch's filing, and the blocks it built
+are a fraction of the store's -- 167 of 1,564 at a hundred thousand
+keys, 757 of 4,693 at three hundred -- so no pass in flight is a
+rebuild. What a first scan pays is the last batch's filing, either by
+waiting for the thread's pass of it or, where the thread has not begun,
+by settling it itself at about a microsecond a write against the
+thread's 0.8; a bound on the wait -- the fresh fills yielding to the
+writer's want as the conversions do -- moves that filing from the one
+phase to the other and leaves the pass's sum where it is, which is what
+the bounded pass had done before. The move registered for the rebuild
+found none, and nothing was built; the cost it would have moved is one
+batch of a burst, ten to twenty-five percent of a lag pass at these
+rungs, and shrinks only as a settle does.
+
 #### The piece's ranks over the heads, and a locked exchange to look at a form
 
 Every written key's rank in its partition is computed by three parties:
