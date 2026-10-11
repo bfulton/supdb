@@ -410,6 +410,14 @@ pub struct Supdb {
     /// (`Options::prefault`). `supdb-populate`, and `supdb-ingestpopulate`
     /// buffered.
     populate: bool,
+    /// Segments written in 256 KB pieces (`SegmentOptions::write_piece`),
+    /// a quarter of the default's fresh pages for the piece buffer.
+    /// `supdb-piece256`, and `supdb-ingestpiece256` buffered.
+    piece256: bool,
+    /// A direct run's records written by `begin`, `value` and `end`, as
+    /// before `Options::direct_put_one`. `supdb-recordsteps`, and
+    /// `supdb-ingestrecordsteps` buffered.
+    recordsteps: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -628,6 +636,14 @@ struct Policy {
     /// (`Options::prefault`). `supdb-populate`, and `supdb-ingestpopulate`
     /// buffered.
     populate: bool,
+    /// Segments written in 256 KB pieces (`SegmentOptions::write_piece`),
+    /// a quarter of the default's fresh pages for the piece buffer.
+    /// `supdb-piece256`, and `supdb-ingestpiece256` buffered.
+    piece256: bool,
+    /// A direct run's records written by `begin`, `value` and `end`, as
+    /// before `Options::direct_put_one`. `supdb-recordsteps`, and
+    /// `supdb-ingestrecordsteps` buffered.
+    recordsteps: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -827,6 +843,8 @@ impl Default for Policy {
             noprefetch: false,
             manifestrename: false,
             populate: false,
+            piece256: false,
+            recordsteps: false,
             rankrecords: false,
             shape: false,
             adaptcap: None,
@@ -2219,6 +2237,56 @@ impl Supdb {
         )
     }
 
+    /// `supdb` writing its segments in 256 KB pieces
+    /// (`SegmentOptions::write_piece`).
+    pub fn create_piece256(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                piece256: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-piece256`.
+    pub fn create_ingest_piece256(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                piece256: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb` with a direct run's records written in three calls each,
+    /// as before `Options::direct_put_one`.
+    pub fn create_recordsteps(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                recordsteps: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-recordsteps`.
+    pub fn create_ingest_recordsteps(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                recordsteps: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` ranking a piece's keys over the partition's records, as
     /// before `Options::piece_ranks_by_heads`: against `supdb` it prices
     /// the ranking over the index's heads, on the segment work's thread.
@@ -2427,6 +2495,8 @@ impl Supdb {
             noprefetch,
             manifestrename,
             populate,
+            piece256,
+            recordsteps,
             rankrecords,
             shape,
             aheadmin,
@@ -2485,6 +2555,8 @@ impl Supdb {
                 },
                 write_piece: if pmd {
                     2 << 20
+                } else if piece256 {
+                    256 << 10
                 } else {
                     supdb::SegmentOptions::default().write_piece
                 },
@@ -2604,6 +2676,7 @@ impl Supdb {
             scan_prefetch: !noprefetch,
             manifest_slots: !manifestrename,
             prefault: populate,
+            direct_put_one: !recordsteps,
             // The scan phases timed where the arm asks, or where the
             // counters lines will read them: ten clock reads a scan.
             scan_timers: timers
@@ -2711,6 +2784,8 @@ impl Supdb {
             noprefetch,
             manifestrename,
             populate,
+            piece256,
+            recordsteps,
             rankrecords,
             shape,
             aheadmin,
@@ -3104,6 +3179,20 @@ impl Engine for Supdb {
                 "supdb-populate"
             } else {
                 "supdb-ingestpopulate"
+            };
+        }
+        if self.piece256 {
+            return if self.partition {
+                "supdb-piece256"
+            } else {
+                "supdb-ingestpiece256"
+            };
+        }
+        if self.recordsteps {
+            return if self.partition {
+                "supdb-recordsteps"
+            } else {
+                "supdb-ingestrecordsteps"
             };
         }
         if self.rankrecords {
@@ -3801,6 +3890,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-noprefetch"
         | "supdb-manifestrename"
         | "supdb-populate"
+        | "supdb-piece256"
+        | "supdb-recordsteps"
         | "supdb-inlinemaint"
         | "supdb-adapt"
         | "supdb-adapttrig"
@@ -3859,6 +3950,8 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestnoprefetch"
         | "supdb-ingestmanifestrename"
         | "supdb-ingestpopulate"
+        | "supdb-ingestpiece256"
+        | "supdb-ingestrecordsteps"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
         | "supdb-ingestrankrecords"
@@ -3975,6 +4068,10 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestmanifestrename" => Box::new(Supdb::create_ingest_manifestrename(dir)?),
         "supdb-populate" => Box::new(Supdb::create_populate(dir)?),
         "supdb-ingestpopulate" => Box::new(Supdb::create_ingest_populate(dir)?),
+        "supdb-piece256" => Box::new(Supdb::create_piece256(dir)?),
+        "supdb-ingestpiece256" => Box::new(Supdb::create_ingest_piece256(dir)?),
+        "supdb-recordsteps" => Box::new(Supdb::create_recordsteps(dir)?),
+        "supdb-ingestrecordsteps" => Box::new(Supdb::create_ingest_recordsteps(dir)?),
         "supdb-ingestsettlefreeze" => Box::new(Supdb::create_ingest_settlefreeze(dir)?),
         "supdb-ingestconvertcap" => Box::new(Supdb::create_ingest_convertcap(dir)?),
         "supdb-ingestshortpass" => Box::new(Supdb::create_ingest_shortpass(dir)?),

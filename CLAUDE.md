@@ -242,8 +242,12 @@ sixty-four pages at its first write and read 0.66x, and a window that
 grows with the fill left it within noise and the load still unmoved
 (`Options::prefault`, off; `supdb-populate` is the arm). Read the
 phase column that names the mechanism beside the rate, and when the
-phase moves and the rate does not, the saving is being spent elsewhere
-in the same load.
+phase moves and the rate does not, look for where the saving is being
+spent in the same load; where the code changed is one phase's alone and
+no other cell can have moved, two sittings of the phase column are the
+verdict and the rate is noted as unresolved -- the record path
+(`Options::direct_put_one`) took the commits a tenth lower in both
+sittings while the rate read 1.12x and then 0.98x.
 
 An instrument in the measured path is priced by taking it away in the
 suite, and the pairing that prices it has to differ in the instrument.

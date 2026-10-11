@@ -352,6 +352,83 @@ fn the_write_piece_changes_how_a_segment_is_written_and_not_what() {
 }
 
 #[test]
+fn a_record_put_in_one_call_is_the_record_the_three_calls_write() {
+    // `put_one` streams a one-value record from the caller's slices;
+    // `begin`, `value` and `end` stage the value, encode the run and
+    // build the record first. The file must not know which was used:
+    // over values inline and in blocks, empty and not, with and without
+    // the batch markers, the two segments are byte for byte the same.
+    let _serial = serial();
+    let dir = scratch("putone");
+    let mut x = 7u64;
+    let data: Vec<(Vec<u8>, Vec<u8>)> = (0..3_000u32)
+        .map(|i| {
+            let len = match i % 7 {
+                0 => 0,
+                1 => 1,
+                2 => 255,
+                3 => 256,
+                4 => 257,
+                5 => 9_000,
+                _ => 100,
+            };
+            let v: Vec<u8> = (0..len).map(|_| splitmix(&mut x) as u8).collect();
+            (format!("key-{i:06}").into_bytes(), v)
+        })
+        .collect();
+    for marks in [false, true] {
+        let steps = dir.join(format!("steps-{marks}.sup"));
+        let one = dir.join(format!("one-{marks}.sup"));
+        {
+            let mut w = SegmentWriter::create(&steps, &opts()).expect("create");
+            w.set_inline_max(INLINE);
+            w.set_marks(marks);
+            for (k, v) in &data {
+                w.begin(k).expect("begin");
+                w.value(v);
+                w.end().expect("end");
+                if marks {
+                    w.mark().expect("mark");
+                }
+            }
+            w.finish(1).expect("finish");
+        }
+        {
+            let mut w = SegmentWriter::create(&one, &opts()).expect("create");
+            w.set_inline_max(INLINE);
+            w.set_marks(marks);
+            for (k, v) in &data {
+                w.put_one(k, v).expect("put_one");
+                if marks {
+                    w.mark().expect("mark");
+                }
+            }
+            assert_eq!(w.keys(), data.len());
+            w.finish(1).expect("finish");
+        }
+        let a = without_the_clock(&std::fs::read(&steps).unwrap());
+        let b = without_the_clock(&std::fs::read(&one).unwrap());
+        let first = a.iter().zip(&b).position(|(x, y)| x != y);
+        assert!(
+            a.len() == b.len() && first.is_none(),
+            "marks {marks}: the one-call record differs: lengths {} and {}, first difference at {first:?}",
+            a.len(),
+            b.len()
+        );
+        let blob = open(&one);
+        for (k, v) in &data {
+            let mut got = Vec::new();
+            let n = blob
+                .read_all(k, |x| got.push(x.to_vec()))
+                .expect("read_all");
+            assert_eq!(n, 1, "one value for {}", String::from_utf8_lossy(k));
+            assert_eq!(&got[0], v);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn fixed_width_counts_come_from_the_extent_alone() {
     let _serial = serial();
     let dir = scratch("fixed");

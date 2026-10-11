@@ -3429,6 +3429,59 @@ found none, and nothing was built; the cost it would have moved is one
 batch of a burst, ten to twenty-five percent of a lag pass at these
 rungs, and shrinks only as a settle does.
 
+#### The buffered load's write path: six copies of a value, and the pages they touch
+
+With the manifest in its slots the buffered ordered load stood at 0.72x
+of the comparator at ten thousand keys and 0.77x at three hundred
+thousand, its commits 2.4 ms against 1.5 for the same ten batches and
+its drain 2.5 against 1.8. A profile of the writer's thread over the
+ordered load's commits, cut to the window by the phase marks, put the
+fault path at about forty percent of its samples -- the kernel zeroing
+fresh pages alone at 26% -- against one and a half percent of the
+comparator's, whose records go into page buffers it reuses and then,
+by `pwrite`, into page-cache pages the kernel allocates without a fault
+or a zeroing; `memmove` was 17% of ours and the kernel's copy into the
+page cache 10%. Ten thousand records of a hundred and sixteen bytes
+touch 3.7 MB of fresh pages here: the ordered table's arena, about 330
+pages; the segment writer's piece buffer, 256; the entries, the keys,
+the key section's own copy of them and the index builder's, the rest.
+And a value is copied six times between the caller's slice and the
+file: into the arena at the append, and at the commit into the run's
+staging, its encoding, the record buffer, the batch buffer, and the
+piece buffer, before the kernel copies it once more.
+
+Three levers were priced against that split, each as an arm in one
+process. Populating the buffers' pages ahead of the fill (`Options::prefault`)
+is above. A piece buffer of 256 KB (`SegmentOptions::write_piece`,
+`supdb-piece256` and `supdb-ingestpiece256`) took the 196 fresh pages
+it should have and the commits from 2.34 ms to 2.22, and moved the load
+by nothing resolvable: 1.04x and 1.03x in twenty-four pairs at ten
+thousand keys, 0.98x and 0.95x in twelve at three hundred thousand; it
+stays an arm, with one observation open -- the scan pass right after
+the drain read 1.05-1.10x with the smaller pieces in five pairings of
+five, three at p < .05, and no mechanism for it is known. The third
+lever is the record path: a one-value run is the value itself under the
+fixed flag, carried inline in its record, so a `put_one` on the segment
+writer streams the record from the caller's slices into the batch and
+the three buffers between the arena and the batch are not visited
+(`Options::direct_put_one`; the three calls are `supdb-recordsteps`
+and `supdb-ingestrecordsteps`). The bytes are the same, and
+`tests/segwriter.rs` requires them to be, with the batch markers on
+and off, over values inline, in blocks and empty. By the load's phases
+the commits read 2.20 ms against 2.44 at ten thousand keys in one
+sitting and 2.12 against 2.38 in another, below in 20 loads of 26, the
+faults identical and the drain level; the shuffled load, which never
+enters a direct run, read level in both. By rate the buffered ordered
+load read 1.12x in twenty-four pairs and then 0.98x in twenty-four, and
+0.94x and then 1.03x in twelve at three hundred thousand: a tenth of
+the commits is four percent of the load, under what the rate resolves
+at that many pairs against the drain's and the host's variance, and
+the first sitting's p .007 was the position effect the lag sweep has
+shown before. The path ships on the phase column, since the code it
+changes is one phase's alone and nothing else in the load can have
+moved; every read, scan, lag and mix cell was level in all four
+pairings.
+
 #### The piece's ranks over the heads, and a locked exchange to look at a form
 
 Every written key's rank in its partition is computed by three parties:

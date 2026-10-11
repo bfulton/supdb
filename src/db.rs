@@ -1346,6 +1346,16 @@ pub struct Options {
     /// default, the copies; on, the arm `supdb-refvals` and
     /// `supdb-ingestrefvals`.
     pub direct_table_refs: bool,
+    /// Whether a direct run's commit writes each entry's record in one
+    /// call (`SegmentWriter::put_one`), the value streamed from the
+    /// table's arena into the batch, rather than through `begin`, `value`
+    /// and `end`, which stage the value, encode the run and build the
+    /// record in three buffers of their own before the batch: three
+    /// copies of every value an ordered load wrote, of six between the
+    /// caller's slice and the file. The bytes written are the same. Off,
+    /// the three calls, kept for pricing as `supdb-recordsteps` and
+    /// `supdb-ingestrecordsteps`.
+    pub direct_put_one: bool,
     /// Bytes the mapping of a direct run's segment starts with; zero, the
     /// default, twice `seal_bytes`. The mapping grows when the run's file
     /// outgrows it. For a test of the growth.
@@ -1600,6 +1610,7 @@ impl Default for Options {
             manifest_slots: true,
             ord_durable: false,
             direct_table_refs: false,
+            direct_put_one: true,
             direct_map_bytes: 0,
             forms_settle_recent_pct: 0,
             forms_carry: true,
@@ -3608,6 +3619,83 @@ impl SegmentWriter {
         Ok(())
     }
 
+    /// `begin`, one `value` and `end`, as one call, for a key with one
+    /// value that the record carries inline: the record is streamed from
+    /// the caller's slices into the batch or the file, byte for byte what
+    /// the three calls write, without the value passing through the run's
+    /// staging, its encoding and the record buffer on the way -- three
+    /// copies of every value an ordered load made, where a one-value run
+    /// is the value itself with the fixed flag. A value the record cannot
+    /// carry inline, an empty one, or a blocks-first layout take the three
+    /// calls (`Options::direct_put_one`).
+    pub fn put_one(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        if value.is_empty() || !inlines(self.inline_max, value.len()) {
+            self.begin(key)?;
+            self.value(value);
+            return self.end();
+        }
+        if self.open_key.is_some() {
+            return Err(err("segment writer: begin while a key is open"));
+        }
+        if key.len() > u16::MAX as usize {
+            return Err(err("segment writer: key longer than 65,535 bytes"));
+        }
+        if let Some(&(s, l)) = self.spans.last() {
+            if key <= &self.key_arena[s..s + l] {
+                return Err(err(
+                    "segment writer: keys must arrive in strictly increasing order",
+                ));
+            }
+        }
+        let layout = self.layout()?;
+        if layout != Layout::RecordsFirst {
+            self.begin(key)?;
+            self.value(value);
+            return self.end();
+        }
+        let start = self.key_arena.len();
+        self.key_arena.extend_from_slice(key);
+        let n = value.len();
+        // What `end_with` derives for one value: a fixed run with no
+        // prefix, the value itself, inline in the record.
+        self.last = 0;
+        self.payload += (key.len() + n) as u64;
+        let ext = Ext {
+            block: Ext::INLINE,
+            off: 0,
+            len: n as u32,
+            last: 0,
+            count: 1 | Ext::FIXED,
+        };
+        let marks = self.marks;
+        let out = if marks {
+            &mut self.batch_buf
+        } else {
+            &mut self.rec_buf
+        };
+        if !marks {
+            out.clear();
+        }
+        let (wrote, tail_at) =
+            flatindex::stream_record_tail_at(out, key, &[ext], value, self.compact_records)
+                .ok_or_else(|| err("segment writer: record exceeds the flat index's limits"))?;
+        if !marks {
+            self.out.write_all(&self.rec_buf)?;
+        }
+        self.last_value = (self.pos + tail_at as u64, n as u32);
+        self.pos += wrote as u64;
+        self.rec_offs.push(self.recs_len as u32);
+        self.recs_len += wrote;
+        self.hashes.push(flatindex::key_hash(key));
+        if self.recs_len > flatindex::MAX_RECS {
+            return Err(err(
+                "segment writer: key section exceeds the flat index's limits",
+            ));
+        }
+        self.spans.push((start, key.len()));
+        Ok(())
+    }
+
     fn flush_block(&mut self) -> Result<()> {
         if self.builder.is_empty() {
             return Ok(());
@@ -4206,6 +4294,14 @@ impl PieceWriter {
     fn end_with(&mut self, tombstone: bool) -> Result<()> {
         self.2 |= tombstone;
         self.0.end_with(tombstone)
+    }
+
+    /// `begin`, one `value` and `end` as one call
+    /// (`SegmentWriter::put_one`), the key into the ordered index as
+    /// `begin` puts it.
+    fn put_one(&mut self, k: &[u8], v: &[u8]) -> Result<()> {
+        self.1.push(k);
+        self.0.put_one(k, v)
     }
 
     /// Whether any key ended with a tombstone: a piece with one cannot
@@ -17354,6 +17450,7 @@ impl Db {
             n => n,
         };
         let shared = self.shared.clone();
+        let put_one = self.opts.direct_put_one;
         let d = self.direct.as_mut().expect("opened above");
         let refs = mem.refs;
         if refs && mem.run().is_none() {
@@ -17369,9 +17466,13 @@ impl Db {
                 1,
                 "an ordered entry has the one value it was appended with"
             );
-            d.w.begin(mem.key_of(e))?;
-            d.w.value(mem.value_at(MemTable::head(e) as usize));
-            d.w.end_with(false)?;
+            if put_one {
+                d.w.put_one(mem.key_of(e), mem.value_at(MemTable::head(e) as usize))?;
+            } else {
+                d.w.begin(mem.key_of(e))?;
+                d.w.value(mem.value_at(MemTable::head(e) as usize));
+                d.w.end_with(false)?;
+            }
             if refs {
                 let (at, len) = d.w.last_value_at();
                 d.pending.push_back((i, at, len));
