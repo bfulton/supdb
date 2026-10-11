@@ -391,6 +391,10 @@ pub struct Supdb {
     /// and `supdb-lendbursts` durable, where the commits sync and so
     /// lend either way.
     lendbursts: bool,
+    /// The scan phases timed on every scan, as before the clock reads
+    /// were gated (`Options::scan_timers`). `supdb-timers`, and
+    /// `supdb-ingesttimers` buffered.
+    timers: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -590,6 +594,10 @@ struct Policy {
     /// and `supdb-lendbursts` durable, where the commits sync and so
     /// lend either way.
     lendbursts: bool,
+    /// The scan phases timed on every scan, as before the clock reads
+    /// were gated (`Options::scan_timers`). `supdb-timers`, and
+    /// `supdb-ingesttimers` buffered.
+    timers: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -784,6 +792,7 @@ impl Default for Policy {
             refvals: false,
             rowatclose: false,
             lendbursts: false,
+            timers: false,
             rankrecords: false,
             shape: false,
             adaptcap: None,
@@ -2051,6 +2060,31 @@ impl Supdb {
         )
     }
 
+    /// `supdb` timing every scan's phases, as before the clock reads were
+    /// gated: against `supdb` it prices the instrument.
+    pub fn create_timers(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                timers: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` timing every scan's phases, as `supdb-timers`.
+    pub fn create_ingest_timers(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                timers: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` ranking a piece's keys over the partition's records, as
     /// before `Options::piece_ranks_by_heads`: against `supdb` it prices
     /// the ranking over the index's heads, on the segment work's thread.
@@ -2254,6 +2288,7 @@ impl Supdb {
             refvals,
             rowatclose,
             lendbursts,
+            timers,
             rankrecords,
             shape,
             aheadmin,
@@ -2427,6 +2462,11 @@ impl Supdb {
             // The upkeep where the arm puts it, or where the engine does.
             upkeep: upkeep.unwrap_or(supdb::Options::default().upkeep),
             upkeep_inline_bursts: !lendbursts,
+            // The scan phases timed where the arm asks, or where the
+            // counters lines will read them: ten clock reads a scan.
+            scan_timers: timers
+                || std::env::var_os("SUPDB_LAG_COUNTERS").is_some()
+                || std::env::var_os("SUPDB_MIX_COUNTERS").is_some(),
             forms_settle_rebuild_from: rebuild,
             snapshot_carry: snapcarry,
             scan_lazy_snapshot: lazysnap,
@@ -2524,6 +2564,7 @@ impl Supdb {
             refvals,
             rowatclose,
             lendbursts,
+            timers,
             rankrecords,
             shape,
             aheadmin,
@@ -2882,6 +2923,13 @@ impl Engine for Supdb {
                 "supdb-lendbursts"
             } else {
                 "supdb-ingestlendbursts"
+            };
+        }
+        if self.timers {
+            return if self.partition {
+                "supdb-timers"
+            } else {
+                "supdb-ingesttimers"
             };
         }
         if self.rankrecords {
@@ -3574,6 +3622,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-refvals"
         | "supdb-rowatclose"
         | "supdb-lendbursts"
+        | "supdb-timers"
         | "supdb-inlinemaint"
         | "supdb-adapt"
         | "supdb-adapttrig"
@@ -3627,6 +3676,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestrefvals"
         | "supdb-ingestrowatclose"
         | "supdb-ingestlendbursts"
+        | "supdb-ingesttimers"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
         | "supdb-ingestrankrecords"
@@ -3733,6 +3783,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestbglag" => Box::new(Supdb::create_ingest_bglag(dir)?),
         "supdb-lendbursts" => Box::new(Supdb::create_lendbursts(dir)?),
         "supdb-ingestlendbursts" => Box::new(Supdb::create_ingest_lendbursts(dir)?),
+        "supdb-timers" => Box::new(Supdb::create_timers(dir)?),
+        "supdb-ingesttimers" => Box::new(Supdb::create_ingest_timers(dir)?),
         "supdb-ingestsettlefreeze" => Box::new(Supdb::create_ingest_settlefreeze(dir)?),
         "supdb-ingestconvertcap" => Box::new(Supdb::create_ingest_convertcap(dir)?),
         "supdb-ingestshortpass" => Box::new(Supdb::create_ingest_shortpass(dir)?),

@@ -231,6 +231,27 @@ Profile a probe that does one thing. The scan probe's own `format!` per
 iteration was 8% of its samples until the keys were built before the
 loop.
 
+An instrument in the measured path is priced by taking it away in the
+suite, and the pairing that prices it has to differ in the instrument.
+The scan path timed its six phases before the walk on every scan, ten
+clock reads, and a probe of the clock in a tight loop read 50 ns a pair;
+the first pairing of the gated timers against the old shape read level
+everywhere and was called a refutation -- but the pairing script
+exported `SUPDB_LAG_COUNTERS` for its counters lines, and the suite turns
+the timers on for every arm under that variable, so both arms had them
+on. Callgrind over ycsb-E's interval put the clock paths at 17% of its
+instructions, and the pairing with a clean environment read ycsb-E 1.30x
+and every scan pass 1.16-1.30x at ten thousand keys (`Options::scan_timers`,
+off by default; `supdb-ingesttimers` is the arm that times). The rule:
+an option the suite sets from the environment is set for both arms of a
+pairing, so the arms are checked to differ in the option before a verdict
+is read, and a measurement that contradicts an exact count is a reason to
+check the measurement before the count. The same interval said something
+the counters could not: our E executed 24% fewer instructions than LMDB's
+and took 40% longer, and the clean scan workload 38% fewer at level time,
+so what a scan of ours pays over LMDB's is stalls per instruction, and the
+remaining levers are in the walk's memory access, not its arithmetic.
+
 Price a structure by taking it away, not by what its doc says it saves.
 The sparse form's doc says it saves the walk the memtable's value
 reads, and the snapshot carries those values in key order anyway, so

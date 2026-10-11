@@ -205,6 +205,52 @@ pub fn phase_mark(arm: &str, phase: &str, edge: &str) {
     );
 }
 
+/// One line of the store's counters around a timed stretch, as deltas
+/// of `e.counters()` read before and after it: the scans' phases before
+/// their walk, the threads' time, the blocks built and the forms copied,
+/// the snapshots and the walks by form, and the store's shape after. The
+/// lag sweep prints one a point (`SUPDB_LAG_COUNTERS`) and the mixes one
+/// a mix (`SUPDB_MIX_COUNTERS`).
+fn counters_line(
+    tag: &str,
+    arm: &str,
+    point: &str,
+    (flt_up, flt_main): (u64, u64),
+    (burst_ms, pass_ms): (f64, f64),
+    c0: &[(&str, f64)],
+    c1: &[(&str, f64)],
+) {
+    let get = |c: &[(&str, f64)], n: &str| c.iter().find(|(k, _)| *k == n).map_or(0.0, |(_, v)| *v);
+    let d = |n: &str| get(c1, n) - get(c0, n);
+    eprintln!(
+        "{tag} {arm} {point} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {burst_ms:.1} pass_ms {pass_ms:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0}",
+        mem_free_mb(),
+        d("scan_take_us") / 1e3,
+        d("scan_sync_us") / 1e3,
+        d("scan_settle_us") / 1e3,
+        d("scan_snap_us") / 1e3,
+        d("scan_ahead_us") / 1e3,
+        d("scan_install_us") / 1e3,
+        d("upkeep_cpu_us") / 1e3,
+        d("upkeep_passes"),
+        d("maint_cpu_us") / 1e3,
+        d("blk_by_upkeep"),
+        d("blk_by_engine"),
+        d("blk_by_reader"),
+        d("forms_cloned"),
+        d("snapshot_builds"),
+        d("snapshot_refreshes"),
+        d("walk_copy"),
+        d("walk_sparse"),
+        d("walk_other"),
+        d("start_at_rank"),
+        d("start_search"),
+        get(c1, "pieces"),
+        get(c1, "unsealed_keys"),
+        d("rd_scans")
+    );
+}
+
 pub fn lag_mark(arm: &str, pct: u64, edge: &str) {
     if std::env::var_os("SUPDB_LAG_MARK").is_none() {
         return;
@@ -723,10 +769,44 @@ fn one_pass(
 
     let mut ycsb_ops_s = Vec::with_capacity(YCSB.len());
     let mut inserted = 0u64;
+    // With `SUPDB_MIX_COUNTERS` set, the store's counters around each mix,
+    // as `SUPDB_LAG_COUNTERS` reads them around a lag point: one
+    // `mixcounters` line a mix on stderr, read before the mix and after it
+    // and never between. A mix's commits are inside its timed region, so
+    // the line's burst is zero and its pass is the whole mix.
+    let mix_counting = std::env::var_os("SUPDB_MIX_COUNTERS").is_some();
     for letter in YCSB_ORDER {
         let w = YCSB.iter().find(|w| w.0 == letter).unwrap();
+        let c0 = if mix_counting {
+            e.counters()
+        } else {
+            Vec::new()
+        };
+        let (flt_up0, flt_main0) = if mix_counting {
+            (minflt_of("supdb-upkeep"), minflt_self())
+        } else {
+            (0, 0)
+        };
+        let mix = format!("ycsb-{letter}");
+        phase_mark(arm, &mix, "start");
         let secs = ycsb(e.as_mut(), w, size, &mut inserted, payload)?;
+        phase_mark(arm, &mix, "end");
         ycsb_ops_s.push((letter, ycsb_ops(size) as f64 / secs));
+        if mix_counting {
+            let c1 = e.counters();
+            counters_line(
+                "mixcounters",
+                arm,
+                &letter.to_string(),
+                (
+                    minflt_of("supdb-upkeep").saturating_sub(flt_up0),
+                    minflt_self().saturating_sub(flt_main0),
+                ),
+                (0.0, secs * 1e3),
+                &c0,
+                &c1,
+            );
+        }
     }
 
     // The threaded scans again, on the store the mixes leave: the keys
@@ -839,42 +919,17 @@ fn one_pass(
         scan_lag.push((pct, (scans * plan.scan_len as u64) as f64 / secs));
         if counting {
             let c1 = e.counters();
-            let get = |c: &[(&str, f64)], n: &str| {
-                c.iter().find(|(k, _)| *k == n).map_or(0.0, |(_, v)| *v)
-            };
-            let d = |n: &str| get(&c1, n) - get(&c0, n);
-            let (flt_up, flt_main) = (
-                minflt_of("supdb-upkeep").saturating_sub(flt_up0),
-                minflt_self().saturating_sub(flt_main0),
-            );
-            eprintln!(
-                "lagcounters {arm} {pct} flt up {flt_up} main {flt_main} memfree_mb {} burst_ms {:.1} pass_ms {:.1} | ph take {:.2} sync {:.2} settle {:.2} snap {:.2} ahead {:.2} install {:.2} | thread {:.1}ms/{:.0}p maint {:.1}ms | built up {:.0} eng {:.0} rd {:.0} cloned {:.0} | snaps {:.0} refr {:.0} | walks {:.0}/{:.0}/{:.0} starts {:.0}/{:.0} | pieces {:.0} unsealed {:.0} handles-scans {:.0}",
-                mem_free_mb(),
-                burst_secs * 1e3,
-                secs * 1e3,
-                d("scan_take_us") / 1e3,
-                d("scan_sync_us") / 1e3,
-                d("scan_settle_us") / 1e3,
-                d("scan_snap_us") / 1e3,
-                d("scan_ahead_us") / 1e3,
-                d("scan_install_us") / 1e3,
-                d("upkeep_cpu_us") / 1e3,
-                d("upkeep_passes"),
-                d("maint_cpu_us") / 1e3,
-                d("blk_by_upkeep"),
-                d("blk_by_engine"),
-                d("blk_by_reader"),
-                d("forms_cloned"),
-                d("snapshot_builds"),
-                d("snapshot_refreshes"),
-                d("walk_copy"),
-                d("walk_sparse"),
-                d("walk_other"),
-                d("start_at_rank"),
-                d("start_search"),
-                get(&c1, "pieces"),
-                get(&c1, "unsealed_keys"),
-                d("rd_scans")
+            counters_line(
+                "lagcounters",
+                arm,
+                &pct.to_string(),
+                (
+                    minflt_of("supdb-upkeep").saturating_sub(flt_up0),
+                    minflt_self().saturating_sub(flt_main0),
+                ),
+                (burst_secs * 1e3, secs * 1e3),
+                &c0,
+                &c1,
             );
         }
     }

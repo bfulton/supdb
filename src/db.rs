@@ -1013,6 +1013,15 @@ pub struct Options {
     /// `supdb-lendbursts` the durable store, whose commits lend either
     /// way (`docs/engine.md`).
     pub upkeep_inline_bursts: bool,
+    /// Time the phases a scan runs before its walk -- the upkeep taken
+    /// back, the log read, the settle, the snapshot's refresh, the builder
+    /// started and its forms installed -- into `Db::scan_phases`, for the
+    /// suite's counters lines. A scan made ten clock reads for them, 17%
+    /// of its instructions over a store of ten thousand keys (ycsb-E, by
+    /// callgrind), so the phases are timed only when asked for: the suite
+    /// asks under `SUPDB_LAG_COUNTERS` and `SUPDB_MIX_COUNTERS`, and
+    /// `supdb-timers` and `supdb-ingesttimers` price the asking.
+    pub scan_timers: bool,
     /// Writes the upkeep thread lets gather before it begins a pass, as
     /// a percentage of the store's keys, unless a commit holds for it or
     /// the writes have stopped for `UPKEEP_BATCH_WAIT`; zero begins one
@@ -1496,6 +1505,7 @@ impl Default for Options {
             upkeep: Upkeep::default(),
             upkeep_lag_pct: 0,
             upkeep_inline_bursts: true,
+            scan_timers: false,
             upkeep_batch_pct: 0,
             upkeep_pass_pct: 0,
             snapshot_carry: false,
@@ -8765,9 +8775,16 @@ impl Drop for Reader {
 }
 
 impl Reader {
+    /// The clock for a scan phase, read only under `Options::scan_timers`.
+    #[inline]
+    fn tick_start(&self) -> Option<std::time::Instant> {
+        self.opts.scan_timers.then(std::time::Instant::now)
+    }
+
     /// `t` since, added to scan phase `i`; see `scan_ns`.
     #[inline]
-    fn scan_tick(&self, i: usize, t: std::time::Instant) {
+    fn scan_tick(&self, i: usize, t: Option<std::time::Instant>) {
+        let Some(t) = t else { return };
         let mut s = self.scan_ns.get();
         s[i] += t.elapsed().as_nanos() as u64;
         self.scan_ns.set(s);
@@ -11258,14 +11275,14 @@ impl Reader {
         // the checks below, four cell borrows and a snapshot's length,
         // seventy nanoseconds of a scan of a microsecond at 300k keys, on
         // a mix that writes once in twenty operations.
-        let t = std::time::Instant::now();
+        let t = self.tick_start();
         let _ = self.fs();
         self.scan_tick(0, t);
-        let t = std::time::Instant::now();
+        let t = self.tick_start();
         let moved = self.sync_log() || self.fs().scan_keys.borrow().is_none();
         self.scan_tick(1, t);
         if use_cache && moved {
-            let t = std::time::Instant::now();
+            let t = self.tick_start();
             self.settle_pending()?;
             self.scan_tick(2, t);
         }
@@ -11303,7 +11320,7 @@ impl Reader {
                 Walk::Resume { .. } => Err(err("block scan: resumed without a snapshot")),
             };
         }
-        let t = std::time::Instant::now();
+        let t = self.tick_start();
         self.refresh_snapshot(gen, use_cache, moved);
         self.scan_tick(3, t);
         let cache = self.fs().scan_keys.borrow();
@@ -14407,13 +14424,13 @@ impl Reader {
                 .is_none_or(|a| a.gen != gen)
             && !lazy
         {
-            let t = std::time::Instant::now();
+            let t = self.tick_start();
             self.start_ahead();
             self.scan_tick(4, t);
         }
         match unsealed {
             Some(unsealed) => {
-                let t = std::time::Instant::now();
+                let t = self.tick_start();
                 self.install_ahead(unsealed)?;
                 self.scan_tick(5, t);
             }

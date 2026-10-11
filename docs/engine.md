@@ -2506,6 +2506,45 @@ it would land on, and the engine measures the first; the second is the
 reader's. The settle's own cost a write, 0.2 µs at ten thousand keys
 and 0.8 at three hundred thousand, is the lever under both shapes.
 
+#### The scan's own clock
+
+ycsb-E, the one mix that lost to LMDB on the buffered arm (0.73x at ten
+thousand keys, 0.90x at three hundred thousand), is 1,584 scans of fifty
+entries and one commit at the smallest rung. The suite prints the store's
+counters around each mix now as it does around each lag point
+(`SUPDB_MIX_COUNTERS`, one `mixcounters` line a mix), and the line split
+the mix: the six phases a scan ran before its walk -- the upkeep taken
+back, the log read, the settle, the snapshot's refresh, the builder's
+check and its forms' install -- summed to 0.35-0.45 ms of E's 1.5, each
+25-40 ns a scan at both rungs, which is what a clock read costs and not
+what any of those phases do when nothing has moved. Callgrind over E's
+interval, cut by a dump at every batch flush, put the clock paths at 17%
+of the mix's instructions.
+
+The phases are timed only when asked for now (`Options::scan_timers`, off
+by default; the suite asks under its counters variables, and
+`supdb-timers` and `supdb-ingesttimers` price the asking). Against the
+timing arm, 24 pairs at ten thousand keys and 12 at three hundred
+thousand: ycsb-E 1.30x and 1.25x, the scan workload 1.19x and 1.10x, the
+lag passes 1.16-1.30x and 1.05-1.14x, the mixes that scan nothing within
+noise. Against `lmdb-nosync`, twelve pairs: ycsb-E 0.97x at ten thousand
+keys, unresolved, from 0.73x, and 1.24x at three hundred thousand from
+0.90x; the scan workload 1.16x and 1.26x; the lag passes 1.06-2.05x and
+1.34-1.81x. A first pairing had read level everywhere and was nearly
+recorded as a refutation: the pairing script exported `SUPDB_LAG_COUNTERS` for its
+counters lines, under which the suite times every arm, so the arms did
+not differ. The counters mode costs what it measures, about a quarter of
+a scan of fifty entries over ten thousand keys, and a figure read with it
+on is a figure of the timed shape.
+
+The same interval compared the two engines by instruction: our E ran
+16.3M to LMDB's 21.4M with the same harness in both, 8,840 a scan against
+11,960, and took 1.4x as long; the clean scan workload ran 13,880 a scan
+of a hundred against LMDB's 22,210 at level time. A scan of ours stalls
+about twice as much per instruction as LMDB's leaf walk, on a dirtied
+store and a clean one alike, and that -- the walk's memory access, not
+its arithmetic -- is where the rest of E and the plain scans' margin is.
+
 #### The freeze that leaves its carry to the next look
 
 At level 1 the freeze is the one place the writer still does work for
