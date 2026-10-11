@@ -231,6 +231,20 @@ Profile a probe that does one thing. The scan probe's own `format!` per
 iteration was 8% of its samples until the keys were built before the
 loop.
 
+A lever on fresh pages is priced on the smallest write set as well as
+the load. A fresh anonymous page costs this guest about a microsecond
+by fault and half that populated in bulk (`MADV_POPULATE_WRITE`), and
+populating the writer's buffers a window ahead of the fill moved the
+buffered load's commits 8% at ten thousand keys in every load and the
+load nothing by rate in forty-eight pairs; the lag sweep's one-percent
+burst, a hundred writes over four pages, paid a fixed window of
+sixty-four pages at its first write and read 0.66x, and a window that
+grows with the fill left it within noise and the load still unmoved
+(`Options::prefault`, off; `supdb-populate` is the arm). Read the
+phase column that names the mechanism beside the rate, and when the
+phase moves and the rate does not, the saving is being spent elsewhere
+in the same load.
+
 An instrument in the measured path is priced by taking it away in the
 suite, and the pairing that prices it has to differ in the instrument.
 The scan path timed its six phases before the walk on every scan, ten

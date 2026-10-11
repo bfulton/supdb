@@ -1256,6 +1256,24 @@ pub struct Options {
     /// the chunks the block before it freed. Off, the room, kept for
     /// pricing as `supdb-copyslack` and `supdb-ingestcopyslack`.
     pub copy_exact: bool,
+    /// EXPERIMENT: the writer's buffers have their pages populated ahead
+    /// of the fill, a window at a time, instead of faulting page by page
+    /// as the bytes land -- the memtable arena's blocks and the segment
+    /// writer's piece buffer, which together are most of the fresh pages
+    /// an ordered load touches, about six hundred of nine hundred at ten
+    /// thousand keys. A first touch costs this guest about a microsecond
+    /// a page by fault and half that by `madvise` (`MADV_POPULATE_WRITE`)
+    /// over a window, the kernel's zeroing being the half that stays, and
+    /// the window grows with the fill (`PREFAULT_MIN`, `PREFAULT_MAX`).
+    /// Priced, it moved the buffered ordered load's commits 8% at ten
+    /// thousand keys and the load nothing by rate in forty-eight pairs,
+    /// level at three hundred thousand, while the mixes' and the small
+    /// bursts' first writes into a fresh table paid the window. Off, and
+    /// the pages fault as they are touched; on as `supdb-populate` and
+    /// `supdb-ingestpopulate`. Linux only: elsewhere, and on a kernel
+    /// without the advice, nothing changes. A `Db` passes it to its
+    /// segment writers over `SegmentOptions::prefault`.
+    pub prefault: bool,
     /// Whether a drain that does not partition on flush names its first
     /// seal's piece as the partition at the close, where it fits one and
     /// holds no tombstone, rather than landing it as a piece and promoting
@@ -1573,6 +1591,7 @@ impl Default for Options {
             forms_convert_behind: usize::MAX,
             convert_from_form: true,
             copy_exact: true,
+            prefault: false,
             drain_names_partition: true,
             manifest_spare: true,
             manifest_slots: true,
@@ -2214,6 +2233,10 @@ fn seg_order(a: &Seg, b: &Seg) -> Ordering {
 struct AlignedWriter {
     file: File,
     buf: Vec<u8>,
+    /// `SegmentOptions::prefault`: the buffer's pages populated a window
+    /// ahead of the fill, and how far they are.
+    prefault: bool,
+    populated: usize,
     /// Bytes on the file so far: where the buffer's contents land.
     written: u64,
     /// The piece, and the boundary every write but a flush's ends on.
@@ -2272,11 +2295,13 @@ struct HelperRow {
 }
 
 impl AlignedWriter {
-    fn new(file: File, piece: usize, writeback: bool, ahead: u64) -> AlignedWriter {
+    fn new(file: File, piece: usize, writeback: bool, ahead: u64, prefault: bool) -> AlignedWriter {
         let piece = piece.max(4096);
         AlignedWriter {
             file,
             buf: Vec::with_capacity(piece),
+            prefault,
+            populated: 0,
             written: 0,
             piece: piece as u64,
             writeback,
@@ -2785,6 +2810,14 @@ impl std::io::Write for AlignedWriter {
         while !rest.is_empty() {
             let room = self.to_boundary() - self.buf.len();
             let take = room.min(rest.len());
+            if self.prefault {
+                populate_ahead(
+                    self.buf.as_ptr() as usize,
+                    self.buf.capacity(),
+                    &mut self.populated,
+                    self.buf.len() + take,
+                );
+            }
             if self.own_on && self.section.is_some() {
                 let at = self.written + self.buf.len() as u64;
                 self.own_hash(at, &rest[..take]);
@@ -3097,6 +3130,7 @@ impl SegmentWriter {
             opts.write_piece,
             opts.early_writeback,
             opts.sync_ahead,
+            opts.prefault,
         );
         out.set_row_on_write(opts.row_on_write);
         // The header region stays zero until `finish`, so a segment that
@@ -4083,6 +4117,10 @@ pub struct SegmentOptions {
     /// thousand keys, kept for pricing as `supdb-rowatclose` and
     /// `supdb-ingestrowatclose`.
     pub row_on_write: bool,
+    /// EXPERIMENT: the piece buffer's pages populated a window ahead of
+    /// the fill rather than faulted one by one as the records land; see
+    /// `Options::prefault`, which a `Db` sets this from. Off.
+    pub prefault: bool,
 }
 
 impl Default for SegmentOptions {
@@ -4096,6 +4134,7 @@ impl Default for SegmentOptions {
             early_writeback: true,
             sync_ahead: 8 << 20,
             row_on_write: true,
+            prefault: false,
         }
     }
 }
@@ -4767,12 +4806,64 @@ const ARENA_BLOCK: usize = 1 << ARENA_SHIFT;
 /// Blocks an arena can address: sixteen gigabytes of the plain size.
 const ARENA_BLOCKS: usize = 1 << 12;
 
+/// The window a buffer's pages are populated by, ahead of its fill
+/// (`Options::prefault`): as much again as is populated, between these
+/// two, so the pages a buffer never fills are at most the fill's own size
+/// below a quarter megabyte and sixty-four pages past it. A fixed window
+/// of sixty-four pages cost a fresh table's first write thirty
+/// microseconds an arena, and the lag sweep's one-percent burst at ten
+/// thousand keys, a hundred writes over four pages, read its updates at
+/// 0.66x and ycsb-B at 0.87x.
+const PREFAULT_MIN: usize = 16 << 10;
+const PREFAULT_MAX: usize = 256 << 10;
+
+/// The pages of `base[..cap]` from `populated` to at least `need`, a
+/// window at a time, populated in one call so each costs the kernel's
+/// zeroing and not a fault's trap as well; `populated` is moved to where
+/// the next call continues from. The range is rounded inward to pages at
+/// its end, so the allocation's last partial page faults as it did, and
+/// outward at its start, where the page is the allocation's own. A
+/// failure -- a kernel without the advice -- leaves the pages to fault.
+#[cfg(target_os = "linux")]
+fn populate_ahead(base: usize, cap: usize, populated: &mut usize, need: usize) {
+    if need <= *populated || *populated >= cap {
+        return;
+    }
+    let window = (*populated).clamp(PREFAULT_MIN, PREFAULT_MAX);
+    let end = need.max(*populated + window).min(cap);
+    let page = 4096usize;
+    let start = (base + *populated) & !(page - 1);
+    let stop = (base + end) & !(page - 1);
+    if stop > start {
+        // SAFETY: `[start, stop)` lies within the allocation at `base`, of
+        // `cap` bytes, bar the page-rounding at `start`, which stays on the
+        // page the allocation's first byte is on; the advice touches no
+        // byte's value.
+        unsafe {
+            libc::madvise(
+                start as *mut libc::c_void,
+                stop - start,
+                libc::MADV_POPULATE_WRITE,
+            );
+        }
+    }
+    *populated = end;
+}
+
+#[cfg(not(target_os = "linux"))]
+fn populate_ahead(_base: usize, cap: usize, populated: &mut usize, need: usize) {
+    *populated = need.max(*populated).min(cap);
+}
+
 struct ByteArena {
     blocks: Box<[AtomicPtr<u8>]>,
     caps: Box<[AtomicUsize]>,
     /// Writer-only.
     tail: UnsafeCell<ArenaTail>,
     used: AtomicUsize,
+    /// `Options::prefault`: the tail's block populated a window ahead of
+    /// the reservations.
+    prefault: bool,
 }
 
 #[derive(Default)]
@@ -4780,10 +4871,15 @@ struct ArenaTail {
     at: usize,
     block_end: usize,
     next_block: usize,
+    /// The tail's block: its logical start, its address, and how far
+    /// into it the pages are populated (`Options::prefault`).
+    block_start: usize,
+    block_base: usize,
+    populated: usize,
 }
 
 impl ByteArena {
-    fn new() -> ByteArena {
+    fn new(prefault: bool) -> ByteArena {
         ByteArena {
             blocks: (0..ARENA_BLOCKS)
                 .map(|_| AtomicPtr::new(std::ptr::null_mut()))
@@ -4791,6 +4887,7 @@ impl ByteArena {
             caps: (0..ARENA_BLOCKS).map(|_| AtomicUsize::new(0)).collect(),
             tail: UnsafeCell::new(ArenaTail::default()),
             used: AtomicUsize::new(0),
+            prefault,
         }
     }
 
@@ -4818,6 +4915,17 @@ impl ByteArena {
             t.at = b << ARENA_SHIFT;
             t.block_end = t.at + cap;
             t.next_block = b + cap.div_ceil(ARENA_BLOCK);
+            t.block_start = t.at;
+            t.block_base = p as usize;
+            t.populated = 0;
+        }
+        if self.prefault {
+            populate_ahead(
+                t.block_base,
+                t.block_end - t.block_start,
+                &mut t.populated,
+                t.at + n - t.block_start,
+            );
         }
         let off = t.at;
         t.at += n;
@@ -5294,7 +5402,7 @@ impl Readers {
 }
 
 impl MemTable {
-    fn new() -> MemTable {
+    fn new(prefault: bool) -> MemTable {
         MemTable {
             entries: Slab::new(),
             index: AtomicPtr::new(Box::into_raw(Box::new(Index::with_slots(1024)))),
@@ -5303,10 +5411,10 @@ impl MemTable {
             run: AtomicPtr::new(std::ptr::null_mut()),
             run_flushed: AtomicU64::new(0),
             retired_runs: UnsafeCell::new(Vec::new()),
-            vals2: ByteArena::new(),
+            vals2: ByteArena::new(prefault),
             staging: UnsafeCell::new(Staging::default()),
-            keys: ByteArena::new(),
-            vals: ByteArena::new(),
+            keys: ByteArena::new(prefault),
+            vals: ByteArena::new(prefault),
             tombs: AtomicUsize::new(0),
             marks: Default::default(),
             mark: AtomicU64::new(0),
@@ -5319,7 +5427,7 @@ impl MemTable {
     /// A table for keys that arrive in order: each above the last; with
     /// `refs`, one whose committed values are references into the run's
     /// segment (`Options::direct_table_refs`).
-    fn new_ordered(refs: bool) -> MemTable {
+    fn new_ordered(refs: bool, prefault: bool) -> MemTable {
         MemTable {
             entries: Slab::new(),
             index: AtomicPtr::new(std::ptr::null_mut()),
@@ -5328,10 +5436,10 @@ impl MemTable {
             run: AtomicPtr::new(std::ptr::null_mut()),
             run_flushed: AtomicU64::new(0),
             retired_runs: UnsafeCell::new(Vec::new()),
-            vals2: ByteArena::new(),
+            vals2: ByteArena::new(prefault),
             staging: UnsafeCell::new(Staging::default()),
-            keys: ByteArena::new(),
-            vals: ByteArena::new(),
+            keys: ByteArena::new(prefault),
+            vals: ByteArena::new(prefault),
             tombs: AtomicUsize::new(0),
             marks: Default::default(),
             mark: AtomicU64::new(0),
@@ -16182,7 +16290,9 @@ impl Db {
     }
 
     fn segment_opts(opts: &Options) -> SegmentOptions {
-        opts.segment.clone()
+        let mut s = opts.segment.clone();
+        s.prefault = opts.prefault;
+        s
     }
 
     pub fn create(dir: &Path, opts: Options) -> Result<Db> {
@@ -16236,7 +16346,7 @@ impl Db {
             scans: AtomicU64::new(0),
             forms_bytes: AtomicUsize::new(0),
             segs,
-            mem: std::sync::Arc::new(MemTable::new()),
+            mem: std::sync::Arc::new(MemTable::new(opts.prefault)),
             frozen: Vec::new(),
             gen: 1,
             lives: 0,
@@ -16547,7 +16657,7 @@ impl Db {
             }
         }
         wal_ids.sort_unstable();
-        let mem = MemTable::new();
+        let mem = MemTable::new(opts.prefault);
         // Replay's own table, for the index resizes a replayed delete
         // frees through; nothing reads beside it.
         let readers = Readers::new(false);
@@ -16783,7 +16893,10 @@ impl Db {
                 if !self.mem().ordered {
                     let old = self.mem().clone();
                     self.set_mem_with(
-                        std::sync::Arc::new(MemTable::new_ordered(self.opts.direct_table_refs)),
+                        std::sync::Arc::new(MemTable::new_ordered(
+                            self.opts.direct_table_refs,
+                            self.opts.prefault,
+                        )),
                         true,
                     );
                     self.carry_switch(&old);
@@ -17322,7 +17435,7 @@ impl Db {
         self.mem_bytes = 0;
         let Some(d) = self.direct.take() else {
             // A run forming with nothing committed: no file, nothing to close.
-            self.set_mem(std::sync::Arc::new(MemTable::new()));
+            self.set_mem(std::sync::Arc::new(MemTable::new(self.opts.prefault)));
             return Ok(());
         };
         self.land_seal()?;
@@ -18143,7 +18256,7 @@ impl Db {
         let settled_at = self.state() as *const State;
         let from = Db::replaced_from(&self.opts, &self.shared);
         let complete = self.fs().tables_complete.get();
-        let fresh = std::sync::Arc::new(MemTable::new());
+        let fresh = std::sync::Arc::new(MemTable::new(self.opts.prefault));
         let carried = std::cell::Cell::new(false);
         let pieces_only = self.opts.forms_pieces_only;
         let Some(old) = self.try_publish_writer(|cur| {
@@ -18190,7 +18303,7 @@ impl Db {
     /// vouch for nothing until a publish into it says otherwise -- so a
     /// handle at it builds its own blocks until the upkeep has looked.
     fn freeze_swap(&mut self, table: &std::sync::Arc<MemTable>) -> bool {
-        let fresh = std::sync::Arc::new(MemTable::new());
+        let fresh = std::sync::Arc::new(MemTable::new(self.opts.prefault));
         let from = Db::replaced_from(&self.opts, &self.shared);
         let Some(old) = self.try_publish_writer_away(|cur| {
             if !std::sync::Arc::ptr_eq(&cur.mem, table) || cur.frozen.len() >= FROZEN_CAP {
@@ -23923,7 +24036,7 @@ impl Maint {
         segs.sort_by(|a, b| seg_order(a, b));
         // One fresh table for every attempt: a landing that lost the swap
         // installs the same empty table on its retry.
-        let fresh = landed.map(|_| std::sync::Arc::new(MemTable::new()));
+        let fresh = landed.map(|_| std::sync::Arc::new(MemTable::new(self.opts.prefault)));
         debug_assert!(
             Self::partitions_tile(&segs),
             "a segment publish left partitions that do not tile the key space"
@@ -25068,7 +25181,7 @@ mod threading {
         };
         let mut want = std::collections::HashMap::new();
         want.insert(0usize, (0usize, 0u64));
-        let dry = super::MemTable::new();
+        let dry = super::MemTable::new(false);
         fill(
             &dry,
             Box::new(|m: &super::MemTable| {
@@ -25076,7 +25189,7 @@ mod threading {
                 want.insert(log, (len, wm));
             }),
         );
-        let mem = super::MemTable::new();
+        let mem = super::MemTable::new(false);
         let stop = AtomicBool::new(false);
         std::thread::scope(|s| {
             let reader = s.spawn(|| {

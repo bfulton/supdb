@@ -3795,6 +3795,46 @@ keys and 1.11x in twelve at three hundred thousand, none resolved at p
 .05, since the commits' faults move a load by more than its drain; the
 durable load 1.01x, and every read, scan, lag and mix cell level.
 
+#### Pages populated ahead of the fill
+
+The commits were then the other half of the buffered load's loss at ten
+thousand keys, 2.4 ms against the comparator's 1.5 for the same ten
+batches, and the writer's faults said where: 925 against 45. Ten
+thousand records of a hundred and sixteen bytes are 1.16 MB, and the
+load touches 3.7 MB of fresh pages for them -- the ordered table's arena
+(about 330 pages, each key and value copied in), the segment writer's
+piece buffer (256, a megabyte touched once), the entries, the key
+section's buffer -- where the comparator's records go by `pwrite` into
+page-cache pages the kernel allocates without a fault or a zeroing. A
+probe priced the alternatives on this guest: a fresh anonymous page
+costs 0.9-1.0 µs by fault and 0.44-0.48 by `madvise` with
+`MADV_POPULATE_WRITE` over a block of them, the kernel's zeroing being
+the half that stays. So the arena's blocks and the piece buffer were
+given a window populated ahead of the fill (`Options::prefault`,
+`populate_ahead`), and the load's phase print read the commits at 2.13
+ms against 2.38, below in 13 loads of 13, 0.25 ms for about six hundred
+pages at half a microsecond each.
+
+The first window was a fixed quarter megabyte, and the pairing refuted
+it where the writes are few: a fresh table's first write populated
+sixty-four pages an arena, thirty microseconds, for the lag sweep's
+one-percent burst of a hundred writes over four pages, whose updates
+read 0.66x in 24 pairs of 24, and for ycsb-B's, 0.87x; the load read
+1.03x (18 of 24). The window grows with the fill now, as much again as
+is populated between 16 KB and 256 KB, and the second pairing had the
+small cells back within noise -- ycsb-B 0.97x at p .02, the one-percent
+burst 0.94x unresolved -- the commits at 2.24 ms against 2.44 in 10 of
+13, and the load nothing by rate: 0.998x in 24 pairs at ten thousand
+keys and 1.09x in 12, 0.95x in 12 at three hundred thousand, the
+durable load level. A lever that moves a phase by a tenth and the load
+by nothing is one whose saving the rest of the load spends, and the
+small write sets paid for it in both versions, so the option ships off
+and the populated shape is the arm, `supdb-populate` and
+`supdb-ingestpopulate`. What the fault count says stands: the fresh
+pages are the commits' gap, and a design that stages records in
+user-space buffers pays them where one that writes into the page cache
+does not.
+
 #### The pin's fence, priced against a sweep that fences for it
 
 A read pins the epoch it reads in by storing it in its slot of the

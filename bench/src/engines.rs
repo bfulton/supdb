@@ -406,6 +406,10 @@ pub struct Supdb {
     /// fsync, as before the two slots (`Options::manifest_slots` off).
     /// `supdb-manifestrename`, and `supdb-ingestmanifestrename` buffered.
     manifestrename: bool,
+    /// The writer's buffers populated a window ahead of their fill
+    /// (`Options::prefault`). `supdb-populate`, and `supdb-ingestpopulate`
+    /// buffered.
+    populate: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -620,6 +624,10 @@ struct Policy {
     /// fsync, as before the two slots (`Options::manifest_slots` off).
     /// `supdb-manifestrename`, and `supdb-ingestmanifestrename` buffered.
     manifestrename: bool,
+    /// The writer's buffers populated a window ahead of their fill
+    /// (`Options::prefault`). `supdb-populate`, and `supdb-ingestpopulate`
+    /// buffered.
+    populate: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -818,6 +826,7 @@ impl Default for Policy {
             wake: false,
             noprefetch: false,
             manifestrename: false,
+            populate: false,
             rankrecords: false,
             shape: false,
             adaptcap: None,
@@ -2185,6 +2194,31 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with its buffers' pages populated ahead of the fill
+    /// (`Options::prefault`).
+    pub fn create_populate(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                populate: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-populate`.
+    pub fn create_ingest_populate(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                populate: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` ranking a piece's keys over the partition's records, as
     /// before `Options::piece_ranks_by_heads`: against `supdb` it prices
     /// the ranking over the index's heads, on the segment work's thread.
@@ -2392,6 +2426,7 @@ impl Supdb {
             wake,
             noprefetch,
             manifestrename,
+            populate,
             rankrecords,
             shape,
             aheadmin,
@@ -2568,6 +2603,7 @@ impl Supdb {
             upkeep_wake_parked: wake,
             scan_prefetch: !noprefetch,
             manifest_slots: !manifestrename,
+            prefault: populate,
             // The scan phases timed where the arm asks, or where the
             // counters lines will read them: ten clock reads a scan.
             scan_timers: timers
@@ -2674,6 +2710,7 @@ impl Supdb {
             wake,
             noprefetch,
             manifestrename,
+            populate,
             rankrecords,
             shape,
             aheadmin,
@@ -3060,6 +3097,13 @@ impl Engine for Supdb {
                 "supdb-manifestrename"
             } else {
                 "supdb-ingestmanifestrename"
+            };
+        }
+        if self.populate {
+            return if self.partition {
+                "supdb-populate"
+            } else {
+                "supdb-ingestpopulate"
             };
         }
         if self.rankrecords {
@@ -3756,6 +3800,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-wake"
         | "supdb-noprefetch"
         | "supdb-manifestrename"
+        | "supdb-populate"
         | "supdb-inlinemaint"
         | "supdb-adapt"
         | "supdb-adapttrig"
@@ -3813,6 +3858,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestwake"
         | "supdb-ingestnoprefetch"
         | "supdb-ingestmanifestrename"
+        | "supdb-ingestpopulate"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
         | "supdb-ingestrankrecords"
@@ -3927,6 +3973,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestnoprefetch" => Box::new(Supdb::create_ingest_noprefetch(dir)?),
         "supdb-manifestrename" => Box::new(Supdb::create_manifestrename(dir)?),
         "supdb-ingestmanifestrename" => Box::new(Supdb::create_ingest_manifestrename(dir)?),
+        "supdb-populate" => Box::new(Supdb::create_populate(dir)?),
+        "supdb-ingestpopulate" => Box::new(Supdb::create_ingest_populate(dir)?),
         "supdb-ingestsettlefreeze" => Box::new(Supdb::create_ingest_settlefreeze(dir)?),
         "supdb-ingestconvertcap" => Box::new(Supdb::create_ingest_convertcap(dir)?),
         "supdb-ingestshortpass" => Box::new(Supdb::create_ingest_shortpass(dir)?),
