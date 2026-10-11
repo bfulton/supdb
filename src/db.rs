@@ -1340,8 +1340,11 @@ pub struct Options {
     /// of the writer's faults and a twentieth of its CPU over that load
     /// and moves the load 4% in twelve pairs, short of significance and of
     /// the tenth it was to move; the entries, the keys and the staging copy
-    /// are the rest of the table's cost. Off, the default, the copies; on,
-    /// the arm `supdb-refvals` and `supdb-ingestrefvals`.
+    /// are the rest of the table's cost, and at ten thousand keys the
+    /// mapping's pages cost what the copy's did, the commits 7% slower
+    /// with more faults in twelve pairs of the load's phases. Off, the
+    /// default, the copies; on, the arm `supdb-refvals` and
+    /// `supdb-ingestrefvals`.
     pub direct_table_refs: bool,
     /// Bytes the mapping of a direct run's segment starts with; zero, the
     /// default, twice `seal_bytes`. The mapping grows when the run's file

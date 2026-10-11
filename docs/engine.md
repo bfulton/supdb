@@ -3752,7 +3752,13 @@ level. The copies ship and the references are the arm. What is left of
 the table -- its entries at thirty-two bytes a key, its keys, the staged
 copy -- is as much as the arena was, and the shape not yet priced is a
 run that keeps no table, serving its reads from the segment writer's own
-sorted keys and record offsets.
+sorted keys and record offsets. Priced again at ten thousand keys once
+the manifest had its slots, by the load's phases in twelve pairs: the
+commits 2.5 ms against 2.4, below the copies in 2 loads of 13, with
+1,015 faults against 930 -- the mapping's pages and the arenas' both --
+and the load 0.96x in 24 pairs, 1.04x in 12 at three hundred thousand,
+every other cell level. At the small rung the mapping costs what the
+copy did, and the arm stays an arm.
 
 
 #### The manifest in two slots
