@@ -1314,6 +1314,30 @@ pub struct Options {
     /// opens under either: a version-1 manifest reads as sequence zero
     /// and the open makes the slot it lacks.
     pub manifest_slots: bool,
+    /// EXPERIMENT, priced and kept as an arm: a seal's manifest riding its
+    /// fsync. At the seal's readable landing the segment work writes the
+    /// slot naming the seal's segments as PENDING, first thing, and hands
+    /// its fdatasync and the directory's fsync to a thread kept for it, so
+    /// that they would share the journal commit the seal thread's fsync
+    /// forces beside them, and the durable landing writes nothing. The open
+    /// takes a pending name only once the segment reads back whole -- its
+    /// key section's checksum row and every block's checksum, so never
+    /// without block checksums (`SegmentOptions::checksums`), where it falls
+    /// back -- and a slot whose pending segments do not is the crash
+    /// window's: the slot before it is the store, the torn segments are
+    /// swept, and the WAL holds the writes, since under this shape a seal's
+    /// WAL and temp name retire only once a slot naming its segments
+    /// durable is itself durable (the next publish, or the close's). Only
+    /// the newest slot's pending names are in doubt. The open and the close
+    /// write a slot with every name durable. On this machine the shape
+    /// bought nothing: a thread woken from idle reaches its first syscall
+    /// about a millisecond on, past the seal's fsync it was to overlap,
+    /// spawned or parked alike, and three shapes read the drain at ten
+    /// thousand keys within a few percent either way. Off, the default: the
+    /// slot written after the seal's fsync returns, one round trip behind
+    /// it. On, `supdb-manifestpending` and `supdb-ingestmanifestpending`.
+    /// Needs the slots; under the rename shape it does nothing.
+    pub manifest_pending: bool,
     /// Whether a segment's ordered index is fsynced when it is written. The
     /// index is a function of the segment's keys and nothing else, so a
     /// store that finds it missing, torn or describing another segment at
@@ -1628,6 +1652,7 @@ impl Default for Options {
             drain_names_partition: true,
             manifest_spare: true,
             manifest_slots: true,
+            manifest_pending: false,
             ord_durable: false,
             direct_table_refs: false,
             direct_put_one: true,
@@ -7025,8 +7050,13 @@ fn check_options(opts: &Options) -> Result<()> {
 /// body_len | u32 crc | body`, had no sequence and one file; it is read as
 /// a sequence of zero, and a store that has one gets its second slot at
 /// the open.
-const MANIFEST_MAGIC: &[u8; 9] = b"SUPDBMAN\x02";
+const MANIFEST_MAGIC: &[u8; 9] = b"SUPDBMAN\x03";
+const MANIFEST_MAGIC_V2: &[u8; 9] = b"SUPDBMAN\x02";
 const MANIFEST_MAGIC_V1: &[u8; 9] = b"SUPDBMAN\x01";
+/// The flag byte behind each name in a version-3 body: the segment is
+/// named at its seal's readable landing and may not be durable yet
+/// (`Options::manifest_pending`).
+const MANIFEST_PENDING: u8 = 1;
 /// The two slot files a publish alternates between.
 const MANIFEST_SLOTS: [&str; 2] = ["manifest", "manifest.alt"];
 
@@ -7057,14 +7087,21 @@ fn sweep_manifest_spares(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A manifest's bytes: the header, then the covered sequence and the names.
-fn manifest_encode(seq: u64, covered_seq: u64, names: &[String]) -> Vec<u8> {
+/// A manifest's bytes: the header, then the covered sequence and the
+/// names, each with its flag byte -- `MANIFEST_PENDING` for the names in
+/// `pending`.
+fn manifest_encode(seq: u64, covered_seq: u64, names: &[String], pending: &[String]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&covered_seq.to_le_bytes());
     body.extend_from_slice(&(names.len() as u32).to_le_bytes());
     for n in names {
         body.extend_from_slice(&(n.len() as u16).to_le_bytes());
         body.extend_from_slice(n.as_bytes());
+        body.push(if pending.contains(n) {
+            MANIFEST_PENDING
+        } else {
+            0
+        });
     }
     let crc = block::crc32_resume(crc32(&seq.to_le_bytes()), &body);
     let mut out = Vec::with_capacity(body.len() + 25);
@@ -7082,17 +7119,36 @@ fn manifest_encode(seq: u64, covered_seq: u64, names: &[String]) -> Vec<u8> {
 /// The slot is never truncated -- a truncate frees blocks, and a freed
 /// block is a discard round trip here -- so a shorter manifest leaves the
 /// old one's tail behind it, past the length the header names.
-fn manifest_write_slot(dir: &Path, seq: u64, covered_seq: u64, names: &[String]) -> Result<()> {
+fn manifest_write_slot(
+    dir: &Path,
+    seq: u64,
+    covered_seq: u64,
+    names: &[String],
+    pending: &[String],
+) -> Result<()> {
+    manifest_write_slot_unsynced(dir, seq, covered_seq, names, pending)?.sync_data()?;
+    Ok(())
+}
+
+/// `manifest_write_slot` without its fdatasync, the slot's file returned
+/// for the caller to sync where it will: the pending publish hands it to a
+/// thread beside the seal's fsync (`Maint::land_readable`).
+fn manifest_write_slot_unsynced(
+    dir: &Path,
+    seq: u64,
+    covered_seq: u64,
+    names: &[String],
+    pending: &[String],
+) -> Result<File> {
     use std::os::unix::fs::FileExt;
-    let out = manifest_encode(seq, covered_seq, names);
+    let out = manifest_encode(seq, covered_seq, names, pending);
     let f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .open(dir.join(manifest_slot(seq)))?;
     f.write_all_at(&out, 0)?;
-    f.sync_data()?;
-    Ok(())
+    Ok(f)
 }
 
 /// The slot files a store under `Options::manifest_slots` needs, made where
@@ -7124,7 +7180,7 @@ fn manifest_write_shape(
     names: &[String],
 ) -> Result<()> {
     if opts.manifest_slots {
-        return manifest_write_slot(dir, seq, covered_seq, names);
+        return manifest_write_slot(dir, seq, covered_seq, names, &[]);
     }
     if let Some(spare) = manifest_write(dir, seq, covered_seq, names, false)? {
         let _ = std::fs::remove_file(spare);
@@ -7144,7 +7200,7 @@ fn manifest_write(
     names: &[String],
     spare: bool,
 ) -> Result<Option<PathBuf>> {
-    let out = manifest_encode(seq, covered_seq, names);
+    let out = manifest_encode(seq, covered_seq, names, &[]);
     let tmp = dir.join("manifest.tmp");
     {
         let mut f = File::create(&tmp)?;
@@ -7175,18 +7231,32 @@ fn manifest_write(
 /// What a manifest names: its publish sequence, the WAL sequence it
 /// covers, and the live segments.
 struct Manifest {
+    /// The format the slot was read in: 1, 2 or 3.
+    version: u8,
     seq: u64,
     covered: u64,
     names: Vec<String>,
+    /// The names flagged `MANIFEST_PENDING`; none below version 3.
+    pending: Vec<String>,
 }
 
 /// One manifest file parsed, either version. A file that fails its CRC is
 /// a torn write and is refused.
 fn manifest_parse(buf: &[u8]) -> Result<Manifest> {
-    let (seq, at) = if buf.len() >= 25 && &buf[..9] == MANIFEST_MAGIC {
-        (u64::from_le_bytes(buf[9..17].try_into().unwrap()), 17usize)
+    let (version, seq, at) = if buf.len() >= 25 && &buf[..9] == MANIFEST_MAGIC {
+        (
+            3u8,
+            u64::from_le_bytes(buf[9..17].try_into().unwrap()),
+            17usize,
+        )
+    } else if buf.len() >= 25 && &buf[..9] == MANIFEST_MAGIC_V2 {
+        (
+            2u8,
+            u64::from_le_bytes(buf[9..17].try_into().unwrap()),
+            17usize,
+        )
     } else if buf.len() >= 17 && &buf[..9] == MANIFEST_MAGIC_V1 {
-        (0u64, 9usize)
+        (1u8, 0u64, 9usize)
     } else {
         return Err(err("manifest magic is wrong"));
     };
@@ -7209,6 +7279,7 @@ fn manifest_parse(buf: &[u8]) -> Result<Manifest> {
     let covered = u64::from_le_bytes(body[..8].try_into().unwrap());
     let n = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
     let mut names = Vec::with_capacity(n);
+    let mut pending = Vec::new();
     let mut p = 12usize;
     for _ in 0..n {
         let l = u16::from_le_bytes(
@@ -7221,25 +7292,34 @@ fn manifest_parse(buf: &[u8]) -> Result<Manifest> {
         let raw = body
             .get(p..p + l)
             .ok_or_else(|| err("manifest is truncated"))?;
-        names.push(String::from_utf8(raw.to_vec()).map_err(|_| err("manifest name is not utf8"))?);
+        let name = String::from_utf8(raw.to_vec()).map_err(|_| err("manifest name is not utf8"))?;
         p += l;
+        if version >= 3 {
+            let flags = *body.get(p).ok_or_else(|| err("manifest is truncated"))?;
+            p += 1;
+            if flags & MANIFEST_PENDING != 0 {
+                pending.push(name.clone());
+            }
+        }
+        names.push(name);
     }
     Ok(Manifest {
+        version,
         seq,
         covered,
         names,
+        pending,
     })
 }
 
-/// The newest valid manifest of the two slots, by publish sequence. `None`
-/// when neither exists -- a store that has never sealed, or one written
-/// before manifests. An empty slot is one made and never written. A slot
-/// that fails its CRC is a torn write: ignored where the other slot is
-/// valid, since the torn one is the publish the crash interrupted and the
-/// other is the store, and refused where no slot is valid rather than
-/// guessed at.
-fn manifest_read(dir: &Path) -> Result<Option<Manifest>> {
-    let mut best: Option<Manifest> = None;
+/// Every valid slot, newest first by publish sequence; empty when neither
+/// exists -- a store that has never sealed, or one written before
+/// manifests. An empty slot is one made and never written. A slot that
+/// fails its CRC is a torn write: ignored where another slot is valid,
+/// since the torn one is the publish the crash interrupted and the other
+/// is the store, and refused where no slot is valid rather than guessed at.
+fn manifest_read_all(dir: &Path) -> Result<Vec<Manifest>> {
+    let mut valid: Vec<Manifest> = Vec::new();
     let mut torn: Option<std::io::Error> = None;
     for slot in MANIFEST_SLOTS {
         let mut buf = Vec::new();
@@ -7252,18 +7332,14 @@ fn manifest_read(dir: &Path) -> Result<Option<Manifest>> {
             continue;
         }
         match manifest_parse(&buf) {
-            Ok(m) => {
-                if best.as_ref().is_none_or(|b| m.seq > b.seq) {
-                    best = Some(m);
-                }
-            }
+            Ok(m) => valid.push(m),
             Err(e) => torn = Some(e),
         }
     }
-    match (best, torn) {
-        (Some(m), _) => Ok(Some(m)),
-        (None, Some(e)) => Err(e),
-        (None, None) => Ok(None),
+    valid.sort_by(|a, b| b.seq.cmp(&a.seq));
+    match (valid.is_empty(), torn) {
+        (true, Some(e)) => Err(e),
+        _ => Ok(valid),
     }
 }
 
@@ -17108,7 +17184,7 @@ impl Db {
         // file that may be torn, and the manifest is what says it is not
         // the store's. The scan stays for stores written before manifests.
         if opts.manifest_slots {
-            manifest_write_slot(dir, 0, 0, &[])?;
+            manifest_write_slot(dir, 0, 0, &[], &[])?;
             manifest_make_slots(dir)?;
         } else {
             manifest_write(dir, 0, 0, &[], false)?;
@@ -17293,8 +17369,36 @@ impl Db {
                 on_disk.push(name);
             }
         }
-        let manifest = manifest_read(dir)?;
+        // The newest valid slot whose pending segments -- named at their
+        // seal's readable landing, before their fsync returned
+        // (`Options::manifest_pending`) -- read back whole; a slot whose do
+        // not is the crash window's, and the slot before it is the store,
+        // with the WAL holding the writes since it retires only at the
+        // durable landing. A store from before the flags, any slot of
+        // version 2 or 1, gets both slots rewritten in this version below,
+        // since a reader of those versions skips a slot it cannot parse for
+        // one it can, and would take the older state for the store.
+        let mut slots = manifest_read_all(dir)?;
+        let upgrade = slots.iter().any(|m| m.version < 3);
+        // Only the newest slot's pending names are in doubt: the slot
+        // before it was written by a publish that waited for that seal's
+        // durable landing.
+        let skipped = slots
+            .first()
+            .is_some_and(|m| !m.pending.is_empty() && !Db::pending_whole(dir, &opts, &m.pending));
+        if skipped {
+            slots.remove(0);
+        }
+        let manifest: Option<Manifest> = if slots.is_empty() {
+            None
+        } else {
+            Some(slots.remove(0))
+        };
         let had_manifest = manifest.is_some();
+        // A slot to write below: pending names verified whole, or a slot
+        // skipped, whose file would otherwise read as the newest at the
+        // next open and be verified again against segments swept here.
+        let had_pending = skipped || manifest.as_ref().is_some_and(|m| !m.pending.is_empty());
         // The publish sequence the store is at, moved by every manifest
         // written here and handed to the segment work.
         let mut mseq = manifest.as_ref().map_or(0, |m| m.seq);
@@ -17330,6 +17434,15 @@ impl Db {
         if !had_manifest {
             mseq += 1;
             manifest_write_shape(dir, &opts, mseq, sealed, &live)?;
+        } else if opts.manifest_slots && (had_pending || upgrade) {
+            // Every name durable now, in a slot of this version; and the
+            // other slot too where it was of a version before, so neither
+            // reads as the store to a reader of that version.
+            mseq += 1;
+            manifest_write_slot(dir, mseq, sealed, &live, &[])?;
+            if upgrade {
+                manifest_write_slot(dir, mseq - 1, sealed, &live, &[])?;
+            }
         }
         // A direct segment a crash left open: its records up to the last
         // commit marker are the batches that were acknowledged, rewritten
@@ -17767,6 +17880,29 @@ impl Db {
         self.fs().log_gen.set(st.gen);
         self.fs().log_seen.set(0);
         self.note_over(st);
+    }
+
+    /// Whether every segment in `names` reads back whole: its superblock
+    /// and key section's checksum row at the open, and every block's
+    /// checksum over a walk of every record (`Options::manifest_pending`).
+    /// A name that is not there, or a segment that is not whole, is a seal
+    /// whose fsync a crash cut short.
+    fn pending_whole(dir: &Path, opts: &Options, names: &[String]) -> bool {
+        // Without block checksums a torn block reads as its bytes: nothing
+        // here can tell it from a whole one, so nothing pending is trusted
+        // and the WAL, kept for this, replays.
+        if !opts.segment.checksums {
+            return false;
+        }
+        names.iter().all(|name| {
+            let Ok(seg) = Seg::open(dir, name, false, false, true, true) else {
+                return false;
+            };
+            // The walk reads every value through its block's checksum; the
+            // limit is a bound the walk never reaches, well under the
+            // sum a rank is added to.
+            seg.blob.scan(&[], u32::MAX as usize, |_, _| {}).is_ok()
+        })
     }
 
     fn direct_can_open(&self) -> bool {
@@ -23976,6 +24112,64 @@ const MAINT_LAND_POLL: std::time::Duration = std::time::Duration::from_micros(10
 /// writer's publishes change the memtables and nothing this holds -- and
 /// its own handle pins what it reads, so the writer need not be the thread
 /// that runs it.
+/// The thread that makes a pending publish durable beside the seal's fsync
+/// (`Maint::land_readable`, `Options::manifest_pending`): one per segment
+/// work, parked between landings and woken by each. A thread spawned for
+/// each landing took a millisecond here to reach its first syscall, past
+/// the seal's fsync it was to overlap, where a wake takes tens of
+/// microseconds.
+struct SyncHelper {
+    jobs: Option<std::sync::mpsc::Sender<(File, File)>>,
+    done: std::sync::mpsc::Receiver<std::io::Result<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SyncHelper {
+    fn spawn() -> std::io::Result<SyncHelper> {
+        let (jobs, rx) = std::sync::mpsc::channel::<(File, File)>();
+        let (tx, done) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("supdb-manifest".into())
+            .spawn(move || {
+                while let Ok((slot, dir)) = rx.recv() {
+                    let r = slot.sync_data().and_then(|()| dir.sync_all());
+                    if tx.send(r).is_err() {
+                        break;
+                    }
+                }
+            })?;
+        Ok(SyncHelper {
+            jobs: Some(jobs),
+            done,
+            thread: Some(thread),
+        })
+    }
+
+    /// `slot` fdatasynced and `dir` fsynced, in that order, on the thread.
+    fn start(&self, slot: File, dir: File) -> std::io::Result<()> {
+        self.jobs
+            .as_ref()
+            .and_then(|j| j.send((slot, dir)).ok())
+            .ok_or_else(|| std::io::Error::other("the manifest's sync thread is gone"))
+    }
+
+    /// The outcome of the last `start`.
+    fn wait(&self) -> std::io::Result<()> {
+        self.done
+            .recv()
+            .map_err(|_| std::io::Error::other("the manifest's sync thread is gone"))?
+    }
+}
+
+impl Drop for SyncHelper {
+    fn drop(&mut self) {
+        self.jobs.take();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
 struct Maint {
     /// Its view of the store: a slot of the engine's own, pinned for each
     /// of its operations as the writer's is, and tables of its own it
@@ -24018,6 +24212,14 @@ struct Maint {
     /// (`Options::manifest_slots`); the open reads it from the manifest it
     /// took and hands it here with the manifests it wrote itself counted.
     manifest_seq: u64,
+    /// The names the newest slot flags pending (`Options::manifest_pending`):
+    /// a seal's, written at its readable landing; durable once its thread
+    /// returns, and flagged so in the file by the next publish, or by the
+    /// close.
+    pending: Vec<String>,
+    /// The thread that makes a pending slot durable beside the seal's
+    /// fsync, spawned at the first pending publish.
+    sync_helper: Option<SyncHelper>,
     /// A partitioning merge in flight. Its inputs stay live and readable
     /// until the manifest names its outputs instead, which is what makes
     /// the swap atomic across a crash.
@@ -24357,6 +24559,16 @@ impl Maint {
         if let Some((_, h)) = self.tiering.take() {
             let _ = h.join();
         }
+        if self.pending_on() && !self.pending.is_empty() {
+            // The seals joined above are durable: a slot with every name
+            // so, and the open after a clean close verifies nothing. An
+            // error leaves the pending slot, which the open verifies. The
+            // state is read inside an operation, as every read of it is.
+            let op = self.op();
+            let _ = self.publish();
+            drop(op);
+        }
+        self.sync_helper = None;
     }
 
     fn new(
@@ -24374,6 +24586,8 @@ impl Maint {
             dir: dir.to_path_buf(),
             covered_seq,
             manifest_seq,
+            pending: Vec::new(),
+            sync_helper: None,
             retiring_wals,
             retiring_tmps: Vec::new(),
             spares: Vec::new(),
@@ -24598,6 +24812,41 @@ impl Maint {
         if self.shared.fail_landing.swap(false, AtomicOrdering::AcqRel) {
             return Err(err("a test failed this landing"));
         }
+        // The pending publish first, before anything else this landing does:
+        // the slot naming the seal's segments as pending, written now and
+        // made durable with the directory's entries by the sync helper, so
+        // that its fsyncs overlap the seal thread's fsync of the data -- the
+        // three wait on the one journal commit that fsync forces -- while
+        // this thread opens and publishes the segments. Written after the
+        // opens, the slot's fdatasync began as the seal's fsync ended and
+        // paid its own commit; handed to a thread spawned for it, the
+        // thread reached its first syscall a millisecond on, past that
+        // fsync too. The open takes a pending name only once the
+        // segment reads back whole, and the slot before otherwise, so a slot
+        // that names a torn segment is the crash window's and not the
+        // store's; the WAL retires only behind a durable slot that names the
+        // segments durable (`retire_covered`).
+        let tp = std::time::Instant::now();
+        let pending_sync = if self.pending_on() && !names.is_empty() {
+            SealCounts::add(&self.shared.seal_counts.publishes, 1);
+            self.manifest_seq += 1;
+            let mut live = self.live_names();
+            live.extend(names.iter().cloned());
+            let covered = names.iter().fold(self.covered_seq, |c, n| {
+                c.max(Db::name_end_seq(n).unwrap_or(0))
+            });
+            let slot =
+                manifest_write_slot_unsynced(&self.dir, self.manifest_seq, covered, &live, names)?;
+            let dir = File::open(&self.dir)?;
+            if self.sync_helper.is_none() {
+                self.sync_helper = Some(SyncHelper::spawn()?);
+            }
+            let helper = self.sync_helper.as_ref().expect("spawned above");
+            helper.start(slot, dir)?;
+            true
+        } else {
+            false
+        };
         let mut segs = self.segs().to_vec();
         for (i, name) in names.iter().enumerate() {
             // Opened as a segment this process has just written: the key
@@ -24621,7 +24870,22 @@ impl Maint {
         for name in names {
             self.covered_seq = self.covered_seq.max(Db::name_end_seq(name).unwrap_or(0));
         }
-        if self.opts.manifest_slots {
+        if pending_sync {
+            // The pending slot and the directory's entries durable: the
+            // durable landing writes nothing. The slot names the seal before
+            // this one durable too, so what that seal's landing deferred
+            // retires.
+            self.sync_helper.as_ref().expect("started above").wait()?;
+            self.pending = names.to_vec();
+            self.shared
+                .manifest_seq
+                .store(self.manifest_seq, AtomicOrdering::Release);
+            self.retire_covered();
+            SealCounts::add(
+                &self.shared.seal_counts.publish_ns,
+                tp.elapsed().as_nanos() as u64,
+            );
+        } else if self.opts.manifest_slots {
             // The segments' directory entries -- the seal's renames, the
             // direct run's link -- made durable here, after the readers
             // have them and while the seal's thread fsyncs the segments'
@@ -24635,6 +24899,12 @@ impl Maint {
             File::open(&self.dir)?.sync_all()?;
         }
         Ok(())
+    }
+
+    /// Whether a seal's manifest rides its fsync (`Options::manifest_pending`
+    /// under the slots).
+    fn pending_on(&self) -> bool {
+        self.opts.manifest_pending && self.opts.manifest_slots
     }
 
     /// The pieces' ranks against the partitions they are aligned to
@@ -24670,17 +24940,40 @@ impl Maint {
         wal: Vec<PathBuf>,
         tmp: Option<PathBuf>,
     ) -> Result<()> {
-        let tp = std::time::Instant::now();
-        self.publish()?;
-        SealCounts::add(
-            &self.shared.seal_counts.publish_ns,
-            tp.elapsed().as_nanos() as u64,
-        );
+        if self.pending_on() && !self.pending.is_empty() {
+            // The slot named this seal's segments at its readable landing
+            // (`land_readable`); they are durable now, and the next publish
+            // or the close flags them so.
+        } else {
+            let tp = std::time::Instant::now();
+            self.publish()?;
+            SealCounts::add(
+                &self.shared.seal_counts.publish_ns,
+                tp.elapsed().as_nanos() as u64,
+            );
+        }
         // This seal's WAL and temp name, retired now that the manifest
-        // names the segments that cover them; the ones the open left are
-        // covered by the first landing after it.
+        // names the segments that cover them -- durably, the seal's thread
+        // having returned; the ones the open left are covered by the first
+        // landing after it. Under the pending shape they wait for the next
+        // publish, whose slot names the segments durable (`retire_covered`):
+        // a slot that still says pending with the WAL gone would leave the
+        // open's fallback nothing to replay.
         self.retiring_wals.extend(wal);
         self.retiring_tmps.extend(tmp);
+        if !self.pending_on() || self.pending.is_empty() {
+            self.retire_covered();
+        }
+        SealCounts::add(
+            &self.shared.seal_counts.seal_ns,
+            t.elapsed().as_nanos() as u64,
+        );
+        Ok(())
+    }
+
+    /// The WAL files and temp names a durable manifest covers, retired:
+    /// one WAL kept as the spare where the writer recycles one.
+    fn retire_covered(&mut self) {
         for old in std::mem::take(&mut self.retiring_wals) {
             // One spare is enough for the common shape, a seal landed
             // before the next rotation; a table handed beside a seal in
@@ -24710,11 +25003,6 @@ impl Maint {
         for tmp in std::mem::take(&mut self.retiring_tmps) {
             let _ = std::fs::remove_file(tmp);
         }
-        SealCounts::add(
-            &self.shared.seal_counts.seal_ns,
-            t.elapsed().as_nanos() as u64,
-        );
-        Ok(())
     }
 
     /// The decisions a landing makes once its seal is durable and counted
@@ -25438,10 +25726,17 @@ impl Maint {
                 self.manifest_seq,
                 self.covered_seq,
                 &self.live_names(),
+                &[],
             )?;
             self.shared
                 .manifest_seq
                 .store(self.manifest_seq, AtomicOrdering::Release);
+            if !self.pending.is_empty() {
+                // Every name durable now, on the device: what waited for
+                // it retires.
+                self.pending.clear();
+                self.retire_covered();
+            }
             return Ok(());
         }
         let spare = manifest_write(

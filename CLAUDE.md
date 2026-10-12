@@ -49,7 +49,13 @@ timing run needs the machine to itself, and CI gives it a job of its own.
 The tests leave their stores under the temp directory, one per test and
 process (`supdb-next-<name>-<pid>`), so a day of test runs on one box is
 tens of thousands of them and the disk they fill; `rm -rf
-$TMPDIR/supdb-next-*` between runs. On a box other runs share, give each
+$TMPDIR/supdb-next-*` between runs. The disk here is a fixed allowance,
+and the first thing to fail when it is spent is not a write with an
+error but the linker: `ld terminated with signal 7 [Bus error]` on the
+bench group's three RocksDB-sized links, with `df` still showing gigabytes
+free. A scratch directory of old bench binaries at a third of a gigabyte
+each is where the allowance went; delete those before reading the link
+failure as anything else. On a box other runs share, give each
 run a `TMPDIR` of its own and clean that: the glob takes every process's
 stores, and a run whose store another run's cleanup removed mid-test
 fails with a bare `NotFound` from whatever file operation came next --
@@ -141,6 +147,16 @@ own speed. The guest's pages land somewhere different each run and how
 the host backs them cannot be seen from inside, so a question of ten
 percent about translation, huge pages or folio size is not one this
 machine can answer; `docs/engine.md` has the probe and both outcomes.
+
+A thread woken from idle costs about a millisecond here before its first
+syscall, spawned or parked alike -- a vCPU halted is the host's to wake --
+so a lever that needs a hand-off to another thread inside a millisecond
+cannot be had on this guest: the seal's manifest slot, written 135 µs
+into the seal thread's fsync and handed to a thread for its fdatasync,
+reached the device 1.2 ms later, after the fsync it was to share a
+commit with had ended, in three shapes (`docs/engine.md`, the manifest's
+round trip). Read the hand-off's latency off `strace -f -tt` before
+designing around one.
 
 The page cache's folios are not hidden: `/proc/self/pagemap` over a
 mapping of the file gives each page's frame, and `/proc/kpageflags` at
@@ -561,7 +577,13 @@ fsync and the manifest does, and no manifest is written while a seal's
 segments are published and unsynced -- it would name a segment that may be
 torn and cover a sequence the WAL still has to hold -- so a merge that
 finishes in that window lands after the seal (`Maint::collect` holds it,
-`publish` asserts it). The seals in flight are a queue (`Maint::sealing`),
+`publish` asserts it). The arm that writes the seal's own slot in that
+window, naming its segments pending (`Options::manifest_pending`,
+`supdb-manifestpending`), trades the order for a rule at the open --
+a pending name counts only once the segment reads back whole, else the
+slot before is the store -- and retires the WAL only behind a slot that
+names the segments durable; it bought nothing here, because the thread
+its fsyncs were handed to woke a millisecond late. The seals in flight are a queue (`Maint::sealing`),
 landed in the order they were handed and each in its two phases, and only
 the oldest lands at all until it is durable, so one seal at most is between
 its phases and no manifest covers a later seal's records before an earlier

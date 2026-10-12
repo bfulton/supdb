@@ -28,9 +28,47 @@ fn manifest_seq_of(bytes: &[u8]) -> Option<u64> {
     }
     match bytes[8] {
         1 => Some(0),
-        2 if bytes.len() >= 25 => Some(u64::from_le_bytes(bytes[9..17].try_into().unwrap())),
+        2 | 3 if bytes.len() >= 25 => Some(u64::from_le_bytes(bytes[9..17].try_into().unwrap())),
         _ => None,
     }
+}
+
+/// A version-3 manifest's names, each with its pending flag
+/// (`Options::manifest_pending`): the body behind the 25-byte header is
+/// the covered sequence, a count, and per name a u16 length, the bytes
+/// and a flag byte.
+fn manifest_names_v3(bytes: &[u8]) -> Vec<(String, bool)> {
+    assert_eq!(bytes[8], 3, "a version-3 manifest");
+    let body = &bytes[25..];
+    let n = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
+    let mut p = 12;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let l = u16::from_le_bytes(body[p..p + 2].try_into().unwrap()) as usize;
+        p += 2;
+        let name = String::from_utf8(body[p..p + l].to_vec()).unwrap();
+        p += l;
+        out.push((name, body[p] & 1 != 0));
+        p += 1;
+    }
+    out
+}
+
+/// CRC32C (Castagnoli) resumed from `seed`, as the manifest's header
+/// carries it over its sequence and body, for a slot a test writes by hand.
+fn crc32c_from(seed: u32, data: &[u8]) -> u32 {
+    let mut crc = !seed;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x82F6_3B78
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }
 
 /// The newest manifest in `d`, by its publish sequence, with the slot it
@@ -2929,10 +2967,13 @@ fn a_manifest_publish_alternates_two_slots_and_the_open_takes_the_newest_valid()
     std::fs::write(d2.join("manifest"), &v1).unwrap();
     std::fs::remove_file(d2.join("manifest.alt")).unwrap();
     let mut db = Db::open(&d2, opts).unwrap();
+    // A version-1 manifest is sequence zero, and a store from before the
+    // pending flags has both slots rewritten in this version at the open,
+    // the newer sequence first: one publish past the zero it read.
     assert_eq!(
         db.manifest_seq(),
-        0,
-        "a version-1 manifest is sequence zero"
+        1,
+        "a version-1 manifest is sequence zero, rewritten one on"
     );
     assert_eq!(
         read_vec(&db, b"only"),
@@ -2943,6 +2984,13 @@ fn a_manifest_publish_alternates_two_slots_and_the_open_takes_the_newest_valid()
         d2.join("manifest.alt").is_file(),
         "the open made the second slot"
     );
+    for slot in MANIFEST_SLOTS {
+        assert_eq!(
+            std::fs::read(d2.join(slot)).unwrap()[8],
+            3,
+            "{slot} rewritten in this version at the open"
+        );
+    }
     for k in 0..2000u32 {
         db.append(key(k).as_bytes(), b"v0");
     }
@@ -10629,7 +10677,12 @@ fn a_handed_tables_log_is_retired_at_its_landing_and_replays_before_it() {
         db.sync().unwrap();
         db.settle().unwrap();
         assert_eq!(db.levels(), (2, 0), "landed and promoted");
-        assert!(!tmp[0].exists(), "the temp name retired at the landing");
+        // The promotion's publish names the tail's segment durable, and
+        // what waited for that retires with it.
+        assert!(
+            !tmp[0].exists(),
+            "the temp name retired by the promotion's publish"
+        );
         assert!(!old_part.exists(), "the partition's old name unlinked");
         drop(db);
         let check = |db: &Db, what: &str| {
@@ -11759,4 +11812,181 @@ fn a_commit_past_the_bound_holds_for_the_thread() {
     m.check(&r, "a handle after the bounded burst");
     m.check(&db, "the writer after the bounded burst");
     std::hint::black_box(sink);
+}
+
+/// Under the arm whose manifest rides the seal's fsync
+/// (`Options::manifest_pending`), the slot naming the seal's segment as
+/// pending is written at the readable landing, while the seal thread's
+/// fsync is still to come. A crash there leaves a segment that may not be
+/// whole, and the open takes the pending name only once the segment reads
+/// back whole -- never without block checksums -- else the slot before it
+/// is the store and the WAL, which retires only behind a slot naming the
+/// segment durable, replays the writes. The windows, emulated on the files
+/// a seal held before its fsync leaves.
+#[test]
+fn a_pending_manifest_is_the_store_only_once_its_segment_reads_back_whole() {
+    // Torn or whole, with block checksums; and whole without them, which
+    // the open cannot tell from torn and so falls back from.
+    for (torn, checksums) in [(true, true), (false, true), (false, false)] {
+        let d = dir(&format!("manifest-pending-{torn}-{checksums}"));
+        let opts = Options {
+            seal_bytes: 1 << 20,
+            manifest_pending: true,
+            segment: supdb::SegmentOptions {
+                checksums,
+                ..Default::default()
+            },
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts.clone()).unwrap();
+        let mut m = ScanModel::default();
+        // Written high to low, so the seal is the memtable's and the WAL
+        // holds the writes, not a direct run's.
+        for k in (0..3000u32).rev() {
+            m.append(&mut db, &format!("key-{k:05}"), "v");
+        }
+        db.commit().unwrap();
+        db.hold_seal_durable(true);
+        db.seal().unwrap();
+        // The readable landing writes the slot and publishes the piece,
+        // in whichever order its shape has: wait for both.
+        wait_for("the piece's publish and its pending slot", || {
+            db.levels().1 == 1
+                && manifest_names_v3(&newest_manifest(&d).1)
+                    .iter()
+                    .any(|(_, p)| *p)
+        });
+        assert!(db.in_flight().0, "held before its fsync");
+        let (_, bytes) = newest_manifest(&d);
+        let names = manifest_names_v3(&bytes);
+        assert_eq!(names.len(), 1, "the slot names the seal's piece: {names:?}");
+        assert!(names[0].1, "named pending while the fsync is to come");
+        let seg = d.join(&names[0].0);
+        assert!(seg.is_file(), "the piece is in place under its name");
+        // The crash: nothing of the store runs on, the seal thread parked
+        // at its hold; the file is what the page cache held, whole, or
+        // with a run of its records lost.
+        std::mem::forget(db);
+        if torn {
+            use std::os::unix::fs::FileExt;
+            let f = std::fs::OpenOptions::new().write(true).open(&seg).unwrap();
+            f.write_all_at(&[0u8; 4096], 8192).unwrap();
+        }
+        let db = Db::open(&d, opts).unwrap();
+        m.check(
+            &db,
+            &format!("torn {torn} checksums {checksums}: every key, from the piece or the WAL"),
+        );
+        if torn || !checksums {
+            assert_eq!(
+                db.levels().1,
+                0,
+                "a piece not read back whole is not the store's"
+            );
+            assert!(!seg.exists(), "the untrusted piece is swept as unnamed");
+        } else {
+            assert_eq!(db.levels().1, 1, "the whole piece is the store's");
+        }
+        let (_, bytes) = newest_manifest(&d);
+        assert!(
+            manifest_names_v3(&bytes).iter().all(|(_, p)| !p),
+            "the open leaves every name durable"
+        );
+        drop(db);
+    }
+}
+
+/// A clean close leaves no pending name: the seals the close joined are
+/// durable, and the slot says so, so the open after verifies nothing.
+#[test]
+fn a_clean_close_leaves_no_pending_name() {
+    let d = dir("manifest-pending-close");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        manifest_pending: true,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    for k in (0..2000u32).rev() {
+        db.append(format!("key-{k:05}").as_bytes(), b"v");
+    }
+    db.commit().unwrap();
+    db.seal().unwrap();
+    db.settle().unwrap();
+    db.close().unwrap();
+    let (_, bytes) = newest_manifest(&d);
+    let names = manifest_names_v3(&bytes);
+    assert!(!names.is_empty(), "the slot names the store's segments");
+    assert!(names.iter().all(|(_, p)| !p), "none pending: {names:?}");
+}
+
+/// A store with a manifest from before the pending flags: a reader of
+/// that version skips a slot it cannot parse for one it can, so a store
+/// with one slot in each version would read to it as the older state and
+/// lose the newer; the open rewrites both slots in this version, the
+/// newer sequence first, so such a reader parses neither.
+#[test]
+fn a_store_from_before_the_pending_flags_opens_with_both_slots_rewritten() {
+    let d = dir("manifest-upgrade");
+    let opts = Options {
+        seal_bytes: 1 << 20,
+        ..Options::default()
+    };
+    let key = |k: u32| format!("key-{k:05}");
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    for k in 0..2000u32 {
+        db.append(key(k).as_bytes(), b"v");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    db.settle().unwrap();
+    db.close().unwrap();
+    // The newest slot's content as a version-2 manifest one sequence on,
+    // in the slot of that sequence: the store as a writer of that version
+    // would have left it after one more publish.
+    let (_, bytes) = newest_manifest(&d);
+    let seq = manifest_seq_of(&bytes).unwrap();
+    let names: Vec<String> = manifest_names_v3(&bytes)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    let covered = &bytes[25..33];
+    let mut body = Vec::new();
+    body.extend_from_slice(covered);
+    body.extend_from_slice(&(names.len() as u32).to_le_bytes());
+    for n in &names {
+        body.extend_from_slice(&(n.len() as u16).to_le_bytes());
+        body.extend_from_slice(n.as_bytes());
+    }
+    let seq2 = seq + 1;
+    let crc = crc32c_from(crc32c_from(0, &seq2.to_le_bytes()), &body);
+    let mut v2 = Vec::new();
+    v2.extend_from_slice(b"SUPDBMAN\x02");
+    v2.extend_from_slice(&seq2.to_le_bytes());
+    v2.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    v2.extend_from_slice(&crc.to_le_bytes());
+    v2.extend_from_slice(&body);
+    std::fs::write(d.join(MANIFEST_SLOTS[(seq2 % 2) as usize]), &v2).unwrap();
+    let db = Db::open(&d, opts).unwrap();
+    for k in (0..2000u32).step_by(97) {
+        assert_eq!(
+            read_vec(&db, key(k).as_bytes()),
+            vec![b"v".to_vec()],
+            "key {k} through the upgraded store"
+        );
+    }
+    for slot in MANIFEST_SLOTS {
+        let b = std::fs::read(d.join(slot)).unwrap();
+        assert_eq!(b[8], 3, "{slot} rewritten in this version");
+        let mut got: Vec<String> = manifest_names_v3(&b).into_iter().map(|(n, _)| n).collect();
+        let mut want = names.clone();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want, "{slot} names the store");
+    }
+    let (_, newest) = newest_manifest(&d);
+    assert!(
+        manifest_seq_of(&newest).unwrap() > seq2,
+        "the rewrite is a publish past the version-2 one"
+    );
 }

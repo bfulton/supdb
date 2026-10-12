@@ -3546,6 +3546,54 @@ enters a run, read level throughout. The copies are the arm now
 (`supdb-copyvals` and `supdb-ingestcopyvals`), and the references into
 the run's file (`supdb-refvals`) stay the third shape beside them.
 
+#### The manifest's round trip, and the millisecond a woken thread costs here
+
+The drain's last device round trip is the manifest's: once the seal
+thread's fsync returns, the segment work writes the slot naming the new
+segment and fdatasyncs it, 0.3-1.6 ms at ten thousand keys against the
+segment's own fsync of about one, by `strace` over twenty-four drains. The
+lever was to write the slot at the seal's readable landing, naming the
+seal's segments as pending (`Options::manifest_pending`; the manifest's
+third version carries a flag byte behind each name), and make it durable
+with the directory's entries while the seal thread's fsync is in flight,
+so that the three wait on the one journal commit that fsync forces and
+the durable landing writes nothing. The invariant that no manifest is
+written while a seal's segments are published and unsynced becomes a rule
+at the open: a pending name is the store's only once the segment reads
+back whole, its key section's checksum row and every block's checksum
+over a walk of every record -- so never without block checksums, which
+the suite's arms run without, where the open falls back -- and a slot
+whose pending segments do not is the crash window's: the slot before it
+is the store, the torn segments are swept as unnamed, and the WAL has the
+writes, because under this shape a seal's WAL and temp name retire only
+once a slot naming its segments durable is itself durable, the next
+publish's or the close's. Only the newest slot's pending names are in
+doubt, since the slot before it was written by a publish that waited for
+that seal's durable landing. A reader from before the flags skips a slot
+it cannot parse for one it can, and would take the older state for the
+store and sweep the newer segments, so the open rewrites both slots in
+the third version when it finds one of an older, the newer sequence
+first. `tests/db.rs` holds the torn and the whole window, with and
+without block checksums, the close, and the upgrade.
+
+It bought nothing, and `strace` says why in three shapes. Written after
+the landing's opens and publish, the slot's fdatasync began as the seal's
+fsync ended and paid its own commit: the drain 2.56 to 2.44 ms, below in
+10 loads of 13, the rate level. Written first and handed to a thread
+spawned for its fsyncs, the slot was on the page cache 135 µs into the
+seal's fsync and the thread's fdatasync began 1.16 ms later, 0.24 ms after
+that fsync had ended: the drain 2.28 to 2.36. Handed to a thread kept
+parked between landings and woken by a channel, the fdatasync began 1.25
+ms after the write, again past the seal's fsync: 2.47 to 2.52. A thread
+woken from idle on this guest reaches its first syscall about a
+millisecond on, spawned or parked alike -- a vCPU halted is the host's to
+wake -- so no hand-off can put the slot's sync inside a commit that lasts
+a millisecond, and issuing it on the landing's own thread would hold the
+publish to readers for the commit's length instead. The shape stays as
+the arm `supdb-manifestpending` and `supdb-ingestmanifestpending`, the
+manifest's third version stays the format, and the open's rules stay,
+since a store the arm wrote opens under the default.
+
 #### The piece's ranks over the heads, and a locked exchange to look at a form
 
 Every written key's rank in its partition is computed by three parties:

@@ -268,16 +268,25 @@ pub type ReaderOpener = Box<dyn FnOnce() -> Res<Box<dyn ThreadReader>> + Send>;
 /// sparse file rather than a correction to one -- but `du` is what a user
 /// checks, and `du` counts blocks.
 fn dir_size(p: &Path) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    dir_size_into(p, &mut seen)
+}
+
+/// `dir_size` over one tree, each inode counted once however many names
+/// it has: a direct run's segment is linked under its piece's name while
+/// its temp name stays for recovery, and summing by name read the store
+/// at twice its size for as long as both names stood.
+fn dir_size_into(p: &Path, seen: &mut std::collections::HashSet<(u64, u64)>) -> u64 {
     use std::os::unix::fs::MetadataExt;
     let mut total = 0;
     if let Ok(rd) = std::fs::read_dir(p) {
         for e in rd.flatten() {
             let Ok(m) = e.metadata() else { continue };
-            total += if m.is_dir() {
-                dir_size(&e.path())
-            } else {
-                m.blocks() * 512
-            };
+            if m.is_dir() {
+                total += dir_size_into(&e.path(), seen);
+            } else if seen.insert((m.dev(), m.ino())) {
+                total += m.blocks() * 512;
+            }
         }
     } else if let Ok(m) = std::fs::metadata(p) {
         total = m.blocks() * 512;
@@ -406,6 +415,10 @@ pub struct Supdb {
     /// fsync, as before the two slots (`Options::manifest_slots` off).
     /// `supdb-manifestrename`, and `supdb-ingestmanifestrename` buffered.
     manifestrename: bool,
+    /// A seal's manifest slot written at its readable landing, naming its
+    /// segments pending (`Options::manifest_pending`). `supdb-manifestpending`,
+    /// and `supdb-ingestmanifestpending` buffered.
+    manifestpending: bool,
     /// The writer's buffers populated a window ahead of their fill
     /// (`Options::prefault`). `supdb-populate`, and `supdb-ingestpopulate`
     /// buffered.
@@ -636,6 +649,10 @@ struct Policy {
     /// fsync, as before the two slots (`Options::manifest_slots` off).
     /// `supdb-manifestrename`, and `supdb-ingestmanifestrename` buffered.
     manifestrename: bool,
+    /// A seal's manifest slot written at its readable landing, naming its
+    /// segments pending (`Options::manifest_pending`). `supdb-manifestpending`,
+    /// and `supdb-ingestmanifestpending` buffered.
+    manifestpending: bool,
     /// The writer's buffers populated a window ahead of their fill
     /// (`Options::prefault`). `supdb-populate`, and `supdb-ingestpopulate`
     /// buffered.
@@ -850,6 +867,7 @@ impl Default for Policy {
             wake: false,
             noprefetch: false,
             manifestrename: false,
+            manifestpending: false,
             populate: false,
             piece256: false,
             recordsteps: false,
@@ -2221,6 +2239,31 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with a seal's manifest slot written at its readable landing,
+    /// its segments named pending (`Options::manifest_pending`).
+    pub fn create_manifestpending(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                manifestpending: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-manifestpending`.
+    pub fn create_ingest_manifestpending(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                manifestpending: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with its buffers' pages populated ahead of the fill
     /// (`Options::prefault`).
     pub fn create_populate(path: &Path) -> Res<Supdb> {
@@ -2528,6 +2571,7 @@ impl Supdb {
             wake,
             noprefetch,
             manifestrename,
+            manifestpending,
             populate,
             piece256,
             recordsteps,
@@ -2710,6 +2754,7 @@ impl Supdb {
             upkeep_wake_parked: wake,
             scan_prefetch: !noprefetch,
             manifest_slots: !manifestrename,
+            manifest_pending: manifestpending,
             prefault: populate,
             direct_put_one: !recordsteps,
             direct_stream: !copyvals && !refvals,
@@ -2819,6 +2864,7 @@ impl Supdb {
             wake,
             noprefetch,
             manifestrename,
+            manifestpending,
             populate,
             piece256,
             recordsteps,
@@ -3211,6 +3257,13 @@ impl Engine for Supdb {
                 "supdb-ingestmanifestrename"
             };
         }
+        if self.manifestpending {
+            return if self.partition {
+                "supdb-manifestpending"
+            } else {
+                "supdb-ingestmanifestpending"
+            };
+        }
         if self.populate {
             return if self.partition {
                 "supdb-populate"
@@ -3381,6 +3434,9 @@ impl Engine for Supdb {
             ("wal_rotations", db.seal_waits().wal_rotations as f64),
             ("freeze_ms", db.seal_waits().freeze_ns as f64 / 1e6),
             ("join_wait_ms", db.seal_waits().join_wait_ns as f64 / 1e6),
+            // The manifest publishes' time on the segment work's thread:
+            // the slot's write and fdatasync, a device round trip each.
+            ("publish_ms", db.seal_waits().publish_ns as f64 / 1e6),
             // Who sorted the frozen tables: the seals that found no order
             // on their table, and readers that sorted one alone.
             ("seal_sorts", db.seal_waits().seal_sorts as f64),
@@ -3933,6 +3989,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-wake"
         | "supdb-noprefetch"
         | "supdb-manifestrename"
+        | "supdb-manifestpending"
         | "supdb-populate"
         | "supdb-piece256"
         | "supdb-recordsteps"
@@ -3994,6 +4051,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestwake"
         | "supdb-ingestnoprefetch"
         | "supdb-ingestmanifestrename"
+        | "supdb-ingestmanifestpending"
         | "supdb-ingestpopulate"
         | "supdb-ingestpiece256"
         | "supdb-ingestrecordsteps"
@@ -4111,7 +4169,9 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-noprefetch" => Box::new(Supdb::create_noprefetch(dir)?),
         "supdb-ingestnoprefetch" => Box::new(Supdb::create_ingest_noprefetch(dir)?),
         "supdb-manifestrename" => Box::new(Supdb::create_manifestrename(dir)?),
+        "supdb-manifestpending" => Box::new(Supdb::create_manifestpending(dir)?),
         "supdb-ingestmanifestrename" => Box::new(Supdb::create_ingest_manifestrename(dir)?),
+        "supdb-ingestmanifestpending" => Box::new(Supdb::create_ingest_manifestpending(dir)?),
         "supdb-populate" => Box::new(Supdb::create_populate(dir)?),
         "supdb-ingestpopulate" => Box::new(Supdb::create_ingest_populate(dir)?),
         "supdb-piece256" => Box::new(Supdb::create_piece256(dir)?),
