@@ -3759,6 +3759,60 @@ trailer at ten thousand keys where the guest still backs the pages, a
 quarter to a half where the host does. That is the next lever, and it is
 sized by the pages, not by the keys.
 
+#### The records' sync beside the finish
+
+With the trailer's fills asking ahead, the buffered ordered load's drain
+at ten thousand keys read about two milliseconds in two serial parts:
+the seal thread's finish, ordered index and link, 0.85 ms of CPU with
+the device idle, and then the segment's fsync, 1.1 ms of device with
+the CPU idle, the directory fsync the landing makes running beside it
+on one journal commit. Nothing had been synced before the finish: the
+helper that syncs a segment behind its writer starts once eight
+megabytes are unsynced, and a run of ten thousand keys is a megabyte
+and a bit. The device's fdatasync, probed on fresh files with the
+pieces hinted as the writer hints them, costs a third of a millisecond
+and then about 0.85 ms a megabyte -- 0.33 for four kilobytes, 1.4 for a
+megabyte, 6.9 for eight -- and 0.03 with nothing dirty, so the flush is
+priced by what is in the device's write-back cache and a redundant sync
+costs nothing. The probe of the drain's own shape, the records' sync
+issued on a thread as the CPU work began, read 14% less than the serial
+shape with the final sync at a third of its length; the trailer's write
+stalls under the concurrent sync in some reps, 0.85 ms, on the
+journal's locked phase and not on allocation, since preallocating the
+file changed nothing.
+
+So a flush's close syncs the records first (`Options::close_presync`):
+the writer, which waits for the drain anyway, takes a second handle on
+the run's file before the seal thread is given the writer, hands the
+seal, and fdatasyncs the records on its own thread while the seal
+thread composes the trailer; the seal's fsync then flushes the trailer
+alone, and the landing's directory fsync beside it the same. Durability
+moves nowhere: the fsync the landing waits for is still made, over
+less. A table handed to a seal without a flush (`hand_tail`) does not
+presync, since that writer is not waiting. Priced against the late sync
+in one process at ten thousand keys buffered, the drain read 1.9 ms
+against 2.9 within the same sitting, 0.71 ms less within pairs in 21 of
+24, the data fsync 0.56 against 1.05 and the landing 0.65 against 1.14,
+and the load 1.18x (21 of 24, p < .001); the second sitting, arms
+swapped, 1.74 against 2.37, 0.51 ms less in 22 of 24, the fsync 0.54
+against 0.95, the load 1.15x (19 of 24, p .007). Against the comparator
+in the same sittings the buffered load at ten thousand keys read 1.01x
+twice, level for the first time. At three hundred thousand keys the
+final fsync did not move, 3.3 ms either way: there the dirty bytes at
+the fsync are the trailer's own, six megabytes of directory and slots
+the finish has just written, and the presync covers only the records the
+helper had not yet synced, two milliseconds under a fifteen-millisecond
+finish -- the drain 3.1 ms less within pairs in 7 of 12 and then 2.8
+more in 8 of 12, the load level both times. The durable arm, whose
+records every commit fdatasyncs, pays the redundant sync 50 µs on the
+writer's path and reads level at ten thousand keys (the drain 18 µs
+less in 13 of 24, then 97 more in 17 of 24); at three hundred thousand
+its drain is level within pairs (6 of 12 both sittings) while its rate
+read 0.91x and 0.95x (p .15, .04) with the difference in the commits'
+column, which the change does not touch and the host's page price moves
+by half between reps -- noted as unresolved, as the rules have it. The
+late sync is the arm `supdb-latesync` and `supdb-ingestlatesync`.
+
 #### The piece's ranks over the heads, and a locked exchange to look at a form
 
 Every written key's rank in its partition is computed by three parties:

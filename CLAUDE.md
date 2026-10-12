@@ -175,9 +175,18 @@ The block device has a write-back cache, and an fsync's cost here is
 the host's flush of it, not the page cache's writeback: a probe that
 wrote forty megabytes with a `sync_file_range` hint after every piece
 and waited for the writeback to finish still paid 24 ms at the fsync,
-and nothing but an fsync issues that flush. So price a sync by who
-issues the fsync and when, not by how much is dirty, and before
-reading a sync phase as the device's, time its steps -- the buffered
+and nothing but an fsync issues that flush. The flush is priced by what
+that cache holds: on fresh files with the pieces hinted as the writer
+hints them, an fdatasync costs a third of a millisecond and then about
+0.85 ms a megabyte, and 0.03 ms with nothing dirty, so a redundant sync
+is free and a sync issued while the CPU has a millisecond of work ahead
+of it is a millisecond of device time hidden (`Options::close_presync`,
+the records synced by the waiting writer while the seal thread composes
+the trailer); a write to the file under a concurrent fdatasync stalls
+until the journal's commit is through, in some reps and not others, so
+the overlap is read in the drain's stamps and not assumed. So price a
+sync by who issues the fsync and when, not by how much is dirty, and
+before reading a sync phase as the device's, time its steps -- the buffered
 load's sync at three hundred thousand keys stayed level after the
 fsync inside it fell from 25 ms to under one, because the phase was a
 segment close whose checksum row re-read the section (`docs/engine.md`,
@@ -607,7 +616,13 @@ follows on the segment work's thread with the WAL's and temp names'
 retirement behind it (`Options::flush_waits_manifest` is the shape that
 waited, `supdb-waitmanifest`): the round trip was a tenth of a
 ten-thousand-key drain, and a crash inside it is a torn newest slot, the
-case the slots were made for. The directory fsync the seal's names need
+case the slots were made for. The flush's close of a direct run
+fdatasyncs the run's records on the writer's thread, which waits for
+the drain anyway, while the seal thread composes the trailer, so the
+seal's fsync flushes the trailer alone (`Options::close_presync`;
+`supdb-latesync` is the shape with the one fsync at the end): nothing
+of the order moves, the landing still waits for the fsync, over less.
+The directory fsync the seal's names need
 runs at the seal's readable landing, on the segment work's thread beside
 the seal thread's fsync of their data, and the two wait on one journal
 commit here: the slots' first version dropped it as the manifest's own,

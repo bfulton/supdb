@@ -448,6 +448,10 @@ pub struct Supdb {
     /// for, the shape before `SegmentOptions::lookahead`. `supdb-fillplain`,
     /// and `supdb-ingestfillplain` buffered.
     fillplain: bool,
+    /// A flush's close with the one fsync at the end, the shape before
+    /// `Options::close_presync`. `supdb-latesync`, and
+    /// `supdb-ingestlatesync` buffered.
+    latesync: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -695,6 +699,10 @@ struct Policy {
     /// for, the shape before `SegmentOptions::lookahead`. `supdb-fillplain`,
     /// and `supdb-ingestfillplain` buffered.
     fillplain: bool,
+    /// A flush's close with the one fsync at the end, the shape before
+    /// `Options::close_presync`. `supdb-latesync`, and
+    /// `supdb-ingestlatesync` buffered.
+    latesync: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -901,6 +909,7 @@ impl Default for Policy {
             copyvals: false,
             keycopies: false,
             fillplain: false,
+            latesync: false,
             rankrecords: false,
             shape: false,
             adaptcap: None,
@@ -2443,6 +2452,31 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with a flush's close making the one fsync at the end, the
+    /// shape before `Options::close_presync`.
+    pub fn create_latesync(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                latesync: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-latesync`.
+    pub fn create_ingest_latesync(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                latesync: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with a flush waiting for its manifest slot's fdatasync, the
     /// shape before `Options::flush_waits_manifest` was off.
     pub fn create_waitmanifest(path: &Path) -> Res<Supdb> {
@@ -2683,6 +2717,7 @@ impl Supdb {
             copyvals,
             keycopies,
             fillplain,
+            latesync,
             rankrecords,
             shape,
             aheadmin,
@@ -2864,6 +2899,7 @@ impl Supdb {
             manifest_slots: !manifestrename,
             manifest_pending: manifestpending,
             flush_waits_manifest: waitmanifest,
+            close_presync: !latesync,
             prefault: populate,
             direct_put_one: !recordsteps,
             direct_stream: !copyvals && !refvals,
@@ -2982,6 +3018,7 @@ impl Supdb {
             copyvals,
             keycopies,
             fillplain,
+            latesync,
             rankrecords,
             shape,
             aheadmin,
@@ -3417,6 +3454,13 @@ impl Engine for Supdb {
                 "supdb-fillplain"
             } else {
                 "supdb-ingestfillplain"
+            };
+        }
+        if self.latesync {
+            return if self.partition {
+                "supdb-latesync"
+            } else {
+                "supdb-ingestlatesync"
             };
         }
         if self.waitmanifest {
@@ -4130,6 +4174,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-copyvals"
         | "supdb-keycopies"
         | "supdb-fillplain"
+        | "supdb-latesync"
         | "supdb-waitmanifest"
         | "supdb-inlinemaint"
         | "supdb-adapt"
@@ -4195,6 +4240,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestcopyvals"
         | "supdb-ingestkeycopies"
         | "supdb-ingestfillplain"
+        | "supdb-ingestlatesync"
         | "supdb-ingestwaitmanifest"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
@@ -4324,6 +4370,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestkeycopies" => Box::new(Supdb::create_ingest_keycopies(dir)?),
         "supdb-fillplain" => Box::new(Supdb::create_fillplain(dir)?),
         "supdb-ingestfillplain" => Box::new(Supdb::create_ingest_fillplain(dir)?),
+        "supdb-latesync" => Box::new(Supdb::create_latesync(dir)?),
+        "supdb-ingestlatesync" => Box::new(Supdb::create_ingest_latesync(dir)?),
         "supdb-waitmanifest" => Box::new(Supdb::create_waitmanifest(dir)?),
         "supdb-ingestwaitmanifest" => Box::new(Supdb::create_ingest_waitmanifest(dir)?),
         "supdb-ingestsettlefreeze" => Box::new(Supdb::create_ingest_settlefreeze(dir)?),

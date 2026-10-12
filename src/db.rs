@@ -1350,6 +1350,20 @@ pub struct Options {
     /// the owed slot first. Kept for pricing as `supdb-waitmanifest` and
     /// `supdb-ingestwaitmanifest`. Only with `manifest_slots`.
     pub flush_waits_manifest: bool,
+    /// At a flush's close of a direct run, the writer fdatasyncs the run's
+    /// file -- the records committed to it so far, hinted to the page
+    /// cache as they were written and flushed to the device by nothing yet
+    /// below `SegmentOptions::sync_ahead` -- while the seal thread composes
+    /// the trailer, so the seal's own fsync flushes the trailer alone. The
+    /// drain at ten thousand keys was a millisecond of the seal thread's
+    /// CPU and then a millisecond of the device, in series, with the
+    /// writer idle through both; the device's flush here costs by the
+    /// bytes in its write-back cache, a third of a millisecond and then
+    /// about a millisecond a megabyte. Nothing of durability moves: the
+    /// fsync the landing waits for is still made, over less. Off, the one
+    /// fsync at the end, the arm `supdb-latesync` and
+    /// `supdb-ingestlatesync`.
+    pub close_presync: bool,
     /// Whether a segment's ordered index is fsynced when it is written. The
     /// index is a function of the segment's keys and nothing else, so a
     /// store that finds it missing, torn or describing another segment at
@@ -1678,6 +1692,7 @@ impl Default for Options {
             manifest_slots: true,
             manifest_pending: false,
             flush_waits_manifest: false,
+            close_presync: true,
             ord_durable: false,
             direct_table_refs: false,
             direct_put_one: true,
@@ -4928,6 +4943,12 @@ impl PieceWriter {
         self.0.set_deferred_keys()?;
         self.3 = true;
         Ok(())
+    }
+
+    /// A second handle on the segment's file, for a sync from another
+    /// thread (`Options::close_presync`).
+    fn file_clone(&self) -> std::io::Result<File> {
+        self.0.out.get_ref().try_clone()
     }
 
     /// Room for `n` keys of about `key_bytes`, in the segment's buffers
@@ -8423,7 +8444,7 @@ struct DrainSteps {
     at: [AtomicU64; DRAIN_STEP_NAMES.len()],
 }
 
-const DRAIN_STEP_NAMES: [&str; 14] = [
+const DRAIN_STEP_NAMES: [&str; 15] = [
     "flush",
     "handed",
     "jobstart",
@@ -8438,6 +8459,7 @@ const DRAIN_STEP_NAMES: [&str; 14] = [
     "published",
     "drained",
     "back",
+    "presynced",
 ];
 
 impl DrainSteps {
@@ -18922,6 +18944,9 @@ impl Db {
         let dir = self.dir.clone();
         let tmp = d.tmp;
         let w = d.w;
+        let presync = (self.draining && self.opts.close_presync)
+            .then(|| w.file_clone().ok())
+            .flatten();
         let limit = self.partition_limit();
         let (id, seq) = (d.id, end_seq);
         let retiring = tmp.clone();
@@ -18979,6 +19004,15 @@ impl Db {
         // files a size rotation closed as a seal's does.
         let wals = std::mem::take(&mut self.closed_wals);
         self.hand_seal(job, table, wals, Some(retiring));
+        // The records' sync, on this thread while the seal thread composes
+        // the trailer (`Options::close_presync`): the writer waits for the
+        // drain anyway, and the seal's fsync then flushes the trailer
+        // alone. An error here is the file's, and the seal's own fsync
+        // reports it.
+        if let Some(f) = presync {
+            let _ = f.sync_data();
+            self.shared.drain_steps.stamp(14);
+        }
     }
 
     /// Freeze the memtable, rotate the WAL, and hand the frozen table to a
