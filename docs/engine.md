@@ -3657,6 +3657,49 @@ fusing was for. No read, scan or mix cell moved outside noise in the
 buffered pairings. The copies are the arm `supdb-keycopies` and
 `supdb-ingestkeycopies`.
 
+#### The drain stamped, and the manifest's sync after the answer
+
+The buffered ordered load's drain at ten thousand keys read 2.2 to 2.7 ms
+against the comparator's single fsync of 1.7 to 2.0, and the suite's
+phase column could say no more than that. Stamped at every point where
+its chain crosses a thread or waits on the device (`SUPDB_DRAIN_STEPS`,
+one `drainsteps` line a flush and one `finishsteps` line a segment
+finish), the drain decomposed as: the writer's close 0.07 ms; the seal
+thread's start 0.03 to 0.2 after the hand-over; the segment's finish
+0.65 to 0.9, of which the trailer's composition 0.29 to 0.47 (fifty to
+eighty first-touched pages and ten thousand keys at some twenty-five
+nanoseconds each), its write 0.04 to 0.13 and the superblock's three
+writes 0.13 to 0.35; the ordered index's file 0.06 to 0.2; the segment's
+fsync 0.9 to 1.6 beside the segment work's readable landing of 1.0 to
+1.5, the two ending together; the manifest slot's write and fdatasync
+0.24 to 0.56; and the writer's wake 0.03. At three hundred thousand keys
+the finish is 22 to 44 ms of a 26 to 54 ms drain, the trailer's
+composition 19 to 28 of it -- three hundred thousand keys at sixty to
+seventy nanoseconds, the FNV a third and the hash slots' random stores
+into a 4.8 MB table most of the rest -- and its 6 MB write 3 to 22.
+
+Two things the stamps corrected. A thread woken here reaches its first
+stamp 15 to 200 µs after the wake, spawned or parked alike; the
+millisecond the manifest's helper took to its fdatasync in the pending
+shape was the device's, an fdatasync queued behind the seal's fsync in
+flight, not the wake. And the slot's round trip sat on the writer's
+wait for no reason the durability needed: the segments are fsynced and
+their directory entries durable before the slot is written, so a flush
+now returns once the slot is written and the segment work fdatasyncs it
+after the answer, retiring the WAL and the temp names behind that sync
+(`Options::flush_waits_manifest`, off). A crash inside the window leaves
+a torn or absent newest slot, which the open ignores for the slot
+before it and recovers the run from its temp name, as it does for any
+publish torn between write and sync; a newer publish supersedes the owed
+slot; `settle` and the close sync it first. Priced against the waiting
+shape in one process over three sittings of twenty-four pairs at ten
+thousand keys, the publish step fell from 391 µs to 22, the drain column
+by 0.13, 0.52 and 0.39 ms, and the load read 1.06x, 1.15x and 1.08x
+(p .064, .023, .023); the durable load at ten thousand 1.10x and level;
+three hundred thousand level, where the slot is a fiftieth of the
+drain. The waiting shape is the arm `supdb-waitmanifest` and
+`supdb-ingestwaitmanifest`.
+
 #### The piece's ranks over the heads, and a locked exchange to look at a form
 
 Every written key's rank in its partition is computed by three parties:

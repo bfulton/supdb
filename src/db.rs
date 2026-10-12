@@ -1338,6 +1338,18 @@ pub struct Options {
     /// it. On, `supdb-manifestpending` and `supdb-ingestmanifestpending`.
     /// Needs the slots; under the rename shape it does nothing.
     pub manifest_pending: bool,
+    /// A flush waits for the seal's manifest slot to be durable before it
+    /// returns. Off, the slot is written before the drain is answered and
+    /// fdatasynced after it, on the segment work's thread, with the WAL and
+    /// temp names it covers retired behind that sync: the segments are
+    /// durable either way, the slot's own round trip -- a quarter to half
+    /// a millisecond here, a tenth of a ten-thousand-key drain -- is off
+    /// the writer's wait, and a crash inside it leaves a torn or absent
+    /// newest slot, which the open ignores for the slot before it and
+    /// recovers the run from its temp name. `settle` and the close sync
+    /// the owed slot first. Kept for pricing as `supdb-waitmanifest` and
+    /// `supdb-ingestwaitmanifest`. Only with `manifest_slots`.
+    pub flush_waits_manifest: bool,
     /// Whether a segment's ordered index is fsynced when it is written. The
     /// index is a function of the segment's keys and nothing else, so a
     /// store that finds it missing, torn or describing another segment at
@@ -1665,6 +1677,7 @@ impl Default for Options {
             manifest_spare: true,
             manifest_slots: true,
             manifest_pending: false,
+            flush_waits_manifest: false,
             ord_durable: false,
             direct_table_refs: false,
             direct_put_one: true,
@@ -4374,6 +4387,11 @@ impl SegmentWriter {
         }
         let layout = self.layout()?;
         let mut bloom: Option<BlockedBloom> = None;
+        let steps_on = finish_steps_on();
+        let t_finish = std::time::Instant::now();
+        let mut t_marks: [u128; 5] = [0; 5];
+        let flt0 = if steps_on { thread_minflt() } else { 0 };
+        let mut flt_trailer = 0u64;
         // A segment with no keys is allowed: a partition whose every key was
         // deleted still has to exist, or the fences stop tiling the key
         // space and a later seal would route keys into a neighbour's range.
@@ -4434,6 +4452,10 @@ impl SegmentWriter {
                         .ok_or_else(limits)?
                     }
                 };
+                t_marks[0] = t_finish.elapsed().as_micros();
+                if steps_on {
+                    flt_trailer = thread_minflt() - flt0;
+                }
                 self.out.write_all(&trailer)?;
                 self.pos += trailer.len() as u64;
                 debug_assert_eq!(self.pos, key_off + total as u64);
@@ -4447,7 +4469,9 @@ impl SegmentWriter {
                 let mut header = header;
                 flatindex::set_checksum_words(&mut header, total);
                 self.out.end_section(self.pos);
+                t_marks[1] = t_finish.elapsed().as_micros();
                 let helped = self.out.join_helper()?;
+                t_marks[2] = t_finish.elapsed().as_micros();
                 let row = SegmentWriter::row_for(&self.out, &header, key_off, total, helped)?;
                 self.out.write_all(&row)?;
                 self.pos += row.len() as u64;
@@ -4532,6 +4556,7 @@ impl SegmentWriter {
             (key_off, key_len, hb)
         };
 
+        t_marks[3] = t_finish.elapsed().as_micros();
         let file = self.out.into_inner()?;
         use std::os::unix::fs::FileExt;
         if let Some(h) = &header {
@@ -4632,6 +4657,19 @@ impl SegmentWriter {
         let x = crate::blob::encode_super_ext(&ext, generation);
         page[1024..1024 + x.len()].copy_from_slice(&x);
         file.write_all_at(&page, 0)?;
+        if steps_on {
+            t_marks[4] = t_finish.elapsed().as_micros();
+            eprintln!(
+                "finishsteps us trailer {} written {} helper {} table {} super {} | flt trailer {} finish {}",
+                t_marks[0],
+                t_marks[1],
+                t_marks[2],
+                t_marks[3],
+                t_marks[4],
+                flt_trailer,
+                thread_minflt() - flt0
+            );
+        }
         Ok((file, bloom))
     }
 }
@@ -8273,6 +8311,95 @@ impl Db {}
 /// counts seals joined.
 /// `SealWaits` counted where the segment work runs, which may not be the
 /// writer's thread, and the time of each landing and each merge's.
+/// A flush's drain, stamped where its chain crosses a thread or waits
+/// on the device, and printed as one `drainsteps` line on stderr at the
+/// writer's return when `SUPDB_DRAIN_STEPS` is set: microseconds from
+/// the flush's entry to the seal handed over, the seal thread's start,
+/// its segments signalled readable, its fsync done, the segment work's
+/// readable landing begun and done, the seal thread joined, the manifest
+/// published, the drain's decisions done, and the writer back. Off, a
+/// branch per step; what it priced was where a ten-thousand-key drain's
+/// time went between three threads.
+/// This thread's minor faults so far, from `/proc/thread-self/stat`; for
+/// the `finishsteps` line alone.
+fn thread_minflt() -> u64 {
+    std::fs::read_to_string("/proc/thread-self/stat")
+        .ok()
+        .and_then(|s| {
+            let rest = s.rsplit_once(')')?.1;
+            rest.split_whitespace().nth(7)?.parse().ok()
+        })
+        .unwrap_or(0)
+}
+
+/// `SUPDB_DRAIN_STEPS`, read once: the segment writer's finish prints
+/// its own steps under it (`finishsteps`).
+fn finish_steps_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SUPDB_DRAIN_STEPS").is_some())
+}
+
+struct DrainSteps {
+    on: bool,
+    epoch: std::time::Instant,
+    at: [AtomicU64; DRAIN_STEP_NAMES.len()],
+}
+
+const DRAIN_STEP_NAMES: [&str; 14] = [
+    "flush",
+    "handed",
+    "jobstart",
+    "finished",
+    "ordwritten",
+    "linked",
+    "readable",
+    "fsynced",
+    "landstart",
+    "landed",
+    "joined",
+    "published",
+    "drained",
+    "back",
+];
+
+impl DrainSteps {
+    fn new() -> DrainSteps {
+        DrainSteps {
+            on: std::env::var_os("SUPDB_DRAIN_STEPS").is_some(),
+            epoch: std::time::Instant::now(),
+            at: Default::default(),
+        }
+    }
+
+    fn stamp(&self, i: usize) {
+        if self.on {
+            self.at[i].store(
+                self.epoch.elapsed().as_nanos() as u64,
+                AtomicOrdering::Relaxed,
+            );
+        }
+    }
+
+    /// The line, from the flush's entry; steps a drain did not reach
+    /// (no seal to hand) print as a dash.
+    fn report(&self) {
+        if !self.on {
+            return;
+        }
+        let t0 = self.at[0].load(AtomicOrdering::Relaxed);
+        let mut line = String::from("drainsteps us");
+        for (i, name) in DRAIN_STEP_NAMES.iter().enumerate().skip(1) {
+            let t = self.at[i].load(AtomicOrdering::Relaxed);
+            if t >= t0 {
+                line.push_str(&format!(" {name} {:.0}", (t - t0) as f64 / 1e3));
+            } else {
+                line.push_str(&format!(" {name} -"));
+            }
+        }
+        eprintln!("{line}");
+    }
+}
+
 #[derive(Default)]
 struct SealCounts {
     /// Reads and scans over lag by the engine's own handles -- the
@@ -9428,6 +9555,8 @@ struct Shared {
     /// What the segment work did, wherever it runs: see `SealWaits`, and
     /// the nanoseconds of each landing and each merge's landing.
     seal_counts: SealCounts,
+    /// A flush's drain stamped step by step (`SUPDB_DRAIN_STEPS`).
+    drain_steps: DrainSteps,
     /// Seals handed to the segment work and not yet durable, and whether a
     /// merge is in flight: what `Db::in_flight` answers. The seals are a
     /// queue, landed in the order they were handed -- a seal's WAL retires
@@ -17548,6 +17677,7 @@ impl Db {
             keeper_thread: std::sync::OnceLock::new(),
             next_seg: AtomicU64::new(next_seg),
             seal_counts: SealCounts::default(),
+            drain_steps: DrainSteps::new(),
             in_seal: AtomicUsize::new(0),
             in_merge: std::sync::atomic::AtomicBool::new(false),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
@@ -17971,6 +18101,7 @@ impl Db {
             keeper_thread: std::sync::OnceLock::new(),
             next_seg: AtomicU64::new(next_seg),
             seal_counts: SealCounts::default(),
+            drain_steps: DrainSteps::new(),
             in_seal: AtomicUsize::new(0),
             in_merge: std::sync::atomic::AtomicBool::new(false),
             seal_hold: std::sync::atomic::AtomicU8::new(0),
@@ -18720,6 +18851,7 @@ impl Db {
         let ord_durable = self.opts.ord_durable;
         let keys = table.clone();
         let job = move |readable: &SealReadable| -> Result<Vec<String>> {
+            shared.drain_steps.stamp(2);
             seal_hold_wait(&shared, SEAL_HOLD_LANDING);
             let tombs = w.tombs();
             // The keys from the table where the writer kept none; else the
@@ -18736,18 +18868,23 @@ impl Db {
                     .map_err(|e| err(&format!("direct finish: {e}")))?;
                 (seg, ord, fact)
             };
+            shared.drain_steps.stamp(3);
             let name = if first_partition && !tombs && std::fs::metadata(&tmp)?.len() <= limit {
                 Db::first_partition_name(id, seq)
             } else {
                 name
             };
             let ordf = write_ord_unsynced(&dir, &name, &ord)?;
+            shared.drain_steps.stamp(4);
             std::fs::hard_link(&tmp, dir.join(&name))?;
+            shared.drain_steps.stamp(5);
             // Phase R, then the fsyncs, as a seal's job orders them; the
             // link is this job's rename.
             let names = vec![name];
             seal_readable(&shared, readable, &names, vec![fact]);
+            shared.drain_steps.stamp(6);
             seg.sync_all()?;
+            shared.drain_steps.stamp(7);
             if ord_durable {
                 ordf.sync_all()?;
             }
@@ -19371,13 +19508,17 @@ impl Db {
     /// supposed to remove, back through the side door.
     pub fn flush(&mut self) -> Result<()> {
         let _op = self.op();
+        self.shared.drain_steps.stamp(0);
         self.commit_staged()?;
         self.unsynced = 0;
         self.draining = true;
-        let sealed = self
-            .seal()
-            .and_then(|_| self.maint_request(MaintAsk::Drain));
+        let sealed = self.seal().and_then(|_| {
+            self.shared.drain_steps.stamp(1);
+            self.maint_request(MaintAsk::Drain)
+        });
         self.draining = false;
+        self.shared.drain_steps.stamp(13);
+        self.shared.drain_steps.report();
         sealed
     }
 
@@ -24524,6 +24665,10 @@ struct Maint {
     /// The thread that makes a pending slot durable beside the seal's
     /// fsync, spawned at the first pending publish.
     sync_helper: Option<SyncHelper>,
+    /// A drain's manifest slot written and not yet durable
+    /// (`Options::flush_waits_manifest` off): synced once the drain is
+    /// answered, and the WAL and temp names it covers retired behind it.
+    slot_sync_due: Option<File>,
     /// A partitioning merge in flight. Its inputs stay live and readable
     /// until the manifest names its outputs instead, which is what makes
     /// the swap atomic across a crash.
@@ -24634,6 +24779,11 @@ impl Maint {
                 // until the next publish.
                 drop(op);
                 let _ = reply.send(out);
+                // A drain's slot made durable once the writer has its
+                // answer, off its wait.
+                if let Err(e) = self.sync_owed_slot() {
+                    self.shared.put_maint_err(e);
+                }
             }
         }
     }
@@ -24643,12 +24793,15 @@ impl Maint {
         match ask {
             MaintAsk::Drain => {
                 self.join_seal(true)?;
-                self.drain()
+                let out = self.drain();
+                self.shared.drain_steps.stamp(12);
+                out
             }
             MaintAsk::Settle => {
                 self.join_seal(false)?;
                 self.join_compact()?;
-                self.join_tier()
+                self.join_tier()?;
+                self.sync_owed_slot()
             }
         }
     }
@@ -24738,8 +24891,10 @@ impl Maint {
         let facts = front.readable.facts.get().cloned().unwrap_or_default();
         let table = front.table.clone();
         let t = std::time::Instant::now();
+        self.shared.drain_steps.stamp(8);
         match self.land_readable(&names, &facts, &table) {
             Ok(()) => {
+                self.shared.drain_steps.stamp(9);
                 if let Some(s) = self.sealing.front_mut() {
                     s.landed = true;
                 }
@@ -24872,6 +25027,7 @@ impl Maint {
             let _ = self.publish();
             drop(op);
         }
+        let _ = self.sync_owed_slot();
         self.sync_helper = None;
     }
 
@@ -24892,6 +25048,7 @@ impl Maint {
             manifest_seq,
             pending: Vec::new(),
             sync_helper: None,
+            slot_sync_due: None,
             retiring_wals,
             retiring_tmps: Vec::new(),
             spares: Vec::new(),
@@ -25054,6 +25211,7 @@ impl Maint {
         let t = std::time::Instant::now();
         let blocked = !handle.is_finished();
         let joined = handle.join().map_err(|_| err("seal thread panicked"));
+        self.shared.drain_steps.stamp(10);
         let waited = t.elapsed().as_nanos() as u64;
         let counts = &self.shared.seal_counts;
         SealCounts::add(&counts.joins, 1);
@@ -25089,7 +25247,9 @@ impl Maint {
                 return Err(e);
             }
         }
-        let out = self.land_durable(t, wal, tmp);
+        let defer = draining && !self.opts.flush_waits_manifest && !self.pending_on();
+        let out = self.land_durable(t, wal, tmp, defer);
+        self.shared.drain_steps.stamp(11);
         // Counted out once the manifest names the segments, or the landing
         // failed: from here the seal is not in flight, and the next seal
         // in the queue may land.
@@ -25243,11 +25403,22 @@ impl Maint {
         t: std::time::Instant,
         wal: Vec<PathBuf>,
         tmp: Option<PathBuf>,
+        defer_sync: bool,
     ) -> Result<()> {
         if self.pending_on() && !self.pending.is_empty() {
             // The slot named this seal's segments at its readable landing
             // (`land_readable`); they are durable now, and the next publish
             // or the close flags them so.
+        } else if defer_sync && self.opts.manifest_slots {
+            // A drain's: the slot written now, its fdatasync once the
+            // writer has its answer (`sync_owed_slot`), the retirement
+            // behind that.
+            let tp = std::time::Instant::now();
+            self.publish_unsynced()?;
+            SealCounts::add(
+                &self.shared.seal_counts.publish_ns,
+                tp.elapsed().as_nanos() as u64,
+            );
         } else {
             let tp = std::time::Instant::now();
             self.publish()?;
@@ -25265,7 +25436,7 @@ impl Maint {
         // open's fallback nothing to replay.
         self.retiring_wals.extend(wal);
         self.retiring_tmps.extend(tmp);
-        if !self.pending_on() || self.pending.is_empty() {
+        if (!self.pending_on() || self.pending.is_empty()) && self.slot_sync_due.is_none() {
             self.retire_covered();
         }
         SealCounts::add(
@@ -26014,6 +26185,42 @@ impl Maint {
     /// covers a sequence the WAL still has to hold. `collect` holds a
     /// merge's landing back for that window, and the seal's own phase D
     /// is the only landing that ends it.
+    /// `publish` for a drain's landing with `Options::flush_waits_manifest`
+    /// off: the slot written and the sequence named, the fdatasync owed
+    /// (`sync_owed_slot`). Slots only.
+    fn publish_unsynced(&mut self) -> Result<()> {
+        debug_assert!(self.opts.manifest_slots);
+        debug_assert!(
+            !self.seal_between_phases(),
+            "a manifest written while a seal's segments are published and not durable"
+        );
+        SealCounts::add(&self.shared.seal_counts.publishes, 1);
+        self.manifest_seq += 1;
+        let f = manifest_write_slot_unsynced(
+            &self.dir,
+            self.manifest_seq,
+            self.covered_seq,
+            &self.live_names(),
+            &[],
+        )?;
+        self.shared
+            .manifest_seq
+            .store(self.manifest_seq, AtomicOrdering::Release);
+        self.slot_sync_due = Some(f);
+        Ok(())
+    }
+
+    /// The slot a drain left unsynced made durable, and the WAL and temp
+    /// names it covers retired: after the drain's answer, before a
+    /// settle returns, and at the close.
+    fn sync_owed_slot(&mut self) -> Result<()> {
+        if let Some(f) = self.slot_sync_due.take() {
+            f.sync_data()?;
+            self.retire_covered();
+        }
+        Ok(())
+    }
+
     fn publish(&mut self) -> Result<()> {
         debug_assert!(
             !self.seal_between_phases(),
@@ -26035,7 +26242,10 @@ impl Maint {
             self.shared
                 .manifest_seq
                 .store(self.manifest_seq, AtomicOrdering::Release);
-            if !self.pending.is_empty() {
+            // A slot owed its sync is superseded by this one, durable and
+            // newer, and what waited behind it retires now.
+            let owed = self.slot_sync_due.take().is_some();
+            if !self.pending.is_empty() || owed {
                 // Every name durable now, on the device: what waited for
                 // it retires.
                 self.pending.clear();

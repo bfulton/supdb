@@ -148,15 +148,18 @@ the host backs them cannot be seen from inside, so a question of ten
 percent about translation, huge pages or folio size is not one this
 machine can answer; `docs/engine.md` has the probe and both outcomes.
 
-A thread woken from idle costs about a millisecond here before its first
-syscall, spawned or parked alike -- a vCPU halted is the host's to wake --
-so a lever that needs a hand-off to another thread inside a millisecond
-cannot be had on this guest: the seal's manifest slot, written 135 µs
-into the seal thread's fsync and handed to a thread for its fdatasync,
-reached the device 1.2 ms later, after the fsync it was to share a
-commit with had ended, in three shapes (`docs/engine.md`, the manifest's
-round trip). Read the hand-off's latency off `strace -f -tt` before
-designing around one.
+A hand-off to another thread costs 15-200 µs here, spawned or parked
+alike, and the drain's stamps say so (`SUPDB_DRAIN_STEPS=1`, a
+`drainsteps` line per flush and a `finishsteps` line per segment finish:
+the writer's hand-over, the seal thread's start, its finish's steps, its
+fsync, the segment work's readable landing, the join, the manifest, the
+answer). This file said a millisecond for a while, read off the pending
+manifest's helper thread, whose fdatasync began 1.2 ms after the slot was
+written: that was the device, an fdatasync queued behind the seal's fsync
+in flight, not the wake -- a wait a thread's first syscall shows is the
+syscall's until a stamp before it says otherwise. Stamp a chain at each
+hand-off and each device wait before pricing either; `strace -f -tt`
+shows the syscalls' timing and nothing of what runs between them.
 
 The page cache's folios are not hidden: `/proc/self/pagemap` over a
 mapping of the file gives each page's frame, and `/proc/kpageflags` at
@@ -580,7 +583,13 @@ two slot files written in place and fdatasynced, the newest valid slot by
 its publish sequence being the store at open, so a torn publish is the
 slot an open ignores (`Options::manifest_slots`; the shape before it wrote
 a temp name, renamed it over the old manifest and fsynced the directory,
-`supdb-ingestmanifestrename`). The directory fsync the seal's names need
+`supdb-ingestmanifestrename`). A flush's drain is answered once its
+seal's fsyncs are done and the slot is written, and the slot's fdatasync
+follows on the segment work's thread with the WAL's and temp names'
+retirement behind it (`Options::flush_waits_manifest` is the shape that
+waited, `supdb-waitmanifest`): the round trip was a tenth of a
+ten-thousand-key drain, and a crash inside it is a torn newest slot, the
+case the slots were made for. The directory fsync the seal's names need
 runs at the seal's readable landing, on the segment work's thread beside
 the seal thread's fsync of their data, and the two wait on one journal
 commit here: the slots' first version dropped it as the manifest's own,

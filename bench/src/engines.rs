@@ -419,6 +419,10 @@ pub struct Supdb {
     /// segments pending (`Options::manifest_pending`). `supdb-manifestpending`,
     /// and `supdb-ingestmanifestpending` buffered.
     manifestpending: bool,
+    /// A flush waiting for its manifest slot's fdatasync, the shape before
+    /// `Options::flush_waits_manifest` was off. `supdb-waitmanifest`, and
+    /// `supdb-ingestwaitmanifest` buffered.
+    waitmanifest: bool,
     /// The writer's buffers populated a window ahead of their fill
     /// (`Options::prefault`). `supdb-populate`, and `supdb-ingestpopulate`
     /// buffered.
@@ -658,6 +662,10 @@ struct Policy {
     /// segments pending (`Options::manifest_pending`). `supdb-manifestpending`,
     /// and `supdb-ingestmanifestpending` buffered.
     manifestpending: bool,
+    /// A flush waiting for its manifest slot's fdatasync, the shape before
+    /// `Options::flush_waits_manifest` was off. `supdb-waitmanifest`, and
+    /// `supdb-ingestwaitmanifest` buffered.
+    waitmanifest: bool,
     /// The writer's buffers populated a window ahead of their fill
     /// (`Options::prefault`). `supdb-populate`, and `supdb-ingestpopulate`
     /// buffered.
@@ -878,6 +886,7 @@ impl Default for Policy {
             noprefetch: false,
             manifestrename: false,
             manifestpending: false,
+            waitmanifest: false,
             populate: false,
             piece256: false,
             recordsteps: false,
@@ -2400,6 +2409,31 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with a flush waiting for its manifest slot's fdatasync, the
+    /// shape before `Options::flush_waits_manifest` was off.
+    pub fn create_waitmanifest(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                waitmanifest: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-waitmanifest`.
+    pub fn create_ingest_waitmanifest(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                waitmanifest: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` ranking a piece's keys over the partition's records, as
     /// before `Options::piece_ranks_by_heads`: against `supdb` it prices
     /// the ranking over the index's heads, on the segment work's thread.
@@ -2608,6 +2642,7 @@ impl Supdb {
             noprefetch,
             manifestrename,
             manifestpending,
+            waitmanifest,
             populate,
             piece256,
             recordsteps,
@@ -2792,6 +2827,7 @@ impl Supdb {
             scan_prefetch: !noprefetch,
             manifest_slots: !manifestrename,
             manifest_pending: manifestpending,
+            flush_waits_manifest: waitmanifest,
             prefault: populate,
             direct_put_one: !recordsteps,
             direct_stream: !copyvals && !refvals,
@@ -2903,6 +2939,7 @@ impl Supdb {
             noprefetch,
             manifestrename,
             manifestpending,
+            waitmanifest,
             populate,
             piece256,
             recordsteps,
@@ -3336,6 +3373,13 @@ impl Engine for Supdb {
                 "supdb-keycopies"
             } else {
                 "supdb-ingestkeycopies"
+            };
+        }
+        if self.waitmanifest {
+            return if self.partition {
+                "supdb-waitmanifest"
+            } else {
+                "supdb-ingestwaitmanifest"
             };
         }
         if self.rankrecords {
@@ -4041,6 +4085,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-recordsteps"
         | "supdb-copyvals"
         | "supdb-keycopies"
+        | "supdb-waitmanifest"
         | "supdb-inlinemaint"
         | "supdb-adapt"
         | "supdb-adapttrig"
@@ -4104,6 +4149,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestrecordsteps"
         | "supdb-ingestcopyvals"
         | "supdb-ingestkeycopies"
+        | "supdb-ingestwaitmanifest"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
         | "supdb-ingestrankrecords"
@@ -4230,6 +4276,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestcopyvals" => Box::new(Supdb::create_ingest_copyvals(dir)?),
         "supdb-keycopies" => Box::new(Supdb::create_keycopies(dir)?),
         "supdb-ingestkeycopies" => Box::new(Supdb::create_ingest_keycopies(dir)?),
+        "supdb-waitmanifest" => Box::new(Supdb::create_waitmanifest(dir)?),
+        "supdb-ingestwaitmanifest" => Box::new(Supdb::create_ingest_waitmanifest(dir)?),
         "supdb-ingestsettlefreeze" => Box::new(Supdb::create_ingest_settlefreeze(dir)?),
         "supdb-ingestconvertcap" => Box::new(Supdb::create_ingest_convertcap(dir)?),
         "supdb-ingestshortpass" => Box::new(Supdb::create_ingest_shortpass(dir)?),
