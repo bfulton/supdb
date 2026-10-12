@@ -285,7 +285,17 @@ faults across a sitting's drains gives both at once (394 µs and 2.2 µs a
 page for the trailer at ten thousand keys), where a mean over the drains
 gives one number that is neither. And read a pairing's stderr by the
 arm each line names, never by the lines' parity: the arms' order swaps
-every other rep, and a parity split reads positions.
+every other rep, and a parity split reads positions. Attribute the
+faults themselves before pricing them: `perf record -e minor-faults -c 1`
+over a pairing records every fault with the instruction that took it,
+and by symbol it put the writer's thirteen thousand a load in the record
+stream's copies, the slab's entries and the keys' copies, the
+comparator's four hundred in a pool it reuses, and seven thousand in the
+scan snapshot's radix histograms. A page a load no longer touches is
+touched by whatever runs next in the same store if it needs the memory:
+the mixes after a load had been finding the stream's pages warm in the
+heap, so the ring's saving in the load shows as faults in the first
+update mix, and only the sum of the phases says which way it went.
 
 A fresh page's price here is the host's, and it is what moves the
 write cells between sittings. The durable ordered load at three hundred
@@ -479,7 +489,14 @@ the writer handed to a seal without freezing it installs an empty live
 table in its place, and the writer, which writes nothing into a handed
 table, takes whichever table it finds live at its next write -- so a
 retry takes the other's half afresh and nobody holds anybody off. A
-memtable's arenas, entries and index never move once published. Everyone
+memtable's arenas, entries and index never move once published -- with
+one exception the epoch licenses: a direct run's record stream runs in
+a ring (`Options::direct_recycle`), and a block of it the file holds
+whole is taken out under a fresh epoch, its pointer nulled, and reused
+for a later block only once no reader is pinned at or before that epoch;
+a reader that finds the block gone reads the record through the run's
+mapping, and one that loaded the pointer first is pinned below the
+epoch and keeps the memory until it leaves. Everyone
 who reads a state
 pins the epoch it reads in through a slot in the reader table -- a handle
 for each read, the writer for each of its operations, the segment work
@@ -736,9 +753,15 @@ the key section's slots and the landing's Bloom, ask for each key
 sixteen ahead and hint its slot and its block meanwhile
 (`SegmentOptions::lookahead`; `supdb-fillplain`, `supdb-ingestfillplain`
 place as they are asked), since each is a random load into a table that
-outgrows the core's cache at a few hundred thousand keys. The entries
-and the keys are the rest of what the table costs, and a run that kept
-no table at all is the shape left to price.
+outgrows the core's cache at a few hundred thousand keys. The stream's
+arena is a ring of megabyte blocks recycled once the file holds them
+(`Options::direct_recycle`; `supdb-norecycle`, `supdb-ingestnorecycle`
+keep the stream whole), since the stream's pages were two thirds of the
+load's first touches and the comparator's dirty pages come from a pool
+it reuses; the mixes after a load in the same store then first-touch
+the pages the whole stream had warmed for them, which the sum of the
+phases carries. The entries and the keys are the rest of what the table
+costs, and a run that kept no table at all is the shape left to price.
 
 ## Shapes the bugs come in
 

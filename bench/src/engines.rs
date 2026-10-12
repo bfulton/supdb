@@ -452,6 +452,10 @@ pub struct Supdb {
     /// `Options::close_presync`. `supdb-latesync`, and
     /// `supdb-ingestlatesync` buffered.
     latesync: bool,
+    /// A direct run's record stream kept whole in the arena, the shape
+    /// before `Options::direct_recycle`. `supdb-norecycle`, and
+    /// `supdb-ingestnorecycle` buffered.
+    norecycle: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -703,6 +707,10 @@ struct Policy {
     /// `Options::close_presync`. `supdb-latesync`, and
     /// `supdb-ingestlatesync` buffered.
     latesync: bool,
+    /// A direct run's record stream kept whole in the arena, the shape
+    /// before `Options::direct_recycle`. `supdb-norecycle`, and
+    /// `supdb-ingestnorecycle` buffered.
+    norecycle: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -910,6 +918,7 @@ impl Default for Policy {
             keycopies: false,
             fillplain: false,
             latesync: false,
+            norecycle: false,
             rankrecords: false,
             shape: false,
             adaptcap: None,
@@ -2477,6 +2486,31 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with a direct run's record stream kept whole in its arena,
+    /// the shape before `Options::direct_recycle`.
+    pub fn create_norecycle(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                norecycle: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-norecycle`.
+    pub fn create_ingest_norecycle(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                norecycle: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with a flush waiting for its manifest slot's fdatasync, the
     /// shape before `Options::flush_waits_manifest` was off.
     pub fn create_waitmanifest(path: &Path) -> Res<Supdb> {
@@ -2718,6 +2752,7 @@ impl Supdb {
             keycopies,
             fillplain,
             latesync,
+            norecycle,
             rankrecords,
             shape,
             aheadmin,
@@ -2904,6 +2939,7 @@ impl Supdb {
             direct_put_one: !recordsteps,
             direct_stream: !copyvals && !refvals,
             direct_derive_keys: !keycopies,
+            direct_recycle: !norecycle,
             // The scan phases timed where the arm asks, or where the
             // counters lines will read them: ten clock reads a scan.
             scan_timers: timers
@@ -3019,6 +3055,7 @@ impl Supdb {
             keycopies,
             fillplain,
             latesync,
+            norecycle,
             rankrecords,
             shape,
             aheadmin,
@@ -3461,6 +3498,13 @@ impl Engine for Supdb {
                 "supdb-latesync"
             } else {
                 "supdb-ingestlatesync"
+            };
+        }
+        if self.norecycle {
+            return if self.partition {
+                "supdb-norecycle"
+            } else {
+                "supdb-ingestnorecycle"
             };
         }
         if self.waitmanifest {
@@ -4175,6 +4219,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-keycopies"
         | "supdb-fillplain"
         | "supdb-latesync"
+        | "supdb-norecycle"
         | "supdb-waitmanifest"
         | "supdb-inlinemaint"
         | "supdb-adapt"
@@ -4241,6 +4286,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestkeycopies"
         | "supdb-ingestfillplain"
         | "supdb-ingestlatesync"
+        | "supdb-ingestnorecycle"
         | "supdb-ingestwaitmanifest"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
@@ -4372,6 +4418,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestfillplain" => Box::new(Supdb::create_ingest_fillplain(dir)?),
         "supdb-latesync" => Box::new(Supdb::create_latesync(dir)?),
         "supdb-ingestlatesync" => Box::new(Supdb::create_ingest_latesync(dir)?),
+        "supdb-norecycle" => Box::new(Supdb::create_norecycle(dir)?),
+        "supdb-ingestnorecycle" => Box::new(Supdb::create_ingest_norecycle(dir)?),
         "supdb-waitmanifest" => Box::new(Supdb::create_waitmanifest(dir)?),
         "supdb-ingestwaitmanifest" => Box::new(Supdb::create_ingest_waitmanifest(dir)?),
         "supdb-ingestsettlefreeze" => Box::new(Supdb::create_ingest_settlefreeze(dir)?),

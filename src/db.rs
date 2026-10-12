@@ -1438,6 +1438,22 @@ pub struct Options {
     /// the arm `supdb-keycopies` and `supdb-ingestkeycopies`. Nothing
     /// without `direct_stream`, whose records the offsets are read from.
     pub direct_derive_keys: bool,
+    /// A streamed direct run's record stream runs in a ring: its arena's
+    /// blocks are a megabyte, the writer's piece, and a block the file
+    /// holds whole is given up at the commit that wrote it, under the
+    /// readers' epoch, and its pages taken again for the next block once
+    /// every reader pinned when it went has left; a record in a block
+    /// given up is read through the run's mapping, as a reference-holding
+    /// table reads every committed record. A load of three hundred thousand
+    /// keys first-touched thirteen thousand pages of anonymous memory, two
+    /// thirds of them the stream's thirty-five megabytes, and each first
+    /// touch costs this host from a fraction of a microsecond to tens of
+    /// them by the sitting (`docs/engine.md`, the pages a load touches);
+    /// the ring holds a few megabytes whatever the run grows to. Off, the
+    /// stream kept whole in blocks of four megabytes, the arm
+    /// `supdb-norecycle` and `supdb-ingestnorecycle`. Nothing without
+    /// `direct_stream`. A run addresses four gigabytes of stream under it.
+    pub direct_recycle: bool,
     /// Bytes the mapping of a direct run's segment starts with; zero, the
     /// default, twice `seal_bytes`. The mapping grows when the run's file
     /// outgrows it. For a test of the growth.
@@ -1698,6 +1714,7 @@ impl Default for Options {
             direct_put_one: true,
             direct_stream: true,
             direct_derive_keys: true,
+            direct_recycle: true,
             direct_map_bytes: 0,
             forms_settle_recent_pct: 0,
             forms_carry: true,
@@ -2420,6 +2437,10 @@ struct AlignedWriter {
     stream_src: Option<std::sync::Arc<MemTable>>,
     held_from: usize,
     held_to: usize,
+    /// The file offset the stream's first byte landed at, from the first
+    /// `stream_hash`; what a stream offset is added to for its place in
+    /// the file.
+    stream_base: Option<u64>,
     /// The piece, and the boundary every write but a flush's ends on.
     piece: u64,
     /// Start the device on each piece as it lands
@@ -2487,6 +2508,7 @@ impl AlignedWriter {
             stream_src: None,
             held_from: 0,
             held_to: 0,
+            stream_base: None,
             piece: piece as u64,
             writeback,
             ahead,
@@ -2587,6 +2609,11 @@ impl AlignedWriter {
             self.held_to = from;
         }
         debug_assert_eq!(from, self.held_to, "the stream is hashed in order");
+        if self.stream_base.is_none() {
+            // The file offset of the stream's first byte: constant from
+            // here on, since the file and the held range advance together.
+            self.stream_base = Some(self.written - self.held_from as u64);
+        }
         let src = self.stream_src.clone().expect("a stream has its table");
         let arena = src.stream_arena();
         let row_piece = 1u64 << flatindex::PIECE_SHIFT;
@@ -2594,7 +2621,7 @@ impl AlignedWriter {
         let mut whole = 0u32;
         let mut p = from;
         while p < to {
-            let part = (to - p).min(ARENA_BLOCK - (p & (ARENA_BLOCK - 1)));
+            let part = (to - p).min(arena.block_len() - (p & (arena.block_len() - 1)));
             let s = arena.slice(p, part);
             let at0 = self.written + (p - self.held_from) as u64;
             let mut q = 0usize;
@@ -2660,7 +2687,7 @@ impl AlignedWriter {
             let (mut p, to) = (self.held_from, self.held_from + n);
             let mut parts: Vec<&[u8]> = Vec::with_capacity(2);
             while p < to {
-                let part = (to - p).min(ARENA_BLOCK - (p & (ARENA_BLOCK - 1)));
+                let part = (to - p).min(arena.block_len() - (p & (arena.block_len() - 1)));
                 parts.push(arena.slice(p, part));
                 p += part;
             }
@@ -2680,6 +2707,11 @@ impl AlignedWriter {
     /// Bytes of the stream hashed and not yet on the file.
     fn stream_held(&self) -> usize {
         self.held_to - self.held_from
+    }
+
+    /// The file offset the stream's first byte landed at, once hashed.
+    fn stream_base(&self) -> Option<u64> {
+        self.stream_base
     }
 
     /// The table whose record stream this writer takes as the file's
@@ -2790,7 +2822,7 @@ impl AlignedWriter {
                 let n = (held - start).min(dst.len() - done);
                 let (mut p, to) = (self.held_from + start, self.held_from + start + n);
                 while p < to {
-                    let part = (to - p).min(ARENA_BLOCK - (p & (ARENA_BLOCK - 1)));
+                    let part = (to - p).min(arena.block_len() - (p & (arena.block_len() - 1)));
                     dst[done..done + part].copy_from_slice(arena.slice(p, part));
                     p += part;
                     done += part;
@@ -2930,7 +2962,7 @@ impl AlignedWriter {
             let mut parts: Vec<&[u8]> = Vec::with_capacity(3);
             let (mut p, to) = (self.held_from, self.held_to);
             while p < to {
-                let part = (to - p).min(ARENA_BLOCK - (p & (ARENA_BLOCK - 1)));
+                let part = (to - p).min(arena.block_len() - (p & (arena.block_len() - 1)));
                 parts.push(arena.slice(p, part));
                 p += part;
             }
@@ -3829,6 +3861,12 @@ impl SegmentWriter {
     /// The bytes the file holds: what the writer's buffer has carried to
     /// it, a piece at a time or at a sync; the rest of what was written
     /// waits in the buffer.
+    /// The file offset the caller's record stream begins at, once the
+    /// first batch of it was hashed (`AlignedWriter::stream_base`).
+    pub(crate) fn stream_base(&self) -> Option<u64> {
+        self.out.stream_base()
+    }
+
     pub(crate) fn file_written(&self) -> u64 {
         self.out.file_written()
     }
@@ -5017,6 +5055,10 @@ impl PieceWriter {
         self.0.stream_out(from, to)
     }
 
+    fn stream_base(&self) -> Option<u64> {
+        self.0.stream_base()
+    }
+
     fn set_stream_source(&mut self, table: std::sync::Arc<MemTable>) {
         self.0.set_stream_source(table);
     }
@@ -5457,6 +5499,13 @@ struct MemTable {
     /// committed reference reaches past.
     run_flushed: AtomicU64,
     retired_runs: UnsafeCell<Vec<(u64, Box<RunMap>)>>,
+    /// `stream` with `Options::direct_recycle`: the stream's blocks are
+    /// recycled once the file holds them, and a record in a recycled
+    /// block is read through the run's mapping at `stream_base` plus its
+    /// stream offset -- the file offset the stream's first byte landed
+    /// at, published by the writer before any block goes.
+    recycle: bool,
+    stream_base: AtomicU64,
     /// With `refs`, the second staging arena: a value stays a copy until
     /// the writer's buffer has carried its record to the file, which is a
     /// piece of a megabyte at a time, so the chunks of several commits
@@ -5658,7 +5707,11 @@ impl Index {
 /// hold it. Offsets are logical, block number times the block size plus
 /// the place inside, so an offset finds its block with a shift.
 const ARENA_SHIFT: u32 = 22;
-const ARENA_BLOCK: usize = 1 << ARENA_SHIFT;
+/// A recycled record stream's block (`Options::direct_recycle`): a
+/// megabyte, the writer's piece, so the ring the stream runs in is a few
+/// megabytes whatever the run grows to. The arena addresses `ARENA_BLOCKS`
+/// of them, four gigabytes of one run.
+const STREAM_SHIFT: u32 = 20;
 /// Blocks an arena can address: sixteen gigabytes of the plain size.
 const ARENA_BLOCKS: usize = 1 << 12;
 
@@ -5720,6 +5773,17 @@ struct ByteArena {
     /// `Options::prefault`: the tail's block populated a window ahead of
     /// the reservations.
     prefault: bool,
+    /// The block's size, as a shift: `ARENA_SHIFT` for a table's arenas,
+    /// `STREAM_SHIFT` for a record stream whose blocks are recycled once
+    /// the file holds them (`recycle_below`), where a smaller block is a
+    /// smaller ring. Every offset finds its block by it.
+    shift: u32,
+    /// Writer-only: blocks taken out of the arena under an epoch, their
+    /// memory handed out again by `block_at` once every reader pinned at
+    /// or before that epoch has left (`recycle_below`), and the memory
+    /// so reclaimed and waiting.
+    retired: UnsafeCell<Vec<(u64, *mut u8)>>,
+    free: UnsafeCell<Vec<*mut u8>>,
 }
 
 #[derive(Default)]
@@ -5732,10 +5796,17 @@ struct ArenaTail {
     block_start: usize,
     block_base: usize,
     populated: usize,
+    /// Blocks below this were offered to `recycle_below` already.
+    recycled: usize,
 }
 
 impl ByteArena {
     fn new(prefault: bool) -> ByteArena {
+        ByteArena::with_shift(prefault, ARENA_SHIFT)
+    }
+
+    /// An arena of blocks of `1 << shift` bytes.
+    fn with_shift(prefault: bool, shift: u32) -> ByteArena {
         ByteArena {
             blocks: (0..ARENA_BLOCKS)
                 .map(|_| AtomicPtr::new(std::ptr::null_mut()))
@@ -5744,7 +5815,90 @@ impl ByteArena {
             tail: UnsafeCell::new(ArenaTail::default()),
             used: AtomicUsize::new(0),
             prefault,
+            shift,
+            retired: UnsafeCell::new(Vec::new()),
+            free: UnsafeCell::new(Vec::new()),
         }
+    }
+
+    /// A block's bytes.
+    #[inline]
+    fn block_len(&self) -> usize {
+        1 << self.shift
+    }
+
+    /// Writer: every block whose bytes lie wholly below `off` taken out
+    /// of the arena -- its pointer nulled, so a reader finds the block
+    /// gone and reads the bytes where the writer has put them meanwhile,
+    /// the run's file -- under a fresh epoch, and the blocks taken out
+    /// under an epoch no reader is pinned at or before handed to the free
+    /// list for `block_at`. The tail's block is never taken. A reader
+    /// that loaded a block's pointer before it was nulled is pinned at an
+    /// epoch below the one the block was retired under, and the block's
+    /// memory is reused only past every such pin, so nothing a reader can
+    /// hold moves under it.
+    fn recycle_below(&self, off: usize, rd: &Readers) -> usize {
+        // SAFETY: writer-only, see the memtable's doc.
+        let t = unsafe { &mut *self.tail.get() };
+        let last = (off >> self.shift).min(t.block_start >> self.shift);
+        let mut taken = 0usize;
+        // SAFETY: writer-only.
+        let retired = unsafe { &mut *self.retired.get() };
+        if t.recycled < last {
+            let mut ptrs = Vec::new();
+            for b in t.recycled..last {
+                let p = self.blocks[b].swap(std::ptr::null_mut(), AtomicOrdering::AcqRel);
+                if !p.is_null() {
+                    debug_assert_eq!(
+                        self.caps[b].load(AtomicOrdering::Relaxed),
+                        self.block_len(),
+                        "a recycled arena's blocks are plain"
+                    );
+                    ptrs.push(p);
+                }
+            }
+            t.recycled = last;
+            if !ptrs.is_empty() {
+                // The epoch after the pointers went: a reader pinned from
+                // here on finds every one of them null.
+                let tag = rd.bump();
+                taken = ptrs.len();
+                retired.extend(ptrs.into_iter().map(|p| (tag, p)));
+            }
+        }
+        if !retired.is_empty() {
+            let oldest = rd.oldest_pinned();
+            // SAFETY: writer-only.
+            let free = unsafe { &mut *self.free.get() };
+            retired.retain(|&(tag, p)| {
+                if tag <= oldest {
+                    free.push(p);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        taken
+    }
+
+    /// The bytes at `off`, or `None` for a block recycled
+    /// (`recycle_below`): the caller then reads them from the file.
+    fn try_slice(&self, off: usize, len: usize) -> Option<&[u8]> {
+        let b = off >> self.shift;
+        let w = off & (self.block_len() - 1);
+        let p = self.blocks[b].load(AtomicOrdering::Acquire);
+        if p.is_null() {
+            return None;
+        }
+        assert!(
+            w + len <= self.caps[b].load(AtomicOrdering::Acquire),
+            "memtable arena: a read past its block"
+        );
+        // SAFETY: inside a block the writer published and has not freed:
+        // a recycled block's memory is reused only past every reader
+        // pinned when its pointer went, and this reader is pinned.
+        Some(unsafe { std::slice::from_raw_parts(p.add(w), len) })
     }
 
     /// Writer: `n` contiguous bytes, at the offset returned.
@@ -5757,7 +5911,7 @@ impl ByteArena {
                 b < ARENA_BLOCKS,
                 "memtable arena: more bytes than it addresses"
             );
-            let cap = ARENA_BLOCK.max((n + 63) & !63);
+            let cap = self.block_len().max((n + 63) & !63);
             let layout = std::alloc::Layout::from_size_align(cap, 64).expect("arena block layout");
             // Not zeroed: a byte is read only past a write that covered
             // it, and zeroing a fresh table's first blocks -- eleven
@@ -5768,9 +5922,9 @@ impl ByteArena {
             assert!(!p.is_null(), "memtable arena: out of memory");
             self.caps[b].store(cap, AtomicOrdering::Release);
             self.blocks[b].store(p, AtomicOrdering::Release);
-            t.at = b << ARENA_SHIFT;
+            t.at = b << self.shift;
             t.block_end = t.at + cap;
-            t.next_block = b + cap.div_ceil(ARENA_BLOCK);
+            t.next_block = b + cap.div_ceil(self.block_len());
             t.block_start = t.at;
             t.block_base = p as usize;
             t.populated = 0;
@@ -5793,7 +5947,7 @@ impl ByteArena {
     /// may run across blocks, so the arena's offsets are one unbroken
     /// stream -- a stream of the segment's records, laid out as the file
     /// takes them, has no gap at a block's end. Every block this makes is
-    /// `ARENA_BLOCK` bytes exactly, so an offset finds its block with the
+    /// `self.block_len()` bytes exactly, so an offset finds its block with the
     /// shift as before, and a block a rewind left behind is taken up
     /// again; a range that straddles is written with `write_contig` and
     /// read a block at a time, since `slice` lends from one block. An
@@ -5814,16 +5968,16 @@ impl ByteArena {
                     "memtable arena: more bytes than it addresses"
                 );
                 let p = self.block_at(b);
-                t.block_start = b << ARENA_SHIFT;
+                t.block_start = b << self.shift;
                 t.block_base = p as usize;
                 t.populated = 0;
-                t.block_end = t.block_start + ARENA_BLOCK;
+                t.block_end = t.block_start + self.block_len();
                 t.next_block = b + 1;
-                if left <= ARENA_BLOCK {
+                if left <= self.block_len() {
                     t.at = t.block_start + left;
                     break;
                 }
-                left -= ARENA_BLOCK;
+                left -= self.block_len();
             }
         }
         if self.prefault {
@@ -5838,24 +5992,34 @@ impl ByteArena {
         off
     }
 
-    /// Writer: block `b`, a plain `ARENA_BLOCK` one: the one there if a
+    /// Writer: block `b`, a plain `self.block_len()` one: the one there if a
     /// rewind left it, else allocated and published.
     fn block_at(&self, b: usize) -> *mut u8 {
         let p = self.blocks[b].load(AtomicOrdering::Acquire);
         if !p.is_null() {
             debug_assert_eq!(
                 self.caps[b].load(AtomicOrdering::Relaxed),
-                ARENA_BLOCK,
+                self.block_len(),
                 "a contiguous arena's blocks are plain"
             );
             return p;
         }
-        let layout =
-            std::alloc::Layout::from_size_align(ARENA_BLOCK, 64).expect("arena block layout");
-        // SAFETY: a non-zero layout; the block is freed by `Drop`.
-        let p = unsafe { std::alloc::alloc(layout) };
-        assert!(!p.is_null(), "memtable arena: out of memory");
-        self.caps[b].store(ARENA_BLOCK, AtomicOrdering::Release);
+        // A block given back by `recycle_below` first: its pages were
+        // touched already, and a fresh page costs this host up to tens of
+        // microseconds at its first touch.
+        // SAFETY: writer-only.
+        let p = match unsafe { &mut *self.free.get() }.pop() {
+            Some(p) => p,
+            None => {
+                let layout = std::alloc::Layout::from_size_align(self.block_len(), 64)
+                    .expect("arena block layout");
+                // SAFETY: a non-zero layout; the block is freed by `Drop`.
+                let p = unsafe { std::alloc::alloc(layout) };
+                assert!(!p.is_null(), "memtable arena: out of memory");
+                p
+            }
+        };
+        self.caps[b].store(self.block_len(), AtomicOrdering::Release);
         self.blocks[b].store(p, AtomicOrdering::Release);
         p
     }
@@ -5865,7 +6029,9 @@ impl ByteArena {
         let mut at = off;
         let mut rest = bytes;
         while !rest.is_empty() {
-            let part = rest.len().min(ARENA_BLOCK - (at & (ARENA_BLOCK - 1)));
+            let part = rest
+                .len()
+                .min(self.block_len() - (at & (self.block_len() - 1)));
             self.write(at, &rest[..part]);
             at += part;
             rest = &rest[part..];
@@ -5873,8 +6039,8 @@ impl ByteArena {
     }
 
     /// Whether `len` bytes at `off` run past their block's end.
-    fn straddles(off: usize, len: usize) -> bool {
-        len > 0 && (off >> ARENA_SHIFT) != ((off + len - 1) >> ARENA_SHIFT)
+    fn straddles(&self, off: usize, len: usize) -> bool {
+        len > 0 && (off >> self.shift) != ((off + len - 1) >> self.shift)
     }
 
     /// Writer: the reserved range at `off`, within one block, lent to `f`
@@ -5902,17 +6068,17 @@ impl ByteArena {
         // The block the tail sits in: the one before `to` where `to` is a
         // block's first byte, so a tail at a block's end stays there and
         // the next reservation steps over as it would have.
-        let b = if to > 0 && to & (ARENA_BLOCK - 1) == 0 {
-            (to >> ARENA_SHIFT) - 1
+        let b = if to > 0 && to & (self.block_len() - 1) == 0 {
+            (to >> self.shift) - 1
         } else {
-            to >> ARENA_SHIFT
+            to >> self.shift
         };
-        if t.block_start != b << ARENA_SHIFT {
-            t.block_start = b << ARENA_SHIFT;
+        if t.block_start != b << self.shift {
+            t.block_start = b << self.shift;
             t.block_base = self.blocks[b].load(AtomicOrdering::Acquire) as usize;
-            t.block_end = t.block_start + ARENA_BLOCK;
+            t.block_end = t.block_start + self.block_len();
             t.next_block = b + 1;
-            t.populated = ARENA_BLOCK;
+            t.populated = self.block_len();
         }
         t.at = to;
     }
@@ -5938,8 +6104,8 @@ impl ByteArena {
     }
 
     fn block(&self, off: usize, len: usize) -> (*mut u8, usize) {
-        let b = off >> ARENA_SHIFT;
-        let w = off & (ARENA_BLOCK - 1);
+        let b = off >> self.shift;
+        let w = off & (self.block_len() - 1);
         let p = self.blocks[b].load(AtomicOrdering::Acquire);
         assert!(
             !p.is_null(),
@@ -5968,40 +6134,11 @@ impl ByteArena {
         unsafe { std::slice::from_raw_parts(p.add(w), len) }
     }
 
-    /// Anyone: published bytes at `off` into `out`, across blocks where
-    /// the range straddles.
-    fn read_contig(&self, off: usize, out: &mut [u8]) {
-        let mut at = off;
-        let mut rest = out;
-        while !rest.is_empty() {
-            let part = rest.len().min(ARENA_BLOCK - (at & (ARENA_BLOCK - 1)));
-            rest[..part].copy_from_slice(self.slice(at, part));
-            at += part;
-            rest = &mut rest[part..];
-        }
-    }
-
-    /// Anyone: whether the published bytes at `off` are `bytes`, across
-    /// blocks where the range straddles.
-    fn eq_contig(&self, off: usize, bytes: &[u8]) -> bool {
-        let mut at = off;
-        let mut rest = bytes;
-        while !rest.is_empty() {
-            let part = rest.len().min(ARENA_BLOCK - (at & (ARENA_BLOCK - 1)));
-            if self.slice(at, part) != &rest[..part] {
-                return false;
-            }
-            at += part;
-            rest = &rest[part..];
-        }
-        true
-    }
-
     /// A hint to fetch the lines at `off`, clipped to the block; nothing
     /// is read.
     fn prefetch(&self, off: usize, len: usize) {
-        let b = off >> ARENA_SHIFT;
-        let w = off & (ARENA_BLOCK - 1);
+        let b = off >> self.shift;
+        let w = off & (self.block_len() - 1);
         let p = self.blocks[b].load(AtomicOrdering::Acquire);
         if p.is_null() {
             return;
@@ -6029,6 +6166,17 @@ impl Drop for ByteArena {
                 // SAFETY: allocated by `reserve` with this layout.
                 unsafe { std::alloc::dealloc(p, layout) };
             }
+        }
+        // The recycled blocks, retired or waiting: plain blocks every one.
+        let layout =
+            std::alloc::Layout::from_size_align(self.block_len(), 64).expect("arena block layout");
+        for &(_, p) in self.retired.get_mut().iter() {
+            // SAFETY: allocated by `block_at` with this layout, owned here.
+            unsafe { std::alloc::dealloc(p, layout) };
+        }
+        for &p in self.free.get_mut().iter() {
+            // SAFETY: as above.
+            unsafe { std::alloc::dealloc(p, layout) };
         }
     }
 }
@@ -6427,6 +6575,8 @@ impl MemTable {
             run: AtomicPtr::new(std::ptr::null_mut()),
             run_flushed: AtomicU64::new(0),
             retired_runs: UnsafeCell::new(Vec::new()),
+            recycle: false,
+            stream_base: AtomicU64::new(0),
             vals2: ByteArena::new(prefault),
             staging: UnsafeCell::new(Staging::default()),
             keys: ByteArena::new(prefault),
@@ -6445,7 +6595,7 @@ impl MemTable {
     /// segment (`Options::direct_table_refs`); with `stream`, one whose
     /// values are the run's records in place (`Options::direct_stream`),
     /// compact where it says.
-    fn new_ordered(refs: bool, prefault: bool, stream: Option<bool>) -> MemTable {
+    fn new_ordered(refs: bool, prefault: bool, stream: Option<bool>, recycle: bool) -> MemTable {
         debug_assert!(!(refs && stream.is_some()), "two shapes of one table");
         MemTable {
             entries: Slab::new(),
@@ -6458,10 +6608,16 @@ impl MemTable {
             run: AtomicPtr::new(std::ptr::null_mut()),
             run_flushed: AtomicU64::new(0),
             retired_runs: UnsafeCell::new(Vec::new()),
+            recycle: stream.is_some() && recycle,
+            stream_base: AtomicU64::new(0),
             vals2: ByteArena::new(prefault),
             staging: UnsafeCell::new(Staging::default()),
             keys: ByteArena::new(prefault),
-            vals: ByteArena::new(prefault),
+            vals: if stream.is_some() && recycle {
+                ByteArena::with_shift(prefault, STREAM_SHIFT)
+            } else {
+                ByteArena::new(prefault)
+            },
             tombs: AtomicUsize::new(0),
             marks: Default::default(),
             mark: AtomicU64::new(0),
@@ -6874,7 +7030,7 @@ impl MemTable {
         let off = self.vals.reserve_contig(rec_len);
         let one = [0u8; 1];
         let tail: &[u8] = if value.is_empty() { &one } else { value };
-        let tail_at = if ByteArena::straddles(off, rec_len) {
+        let tail_at = if self.vals.straddles(off, rec_len) {
             let mut scratch = vec![0u8; rec_len];
             let at = flatindex::record_into(&mut scratch, key, &[ext], tail, self.stream_compact);
             self.vals.write_contig(off, &scratch);
@@ -6889,7 +7045,7 @@ impl MemTable {
         if value.is_empty() {
             return REF_STREAM | ref_pack(voff as u64, 0);
         }
-        if ByteArena::straddles(voff, value.len()) {
+        if self.vals.straddles(voff, value.len()) {
             let copy = self.vals2.reserve(value.len());
             self.vals2.write(copy, value);
             return REF_STREAM | REF_ARENA2 | ref_pack(copy as u64, value.len() as u32);
@@ -6912,6 +7068,76 @@ impl MemTable {
             flatindex::record_tail_at(klen, &[ext], self.stream_compact),
             vlen,
         )
+    }
+
+    /// `stream` only: `len` bytes of the stream at `at`, from the arena
+    /// where it still holds them, else from the run's file, which holds
+    /// every block the arena has given up (`ByteArena::recycle_below`).
+    fn stream_bytes(&self, at: usize, len: usize) -> &[u8] {
+        debug_assert!(self.stream);
+        if let Some(s) = self.vals.try_slice(at, len) {
+            return s;
+        }
+        let base = self.stream_base.load(AtomicOrdering::Acquire) as usize;
+        let end = base + at + len;
+        // Not a debug assertion: past the pushed length the mapping may
+        // hold no page, and the kernel's answer to that is a signal.
+        assert!(
+            end as u64 <= self.run_flushed.load(AtomicOrdering::Acquire),
+            "a recycled block's bytes are on the file"
+        );
+        let run = self.run().expect("a recycled block has a run to read");
+        &run.map[base + at..end]
+    }
+
+    /// `stream` only: `out` filled from the stream at `at`, across blocks.
+    fn stream_read_contig(&self, at: usize, out: &mut [u8]) {
+        let bl = self.vals.block_len();
+        let mut p = at;
+        let mut rest = out;
+        while !rest.is_empty() {
+            let part = rest.len().min(bl - (p & (bl - 1)));
+            rest[..part].copy_from_slice(self.stream_bytes(p, part));
+            p += part;
+            rest = &mut rest[part..];
+        }
+    }
+
+    /// `stream` only: whether the stream at `at` holds `bytes`.
+    fn stream_eq_contig(&self, at: usize, bytes: &[u8]) -> bool {
+        let bl = self.vals.block_len();
+        let mut p = at;
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let part = rest.len().min(bl - (p & (bl - 1)));
+            if self.stream_bytes(p, part) != &rest[..part] {
+                return false;
+            }
+            p += part;
+            rest = &rest[part..];
+        }
+        true
+    }
+
+    /// Writer, `stream` with `recycle`: the file offset the stream's
+    /// first byte landed at, before any block is recycled.
+    fn set_stream_base(&self, base: u64) {
+        self.stream_base.store(base, AtomicOrdering::Release);
+    }
+
+    /// Writer, `stream` with `recycle`, once a commit: the stream's
+    /// blocks wholly below the file's `written` bytes given up, their
+    /// records read through the run's mapping from here on
+    /// (`ByteArena::recycle_below`), the mapping covering `written` and
+    /// `run_flushed` published at it first. Returns the blocks taken.
+    fn recycle_stream(&self, written: u64, rd: &Readers) -> usize {
+        debug_assert!(self.stream && self.recycle);
+        let base = self.stream_base.load(AtomicOrdering::Relaxed);
+        if written <= base {
+            return 0;
+        }
+        debug_assert!(self.run_flushed.load(AtomicOrdering::Relaxed) >= written);
+        self.vals.recycle_below((written - base) as usize, rd)
     }
 
     /// `stream` only: the record stream and where it ends.
@@ -6954,10 +7180,10 @@ impl MemTable {
         let klen = e.key_len as usize;
         let mut hdr = [0u8; 4];
         let starts_at = |at: usize, hdr: &mut [u8; 4]| {
-            self.vals.read_contig(at, hdr);
+            self.stream_read_contig(at, hdr);
             hdr[0..2] == (klen as u16).to_le_bytes()
                 && hdr[2..4] != [0, 0]
-                && self.vals.eq_contig(at + 4, self.key_of(e))
+                && self.stream_eq_contig(at + 4, self.key_of(e))
         };
         if starts_at(end, &mut hdr) {
             end
@@ -7209,7 +7435,7 @@ impl MemTable {
             if off & REF_ARENA2 != 0 {
                 return self.vals2.slice(at, len as usize);
             }
-            return self.vals.slice(at, len as usize);
+            return self.stream_bytes(at, len as usize);
         }
         if self.refs {
             let off = off as u64;
@@ -7375,6 +7601,23 @@ impl Drop for MemTable {
 /// only ever appended to and never truncated under the mapping.
 struct RunMap {
     map: memmap2::Mmap,
+}
+
+/// The run's mapping grown past the file's `written` bytes where it falls
+/// short, doubling from a megabyte, the one replaced retired under the
+/// readers' epoch (`MemTable::set_run`); the caller publishes the length
+/// after, before any reference that needs it.
+fn grow_run_map(mem: &MemTable, tmp: &Path, written: u64, shared: &Shared) -> Result<()> {
+    let cap = mem.run().map_or(0, |r| r.cap() as u64);
+    if written > cap {
+        let mut grown = cap.max(1 << 20);
+        while grown < written {
+            grown *= 2;
+        }
+        mem.set_run(RunMap::open(tmp, grown as usize)?, &shared.readers);
+        shared.run_remaps.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    Ok(())
 }
 
 impl RunMap {
@@ -9575,6 +9818,9 @@ struct Shared {
     /// Direct runs whose mapping was grown past the file's end
     /// (`Options::direct_table_refs`); see `Db::run_remaps`.
     run_remaps: AtomicU64,
+    /// Stream blocks given up for recycling over this store's life
+    /// (`Options::direct_recycle`); see `Db::stream_recycled`.
+    stream_recycled: AtomicU64,
     /// The sequence of the last manifest the store published, stored by
     /// the publish once the slot or the rename is durable; see
     /// `Db::manifest_seq`.
@@ -17756,6 +18002,7 @@ impl Db {
             convert_total_ns: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(0),
             run_remaps: AtomicU64::new(0),
+            stream_recycled: AtomicU64::new(0),
             manifest_seq: AtomicU64::new(0),
             forms_cloned: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
@@ -18180,6 +18427,7 @@ impl Db {
             convert_total_ns: AtomicU64::new(0),
             ord_rebuilt: AtomicU64::new(ord_rebuilt),
             run_remaps: AtomicU64::new(0),
+            stream_recycled: AtomicU64::new(0),
             manifest_seq: AtomicU64::new(0),
             forms_cloned: AtomicU64::new(0),
             form_takes: AtomicU64::new(0),
@@ -18318,6 +18566,7 @@ impl Db {
                             self.opts
                                 .direct_stream
                                 .then_some(self.opts.segment.compact_records),
+                            self.opts.direct_recycle,
                         )),
                         true,
                     );
@@ -18806,10 +19055,11 @@ impl Db {
         let put_one = self.opts.direct_put_one;
         let d = self.direct.as_mut().expect("opened above");
         let refs = mem.refs;
-        if refs && mem.run().is_none() {
+        if (refs || mem.recycle) && mem.run().is_none() {
             // The table reads its committed values through the run's
-            // file from here on; the mapping starts at twice the run's
-            // allowance and grows with the file.
+            // file from here on -- every one with `refs`, those in blocks
+            // given up with `recycle`; the mapping starts at twice the
+            // run's allowance and grows with the file.
             mem.set_run(RunMap::open(&d.tmp, map_bytes)?, &shared.readers);
         }
         if mem.stream {
@@ -18829,6 +19079,22 @@ impl Db {
             d.w.mark_stream(mem.stream_arena())?;
             d.stream_from = mem.stream_tail();
             mem.set_stream_committed(d.stream_from);
+            if mem.recycle {
+                // The blocks the file holds whole given up, their records
+                // read through the run's mapping from here on: the mapping
+                // grown over the file and its length published first, so a
+                // reader that finds a block gone finds the bytes.
+                if let Some(base) = d.w.stream_base() {
+                    mem.set_stream_base(base);
+                    let written = d.w.file_written();
+                    grow_run_map(&mem, &d.tmp, written, &shared)?;
+                    mem.set_run_flushed(written);
+                    let n = mem.recycle_stream(written, &shared.readers);
+                    shared
+                        .stream_recycled
+                        .fetch_add(n as u64, AtomicOrdering::Relaxed);
+                }
+            }
         } else {
             for i in d.committed..mem.len() {
                 let e = mem.entry(i);
@@ -18871,15 +19137,7 @@ impl Db {
             // file's end first where it would fall short, and the length
             // published before any reference that needs it.
             let written = d.w.file_written();
-            let cap = mem.run().map_or(0, |r| r.cap() as u64);
-            if written > cap {
-                let mut grown = cap.max(1 << 20);
-                while grown < written {
-                    grown *= 2;
-                }
-                mem.set_run(RunMap::open(&d.tmp, grown as usize)?, &shared.readers);
-                shared.run_remaps.fetch_add(1, AtomicOrdering::Relaxed);
-            }
+            grow_run_map(&mem, &d.tmp, written, &shared)?;
             mem.set_run_flushed(written);
             while let Some(&(i, at, len)) = d.pending.front() {
                 if at + u64::from(len) > written {
@@ -22810,6 +23068,13 @@ impl Db {
     /// end, over this store's life (`Options::direct_table_refs`).
     pub fn run_remaps(&self) -> u64 {
         self.shared.run_remaps.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Blocks of a direct run's record stream given up for recycling
+    /// once the file held them, over this store's life
+    /// (`Options::direct_recycle`).
+    pub fn stream_recycled(&self) -> u64 {
+        self.shared.stream_recycled.load(AtomicOrdering::Relaxed)
     }
 
     /// Patches that copied a form shared with a published copy before

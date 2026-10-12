@@ -3813,6 +3813,67 @@ column, which the change does not touch and the host's page price moves
 by half between reps -- noted as unresolved, as the rules have it. The
 late sync is the arm `supdb-latesync` and `supdb-ingestlatesync`.
 
+#### The record stream in a ring
+
+A buffered ordered load of three hundred thousand keys read level with
+the comparator in one sitting and at half its rate in the next, and the
+variance was the loss. Every minor fault of a pairing recorded with its
+instruction (`perf record -e minor-faults -c 1`) put the writer's load at
+thirteen thousand first touches of anonymous memory -- 178 bytes a key:
+the record stream 116, the slab entry 38, the key's copy 16 -- against
+the comparator's four hundred, whose dirty pages come from a pool it
+reuses and reach the file by `write`; in a dear sitting the same load's
+commits read 147 to 370 ms against the comparator's 51 to 63 at the same
+fault count, seven to twenty-four microseconds a page, while the
+kernel's copies into the page cache, which both engines make for the
+same forty megabytes, cost it nothing of the kind. So the lever was the
+comparator's own shape: a bounded, reused footprint in front of `write`,
+and not the stream's thirty-five megabytes touched once each. The
+reference-holding table (`Options::direct_table_refs`), measured the same
+day, took a fifth of the faults off and read slower, its staging arenas
+rotating at a piece and not recycled.
+
+The stream's arena runs in a ring now (`Options::direct_recycle`): its
+blocks are a megabyte, the writer's piece, and at each commit, once the
+batch is on the file, every block the file holds whole is taken out of
+the arena under a fresh epoch -- its pointer nulled, so a reader that
+finds the block gone reads the record through the run's mapping, the
+one the reference-holding table reads every record through, at the
+stream's base plus its offset -- and its memory is handed out again for
+the next block once no reader is pinned at or before that epoch. A
+reader that loaded the pointer first is pinned below the epoch, and the
+memory is reused only past every such pin, so the invariant that
+nothing a reader follows moves holds by the epoch rather than by never
+freeing. The ring is two live blocks and the ones awaiting their epoch,
+a few megabytes whatever the run grows to; the reserve for the offsets
+stays what it was, so a run addresses four gigabytes of stream.
+
+Priced against the whole arena in one process over two sittings with
+the arms' order swapped, the writer's faults a load fell from 13,050 to 5,030 at three hundred
+thousand keys and from 4,390 to 2,130 at a hundred thousand in every
+load of both, and stayed at five hundred at ten thousand, where the run
+fits the ring; the commits' column read 40 ms against 53 and 41 against
+54 at three hundred thousand buffered, the load 1.22x (10 of 12, p .04)
+and then 1.05x (9 of 12), the durable load 1.15x (p .04) and 1.10x, the
+hundred-thousand load 1.11x and 1.10x, ten thousand level throughout,
+all in cheap sittings where a page cost under two microseconds. One cost
+moved rather than vanished, and the suite's own shape shows it: the
+mixes that follow a load in the same store had been finding the thirty-
+five megabytes the load first-touched warm in the heap, and with the
+ring they first-touch their own -- the mix counters read seven hundred
+and seventy faults in the update mix's thread where the whole arena's
+had read none, a thousand pages over the mixes against the eight
+thousand the load no longer touches -- so the update-heavy mixes and
+the rewriting lag point at three hundred thousand keys read a few
+percent behind the arm, cells this engine leads the comparator by half
+to twice over, and the sum of the phases over a store is near level in a
+cheap sitting. What the ring wins is the load against the comparator in
+a dear sitting, where the thirteen thousand first touches had cost it
+half to two thirds of its rate and the comparator's four hundred cost it
+nothing, and a run's footprint of a few megabytes in place of its whole
+length. The whole arena is the arm `supdb-norecycle` and
+`supdb-ingestnorecycle`.
+
 #### The piece's ranks over the heads, and a locked exchange to look at a form
 
 Every written key's rank in its partition is computed by three parties:

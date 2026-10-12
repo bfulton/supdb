@@ -1001,6 +1001,114 @@ fn a_direct_runs_table_reads_its_values_through_the_runs_segment() {
     db.close().unwrap();
 }
 
+/// A streamed run whose arena's blocks are recycled once the file holds
+/// them (`Options::direct_recycle`): a handle reads every committed key
+/// through the run's mapping where its block is gone and through the
+/// arena where it is not, on its own thread while the writer commits and
+/// recycles, the writer's own reads the same, and the blocks do go -- the
+/// pieces small, so the file takes the records within a commit or two,
+/// and enough records that the stream crosses its block more than once.
+#[test]
+fn a_streamed_runs_recycled_blocks_read_through_the_runs_segment() {
+    let d = dir("direct-recycle");
+    let opts = Options {
+        direct_recycle: true,
+        direct_map_bytes: 16 << 10,
+        seal_bytes: 64 << 20,
+        segment: supdb::SegmentOptions {
+            write_piece: 4096,
+            ..Default::default()
+        },
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    let key = |k: u32| format!("key-{k:06}").into_bytes();
+    let val = |k: u32| format!("value-{k}-{}", "x".repeat(200)).into_bytes();
+    // Eight committed batches of a thousand: some two megabytes of
+    // stream, so the first blocks are given up while the run is open.
+    for b in 0u32..8 {
+        for k in b * 1000..(b + 1) * 1000 {
+            db.append(&key(k), &val(k));
+        }
+        db.commit().unwrap();
+    }
+    assert!(db.stream_recycled() >= 1, "a block was given up");
+    assert!(db.run_remaps() >= 1, "the mapping grew with the file");
+    for k in [0u32, 1, 999, 1000, 4000, 7999] {
+        assert_eq!(read_vec(&db, &key(k)), vec![val(k)], "the writer reads {k}");
+    }
+    let r = db.reader().unwrap();
+    for k in [0u32, 2500, 7999] {
+        assert_eq!(read_vec(&r, &key(k)), vec![val(k)], "a handle reads {k}");
+    }
+    // The handle reads committed keys on its own thread while the writer
+    // commits eight more batches and gives up their blocks: a key answers
+    // its value or, not yet committed when the handle looked, nothing.
+    std::thread::scope(|s| {
+        let reader = s.spawn(move || {
+            let mut rounds = 0usize;
+            loop {
+                rounds += 1;
+                let mut last = false;
+                for k in (0u32..16000).step_by(13).chain(std::iter::once(15999)) {
+                    let got = read_vec(&r, &key(k));
+                    if k < 8000 {
+                        assert_eq!(got, vec![val(k)], "committed key {k} in round {rounds}");
+                    } else if !got.is_empty() {
+                        assert_eq!(got, vec![val(k)], "key {k} read with another's value");
+                        last |= k == 15999;
+                    }
+                }
+                if last {
+                    return rounds;
+                }
+                assert!(rounds < 1_000_000, "the last commit never became visible");
+            }
+        });
+        for b in 8u32..16 {
+            for k in b * 1000..(b + 1) * 1000 {
+                db.append(&key(k), &val(k));
+            }
+            db.commit().unwrap();
+        }
+        let rounds = reader.join().unwrap();
+        assert!(rounds >= 1);
+    });
+    assert!(db.stream_recycled() >= 3, "blocks went as the run grew");
+    // A scan through a fresh handle walks the run in order, through the
+    // mapping and the arena alike.
+    let r = db.reader().unwrap();
+    let mut n = 0u32;
+    r.scan(b"", usize::MAX, |k, v| {
+        assert_eq!(k, key(n).as_slice());
+        assert_eq!(v, val(n).as_slice());
+        n += 1;
+    })
+    .unwrap();
+    assert_eq!(n, 16000);
+    // The run closed by a key below its greatest, flushed, reopened.
+    db.append(b"aaa", b"below");
+    db.commit().unwrap();
+    assert_eq!(read_vec(&db, &key(12345)), vec![val(12345)]);
+    db.flush().unwrap();
+    db.settle().unwrap();
+    let r = db.reader().unwrap();
+    assert_eq!(read_vec(&r, &key(100)), vec![val(100)]);
+    assert_eq!(read_vec(&r, &key(15999)), vec![val(15999)]);
+    db.close().unwrap();
+    let db = Db::open(&d, opts).unwrap();
+    let mut n = 0u32;
+    db.scan(&key(0), usize::MAX, |k, v| {
+        assert_eq!(k, key(n).as_slice());
+        assert_eq!(v, val(n).as_slice());
+        n += 1;
+    })
+    .unwrap();
+    assert_eq!(n, 16000);
+    assert_eq!(read_vec(&db, b"aaa"), vec![b"below".to_vec()]);
+    db.close().unwrap();
+}
+
 /// The same run under the shipping shape, the copies.
 #[test]
 fn a_direct_runs_table_that_copies_its_values_reads_the_same() {
