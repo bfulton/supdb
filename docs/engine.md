@@ -3675,8 +3675,9 @@ fsync 0.9 to 1.6 beside the segment work's readable landing of 1.0 to
 0.24 to 0.56; and the writer's wake 0.03. At three hundred thousand keys
 the finish is 22 to 44 ms of a 26 to 54 ms drain, the trailer's
 composition 19 to 28 of it -- three hundred thousand keys at sixty to
-seventy nanoseconds, the FNV a third and the hash slots' random stores
-into a 4.8 MB table most of the rest -- and its 6 MB write 3 to 22.
+seventy nanoseconds, which the next section takes apart; the guess made
+here, the FNV a third and the slots' stores the rest, was wrong on both
+counts -- and its 6 MB write 3 to 22.
 
 Two things the stamps corrected. A thread woken here reaches its first
 stamp 15 to 200 µs after the wake, spawned or parked alike; the
@@ -3699,6 +3700,64 @@ by 0.13, 0.52 and 0.39 ms, and the load read 1.06x, 1.15x and 1.08x
 three hundred thousand level, where the slot is a fiftieth of the
 drain. The waiting shape is the arm `supdb-waitmanifest` and
 `supdb-ingestwaitmanifest`.
+
+#### The finish's fills, asked ahead
+
+The segment finish's trailer -- fences, directory, hash slots, composed
+in one pass over the keys -- read 0.47 ms at ten thousand keys and 18
+at three hundred thousand in the streamed run's close, 0.16 and 8 in a
+seal whose writer kept its keys, and the stamps could say no more than
+that. Four instruments said where it went. The time fitted against the
+finish's first-touched pages across every drain of a sitting is 394 µs
+plus 2.2 µs a page at ten thousand keys and 15.8 ms plus 2.9 a page at
+three hundred thousand: forty and fifty-three nanoseconds a key of work,
+the rest the host's price for fifty and eleven hundred pages. Callgrind
+over the finish counts 376 instructions a key, a hundred and sixty-seven
+of them in the key source's read -- the FNV sixty-five, the record's
+start forty-one -- ninety-five in the closure that adds the key to the
+Bloom and tells the composer, fifty-three in the composer, thirty-six in
+the slot fill. A micro-probe of the FNV over the suite's sixteen-byte
+keys reads 4 ns a key, one key at a time or four interleaved alike, and
+the Bloom's modulo 1.5: neither is the twenty nanoseconds the notes had
+given the FNV. And perf over the finish at three hundred thousand keys
+puts four fifths of the fill loop's samples on the branch after the
+slot probe's load and a third of the closure's on the first store into
+the Bloom's block: two random loads a key, the slot in a four-megabyte
+table and the block in a filter of three hundred and seventy kilobytes,
+each missing the core's own cache while the records, keys and entries
+stream past it. A micro-probe of the two fills over the same shapes
+reads 15 ns a key at three hundred thousand and 11 with the slot and the
+block hinted sixteen keys ahead, 10 and 9.7 at ten thousand, where both
+tables sit in the second-level cache.
+
+So the fills ask ahead (`SegmentOptions::lookahead`): the slot fill
+takes each key sixteen before its slot is probed and hints the home
+slot meanwhile, placing the keys in the order given so the section is
+the plain fill's bytes, which a unit test holds; the Bloom's fill holds
+sixteen FNV words in a ring, hints each word's block as it arrives and
+sets the bits of the word sixteen back, the filter the same whatever
+order its bits are set in. Both writers of the trailer take it, the
+streamed run's close and the seal that kept its keys, and the landing's
+Bloom from kept hashes. Priced against the plain fills in one process
+over two sittings of twelve pairs, the arms' order swapped between them,
+the streamed close's trailer at three hundred thousand keys read 4.0 and
+4.8 ms less within pairs buffered (10 and 11 of 12 pairs) and 3.1 and
+6.6 less durable (11 and 9 of 12), the drain 3.7 and 5.1 less buffered
+and 4.8 and 4.3 durable, and the load's rate followed in sign without
+reaching a verdict (1.03x and 1.10x buffered; the durable rate split,
+0.91x then 1.10x, in a sitting whose shuffled cell read 0.87x at p .04
+and then 1.05x -- the position effect the rules name). At ten thousand
+keys the trailer read level in the buffered pairings and 0 and 35 µs
+less in the durable, as the probe said it would. The plain fills are the
+arm `supdb-fillplain` and `supdb-ingestfillplain`.
+
+What the fits also say is what the fills do not touch: the pages. The
+trailer's buffer is fresh anonymous memory at every finish, fifty pages
+at ten thousand keys and thirteen hundred at three hundred thousand,
+and the finish pays the host's price for each -- a fiftieth of the
+trailer at ten thousand keys where the guest still backs the pages, a
+quarter to a half where the host does. That is the next lever, and it is
+sized by the pages, not by the keys.
 
 #### The piece's ranks over the heads, and a locked exchange to look at a form
 

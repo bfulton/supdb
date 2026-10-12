@@ -2127,6 +2127,63 @@ pub(crate) struct BlockedBloom {
     blocks: Vec<[u64; 8]>,
 }
 
+/// A Bloom built from FNV words as they come: `add` takes each word and,
+/// with `lookahead`, hints the word's block to the core and sets the bits
+/// of the word taken `BLOOM_AHEAD` adds before, whose block has arrived
+/// meanwhile -- a block is a random line of a filter of three hundred and
+/// seventy kilobytes at three hundred thousand keys, and the first store
+/// into it was a third of the streamed finish's closure. The filter is
+/// the same whatever order its bits are set in.
+pub(crate) struct BloomFill {
+    bloom: BlockedBloom,
+    lookahead: bool,
+    ring: [u64; BLOOM_AHEAD],
+    n: usize,
+}
+
+/// Words a lookahead Bloom fill holds before setting their bits.
+const BLOOM_AHEAD: usize = 16;
+
+impl BloomFill {
+    fn new(bloom: BlockedBloom, lookahead: bool) -> BloomFill {
+        BloomFill {
+            bloom,
+            lookahead,
+            ring: [0; BLOOM_AHEAD],
+            n: 0,
+        }
+    }
+
+    /// One key by its FNV word (`key_hash`).
+    #[inline]
+    fn add(&mut self, h: u64) {
+        if !self.lookahead {
+            self.bloom.add_fnv(h);
+            return;
+        }
+        self.bloom.prefetch_fnv(h);
+        let at = self.n % BLOOM_AHEAD;
+        if self.n >= BLOOM_AHEAD {
+            let due = self.ring[at];
+            self.bloom.add_fnv(due);
+        }
+        self.ring[at] = h;
+        self.n += 1;
+    }
+
+    /// The filter, every word added set.
+    fn finish(mut self) -> BlockedBloom {
+        if self.lookahead {
+            let held = self.n.min(BLOOM_AHEAD);
+            for k in 0..held {
+                let h = self.ring[(self.n - held + k) % BLOOM_AHEAD];
+                self.bloom.add_fnv(h);
+            }
+        }
+        self.bloom
+    }
+}
+
 impl BlockedBloom {
     fn with_capacity(n: usize) -> BlockedBloom {
         BlockedBloom {
@@ -2158,13 +2215,20 @@ impl BlockedBloom {
     /// FNV words the segment writer kept for the index (`key_hash`): what
     /// the landing takes instead of walking the records it just wrote,
     /// which was three quarters of the segment work's time over an
-    /// ordered load.
-    fn from_fnv(hashes: &[u64]) -> BlockedBloom {
-        let mut b = BlockedBloom::with_capacity(hashes.len());
+    /// ordered load. `lookahead` asks ahead (`BloomFill`) or not.
+    fn from_fnv(hashes: &[u64], lookahead: bool) -> BlockedBloom {
+        let mut f = BloomFill::new(BlockedBloom::with_capacity(hashes.len()), lookahead);
         for &h in hashes {
-            b.add_fnv(h);
+            f.add(h);
         }
-        b
+        f.finish()
+    }
+
+    /// A hint to fetch the block `add_fnv(h)` sets bits in; nothing is read.
+    #[inline]
+    fn prefetch_fnv(&self, h: u64) {
+        let bi = (BlockedBloom::finalize(h) >> 32) as usize % self.blocks.len();
+        prefetch_lines(self.blocks[bi].as_ptr() as *const u8, 64);
     }
 
     /// One key by its FNV word (`key_hash`), as `from_fnv` adds each.
@@ -3297,6 +3361,8 @@ pub struct SegmentWriter {
     /// `SegmentOptions::row_on_write`: whether the writer's own pass yields
     /// the row, which decides at `set_marks` whether the helper hashes.
     row_on_write: bool,
+    /// `SegmentOptions::lookahead`: the finish's fills ask ahead and hint.
+    lookahead: bool,
     /// `set_deferred_keys`: how many keys were taken in with no copy of
     /// them kept -- `key_arena`, `spans`, `rec_offs` and `hashes` stay
     /// empty and the finish is handed the keys (`finish_unsynced_from`)
@@ -3493,6 +3559,7 @@ impl SegmentWriter {
             pos: crate::format::SUPER,
             last_value: (0, 0),
             row_on_write: opts.row_on_write,
+            lookahead: opts.lookahead,
             deferred: None,
             last_key: Vec::new(),
             builder: BlockBuilder::new(block_size),
@@ -3577,7 +3644,7 @@ impl SegmentWriter {
     /// walks as before.
     pub(crate) fn landing_bloom(&self) -> Option<BlockedBloom> {
         (self.mode == Some(Layout::RecordsFirst) && !self.hashes.is_empty())
-            .then(|| BlockedBloom::from_fnv(&self.hashes))
+            .then(|| BlockedBloom::from_fnv(&self.hashes, self.lookahead))
     }
 
     /// A commit marker after the records so far, in the records-first
@@ -4417,21 +4484,22 @@ impl SegmentWriter {
                         // One pass over the source: each key read once
                         // for its offset and hash, the Bloom and the
                         // caller's own composition told of it as it goes.
-                        let mut b = BlockedBloom::with_capacity(n);
+                        let mut b = BloomFill::new(BlockedBloom::with_capacity(n), self.lookahead);
                         let r = flatindex::stream_trailer(
                             n,
                             self.recs_len,
                             &|i| src.key_at(i),
                             &mut |i| {
                                 let (key, off, h) = src.at(i);
-                                b.add_fnv(h);
+                                b.add(h);
                                 on_key(key);
                                 (off, h)
                             },
                             generation,
+                            self.lookahead,
                         )
                         .ok_or_else(limits)?;
-                        bloom = Some(b);
+                        bloom = Some(b.finish());
                         r
                     }
                     None => {
@@ -4448,6 +4516,7 @@ impl SegmentWriter {
                             &key_at,
                             &mut |i| (rec_offs[i], hashes[i]),
                             generation,
+                            self.lookahead,
                         )
                         .ok_or_else(limits)?
                     }
@@ -4789,6 +4858,14 @@ pub struct SegmentOptions {
     /// thousand keys, kept for pricing as `supdb-rowatclose` and
     /// `supdb-ingestrowatclose`.
     pub row_on_write: bool,
+    /// The finish's slot and Bloom fills ask for each key sixteen ahead of
+    /// placing it and hint its slot and its block to the core meanwhile
+    /// (`flatindex::fill_hash`, `BloomFill`): the probe of a random slot
+    /// in a table that outgrows the core's cache was four fifths of the
+    /// fill's time at three hundred thousand keys. Off, the plain fills,
+    /// the arm `supdb-fillplain` and `supdb-ingestfillplain`. The bytes
+    /// are the same either way.
+    pub lookahead: bool,
     /// EXPERIMENT: the piece buffer's pages populated a window ahead of
     /// the fill rather than faulted one by one as the records land; see
     /// `Options::prefault`, which a `Db` sets this from. Off.
@@ -4806,6 +4883,7 @@ impl Default for SegmentOptions {
             early_writeback: true,
             sync_ahead: 8 << 20,
             row_on_write: true,
+            lookahead: true,
             prefault: false,
         }
     }
@@ -26704,11 +26782,16 @@ mod landing_facts {
             .iter()
             .map(|k| crate::flatindex::key_hash(k.as_bytes()))
             .collect();
-        let by_hash = BlockedBloom::from_fnv(&hashes);
+        let by_hash = BlockedBloom::from_fnv(&hashes, false);
         assert_eq!(
             by_key.blocks, by_hash.blocks,
             "inserted by key and by FNV word"
         );
+        for n in [0usize, 1, 15, 16, 17, 40, 5000] {
+            let plain = BlockedBloom::from_fnv(&hashes[..n], false);
+            let ahead = BlockedBloom::from_fnv(&hashes[..n], true);
+            assert_eq!(plain.blocks, ahead.blocks, "{n} words, asked ahead");
+        }
     }
 }
 

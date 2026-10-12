@@ -104,9 +104,23 @@ fn hash_cap_for(keys: usize) -> Option<usize> {
 /// table forward, was tried against this and not kept: the fill is under
 /// one percent of a seal's thread at three hundred thousand keys, and the
 /// sort's own passes and scratch were not priced.
-fn fill_hash(t: &mut [u8], mask: usize, n: usize, mut at: impl FnMut(usize) -> (u64, u32)) {
-    for i in 0..n {
-        let (h, off) = at(i);
+///
+/// `lookahead` asks for each key `FILL_AHEAD` keys before its slot is
+/// probed and hints its home slot to the core meanwhile: the probe is a
+/// load at a random slot of a table that outgrows the core's own cache
+/// at a few hundred thousand keys -- four megabytes at three hundred
+/// thousand -- and four fifths of the time a streamed run's finish spent
+/// in this loop was on that load. The keys are placed in the order given
+/// either way, so the bytes are the plain fill's.
+fn fill_hash(
+    t: &mut [u8],
+    mask: usize,
+    n: usize,
+    mut at: impl FnMut(usize) -> (u64, u32),
+    lookahead: bool,
+) {
+    #[inline(always)]
+    fn place(t: &mut [u8], mask: usize, h: u64, off: u32) {
         // The tag is forced non-zero so an occupied slot is never all zero,
         // which is what marks a slot empty.
         let tag = ((h >> 56) | 1) & 0xff;
@@ -120,6 +134,52 @@ fn fill_hash(t: &mut [u8], mask: usize, n: usize, mut at: impl FnMut(usize) -> (
             }
             s = (s + 1) & mask;
         }
+    }
+    if !lookahead {
+        for i in 0..n {
+            let (h, off) = at(i);
+            place(t, mask, h, off);
+        }
+        return;
+    }
+    let mut ring = [(0u64, 0u32); FILL_AHEAD];
+    for (i, slot) in ring.iter_mut().enumerate().take(n) {
+        *slot = at(i);
+        prefetch_slot(t, mask, slot.0);
+    }
+    for i in 0..n {
+        let (h, off) = ring[i % FILL_AHEAD];
+        if i + FILL_AHEAD < n {
+            let next = at(i + FILL_AHEAD);
+            prefetch_slot(t, mask, next.0);
+            ring[i % FILL_AHEAD] = next;
+        }
+        place(t, mask, h, off);
+    }
+}
+
+/// Keys a lookahead fill asks for ahead of placing them: enough that a
+/// slot's line has arrived from memory by the time its key is placed,
+/// at a line's latency of a few hundred cycles over the loop's few dozen
+/// a key.
+const FILL_AHEAD: usize = 16;
+
+/// A hint to fetch the line of hash `h`'s home slot in `t`; nothing is
+/// read, and on any architecture but x86-64 nothing is done.
+#[inline(always)]
+fn prefetch_slot(t: &[u8], mask: usize, h: u64) {
+    let a = ((h as usize) & mask) * SLOT;
+    debug_assert!(a + SLOT <= t.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        // SAFETY: a prefetch is a hint that faults on no address, and the
+        // slot is inside the table.
+        unsafe { _mm_prefetch(t.as_ptr().add(a) as *const i8, _MM_HINT_T0) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (t, a);
     }
 }
 
@@ -857,7 +917,8 @@ pub fn stream_record_tail_at(
 /// exactly once for each i in key order -- the directory and the hash
 /// slots are filled in that one pass -- so a caller whose keys live in a
 /// table it already keeps reads each entry once and copies nothing for
-/// the trailer. Returns (header, trailer, section total).
+/// the trailer. `lookahead` is the slot fill's (`fill_hash`). Returns
+/// (header, trailer, section total).
 ///
 /// The layout is one `FlatIndex::parse` accepts because every region is
 /// addressed by offset; it differs from `encode`'s only in order, and
@@ -868,6 +929,7 @@ pub fn stream_trailer<'a>(
     key_at: &dyn Fn(usize) -> &'a [u8],
     each: &mut dyn FnMut(usize) -> (u32, u64),
     generation: u64,
+    lookahead: bool,
 ) -> Option<(Vec<u8>, Vec<u8>, usize)> {
     if recs_len > MAX_RECS {
         return None;
@@ -916,11 +978,17 @@ pub fn stream_trailer<'a>(
     t.resize(hash_start + cap * SLOT, 0);
     {
         let (dir, slots) = t[dir_start..].split_at_mut(hash_start - dir_start);
-        fill_hash(&mut slots[..cap * SLOT], mask, n, |i| {
-            let (off, h) = each(i);
-            dir[i * 4..i * 4 + 4].copy_from_slice(&off.to_le_bytes());
-            (h, off)
-        });
+        fill_hash(
+            &mut slots[..cap * SLOT],
+            mask,
+            n,
+            |i| {
+                let (off, h) = each(i);
+                dir[i * 4..i * 4 + 4].copy_from_slice(&off.to_le_bytes());
+                (h, off)
+            },
+            lookahead,
+        );
     }
     at += cap * SLOT;
     let total = at;
@@ -1336,11 +1404,14 @@ pub fn encode_inline(
     let aligned = (out.as_ptr() as usize + hash_off).is_multiple_of(8);
     if !parallel || threads < 2 || all.len() < 64 * 1024 || !aligned {
         let n = all.len();
+        // The plain fill: the lookahead is priced on the streamed finish
+        // (`stream_trailer`) and on nothing this path writes.
         fill_hash(
             &mut out[hash_off..hash_off + p.hash_cap * SLOT],
             mask,
             n,
             |i| (hash_of(all[i].0), p.rec_offs[i]),
+            false,
         );
     } else {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -2157,6 +2228,44 @@ impl FlatIndex {
             }
         }
         lo
+    }
+}
+
+#[cfg(test)]
+mod fill_tests {
+    use super::*;
+
+    /// The lookahead fill places every key where the plain fill does, so
+    /// the section is the same bytes either way, and each key is asked
+    /// for once, in order, by both.
+    #[test]
+    fn the_lookahead_fill_writes_the_plain_fills_bytes() {
+        for n in [0usize, 1, 7, 16, 17, 33, 5000] {
+            let keys: Vec<Vec<u8>> = (0..n).map(|i| format!("key-{i:08}").into_bytes()).collect();
+            let mut outs = Vec::new();
+            for lookahead in [false, true] {
+                let mut asked = Vec::new();
+                let r = stream_trailer(
+                    n,
+                    n * 20,
+                    &|i| &keys[i][..],
+                    &mut |i| {
+                        asked.push(i);
+                        ((i * 20) as u32, key_hash(&keys[i]))
+                    },
+                    7,
+                    lookahead,
+                )
+                .expect("a section within the limits");
+                assert_eq!(
+                    asked,
+                    (0..n).collect::<Vec<_>>(),
+                    "{n} keys, each asked once in order"
+                );
+                outs.push(r);
+            }
+            assert_eq!(outs[0], outs[1], "{n} keys");
+        }
     }
 }
 

@@ -444,6 +444,10 @@ pub struct Supdb {
     /// before `Options::direct_derive_keys`. `supdb-keycopies`, and
     /// `supdb-ingestkeycopies` buffered.
     keycopies: bool,
+    /// The finish's slot and Bloom fills placing each key as it is asked
+    /// for, the shape before `SegmentOptions::lookahead`. `supdb-fillplain`,
+    /// and `supdb-ingestfillplain` buffered.
+    fillplain: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -687,6 +691,10 @@ struct Policy {
     /// before `Options::direct_derive_keys`. `supdb-keycopies`, and
     /// `supdb-ingestkeycopies` buffered.
     keycopies: bool,
+    /// The finish's slot and Bloom fills placing each key as it is asked
+    /// for, the shape before `SegmentOptions::lookahead`. `supdb-fillplain`,
+    /// and `supdb-ingestfillplain` buffered.
+    fillplain: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -892,6 +900,7 @@ impl Default for Policy {
             recordsteps: false,
             copyvals: false,
             keycopies: false,
+            fillplain: false,
             rankrecords: false,
             shape: false,
             adaptcap: None,
@@ -2409,6 +2418,31 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with the finish's slot and Bloom fills placing each key as
+    /// it is asked for, the shape before `SegmentOptions::lookahead`.
+    pub fn create_fillplain(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                fillplain: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-fillplain`.
+    pub fn create_ingest_fillplain(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                fillplain: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with a flush waiting for its manifest slot's fdatasync, the
     /// shape before `Options::flush_waits_manifest` was off.
     pub fn create_waitmanifest(path: &Path) -> Res<Supdb> {
@@ -2648,6 +2682,7 @@ impl Supdb {
             recordsteps,
             copyvals,
             keycopies,
+            fillplain,
             rankrecords,
             shape,
             aheadmin,
@@ -2712,6 +2747,7 @@ impl Supdb {
                     supdb::SegmentOptions::default().write_piece
                 },
                 row_on_write: !rowatclose,
+                lookahead: !fillplain,
                 ..Default::default()
             },
             // The engine's own defaults: 32 MB seals over 64 MB partitions,
@@ -2945,6 +2981,7 @@ impl Supdb {
             recordsteps,
             copyvals,
             keycopies,
+            fillplain,
             rankrecords,
             shape,
             aheadmin,
@@ -3373,6 +3410,13 @@ impl Engine for Supdb {
                 "supdb-keycopies"
             } else {
                 "supdb-ingestkeycopies"
+            };
+        }
+        if self.fillplain {
+            return if self.partition {
+                "supdb-fillplain"
+            } else {
+                "supdb-ingestfillplain"
             };
         }
         if self.waitmanifest {
@@ -4085,6 +4129,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-recordsteps"
         | "supdb-copyvals"
         | "supdb-keycopies"
+        | "supdb-fillplain"
         | "supdb-waitmanifest"
         | "supdb-inlinemaint"
         | "supdb-adapt"
@@ -4149,6 +4194,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestrecordsteps"
         | "supdb-ingestcopyvals"
         | "supdb-ingestkeycopies"
+        | "supdb-ingestfillplain"
         | "supdb-ingestwaitmanifest"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
@@ -4276,6 +4322,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestcopyvals" => Box::new(Supdb::create_ingest_copyvals(dir)?),
         "supdb-keycopies" => Box::new(Supdb::create_keycopies(dir)?),
         "supdb-ingestkeycopies" => Box::new(Supdb::create_ingest_keycopies(dir)?),
+        "supdb-fillplain" => Box::new(Supdb::create_fillplain(dir)?),
+        "supdb-ingestfillplain" => Box::new(Supdb::create_ingest_fillplain(dir)?),
         "supdb-waitmanifest" => Box::new(Supdb::create_waitmanifest(dir)?),
         "supdb-ingestwaitmanifest" => Box::new(Supdb::create_ingest_waitmanifest(dir)?),
         "supdb-ingestsettlefreeze" => Box::new(Supdb::create_ingest_settlefreeze(dir)?),

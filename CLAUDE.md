@@ -260,6 +260,24 @@ Profile a probe that does one thing. The scan probe's own `format!` per
 iteration was 8% of its samples until the keys were built before the
 loop.
 
+A per-key cost written down from a guess is not one until a count or a
+probe has it, and an estimate that stands in a note for a month is
+believed as a measurement. The finish's trailer carried "the FNV a
+third, the slots' random stores the rest" from the stamps that first
+split it; callgrind over the finish counted the FNV at sixty-five
+instructions a key, a micro-probe timed it at 4 ns, and perf's
+annotation put four fifths of the fill loop's samples on the branch
+after the slot probe's load -- a load, not the store, missing the core's
+cache -- so the lever was a prefetch sixteen keys ahead, priced in a
+micro-probe of the loop's own shape before it was built, and neither of
+the two things the note named. Separate the pages from the per-key work
+before either is priced: a phase's time fitted against its first-touch
+faults across a sitting's drains gives both at once (394 µs and 2.2 µs a
+page for the trailer at ten thousand keys), where a mean over the drains
+gives one number that is neither. And read a pairing's stderr by the
+arm each line names, never by the lines' parity: the arms' order swaps
+every other rep, and a parity split reads positions.
+
 A fresh page's price here is the host's, and it is what moves the
 write cells between sittings. The durable ordered load at three hundred
 thousand keys ran in two shapes with the writer's CPU at 2.5-3x in one
@@ -698,9 +716,14 @@ close composes the trailer, the Bloom and the ordered index from the
 table in one pass now (`Options::direct_derive_keys`,
 `flatindex::stream_trailer` by position, `ordindex::Composer`), a quarter
 of the load's first-touched pages gone, and the kept copies are the arm
-(`supdb-keycopies`, `supdb-ingestkeycopies`). The entries and the keys
-are the rest of what the table costs, and a run that kept no table at
-all is the shape left to price.
+(`supdb-keycopies`, `supdb-ingestkeycopies`). The close's two fills,
+the key section's slots and the landing's Bloom, ask for each key
+sixteen ahead and hint its slot and its block meanwhile
+(`SegmentOptions::lookahead`; `supdb-fillplain`, `supdb-ingestfillplain`
+place as they are asked), since each is a random load into a table that
+outgrows the core's cache at a few hundred thousand keys. The entries
+and the keys are the rest of what the table costs, and a run that kept
+no table at all is the shape left to price.
 
 ## Shapes the bugs come in
 
