@@ -1400,6 +1400,18 @@ pub struct Options {
     /// kept as the arm `supdb-copyvals` and `supdb-ingestcopyvals`. Not
     /// with `direct_table_refs`, which is another shape of the same table.
     pub direct_stream: bool,
+    /// A streamed direct run's segment writer keeps no copy of the keys:
+    /// the table's record stream holds every key with its record and the
+    /// table its entries, so the close composes the key section, the
+    /// ordered index and the landing's Bloom from the table, in one pass
+    /// over keys it reads in place. What the copies cost was sixty-four
+    /// bytes of fresh memory a key -- the writer's key, span, offset and
+    /// hash and the index builder's key and start -- a quarter of the
+    /// first-touched pages of an ordered load, each priced by the host
+    /// (`docs/engine.md`, the pages a load touches). Off, the copies, as
+    /// the arm `supdb-keycopies` and `supdb-ingestkeycopies`. Nothing
+    /// without `direct_stream`, whose records the offsets are read from.
+    pub direct_derive_keys: bool,
     /// Bytes the mapping of a direct run's segment starts with; zero, the
     /// default, twice `seal_bytes`. The mapping grows when the run's file
     /// outgrows it. For a test of the growth.
@@ -1657,6 +1669,7 @@ impl Default for Options {
             direct_table_refs: false,
             direct_put_one: true,
             direct_stream: true,
+            direct_derive_keys: true,
             direct_map_bytes: 0,
             forms_settle_recent_pct: 0,
             forms_carry: true,
@@ -2136,12 +2149,17 @@ impl BlockedBloom {
     fn from_fnv(hashes: &[u64]) -> BlockedBloom {
         let mut b = BlockedBloom::with_capacity(hashes.len());
         for &h in hashes {
-            let (bi, probes) = b.slots_of(BlockedBloom::finalize(h));
-            for (w, m) in probes {
-                b.blocks[bi][w] |= m;
-            }
+            b.add_fnv(h);
         }
         b
+    }
+
+    /// One key by its FNV word (`key_hash`), as `from_fnv` adds each.
+    fn add_fnv(&mut self, h: u64) {
+        let (bi, probes) = self.slots_of(BlockedBloom::finalize(h));
+        for (w, m) in probes {
+            self.blocks[bi][w] |= m;
+        }
     }
 
     fn slots(&self, key: &[u8]) -> (usize, [(usize, u64); 4]) {
@@ -3163,6 +3181,22 @@ impl AlignedWriter {
 /// `store::Super::encode`, the record encoding is `index::put_uvarint`
 /// because that is the reader's inverse, and the test corrupts a block to
 /// prove the checksum recorded is the one the reader checks.
+/// The keys of a run whose writer kept none (`SegmentWriter::set_deferred_keys`),
+/// answered by position in key order by the table that holds them: the
+/// i-th key, and where its record starts in the record section.
+pub(crate) trait KeySource {
+    fn len(&self) -> usize;
+    /// The i-th key, for the few the finish samples before its pass.
+    fn key_at(&self, i: usize) -> &[u8];
+    /// The i-th key, where its record starts in the record section, and
+    /// its `key_hash`: the finish's one pass asks this once per key.
+    fn at(&self, i: usize) -> (&[u8], u32, u64);
+}
+
+/// A finish's walk over deferred keys: their source, and the caller's
+/// hook told each key in order as the pass takes it.
+type KeyWalk<'s, 'k> = (&'s dyn KeySource, &'k mut dyn FnMut(&[u8]));
+
 pub struct SegmentWriter {
     out: AlignedWriter,
     /// File offset the next write lands at. Data starts after the header
@@ -3250,6 +3284,13 @@ pub struct SegmentWriter {
     /// `SegmentOptions::row_on_write`: whether the writer's own pass yields
     /// the row, which decides at `set_marks` whether the helper hashes.
     row_on_write: bool,
+    /// `set_deferred_keys`: how many keys were taken in with no copy of
+    /// them kept -- `key_arena`, `spans`, `rec_offs` and `hashes` stay
+    /// empty and the finish is handed the keys (`finish_unsynced_from`)
+    /// -- with the last key alone kept for the order check. `None` keeps
+    /// the arrays, as a seal's writer does.
+    deferred: Option<usize>,
+    last_key: Vec<u8>,
 }
 
 /// The two layouts the writer produces. Same format, same readers, one
@@ -3439,6 +3480,8 @@ impl SegmentWriter {
             pos: crate::format::SUPER,
             last_value: (0, 0),
             row_on_write: opts.row_on_write,
+            deferred: None,
+            last_key: Vec::new(),
             builder: BlockBuilder::new(block_size),
             block_size,
             blocks: Vec::new(),
@@ -3496,6 +3539,25 @@ impl SegmentWriter {
         self.hashes.reserve(n);
     }
 
+    /// Keep no copy of the keys: this writer takes streamed records only
+    /// (`put_encoded`), counts them, and is handed the keys at the finish
+    /// by whoever kept them (`finish_unsynced_from`). Before the first
+    /// key. What the arrays cost a direct run was forty-four bytes of
+    /// fresh memory a key beside the sixteen the key is, every page of it
+    /// first-touched on the writer's path (`Options::direct_derive_keys`).
+    pub(crate) fn set_deferred_keys(&mut self) -> Result<()> {
+        if !self.spans.is_empty() || self.open_key.is_some() {
+            return Err(err("segment writer: keys deferred after a key was written"));
+        }
+        self.deferred = Some(0);
+        Ok(())
+    }
+
+    /// Keys taken in so far, kept or deferred.
+    fn key_count(&self) -> usize {
+        self.deferred.unwrap_or(self.spans.len())
+    }
+
     /// The Bloom a landing would build by walking this segment's keys,
     /// from the hashes the records-first layout kept for the index; none
     /// for a blocks-first segment or one with no keys, which the landing
@@ -3538,7 +3600,7 @@ impl SegmentWriter {
         m[4..8].copy_from_slice(&DIRECT_MARK);
         m[8..12].copy_from_slice(&self.mark_crc.to_le_bytes());
         m[12..16].copy_from_slice(&((self.recs_len - self.mark_start) as u32).to_le_bytes());
-        m[16..24].copy_from_slice(&(self.spans.len() as u64).to_le_bytes());
+        m[16..24].copy_from_slice(&(self.key_count() as u64).to_le_bytes());
         m
     }
 
@@ -3570,33 +3632,49 @@ impl SegmentWriter {
         if key.len() > u16::MAX as usize {
             return Err(err("segment writer: key longer than 65,535 bytes"));
         }
-        if let Some(&(s, l)) = self.spans.last() {
-            if key <= &self.key_arena[s..s + l] {
-                return Err(err(
-                    "segment writer: keys must arrive in strictly increasing order",
-                ));
-            }
+        let below_last = match self.deferred {
+            Some(n) => n > 0 && key <= self.last_key.as_slice(),
+            None => match self.spans.last() {
+                Some(&(s, l)) => key <= &self.key_arena[s..s + l],
+                None => false,
+            },
+        };
+        if below_last {
+            return Err(err(
+                "segment writer: keys must arrive in strictly increasing order",
+            ));
         }
         if self.layout()? != Layout::RecordsFirst {
             return Err(err(
                 "segment writer: a streamed record needs the records-first layout",
             ));
         }
-        let start = self.key_arena.len();
-        self.key_arena.extend_from_slice(key);
         self.last = 0;
         self.payload += (key.len() + value_len as usize) as u64;
         self.last_value = (self.pos + tail_at as u64, value_len);
         self.pos += rec_len as u64;
-        self.rec_offs.push(self.recs_len as u32);
+        match self.deferred {
+            Some(n) => {
+                // The count and the last key, nothing else of it: the
+                // finish is handed the keys by the table that keeps them.
+                self.last_key.clear();
+                self.last_key.extend_from_slice(key);
+                self.deferred = Some(n + 1);
+            }
+            None => {
+                let start = self.key_arena.len();
+                self.key_arena.extend_from_slice(key);
+                self.rec_offs.push(self.recs_len as u32);
+                self.hashes.push(flatindex::key_hash(key));
+                self.spans.push((start, key.len()));
+            }
+        }
         self.recs_len += rec_len;
-        self.hashes.push(flatindex::key_hash(key));
         if self.recs_len > flatindex::MAX_RECS {
             return Err(err(
                 "segment writer: key section exceeds the flat index's limits",
             ));
         }
-        self.spans.push((start, key.len()));
         Ok(())
     }
 
@@ -3849,6 +3927,11 @@ impl SegmentWriter {
     /// writer refuses anything else rather than build an index whose
     /// directory disagrees with its records.
     pub fn begin(&mut self, key: &[u8]) -> Result<()> {
+        if self.deferred.is_some() {
+            return Err(err(
+                "segment writer: a writer whose keys are deferred takes streamed records only",
+            ));
+        }
         if self.open_key.is_some() {
             return Err(err("segment writer: begin while a key is open"));
         }
@@ -4022,6 +4105,11 @@ impl SegmentWriter {
     /// carry inline, an empty one, or a blocks-first layout take the three
     /// calls (`Options::direct_put_one`).
     pub fn put_one(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        if self.deferred.is_some() {
+            return Err(err(
+                "segment writer: a writer whose keys are deferred takes streamed records only",
+            ));
+        }
         if value.is_empty() || !inlines(self.inline_max, value.len()) {
             self.begin(key)?;
             self.value(value);
@@ -4231,7 +4319,7 @@ impl SegmentWriter {
 
     /// Keys written so far.
     pub fn keys(&self) -> usize {
-        self.spans.len()
+        self.key_count()
     }
 
     /// Write what is left -- the key section or its trailer, the held
@@ -4248,11 +4336,44 @@ impl SegmentWriter {
     /// The seal publishes its segment to readers off this and pays the
     /// fsync afterwards; a caller that wants the segment durable syncs the
     /// file it is handed.
-    pub(crate) fn finish_unsynced(mut self, generation: u64) -> Result<File> {
+    pub(crate) fn finish_unsynced(self, generation: u64) -> Result<File> {
+        self.finish_unsynced_with(generation, None).map(|(f, _)| f)
+    }
+
+    /// `finish_unsynced` for a writer whose keys were deferred
+    /// (`set_deferred_keys`): `src` answers the keys in order, and the
+    /// Bloom a landing would build from them is composed in the same pass
+    /// that fills the hash slots, so the keys are hashed once. The record
+    /// offsets the source answers are the section's -- the stream the
+    /// writer was fed is the record section byte for byte.
+    pub(crate) fn finish_unsynced_from(
+        self,
+        generation: u64,
+        src: &dyn KeySource,
+        on_key: &mut dyn FnMut(&[u8]),
+    ) -> Result<(File, BlockedBloom)> {
+        let (file, bloom) = self.finish_unsynced_with(generation, Some((src, on_key)))?;
+        Ok((
+            file,
+            bloom.expect("a finish from a source composes the Bloom"),
+        ))
+    }
+
+    fn finish_unsynced_with(
+        mut self,
+        generation: u64,
+        src: Option<KeyWalk<'_, '_>>,
+    ) -> Result<(File, Option<BlockedBloom>)> {
         if self.open_key.is_some() {
             return Err(err("segment writer: finish with a key still open"));
         }
+        if src.is_none() && self.deferred.is_some() {
+            return Err(err(
+                "segment writer: deferred keys need their source at the finish",
+            ));
+        }
         let layout = self.layout()?;
+        let mut bloom: Option<BlockedBloom> = None;
         // A segment with no keys is allowed: a partition whose every key was
         // deleted still has to exist, or the fences stop tiling the key
         // space and a later seal would route keys into a neighbour's range.
@@ -4266,23 +4387,52 @@ impl SegmentWriter {
         let (key_off, key_len, header): (u64, usize, Option<Vec<u8>>) = match layout {
             Layout::RecordsFirst => {
                 let key_off = self.key_start();
-                let (header, trailer, total) = {
-                    let arena = &self.key_arena;
-                    let spans = &self.spans;
-                    let key_at = |i: usize| -> &[u8] {
-                        let (s, l) = spans[i];
-                        &arena[s..s + l]
-                    };
-                    flatindex::stream_trailer(
-                        self.recs_len,
-                        &self.rec_offs,
-                        &key_at,
-                        &self.hashes,
-                        generation,
-                    )
-                    .ok_or_else(|| {
-                        err("segment writer: key section exceeds the flat index's limits")
-                    })?
+                let limits = || err("segment writer: key section exceeds the flat index's limits");
+                let (header, trailer, total) = match src {
+                    Some((src, on_key)) => {
+                        let n = src.len();
+                        if self.deferred != Some(n) {
+                            return Err(err(
+                                "segment writer: the key source holds a different count of keys than were written",
+                            ));
+                        }
+                        // One pass over the source: each key read once
+                        // for its offset and hash, the Bloom and the
+                        // caller's own composition told of it as it goes.
+                        let mut b = BlockedBloom::with_capacity(n);
+                        let r = flatindex::stream_trailer(
+                            n,
+                            self.recs_len,
+                            &|i| src.key_at(i),
+                            &mut |i| {
+                                let (key, off, h) = src.at(i);
+                                b.add_fnv(h);
+                                on_key(key);
+                                (off, h)
+                            },
+                            generation,
+                        )
+                        .ok_or_else(limits)?;
+                        bloom = Some(b);
+                        r
+                    }
+                    None => {
+                        let arena = &self.key_arena;
+                        let spans = &self.spans;
+                        let (rec_offs, hashes) = (&self.rec_offs, &self.hashes);
+                        let key_at = |i: usize| -> &[u8] {
+                            let (s, l) = spans[i];
+                            &arena[s..s + l]
+                        };
+                        flatindex::stream_trailer(
+                            spans.len(),
+                            self.recs_len,
+                            &key_at,
+                            &mut |i| (rec_offs[i], hashes[i]),
+                            generation,
+                        )
+                        .ok_or_else(limits)?
+                    }
                 };
                 self.out.write_all(&trailer)?;
                 self.pos += trailer.len() as u64;
@@ -4482,7 +4632,7 @@ impl SegmentWriter {
         let x = crate::blob::encode_super_ext(&ext, generation);
         page[1024..1024 + x.len()].copy_from_slice(&x);
         file.write_all_at(&page, 0)?;
-        Ok(file)
+        Ok((file, bloom))
     }
 }
 
@@ -4630,7 +4780,12 @@ impl Default for SegmentOptions {
 /// two in one process and price the change honestly. That comparison is
 /// settled and the old path is gone, so what is left is a thin shim that
 /// keeps `flush` and `merge` reading as a sequence of begin/value/end calls.
-struct PieceWriter(Box<SegmentWriter>, crate::ordindex::Builder, bool);
+/// A piece's writer: the segment, the ordered index composed beside it
+/// from the keys as they are written, whether a key ended with a
+/// tombstone, and whether the keys are deferred -- kept by the table that
+/// streams them and handed to the finish, the ordered index composed from
+/// there too (`Options::direct_derive_keys`).
+struct PieceWriter(Box<SegmentWriter>, crate::ordindex::Builder, bool, bool);
 
 impl PieceWriter {
     fn create(
@@ -4646,7 +4801,17 @@ impl PieceWriter {
             Box::new(w),
             crate::ordindex::Builder::new(),
             false,
+            false,
         ))
+    }
+
+    /// `SegmentWriter::set_deferred_keys`: no copy of the keys here or in
+    /// the ordered index's builder; the finish is handed them
+    /// (`finish_unsynced_from`).
+    fn set_deferred_keys(&mut self) -> Result<()> {
+        self.0.set_deferred_keys()?;
+        self.3 = true;
+        Ok(())
     }
 
     /// Room for `n` keys of about `key_bytes`, in the segment's buffers
@@ -4705,7 +4870,9 @@ impl PieceWriter {
         tail_at: usize,
         value_len: u32,
     ) -> Result<()> {
-        self.1.push(k);
+        if !self.3 {
+            self.1.push(k);
+        }
         self.0.put_encoded(k, rec_len, tail_at, value_len)
     }
 
@@ -4752,6 +4919,28 @@ impl PieceWriter {
     fn finish_unsynced(self) -> Result<(File, Vec<u8>)> {
         let file = (*self.0).finish_unsynced(1)?;
         Ok((file, self.1.finish()))
+    }
+
+    /// `finish_unsynced` for deferred keys (`set_deferred_keys`): the
+    /// segment's file, the ordered index composed from `src`'s keys, and
+    /// the landing's facts -- the Bloom the finish composed in its pass
+    /// over the keys, and the tombstone flag.
+    fn finish_unsynced_from(
+        self,
+        src: &dyn KeySource,
+    ) -> Result<(File, Vec<u8>, (BlockedBloom, bool))> {
+        debug_assert!(self.3, "a finish from a source is for deferred keys");
+        let tombs = self.2;
+        let n = src.len();
+        // The ordered index composed in the finish's own pass over the
+        // keys, told each as the trailer takes it.
+        let mut ord = if n == 0 {
+            crate::ordindex::Composer::new(0, &[], &[])
+        } else {
+            crate::ordindex::Composer::new(n, src.key_at(0), src.key_at(n - 1))
+        };
+        let (file, bloom) = (*self.0).finish_unsynced_from(1, src, &mut |k| ord.push(k))?;
+        Ok((file, ord.finish(), (bloom, tombs)))
     }
 }
 
@@ -5640,6 +5829,35 @@ impl ByteArena {
         // SAFETY: inside a block that lives as long as the arena, bytes
         // the writer wrote before publishing the offset that names them.
         unsafe { std::slice::from_raw_parts(p.add(w), len) }
+    }
+
+    /// Anyone: published bytes at `off` into `out`, across blocks where
+    /// the range straddles.
+    fn read_contig(&self, off: usize, out: &mut [u8]) {
+        let mut at = off;
+        let mut rest = out;
+        while !rest.is_empty() {
+            let part = rest.len().min(ARENA_BLOCK - (at & (ARENA_BLOCK - 1)));
+            rest[..part].copy_from_slice(self.slice(at, part));
+            at += part;
+            rest = &mut rest[part..];
+        }
+    }
+
+    /// Anyone: whether the published bytes at `off` are `bytes`, across
+    /// blocks where the range straddles.
+    fn eq_contig(&self, off: usize, bytes: &[u8]) -> bool {
+        let mut at = off;
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let part = rest.len().min(ARENA_BLOCK - (at & (ARENA_BLOCK - 1)));
+            if self.slice(at, part) != &rest[..part] {
+                return false;
+            }
+            at += part;
+            rest = &rest[part..];
+        }
+        true
     }
 
     /// A hint to fetch the lines at `off`, clipped to the block; nothing
@@ -6569,6 +6787,52 @@ impl MemTable {
         self.vals.tail()
     }
 
+    /// `stream` only: where entry `i`'s record starts in the stream, which
+    /// is the file's record section's offset of it. From the head for a
+    /// record whose value is in place -- the value's offset less the
+    /// tail's place in the record -- and for one whose value straddled
+    /// into the second arena (`REF_ARENA2`), from the record before it:
+    /// its end, or the marker a commit laid behind it when the next
+    /// record's header is not there, since a record's header is its key's
+    /// length and its extent count, neither zero, where a marker begins
+    /// with four zero bytes.
+    fn stream_rec_off(&self, i: usize) -> usize {
+        self.stream_rec_off_of(i, self.entry(i))
+    }
+
+    /// `stream_rec_off` with entry `i` in hand.
+    fn stream_rec_off_of(&self, i: usize, e: &MemEntry) -> usize {
+        debug_assert!(self.stream);
+        let head = MemTable::head(e);
+        let (_, tail_at, _) = self.stream_record_shape(e);
+        if head & REF_ARENA2 == 0 {
+            return (((head & !REF_TAGS & !REF_STREAM) >> REF_LEN_BITS) as usize) - tail_at;
+        }
+        assert!(
+            i > 0,
+            "the first record starts the stream and straddles nothing"
+        );
+        let prev = self.entry(i - 1);
+        let end = self.stream_rec_off(i - 1) + self.stream_record_shape(prev).0;
+        let klen = e.key_len as usize;
+        let mut hdr = [0u8; 4];
+        let starts_at = |at: usize, hdr: &mut [u8; 4]| {
+            self.vals.read_contig(at, hdr);
+            hdr[0..2] == (klen as u16).to_le_bytes()
+                && hdr[2..4] != [0, 0]
+                && self.vals.eq_contig(at + 4, self.key_of(e))
+        };
+        if starts_at(end, &mut hdr) {
+            end
+        } else {
+            debug_assert!(
+                starts_at(end + DIRECT_MARK_LEN, &mut hdr),
+                "a record follows the one before it, or the marker behind that one"
+            );
+            end + DIRECT_MARK_LEN
+        }
+    }
+
     /// Writer, `stream` only: the stream is committed to `at`, its marker
     /// included.
     fn set_stream_committed(&self, at: usize) {
@@ -6925,6 +7189,29 @@ impl MemTable {
             }
             i = (i + 1) & idx.mask;
         }
+    }
+}
+
+/// A stream table as the keys of its run's segment (`KeySource`): the
+/// entries in key order, their keys, and each record's start in the
+/// stream, which the writer took as the file's record section.
+struct StreamKeys<'t>(&'t MemTable);
+
+impl KeySource for StreamKeys<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn key_at(&self, i: usize) -> &[u8] {
+        self.0.key_of(self.0.entry(i))
+    }
+
+    fn at(&self, i: usize) -> (&[u8], u32, u64) {
+        let e = self.0.entry(i);
+        let key = self.0.key_of(e);
+        let off = u32::try_from(self.0.stream_rec_off_of(i, e))
+            .expect("a record section the flat index addresses");
+        (key, off, flatindex::key_hash(key))
     }
 }
 
@@ -18258,11 +18545,17 @@ impl Db {
             let _ = std::fs::remove_file(&tmp);
             let opts = Db::segment_opts(&self.opts);
             let mut w = PieceWriter::create(&tmp, &opts, 0, self.opts.inline_bytes)?;
-            // Sized for the run the seal threshold allows, at a key and
-            // value of sixty-four bytes together: address space until
-            // touched, and the doublings the batches met otherwise.
-            let hint = (self.seal_threshold() / 64).max(1 << 10);
-            w.reserve_keys(hint, hint * 16);
+            if self.r.mem().stream && self.opts.direct_derive_keys {
+                // The table keeps the keys; the writer counts them and
+                // the close reads them from there.
+                w.set_deferred_keys()?;
+            } else {
+                // Sized for the run the seal threshold allows, at a key and
+                // value of sixty-four bytes together: address space until
+                // touched, and the doublings the batches met otherwise.
+                let hint = (self.seal_threshold() / 64).max(1 << 10);
+                w.reserve_keys(hint, hint * 16);
+            }
             w.set_marks(true);
             self.direct = Some(Direct {
                 w,
@@ -18425,13 +18718,24 @@ impl Db {
         let retiring = tmp.clone();
         let shared = self.shared.clone();
         let ord_durable = self.opts.ord_durable;
+        let keys = table.clone();
         let job = move |readable: &SealReadable| -> Result<Vec<String>> {
             seal_hold_wait(&shared, SEAL_HOLD_LANDING);
             let tombs = w.tombs();
-            let fact = w.landing_facts();
-            let (seg, ord) = w
-                .finish_unsynced()
-                .map_err(|e| err(&format!("direct finish: {e}")))?;
+            // The keys from the table where the writer kept none; else the
+            // writer's own copies, and the facts it took from them.
+            let (seg, ord, fact) = if w.3 {
+                let (seg, ord, fact) = w
+                    .finish_unsynced_from(&StreamKeys(&keys))
+                    .map_err(|e| err(&format!("direct finish: {e}")))?;
+                (seg, ord, Some(fact))
+            } else {
+                let fact = w.landing_facts();
+                let (seg, ord) = w
+                    .finish_unsynced()
+                    .map_err(|e| err(&format!("direct finish: {e}")))?;
+                (seg, ord, fact)
+            };
             let name = if first_partition && !tombs && std::fs::metadata(&tmp)?.len() <= limit {
                 Db::first_partition_name(id, seq)
             } else {

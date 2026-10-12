@@ -257,6 +257,25 @@ Profile a probe that does one thing. The scan probe's own `format!` per
 iteration was 8% of its samples until the keys were built before the
 loop.
 
+A fresh page's price here is the host's, and it is what moves the
+write cells between sittings. The durable ordered load at three hundred
+thousand keys ran in two shapes with the writer's CPU at 2.5-3x in one
+and the fault count the same in both; the per-window profile put the
+excess in `clear_page_erms`, the copy into the page cache and the
+allocator's list walks -- 0.14 µs a page zeroed where the guest backs
+it, 6-8 where the balloon has reported the block -- and every slow load
+followed the comparator's rep, whose dropped store had freed the blocks.
+The suite makes the pages fresh by design (`release_freed_memory`, the
+allocator trimmed after every store, since the ten-million rung held
+13 GB otherwise), so glibc's tunables move nothing under it, and the
+count of pages a load first-touches is the engine's lever
+(`docs/engine.md`, the pages a load touches). Count the pages per key
+before the instructions per key: the writer's two key copies cost 64
+bytes a key of fresh memory and a few nanoseconds of CPU, and the pages
+were the loss. And a derivation moved to the finish is one pass -- the
+first version of the derived close read the entries five times and the
+keys three, and gave back at the drain what it had saved at the commits.
+
 A lever on fresh pages is priced on the smallest write set as well as
 the load. A fresh anonymous page costs this guest about a microsecond
 by fault and half that populated in bulk (`MADV_POPULATE_WRITE`), and
@@ -662,9 +681,17 @@ laid out as its record at the append and the commit writes the batch to
 the file from the arena, a whole write piece at a time as the buffer
 path's pieces reached it, so the staged copy and the piece buffer's pages
 are gone from the writer's faults and the copies are the arm
-(`supdb-copyvals`, `supdb-ingestcopyvals`); the entries and the keys are
-the rest of what the table costs, and a run that kept no table at all is
-the shape left to price.
+(`supdb-copyvals`, `supdb-ingestcopyvals`). The segment writer kept two
+more copies of every key for the close -- its own key, span, offset and
+hash for the key section and the Bloom, and the ordered index builder's
+-- while the table it streams from held every key with its record; the
+close composes the trailer, the Bloom and the ordered index from the
+table in one pass now (`Options::direct_derive_keys`,
+`flatindex::stream_trailer` by position, `ordindex::Composer`), a quarter
+of the load's first-touched pages gone, and the kept copies are the arm
+(`supdb-keycopies`, `supdb-ingestkeycopies`). The entries and the keys
+are the rest of what the table costs, and a run that kept no table at
+all is the shape left to price.
 
 ## Shapes the bugs come in
 

@@ -3594,6 +3594,69 @@ the arm `supdb-manifestpending` and `supdb-ingestmanifestpending`, the
 manifest's third version stays the format, and the open's rules stay,
 since a store the arm wrote opens under the default.
 
+#### The pages a load touches, and the keys the writer kept twice
+
+The ordered load's remaining cells against LMDB moved by tens of percent
+between sittings of one tree, and the durable load at three hundred
+thousand keys ran in two shapes: eight loads in thirteen at 170-260 ms
+of commits with the writer's CPU at 100-170, five at 370-470 with the
+CPU at 280-340, the fault count the same 17.7 thousand in every one. A
+CPU-clock profile cut to each load's window on the writer named the
+excess: `clear_page_erms` at 100-135 ms in the slow windows against under
+three in the fast, the kernel's copy into the page cache at up to 70
+against five, the buddy allocator's list walks at up to 60 -- the same
+pages, zeroed and copied at a different price. A fresh page costs this
+guest 0.14 µs to zero when the guest still backs it and 6-8 when the
+balloon has reported the block it is in to the host, and which pages a
+load gets depends on what the rep before it freed: every slow load
+followed an LMDB rep, whose store of 150 MB had just been dropped, and
+beside another supdb arm there was no slow shape at all. The suite makes
+the pages fresh on purpose -- `release_freed_memory` trims the allocator
+after every store it drops, since the ten-million rung otherwise held
+13 GB in glibc's arenas -- and the glibc tunables that stop its give-back
+moved nothing, since the trim undoes them; with both off the writer's
+faults reached zero by the sixth load and the slow shape stayed, which is
+how the partner was found.
+
+What the engine owns is the count. A streamed run first-touched about
+240 bytes of anonymous memory a key for a 116-byte record: the arena
+stream (116), the segment writer's key, span, offset and hash (44), the
+table's entry (38), the ordered index builder's key and start (20), the
+table's key (16). LMDB first-touches its page cache and some four hundred
+pages besides. The writer's two copies of every key were kept for the
+close -- the key section's trailer, the ordered index and the landing's
+Bloom were composed from them -- while the table it streams from already
+held every key with its record and every entry in key order. With
+`direct_derive_keys` the writer counts the keys and keeps the last for
+the order check, and the close composes all three from the table in one
+pass: `stream_trailer` takes the keys by position and fills the directory
+and the hash slots as it goes, hashing each key once for the slots and
+the Bloom, and tells `ordindex::Composer` each key, which writes its head
+and keeps nothing. A record whose value straddled into the second arena
+has no stream offset in its head, so its start is the record before it,
+or that plus a marker's length when the record's header -- its key's
+length, its extent count, its key -- is not there; `tests/db.rs` writes
+forty thousand keys past an arena block through both shapes and holds
+every segment and ordered index byte for byte.
+
+The first version of the close read the entries five times and the keys
+three -- the offsets for the directory and again for the slots, the keys
+for the hashes, and the index builder's uniform pass and its heads -- and
+at three hundred thousand keys the drain grew by 8.7 ms, as much as the
+commits fell; fused to the one pass, the drain grew 4 and the commits
+fell 8.7 and 13.6 in two sittings. The faults fell by 4.7 thousand a load
+at three hundred thousand keys and 160 at ten thousand in every sitting,
+the quarter predicted. By the phases' sum the ordered load read 2% and
+4% faster at ten thousand keys over two sittings of twenty-four pairs
+(commits -0.17 and -0.23 ms, the drain +0.08 and +0.07), 3% and 7% at
+three hundred thousand buffered (unfused and fused), and 10% at three
+hundred thousand durable in the fused sitting, where the copies arm met
+more of the slow shape; the unfused durable sitting read the drain's
+growth and no commit saving, a 5% loss by the sum, which is what the
+fusing was for. No read, scan or mix cell moved outside noise in the
+buffered pairings. The copies are the arm `supdb-keycopies` and
+`supdb-ingestkeycopies`.
+
 #### The piece's ranks over the heads, and a locked exchange to look at a form
 
 Every written key's rank in its partition is computed by three parties:

@@ -851,21 +851,25 @@ pub fn stream_record_tail_at(
 /// The section header and the trailer for a records-first section: the
 /// records were streamed starting at `HEADER`, `recs_len` bytes of them, and
 /// the trailer -- fences, directory, hash slots, each aligned -- follows
-/// them. `key_at(i)` returns the i-th key (for the fence samples) and
-/// `hashes[i]` its hash. Returns (header, trailer, section total).
+/// them. The `n` keys are answered by position: `key_at(i)` is the i-th
+/// key, asked for the fence samples alone, and `each(i)` is where the
+/// i-th record starts in the section with the key's `key_hash`, asked
+/// exactly once for each i in key order -- the directory and the hash
+/// slots are filled in that one pass -- so a caller whose keys live in a
+/// table it already keeps reads each entry once and copies nothing for
+/// the trailer. Returns (header, trailer, section total).
 ///
 /// The layout is one `FlatIndex::parse` accepts because every region is
 /// addressed by offset; it differs from `encode`'s only in order, and
 /// `tests/segwriter.rs` holds the two to the same answers on every read.
 pub fn stream_trailer<'a>(
+    n: usize,
     recs_len: usize,
-    rec_offs: &[u32],
     key_at: &dyn Fn(usize) -> &'a [u8],
-    hashes: &[u64],
+    each: &mut dyn FnMut(usize) -> (u32, u64),
     generation: u64,
 ) -> Option<(Vec<u8>, Vec<u8>, usize)> {
-    let n = rec_offs.len();
-    if hashes.len() != n || recs_len > MAX_RECS {
+    if recs_len > MAX_RECS {
         return None;
     }
     let recs_off = HEADER;
@@ -897,20 +901,27 @@ pub fn stream_trailer<'a>(
         t.extend_from_slice(&blob);
         at += offs_len + blob.len();
     }
-    // Directory.
+    // Directory, then the hash slots, 8-aligned: both regions laid out
+    // first and filled in one pass, each key's offset into its directory
+    // word and its slot, the slots as `encode` fills its own, byte for
+    // byte.
     pad_to(&mut t, &mut at, 4);
     let dir_off = at;
-    for o in rec_offs {
-        t.extend_from_slice(&o.to_le_bytes());
-    }
+    let dir_start = t.len();
+    t.resize(dir_start + n * 4, 0);
     at += n * 4;
-    // Hash slots: 8-aligned, filled as `encode` fills its own, byte for
-    // byte.
     pad_to(&mut t, &mut at, 8);
     let hash_off = at;
     let hash_start = t.len();
     t.resize(hash_start + cap * SLOT, 0);
-    fill_hash(&mut t[hash_start..], mask, n, |i| (hashes[i], rec_offs[i]));
+    {
+        let (dir, slots) = t[dir_start..].split_at_mut(hash_start - dir_start);
+        fill_hash(&mut slots[..cap * SLOT], mask, n, |i| {
+            let (off, h) = each(i);
+            dir[i * 4..i * 4 + 4].copy_from_slice(&off.to_le_bytes());
+            (h, off)
+        });
+    }
     at += cap * SLOT;
     let total = at;
 

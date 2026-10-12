@@ -250,53 +250,114 @@ impl Builder {
     /// The file's bytes: a header, one head a key, a checksum.
     pub fn finish(mut self) -> Vec<u8> {
         self.starts.push(self.bytes.len() as u32);
-        let pfx = self.common_prefix();
-        let len0 = self.starts.get(1).map_or(0, |&b| b as usize);
-        let uniform = self.n > 0
-            && len0 <= pfx + HEAD
-            && (0..self.n).all(|i| (self.starts[i + 1] - self.starts[i]) as usize == len0);
-        let mut out = Vec::with_capacity(HEADER + self.n * HEAD + 4);
-        out.resize(HEADER, 0);
-        for i in 0..self.n {
-            let k = &self.bytes[self.starts[i] as usize..self.starts[i + 1] as usize];
-            out.extend_from_slice(&head_of(k, pfx).to_be_bytes());
+        let (starts, bytes) = (&self.starts, &self.bytes);
+        Builder::finish_from(self.n, &|i| {
+            &bytes[starts[i] as usize..starts[i + 1] as usize]
+        })
+    }
+
+    /// `finish` for keys a caller holds elsewhere -- `n` of them, in key
+    /// order, `key_at(i)` the i-th -- through the one `Composer` `finish`
+    /// also runs its own copies through, so the two produce the same bytes.
+    pub fn finish_from<'a>(n: usize, key_at: &dyn Fn(usize) -> &'a [u8]) -> Vec<u8> {
+        let mut c = if n == 0 {
+            Composer::new(0, &[], &[])
+        } else {
+            Composer::new(n, key_at(0), key_at(n - 1))
+        };
+        for i in 0..n {
+            c.push(key_at(i));
         }
+        c.finish()
+    }
+}
+
+/// The index composed a key at a time from keys someone else is walking:
+/// told the count and the first and last key up front -- the common
+/// prefix is theirs alone, the keys being sorted -- it writes each key's
+/// head as the key is pushed and keeps no key. A direct run's close walks
+/// its table's keys once for the segment's trailer and tells the composer
+/// each (`Options::direct_derive_keys`), so the builder's copy of the keys
+/// is never made.
+pub struct Composer {
+    out: Vec<u8>,
+    pfx: usize,
+    len0: usize,
+    uniform: bool,
+    n: usize,
+    pushed: usize,
+}
+
+impl Composer {
+    /// For `n` keys, the first and the last of them.
+    pub fn new(n: usize, first: &[u8], last: &[u8]) -> Composer {
+        let pfx = if n == 0 {
+            0
+        } else {
+            common_prefix(first, last)
+        };
+        let len0 = if n == 0 { 0 } else { first.len() };
+        let mut out = Vec::with_capacity(HEADER + n * HEAD + 4);
+        out.resize(HEADER, 0);
+        Composer {
+            out,
+            pfx,
+            len0,
+            uniform: n > 0 && len0 <= pfx + HEAD,
+            n,
+            pushed: 0,
+        }
+    }
+
+    /// The next key in key order.
+    pub fn push(&mut self, key: &[u8]) {
+        self.uniform &= key.len() == self.len0;
+        self.out
+            .extend_from_slice(&head_of(key, self.pfx).to_be_bytes());
+        self.pushed += 1;
+    }
+
+    /// The file's bytes: a header, one head a key, a checksum.
+    pub fn finish(mut self) -> Vec<u8> {
+        assert_eq!(
+            self.pushed, self.n,
+            "an ordered index of every key it was told of"
+        );
         let w = |out: &mut Vec<u8>, at: usize, v: u64| {
             out[at..at + 8].copy_from_slice(&v.to_le_bytes());
         };
-        w(&mut out, 0, MAGIC);
-        w(&mut out, 8, self.n as u64);
-        w(&mut out, 16, pfx as u64);
-        w(&mut out, 24, HEADER as u64);
+        w(&mut self.out, 0, MAGIC);
+        w(&mut self.out, 8, self.n as u64);
+        w(&mut self.out, 16, self.pfx as u64);
+        w(&mut self.out, 24, HEADER as u64);
         w(
-            &mut out,
+            &mut self.out,
             UNIFORM_AT,
-            if uniform { len0 as u64 + 1 } else { 0 },
+            if self.uniform {
+                self.len0 as u64 + 1
+            } else {
+                0
+            },
         );
         // The checksum goes last and covers everything before it, the spare
         // header words included. Covering only the body left those
         // unchecked and the damage test found it: a flip there opened clean,
         // which is the shape of the bug that made the key section's checksum
         // row name its own piece shift.
-        let crc = crc32(&out);
-        out.extend_from_slice(&crc.to_le_bytes());
-        out
+        let crc = crc32(&self.out);
+        self.out.extend_from_slice(&crc.to_le_bytes());
+        self.out
     }
+}
 
-    /// The bytes every key shares, from the first and the last: the keys are
-    /// sorted, so no key between them can differ earlier than those two do.
-    fn common_prefix(&self) -> usize {
-        if self.n == 0 {
-            return 0;
-        }
-        let first = &self.bytes[self.starts[0] as usize..self.starts[1] as usize];
-        let last = &self.bytes[self.starts[self.n - 1] as usize..self.starts[self.n] as usize];
-        first
-            .iter()
-            .zip(last.iter())
-            .take_while(|(a, b)| a == b)
-            .count()
-    }
+/// The bytes every key shares, from the first and the last: the keys are
+/// sorted, so no key between them can differ earlier than those two do.
+fn common_prefix(first: &[u8], last: &[u8]) -> usize {
+    first
+        .iter()
+        .zip(last.iter())
+        .take_while(|(a, b)| a == b)
+        .count()
 }
 
 /// One segment's ordered index, mapped.

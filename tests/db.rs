@@ -11990,3 +11990,96 @@ fn a_store_from_before_the_pending_flags_opens_with_both_slots_rewritten() {
         "the rewrite is a publish past the version-2 one"
     );
 }
+
+/// With `Options::direct_derive_keys` a streamed run's writer keeps no copy
+/// of its keys: the close composes the key section, the ordered index and
+/// the landing's Bloom from the table, whose stream holds every record and
+/// whose entries hold every key. The two shapes must leave the same bytes
+/// -- every segment past the superblock region and every ordered index
+/// whole -- and answer every read the same, over forty thousand keys in
+/// batches of a thousand, past a four-megabyte arena block so a record
+/// straddles one and its offset is found from the record before it, with
+/// values empty, of one byte and of a few hundred, a run left by a smaller
+/// key and a second run after it.
+#[test]
+fn a_run_whose_keys_the_table_keeps_leaves_the_segment_the_copies_leave() {
+    let key = |k: u32| format!("key-{k:06}");
+    let val = |k: u32| -> String {
+        match k % 5 {
+            0 => String::new(),
+            1 => "x".to_string(),
+            2 => "a".repeat(50),
+            3 => "c".repeat(200),
+            _ => "b".repeat(100),
+        }
+    };
+    let opts = |derive: bool| Options {
+        seal_bytes: 64 << 20,
+        partition_bytes: Some(1 << 20),
+        direct_derive_keys: derive,
+        ..Options::default()
+    };
+    let drive = |d: &std::path::Path, derive: bool| {
+        let mut db = Db::create(d, opts(derive)).unwrap();
+        let mut m = ScanModel::default();
+        for batch in 0..40u32 {
+            for k in batch * 1000..(batch + 1) * 1000 {
+                m.append(&mut db, &key(k), &val(k));
+            }
+            db.commit().unwrap();
+        }
+        m.check(&db, &format!("derive {derive}: forty batches"));
+        m.append(&mut db, "aaa", "left");
+        db.commit().unwrap();
+        m.check(&db, &format!("derive {derive}: the run left"));
+        for k in 40_300..42_000u32 {
+            m.append(&mut db, &key(k), &val(k));
+        }
+        db.commit().unwrap();
+        m.check(&db, &format!("derive {derive}: a second run"));
+        db.flush().unwrap();
+        db.settle().unwrap();
+        m.flushed();
+        m.check(&db, &format!("derive {derive}: flushed"));
+        drop(db);
+        let db = Db::open(d, opts(derive)).unwrap();
+        m.check(&db, &format!("derive {derive}: reopened"));
+    };
+    let da = dir("derive-copies");
+    let db_ = dir("derive-table");
+    drive(&da, false);
+    drive(&db_, true);
+    let files = |d: &std::path::Path, suffix: &str| -> Vec<(String, Vec<u8>)> {
+        let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(suffix))
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(e.path()).unwrap(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    for (suffix, skip) in [(".sup", 4096usize), (".oidx", 0)] {
+        let (sa, sb) = (files(&da, suffix), files(&db_, suffix));
+        assert!(!sa.is_empty(), "the stores left {suffix} files");
+        assert_eq!(
+            sa.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+            sb.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+            "the same {suffix} files by name"
+        );
+        for ((n, x), (_, y)) in sa.iter().zip(&sb) {
+            assert_eq!(x.len(), y.len(), "{n}: the same length");
+            let first = x[skip..].iter().zip(&y[skip..]).position(|(p, q)| p != q);
+            assert!(
+                first.is_none(),
+                "{n}: the derived keys wrote different bytes, first at {:?}",
+                first.map(|i| i + skip)
+            );
+        }
+    }
+}
