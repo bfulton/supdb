@@ -142,6 +142,16 @@ the host backs them cannot be seen from inside, so a question of ten
 percent about translation, huge pages or folio size is not one this
 machine can answer; `docs/engine.md` has the probe and both outcomes.
 
+The page cache's folios are not hidden: `/proc/self/pagemap` over a
+mapping of the file gives each page's frame, and `/proc/kpageflags` at
+that frame says whether it heads a compound page or follows one, so a
+walk of the mapping reads the file's folio composition -- forty of a
+megabyte, or twenty-nine and nine ladders of 512 KB down to 4 KB over
+the same bytes, which is what the stream's third shape left and the
+reads trailed by. The kernel sizes a folio by the write that makes it
+and the alignment of its offset, so a change to who writes a file is
+read there when its bytes are the same and its reads are not.
+
 The block device has a write-back cache, and an fsync's cost here is
 the host's flush of it, not the page cache's writeback: a probe that
 wrote forty megabytes with a `sync_file_range` hint after every piece
@@ -624,9 +634,15 @@ each first touch a fault the host prices; a table that holds references
 into the run's own segment instead (`Options::direct_table_refs`,
 `supdb-refvals`) took two fifths of those faults and a twentieth of the
 writer's CPU and moved the load 4% in twelve pairs, short of the tenth it
-was predicted to, so the copies ship and the references are an arm: the
-entries, the keys and the staged copy are the rest of what the table
-costs, and a run that kept no table at all is the shape left to price.
+was predicted to, so the references are an arm. What ships is the table
+whose arena is the record stream (`Options::direct_stream`): a value is
+laid out as its record at the append and the commit writes the batch to
+the file from the arena, a whole write piece at a time as the buffer
+path's pieces reached it, so the staged copy and the piece buffer's pages
+are gone from the writer's faults and the copies are the arm
+(`supdb-copyvals`, `supdb-ingestcopyvals`); the entries and the keys are
+the rest of what the table costs, and a run that kept no table at all is
+the shape left to price.
 
 ## Shapes the bugs come in
 
@@ -669,7 +685,14 @@ mark the live path sets is the test that tells the two apart.
 marked dirty, and the checkpoint asked to carry it dropped it, leaving the key
 readable at its old extents. It was invisible for as long as every insertion
 forced a full rewrite, because a rewrite reads the tombstone directly. Turning
-a flag on is what exposed it, and the bug was older than the flag.
+a flag on is what exposed it, and the bug was older than the flag. It came
+back with the record stream: every consumer of a table's head decoded the
+stream's tagged form but the block-cache scan's prefetch, which indexed the
+arena's block table by the tag, and six sittings of the stream as an arm
+never ran a scan over a run in progress with the cache on; the gate's first
+run with the stream as the default did, in a test written for another bug.
+Flipping the default is the test an arm never gets, so flip it under the
+gate before pricing it as the default.
 
 **The sharp edges of a log are in the bookkeeping around it, never in the
 append.** A value-carrying log queued a key twice when it sealed, re-queued
@@ -1486,6 +1509,34 @@ same file: the host imports are named with `wasm_import_module = "env"`
 because the bare `extern` block silently stopped linking on a toolchain
 update, and the host ABI's 32-bit offsets refuse an object at or over 4 GiB
 at open rather than wrapping.
+
+**A constant with two meanings, used for the other one.** The key
+section's checksum row hashes the section in pieces of 16 KB
+(`flatindex::PIECE_SHIFT`), and the segment writer writes the file in
+pieces of a megabyte (`SegmentOptions::write_piece`); the first shape
+of the direct run's stream hashed, wrote and hinted at the row's piece,
+and a load of ten thousand keys made ninety-seven writes and
+seventy-seven writeback hints where the buffer path made three and two.
+Nothing raised and the bytes were right; the commits ran at three times
+their time, and a profile named the doorbell write and the kernel's
+copy before `strace`, per file, counted the calls. The rule: a quantity
+with a name is used under that name, and a count of the syscalls a
+phase makes is read beside its profile before the phase is priced.
+
+**A write pattern priced on the bytes it wrote.** The stream's second
+shape wrote a commit's batch as one write at whatever offset it fell
+on, and its third wrote a piece that spanned an arena block as two.
+Both left a file byte for byte the buffer path's, dumped and compared,
+and every read over it trailed by a few percent at every rung, with the
+read pass's profile identical to half a percent per symbol. The kernel
+sizes a page-cache folio by the write that creates it and the alignment
+of its offset, and `/proc/self/pagemap` with `/proc/kpageflags` over a
+mapping of the file read the composition: forty folios of a megabyte
+under the buffer path, twenty-nine and nine ladders of 512 KB down to
+4 KB under the stream's. The rule: a file is its bytes and the page
+cache that holds them, and a change to who writes the bytes is priced
+on the reads as well as the writes, with the folios read when the bytes
+are the same and the reads are not.
 
 ## Standing limitations
 

@@ -853,6 +853,7 @@ fn a_direct_runs_table_reads_its_values_through_the_runs_segment() {
     let d = dir("direct-refs");
     let opts = Options {
         direct_table_refs: true,
+        direct_stream: false,
         // Far below the run's size, so the mapping has to grow, under a
         // handle that reads through it meanwhile; and the writer's pieces
         // small, so the file takes the records within a commit or two and
@@ -3699,6 +3700,228 @@ fn an_ordered_load_goes_straight_into_segments() {
         let db = Db::open(&d, opts).unwrap();
         m.check(&db, "reopened after close");
     }
+}
+
+/// With `Options::direct_stream` a direct run's table holds the run's
+/// records themselves, laid out as the file takes them, and a commit
+/// writes the batch from the table and copies nothing. The two shapes must
+/// leave the same segment bytes and answer every read the same: forty
+/// thousand keys in batches of a thousand -- past a four-megabyte arena
+/// block, so a record and a value run across one -- with values empty, of
+/// one byte and of a few hundred; a handle reading mid-run beside staged
+/// writes; a smaller key that leaves the run with staged entries behind it
+/// and a second run after it; and the crash windows a dropped store
+/// leaves, recovered from the stream's markers as the copies' are.
+#[test]
+fn a_direct_run_streamed_from_its_table_is_the_run_the_copies_write() {
+    let key = |k: u32| format!("key-{k:06}");
+    let val = |k: u32| -> String {
+        match k % 5 {
+            0 => String::new(),
+            1 => "x".to_string(),
+            2 => "a".repeat(50),
+            3 => "c".repeat(200),
+            _ => "b".repeat(100),
+        }
+    };
+    let opts = |stream: bool| Options {
+        seal_bytes: 64 << 20,
+        partition_bytes: Some(1 << 20),
+        direct_stream: stream,
+        ..Options::default()
+    };
+    let drive = |d: &std::path::Path, stream: bool| -> (Db, ScanModel) {
+        let mut db = Db::create(d, opts(stream)).unwrap();
+        let mut m = ScanModel::default();
+        for batch in 0..40u32 {
+            for k in batch * 1000..(batch + 1) * 1000 {
+                m.append(&mut db, &key(k), &val(k));
+            }
+            db.commit().unwrap();
+        }
+        m.check(&db, &format!("stream {stream}: forty batches"));
+        // Staged, uncommitted: the writer reads them, a handle does not.
+        for k in 40_000..40_300u32 {
+            m.append(&mut db, &key(k), &val(k));
+        }
+        assert_eq!(
+            read_vec(&db, key(40_100).as_bytes()),
+            vec![val(40_100).into_bytes()],
+            "stream {stream}: the writer reads a staged key"
+        );
+        let r = db.reader().unwrap();
+        assert!(
+            read_vec(&r, key(40_100).as_bytes()).is_empty(),
+            "stream {stream}: a handle reads nothing staged"
+        );
+        assert_eq!(
+            read_vec(&r, key(39_999).as_bytes()),
+            vec![val(39_999).into_bytes()],
+            "stream {stream}: a handle reads the last committed key"
+        );
+        drop(r);
+        // A smaller key leaves the run: the staged entries go with it to
+        // the hashed table and the WAL, and the stream is cut back to its
+        // last marker.
+        m.append(&mut db, "aaa", "left");
+        db.commit().unwrap();
+        m.check(&db, &format!("stream {stream}: the run left"));
+        // Keys above everything open a second run.
+        for k in 40_300..42_000u32 {
+            m.append(&mut db, &key(k), &val(k));
+        }
+        db.commit().unwrap();
+        m.check(&db, &format!("stream {stream}: a second run"));
+        db.flush().unwrap();
+        db.settle().unwrap();
+        m.flushed();
+        m.check(&db, &format!("stream {stream}: flushed"));
+        (db, m)
+    };
+    let da = dir("stream-copies");
+    let db_ = dir("stream-stream");
+    let (a, _) = drive(&da, false);
+    let (b, _) = drive(&db_, true);
+    drop(a);
+    drop(b);
+    // The segments the two left, byte for byte past the superblock region.
+    let segs = |d: &std::path::Path| -> Vec<(String, Vec<u8>)> {
+        let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".sup"))
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(e.path()).unwrap(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let (sa, sb) = (segs(&da), segs(&db_));
+    assert!(!sa.is_empty(), "the stores left segments");
+    assert_eq!(
+        sa.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+        sb.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+        "the same segments by name"
+    );
+    for ((n, x), (_, y)) in sa.iter().zip(&sb) {
+        assert_eq!(x.len(), y.len(), "{n}: the same length");
+        let first = x[4096..].iter().zip(&y[4096..]).position(|(p, q)| p != q);
+        assert!(
+            first.is_none(),
+            "{n}: the stream wrote different bytes, first at {:?}",
+            first.map(|i| i + 4096)
+        );
+    }
+    // The crash windows, on a streamed run: a batch after the last marker
+    // is lost whole, and a marker torn in half loses its batch.
+    let load = |d: &std::path::Path| -> (Db, ScanModel) {
+        let mut db = Db::create(d, opts(true)).unwrap();
+        let mut m = ScanModel::default();
+        for batch in 0..3u32 {
+            for k in batch * 100..(batch + 1) * 100 {
+                m.append(&mut db, &key(k), &val(k));
+            }
+            db.commit().unwrap();
+        }
+        (db, m)
+    };
+    let tmp_of = |d: &std::path::Path| d.join("direct-00000000.tmp");
+    {
+        let d = dir("stream-torn-tail");
+        let (db, m) = load(&d);
+        std::mem::forget(db);
+        let tmp = tmp_of(&d);
+        assert!(tmp.exists(), "the open run's temp file");
+        let mut f = std::fs::OpenOptions::new().append(true).open(&tmp).unwrap();
+        std::io::Write::write_all(&mut f, &[0x2a; 777]).unwrap();
+        drop(f);
+        let db = Db::open(&d, opts(true)).unwrap();
+        assert!(!tmp.exists(), "recovered and removed");
+        m.check(
+            &db,
+            "stream: three batches, the garbage after the marker ignored",
+        );
+    }
+    {
+        let d = dir("stream-torn-marker");
+        let (db, mut m) = load(&d);
+        std::mem::forget(db);
+        let tmp = tmp_of(&d);
+        let len = std::fs::metadata(&tmp).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp)
+            .unwrap()
+            .set_len(len - 8)
+            .unwrap();
+        for k in 200..300u32 {
+            m.vals.remove(key(k).as_bytes());
+            m.touched.remove(key(k).as_bytes());
+        }
+        let db = Db::open(&d, opts(true)).unwrap();
+        m.check(&db, "stream: two batches, the third's marker torn");
+        for k in 200..300u32 {
+            assert!(
+                read_vec(&db, key(k).as_bytes()).is_empty(),
+                "key {k} lost whole"
+            );
+        }
+    }
+    // Buffered, no sync at the commits: the stream's tail is held in the
+    // table until a write piece is whole, as the copies path's buffer
+    // holds its records, so the file a crash leaves is the copies path's
+    // byte for byte -- the whole pieces, with the batches and markers
+    // they hold -- and recovers the same batches, nothing of the tail.
+    let buffered = |d: &std::path::Path, stream: bool| {
+        let o = Options {
+            sync: supdb::SyncPolicy::EveryN(u32::MAX),
+            ..opts(stream)
+        };
+        let mut db = Db::create(d, o).unwrap();
+        let v = "b".repeat(100);
+        for batch in 0..12u32 {
+            for k in batch * 1000..(batch + 1) * 1000 {
+                // `append`: a `put` is a replace, which no run takes.
+                db.append(key(k).as_bytes(), v.as_bytes());
+            }
+            db.commit().unwrap();
+        }
+        std::mem::forget(db);
+    };
+    let (dc, ds) = (dir("stream-buffered-copies"), dir("stream-buffered-stream"));
+    buffered(&dc, false);
+    buffered(&ds, true);
+    let (fc, fs) = (
+        std::fs::read(tmp_of(&dc)).unwrap(),
+        std::fs::read(tmp_of(&ds)).unwrap(),
+    );
+    assert!(
+        fc.len() >= 1 << 20 && fc.len() < 12_000 * 130,
+        "the whole pieces on the file and the tail held: {} bytes",
+        fc.len()
+    );
+    assert_eq!(
+        fc.len(),
+        fs.len(),
+        "the crash-left files are the same length"
+    );
+    assert!(fc == fs, "the crash-left files of the two shapes differ");
+    let recovered = |d: &std::path::Path, stream: bool| -> usize {
+        let db = Db::open(d, opts(stream)).unwrap();
+        (0..12_000u32)
+            .filter(|k| !read_vec(&db, key(*k).as_bytes()).is_empty())
+            .count()
+    };
+    let (rc, rs) = (recovered(&dc, false), recovered(&ds, true));
+    assert_eq!(rc, rs, "the same keys recovered from the two shapes");
+    assert!(
+        (7000..12_000).contains(&rc) && rc % 1000 == 0,
+        "whole batches up to the last marker on the file: {rc}"
+    );
 }
 
 /// A direct segment's crash windows, emulated on the file a dropped store

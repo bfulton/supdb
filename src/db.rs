@@ -1356,6 +1356,26 @@ pub struct Options {
     /// the three calls, kept for pricing as `supdb-recordsteps` and
     /// `supdb-ingestrecordsteps`.
     pub direct_put_one: bool,
+    /// A direct run's table lays its values out as the segment's records,
+    /// in the file's own layout, so a commit writes the batch to the file
+    /// from the table's arena and copies nothing: the record is encoded
+    /// once, at the append, where the table copied the value in and the
+    /// commit encoded the record into the batch and the piece buffer
+    /// before the kernel's copy. The stream reaches the file as the buffer
+    /// path's pieces did -- a whole write piece at a time, one `writev`
+    /// each whatever arena blocks it spans, and the tail with the index
+    /// at the close -- because the kernel sizes the page cache's folios by
+    /// the write that makes them and every read over the segment trailed
+    /// while the stream's writes were a commit's batch at the offset it
+    /// fell on, over a file byte for byte the same. A reader of the run
+    /// reads the value inside its record. The buffered ordered load's
+    /// commits read a fifth lower by their phase column at ten thousand
+    /// keys with the writer's faults down by the staged copy's pages, and
+    /// the load 1.06-1.12x in five sittings, four at p < .05; every read,
+    /// scan and mix cell level once the folios matched. Off, the copies,
+    /// kept as the arm `supdb-copyvals` and `supdb-ingestcopyvals`. Not
+    /// with `direct_table_refs`, which is another shape of the same table.
+    pub direct_stream: bool,
     /// Bytes the mapping of a direct run's segment starts with; zero, the
     /// default, twice `seal_bytes`. The mapping grows when the run's file
     /// outgrows it. For a test of the growth.
@@ -1611,6 +1631,7 @@ impl Default for Options {
             ord_durable: false,
             direct_table_refs: false,
             direct_put_one: true,
+            direct_stream: true,
             direct_map_bytes: 0,
             forms_settle_recent_pct: 0,
             forms_carry: true,
@@ -2022,6 +2043,9 @@ struct Direct {
     /// value's place in the file, converted to a reference once the file
     /// holds it (`Options::direct_table_refs`).
     pending: std::collections::VecDeque<(usize, u64, u32)>,
+    /// With `Options::direct_stream`, where the table's record stream is
+    /// written to from here: its end at the last commit, marker included.
+    stream_from: usize,
 }
 
 /// A half-open key range `[lo, hi)`, `None` above meaning unbounded. The
@@ -2253,6 +2277,14 @@ struct AlignedWriter {
     populated: usize,
     /// Bytes on the file so far: where the buffer's contents land.
     written: u64,
+    /// The record stream a table keeps as the file's record section
+    /// (`stream_hash`): the table, and the arena range hashed and not yet
+    /// written, which lands at `written` on, a whole piece at a time
+    /// (`stream_flush`) or ahead of the buffer's bytes in the write that
+    /// takes those. Equal when nothing is held.
+    stream_src: Option<std::sync::Arc<MemTable>>,
+    held_from: usize,
+    held_to: usize,
     /// The piece, and the boundary every write but a flush's ends on.
     piece: u64,
     /// Start the device on each piece as it lands
@@ -2317,6 +2349,9 @@ impl AlignedWriter {
             prefault,
             populated: 0,
             written: 0,
+            stream_src: None,
+            held_from: 0,
+            held_to: 0,
             piece: piece as u64,
             writeback,
             ahead,
@@ -2350,7 +2385,7 @@ impl AlignedWriter {
     /// pass for its marker and its row together.
     fn write_hashed(&mut self, data: &[u8]) -> std::io::Result<u32> {
         let piece = 1u64 << flatindex::PIECE_SHIFT;
-        let at0 = self.written + self.buf.len() as u64;
+        let at0 = self.pos() + self.buf.len() as u64;
         let end = at0 + data.len() as u64;
         let own = self.own_on && self.section.is_some();
         let mut whole = 0u32;
@@ -2380,6 +2415,144 @@ impl AlignedWriter {
         let r = std::io::Write::write_all(self, data);
         self.own_on = was;
         r.map(|()| whole)
+    }
+
+    /// Bytes `from..to` of `src` -- the record stream a table keeps as the
+    /// file's record section (`Options::direct_stream`) -- hashed as
+    /// `write_hashed` hashes a slice, in the row's pieces for the row where
+    /// the key section is on and once over for the whole range's CRC, which
+    /// is returned; and held, not written. The stream is the table's and
+    /// stays where it is, so the file takes it as the buffer path's pieces
+    /// reached it, a whole write piece at a time (`stream_flush`), and the
+    /// hashing runs ahead of the writes at the positions they will land.
+    /// Whatever the buffer holds goes to the file first, so the file's
+    /// order is the caller's; the ranges come in order, each from where the
+    /// last ended.
+    ///
+    /// The first shape of this wrote each range as it was hashed, and cut
+    /// the writes and the writeback hints at the row's piece
+    /// (`flatindex::PIECE_SHIFT`, 16 KB), the hashing's unit and nothing
+    /// else's: seventy-seven hints and a hundred writes over a load of ten
+    /// thousand keys where the buffer made two and three, and the commits
+    /// ran at three times their time -- `strace` counted the hints, after a
+    /// profile had put a tenth of the thread in the hint's doorbell write
+    /// and a fifth more in the kernel's copy. Cut at the write piece but
+    /// written at every commit, the commits came below the buffer path's
+    /// and every read over the segment trailed, at ten thousand keys and
+    /// three hundred, over a file byte for byte the buffer's: the page
+    /// cache a write leaves is sized by the write, and twenty-two writes of
+    /// a commit's batch at the offsets they fell on left ten times the
+    /// folios the buffer's whole pieces did.
+    fn stream_hash(&mut self, from: usize, to: usize) -> std::io::Result<u32> {
+        if !self.buf.is_empty() {
+            self.write_buf_with(false)?;
+        }
+        if self.held_from == self.held_to {
+            self.held_from = from;
+            self.held_to = from;
+        }
+        debug_assert_eq!(from, self.held_to, "the stream is hashed in order");
+        let src = self.stream_src.clone().expect("a stream has its table");
+        let arena = src.stream_arena();
+        let row_piece = 1u64 << flatindex::PIECE_SHIFT;
+        let own = self.own_on && self.section.is_some();
+        let mut whole = 0u32;
+        let mut p = from;
+        while p < to {
+            let part = (to - p).min(ARENA_BLOCK - (p & (ARENA_BLOCK - 1)));
+            let s = arena.slice(p, part);
+            let at0 = self.written + (p - self.held_from) as u64;
+            let mut q = 0usize;
+            while q < part {
+                let at = at0 + q as u64;
+                let boundary = (at / row_piece + 1) * row_piece;
+                let take = (part - q).min((boundary - at) as usize);
+                let c = block::crc32(&s[q..q + take]);
+                whole = block::crc32_combine(whole, c, take as u64);
+                let stop = at + take as u64;
+                if own && stop > self.own_at {
+                    debug_assert!(at >= self.own_at, "a chunk hashed twice into the row");
+                    self.own_crc = block::crc32_combine(self.own_crc, c, take as u64);
+                    if stop == boundary {
+                        self.own_row.push(self.own_crc);
+                        self.own_crc = 0;
+                    }
+                    self.own_at = stop;
+                }
+                q += take;
+            }
+            p += part;
+        }
+        self.held_to = to;
+        Ok(whole)
+    }
+
+    /// The held stream written: the whole write pieces it completes, or
+    /// `all` of it -- at a sync, and before the close writes the index
+    /// behind the records -- one `write` per arena block, with the
+    /// writeback hint per whole piece as the buffer gives it. The tail is
+    /// not hinted: an fsync follows it at once in both cases, and a hint
+    /// over it wrote its last page to the device once for the hint and
+    /// again when the index behind it dirtied the page.
+    fn stream_flush(&mut self, all: bool) -> std::io::Result<()> {
+        let held = self.stream_held() as u64;
+        let piece = self.piece;
+        let end = self.written + held;
+        let target = if all { end } else { end / piece * piece };
+        if target <= self.written {
+            return Ok(());
+        }
+        debug_assert!(
+            self.buf.is_empty(),
+            "the buffer went when the stream was hashed"
+        );
+        let src = self
+            .stream_src
+            .clone()
+            .expect("a held stream has its table");
+        let arena = src.stream_arena();
+        while self.written < target {
+            // One write per piece, whatever arena blocks it spans: the
+            // kernel sizes a folio by the write it sees and the offset it
+            // starts at, and a piece in two writes -- the second at the
+            // offset an arena block's end fell on -- left nine of a 40 MB
+            // partition's forty pieces as ladders of 512 KB down to 4 KB
+            // where the buffer path's were one folio each, read from the
+            // page flags; and never a write longer than a piece, since a
+            // 2 MB folio is what the piece's size was chosen to avoid.
+            let stop = ((self.written / piece + 1) * piece).min(target);
+            let n = (stop - self.written) as usize;
+            let (mut p, to) = (self.held_from, self.held_from + n);
+            let mut parts: Vec<&[u8]> = Vec::with_capacity(2);
+            while p < to {
+                let part = (to - p).min(ARENA_BLOCK - (p & (ARENA_BLOCK - 1)));
+                parts.push(arena.slice(p, part));
+                p += part;
+            }
+            writev_all(&mut self.file, &parts)?;
+            self.written = stop;
+            self.held_from = to;
+            if self.writeback && stop % piece == 0 {
+                start_writeback(&self.file, stop - piece, piece);
+            }
+        }
+        if self.ahead > 0 {
+            self.landed()?;
+        }
+        Ok(())
+    }
+
+    /// Bytes of the stream hashed and not yet on the file.
+    fn stream_held(&self) -> usize {
+        self.held_to - self.held_from
+    }
+
+    /// The table whose record stream this writer takes as the file's
+    /// record section (`Options::direct_stream`), before the first
+    /// `stream_hash`.
+    fn set_stream_source(&mut self, table: std::sync::Arc<MemTable>) {
+        debug_assert!(table.stream, "a stream source streams");
+        self.stream_src = Some(table);
     }
 
     /// Whether the writer hashes the section's pieces itself until the
@@ -2468,13 +2641,34 @@ impl AlignedWriter {
         if on_file > 0 {
             self.file.read_exact_at(&mut dst[..on_file], off)?;
         }
-        if on_file < dst.len() {
-            let start = (off + on_file as u64 - self.written) as usize;
-            let n = dst.len() - on_file;
-            let held = self.buf.get(start..start + n).ok_or_else(|| {
+        let mut done = on_file;
+        let held = self.stream_held();
+        if done < dst.len() && held > 0 {
+            // The held stream, from the table's arena.
+            let src = self
+                .stream_src
+                .as_ref()
+                .expect("a held stream has its table");
+            let arena = src.stream_arena();
+            let start = (off + done as u64 - self.written) as usize;
+            if start < held {
+                let n = (held - start).min(dst.len() - done);
+                let (mut p, to) = (self.held_from + start, self.held_from + start + n);
+                while p < to {
+                    let part = (to - p).min(ARENA_BLOCK - (p & (ARENA_BLOCK - 1)));
+                    dst[done..done + part].copy_from_slice(arena.slice(p, part));
+                    p += part;
+                    done += part;
+                }
+            }
+        }
+        if done < dst.len() {
+            let start = (off + done as u64 - self.written - held as u64) as usize;
+            let n = dst.len() - done;
+            let buffered = self.buf.get(start..start + n).ok_or_else(|| {
                 std::io::Error::other("segment writer: a read past what was written")
             })?;
-            dst[on_file..].copy_from_slice(held);
+            dst[done..].copy_from_slice(buffered);
         }
         Ok(())
     }
@@ -2567,21 +2761,60 @@ impl AlignedWriter {
     /// Bytes from the file's end to the next boundary: what the buffer
     /// holds before it is written.
     fn to_boundary(&self) -> usize {
-        (self.piece - self.written % self.piece) as usize
+        (self.piece - self.pos() % self.piece) as usize
+    }
+
+    /// Where the buffer's first byte lands: the file's end, past the held
+    /// stream.
+    fn pos(&self) -> u64 {
+        self.written + self.stream_held() as u64
     }
 
     fn write_buf(&mut self) -> std::io::Result<()> {
+        self.write_buf_with(true)
+    }
+
+    /// `write_buf`, with the writeback hint or without: the head a stream
+    /// pushes out ahead of its first piece (`stream_hash`) is hinted with
+    /// that piece, as the buffer path's head is, and not on its own -- a
+    /// hint over the head alone wrote its page to the device once early
+    /// and again at the finish's patch.
+    fn write_buf_with(&mut self, hint: bool) -> std::io::Result<()> {
         let at = self.written;
-        let split = (self.prefix as usize).min(self.buf.len());
-        if at == 0 && split > 0 && split < self.buf.len() {
-            std::io::Write::write_all(&mut self.file, &self.buf[..split])?;
-            std::io::Write::write_all(&mut self.file, &self.buf[split..])?;
+        let held = self.stream_held();
+        if held > 0 {
+            // The stream's tail, held for a whole piece, ahead of the
+            // buffer's bytes in one write: the close's records and the
+            // index behind them as the buffer path writes them, one write
+            // and the folios it makes.
+            let src = self
+                .stream_src
+                .clone()
+                .expect("a held stream has its table");
+            let arena = src.stream_arena();
+            let mut parts: Vec<&[u8]> = Vec::with_capacity(3);
+            let (mut p, to) = (self.held_from, self.held_to);
+            while p < to {
+                let part = (to - p).min(ARENA_BLOCK - (p & (ARENA_BLOCK - 1)));
+                parts.push(arena.slice(p, part));
+                p += part;
+            }
+            parts.push(&self.buf);
+            writev_all(&mut self.file, &parts)?;
+            self.held_from = self.held_to;
         } else {
-            std::io::Write::write_all(&mut self.file, &self.buf)?;
+            let split = (self.prefix as usize).min(self.buf.len());
+            if at == 0 && split > 0 && split < self.buf.len() {
+                std::io::Write::write_all(&mut self.file, &self.buf[..split])?;
+                std::io::Write::write_all(&mut self.file, &self.buf[split..])?;
+            } else {
+                std::io::Write::write_all(&mut self.file, &self.buf)?;
+            }
         }
-        self.written += self.buf.len() as u64;
-        if self.writeback {
-            start_writeback(&self.file, at, self.buf.len() as u64);
+        let total = (held + self.buf.len()) as u64;
+        self.written += total;
+        if self.writeback && hint {
+            start_writeback(&self.file, at, total);
         }
         self.buf.clear();
         if self.ahead > 0 {
@@ -2589,6 +2822,30 @@ impl AlignedWriter {
         }
         Ok(())
     }
+}
+
+/// `write_all` over several slices as one `writev`: the kernel sizes the
+/// page cache's folios by the write it sees and the offset it starts at,
+/// so a piece in two parts -- a stream across an arena block, a tail with
+/// the index behind it -- goes as one write, as the buffer's pieces do.
+fn writev_all(file: &mut File, parts: &[&[u8]]) -> std::io::Result<()> {
+    let mut iovs: Vec<std::io::IoSlice<'_>> = parts
+        .iter()
+        .filter(|p| !p.is_empty())
+        .map(|p| std::io::IoSlice::new(p))
+        .collect();
+    let mut iov: &mut [std::io::IoSlice<'_>] = &mut iovs[..];
+    while !iov.is_empty() {
+        let n = std::io::Write::write_vectored(file, iov)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to write whole buffer",
+            ));
+        }
+        std::io::IoSlice::advance_slices(&mut iov, n);
+    }
+    Ok(())
 }
 
 /// Ask the kernel to start writing `len` bytes of `file` from `at` to the
@@ -2833,7 +3090,7 @@ impl std::io::Write for AlignedWriter {
                 );
             }
             if self.own_on && self.section.is_some() {
-                let at = self.written + self.buf.len() as u64;
+                let at = self.pos() + self.buf.len() as u64;
                 self.own_hash(at, &rest[..take]);
             }
             self.buf.extend_from_slice(&rest[..take]);
@@ -2846,7 +3103,7 @@ impl std::io::Write for AlignedWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        if !self.buf.is_empty() {
+        if !self.buf.is_empty() || self.stream_held() > 0 {
             self.write_buf()?;
         }
         self.file.flush()
@@ -3243,16 +3500,124 @@ impl SegmentWriter {
         let c = self.out.write_hashed(&self.batch_buf)?;
         self.mark_crc = block::crc32_combine(self.mark_crc, c, self.batch_buf.len() as u64);
         self.batch_buf.clear();
+        let m = self.marker_bytes();
+        self.out.write_all(&m)?;
+        self.marked();
+        Ok(())
+    }
+
+    /// The marker closing the batch of records since the last one: its
+    /// CRC, its length and the key count so far.
+    fn marker_bytes(&self) -> [u8; DIRECT_MARK_LEN] {
         let mut m = [0u8; DIRECT_MARK_LEN];
         m[4..8].copy_from_slice(&DIRECT_MARK);
         m[8..12].copy_from_slice(&self.mark_crc.to_le_bytes());
         m[12..16].copy_from_slice(&((self.recs_len - self.mark_start) as u32).to_le_bytes());
         m[16..24].copy_from_slice(&(self.spans.len() as u64).to_le_bytes());
-        self.out.write_all(&m)?;
+        m
+    }
+
+    /// A marker is on the file: the section grew by it and the next batch
+    /// starts after it.
+    fn marked(&mut self) {
         self.pos += DIRECT_MARK_LEN as u64;
         self.recs_len += DIRECT_MARK_LEN;
         self.mark_crc = 0;
         self.mark_start = self.recs_len;
+    }
+
+    /// `put_one` for a record already laid out in a stream the caller keeps
+    /// as the file's record section (`Options::direct_stream`): `rec_len`
+    /// bytes, its tail `tail_at` in and a value `value_len` long. The
+    /// bookkeeping the three calls do, and no byte copied; the bytes reach
+    /// the file through `stream_out`, which is the caller's to call before
+    /// anything else is written.
+    fn put_encoded(
+        &mut self,
+        key: &[u8],
+        rec_len: usize,
+        tail_at: usize,
+        value_len: u32,
+    ) -> Result<()> {
+        if self.open_key.is_some() {
+            return Err(err("segment writer: begin while a key is open"));
+        }
+        if key.len() > u16::MAX as usize {
+            return Err(err("segment writer: key longer than 65,535 bytes"));
+        }
+        if let Some(&(s, l)) = self.spans.last() {
+            if key <= &self.key_arena[s..s + l] {
+                return Err(err(
+                    "segment writer: keys must arrive in strictly increasing order",
+                ));
+            }
+        }
+        if self.layout()? != Layout::RecordsFirst {
+            return Err(err(
+                "segment writer: a streamed record needs the records-first layout",
+            ));
+        }
+        let start = self.key_arena.len();
+        self.key_arena.extend_from_slice(key);
+        self.last = 0;
+        self.payload += (key.len() + value_len as usize) as u64;
+        self.last_value = (self.pos + tail_at as u64, value_len);
+        self.pos += rec_len as u64;
+        self.rec_offs.push(self.recs_len as u32);
+        self.recs_len += rec_len;
+        self.hashes.push(flatindex::key_hash(key));
+        if self.recs_len > flatindex::MAX_RECS {
+            return Err(err(
+                "segment writer: key section exceeds the flat index's limits",
+            ));
+        }
+        self.spans.push((start, key.len()));
+        Ok(())
+    }
+
+    /// Bytes `from..to` of the caller's record stream hashed into the
+    /// marker's CRC as a batch of records is, and held for the file
+    /// (`AlignedWriter::stream_hash`): the marker behind them writes what
+    /// makes a whole piece, and `stream_flush` the rest.
+    fn stream_out(&mut self, from: usize, to: usize) -> Result<()> {
+        let c = self.out.stream_hash(from, to)?;
+        self.mark_crc = block::crc32_combine(self.mark_crc, c, (to - from) as u64);
+        Ok(())
+    }
+
+    /// The table whose stream is this segment's record section
+    /// (`AlignedWriter::set_stream_source`).
+    fn set_stream_source(&mut self, table: std::sync::Arc<MemTable>) {
+        self.out.set_stream_source(table);
+    }
+
+    /// `mark`, the marker laid into the caller's stream at its end and
+    /// written from there, so the stream stays the file's record section
+    /// byte for byte.
+    fn mark_stream(&mut self, src: &ByteArena) -> Result<()> {
+        if self.open_key.is_some() {
+            return Err(err("segment writer: mark while a key is open"));
+        }
+        if self.layout()? != Layout::RecordsFirst {
+            return Err(err(
+                "segment writer: a marker needs the records-first layout",
+            ));
+        }
+        if !self.marks {
+            return Err(err("segment writer: mark on a writer not set to mark"));
+        }
+        debug_assert!(
+            self.batch_buf.is_empty(),
+            "a streamed writer batches nothing"
+        );
+        let m = self.marker_bytes();
+        let off = src.reserve_contig(DIRECT_MARK_LEN);
+        src.write_contig(off, &m);
+        self.out.stream_hash(off, off + DIRECT_MARK_LEN)?;
+        self.marked();
+        // The whole pieces the batch completed, as the buffer path's
+        // buffer went at each boundary; the rest waits for the next.
+        self.out.stream_flush(false)?;
         Ok(())
     }
 
@@ -3283,6 +3648,9 @@ impl SegmentWriter {
             self.mark_crc = block::crc32_combine(self.mark_crc, c, self.batch_buf.len() as u64);
             self.batch_buf.clear();
         }
+        // A streamed writer's tail, held for a whole piece: the sync covers
+        // only what is on the file.
+        self.out.stream_flush(true)?;
         self.out.flush()?;
         self.out.get_ref().sync_data()?;
         self.out.synced_all();
@@ -4304,6 +4672,30 @@ impl PieceWriter {
         self.0.put_one(k, v)
     }
 
+    /// `SegmentWriter::put_encoded`, the key into the ordered index.
+    fn put_encoded(
+        &mut self,
+        k: &[u8],
+        rec_len: usize,
+        tail_at: usize,
+        value_len: u32,
+    ) -> Result<()> {
+        self.1.push(k);
+        self.0.put_encoded(k, rec_len, tail_at, value_len)
+    }
+
+    fn stream_out(&mut self, from: usize, to: usize) -> Result<()> {
+        self.0.stream_out(from, to)
+    }
+
+    fn set_stream_source(&mut self, table: std::sync::Arc<MemTable>) {
+        self.0.set_stream_source(table);
+    }
+
+    fn mark_stream(&mut self, src: &ByteArena) -> Result<()> {
+        self.0.mark_stream(src)
+    }
+
     /// Whether any key ended with a tombstone: a piece with one cannot
     /// be a partition as it is, since the bottom level drops them.
     fn tombs(&self) -> bool {
@@ -4691,6 +5083,20 @@ struct MemTable {
     /// of the batch it writes and resets the arena, which nothing but
     /// staged heads point into.
     refs: bool,
+    /// The table's values are the segment's records themselves
+    /// (`Options::direct_stream`): `vals` is the run's record stream, laid
+    /// out as the file takes it from its first record on, and an entry's
+    /// head names its value's bytes inside its record, tagged
+    /// `REF_STREAM`, with the length beside the offset as a committed
+    /// reference carries it; `vals2` holds the copy of a value whose
+    /// record runs across two blocks, tagged `REF_ARENA2` as well, since a
+    /// slice lends from one block. Nothing in a stream table is a chunk.
+    stream: bool,
+    /// `SegmentOptions::compact_records` of the run the stream is for.
+    stream_compact: bool,
+    /// The stream's end at the last commit, past its marker: where a
+    /// truncation of the uncommitted tail rewinds the stream to.
+    stream_committed: AtomicUsize,
     /// The mapping of the run's segment the committed references read
     /// through, published by the writer once the run has a file and
     /// replaced by a larger one when the file outgrows it; the one
@@ -5030,6 +5436,134 @@ impl ByteArena {
         t.at += n;
         self.used.fetch_add(n, AtomicOrdering::Relaxed);
         off
+    }
+
+    /// Writer: `n` bytes at the tail as `reserve`, except that the range
+    /// may run across blocks, so the arena's offsets are one unbroken
+    /// stream -- a stream of the segment's records, laid out as the file
+    /// takes them, has no gap at a block's end. Every block this makes is
+    /// `ARENA_BLOCK` bytes exactly, so an offset finds its block with the
+    /// shift as before, and a block a rewind left behind is taken up
+    /// again; a range that straddles is written with `write_contig` and
+    /// read a block at a time, since `slice` lends from one block. An
+    /// arena is reserved from by this or by `reserve`, never both.
+    fn reserve_contig(&self, n: usize) -> usize {
+        // SAFETY: writer-only, see the memtable's doc.
+        let t = unsafe { &mut *self.tail.get() };
+        let off = t.at;
+        let room = t.block_end - t.at;
+        if n <= room && t.block_end > 0 {
+            t.at += n;
+        } else {
+            let mut left = n - room;
+            loop {
+                let b = t.next_block;
+                assert!(
+                    b < ARENA_BLOCKS,
+                    "memtable arena: more bytes than it addresses"
+                );
+                let p = self.block_at(b);
+                t.block_start = b << ARENA_SHIFT;
+                t.block_base = p as usize;
+                t.populated = 0;
+                t.block_end = t.block_start + ARENA_BLOCK;
+                t.next_block = b + 1;
+                if left <= ARENA_BLOCK {
+                    t.at = t.block_start + left;
+                    break;
+                }
+                left -= ARENA_BLOCK;
+            }
+        }
+        if self.prefault {
+            populate_ahead(
+                t.block_base,
+                t.block_end - t.block_start,
+                &mut t.populated,
+                t.at - t.block_start,
+            );
+        }
+        self.used.fetch_add(n, AtomicOrdering::Relaxed);
+        off
+    }
+
+    /// Writer: block `b`, a plain `ARENA_BLOCK` one: the one there if a
+    /// rewind left it, else allocated and published.
+    fn block_at(&self, b: usize) -> *mut u8 {
+        let p = self.blocks[b].load(AtomicOrdering::Acquire);
+        if !p.is_null() {
+            debug_assert_eq!(
+                self.caps[b].load(AtomicOrdering::Relaxed),
+                ARENA_BLOCK,
+                "a contiguous arena's blocks are plain"
+            );
+            return p;
+        }
+        let layout =
+            std::alloc::Layout::from_size_align(ARENA_BLOCK, 64).expect("arena block layout");
+        // SAFETY: a non-zero layout; the block is freed by `Drop`.
+        let p = unsafe { std::alloc::alloc(layout) };
+        assert!(!p.is_null(), "memtable arena: out of memory");
+        self.caps[b].store(ARENA_BLOCK, AtomicOrdering::Release);
+        self.blocks[b].store(p, AtomicOrdering::Release);
+        p
+    }
+
+    /// Writer: `bytes` at `off`, across blocks where the range straddles.
+    fn write_contig(&self, off: usize, bytes: &[u8]) {
+        let mut at = off;
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let part = rest.len().min(ARENA_BLOCK - (at & (ARENA_BLOCK - 1)));
+            self.write(at, &rest[..part]);
+            at += part;
+            rest = &rest[part..];
+        }
+    }
+
+    /// Whether `len` bytes at `off` run past their block's end.
+    fn straddles(off: usize, len: usize) -> bool {
+        len > 0 && (off >> ARENA_SHIFT) != ((off + len - 1) >> ARENA_SHIFT)
+    }
+
+    /// Writer: the reserved range at `off`, within one block, lent to `f`
+    /// to fill in place.
+    fn write_with<R>(&self, off: usize, len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+        let (p, w) = self.block(off, len);
+        // SAFETY: inside the block, a range this writer reserved and no
+        // reader can reach until it is published; writer-only, so no other
+        // reference to it is alive, and the slice does not outlive the
+        // call.
+        f(unsafe { std::slice::from_raw_parts_mut(p.add(w), len) })
+    }
+
+    /// Writer: the tail back to `to`, a position the stream was at, for an
+    /// uncommitted tail no reader can have reached; the blocks past it stay
+    /// allocated for `reserve_contig` to take up again.
+    fn rewind(&self, to: usize) {
+        // SAFETY: writer-only.
+        let t = unsafe { &mut *self.tail.get() };
+        debug_assert!(to <= t.at, "a rewind goes back");
+        if to == t.at {
+            return;
+        }
+        self.used.fetch_sub(t.at - to, AtomicOrdering::Relaxed);
+        // The block the tail sits in: the one before `to` where `to` is a
+        // block's first byte, so a tail at a block's end stays there and
+        // the next reservation steps over as it would have.
+        let b = if to > 0 && to & (ARENA_BLOCK - 1) == 0 {
+            (to >> ARENA_SHIFT) - 1
+        } else {
+            to >> ARENA_SHIFT
+        };
+        if t.block_start != b << ARENA_SHIFT {
+            t.block_start = b << ARENA_SHIFT;
+            t.block_base = self.blocks[b].load(AtomicOrdering::Acquire) as usize;
+            t.block_end = t.block_start + ARENA_BLOCK;
+            t.next_block = b + 1;
+            t.populated = ARENA_BLOCK;
+        }
+        t.at = to;
     }
 
     /// Writer: the tail back to the first block's start, when the arena
@@ -5507,6 +6041,9 @@ impl MemTable {
             index: AtomicPtr::new(Box::into_raw(Box::new(Index::with_slots(1024)))),
             ordered: false,
             refs: false,
+            stream: false,
+            stream_compact: false,
+            stream_committed: AtomicUsize::new(0),
             run: AtomicPtr::new(std::ptr::null_mut()),
             run_flushed: AtomicU64::new(0),
             retired_runs: UnsafeCell::new(Vec::new()),
@@ -5525,13 +6062,19 @@ impl MemTable {
 
     /// A table for keys that arrive in order: each above the last; with
     /// `refs`, one whose committed values are references into the run's
-    /// segment (`Options::direct_table_refs`).
-    fn new_ordered(refs: bool, prefault: bool) -> MemTable {
+    /// segment (`Options::direct_table_refs`); with `stream`, one whose
+    /// values are the run's records in place (`Options::direct_stream`),
+    /// compact where it says.
+    fn new_ordered(refs: bool, prefault: bool, stream: Option<bool>) -> MemTable {
+        debug_assert!(!(refs && stream.is_some()), "two shapes of one table");
         MemTable {
             entries: Slab::new(),
             index: AtomicPtr::new(std::ptr::null_mut()),
             ordered: true,
             refs,
+            stream: stream.is_some(),
+            stream_compact: stream.unwrap_or(false),
+            stream_committed: AtomicUsize::new(0),
             run: AtomicPtr::new(std::ptr::null_mut()),
             run_flushed: AtomicU64::new(0),
             retired_runs: UnsafeCell::new(Vec::new()),
@@ -5608,6 +6151,22 @@ impl MemTable {
         if off == NO_CHUNK {
             return;
         }
+        if self.stream {
+            // The value inside its record, as `value_at` finds it. The
+            // first shape of the stream left this path on the arena's
+            // plain offsets, and a scan over a run in progress with the
+            // block cache on indexed the arena's block table by a tagged
+            // head: the test that opens a direct run after a landing the
+            // writer has not seen, which no stream test had reached.
+            let at = ((off & !REF_TAGS & !REF_STREAM) >> REF_LEN_BITS) as usize;
+            let len = ((off & REF_LEN_MASK) as usize).min(bytes);
+            if off & REF_ARENA2 != 0 {
+                self.vals2.prefetch(at, len);
+            } else {
+                self.vals.prefetch(at, len);
+            }
+            return;
+        }
         if self.refs {
             // A staged chunk is in the arena under its tag; a committed
             // reference is in the run's file, whose lines the hint can
@@ -5649,6 +6208,12 @@ impl MemTable {
 
     /// Writer: the entries from `n` on forgotten; see `Slab::truncate`.
     fn truncate_entries(&self, n: usize, rd: &Readers) {
+        if self.stream {
+            // The uncommitted records go with their entries: the stream
+            // back to the last commit's marker.
+            self.vals
+                .rewind(self.stream_committed.load(AtomicOrdering::Acquire));
+        }
         if self.refs {
             for i in n..self.len() {
                 let h = MemTable::head(self.entry(i));
@@ -5672,7 +6237,7 @@ impl MemTable {
         // in the file, none of them one order, and an entry has the one
         // chunk it was appended with: what hides a staged entry from a
         // handle is the count, and nothing a watermark could add.
-        let wm = if self.refs {
+        let wm = if self.refs || self.stream {
             u64::MAX
         } else {
             self.vals.tail() as u64
@@ -5801,6 +6366,7 @@ impl MemTable {
         let key_off = self.keys.reserve(key.len());
         self.keys.write(key_off, key);
         let (off, count) = match value {
+            Some(v) if self.stream => (self.push_record(key, v), 1),
             Some(v) => (self.push_chunk(NO_CHUNK, v), 1),
             None => (self.push_tomb(NO_CHUNK), 0),
         };
@@ -5886,6 +6452,104 @@ impl MemTable {
         off as u64
     }
 
+    /// The record a direct run writes for one value: inline, a fixed run
+    /// of the value itself, or of a one-byte length for an empty value --
+    /// what `encode_run` and `end_with` make of one value -- and its
+    /// tail's length.
+    fn stream_ext(value_len: usize) -> (Ext, usize) {
+        if value_len == 0 {
+            (
+                Ext {
+                    block: Ext::INLINE,
+                    off: 0,
+                    len: 1,
+                    last: 0,
+                    count: 1,
+                },
+                1,
+            )
+        } else {
+            (
+                Ext {
+                    block: Ext::INLINE,
+                    off: 0,
+                    len: value_len as u32,
+                    last: 0,
+                    count: 1 | Ext::FIXED,
+                },
+                value_len,
+            )
+        }
+    }
+
+    /// Writer, `stream` only: `key`'s record with `value` laid out at the
+    /// stream's end, byte for byte what the segment writer writes for it;
+    /// the head for the entry, naming the value inside the record, or its
+    /// copy in `vals2` where the value runs across two blocks.
+    fn push_record(&self, key: &[u8], value: &[u8]) -> u64 {
+        debug_assert!(self.stream);
+        let (ext, tail_len) = MemTable::stream_ext(value.len());
+        let rec_len = flatindex::record_len_for(key.len(), &[ext], tail_len, self.stream_compact)
+            .expect("a direct run takes keys and values a record holds");
+        let off = self.vals.reserve_contig(rec_len);
+        let one = [0u8; 1];
+        let tail: &[u8] = if value.is_empty() { &one } else { value };
+        let tail_at = if ByteArena::straddles(off, rec_len) {
+            let mut scratch = vec![0u8; rec_len];
+            let at = flatindex::record_into(&mut scratch, key, &[ext], tail, self.stream_compact);
+            self.vals.write_contig(off, &scratch);
+            at
+        } else {
+            let compact = self.stream_compact;
+            self.vals.write_with(off, rec_len, |rec| {
+                flatindex::record_into(rec, key, &[ext], tail, compact)
+            })
+        };
+        let voff = off + tail_at;
+        if value.is_empty() {
+            return REF_STREAM | ref_pack(voff as u64, 0);
+        }
+        if ByteArena::straddles(voff, value.len()) {
+            let copy = self.vals2.reserve(value.len());
+            self.vals2.write(copy, value);
+            return REF_STREAM | REF_ARENA2 | ref_pack(copy as u64, value.len() as u32);
+        }
+        REF_STREAM | ref_pack(voff as u64, value.len() as u32)
+    }
+
+    /// `stream` only: entry `e`'s record as the segment writer accounts
+    /// for it -- its length, its tail's offset within it, its value's
+    /// length -- from the one definition of the layout the append used.
+    fn stream_record_shape(&self, e: &MemEntry) -> (usize, usize, u32) {
+        debug_assert!(self.stream);
+        let vlen = (MemTable::head(e) & REF_LEN_MASK) as u32;
+        let (ext, tail_len) = MemTable::stream_ext(vlen as usize);
+        let klen = e.key_len as usize;
+        let rec_len = flatindex::record_len_for(klen, &[ext], tail_len, self.stream_compact)
+            .expect("a direct run's record fits the flat index");
+        (
+            rec_len,
+            flatindex::record_tail_at(klen, &[ext], self.stream_compact),
+            vlen,
+        )
+    }
+
+    /// `stream` only: the record stream and where it ends.
+    fn stream_arena(&self) -> &ByteArena {
+        debug_assert!(self.stream);
+        &self.vals
+    }
+
+    fn stream_tail(&self) -> usize {
+        self.vals.tail()
+    }
+
+    /// Writer, `stream` only: the stream is committed to `at`, its marker
+    /// included.
+    fn set_stream_committed(&self, at: usize) {
+        self.stream_committed.store(at, AtomicOrdering::Release);
+    }
+
     fn push_tomb(&self, prev: u64) -> u64 {
         let off = self.vals.reserve(CHUNK_HDR);
         self.vals.write(off, &prev.to_le_bytes());
@@ -5906,6 +6570,10 @@ impl MemTable {
     }
 
     fn chunk_prev(&self, off: u64) -> u64 {
+        if self.stream {
+            // One value a key, in its record: no chain.
+            return NO_CHUNK;
+        }
         if self.refs {
             // One value a key, so a committed reference has no chain; a
             // staged chunk is in an arena, under its tags.
@@ -5924,6 +6592,9 @@ impl MemTable {
     }
 
     fn chunk_len(&self, off: u64) -> u32 {
+        if self.stream {
+            return (off & REF_LEN_MASK) as u32;
+        }
         if self.refs {
             if off & REF_STAGED == 0 {
                 return (off & REF_LEN_MASK) as u32;
@@ -6106,6 +6777,14 @@ impl MemTable {
     fn value_at(&self, off: usize) -> &[u8] {
         let len = self.chunk_len(off as u64);
         debug_assert_ne!(len, TOMB_LEN, "a tombstone has no value");
+        if self.stream {
+            let off = off as u64;
+            let at = ((off & !REF_TAGS & !REF_STREAM) >> REF_LEN_BITS) as usize;
+            if off & REF_ARENA2 != 0 {
+                return self.vals2.slice(at, len as usize);
+            }
+            return self.vals.slice(at, len as usize);
+        }
         if self.refs {
             let off = off as u64;
             if off & REF_STAGED != 0 {
@@ -6285,6 +6964,11 @@ const STAGING_ROTATE: usize = 1 << 20;
 const REF_STAGED: u64 = 1 << 62;
 const REF_ARENA2: u64 = 1 << 61;
 const REF_TAGS: u64 = REF_STAGED | REF_ARENA2;
+/// A stream table's head (`Options::direct_stream`): the value's offset in
+/// the record stream above `REF_LEN_BITS` and its length in them, as a
+/// committed reference packs a file offset, with `REF_ARENA2` where the
+/// value is the copy in the second arena.
+const REF_STREAM: u64 = 1 << 60;
 /// A committed reference: the value's file offset above these bits, its
 /// length in them.
 const REF_LEN_BITS: u32 = 24;
@@ -6306,6 +6990,11 @@ fn ref_pack(off: u64, len: u32) -> u64 {
 /// read, and the suite's unpinned arm faulted in a third of its runs once
 /// the segment work moved to a thread of its own.
 fn check_options(opts: &Options) -> Result<()> {
+    if opts.direct_stream && opts.direct_table_refs {
+        return Err(err(
+            "direct_stream and direct_table_refs are two shapes of one table",
+        ));
+    }
     if !opts.writer_pins && (opts.publish_in_background || opts.snapshot_keeper) {
         return Err(err(
             "writer_pins off needs every publish on the writer's thread: \
@@ -16995,6 +17684,9 @@ impl Db {
                         std::sync::Arc::new(MemTable::new_ordered(
                             self.opts.direct_table_refs,
                             self.opts.prefault,
+                            self.opts
+                                .direct_stream
+                                .then_some(self.opts.segment.compact_records),
                         )),
                         true,
                     );
@@ -17088,7 +17780,7 @@ impl Db {
     /// block is held until the segment closes and is not durable at a
     /// marker.
     fn goes_direct(&mut self, key: &[u8], value: &[u8]) -> bool {
-        if key.is_empty() || key <= self.max_key.as_slice() {
+        if key.is_empty() || key.len() > u16::MAX as usize || key <= self.max_key.as_slice() {
             return false;
         }
         // One value's run is the value itself (`encode_run`'s fixed form),
@@ -17442,6 +18134,7 @@ impl Db {
                 id,
                 committed: 0,
                 pending: std::collections::VecDeque::new(),
+                stream_from: 0,
             });
         }
         let mem = self.r.mem().clone();
@@ -17459,26 +18152,45 @@ impl Db {
             // allowance and grows with the file.
             mem.set_run(RunMap::open(&d.tmp, map_bytes)?, &shared.readers);
         }
-        for i in d.committed..mem.len() {
-            let e = mem.entry(i);
-            debug_assert_eq!(
-                e.count.load(AtomicOrdering::Relaxed),
-                1,
-                "an ordered entry has the one value it was appended with"
-            );
-            if put_one {
-                d.w.put_one(mem.key_of(e), mem.value_at(MemTable::head(e) as usize))?;
-            } else {
-                d.w.begin(mem.key_of(e))?;
-                d.w.value(mem.value_at(MemTable::head(e) as usize));
-                d.w.end_with(false)?;
+        if mem.stream {
+            // The records are in the table's stream already, laid out as
+            // the file takes them: the writer accounts for each and the
+            // batch goes to the file from the arena, its marker behind it.
+            if d.committed == 0 && d.stream_from == 0 {
+                d.w.set_stream_source(mem.clone());
             }
-            if refs {
-                let (at, len) = d.w.last_value_at();
-                d.pending.push_back((i, at, len));
+            for i in d.committed..mem.len() {
+                let e = mem.entry(i);
+                let (rec_len, tail_at, vlen) = mem.stream_record_shape(e);
+                d.w.put_encoded(mem.key_of(e), rec_len, tail_at, vlen)?;
             }
+            let to = mem.stream_tail();
+            d.w.stream_out(d.stream_from, to)?;
+            d.w.mark_stream(mem.stream_arena())?;
+            d.stream_from = mem.stream_tail();
+            mem.set_stream_committed(d.stream_from);
+        } else {
+            for i in d.committed..mem.len() {
+                let e = mem.entry(i);
+                debug_assert_eq!(
+                    e.count.load(AtomicOrdering::Relaxed),
+                    1,
+                    "an ordered entry has the one value it was appended with"
+                );
+                if put_one {
+                    d.w.put_one(mem.key_of(e), mem.value_at(MemTable::head(e) as usize))?;
+                } else {
+                    d.w.begin(mem.key_of(e))?;
+                    d.w.value(mem.value_at(MemTable::head(e) as usize));
+                    d.w.end_with(false)?;
+                }
+                if refs {
+                    let (at, len) = d.w.last_value_at();
+                    d.pending.push_back((i, at, len));
+                }
+            }
+            d.w.mark()?;
         }
-        d.w.mark()?;
         d.committed = mem.len();
         mem.commit();
         self.unsynced += 1;

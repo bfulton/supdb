@@ -704,6 +704,7 @@ fn one_pass(
     let mut kb = [0u8; KEY_SIZE];
     let mut g = KeyGen::new(KeyDist::Uniform, size, 7);
     let mut h = Hist::new();
+    phase_mark(arm, "read", "start");
     let t = Instant::now();
     for _ in 0..size {
         db_key_into(g.next(), &mut kb);
@@ -712,6 +713,7 @@ fn one_pass(
         h.record(t1.elapsed().as_nanos() as u64);
     }
     let read_s = t.elapsed().as_secs_f64();
+    phase_mark(arm, "read", "end");
 
     // The same reads over each thread count, on the store as loaded and
     // with the writer idle: the single-threaded pass's operations on every

@@ -418,6 +418,10 @@ pub struct Supdb {
     /// before `Options::direct_put_one`. `supdb-recordsteps`, and
     /// `supdb-ingestrecordsteps` buffered.
     recordsteps: bool,
+    /// A direct run's table holding a copy of each value, re-encoded at
+    /// the commit, the shape before `Options::direct_stream`.
+    /// `supdb-copyvals`, and `supdb-ingestcopyvals` buffered.
+    copyvals: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -644,6 +648,10 @@ struct Policy {
     /// before `Options::direct_put_one`. `supdb-recordsteps`, and
     /// `supdb-ingestrecordsteps` buffered.
     recordsteps: bool,
+    /// A direct run's table holding a copy of each value, re-encoded at
+    /// the commit, the shape before `Options::direct_stream`.
+    /// `supdb-copyvals`, and `supdb-ingestcopyvals` buffered.
+    copyvals: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -845,6 +853,7 @@ impl Default for Policy {
             populate: false,
             piece256: false,
             recordsteps: false,
+            copyvals: false,
             rankrecords: false,
             shape: false,
             adaptcap: None,
@@ -2287,6 +2296,31 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with a direct run's table copying each value and the commit
+    /// re-encoding it, the shape before `Options::direct_stream`.
+    pub fn create_copyvals(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                copyvals: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-copyvals`.
+    pub fn create_ingest_copyvals(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                copyvals: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` ranking a piece's keys over the partition's records, as
     /// before `Options::piece_ranks_by_heads`: against `supdb` it prices
     /// the ranking over the index's heads, on the segment work's thread.
@@ -2497,6 +2531,7 @@ impl Supdb {
             populate,
             piece256,
             recordsteps,
+            copyvals,
             rankrecords,
             shape,
             aheadmin,
@@ -2677,6 +2712,7 @@ impl Supdb {
             manifest_slots: !manifestrename,
             prefault: populate,
             direct_put_one: !recordsteps,
+            direct_stream: !copyvals && !refvals,
             // The scan phases timed where the arm asks, or where the
             // counters lines will read them: ten clock reads a scan.
             scan_timers: timers
@@ -2786,6 +2822,7 @@ impl Supdb {
             populate,
             piece256,
             recordsteps,
+            copyvals,
             rankrecords,
             shape,
             aheadmin,
@@ -3193,6 +3230,13 @@ impl Engine for Supdb {
                 "supdb-recordsteps"
             } else {
                 "supdb-ingestrecordsteps"
+            };
+        }
+        if self.copyvals {
+            return if self.partition {
+                "supdb-copyvals"
+            } else {
+                "supdb-ingestcopyvals"
             };
         }
         if self.rankrecords {
@@ -3892,6 +3936,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-populate"
         | "supdb-piece256"
         | "supdb-recordsteps"
+        | "supdb-copyvals"
         | "supdb-inlinemaint"
         | "supdb-adapt"
         | "supdb-adapttrig"
@@ -3952,6 +3997,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestpopulate"
         | "supdb-ingestpiece256"
         | "supdb-ingestrecordsteps"
+        | "supdb-ingestcopyvals"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
         | "supdb-ingestrankrecords"
@@ -4072,6 +4118,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestpiece256" => Box::new(Supdb::create_ingest_piece256(dir)?),
         "supdb-recordsteps" => Box::new(Supdb::create_recordsteps(dir)?),
         "supdb-ingestrecordsteps" => Box::new(Supdb::create_ingest_recordsteps(dir)?),
+        "supdb-copyvals" => Box::new(Supdb::create_copyvals(dir)?),
+        "supdb-ingestcopyvals" => Box::new(Supdb::create_ingest_copyvals(dir)?),
         "supdb-ingestsettlefreeze" => Box::new(Supdb::create_ingest_settlefreeze(dir)?),
         "supdb-ingestconvertcap" => Box::new(Supdb::create_ingest_convertcap(dir)?),
         "supdb-ingestshortpass" => Box::new(Supdb::create_ingest_shortpass(dir)?),

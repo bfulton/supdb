@@ -640,7 +640,7 @@ fn compacts(exts: &[Ext]) -> bool {
 
 /// A compact record's length: the header, the key padded to 4, the run's
 /// header, and the run padded to 4.
-fn record_len_compact(klen: usize, run: usize) -> usize {
+pub(crate) fn record_len_compact(klen: usize, run: usize) -> usize {
     align_up(4 + klen, REC_ALIGN) + 4 + align_up(run, REC_ALIGN)
 }
 
@@ -758,42 +758,69 @@ pub fn stream_record_as(
 /// begins within it, since the record is padded to its alignment after the
 /// tail: what a reader that keeps a reference to the tail's bytes in place
 /// of a copy needs from the one definition of the layout.
-pub fn stream_record_tail_at(
-    out: &mut Vec<u8>,
+/// The bytes a record of a key `klen` long, `exts` and a tail of `tail`
+/// bytes takes in `stream_record_tail_at`'s layout, compact where
+/// `compact` and the extents allow; `None` where no record can hold them.
+pub(crate) fn record_len_for(
+    klen: usize,
+    exts: &[Ext],
+    tail: usize,
+    compact: bool,
+) -> Option<usize> {
+    if klen > u16::MAX as usize || exts.len() >= COMPACT as usize {
+        return None;
+    }
+    Some(if compact && compacts(exts) {
+        record_len_compact(klen, tail)
+    } else {
+        record_len_tail(klen, exts.len(), tail)
+    })
+}
+
+/// Where such a record's tail begins within it.
+pub(crate) fn record_tail_at(klen: usize, exts: &[Ext], compact: bool) -> usize {
+    let at = align_up(4 + klen, REC_ALIGN);
+    if compact && compacts(exts) {
+        at + 4
+    } else {
+        at + exts.len() * EXT_BYTES
+    }
+}
+
+/// One record into `rec`, exactly `record_len_for` bytes of it, the
+/// padding zeroed wherever the slice came from; the tail's offset within
+/// the record is returned. The one definition of the layout that
+/// `stream_record_tail_at` and a writer laying records out in place share.
+pub(crate) fn record_into(
+    rec: &mut [u8],
     key: &[u8],
     exts: &[Ext],
     tail: &[u8],
     compact: bool,
-) -> Option<(usize, usize)> {
-    if key.len() > u16::MAX as usize || exts.len() >= COMPACT as usize {
-        return None;
-    }
+) -> usize {
+    rec[0..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+    rec[4..4 + key.len()].copy_from_slice(key);
+    let at = align_up(4 + key.len(), REC_ALIGN);
+    rec[4 + key.len()..at].fill(0);
     if compact && compacts(exts) {
         debug_assert_eq!(
             tail.len(),
             exts[0].len as usize,
             "a compact run is its tail"
         );
-        let len = record_len_compact(key.len(), tail.len());
-        let base = out.len();
-        out.resize(base + len, 0);
-        let rec = &mut out[base..];
-        rec[0..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+        debug_assert_eq!(rec.len(), record_len_compact(key.len(), tail.len()));
         rec[2..4].copy_from_slice(&COMPACT.to_le_bytes());
-        rec[4..4 + key.len()].copy_from_slice(key);
-        let at = align_up(4 + key.len(), REC_ALIGN);
         rec[at..at + 4].copy_from_slice(&compact_header(&exts[0]));
         rec[at + 4..at + 4 + tail.len()].copy_from_slice(tail);
-        return Some((len, at + 4));
+        rec[at + 4 + tail.len()..].fill(0);
+        return at + 4;
     }
-    let len = record_len_tail(key.len(), exts.len(), tail.len());
-    let base = out.len();
-    out.resize(base + len, 0);
-    let rec = &mut out[base..];
-    rec[0..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
+    debug_assert_eq!(
+        rec.len(),
+        record_len_tail(key.len(), exts.len(), tail.len())
+    );
     rec[2..4].copy_from_slice(&(exts.len() as u16).to_le_bytes());
-    rec[4..4 + key.len()].copy_from_slice(key);
-    let mut at = align_up(4 + key.len(), REC_ALIGN);
+    let mut at = at;
     for e in exts {
         rec[at..at + 4].copy_from_slice(&e.block.to_le_bytes());
         rec[at + 4..at + 8].copy_from_slice(&e.off.to_le_bytes());
@@ -803,7 +830,22 @@ pub fn stream_record_tail_at(
         at += EXT_BYTES;
     }
     rec[at..at + tail.len()].copy_from_slice(tail);
-    Some((len, at))
+    rec[at + tail.len()..].fill(0);
+    at
+}
+
+pub fn stream_record_tail_at(
+    out: &mut Vec<u8>,
+    key: &[u8],
+    exts: &[Ext],
+    tail: &[u8],
+    compact: bool,
+) -> Option<(usize, usize)> {
+    let len = record_len_for(key.len(), exts, tail.len(), compact)?;
+    let base = out.len();
+    out.resize(base + len, 0);
+    let tail_at = record_into(&mut out[base..], key, exts, tail, compact);
+    Some((len, tail_at))
 }
 
 /// The section header and the trailer for a records-first section: the

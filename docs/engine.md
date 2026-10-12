@@ -3482,6 +3482,70 @@ changes is one phase's alone and nothing else in the load can have
 moved; every read, scan, lag and mix cell was level in all four
 pairings.
 
+#### The table's arena as the record stream, and the folios a write leaves
+
+The fourth lever takes the staged copy away altogether: under
+`Options::direct_stream` the ordered table's arena holds each record as
+the file takes it -- the key, the one-value compact extent and the
+value, laid out by `flatindex::record_into` at the append -- and the
+table's heads reference the value inside its record, so a read of a key
+in the run in progress decodes nothing it did not before. At the commit
+the segment writer accounts for each record (`put_encoded`), hashes the
+batch's bytes from the arena for its marker and for the key section's
+checksum row, and lays the marker into the arena behind them; the file
+takes the arena's bytes directly, a whole write piece at a time as the
+buffer path's pieces reached it, and the tail of a batch waits in the
+arena -- it is the table's, and goes nowhere -- for the piece it
+completes, or for the sync or the close. The copy count between the
+caller's slice and the file is one, the kernel's. A record that would
+straddle an arena block is laid in two parts and its value copied once
+for the reads; a key over 65,535 bytes does not enter a run. The bytes
+are the buffer path's byte for byte, which `tests/db.rs` requires of the
+finished segments and of the file a crash leaves under both shapes,
+with the same batches recovered from each.
+
+It took four shapes to price, and the first three lost for reasons that
+had nothing to do with the copies. The first wrote and hinted at the
+checksum row's piece, 16 KB, which the hashing walks: seventy-seven
+`sync_file_range` calls and ninety-seven writes over a load of ten
+thousand keys where the buffer path made two and three, a tenth of the
+writer's thread in the virtio doorbell and a fifth more in the kernel's
+copy, the commits at three times their time; `strace` counted them
+after a profile had named the symbols. The second wrote the batch at
+every commit, in one write of its hundred and sixteen kilobytes at
+whatever offset it fell on: the commits came in under the buffer
+path's, and every read over the segment trailed, by 3-9% at three
+hundred thousand keys and in the read's p99 at every rung, over a file
+byte for byte the same -- the kernel sizes a page-cache folio by the
+write that creates it and the alignment of its offset, and twenty-two
+writes of a batch left ten times the folios two writes of a megabyte
+did. The third held the stream for whole pieces and lost 3% on the
+reads still: nine of a 40 MB partition's forty megabytes were ladders
+of 512 KB down to 4 KB where the buffer's were one folio each, read
+from `/proc/kpageflags` over the mapping, because a piece that spanned
+an arena block went to the file in two writes, the second at the
+offset the block's end fell on. A piece goes as one `writev` now, its
+arena parts the vector, and the close's tail rides the index's first
+buffered write the same way, so the two shapes leave the page cache in
+the same folios but for the head's eight kilobytes.
+
+By the load's phases at ten thousand keys the commits read 1.77 ms
+against 2.26 and 1.73 against 2.12 in the two sittings of the whole-piece
+shape, below in 21 loads of 26, the writer's faults 919 to 668 -- the
+staged copy's pages, as predicted -- its CPU 2.8 ms to 2.3, the drain
+level; by rate the buffered ordered load read 1.107x and 1.118x and
+1.117x in three sittings at ten thousand keys, two of them at p < .01,
+and 1.137x, 1.095x and 0.958x in twelve pairs at three hundred thousand,
+where the rate does not resolve a tenth against the host. With the folios the same the read
+side was level for the first time: the read's p99 at ten thousand keys
+read 1.02x and 0.99x in the two pairings where the three shapes before
+had read 1.15-1.30x, and at three hundred thousand the point reads read
+0.99x and the p99 1.01x, in twelve pairs, where the shapes before had
+read 0.91x, 0.96x and 0.97x and 1.06x, 1.03x and 1.03x. The shuffled load, which never
+enters a run, read level throughout. The copies are the arm now
+(`supdb-copyvals` and `supdb-ingestcopyvals`), and the references into
+the run's file (`supdb-refvals`) stay the third shape beside them.
+
 #### The piece's ranks over the heads, and a locked exchange to look at a form
 
 Every written key's rank in its partition is computed by three parties:
@@ -3829,8 +3893,9 @@ to the other arena every piece: the buffered writer's faults fell from
 loads read 1.04x and 1.05x at three hundred thousand and a hundred
 thousand keys in twelve pairs, short of significance and of the tenth the
 lever was registered to move; the durable load 1.03x, every read cell
-level. The copies ship and the references are the arm. What is left of
-the table -- its entries at thirty-two bytes a key, its keys, the staged
+level. The references are the arm, and the copies were the shape that
+shipped until the table's arena became the record stream (below). What
+is left of the table -- its entries at thirty-two bytes a key, its keys, the staged
 copy -- is as much as the arena was, and the shape not yet priced is a
 run that keeps no table, serving its reads from the segment writer's own
 sorted keys and record offsets. Priced again at ten thousand keys once
