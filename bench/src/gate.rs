@@ -34,13 +34,14 @@ pub const MIN_HISTORY: usize = 3;
 
 /// Which way is worse. Every quantity a workload records is named here;
 /// one that is not is an error, never a guess. The threaded read and scan
-/// quantities are one per count in `run::THREADS`, and a count added
-/// there is named here or `every_threaded_quantity_is_named` fails --
-/// before a run has paid for the measurement the gate would refuse.
+/// quantities are named by their suffix (`run::threads_of`), one per count
+/// in `run::thread_counts`, and `every_threaded_quantity_is_named` holds
+/// every count a machine of up to sixty-four cores runs -- before a run
+/// has paid for a measurement the gate would refuse.
 pub fn higher_is_better(quantity: &str) -> Option<bool> {
     Some(match quantity {
         "ops_per_s" | "reads_per_s" | "entries_per_s" | "bytes_per_s" | "pages_per_s" => true,
-        "reads_per_s_2t" | "reads_per_s_4t" | "entries_per_s_2t" | "entries_per_s_4t" => true,
+        q if crate::run::threads_of(q).is_some() => true,
         "entries_per_s_lag0pct" | "entries_per_s_lag1pct" => true,
         "entries_per_s_lag10pct" | "entries_per_s_lag100pct" => true,
         "updates_per_s_lag1pct" | "updates_per_s_lag10pct" | "updates_per_s_lag100pct" => true,
@@ -973,17 +974,20 @@ mod tests {
         assert!(!rep.regressed());
     }
 
-    /// One name per thread count the runner measures at. Kept in step
-    /// here rather than derived, since a derived direction is a guess
-    /// about a quantity nobody has looked at.
+    /// One name per thread count the runner measures at, on any machine
+    /// the suite runs on: the names are a pattern over the two bases a
+    /// threaded pass has, and nothing else carries the suffix.
     #[test]
     fn every_threaded_quantity_is_named() {
-        for t in crate::run::THREADS {
-            for base in ["reads_per_s", "entries_per_s"] {
-                let q = crate::run::threaded_quantity(base, t);
-                assert_eq!(higher_is_better(&q), Some(true), "{q} is not named");
+        for cpus in 1..=64 {
+            for t in crate::run::thread_counts(cpus) {
+                for base in ["reads_per_s", "entries_per_s"] {
+                    let q = crate::run::threaded_quantity(base, t);
+                    assert_eq!(higher_is_better(&q), Some(true), "{q} is not named");
+                }
             }
         }
+        assert_eq!(higher_is_better("ops_per_s_2t"), None);
     }
 
     #[test]

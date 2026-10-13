@@ -164,7 +164,12 @@ fn cmd_ab(a: Args) -> i32 {
     }
     let size = a.num("--size").unwrap_or(100_000);
     let reps = a.num("--reps").unwrap_or(12).max(1) as usize;
-    let mut plan = run::Plan::new(Scale::Quick, vec![a0.clone(), b0.clone()], size);
+    let mut plan = run::Plan::new(
+        Scale::Quick,
+        vec![a0.clone(), b0.clone()],
+        size,
+        env::capture().cpus,
+    );
     if let Some(l) = a.num("--len") {
         plan.scan_len = (l as usize).max(1);
     }
@@ -254,7 +259,7 @@ fn cmd_run(a: Args) -> i32 {
         Scale::Quick => 300_000,
         Scale::Full => run::full_top(machine.mem_total_kb, 100),
     });
-    let mut plan = run::Plan::new(scale, arms, top);
+    let mut plan = run::Plan::new(scale, arms, top, machine.cpus);
     if let Some(b) = a.num("--bottom") {
         // Refused rather than run, because a bottom above the top leaves an
         // empty ladder, and a row with no measurements in it is a run that

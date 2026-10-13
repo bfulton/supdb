@@ -30,11 +30,30 @@ pub const FLOOR_ARM: &str = "floor";
 /// The reader-thread counts `read` and `scan` run at beside their
 /// single-threaded pass, each a quantity of its own (`reads_per_s_2t`)
 /// on the same workload, so a row shows where an arm's throughput stops
-/// scaling. Two and four, because the class the suite gates on has four
-/// cores; a class with more runs the same counts, since the counts name
-/// the quantities and the gate names every quantity. A count added here
-/// is named in `gate::higher_is_better`, or the gate's test says so.
-pub const THREADS: [usize; 2] = [2, 4];
+/// scaling: two, doubling, and one fewer than the machine's cores as the
+/// top. The top was the core count, and a pass with as many readers as
+/// cores shares them with the harness's thread, the engines' own threads
+/// and the host: its cells read two to four times the spread of the
+/// counts below, for every engine, and our ratio to LMDB on them swung
+/// from 0.65x to 2.1x across rows where the counts below sat within a
+/// fifth. The counts derive from the class's core count, which the class
+/// is keyed on, so a class runs one set and names one set of quantities,
+/// and a machine of two cores runs none. `gate::higher_is_better` names
+/// the threaded quantities by their suffix, and its test derives the
+/// counts from here.
+pub fn thread_counts(cpus: usize) -> Vec<usize> {
+    let top = cpus.saturating_sub(1);
+    let mut counts = Vec::new();
+    let mut t = 2;
+    while t < top {
+        counts.push(t);
+        t *= 2;
+    }
+    if top >= 2 {
+        counts.push(top);
+    }
+    counts
+}
 
 /// The quantity `base` measured over `threads` reader threads:
 /// `reads_per_s_4t`.
@@ -66,10 +85,13 @@ pub struct Plan {
     pub value_size: usize,
     pub batch: usize,
     pub scan_len: usize,
+    /// The reader-thread counts of this machine's class (`thread_counts`).
+    pub threads: Vec<usize>,
 }
 
 impl Plan {
-    pub fn new(scale: Scale, arms: Vec<String>, top: u64) -> Plan {
+    /// `cpus` is the machine's core count as the class records it.
+    pub fn new(scale: Scale, arms: Vec<String>, top: u64, cpus: usize) -> Plan {
         Plan {
             scale,
             arms,
@@ -79,6 +101,7 @@ impl Plan {
             value_size: VALUE_SIZE,
             batch: 1_000,
             scan_len: 100,
+            threads: thread_counts(cpus),
         }
     }
 }
@@ -583,7 +606,7 @@ pub fn run(
                         s.push("scan-mixed", sz, arm, g, (q.as_str(), "entries/s"), *v);
                     }
                 }
-                let top = *THREADS.last().unwrap_or(&1);
+                let top = *plan.threads.last().unwrap_or(&1);
                 let at_top = |v: &[(usize, f64)]| {
                     v.iter()
                         .find(|(t, _)| *t == top)
@@ -703,7 +726,7 @@ struct OnePass {
     /// Each lag point's burst: the updates it wrote over the time it took
     /// to write them, its last batch flushed.
     burst_lag: Vec<(u64, f64)>,
-    /// The same reads and scans again over each count in `THREADS`:
+    /// The same reads and scans again over each count in `Plan::threads`:
     /// (threads, aggregate throughput).
     reads_s_threaded: Vec<(usize, f64)>,
     scan_entries_s_threaded: Vec<(usize, f64)>,
@@ -812,8 +835,8 @@ fn one_pass(
     // scans were over in the time a thread takes to wake. Every key was
     // loaded with one value of `value_size` bytes, and that is what each
     // thread must read back.
-    let mut reads_s_threaded = Vec::with_capacity(THREADS.len());
-    for threads in THREADS {
+    let mut reads_s_threaded = Vec::with_capacity(plan.threads.len());
+    for &threads in &plan.threads {
         let ops = size * threads as u64;
         let (secs, bytes) = threaded(e.as_ref(), threads, ops, size, 0x7EAD, Op::Get)?;
         let want = ops * plan.value_size as u64;
@@ -838,8 +861,8 @@ fn one_pass(
 
     // And the same scans. Every start is at least `scan_len` below the
     // top, so every scan walks `scan_len` loaded entries.
-    let mut scan_entries_s_threaded = Vec::with_capacity(THREADS.len());
-    for threads in THREADS {
+    let mut scan_entries_s_threaded = Vec::with_capacity(plan.threads.len());
+    for &threads in &plan.threads {
         let ops = scans * threads as u64;
         let (secs, bytes) = threaded(
             e.as_ref(),
@@ -907,8 +930,8 @@ fn one_pass(
     // clean partitions. Every thread's bytes are at least the loaded
     // store's, since a mix only adds to a key; what an engine adds for
     // an update is its own and is not held to.
-    let mut scan_mixed_threaded = Vec::with_capacity(THREADS.len());
-    for threads in THREADS {
+    let mut scan_mixed_threaded = Vec::with_capacity(plan.threads.len());
+    for &threads in &plan.threads {
         let ops = scans * threads as u64;
         let (secs, bytes) = threaded(
             e.as_ref(),
@@ -1958,6 +1981,17 @@ mod tests {
         }
     }
 
+    /// Two, doubling, and one fewer than the cores; none on two cores.
+    #[test]
+    fn the_thread_counts_stop_one_short_of_the_cores() {
+        assert_eq!(thread_counts(4), vec![2, 3]);
+        assert_eq!(thread_counts(8), vec![2, 4, 7]);
+        assert_eq!(thread_counts(16), vec![2, 4, 8, 15]);
+        assert_eq!(thread_counts(3), vec![2]);
+        assert_eq!(thread_counts(2), Vec::<usize>::new());
+        assert_eq!(thread_counts(1), Vec::<usize>::new());
+    }
+
     #[test]
     fn a_threaded_quantity_names_its_count_and_nothing_else_does() {
         assert_eq!(threaded_quantity("reads_per_s", 4), "reads_per_s_4t");
@@ -1983,7 +2017,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("supdb-bench-threaded-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let plan = Plan::new(Scale::Quick, vec![], 10_000);
+        let plan = Plan::new(Scale::Quick, vec![], 10_000, 4);
         let payload = Payload::new(plan.value_size, 0.5, 0xE1);
         let size = 2_000u64;
         for arm in ["supdb", "supdb-ingest", "lmdb", "rocksdb-tuned"] {

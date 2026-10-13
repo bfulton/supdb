@@ -16,8 +16,8 @@ The workloads below, plus four floors. Each yields one or more quantities.
 |---|---|---|
 | `load` | n keys in key order, 100-byte values, durable per batch | ops/s, device bytes written per byte stored, bytes on disk per byte stored |
 | `load-shuffled` | the same keys in shuffled order | ops/s |
-| `read` | uniform point reads over the loaded set, on one thread and again on 2 and on 4 | reads/s, p99 µs; reads/s per thread count |
-| `scan` | `size/100` scans of 100 entries, from uniform random starts, on one thread and again on 2 and on 4 | entries/s; entries/s per thread count |
+| `read` | uniform point reads over the loaded set, on one thread and again on each of the class's reader-thread counts: two, doubling, one fewer than its cores | reads/s, p99 µs; reads/s per thread count |
+| `scan` | `size/100` scans of 100 entries, from uniform random starts, on one thread and again on each of the class's reader-thread counts | entries/s; entries/s per thread count |
 | `ycsb` | core A–F on the loaded store, zipfian, a sixth of the keys in operations per mix | ops/s per mix |
 | `scan-lag` | on the store the shuffled load leaves, the keys updated in slices to 0, 1, 10 and 100% of the store, each slice a burst of batches followed by the `scan` workload's scans with nothing merged between | entries/s of each point's scans; updates/s of each point's burst |
 | `wal-floor` | framed 1,000-record batches appended to one file, one `fdatasync` each, no engine | ops/s |
@@ -116,18 +116,24 @@ inserts: the latest distribution needs a Zipfian over a count that grows
 with every insert, and tracking that is not a cost to charge the engines.
 
 Every workload runs one thread against the engine, and `read` and `scan`
-run again on two and on four reader threads, so a row shows where an
-arm's throughput stops scaling against LMDB and RocksDB at the same
-count. Each count is a quantity of its own on the workload it repeats:
-`reads_per_s_2t`, `reads_per_s_4t`, `entries_per_s_2t`,
-`entries_per_s_4t`. The threaded passes run on the store as loaded, after
+run again on each reader-thread count of the machine's class -- two,
+doubling, and one fewer than its cores as the top; two and three on four
+cores -- so a row shows where an arm's throughput stops scaling against
+LMDB and RocksDB at the same count. Each count is a quantity of its own
+on the workload it repeats: `reads_per_s_2t`, `entries_per_s_3t`. The
+top stops one short of the cores because a pass with as many readers as
+cores shares them with the harness's thread, the engines' own threads and
+the host: at the core count the cells read two to four times the spread
+of the counts below, within a row and across rows, for every engine, and
+the class is keyed on the core count, so one class runs one set of counts
+and names one set of quantities. The threaded passes run on the store as loaded, after
 the single-threaded pass they repeat and before the mixes, with the writer
 idle. Every thread reads through a handle of its own -- supdb's
 `Db::reader`, an LMDB read transaction begun on the thread, RocksDB's
 shared handle -- and draws its keys from a uniform generator seeded apart
 from the others'. Every thread runs the single-threaded pass's
-operations, so a pass on four threads is as long as the pass on one and
-not a quarter of it, and the quantity is total operations over the pass;
+operations, so a pass on three threads is as long as the pass on one and
+not a third of it, and the quantity is total operations over the pass;
 they are released together, each times itself from its release to its
 finish, and the quantity is the aggregate throughput over the span from
 the first release to the last finish, so the spawning and the opening are

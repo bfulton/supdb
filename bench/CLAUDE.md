@@ -321,6 +321,25 @@ at a sample's; and when the quantity is the machine's and the
 measurement cannot be made independent of it, make the measurement
 independent of it and read the quantity beside it.
 
+**As many reader threads as cores measures the scheduler.** The
+threaded passes ran on two and on four threads, four being the gating
+class's cores, and the four-thread cells read two to four times the
+spread of the one- and two-thread cells within a row and across rows --
+23-29% against 3-10% at thirty thousand keys -- for LMDB as much as for
+supdb, and LMDB runs no thread of its own. Four readers on four vCPUs
+share them with the harness's thread, the engines' threads, the kernel
+and the host, so the cell was the scheduler's and read our ratio to LMDB
+on the 30k scans from 0.65x to 2.1x across rows where the counts below
+sat within a fifth. The counts derive from the class's cores now
+(`run::thread_counts`): two, doubling, and one fewer than the cores as
+the top, which keeps one core for everything a reader is not. The gate
+names the threaded quantities by their suffix and its test derives the
+counts from the same function for every core count, so a count can
+never be measured and then refused. The rule: a cell that reads the
+machine for both engines is the machine's, and a count of threads that
+leaves nothing for the rest of the process measures the rest of the
+process.
+
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`
