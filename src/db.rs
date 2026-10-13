@@ -1497,6 +1497,17 @@ pub struct Options {
     /// `supdb-ordlog` and `supdb-ingestordlog`: the ordered table keeps
     /// the log as a hash table does.
     pub direct_log_range: bool,
+    /// An ordered table's entry is one word (`MemTable::slim`): the record's
+    /// offset in the stream, the key's length and the value's, from which
+    /// the key's place and the head are arithmetic and the key and value
+    /// are read in the record, where a lookup reads them anyway. The
+    /// twenty-four byte entry stays for a record that straddles a block of
+    /// the stream, a key copied past the bias or a value over sixty-four
+    /// kilobytes, behind a flag bit in the word. A load first-touches each
+    /// entry once, and the entries were half of a load's fresh pages at
+    /// three hundred thousand keys. Off, the arm `supdb-fatentries` and
+    /// `supdb-ingestfatentries`: every entry twenty-four bytes.
+    pub direct_slim_entries: bool,
     /// Bytes the mapping of a direct run's segment starts with; zero, the
     /// default, twice `seal_bytes`. The mapping grows when the run's file
     /// outgrows it. For a test of the growth.
@@ -1762,6 +1773,7 @@ impl Default for Options {
             direct_recycle: true,
             direct_keys_in_stream: true,
             direct_log_range: true,
+            direct_slim_entries: true,
             direct_map_bytes: 0,
             forms_settle_recent_pct: 0,
             forms_carry: true,
@@ -5561,6 +5573,11 @@ struct MemTable {
     /// entries' range, nothing is pushed to `log`, and `log_len` is the
     /// entry count.
     log_range: bool,
+    /// `ordered` and `stream` with `Options::direct_slim_entries`: an
+    /// entry is a word of `slim`, and `entries` holds only the fat ones a
+    /// word points at with `SLIM_FAT`.
+    slim_entries: bool,
+    slim: Slab<u64>,
     /// With `refs`, the second staging arena: a value stays a copy until
     /// the writer's buffer has carried its record to the file, which is a
     /// piece of a megabyte at a time, so the chunks of several commits
@@ -5720,10 +5737,52 @@ struct MemEntry {
 }
 
 impl MemEntry {
+    /// The chain's newest chunk, `NO_CHUNK` for none.
+    fn chain_head(&self) -> u64 {
+        match self.head.load(AtomicOrdering::Acquire) {
+            0 => NO_CHUNK,
+            h => h - 1,
+        }
+    }
+}
+
+/// An entry as a reader has it, whichever shape the table keeps it in: the
+/// chain's head (`NO_CHUNK` for none), the key's span and its chunk count,
+/// taken once; the writer's stores go to the fat entry itself
+/// (`MemTable::fat`). The lifetime is the table's, as a borrowed entry's
+/// was.
+#[derive(Clone, Copy)]
+struct Entry<'a> {
+    head: u64,
+    key_off: u32,
+    klen: u16,
+    count: u32,
+    _table: std::marker::PhantomData<&'a MemTable>,
+}
+
+impl<'a> Entry<'a> {
+    fn fat(e: &'a MemEntry) -> Entry<'a> {
+        Entry {
+            head: e.chain_head(),
+            key_off: e.key_off,
+            klen: e.klen,
+            count: e.count.load(AtomicOrdering::Relaxed),
+            _table: std::marker::PhantomData,
+        }
+    }
+
     fn key_len(&self) -> u32 {
         u32::from(self.klen)
     }
 }
+
+/// A slim word (`Options::direct_slim_entries`): the record's stream
+/// offset above `SLIM_REC_SHIFT`, the key's length above `SLIM_KLEN_SHIFT`,
+/// the value's in the low sixteen bits, or `SLIM_FAT` over the number of
+/// the fat entry that holds it.
+const SLIM_FAT: u64 = 1 << 63;
+const SLIM_REC_SHIFT: u32 = 32;
+const SLIM_KLEN_SHIFT: u32 = 16;
 
 /// The index's slot for a hash, from the half the entry keeps.
 fn slot_of(hash: u64, mask: usize) -> usize {
@@ -6656,6 +6715,8 @@ impl MemTable {
             stream_base: AtomicU64::new(0),
             keys_in_stream: false,
             log_range: false,
+            slim_entries: false,
+            slim: Slab::new(),
             vals2: ByteArena::new(prefault),
             staging: UnsafeCell::new(Staging::default()),
             keys: ByteArena::new(prefault),
@@ -6681,6 +6742,7 @@ impl MemTable {
         recycle: bool,
         keys_in_stream: bool,
         log_range: bool,
+        slim_entries: bool,
     ) -> MemTable {
         debug_assert!(!(refs && stream.is_some()), "two shapes of one table");
         MemTable {
@@ -6698,6 +6760,8 @@ impl MemTable {
             stream_base: AtomicU64::new(0),
             keys_in_stream: stream.is_some() && keys_in_stream,
             log_range,
+            slim_entries: stream.is_some() && keys_in_stream && slim_entries,
+            slim: Slab::new(),
             vals2: ByteArena::new(prefault),
             staging: UnsafeCell::new(Staging::default()),
             keys: ByteArena::new(prefault),
@@ -6719,7 +6783,7 @@ impl MemTable {
     /// the log is the entries' range (`log_range`).
     fn log_len(&self) -> usize {
         if self.log_range {
-            self.entries.len()
+            self.len()
         } else {
             self.log.len()
         }
@@ -6740,7 +6804,7 @@ impl MemTable {
     fn log_write(&self, id: usize, new: bool) {
         if self.log_range {
             debug_assert!(
-                new && id + 1 == self.entries.len(),
+                new && id + 1 == self.len(),
                 "an ordered table's writes are its entries, in order"
             );
             return;
@@ -6756,18 +6820,56 @@ impl MemTable {
     }
 
     fn len(&self) -> usize {
-        self.entries.len()
+        if self.slim_entries {
+            self.slim.len()
+        } else {
+            self.entries.len()
+        }
     }
 
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    fn entry(&self, id: usize) -> &MemEntry {
+    /// Entry `id`, whichever shape it is kept in.
+    fn entry(&self, id: usize) -> Entry<'_> {
+        if !self.slim_entries {
+            return Entry::fat(self.entries.get(id));
+        }
+        let w = *self.slim.get(id);
+        if w & SLIM_FAT != 0 {
+            return Entry::fat(self.entries.get((w & !SLIM_FAT) as usize));
+        }
+        self.slim_entry(w)
+    }
+
+    /// Writer: entry `id` as the twenty-four byte entry a hash table
+    /// keeps, for the chain's head and count it stores to; an ordered
+    /// table's entries are written once and never reached here.
+    fn fat(&self, id: usize) -> &MemEntry {
+        debug_assert!(!self.slim_entries, "a slim entry is never stored to");
         self.entries.get(id)
     }
 
-    fn key_of(&self, e: &MemEntry) -> &[u8] {
+    /// A slim word's entry (`Options::direct_slim_entries`): the key at
+    /// `RECORD_KEY_AT` in its record, the head the record's tail as the
+    /// append packed it (`push_record`), one value.
+    fn slim_entry(&self, w: u64) -> Entry<'_> {
+        let rec = (w >> SLIM_REC_SHIFT) as usize;
+        let klen = ((w >> SLIM_KLEN_SHIFT) & 0xffff) as u16;
+        let vlen = (w & 0xffff) as u32;
+        let (ext, _) = MemTable::stream_ext(vlen as usize);
+        let tail_at = flatindex::record_tail_at(usize::from(klen), &[ext], self.stream_compact);
+        Entry {
+            head: REF_STREAM | ref_pack((rec + tail_at) as u64, vlen),
+            key_off: (rec + flatindex::RECORD_KEY_AT) as u32,
+            klen,
+            count: 1,
+            _table: std::marker::PhantomData,
+        }
+    }
+
+    fn key_of(&self, e: Entry<'_>) -> &[u8] {
         self.key_at(e.key_off, e.key_len())
     }
 
@@ -6800,7 +6902,12 @@ impl MemTable {
 
     /// A hint to fetch an entry's line; nothing is read.
     fn prefetch_entry(&self, id: usize) {
-        let e: *const MemEntry = self.entry(id);
+        if self.slim_entries {
+            let w: *const u64 = self.slim.get(id);
+            prefetch_lines(w as *const u8, std::mem::size_of::<u64>());
+            return;
+        }
+        let e: *const MemEntry = self.entries.get(id);
         prefetch_lines(e as *const u8, std::mem::size_of::<MemEntry>());
     }
 
@@ -6858,11 +6965,8 @@ impl MemTable {
     }
 
     /// The offset of the entry's newest chunk, or `NO_CHUNK`.
-    fn head(e: &MemEntry) -> u64 {
-        match e.head.load(AtomicOrdering::Acquire) {
-            0 => NO_CHUNK,
-            h => h - 1,
-        }
+    fn head(e: Entry<'_>) -> u64 {
+        e.head
     }
 
     /// Writer: the entries from `n` on forgotten; see `Slab::truncate`.
@@ -6881,6 +6985,15 @@ impl MemTable {
                 }
             }
         }
+        if self.slim_entries {
+            // The fat entries the truncated words point at go with them.
+            let fat_gone = (n..self.slim.len())
+                .filter(|&i| *self.slim.get(i) & SLIM_FAT != 0)
+                .count();
+            self.entries.truncate(self.entries.len() - fat_gone);
+            self.slim.truncate(n);
+            return;
+        }
         self.entries.truncate(n);
     }
 
@@ -6891,7 +7004,7 @@ impl MemTable {
         let n = self.mark.load(AtomicOrdering::Relaxed) + 1;
         let m = &self.marks[(n & 1) as usize];
         m.log.store(self.log_len(), AtomicOrdering::Release);
-        m.len.store(self.entries.len(), AtomicOrdering::Release);
+        m.len.store(self.len(), AtomicOrdering::Release);
         // With references a head is a position in one of two arenas or
         // in the file, none of them one order, and an entry has the one
         // chunk it was appended with: what hides a staged entry from a
@@ -6959,8 +7072,8 @@ impl MemTable {
             return;
         }
         if let Some(id) = self.probe(hash, key) {
-            let e = self.entry(id);
-            let prev = MemTable::head(e);
+            let e = self.fat(id);
+            let prev = e.chain_head();
             let off = match value {
                 Some(v) => self.push_chunk(prev, v),
                 None => self.push_tomb(prev),
@@ -6990,8 +7103,8 @@ impl MemTable {
     fn put(&self, hash: u64, key: &[u8], value: &[u8], rd: &Readers) {
         assert!(!self.ordered, "a put never reaches an ordered memtable");
         if let Some(id) = self.probe(hash, key) {
-            let e = self.entry(id);
-            let tomb = self.push_tomb(MemTable::head(e));
+            let e = self.fat(id);
+            let tomb = self.push_tomb(e.chain_head());
             let off = self.push_chunk(tomb, value);
             e.head.store(off + 1, AtomicOrdering::Release);
             e.count.store(1, AtomicOrdering::Relaxed);
@@ -6999,8 +7112,8 @@ impl MemTable {
             return;
         }
         let id = self.new_entry(hash, key, None);
-        let e = self.entry(id);
-        let off = self.push_chunk(MemTable::head(e), value);
+        let e = self.fat(id);
+        let off = self.push_chunk(e.chain_head(), value);
         e.head.store(off + 1, AtomicOrdering::Release);
         e.count.store(1, AtomicOrdering::Relaxed);
         self.index_insert(hash, id, rd);
@@ -7058,6 +7171,22 @@ impl MemTable {
             key.len() <= usize::from(u16::MAX),
             "a key fits a record's length word"
         );
+        if self.slim_entries {
+            debug_assert!(value.is_some(), "a slim table takes no tombstone");
+            // A word where the record holds the key in place, the value
+            // in place and short enough, and the record's offset fits.
+            if let Some(w) = self.slim_pack(off, key_off, key.len()) {
+                return self.slim.push(w);
+            }
+            let fat = self.entries.push(MemEntry {
+                hash: (hash >> 32) as u32,
+                key_off,
+                klen: key.len() as u16,
+                head: AtomicU64::new(off + 1),
+                count: AtomicU32::new(count),
+            });
+            return self.slim.push(SLIM_FAT | fat as u64);
+        }
         self.entries.push(MemEntry {
             hash: (hash >> 32) as u32,
             key_off,
@@ -7065,6 +7194,23 @@ impl MemTable {
             head: AtomicU64::new(off + 1),
             count: AtomicU32::new(count),
         })
+    }
+
+    /// The slim word for a stream record whose head is `head`, whose key
+    /// is at `key_off` and `klen` long; `None` where the record needs the
+    /// fat entry: a key copied (`KEYS_BIAS`), a value copied across a
+    /// seam (`REF_ARENA2`) or longer than the word's field, or a record
+    /// past the offset the word holds.
+    fn slim_pack(&self, head: u64, key_off: u32, klen: usize) -> Option<u64> {
+        if key_off & KEYS_BIAS != 0 || head & REF_ARENA2 != 0 {
+            return None;
+        }
+        let vlen = head & REF_LEN_MASK;
+        let rec = key_off as usize - flatindex::RECORD_KEY_AT;
+        if vlen > 0xffff || klen > 0xffff || rec >= 1 << 31 {
+            return None;
+        }
+        Some(((rec as u64) << SLIM_REC_SHIFT) | ((klen as u64) << SLIM_KLEN_SHIFT) | vlen)
     }
 
     /// Writer: entry `id` into the index at `hash`, after a rebuild when
@@ -7089,7 +7235,7 @@ impl MemTable {
         let cap = old.slots.len() * 2;
         let fresh = Index::with_slots(cap);
         for id in 0..self.len() {
-            let hash = u64::from(self.entry(id).hash) << 32;
+            let hash = u64::from(self.fat(id).hash) << 32;
             let mut i = slot_of(hash, fresh.mask);
             while fresh.slots[i].load(AtomicOrdering::Relaxed) != 0 {
                 i = (i + 1) & fresh.mask;
@@ -7212,7 +7358,7 @@ impl MemTable {
     /// `stream` only: entry `e`'s record as the segment writer accounts
     /// for it -- its length, its tail's offset within it, its value's
     /// length -- from the one definition of the layout the append used.
-    fn stream_record_shape(&self, e: &MemEntry) -> (usize, usize, u32) {
+    fn stream_record_shape(&self, e: Entry<'_>) -> (usize, usize, u32) {
         debug_assert!(self.stream);
         let vlen = (MemTable::head(e) & REF_LEN_MASK) as u32;
         let (ext, tail_len) = MemTable::stream_ext(vlen as usize);
@@ -7340,7 +7486,7 @@ impl MemTable {
     }
 
     /// `stream_rec_off` with entry `i` in hand.
-    fn stream_rec_off_of(&self, i: usize, e: &MemEntry) -> usize {
+    fn stream_rec_off_of(&self, i: usize, e: Entry<'_>) -> usize {
         debug_assert!(self.stream);
         if self.keys_in_stream && e.key_off & KEYS_BIAS == 0 {
             // The key's place names the record's: the stream's layout.
@@ -7480,8 +7626,8 @@ impl MemTable {
     /// head before are gone.
     fn set_ref(&self, id: usize, off: u64, len: u32, rd: &Readers) {
         debug_assert!(self.refs);
-        let e = self.entry(id);
-        let old = MemTable::head(e);
+        let e = self.fat(id);
+        let old = e.chain_head();
         e.head
             .store(ref_pack(off, len) + 1, AtomicOrdering::Release);
         if old & REF_STAGED != 0 {
@@ -7566,15 +7712,15 @@ impl MemTable {
     /// the chain -- in which case everything older, here and in every older
     /// source, is dead. Chunks at or past `wm` are skipped: a reader's
     /// watermark, or `SEE_ALL`.
-    fn live_chain(&self, e: &MemEntry, wm: u64) -> (Vec<usize>, bool) {
-        let mut offs = Vec::with_capacity(e.count.load(AtomicOrdering::Relaxed) as usize);
+    fn live_chain(&self, e: Entry<'_>, wm: u64) -> (Vec<usize>, bool) {
+        let mut offs = Vec::with_capacity(e.count as usize);
         let tomb = self.live_offs_into(e, &mut offs, wm);
         (offs, tomb)
     }
 
     /// `live_chain` into a caller's buffer, oldest first, allocating nothing
     /// after the buffer has grown once; returns whether a tombstone cut it.
-    fn live_offs_into(&self, e: &MemEntry, out: &mut Vec<usize>, wm: u64) -> bool {
+    fn live_offs_into(&self, e: Entry<'_>, out: &mut Vec<usize>, wm: u64) -> bool {
         out.clear();
         let mut at = MemTable::head(e);
         let mut tomb = false;
@@ -7595,7 +7741,7 @@ impl MemTable {
     }
 
     /// Whether a tombstone sits anywhere in the key's chain below `wm`.
-    fn has_tomb(&self, e: &MemEntry, wm: u64) -> bool {
+    fn has_tomb(&self, e: Entry<'_>, wm: u64) -> bool {
         let mut at = MemTable::head(e);
         while at != NO_CHUNK {
             if at < wm && self.is_tomb(at) {
@@ -7648,12 +7794,12 @@ impl MemTable {
     /// or committed after -- and a direct run's exit truncates its
     /// uncommitted tail below the length a reader may have loaded
     /// (`Slab::truncate`).
-    fn get(&self, key: &[u8], upto: usize) -> Option<&MemEntry> {
+    fn get(&self, key: &[u8], upto: usize) -> Option<Entry<'_>> {
         self.slot_of(key, upto).map(|i| self.entry(i))
     }
 
     /// `get` with the hash `prefetch` returned.
-    fn get_with(&self, hash: u64, key: &[u8], upto: usize) -> Option<&MemEntry> {
+    fn get_with(&self, hash: u64, key: &[u8], upto: usize) -> Option<Entry<'_>> {
         if self.ordered {
             return self.get(key, upto);
         }
@@ -11297,7 +11443,7 @@ impl SnapArena {
     /// as a count and then each chunk's memtable offset, its length and,
     /// for a value, its bytes, in one contiguous reservation. Returns
     /// where the run starts.
-    fn copy_run(&self, mem: &MemTable, e: &MemEntry, scratch: &mut Vec<(u64, u32)>) -> u32 {
+    fn copy_run(&self, mem: &MemTable, e: Entry<'_>, scratch: &mut Vec<(u64, u32)>) -> u32 {
         scratch.clear();
         let mut at = MemTable::head(e);
         let mut bytes = 0usize;
@@ -11334,7 +11480,7 @@ impl SnapArena {
     /// per key and `copy_run` looks the block up for every word.
     fn write_key_run(
         mem: &MemTable,
-        e: &MemEntry,
+        e: Entry<'_>,
         scratch: &mut Vec<(u64, u32)>,
         buf: &mut [u8],
     ) -> usize {
@@ -11981,7 +12127,7 @@ impl Snapshot {
         self.ents.push(e);
     }
 
-    fn copy_run(&self, mem: &MemTable, e: &MemEntry, scratch: &mut Vec<(u64, u32)>) -> u32 {
+    fn copy_run(&self, mem: &MemTable, e: Entry<'_>, scratch: &mut Vec<(u64, u32)>) -> u32 {
         self.arena.copy_run(mem, e, scratch)
     }
 
@@ -17822,7 +17968,7 @@ impl Reader {
                 continue;
             }
             if let Some(e) = fr.get(key, MemTable::ALL) {
-                n += u64::from(e.count.load(AtomicOrdering::Relaxed));
+                n += u64::from(e.count);
             }
         }
         if mem_ix >= start && !mem_empty {
@@ -18750,6 +18896,7 @@ impl Db {
                             self.opts.direct_recycle,
                             self.opts.direct_keys_in_stream,
                             self.opts.direct_log_range,
+                            self.opts.direct_slim_entries,
                         )),
                         true,
                     );
@@ -19282,8 +19429,7 @@ impl Db {
             for i in d.committed..mem.len() {
                 let e = mem.entry(i);
                 debug_assert_eq!(
-                    e.count.load(AtomicOrdering::Relaxed),
-                    1,
+                    e.count, 1,
                     "an ordered entry has the one value it was appended with"
                 );
                 if put_one {
@@ -24848,11 +24994,7 @@ impl<'s> BuildCtx<'s> {
             let Some(sk) = o.sk else { continue };
             chased(&sk, &mut |t, slot| {
                 if (slot as usize) < t.len() {
-                    let e = t.entry(slot as usize);
-                    prefetch_lines(
-                        e as *const MemEntry as *const u8,
-                        std::mem::size_of::<MemEntry>(),
-                    );
+                    t.prefetch_entry(slot as usize);
                 }
             });
         }
@@ -27246,7 +27388,7 @@ mod streaming_writes {
     fn a_streamed_tables_keys_read_in_place_and_across_a_seam() {
         for compact in [false, true] {
             let rd = Readers::new(false);
-            let mem = MemTable::new_ordered(false, false, Some(compact), true, true, true);
+            let mem = MemTable::new_ordered(false, false, Some(compact), true, true, true, true);
             let block = mem.vals.block_len();
             let value = vec![b'v'; 10];
             let (ext, tail) = MemTable::stream_ext(value.len());

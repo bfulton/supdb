@@ -3966,6 +3966,39 @@ same sitting as the pairings above. The hash tables the mixes write
 take the same entry and the same index, with the slot drawn from the
 tag's half; their cells are the gate's to watch.
 
+#### The ordered table's one-word entry
+
+An ordered table's entry was the hash table's: a twenty-four byte record
+of the hash's high half, the key's span, the chain's head and its count,
+each first-touched once as the load appends it -- 1,755 pages of a three
+hundred thousand key load's 3,300, more than half. An ordered table has
+no index, so the hash is read by nothing; its keys sit in their records
+in the stream, so the key's span is the record's offset plus four; it
+takes one value a key, so the count is one; and the head is the record's
+tail, which the record's layout gives from the key's length and the
+value's. The entry is one word now (`Options::direct_slim_entries`,
+`MemTable::slim`): the record's offset in the stream in the high half,
+the key's length and the value's in the low, and `MemTable::entry`
+materialises the head and the span from it in arithmetic; a record that
+straddles a block of the stream, a key copied past the bias or a value
+longer than the word's field keeps a fat entry, which the word names
+behind a flag bit. Readers take every entry through one view (`Entry`),
+whichever shape the table keeps it in; the writer's stores -- a hash
+table's chain head and count, the reference arm's rewritten heads -- go
+to the fat entry itself (`MemTable::fat`), which an ordered table never
+reaches. The arm `supdb-fatentries` and `supdb-ingestfatentries` keeps
+every entry twenty-four bytes. Priced in one
+process over two sittings with the arms' order swapped: the writer's
+first touches per ordered load 2,990 to 1,820 at three hundred thousand
+keys, 1,440 to 1,050 at a hundred thousand and 440 to 400 at ten
+thousand -- sixteen bytes a key -- in every pair of both sittings; the
+ordered load's commits by median 2% and 25% shorter at the top rung,
+where the fat entry drew the second sitting's dear reps, 6-8% at the
+two below, in both sittings; the load's rate 1.05x and 0.98x at the
+top rung, 1.02x and 1.04x, 1.04x and 1.03x below; the cells on hash
+tables, which the word does not touch, scattered with the second-named
+arm behind in both sittings, as every pairing's do.
+
 #### The ordered table's write log as a range
 
 A handle reads a memtable's write log to list the slots created since

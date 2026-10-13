@@ -468,6 +468,10 @@ pub struct Supdb {
     /// shape before `Options::direct_log_range`. `supdb-ordlog`, and
     /// `supdb-ingestordlog` buffered.
     ordlog: bool,
+    /// An ordered table's entries twenty-four bytes each, the shape
+    /// before `Options::direct_slim_entries`. `supdb-fatentries`, and
+    /// `supdb-ingestfatentries` buffered.
+    fatentries: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -735,6 +739,10 @@ struct Policy {
     /// shape before `Options::direct_log_range`. `supdb-ordlog`, and
     /// `supdb-ingestordlog` buffered.
     ordlog: bool,
+    /// An ordered table's entries twenty-four bytes each, the shape
+    /// before `Options::direct_slim_entries`. `supdb-fatentries`, and
+    /// `supdb-ingestfatentries` buffered.
+    fatentries: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -946,6 +954,7 @@ impl Default for Policy {
             keysarena: false,
             noalert: false,
             ordlog: false,
+            fatentries: false,
             rankrecords: false,
             shape: false,
             adaptcap: None,
@@ -2613,6 +2622,31 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with an ordered table's entries twenty-four bytes each, the
+    /// shape before `Options::direct_slim_entries`.
+    pub fn create_fatentries(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                fatentries: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-fatentries`.
+    pub fn create_ingest_fatentries(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                fatentries: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with a flush waiting for its manifest slot's fdatasync, the
     /// shape before `Options::flush_waits_manifest` was off.
     pub fn create_waitmanifest(path: &Path) -> Res<Supdb> {
@@ -2858,6 +2892,7 @@ impl Supdb {
             keysarena,
             noalert,
             ordlog,
+            fatentries,
             rankrecords,
             shape,
             aheadmin,
@@ -3048,6 +3083,7 @@ impl Supdb {
             direct_keys_in_stream: !keysarena,
             upkeep_alert: !noalert,
             direct_log_range: !ordlog,
+            direct_slim_entries: !fatentries,
             // The scan phases timed where the arm asks, or where the
             // counters lines will read them: ten clock reads a scan.
             scan_timers: timers
@@ -3167,6 +3203,7 @@ impl Supdb {
             keysarena,
             noalert,
             ordlog,
+            fatentries,
             rankrecords,
             shape,
             aheadmin,
@@ -3637,6 +3674,13 @@ impl Engine for Supdb {
                 "supdb-ordlog"
             } else {
                 "supdb-ingestordlog"
+            };
+        }
+        if self.fatentries {
+            return if self.partition {
+                "supdb-fatentries"
+            } else {
+                "supdb-ingestfatentries"
             };
         }
         if self.waitmanifest {
@@ -4356,6 +4400,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-keysarena"
         | "supdb-noalert"
         | "supdb-ordlog"
+        | "supdb-fatentries"
         | "supdb-waitmanifest"
         | "supdb-inlinemaint"
         | "supdb-adapt"
@@ -4426,6 +4471,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestkeysarena"
         | "supdb-ingestnoalert"
         | "supdb-ingestordlog"
+        | "supdb-ingestfatentries"
         | "supdb-ingestwaitmanifest"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
@@ -4565,6 +4611,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestnoalert" => Box::new(Supdb::create_ingest_noalert(dir)?),
         "supdb-ordlog" => Box::new(Supdb::create_ordlog(dir)?),
         "supdb-ingestordlog" => Box::new(Supdb::create_ingest_ordlog(dir)?),
+        "supdb-fatentries" => Box::new(Supdb::create_fatentries(dir)?),
+        "supdb-ingestfatentries" => Box::new(Supdb::create_ingest_fatentries(dir)?),
         "supdb-waitmanifest" => Box::new(Supdb::create_waitmanifest(dir)?),
         "supdb-ingestwaitmanifest" => Box::new(Supdb::create_ingest_waitmanifest(dir)?),
         "supdb-ingestsettlefreeze" => Box::new(Supdb::create_ingest_settlefreeze(dir)?),

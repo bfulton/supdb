@@ -811,8 +811,18 @@ run's mapping, which is the bandwidth of the whole section where the
 copies were an eighth of it. An entry is three words now -- the hash's
 high half, which the index draws the slot and the tag from and a
 rebuild reinserts by, the key's span and a thirty-two-bit count beside
-the head -- and the entries are the rest of what the table costs, with the
-write log beside them: every write to an ordered table makes a new
+the head -- and an ordered table's entry is one word now, the record's
+offset in the stream with the key's and the value's lengths
+(`Options::direct_slim_entries`; `supdb-fatentries` and
+`supdb-ingestfatentries` keep the twenty-four bytes), the head and the
+key's place arithmetic over it and the key and value read in the
+record, where a lookup reads them anyway; a record that straddles a
+block, a key copied past the bias or a value over sixty-four kilobytes
+keeps a fat entry behind a flag bit in the word, and the writer's
+stores to a hash table's entries go to the fat entry itself
+(`MemTable::fat`), which a reader never reaches through the view
+(`Entry`). The write log is beside them: every write to an ordered
+table makes a new
 entry, each above the last, so write `i` is entry `i` and the log is
 the entries' range (`Options::direct_log_range`; `supdb-ordlog` and
 `supdb-ingestordlog` keep the slab a hash table logs into) -- a word a
@@ -1743,6 +1753,18 @@ sleeper cannot read a condition that changed after it chose; and a
 background worker's effect is read per rep in its own counters before
 its cell is read, because a thread that runs in some reps makes a cell
 that reads bimodal, and a median over it reads neither shape.
+
+**A length read off the slab that held the exceptions.** The ordered
+table's write log became the range of its entries, its length the
+entries' count, and read that count off the entries' slab; the one-word
+entry then moved an ordered table's entries into a slab of words and
+left the old slab holding only the straddlers, so every commit's mark
+named a log of nothing, and three tests saw the inserts a run had
+staged, since a handle that finds no log since its snapshot takes the
+table whole. The count comes from the table's own `len` now, which knows
+which slab holds the entries. The rule: a quantity derived from one
+container is derived through the accessor that knows which container
+holds it, since the next change moves the contents and not the name.
 
 ## Standing limitations
 
