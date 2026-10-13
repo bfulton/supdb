@@ -5668,13 +5668,28 @@ const TOMB_LEN: u32 = u32::MAX;
 const CHUNK_HDR: usize = 12;
 
 struct MemEntry {
-    hash: u64,
+    /// The high half of the key's hash: what the index derives a slot
+    /// and its tag from, and what a rebuild reinserts by. The low half
+    /// is not kept; the entry is twenty-four bytes, and a load
+    /// first-touches each one.
+    hash: u32,
     key_off: u32,
-    key_len: u32,
+    klen: u16,
     /// Offset+1 of this key's newest chunk in `vals`, stored after the
     /// chunk's bytes; 0 = no chunk yet, which no published entry has.
     head: AtomicU64,
-    count: AtomicU64,
+    count: AtomicU32,
+}
+
+impl MemEntry {
+    fn key_len(&self) -> u32 {
+        u32::from(self.klen)
+    }
+}
+
+/// The index's slot for a hash, from the half the entry keeps.
+fn slot_of(hash: u64, mask: usize) -> usize {
+    ((hash >> 32) as usize) & mask
 }
 
 const NO_CHUNK: u64 = u64::MAX;
@@ -5695,8 +5710,9 @@ fn mem_hash(key: &[u8]) -> u64 {
 
 /// The hash index: per slot the hash's high half over the entry number
 /// plus one, zero vacant, open addressing with linear probing at load
-/// <= 0.5. A slot is stored once, with a release, and never moved:
-/// growth is a new table. The tag is what keeps a probe from reading an
+/// <= 0.5, the slot indexed by that same half (`slot_of`), since the
+/// half is all an entry keeps and a rebuild reinserts by it. A slot is
+/// stored once, with a release, and never moved: growth is a new table. The tag is what keeps a probe from reading an
 /// entry it will not match -- the entry is a line of its own, and at
 /// thirty million keys the slot and the entry are both misses.
 struct Index {
@@ -6694,7 +6710,7 @@ impl MemTable {
     }
 
     fn key_of(&self, e: &MemEntry) -> &[u8] {
-        self.key_at(e.key_off, e.key_len)
+        self.key_at(e.key_off, e.key_len())
     }
 
     /// The key an entry's span names: in `keys`, or, for a table that
@@ -6980,12 +6996,16 @@ impl MemTable {
             Some(v) => (self.push_chunk(NO_CHUNK, v), 1, copy()),
             None => (self.push_tomb(NO_CHUNK), 0, copy()),
         };
+        debug_assert!(
+            key.len() <= usize::from(u16::MAX),
+            "a key fits a record's length word"
+        );
         self.entries.push(MemEntry {
-            hash,
+            hash: (hash >> 32) as u32,
             key_off,
-            key_len: key.len() as u32,
+            klen: key.len() as u16,
             head: AtomicU64::new(off + 1),
-            count: AtomicU64::new(count),
+            count: AtomicU32::new(count),
         })
     }
 
@@ -6998,7 +7018,7 @@ impl MemTable {
         } else {
             idx
         };
-        let mut i = (hash as usize) & idx.mask;
+        let mut i = slot_of(hash, idx.mask);
         while idx.slots[i].load(AtomicOrdering::Relaxed) != 0 {
             i = (i + 1) & idx.mask;
         }
@@ -7011,8 +7031,8 @@ impl MemTable {
         let cap = old.slots.len() * 2;
         let fresh = Index::with_slots(cap);
         for id in 0..self.len() {
-            let hash = self.entry(id).hash;
-            let mut i = (hash as usize) & fresh.mask;
+            let hash = u64::from(self.entry(id).hash) << 32;
+            let mut i = slot_of(hash, fresh.mask);
             while fresh.slots[i].load(AtomicOrdering::Relaxed) != 0 {
                 i = (i + 1) & fresh.mask;
             }
@@ -7138,7 +7158,7 @@ impl MemTable {
         debug_assert!(self.stream);
         let vlen = (MemTable::head(e) & REF_LEN_MASK) as u32;
         let (ext, tail_len) = MemTable::stream_ext(vlen as usize);
-        let klen = e.key_len as usize;
+        let klen = e.key_len() as usize;
         let rec_len = flatindex::record_len_for(klen, &[ext], tail_len, self.stream_compact)
             .expect("a direct run's record fits the flat index");
         (
@@ -7279,7 +7299,7 @@ impl MemTable {
         );
         let prev = self.entry(i - 1);
         let end = self.stream_rec_off(i - 1) + self.stream_record_shape(prev).0;
-        let klen = e.key_len as usize;
+        let klen = e.key_len() as usize;
         let mut hdr = [0u8; 4];
         let starts_at = |at: usize, hdr: &mut [u8; 4]| {
             self.stream_read_contig(at, hdr);
@@ -7639,16 +7659,17 @@ impl MemTable {
 
     fn probe(&self, hash: u64, key: &[u8]) -> Option<usize> {
         let idx = self.index()?;
-        let mut i = (hash as usize) & idx.mask;
+        let mut i = slot_of(hash, idx.mask);
         loop {
             let s = idx.slots[i].load(AtomicOrdering::Acquire);
             if s == 0 {
                 return None;
             }
+            // The tag is the half the entry keeps, so the key decides.
             if s >> 32 == hash >> 32 {
                 let id = ((s & 0xffff_ffff) - 1) as usize;
                 let e = self.entry(id);
-                if e.hash == hash && self.key_of(e) == key {
+                if self.key_of(e) == key {
                     return Some(id);
                 }
             }
@@ -11511,18 +11532,18 @@ impl Snapshot {
             }
             if let Some(&j) = order.get(at + SEAL_AHEAD_CHAIN) {
                 let f = mem.entry(j as usize);
-                mem.prefetch_key(f.key_off, f.key_len);
+                mem.prefetch_key(f.key_off, f.key_len());
                 mem.prefetch_chunk(MemTable::head(f), SEAL_AHEAD_CHUNK_BYTES);
             }
             let e = mem.entry(i as usize);
             let wrote = SnapArena::write_key_run(mem, e, &mut scratch, &mut buf[p..]);
             ents.push(SnapKey {
                 off: base + p as u32,
-                len: e.key_len,
+                len: e.key_len(),
                 mem: u32::MAX,
                 frozen: i,
                 lrun: NO_RUN,
-                frun: base + p as u32 + e.key_len,
+                frun: base + p as u32 + e.key_len(),
             });
             p += wrote;
         }
@@ -13104,7 +13125,7 @@ impl Reader {
                 let upto = if live { live_len } else { mem.len() };
                 order.extend((0..upto).map(|i| {
                     let e = mem.entry(i);
-                    (e.key_off, e.key_len, i as u32)
+                    (e.key_off, e.key_len(), i as u32)
                 }));
                 radix_by_first(&mut order, &mut scratch);
                 // Without runs the keys are the arena's only bytes here,
@@ -13580,13 +13601,13 @@ impl Reader {
                 let e = mem.entry(id);
                 match pending.last_mut() {
                     Some(last) if last.0 == e.key_off => last.2 |= new,
-                    _ => pending.push((e.key_off, e.key_len, new, id as u32)),
+                    _ => pending.push((e.key_off, e.key_len(), new, id as u32)),
                 }
             }
             if let Some((from, since)) = since.as_mut() {
                 if i >= *from {
                     let e = mem.entry(id);
-                    since.file(mem, e.key_off, e.key_len);
+                    since.file(mem, e.key_off, e.key_len());
                 }
             }
         }
@@ -13730,7 +13751,7 @@ impl Reader {
                     let e = table.entry(id);
                     match writes.last() {
                         Some(last) if last.0 == e.key_off => {}
-                        _ => writes.push((e.key_off, e.key_len, false, id as u32)),
+                        _ => writes.push((e.key_off, e.key_len(), false, id as u32)),
                     }
                 }
                 for w in &mut writes {
@@ -17743,7 +17764,7 @@ impl Reader {
                 continue;
             }
             if let Some(e) = fr.get(key, MemTable::ALL) {
-                n += e.count.load(AtomicOrdering::Relaxed);
+                n += u64::from(e.count.load(AtomicOrdering::Relaxed));
             }
         }
         if mem_ix >= start && !mem_empty {
@@ -20806,7 +20827,7 @@ impl Reader {
             for i in from..self.fs().log_seen.get() {
                 let (id, _) = mem.log_at(i);
                 let e = mem.entry(id);
-                since.file(mem, e.key_off, e.key_len);
+                since.file(mem, e.key_off, e.key_len());
             }
         }
         // Per block: 0 for no form, 1 for a form the builder leaves
@@ -21285,6 +21306,12 @@ impl Db {
 
     fn close_inner(&mut self) -> Result<()> {
         self.flush()?;
+        // A flush is answered before the slot's fdatasync and the WAL's
+        // retirement, which follow on the segment work's thread and are
+        // what offers the spare (`Maint::retire_covered`): wait for them,
+        // or the spare is offered after it was taken here and outlives
+        // the close.
+        self.settle()?;
         // Nothing will rotate into a spare again.
         if let Some(spare) = self.shared.take_spare() {
             let _ = std::fs::remove_file(spare);
@@ -27101,6 +27128,13 @@ mod streaming_writes {
         assert_eq!(recs.len(), 200, "both batches are behind the one marker");
         assert_eq!(recs[150].0, b"key-00000150".to_vec());
         assert_eq!(recs[150].1, b"value-150".to_vec());
+    }
+
+    /// A memtable entry is three words: a load first-touches one per key,
+    /// and the row's faults priced the fourth.
+    #[test]
+    fn an_entry_is_twenty_four_bytes() {
+        assert_eq!(std::mem::size_of::<MemEntry>(), 24);
     }
 
     /// A streamed table reading its keys in place (`keys_in_stream`)

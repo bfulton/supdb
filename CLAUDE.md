@@ -780,8 +780,11 @@ its record in the stream now (`Options::direct_keys_in_stream`;
 `supdb-keysarena`, `supdb-ingestkeysarena` keep the copies), and the
 close's one pass reads the keys out of the record section through the
 run's mapping, which is the bandwidth of the whole section where the
-copies were an eighth of it. The entries are the rest of what the table
-costs, and a run that kept no table at all is the shape left to price.
+copies were an eighth of it. An entry is three words now -- the hash's
+high half, which the index draws the slot and the tag from and a
+rebuild reinserts by, the key's span and a thirty-two-bit count beside
+the head -- and the entries are the rest of what the table costs; a run
+that kept no table at all is the shape left to price.
 
 ## Shapes the bugs come in
 
@@ -1676,6 +1679,20 @@ under the buffer path, twenty-nine and nine ladders of 512 KB down to
 cache that holds them, and a change to who writes the bytes is priced
 on the reads as well as the writes, with the folios read when the bytes
 are the same and the reads are not.
+
+**A close that took the spare before the thread offered it.** `close`
+flushed, took the WAL spare and removed it, and the flush is answered
+before the slot's fdatasync and the WAL's retirement, which follow on
+the segment work's thread; the retirement is what offers the spare. On
+a loaded machine the thread's retirement fell after the close's take,
+the spare was offered to nobody and outlived the close, and the test
+that asserts a closed store leaves no spare failed once in a run beside
+a build, and in none of fifteen runs alone or four at a time. The close
+settles the segment work before it takes the spare now. The rule is the
+one the settle's own join gave: a step that waits for a worker's answer
+has waited for the work the answer names and nothing after it, so a
+caller that needs what the worker does afterwards joins the worker, not
+the answer.
 
 ## Standing limitations
 

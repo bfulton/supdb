@@ -3940,6 +3940,32 @@ cost seven to twenty-four microseconds each and the pass's bandwidth
 costs what it costs here, which is the case the change is for. The
 copies are the arm `supdb-keysarena` and `supdb-ingestkeysarena`.
 
+#### The entry in three words
+
+What a load first-touched after the keys moved into their records was
+the entries first: thirty-two bytes a key, a sixty-four-bit hash, two
+thirty-two-bit words for the key's span, the head and a sixty-four-bit
+count, twenty-four hundred pages of the thirty-nine hundred at three
+hundred thousand keys. The hash index derived a slot from the hash's low
+half and a slot's tag from its high half, and kept the whole hash in the
+entry so that a rebuild could reinsert by it and a probe could compare
+it before the key. An entry keeps the high half alone now, the slot is
+indexed by that same half (`slot_of`), and the probe's compare of the
+entry's hash is gone, since the slot's tag is the same test; the key's
+length is sixteen bits, which is what a record's length word allows and
+every write checks; the count is thirty-two bits, more values of one key
+than the arena addresses. Twenty-four bytes, asserted by a test, no arm
+-- two layouts of the entry cannot share a process -- and the faults
+are the verdict: the writer's faults a load read 3,270 against the 3,860 to 3,880
+of the three pairings before, 1,550 against 1,720 to 1,740 and 437
+against 454 to 457 at three hundred thousand, a hundred thousand and
+ten thousand keys buffered, 3,050 against 3,600 and 453 against 468
+durable -- the eight bytes a key, at every rung -- with the commits
+level, 32.5 ms at three hundred thousand against 33.0 to 33.4, in the
+same sitting as the pairings above. The hash tables the mixes write
+take the same entry and the same index, with the slot drawn from the
+tag's half; their cells are the gate's to watch.
+
 #### The piece's ranks over the heads, and a locked exchange to look at a form
 
 Every written key's rank in its partition is computed by three parties:
