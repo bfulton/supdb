@@ -3966,6 +3966,31 @@ same sitting as the pairings above. The hash tables the mixes write
 take the same entry and the same index, with the slot drawn from the
 tag's half; their cells are the gate's to watch.
 
+#### The ordered table's write log as a range
+
+A handle reads a memtable's write log to list the slots created since
+its snapshot, and the log is a slab of one word a write. An ordered
+table takes each key above its last and nothing else -- no put, no
+delete, no second value -- so every write to one is a new entry and
+write `i` is entry `i`: the log held the sequence 0, 1, 2 and so on, a
+fresh page every thousand writes, a tenth of a three hundred thousand
+key load's first touches, for what the entry count already said. The
+log is the entries' range now (`Options::direct_log_range`): `log_len`
+is the entry count, `log_at(i)` is `(i, new)`, nothing is pushed, and
+the mark a commit publishes carries the count under both names. The arm
+`supdb-ordlog` and `supdb-ingestordlog` keeps the slab. Priced in one
+process over two sittings with the arms' order swapped and a third with
+the mixes timed by kind: the writer's first touches a load 3,300 to
+3,000 at three hundred thousand keys, 1,540 to 1,440 at a hundred
+thousand, 450 to 440 at ten thousand, in every pair; the load's rate
+level, 1.02x and 0.98x by sitting at the top rung, as a fifth of a
+millisecond among forty must be; every read cell level, and the one mix
+that read 7% one way in two sittings read 9% the other in the third.
+The truncation of a run's uncommitted tail, which takes the entries
+back to the last commit when a smaller key leaves the run, left the
+slab's tail standing; the table takes no write after it, so nothing
+read it, and the range has no tail to leave.
+
 #### The upkeep thread kept alert
 
 ycsb-E at ten and thirty thousand keys read 0.90x to 0.97x of the

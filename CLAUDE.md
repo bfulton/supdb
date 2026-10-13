@@ -811,8 +811,14 @@ run's mapping, which is the bandwidth of the whole section where the
 copies were an eighth of it. An entry is three words now -- the hash's
 high half, which the index draws the slot and the tag from and a
 rebuild reinserts by, the key's span and a thirty-two-bit count beside
-the head -- and the entries are the rest of what the table costs; a run
-that kept no table at all is the shape left to price.
+the head -- and the entries are the rest of what the table costs, with the
+write log beside them: every write to an ordered table makes a new
+entry, each above the last, so write `i` is entry `i` and the log is
+the entries' range (`Options::direct_log_range`; `supdb-ordlog` and
+`supdb-ingestordlog` keep the slab a hash table logs into) -- a word a
+write and a fresh page a thousand that said nothing the entry count
+did not, and whose tail the truncation of an uncommitted run never
+trimmed. A run that kept no table at all is the shape left to price.
 
 ## Shapes the bugs come in
 

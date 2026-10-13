@@ -464,6 +464,10 @@ pub struct Supdb {
     /// park, the shape before `Options::upkeep_alert`. `supdb-noalert`,
     /// and `supdb-ingestnoalert` buffered.
     noalert: bool,
+    /// An ordered table keeping a write log as a hash table does, the
+    /// shape before `Options::direct_log_range`. `supdb-ordlog`, and
+    /// `supdb-ingestordlog` buffered.
+    ordlog: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -727,6 +731,10 @@ struct Policy {
     /// park, the shape before `Options::upkeep_alert`. `supdb-noalert`,
     /// and `supdb-ingestnoalert` buffered.
     noalert: bool,
+    /// An ordered table keeping a write log as a hash table does, the
+    /// shape before `Options::direct_log_range`. `supdb-ordlog`, and
+    /// `supdb-ingestordlog` buffered.
+    ordlog: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -937,6 +945,7 @@ impl Default for Policy {
             norecycle: false,
             keysarena: false,
             noalert: false,
+            ordlog: false,
             rankrecords: false,
             shape: false,
             adaptcap: None,
@@ -2579,6 +2588,31 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with an ordered table keeping a write log, the shape
+    /// before `Options::direct_log_range`.
+    pub fn create_ordlog(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                ordlog: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-ordlog`.
+    pub fn create_ingest_ordlog(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                ordlog: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with a flush waiting for its manifest slot's fdatasync, the
     /// shape before `Options::flush_waits_manifest` was off.
     pub fn create_waitmanifest(path: &Path) -> Res<Supdb> {
@@ -2823,6 +2857,7 @@ impl Supdb {
             norecycle,
             keysarena,
             noalert,
+            ordlog,
             rankrecords,
             shape,
             aheadmin,
@@ -3012,6 +3047,7 @@ impl Supdb {
             direct_recycle: !norecycle,
             direct_keys_in_stream: !keysarena,
             upkeep_alert: !noalert,
+            direct_log_range: !ordlog,
             // The scan phases timed where the arm asks, or where the
             // counters lines will read them: ten clock reads a scan.
             scan_timers: timers
@@ -3130,6 +3166,7 @@ impl Supdb {
             norecycle,
             keysarena,
             noalert,
+            ordlog,
             rankrecords,
             shape,
             aheadmin,
@@ -3593,6 +3630,13 @@ impl Engine for Supdb {
                 "supdb-noalert"
             } else {
                 "supdb-ingestnoalert"
+            };
+        }
+        if self.ordlog {
+            return if self.partition {
+                "supdb-ordlog"
+            } else {
+                "supdb-ingestordlog"
             };
         }
         if self.waitmanifest {
@@ -4311,6 +4355,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-norecycle"
         | "supdb-keysarena"
         | "supdb-noalert"
+        | "supdb-ordlog"
         | "supdb-waitmanifest"
         | "supdb-inlinemaint"
         | "supdb-adapt"
@@ -4380,6 +4425,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestnorecycle"
         | "supdb-ingestkeysarena"
         | "supdb-ingestnoalert"
+        | "supdb-ingestordlog"
         | "supdb-ingestwaitmanifest"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
@@ -4517,6 +4563,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestkeysarena" => Box::new(Supdb::create_ingest_keysarena(dir)?),
         "supdb-noalert" => Box::new(Supdb::create_noalert(dir)?),
         "supdb-ingestnoalert" => Box::new(Supdb::create_ingest_noalert(dir)?),
+        "supdb-ordlog" => Box::new(Supdb::create_ordlog(dir)?),
+        "supdb-ingestordlog" => Box::new(Supdb::create_ingest_ordlog(dir)?),
         "supdb-waitmanifest" => Box::new(Supdb::create_waitmanifest(dir)?),
         "supdb-ingestwaitmanifest" => Box::new(Supdb::create_ingest_waitmanifest(dir)?),
         "supdb-ingestsettlefreeze" => Box::new(Supdb::create_ingest_settlefreeze(dir)?),

@@ -1489,6 +1489,14 @@ pub struct Options {
     /// the copies, the arm `supdb-keysarena` and `supdb-ingestkeysarena`.
     /// Nothing without `direct_stream`.
     pub direct_keys_in_stream: bool,
+    /// An ordered table's write log is the range of its entries
+    /// (`MemTable::log_len`, `log_at`): every write to one makes a new
+    /// entry, each above the last, so write `i` is entry `i`, and the
+    /// log a hash table keeps -- a word a write, a fresh page every
+    /// thousand -- says nothing the entry count does not. Off, the arm
+    /// `supdb-ordlog` and `supdb-ingestordlog`: the ordered table keeps
+    /// the log as a hash table does.
+    pub direct_log_range: bool,
     /// Bytes the mapping of a direct run's segment starts with; zero, the
     /// default, twice `seal_bytes`. The mapping grows when the run's file
     /// outgrows it. For a test of the growth.
@@ -1753,6 +1761,7 @@ impl Default for Options {
             direct_derive_keys: true,
             direct_recycle: true,
             direct_keys_in_stream: true,
+            direct_log_range: true,
             direct_map_bytes: 0,
             forms_settle_recent_pct: 0,
             forms_carry: true,
@@ -5548,6 +5557,10 @@ struct MemTable {
     /// names the key inside its record in the stream, or, with `KEYS_BIAS`
     /// set in the offset, a copy in `keys`.
     keys_in_stream: bool,
+    /// `ordered` with `Options::direct_log_range`: the write log is the
+    /// entries' range, nothing is pushed to `log`, and `log_len` is the
+    /// entry count.
+    log_range: bool,
     /// With `refs`, the second staging arena: a value stays a copy until
     /// the writer's buffer has carried its record to the file, which is a
     /// piece of a megabyte at a time, so the chunks of several commits
@@ -6642,6 +6655,7 @@ impl MemTable {
             recycle: false,
             stream_base: AtomicU64::new(0),
             keys_in_stream: false,
+            log_range: false,
             vals2: ByteArena::new(prefault),
             staging: UnsafeCell::new(Staging::default()),
             keys: ByteArena::new(prefault),
@@ -6666,6 +6680,7 @@ impl MemTable {
         stream: Option<bool>,
         recycle: bool,
         keys_in_stream: bool,
+        log_range: bool,
     ) -> MemTable {
         debug_assert!(!(refs && stream.is_some()), "two shapes of one table");
         MemTable {
@@ -6682,6 +6697,7 @@ impl MemTable {
             recycle: stream.is_some() && recycle,
             stream_base: AtomicU64::new(0),
             keys_in_stream: stream.is_some() && keys_in_stream,
+            log_range,
             vals2: ByteArena::new(prefault),
             staging: UnsafeCell::new(Staging::default()),
             keys: ByteArena::new(prefault),
@@ -6699,19 +6715,36 @@ impl MemTable {
         }
     }
 
-    /// The writes so far, for a handle's `log_at`.
+    /// The writes so far, for a handle's `log_at`: the entry count where
+    /// the log is the entries' range (`log_range`).
     fn log_len(&self) -> usize {
-        self.log.len()
+        if self.log_range {
+            self.entries.len()
+        } else {
+            self.log.len()
+        }
     }
 
     /// The `i`th write: the entry it wrote and whether it made it.
     fn log_at(&self, i: usize) -> (usize, bool) {
+        if self.log_range {
+            // Write `i` made entry `i`: an ordered table takes each key
+            // above its last and nothing else.
+            return (i, true);
+        }
         let w = *self.log.get(i);
         ((w & 0x7fff_ffff) as usize, w >> 31 != 0)
     }
 
     /// Writer: the write logged, after the entry it names is published.
     fn log_write(&self, id: usize, new: bool) {
+        if self.log_range {
+            debug_assert!(
+                new && id + 1 == self.entries.len(),
+                "an ordered table's writes are its entries, in order"
+            );
+            return;
+        }
         self.log.push(id as u32 | ((new as u32) << 31));
     }
 
@@ -6857,7 +6890,7 @@ impl MemTable {
     fn commit(&self) {
         let n = self.mark.load(AtomicOrdering::Relaxed) + 1;
         let m = &self.marks[(n & 1) as usize];
-        m.log.store(self.log.len(), AtomicOrdering::Release);
+        m.log.store(self.log_len(), AtomicOrdering::Release);
         m.len.store(self.entries.len(), AtomicOrdering::Release);
         // With references a head is a position in one of two arenas or
         // in the file, none of them one order, and an entry has the one
@@ -18716,6 +18749,7 @@ impl Db {
                                 .then_some(self.opts.segment.compact_records),
                             self.opts.direct_recycle,
                             self.opts.direct_keys_in_stream,
+                            self.opts.direct_log_range,
                         )),
                         true,
                     );
@@ -27212,7 +27246,7 @@ mod streaming_writes {
     fn a_streamed_tables_keys_read_in_place_and_across_a_seam() {
         for compact in [false, true] {
             let rd = Readers::new(false);
-            let mem = MemTable::new_ordered(false, false, Some(compact), true, true);
+            let mem = MemTable::new_ordered(false, false, Some(compact), true, true, true);
             let block = mem.vals.block_len();
             let value = vec![b'v'; 10];
             let (ext, tail) = MemTable::stream_ext(value.len());
