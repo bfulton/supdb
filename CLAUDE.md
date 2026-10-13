@@ -427,6 +427,25 @@ the whole excess, the freeze's, at five milliseconds. Time the kinds
 apart before naming the one that is slow, and when the excess is one
 operation, decompose that operation next.
 
+A background thread beside the writer is priced by what it files, and
+what it costs the writer is found by taking its work apart, not by
+sampling the writer: the alert upkeep thread cost the mixes that
+write a tenth to a fifth at ten thousand keys, and a perf cut of the
+writer's samples by symbol moved by thirty where the tax was a
+hundred. A pass that pinned, parked and left cost A four percent and
+the reads nothing; one that filed and built nothing cost the whole
+tax; the full pass cost the same -- so the filing's re-reads of the
+entries the writer is rewriting are the cost, each an ownership the
+next update pays for, and three cache-line separations guessed at
+before the bisect moved nothing and were taken out. The mixes have a
+timer by kind (`SUPDB_MIX_KINDS=1`, a `mixkinds` line per mix on
+stderr for every arm, its reads, scans and commits apart), which read
+the E gap as the scans' alone and the tax as the commits' and the
+gets'; `SUPDB_MIX_EVENTS=1` prints each mix's form events, upkeep
+passes and snapshot builds beside its counters. Read a thread's
+passes per rep there before reading its cell: a thread that ran in
+two reps of five made a cell that read neither shape.
+
 ## The suite lives in bench/, and it gates this repository
 
 `bench/` is a time series. `bench run` measures every arm -- supdb's
@@ -572,8 +591,17 @@ writes kept to settle through that table and every table live since the
 look kept for it in `State::replaced`. The forms a pass publishes carry the commit the writer named,
 never the latest, or a handle at the latest takes forms without the
 writes between; and `settle` joins it before anything else, because
-every other join touches it. The threaded test runs at each level, since
-a level that holds hides what a level that lends exposes.
+every other join touches it. The thread keeps its own timer: for a
+hundred milliseconds after its last pass or hand-over it parks for at
+most `Options::upkeep_alert_poll_us` at a time while reads are around
+(`Options::upkeep_alert`; `supdb-noalert` is the back-off as it was),
+since a mix's batch of a hundred is lent and too small to wake it for,
+and the back-off it had climbed across the read passes slept through
+the mixes; the writer wakes it once, where reads come around or it
+finds the thread parked past its poll, because a cap a sleeper applies
+when it chooses its park cannot shorten the park it is already in. The
+threaded test runs at each level, since a level that holds hides what
+a level that lends exposes.
 
 **`Blob::zero_copy()` stays true on the native path.** `Bytes` has two halves
 for one reason: `read_at` copies and every source can answer it; `slice_at`
@@ -1693,6 +1721,22 @@ one the settle's own join gave: a step that waits for a worker's answer
 has waited for the work the answer names and nothing after it, so a
 caller that needs what the worker does afterwards joins the worker, not
 the answer.
+
+**A poll capped at the next park slept through the regime it was for.**
+The upkeep thread was to stay alert while reads were around, parking for
+at most two hundred microseconds at a time; the cap was applied where the
+thread chose its park, and reads came around while it was already inside
+a park of several milliseconds it had chosen during the read passes
+before the mixes, which last two. It ran during A or F in two reps of
+five and E built every block of the store in the other three, with the
+counters saying so rep by rep and nothing raised. The commit that finds
+reads newly around, or finds the thread parked longer than its poll,
+wakes it once now. The rule: a bound on how long a sleeper sleeps is
+enforced by whoever changes the condition the bound is for, since the
+sleeper cannot read a condition that changed after it chose; and a
+background worker's effect is read per rep in its own counters before
+its cell is read, because a thread that runs in some reps makes a cell
+that reads bimodal, and a median over it reads neither shape.
 
 ## Standing limitations
 

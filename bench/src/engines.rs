@@ -460,6 +460,10 @@ pub struct Supdb {
     /// `Options::direct_keys_in_stream`. `supdb-keysarena`, and
     /// `supdb-ingestkeysarena` buffered.
     keysarena: bool,
+    /// The upkeep thread's back-off as it was, climbing from its first
+    /// park, the shape before `Options::upkeep_alert`. `supdb-noalert`,
+    /// and `supdb-ingestnoalert` buffered.
+    noalert: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -719,6 +723,10 @@ struct Policy {
     /// `Options::direct_keys_in_stream`. `supdb-keysarena`, and
     /// `supdb-ingestkeysarena` buffered.
     keysarena: bool,
+    /// The upkeep thread's back-off as it was, climbing from its first
+    /// park, the shape before `Options::upkeep_alert`. `supdb-noalert`,
+    /// and `supdb-ingestnoalert` buffered.
+    noalert: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -928,6 +936,7 @@ impl Default for Policy {
             latesync: false,
             norecycle: false,
             keysarena: false,
+            noalert: false,
             rankrecords: false,
             shape: false,
             adaptcap: None,
@@ -2545,6 +2554,31 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with the upkeep thread's back-off as it was, the shape
+    /// before `Options::upkeep_alert`.
+    pub fn create_noalert(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                noalert: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-noalert`.
+    pub fn create_ingest_noalert(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                noalert: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with a flush waiting for its manifest slot's fdatasync, the
     /// shape before `Options::flush_waits_manifest` was off.
     pub fn create_waitmanifest(path: &Path) -> Res<Supdb> {
@@ -2788,6 +2822,7 @@ impl Supdb {
             latesync,
             norecycle,
             keysarena,
+            noalert,
             rankrecords,
             shape,
             aheadmin,
@@ -2976,6 +3011,7 @@ impl Supdb {
             direct_derive_keys: !keycopies,
             direct_recycle: !norecycle,
             direct_keys_in_stream: !keysarena,
+            upkeep_alert: !noalert,
             // The scan phases timed where the arm asks, or where the
             // counters lines will read them: ten clock reads a scan.
             scan_timers: timers
@@ -3093,6 +3129,7 @@ impl Supdb {
             latesync,
             norecycle,
             keysarena,
+            noalert,
             rankrecords,
             shape,
             aheadmin,
@@ -3551,6 +3588,13 @@ impl Engine for Supdb {
                 "supdb-ingestkeysarena"
             };
         }
+        if self.noalert {
+            return if self.partition {
+                "supdb-noalert"
+            } else {
+                "supdb-ingestnoalert"
+            };
+        }
         if self.waitmanifest {
             return if self.partition {
                 "supdb-waitmanifest"
@@ -3756,6 +3800,7 @@ impl Engine for Supdb {
             ("convert_build_us", db.convert_us().0 as f64),
             ("convert_total_us", db.convert_us().1 as f64),
             ("forms_cloned", db.forms_cloned() as f64),
+            ("forms_rebased", db.forms_rebased() as f64),
             ("pin_barriers", uk[10] as f64),
         ]
     }
@@ -4265,6 +4310,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-latesync"
         | "supdb-norecycle"
         | "supdb-keysarena"
+        | "supdb-noalert"
         | "supdb-waitmanifest"
         | "supdb-inlinemaint"
         | "supdb-adapt"
@@ -4333,6 +4379,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestlatesync"
         | "supdb-ingestnorecycle"
         | "supdb-ingestkeysarena"
+        | "supdb-ingestnoalert"
         | "supdb-ingestwaitmanifest"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
@@ -4468,6 +4515,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestnorecycle" => Box::new(Supdb::create_ingest_norecycle(dir)?),
         "supdb-keysarena" => Box::new(Supdb::create_keysarena(dir)?),
         "supdb-ingestkeysarena" => Box::new(Supdb::create_ingest_keysarena(dir)?),
+        "supdb-noalert" => Box::new(Supdb::create_noalert(dir)?),
+        "supdb-ingestnoalert" => Box::new(Supdb::create_ingest_noalert(dir)?),
         "supdb-waitmanifest" => Box::new(Supdb::create_waitmanifest(dir)?),
         "supdb-ingestwaitmanifest" => Box::new(Supdb::create_ingest_waitmanifest(dir)?),
         "supdb-ingestsettlefreeze" => Box::new(Supdb::create_ingest_settlefreeze(dir)?),

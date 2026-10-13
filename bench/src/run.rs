@@ -249,6 +249,38 @@ fn counters_line(
         get(c1, "unsealed_keys"),
         d("rd_scans")
     );
+    // The forms' events over the window, by name, for a decomposition of
+    // who built what beside whom.
+    if std::env::var_os("SUPDB_MIX_EVENTS").is_some() {
+        let names = [
+            "table_drops",
+            "ahead_starts",
+            "ahead_stops",
+            "ahead_installed",
+            "settle_notable",
+            "fill_dense",
+            "fill_fresh",
+            "ahead_skip_held",
+            "ahead_skip_overlay",
+            "ahead_built",
+            "install_gen_drop",
+            "install_slot_skip",
+            "fill_from_form",
+            "convert_total_us",
+            "upkeep_partial",
+            "upkeep_skipped",
+            "upkeep_passes",
+            "forms_rebased",
+            "forms_cloned",
+            "form_takes",
+            "snapshot_builds",
+            "snapshot_extends",
+            "canon_tried",
+            "canon_hit",
+        ];
+        let ev: Vec<String> = names.iter().map(|n| format!("{n} {:.0}", d(n))).collect();
+        eprintln!("{tag}-events {arm} {point} {}", ev.join(" | "));
+    }
 }
 
 pub fn lag_mark(arm: &str, pct: u64, edge: &str) {
@@ -791,7 +823,7 @@ fn one_pass(
         };
         let mix = format!("ycsb-{letter}");
         phase_mark(arm, &mix, "start");
-        let secs = ycsb(e.as_mut(), w, size, &mut inserted, payload)?;
+        let secs = ycsb(e.as_mut(), arm, w, size, &mut inserted, payload)?;
         phase_mark(arm, &mix, "end");
         ycsb_ops_s.push((letter, ycsb_ops(size) as f64 / secs));
         if mix_counting {
@@ -1257,8 +1289,58 @@ fn threaded(
 /// One YCSB workload over a loaded store: `ycsb_ops(size)` operations,
 /// writes batched by `YCSB_BATCH` and the tail flushed inside the timed
 /// region, inserts taking fresh keys past the loaded range. Returns seconds.
+/// With `SUPDB_MIX_KINDS` set, a mix's time by the kind of operation --
+/// the reads, the scans and the commits -- summed over the mix and printed
+/// as one `mixkinds` line a mix on stderr, for both arms alike, since the
+/// clock reads around every operation are a cost the rows must not carry.
+/// A mix's rate names none of its kinds; this names each.
+struct MixKinds {
+    on: bool,
+    gets: (u64, f64),
+    scans: (u64, f64),
+    commits: (u64, f64),
+}
+
+impl MixKinds {
+    fn new() -> MixKinds {
+        MixKinds {
+            on: std::env::var_os("SUPDB_MIX_KINDS").is_some(),
+            gets: (0, 0.0),
+            scans: (0, 0.0),
+            commits: (0, 0.0),
+        }
+    }
+
+    fn start(&self) -> Option<Instant> {
+        self.on.then(Instant::now)
+    }
+
+    fn add(slot: &mut (u64, f64), t0: Option<Instant>) {
+        if let Some(t0) = t0 {
+            slot.0 += 1;
+            slot.1 += t0.elapsed().as_secs_f64();
+        }
+    }
+
+    fn report(&self, arm: &str, letter: char, size: u64, ops: u64, total: f64) {
+        if self.on {
+            eprintln!(
+                "mixkinds {arm} {letter} size {size} ops {ops} gets {} {:.3} scans {} {:.3} commits {} {:.3} total {:.3}",
+                self.gets.0,
+                self.gets.1 * 1e3,
+                self.scans.0,
+                self.scans.1 * 1e3,
+                self.commits.0,
+                self.commits.1 * 1e3,
+                total * 1e3
+            );
+        }
+    }
+}
+
 fn ycsb(
     e: &mut dyn Engine,
+    arm: &str,
     w: &(char, u32, u32, u32, u32, u32, KeyDist),
     size: u64,
     inserted: &mut u64,
@@ -1272,12 +1354,15 @@ fn ycsb(
     let mut kb = [0u8; KEY_SIZE];
     let mut wbuf = Batch::with_capacity(YCSB_BATCH, payload.value_size());
     let mut wbuf_is_insert = false;
+    let mut kinds = MixKinds::new();
     let t = Instant::now();
     for _ in 0..ops {
         let roll = pick.below(100) as u32;
         if roll < pread {
             db_key_into(keys.next(), &mut kb);
+            let t0 = kinds.start();
             e.get(&kb)?;
+            MixKinds::add(&mut kinds.gets, t0);
         } else if roll < pread + pupd {
             db_key_into(keys.next(), &mut kb);
             wbuf.push(&kb, payload.get(&mut vrng));
@@ -1289,19 +1374,29 @@ fn ycsb(
             wbuf_is_insert = true;
         } else if roll < pread + pupd + pins + pscan {
             db_key_into(keys.next(), &mut kb);
+            let t0 = kinds.start();
             e.range(&kb, YCSB_SCAN)?;
+            MixKinds::add(&mut kinds.scans, t0);
         } else if prmw > 0 {
             db_key_into(keys.next(), &mut kb);
+            let t0 = kinds.start();
             e.get(&kb)?;
+            MixKinds::add(&mut kinds.gets, t0);
             wbuf.push(&kb, payload.get(&mut vrng));
             wbuf_is_insert = false;
         }
         if wbuf.len() >= YCSB_BATCH {
+            let t0 = kinds.start();
             flush_ycsb(&mut wbuf, e, wbuf_is_insert)?;
+            MixKinds::add(&mut kinds.commits, t0);
         }
     }
+    let t0 = kinds.start();
     flush_ycsb(&mut wbuf, e, wbuf_is_insert)?;
-    Ok(t.elapsed().as_secs_f64())
+    MixKinds::add(&mut kinds.commits, t0);
+    let total = t.elapsed().as_secs_f64();
+    kinds.report(arm, letter, size, ops, total);
+    Ok(total)
 }
 
 fn flush_ycsb(b: &mut Batch, e: &mut dyn Engine, insert: bool) -> Result<(), String> {

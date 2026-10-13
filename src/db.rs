@@ -1025,6 +1025,29 @@ pub struct Options {
     /// the mixes that write pay more than the mix that scans gains, so
     /// this is off: `supdb-wake` and `supdb-ingestwake` price it.
     pub upkeep_wake_parked: bool,
+    /// The upkeep thread stays alert after work: for `UPKEEP_ALERT` after
+    /// its last pass or hand-over it parks for at most `UPKEEP_ALERT_POLL`
+    /// at a time, and climbs its back-off to `UPKEEP_POLL_MAX` only once
+    /// that has passed, so a batch lent without a wake -- one too small to
+    /// wake it for, a hundred writes of a mix -- is filed within a poll
+    /// and the thread builds the forms the next scan would have. The
+    /// writer wakes nobody: the thread's own timer runs on its own core,
+    /// where a wake from the writer was a VM exit on this guest, seven
+    /// microseconds a commit, and the mixes that write paid more than the
+    /// mix that scans gained (`upkeep_wake_parked`). Before this the
+    /// back-off, climbed during the read passes, slept through two
+    /// milliseconds of mixes, and ycsb-E's first scans filed seventeen
+    /// hundred writes and built a hundred and fifty blocks at ten thousand
+    /// keys, 0.93x of the comparator where the durable store, whose
+    /// fsyncs gave the thread its window, read 1.3x. Off, the arm
+    /// `supdb-noalert` and `supdb-ingestnoalert`: the back-off as it was.
+    pub upkeep_alert: bool,
+    /// The longest the alert thread parks for, in microseconds: how soon
+    /// after a lent batch it files and builds, against how often its
+    /// passes re-read the entries the writer is rewriting, each re-read
+    /// an ownership the writer's next update pays for. Priced in one
+    /// process over a sweep of lengths (`docs/engine.md`).
+    pub upkeep_alert_poll_us: u32,
     /// With reads around, a commit that does not sync and whose batch is
     /// large enough to wake the upkeep thread for files the batch itself
     /// before it returns, whatever the settle bound says, and lends the
@@ -1698,6 +1721,8 @@ impl Default for Options {
             upkeep: Upkeep::default(),
             upkeep_lag_pct: 0,
             upkeep_wake_parked: false,
+            upkeep_alert: true,
+            upkeep_alert_poll_us: 200,
             upkeep_inline_bursts: true,
             scan_timers: false,
             upkeep_batch_pct: 0,
@@ -22304,6 +22329,11 @@ struct Lend {
     /// between polls, zero while it is awake: what a commit reads to
     /// wake a thread that has backed off (`Options::upkeep_wake_parked`).
     parked_us: std::sync::atomic::AtomicU32,
+    /// Whether reads were around at the last hand-over: what the thread
+    /// stays alert for (`Options::upkeep_alert`), since a pass beside a
+    /// write-only stretch builds forms nobody reads and costs the writer
+    /// the lines they share.
+    alert_hint: std::sync::atomic::AtomicBool,
 }
 
 /// The upkeep is away from the writer: in the cell, or out with the
@@ -22409,6 +22439,10 @@ impl SeqTo {
 /// for the read that takes the upkeep back and files it itself.
 const UPKEEP_POLL_MIN: std::time::Duration = std::time::Duration::from_micros(100);
 const UPKEEP_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(20);
+/// How long after its last pass or hand-over the upkeep thread stays alert
+/// (`Options::upkeep_alert`); the longest it parks for while it is, is
+/// `Options::upkeep_alert_poll_us`.
+const UPKEEP_ALERT: std::time::Duration = std::time::Duration::from_millis(100);
 const UPKEEP_WAKE_WRITES: usize = 256;
 
 /// How long the upkeep thread lets a commit short of
@@ -22642,6 +22676,9 @@ impl Reader {
         let _ = lend.thread.set(std::thread::current());
         let mut idle = UPKEEP_POLL_MIN;
         let mut short_since: Option<std::time::Instant> = None;
+        // Alert from the start: the first commits of a store's life are
+        // the ones nobody has measured a wake for.
+        let mut alert_until = std::time::Instant::now() + UPKEEP_ALERT;
         loop {
             if stop.load(AtomicOrdering::SeqCst) {
                 break;
@@ -22663,13 +22700,25 @@ impl Reader {
             }
             short_since = None;
             let Some((fs, to)) = lend.take_out() else {
+                // Alert, the park is capped at a poll; past it, the
+                // back-off climbs as before (`Options::upkeep_alert`).
+                let cap = if self.opts.upkeep_alert
+                    && lend.alert_hint.load(AtomicOrdering::Relaxed)
+                    && std::time::Instant::now() < alert_until
+                {
+                    std::time::Duration::from_micros(u64::from(self.opts.upkeep_alert_poll_us))
+                } else {
+                    UPKEEP_POLL_MAX
+                };
+                let wait = idle.min(cap);
                 lend.parked_us
-                    .store(idle.as_micros() as u32, AtomicOrdering::Release);
-                std::thread::park_timeout(idle);
+                    .store(wait.as_micros() as u32, AtomicOrdering::Release);
+                std::thread::park_timeout(wait);
                 lend.parked_us.store(0, AtomicOrdering::Relaxed);
                 idle = (idle * 2).min(UPKEEP_POLL_MAX);
                 continue;
             };
+            alert_until = std::time::Instant::now() + UPKEEP_ALERT;
             let began = std::time::Instant::now();
             let cpu0 = thread_cpu_ns();
             let lent = to.lent;
@@ -22907,6 +22956,22 @@ impl Db {
             self.upkeep_since_scan += batch as u64;
         }
         let reads_around = reads_around(life, self.upkeep_since_scan, keys);
+        // The thread stays alert on its own timer while reads are around
+        // (`Options::upkeep_alert`), but it chooses a park's length only
+        // when it parks: one that fell into a long park while nothing was
+        // posted -- the read passes before a mix -- sleeps through the mix
+        // unless the commit that finds reads around wakes it. Once, at the
+        // transition or on finding it parked long; its own polls carry it
+        // from there, so this is a wake a regime and not a wake a commit.
+        let lend = &self.shared.upkeep;
+        let was_alert = lend.alert_hint.swap(reads_around, AtomicOrdering::Relaxed);
+        if self.opts.upkeep_alert
+            && reads_around
+            && (!was_alert
+                || lend.parked_us.load(AtomicOrdering::Acquire) > self.opts.upkeep_alert_poll_us)
+        {
+            lend.wake();
+        }
         // With reads around, a batch worth waking the thread for is filed
         // by a commit that does not sync, and the thread is lent nothing
         // of it; one that syncs lends it, since the thread works through

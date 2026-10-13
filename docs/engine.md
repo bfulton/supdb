@@ -3966,6 +3966,92 @@ same sitting as the pairings above. The hash tables the mixes write
 take the same entry and the same index, with the slot drawn from the
 tag's half; their cells are the gate's to watch.
 
+#### The upkeep thread kept alert
+
+ycsb-E at ten and thirty thousand keys read 0.90x to 0.97x of the
+comparator in every row of a fortnight while the durable store read it
+at 1.1x to 1.3x, and a timer on each kind of operation in the mix
+(`SUPDB_MIX_KINDS`, both arms alike) put the whole gap in the scans:
+1,585 scans of fifty at 691 ns against 633 at ten thousand keys, the
+mix's one commit level. The same arms read our hundred-entry scans on
+the drained store 1.21x the comparator's, and the durable store's E
+scans ran at 532 ns on the same keys; what the buffered scans paid was
+the store the mixes before E had left. The mix counters said what: at
+ten thousand keys E's scans built a hundred and fifty blocks, every
+block of the store, where the durable store's E built sixteen, because
+the durable store's upkeep thread had built them during the update
+mixes, six passes beside A's fsyncs and nine beside F's, and the
+buffered store's thread had run no pass at all. A batch of a hundred
+writes, the mixes' size, is lent to the thread but is below the batch a
+commit wakes it for, and the thread's back-off, doubled from a hundred
+microseconds to twenty milliseconds across the read passes before the
+mixes, slept through the two milliseconds the mixes take. The arm that
+lends the bursts' filing too made E's scans slower, 709 ns, and the lag
+cells a third of what they were, and the option that wakes the thread
+for any batch once it is parked over a millisecond had been priced and
+turned off: E 1.18x, A and F 0.85x, the wake being a VM exit here.
+
+The thread stays alert now (`Options::upkeep_alert`): for a hundred
+milliseconds after its last pass or hand-over it parks for at most two
+hundred microseconds at a time while reads are around, on its own timer
+and its own core, and climbs its back-off only past that; and the commit
+that finds reads newly around, or finds the thread parked longer than
+its poll, wakes it once, since a thread chooses a park's length only when
+it parks and the first shape of this slept through three mixes in five
+inside a park it had chosen before the reads began. With it the thread
+runs four to six passes beside A and two to six beside F at ten thousand
+keys in every rep, E builds sixteen blocks, and E's scans run at 526 ns.
+Two probes priced what a thread beside the writer costs on this guest
+before the shape was chosen: a spinning thread on another core slows an
+L2-resident dependent-load loop on the writer's by nothing and a
+memory-bound one by nothing, a streaming one by five percent, and a
+thread that wakes every two hundred microseconds for twenty of work the
+same; the writer's own wake is what the earlier option paid for, and
+this shape pays for none. What remains is what the pass's own work
+costs the writer beside it -- its reads of the memtable lines the writer
+is writing, re-owned at the next write -- which the kinds timer reads
+as about five microseconds a commit of a hundred updates and fifteen to
+twenty-five nanoseconds a point read while a pass runs, on the mixes
+that write.
+
+Priced against the back-off as it was over two sittings with the arms'
+order swapped, the timer by kind on for every arm: E's scans at ten
+thousand keys read 564 ns against 705 and then 524 against 667, at
+thirty thousand 556 against 718 and then 562 against 715; the cell 1.22x
+and 1.20x in the first sitting (p .004, .039) and 1.23x at both in the
+second, every pair of sixteen and of twelve; against the comparator with
+it, E 1.19x to 1.20x and 1.14x to 1.21x at the two rungs where the rows
+had read 0.90x to 0.97x, the burst's updates at the one percent lag
+point 1.8x and its scans level to 1.7x, and no other buffered cell
+behind the comparator at either rung. The mixes that write beside the
+passes pay for the filing: A at ten thousand keys 0.532 ms against 0.440
+and F 0.642 against 0.512 in the first sitting, about nine microseconds
+a commit of a hundred updates and twenty nanoseconds a point read, B and
+D within a few percent, the same at thirty thousand; at a hundred
+thousand the two sittings disagree in sign on A and on the lag points
+within eight pairs' noise, with E's scans level to the nanosecond, and
+at three hundred thousand nothing moved or the update mixes gained in
+both -- so A and F at the small rungs give back a tenth to a fifth of a
+lead of 1.4x to 2.3x over the comparator, which is where a loss against
+our own rows will read in the quick row's gate. What that tax is was
+bisected by experiment: a pass that pins, parks for fifty microseconds
+and leaves costs A four percent and the reads nothing; one that files
+and builds nothing costs the whole of it with a third of E's gain; the
+full pass costs the same and gives E the rest. The filing re-reads the
+hot entries the writer's zipfian updates are rewriting, and each re-read
+is an ownership the next update pays for, beside the memtable streamed
+through the shared cache. The poll's length does not move it, two
+hundred, five hundred or a thousand microseconds alike, because a thread
+once awake runs a pass per posted commit at its shortest poll; the
+upkeep's batch option, which waits for five percent of the store's keys
+before a pass, trades a twentieth of E's gain for A level and F still a
+fifth behind, and three cache-line separations -- the arena's writer
+words, the state's forms-bytes counter, the pins' walk at an operation's
+end -- each moved nothing and were taken out again. The durable store's
+thread has paid the same beside the fsyncs since the upkeep was lent,
+with no cell to show it against. The back-off as it was is the arm
+`supdb-noalert` and `supdb-ingestnoalert`.
+
 #### The piece's ranks over the heads, and a locked exchange to look at a form
 
 Every written key's rank in its partition is computed by three parties:
