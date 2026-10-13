@@ -277,6 +277,30 @@ banked on its controls -- floors and comparators in band -- so the next
 window carries the new definition; the engine's part of the step was
 read by alternating two binaries in one sitting, never from the row.
 
+**A host that moved on an axis no floor read.** A quick row read the
+buffered arm's load at three hundred thousand keys at 0.41x of LMDB,
+five slow reps of five, where the two rows before read 1.1-1.2x and
+every arm's load at that rung was down a fifth to a half, with the
+comparators in band and all three floors within their window. Paired an
+hour later in one process with the row's own binary, the arm loaded at
+its old rate and its one slow rep had the shape the profiles know: the
+same fault count as the fast reps at three to four times the CPU, in
+the kernel's zeroing of its fresh anonymous pages and its copy into
+fresh page-cache pages. A probe of the price itself read 1.1-1.3 µs a
+page while the fresh footprint fit what had recently been freed and
+5-15 past it, and which price a load gets depends on what the pass
+before it freed and how long ago -- the arm before it in `ARMS`, a
+variable nobody chose. The write piece's size was not it: a probe
+wrote the same forty megabytes in pieces of a megabyte, 64 KB and 4 KB
+at the same price per page in the same state. The fourth floor reads
+that axis (`page-floor`), sampled after every rep of every rung as well
+as at the start because the price moves within a row, and it holds the
+pages it touched to the row's end, since a floor that freed them would
+hand the next pass a cheaper load than the one before had. The rule: a
+control reads the axis the measurement moves on, where and when the
+measurement is taken; and a floor that gives back what it measured has
+measured the pass after it instead.
+
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`

@@ -10,7 +10,7 @@ row outside the error bars its neighbours drew.
 
 ## Workloads
 
-The workloads below, plus three floors. Each yields one or more quantities.
+The workloads below, plus four floors. Each yields one or more quantities.
 
 | workload | shape | quantities |
 |---|---|---|
@@ -23,6 +23,7 @@ The workloads below, plus three floors. Each yields one or more quantities.
 | `wal-floor` | framed 1,000-record batches appended to one file, one `fdatasync` each, no engine | ops/s |
 | `scan-floor` | one `mmap` sequential walk of a file the top rung's size (capped at 4 GiB), no engine | bytes/s |
 | `mem-floor` | one dependent load at a time around a permutation of a 64 MiB buffer's cache lines, no engine | chases/s |
+| `page-floor` | one first touch per page of a fresh anonymous mapping of a thousand pages, the mapping held to the row's end; sampled with the other floors and again after every rep of every rung, no engine | pages/s |
 
 A read or a scan consumes what it returns: every value is copied out, into
 the reading thread's own buffer, on every arm, in the workloads above and in
@@ -47,10 +48,18 @@ points still land in the series beside every other run's.
 The floors are per-machine constants, not per-engine and not per-size. They
 are what "as fast as possible" means on that host; an engine's distance from
 them is the headroom left, and they are the gate's control over the host
-(below). Three, because a host moves in three ways this suite feels: the
-device's sync rate, the mapped sequential read, and the latency of a load
+(below). Four, because a host moves in four ways this suite feels: the
+device's sync rate, the mapped sequential read, the latency of a load
 that nothing can predict, which is the shape of every table, index and
-chain the engine walks and the one the other two floors cannot see. The scan floor's file fits in memory at `quick`
+chain the engine walks and the one the sequential floors cannot see, and
+the price of a page nobody has touched since it was freed, which every
+load's tables and every written file's page cache pay and which the
+other three cannot see either: about a microsecond where the guest still
+backs the page, five to fifteen where its host has to. That last one
+moves within a row, with what was freed before each pass and how long
+ago, so it is sampled after every rep of every rung as well as at the
+start, and its mappings are kept to the row's end, since pages freed are
+cheap again for the pass that follows. The scan floor's file fits in memory at `quick`
 and is served from the page cache after its first walk, which is also what a
 store that fits in memory sees; at `full` neither fits.
 

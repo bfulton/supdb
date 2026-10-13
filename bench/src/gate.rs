@@ -39,7 +39,7 @@ pub const MIN_HISTORY: usize = 3;
 /// before a run has paid for the measurement the gate would refuse.
 pub fn higher_is_better(quantity: &str) -> Option<bool> {
     Some(match quantity {
-        "ops_per_s" | "reads_per_s" | "entries_per_s" | "bytes_per_s" => true,
+        "ops_per_s" | "reads_per_s" | "entries_per_s" | "bytes_per_s" | "pages_per_s" => true,
         "reads_per_s_2t" | "reads_per_s_4t" | "entries_per_s_2t" | "entries_per_s_4t" => true,
         "entries_per_s_lag0pct" | "entries_per_s_lag1pct" => true,
         "entries_per_s_lag10pct" | "entries_per_s_lag100pct" => true,
@@ -50,11 +50,14 @@ pub fn higher_is_better(quantity: &str) -> Option<bool> {
 }
 
 /// The workloads that measure the machine rather than an engine: the
-/// device's sync rate, the mapped sequential read, and the random-access
-/// chase. Named here, never guessed, so a floor added in `run` is added
-/// here or it is not a control.
+/// device's sync rate, the mapped sequential read, the random-access
+/// chase, and the price of a fresh page. Named here, never guessed, so a
+/// floor added in `run` is added here or it is not a control.
 pub fn is_floor(workload: &str) -> bool {
-    matches!(workload, "wal-floor" | "scan-floor" | "mem-floor")
+    matches!(
+        workload,
+        "wal-floor" | "scan-floor" | "mem-floor" | "page-floor"
+    )
 }
 
 /// The arms an engine change cannot touch: the comparators a user would

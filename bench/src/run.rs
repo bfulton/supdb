@@ -314,6 +314,15 @@ const WAL_FLOOR_BATCHES: u64 = 100;
 const MEM_FLOOR_BYTES: usize = 64 << 20;
 const MEM_FLOOR_CHASES: usize = 1 << 20;
 
+/// The fresh-page floor's sample: how many pages of a fresh anonymous
+/// mapping one sample first-touches, in the system's page size. A
+/// thousand is a millisecond where the guest backs the pages and five to
+/// fifteen where its host has to, enough to time either, and a few
+/// megabytes beside the pool of recently freed pages it draws from --
+/// the pool the next pass's load draws from too, so the sample takes
+/// little of it and keeps what it took (`FreshPages`).
+const PAGE_FLOOR_PAGES: usize = 1024;
+
 type Key = (String, Option<u64>, String, String); // workload, size, arm, quantity
 
 struct Samples {
@@ -392,10 +401,14 @@ pub fn run(
     // The floors first: what the device does with no engine in the way.
     let floor_bytes =
         (*rungs.last().unwrap_or(&0) * (KEY_SIZE + plan.value_size) as u64).min(SCAN_FLOOR_CAP);
+    // The page floor's mappings, held to the row's end (`FreshPages`).
+    let mut fresh: Vec<FreshPages> = Vec::new();
     for rep in 0..=plan.reps {
         let wal = wal_floor(&root, plan, &payload)?;
         let scan = scan_floor(&root, floor_bytes)?;
         let mem = mem_floor();
+        let (page, held) = page_floor()?;
+        fresh.push(held);
         if rep > 0 {
             s.push(
                 "wal-floor",
@@ -423,13 +436,22 @@ pub fn run(
                 ("ops_per_s", "chases/s"),
                 mem,
             );
+            s.push(
+                "page-floor",
+                None,
+                FLOOR_ARM,
+                Guarantee::Buffered,
+                ("pages_per_s", "pages/s"),
+                page,
+            );
         }
         log(&format!(
-            "{:>7}s  floors rep {rep}{}  wal {wal:>10.0} ops/s  mmap {:>8.2} GB/s  chase {:>9.0}/s",
+            "{:>7}s  floors rep {rep}{}  wal {wal:>10.0} ops/s  mmap {:>8.2} GB/s  chase {:>9.0}/s  page {:>5.2} us",
             started.elapsed().as_secs(),
             if rep == 0 { " (warmup)" } else { "" },
             scan / 1e9,
             mem,
+            1e6 / page,
         ));
     }
     // The scan floor's file is dead weight from here: it is the top rung's
@@ -574,6 +596,22 @@ pub fn run(
                     at_top(&one.scan_entries_s_threaded),
                     one.ycsb_ops_s.iter().find(|(l, _)| *l == 'A').map(|(_, v)| *v).unwrap_or(0.0),
                 ));
+            }
+            // The price of a fresh page as this rep leaves it for the next
+            // (`page_floor`): what the pass after it will pay for its
+            // tables and its files' pages, read where the loads are and not
+            // only at the row's start.
+            let (page, held) = page_floor()?;
+            fresh.push(held);
+            if rep > 0 {
+                s.push(
+                    "page-floor",
+                    None,
+                    FLOOR_ARM,
+                    Guarantee::Buffered,
+                    ("pages_per_s", "pages/s"),
+                    page,
+                );
             }
         }
         // Bank the row now that this rung is whole. A rung past the memory
@@ -1548,6 +1586,69 @@ fn scan_floor(root: &Path, bytes: u64) -> Result<f64, String> {
 /// both sequential and neither sees a host whose memory latency has
 /// moved: a row where the engine's rates fall and the floors do not is
 /// the engine's, and telling those apart is the gate's whole job.
+/// A fresh anonymous mapping the page floor touched, held until the row
+/// ends. Pages freed are cheap again for whoever allocates next -- that
+/// is what the floor measures -- so a floor that freed its pages would
+/// hand the pass after it a cheaper load than the pass before had, and a
+/// control that moves what it controls is not one.
+struct FreshPages {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl Drop for FreshPages {
+    fn drop(&mut self) {
+        // SAFETY: the mapping `page_floor` made, unmapped once.
+        unsafe { libc::munmap(self.ptr.cast(), self.len) };
+    }
+}
+
+/// One first touch per page of a fresh anonymous mapping, timed: the
+/// price this host charges for a page nobody has touched since it was
+/// freed. Where the guest still backs the page it is the kernel's zeroing,
+/// about a microsecond; where the guest's balloon has handed the block to
+/// the host it is the host's fault and allocation, five to fifteen. Every
+/// write path's fresh memory pays it -- an engine's tables and arenas,
+/// the page cache's pages behind a `write` -- and which price a load gets
+/// depends on how much was freed before it and how long ago, so a row's
+/// loads can read at a third of the rows before with every comparator in
+/// band and the other three floors within their window, which is the row
+/// this floor came from. It is sampled through the row, not only at its
+/// start, because the price moves within one. Pages a second, and the
+/// mapping for the caller to hold.
+fn page_floor() -> Result<(f64, FreshPages), String> {
+    // SAFETY: a plain query of the system's page size.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page = usize::try_from(page).map_err(|_| "page floor: no page size".to_string())?;
+    let len = PAGE_FLOOR_PAGES * page;
+    // SAFETY: an anonymous private mapping of `len` bytes, checked below.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(format!(
+            "page floor: mmap of {len} bytes failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let ptr: *mut u8 = ptr.cast();
+    let t = Instant::now();
+    for i in 0..PAGE_FLOOR_PAGES {
+        // SAFETY: `i * page` is inside the mapping; volatile so the touch
+        // is a store the compiler keeps.
+        unsafe { std::ptr::write_volatile(ptr.add(i * page), 1) };
+    }
+    let secs = t.elapsed().as_secs_f64();
+    Ok((PAGE_FLOOR_PAGES as f64 / secs, FreshPages { ptr, len }))
+}
+
 fn mem_floor() -> f64 {
     let lines = MEM_FLOOR_BYTES / 64;
     // A permutation of the lines as one cycle, so no prefetcher can
