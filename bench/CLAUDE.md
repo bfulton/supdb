@@ -301,6 +301,26 @@ control reads the axis the measurement moves on, where and when the
 measurement is taken; and a floor that gives back what it measured has
 measured the pass after it instead.
 
+**A floor inside the pool the loads exhaust.** The fresh-page floor
+read 1.0-1.4 µs a page in all twenty-five samples of the first row that
+carried it, while every arm's load at the top rung read a third to a
+half of the rows before, LMDB's included. Its thousand pages drew from
+the pool of recently freed pages, and a forty-megabyte load draws past
+it: probes put the pool at about what the pass before had freed, cheap
+for seconds, and everything past it at the host's price. So the floor
+read the price the loads were not paying. Rather than a floor sized to a
+load, which would consume the pool it measured and prime the next pass
+unevenly, the runner primes the pool itself before every store a pass
+opens -- a touch and free of 512 bytes a key of the rung, between 16 and
+512 MB -- so every load meets a pool larger than its footprint whatever
+ran before it, and the first row after it banks on its controls against
+a window that predates the definition. The prime's own price per page
+is printed on the pass line and paired by `ab`, never banked. The rule:
+a control reads the quantity at the footprint the measurement has, not
+at a sample's; and when the quantity is the machine's and the
+measurement cannot be made independent of it, make the measurement
+independent of it and read the quantity beside it.
+
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`

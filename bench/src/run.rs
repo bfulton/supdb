@@ -323,6 +323,17 @@ const MEM_FLOOR_CHASES: usize = 1 << 20;
 /// little of it and keeps what it took (`FreshPages`).
 const PAGE_FLOOR_PAGES: usize = 1024;
 
+/// The pool a pass's store loads into, primed before the store opens
+/// (`prime_fresh_pool`): bytes per key of the rung, between a floor and a
+/// cap. The largest fresh footprint a load on the quick ladder takes is
+/// about 340 bytes a key -- RocksDB's forty-two megabytes of memtable
+/// and its files at three hundred thousand keys, or the supdb arms'
+/// shuffled load -- so 512 covers every arm with margin; a load at the
+/// full scale is gigabytes, which no prime covers, and the cap says so.
+const PRIME_BYTES_PER_KEY: u64 = 512;
+const PRIME_MIN_BYTES: u64 = 16 << 20;
+const PRIME_MAX_BYTES: u64 = 512 << 20;
+
 type Key = (String, Option<u64>, String, String); // workload, size, arm, quantity
 
 struct Samples {
@@ -586,7 +597,7 @@ pub fn run(
                     .map(|b| format!("{:.2} GB", b as f64 / 1e9))
                     .unwrap_or_else(|| "-".into());
                 log(&format!(
-                    "{:>7}s  size {size:>9}  rep {rep}{}  {arm:<15} load {:>10.0} ops/s  read {:>10.0}/s  {top}t {:>10.0}/s  scan {:>11.0}/s  {top}t {:>11.0}/s  ycsb-A {:>9.0}/s  rss {rss}",
+                    "{:>7}s  size {size:>9}  rep {rep}{}  {arm:<15} load {:>10.0} ops/s  read {:>10.0}/s  {top}t {:>10.0}/s  scan {:>11.0}/s  {top}t {:>11.0}/s  ycsb-A {:>9.0}/s  prime {:>5.2} us/pg  rss {rss}",
                     started.elapsed().as_secs(),
                     if rep == 0 { " (warmup)" } else { "" },
                     one.load_ops_s,
@@ -595,6 +606,7 @@ pub fn run(
                     one.scan_entries_s,
                     at_top(&one.scan_entries_s_threaded),
                     one.ycsb_ops_s.iter().find(|(l, _)| *l == 'A').map(|(_, v)| *v).unwrap_or(0.0),
+                    one.prime_us_per_page,
                 ));
             }
             // The price of a fresh page as this rep leaves it for the next
@@ -668,6 +680,10 @@ fn row_of(utc: &str, machine: &MachineInfo, plan: &Plan, s: &Samples) -> Row {
 }
 
 struct OnePass {
+    /// The dearer of the pass's two primes, microseconds a page: the
+    /// host's price for a load-sized footprint this pass, logged and
+    /// paired, never banked.
+    prime_us_per_page: f64,
     load_ops_s: f64,
     load_bpb: f64,
     /// Bytes the store's files hold on disk after the load, per byte
@@ -705,6 +721,7 @@ impl OnePass {
     /// Every quantity of the pass under one name, for `ab` to pair.
     fn flat(&self) -> Vec<(String, f64)> {
         let mut v = vec![
+            ("prime us_per_page".into(), self.prime_us_per_page),
             ("load ops_per_s".into(), self.load_ops_s),
             ("load device_bytes_per_byte".into(), self.load_bpb),
             ("load bytes_on_disk_per_byte".into(), self.disk_bpb),
@@ -746,7 +763,10 @@ fn one_pass(
     plan: &Plan,
     payload: &Payload,
 ) -> Result<OnePass, String> {
-    // Ordered load, then reads, scans and the YCSB mixes over it.
+    // Ordered load, then reads, scans and the YCSB mixes over it. The
+    // store opens into a primed pool (`prime_fresh_pool`), as every store
+    // a pass opens does.
+    let prime_a = prime_fresh_pool(prime_bytes_for(size))?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let mut e = engines::open(arm, dir, map_gb)?;
     let (load_s, wrote) = load(e.as_mut(), size, plan, payload, |i| i)?;
@@ -918,7 +938,9 @@ fn one_pass(
     release_freed_memory();
     let _ = std::fs::remove_dir_all(dir);
 
-    // The same keys in a shuffled order, on a fresh store.
+    // The same keys in a shuffled order, on a fresh store, into a primed
+    // pool again.
+    let prime_b = prime_fresh_pool(prime_bytes_for(size))?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let mut e = engines::open(arm, dir, map_gb)?;
     let perm = Permutation::new(size, 0x5EED);
@@ -1015,6 +1037,7 @@ fn one_pass(
     release_freed_memory();
 
     Ok(OnePass {
+        prime_us_per_page: prime_a.max(prime_b),
         load_ops_s: size as f64 / load_s,
         load_bpb: wrote as f64 / stored,
         disk_bpb: on_disk as f64 / stored,
@@ -1601,6 +1624,83 @@ impl Drop for FreshPages {
         // SAFETY: the mapping `page_floor` made, unmapped once.
         unsafe { libc::munmap(self.ptr.cast(), self.len) };
     }
+}
+
+/// The pool to prime for a rung of `size` keys (`PRIME_BYTES_PER_KEY`).
+fn prime_bytes_for(size: u64) -> u64 {
+    (size * PRIME_BYTES_PER_KEY).clamp(PRIME_MIN_BYTES, PRIME_MAX_BYTES)
+}
+
+/// Touch and free a fresh anonymous mapping of `bytes` before a store
+/// opens, so the load that follows draws its fresh pages -- its tables,
+/// its files' page cache -- from pages this guest still backs. A page
+/// nobody has touched since it was freed costs about a microsecond where
+/// the guest backs it and five to fifteen where its host has to, and
+/// which price a load gets depends on how much the pass before it freed
+/// and how long ago: two rows read every arm's load at the top rung at
+/// a third to a half of the rows before, with every control in band,
+/// because the arm before each had left a pool smaller than its
+/// footprint. The pages stay fresh to the allocator -- the kernel zeroes
+/// them on the load's first touch as before -- and the host's price is
+/// paid here, once, where it is measured and not timed. Returns the
+/// microseconds a page the touch cost, which the pass line prints: the
+/// host's price for a load-sized footprint, read beside the page floor's
+/// price inside the pool.
+fn prime_fresh_pool(bytes: u64) -> Result<f64, String> {
+    // SAFETY: a plain query of the system's page size.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page = usize::try_from(page).map_err(|_| "prime: no page size".to_string())?;
+    let len = usize::try_from(bytes).map_err(|_| "prime: too large".to_string())?;
+    let len = len.div_ceil(page) * page;
+    // SAFETY: an anonymous private mapping of `len` bytes, checked below,
+    // unmapped at the end of this function.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(format!(
+            "prime: mmap of {len} bytes failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let t = Instant::now();
+    let populated = populate_write(ptr, len);
+    if !populated {
+        let p: *mut u8 = ptr.cast();
+        for i in (0..len).step_by(page) {
+            // SAFETY: inside the mapping; volatile so the touch is a
+            // store the compiler keeps.
+            unsafe { std::ptr::write_volatile(p.add(i), 1) };
+        }
+    }
+    let secs = t.elapsed().as_secs_f64();
+    // SAFETY: the mapping made above, unmapped once.
+    unsafe { libc::munmap(ptr, len) };
+    Ok(secs * 1e6 / (len / page) as f64)
+}
+
+/// Populate a fresh mapping's pages in one call where the kernel offers
+/// it (`MADV_POPULATE_WRITE`, Linux 5.14): half the price of a fault a
+/// page. False where it is not offered, and the caller touches.
+#[cfg(target_os = "linux")]
+fn populate_write(ptr: *mut libc::c_void, len: usize) -> bool {
+    // Not in every libc crate the suite builds against; the value is the
+    // kernel's (`include/uapi/asm-generic/mman-common.h`).
+    const MADV_POPULATE_WRITE: libc::c_int = 23;
+    // SAFETY: advice over a mapping this process holds.
+    unsafe { libc::madvise(ptr, len, MADV_POPULATE_WRITE) == 0 }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn populate_write(_ptr: *mut libc::c_void, _len: usize) -> bool {
+    false
 }
 
 /// One first touch per page of a fresh anonymous mapping, timed: the

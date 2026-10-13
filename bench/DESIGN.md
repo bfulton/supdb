@@ -23,7 +23,7 @@ The workloads below, plus four floors. Each yields one or more quantities.
 | `wal-floor` | framed 1,000-record batches appended to one file, one `fdatasync` each, no engine | ops/s |
 | `scan-floor` | one `mmap` sequential walk of a file the top rung's size (capped at 4 GiB), no engine | bytes/s |
 | `mem-floor` | one dependent load at a time around a permutation of a 64 MiB buffer's cache lines, no engine | chases/s |
-| `page-floor` | one first touch per page of a fresh anonymous mapping of a thousand pages, the mapping held to the row's end; sampled with the other floors and again after every rep of every rung, no engine | pages/s |
+| `page-floor` | one first touch per page of a fresh anonymous mapping of a thousand pages, the mapping held to the row's end; sampled with the other floors and again after every rep of every rung, no engine: the price of a page inside the pool every store is primed with (below) | pages/s |
 
 A read or a scan consumes what it returns: every value is copied out, into
 the reading thread's own buffer, on every arm, in the workloads above and in
@@ -59,7 +59,23 @@ backs the page, five to fifteen where its host has to. That last one
 moves within a row, with what was freed before each pass and how long
 ago, so it is sampled after every rep of every rung as well as at the
 start, and its mappings are kept to the row's end, since pages freed are
-cheap again for the pass that follows. The scan floor's file fits in memory at `quick`
+cheap again for the pass that follows.
+
+That price is paid before the measurement, not inside it. Before every
+store a pass opens, the runner touches and frees a fresh anonymous
+mapping of 512 bytes a key of the rung, between 16 and 512 MB, so the
+load that follows draws its tables and its files' page cache from pages
+the guest still backs: the largest footprint a load on the quick ladder
+takes is about 340 bytes a key, RocksDB's memtable and files or the
+supdb arms' shuffled load at the top rung, and a load at the full scale
+is gigabytes, which no prime covers. Without it, which arm ran before
+which decided how large a pool each load met, and two rows read every
+arm's load at the top rung at a third to a half of the rows before with
+every control in band. The pages stay fresh to the allocator, zeroed on
+the load's first touch as before; only the host's part of the price
+moves to the prime, whose microseconds a page the pass line prints and
+`ab` pairs, and the page floor reads the price inside the primed pool,
+which is the price the loads then pay. The scan floor's file fits in memory at `quick`
 and is served from the page cache after its first walk, which is also what a
 store that fits in memory sees; at `full` neither fits.
 
