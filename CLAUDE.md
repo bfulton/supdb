@@ -265,6 +265,20 @@ forty microseconds against the three hundred the read-back cost, so a
 cell that moves when a step is removed is read beside the phase the step
 was in before it is read as the step's.
 
+A copy taken off the writer's path is priced at every reader of the
+copy and in the phase that inherits its pages. The streamed table's
+key copies were twelve hundred first touches a load at three hundred
+thousand keys, and taking them away moved the commits 3.5 ms; the
+close's one pass over the keys then streamed the forty-megabyte record
+section where it had streamed five megabytes of copies, 2.5 ms in every
+pair of both sittings and nothing at ten thousand keys, and the first
+update mix after the load first-touched a third of the pages the load
+no longer did, 670 faults in its thread against 60, a cell down 3-5%
+at p .04 twice while the read-only mixes sat level. The fault record by
+symbol named the copy, the drain's finish steps named the pass, and
+the mix counters named the inheriting mix; a rate over any one of the
+three would have named none of them.
+
 Profile a probe that does one thing. The scan probe's own `format!` per
 iteration was 8% of its samples until the keys were built before the
 loop.
@@ -760,7 +774,13 @@ keep the stream whole), since the stream's pages were two thirds of the
 load's first touches and the comparator's dirty pages come from a pool
 it reuses; the mixes after a load in the same store then first-touch
 the pages the whole stream had warmed for them, which the sum of the
-phases carries. The entries and the keys are the rest of what the table
+phases carries. The table's copy of every key was sixteen bytes a key of the
+same kind, a quarter of the pages left; an entry names its key inside
+its record in the stream now (`Options::direct_keys_in_stream`;
+`supdb-keysarena`, `supdb-ingestkeysarena` keep the copies), and the
+close's one pass reads the keys out of the record section through the
+run's mapping, which is the bandwidth of the whole section where the
+copies were an eighth of it. The entries are the rest of what the table
 costs, and a run that kept no table at all is the shape left to price.
 
 ## Shapes the bugs come in

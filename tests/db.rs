@@ -12121,14 +12121,15 @@ fn a_run_whose_keys_the_table_keeps_leaves_the_segment_the_copies_leave() {
             _ => "b".repeat(100),
         }
     };
-    let opts = |derive: bool| Options {
+    let opts = |derive: bool, in_stream: bool| Options {
         seal_bytes: 64 << 20,
         partition_bytes: Some(1 << 20),
         direct_derive_keys: derive,
+        direct_keys_in_stream: in_stream,
         ..Options::default()
     };
-    let drive = |d: &std::path::Path, derive: bool| {
-        let mut db = Db::create(d, opts(derive)).unwrap();
+    let drive = |d: &std::path::Path, derive: bool, in_stream: bool| {
+        let mut db = Db::create(d, opts(derive, in_stream)).unwrap();
         let mut m = ScanModel::default();
         for batch in 0..40u32 {
             for k in batch * 1000..(batch + 1) * 1000 {
@@ -12150,13 +12151,15 @@ fn a_run_whose_keys_the_table_keeps_leaves_the_segment_the_copies_leave() {
         m.flushed();
         m.check(&db, &format!("derive {derive}: flushed"));
         drop(db);
-        let db = Db::open(d, opts(derive)).unwrap();
+        let db = Db::open(d, opts(derive, in_stream)).unwrap();
         m.check(&db, &format!("derive {derive}: reopened"));
     };
     let da = dir("derive-copies");
     let db_ = dir("derive-table");
-    drive(&da, false);
-    drive(&db_, true);
+    let dc = dir("derive-table-keys-in-stream");
+    drive(&da, false, false);
+    drive(&db_, true, false);
+    drive(&dc, true, true);
     let files = |d: &std::path::Path, suffix: &str| -> Vec<(String, Vec<u8>)> {
         let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(d)
             .unwrap()
@@ -12172,8 +12175,13 @@ fn a_run_whose_keys_the_table_keeps_leaves_the_segment_the_copies_leave() {
         v.sort();
         v
     };
-    for (suffix, skip) in [(".sup", 4096usize), (".oidx", 0)] {
-        let (sa, sb) = (files(&da, suffix), files(&db_, suffix));
+    for (suffix, skip, other) in [
+        (".sup", 4096usize, &db_),
+        (".oidx", 0, &db_),
+        (".sup", 4096, &dc),
+        (".oidx", 0, &dc),
+    ] {
+        let (sa, sb) = (files(&da, suffix), files(other, suffix));
         assert!(!sa.is_empty(), "the stores left {suffix} files");
         assert_eq!(
             sa.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),

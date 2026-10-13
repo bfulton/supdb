@@ -851,6 +851,11 @@ pub(crate) fn record_tail_at(klen: usize, exts: &[Ext], compact: bool) -> usize 
 /// padding zeroed wherever the slice came from; the tail's offset within
 /// the record is returned. The one definition of the layout that
 /// `stream_record_tail_at` and a writer laying records out in place share.
+/// Where a record's key begins: after its two-byte key length and its
+/// two-byte extent count. A table that reads its keys in place in a
+/// record stream reads them here (`MemTable::key_of`).
+pub(crate) const RECORD_KEY_AT: usize = 4;
+
 pub(crate) fn record_into(
     rec: &mut [u8],
     key: &[u8],
@@ -859,7 +864,7 @@ pub(crate) fn record_into(
     compact: bool,
 ) -> usize {
     rec[0..2].copy_from_slice(&(key.len() as u16).to_le_bytes());
-    rec[4..4 + key.len()].copy_from_slice(key);
+    rec[RECORD_KEY_AT..RECORD_KEY_AT + key.len()].copy_from_slice(key);
     let at = align_up(4 + key.len(), REC_ALIGN);
     rec[4 + key.len()..at].fill(0);
     if compact && compacts(exts) {

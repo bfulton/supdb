@@ -3874,6 +3874,72 @@ nothing, and a run's footprint of a few megabytes in place of its whole
 length. The whole arena is the arm `supdb-norecycle` and
 `supdb-ingestnorecycle`.
 
+#### The keys read in their records
+
+With the stream in a ring, a buffered ordered load of three hundred
+thousand keys first-touched five thousand pages against the comparator's
+four hundred, and the fault record by symbol put twelve hundred of them
+in the table's copy of every key: sixteen bytes a key, kept beside a
+record that holds the same bytes four in from its start. The copy served
+the lookups a run in progress answers, the scan snapshot's build, the
+seal's sort and the close's one pass over the keys -- the trailer's slots,
+the Bloom and the ordered index's heads -- and every one of them can read
+the key where the record holds it.
+
+An entry of a streamed table names its key in the stream now
+(`Options::direct_keys_in_stream`): the record's offset plus the four
+bytes of its header, read through the arena's block while the block is
+live and through the run's mapping once the ring has taken the block
+out, as a value is; and the record's own offset, which the close asks
+for every key, is the key's less the header, where before it was worked
+back from the head. Two kinds of key keep a copy: one whose record runs
+across two of the arena's blocks with the key on the seam, since the
+blocks are not contiguous and a read across a seam copies out, and one
+past two gigabytes of a run, since the key offset is a word of
+thirty-two bits; both are marked by the word's top bit, which no stream
+offset below the limit carries. A seam falls inside a key once in about
+every ten megabytes of the suite's records, a few keys in a load of
+three hundred thousand, and a unit test puts one on the first seam in
+both record shapes. The segment a run closes is byte for byte what the
+copies composed; the test that held the derived close to the copies'
+bytes drives a third store this way and compares it the same.
+
+Priced against the copies in one process over two sittings with the
+arms' order swapped, the writer's faults a load fell from 5,050 to 3,880
+at three hundred thousand keys, 2,120 to 1,730 at a hundred thousand and
+495 to 455 at ten thousand -- the copy's pages, in every load of both
+sittings -- and the commits with them, 36.5 to 33.0 ms and 36.8 to 33.4,
+12.6 to 11.4 and 12.8 to 11.5, 1.51 to 1.40 and 1.52 to 1.44. The close
+pays for part of it: its one pass reads each key out of a record of a
+hundred and thirty bytes instead of a copy of sixteen, so it streams the
+record section through the mapping where it streamed an eighth of that
+through the heap, and the trailer step read 15.8 ms against 13.1 and
+16.2 against 14.0 at three hundred thousand buffered, in every pair of
+the second sitting, 4.9 against 4.3 at a hundred thousand, level at ten
+thousand, with the step's faults the same in both arms where the
+mapping's pages were mapped sixteen a fault and up to eighteen hundred
+more in one durable sitting where they were not. The composer needs the
+key's bytes at the first and last keys' common prefix, which is known
+only at the close, so a hash kept in the entry would spare the pass
+nothing. And a third of the pages the load no longer touches are touched
+by the first update mix after it in the same store, as the ring's were:
+the mix's thread read 670 faults against 60, and ycsb-A at three hundred
+thousand buffered read 0.97x, 0.95x and 0.95x of the copies' arm over
+three pairings, a cell this engine leads the comparator by nearly three
+to one, while the read-only mixes read level. The load's sum of phases
+read 3.46 ms against 3.59 and 3.56 against 3.68 at ten thousand, 30.7
+against 31.5 and 31.7 against 31.8 at a hundred thousand, 78.8 against
+81.9 and 83.8 against 81.2 at three hundred thousand; the load 1.04x in
+both sittings at ten thousand (33 of 48 pairs), 1.04x and 1.00x at a
+hundred thousand, 1.03x, 0.95x and 1.08x at three hundred thousand over
+three pairings, and the durable load 1.02x twice at ten thousand and
+1.01x and 1.03x at three hundred thousand, all in sittings where a fresh
+page cost about three microseconds, which makes the pages and the
+bandwidth near a wash there; in a dear sitting the twelve hundred pages
+cost seven to twenty-four microseconds each and the pass's bandwidth
+costs what it costs here, which is the case the change is for. The
+copies are the arm `supdb-keysarena` and `supdb-ingestkeysarena`.
+
 #### The piece's ranks over the heads, and a locked exchange to look at a form
 
 Every written key's rank in its partition is computed by three parties:

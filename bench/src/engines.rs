@@ -456,6 +456,10 @@ pub struct Supdb {
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
     norecycle: bool,
+    /// A streamed table keeping a copy of every key, the shape before
+    /// `Options::direct_keys_in_stream`. `supdb-keysarena`, and
+    /// `supdb-ingestkeysarena` buffered.
+    keysarena: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -711,6 +715,10 @@ struct Policy {
     /// before `Options::direct_recycle`. `supdb-norecycle`, and
     /// `supdb-ingestnorecycle` buffered.
     norecycle: bool,
+    /// A streamed table keeping a copy of every key, the shape before
+    /// `Options::direct_keys_in_stream`. `supdb-keysarena`, and
+    /// `supdb-ingestkeysarena` buffered.
+    keysarena: bool,
     /// Aligned pieces over a range at which they are merged into one
     /// piece, or none for the engine's own, which leaves them for the
     /// partition merge. `supdb-tier`.
@@ -919,6 +927,7 @@ impl Default for Policy {
             fillplain: false,
             latesync: false,
             norecycle: false,
+            keysarena: false,
             rankrecords: false,
             shape: false,
             adaptcap: None,
@@ -2511,6 +2520,31 @@ impl Supdb {
         )
     }
 
+    /// `supdb` with a streamed table keeping a copy of every key, the
+    /// shape before `Options::direct_keys_in_stream`.
+    pub fn create_keysarena(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                keysarena: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-keysarena`.
+    pub fn create_ingest_keysarena(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                keysarena: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` with a flush waiting for its manifest slot's fdatasync, the
     /// shape before `Options::flush_waits_manifest` was off.
     pub fn create_waitmanifest(path: &Path) -> Res<Supdb> {
@@ -2753,6 +2787,7 @@ impl Supdb {
             fillplain,
             latesync,
             norecycle,
+            keysarena,
             rankrecords,
             shape,
             aheadmin,
@@ -2940,6 +2975,7 @@ impl Supdb {
             direct_stream: !copyvals && !refvals,
             direct_derive_keys: !keycopies,
             direct_recycle: !norecycle,
+            direct_keys_in_stream: !keysarena,
             // The scan phases timed where the arm asks, or where the
             // counters lines will read them: ten clock reads a scan.
             scan_timers: timers
@@ -3056,6 +3092,7 @@ impl Supdb {
             fillplain,
             latesync,
             norecycle,
+            keysarena,
             rankrecords,
             shape,
             aheadmin,
@@ -3505,6 +3542,13 @@ impl Engine for Supdb {
                 "supdb-norecycle"
             } else {
                 "supdb-ingestnorecycle"
+            };
+        }
+        if self.keysarena {
+            return if self.partition {
+                "supdb-keysarena"
+            } else {
+                "supdb-ingestkeysarena"
             };
         }
         if self.waitmanifest {
@@ -4220,6 +4264,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-fillplain"
         | "supdb-latesync"
         | "supdb-norecycle"
+        | "supdb-keysarena"
         | "supdb-waitmanifest"
         | "supdb-inlinemaint"
         | "supdb-adapt"
@@ -4287,6 +4332,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestfillplain"
         | "supdb-ingestlatesync"
         | "supdb-ingestnorecycle"
+        | "supdb-ingestkeysarena"
         | "supdb-ingestwaitmanifest"
         | "supdb-ingestrebuild"
         | "supdb-rankrecords"
@@ -4420,6 +4466,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestlatesync" => Box::new(Supdb::create_ingest_latesync(dir)?),
         "supdb-norecycle" => Box::new(Supdb::create_norecycle(dir)?),
         "supdb-ingestnorecycle" => Box::new(Supdb::create_ingest_norecycle(dir)?),
+        "supdb-keysarena" => Box::new(Supdb::create_keysarena(dir)?),
+        "supdb-ingestkeysarena" => Box::new(Supdb::create_ingest_keysarena(dir)?),
         "supdb-waitmanifest" => Box::new(Supdb::create_waitmanifest(dir)?),
         "supdb-ingestwaitmanifest" => Box::new(Supdb::create_ingest_waitmanifest(dir)?),
         "supdb-ingestsettlefreeze" => Box::new(Supdb::create_ingest_settlefreeze(dir)?),

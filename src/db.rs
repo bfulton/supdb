@@ -1454,6 +1454,18 @@ pub struct Options {
     /// `supdb-norecycle` and `supdb-ingestnorecycle`. Nothing without
     /// `direct_stream`. A run addresses four gigabytes of stream under it.
     pub direct_recycle: bool,
+    /// A streamed direct run's table keeps no copy of its keys: each entry
+    /// names the key where its record holds it, in the stream, and the
+    /// lookups, the scan snapshot and the close read it there -- through
+    /// the arena while the block is live and through the run's mapping
+    /// once the block is recycled. The copy was sixteen bytes a key of
+    /// fresh memory, a quarter of what a load first-touched after the
+    /// stream ran in a ring. A key that would run across two of the
+    /// arena's blocks, one in a megabyte, is copied as before and read
+    /// from the copy, as is every key past two gigabytes of one run. Off,
+    /// the copies, the arm `supdb-keysarena` and `supdb-ingestkeysarena`.
+    /// Nothing without `direct_stream`.
+    pub direct_keys_in_stream: bool,
     /// Bytes the mapping of a direct run's segment starts with; zero, the
     /// default, twice `seal_bytes`. The mapping grows when the run's file
     /// outgrows it. For a test of the growth.
@@ -1715,6 +1727,7 @@ impl Default for Options {
             direct_stream: true,
             direct_derive_keys: true,
             direct_recycle: true,
+            direct_keys_in_stream: true,
             direct_map_bytes: 0,
             forms_settle_recent_pct: 0,
             forms_carry: true,
@@ -5506,6 +5519,10 @@ struct MemTable {
     /// at, published by the writer before any block goes.
     recycle: bool,
     stream_base: AtomicU64,
+    /// `stream` with `Options::direct_keys_in_stream`: an entry's key span
+    /// names the key inside its record in the stream, or, with `KEYS_BIAS`
+    /// set in the offset, a copy in `keys`.
+    keys_in_stream: bool,
     /// With `refs`, the second staging arena: a value stays a copy until
     /// the writer's buffer has carried its record to the file, which is a
     /// piece of a megabyte at a time, so the chunks of several commits
@@ -5712,6 +5729,12 @@ const ARENA_SHIFT: u32 = 22;
 /// megabytes whatever the run grows to. The arena addresses `ARENA_BLOCKS`
 /// of them, four gigabytes of one run.
 const STREAM_SHIFT: u32 = 20;
+/// A streamed table reading its keys in place (`Options::direct_keys_in_stream`)
+/// marks an entry whose key is a copy in `keys` after all -- one that
+/// straddles two of the stream's blocks, or sits past two gigabytes of the
+/// run -- by this bit in its key offset, which no stream offset below it
+/// carries.
+const KEYS_BIAS: u32 = 1 << 31;
 /// Blocks an arena can address: sixteen gigabytes of the plain size.
 const ARENA_BLOCKS: usize = 1 << 12;
 
@@ -6577,6 +6600,7 @@ impl MemTable {
             retired_runs: UnsafeCell::new(Vec::new()),
             recycle: false,
             stream_base: AtomicU64::new(0),
+            keys_in_stream: false,
             vals2: ByteArena::new(prefault),
             staging: UnsafeCell::new(Staging::default()),
             keys: ByteArena::new(prefault),
@@ -6595,7 +6619,13 @@ impl MemTable {
     /// segment (`Options::direct_table_refs`); with `stream`, one whose
     /// values are the run's records in place (`Options::direct_stream`),
     /// compact where it says.
-    fn new_ordered(refs: bool, prefault: bool, stream: Option<bool>, recycle: bool) -> MemTable {
+    fn new_ordered(
+        refs: bool,
+        prefault: bool,
+        stream: Option<bool>,
+        recycle: bool,
+        keys_in_stream: bool,
+    ) -> MemTable {
         debug_assert!(!(refs && stream.is_some()), "two shapes of one table");
         MemTable {
             entries: Slab::new(),
@@ -6610,6 +6640,7 @@ impl MemTable {
             retired_runs: UnsafeCell::new(Vec::new()),
             recycle: stream.is_some() && recycle,
             stream_base: AtomicU64::new(0),
+            keys_in_stream: stream.is_some() && keys_in_stream,
             vals2: ByteArena::new(prefault),
             staging: UnsafeCell::new(Staging::default()),
             keys: ByteArena::new(prefault),
@@ -6663,15 +6694,33 @@ impl MemTable {
     }
 
     fn key_of(&self, e: &MemEntry) -> &[u8] {
-        self.keys.slice(e.key_off as usize, e.key_len as usize)
+        self.key_at(e.key_off, e.key_len)
     }
 
+    /// The key an entry's span names: in `keys`, or, for a table that
+    /// reads its keys in place, in the stream unless the span carries
+    /// `KEYS_BIAS`.
     fn key_at(&self, off: u32, len: u32) -> &[u8] {
+        if self.keys_in_stream {
+            if off & KEYS_BIAS == 0 {
+                return self.stream_bytes(off as usize, len as usize);
+            }
+            return self.keys.slice((off & !KEYS_BIAS) as usize, len as usize);
+        }
         self.keys.slice(off as usize, len as usize)
     }
 
     /// A hint to fetch a key's bytes; nothing is read.
     fn prefetch_key(&self, off: u32, len: u32) {
+        if self.keys_in_stream {
+            if off & KEYS_BIAS == 0 {
+                self.stream_prefetch(off as usize, len as usize);
+            } else {
+                self.keys
+                    .prefetch((off & !KEYS_BIAS) as usize, len as usize);
+            }
+            return;
+        }
         self.keys.prefetch(off as usize, len as usize);
     }
 
@@ -6899,16 +6948,41 @@ impl MemTable {
     /// Writer: a new entry, its key and first chunk written, published by
     /// the slab's length; the index is the caller's.
     fn new_entry(&self, hash: u64, key: &[u8], value: Option<&[u8]>) -> usize {
-        let key_off = self.keys.reserve(key.len());
-        self.keys.write(key_off, key);
-        let (off, count) = match value {
-            Some(v) if self.stream => (self.push_record(key, v), 1),
-            Some(v) => (self.push_chunk(NO_CHUNK, v), 1),
-            None => (self.push_tomb(NO_CHUNK), 0),
+        // A copy in `keys`, marked as one where the table's keys are
+        // otherwise read in the stream.
+        let copy = || -> u32 {
+            let key_off = self.keys.reserve(key.len());
+            self.keys.write(key_off, key);
+            let off = u32::try_from(key_off).expect("a memtable's keys stay under four gigabytes");
+            debug_assert!(off & KEYS_BIAS == 0 || !self.keys_in_stream);
+            if self.keys_in_stream {
+                off | KEYS_BIAS
+            } else {
+                off
+            }
+        };
+        let (off, count, key_off) = match value {
+            Some(v) if self.stream => {
+                let (head, rec) = self.push_record(key, v);
+                // The key where the record holds it, unless it runs
+                // across two blocks or past the bias: then a copy.
+                let at = rec + flatindex::RECORD_KEY_AT;
+                let key_off = if self.keys_in_stream
+                    && at + key.len() <= KEYS_BIAS as usize
+                    && !self.vals.straddles(at, key.len())
+                {
+                    at as u32
+                } else {
+                    copy()
+                };
+                (head, 1, key_off)
+            }
+            Some(v) => (self.push_chunk(NO_CHUNK, v), 1, copy()),
+            None => (self.push_tomb(NO_CHUNK), 0, copy()),
         };
         self.entries.push(MemEntry {
             hash,
-            key_off: u32::try_from(key_off).expect("a memtable's keys stay under four gigabytes"),
+            key_off,
             key_len: key.len() as u32,
             head: AtomicU64::new(off + 1),
             count: AtomicU64::new(count),
@@ -7021,8 +7095,9 @@ impl MemTable {
     /// Writer, `stream` only: `key`'s record with `value` laid out at the
     /// stream's end, byte for byte what the segment writer writes for it;
     /// the head for the entry, naming the value inside the record, or its
-    /// copy in `vals2` where the value runs across two blocks.
-    fn push_record(&self, key: &[u8], value: &[u8]) -> u64 {
+    /// copy in `vals2` where the value runs across two blocks, and where
+    /// the record starts in the stream.
+    fn push_record(&self, key: &[u8], value: &[u8]) -> (u64, usize) {
         debug_assert!(self.stream);
         let (ext, tail_len) = MemTable::stream_ext(value.len());
         let rec_len = flatindex::record_len_for(key.len(), &[ext], tail_len, self.stream_compact)
@@ -7043,14 +7118,17 @@ impl MemTable {
         };
         let voff = off + tail_at;
         if value.is_empty() {
-            return REF_STREAM | ref_pack(voff as u64, 0);
+            return (REF_STREAM | ref_pack(voff as u64, 0), off);
         }
         if self.vals.straddles(voff, value.len()) {
             let copy = self.vals2.reserve(value.len());
             self.vals2.write(copy, value);
-            return REF_STREAM | REF_ARENA2 | ref_pack(copy as u64, value.len() as u32);
+            return (
+                REF_STREAM | REF_ARENA2 | ref_pack(copy as u64, value.len() as u32),
+                off,
+            );
         }
-        REF_STREAM | ref_pack(voff as u64, value.len() as u32)
+        (REF_STREAM | ref_pack(voff as u64, value.len() as u32), off)
     }
 
     /// `stream` only: entry `e`'s record as the segment writer accounts
@@ -7088,6 +7166,26 @@ impl MemTable {
         );
         let run = self.run().expect("a recycled block has a run to read");
         &run.map[base + at..end]
+    }
+
+    /// `stream` only: a hint to fetch `len` bytes of the stream at `at`,
+    /// where `stream_bytes` would read them; nothing is read.
+    fn stream_prefetch(&self, at: usize, len: usize) {
+        debug_assert!(self.stream);
+        if let Some(s) = self.vals.try_slice(at, len) {
+            prefetch_lines(s.as_ptr(), len);
+            return;
+        }
+        let base = self.stream_base.load(AtomicOrdering::Acquire) as usize;
+        let end = base + at + len;
+        if end as u64 > self.run_flushed.load(AtomicOrdering::Acquire) {
+            return;
+        }
+        if let Some(run) = self.run() {
+            if end <= run.map.len() {
+                prefetch_lines(run.map[base + at..end].as_ptr(), len);
+            }
+        }
     }
 
     /// `stream` only: `out` filled from the stream at `at`, across blocks.
@@ -7166,6 +7264,10 @@ impl MemTable {
     /// `stream_rec_off` with entry `i` in hand.
     fn stream_rec_off_of(&self, i: usize, e: &MemEntry) -> usize {
         debug_assert!(self.stream);
+        if self.keys_in_stream && e.key_off & KEYS_BIAS == 0 {
+            // The key's place names the record's: the stream's layout.
+            return e.key_off as usize - flatindex::RECORD_KEY_AT;
+        }
         let head = MemTable::head(e);
         let (_, tail_at, _) = self.stream_record_shape(e);
         if head & REF_ARENA2 == 0 {
@@ -18567,6 +18669,7 @@ impl Db {
                                 .direct_stream
                                 .then_some(self.opts.segment.compact_records),
                             self.opts.direct_recycle,
+                            self.opts.direct_keys_in_stream,
                         )),
                         true,
                     );
@@ -26998,6 +27101,68 @@ mod streaming_writes {
         assert_eq!(recs.len(), 200, "both batches are behind the one marker");
         assert_eq!(recs[150].0, b"key-00000150".to_vec());
         assert_eq!(recs[150].1, b"value-150".to_vec());
+    }
+
+    /// A streamed table reading its keys in place (`keys_in_stream`)
+    /// names each key where its record holds it, and the one whose record
+    /// runs across two of the arena's blocks with the key on the seam is
+    /// a copy marked `KEYS_BIAS`: every key reads back as written, and
+    /// every record's offset is the key's less its header, or found from
+    /// the head where the key is the copy.
+    #[test]
+    fn a_streamed_tables_keys_read_in_place_and_across_a_seam() {
+        for compact in [false, true] {
+            let rd = Readers::new(false);
+            let mem = MemTable::new_ordered(false, false, Some(compact), true, true);
+            let block = mem.vals.block_len();
+            let value = vec![b'v'; 10];
+            let (ext, tail) = MemTable::stream_ext(value.len());
+            // A key length whose records, back to back from zero, put the
+            // first seam inside a key: past the key's first byte and
+            // before its last.
+            let at = flatindex::RECORD_KEY_AT;
+            let mut klen = 1000usize;
+            let rec_len = loop {
+                let l = flatindex::record_len_for(klen, &[ext], tail, compact).unwrap();
+                let into = block % l;
+                if into > at && into < at + klen {
+                    break l;
+                }
+                klen += 1;
+            };
+            let seam = block / rec_len;
+            let key = |i: usize| {
+                let mut k = vec![b'k'; klen];
+                k[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                k
+            };
+            let n = seam + 3;
+            for i in 0..n {
+                let k = key(i);
+                mem.append(BlockedBloom::hash(&k), &k, &value, &rd);
+                if i % 97 == 0 {
+                    mem.commit();
+                }
+            }
+            mem.commit();
+            let mut biased = 0;
+            for i in 0..n {
+                let e = mem.entry(i);
+                assert_eq!(mem.key_of(e), key(i), "key {i} of {n}, compact {compact}");
+                assert_eq!(
+                    mem.stream_rec_off(i),
+                    i * rec_len,
+                    "record {i}'s offset, compact {compact}"
+                );
+                if e.key_off & KEYS_BIAS != 0 {
+                    biased += 1;
+                    assert_eq!(i, seam, "the copied key is the one on the seam");
+                } else {
+                    assert_eq!(e.key_off as usize, i * rec_len + at);
+                }
+            }
+            assert_eq!(biased, 1, "one key crosses the seam, compact {compact}");
+        }
     }
 }
 
