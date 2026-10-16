@@ -366,7 +366,10 @@ cell whose length is within the host's own unevenness is the host's for
 every engine, and the statistic a threaded pass reports has to be one
 that length can carry -- the per-thread columns are read before the
 span, and a threaded pass as short as a thread hand-off is a floor, not
-a measurement.
+a measurement. The threaded scan passes run `size` scans a thread now,
+the threaded read pass's count, tens of milliseconds at the smallest
+rung as the read passes are; the first row after it banks on its
+controls as a definition step.
 
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft

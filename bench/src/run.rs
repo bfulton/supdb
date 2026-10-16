@@ -893,11 +893,19 @@ fn one_pass(
     }
     let scan_s = t.elapsed().as_secs_f64();
 
-    // And the same scans. Every start is at least `scan_len` below the
-    // top, so every scan walks `scan_len` loaded entries.
+    // And the scans, `size` of them a thread -- the threaded read pass's
+    // count, a hundred times the single-threaded scan pass's. That pass
+    // is a few milliseconds at the small rungs, and a threaded pass that
+    // short is within the host's own unevenness between vCPUs: its span
+    // is the slowest thread's, and the slowest thread was whichever vCPU
+    // the host had shorted, for every engine alike (bench/CLAUDE.md, the
+    // vCPU entry). The read cells, tens of milliseconds, are tight in
+    // every row; the scans run as long now. Every start is at least
+    // `scan_len` below the top, so every scan walks `scan_len` loaded
+    // entries.
     let mut scan_entries_s_threaded = Vec::with_capacity(plan.threads.len());
     for &threads in &plan.threads {
-        let ops = scans * threads as u64;
+        let ops = size * threads as u64;
         let (secs, bytes) = threaded(
             e.as_ref(),
             "scan",
@@ -964,10 +972,11 @@ fn one_pass(
     // the blocks it walks, where the pass on the store as loaded walks
     // clean partitions. Every thread's bytes are at least the loaded
     // store's, since a mix only adds to a key; what an engine adds for
-    // an update is its own and is not held to.
+    // an update is its own and is not held to. `size` scans a thread, as
+    // above.
     let mut scan_mixed_threaded = Vec::with_capacity(plan.threads.len());
     for &threads in &plan.threads {
-        let ops = scans * threads as u64;
+        let ops = size * threads as u64;
         let (secs, bytes) = threaded(
             e.as_ref(),
             "scan-mixed",

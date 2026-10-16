@@ -17,7 +17,7 @@ The workloads below, plus four floors. Each yields one or more quantities.
 | `load` | n keys in key order, 100-byte values, durable per batch | ops/s, device bytes written per byte stored, bytes on disk per byte stored |
 | `load-shuffled` | the same keys in shuffled order | ops/s |
 | `read` | uniform point reads over the loaded set, on one thread and again on each of the class's reader-thread counts: two, doubling, one fewer than its cores | reads/s, p99 µs; reads/s per thread count |
-| `scan` | `size/100` scans of 100 entries, from uniform random starts, on one thread and again on each of the class's reader-thread counts | entries/s; entries/s per thread count |
+| `scan` | `size/100` scans of 100 entries, from uniform random starts, on one thread; `size` scans a thread again on each of the class's reader-thread counts | entries/s; entries/s per thread count |
 | `ycsb` | core A–F on the loaded store, zipfian, a sixth of the keys in operations per mix | ops/s per mix |
 | `scan-lag` | on the store the shuffled load leaves, the keys updated in slices to 0, 1, 10 and 100% of the store, each slice a burst of batches followed by the `scan` workload's scans with nothing merged between | entries/s of each point's scans; updates/s of each point's burst |
 | `wal-floor` | framed 1,000-record batches appended to one file, one `fdatasync` each, no engine | ops/s |
@@ -131,18 +131,21 @@ the single-threaded pass they repeat and before the mixes, with the writer
 idle. Every thread reads through a handle of its own -- supdb's
 `Db::reader`, an LMDB read transaction begun on the thread, RocksDB's
 shared handle -- and draws its keys from a uniform generator seeded apart
-from the others'. Every thread runs the single-threaded pass's
-operations, so a pass on three threads is as long as the pass on one and
-not a third of it, and the quantity is total operations over the pass;
-they are released together, each times itself from its release to its
-finish, and the quantity is the aggregate throughput over the span from
-the first release to the last finish, so the spawning and the opening are
-outside the clock. Every thread's bytes are held to
-what the loaded store holds, because a reader that answered a different
-store would post a throughput like any other. The counts are one, two and
-four because the class the suite gates on has four cores; a class with
-more runs the same counts, since the counts name the quantities and the
-gate names every quantity. The threaded scans run once more after the
+from the others'. Every thread runs `size` operations -- the
+single-threaded read pass's count, and for the scans a hundred times
+the single-threaded scan pass's, since that pass is a few milliseconds at
+the small rungs and a threaded pass that short reads the host's
+unevenness between its vCPUs rather than the engine -- so a pass on
+three threads is as long as the pass on one and not a third of it, and
+the quantity is total operations over the pass; they are released
+together, each times itself from its release to its finish, and the
+quantity is the aggregate throughput over the span from the first
+release to the last finish, so the spawning and the opening are outside
+the clock. Every thread's bytes are held to what the loaded store
+holds, because a reader that answered a different store would post a
+throughput like any other. The counts are a function of the class's
+cores, since the counts name the quantities and the gate names every
+quantity. The threaded scans run once more after the
 mixes, on the store they leave, as the workload `scan-mixed`: the keys
 the mixes updated and inserted are unsealed there, so every handle's
 pass builds the blocks it walks over them, and what the pass measures

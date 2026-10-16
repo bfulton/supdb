@@ -39,8 +39,8 @@ unversioned exists). CI runs the same script, and so does the engine's
 |---|---|
 | `load` | keys in order, 100-byte values, durable per batch |
 | `load-shuffled` | the same keys in a shuffled order |
-| `read` | uniform point reads over the loaded set, on one thread and on 2 and 4 |
-| `scan` | ordered scans of 100 entries from uniform starts, on one thread and on 2 and 4 |
+| `read` | uniform point reads over the loaded set, on one thread and on each of the class's reader-thread counts |
+| `scan` | ordered scans of 100 entries from uniform starts, on one thread and on each of the class's reader-thread counts |
 | `ycsb-A` … `ycsb-F` | the YCSB core mixes on the loaded store |
 | `wal-floor`, `scan-floor` | what the device does with no engine in the way |
 
