@@ -3781,6 +3781,26 @@ keys in the seal thread: the sort 0.4 ms, the snapshot's copy 1.0 to
 1.5, the records and the finish 2.5 to 3.3, the segment's fsync 1.6
 beside the directory's, and the slot 0.5.
 
+The snapshot's copy was the next thing taken away, and it came back. A
+drain's seal copies the frozen table's chains into a snapshot for the
+scans over the store while the seal runs, as any seal does, and under a
+drain the writer waits and reads nothing, so the copy read as a cost
+paid for nobody: fresh pages at the host's price, 1.0 to 1.5 ms at ten
+thousand keys and 5 to 7 at thirty. Without it the seal writes its
+records from the table's chains, given the copy's own lookahead, and
+the records phase grew by what the copy had cost at both rungs -- 2.8
+to 4.1 and 4.7 ms at ten thousand, 8.4 to 11.7 and 13.8 at thirty --
+with the drain's end level in four sittings (the shuffled load 0.94x,
+1.08x, 1.09x and 0.98x against the copy, none resolved) and the
+durable drain 0.9 ms longer. So the copy is the cheaper of two walks
+over the table: one pass with its lookahead and a sequential read after
+it, against a walk interleaved with the writer's work on every record;
+its pages were not the price. The shape without it is the arm
+`supdb-nodrainsnap` and `supdb-ingestnodrainsnap`
+(`Options::drain_snapshot`). What is left in that phase is the
+writer's own work on a record, some 230 ns of it at ten thousand keys
+from a sequential arena, which the next decomposition takes apart.
+
 #### The finish's fills, asked ahead
 
 The segment finish's trailer -- fences, directory, hash slots, composed

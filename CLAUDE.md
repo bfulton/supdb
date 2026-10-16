@@ -393,7 +393,12 @@ three times longer, because the form's real saving was the fold of the
 level-0 pieces under the block, read from their records at every walk
 otherwise (`docs/engine.md`, the dense-burst regime). Measure the
 removal in the suite's shape, pieces and all, before building the
-replacement.
+replacement. The seal's snapshot copy on a drain went the other way:
+read as fresh pages paid for readers a drain never has, it was taken
+away and the records phase grew by exactly what the copy had cost,
+since the copy was the cheaper of two walks over the table
+(`Options::drain_snapshot`, the arm `supdb-ingestnodrainsnap`); the
+pages were never the price, and only the removal said so.
 
 Give the probe the suite's shape before believing it disagrees with the
 suite. Four probes in one day failed to reproduce a figure from the lag

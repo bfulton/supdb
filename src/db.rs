@@ -1414,6 +1414,23 @@ pub struct Options {
     /// slot's fdatasync. Kept for pricing as `supdb-walsync` and
     /// `supdb-ingestwalsync`.
     pub drain_syncs_wal: bool,
+    /// EXPERIMENT, refuted and kept as an arm: a drain's seal copies the
+    /// frozen table's chains into a snapshot for the scans over the
+    /// store while the seal runs, as any seal does (`seal_snapshot`),
+    /// and under a drain the writer waits and reads nothing, so the copy
+    /// -- 1.0 to 1.5 ms of a shuffled load's drain at ten thousand keys
+    /// and 5 to 7 of 17 at thirty, in the drain's stamps (`snapped`) --
+    /// read as a cost paid for nobody. Taken away, the records phase grew
+    /// by the same amount at both rungs and the drain ended level: the
+    /// copy is the cheaper of two walks over the table, one pass with
+    /// its lookahead and a sequential read after it against a walk
+    /// interleaved with the writer's work, and its pages were not the
+    /// price. On, the default, the copy whatever the seal's reason. Off,
+    /// a drain's seal builds none and writes its records from the
+    /// table's chains with the copy's lookahead, a copy someone set on
+    /// the table already taken as it is: `supdb-nodrainsnap` and
+    /// `supdb-ingestnodrainsnap`.
+    pub drain_snapshot: bool,
     /// At a flush's close of a direct run, the writer fdatasyncs the run's
     /// file -- the records committed to it so far, hinted to the page
     /// cache as they were written and flushed to the device by nothing yet
@@ -1808,6 +1825,7 @@ impl Default for Options {
             manifest_pending: false,
             flush_waits_manifest: false,
             drain_syncs_wal: false,
+            drain_snapshot: true,
             close_presync: true,
             ord_durable: false,
             direct_table_refs: false,
@@ -19851,6 +19869,7 @@ impl Db {
         };
         let from_snapshot = self.opts.seal_from_snapshot;
         let frozen_snaps = self.opts.frozen_snaps;
+        let build_copy = !self.draining || self.opts.drain_snapshot;
         let job = move |readable: &SealReadable| -> Result<Vec<String>> {
             if background_io == BackgroundIo::Idle {
                 idle_io_priority();
@@ -19919,6 +19938,8 @@ impl Db {
                 });
                 let snap = match copied {
                     Some(h) => h.clone(),
+                    // A drain's seal builds none (`Options::drain_snapshot`).
+                    None if !build_copy => return None,
                     None => {
                         let mut built = Snapshot::from_frozen(&mem, &order)?;
                         if let Some(h) = &have {
@@ -20045,7 +20066,20 @@ impl Db {
                         }
                         None => {
                             let mut offs = Vec::new();
-                            for &i in &order[start..at] {
+                            for (pos, &i) in order[start..at].iter().enumerate() {
+                                // The copy's lookahead (`Snapshot::from_frozen`):
+                                // the order is known, so an entry's line is
+                                // asked for well ahead, and its key's and its
+                                // newest chunk's once that line is in.
+                                let pos = start + pos;
+                                if let Some(&j) = order.get(pos + SEAL_AHEAD_ENTRY) {
+                                    mem.prefetch_entry(j as usize);
+                                }
+                                if let Some(&j) = order.get(pos + SEAL_AHEAD_CHAIN) {
+                                    let f = mem.entry(j as usize);
+                                    mem.prefetch_key(f.key_off, f.key_len());
+                                    mem.prefetch_chunk(MemTable::head(f), SEAL_AHEAD_CHUNK_BYTES);
+                                }
                                 let e = mem.entry(i as usize);
                                 let key = mem.key_of(e);
                                 // Only what is live after the newest
