@@ -1402,6 +1402,18 @@ pub struct Options {
     /// the owed slot first. Kept for pricing as `supdb-waitmanifest` and
     /// `supdb-ingestwaitmanifest`. Only with `manifest_slots`.
     pub flush_waits_manifest: bool,
+    /// A flush's commit of what is staged fsyncs the WAL whatever the
+    /// policy, before the seal is handed over: the buffered arm's drain
+    /// at ten thousand keys began with a 2.4 ms fdatasync of a log the
+    /// landing retires, a fifth of the shuffled load's drain, for frames
+    /// the segment makes durable before the flush is answered. Off, the
+    /// flush commits under the policy as a commit does, and a drain whose
+    /// WAL holds unsynced frames is answered only once its slot is
+    /// durable, as under `flush_waits_manifest`, since the log's
+    /// durability was what covered the window between the answer and the
+    /// slot's fdatasync. Kept for pricing as `supdb-walsync` and
+    /// `supdb-ingestwalsync`.
+    pub drain_syncs_wal: bool,
     /// At a flush's close of a direct run, the writer fdatasyncs the run's
     /// file -- the records committed to it so far, hinted to the page
     /// cache as they were written and flushed to the device by nothing yet
@@ -1795,6 +1807,7 @@ impl Default for Options {
             manifest_slots: true,
             manifest_pending: false,
             flush_waits_manifest: false,
+            drain_syncs_wal: false,
             close_presync: true,
             ord_durable: false,
             direct_table_refs: false,
@@ -9045,7 +9058,7 @@ struct DrainSteps {
     at: [AtomicU64; DRAIN_STEP_NAMES.len()],
 }
 
-const DRAIN_STEP_NAMES: [&str; 15] = [
+const DRAIN_STEP_NAMES: [&str; 17] = [
     "flush",
     "handed",
     "jobstart",
@@ -9061,6 +9074,8 @@ const DRAIN_STEP_NAMES: [&str; 15] = [
     "drained",
     "back",
     "presynced",
+    "sorted",
+    "snapped",
 ];
 
 impl DrainSteps {
@@ -19411,8 +19426,28 @@ impl Db {
             self.commit_direct()
         } else {
             self.wal_dir_barrier()?;
-            self.wal.commit()?;
+            // Under the policy, as `commit` is: the sync `Wal::commit`
+            // made whatever the policy was cost a buffered drain a
+            // fdatasync of the whole log before its seal began
+            // (`Options::drain_syncs_wal`). A sync owed and not yet paid
+            // -- a failed one, or the staged frames under `Always` -- is
+            // paid here; one the log holds nothing for is skipped.
+            let staged = !self.wal.pending.is_empty();
+            self.wal.mark_commit();
+            self.wal.write()?;
             self.mem().commit();
+            if staged {
+                self.unsynced += 1;
+            }
+            let due = self.opts.drain_syncs_wal
+                || match self.opts.sync {
+                    SyncPolicy::Always => true,
+                    SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
+                };
+            if due && self.wal.synced < self.wal.written {
+                self.wal.sync()?;
+                self.unsynced = 0;
+            }
             Ok(())
         }
     }
@@ -19822,6 +19857,7 @@ impl Db {
             }
             let counts = &shared.seal_counts;
             let t_job = std::time::Instant::now();
+            shared.drain_steps.stamp(2);
             // In KEY order, not hash order. A segment written in the
             // memtable's iteration order scatters each key's values across
             // blocks by hash, so an ordered scan walks the file randomly;
@@ -19851,6 +19887,7 @@ impl Db {
                 }
             };
             SealCounts::add(&counts.seal_sort_ns, t_job.elapsed().as_nanos() as u64);
+            shared.drain_steps.stamp(15);
 
             // The table's snapshot, with every chain copied in key order,
             // published into the state the freeze made -- or the state
@@ -19931,6 +19968,7 @@ impl Db {
             if snap.is_some() {
                 SealCounts::add(&counts.seal_snap_ns, t_snap.elapsed().as_nanos() as u64);
             }
+            shared.drain_steps.stamp(16);
             // A test's hold takes effect here, with the snapshot published
             // and nothing written: held before the sort, the seal
             // published no snapshot, and a test that waited for one
@@ -20028,6 +20066,7 @@ impl Db {
                         .finish_unsynced()
                         .map_err(|e| err(&format!("seal finish: {e}")))?;
                 }
+                shared.drain_steps.stamp(3);
                 let whole = ranges.len() == 1 && lo.is_empty() && hi.is_none();
                 let name = if whole
                     && first_partition
@@ -20047,7 +20086,9 @@ impl Db {
                 // Before the segment's own rename, so the segment never
                 // exists without it.
                 let ordf = write_ord_unsynced(&dir, &name, &ord)?;
+                shared.drain_steps.stamp(4);
                 std::fs::rename(&tmp, dir.join(&name))?;
+                shared.drain_steps.stamp(5);
                 names.push(name);
                 facts.push(fact);
                 files.push((seg, ordf));
@@ -20056,8 +20097,10 @@ impl Db {
             // segment work may publish it to readers. Phase D: the
             // fsyncs, which nothing but the manifest waits for.
             seal_readable(&shared, readable, &names, facts);
+            shared.drain_steps.stamp(6);
             for (seg, ordf) in files {
                 seg.sync_all()?;
+                shared.drain_steps.stamp(7);
                 if ord_durable {
                     ordf.sync_all()?;
                 }
@@ -20148,6 +20191,10 @@ impl Db {
     pub fn sync(&mut self) -> Result<()> {
         let _op = self.op();
         self.commit_staged()?;
+        // The promise is this call's, whatever the policy left unsynced.
+        if !self.mem().ordered && self.wal.synced < self.wal.written {
+            self.wal.sync()?;
+        }
         self.unsynced = 0;
         // The tail goes to a seal too, without waiting for it and without
         // a freeze (`hand_tail`): the segment work partitions what lands
@@ -21340,6 +21387,7 @@ impl Db {
             wal,
             tmp,
             draining,
+            wal_unsynced: self.wal.synced < self.wal.written,
         };
         // Counted before it is sent, so the count never reads zero with a
         // seal in flight.
@@ -25410,6 +25458,10 @@ struct SealJob {
     wal: Vec<PathBuf>,
     tmp: Option<PathBuf>,
     draining: bool,
+    /// The log held frames not yet synced when the seal was handed over:
+    /// a drain of such a seal is answered only behind a durable slot,
+    /// since nothing else covers them (`Options::drain_syncs_wal`).
+    wal_unsynced: bool,
 }
 
 /// What the writer waits for.
@@ -26087,6 +26139,7 @@ impl Maint {
             wal,
             tmp,
             readable,
+            wal_unsynced,
             ..
         } = job;
         let t = std::time::Instant::now();
@@ -26128,7 +26181,8 @@ impl Maint {
                 return Err(e);
             }
         }
-        let defer = draining && !self.opts.flush_waits_manifest && !self.pending_on();
+        let defer =
+            draining && !self.opts.flush_waits_manifest && !self.pending_on() && !wal_unsynced;
         let out = self.land_durable(t, wal, tmp, defer);
         self.shared.drain_steps.stamp(11);
         // Counted out once the manifest names the segments, or the landing

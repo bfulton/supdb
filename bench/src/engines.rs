@@ -410,6 +410,10 @@ pub struct Supdb {
     /// `supdb-ingestlazysettle`, and `supdb-lazysettle` durable, where the
     /// commits sync and so lend either way.
     lazysettle: bool,
+    /// A flush fsyncs the WAL before its seal whatever the policy, as
+    /// before (`Options::drain_syncs_wal`). `supdb-ingestwalsync`, and
+    /// `supdb-walsync` durable, where every commit synced already.
+    walsync: bool,
     /// The scan phases timed on every scan, as before the clock reads
     /// were gated (`Options::scan_timers`). `supdb-timers`, and
     /// `supdb-ingesttimers` buffered.
@@ -691,6 +695,10 @@ struct Policy {
     /// `supdb-ingestlazysettle`, and `supdb-lazysettle` durable, where the
     /// commits sync and so lend either way.
     lazysettle: bool,
+    /// A flush fsyncs the WAL before its seal whatever the policy, as
+    /// before (`Options::drain_syncs_wal`). `supdb-ingestwalsync`, and
+    /// `supdb-walsync` durable, where every commit synced already.
+    walsync: bool,
     /// The scan phases timed on every scan, as before the clock reads
     /// were gated (`Options::scan_timers`). `supdb-timers`, and
     /// `supdb-ingesttimers` buffered.
@@ -959,6 +967,7 @@ impl Default for Policy {
             lendbursts: false,
             inlineall: false,
             lazysettle: false,
+            walsync: false,
             timers: false,
             wake: false,
             noprefetch: false,
@@ -2303,6 +2312,34 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose flush fsyncs the WAL before its seal, as before. Its
+    /// commits sync, so the log holds nothing to sync at a flush: against
+    /// `supdb` it is a null pairing.
+    pub fn create_walsync(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                walsync: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose flush fsyncs the WAL before its seal, as
+    /// before a buffered drain was answered behind its slot instead:
+    /// against `supdb-ingest` it prices that fdatasync on the drain.
+    pub fn create_ingest_walsync(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                walsync: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` timing every scan's phases, as before the clock reads were
     /// gated: against `supdb` it prices the instrument.
     pub fn create_timers(path: &Path) -> Res<Supdb> {
@@ -2958,6 +2995,7 @@ impl Supdb {
             lendbursts,
             inlineall,
             lazysettle,
+            walsync,
             timers,
             wake,
             noprefetch,
@@ -3158,6 +3196,7 @@ impl Supdb {
                 supdb::Options::default().upkeep_inline_min
             },
             upkeep_settle_after_scans: !lazysettle,
+            drain_syncs_wal: walsync,
             upkeep_wake_parked: wake,
             scan_prefetch: !noprefetch,
             manifest_slots: !manifestrename,
@@ -3277,6 +3316,7 @@ impl Supdb {
             lendbursts,
             inlineall,
             lazysettle,
+            walsync,
             timers,
             wake,
             noprefetch,
@@ -3667,6 +3707,13 @@ impl Engine for Supdb {
                 "supdb-lazysettle"
             } else {
                 "supdb-ingestlazysettle"
+            };
+        }
+        if self.walsync {
+            return if self.partition {
+                "supdb-walsync"
+            } else {
+                "supdb-ingestwalsync"
             };
         }
         if self.timers {
@@ -4491,6 +4538,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-lendbursts"
         | "supdb-inlineall"
         | "supdb-lazysettle"
+        | "supdb-walsync"
         | "supdb-timers"
         | "supdb-wake"
         | "supdb-noprefetch"
@@ -4564,6 +4612,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestlendbursts"
         | "supdb-ingestinlineall"
         | "supdb-ingestlazysettle"
+        | "supdb-ingestwalsync"
         | "supdb-ingesttimers"
         | "supdb-ingestwake"
         | "supdb-ingestnoprefetch"
@@ -4692,6 +4741,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestinlineall" => Box::new(Supdb::create_ingest_inlineall(dir)?),
         "supdb-lazysettle" => Box::new(Supdb::create_lazysettle(dir)?),
         "supdb-ingestlazysettle" => Box::new(Supdb::create_ingest_lazysettle(dir)?),
+        "supdb-walsync" => Box::new(Supdb::create_walsync(dir)?),
+        "supdb-ingestwalsync" => Box::new(Supdb::create_ingest_walsync(dir)?),
         "supdb-timers" => Box::new(Supdb::create_timers(dir)?),
         "supdb-ingesttimers" => Box::new(Supdb::create_ingest_timers(dir)?),
         "supdb-wake" => Box::new(Supdb::create_wake(dir)?),

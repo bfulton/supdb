@@ -689,7 +689,12 @@ follows on the segment work's thread with the WAL's and temp names'
 retirement behind it (`Options::flush_waits_manifest` is the shape that
 waited, `supdb-waitmanifest`): the round trip was a tenth of a
 ten-thousand-key drain, and a crash inside it is a torn newest slot, the
-case the slots were made for. The flush's close of a direct run
+case the slots were made for. A buffered store's flush commits what is
+staged under its policy, with no sync (`Options::drain_syncs_wal` is the
+shape that fsynced the whole log first, `supdb-ingestwalsync`), so its
+drain is answered behind the slot's fdatasync instead: the log's
+durability was what covered that window, and without it the slot's own
+does. The flush's close of a direct run
 fdatasyncs the run's records on the writer's thread, which waits for
 the drain anyway, while the seal thread composes the trailer, so the
 seal's fsync flushes the trailer alone (`Options::close_presync`;
@@ -1801,6 +1806,27 @@ settle, a third of the fill, runs at a commit a scan preceded, and the
 forms stay the scans' (`Options::upkeep_settle_after_scans`), which the
 mixes without scans between their commits never reach; the allocations
 were worth 5 instructions an entry of the 57.
+
+**A sync the policy never asked for, on the one path that waits for
+it.** `Wal::commit` writes the frames and fdatasyncs, and the flush's
+commit of what is staged called it whatever the sync policy, so a
+buffered store's drain began with the whole log fsynced on the writer's
+path before its seal was handed over -- 2.4 ms of a 9 ms drain at ten
+thousand keys, 3.5 of 17 at thirty -- for frames the segment would make
+durable before the flush was answered, in a file the landing retires.
+Nothing raised, and every decomposition of the drain before this one
+had read the fdatasync as the device's: the durable arm, whose commits
+sync, pays nothing there, so the pairing of the two policies never
+isolated it, and the shuffled load at ten thousand keys read level with
+a comparator whose sync is an fsync of its log alone. `strace -f -tt -T`
+over the drain named it as the sync phase's first syscall, and the
+stamps put it before `handed`. The flush commits under the policy now,
+and a drain whose log holds unsynced frames is answered behind its
+slot's fdatasync, since the log's durability was what covered that
+window (`Options::drain_syncs_wal`). The rule: a sync is issued by the
+policy, never by the shape of the call that happens to need the write;
+and a drain's syscalls are listed under `strace` beside its stamps
+before any wait in it is read as the device's floor.
 
 **A length read off the slab that held the exceptions.** The ordered
 table's write log became the range of its entries, its length the

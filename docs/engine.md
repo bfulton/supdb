@@ -3754,6 +3754,33 @@ three hundred thousand level, where the slot is a fiftieth of the
 drain. The waiting shape is the arm `supdb-waitmanifest` and
 `supdb-ingestwaitmanifest`.
 
+The buffered drain carried one more device wait the durability never
+asked for. A flush commits what is staged through `Wal::commit`, which
+fdatasyncs the log whatever the policy, so a buffered store's drain
+began with the whole log's sync on the writer's path before the seal
+was handed over -- 2.4 ms at ten thousand keys and 3.5 at thirty, read
+in the drain's stamps (`handed`) and in `strace` as the sync phase's
+first syscall -- for frames the segment makes durable before the flush
+is answered, in a file the landing retires. The flush commits under the
+policy now, as a commit does (`Options::drain_syncs_wal`, off), and
+since the log's durability was what covered the window between the
+answer and the slot's fdatasync, a drain whose log holds unsynced
+frames is answered behind its slot, as the waiting shape above is:
+half a millisecond in most drains, two in a few. Paired in one process
+against the old shape, the drain ended 0.5 to 2.2 ms earlier at ten
+thousand keys in four sittings and the shuffled load read 1.32x, 0.95x,
+1.12x and 1.08x -- the level sitting had the seal thread's own phases a
+millisecond slower, within what this host moves them by -- and 1.09x
+and 1.22x at thirty thousand (p .008 both). The ordered load has no log
+to sync and did not move; the durable store's log is synced at every
+commit, and its flush skips a sync the log holds nothing for. The old
+shape is the arm `supdb-walsync` and `supdb-ingestwalsync`. The stamps
+cover the hashed table's seal now as well (`sorted`, `snapped`, and the
+finish's steps), and they put the rest of that drain at ten thousand
+keys in the seal thread: the sort 0.4 ms, the snapshot's copy 1.0 to
+1.5, the records and the finish 2.5 to 3.3, the segment's fsync 1.6
+beside the directory's, and the slot 0.5.
+
 #### The finish's fills, asked ahead
 
 The segment finish's trailer -- fences, directory, hash slots, composed

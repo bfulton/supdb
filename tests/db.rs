@@ -1584,6 +1584,55 @@ fn every_n_loses_the_unsynced_tail_whole_and_never_in_part() {
     }
 }
 
+/// A buffered flush is answered once its segment and the slot naming it
+/// are durable, and needs nothing of its log: the log's frames since the
+/// last sync were never fsynced -- a flush under `EveryN` commits under
+/// the policy, as a commit does -- so a crash after the answer may lose
+/// them whole, and the store is the slot's segment.
+#[test]
+fn a_buffered_flush_is_answered_by_its_slot_and_needs_nothing_of_its_log() {
+    use supdb::SyncPolicy;
+    let d = dir("flushnolog");
+    let opts = Options {
+        sync: SyncPolicy::EveryN(u32::MAX),
+        ..wal_arm()
+    };
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    for c in 0u32..500 {
+        db.append(format!("k{c:04}").as_bytes(), &c.to_le_bytes());
+        if c % 50 == 49 {
+            db.commit().unwrap();
+        }
+    }
+    db.flush().unwrap();
+    drop(db);
+    // The crash's shape: every frame the log took since its header is
+    // gone, as unsynced frames may be.
+    for e in std::fs::read_dir(&d).unwrap() {
+        let p = e.unwrap().path();
+        let is_wal = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("wal-"));
+        if is_wal {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_len(8)
+                .unwrap();
+        }
+    }
+    let db = Db::open(&d, opts).unwrap();
+    for c in 0u32..500 {
+        assert_eq!(
+            read_vec(&db, format!("k{c:04}").as_bytes()),
+            vec![c.to_le_bytes().to_vec()],
+            "a flushed record survives the loss of its log"
+        );
+    }
+}
+
 fn dir_bytes(d: &std::path::Path) -> u64 {
     std::fs::read_dir(d)
         .unwrap()
