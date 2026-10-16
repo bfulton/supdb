@@ -10703,6 +10703,19 @@ struct FormsState {
     /// The live offsets of one settled key's chain, for the same reason
     /// `settle_run` is one buffer.
     settle_offs: std::cell::RefCell<Vec<usize>>,
+    /// The one `Clean` form every clean block's slot shares: a block
+    /// materialized clean was wrapped in an `Arc` of its own, a malloc a
+    /// block, 75 of a pass of a hundred scans after a burst of a hundred
+    /// writes, for a form that holds nothing.
+    clean: std::sync::Arc<Cached>,
+    /// The chain-offset scratch a build or a walk's emissions use,
+    /// `BuildCtx::take_offs`.
+    emit_offs: std::cell::RefCell<Vec<usize>>,
+    /// The key a block scan resumes from (`Walk::Resume`), kept between
+    /// resumes: copied into a fresh `Vec` it was a malloc and a free on
+    /// every scan that met a block without a form, 132 of a pass of a
+    /// hundred scans after a burst.
+    resume_key: std::cell::RefCell<Vec<u8>>,
     /// EXPERIMENT: whether any table holds a block built or patched
     /// since the last publish; the writer's own handle alone sets it.
     dirty_any: std::cell::Cell<bool>,
@@ -10837,6 +10850,9 @@ impl FormsState {
             pending_frozen: std::cell::RefCell::new(Vec::new()),
             settle_run: std::cell::RefCell::new(Vec::new()),
             settle_offs: std::cell::RefCell::new(Vec::new()),
+            clean: std::sync::Arc::new(Cached::Clean),
+            emit_offs: std::cell::RefCell::new(Vec::new()),
+            resume_key: std::cell::RefCell::new(Vec::new()),
             dirty_any: std::cell::Cell::new(false),
             tables_complete: std::cell::Cell::new(false),
             publish_due: std::cell::Cell::new(false),
@@ -11620,7 +11636,10 @@ struct Snapshot {
 /// entries emitted so far and the key the walk goes on from.
 enum Walk {
     Done(usize),
-    Resume { seen: usize, from: Vec<u8> },
+    /// The key to resume from is in `FormsState::resume_key`.
+    Resume {
+        seen: usize,
+    },
 }
 
 /// Entries a filing may leave in `fresh` before it is folded into `side`.
@@ -13575,14 +13594,20 @@ impl Reader {
                     self.fs().lazy_scans.set(counts);
                     return Ok(n);
                 }
-                Walk::Resume { seen, from } => (seen, from),
+                Walk::Resume { seen } => (
+                    seen,
+                    std::mem::take(&mut *self.fs().resume_key.borrow_mut()),
+                ),
             };
             counts[1] += 1;
             self.fs().lazy_scans.set(counts);
             self.refresh_snapshot(gen, use_cache, true);
             let cache = self.fs().scan_keys.borrow();
             let unsealed: &Snapshot = &cache.as_ref().expect("scan snapshot").1;
-            return match self.scan_blocks(&from, limit - seen, Some(unsealed), true, &mut f)? {
+            let walked = self.scan_blocks(&from, limit - seen, Some(unsealed), true, &mut f);
+            // The buffer back for the next resume, whatever the walk said.
+            *self.fs().resume_key.borrow_mut() = from;
+            return match walked? {
                 Walk::Done(n) => Ok(seen + n),
                 Walk::Resume { .. } => Err(err("block scan: resumed without a snapshot")),
             };
@@ -14982,6 +15007,24 @@ impl Reader {
         )
     }
 
+    /// A built form behind an `Arc`: the shared clean one for `Clean`,
+    /// which holds nothing, and a fresh one for a form with contents.
+    fn share_form(&self, form: Cached) -> std::sync::Arc<Cached> {
+        match form {
+            Cached::Clean => self.fs().clean.clone(),
+            form => std::sync::Arc::new(form),
+        }
+    }
+
+    /// `Walk::Resume` from `seen` entries at `key`, the key kept in the
+    /// forms state's buffer rather than a fresh `Vec`.
+    fn resume_at(&self, seen: usize, key: &[u8]) -> Walk {
+        let mut k = self.fs().resume_key.borrow_mut();
+        k.clear();
+        k.extend_from_slice(key);
+        Walk::Resume { seen }
+    }
+
     /// PROTOTYPE: the build context over this store's own state.
     fn build_ctx(&self) -> BuildCtx<'_> {
         BuildCtx {
@@ -14999,6 +15042,7 @@ impl Reader {
                 CACHE_DENSE
             },
             stale: self.fs().snap_stale.borrow(),
+            offs: Some(&self.fs().emit_offs),
             copy_dense: false,
             copy_exact: self.opts.copy_exact,
             merge_pieces: self.opts.overlay_merge,
@@ -15680,7 +15724,7 @@ impl Reader {
                     continue;
                 }
                 self.shared.forms_events[6].fetch_add(1, AtomicOrdering::Relaxed);
-                let built = std::sync::Arc::new(ctx.materialize(src, table, b, unsealed)?);
+                let built = self.share_form(ctx.materialize(src, table, b, unsealed)?);
                 self.count_built();
                 let bytes = built.bytes();
                 table.slots[b] = Some(built);
@@ -16124,6 +16168,12 @@ impl Reader {
             }
             if new {
                 if let Some(list) = table.added.get_mut(b) {
+                    // Room for a few at the first push: grown one at a
+                    // time from empty, the lists of a burst's blocks were
+                    // 71 growths and 14 reallocations a burst of a hundred.
+                    if list.capacity() == 0 {
+                        list.reserve_exact(ROOM_AT_BIRTH);
+                    }
                     list.push((slot, cut));
                     table.filed += 1;
                 }
@@ -16296,9 +16346,10 @@ impl Reader {
         let was_clean = matches!(table.slots[b].as_deref(), Some(Cached::Clean));
         let mut bloated = false;
         let mut dense = false;
+        // The shared clean form is not a clone of anything.
         if table.slots[b]
             .as_ref()
-            .is_some_and(|a| std::sync::Arc::strong_count(a) > 1)
+            .is_some_and(|a| std::sync::Arc::strong_count(a) > 1 && !matches!(**a, Cached::Clean))
         {
             self.shared
                 .forms_cloned
@@ -16704,10 +16755,7 @@ impl Reader {
             // The builder's forms are spliced against the snapshot, so a
             // scan with forms waiting starts from the snapshot.
             None if self.ahead_posted() => {
-                return Ok(Walk::Resume {
-                    seen: 0,
-                    from: from.to_vec(),
-                });
+                return Ok(self.resume_at(0, from));
             }
             None => {}
         }
@@ -16801,10 +16849,7 @@ impl Reader {
             if held.is_none() {
                 // A table is made against the snapshot's bounds.
                 let Some(unsealed) = unsealed else {
-                    return Ok(Walk::Resume {
-                        seen,
-                        from: cursor.to_vec(),
-                    });
+                    return Ok(self.resume_at(seen, cursor));
                 };
                 *held = Some(self.make_table(seg, l0, unsealed)?);
                 self.fs().cache_used.set(true);
@@ -16887,24 +16932,21 @@ impl Reader {
                     Some(u) => u,
                     None if wants_snapshot => {
                         self.count_takes(takes);
-                        let from = if first {
-                            cursor.to_vec()
+                        let from: &[u8] = if first {
+                            cursor
                         } else {
-                            seg.blob
-                                .key_at(lo)
-                                .ok_or_else(|| {
-                                    err("block scan: a block's first rank did not resolve")
-                                })?
-                                .to_vec()
+                            seg.blob.key_at(lo).ok_or_else(|| {
+                                err("block scan: a block's first rank did not resolve")
+                            })?
                         };
-                        return Ok(Walk::Resume { seen, from });
+                        return Ok(self.resume_at(seen, from));
                     }
                     // Nothing below reads it for a block held as another
                     // form; the empty one stands in.
                     None => &NO_SNAPSHOT,
                 };
                 if canon.is_none() && table.slots[b].is_none() {
-                    let built = std::sync::Arc::new(ctx.materialize(src, table, b, unsealed)?);
+                    let built = self.share_form(ctx.materialize(src, table, b, unsealed)?);
                     self.count_built();
                     let bytes = built.bytes();
                     table.slots[b] = Some(built);
@@ -23687,6 +23729,8 @@ struct BuildCtx<'s> {
     dense_from: usize,
     /// The handle's stale set, held for the build: see `Snapshot::vals`.
     stale: std::cell::Ref<'s, SlotSet>,
+    /// Where `take_offs` keeps the chain-offset scratch between uses.
+    offs: Option<&'s std::cell::RefCell<Vec<usize>>>,
     /// PROTOTYPE: whether a block the unsealed run covers is copied now
     /// or walked. A read's first touch walks it: every partition record
     /// under a run that covers the block is masked by its update's
@@ -24470,7 +24514,7 @@ impl<'s> BuildCtx<'s> {
             let same = rank < hi && at_bound == Ordering::Equal;
             let em = em.get_or_insert_with(|| Emit {
                 tombs: self.tombs,
-                scratch: Vec::new(),
+                scratch: self.take_offs(),
             });
             on_key(o.key);
             self.emit_over(&mut f, em, ov, oi, same.then_some(rank), src)?;
@@ -24479,6 +24523,9 @@ impl<'s> BuildCtx<'s> {
             }
             oi += 1;
             seen += 1;
+        }
+        if let Some(em) = em {
+            self.give_offs(em.scratch);
         }
         Ok(seen)
     }
@@ -24541,6 +24588,16 @@ impl<'s> BuildCtx<'s> {
                 .sum::<usize>();
         let runs = unsealed.runs && frozen_runs;
         let covered = !self.copy_dense && runs && over * 4 >= (hi - lo) * 3;
+        // Nothing over the block in any source: clean, without an overlay
+        // built to find that out. The first scans after a burst
+        // materialize every block they walk that has no form, and three
+        // blocks of five had no key over them: the overlay cost about 450
+        // instructions each to come back empty, 48,000 of a pass of a
+        // hundred scans after a burst of a hundred writes at ten thousand
+        // keys, a tenth of what the pass paid over the sealed walk.
+        if over == 0 && floor == 0 && table.added.get(b).is_none_or(|l| l.is_empty()) {
+            return Ok(Cached::Clean);
+        }
         // Under `pieces_only` the form is the pieces' fold whatever the
         // memtables hold over the block, and a block dense with piece
         // keys is a copy, since the wide form's walk assembles the
@@ -24576,6 +24633,24 @@ impl<'s> BuildCtx<'s> {
     /// where each cuts the walk, and its values from every source that
     /// holds it, the partition's own for an equal key first, packed into
     /// one block.
+    /// The chain-offset scratch `emit_over` fills, taken from the forms
+    /// state and given back after the walk or the build that used it:
+    /// `live_offs_into` allocates nothing after its buffer has grown
+    /// once, and a buffer made fresh for every block grew once per block
+    /// -- 57 growths a pass of a hundred scans after a burst of a hundred
+    /// writes, each a malloc. A context without a home for it, or one
+    /// taken already, works from an empty one, which is only the old
+    /// cost.
+    fn take_offs(&self) -> Vec<usize> {
+        self.offs
+            .map(|o| std::mem::take(&mut *o.borrow_mut()))
+            .unwrap_or_default()
+    }
+    fn give_offs(&self, v: Vec<usize>) {
+        if let Some(o) = self.offs {
+            *o.borrow_mut() = v;
+        }
+    }
     fn deltas_for(
         &self,
         src: Sources,
@@ -24586,7 +24661,7 @@ impl<'s> BuildCtx<'s> {
         let hi = ranks.end;
         let mut em = Emit {
             tombs: self.tombs,
-            scratch: Vec::new(),
+            scratch: self.take_offs(),
         };
         self.prefetch_overlay(ov);
         // Sized once from the key count: a buffer grown by doubling from
@@ -24629,6 +24704,7 @@ impl<'s> BuildCtx<'s> {
             });
             rank = cut + same as usize;
         }
+        self.give_offs(em.scratch);
         Ok(blk)
     }
     /// A run's positions over a block from the cursor on, at most
@@ -24767,7 +24843,7 @@ impl<'s> BuildCtx<'s> {
         let mut oi = 0usize;
         let mut em = Emit {
             tombs: self.tombs,
-            scratch: Vec::new(),
+            scratch: self.take_offs(),
         };
         let scan = |rank: &mut usize, to: usize, seen: &mut usize, f: &mut F| -> Result<()> {
             let want = (to - *rank).min(limit - *seen);
@@ -24855,6 +24931,7 @@ impl<'s> BuildCtx<'s> {
         if seen < limit && rank < hi {
             scan(&mut rank, hi, &mut seen, &mut f)?;
         }
+        self.give_offs(em.scratch);
         Ok(seen)
     }
     /// A copy walked with the memtables' keys over the block slipped in:
@@ -24880,7 +24957,7 @@ impl<'s> BuildCtx<'s> {
         let mut seen = 0usize;
         let mut em = Emit {
             tombs: self.tombs,
-            scratch: Vec::new(),
+            scratch: self.take_offs(),
         };
         while seen < limit {
             let order = match (blk.ents.get(i), ov.over.get(oi)) {
@@ -24911,6 +24988,7 @@ impl<'s> BuildCtx<'s> {
             }
             seen += 1;
         }
+        self.give_offs(em.scratch);
         Ok(seen)
     }
     /// PROTOTYPE: the walk over ranks `from..hi` with the block's resolved
