@@ -3867,6 +3867,31 @@ the device: the records' sync and the trailer's, two round trips of a
 file the load has just written, and the second cannot begin before the
 first is through.
 
+The scan pass at ten thousand keys read level with LMDB on this host,
+and the harness times every scan of the pass on its own now
+(`SUPDB_SCAN_OPS=1`, a `scanops` line a pass for every arm with the
+first scans beside the median; the pass is marked for a profile too).
+It put the first scan of ours at 18 to 29 µs at ten thousand keys and 32
+to 51 at thirty, against 2 to 6 for the scans after it and 6 to 11 for
+the comparator's first, in a pass of 250 to 500 µs. A probe over the
+store the load leaves, with the engine's scan timers, split the first
+scan into its phases and callgrind counted it at 42,000 instructions
+against 7,600 for the second: 18,000 of them a radix sort over the
+empty memtable, whose masks of the bytes that vary among the records
+read every byte as varying over no records and ran sixteen histogram
+passes for nothing, in the snapshot the first scan builds over a store
+just drained; and 14,000 in the block table's allocations, a loop
+writing `None` per block twice. The sort returns for a run of fewer
+than two and the slots are allocated as a run; the first scan counts
+23,000 now. In the suite's shape its column did not move within its
+spread, 21 to 29 µs at ten thousand keys in two sittings after as
+before, since the sort was a fifth of it by count and the rest is cold
+lines -- the log read, the snapshot, the table's seeks and the walk's
+own -- that the comparator pays its own share of; the pass read 1.35x
+and 1.23x against LMDB at ten and thirty thousand keys in those
+sittings, where it had read level in one before, which is the host's
+spread between sittings and not the sort's. The count is the verdict.
+
 #### The finish's fills, asked ahead
 
 The segment finish's trailer -- fences, directory, hash slots, composed

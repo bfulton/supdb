@@ -886,12 +886,45 @@ fn one_pass(
     let scans = (size / plan.scan_len as u64).max(1);
     let scan_keys = size.saturating_sub(plan.scan_len as u64).max(1);
     let mut g2 = KeyGen::new(KeyDist::Uniform, scan_keys, 11);
+    // With `SUPDB_SCAN_OPS` set, every scan of the pass is timed on its
+    // own, for every arm, and the pass line names its first scans beside
+    // the rest: a pass of a hundred scans at the smallest rung is a few
+    // hundred microseconds, and a first scan that builds what the pass
+    // needs once is a share of it no rate shows. The clock reads around
+    // every scan are a cost the rows must not carry.
+    let per_op = std::env::var_os("SUPDB_SCAN_OPS").is_some();
+    let mut op_us: Vec<f64> = Vec::new();
+    phase_mark(arm, "scan", "start");
     let t = Instant::now();
     for _ in 0..scans {
         db_key_into(g2.next(), &mut kb);
-        e.range(&kb, plan.scan_len)?;
+        if per_op {
+            let t0 = Instant::now();
+            e.range(&kb, plan.scan_len)?;
+            op_us.push(t0.elapsed().as_secs_f64() * 1e6);
+        } else {
+            e.range(&kb, plan.scan_len)?;
+        }
     }
     let scan_s = t.elapsed().as_secs_f64();
+    phase_mark(arm, "scan", "end");
+    if per_op && !op_us.is_empty() {
+        let mut sorted = op_us.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let med = sorted[sorted.len() / 2];
+        let head: Vec<String> = op_us.iter().take(4).map(|u| format!("{u:.1}")).collect();
+        eprintln!(
+            "scanops {} size {} scans {} first {} med {:.1} max {:.1} sum_us {:.1} pass_us {:.1}",
+            e.name(),
+            size,
+            scans,
+            head.join("/"),
+            med,
+            sorted[sorted.len() - 1],
+            op_us.iter().sum::<f64>(),
+            scan_s * 1e6
+        );
+    }
 
     // And the scans, `size` of them a thread -- the threaded read pass's
     // count, a hundred times the single-threaded scan pass's. That pass

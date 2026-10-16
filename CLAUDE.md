@@ -469,7 +469,12 @@ timer by kind (`SUPDB_MIX_KINDS=1`, a `mixkinds` line per mix on
 stderr for every arm, its reads, scans and commits apart), which read
 the E gap as the scans' alone and the tax as the commits' and the
 gets'; `SUPDB_MIX_EVENTS=1` prints each mix's form events, upkeep
-passes and snapshot builds beside its counters. Read a thread's
+passes and snapshot builds beside its counters. `SUPDB_SCAN_OPS=1` times
+every scan of the single-threaded scan pass on its own, for every arm,
+and prints a `scanops` line a pass with the first scans beside the
+median: a pass of a hundred scans at the smallest rung is a few hundred
+microseconds, and a first scan that builds what the pass needs once is a
+share of it no rate shows. Read a thread's
 passes per rep there before reading its cell: a thread that ran in
 two reps of five made a cell that read neither shape.
 
@@ -1858,6 +1863,26 @@ been. The rule: a condition over two counters is written against the
 values both have at birth, not the values they share once running; and
 a change priced on the cell it was made for is read on every cell that
 shares the path it changed, before its first verdict is banked.
+
+**A mask over an empty run that said every byte varies.** The scan
+snapshot's radix sort takes a pass only over the bytes that differ
+among the records, found by folding every record's prefix words with
+`and` and `or`; over no records the folds keep their identities, all
+ones and all zeros, the mask reads every byte as varying, and the sort
+ran sixteen passes of a histogram zeroed and summed for nothing: 18,000
+of the 42,000 instructions of the first scan over a store just
+drained, whose snapshot is built over the empty table, in a pass of a
+hundred scans at ten thousand keys. Nothing raised and nothing was
+wrong, and the pass read level with the comparator where its scans
+after the first read faster. The harness's per-scan timer
+(`SUPDB_SCAN_OPS`) named the first scan, a probe with the engine's
+timers named the snapshot, and callgrind over the probe's first scan
+named the sort. The rule is the small rungs' again, with a corollary: a
+routine whose work is shaped by a fold over its input does the whole
+of the work for an empty input, since the fold's identity is the case
+that selects everything, so a run of fewer than two returns before the
+fold; and the first operation of a pass is timed on its own at every
+rung where the pass is short, not only where it reads slow.
 
 **A length read off the slab that held the exceptions.** The ordered
 table's write log became the range of its entries, its length the
