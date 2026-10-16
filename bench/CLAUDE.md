@@ -340,6 +340,34 @@ machine for both engines is the machine's, and a count of threads that
 leaves nothing for the rest of the process measures the rest of the
 process.
 
+**A threaded cell at the small rungs that read the guest's vCPUs.** The
+three-thread scan cells at thirty and a hundred thousand keys read 0.94x
+of LMDB in the first row that carried them, 2 and 3 wins of 5, with
+both engines spreading 34-59% where the one-thread cells spread 6-18%,
+and the loss was taken for the engine's: the upkeep thread as a fourth
+runnable thread beside three readers. Paired against the arm whose
+thread backs off, the cells did not move. `SUPDB_THREAD_SPANS` was
+written to take the pass apart, one line a pass with each thread's own
+wall and CPU, the release and finish skew, and every other thread's run
+and wait across it, and it said: the skew was 8-58 µs of a span of 0.5
+to 5 ms; the engine's threads ran 0-0.4 ms of a free core; and the
+three threads ran uneven by 1.5-3x in both engines, the slowest a
+random index, with wall equal to CPU, so the slow thread had its vCPU
+and the vCPU was slow. A control with no engine in it, three threads of
+identical fixed work released by a barrier, ran the same way: a thread's
+own CPU time 1.4-2x its siblings' at random, for tens of milliseconds,
+and every thread at 0.6x for its first millisecond or two after its
+vCPU had idled ten milliseconds, which a threaded pass's fresh threads
+on vCPUs the single-threaded phase before left idle always are. The
+span is the slowest thread's wall, so a pass of a few milliseconds reads
+which vCPU the host shorted, for both engines alike; the same arms paired
+on another host read the cells at 1.2-1.7x in both orders. The rule: a
+cell whose length is within the host's own unevenness is the host's for
+every engine, and the statistic a threaded pass reports has to be one
+that length can carry -- the per-thread columns are read before the
+span, and a threaded pass as short as a thread hand-off is a floor, not
+a measurement.
+
 **A workflow that never runs can be syntactically invalid for months.**
 Both self-hosted pickup watchdogs arrived with a block of an older draft
 pasted after their `exit 1`. `scripts/workflows.sh` parses every `run:`

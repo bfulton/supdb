@@ -171,7 +171,40 @@ pub fn minflt_of(comm: &str) -> u64 {
     total
 }
 
-/// This thread's minor page faults so far.
+/// Every thread of this process by tid: its name, and from
+/// `/proc/self/task/*/schedstat` its nanoseconds on a CPU, its nanoseconds
+/// waiting on a run queue and its timeslices so far. Two readings around
+/// a pass give what every thread the engine runs beside the pass's own
+/// cost it: a thread that ran took a core the readers had, and one that
+/// waited was contending for one.
+pub fn sched_of_tasks() -> Vec<(u32, String, u64, u64, u64)> {
+    let Ok(rd) = std::fs::read_dir("/proc/self/task") else {
+        return Vec::new();
+    };
+    let mut v = Vec::new();
+    for e in rd.flatten() {
+        let p = e.path();
+        let Some(tid) = p.file_name().and_then(|n| n.to_str()?.parse().ok()) else {
+            continue;
+        };
+        let comm = std::fs::read_to_string(p.join("comm"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let Ok(st) = std::fs::read_to_string(p.join("schedstat")) else {
+            continue;
+        };
+        let mut f = st.split_whitespace().map(|x| x.parse::<u64>().unwrap_or(0));
+        let (run, wait, slices) = (
+            f.next().unwrap_or(0),
+            f.next().unwrap_or(0),
+            f.next().unwrap_or(0),
+        );
+        v.push((tid, comm, run, wait, slices));
+    }
+    v
+}
+
 /// Microseconds of CPU the calling thread has used.
 pub fn thread_cpu_us() -> u64 {
     let mut ts = libc::timespec {
@@ -183,6 +216,7 @@ pub fn thread_cpu_us() -> u64 {
     ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
 }
 
+/// This thread's minor page faults so far.
 pub fn minflt_self() -> u64 {
     std::fs::read_to_string("/proc/thread-self/stat").map_or(0, |s| stat_minflt(&s))
 }
@@ -838,7 +872,7 @@ fn one_pass(
     let mut reads_s_threaded = Vec::with_capacity(plan.threads.len());
     for &threads in &plan.threads {
         let ops = size * threads as u64;
-        let (secs, bytes) = threaded(e.as_ref(), threads, ops, size, 0x7EAD, Op::Get)?;
+        let (secs, bytes) = threaded(e.as_ref(), "read", threads, ops, size, 0x7EAD, Op::Get)?;
         let want = ops * plan.value_size as u64;
         if bytes != want {
             return Err(format!(
@@ -866,6 +900,7 @@ fn one_pass(
         let ops = scans * threads as u64;
         let (secs, bytes) = threaded(
             e.as_ref(),
+            "scan",
             threads,
             ops,
             scan_keys,
@@ -935,6 +970,7 @@ fn one_pass(
         let ops = scans * threads as u64;
         let (secs, bytes) = threaded(
             e.as_ref(),
+            "scan-mixed",
             threads,
             ops,
             scan_keys,
@@ -1293,8 +1329,21 @@ fn share(ops: u64, threads: usize, i: usize) -> u64 {
 /// loaded box was tens of microseconds after the workers were running,
 /// and a hundred scans on four threads at ten thousand keys were over by
 /// then: the smoke run recorded them at billions of entries a second.
+///
+/// With `SUPDB_THREAD_SPANS` set, one `threadspans` line per pass on
+/// stderr, for every arm: the span and how much of it is the threads'
+/// release and finish skew, each thread's own wall and CPU time, and the
+/// run and run-queue wait of every other thread of the process across
+/// the pass. The span of a pass at the small rungs is under two
+/// milliseconds where a thread hand-off here costs up to a fifth of one,
+/// so a three-thread cell's spread is the skew's as much as the engine's,
+/// and the line says which; the per-thread columns say whether a loss
+/// against the comparator is every thread's rate, one thread's, or a
+/// thread of the engine's on the fourth core. Off, the pass reads no
+/// clock it did not; on, two thread-clock reads a thread a pass.
 fn threaded(
     e: &dyn Engine,
+    pass: &str,
     threads: usize,
     ops: u64,
     keys: u64,
@@ -1304,12 +1353,14 @@ fn threaded(
     if threads == 0 {
         return Err("a threaded pass needs at least one thread".to_string());
     }
+    let spans = std::env::var_os("SUPDB_THREAD_SPANS").is_some();
     let mut openers = Vec::with_capacity(threads);
     for _ in 0..threads {
         openers.push(e.thread_reader()?);
     }
     let barrier = std::sync::Barrier::new(threads + 1);
-    type Timed = Result<(Instant, Instant, u64), String>;
+    type Timed = Result<(Instant, Instant, u64, u64), String>;
+    let mut sched_before = Vec::new();
     let results: Vec<Timed> = std::thread::scope(|s| {
         let workers: Vec<_> = openers
             .into_iter()
@@ -1332,6 +1383,7 @@ fn threaded(
                     let mut kb = [0u8; KEY_SIZE];
                     barrier.wait();
                     let start = Instant::now();
+                    let cpu0 = if spans { thread_cpu_us() } else { 0 };
                     let mut r = opened?;
                     let mut bytes = 0u64;
                     for _ in 0..share {
@@ -1341,10 +1393,17 @@ fn threaded(
                             Op::Range(n) => r.range(&kb, n)?,
                         } as u64;
                     }
-                    Ok((start, Instant::now(), bytes))
+                    let end = Instant::now();
+                    let cpu = if spans { thread_cpu_us() - cpu0 } else { 0 };
+                    Ok((start, end, bytes, cpu))
                 })
             })
             .collect();
+        // The other threads' clocks, read with the readers spawned and
+        // not yet released; the readers report their own.
+        if spans {
+            sched_before = sched_of_tasks();
+        }
         barrier.wait();
         workers
             .into_iter()
@@ -1354,19 +1413,67 @@ fn threaded(
             })
             .collect()
     });
+    let sched_after = if spans { sched_of_tasks() } else { Vec::new() };
+    let mut timed = Vec::with_capacity(threads);
     let mut bytes = 0u64;
     let mut first: Option<Instant> = None;
     let mut last: Option<Instant> = None;
     for r in results {
-        let (start, end, b) = r?;
+        let (start, end, b, cpu) = r?;
         bytes += b;
         first = Some(first.map_or(start, |f| f.min(start)));
         last = Some(last.map_or(end, |l| l.max(end)));
+        timed.push((start, end, b, cpu));
     }
     let secs = match (first, last) {
         (Some(f), Some(l)) => l.duration_since(f).as_secs_f64(),
         _ => 0.0,
     };
+    if let (true, Some(first), Some(last)) = (spans, first, last) {
+        let us = |d: std::time::Duration| d.as_secs_f64() * 1e6;
+        let last_start = timed.iter().map(|t| t.0).max().unwrap_or(first);
+        let first_end = timed.iter().map(|t| t.1).min().unwrap_or(last);
+        let mut line = format!(
+            "threadspans {} {pass} {threads}t span_us={:.0} start_skew_us={:.0} end_skew_us={:.0}",
+            e.name(),
+            secs * 1e6,
+            us(last_start.duration_since(first)),
+            us(last.duration_since(first_end)),
+        );
+        for (i, (start, end, b, cpu)) in timed.iter().enumerate() {
+            line += &format!(
+                " | t{i} off_us={:.0} wall_us={:.0} cpu_us={cpu} bytes={b}",
+                us(start.duration_since(first)),
+                us(end.duration_since(*start)),
+            );
+        }
+        // Every thread present at both readings that ran or waited at
+        // all: the readers themselves have exited by the second reading
+        // and are the columns above, and this thread's own run across the
+        // pass is its wake from the barrier, the join and the second
+        // reading's walk of /proc, which says nothing of the pass.
+        // SAFETY: a plain syscall with no arguments.
+        let me = unsafe { libc::gettid() } as u32;
+        for (tid, comm, run1, wait1, slices1) in &sched_after {
+            if *tid == me {
+                continue;
+            }
+            let Some((_, _, run0, wait0, slices0)) = sched_before.iter().find(|t| t.0 == *tid)
+            else {
+                continue;
+            };
+            let (run, wait, slices) = (run1 - run0, wait1 - wait0, slices1 - slices0);
+            if run == 0 && wait == 0 {
+                continue;
+            }
+            line += &format!(
+                " | {comm}/{tid} run_us={} wait_us={} slices={slices}",
+                run / 1000,
+                wait / 1000
+            );
+        }
+        eprintln!("{line}");
+    }
     Ok((secs, bytes))
 }
 
@@ -2025,12 +2132,13 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             let mut e = engines::open(arm, &dir, 1).unwrap();
             load(e.as_mut(), size, &plan, &payload, |i| i).unwrap();
-            let (secs, bytes) = threaded(e.as_ref(), 2, size, size, 1, Op::Get).unwrap();
+            let (secs, bytes) = threaded(e.as_ref(), "read", 2, size, size, 1, Op::Get).unwrap();
             assert_eq!(bytes, size * plan.value_size as u64, "{arm}: point reads");
             assert!(secs > 0.0, "{arm}: a pass took no time");
             let scans = size / plan.scan_len as u64;
             let (_, bytes) = threaded(
                 e.as_ref(),
+                "scan",
                 2,
                 scans,
                 size - plan.scan_len as u64,
