@@ -418,6 +418,10 @@ pub struct Supdb {
     /// its records (`Options::drain_snapshot` off), the refuted shape.
     /// `supdb-ingestnodrainsnap`, and `supdb-nodrainsnap` durable.
     nodrainsnap: bool,
+    /// A seal writes every key through the writer's general path, as
+    /// before the one-value path (`Options::seal_put_one` off).
+    /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
+    sealrun: bool,
     /// The scan phases timed on every scan, as before the clock reads
     /// were gated (`Options::scan_timers`). `supdb-timers`, and
     /// `supdb-ingesttimers` buffered.
@@ -707,6 +711,10 @@ struct Policy {
     /// its records (`Options::drain_snapshot` off), the refuted shape.
     /// `supdb-ingestnodrainsnap`, and `supdb-nodrainsnap` durable.
     nodrainsnap: bool,
+    /// A seal writes every key through the writer's general path, as
+    /// before the one-value path (`Options::seal_put_one` off).
+    /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
+    sealrun: bool,
     /// The scan phases timed on every scan, as before the clock reads
     /// were gated (`Options::scan_timers`). `supdb-timers`, and
     /// `supdb-ingesttimers` buffered.
@@ -977,6 +985,7 @@ impl Default for Policy {
             lazysettle: false,
             walsync: false,
             nodrainsnap: false,
+            sealrun: false,
             timers: false,
             wake: false,
             noprefetch: false,
@@ -2377,6 +2386,34 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose seals write every key through the writer's general
+    /// path, as before: against `supdb` it prices the one-value path on
+    /// the durable seals.
+    pub fn create_sealrun(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                sealrun: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose seals write every key through the writer's
+    /// general path, as before: against `supdb-ingest` it prices the
+    /// one-value path on the buffered seals.
+    pub fn create_ingest_sealrun(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                sealrun: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` timing every scan's phases, as before the clock reads were
     /// gated: against `supdb` it prices the instrument.
     pub fn create_timers(path: &Path) -> Res<Supdb> {
@@ -3034,6 +3071,7 @@ impl Supdb {
             lazysettle,
             walsync,
             nodrainsnap,
+            sealrun,
             timers,
             wake,
             noprefetch,
@@ -3236,6 +3274,7 @@ impl Supdb {
             upkeep_settle_after_scans: !lazysettle,
             drain_syncs_wal: walsync,
             drain_snapshot: !nodrainsnap,
+            seal_put_one: !sealrun,
             upkeep_wake_parked: wake,
             scan_prefetch: !noprefetch,
             manifest_slots: !manifestrename,
@@ -3357,6 +3396,7 @@ impl Supdb {
             lazysettle,
             walsync,
             nodrainsnap,
+            sealrun,
             timers,
             wake,
             noprefetch,
@@ -3761,6 +3801,13 @@ impl Engine for Supdb {
                 "supdb-nodrainsnap"
             } else {
                 "supdb-ingestnodrainsnap"
+            };
+        }
+        if self.sealrun {
+            return if self.partition {
+                "supdb-sealrun"
+            } else {
+                "supdb-ingestsealrun"
             };
         }
         if self.timers {
@@ -4587,6 +4634,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-lazysettle"
         | "supdb-walsync"
         | "supdb-nodrainsnap"
+        | "supdb-sealrun"
         | "supdb-timers"
         | "supdb-wake"
         | "supdb-noprefetch"
@@ -4662,6 +4710,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestlazysettle"
         | "supdb-ingestwalsync"
         | "supdb-ingestnodrainsnap"
+        | "supdb-ingestsealrun"
         | "supdb-ingesttimers"
         | "supdb-ingestwake"
         | "supdb-ingestnoprefetch"
@@ -4794,6 +4843,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestwalsync" => Box::new(Supdb::create_ingest_walsync(dir)?),
         "supdb-nodrainsnap" => Box::new(Supdb::create_nodrainsnap(dir)?),
         "supdb-ingestnodrainsnap" => Box::new(Supdb::create_ingest_nodrainsnap(dir)?),
+        "supdb-sealrun" => Box::new(Supdb::create_sealrun(dir)?),
+        "supdb-ingestsealrun" => Box::new(Supdb::create_ingest_sealrun(dir)?),
         "supdb-timers" => Box::new(Supdb::create_timers(dir)?),
         "supdb-ingesttimers" => Box::new(Supdb::create_ingest_timers(dir)?),
         "supdb-wake" => Box::new(Supdb::create_wake(dir)?),

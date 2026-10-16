@@ -1431,6 +1431,16 @@ pub struct Options {
     /// the table already taken as it is: `supdb-nodrainsnap` and
     /// `supdb-ingestnodrainsnap`.
     pub drain_snapshot: bool,
+    /// A seal writes a key whose chain holds one value and no tombstone
+    /// -- every key of a load, and most of any table -- through the
+    /// writer's one-value path (`SegmentWriter::put_one`), the record
+    /// laid out once, where the general path staged the value, encoded
+    /// the run from the staging and encoded the record from the run:
+    /// callgrind over the seal's job counted the general path at some
+    /// 950 instructions a record of the job's 2,350. Off, every key takes
+    /// the general path, as before: `supdb-sealrun` and
+    /// `supdb-ingestsealrun`.
+    pub seal_put_one: bool,
     /// At a flush's close of a direct run, the writer fdatasyncs the run's
     /// file -- the records committed to it so far, hinted to the page
     /// cache as they were written and flushed to the device by nothing yet
@@ -1826,6 +1836,7 @@ impl Default for Options {
             flush_waits_manifest: false,
             drain_syncs_wal: false,
             drain_snapshot: true,
+            seal_put_one: true,
             close_presync: true,
             ord_durable: false,
             direct_table_refs: false,
@@ -19870,6 +19881,7 @@ impl Db {
         let from_snapshot = self.opts.seal_from_snapshot;
         let frozen_snaps = self.opts.frozen_snaps;
         let build_copy = !self.draining || self.opts.drain_snapshot;
+        let put_one = self.opts.seal_put_one;
         let job = move |readable: &SealReadable| -> Result<Vec<String>> {
             if background_io == BackgroundIo::Idle {
                 idle_io_priority();
@@ -20051,6 +20063,20 @@ impl Db {
                                 // sources older than it.
                                 let (n, v) = s.arena.run(e.frun);
                                 let (range, tomb) = Snapshot::run_visible(n, v, SEE_ALL);
+                                // One value and no tombstone: the record
+                                // laid out once (`Options::seal_put_one`).
+                                if put_one && !tomb && range.len() >= 12 {
+                                    let len = u32::from_le_bytes(
+                                        v[range.start + 8..range.start + 12]
+                                            .try_into()
+                                            .expect("four bytes"),
+                                    ) as usize;
+                                    if range.start + 12 + len == range.end {
+                                        let p = range.start + 12;
+                                        w.put_one(s.key_of(e), &v[p..p + len])?;
+                                        continue;
+                                    }
+                                }
                                 w.begin(s.key_of(e))?;
                                 let mut p = range.start;
                                 while p < range.end {
@@ -20085,6 +20111,10 @@ impl Db {
                                 // Only what is live after the newest
                                 // tombstone, and the flag if there was one.
                                 let tomb = mem.live_offs_into(e, &mut offs, SEE_ALL);
+                                if put_one && !tomb && offs.len() == 1 {
+                                    w.put_one(key, mem.value_at(offs[0]))?;
+                                    continue;
+                                }
                                 w.begin(key)?;
                                 for &off in &offs {
                                     w.value(mem.value_at(off));

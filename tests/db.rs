@@ -1633,6 +1633,55 @@ fn a_buffered_flush_is_answered_by_its_slot_and_needs_nothing_of_its_log() {
     }
 }
 
+/// The seal's one-value path lays a record out once where the general
+/// path staged, encoded and re-encoded it, and the two must leave the
+/// same bytes: a segment sealed through each, from the same table, byte
+/// for byte, its ordered index too.
+#[test]
+fn a_seal_through_the_one_value_path_writes_the_segment_the_general_path_does() {
+    let mut files: Vec<std::collections::BTreeMap<String, Vec<u8>>> = Vec::new();
+    for put_one in [true, false] {
+        let d = dir(if put_one { "sealputone" } else { "sealrun" });
+        let opts = Options {
+            seal_put_one: put_one,
+            ..wal_arm()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        for c in 0u32..3000 {
+            // Mostly one value a key; some keys two, a few deleted.
+            let k = format!("k{:04}", (c * 7919) % 2500);
+            db.append(k.as_bytes(), &c.to_le_bytes());
+            if c % 97 == 0 {
+                db.delete(k.as_bytes());
+            }
+            if c % 50 == 49 {
+                db.commit().unwrap();
+            }
+        }
+        db.flush().unwrap();
+        drop(db);
+        let mut m = std::collections::BTreeMap::new();
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            let name = p.file_name().unwrap().to_str().unwrap().to_string();
+            if name.ends_with(".sup") || name.ends_with(".oidx") {
+                m.insert(name, std::fs::read(&p).unwrap());
+            }
+        }
+        assert!(!m.is_empty(), "the flush sealed a segment");
+        files.push(m);
+    }
+    let (a, b) = (&files[0], &files[1]);
+    assert_eq!(
+        a.keys().collect::<Vec<_>>(),
+        b.keys().collect::<Vec<_>>(),
+        "the same files"
+    );
+    for (name, bytes) in a {
+        assert!(bytes == &b[name], "{name} differs between the two paths");
+    }
+}
+
 fn dir_bytes(d: &std::path::Path) -> u64 {
     std::fs::read_dir(d)
         .unwrap()

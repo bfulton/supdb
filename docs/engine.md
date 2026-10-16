@@ -3801,6 +3801,25 @@ its pages were not the price. The shape without it is the arm
 writer's own work on a record, some 230 ns of it at ten thousand keys
 from a sequential arena, which the next decomposition takes apart.
 
+Callgrind over the seal's job (`--toggle-collect` on the job's own
+symbol, with `--demangle=no`, since the toggle never matched the
+demangled closure's name) counted some 2,350 instructions a record at
+ten thousand keys: 600 in the snapshot's copy, five small `memcpy`
+calls and three arena resolutions a record; 950 in the record writer,
+of which `end_with` 800 -- the run encoded from the staged value, the
+record from the run, and the record copied into the aligned buffer
+with a checksum call a record; 290 in the finish; the rest in the
+sort, the Bloom and the ordered index. A key whose chain holds one
+value and no tombstone, every key of a load, goes through the
+writer's one-value path now (`Options::seal_put_one`,
+`SegmentWriter::put_one`), the record laid out once from the value:
+172 instructions a record fewer by count, 7% of the job, and the
+records phase at thirty thousand keys 1.1 and 2.5 ms shorter in two
+sittings with the drain's end 1.3 to 1.5 ms earlier; at ten thousand
+the phase moved within the host's noise and no rate resolved either
+rung. The general path for every key is the arm `supdb-sealrun` and
+`supdb-ingestsealrun`, and a test holds the two to the same bytes.
+
 #### The finish's fills, asked ahead
 
 The segment finish's trailer -- fences, directory, hash slots, composed
