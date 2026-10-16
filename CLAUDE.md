@@ -56,7 +56,8 @@ it.
 `sh scripts/check.sh` runs every group -- build, test, lint, wasm, bench --
 and CI calls the same script with the same names, so a green run here is a
 green run there. Use a group name to run one. `quick` is a group too, the
-suite's three-minute measurement; it is not in the default set because a
+suite's quick-scale measurement, twenty minutes or so with half of it
+the threaded scans; it is not in the default set because a
 timing run needs the machine to itself, and CI gives it a job of its own.
 
 The tests leave their stores under the temp directory, one per test and

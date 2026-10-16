@@ -23,7 +23,7 @@ every arm over a ladder of store sizes and writes one row of raw samples
 under `bench/runs/<scale>/`; `bench/DESIGN.md` is the specification and
 `bench/CLAUDE.md` the rules. Two scales:
 
-- `quick` runs on every pull request, on a hosted runner, about three
+- `quick` runs on every pull request, on a hosted runner, about twenty
   minutes. It gates the change against the last ten rows of that runner's
   class in `bench/runs/`, and until a class has three rows it can only prove
   the suite runs end to end.
