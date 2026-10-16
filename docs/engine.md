@@ -2629,6 +2629,31 @@ pairs of five, E 0.97x. No direction survives both rungs, so the span
 stays at four kilobytes and the kilobyte is the arm `supdb-prefetch1k`
 and `supdb-ingestprefetch1k`.
 
+The narrowest mix on this host is D, level with LMDB at thirty and a
+hundred thousand keys where C reads 1.25-1.8x, and the mixes' timers
+by kind say why: a D read costs 0.62 µs against a C read's 0.27 for
+us, 0.64 against 0.37 for LMDB. D's reads are uniform, as C's are; what
+differs is the store they read, after A and F have put a sixth of the
+keys into the memtable. A probe over that store priced the sources a
+read consults -- the partition alone 0.5 µs a read at a hundred
+thousand keys, 0.9 to 1.0 with the memtable holding a sixth, 0.5 again
+once it is sealed into a piece whose filter answers for it -- and its
+profile put the excess not in the memtable's probe, a tenth of it, but
+in the partition's own lookup, 0.30 to 0.65 µs a read: the memtable's
+arena and index, and the block forms the upkeep keeps current for
+every block the updates dirtied, a second copy of the partition, have
+outgrown the cache with it. Against the arm with no block forms
+(`supdb-nocache`, durable), D read 1.20x, B 1.18x, F 1.13x and A 1.06x
+without them, 4-5/6, with D's reads 0.66 µs against 0.72 and its
+commits 520 µs against 770 -- the thread's pass over the hundred keys a
+commit lends, outrunning the fsync it works beside -- while E read 0.34x
+and the rewritten lag point 0.15x, which is what the forms are for. The
+forms are kept current through A, B, F and D, four mixes with no scan
+in them, for E. Filing them only while scans are around, and leaving a
+scan-free stretch's writes listed by block for the first walk to merge
+(`added`, as a handle's extension files them), is the lever this
+decomposition leaves, priced by the mixes' sum.
+
 Waking the thread for the mixes' small batches was priced three ways
 (`Options::upkeep_wake_parked`, the arm `supdb-ingestwake`), each
 against the shape that wakes only for a batch worth waking for, 24 pairs
