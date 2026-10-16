@@ -2093,6 +2093,19 @@ impl Wal {
         Ok(())
     }
 
+    /// Whether the file holds frames no sync has covered. `written`
+    /// starts at the header's length and `synced` at zero, so the two
+    /// differ from the file's birth until its first sync: read as
+    /// "unsynced", that made every drain of a store whose log never
+    /// syncs -- a buffered store's direct runs, a durable store's, whose
+    /// records sync in the run's own file -- wait for its slot's
+    /// fdatasync, 0.4 to 0.9 ms on the drain for frames the log did
+    /// not hold. The header needs no sync of its own: an open takes a
+    /// file short of it, or torn inside it, as a log with nothing in it.
+    fn frames_unsynced(&self) -> bool {
+        self.written > self.synced.max(WAL_MAGIC.len() as u64)
+    }
+
     /// Replay committed batches: `apply(kind, key, value)` for every record
     /// of every batch whose commit frame was read intact, in order. Frames
     /// after the last commit frame are a batch that never committed -- torn,
@@ -18159,7 +18172,7 @@ impl Db {
     /// over the live file and retired it. A failed barrier is sticky
     /// instead (`wal_dir_unsynced`) and every commit retries it first.
     fn rotate_wal(&mut self) -> Result<()> {
-        if self.wal.synced < self.wal.written {
+        if self.wal.frames_unsynced() {
             self.wal.sync()?;
             self.unsynced = 0;
         }
@@ -19473,7 +19486,7 @@ impl Db {
                     SyncPolicy::Always => true,
                     SyncPolicy::EveryN(n) => self.unsynced >= n.max(1),
                 };
-            if due && self.wal.synced < self.wal.written {
+            if due && self.wal.frames_unsynced() {
                 self.wal.sync()?;
                 self.unsynced = 0;
             }
@@ -20256,7 +20269,7 @@ impl Db {
         let _op = self.op();
         self.commit_staged()?;
         // The promise is this call's, whatever the policy left unsynced.
-        if !self.mem().ordered && self.wal.synced < self.wal.written {
+        if !self.mem().ordered && self.wal.frames_unsynced() {
             self.wal.sync()?;
         }
         self.unsynced = 0;
@@ -21451,7 +21464,7 @@ impl Db {
             wal,
             tmp,
             draining,
-            wal_unsynced: self.wal.synced < self.wal.written,
+            wal_unsynced: self.wal.frames_unsynced(),
         };
         // Counted before it is sent, so the count never reads zero with a
         // seal in flight.

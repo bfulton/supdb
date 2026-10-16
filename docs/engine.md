@@ -3774,7 +3774,17 @@ millisecond slower, within what this host moves them by -- and 1.09x
 and 1.22x at thirty thousand (p .008 both). The ordered load has no log
 to sync and did not move; the durable store's log is synced at every
 commit, and its flush skips a sync the log holds nothing for. The old
-shape is the arm `supdb-walsync` and `supdb-ingestwalsync`. The stamps
+shape is the arm `supdb-walsync` and `supdb-ingestwalsync`. The first
+version of the wait asked whether the log's synced length was short of
+its written length, and the two differ from the file's birth -- the
+header is written and never synced -- so every drain of a store whose
+log never syncs waited for its slot as well: a buffered store's direct
+runs, and a durable store's, whose records sync in the run's own file.
+The stamps read it as 0.4 to 0.9 ms between the landing and the publish
+of every direct run's drain, where the shape before had read 0.05, and
+the ordered load at ten thousand keys fell to 0.90x of LMDB in one
+sitting; the wait asks whether the log holds frames past its header
+now (`Wal::frames_unsynced`). The stamps
 cover the hashed table's seal now as well (`sorted`, `snapped`, and the
 finish's steps), and they put the rest of that drain at ten thousand
 keys in the seal thread: the sort 0.4 ms, the snapshot's copy 1.0 to

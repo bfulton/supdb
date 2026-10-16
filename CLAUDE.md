@@ -1833,6 +1833,24 @@ policy, never by the shape of the call that happens to need the write;
 and a drain's syscalls are listed under `strace` beside its stamps
 before any wait in it is read as the device's floor.
 
+**Two counters that start apart, compared as if they started
+together.** The drain's slot wait asked whether the log had frames no
+sync had covered as `synced < written`, and a log's `written` starts at
+its header's length while `synced` starts at zero, so the pair read
+"unsynced" from the file's birth until its first sync -- never, for a
+buffered store's direct runs and for a durable store's, whose records
+sync in the run's own file -- and every direct run's drain waited for
+its slot's fdatasync, 0.4 to 0.9 ms where the publish had followed the
+landing in 0.05. The change was priced on the shuffled load, the one
+drain whose log holds frames, and read as a win there; the ordered load
+beside it read 1.07x and 1.33x for the comparator across two sittings
+and was taken for the host until a third sitting, with the stamps of
+the direct run's drain beside it, put the slot wait where none had
+been. The rule: a condition over two counters is written against the
+values both have at birth, not the values they share once running; and
+a change priced on the cell it was made for is read on every cell that
+shares the path it changed, before its first verdict is banked.
+
 **A length read off the slab that held the exceptions.** The ordered
 table's write log became the range of its entries, its length the
 entries' count, and read that count off the entries' slab; the one-word
