@@ -2506,6 +2506,29 @@ it would land on, and the engine measures the first; the second is the
 reader's. The settle's own cost a write, 0.2 µs at ten thousand keys
 and 0.8 at three hundred thousand, is the lever under both shapes.
 
+The threshold that decides "worth waking for" is one rung of the ladder
+wide. `UPKEEP_WAKE_WRITES` is 256, and the lag sweep's one-percent burst
+is one batch of `size/100` writes: a hundred at ten thousand keys, lent
+and taken back by the first scan, and three hundred at thirty thousand,
+filed inline. So the one-percent point at ten thousand keys read level
+with LMDB in every row (0.95-1.05x) while the point above it read
+1.3-1.4x, and the first scan's settle of the 99 keys and the forms it
+materialized counted 570,000 instructions over the pass's hundred
+scans, 196 an entry against 139 for the sealed walk alone and 158 with
+the burst filed at the commit (`Options::upkeep_inline_min`). Filing
+every batch inline, `supdb-ingestinlineall` against `supdb-ingest` in
+eight pairs each way: at ten thousand keys the one-percent scans 1.57x
+and 1.60x (15 wins of 16), the burst 0.47x (0 of 16), their sum level,
+and ycsb-A 0.78x and 0.86x, F 0.79x and 0.88x; at thirty thousand,
+where both arms file the burst, A 0.65x and 0.53x and F 0.75x and
+0.59x, the lag points level. A mix's batches of a hundred cross the same
+threshold, and filing them on the mix's own thread costs it far more
+than the alert thread's re-reads beside it did; and the burst at 0.47x
+would fall under LMDB's (0.86M updates a second against our 1.5M at
+ten thousand keys in the row). The threshold stays, as an option, and
+the point's remaining lever is the filing's own cost: the 150,000
+instructions of its 550 allocator calls.
+
 #### The scan's own clock
 
 ycsb-E, the one mix that lost to LMDB on the buffered arm (0.73x at ten

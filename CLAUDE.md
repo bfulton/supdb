@@ -1768,6 +1768,35 @@ background worker's effect is read per rep in its own counters before
 its cell is read, because a thread that runs in some reps makes a cell
 that reads bimodal, and a median over it reads neither shape.
 
+**A cell one rung under a threshold the rungs above it cleared.** The
+lag sweep's one-percent scans at ten thousand keys read level with
+LMDB in twelve rows while the point read 1.3-1.4x at every rung above,
+and the first two decompositions went after the walk: the alert
+thread beside it (nothing moved), then the sealed walk against the
+copy walk the sweep's later points take, which callgrind counted at
+139 instructions an entry against 129 -- the copy's 1.4x was the
+sealed segment cold on the scanning core after the seal thread wrote
+it, and LMDB's first pass over its store is cold the same way. The
+level point counted 196: the first scan's settle of the burst's 99
+keys, 145,000 instructions, the forms materialized block by block,
+150,000, and 150,000 in some 550 allocator calls between them. The
+burst's commit files its batch itself only from `UPKEEP_WAKE_WRITES`
+writes, 256; the sweep's one-percent burst is one batch of `size/100`
+-- a hundred at ten thousand keys, lent, and taken back untouched by
+the scan that starts a microsecond after the commit returns; three
+hundred at thirty thousand, filed inline, the cell a win -- and the
+pricing note that set the threshold had already read the point as
+"0.99x (a batch of 99, lent)". Filing every batch inline
+(`Options::upkeep_inline_min`, `supdb-ingestinlineall`) took the point
+to 1.6x in both orders and the burst to 0.47x, below LMDB's, and cost
+ycsb-A and F a sixth to a half at both rungs, since a mix's batches of
+a hundred cross the same threshold and the thread files those beside
+the reads. The rule: before a cell's walk is taken apart, read which
+regime of the engine the cell's inputs fall in against every fixed
+count on the path -- a batch size, a bound, a wake -- since a ladder
+whose rungs straddle one measures two engines and names neither; and a
+threshold moved for one cell is priced on every cell that crosses it.
+
 **A length read off the slab that held the exceptions.** The ordered
 table's write log became the range of its entries, its length the
 entries' count, and read that count off the entries' slab; the one-word

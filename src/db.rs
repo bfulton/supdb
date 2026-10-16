@@ -1070,6 +1070,19 @@ pub struct Options {
     /// `supdb-lendbursts` the durable store, whose commits lend either
     /// way (`docs/engine.md`).
     pub upkeep_inline_bursts: bool,
+    /// The smallest batch `upkeep_inline_bursts` files in the commit;
+    /// below it the batch is lent, as a mix's batches of a hundred are,
+    /// so the alert thread can file them beside the reads. The lag
+    /// sweep's one-percent burst at ten thousand keys is one batch of a
+    /// hundred: lent, and the scans start within a microsecond of the
+    /// commit's return, so the first scan takes it back before the
+    /// thread's first poll and pays the settle and the forms itself --
+    /// 570,000 instructions over a pass of a hundred scans, 41% of the
+    /// pass, and the one lag point on the ladder that read level with
+    /// LMDB for twelve rows while the three-hundred-write burst at
+    /// thirty thousand keys, filed inline, read 1.3x. `supdb-inlineall`
+    /// and `supdb-ingestinlineall` file every batch.
+    pub upkeep_inline_min: usize,
     /// Time the phases a scan runs before its walk -- the upkeep taken
     /// back, the log read, the settle, the snapshot's refresh, the builder
     /// started and its forms installed -- into `Db::scan_phases`, for the
@@ -1743,6 +1756,7 @@ impl Default for Options {
             upkeep_alert: true,
             upkeep_alert_poll_us: 200,
             upkeep_inline_bursts: true,
+            upkeep_inline_min: UPKEEP_WAKE_WRITES,
             scan_timers: false,
             upkeep_batch_pct: 0,
             upkeep_pass_pct: 0,
@@ -23151,12 +23165,14 @@ impl Db {
         // With reads around, a batch worth waking the thread for is filed
         // by a commit that does not sync, and the thread is lent nothing
         // of it; one that syncs lends it, since the thread works through
-        // the fsync: see `Options::upkeep_inline_bursts`.
+        // the fsync: see `Options::upkeep_inline_bursts`, and
+        // `Options::upkeep_inline_min` for where "worth waking for" is
+        // drawn.
         if level == 1
             && self.opts.upkeep_inline_bursts
             && !syncs
             && reads_around
-            && batch >= UPKEEP_WAKE_WRITES
+            && batch >= self.opts.upkeep_inline_min
         {
             self.upkeep_hand = Hand::File;
             return;
