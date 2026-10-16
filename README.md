@@ -139,11 +139,12 @@ Worker.
 ## Building
 
 ```sh
+sh scripts/deps.sh             # the toolchain pieces the checks need, where missing
 cargo build --release
 cargo test --release
 sh scripts/check.sh            # build, test, lint, wasm, bench -- what CI runs
 sh scripts/check.sh quick      # one quick-scale measurement, on an otherwise idle machine
-rustup target add wasm32-unknown-unknown && sh web/build.sh   # the browser module
+sh web/build.sh                # the browser module
 ```
 
 ## Documentation

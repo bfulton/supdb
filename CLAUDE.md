@@ -40,6 +40,19 @@ caller. Nothing is exempt from the format gate, and everything holds to
 
 ## Running the checks
 
+`sh scripts/deps.sh` readies a host for every group, installing only
+what is missing and ending in an `all deps ready` line to gate on; run it
+first in a fresh container, which has no wasm target and libclang only as
+versioned files. It names libclang through `bench/scripts/libclang.sh`,
+the one definition CI uses, and keeps no variable. clang-sys's build
+script declares nothing to rerun on, so the directory it found libclang
+in at the first build stays in its cached output for good: a
+`LIBCLANG_PATH` pointed by hand at a symlink in a scratch directory
+built the comparators once, and with the directory gone the next build
+failed at RocksDB's build script, `unable to find library -lclang`.
+`deps.sh` cleans an output that names a directory with no libclang in
+it.
+
 `sh scripts/check.sh` runs every group -- build, test, lint, wasm, bench --
 and CI calls the same script with the same names, so a green run here is a
 green run there. Use a group name to run one. `quick` is a group too, the

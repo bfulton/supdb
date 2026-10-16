@@ -4,14 +4,17 @@
 
     git clone https://github.com/bfulton/supdb
     cd supdb
+    sh scripts/deps.sh             # what the checks need, installed where missing
     sh scripts/check.sh            # build, test, lint, wasm, bench -- what CI runs
     sh scripts/check.sh lint       # or one group; the script's header lists them
 
 Rust stable with `rustfmt` and `clippy`; the browser reader also wants the
 `wasm32-unknown-unknown` target (`web/build.sh`). The `bench` group builds
 the comparators, which is a ten-minute C++ build the first time and needs
-libclang; `bench/scripts/libclang.sh` names it when cargo cannot. CI calls
-the same script with the same group names, so what passes here passes there.
+libclang; `bench/scripts/libclang.sh` names it when cargo cannot.
+`scripts/deps.sh` checks for all three and installs what is missing, and
+`sh scripts/deps.sh profile` adds perf and valgrind. CI calls the same
+check script with the same group names, so what passes here passes there.
 
 ## The suite
 

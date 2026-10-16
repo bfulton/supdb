@@ -30,7 +30,8 @@ shared library (`libclang.so` on Linux, `libclang.dylib` on macOS). If the
 build cannot find one, `eval "$(sh scripts/libclang.sh)"` exports what the
 host needs: the toolchain's directory, and on macOS a run-time search path
 for it (on a Debian-family host it installs `libclang-dev` when nothing
-unversioned exists). CI runs the same script.
+unversioned exists). CI runs the same script, and so does the engine's
+`scripts/deps.sh`, which readies a host for every check.
 
 ## What is measured
 
