@@ -1414,6 +1414,22 @@ pub struct Options {
     /// slot's fdatasync. Kept for pricing as `supdb-walsync` and
     /// `supdb-ingestwalsync`.
     pub drain_syncs_wal: bool,
+    /// EXPERIMENT, refuted and kept as an arm: a flush's close of a direct
+    /// run composes the segment's trailer on the writer's own thread,
+    /// which waits for the drain anyway and is warm, while the records'
+    /// fdatasync (`close_presync`) runs on a thread of its own, and the
+    /// seal thread takes the rest once the trailer is written. The finish
+    /// at ten thousand keys took 1.1 to 1.3 ms on the seal thread, beside
+    /// a records' sync of the same length, and read as a fresh thread's
+    /// cold millisecond; on the writer it took 1.8 to 1.9, because the
+    /// trailer's write waits for the journal commit the records' fdatasync
+    /// forces, on whichever thread writes it -- the finish ends when the
+    /// sync ends in either shape -- and the seal thread, spawned after the
+    /// finish now, wrote the ordered index 0.3 ms later than before: the
+    /// drain read 3.5 ms against 2.8. Off, the default: the seal thread
+    /// composes the trailer while the writer syncs the records. On,
+    /// `supdb-closeinline` and `supdb-ingestcloseinline`.
+    pub close_finish_inline: bool,
     /// EXPERIMENT, refuted and kept as an arm: a drain's seal copies the
     /// frozen table's chains into a snapshot for the scans over the
     /// store while the seal runs, as any seal does (`seal_snapshot`),
@@ -1835,6 +1851,7 @@ impl Default for Options {
             manifest_pending: false,
             flush_waits_manifest: false,
             drain_syncs_wal: false,
+            close_finish_inline: false,
             drain_snapshot: true,
             seal_put_one: true,
             close_presync: true,
@@ -5047,6 +5064,18 @@ pub struct SegmentOptions {
     /// inside the sync a load ends with, while the writer's own pace
     /// leaves a thread time for both beside it. Zero leaves it all to the
     /// close. On by default; the `latewb` arms turn it and the hint off.
+    /// Eight megabytes, and a run under that is synced whole at its
+    /// close: a thirty-thousand-key load's close syncs 3 ms of records
+    /// on the writer's path, and a lower threshold was priced to take
+    /// that off it. At a megabyte the close's sync fell to half a
+    /// millisecond, but a thread started at a ten-thousand-key run's last
+    /// piece was mid-sync at the close and the drain read 0.3 ms later
+    /// than with no thread; at two the close's sync at thirty thousand
+    /// fell to 1.3 ms and the finish ended 1.5 to 2 ms later with the
+    /// thread beside it, the load 0.87x and 0.89x of the eight-megabyte
+    /// shape in two sittings. What the thread's sync saves the close, its
+    /// presence beside the writer's last pieces and the finish costs
+    /// more at those sizes, by a mechanism the stamps did not name.
     pub sync_ahead: u64,
     /// Whether the writer hashes the key section's checksum pieces itself,
     /// as their bytes are buffered and hot, until the helper thread runs
@@ -9099,6 +9128,11 @@ struct DrainSteps {
     epoch: std::time::Instant,
     at: [AtomicU64; DRAIN_STEP_NAMES.len()],
 }
+
+/// What a direct run's finish hands the rest of its close: whether the
+/// run holds a tombstone, the segment's file, the ordered index's bytes
+/// and the landing's facts where the finish took them.
+type DirectFinished = (bool, File, Vec<u8>, Option<(BlockedBloom, bool)>);
 
 const DRAIN_STEP_NAMES: [&str; 17] = [
     "flush",
@@ -19693,65 +19727,116 @@ impl Db {
         let shared = self.shared.clone();
         let ord_durable = self.opts.ord_durable;
         let keys = table.clone();
-        let job = move |readable: &SealReadable| -> Result<Vec<String>> {
-            shared.drain_steps.stamp(2);
-            seal_hold_wait(&shared, SEAL_HOLD_LANDING);
-            let tombs = w.tombs();
-            // The keys from the table where the writer kept none; else the
-            // writer's own copies, and the facts it took from them.
-            let (seg, ord, fact) = if w.3 {
-                let (seg, ord, fact) = w
-                    .finish_unsynced_from(&StreamKeys(&keys))
-                    .map_err(|e| err(&format!("direct finish: {e}")))?;
-                (seg, ord, Some(fact))
-            } else {
-                let fact = w.landing_facts();
-                let (seg, ord) = w
-                    .finish_unsynced()
-                    .map_err(|e| err(&format!("direct finish: {e}")))?;
-                (seg, ord, fact)
-            };
-            shared.drain_steps.stamp(3);
-            let name = if first_partition && !tombs && std::fs::metadata(&tmp)?.len() <= limit {
-                Db::first_partition_name(id, seq)
-            } else {
-                name
-            };
-            let ordf = write_ord_unsynced(&dir, &name, &ord)?;
-            shared.drain_steps.stamp(4);
-            std::fs::hard_link(&tmp, dir.join(&name))?;
-            shared.drain_steps.stamp(5);
-            // Phase R, then the fsyncs, as a seal's job orders them; the
-            // link is this job's rename.
-            let names = vec![name];
-            seal_readable(&shared, readable, &names, vec![fact]);
-            shared.drain_steps.stamp(6);
-            seg.sync_all()?;
-            shared.drain_steps.stamp(7);
-            if ord_durable {
-                ordf.sync_all()?;
+        // The finish: the trailer composed and written, the Bloom and the
+        // ordered index with it, from the table where the writer kept no
+        // key copies and from its own copies otherwise. Run on the writer's
+        // thread under `Options::close_finish_inline` at a drain, on the
+        // seal thread otherwise.
+        let finish = {
+            let shared = shared.clone();
+            move |w: PieceWriter, keys: &MemTable| {
+                shared.drain_steps.stamp(2);
+                let tombs = w.tombs();
+                let (seg, ord, fact) = if w.3 {
+                    let (seg, ord, fact) = w
+                        .finish_unsynced_from(&StreamKeys(keys))
+                        .map_err(|e| err(&format!("direct finish: {e}")))?;
+                    (seg, ord, Some(fact))
+                } else {
+                    let fact = w.landing_facts();
+                    let (seg, ord) = w
+                        .finish_unsynced()
+                        .map_err(|e| err(&format!("direct finish: {e}")))?;
+                    (seg, ord, fact)
+                };
+                shared.drain_steps.stamp(3);
+                Ok::<_, std::io::Error>((tombs, seg, ord, fact))
             }
-            // The directory's entry is made durable by the segment work,
-            // at the readable landing or by the publish that names the
-            // segment (`Options::manifest_slots`), before the WAL retires;
-            // a sync here as well was one more device round trip a drain
-            // waited for.
-            Ok(names)
+        };
+        // The rest, on the seal thread: the ordered index, the link, the
+        // readable signal and the fsyncs, with the records' sync joined
+        // before the trailer's fsync where a thread took it.
+        let after = {
+            let shared = shared.clone();
+            move |readable: &SealReadable,
+                  done: Result<DirectFinished>,
+                  presynced: Option<std::thread::JoinHandle<std::io::Result<()>>>|
+                  -> Result<Vec<String>> {
+                let (tombs, seg, ord, fact) = done?;
+                let name = if first_partition && !tombs && std::fs::metadata(&tmp)?.len() <= limit {
+                    Db::first_partition_name(id, seq)
+                } else {
+                    name
+                };
+                let ordf = write_ord_unsynced(&dir, &name, &ord)?;
+                shared.drain_steps.stamp(4);
+                std::fs::hard_link(&tmp, dir.join(&name))?;
+                shared.drain_steps.stamp(5);
+                // Phase R, then the fsyncs, as a seal's job orders them; the
+                // link is this job's rename.
+                let names = vec![name];
+                seal_readable(&shared, readable, &names, vec![fact]);
+                shared.drain_steps.stamp(6);
+                if let Some(t) = presynced {
+                    t.join()
+                        .map_err(|_| err("the records' sync thread panicked"))??;
+                }
+                seg.sync_all()?;
+                shared.drain_steps.stamp(7);
+                if ord_durable {
+                    ordf.sync_all()?;
+                }
+                // The directory's entry is made durable by the segment work,
+                // at the readable landing or by the publish that names the
+                // segment (`Options::manifest_slots`), before the WAL retires;
+                // a sync here as well was one more device round trip a drain
+                // waited for.
+                Ok(names)
+            }
         };
         // Every WAL record below the run's end was in a table sealed
         // before the run opened -- a run opens only over an empty table
         // and writes nothing to the log -- so its landing covers the
         // files a size rotation closed as a seal's does.
         let wals = std::mem::take(&mut self.closed_wals);
-        self.hand_seal(job, table, wals, Some(retiring));
-        // The records' sync, on this thread while the seal thread composes
-        // the trailer (`Options::close_presync`): the writer waits for the
-        // drain anyway, and the seal's fsync then flushes the trailer
-        // alone. An error here is the file's, and the seal's own fsync
-        // reports it.
-        if let Some(f) = presync {
-            let _ = f.sync_data();
-            self.shared.drain_steps.stamp(14);
+        if self.draining && self.opts.close_finish_inline {
+            // The records' sync first, on a thread of its own, so the
+            // device works while this thread composes the trailer
+            // (`Options::close_presync`); a thread that cannot be spawned
+            // leaves the sync to the trailer's fsync, which covers the
+            // records as well. An error in it is the file's, and the
+            // seal's own fsync reports it.
+            let presynced = presync.and_then(|f| {
+                let shared = self.shared.clone();
+                std::thread::Builder::new()
+                    .name("supdb-presync".into())
+                    .spawn(move || {
+                        let r = f.sync_data();
+                        shared.drain_steps.stamp(14);
+                        r
+                    })
+                    .ok()
+            });
+            let done = finish(w, &keys);
+            let job = move |readable: &SealReadable| -> Result<Vec<String>> {
+                seal_hold_wait(&shared, SEAL_HOLD_LANDING);
+                after(readable, done, presynced)
+            };
+            self.hand_seal(job, table, wals, Some(retiring));
+        } else {
+            let job = move |readable: &SealReadable| -> Result<Vec<String>> {
+                seal_hold_wait(&shared, SEAL_HOLD_LANDING);
+                let done = finish(w, &keys);
+                after(readable, done, None)
+            };
+            self.hand_seal(job, table, wals, Some(retiring));
+            // The records' sync, on this thread while the seal thread
+            // composes the trailer: the writer waits for the drain anyway,
+            // and the seal's fsync then flushes the trailer alone.
+            if let Some(f) = presync {
+                let _ = f.sync_data();
+                self.shared.drain_steps.stamp(14);
+            }
         }
     }
 

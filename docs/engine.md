@@ -3830,6 +3830,43 @@ the phase moved within the host's noise and no rate resolved either
 rung. The general path for every key is the arm `supdb-sealrun` and
 `supdb-ingestsealrun`, and a test holds the two to the same bytes.
 
+The direct run's close was taken apart the same way, with the stamps
+and the loads' phases at ten thousand keys: the seal thread's start 0.2
+ms after the flush's entry, its finish 1.1 to 1.3 beside the writer's
+fdatasync of the records of 1.4, the ordered index and the link 0.15,
+the trailer's fsync 0.8 to 1.0, the landing and the slot 0.1 -- 2.6 to
+2.8 in all, against the comparator's one fdatasync of 2.3 to 3.0. Two
+changes were priced on it, and both came back. The writer's helper,
+which syncs a segment behind the writer, starts only once the file is
+eight megabytes long (`SegmentOptions::sync_ahead`), so every run under
+that is synced whole at its close; at a megabyte the close's sync at
+thirty thousand keys fell from 3.0 ms to 0.5 and the load read 1.10x
+and 1.16x against the old threshold, neither resolved by the pairs, with
+a hundred thousand and three hundred thousand level in the drain and in
+the commits -- but at ten thousand the one sync the helper made began at
+the run's last piece, the close's own sync queued behind it and the
+finish's join of the thread waited for it, 0.3 ms on the drain; and at
+two megabytes, no thread for a ten-thousand-key run, the close's sync
+at thirty thousand fell to 1.3 ms while the finish ended 1.5 to 2 ms
+later with the thread beside it, the load 0.87x and 0.89x of the old
+threshold in two sittings. The threshold stays at eight; what the
+thread's sync saves the close, its presence beside the writer's last
+pieces and the finish costs more at those sizes, by a mechanism the
+stamps did not name. The finish on the writer's own thread, warm from
+the load, with the records' fdatasync on a thread of its own
+(`Options::close_finish_inline`), was the other, and it read the other
+way too: the finish took 1.8 to 1.9 ms on the writer against 1.1 to 1.3
+on the seal thread, because the trailer's write waits for the journal
+commit the records' fdatasync forces, on whichever thread writes it, so
+the finish ends when the sync ends in either shape and its composition
+was never the critical path; and the seal thread, spawned after the
+finish, wrote the ordered index 0.3 ms later than before. The drain
+read 3.5 ms against 2.8, and the shape is the arm `supdb-closeinline`
+and `supdb-ingestcloseinline`. What bounds the drain at that rung is
+the device: the records' sync and the trailer's, two round trips of a
+file the load has just written, and the second cannot begin before the
+first is through.
+
 #### The finish's fills, asked ahead
 
 The segment finish's trailer -- fences, directory, hash slots, composed

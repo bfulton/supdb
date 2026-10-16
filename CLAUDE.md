@@ -173,7 +173,15 @@ written: that was the device, an fdatasync queued behind the seal's fsync
 in flight, not the wake -- a wait a thread's first syscall shows is the
 syscall's until a stamp before it says otherwise. Stamp a chain at each
 hand-off and each device wait before pricing either; `strace -f -tt`
-shows the syscalls' timing and nothing of what runs between them.
+shows the syscalls' timing and nothing of what runs between them. And a
+phase on one thread that ends when a sync of the same file ends on
+another is the sync's, not the thread's: the direct run's finish read
+1.1 to 1.3 ms on a fresh thread beside the writer's fdatasync of the
+records, which this file's own figure for a cold vCPU made plausible,
+and moved to the warm writer it read 1.8, because the trailer's write
+waits for the journal commit the fdatasync forces, on whichever thread
+writes it (`Options::close_finish_inline`, refuted). Stamp the compose
+apart from the write before pricing a finish beside a sync.
 
 The page cache's folios are not hidden: `/proc/self/pagemap` over a
 mapping of the file gives each page's frame, and `/proc/kpageflags` at

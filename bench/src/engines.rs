@@ -422,6 +422,11 @@ pub struct Supdb {
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
     sealrun: bool,
+    /// A flush's close composes the trailer on the writer's thread while
+    /// a thread syncs the records (`Options::close_finish_inline`), the
+    /// refuted shape. `supdb-ingestcloseinline`, and `supdb-closeinline`
+    /// durable.
+    closeinline: bool,
     /// The scan phases timed on every scan, as before the clock reads
     /// were gated (`Options::scan_timers`). `supdb-timers`, and
     /// `supdb-ingesttimers` buffered.
@@ -715,6 +720,11 @@ struct Policy {
     /// before the one-value path (`Options::seal_put_one` off).
     /// `supdb-ingestsealrun`, and `supdb-sealrun` durable.
     sealrun: bool,
+    /// A flush's close composes the trailer on the writer's thread while
+    /// a thread syncs the records (`Options::close_finish_inline`), the
+    /// refuted shape. `supdb-ingestcloseinline`, and `supdb-closeinline`
+    /// durable.
+    closeinline: bool,
     /// The scan phases timed on every scan, as before the clock reads
     /// were gated (`Options::scan_timers`). `supdb-timers`, and
     /// `supdb-ingesttimers` buffered.
@@ -986,6 +996,7 @@ impl Default for Policy {
             walsync: false,
             nodrainsnap: false,
             sealrun: false,
+            closeinline: false,
             timers: false,
             wake: false,
             noprefetch: false,
@@ -2414,6 +2425,35 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose flush composes the trailer on the writer's thread
+    /// while a thread syncs the records: against `supdb` it prices the
+    /// finish on the writer, which read slower, since the trailer's write
+    /// waits for the records' sync on either thread.
+    pub fn create_closeinline(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                closeinline: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose flush composes the trailer on the writer's
+    /// thread while a thread syncs the records: against `supdb-ingest` it
+    /// prices the finish on the writer, which read slower.
+    pub fn create_ingest_closeinline(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                closeinline: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` timing every scan's phases, as before the clock reads were
     /// gated: against `supdb` it prices the instrument.
     pub fn create_timers(path: &Path) -> Res<Supdb> {
@@ -3072,6 +3112,7 @@ impl Supdb {
             walsync,
             nodrainsnap,
             sealrun,
+            closeinline,
             timers,
             wake,
             noprefetch,
@@ -3275,6 +3316,7 @@ impl Supdb {
             drain_syncs_wal: walsync,
             drain_snapshot: !nodrainsnap,
             seal_put_one: !sealrun,
+            close_finish_inline: closeinline,
             upkeep_wake_parked: wake,
             scan_prefetch: !noprefetch,
             manifest_slots: !manifestrename,
@@ -3397,6 +3439,7 @@ impl Supdb {
             walsync,
             nodrainsnap,
             sealrun,
+            closeinline,
             timers,
             wake,
             noprefetch,
@@ -3808,6 +3851,13 @@ impl Engine for Supdb {
                 "supdb-sealrun"
             } else {
                 "supdb-ingestsealrun"
+            };
+        }
+        if self.closeinline {
+            return if self.partition {
+                "supdb-closeinline"
+            } else {
+                "supdb-ingestcloseinline"
             };
         }
         if self.timers {
@@ -4635,6 +4685,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-walsync"
         | "supdb-nodrainsnap"
         | "supdb-sealrun"
+        | "supdb-closeinline"
         | "supdb-timers"
         | "supdb-wake"
         | "supdb-noprefetch"
@@ -4711,6 +4762,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingestwalsync"
         | "supdb-ingestnodrainsnap"
         | "supdb-ingestsealrun"
+        | "supdb-ingestcloseinline"
         | "supdb-ingesttimers"
         | "supdb-ingestwake"
         | "supdb-ingestnoprefetch"
@@ -4845,6 +4897,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestnodrainsnap" => Box::new(Supdb::create_ingest_nodrainsnap(dir)?),
         "supdb-sealrun" => Box::new(Supdb::create_sealrun(dir)?),
         "supdb-ingestsealrun" => Box::new(Supdb::create_ingest_sealrun(dir)?),
+        "supdb-closeinline" => Box::new(Supdb::create_closeinline(dir)?),
+        "supdb-ingestcloseinline" => Box::new(Supdb::create_ingest_closeinline(dir)?),
         "supdb-timers" => Box::new(Supdb::create_timers(dir)?),
         "supdb-ingesttimers" => Box::new(Supdb::create_ingest_timers(dir)?),
         "supdb-wake" => Box::new(Supdb::create_wake(dir)?),
