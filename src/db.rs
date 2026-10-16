@@ -8330,7 +8330,7 @@ fn manifest_read_all(dir: &Path) -> Result<Vec<Manifest>> {
             Err(e) => torn = Some(e),
         }
     }
-    valid.sort_by(|a, b| b.seq.cmp(&a.seq));
+    valid.sort_by_key(|m| std::cmp::Reverse(m.seq));
     match (valid.is_empty(), torn) {
         (true, Some(e)) => Err(e),
         _ => Ok(valid),
@@ -20943,11 +20943,7 @@ impl Db {
         let (bytes, keys) = segs.iter().fold((0usize, 0usize), |(b, k), s| {
             (b + s.blob.index_bytes(), k + s.blob.keys())
         });
-        if keys == 0 {
-            0
-        } else {
-            bytes / keys
-        }
+        bytes.checked_div(keys).unwrap_or(0)
     }
 
     /// One empty table cell per segment.
