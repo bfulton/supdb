@@ -1796,6 +1796,11 @@ regime of the engine the cell's inputs fall in against every fixed
 count on the path -- a batch size, a bound, a wake -- since a ladder
 whose rungs straddle one measures two engines and names neither; and a
 threshold moved for one cell is priced on every cell that crosses it.
+What won both cells was the split the count suggested: the batch's
+settle, a third of the fill, runs at a commit a scan preceded, and the
+forms stay the scans' (`Options::upkeep_settle_after_scans`), which the
+mixes without scans between their commits never reach; the allocations
+were worth 5 instructions an entry of the 57.
 
 **A length read off the slab that held the exceptions.** The ordered
 table's write log became the range of its entries, its length the

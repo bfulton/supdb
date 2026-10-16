@@ -1083,6 +1083,22 @@ pub struct Options {
     /// thirty thousand keys, filed inline, read 1.3x. `supdb-inlineall`
     /// and `supdb-ingestinlineall` file every batch.
     pub upkeep_inline_min: usize,
+    /// A buffered commit near reads whose batch is under
+    /// `upkeep_inline_min` settles it here when a scan ran since the last
+    /// commit, and lends the rest -- the forms the scans will walk, built
+    /// by those scans block by block as before. The shape it is for is a
+    /// small burst with scans at once behind it: the batch was lent to a
+    /// thread whose first poll comes two hundred microseconds later, and
+    /// the first scan took it back untouched a microsecond after the
+    /// commit returned and paid the settle itself, 145,000 instructions
+    /// of a pass of a hundred scans at ten thousand keys. Filing the whole
+    /// batch at the commit instead (`supdb-ingestinlineall`) cost the
+    /// burst 427,000, under LMDB's, and the mixes with no scan between
+    /// their commits a sixth to a half; the settle alone is a third of
+    /// that, and a mix whose commits no scan separates never reaches it.
+    /// `supdb-lazysettle` and `supdb-ingestlazysettle` leave the settle
+    /// to the scan.
+    pub upkeep_settle_after_scans: bool,
     /// Time the phases a scan runs before its walk -- the upkeep taken
     /// back, the log read, the settle, the snapshot's refresh, the builder
     /// started and its forms installed -- into `Db::scan_phases`, for the
@@ -1757,6 +1773,7 @@ impl Default for Options {
             upkeep_alert_poll_us: 200,
             upkeep_inline_bursts: true,
             upkeep_inline_min: UPKEEP_WAKE_WRITES,
+            upkeep_settle_after_scans: true,
             scan_timers: false,
             upkeep_batch_pct: 0,
             upkeep_pass_pct: 0,
@@ -11015,6 +11032,9 @@ enum Hand {
     /// The commit's own maintenance, forced: the batch filed now whatever
     /// the settle bound says (`Options::upkeep_inline_bursts`).
     File,
+    /// The batch settled here and its forms left to the scans that walk
+    /// them (`Options::upkeep_settle_after_scans`).
+    Settle,
 }
 
 /// A read in progress on a handle; dropping it ends the read.
@@ -23219,6 +23239,21 @@ impl Db {
             self.upkeep_hand = Hand::File;
             return;
         }
+        // A smaller batch with a scan since the last commit: the scans
+        // behind it take the batch back before the thread's first poll,
+        // so its settle runs here and the forms wait for the scans that
+        // walk them (`Options::upkeep_settle_after_scans`). `since_scan`
+        // is zero only where the scan count moved since the last commit.
+        if level == 1
+            && self.opts.upkeep_inline_bursts
+            && self.opts.upkeep_settle_after_scans
+            && !syncs
+            && reads_around
+            && self.upkeep_since_scan == 0
+        {
+            self.upkeep_hand = Hand::Settle;
+            return;
+        }
         // How far the thread trails, this batch included: what was lent
         // past what it has filed, or past everything lent before this
         // batch where it is caught up now.
@@ -23328,7 +23363,7 @@ impl Db {
     /// held for until the thread has filed it. Whether it was left lent
     /// with no pass waited for.
     fn finish_hand(&mut self) -> Result<bool> {
-        if self.fs_home() && !matches!(self.upkeep_hand, Hand::Inline | Hand::File) {
+        if self.fs_home() && !matches!(self.upkeep_hand, Hand::Inline | Hand::File | Hand::Settle) {
             self.hand_over_upkeep(false);
         }
         match std::mem::take(&mut self.upkeep_hand) {
@@ -23339,6 +23374,14 @@ impl Db {
                 let filed = self.maintain_forms();
                 self.r.force_due.set(false);
                 filed.map(|()| false)
+            }
+            // What the first scan after the batch would have done first,
+            // and nothing it would have left to its walk.
+            Hand::Settle => {
+                if self.r.sync_log() {
+                    self.r.settle_pending()?;
+                }
+                Ok(false)
             }
             Hand::Hold if matches!(self.opts.upkeep, Upkeep::Background(1)) => {
                 let keys: usize = self

@@ -2525,9 +2525,39 @@ where both arms file the burst, A 0.65x and 0.53x and F 0.75x and
 threshold, and filing them on the mix's own thread costs it far more
 than the alert thread's re-reads beside it did; and the burst at 0.47x
 would fall under LMDB's (0.86M updates a second against our 1.5M at
-ten thousand keys in the row). The threshold stays, as an option, and
-the point's remaining lever is the filing's own cost: the 150,000
-instructions of its 550 allocator calls.
+ten thousand keys in the row). The threshold stays, as an option.
+
+The filing's allocations were a smaller lever than their count said:
+a block materialized clean answered from the table's bounds without an
+overlay built to say so, one shared `Arc` for every clean slot, the
+chain-offset scratch kept on the forms state and the filed lists born
+with room took the point from 196 instructions an entry to 191, with
+367 mallocs a pass where it made 498; the forms' own storage and the
+lists' first allocations are what remain, 60% of the mallocs left.
+
+What moved the point was splitting the fill. It is two halves: the
+settle of the batch, each key resolved to its block and filed into
+whatever form the block holds, about 150,000 instructions for a
+hundred keys; and the forms for the blocks the scans will walk, which
+`complete_forms` builds for every block of the table at the commit
+where the scans build them lazily for only the blocks they touch, the
+rest of the 427,000. A commit near reads whose batch is under the
+threshold settles it there when a scan ran since the last commit, and
+leaves the forms to the scans (`Options::upkeep_settle_after_scans`;
+`supdb-ingestlazysettle` leaves the settle to the scan too). The
+signal is the one the regime already keeps, the scan count unchanged
+since the last commit, so a mix whose commits no scan separates --
+A, B, D, F -- never reaches it, and E and the sweep's bursts do. Under
+callgrind at ten thousand keys the one-percent burst's commit went from
+115,000 instructions to 290,000 and the point's scans from 1.92M to
+1.74M, 174 an entry, their sum level within 3,000, the first scan's
+settle phase zero; over a rep's mixes the commits grew 123,000 and the
+scans fell 1,260,000. Timed on a host out of band, the burst read 0.70x
+and 0.62x of the arm that leaves the settle to the scan, and the scans
+nothing a 0.3 ms pass can resolve; by the counts, on the row's host,
+the point stands at about 1.08x of LMDB from level and the burst at
+about 1.2x from 1.8x, two wins in place of a win and a level, the sum
+of the two phases unchanged.
 
 #### The scan's own clock
 
