@@ -701,6 +701,17 @@ pub struct Options {
     /// 12/12 and 11/12. So they stay; `supdb-noprefetch` and
     /// `supdb-ingestnoprefetch` are the arm that priced them.
     pub scan_prefetch: bool,
+    /// How far into the partition's records a walk's prefetch reaches,
+    /// in bytes from the walk's first record: the lines are asked for at
+    /// once, and a core holds a dozen or so line fills in flight, so a
+    /// span of sixty-four lines stalls the asking thread on the fills it
+    /// cannot start -- a tenth of ycsb-E's samples at a hundred thousand
+    /// keys sat on the prefetch instructions themselves. 4096 is the span
+    /// the rows have measured, and a kilobyte read E 1.02x at a hundred
+    /// thousand keys with the drained lag point 0.87x, and the plain scan
+    /// 0.85x at three hundred thousand: no direction held at both rungs.
+    /// `supdb-prefetch1k` and `supdb-ingestprefetch1k` ask for a kilobyte.
+    pub scan_prefetch_bytes: usize,
     /// PROTOTYPE: the partitions' blocks below which no builder starts.
     /// Measured on the probe's E, six rounds interleaved, the builder
     /// against none: at ten thousand keys, 160 blocks, 310k-351k against
@@ -1803,6 +1814,7 @@ impl Default for Options {
             scan_cache_bytes: 0,
             scan_cache_ahead: true,
             scan_prefetch: true,
+            scan_prefetch_bytes: 4096,
             scan_cache_ahead_min_blocks: 1024,
             commit_forms: true,
             forms_from_reader_scans: 0,
@@ -9496,14 +9508,14 @@ fn prefetch_form(form: &Cached) {
     }
 }
 
-fn prefetch_block(blob: &Blob<MmapBytes>, form: &Cached, from: usize, n: usize) {
+fn prefetch_block(blob: &Blob<MmapBytes>, form: &Cached, from: usize, n: usize, cap: usize) {
     match form {
         Cached::Block(blk) => blk.prefetch(),
         Cached::Sparse(sb) => {
             sb.prefetch();
-            blob.prefetch_ranks(from, n);
+            blob.prefetch_ranks(from, n, cap);
         }
-        Cached::Clean => blob.prefetch_ranks(from, n),
+        Cached::Clean => blob.prefetch_ranks(from, n, cap),
         Cached::Wide(_) => {}
     }
 }
@@ -17168,7 +17180,7 @@ impl Reader {
                     None
                 };
                 if !fetched && self.opts.scan_prefetch {
-                    prefetch_block(&seg.blob, form, start, ahead);
+                    prefetch_block(&seg.blob, form, start, ahead, self.opts.scan_prefetch_bytes);
                 }
                 fetched = false;
                 if self.opts.scan_prefetch && hi - start < ahead && b + 1 < nblocks {
@@ -17181,7 +17193,13 @@ impl Reader {
                         None => table.slots[b + 1].as_deref(),
                     };
                     if let Some(next) = next {
-                        prefetch_block(&seg.blob, next, hi, ahead - (hi - start));
+                        prefetch_block(
+                            &seg.blob,
+                            next,
+                            hi,
+                            ahead - (hi - start),
+                            self.opts.scan_prefetch_bytes,
+                        );
                         fetched = true;
                     }
                 }

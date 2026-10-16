@@ -2613,7 +2613,21 @@ Taking the prefetches away (`Options::scan_prefetch` off, the arm
 `supdb-ingestnoprefetch`) read E 1.04x at ten thousand keys, unresolved,
 and the lag passes 1.0-1.09x; at three hundred thousand, where the store
 is past the cache, the lag passes read 0.80-0.93x and E 0.97x, 11/12 and
-12/12. The prefetches stay.
+12/12. The prefetches stay. Paired again on this host after the E
+window's profile put a tenth of its samples on the prefetch
+instructions themselves: at three hundred thousand the shape without
+them read the lag passes 0.67x and 0.79x, the mixed scans 0.81-0.83x
+and E 0.76x, 5/5 each; at a hundred thousand E level and the mixed scans
+1.09-1.18x without them, 4/8 and 5/8; at thirty thousand nothing
+resolved. What the instructions stall on is the span: sixty-four lines
+asked for at once against a core's dozen fills in flight, so the span
+is an option now (`Options::scan_prefetch_bytes`), and a kilobyte was
+priced against the four: E 1.02x at a hundred thousand keys, 7/8, with
+the drained lag point 0.87x and the rewritten one 0.90x; at three
+hundred thousand the plain scan 0.85x, the lag points 1.10-1.16x in two
+pairs of five, E 0.97x. No direction survives both rungs, so the span
+stays at four kilobytes and the kilobyte is the arm `supdb-prefetch1k`
+and `supdb-ingestprefetch1k`.
 
 Waking the thread for the mixes' small batches was priced three ways
 (`Options::upkeep_wake_parked`, the arm `supdb-ingestwake`), each

@@ -438,6 +438,10 @@ pub struct Supdb {
     /// The block walk issues no prefetches (`Options::scan_prefetch`
     /// off). `supdb-noprefetch`, and `supdb-ingestnoprefetch` buffered.
     noprefetch: bool,
+    /// A walk's prefetch reaching a kilobyte into the records rather than
+    /// four (`Options::scan_prefetch_bytes`). `supdb-prefetch1k`, and
+    /// `supdb-ingestprefetch1k` buffered.
+    prefetch1k: bool,
     /// The manifest published by a temp file, a rename and a directory
     /// fsync, as before the two slots (`Options::manifest_slots` off).
     /// `supdb-manifestrename`, and `supdb-ingestmanifestrename` buffered.
@@ -736,6 +740,10 @@ struct Policy {
     /// The block walk issues no prefetches (`Options::scan_prefetch`
     /// off). `supdb-noprefetch`, and `supdb-ingestnoprefetch` buffered.
     noprefetch: bool,
+    /// A walk's prefetch reaching a kilobyte into the records rather than
+    /// four (`Options::scan_prefetch_bytes`). `supdb-prefetch1k`, and
+    /// `supdb-ingestprefetch1k` buffered.
+    prefetch1k: bool,
     /// The manifest published by a temp file, a rename and a directory
     /// fsync, as before the two slots (`Options::manifest_slots` off).
     /// `supdb-manifestrename`, and `supdb-ingestmanifestrename` buffered.
@@ -1000,6 +1008,7 @@ impl Default for Policy {
             timers: false,
             wake: false,
             noprefetch: false,
+            prefetch1k: false,
             manifestrename: false,
             manifestpending: false,
             waitmanifest: false,
@@ -2529,6 +2538,32 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose walks prefetch a kilobyte of records rather than
+    /// four: against `supdb` it prices the span.
+    pub fn create_prefetch1k(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                prefetch1k: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` whose walks prefetch a kilobyte of records rather
+    /// than four: against `supdb-ingest` it prices the span.
+    pub fn create_ingest_prefetch1k(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                prefetch1k: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` publishing its manifest by a temp file, a rename and a
     /// directory fsync, as before the two slots.
     pub fn create_manifestrename(path: &Path) -> Res<Supdb> {
@@ -3116,6 +3151,7 @@ impl Supdb {
             timers,
             wake,
             noprefetch,
+            prefetch1k,
             manifestrename,
             manifestpending,
             waitmanifest,
@@ -3319,6 +3355,7 @@ impl Supdb {
             close_finish_inline: closeinline,
             upkeep_wake_parked: wake,
             scan_prefetch: !noprefetch,
+            scan_prefetch_bytes: if prefetch1k { 1024 } else { 4096 },
             manifest_slots: !manifestrename,
             manifest_pending: manifestpending,
             flush_waits_manifest: waitmanifest,
@@ -3443,6 +3480,7 @@ impl Supdb {
             timers,
             wake,
             noprefetch,
+            prefetch1k,
             manifestrename,
             manifestpending,
             waitmanifest,
@@ -3879,6 +3917,13 @@ impl Engine for Supdb {
                 "supdb-noprefetch"
             } else {
                 "supdb-ingestnoprefetch"
+            };
+        }
+        if self.prefetch1k {
+            return if self.partition {
+                "supdb-prefetch1k"
+            } else {
+                "supdb-ingestprefetch1k"
             };
         }
         if self.manifestrename {
@@ -4689,6 +4734,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-timers"
         | "supdb-wake"
         | "supdb-noprefetch"
+        | "supdb-prefetch1k"
         | "supdb-manifestrename"
         | "supdb-manifestpending"
         | "supdb-populate"
@@ -4766,6 +4812,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingesttimers"
         | "supdb-ingestwake"
         | "supdb-ingestnoprefetch"
+        | "supdb-ingestprefetch1k"
         | "supdb-ingestmanifestrename"
         | "supdb-ingestmanifestpending"
         | "supdb-ingestpopulate"
@@ -4905,6 +4952,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestwake" => Box::new(Supdb::create_ingest_wake(dir)?),
         "supdb-noprefetch" => Box::new(Supdb::create_noprefetch(dir)?),
         "supdb-ingestnoprefetch" => Box::new(Supdb::create_ingest_noprefetch(dir)?),
+        "supdb-prefetch1k" => Box::new(Supdb::create_prefetch1k(dir)?),
+        "supdb-ingestprefetch1k" => Box::new(Supdb::create_ingest_prefetch1k(dir)?),
         "supdb-manifestrename" => Box::new(Supdb::create_manifestrename(dir)?),
         "supdb-manifestpending" => Box::new(Supdb::create_manifestpending(dir)?),
         "supdb-ingestmanifestrename" => Box::new(Supdb::create_ingest_manifestrename(dir)?),
