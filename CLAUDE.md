@@ -1884,6 +1884,19 @@ that selects everything, so a run of fewer than two returns before the
 fold; and the first operation of a pass is timed on its own at every
 rung where the pass is short, not only where it reads slow.
 
+**A sync whose error the next sync could not see.** The close's presync
+of a direct run's records ran on the writer's thread while the seal
+thread composed the trailer, and discarded its result on the reading
+that the seal's fsync of the same file would report the error again.
+Linux reports a writeback error once per open file description, and the
+presync's handle was a clone of the writer's -- one description, one
+sample -- so a failed sync of the records was answered as a flush that
+had made them durable, under both policies, for as long as the arm
+shipped. The flush answers with the presync's error now, and a hook
+injects the failure for the test. The rule: an fsync's error is consumed
+by the call that sees it, so the result of every sync on a path is
+checked by that path and never left to a later sync of the same file.
+
 **A length read off the slab that held the exceptions.** The ordered
 table's write log became the range of its entries, its length the
 entries' count, and read that count off the entries' slab; the one-word

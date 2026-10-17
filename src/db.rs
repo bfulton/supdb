@@ -9146,7 +9146,7 @@ struct DrainSteps {
 /// and the landing's facts where the finish took them.
 type DirectFinished = (bool, File, Vec<u8>, Option<(BlockedBloom, bool)>);
 
-const DRAIN_STEP_NAMES: [&str; 17] = [
+const DRAIN_STEP_NAMES: [&str; 18] = [
     "flush",
     "handed",
     "jobstart",
@@ -9164,6 +9164,7 @@ const DRAIN_STEP_NAMES: [&str; 17] = [
     "presynced",
     "sorted",
     "snapped",
+    "readers",
 ];
 
 impl DrainSteps {
@@ -10399,6 +10400,9 @@ struct Shared {
     seal_wedged: std::sync::atomic::AtomicBool,
     /// A test's: the next readable landing fails as a `Seg::open` would.
     fail_landing: std::sync::atomic::AtomicBool,
+    /// A test's: the next close's presync reports a failure as a failed
+    /// fdatasync would.
+    fail_presync: std::sync::atomic::AtomicBool,
     /// An error of the segment work's, for the writer's next commit to
     /// return: one slot, the first error kept.
     maint_err: AtomicPtr<std::io::Error>,
@@ -11098,6 +11102,12 @@ pub struct Db {
     /// Set by `flush` while it waits for the last seal, so that wait is
     /// booked as the drain and not as backpressure.
     draining: bool,
+    /// The records' sync the close issued on this thread failed
+    /// (`Options::close_presync`): the error the flush answers with,
+    /// since the seal's own fsync cannot report it again -- the two
+    /// descriptors are one open file description, and an fsync error
+    /// is reported once per description.
+    presync_failed: Option<std::io::Error>,
     /// PROTOTYPE: the run keeper, once the first commit has started it.
     keeper: Option<Keeper>,
     /// EXPERIMENT: the upkeep thread, once a commit has had something
@@ -18550,6 +18560,7 @@ impl Db {
             seal_hold: std::sync::atomic::AtomicU8::new(0),
             seal_wedged: std::sync::atomic::AtomicBool::new(false),
             fail_landing: std::sync::atomic::AtomicBool::new(false),
+            fail_presync: std::sync::atomic::AtomicBool::new(false),
             maint_err: AtomicPtr::new(std::ptr::null_mut()),
             maint_stop: std::sync::atomic::AtomicBool::new(false),
             spare_wal: AtomicPtr::new(spare_wal),
@@ -18624,6 +18635,7 @@ impl Db {
             lag_log: (0, 0),
             phase_ns: [0; 3],
             draining: false,
+            presync_failed: None,
         };
         db.go_away()?;
         Ok(db)
@@ -18975,6 +18987,7 @@ impl Db {
             seal_hold: std::sync::atomic::AtomicU8::new(0),
             seal_wedged: std::sync::atomic::AtomicBool::new(false),
             fail_landing: std::sync::atomic::AtomicBool::new(false),
+            fail_presync: std::sync::atomic::AtomicBool::new(false),
             maint_err: AtomicPtr::new(std::ptr::null_mut()),
             maint_stop: std::sync::atomic::AtomicBool::new(false),
             spare_wal: AtomicPtr::new(spare_wal),
@@ -19049,6 +19062,7 @@ impl Db {
             lag_log: (0, 0),
             phase_ns: [0; 3],
             draining: false,
+            presync_failed: None,
         };
         db.go_away()?;
         Ok(db)
@@ -19830,8 +19844,8 @@ impl Db {
             // device works while this thread composes the trailer
             // (`Options::close_presync`); a thread that cannot be spawned
             // leaves the sync to the trailer's fsync, which covers the
-            // records as well. An error in it is the file's, and the
-            // seal's own fsync reports it.
+            // records as well. Its error is joined into the finish's
+            // answer, before the seal's own fsync.
             let presynced = presync.and_then(|f| {
                 let shared = self.shared.clone();
                 std::thread::Builder::new()
@@ -19858,10 +19872,22 @@ impl Db {
             self.hand_seal(job, table, wals, Some(retiring));
             // The records' sync, on this thread while the seal thread
             // composes the trailer: the writer waits for the drain anyway,
-            // and the seal's fsync then flushes the trailer alone.
+            // and the seal's fsync then flushes the trailer alone. Its
+            // error is the flush's answer (`presync_failed`): the first
+            // version discarded it on the reading that the seal's fsync
+            // of the same file would report it again, and on Linux it
+            // does not -- a writeback error is reported once per open
+            // file description, and the clone shares the description.
             if let Some(f) = presync {
-                let _ = f.sync_data();
+                let r = if self.shared.fail_presync.swap(false, AtomicOrdering::AcqRel) {
+                    Err(std::io::Error::other("the records' sync failed (injected)"))
+                } else {
+                    f.sync_data()
+                };
                 self.shared.drain_steps.stamp(14);
+                if let Err(e) = r {
+                    self.presync_failed = Some(e);
+                }
             }
         }
     }
@@ -20529,6 +20555,9 @@ impl Db {
         self.draining = false;
         self.shared.drain_steps.stamp(13);
         self.shared.drain_steps.report();
+        if let Some(e) = self.presync_failed.take() {
+            return Err(e);
+        }
         sealed
     }
 
@@ -21762,6 +21791,15 @@ impl Db {
     /// A test's: the next seal's readable landing fails as a `Seg::open`
     /// that cannot read the segment would, so the queue behind it is seen
     /// to stop and a reopen to replay what the failed seal covered.
+    /// A test's: the next flush's presync of a direct run's records
+    /// fails, as a device error in the fdatasync would.
+    #[doc(hidden)]
+    pub fn fail_next_presync(&self) {
+        self.shared
+            .fail_presync
+            .store(true, AtomicOrdering::Release);
+    }
+
     #[doc(hidden)]
     pub fn fail_next_landing(&self) {
         self.shared
@@ -26454,6 +26492,7 @@ impl Maint {
         }
         self.rank_before_publish(&segs)?;
         self.publish_segs_with(segs, false, Some(table));
+        self.shared.drain_steps.stamp(17);
         for name in names {
             self.covered_seq = self.covered_seq.max(Db::name_end_seq(name).unwrap_or(0));
         }
