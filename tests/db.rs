@@ -12297,3 +12297,43 @@ fn a_run_whose_keys_the_table_keeps_leaves_the_segment_the_copies_leave() {
         }
     }
 }
+
+/// The records' sync a close issues on the writer's thread while the
+/// seal thread composes the trailer (`Options::close_presync`) reports
+/// its failure as the flush's answer. The first version discarded the
+/// result on the reading that the seal's fsync of the same file would
+/// report the error again, and Linux reports a writeback error once per
+/// open file description, which the presync's clone shares: a failed
+/// sync of the records was answered as a flush that had made them
+/// durable. The store goes on past the answer -- the seal lands, the
+/// next flush is answered -- and a reopen reads every key.
+#[test]
+fn a_failed_presync_is_the_flushs_answer() {
+    let d = dir("presyncfail");
+    let opts = Options::default();
+    let mut db = Db::create(&d, opts.clone()).unwrap();
+    for c in 0u32..500 {
+        db.append(format!("k{c:04}").as_bytes(), &c.to_le_bytes());
+        if c % 50 == 49 {
+            db.commit().unwrap();
+        }
+    }
+    db.fail_next_presync();
+    assert!(
+        db.flush().is_err(),
+        "the records' failed sync is the flush's answer"
+    );
+    db.append(b"k9999", b"z");
+    db.commit().unwrap();
+    db.flush().unwrap();
+    drop(db);
+    let db = Db::open(&d, opts).unwrap();
+    for c in 0u32..500 {
+        assert_eq!(
+            read_vec(&db, format!("k{c:04}").as_bytes()),
+            vec![c.to_le_bytes().to_vec()],
+            "every key of the run the failed sync was reported for"
+        );
+    }
+    assert_eq!(read_vec(&db, b"k9999"), vec![b"z".to_vec()]);
+}
