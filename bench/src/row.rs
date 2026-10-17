@@ -265,7 +265,8 @@ mod tests {
     fn a_bound_is_its_own_class() {
         let mut row = Row::read(&first_banked_row()).unwrap();
         let base = row.class();
-        assert!(!base.contains("/b"), "{base}");
+        // Unbounded, the class ends at the virtualisation field.
+        assert_eq!(base.rsplit('/').next().unwrap(), row.machine.virtualised, "{base}");
         row.machine.mem_limit_bytes = Some(1536 << 20);
         let b1536 = row.class();
         assert_eq!(b1536, format!("{base}/b1536m"));
@@ -387,7 +388,12 @@ mod tests {
                 .into_owned();
             if row.scale != Scale::Ooc {
                 assert_eq!(row.machine.mem_limit_bytes, None, "{rel}");
-                assert!(!row.class().contains("/b"), "{rel}: {}", row.class());
+                assert_eq!(
+                    row.class().rsplit('/').next().unwrap(),
+                    row.machine.virtualised,
+                    "{rel}: {}",
+                    row.class()
+                );
             }
             if let Some((_, class)) = snapshot.iter().find(|(f, _)| *f == rel) {
                 assert_eq!(row.class(), *class, "{rel}");

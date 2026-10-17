@@ -88,7 +88,8 @@ its last and never between: `read_bytes_per_op` and `majfaults_per_op`
 are the operating threads' own, from each thread's `/proc/thread-self`;
 `bg_read_bytes_per_op` is the process's device bytes less the operating
 threads', which is the merges' streaming and a comparator's background
-jobs; `refaults_per_op` is the group's `workingset_refault_file`, the
+jobs and, for a threaded phase, the readers' opening before their
+release; `refaults_per_op` is the group's `workingset_refault_file`, the
 file pages reclaimed under the bound and read back; `read_us_per_io` is
 the device's read ticks over its read I/Os across the phase, from
 `/sys/block/<dev>/stat`, and is omitted where that file cannot be read.
@@ -96,10 +97,14 @@ None is a sum of any two, so a reader can tell the engine's reads from
 the kernel's readahead and both from the comparator's compaction. The
 pass line prints a self-check per phase, `counts ok` where the threads'
 device bytes cover their major faults and those cover the refaults, and
-`counts odd` where a count is not what its name says. Every count is a
-cost and moves with the machine. A bounded row's read passes run a
-divided count of operations (`--ops-div`, thirty by default, never below
-a thousand operations); its loads and bursts are whole.
+`counts odd` where a count is not what its name says, with the three raw
+counts beside the word. A pread engine fails the second leg by
+construction, since its refaults are `read()`s and not faults, so `odd`
+on a comparator's phase is the engine's read path and not a broken
+count. Every count is a cost and moves with the machine. A bounded
+row's read passes run a divided count of operations (`--ops-div`,
+thirty by default, never below a thousand operations); its loads and
+bursts are whole.
 
 The load's two byte quantities are taken apart, and they are not the same
 question. Device bytes written per byte stored is a flow: the device's

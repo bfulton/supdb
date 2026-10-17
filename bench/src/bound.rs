@@ -268,16 +268,16 @@ impl Bound {
         &self.group
     }
 
-    /// The group's counters now. Read before the first operation of a
-    /// phase and after its last, never between, as every counter the
+    /// The group's counters now, or the error naming the file that could
+    /// not be read -- never a zero in its place, which would read as a
+    /// store that never left the cache. Read before the first operation
+    /// of a phase and after its last, never between, as every counter the
     /// suite reads around a phase is.
-    pub fn stat(&self) -> BoundStat {
-        let text = std::fs::read_to_string(self.group.join("memory.stat")).unwrap_or_default();
-        let mut s = parse_stat(&text);
-        s.max_usage_in_bytes =
-            read_u64(&self.group.join("memory.max_usage_in_bytes")).unwrap_or(0);
-        s.failcnt = read_u64(&self.group.join("memory.failcnt")).unwrap_or(0);
-        s
+    pub fn stat(&self) -> io::Result<BoundStat> {
+        let mut s = parse_stat(&read_from(&self.group.join("memory.stat"))?);
+        s.max_usage_in_bytes = read_u64(&self.group.join("memory.max_usage_in_bytes"))?;
+        s.failcnt = read_u64(&self.group.join("memory.failcnt"))?;
+        Ok(s)
     }
 }
 

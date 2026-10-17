@@ -1081,8 +1081,9 @@ impl OnePass {
         v
     }
 
-    /// The pass line's self-check: one word a phase, or nothing for an
-    /// unbounded pass.
+    /// The pass line's self-check: one word a phase with the three raw
+    /// counts it was judged on (the threads' device bytes, their major
+    /// faults, the group's refaults), or nothing for an unbounded pass.
     fn counts_verdicts(&self) -> String {
         if self.phase_counts.is_empty() {
             return String::new();
@@ -1092,8 +1093,11 @@ impl OnePass {
             .iter()
             .map(|(w, suffix, c)| {
                 format!(
-                    "{w}{suffix} {}",
-                    if c.plausible { "ok" } else { "odd" }
+                    "{w}{suffix} {} ({}B/{}mf/{}rf)",
+                    if c.plausible { "ok" } else { "odd" },
+                    c.own_read,
+                    c.own_majflt,
+                    c.refaults
                 )
             })
             .collect();
@@ -1113,7 +1117,8 @@ struct PhaseCounts {
     /// `/proc/thread-self/stat`.
     majfaults_per_op: f64,
     /// The whole process's device bytes read less the operating threads':
-    /// the merges' streaming and a comparator's background jobs, named
+    /// the merges' streaming and a comparator's background jobs, and, for
+    /// a threaded phase, the readers' opening before their release, named
     /// rather than blended into the readers'.
     bg_read_bytes_per_op: f64,
     /// The group's `workingset_refault_file`, which is every thread's.
@@ -1126,6 +1131,13 @@ struct PhaseCounts {
     /// fault of a page the group had and lost. A phase that fails it has
     /// a count that is not what its name says, and the pass line says so.
     plausible: bool,
+    /// The three raw counts the check was made on -- the operating
+    /// threads' device bytes, their major faults and the group's refaults
+    /// over the phase -- printed beside the verdict so a reader of the
+    /// pass line sees what was judged.
+    own_read: u64,
+    own_majflt: u64,
+    refaults: u64,
 }
 
 impl PhaseCounts {
@@ -1165,27 +1177,37 @@ struct Counting<'a> {
 }
 
 impl<'a> Counting<'a> {
-    fn new(bound: Option<&'a Bound>, dir: &Path) -> Counting<'a> {
+    /// Bounded, the three counters a phase's counts are read from are
+    /// probed once here (`probe_counts`), so a file or a field that is
+    /// missing refuses the pass by name before anything is measured
+    /// rather than recording a zero that reads as a store that never
+    /// left the cache. Unbounded, none of them is read at all.
+    fn new(bound: Option<&'a Bound>, dir: &Path) -> Result<Counting<'a>, String> {
+        if let Some(b) = bound {
+            probe_counts(b)?;
+        }
         let dev_stat = bound.map(|_| {
             let dev = env::block_device_of(dir).unwrap_or_else(|| "vda".to_string());
             PathBuf::from(format!("/sys/block/{dev}/stat"))
         });
         let dev_stat = dev_stat.filter(|p| dev_read_stat(p).is_some());
-        Counting {
+        Ok(Counting {
             bound,
             dev_stat,
             out: Vec::new(),
-        }
+        })
     }
 
     /// The readings before a phase's first operation, or none unbounded.
+    /// A counter that cannot be read after the probe leaves the phase
+    /// uncounted, never counted as zero.
     fn begin(&self) -> Option<CountSnap> {
         let bound = self.bound?;
         Some(CountSnap {
             process: IoCounters::read_now(),
-            own_read: thread_read_bytes(),
-            own_majflt: majflt_self(),
-            refaults: bound.stat().workingset_refault_file,
+            own_read: thread_read_bytes()?,
+            own_majflt: majflt_self()?,
+            refaults: bound.stat().ok()?.workingset_refault_file,
             dev: self.dev_stat.as_deref().and_then(dev_read_stat),
         })
     }
@@ -1206,16 +1228,19 @@ impl<'a> Counting<'a> {
             return;
         };
         let process = IoCounters::read_now().since(&b.process).read_bytes;
-        let (own_read, own_majflt) = workers.unwrap_or_else(|| {
-            (
-                thread_read_bytes().saturating_sub(b.own_read),
-                majflt_self().saturating_sub(b.own_majflt),
-            )
-        });
-        let refaults = bound
-            .stat()
-            .workingset_refault_file
-            .saturating_sub(b.refaults);
+        let own = match workers {
+            Some(w) => Some(w),
+            None => match (thread_read_bytes(), majflt_self()) {
+                (Some(r), Some(m)) => {
+                    Some((r.saturating_sub(b.own_read), m.saturating_sub(b.own_majflt)))
+                }
+                _ => None,
+            },
+        };
+        let (Some((own_read, own_majflt)), Ok(stat)) = (own, bound.stat()) else {
+            return;
+        };
+        let refaults = stat.workingset_refault_file.saturating_sub(b.refaults);
         let per = |n: u64| n as f64 / ops.max(1) as f64;
         let read_us_per_io = match (b.dev, self.dev_stat.as_deref().and_then(dev_read_stat)) {
             (Some((ios0, ticks0)), Some((ios1, ticks1))) if ios1 > ios0 => {
@@ -1233,9 +1258,29 @@ impl<'a> Counting<'a> {
                 refaults_per_op: per(refaults),
                 read_us_per_io,
                 plausible: own_read / 4096 >= own_majflt && own_majflt >= refaults,
+                own_read,
+                own_majflt,
+                refaults,
             },
         ));
     }
+}
+
+/// The refusals for a thread's own counters, named by the file.
+const THREAD_IO_MISSING: &str = "/proc/thread-self/io has no read_bytes field or cannot be read";
+const THREAD_STAT_MISSING: &str = "/proc/thread-self/stat has no majflt field or cannot be read";
+
+/// Read each of the three counters a bounded phase's counts come from
+/// once -- the group's `memory.stat` with its two counter files, this
+/// thread's `/proc/thread-self/io` and `/proc/thread-self/stat` -- and
+/// refuse, naming the file, where one cannot be read: a bounded run or
+/// pairing calls it before its floors, and `Counting::new` again for
+/// every pass.
+pub fn probe_counts(bound: &Bound) -> Result<(), String> {
+    bound.stat().map_err(|e| format!("the bound's counters: {e}"))?;
+    thread_read_bytes().ok_or_else(|| THREAD_IO_MISSING.to_string())?;
+    majflt_self().ok_or_else(|| THREAD_STAT_MISSING.to_string())?;
+    Ok(())
 }
 
 /// `/sys/block/<dev>/stat`'s (read I/Os, read ticks in ms): the first and
@@ -1249,8 +1294,9 @@ fn dev_read_stat(path: &Path) -> Option<(u64, u64)> {
 }
 
 /// This thread's own bytes read from the device so far, from
-/// `/proc/thread-self/io`.
-fn thread_read_bytes() -> u64 {
+/// `/proc/thread-self/io`; `None` where the file or the field is
+/// missing, never a zero that reads as a count.
+fn thread_read_bytes() -> Option<u64> {
     std::fs::read_to_string("/proc/thread-self/io")
         .ok()
         .and_then(|s| {
@@ -1258,19 +1304,20 @@ fn thread_read_bytes() -> u64 {
                 .find_map(|l| l.strip_prefix("read_bytes:"))
                 .and_then(|v| v.trim().parse().ok())
         })
-        .unwrap_or(0)
 }
 
 /// This thread's major page faults so far: the tenth field after the
-/// comm's closing parenthesis, two past the minor faults.
-fn majflt_self() -> u64 {
-    std::fs::read_to_string("/proc/thread-self/stat").map_or(0, |s| stat_majflt(&s))
+/// comm's closing parenthesis, two past the minor faults; `None` where
+/// the file or the field is missing.
+fn majflt_self() -> Option<u64> {
+    std::fs::read_to_string("/proc/thread-self/stat")
+        .ok()
+        .and_then(|s| stat_majflt(&s))
 }
 
-fn stat_majflt(stat: &str) -> u64 {
+fn stat_majflt(stat: &str) -> Option<u64> {
     stat.rsplit_once(')')
         .and_then(|(_, rest)| rest.split_whitespace().nth(9).and_then(|v| v.parse().ok()))
-        .unwrap_or(0)
 }
 
 fn one_pass(
@@ -1289,7 +1336,7 @@ fn one_pass(
     let passes = plan.passes;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     // The directory first, since the counting finds the device through it.
-    let mut counting = Counting::new(plan.bound.as_ref(), dir);
+    let mut counting = Counting::new(plan.bound.as_ref(), dir)?;
     let prime_a = prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
     let mut e = engines::open(arm, dir, map_gb)?;
     let c0 = counting.begin();
@@ -1612,7 +1659,11 @@ fn one_pass(
         } else {
             f64::NAN
         },
-        shuffled_ops_s: size as f64 / shuf_s,
+        shuffled_ops_s: if passes.load {
+            size as f64 / shuf_s
+        } else {
+            f64::NAN
+        },
         scan_lag,
         burst_lag,
         reads_s: reads as f64 / read_s,
@@ -1972,6 +2023,8 @@ fn share(ops: u64, threads: usize, i: usize) -> u64 {
 /// the deltas is `Threaded::own`: a bounded pass's counts are the
 /// operating threads' (`Counting`), and the process's counters would
 /// blend the readers' faults with the engine's merges beside them.
+// Eight parameters: clippy::too_many_arguments, allowed as `lag_sweep` allows it.
+#[allow(clippy::too_many_arguments)]
 fn threaded(
     e: &dyn Engine,
     pass: &str,
@@ -2018,7 +2071,10 @@ fn threaded(
                     // before its clock starts so the two `/proc` reads
                     // are outside it; a bounded pass only.
                     let (rb0, mf0) = if count {
-                        (thread_read_bytes(), majflt_self())
+                        (
+                            thread_read_bytes().ok_or_else(|| THREAD_IO_MISSING.to_string())?,
+                            majflt_self().ok_or_else(|| THREAD_STAT_MISSING.to_string())?,
+                        )
                     } else {
                         (0, 0)
                     };
@@ -2037,8 +2093,12 @@ fn threaded(
                     let cpu = if spans { thread_cpu_us() - cpu0 } else { 0 };
                     let own = if count {
                         (
-                            thread_read_bytes().saturating_sub(rb0),
-                            majflt_self().saturating_sub(mf0),
+                            thread_read_bytes()
+                                .ok_or_else(|| THREAD_IO_MISSING.to_string())?
+                                .saturating_sub(rb0),
+                            majflt_self()
+                                .ok_or_else(|| THREAD_STAT_MISSING.to_string())?
+                                .saturating_sub(mf0),
                         )
                     } else {
                         (0, 0)
@@ -2378,12 +2438,13 @@ fn scan_floor(root: &Path, bytes: u64) -> Result<f64, String> {
 }
 
 /// The scan floor's file under `root`, `bytes` long and synced, written
-/// where it is not there at that length already, and its pages dropped
-/// from the cache after the write. Public so that a bounded run writes
-/// it before it enters its bound: the write's dirty pages would be
-/// charged to the group, and a bound the floor file cannot fit is a
+/// where it is not there at that length already. Public so that a bounded
+/// run writes it before it enters its bound: the write's dirty pages would
+/// be charged to the group, and a bound the floor file cannot fit is a
 /// group whose first act is reclaiming what the floor is about to read.
-/// Returns the path.
+/// The pages stay in the cache, which is the in-core floor's shape; a
+/// bounded run drops them itself (`drop_cache`), since the advice refuses
+/// off Linux. Returns the path.
 pub fn write_scan_floor(root: &Path, bytes: u64) -> Result<PathBuf, String> {
     let path = root.join("scan-floor.dat");
     if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) != bytes {
@@ -2402,7 +2463,6 @@ pub fn write_scan_floor(root: &Path, bytes: u64) -> Result<PathBuf, String> {
         }
         f.sync_all().map_err(|e| e.to_string())?;
         drop(f);
-        drop_cache(&path)?;
     }
     Ok(path)
 }
@@ -2431,8 +2491,10 @@ struct SeekFloor {
 /// the next read of them is the device's: the advice drops clean pages
 /// only, which is why the writer syncs first, and it drops pages mapped
 /// by nobody, which is why the scan floor's mapping is gone before the
-/// seek floor runs.
-fn drop_cache(path: &Path) -> Result<(), String> {
+/// seek floor runs. Public for the bounded run's drop of the floor file
+/// it wrote before entering its bound; the advice refuses off Linux, so
+/// an unbounded run never calls it.
+pub fn drop_cache(path: &Path) -> Result<(), String> {
     let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
     fadvise(&f, FADV_DONTNEED).map_err(|e| format!("{}: fadvise DONTNEED: {e}", path.display()))
 }
@@ -2460,7 +2522,7 @@ fn seek_floor(path: &Path) -> Result<SeekFloor, String> {
     let mut rng = Rng::new(0x5EEC);
     let mut buf = [0u8; SEEK_READ_BYTES];
     let mut us: Vec<f64> = Vec::with_capacity(SEEK_FLOOR_READS);
-    let read0 = thread_read_bytes();
+    let read0 = thread_read_bytes().ok_or(THREAD_IO_MISSING)?;
     for _ in 0..SEEK_FLOOR_READS {
         let off = (rng.next() % pages) * SEEK_READ_BYTES as u64;
         let t = Instant::now();
@@ -2468,7 +2530,9 @@ fn seek_floor(path: &Path) -> Result<SeekFloor, String> {
         us.push(t.elapsed().as_secs_f64() * 1e6);
         std::hint::black_box(&buf);
     }
-    let read = thread_read_bytes().saturating_sub(read0);
+    let read = thread_read_bytes()
+        .ok_or(THREAD_IO_MISSING)?
+        .saturating_sub(read0);
     us.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let at = |pct: f64| us[((us.len() as f64 * pct / 100.0) as usize).min(us.len() - 1)];
     Ok(SeekFloor {
@@ -3039,10 +3103,10 @@ mod tests {
     #[test]
     fn the_major_faults_are_the_tenth_field_past_the_comm() {
         let stat = "1234 (a (weird) comm) S 1 2 3 4 5 6 8 0 42 0 0 0";
-        assert_eq!(stat_majflt(stat), 42);
+        assert_eq!(stat_majflt(stat), Some(42));
         assert_eq!(stat_minflt(stat), 8);
-        assert_eq!(stat_majflt("garbage"), 0);
-        assert!(majflt_self() < u64::MAX);
+        assert_eq!(stat_majflt("garbage"), None);
+        assert!(majflt_self().is_some_and(|n| n < u64::MAX));
     }
 
     /// The device's stat line: read I/Os first, read ticks fourth.

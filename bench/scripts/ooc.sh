@@ -76,7 +76,8 @@ shift
 # it and the banked-rungs line is the verdict. Its status is written by
 # the subshell that ran it, where `$?` is the run's own.
 ( "$bin" run --scale ooc --bound "$L" "$@" 2>&1; echo $? >"$st" ) | tee "$err"
-status=$(cat "$st" 2>/dev/null || echo 1)
+status=$(cat "$st" 2>/dev/null)
+case "$status" in ''|*[!0-9]*) status=1;; esac
 group=$(sed -n 's/^bench: bound [0-9]* bytes in group //p' "$err" | tail -n 1)
 if [ "$status" -eq 137 ]; then
   echo "ooc.sh: the run was killed under its bound of $L bytes: raise L" >&2

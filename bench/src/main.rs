@@ -48,13 +48,15 @@ figures draws every figure for the latest row of each class at --scale (default 
        --out (default figures), from --runs (default runs)
 machine prints the machine fields as a row records them, and its derived class";
 
-/// The bound an argument names, entered: `None` with no `--bound`, and
-/// otherwise the group or the refusal, which has the shape of the ENOSPC
-/// refusal in `run` -- before anything is measured, and never a row (or
-/// a pairing) without the bound in it. A bound below `MIN_BOUND_BYTES`
-/// is refused here, since the floors cannot run under it, and it is the
-/// known-red input `scripts/ooc.sh --prove-red` proves its gate on.
-fn enter_bound(a: &Args) -> Result<Option<Bound>, String> {
+/// The bound an argument names, checked and not yet entered: `None` with
+/// no `--bound`, the bytes otherwise, or the refusal. A bound below
+/// `MIN_BOUND_BYTES` is refused, since the floors cannot run under it,
+/// and it is the known-red input `scripts/ooc.sh --prove-red` proves its
+/// gate on; one that is not a whole number of mebibytes is refused too,
+/// since the row's class names the bound in exact mebibytes
+/// (`Row::class`). Checked before anything is written, so a bad number
+/// never costs the scan floor's file.
+fn bound_arg(a: &Args) -> Result<Option<u64>, String> {
     let Some(text) = a.get("--bound") else {
         return Ok(None);
     };
@@ -67,6 +69,19 @@ fn enter_bound(a: &Args) -> Result<Option<Bound>, String> {
             run::MIN_BOUND_BYTES
         ));
     }
+    if bytes % (1 << 20) != 0 {
+        return Err(format!("--bound {bytes} is not a whole number of mebibytes"));
+    }
+    Ok(Some(bytes))
+}
+
+/// The bound entered: the group, or the refusal, which has the shape of
+/// the ENOSPC refusal in `run` -- before anything is measured, and never
+/// a row (or a pairing) without the bound in it. The counters a bounded
+/// phase's counts are read from are probed once here, so a count that
+/// cannot be read refuses by name before the floors rather than
+/// recording a zero.
+fn enter_bound(bytes: u64) -> Result<Bound, String> {
     let b = Bound::enter(bytes).map_err(|e| format!("refused: could not enter the bound: {e}"))?;
     // The group's path on stderr, for the wrapper that removes it if the
     // run is killed inside it (`scripts/ooc.sh`).
@@ -75,7 +90,8 @@ fn enter_bound(a: &Args) -> Result<Option<Bound>, String> {
         b.limit(),
         b.group().display()
     );
-    Ok(Some(b))
+    run::probe_counts(&b).map_err(|e| format!("refused: {e}"))?;
+    Ok(b)
 }
 
 struct Args(Vec<String>);
@@ -221,7 +237,7 @@ fn cmd_ab(a: Args) -> i32 {
     // The bound first, before the machine capture and the plan's threads:
     // a cgroup v1 move takes the whole thread group, and the pairing's
     // every allocation is to be the group's.
-    let bound = match enter_bound(&a) {
+    let bound = match bound_arg(&a).and_then(|b| b.map(enter_bound).transpose()) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("bench ab: {e}");
@@ -343,6 +359,16 @@ fn cmd_run(a: Args) -> i32 {
         },
         None => run::OOC_OPS_DIV,
     };
+    // The bound's number, checked before anything is written: a bound
+    // that is refused costs no scan floor's file, and the floor file is
+    // written and synced before the bound is entered.
+    let bound_bytes = match bound_arg(&a) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("bench run: {e}");
+            return 1;
+        }
+    };
     let arms: Vec<String> = match a.get("--arms") {
         Some(list) => list
             .split(',')
@@ -412,7 +438,16 @@ fn cmd_run(a: Args) -> i32 {
     };
     if bounded {
         let bytes = run::scan_floor_bytes(top, run::VALUE_SIZE);
-        if let Err(e) = run::write_scan_floor(&root, bytes) {
+        let path = match run::write_scan_floor(&root, bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("bench run: the scan floor's file: {e}");
+                return 1;
+            }
+        };
+        // Dropped here and not by the writer: the unbounded floor keeps
+        // its pages, and the advice refuses off Linux.
+        if let Err(e) = run::drop_cache(&path) {
             eprintln!("bench run: the scan floor's file: {e}");
             return 1;
         }
@@ -420,11 +455,13 @@ fn cmd_run(a: Args) -> i32 {
     // Then the bound: before the machine capture, the plan's threads and
     // every allocation the row will charge to it. Its refusal has the
     // ENOSPC refusal's shape -- before the floors, with no row written --
-    // so a bounded row is never written without its bound in it.
-    let bound = match enter_bound(&a) {
+    // so a bounded row is never written without its bound in it, and the
+    // fresh root goes with the refusal, as `run` removes it at its end.
+    let bound = match bound_bytes.map(enter_bound).transpose() {
         Ok(b) => b,
         Err(e) => {
             eprintln!("bench run: {e}");
+            let _ = std::fs::remove_dir_all(&root);
             return 1;
         }
     };
@@ -476,5 +513,28 @@ fn cmd_run(a: Args) -> i32 {
             eprintln!("run failed: {e}");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bound that is not a whole number of mebibytes is refused naming
+    /// it, since the class names the bound in exact mebibytes; a whole one
+    /// passes, and one below the floors' need is refused as such first.
+    #[test]
+    fn a_bound_not_in_whole_mebibytes_is_refused() {
+        let args = |b: &str| Args(vec!["--bound".to_string(), b.to_string()]);
+        assert_eq!(
+            bound_arg(&args("1610612737")).unwrap_err(),
+            "--bound 1610612737 is not a whole number of mebibytes"
+        );
+        assert_eq!(bound_arg(&args("1610612736")).unwrap(), Some(1610612736));
+        let low = bound_arg(&args("67108864")).unwrap_err();
+        assert!(low.starts_with("refused: --bound 67108864 is below"), "{low}");
+        let text = bound_arg(&args("64MiB")).unwrap_err();
+        assert!(text.contains("takes a number"), "{text}");
+        assert_eq!(bound_arg(&Args(vec![])).unwrap(), None);
     }
 }
