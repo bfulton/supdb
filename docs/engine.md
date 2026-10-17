@@ -3830,6 +3830,36 @@ keys in the seal thread: the sort 0.4 ms, the snapshot's copy 1.0 to
 1.5, the records and the finish 2.5 to 3.3, the segment's fsync 1.6
 beside the directory's, and the slot 0.5.
 
+The direct run's drain had never been stamped under the durable policy:
+every figure above is the buffered arm's, and the one durable figure,
+2.1 ms, predates the slots. One sitting of each arm against itself at
+ten thousand keys, twenty-six drains each, puts the durable drain at
+1.87 ms and the buffered at 1.94, and splits them the same way, with a
+stamp at the landing's publish to readers (`readers`) that is new. The
+writer's work before the hand-off is 0.11 ms. The presync is nothing
+under the durable policy, where every commit synced the run, and 0.85
+ms for the buffered run's 1.2 MB, which the seal thread's finish hides
+whole. The finish is 0.98 ms: the trailer composed in 0.34, the tail
+and the trailer's 360 KB written in 0.45, the superblock's three
+patches in 0.11. The landing opens and publishes the segment 0.17 ms
+after it is linked, and from there the trailer's fsync, 0.52 ms
+durable and 0.62 buffered, beside the directory's on the segment
+work's thread, then the join, the slot's write and the reply, 0.13,
+hold the answer: 0.48 ms durable and 0.58 buffered past the point
+readers have the segment. Under the durable policy that wait is the
+trailer's durability alone, since the records were durable at every
+commit and recovery reads them from the temp name's markers; the
+finish, two thirds of it the trailer's write and the superblock's
+patches rather than its composition, is the rest of the chain and
+within the order. The commits beside it read 6.9 ms durable, the ten
+fdatasyncs 0.49 to 0.54 ms each in `strace`, and 2.0 buffered. The
+inline finish (`supdb-closeinline`) read the sync column within 0.1 ms
+and the commits 0.85 ms apart in opposite directions in the two orders,
+a position effect, and stays an arm. What the stamps leave within the
+contract is the finish's write and patches; what they leave past it is
+an answer at the readable landing for the durable policy, which the
+crash-discipline paragraph does not grant and the owner decides.
+
 The snapshot's copy was the next thing taken away, and it came back. A
 drain's seal copies the frozen table's chains into a snapshot for the
 scans over the store while the seal runs, as any seal does, and under a
