@@ -712,6 +712,22 @@ pub struct Options {
     /// 0.85x at three hundred thousand: no direction held at both rungs.
     /// `supdb-prefetch1k` and `supdb-ingestprefetch1k` ask for a kilobyte.
     pub scan_prefetch_bytes: usize,
+    /// A scan's seek asks for the partition's directory words of the
+    /// stride window its answer lies in at the moment it asks for the
+    /// stride's heads, and the record hint after it estimates its span
+    /// from the index's mean record length rather than reading the
+    /// directory word at the span's end. A scan's start was three fills
+    /// one behind the other -- the stride's heads, then the directory
+    /// word the record hint had to read before it could issue anything,
+    /// then the first record -- and the window is known before a head is
+    /// read, so the directory's fill rides the heads' and the chain is
+    /// two. The directory is an L3 fill at every quick rung from thirty
+    /// thousand keys and L2-resident at ten thousand, so the regime the
+    /// hint is for is every rung but the smallest. Under `scan_prefetch`
+    /// off nothing issues either way. `supdb-dirplain` and
+    /// `supdb-ingestdirplain` are the arm with the shape before: no
+    /// window hint, and the record hint's two directory reads.
+    pub seek_prefetch_dir: bool,
     /// PROTOTYPE: the partitions' blocks below which no builder starts.
     /// Measured on the probe's E, six rounds interleaved, the builder
     /// against none: at ten thousand keys, 160 blocks, 310k-351k against
@@ -1815,6 +1831,7 @@ impl Default for Options {
             scan_cache_ahead: true,
             scan_prefetch: true,
             scan_prefetch_bytes: 4096,
+            seek_prefetch_dir: true,
             scan_cache_ahead_min_blocks: 1024,
             commit_forms: true,
             forms_from_reader_scans: 0,
@@ -9509,14 +9526,34 @@ fn prefetch_form(form: &Cached) {
     }
 }
 
-fn prefetch_block(blob: &Blob<MmapBytes>, form: &Cached, from: usize, n: usize, cap: usize) {
+/// The lines a walk of `form` over the partition's ranks `from` to `n`
+/// on will read, asked for ahead of it: the form's own, and for a form
+/// walked in the partition the records' span, its end read from the
+/// directory or, with `estimate`, put at the mean record length times
+/// the ranks (`Options::seek_prefetch_dir`), since the read is a load
+/// the hint waits for before it can issue.
+fn prefetch_block(
+    blob: &Blob<MmapBytes>,
+    form: &Cached,
+    from: usize,
+    n: usize,
+    cap: usize,
+    estimate: bool,
+) {
+    let ranks = |blob: &Blob<MmapBytes>| {
+        if estimate {
+            blob.prefetch_ranks_est(from, n, cap);
+        } else {
+            blob.prefetch_ranks(from, n, cap);
+        }
+    };
     match form {
         Cached::Block(blk) => blk.prefetch(),
         Cached::Sparse(sb) => {
             sb.prefetch();
-            blob.prefetch_ranks(from, n, cap);
+            ranks(blob);
         }
-        Cached::Clean => blob.prefetch_ranks(from, n, cap),
+        Cached::Clean => ranks(blob),
         Cached::Wide(_) => {}
     }
 }
@@ -10870,6 +10907,10 @@ struct FormsState {
     /// The forms the writer's block walks met: copies, sparse forms,
     /// anything else -- what a pass after a burst is walking.
     walk_kinds: std::cell::Cell<[u64; 3]>,
+    /// Seeks whose stride window's directory lines were asked for ahead
+    /// of the heads' read (`Options::seek_prefetch_dir`), the window
+    /// empty or not: one a scan's start on the block path.
+    dir_prefetches: std::cell::Cell<u64>,
     /// Scans that started a copy walk at the seek's rank, and that
     /// searched the copy (`Options::copy_start_at_rank`).
     copy_starts: std::cell::Cell<[u64; 2]>,
@@ -10987,6 +11028,7 @@ impl FormsState {
             log_counted: std::cell::Cell::new((0, 0)),
             choices: std::cell::Cell::new([0; 5]),
             walk_kinds: std::cell::Cell::new([0; 3]),
+            dir_prefetches: std::cell::Cell::new(0),
             copy_starts: std::cell::Cell::new([0; 2]),
             read_cap: std::cell::Cell::new(0),
             pass_lent: std::cell::Cell::new(0),
@@ -16980,7 +17022,17 @@ impl Reader {
                     None => break,
                 }
             }
-            let (rank, exact) = seg.ord.seek_exact(cursor, |r| seg.blob.key_at(r));
+            let (rank, exact) = seg.ord.seek_exact_hint(
+                cursor,
+                |r| seg.blob.key_at(r),
+                |lo, hi| {
+                    if self.opts.scan_prefetch && self.opts.seek_prefetch_dir {
+                        seg.blob.prefetch_dir(lo, hi - lo);
+                        let fs = self.fs();
+                        fs.dir_prefetches.set(fs.dir_prefetches.get() + 1);
+                    }
+                },
+            );
             let same =
                 rank < keys && exact.unwrap_or_else(|| seg.blob.key_at(rank) == Some(cursor));
             let owner = if same { rank } else { rank.saturating_sub(1) };
@@ -17190,7 +17242,14 @@ impl Reader {
                     None
                 };
                 if !fetched && self.opts.scan_prefetch {
-                    prefetch_block(&seg.blob, form, start, ahead, self.opts.scan_prefetch_bytes);
+                    prefetch_block(
+                        &seg.blob,
+                        form,
+                        start,
+                        ahead,
+                        self.opts.scan_prefetch_bytes,
+                        self.opts.seek_prefetch_dir,
+                    );
                 }
                 fetched = false;
                 if self.opts.scan_prefetch && hi - start < ahead && b + 1 < nblocks {
@@ -17209,6 +17268,7 @@ impl Reader {
                             hi,
                             ahead - (hi - start),
                             self.opts.scan_prefetch_bytes,
+                            self.opts.seek_prefetch_dir,
                         );
                         fetched = true;
                     }
@@ -21065,6 +21125,14 @@ impl Db {
         self.r.fs().copy_starts.get()
     }
 
+    /// The writer's own seeks that hinted their stride window's
+    /// directory, over the store's life (`Options::seek_prefetch_dir`);
+    /// a handle's are `Reader::dir_prefetches`.
+    pub fn dir_prefetches(&self) -> u64 {
+        self.take_back_upkeep();
+        self.r.fs().dir_prefetches.get()
+    }
+
     /// Nanoseconds the writer's scans spent in each phase before their
     /// walk; see `Reader::scan_ns`.
     pub fn scan_phases(&self) -> [u64; 6] {
@@ -21097,6 +21165,20 @@ impl Db {
 }
 
 impl Reader {
+    /// This handle's seeks that hinted their stride window's directory
+    /// (`Options::seek_prefetch_dir`); the writer's own count is
+    /// `Db::dir_prefetches`.
+    pub fn dir_prefetches(&self) -> u64 {
+        self.fs().dir_prefetches.get()
+    }
+
+    /// The options the store was opened with, for a test that holds an
+    /// arm to the one option it differs by.
+    #[doc(hidden)]
+    pub fn options(&self) -> &Options {
+        &self.opts
+    }
+
     /// A handle that reads this store from any thread, under `Latest`
     /// isolation to begin with, with caches of its own and a slot in the
     /// reader table for its life. It is `Send` and not `Sync`: one

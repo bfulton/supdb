@@ -1487,6 +1487,11 @@ pub struct FlatIndex {
     hash_cap: usize,
     mask: usize,
     nkeys: usize,
+    /// The record region's bytes over its keys, at least one: what a hint
+    /// that estimates a span of records from a count of ranks scales by
+    /// (`Blob::prefetch_ranks_est`). Taken once here and never divided
+    /// for on a scan.
+    mean_record_len: usize,
     /// Absolute offset of the record region within the section, and how much
     /// of it is reserved. `bump` is where the next in-place update lands.
     recs_off: usize,
@@ -1687,6 +1692,7 @@ impl FlatIndex {
             hash_cap,
             mask: hash_cap - 1,
             nkeys,
+            mean_record_len: (recs_len / nkeys.max(1)).max(1),
             recs_off,
             recs_cap,
             bump,
@@ -1921,6 +1927,37 @@ impl FlatIndex {
         let a = rd_u32(dir, rank * 4)? as usize;
         let b = rd_u32(dir, last * 4)? as usize;
         Some((a, b.max(a)))
+    }
+
+    /// The byte range of the directory words for the ranks `rank` to
+    /// `n` on, `rank..min(rank + n, nkeys)`, within the directory; `None`
+    /// past the last rank. A seek's stride window is known before its
+    /// heads are read, and the directory words of the window asked for
+    /// then are one fill the scan's first record read no longer waits
+    /// for behind the stride's (`Blob::prefetch_dir`). The word's width
+    /// is this file's alone, the arithmetic `at_full_in` reads by.
+    pub fn dir_span(&self, rank: usize, n: usize) -> Option<(usize, usize)> {
+        if rank >= self.nkeys {
+            return None;
+        }
+        // A window can be a scan's whole limit: the sum saturates.
+        let end = rank.saturating_add(n).min(self.nkeys);
+        Some((rank * 4, end * 4))
+    }
+
+    /// Where the record at `rank` lies by the directory: the one word, for
+    /// a hint that estimates the span past it rather than reading a second
+    /// word for it. `None` past the last rank or off the directory.
+    pub fn record_off(&self, dir: &[u8], rank: usize) -> Option<usize> {
+        if rank >= self.nkeys {
+            return None;
+        }
+        Some(rd_u32(dir, rank * 4)? as usize)
+    }
+
+    /// The record region's bytes over its keys, at least one.
+    pub fn mean_record_len(&self) -> usize {
+        self.mean_record_len
     }
 
     /// `at_full` against regions `regions` already sliced. The directory is
@@ -2527,6 +2564,44 @@ mod tests {
             let k = format!("absent{i:012}").into_bytes();
             assert!(ix.lookup(&sec, &k, h).is_none());
         }
+    }
+
+    /// `dir_span` names exactly the directory bytes `at_full_in` reads
+    /// for the ranks of the window, clipped at the key count, and nothing
+    /// for a rank past it; a window of a scan's whole limit saturates
+    /// rather than wraps. The mean record length is the record region's
+    /// bytes over its keys and never zero, so a span scaled by it is
+    /// never empty by arithmetic.
+    #[test]
+    fn a_directory_span_is_the_words_the_ranks_read_by() {
+        let all = corpus(1000);
+        let sec = padded(encode(&refs(&all), 1, None, h, 0, false).unwrap());
+        let ix = FlatIndex::parse(&sec).unwrap();
+        let (recs, dir) = ix.regions(&sec).unwrap();
+        let nkeys = ix.len();
+        assert_eq!(nkeys, all.len());
+        for r in [0usize, nkeys / 2, nkeys - 1] {
+            for n in [0usize, 1, 64, usize::MAX] {
+                let (a, b) = ix.dir_span(r, n).expect("a rank in range");
+                let end = r.saturating_add(n).min(nkeys);
+                assert_eq!((a, b), (r * 4, end * 4), "rank {r} n {n}");
+                assert!(b <= dir.len(), "inside the directory");
+                // The bytes between are the words of the ranks `r..end`,
+                // and each word is what `at_full_in` resolves the rank by.
+                for (i, w) in dir[a..b].chunks_exact(4).enumerate() {
+                    let off = u32::from_le_bytes([w[0], w[1], w[2], w[3]]) as usize;
+                    assert_eq!(ix.record_off(dir, r + i), Some(off));
+                    let (k, _, _) = ix.at_full_in(recs, dir, r + i).expect("resolves");
+                    assert_eq!(k, all[r + i].0.as_slice(), "rank {}", r + i);
+                }
+            }
+        }
+        assert_eq!(ix.dir_span(nkeys, 1), None);
+        assert_eq!(ix.dir_span(usize::MAX, usize::MAX), None);
+        assert_eq!(ix.record_off(dir, nkeys), None);
+        let recs_len = rd_u64(&sec, 96).unwrap() as usize;
+        assert_eq!(ix.mean_record_len(), (recs_len / nkeys).max(1));
+        assert!(ix.mean_record_len() >= 1);
     }
 
     #[test]
