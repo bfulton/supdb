@@ -474,7 +474,9 @@ every scan of the single-threaded scan pass on its own, for every arm,
 and prints a `scanops` line a pass with the first scans beside the
 median: a pass of a hundred scans at the smallest rung is a few hundred
 microseconds, and a first scan that builds what the pass needs once is a
-share of it no rate shows. Read a thread's
+share of it no rate shows. Its median prints to the nanosecond: printed
+to the tenth of a microsecond it hid a fifty-nanosecond move behind four
+sittings of pairs, and the move was read off the pass sums instead. Read a thread's
 passes per rep there before reading its cell: a thread that ran in
 two reps of five made a cell that read neither shape.
 

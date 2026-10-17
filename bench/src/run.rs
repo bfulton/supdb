@@ -914,7 +914,7 @@ fn one_pass(
         let med = sorted[sorted.len() / 2];
         let head: Vec<String> = op_us.iter().take(4).map(|u| format!("{u:.1}")).collect();
         eprintln!(
-            "scanops {} size {} scans {} first {} med {:.1} max {:.1} sum_us {:.1} pass_us {:.1}",
+            "scanops {} size {} scans {} first {} med {:.3} max {:.1} sum_us {:.1} pass_us {:.1}",
             e.name(),
             size,
             scans,

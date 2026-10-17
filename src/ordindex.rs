@@ -712,6 +712,24 @@ impl OrdIndex {
         key: &[u8],
         key_at: impl Fn(usize) -> Option<&'a [u8]>,
     ) -> (usize, Option<bool>) {
+        self.seek_exact_hint(key, key_at, |_, _| {})
+    }
+
+    /// `seek_exact`, telling `on_window` the stride window `(lo, hi)` the
+    /// answer lies in -- `lo..=hi`, one stride at most, `(0, 0)` for a
+    /// query below every sample -- at the moment the window's heads are
+    /// asked for and before any is read, so a caller can ask for what it
+    /// will read next by the window alone: the partition's directory
+    /// words for those ranks, a fill that otherwise waits behind the
+    /// heads' (`Options::seek_prefetch_dir`). A query outside the common
+    /// prefix is answered from the prefix with no window and no call;
+    /// so is an empty index.
+    pub fn seek_exact_hint<'a>(
+        &self,
+        key: &[u8],
+        key_at: impl Fn(usize) -> Option<&'a [u8]>,
+        on_window: impl FnOnce(usize, usize),
+    ) -> (usize, Option<bool>) {
         if self.n == 0 {
             return (0, Some(false));
         }
@@ -742,6 +760,7 @@ impl OrdIndex {
             let at = HEADER + lo * HEAD;
             crate::db::prefetch_lines(self.map.0[at..].as_ptr(), (hi - lo) * HEAD);
         }
+        on_window(lo, hi);
         // The stride's heads searched with a mask a step, as the top
         // level is: the branch form mispredicted about half its steps.
         let base = lo;
@@ -1072,6 +1091,48 @@ mod tests {
             k
         };
         check_from(&keys, &[b"x", longer.as_slice(), b"zz"], "from-headtie");
+    }
+
+    /// The window the hinted seek names holds its answer and spans one
+    /// stride at most, for every key, between keys and at both ends;
+    /// `(0, 0)` for a query below every sample of the top level; and the
+    /// answer is `seek_exact`'s. The first and the last key share no
+    /// prefix, so no query is outside it and every seek reaches the
+    /// window, the ends included.
+    #[test]
+    fn the_hinted_seek_names_a_window_of_one_stride_that_holds_its_answer() {
+        let digits: Vec<Vec<u8>> = (0u32..2_000)
+            .map(|i| format!("{:08}", i * 50_000).into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = digits.iter().map(|k| k.as_slice()).collect();
+        let between: Vec<Vec<u8>> = (0u32..700)
+            .map(|i| format!("{:08}", i * 50_000 + 1).into_bytes())
+            .collect();
+        let mut probes: Vec<&[u8]> = between.iter().map(|k| k.as_slice()).collect();
+        // The ends: below every key, and above every key.
+        probes.push(b"");
+        probes.push(b"99999999");
+        let p = write(&build(&keys), "hint-window");
+        let idx = OrdIndex::open(&p, keys.len()).expect("opens");
+        for k in keys.iter().chain(probes.iter()) {
+            let want = idx.seek_exact(k, resolver(&keys));
+            let mut window = None;
+            let got = idx.seek_exact_hint(k, resolver(&keys), |lo, hi| window = Some((lo, hi)));
+            assert_eq!(got, want, "key {:?}", String::from_utf8_lossy(k));
+            let (lo, hi) = window.expect("every seek here reaches its window");
+            assert!(lo <= hi && hi - lo <= TOP_STRIDE, "one stride: {lo}..{hi}");
+            assert!(
+                lo <= want.0 && want.0 <= hi,
+                "the window {lo}..={hi} holds the rank {} for {:?}",
+                want.0,
+                String::from_utf8_lossy(k)
+            );
+            let h = head_of(k, idx.pfx);
+            if super::lower_bound(&idx.top, h) == 0 {
+                assert_eq!((lo, hi), (0, 0), "below every sample");
+            }
+        }
+        let _ = std::fs::remove_file(&p);
     }
 
     /// Sixteen zero-padded digits: the shape whose first ten bytes are

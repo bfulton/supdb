@@ -12337,3 +12337,273 @@ fn a_failed_presync_is_the_flushs_answer() {
     }
     assert_eq!(read_vec(&db, b"k9999"), vec![b"z".to_vec()]);
 }
+
+/// A scan's seek hints the directory lines of its stride window and the
+/// record hint estimates its span (`Options::seek_prefetch_dir`); both
+/// are hints, so every answer is the same with them and without, over the
+/// starts that put the window at the index's edges: a key in the last
+/// stride, the last key, above every key, below every key, and from the
+/// empty key, on a partitioned run of many strides, a one-key partition
+/// and an empty store, at a limit of `usize::MAX` -- the span a hint once
+/// wrapped on. Through the writer and through a handle.
+#[test]
+fn a_scans_answers_are_the_same_with_the_directory_hint_and_without() {
+    let build = |name: &str, hint: bool, keys: u32| -> (PathBuf, Db) {
+        let d = dir(&format!("{name}-{}", if hint { "hint" } else { "plain" }));
+        let opts = Options {
+            seek_prefetch_dir: hint,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        for k in 0..keys {
+            db.append(format!("key-{k:06}").as_bytes(), format!("v{k}").as_bytes());
+        }
+        if keys > 0 {
+            db.commit().unwrap();
+            db.flush().unwrap();
+        }
+        if keys > 1 {
+            assert!(db.levels().0 > 0, "{name}: a partition to seek in");
+        }
+        (d, db)
+    };
+    type Seen = Vec<(Vec<u8>, Vec<u8>)>;
+    let scan_all = |db: &Reader, from: &[u8]| -> (usize, Seen) {
+        let mut got = Vec::new();
+        let n = db
+            .scan(from, usize::MAX, |k, v| got.push((k.to_vec(), v.to_vec())))
+            .unwrap();
+        (n, got)
+    };
+    for (name, keys) in [
+        ("dirhint-run", 5_000u32),
+        ("dirhint-one", 1),
+        ("dirhint-empty", 0),
+    ] {
+        let (_da, a) = build(name, true, keys);
+        let (_db, b) = build(name, false, keys);
+        let last = keys.saturating_sub(1);
+        let starts: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"key-".to_vec(),
+            format!("key-{:06}", last / 64 * 64).into_bytes(),
+            format!("key-{:06}", last.saturating_sub(1)).into_bytes(),
+            format!("key-{last:06}").into_bytes(),
+            b"key-999999".to_vec(),
+            b"zzz".to_vec(),
+        ];
+        let ra = a.reader().unwrap();
+        let rb = b.reader().unwrap();
+        for from in &starts {
+            let want = (0..keys)
+                .filter(|k| format!("key-{k:06}").as_bytes() >= from.as_slice())
+                .count();
+            let (na, ga) = scan_all(&a, from.as_slice());
+            let (nb, gb) = scan_all(&b, from.as_slice());
+            assert_eq!(
+                na,
+                want,
+                "{name}: the count from {:?}",
+                String::from_utf8_lossy(from)
+            );
+            assert_eq!(
+                (na, &ga),
+                (nb, &gb),
+                "{name}: the writer, hint against none"
+            );
+            assert_eq!(
+                scan_all(&ra, from.as_slice()),
+                (na, ga.clone()),
+                "{name}: a handle with the hint"
+            );
+            assert_eq!(
+                scan_all(&rb, from.as_slice()),
+                (nb, gb),
+                "{name}: a handle without"
+            );
+        }
+    }
+}
+
+/// A seek on the block path hints its stride window's directory once a
+/// scan, through a handle and through the writer, and counts it
+/// (`Reader::dir_prefetches`, `Db::dir_prefetches`); the upkeep thread's
+/// pass over a lent burst hints nothing, since the settle resolves its
+/// keys from the last answer (`seek_exact_from`) and never seeks from
+/// the top, so a writer that scanned nothing stays at zero through a
+/// burst the thread filed.
+#[test]
+fn a_seek_counts_its_directory_hint_once_a_scan_and_the_threads_pass_none() {
+    // A drained store, one partition: every scan of ten is one seek.
+    let d = dir("dirhint-count");
+    let mut db = Db::create(&d, Options::default()).unwrap();
+    let key = |k: u32| format!("key-{k:06}").into_bytes();
+    for k in 0..5_000u32 {
+        db.append(&key(k), b"0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert!(db.levels().0 > 0, "a partition to seek in");
+    assert_eq!(db.dir_prefetches(), 0, "nothing scanned yet");
+    let live = db.reader().unwrap();
+    assert_eq!(live.dir_prefetches(), 0);
+    let mut sink = 0usize;
+    for i in 0..5u32 {
+        live.scan(&key(100 + i), 10, |_k, v| sink += v.len())
+            .unwrap();
+        assert_eq!(
+            live.dir_prefetches(),
+            u64::from(i) + 1,
+            "one hint a scan through the handle"
+        );
+    }
+    assert_eq!(
+        db.dir_prefetches(),
+        0,
+        "the handle's scans are not the writer's"
+    );
+    for i in 0..3u32 {
+        db.scan(&key(200 + i), 10, |_k, v| sink += v.len()).unwrap();
+        assert_eq!(
+            db.dir_prefetches(),
+            u64::from(i) + 1,
+            "one hint a scan through the writer"
+        );
+    }
+    assert_eq!(
+        live.dir_prefetches(),
+        5,
+        "and the writer's are not the handle's"
+    );
+    drop(live);
+    db.close().unwrap();
+
+    // A burst lent to the thread and filed with no scan of the writer's:
+    // the shape of `a_commit_that_syncs_lends_its_burst_to_the_thread`.
+    let d = dir("dirhint-burst");
+    let opts = Options {
+        upkeep: supdb::Upkeep::Background(1),
+        upkeep_inline_bursts: true,
+        partition_bytes: Some(256 << 10),
+        seal_max_pct: 0,
+        ..Options::default()
+    };
+    let mut db = Db::create(&d, opts).unwrap();
+    let keys = 20_000u32;
+    for k in 0..keys {
+        db.append(&key(k), b"0");
+    }
+    db.commit().unwrap();
+    db.flush().unwrap();
+    assert!(db.levels().0 > 0, "partitions for the forms to hang on");
+    let live = db.reader().unwrap();
+    // Reads around, through the handle: the commit lends the burst.
+    live.scan(&key(0), keys as usize, |_k, v| sink += v.len())
+        .unwrap();
+    // One hint a partition the scan crossed: a seek in each.
+    let crossed = db.levels().0 as u64;
+    assert_eq!(
+        live.dir_prefetches(),
+        crossed,
+        "one hint a partition crossed"
+    );
+    let passes = db.upkeep_counts()[0];
+    let mut x = 0x2545_F491_4F6C_DD1Du64;
+    for _ in 0..300 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let k = (x % keys as u64) as u32;
+        db.put(&key(k), b"a");
+    }
+    db.commit().unwrap();
+    db.settle().unwrap();
+    assert!(
+        db.upkeep_counts()[0] > passes,
+        "the thread's pass filed the burst"
+    );
+    assert_eq!(
+        db.dir_prefetches(),
+        0,
+        "no hint of the thread's, none of the writer's"
+    );
+    assert_eq!(live.dir_prefetches(), crossed, "and none on the handle");
+    std::hint::black_box(sink);
+}
+
+/// The directory hint is the reader's: a store written with it and one
+/// without leave the same segment and the same ordered index, byte for
+/// byte, so the magic does not move (`Options::seek_prefetch_dir`).
+#[test]
+fn the_directory_hint_writes_the_segment_and_the_ordered_index_the_default_does() {
+    let mut files: Vec<BTreeMap<String, Vec<u8>>> = Vec::new();
+    for hint in [true, false] {
+        let d = dir(if hint {
+            "dirhint-files"
+        } else {
+            "dirplain-files"
+        });
+        let opts = Options {
+            seek_prefetch_dir: hint,
+            ..Options::default()
+        };
+        let mut db = Db::create(&d, opts).unwrap();
+        for c in 0u32..3000 {
+            let k = format!("k{:04}", (c * 7919) % 2500);
+            db.append(k.as_bytes(), &c.to_le_bytes());
+            if c % 97 == 0 {
+                db.delete(k.as_bytes());
+            }
+            if c % 50 == 49 {
+                db.commit().unwrap();
+            }
+        }
+        db.flush().unwrap();
+        // A scan each way, so the hint ran over what it reads.
+        let mut n = 0usize;
+        db.scan(b"k1000", 100, |_, _| n += 1).unwrap();
+        assert!(n > 0);
+        drop(db);
+        let mut m = BTreeMap::new();
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            let name = p.file_name().unwrap().to_str().unwrap().to_string();
+            if name.ends_with(".sup") || name.ends_with(".oidx") || name.starts_with("ord-") {
+                m.insert(name, std::fs::read(&p).unwrap());
+            }
+        }
+        assert!(
+            m.keys().any(|n| n.ends_with(".sup")),
+            "the flush sealed a segment"
+        );
+        assert!(
+            m.keys()
+                .any(|n| n.ends_with(".oidx") || n.starts_with("ord-")),
+            "with its ordered index"
+        );
+        files.push(m);
+    }
+    let (a, b) = (&files[0], &files[1]);
+    assert_eq!(
+        a.keys().collect::<Vec<_>>(),
+        b.keys().collect::<Vec<_>>(),
+        "the same files"
+    );
+    // The superblock carries the second its finish landed in, so two
+    // seals that straddle a second differ in that one aligned word and
+    // nowhere else.
+    for (name, bytes) in a {
+        assert_eq!(bytes.len(), b[name].len(), "{name} differs in length");
+        let diff: Vec<usize> = bytes
+            .iter()
+            .zip(&b[name])
+            .enumerate()
+            .filter(|(_, (x, y))| x != y)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            diff.iter().all(|&i| i / 8 == diff[0] / 8),
+            "{name} differs past the superblock's finish second: {diff:?}"
+        );
+    }
+}

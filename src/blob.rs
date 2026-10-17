@@ -896,6 +896,60 @@ impl<B: Bytes> Blob<B> {
         }
     }
 
+    /// PROTOTYPE: a hint to fetch the directory's lines for the ranks
+    /// `rank` to `n` on, ahead of a seek that will read one of them;
+    /// nothing is waited for and nothing is read. A scan's start was three
+    /// fills in a row -- the stride's heads, then the directory word the
+    /// record hint needs, then the first record -- and the stride's window
+    /// is known before its heads are read, so the window's directory lines
+    /// asked for with the heads make the directory's fill the heads' and
+    /// not a fill of its own (`Options::seek_prefetch_dir`).
+    #[cfg(not(target_family = "wasm"))]
+    pub fn prefetch_dir(&self, rank: usize, n: usize) {
+        let Some((sec, idx)) = self.flat() else {
+            return;
+        };
+        let Some((_, dir)) = idx.regions(sec) else {
+            return;
+        };
+        let Some((a, b)) = idx.dir_span(rank, n) else {
+            return;
+        };
+        let b = b.min(dir.len());
+        if a < b {
+            crate::db::prefetch_lines(dir[a..].as_ptr(), b - a);
+        }
+    }
+
+    /// `prefetch_ranks` with the span's end estimated rather than read:
+    /// the directory word at `rank` says where the first record lies, and
+    /// `n` ranks at the index's mean record length says about where the
+    /// last does, capped at `cap` bytes and the region's end. The second
+    /// directory word `prefetch_ranks` reads is a load the hint waits for
+    /// before it can issue anything, on the scan's serial chain; an
+    /// estimate puts nothing there. Hints only: past the one word nothing
+    /// is read, and every sum saturates, since a span that wraps past a
+    /// scan's limit is the failure the checked profile exists for.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn prefetch_ranks_est(&self, rank: usize, n: usize, cap: usize) {
+        let Some((sec, idx)) = self.flat() else {
+            return;
+        };
+        let Some((recs, dir)) = idx.regions(sec) else {
+            return;
+        };
+        let Some(a) = idx.record_off(dir, rank) else {
+            return;
+        };
+        let b = a
+            .saturating_add(n.saturating_mul(idx.mean_record_len()))
+            .min(a.saturating_add(cap))
+            .min(recs.len());
+        if a < b {
+            crate::db::prefetch_lines(recs[a..].as_ptr(), b - a);
+        }
+    }
+
     /// The key at `rank` in key order.
     pub fn key_at(&self, rank: usize) -> Option<&[u8]> {
         let (sec, idx) = self.flat()?;

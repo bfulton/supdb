@@ -2677,6 +2677,38 @@ is the first scan's filing of the mixes' backlog is the shape to price
 next if the cell is to flip at the small rung: the settle's cost a write
 at a store that fits the cache, and the sorts and allocations around it.
 
+A scan's first record sits behind three serial fills: the ordered
+index's head stride, eight lines asked for at once; the directory word
+at the rank the stride's select lands on, read by the record hint
+before it can issue anything, since the hint's span is the span the
+two directory words name; and the first record. The stride window is
+fixed before the stride's lines are issued, so the directory lines of
+the window are hinted at the same moment now and the record hint's
+span is estimated from the mean record length, read once when the
+index is parsed, so the second word is never on the chain: two serial
+fills, not three (`Options::seek_prefetch_dir`; `supdb-dirplain` and
+`supdb-ingestdirplain` keep the three). The directory is 120 KB at
+thirty thousand keys and 1.2 MB at three hundred, touched about once a
+line in a pass, so the word is an L3 fill at every rung from thirty
+thousand, and the mem-floor prices one at 50 to 70 ns here; at ten
+thousand the store sits in the L2 and there is nothing to hide. Priced
+by the per-scan mean after the first scan, paired rep by rep in both
+orders: at a hundred thousand keys the durable arm read the new shape
+faster by 44 to 92 ns at the median of four sittings of twelve and
+twenty-four pairs and the buffered arm by 59 and 0 in twelve pairs and
+level in twenty-four; at three hundred thousand 4 to 154 ns in four
+sittings; at ten thousand 109 ns against and 67 for, in the two orders.
+None of it clears a sign test on this host, whose rep spread on one arm
+is 1.25 to 2.11 µs a scan at a hundred thousand keys. The profile is
+what resolves it: twenty-one scan passes of each arm in one process at
+three hundred thousand keys, 35,000 samples an arm, put 3.4% of the
+plain arm's samples on one instruction of the record walk and 0.5% of
+the new arm's, every other hot instruction within a few tenths of a
+percent between them -- a stall of about 55 ns a scan, the fill the
+window takes off the chain. The per-scan median the harness prints was
+rounded to a tenth of a microsecond and could not have seen it; it
+prints to the nanosecond now.
+
 #### The freeze that leaves its carry to the next look
 
 At level 1 the freeze is the one place the writer still does work for
@@ -5766,6 +5798,37 @@ device its pieces as they land and has something off the critical path
 issue the flushes behind it; and a quantity read from `/proc/self/io` is
 a count of folios dirtied, so a patch made in place after a writeback is
 a folio written twice to it, whatever the device sees.
+
+#### Out of core: what a miss costs on this host
+
+Every banked row is in-core -- the full rows top out at three million
+keys on a sixteen-gigabyte box -- so before an out-of-core rung is
+built the question is what a miss costs where it would be measured. A
+probe placed itself in a cgroup v1 group bounded at 256 MiB and read a
+1 GiB file written outside the group, fsynced and dropped from the
+cache, 10,000 random 4 KiB preads under `POSIX_FADV_RANDOM`: p50 38 µs,
+p90 51, p99 120, nine reads in ten under 50 µs, one block I/O per read
+(9,796 of 10,000 reached the device) at 35 µs each by the block layer's
+own clock; the same offsets again after a second drop read p50 35, and
+sixty seconds after the write p50 34. A disk answers a cold 4 KiB read
+in a hundred microseconds or more and the second pass no faster than
+the first; this is the host's page cache behind the virtio device, and
+it kept a file the guest wrote for at least a minute. So an
+out-of-core rung on this host measures misses served at 35 µs: the
+counts a bounded pass makes -- faults and block I/Os per operation --
+are what transfer to a disk, and the rates are this host's. 128 KiB
+sequential preads ran at 133 µs each, 830 MB/s; a 4 KiB write with
+fdatasync 188 µs at p50, one flush each.
+
+The kernel honours `MADV_WILLNEED` under `MADV_RANDOM`, which is the
+mechanism a cold scan's span prefetch needs: over the dropped file
+mapped `MADV_RANDOM`, one touch and then four dependent pages 4 KiB
+apart cost 4.6 major faults, 4.6 block I/Os and 182 µs an iteration;
+with `madvise(MADV_WILLNEED)` over the four between the first touch and
+their reads, 0.9 faults, 1.9 I/Os and 82 µs, the four pages fetched as
+one I/O behind the first. A cold scan of a hundred entries touches an
+index stride, a directory page and three or four record pages in
+series today; asked for together they are two round trips, not six.
 
 ### Arrival order
 

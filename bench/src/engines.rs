@@ -438,6 +438,11 @@ pub struct Supdb {
     /// The block walk issues no prefetches (`Options::scan_prefetch`
     /// off). `supdb-noprefetch`, and `supdb-ingestnoprefetch` buffered.
     noprefetch: bool,
+    /// A scan's seek without the stride window's directory hint, and the
+    /// record hint reading its span's two directory words
+    /// (`Options::seek_prefetch_dir` off). `supdb-dirplain`, and
+    /// `supdb-ingestdirplain` buffered.
+    dirplain: bool,
     /// A walk's prefetch reaching a kilobyte into the records rather than
     /// four (`Options::scan_prefetch_bytes`). `supdb-prefetch1k`, and
     /// `supdb-ingestprefetch1k` buffered.
@@ -740,6 +745,11 @@ struct Policy {
     /// The block walk issues no prefetches (`Options::scan_prefetch`
     /// off). `supdb-noprefetch`, and `supdb-ingestnoprefetch` buffered.
     noprefetch: bool,
+    /// A scan's seek without the stride window's directory hint, and the
+    /// record hint reading its span's two directory words
+    /// (`Options::seek_prefetch_dir` off). `supdb-dirplain`, and
+    /// `supdb-ingestdirplain` buffered.
+    dirplain: bool,
     /// A walk's prefetch reaching a kilobyte into the records rather than
     /// four (`Options::scan_prefetch_bytes`). `supdb-prefetch1k`, and
     /// `supdb-ingestprefetch1k` buffered.
@@ -1008,6 +1018,7 @@ impl Default for Policy {
             timers: false,
             wake: false,
             noprefetch: false,
+            dirplain: false,
             prefetch1k: false,
             manifestrename: false,
             manifestpending: false,
@@ -2538,6 +2549,33 @@ impl Supdb {
         )
     }
 
+    /// `supdb` whose scans seek without the stride window's directory
+    /// hint and whose record hint reads its span's two directory words
+    /// (`Options::seek_prefetch_dir` off): against `supdb` it prices
+    /// the fill taken off a scan's start.
+    pub fn create_dirplain(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                dirplain: true,
+                ..Policy::default()
+            },
+        )
+    }
+
+    /// `supdb-ingest` as `supdb-dirplain`.
+    pub fn create_ingest_dirplain(path: &Path) -> Res<Supdb> {
+        Supdb::with_policy(
+            path,
+            Policy {
+                partition: false,
+                durable: false,
+                dirplain: true,
+                ..Policy::default()
+            },
+        )
+    }
+
     /// `supdb` whose walks prefetch a kilobyte of records rather than
     /// four: against `supdb` it prices the span.
     pub fn create_prefetch1k(path: &Path) -> Res<Supdb> {
@@ -3151,6 +3189,7 @@ impl Supdb {
             timers,
             wake,
             noprefetch,
+            dirplain,
             prefetch1k,
             manifestrename,
             manifestpending,
@@ -3355,6 +3394,7 @@ impl Supdb {
             close_finish_inline: closeinline,
             upkeep_wake_parked: wake,
             scan_prefetch: !noprefetch,
+            seek_prefetch_dir: !dirplain,
             scan_prefetch_bytes: if prefetch1k { 1024 } else { 4096 },
             manifest_slots: !manifestrename,
             manifest_pending: manifestpending,
@@ -3480,6 +3520,7 @@ impl Supdb {
             timers,
             wake,
             noprefetch,
+            dirplain,
             prefetch1k,
             manifestrename,
             manifestpending,
@@ -3919,6 +3960,13 @@ impl Engine for Supdb {
                 "supdb-ingestnoprefetch"
             };
         }
+        if self.dirplain {
+            return if self.partition {
+                "supdb-dirplain"
+            } else {
+                "supdb-ingestdirplain"
+            };
+        }
         if self.prefetch1k {
             return if self.partition {
                 "supdb-prefetch1k"
@@ -4214,6 +4262,9 @@ impl Engine for Supdb {
             ("start_search", cs[1] as f64),
             ("walk_sparse", wk[1] as f64),
             ("walk_other", wk[2] as f64),
+            // Seeks that hinted their stride window's directory: see
+            // `Db::dir_prefetches`.
+            ("dir_prefetches", db.dir_prefetches() as f64),
             // Where the writer's scans spent their time before walking,
             // in microseconds: see `Db::scan_phases`.
             ("scan_take_us", ph[0] as f64 / 1e3),
@@ -4734,6 +4785,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-timers"
         | "supdb-wake"
         | "supdb-noprefetch"
+        | "supdb-dirplain"
         | "supdb-prefetch1k"
         | "supdb-manifestrename"
         | "supdb-manifestpending"
@@ -4812,6 +4864,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-ingesttimers"
         | "supdb-ingestwake"
         | "supdb-ingestnoprefetch"
+        | "supdb-ingestdirplain"
         | "supdb-ingestprefetch1k"
         | "supdb-ingestmanifestrename"
         | "supdb-ingestmanifestpending"
@@ -4952,6 +5005,8 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestwake" => Box::new(Supdb::create_ingest_wake(dir)?),
         "supdb-noprefetch" => Box::new(Supdb::create_noprefetch(dir)?),
         "supdb-ingestnoprefetch" => Box::new(Supdb::create_ingest_noprefetch(dir)?),
+        "supdb-dirplain" => Box::new(Supdb::create_dirplain(dir)?),
+        "supdb-ingestdirplain" => Box::new(Supdb::create_ingest_dirplain(dir)?),
         "supdb-prefetch1k" => Box::new(Supdb::create_prefetch1k(dir)?),
         "supdb-ingestprefetch1k" => Box::new(Supdb::create_ingest_prefetch1k(dir)?),
         "supdb-manifestrename" => Box::new(Supdb::create_manifestrename(dir)?),
@@ -5095,6 +5150,60 @@ mod tests {
                 0,
                 "{arm}: the second store read the first's key"
             );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `supdb-dirplain` and `supdb-ingestdirplain` are the policy with
+    /// `dirplain` alone set over their row's default, open under that
+    /// name, and the options they open the engine with differ from the
+    /// default's in `seek_prefetch_dir` alone on the scan's prefetch
+    /// path -- an arm sound only beside the default it is priced with
+    /// keeps that default's other settings (`CLAUDE.md`).
+    #[test]
+    fn the_dirplain_arms_differ_from_their_defaults_in_the_directory_hint_alone() {
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-dirplain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (name, buffered) in [("supdb-dirplain", false), ("supdb-ingestdirplain", true)] {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            let arm = if buffered {
+                Supdb::create_ingest_dirplain(&d)
+            } else {
+                Supdb::create_dirplain(&d)
+            }
+            .unwrap();
+            assert_eq!(arm.name(), name);
+            assert!(arm.dirplain && !arm.noprefetch && !arm.prefetch1k, "{name}");
+            let base_d = root.join(format!("{name}-base"));
+            std::fs::create_dir_all(&base_d).unwrap();
+            let base = if buffered {
+                Supdb::create_ingest(&base_d)
+            } else {
+                Supdb::create(&base_d)
+            }
+            .unwrap();
+            assert_eq!(arm.partition, base.partition, "{name}: the row's shape");
+            assert_eq!(arm.durable, base.durable, "{name}: the row's guarantee");
+            assert_eq!(arm.features(), base.features(), "{name}");
+            let (a, b) = (
+                arm.db.as_ref().unwrap().options(),
+                base.db.as_ref().unwrap().options(),
+            );
+            assert!(
+                !a.seek_prefetch_dir && b.seek_prefetch_dir,
+                "{name}: the one option"
+            );
+            assert_eq!(a.scan_prefetch, b.scan_prefetch, "{name}");
+            assert_eq!(a.scan_prefetch_bytes, b.scan_prefetch_bytes, "{name}");
+            drop(arm);
+            drop(base);
+            // The dispatch opens the arm by its name.
+            let opened_d = root.join(format!("{name}-open"));
+            std::fs::create_dir_all(&opened_d).unwrap();
+            let e = open(name, &opened_d, 1).unwrap();
+            assert_eq!(e.name(), name, "the dispatch");
         }
         let _ = std::fs::remove_dir_all(&root);
     }
