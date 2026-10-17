@@ -48,6 +48,24 @@ pub struct MachineInfo {
     /// -- `kvm`, `firecracker`, `vmware` -- or `hypervisor` when it says only
     /// that there is one. A noisy VM is a class like any other.
     pub virtualised: String,
+    /// The memory bound the run measured under (`bound::Bound`), as the
+    /// kernel read it back; none for an unbounded run. It is part of the
+    /// class, since a store past the bound reads from the device where
+    /// the same store unbounded reads from memory. Defaulted on read so
+    /// that every row banked before the field parses, as the three device
+    /// fields below are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_limit_bytes: Option<u64>,
+    /// The block device under the run's stores, as its queue reports it:
+    /// its readahead window, whether it calls itself rotational, and its
+    /// write cache's mode. None where the device cannot be found from the
+    /// temp directory or the file is unreadable, which a macOS row is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_ahead_kb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotational: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_cache: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -103,12 +121,20 @@ impl Row {
     /// Architecture, the CPU model, the core count, memory to the nearest
     /// power of two, and whether the host is virtualised. Two GitHub
     /// runners of the same instance type land in the same class, which is
-    /// what a band needs.
+    /// what a band needs. A bounded run appends its bound in exact
+    /// mebibytes (`/b1536m`): the bound decides what the store reads
+    /// from, so two bounds are two classes, and an unbounded row's class
+    /// is the string it always was, which `every_banked_row_keeps_its_class`
+    /// holds over every row under `runs/`.
     pub fn class(&self) -> String {
         let m = &self.machine;
         let cpu = slug(&m.cpu_model);
         let mem_gb = (m.mem_total_kb as f64 / 1048576.0).log2().round().exp2() as u64;
-        format!("{}/{cpu}/{}c/{mem_gb}g/{}", m.arch, m.cpus, m.virtualised)
+        let class = format!("{}/{cpu}/{}c/{mem_gb}g/{}", m.arch, m.cpus, m.virtualised);
+        match m.mem_limit_bytes {
+            Some(b) => format!("{class}/b{}m", b >> 20),
+            None => class,
+        }
     }
 }
 
@@ -205,6 +231,10 @@ mod tests {
                 pmu_available: false,
                 aslr_disabled: false,
                 virtualised: "firecracker".into(),
+                mem_limit_bytes: None,
+                read_ahead_kb: Some(128),
+                rotational: Some(true),
+                write_cache: Some("write back".into()),
             },
             measurements: vec![Measurement {
                 workload: "read".into(),
@@ -225,6 +255,152 @@ mod tests {
             back.class(),
             "x86_64/intel-r-xeon-r-processor-2.80ghz/4c/16g/firecracker"
         );
+        assert_eq!(back.machine.read_ahead_kb, Some(128));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A bound is a class of its own, in exact mebibytes, and two bounds
+    /// are two classes; without one the class is the unbounded string.
+    #[test]
+    fn a_bound_is_its_own_class() {
+        let mut row = Row::read(&first_banked_row()).unwrap();
+        let base = row.class();
+        assert!(!base.contains("/b"), "{base}");
+        row.machine.mem_limit_bytes = Some(1536 << 20);
+        let b1536 = row.class();
+        assert_eq!(b1536, format!("{base}/b1536m"));
+        row.machine.mem_limit_bytes = Some(2048 << 20);
+        let b2048 = row.class();
+        assert_eq!(b2048, format!("{base}/b2048m"));
+        assert_ne!(b1536, b2048);
+        // The JSON of a bounded row carries the bound; an unbounded row's
+        // carries no field for it, as the rows before the field had none.
+        let text = serde_json::to_string(&row).unwrap();
+        assert!(text.contains("\"mem_limit_bytes\":2147483648"), "{text}");
+        row.machine.mem_limit_bytes = None;
+        let text = serde_json::to_string(&row).unwrap();
+        assert!(!text.contains("mem_limit_bytes"), "{text}");
+    }
+
+    fn runs_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("runs")
+    }
+
+    fn banked_rows() -> Vec<PathBuf> {
+        let mut v = Vec::new();
+        for scale in ["quick", "full", "ooc"] {
+            let Ok(rd) = std::fs::read_dir(runs_dir().join(scale)) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                if e.path().extension().and_then(|s| s.to_str()) == Some("json") {
+                    v.push(e.path());
+                }
+            }
+        }
+        v.sort();
+        v
+    }
+
+    fn first_banked_row() -> PathBuf {
+        banked_rows()
+            .into_iter()
+            .find(|p| !p.to_string_lossy().contains("/ooc/"))
+            .expect("a banked row under runs/")
+    }
+
+    /// Every row banked before the machine gained its bound and device
+    /// fields parses with none of them, and its class is the string it
+    /// was: a field added to the machine re-buckets nothing. The classes
+    /// are a snapshot of the files present when the fields were added,
+    /// so a later change to `class` that moves one of them is caught
+    /// here, and a row banked after the snapshot is held only to parsing
+    /// and, outside `runs/ooc/`, to carrying no bound.
+    #[test]
+    fn every_banked_row_keeps_its_class() {
+        const XEON_280: &str = "x86_64/intel-r-xeon-r-processor-2.80ghz/4c/16g/hypervisor";
+        const XEON_210: &str = "x86_64/intel-r-xeon-r-processor-2.10ghz/4c/16g/hypervisor";
+        const XEON: &str = "x86_64/intel-r-xeon-r-processor/4c/16g/hypervisor";
+        let snapshot: &[(&str, &str)] = &[
+            ("full/20260927T214755Z-f87b394.json", XEON_280),
+            ("full/20260927T231042Z-260c09d.json", XEON_280),
+            ("full/20260928T091313Z-260c09d.json", XEON_280),
+            ("full/20260928T180204Z-f19abe5.json", XEON_280),
+            ("full/20260929T025048Z-5eabd8d.json", XEON_210),
+            ("quick/20260907T184735Z-4f0797c.json", XEON_280),
+            ("quick/20260914T045949Z-7344833.json", XEON_280),
+            ("quick/20260914T052409Z-9ef908a.json", XEON_280),
+            ("quick/20260914T194945Z-13ebfcd.json", XEON_280),
+            ("quick/20260915T010025Z-499c9b4.json", XEON_280),
+            ("quick/20260915T161912Z-5fda5d8.json", XEON_210),
+            ("quick/20260915T210115Z-400512b.json", XEON_280),
+            ("quick/20260916T000227Z-9e78797.json", XEON_280),
+            ("quick/20260916T005118Z-94a93d3.json", XEON_210),
+            ("quick/20260916T005857Z-d6b1e4d.json", XEON_280),
+            ("quick/20260916T022124Z-7a9391b.json", XEON_280),
+            ("quick/20260916T033905Z-c6af669.json", XEON_280),
+            ("quick/20260916T034414Z-c6af669.json", XEON_210),
+            ("quick/20260916T102539Z-6b75f98.json", XEON_280),
+            ("quick/20260916T112531Z-86940c3.json", XEON_280),
+            ("quick/20260916T113005Z-9d09fd7.json", XEON_280),
+            ("quick/20260916T131311Z-cb21c7e.json", XEON_280),
+            ("quick/20260916T133021Z-d0a8440.json", XEON_280),
+            ("quick/20260916T134450Z-33b864e.json", XEON_280),
+            ("quick/20260916T140750Z-9b4bae8.json", XEON_280),
+            ("quick/20260916T143244Z-1521f41.json", XEON_280),
+            ("quick/20260916T150101Z-628ecb6.json", XEON_280),
+            ("quick/20260916T154615Z-3a1235a.json", XEON_280),
+            ("quick/20260916T180836Z-069eecb.json", XEON_280),
+            ("quick/20260916T193913Z-820e03e.json", XEON_280),
+            ("quick/20260916T212033Z-1583179.json", XEON_280),
+            ("quick/20260916T232510Z-e2f4a83.json", XEON_280),
+            ("quick/20260917T094308Z-47e0f2b.json", XEON_210),
+            ("quick/20260923T084105Z-91870c8.json", XEON_280),
+            ("quick/20260927T213848Z-f87b394.json", XEON_280),
+            ("quick/20260927T230050Z-260c09d.json", XEON_280),
+            ("quick/20260928T175054Z-f19abe5.json", XEON_280),
+            ("quick/20261004T071938Z-b247414.json", XEON_280),
+            ("quick/20261005T002546Z-7476b89.json", XEON_210),
+            ("quick/20261005T021448Z-0cac4db.json", XEON_210),
+            ("quick/20261005T030257Z-a466e59.json", XEON_210),
+            ("quick/20261011T212304Z-db6fe5c.json", XEON),
+            ("quick/20261012T085748Z-3c42fff.json", XEON),
+            ("quick/20261012T112705Z-0968643.json", XEON),
+            ("quick/20261012T165604Z-81a21d7.json", XEON),
+            ("quick/20261012T183615Z-a0e1122.json", XEON),
+            ("quick/20261013T000540Z-f63607a.json", XEON),
+            ("quick/20261013T004708Z-570ce26.json", XEON),
+            ("quick/20261013T051945Z-8cbe619.json", XEON),
+            ("quick/20261013T103938Z-2b893ff.json", XEON),
+            ("quick/20261013T123455Z-4cff9e9.json", XEON),
+            ("quick/20261013T130539Z-503c1cf.json", XEON),
+        ];
+        let rows = banked_rows();
+        assert!(!rows.is_empty(), "no rows under {}", runs_dir().display());
+        let mut seen = 0;
+        for path in &rows {
+            let row = Row::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let rel = path
+                .strip_prefix(runs_dir())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if row.scale != Scale::Ooc {
+                assert_eq!(row.machine.mem_limit_bytes, None, "{rel}");
+                assert!(!row.class().contains("/b"), "{rel}: {}", row.class());
+            }
+            if let Some((_, class)) = snapshot.iter().find(|(f, _)| *f == rel) {
+                assert_eq!(row.class(), *class, "{rel}");
+                assert_eq!(row.machine.read_ahead_kb, None, "{rel}");
+                assert_eq!(row.machine.rotational, None, "{rel}");
+                assert_eq!(row.machine.write_cache, None, "{rel}");
+                seen += 1;
+            }
+        }
+        assert_eq!(
+            seen,
+            snapshot.len(),
+            "a snapshotted row is missing from runs/"
+        );
     }
 }

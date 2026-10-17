@@ -7,8 +7,9 @@
 //! discarded, because the first touch of a fresh file pays for allocation
 //! and first-fault costs that no steady state repeats.
 
+use crate::bound::Bound;
 use crate::engines::{self, Batch, Engine};
-use crate::env::IoCounters;
+use crate::env::{self, IoCounters};
 use crate::gate;
 use crate::hist::Hist;
 use crate::row::{Guarantee, MachineInfo, Measurement, Row};
@@ -16,7 +17,10 @@ use crate::workload::{db_key_into, KeyDist, KeyGen, Payload, Permutation, Rng};
 use crate::{ladder_from, Scale};
 use std::collections::BTreeMap;
 use std::io::Write as _;
-use std::path::Path;
+use std::os::unix::fs::FileExt as _;
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd as _;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 /// Every record the suite writes is this key and this value, so a figure
@@ -71,6 +75,146 @@ pub fn threads_of(quantity: &str) -> Option<usize> {
     count.strip_suffix('t')?.parse().ok()
 }
 
+/// The five counts a bounded row records around every timed phase, per
+/// operation of the phase: the operating threads' own device bytes and
+/// major faults, the rest of the process's device bytes (the merges'
+/// streaming, a comparator's background jobs), the group's refaults, and
+/// the device's read latency over the phase. Each is one count and never
+/// a sum of two, so a reader can tell the engine's reads from the
+/// kernel's readahead and both from the comparator's compaction.
+pub const COUNTS: [(&str, &str); 5] = [
+    ("read_bytes_per_op", "B/op"),
+    ("majfaults_per_op", "faults/op"),
+    ("bg_read_bytes_per_op", "B/op"),
+    ("refaults_per_op", "refaults/op"),
+    ("read_us_per_io", "us/io"),
+];
+
+/// The count a quantity's name is, under a thread suffix (`_3t`) or a lag
+/// suffix (`_lag10pct`) or none, or `None` for a quantity that is not one
+/// of the five. The suffixes are the ones the rates on the same workloads
+/// carry, so a count sits beside the rate it was taken around.
+pub fn count_of(quantity: &str) -> Option<&'static str> {
+    let base = COUNTS.iter().map(|(b, _)| *b).find(|b| {
+        quantity == *b
+            || quantity
+                .strip_prefix(*b)
+                .and_then(|rest| rest.strip_prefix('_'))
+                .is_some_and(|s| {
+                    s.strip_suffix('t')
+                        .is_some_and(|n| n.parse::<usize>().is_ok())
+                        || s.strip_prefix("lag")
+                            .and_then(|s| s.strip_suffix("pct"))
+                            .is_some_and(|n| n.parse::<u64>().is_ok())
+                })
+    })?;
+    Some(base)
+}
+
+/// A count's unit, by its base name.
+fn count_unit(base: &str) -> &'static str {
+    COUNTS
+        .iter()
+        .find(|(b, _)| *b == base)
+        .map_or("?", |(_, u)| u)
+}
+
+/// Which of a pass's phases run. Every phase in a row; `bench ab
+/// --passes` names a subset, for a question one phase answers at a rung
+/// where the whole pass is an hour. The loads are one name, since the
+/// second store exists for the shuffled load and the lag sweep, and is
+/// built only when one of them runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Passes {
+    pub load: bool,
+    pub read: bool,
+    pub read_threaded: bool,
+    pub scan: bool,
+    pub scan_threaded: bool,
+    pub mixes: bool,
+    pub scan_mixed: bool,
+    pub lag: bool,
+}
+
+impl Passes {
+    pub const NAMES: [&'static str; 8] = [
+        "load",
+        "read",
+        "read-threaded",
+        "scan",
+        "scan-threaded",
+        "mixes",
+        "scan-mixed",
+        "lag",
+    ];
+
+    pub fn all() -> Passes {
+        Passes {
+            load: true,
+            read: true,
+            read_threaded: true,
+            scan: true,
+            scan_threaded: true,
+            mixes: true,
+            scan_mixed: true,
+            lag: true,
+        }
+    }
+
+    /// A comma-separated list of `NAMES`; a name not among them is an
+    /// error naming it, and an empty list is one too.
+    pub fn parse(list: &str) -> Result<Passes, String> {
+        let mut p = Passes {
+            load: false,
+            read: false,
+            read_threaded: false,
+            scan: false,
+            scan_threaded: false,
+            mixes: false,
+            scan_mixed: false,
+            lag: false,
+        };
+        let mut any = false;
+        for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            any = true;
+            match name {
+                "load" => p.load = true,
+                "read" => p.read = true,
+                "read-threaded" => p.read_threaded = true,
+                "scan" => p.scan = true,
+                "scan-threaded" => p.scan_threaded = true,
+                "mixes" => p.mixes = true,
+                "scan-mixed" => p.scan_mixed = true,
+                "lag" => p.lag = true,
+                other => {
+                    return Err(format!(
+                        "no pass named {other:?}; the passes are {}",
+                        Passes::NAMES.join(",")
+                    ))
+                }
+            }
+        }
+        if !any {
+            return Err(format!(
+                "--passes names no pass; the passes are {}",
+                Passes::NAMES.join(",")
+            ));
+        }
+        Ok(p)
+    }
+}
+
+/// The smallest bound a run accepts: the floors alone hold a 64 MiB
+/// chase buffer, a prime of at least 16 MiB and the stores' own tables,
+/// and a bound below this is one the floors cannot run under, refused
+/// before anything is measured. It is also the known-red input the
+/// wrapper proves its gate on (`scripts/ooc.sh --prove-red`).
+pub const MIN_BOUND_BYTES: u64 = 256 << 20;
+
+/// The default divisor of a bounded run's read operations
+/// (`Plan::ops_div`).
+pub const OOC_OPS_DIV: u64 = 30;
+
 pub struct Plan {
     pub scale: Scale,
     pub arms: Vec<String>,
@@ -87,6 +231,21 @@ pub struct Plan {
     pub scan_len: usize,
     /// The reader-thread counts of this machine's class (`thread_counts`).
     pub threads: Vec<usize>,
+    /// What the read passes' operation counts are divided by: one at
+    /// quick and full, where every count is the rung's. Out of core a
+    /// point read is a device read of a few milliseconds, so `size` of
+    /// them at ten million keys is hours a pass, and a divided count
+    /// (`divided`) measures the same regime in minutes; the loads and the
+    /// lag bursts are never divided, since a store is built whole or not
+    /// at all.
+    pub ops_div: u64,
+    /// The memory bound the run measures under, entered before the plan
+    /// was made (`bound::Bound`), or none.
+    pub bound: Option<Bound>,
+    /// Which phases a pass runs: every one for a row, since `run` records
+    /// each phase's quantity whether it ran or not, and a subset only
+    /// through `ab`, which pairs what ran.
+    pub passes: Passes,
 }
 
 impl Plan {
@@ -102,7 +261,30 @@ impl Plan {
             batch: 1_000,
             scan_len: 100,
             threads: thread_counts(cpus),
+            ops_div: match scale {
+                Scale::Ooc => OOC_OPS_DIV,
+                Scale::Quick | Scale::Full => 1,
+            },
+            bound: None,
+            passes: Passes::all(),
         }
+    }
+
+    /// `n` operations under `ops_div`: `n` itself at a divisor of one,
+    /// and otherwise the quotient rounded up, floored at a thousand so
+    /// no divided pass is shorter than a thread hand-off is noisy, and
+    /// never more than `n`.
+    pub fn divided(&self, n: u64) -> u64 {
+        if self.ops_div <= 1 {
+            n
+        } else {
+            n.div_ceil(self.ops_div).max(1_000).min(n)
+        }
+    }
+
+    /// The bound's limit, as read back, or none.
+    pub fn bound_bytes(&self) -> Option<u64> {
+        self.bound.as_ref().map(Bound::limit)
     }
 }
 
@@ -429,20 +611,17 @@ impl Samples {
     }
 }
 
-pub fn run(
-    plan: &Plan,
-    machine: MachineInfo,
-    log: &mut dyn FnMut(&str),
-    bank: Option<&Path>,
-) -> Result<Row, String> {
-    let utc = crate::row::utc_now();
-    // Every stale working directory, not just this process's. The store a
-    // run builds is removed when `run` returns, so a run that is KILLED
-    // leaves it -- and at full scale that is tens of gigabytes. Two
-    // cancelled runs on the self-hosted M2 stranded their stores and
-    // nothing reclaimed them, because the cleanup here only knew its own
-    // pid. Two timing runs may not share a machine anyway, so anything
-    // matching the pattern is garbage from a run that is over.
+/// The directory a run builds its stores under, made fresh: every stale
+/// working directory goes first, not just this process's. The store a
+/// run builds is removed when `run` returns, so a run that is KILLED
+/// leaves it -- and at full scale that is tens of gigabytes. Two
+/// cancelled runs on the self-hosted M2 stranded their stores and
+/// nothing reclaimed them, because the cleanup here only knew its own
+/// pid. Two timing runs may not share a machine anyway, so anything
+/// matching the pattern is garbage from a run that is over. Apart from
+/// `run` so that a bounded run can write the scan floor's file here
+/// before it enters its bound (`write_scan_floor`).
+pub fn prepare_root() -> Result<PathBuf, String> {
     let tmp = std::env::temp_dir();
     if let Ok(entries) = std::fs::read_dir(&tmp) {
         for entry in entries.flatten() {
@@ -457,7 +636,25 @@ pub fn run(
     }
     let root = tmp.join(format!("supdb-bench-{}", std::process::id()));
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-    engines::check_matched(&plan.arms, &root)?;
+    Ok(root)
+}
+
+/// The scan floor's file size for a ladder topping at `top`: the top
+/// rung's records, capped (`SCAN_FLOOR_CAP`).
+pub fn scan_floor_bytes(top: u64, value_size: usize) -> u64 {
+    let rung = crate::ladder(top).last().copied().unwrap_or(0);
+    (rung * (KEY_SIZE + value_size) as u64).min(SCAN_FLOOR_CAP)
+}
+
+pub fn run(
+    plan: &Plan,
+    machine: MachineInfo,
+    log: &mut dyn FnMut(&str),
+    bank: Option<&Path>,
+    root: &Path,
+) -> Result<Row, String> {
+    let utc = crate::row::utc_now();
+    engines::check_matched(&plan.arms, root)?;
 
     let rungs = ladder_from(plan.bottom, plan.top);
     let payload = Payload::new(plan.value_size, 0.5, 0xE1);
@@ -467,13 +664,41 @@ pub fn run(
     let started = Instant::now();
 
     // The floors first: what the device does with no engine in the way.
-    let floor_bytes =
-        (*rungs.last().unwrap_or(&0) * (KEY_SIZE + plan.value_size) as u64).min(SCAN_FLOOR_CAP);
+    let floor_bytes = scan_floor_bytes(*rungs.last().unwrap_or(&0), plan.value_size);
+    let floor = root.join("scan-floor.dat");
     // The page floor's mappings, held to the row's end (`FreshPages`).
     let mut fresh: Vec<FreshPages> = Vec::new();
+    // The seek floors, under a bound: the device's random read over the
+    // scan floor's file, cold, and again over the same offsets.
+    let bounded = plan.bound.is_some();
+    let seek_floors = |s: &mut Samples, rep: usize| -> Result<String, String> {
+        if !bounded {
+            return Ok(String::new());
+        }
+        drop_cache(&floor)?;
+        let first = seek_floor(&floor)?;
+        drop_cache(&floor)?;
+        let again = seek_floor(&floor)?;
+        if rep > 0 {
+            for (name, f) in [("seek-floor", &first), ("seek-floor-again", &again)] {
+                s.push(name, None, FLOOR_ARM, Guarantee::Buffered, ("p50_us", "us"), f.p50_us);
+                s.push(name, None, FLOOR_ARM, Guarantee::Buffered, ("p99_us", "us"), f.p99_us);
+            }
+        }
+        Ok(format!(
+            "  seek p50 {:>7.0} p99 {:>7.0} us x{:.2}  again p50 {:>7.0} p99 {:>7.0} us x{:.2}",
+            first.p50_us,
+            first.p99_us,
+            first.amplification,
+            again.p50_us,
+            again.p99_us,
+            again.amplification
+        ))
+    };
     for rep in 0..=plan.reps {
-        let wal = wal_floor(&root, plan, &payload)?;
-        let scan = scan_floor(&root, floor_bytes)?;
+        let wal = wal_floor(root, plan, &payload)?;
+        let scan = scan_floor(root, floor_bytes)?;
+        let seek = seek_floors(&mut s, rep)?;
         let mem = mem_floor();
         let (page, held) = page_floor()?;
         fresh.push(held);
@@ -514,7 +739,7 @@ pub fn run(
             );
         }
         log(&format!(
-            "{:>7}s  floors rep {rep}{}  wal {wal:>10.0} ops/s  mmap {:>8.2} GB/s  chase {:>9.0}/s  page {:>5.2} us",
+            "{:>7}s  floors rep {rep}{}  wal {wal:>10.0} ops/s  mmap {:>8.2} GB/s  chase {:>9.0}/s  page {:>5.2} us{seek}",
             started.elapsed().as_secs(),
             if rep == 0 { " (warmup)" } else { "" },
             scan / 1e9,
@@ -527,8 +752,16 @@ pub fn run(
     // the whole rung phase -- the days-long part, on the host that ran out
     // of disk. Reclaimed here rather than by the cleanup at the end, which
     // a killed run never reaches. The WAL floor already removes its own.
-    let floor = root.join("scan-floor.dat");
-    if let Ok(m) = std::fs::metadata(&floor) {
+    // Under a bound the file stays: the seek floors read it after every
+    // rep of every rung, as the page floor is sampled, and a bounded
+    // ladder's top is a gigabyte or so of it.
+    if bounded {
+        log(&format!(
+            "{:>7}s  the scan floor's file stays for the seek floors, {:.1} GB",
+            started.elapsed().as_secs(),
+            floor_bytes as f64 / 1e9
+        ));
+    } else if let Ok(m) = std::fs::metadata(&floor) {
         let bytes = m.len();
         if std::fs::remove_file(&floor).is_ok() {
             log(&format!(
@@ -639,6 +872,14 @@ pub fn run(
                         let q = threaded_quantity("entries_per_s", *threads);
                         s.push("scan-mixed", sz, arm, g, (q.as_str(), "entries/s"), *v);
                     }
+                    // The counts around each phase, a bounded row's only.
+                    for (workload, suffix, c) in &one.phase_counts {
+                        for (base, v) in c.each() {
+                            let Some(v) = v else { continue };
+                            let q = format!("{base}{suffix}");
+                            s.push(workload, sz, arm, g, (q.as_str(), count_unit(base)), v);
+                        }
+                    }
                 }
                 let top = *plan.threads.last().unwrap_or(&1);
                 let at_top = |v: &[(usize, f64)]| {
@@ -653,8 +894,13 @@ pub fn run(
                 let rss = resident_bytes()
                     .map(|b| format!("{:.2} GB", b as f64 / 1e9))
                     .unwrap_or_else(|| "-".into());
+                // A bounded pass's self-check per phase: the operating
+                // threads' device bytes cover their major faults, which
+                // cover the group's refaults, or the counts are odd and
+                // the line says so before anyone reads the cells.
+                let counts = one.counts_verdicts();
                 log(&format!(
-                    "{:>7}s  size {size:>9}  rep {rep}{}  {arm:<15} load {:>10.0} ops/s  read {:>10.0}/s  {top}t {:>10.0}/s  scan {:>11.0}/s  {top}t {:>11.0}/s  ycsb-A {:>9.0}/s  prime {:>5.2} us/pg  rss {rss}",
+                    "{:>7}s  size {size:>9}  rep {rep}{}  {arm:<15} load {:>10.0} ops/s  read {:>10.0}/s  {top}t {:>10.0}/s  scan {:>11.0}/s  {top}t {:>11.0}/s  ycsb-A {:>9.0}/s  prime {:>5.2} us/pg  rss {rss}{counts}",
                     started.elapsed().as_secs(),
                     if rep == 0 { " (warmup)" } else { "" },
                     one.load_ops_s,
@@ -669,7 +915,10 @@ pub fn run(
             // The price of a fresh page as this rep leaves it for the next
             // (`page_floor`): what the pass after it will pay for its
             // tables and its files' pages, read where the loads are and not
-            // only at the row's start.
+            // only at the row's start. Under a bound the seek floors are
+            // sampled here too, since the device a rep leaves behind --
+            // its queue, the host's cache of what the rep read -- is the
+            // device the next pass reads from.
             let (page, held) = page_floor()?;
             fresh.push(held);
             if rep > 0 {
@@ -681,6 +930,13 @@ pub fn run(
                     ("pages_per_s", "pages/s"),
                     page,
                 );
+            }
+            let seek = seek_floors(&mut s, rep)?;
+            if !seek.is_empty() {
+                log(&format!(
+                    "{:>7}s  size {size:>9}  rep {rep}  floors{seek}",
+                    started.elapsed().as_secs()
+                ));
             }
         }
         // Bank the row now that this rung is whole. A rung past the memory
@@ -772,10 +1028,16 @@ struct OnePass {
     /// What the engine says it did, rather than how fast; see
     /// `Engine::counters`.
     counters: Vec<(&'static str, f64)>,
+    /// A bounded pass's counts around each timed phase (`PhaseCounts`):
+    /// the phase's workload, the suffix its quantities carry (`_3t`,
+    /// `_lag10pct`, or none), and the counts. Empty unbounded.
+    phase_counts: Vec<(String, String, PhaseCounts)>,
 }
 
 impl OnePass {
-    /// Every quantity of the pass under one name, for `ab` to pair.
+    /// Every quantity of the pass under one name, for `ab` to pair. A
+    /// phase the plan's passes left out is a NaN here and is skipped, so
+    /// a pairing over a subset pairs the subset.
     fn flat(&self) -> Vec<(String, f64)> {
         let mut v = vec![
             ("prime us_per_page".into(), self.prime_us_per_page),
@@ -787,6 +1049,7 @@ impl OnePass {
             ("read p99_us".into(), self.p99_us),
             ("scan entries_per_s".into(), self.scan_entries_s),
         ];
+        v.retain(|(_, x)| !x.is_nan());
         for (pct, x) in &self.scan_lag {
             v.push((format!("scan-lag entries_per_s_lag{pct}pct"), *x));
         }
@@ -808,8 +1071,206 @@ impl OnePass {
         for (n, x) in &self.counters {
             v.push((format!("count {n}"), *x));
         }
+        for (workload, suffix, c) in &self.phase_counts {
+            for (base, x) in c.each() {
+                if let Some(x) = x {
+                    v.push((format!("{workload} {base}{suffix}"), x));
+                }
+            }
+        }
         v
     }
+
+    /// The pass line's self-check: one word a phase, or nothing for an
+    /// unbounded pass.
+    fn counts_verdicts(&self) -> String {
+        if self.phase_counts.is_empty() {
+            return String::new();
+        }
+        let words: Vec<String> = self
+            .phase_counts
+            .iter()
+            .map(|(w, suffix, c)| {
+                format!(
+                    "{w}{suffix} {}",
+                    if c.plausible { "ok" } else { "odd" }
+                )
+            })
+            .collect();
+        format!("  counts {}", words.join(", "))
+    }
+}
+
+/// The counts a bounded row records around one timed phase, per
+/// operation of the phase (`COUNTS`), from readings taken before its
+/// first operation and after its last and never between.
+#[derive(Clone, Copy, Debug)]
+struct PhaseCounts {
+    /// The operating threads' own device bytes read, from each thread's
+    /// `/proc/thread-self/io`.
+    read_bytes_per_op: f64,
+    /// The operating threads' own major faults, from each thread's
+    /// `/proc/thread-self/stat`.
+    majfaults_per_op: f64,
+    /// The whole process's device bytes read less the operating threads':
+    /// the merges' streaming and a comparator's background jobs, named
+    /// rather than blended into the readers'.
+    bg_read_bytes_per_op: f64,
+    /// The group's `workingset_refault_file`, which is every thread's.
+    refaults_per_op: f64,
+    /// The device's read ticks over its read I/Os across the phase,
+    /// device-wide; none where the device's stat file is unreadable.
+    read_us_per_io: Option<f64>,
+    /// `read_bytes / 4096 >= majfaults >= refaults`: every major fault
+    /// read at least a page from the device, and a refault is a major
+    /// fault of a page the group had and lost. A phase that fails it has
+    /// a count that is not what its name says, and the pass line says so.
+    plausible: bool,
+}
+
+impl PhaseCounts {
+    /// Each count under its base name, in `COUNTS` order.
+    fn each(&self) -> [(&'static str, Option<f64>); 5] {
+        [
+            (COUNTS[0].0, Some(self.read_bytes_per_op)),
+            (COUNTS[1].0, Some(self.majfaults_per_op)),
+            (COUNTS[2].0, Some(self.bg_read_bytes_per_op)),
+            (COUNTS[3].0, Some(self.refaults_per_op)),
+            (COUNTS[4].0, self.read_us_per_io),
+        ]
+    }
+}
+
+/// One reading of everything a phase's counts are deltas of.
+struct CountSnap {
+    /// The whole process's device bytes.
+    process: IoCounters,
+    /// This thread's own device bytes and major faults, which are the
+    /// operating thread's for a single-threaded phase.
+    own_read: u64,
+    own_majflt: u64,
+    /// The group's refaults.
+    refaults: u64,
+    /// The device's (read I/Os, read ticks in ms), where readable.
+    dev: Option<(u64, u64)>,
+}
+
+/// Takes the readings around a bounded pass's phases, and nothing for
+/// an unbounded one. The device is the temp directory's, falling back to
+/// `vda`, and its stat file read once to decide whether it is there.
+struct Counting<'a> {
+    bound: Option<&'a Bound>,
+    dev_stat: Option<PathBuf>,
+    out: Vec<(String, String, PhaseCounts)>,
+}
+
+impl<'a> Counting<'a> {
+    fn new(bound: Option<&'a Bound>, dir: &Path) -> Counting<'a> {
+        let dev_stat = bound.map(|_| {
+            let dev = env::block_device_of(dir).unwrap_or_else(|| "vda".to_string());
+            PathBuf::from(format!("/sys/block/{dev}/stat"))
+        });
+        let dev_stat = dev_stat.filter(|p| dev_read_stat(p).is_some());
+        Counting {
+            bound,
+            dev_stat,
+            out: Vec::new(),
+        }
+    }
+
+    /// The readings before a phase's first operation, or none unbounded.
+    fn begin(&self) -> Option<CountSnap> {
+        let bound = self.bound?;
+        Some(CountSnap {
+            process: IoCounters::read_now(),
+            own_read: thread_read_bytes(),
+            own_majflt: majflt_self(),
+            refaults: bound.stat().workingset_refault_file,
+            dev: self.dev_stat.as_deref().and_then(dev_read_stat),
+        })
+    }
+
+    /// The readings after a phase's last operation, against `begun`, over
+    /// `ops` operations; `workers` is the operating threads' own (device
+    /// bytes, major faults) summed where the phase ran on threads of its
+    /// own, and this thread's delta otherwise.
+    fn end(
+        &mut self,
+        begun: Option<CountSnap>,
+        workload: &str,
+        suffix: &str,
+        workers: Option<(u64, u64)>,
+        ops: u64,
+    ) {
+        let (Some(b), Some(bound)) = (begun, self.bound) else {
+            return;
+        };
+        let process = IoCounters::read_now().since(&b.process).read_bytes;
+        let (own_read, own_majflt) = workers.unwrap_or_else(|| {
+            (
+                thread_read_bytes().saturating_sub(b.own_read),
+                majflt_self().saturating_sub(b.own_majflt),
+            )
+        });
+        let refaults = bound
+            .stat()
+            .workingset_refault_file
+            .saturating_sub(b.refaults);
+        let per = |n: u64| n as f64 / ops.max(1) as f64;
+        let read_us_per_io = match (b.dev, self.dev_stat.as_deref().and_then(dev_read_stat)) {
+            (Some((ios0, ticks0)), Some((ios1, ticks1))) if ios1 > ios0 => {
+                Some((ticks1.saturating_sub(ticks0) * 1000) as f64 / (ios1 - ios0) as f64)
+            }
+            _ => None,
+        };
+        self.out.push((
+            workload.to_string(),
+            suffix.to_string(),
+            PhaseCounts {
+                read_bytes_per_op: per(own_read),
+                majfaults_per_op: per(own_majflt),
+                bg_read_bytes_per_op: per(process.saturating_sub(own_read)),
+                refaults_per_op: per(refaults),
+                read_us_per_io,
+                plausible: own_read / 4096 >= own_majflt && own_majflt >= refaults,
+            },
+        ));
+    }
+}
+
+/// `/sys/block/<dev>/stat`'s (read I/Os, read ticks in ms): the first and
+/// fourth fields (`Documentation/block/stat.rst`).
+fn dev_read_stat(path: &Path) -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut f = text.split_whitespace().map(|x| x.parse::<u64>().ok());
+    let ios = f.next()??;
+    let ticks = f.nth(2)??;
+    Some((ios, ticks))
+}
+
+/// This thread's own bytes read from the device so far, from
+/// `/proc/thread-self/io`.
+fn thread_read_bytes() -> u64 {
+    std::fs::read_to_string("/proc/thread-self/io")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("read_bytes:"))
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// This thread's major page faults so far: the tenth field after the
+/// comm's closing parenthesis, two past the minor faults.
+fn majflt_self() -> u64 {
+    std::fs::read_to_string("/proc/thread-self/stat").map_or(0, |s| stat_majflt(&s))
+}
+
+fn stat_majflt(stat: &str) -> u64 {
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(9).and_then(|v| v.parse().ok()))
+        .unwrap_or(0)
 }
 
 fn one_pass(
@@ -822,11 +1283,18 @@ fn one_pass(
 ) -> Result<OnePass, String> {
     // Ordered load, then reads, scans and the YCSB mixes over it. The
     // store opens into a primed pool (`prime_fresh_pool`), as every store
-    // a pass opens does.
-    let prime_a = prime_fresh_pool(prime_bytes_for(size))?;
+    // a pass opens does. Under a bound every timed phase has its counts
+    // read around it (`Counting`), and the plan's passes say which phases
+    // run at all; a phase left out leaves a NaN where its rate would be.
+    let passes = plan.passes;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    // The directory first, since the counting finds the device through it.
+    let mut counting = Counting::new(plan.bound.as_ref(), dir);
+    let prime_a = prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
     let mut e = engines::open(arm, dir, map_gb)?;
+    let c0 = counting.begin();
     let (load_s, wrote) = load(e.as_mut(), size, plan, payload, |i| i)?;
+    counting.end(c0, "load", "", None, size);
     let stored = size as f64 * (KEY_SIZE + plan.value_size) as f64;
     // Read here so that this and the device bytes describe one moment: what
     // the engine wrote to get there, and what it occupies having got there.
@@ -848,19 +1316,27 @@ fn one_pass(
     // about 3% and is not where a size comparison turns.
     let on_disk = e.size_bytes();
 
+    // The point reads: `size` of them, or the divided count out of core
+    // (`Plan::divided`), each a key drawn uniformly over the loaded set.
+    let reads = plan.divided(size);
     let mut kb = [0u8; KEY_SIZE];
     let mut g = KeyGen::new(KeyDist::Uniform, size, 7);
     let mut h = Hist::new();
-    phase_mark(arm, "read", "start");
-    let t = Instant::now();
-    for _ in 0..size {
-        db_key_into(g.next(), &mut kb);
-        let t1 = Instant::now();
-        e.get(&kb)?;
-        h.record(t1.elapsed().as_nanos() as u64);
+    let mut read_s = f64::NAN;
+    if passes.read {
+        let c0 = counting.begin();
+        phase_mark(arm, "read", "start");
+        let t = Instant::now();
+        for _ in 0..reads {
+            db_key_into(g.next(), &mut kb);
+            let t1 = Instant::now();
+            e.get(&kb)?;
+            h.record(t1.elapsed().as_nanos() as u64);
+        }
+        read_s = t.elapsed().as_secs_f64();
+        phase_mark(arm, "read", "end");
+        counting.end(c0, "read", "", None, reads);
     }
-    let read_s = t.elapsed().as_secs_f64();
-    phase_mark(arm, "read", "end");
 
     // The same reads over each thread count, on the store as loaded and
     // with the writer idle: the single-threaded pass's operations on every
@@ -871,19 +1347,34 @@ fn one_pass(
     // thread must read back.
     let mut reads_s_threaded = Vec::with_capacity(plan.threads.len());
     for &threads in &plan.threads {
-        let ops = size * threads as u64;
-        let (secs, bytes) = threaded(e.as_ref(), "read", threads, ops, size, 0x7EAD, Op::Get)?;
+        if !passes.read_threaded {
+            break;
+        }
+        let ops = reads * threads as u64;
+        let c0 = counting.begin();
+        let got = threaded(
+            e.as_ref(),
+            "read",
+            threads,
+            ops,
+            size,
+            0x7EAD,
+            Op::Get,
+            c0.is_some(),
+        )?;
+        counting.end(c0, "read", &format!("_{threads}t"), Some(got.own), ops);
         let want = ops * plan.value_size as u64;
-        if bytes != want {
+        if got.bytes != want {
             return Err(format!(
-                "{arm} at {size}: point reads on {threads} threads read back {bytes} bytes \
-                 and the store holds {want}; a reader over a different store is not a measurement"
+                "{arm} at {size}: point reads on {threads} threads read back {} bytes \
+                 and the store holds {want}; a reader over a different store is not a measurement",
+                got.bytes
             ));
         }
-        reads_s_threaded.push((threads, ops as f64 / secs));
+        reads_s_threaded.push((threads, ops as f64 / got.secs));
     }
 
-    let scans = (size / plan.scan_len as u64).max(1);
+    let scans = plan.divided((size / plan.scan_len as u64).max(1));
     let scan_keys = size.saturating_sub(plan.scan_len as u64).max(1);
     let mut g2 = KeyGen::new(KeyDist::Uniform, scan_keys, 11);
     // With `SUPDB_SCAN_OPS` set, every scan of the pass is timed on its
@@ -894,20 +1385,25 @@ fn one_pass(
     // every scan are a cost the rows must not carry.
     let per_op = std::env::var_os("SUPDB_SCAN_OPS").is_some();
     let mut op_us: Vec<f64> = Vec::new();
-    phase_mark(arm, "scan", "start");
-    let t = Instant::now();
-    for _ in 0..scans {
-        db_key_into(g2.next(), &mut kb);
-        if per_op {
-            let t0 = Instant::now();
-            e.range(&kb, plan.scan_len)?;
-            op_us.push(t0.elapsed().as_secs_f64() * 1e6);
-        } else {
-            e.range(&kb, plan.scan_len)?;
+    let mut scan_s = f64::NAN;
+    if passes.scan {
+        let c0 = counting.begin();
+        phase_mark(arm, "scan", "start");
+        let t = Instant::now();
+        for _ in 0..scans {
+            db_key_into(g2.next(), &mut kb);
+            if per_op {
+                let t0 = Instant::now();
+                e.range(&kb, plan.scan_len)?;
+                op_us.push(t0.elapsed().as_secs_f64() * 1e6);
+            } else {
+                e.range(&kb, plan.scan_len)?;
+            }
         }
+        scan_s = t.elapsed().as_secs_f64();
+        phase_mark(arm, "scan", "end");
+        counting.end(c0, "scan", "", None, scans);
     }
-    let scan_s = t.elapsed().as_secs_f64();
-    phase_mark(arm, "scan", "end");
     if per_op && !op_us.is_empty() {
         let mut sorted = op_us.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -938,8 +1434,12 @@ fn one_pass(
     // entries.
     let mut scan_entries_s_threaded = Vec::with_capacity(plan.threads.len());
     for &threads in &plan.threads {
-        let ops = size * threads as u64;
-        let (secs, bytes) = threaded(
+        if !passes.scan_threaded {
+            break;
+        }
+        let ops = plan.divided(size) * threads as u64;
+        let c0 = counting.begin();
+        let got = threaded(
             e.as_ref(),
             "scan",
             threads,
@@ -947,19 +1447,23 @@ fn one_pass(
             scan_keys,
             0x5CA0,
             Op::Range(plan.scan_len),
+            c0.is_some(),
         )?;
+        counting.end(c0, "scan", &format!("_{threads}t"), Some(got.own), ops);
         let want = ops * (plan.scan_len as u64).min(size) * plan.value_size as u64;
-        if bytes != want {
+        if got.bytes != want {
             return Err(format!(
-                "{arm} at {size}: scans on {threads} threads read back {bytes} bytes \
-                 and the store holds {want}; a reader over a different store is not a measurement"
+                "{arm} at {size}: scans on {threads} threads read back {} bytes \
+                 and the store holds {want}; a reader over a different store is not a measurement",
+                got.bytes
             ));
         }
-        scan_entries_s_threaded.push((threads, (ops * plan.scan_len as u64) as f64 / secs));
+        scan_entries_s_threaded.push((threads, (ops * plan.scan_len as u64) as f64 / got.secs));
     }
 
     let mut ycsb_ops_s = Vec::with_capacity(YCSB.len());
     let mut inserted = 0u64;
+    let mix_ops = plan.divided(ycsb_ops(size));
     // With `SUPDB_MIX_COUNTERS` set, the store's counters around each mix,
     // as `SUPDB_LAG_COUNTERS` reads them around a lag point: one
     // `mixcounters` line a mix on stderr, read before the mix and after it
@@ -967,6 +1471,9 @@ fn one_pass(
     // the line's burst is zero and its pass is the whole mix.
     let mix_counting = std::env::var_os("SUPDB_MIX_COUNTERS").is_some();
     for letter in YCSB_ORDER {
+        if !passes.mixes {
+            break;
+        }
         let w = YCSB.iter().find(|w| w.0 == letter).unwrap();
         let c0 = if mix_counting {
             e.counters()
@@ -979,10 +1486,12 @@ fn one_pass(
             (0, 0)
         };
         let mix = format!("ycsb-{letter}");
+        let cb = counting.begin();
         phase_mark(arm, &mix, "start");
-        let secs = ycsb(e.as_mut(), arm, w, size, &mut inserted, payload)?;
+        let secs = ycsb(e.as_mut(), arm, w, size, mix_ops, &mut inserted, payload)?;
         phase_mark(arm, &mix, "end");
-        ycsb_ops_s.push((letter, ycsb_ops(size) as f64 / secs));
+        counting.end(cb, &mix, "", None, mix_ops);
+        ycsb_ops_s.push((letter, mix_ops as f64 / secs));
         if mix_counting {
             let c1 = e.counters();
             counters_line(
@@ -1009,8 +1518,12 @@ fn one_pass(
     // above.
     let mut scan_mixed_threaded = Vec::with_capacity(plan.threads.len());
     for &threads in &plan.threads {
-        let ops = size * threads as u64;
-        let (secs, bytes) = threaded(
+        if !passes.scan_mixed {
+            break;
+        }
+        let ops = plan.divided(size) * threads as u64;
+        let c0 = counting.begin();
+        let got = threaded(
             e.as_ref(),
             "scan-mixed",
             threads,
@@ -1018,15 +1531,18 @@ fn one_pass(
             scan_keys,
             0x5CA1,
             Op::Range(plan.scan_len),
+            c0.is_some(),
         )?;
+        counting.end(c0, "scan-mixed", &format!("_{threads}t"), Some(got.own), ops);
         let want = ops * (plan.scan_len as u64).min(size) * plan.value_size as u64;
-        if bytes < want {
+        if got.bytes < want {
             return Err(format!(
-                "{arm} at {size}: scans on {threads} threads after the mixes read back {bytes} bytes \
-                 and the loaded store alone holds {want}; a reader over a different store is not a measurement"
+                "{arm} at {size}: scans on {threads} threads after the mixes read back {} bytes \
+                 and the loaded store alone holds {want}; a reader over a different store is not a measurement",
+                got.bytes
             ));
         }
-        scan_mixed_threaded.push((threads, (ops * plan.scan_len as u64) as f64 / secs));
+        scan_mixed_threaded.push((threads, (ops * plan.scan_len as u64) as f64 / got.secs));
     }
     // A pass opens two stores -- this one, and a fresh one below for the
     // shuffled load and the lag sweep -- so the counts of the first are
@@ -1039,29 +1555,113 @@ fn one_pass(
     release_freed_memory();
     let _ = std::fs::remove_dir_all(dir);
 
-    // The same keys in a shuffled order, on a fresh store, into a primed
-    // pool again.
-    let prime_b = prime_fresh_pool(prime_bytes_for(size))?;
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let mut e = engines::open(arm, dir, map_gb)?;
-    let perm = Permutation::new(size, 0x5EED);
-    let (shuf_s, _) = load(e.as_mut(), size, plan, payload, |i| perm.at(i))?;
-
-    // The lag sweep, on the store the shuffled load just left, so it
-    // costs no load of its own: the same scans as the scan workload, at
-    // each depth of unmerged writes. The first point is the drained
-    // store; each point after it writes another slice of the store and
-    // scans without merging in between, so the curve is scan throughput
-    // against merge lag rather than one number at whatever lag a
-    // workload happened to leave.
+    // The second store, for the shuffled load and the lag sweep, built
+    // only when one of them runs: the same keys in a shuffled order, on a
+    // fresh store, into a primed pool again.
     let mut scan_lag = Vec::with_capacity(LAG_PCT.len());
     let mut burst_lag = Vec::with_capacity(LAG_PCT.len());
+    let mut prime_b = f64::NAN;
+    let mut shuf_s = f64::NAN;
+    if passes.load || passes.lag {
+        prime_b = prime_fresh_pool(prime_bytes_for(size, plan.bound_bytes()))?;
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let mut e = engines::open(arm, dir, map_gb)?;
+        let perm = Permutation::new(size, 0x5EED);
+        let c0 = counting.begin();
+        let (secs, _) = load(e.as_mut(), size, plan, payload, |i| perm.at(i))?;
+        counting.end(c0, "load-shuffled", "", None, size);
+        shuf_s = secs;
+        if passes.lag {
+            lag_sweep(
+                e.as_mut(),
+                arm,
+                size,
+                scans,
+                scan_keys,
+                plan,
+                payload,
+                &mut counting,
+                &mut scan_lag,
+                &mut burst_lag,
+            )?;
+        }
+        for (name, v) in e.counters() {
+            match counters.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, had)) => *had += v,
+                None => counters.push((name, v)),
+            }
+        }
+        drop(e);
+        release_freed_memory();
+    }
+
+    Ok(OnePass {
+        prime_us_per_page: prime_a.max(prime_b),
+        load_ops_s: if passes.load {
+            size as f64 / load_s
+        } else {
+            f64::NAN
+        },
+        load_bpb: if passes.load {
+            wrote as f64 / stored
+        } else {
+            f64::NAN
+        },
+        disk_bpb: if passes.load {
+            on_disk as f64 / stored
+        } else {
+            f64::NAN
+        },
+        shuffled_ops_s: size as f64 / shuf_s,
+        scan_lag,
+        burst_lag,
+        reads_s: reads as f64 / read_s,
+        p99_us: if passes.read {
+            h.percentile(99.0) as f64 / 1000.0
+        } else {
+            f64::NAN
+        },
+        scan_entries_s: (scans * plan.scan_len as u64) as f64 / scan_s,
+        reads_s_threaded,
+        scan_entries_s_threaded,
+        ycsb_ops_s,
+        scan_mixed_threaded,
+        counters,
+        phase_counts: counting.out,
+    })
+}
+
+/// The lag sweep, on the store the shuffled load just left, so it
+/// costs no load of its own: the same scans as the scan workload, at
+/// each depth of unmerged writes. The first point is the drained
+/// store; each point after it writes another slice of the store and
+/// scans without merging in between, so the curve is scan throughput
+/// against merge lag rather than one number at whatever lag a
+/// workload happened to leave. The bursts are never divided: a store is
+/// updated by its slice whole or the point is another store's. Each
+/// point's scans are counted around under `scan-lag` and its burst
+/// under `lag-burst`, both with the point's suffix.
+#[allow(clippy::too_many_arguments)]
+fn lag_sweep(
+    e: &mut dyn Engine,
+    arm: &str,
+    size: u64,
+    scans: u64,
+    scan_keys: u64,
+    plan: &Plan,
+    payload: &Payload,
+    counting: &mut Counting<'_>,
+    scan_lag: &mut Vec<(u64, f64)>,
+    burst_lag: &mut Vec<(u64, f64)>,
+) -> Result<(), String> {
+    let mut kb = [0u8; KEY_SIZE];
     let mut vrng = Rng::new(0x1A5);
     let mut updated = 0u64;
     let mut ug = KeyGen::new(KeyDist::Uniform, size, 0x1A6);
     let mut buf = Batch::with_capacity(plan.batch, payload.value_size());
     for pct in LAG_PCT {
         let want = size * pct / 100;
+        let suffix = format!("_lag{pct}pct");
         // The burst is timed as well as the scans after it: an engine can
         // make its scans fast by converting the burst's writes while it
         // takes them, and a point that times only the scans would credit
@@ -1074,27 +1674,33 @@ fn one_pass(
         // scans' phases before their walk, the threads' time, the blocks
         // built and the forms copied, which say what a pass was made of
         // in the suite's own shape rather than a probe's.
-        let counting = std::env::var_os("SUPDB_LAG_COUNTERS").is_some();
-        let c0 = if counting { e.counters() } else { Vec::new() };
-        let (flt_up0, flt_main0) = if counting {
+        let counting_store = std::env::var_os("SUPDB_LAG_COUNTERS").is_some();
+        let c0 = if counting_store {
+            e.counters()
+        } else {
+            Vec::new()
+        };
+        let (flt_up0, flt_main0) = if counting_store {
             (minflt_of("supdb-upkeep"), minflt_self())
         } else {
             (0, 0)
         };
+        let cb = if wrote > 0 { counting.begin() } else { None };
         let tw = Instant::now();
         while updated < want {
             db_key_into(ug.next(), &mut kb);
             buf.push(&kb, payload.get(&mut vrng));
             updated += 1;
             if buf.len() == plan.batch {
-                buf.flush_updates(e.as_mut())?;
+                buf.flush_updates(e)?;
             }
         }
         if !buf.is_empty() {
-            buf.flush_updates(e.as_mut())?;
+            buf.flush_updates(e)?;
         }
         let burst_secs = tw.elapsed().as_secs_f64();
         if wrote > 0 {
+            counting.end(cb, "lag-burst", &suffix, None, wrote);
             burst_lag.push((pct, wrote as f64 / burst_secs));
         }
         if pct == 0 {
@@ -1103,6 +1709,7 @@ fn one_pass(
             e.sync()?;
         }
         let mut g3 = KeyGen::new(KeyDist::Uniform, scan_keys, 0x1A7);
+        let cs = counting.begin();
         lag_mark(arm, pct, "start");
         let t = Instant::now();
         for _ in 0..scans {
@@ -1111,8 +1718,9 @@ fn one_pass(
         }
         let secs = t.elapsed().as_secs_f64();
         lag_mark(arm, pct, "end");
+        counting.end(cs, "scan-lag", &suffix, None, scans);
         scan_lag.push((pct, (scans * plan.scan_len as u64) as f64 / secs));
-        if counting {
+        if counting_store {
             let c1 = e.counters();
             counters_line(
                 "lagcounters",
@@ -1128,32 +1736,7 @@ fn one_pass(
             );
         }
     }
-    for (name, v) in e.counters() {
-        match counters.iter_mut().find(|(n, _)| *n == name) {
-            Some((_, had)) => *had += v,
-            None => counters.push((name, v)),
-        }
-    }
-    drop(e);
-    release_freed_memory();
-
-    Ok(OnePass {
-        prime_us_per_page: prime_a.max(prime_b),
-        load_ops_s: size as f64 / load_s,
-        load_bpb: wrote as f64 / stored,
-        disk_bpb: on_disk as f64 / stored,
-        shuffled_ops_s: size as f64 / shuf_s,
-        scan_lag,
-        burst_lag,
-        reads_s: size as f64 / read_s,
-        p99_us: h.percentile(99.0) as f64 / 1000.0,
-        scan_entries_s: (scans * plan.scan_len as u64) as f64 / scan_s,
-        reads_s_threaded,
-        scan_entries_s_threaded,
-        ycsb_ops_s,
-        scan_mixed_threaded,
-        counters,
-    })
+    Ok(())
 }
 
 /// Two arms in one process, alternating, paired rep by rep.
@@ -1383,6 +1966,12 @@ fn share(ops: u64, threads: usize, i: usize) -> u64 {
 /// against the comparator is every thread's rate, one thread's, or a
 /// thread of the engine's on the fourth core. Off, the pass reads no
 /// clock it did not; on, two thread-clock reads a thread a pass.
+///
+/// With `count`, each thread reads its own device bytes and major faults
+/// at its release and at its finish, outside its clock, and the sum of
+/// the deltas is `Threaded::own`: a bounded pass's counts are the
+/// operating threads' (`Counting`), and the process's counters would
+/// blend the readers' faults with the engine's merges beside them.
 fn threaded(
     e: &dyn Engine,
     pass: &str,
@@ -1391,7 +1980,8 @@ fn threaded(
     keys: u64,
     seed: u64,
     op: Op,
-) -> Result<(f64, u64), String> {
+    count: bool,
+) -> Result<Threaded, String> {
     if threads == 0 {
         return Err("a threaded pass needs at least one thread".to_string());
     }
@@ -1401,7 +1991,7 @@ fn threaded(
         openers.push(e.thread_reader()?);
     }
     let barrier = std::sync::Barrier::new(threads + 1);
-    type Timed = Result<(Instant, Instant, u64, u64), String>;
+    type Timed = Result<(Instant, Instant, u64, u64, (u64, u64)), String>;
     let mut sched_before = Vec::new();
     let results: Vec<Timed> = std::thread::scope(|s| {
         let workers: Vec<_> = openers
@@ -1424,6 +2014,14 @@ fn threaded(
                     let mut g = KeyGen::new(KeyDist::Uniform, keys, seed);
                     let mut kb = [0u8; KEY_SIZE];
                     barrier.wait();
+                    // This thread's own counters at its release, read
+                    // before its clock starts so the two `/proc` reads
+                    // are outside it; a bounded pass only.
+                    let (rb0, mf0) = if count {
+                        (thread_read_bytes(), majflt_self())
+                    } else {
+                        (0, 0)
+                    };
                     let start = Instant::now();
                     let cpu0 = if spans { thread_cpu_us() } else { 0 };
                     let mut r = opened?;
@@ -1437,7 +2035,15 @@ fn threaded(
                     }
                     let end = Instant::now();
                     let cpu = if spans { thread_cpu_us() - cpu0 } else { 0 };
-                    Ok((start, end, bytes, cpu))
+                    let own = if count {
+                        (
+                            thread_read_bytes().saturating_sub(rb0),
+                            majflt_self().saturating_sub(mf0),
+                        )
+                    } else {
+                        (0, 0)
+                    };
+                    Ok((start, end, bytes, cpu, own))
                 })
             })
             .collect();
@@ -1458,11 +2064,14 @@ fn threaded(
     let sched_after = if spans { sched_of_tasks() } else { Vec::new() };
     let mut timed = Vec::with_capacity(threads);
     let mut bytes = 0u64;
+    let mut own = (0u64, 0u64);
     let mut first: Option<Instant> = None;
     let mut last: Option<Instant> = None;
     for r in results {
-        let (start, end, b, cpu) = r?;
+        let (start, end, b, cpu, o) = r?;
         bytes += b;
+        own.0 += o.0;
+        own.1 += o.1;
         first = Some(first.map_or(start, |f| f.min(start)));
         last = Some(last.map_or(end, |l| l.max(end)));
         timed.push((start, end, b, cpu));
@@ -1516,12 +2125,22 @@ fn threaded(
         }
         eprintln!("{line}");
     }
-    Ok((secs, bytes))
+    Ok(Threaded { secs, bytes, own })
 }
 
-/// One YCSB workload over a loaded store: `ycsb_ops(size)` operations,
-/// writes batched by `YCSB_BATCH` and the tail flushed inside the timed
-/// region, inserts taking fresh keys past the loaded range. Returns seconds.
+/// What a threaded pass measured: the span from the first thread's release
+/// to the last's finish, the bytes every thread read back, and under a
+/// bound the threads' own (device bytes read, major faults), summed.
+struct Threaded {
+    secs: f64,
+    bytes: u64,
+    own: (u64, u64),
+}
+
+/// One YCSB workload over a loaded store: `ops` operations (`ycsb_ops`,
+/// divided out of core), writes batched by `YCSB_BATCH` and the tail
+/// flushed inside the timed region, inserts taking fresh keys past the
+/// loaded range. Returns seconds.
 /// With `SUPDB_MIX_KINDS` set, a mix's time by the kind of operation --
 /// the reads, the scans and the commits -- summed over the mix and printed
 /// as one `mixkinds` line a mix on stderr, for both arms alike, since the
@@ -1576,11 +2195,11 @@ fn ycsb(
     arm: &str,
     w: &(char, u32, u32, u32, u32, u32, KeyDist),
     size: u64,
+    ops: u64,
     inserted: &mut u64,
     payload: &Payload,
 ) -> Result<f64, String> {
     let (letter, pread, pupd, pins, pscan, prmw, dist) = *w;
-    let ops = ycsb_ops(size);
     let mut keys = KeyGen::new(dist, size, 0x9C5B ^ letter as u64);
     let mut pick = Rng::new(0x5EED ^ letter as u64);
     let mut vrng = Rng::new(0xE2);
@@ -1744,6 +2363,28 @@ fn wal_floor(root: &Path, plan: &Plan, payload: &Payload) -> Result<f64, String>
 /// which is also what a store that fits in memory sees; at `full` the file
 /// does not fit and neither does the store.
 fn scan_floor(root: &Path, bytes: u64) -> Result<f64, String> {
+    let path = write_scan_floor(root, bytes)?;
+    let f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+    // SAFETY: the file is private to this process and not written while mapped.
+    let map = unsafe { memmap2::Mmap::map(&f) }.map_err(|e| e.to_string())?;
+    let t = Instant::now();
+    let mut acc = 0u64;
+    for w in map.as_chunks::<8>().0 {
+        acc = acc.wrapping_add(u64::from_le_bytes(*w));
+    }
+    let secs = t.elapsed().as_secs_f64();
+    std::hint::black_box(acc);
+    Ok(bytes as f64 / secs)
+}
+
+/// The scan floor's file under `root`, `bytes` long and synced, written
+/// where it is not there at that length already, and its pages dropped
+/// from the cache after the write. Public so that a bounded run writes
+/// it before it enters its bound: the write's dirty pages would be
+/// charged to the group, and a bound the floor file cannot fit is a
+/// group whose first act is reclaiming what the floor is about to read.
+/// Returns the path.
+pub fn write_scan_floor(root: &Path, bytes: u64) -> Result<PathBuf, String> {
     let path = root.join("scan-floor.dat");
     if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) != bytes {
         let _ = std::fs::remove_file(&path);
@@ -1760,18 +2401,113 @@ fn scan_floor(root: &Path, bytes: u64) -> Result<f64, String> {
             left -= n as u64;
         }
         f.sync_all().map_err(|e| e.to_string())?;
+        drop(f);
+        drop_cache(&path)?;
     }
-    let f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-    // SAFETY: the file is private to this process and not written while mapped.
-    let map = unsafe { memmap2::Mmap::map(&f) }.map_err(|e| e.to_string())?;
-    let t = Instant::now();
-    let mut acc = 0u64;
-    for w in map.as_chunks::<8>().0 {
-        acc = acc.wrapping_add(u64::from_le_bytes(*w));
+    Ok(path)
+}
+
+/// The seek floors' sample: `SEEK_FLOOR_READS` reads of one page each at
+/// page-aligned offsets drawn uniformly over the file, the same offsets
+/// every call (a fixed seed), so the second floor reads what the first
+/// read. A thousand reads is a few milliseconds warm and a second or two
+/// cold, and a p99 over a thousand is the tenth-slowest read, which is a
+/// latency and not one sample of the host's worst minute.
+const SEEK_FLOOR_READS: usize = 1024;
+const SEEK_READ_BYTES: usize = 4096;
+
+/// One seek floor's figures: the latency of a read at the median and the
+/// ninety-ninth percentile, and the device bytes the thread read over
+/// the bytes the floor asked for, which is readahead's share --
+/// `posix_fadvise(RANDOM)` asks for one, and the amplification says
+/// whether the kernel gave it.
+struct SeekFloor {
+    p50_us: f64,
+    p99_us: f64,
+    amplification: f64,
+}
+
+/// Drop `path`'s pages from the page cache (`POSIX_FADV_DONTNEED`), so
+/// the next read of them is the device's: the advice drops clean pages
+/// only, which is why the writer syncs first, and it drops pages mapped
+/// by nobody, which is why the scan floor's mapping is gone before the
+/// seek floor runs.
+fn drop_cache(path: &Path) -> Result<(), String> {
+    let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    fadvise(&f, FADV_DONTNEED).map_err(|e| format!("{}: fadvise DONTNEED: {e}", path.display()))
+}
+
+/// The random-read floor: `SEEK_FLOOR_READS` preads of a page at
+/// page-aligned offsets of the scan floor's file, each timed on its own,
+/// under `POSIX_FADV_RANDOM` so the kernel's readahead stays out of them.
+/// Run after `drop_cache` it is the device's own random read, which is
+/// what every out-of-core point read costs before the engine adds
+/// anything; run again over the same offsets after a second drop it says
+/// whether the host serves the second read from a cache the guest cannot
+/// see, which is the floor's reason for being two-sided in the gate
+/// (`gate::is_seek_floor`).
+fn seek_floor(path: &Path) -> Result<SeekFloor, String> {
+    let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let len = f.metadata().map_err(|e| e.to_string())?.len();
+    let pages = len / SEEK_READ_BYTES as u64;
+    if pages == 0 {
+        return Err(format!(
+            "{}: {len} bytes is shorter than one page, so there is nothing to seek in",
+            path.display()
+        ));
     }
-    let secs = t.elapsed().as_secs_f64();
-    std::hint::black_box(acc);
-    Ok(bytes as f64 / secs)
+    fadvise(&f, FADV_RANDOM).map_err(|e| format!("{}: fadvise RANDOM: {e}", path.display()))?;
+    let mut rng = Rng::new(0x5EEC);
+    let mut buf = [0u8; SEEK_READ_BYTES];
+    let mut us: Vec<f64> = Vec::with_capacity(SEEK_FLOOR_READS);
+    let read0 = thread_read_bytes();
+    for _ in 0..SEEK_FLOOR_READS {
+        let off = (rng.next() % pages) * SEEK_READ_BYTES as u64;
+        let t = Instant::now();
+        f.read_exact_at(&mut buf, off).map_err(|e| e.to_string())?;
+        us.push(t.elapsed().as_secs_f64() * 1e6);
+        std::hint::black_box(&buf);
+    }
+    let read = thread_read_bytes().saturating_sub(read0);
+    us.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let at = |pct: f64| us[((us.len() as f64 * pct / 100.0) as usize).min(us.len() - 1)];
+    Ok(SeekFloor {
+        p50_us: at(50.0),
+        p99_us: at(99.0),
+        amplification: read as f64 / (SEEK_FLOOR_READS * SEEK_READ_BYTES) as f64,
+    })
+}
+
+#[cfg(target_os = "linux")]
+const FADV_RANDOM: libc::c_int = libc::POSIX_FADV_RANDOM;
+#[cfg(target_os = "linux")]
+const FADV_DONTNEED: libc::c_int = libc::POSIX_FADV_DONTNEED;
+#[cfg(not(target_os = "linux"))]
+const FADV_RANDOM: libc::c_int = 0;
+#[cfg(not(target_os = "linux"))]
+const FADV_DONTNEED: libc::c_int = 0;
+
+/// `posix_fadvise` over the whole of `f`. Linux only: the seek floors run
+/// under a bound, which is a Linux cgroup, and on any other host a floor
+/// that could not drop the cache would read the cache and call it the
+/// device, so the call refuses there instead.
+#[cfg(target_os = "linux")]
+fn fadvise(f: &std::fs::File, advice: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: advice on a descriptor this process holds open; the
+    // call reads nothing and writes nothing of ours.
+    let rc = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, advice) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(rc))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fadvise(_f: &std::fs::File, _advice: libc::c_int) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "posix_fadvise is not available on this platform",
+    ))
 }
 
 /// The random-access floor: one dependent load at a time around a
@@ -1798,9 +2534,18 @@ impl Drop for FreshPages {
     }
 }
 
-/// The pool to prime for a rung of `size` keys (`PRIME_BYTES_PER_KEY`).
-fn prime_bytes_for(size: u64) -> u64 {
-    (size * PRIME_BYTES_PER_KEY).clamp(PRIME_MIN_BYTES, PRIME_MAX_BYTES)
+/// The pool to prime for a rung of `size` keys (`PRIME_BYTES_PER_KEY`),
+/// and under a bound of `bound` bytes never more than an eighth of it:
+/// the prime's pages are charged to the group like every other, and a
+/// prime the size of the bound would reclaim the page cache the floors
+/// and the store before it had warmed, which is what a bounded row
+/// measures and not what the prime is for.
+fn prime_bytes_for(size: u64, bound: Option<u64>) -> u64 {
+    let pool = (size * PRIME_BYTES_PER_KEY).clamp(PRIME_MIN_BYTES, PRIME_MAX_BYTES);
+    match bound {
+        Some(limit) => pool.min(limit / 8),
+        None => pool,
+    }
 }
 
 /// Touch and free a fresh anonymous mapping of `bytes` before a store
@@ -2174,11 +2919,14 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             let mut e = engines::open(arm, &dir, 1).unwrap();
             load(e.as_mut(), size, &plan, &payload, |i| i).unwrap();
-            let (secs, bytes) = threaded(e.as_ref(), "read", 2, size, size, 1, Op::Get).unwrap();
-            assert_eq!(bytes, size * plan.value_size as u64, "{arm}: point reads");
-            assert!(secs > 0.0, "{arm}: a pass took no time");
+            let got = threaded(e.as_ref(), "read", 2, size, size, 1, Op::Get, true).unwrap();
+            assert_eq!(got.bytes, size * plan.value_size as u64, "{arm}: point reads");
+            assert!(got.secs > 0.0, "{arm}: a pass took no time");
+            // In core, the threads' own device reads and major faults
+            // over a store just written are nothing or next to it.
+            assert!(got.own.0 < 1 << 20, "{arm}: {} device bytes", got.own.0);
             let scans = size / plan.scan_len as u64;
-            let (_, bytes) = threaded(
+            let got = threaded(
                 e.as_ref(),
                 "scan",
                 2,
@@ -2186,14 +2934,156 @@ mod tests {
                 size - plan.scan_len as u64,
                 2,
                 Op::Range(plan.scan_len),
+                false,
             )
             .unwrap();
             assert_eq!(
-                bytes,
+                got.bytes,
                 scans * (plan.scan_len * plan.value_size) as u64,
                 "{arm}: scans"
             );
+            assert_eq!(got.own, (0, 0), "{arm}: counted without being asked");
             drop(e);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The divisor: thirty at thirty million keys gives a million point
+    /// reads, ten thousand scans, a sixth of a million mix operations
+    /// and ten thousand lag scans; at ten thousand keys every divided
+    /// count sits on the floor of a thousand, or at the rung where the
+    /// rung is smaller; and at the two unbounded scales nothing is
+    /// divided at all.
+    #[test]
+    fn the_divisor_floors_at_a_thousand_and_divides_nothing_at_quick_and_full() {
+        let ooc = Plan::new(Scale::Ooc, vec![], 30_000_000, 4);
+        assert_eq!(ooc.ops_div, OOC_OPS_DIV);
+        let size = 30_000_000u64;
+        assert_eq!(ooc.divided(size), 1_000_000);
+        assert_eq!(ooc.divided(size / ooc.scan_len as u64), 10_000);
+        assert_eq!(ooc.divided(ycsb_ops(size)), 166_667);
+        // The lag scans are the scan pass's count.
+        assert_eq!(
+            ooc.divided((size / ooc.scan_len as u64).max(1)),
+            10_000
+        );
+        // The floor at ten thousand keys: the reads at a thousand, the
+        // scans at the rung's hundred, the mixes at their own thousand.
+        assert_eq!(ooc.divided(10_000), 1_000);
+        assert_eq!(ooc.divided(10_000 / ooc.scan_len as u64), 100);
+        assert_eq!(ooc.divided(ycsb_ops(10_000)), 1_000);
+        assert_eq!(ooc.divided(0), 0);
+        for scale in [Scale::Quick, Scale::Full] {
+            let p = Plan::new(scale, vec![], 300_000, 4);
+            assert_eq!(p.ops_div, 1);
+            for n in [1u64, 999, 1_000, 300_000, 30_000_000] {
+                assert_eq!(p.divided(n), n, "{scale:?} {n}");
+            }
+        }
+    }
+
+    /// The prime under a bound never exceeds an eighth of it, and without
+    /// one is the clamp it always was.
+    #[test]
+    fn the_prime_under_a_bound_is_at_most_an_eighth_of_it() {
+        for size in [10_000u64, 300_000, 3_000_000, 10_000_000] {
+            let free = prime_bytes_for(size, None);
+            assert!((PRIME_MIN_BYTES..=PRIME_MAX_BYTES).contains(&free), "{size}");
+            for limit in [MIN_BOUND_BYTES, 1536 << 20, 2048 << 20, 16 << 30] {
+                let bounded = prime_bytes_for(size, Some(limit));
+                assert!(bounded <= limit / 8, "{size} under {limit}: {bounded}");
+                assert!(bounded <= free, "{size} under {limit}: {bounded} over {free}");
+                assert_eq!(bounded, free.min(limit / 8));
+            }
+        }
+        assert_eq!(prime_bytes_for(10_000, None), PRIME_MIN_BYTES);
+        assert_eq!(prime_bytes_for(10_000_000, None), PRIME_MAX_BYTES);
+    }
+
+    /// The pass names parse to the phases they name, an unknown name is
+    /// refused naming it, and an empty list is refused too.
+    #[test]
+    fn the_passes_parse_by_name_and_refuse_a_name_they_lack() {
+        let all = Passes::parse(&Passes::NAMES.join(",")).unwrap();
+        assert_eq!(all, Passes::all());
+        let some = Passes::parse("read, scan-threaded,lag").unwrap();
+        assert!(some.read && some.scan_threaded && some.lag);
+        assert!(!some.load && !some.read_threaded && !some.scan && !some.mixes);
+        assert!(!some.scan_mixed);
+        let err = Passes::parse("read,scna").unwrap_err();
+        assert!(err.contains("scna"), "{err}");
+        assert!(Passes::parse("").is_err());
+        assert!(Passes::parse(" , ").is_err());
+    }
+
+    /// The count names: each of the five under no suffix, a thread
+    /// suffix or a lag suffix, and nothing else.
+    #[test]
+    fn a_count_is_named_under_every_suffix_a_rate_carries() {
+        for (base, unit) in COUNTS {
+            assert_eq!(count_of(base), Some(base));
+            assert_eq!(count_of(&format!("{base}_2t")), Some(base));
+            assert_eq!(count_of(&format!("{base}_lag0pct")), Some(base));
+            assert_eq!(count_of(&format!("{base}_lagpct")), None);
+            assert_eq!(count_of(&format!("{base}_t")), None);
+            assert_eq!(count_of(&format!("{base}2t")), None);
+            assert_eq!(count_unit(base), unit);
+        }
+        assert_eq!(count_of("reads_per_s"), None);
+        assert_eq!(count_of("read_bytes"), None);
+        assert_eq!(count_unit("not_a_count"), "?");
+    }
+
+    /// The thread's stat line is parsed past the comm, which may hold
+    /// spaces and parentheses of its own.
+    #[test]
+    fn the_major_faults_are_the_tenth_field_past_the_comm() {
+        let stat = "1234 (a (weird) comm) S 1 2 3 4 5 6 8 0 42 0 0 0";
+        assert_eq!(stat_majflt(stat), 42);
+        assert_eq!(stat_minflt(stat), 8);
+        assert_eq!(stat_majflt("garbage"), 0);
+        assert!(majflt_self() < u64::MAX);
+    }
+
+    /// The device's stat line: read I/Os first, read ticks fourth.
+    #[test]
+    fn the_devices_read_ios_and_ticks_are_its_first_and_fourth_fields() {
+        let dir = std::env::temp_dir().join(format!("supdb-bench-devstat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("stat");
+        std::fs::write(&p, "  100 2 3000 400   5 6 7 8 0 9 10 0 0 0 0 0 0\n").unwrap();
+        assert_eq!(dev_read_stat(&p), Some((100, 400)));
+        std::fs::write(&p, "100 2 3000\n").unwrap();
+        assert_eq!(dev_read_stat(&p), None);
+        assert_eq!(dev_read_stat(&dir.join("none")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The scan floor's file is written once at its length, synced, and
+    /// a seek over it reads the same offsets twice: the two floors answer
+    /// the same question of the same pages, and a page-aligned read of a
+    /// page reads at most the file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_seek_floor_reads_the_same_offsets_each_time() {
+        let root = std::env::temp_dir().join(format!("supdb-bench-seek-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let bytes = 64 * SEEK_READ_BYTES as u64;
+        let path = write_scan_floor(&root, bytes).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes);
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // A second call at the same length rewrites nothing.
+        write_scan_floor(&root, bytes).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), before);
+        drop_cache(&path).unwrap();
+        let a = seek_floor(&path).unwrap();
+        drop_cache(&path).unwrap();
+        let b = seek_floor(&path).unwrap();
+        for f in [&a, &b] {
+            assert!(f.p50_us >= 0.0 && f.p99_us >= f.p50_us);
+            assert!(f.amplification >= 0.0);
         }
         let _ = std::fs::remove_dir_all(&root);
     }

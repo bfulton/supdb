@@ -24,6 +24,8 @@ The workloads below, plus four floors. Each yields one or more quantities.
 | `scan-floor` | one `mmap` sequential walk of a file the top rung's size (capped at 4 GiB), no engine | bytes/s |
 | `mem-floor` | one dependent load at a time around a permutation of a 64 MiB buffer's cache lines, no engine | chases/s |
 | `page-floor` | one first touch per page of a fresh anonymous mapping of a thousand pages, the mapping held to the row's end; sampled with the other floors and again after every rep of every rung, no engine: the price of a page inside the pool every store is primed with (below) | pages/s |
+| `seek-floor` | bounded rows only: 1,024 reads of one page at page-aligned uniform offsets of the scan floor's file, its pages dropped from the cache first (`posix_fadvise(DONTNEED)`) and the kernel's readahead asked off (`RANDOM`), each read timed on its own; sampled with the other floors and after every rep of every rung, no engine: the device's random read, which every out-of-core point read costs before an engine adds anything | p50 µs, p99 µs |
+| `seek-floor-again` | the same offsets after a second drop | p50 µs, p99 µs |
 
 A read or a scan consumes what it returns: every value is copied out, into
 the reading thread's own buffer, on every arm, in the workloads above and in
@@ -78,6 +80,26 @@ moves to the prime, whose microseconds a page the pass line prints and
 which is the price the loads then pay. The scan floor's file fits in memory at `quick`
 and is served from the page cache after its first walk, which is also what a
 store that fits in memory sees; at `full` neither fits.
+
+A bounded row (`ooc`, below) carries two floors more, the seek floors,
+and five counts beside every timed phase of every arm. The counts are
+per operation of the phase, read before its first operation and after
+its last and never between: `read_bytes_per_op` and `majfaults_per_op`
+are the operating threads' own, from each thread's `/proc/thread-self`;
+`bg_read_bytes_per_op` is the process's device bytes less the operating
+threads', which is the merges' streaming and a comparator's background
+jobs; `refaults_per_op` is the group's `workingset_refault_file`, the
+file pages reclaimed under the bound and read back; `read_us_per_io` is
+the device's read ticks over its read I/Os across the phase, from
+`/sys/block/<dev>/stat`, and is omitted where that file cannot be read.
+None is a sum of any two, so a reader can tell the engine's reads from
+the kernel's readahead and both from the comparator's compaction. The
+pass line prints a self-check per phase, `counts ok` where the threads'
+device bytes cover their major faults and those cover the refaults, and
+`counts odd` where a count is not what its name says. Every count is a
+cost and moves with the machine. A bounded row's read passes run a
+divided count of operations (`--ops-div`, thirty by default, never below
+a thousand operations); its loads and bursts are whole.
 
 The load's two byte quantities are taken apart, and they are not the same
 question. Device bytes written per byte stored is a flow: the device's
@@ -190,12 +212,25 @@ drifts drifts across all of them.
 
 ## Scale
 
-Two. `quick` gates pull requests; `full` is the number.
+Three. `quick` gates pull requests; `full` is the number; `ooc` is the
+out-of-core regime reached under a memory bound.
 
 | scale | top of the ladder | reps | where |
 |---|---|---|---|
 | `quick` | 300 000 keys — measured once: 160 s with every arm, the six YCSB mixes and the floors on a 4-core VM | 5 | every pull request, on a GitHub Actions runner |
 | `full` | the rung at which the store is at least 1.5× the machine's memory | 7 | on demand or scheduled, on a quiet machine |
+| `ooc` | ten million keys, from three million, under `--bound BYTES`: a cgroup of the run's own with that memory limit, the process moved into it before anything is measured | 3 | on demand, on a quiet Linux machine with the cgroup v1 memory controller writable (`scripts/ooc.sh`) |
+
+`ooc` exists because every banked row is in-core: `full`'s top was never
+reached. The bound is the row's class (`/b<MiB>m`), since a store past it
+reads from the device where the same store unbounded reads from memory,
+and its rows live under `runs/ooc/`. Its default arms are the default,
+the three options whose difference is what a read past the page cache
+costs (`supdb-nocache`, `supdb-cache256`, `supdb-noadvice`) and the
+durable comparators, LMDB twice: as a user gets it and with its readahead
+off (`lmdb-nordahead`), the LMDB a user configures for the regime. The
+scan floor's file is written and synced outside the group and dropped
+from the cache; the floors and every pass run inside it.
 
 `full`'s top is a function of the machine, not a constant, so its curve
 crosses the memory line everywhere it runs — the 16 GB box and the 4 GB VM
@@ -434,6 +469,15 @@ noise; a control costs a rerun, so it must survive a bad machine. The CI
 rule was tried first and is useless here — a floor's samples range over a
 factor of two inside one run, so its CI overlaps the window on a host where
 LMDB's own scan ran at a third of its band.
+
+The wal, scan, mem and page floors are judged on that one side, below:
+a page that costs less or a chase that runs faster is a host that got
+better and takes the engine's cells with it. The two seek floors are
+judged on both sides: a seek faster than every prior row's is the host
+serving the device's reads from a cache the guest cannot see, which
+flatters every out-of-core cell under it, so a bounded row whose seek
+floor is above its window withholds the machine's verdicts as one below
+it does.
 
 Either control withholds; neither ever fails. A floor or a comparator below
 its window is the machine, and the run did not choose its machine. What

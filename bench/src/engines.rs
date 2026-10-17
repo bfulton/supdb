@@ -4542,25 +4542,45 @@ pub struct Lmdb {
     /// to LMDB's boundary; this brings LMDB down to Supdb's default, so the
     /// pair can be compared at both levels of promise rather than at neither.
     nosync: bool,
+    /// MDB_NORDAHEAD: the map opened with the kernel's readahead off, so a
+    /// point read past the page cache faults one page and not the
+    /// readahead window around it. Out of core, where every miss is a
+    /// device read, the window is what a random read pays for a
+    /// sequential one's benefit; this is the LMDB a user would configure
+    /// for that regime, beside the default a user gets. Durable as the
+    /// default is: the flag touches the read path alone.
+    nordahead: bool,
 }
 
 impl Lmdb {
     pub fn create(path: &Path, map_gb: usize) -> Res<Lmdb> {
-        Lmdb::with_sync(path, map_gb, true)
+        Lmdb::with_flags(path, map_gb, true, false)
     }
 
     /// Matched to Supdb's default: a commit that does not reach the device.
     pub fn create_nosync(path: &Path, map_gb: usize) -> Res<Lmdb> {
-        Lmdb::with_sync(path, map_gb, false)
+        Lmdb::with_flags(path, map_gb, false, false)
     }
 
-    fn with_sync(path: &Path, map_gb: usize, sync: bool) -> Res<Lmdb> {
+    /// The durable arm with readahead off (`nordahead`).
+    pub fn create_nordahead(path: &Path, map_gb: usize) -> Res<Lmdb> {
+        Lmdb::with_flags(path, map_gb, true, true)
+    }
+
+    fn with_flags(path: &Path, map_gb: usize, sync: bool, nordahead: bool) -> Res<Lmdb> {
         std::fs::create_dir_all(path).map_err(|e| e.to_string())?;
         let env = unsafe {
             let mut o = heed::EnvOpenOptions::new();
             o.map_size(map_gb * 1024 * 1024 * 1024).max_dbs(4);
+            let mut flags = heed::EnvFlags::empty();
             if !sync {
-                o.flags(heed::EnvFlags::NO_SYNC);
+                flags |= heed::EnvFlags::NO_SYNC;
+            }
+            if nordahead {
+                flags |= heed::EnvFlags::NO_READ_AHEAD;
+            }
+            if !flags.is_empty() {
+                o.flags(flags);
             }
             o.open(path)
         }
@@ -4576,7 +4596,17 @@ impl Lmdb {
             path: path.to_path_buf(),
             txn: None,
             nosync: !sync,
+            nordahead,
         })
+    }
+
+    /// The flags the environment was opened with, as LMDB reports them.
+    fn env_flags(&self) -> heed::EnvFlags {
+        self.env
+            .flags()
+            .ok()
+            .flatten()
+            .unwrap_or(heed::EnvFlags::empty())
     }
 
     /// The held read transaction, opened if there is not one.
@@ -4648,10 +4678,10 @@ impl ThreadReader for LmdbReader {
 
 impl Engine for Lmdb {
     fn name(&self) -> &'static str {
-        if self.nosync {
-            "lmdb-nosync"
-        } else {
-            "lmdb"
+        match (self.nosync, self.nordahead) {
+            (true, _) => "lmdb-nosync",
+            (false, true) => "lmdb-nordahead",
+            (false, false) => "lmdb",
         }
     }
     fn features(&self) -> Features {
@@ -4729,6 +4759,25 @@ pub const ARMS: [&str; 12] = [
     "supdb-ingest",
     "lmdb-nosync",
     "rocksdb-nosync",
+];
+
+/// The arms a bounded run (`Scale::Ooc`) measures by default: the default
+/// and the three shipping options whose difference is what a read past
+/// the page cache costs -- no block cache, the cache bounded at RocksDB's
+/// 256 MB, and no read advice -- against the durable comparators, LMDB
+/// twice: as a user gets it and with its readahead off, which is the LMDB
+/// a user configures for the regime. The buffered group is not here: a
+/// bounded row is about reads from the device, and a buffered load reads
+/// nothing a durable one does not. `--arms` overrides it as it does
+/// `ARMS`.
+pub const OOC_ARMS: [&str; 7] = [
+    "supdb",
+    "supdb-nocache",
+    "supdb-cache256",
+    "supdb-noadvice",
+    "lmdb",
+    "lmdb-nordahead",
+    "rocksdb-tuned",
 ];
 
 pub fn guarantee(arm: &str) -> Option<Guarantee> {
@@ -4821,6 +4870,7 @@ pub fn guarantee(arm: &str) -> Option<Guarantee> {
         | "supdb-bg"
         | "supdb-bglag"
         | "lmdb"
+        | "lmdb-nordahead"
         | "rocksdb-tuned" => Guarantee::Durable,
         "supdb-ingest"
         | "supdb-ingestleave"
@@ -5050,6 +5100,7 @@ pub fn open(arm: &str, dir: &Path, map_gb: usize) -> Res<Box<dyn Engine>> {
         "supdb-ingestadaptloose" => Box::new(Supdb::create_ingest_adaptloose(dir)?),
         "supdb-ingestnoseal" => Box::new(Supdb::create_ingest_noseal(dir)?),
         "lmdb" => Box::new(Lmdb::create(dir, map_gb)?),
+        "lmdb-nordahead" => Box::new(Lmdb::create_nordahead(dir, map_gb)?),
         "lmdb-nosync" => Box::new(Lmdb::create_nosync(dir, map_gb)?),
         "rocksdb-tuned" => Box::new(Rocks::create_tuned(dir)?),
         "rocksdb-nosync" => Box::new(Rocks::create(dir, false)?),
@@ -5089,9 +5140,53 @@ pub fn check_matched(arms: &[String], dir: &Path) -> Res<()> {
     Ok(())
 }
 
+/// Every arm either roster runs, each once, `ARMS` first and in its
+/// order: what a test over "every arm" walks, so an arm only the bounded
+/// roster names is not an arm nothing tests, and the order the figures
+/// draw curves in, so an arm only that roster names is not a curve
+/// nothing draws.
+pub fn every_arm() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = ARMS.to_vec();
+    for a in OOC_ARMS {
+        if !v.contains(&a) {
+            v.push(a);
+        }
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The readahead arm is the durable LMDB arm with one flag more, and
+    /// nothing else: named, durable, in the bounded roster, and opened
+    /// with exactly `NO_READ_AHEAD` over the flags `lmdb` is opened with.
+    /// Copied from the matching test's shape: a difference that is not
+    /// the one the arm is for is a second arm nobody declared.
+    #[test]
+    fn the_readahead_arm_differs_from_lmdb_in_one_flag() {
+        assert_eq!(guarantee("lmdb-nordahead"), Some(Guarantee::Durable));
+        assert!(OOC_ARMS.contains(&"lmdb-nordahead"));
+        assert!(OOC_ARMS.contains(&"lmdb"));
+        let root =
+            std::env::temp_dir().join(format!("supdb-bench-nordahead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let plain = Lmdb::create(&root.join("lmdb"), 1).unwrap();
+        let off = Lmdb::create_nordahead(&root.join("lmdb-nordahead"), 1).unwrap();
+        assert_eq!(plain.name(), "lmdb");
+        assert_eq!(off.name(), "lmdb-nordahead");
+        assert_eq!(plain.features(), off.features());
+        assert!(plain.features().durable_commit);
+        assert_eq!(
+            off.env_flags() ^ plain.env_flags(),
+            heed::EnvFlags::NO_READ_AHEAD
+        );
+        assert!(!plain.env_flags().contains(heed::EnvFlags::NO_READ_AHEAD));
+        drop(plain);
+        drop(off);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// The buffered group is defined by what it gives up: an arm that
     /// commits durably does not belong in it, whatever its row says.
@@ -5125,7 +5220,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("supdb-bench-reopen-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (k, v) = (b"k0000000000000001".as_slice(), [7u8; 100]);
-        for arm in ARMS {
+        for arm in every_arm() {
             let dir = root.join(arm);
             std::fs::create_dir_all(&dir).unwrap();
             let mut e = open(arm, &dir, 1).unwrap();
